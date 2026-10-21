@@ -312,7 +312,8 @@ fn shell_line(argv: &[String]) -> String {
         .join(" ")
 }
 
-/// [`plan`] as shell lines, the form the report prints.
+/// [`plan`] as shell lines, the form the report prints for a local run.
+#[cfg(test)]
 pub(crate) fn commands(paths: &[String]) -> Vec<String> {
     plan(paths).iter().map(|c| shell_line(c)).collect()
 }
@@ -333,9 +334,23 @@ fn comment_text(text: &str) -> String {
         .collect()
 }
 
-/// The report: every changed path with its verdict as a `#` comment, then the
-/// commands, one per line — so the output is itself a shell script.
+/// The report for a local run: every changed path with its verdict as a `#`
+/// comment, then the commands, one per line — so the output is itself a shell
+/// script. `run` uses [`render_with`], which also covers a remote runner.
+#[cfg(test)]
 pub(crate) fn render(origin: &str, paths: &[String]) -> String {
+    render_with(origin, paths, &plan(paths), None)
+}
+
+/// [`render`] for a plan that may have been rewritten for a remote runner, with
+/// the note that says so. The commands printed are exactly the ones `--run`
+/// executes.
+pub(crate) fn render_with(
+    origin: &str,
+    paths: &[String],
+    plan: &[Vec<String>],
+    note: Option<&str>,
+) -> String {
     let origin = comment_text(origin);
     let mut out = String::new();
     if paths.is_empty() {
@@ -372,8 +387,11 @@ pub(crate) fn render(origin: &str, paths: &[String]) -> String {
         );
     }
     out.push_str("# Plus the tests covering what you touched, any tier (CLAUDE.md rule 5).\n");
-    for command in commands(paths) {
-        out.push_str(&command);
+    if let Some(note) = note {
+        out.push_str(&format!("# {}\n", comment_text(note)));
+    }
+    for command in plan {
+        out.push_str(&shell_line(command));
         out.push('\n');
     }
     out
@@ -497,6 +515,163 @@ fn execute(root: &Path, plan: &[Vec<String>]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Opt-in for running the test commands in an RWX sandbox instead of locally.
+/// Unset or empty keeps everything local; `rwx` sends `cargo test-fast` and
+/// `cargo nextest` commands to the sandbox while fmt and clippy stay local
+/// (they are faster locally: every sandbox command pays a sync).
+pub(crate) const REMOTE_ENV: &str = "DAD_REMOTE_EXEC";
+
+/// `1` leaves the sandbox running after `--run`, for several runs in a row. By
+/// default it is stopped, because a sandbox is billed per second while active,
+/// idle included.
+pub(crate) const REMOTE_KEEP_ENV: &str = "DAD_REMOTE_EXEC_KEEP";
+
+/// The sandbox definition `rwx sandbox exec` uses, relative to the root.
+pub(crate) const SANDBOX_CONFIG: &str = ".rwx/sandbox.yml";
+
+/// Where the test commands of a plan run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Runner {
+    Local,
+    Rwx,
+}
+
+/// What the RWX runner needs, probed only when it was asked for.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Readiness {
+    pub(crate) cli: bool,
+    pub(crate) logged_in: bool,
+    pub(crate) config: bool,
+}
+
+/// Where the test commands run, and a note for the report whenever a remote
+/// runner was asked for — including when it could not be used and the run
+/// falls back to local, so the fallback is never silent.
+pub(crate) fn choose_runner(opt_in: Option<&str>, ready: Readiness) -> (Runner, Option<String>) {
+    match opt_in.map(str::trim) {
+        None | Some("") => (Runner::Local, None),
+        Some("rwx") => {
+            let missing: Vec<&str> = [
+                (!ready.cli).then_some("the `rwx` CLI is not on PATH"),
+                (ready.cli && !ready.logged_in).then_some("`rwx whoami` fails (not logged in)"),
+                (!ready.config).then_some("`.rwx/sandbox.yml` does not exist"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            if missing.is_empty() {
+                (
+                    Runner::Rwx,
+                    Some(format!(
+                        "{REMOTE_ENV}=rwx: the test commands run in an RWX sandbox"
+                    )),
+                )
+            } else {
+                (
+                    Runner::Local,
+                    Some(format!(
+                        "{REMOTE_ENV}=rwx is set, but {}, so everything runs locally",
+                        missing.join(" and ")
+                    )),
+                )
+            }
+        }
+        Some(other) => (
+            Runner::Local,
+            Some(format!(
+                "{REMOTE_ENV}={other:?} names no known runner (the only one is `rwx`), so everything runs locally"
+            )),
+        ),
+    }
+}
+
+/// A test command: `cargo test-fast` or any `cargo nextest` invocation.
+fn is_test_command(command: &[String]) -> bool {
+    matches!(command, [cargo, sub, ..] if cargo == "cargo" && (sub == "test-fast" || sub == "nextest"))
+}
+
+/// The plan as `runner` executes it: for RWX, each test command is prefixed
+/// with `rwx sandbox exec --`; every other command is unchanged.
+pub(crate) fn for_runner(runner: Runner, plan: Vec<Vec<String>>) -> Vec<Vec<String>> {
+    match runner {
+        Runner::Local => plan,
+        Runner::Rwx => plan
+            .into_iter()
+            .map(|command| {
+                if is_test_command(&command) {
+                    let mut wrapped = argv(&["rwx", "sandbox", "exec", "--"]);
+                    wrapped.extend(command);
+                    wrapped
+                } else {
+                    command
+                }
+            })
+            .collect(),
+    }
+}
+
+fn rwx_succeeds(root: &Path, args: &[&str]) -> bool {
+    Command::new("rwx")
+        .args(args)
+        .current_dir(root)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn probe(root: &Path) -> Readiness {
+    let cli = rwx_succeeds(root, &["--version"]);
+    Readiness {
+        cli,
+        logged_in: cli && rwx_succeeds(root, &["whoami"]),
+        config: root.join(SANDBOX_CONFIG).is_file(),
+    }
+}
+
+/// Whether `rwx sandbox list` shows this checkout's sandbox as still active.
+pub(crate) fn sandbox_listed_active(listing: &str, config: &str) -> bool {
+    listing
+        .lines()
+        .any(|line| line.split_whitespace().nth(1) == Some("active") && line.contains(config))
+}
+
+/// Stops this checkout's sandbox. `rwx sandbox stop` has been seen to time out
+/// and leave the sandbox running (2026-10-19), so the listing is checked and
+/// the stop repeated once; a sandbox that is still active after that is named,
+/// because it keeps billing.
+fn stop_sandbox(root: &Path) {
+    let config = root
+        .canonicalize()
+        .unwrap_or_else(|_| root.to_path_buf())
+        .join(SANDBOX_CONFIG)
+        .to_string_lossy()
+        .into_owned();
+    for attempt in 1..=2 {
+        eprintln!("affected-checks: stopping the RWX sandbox");
+        let _ = Command::new("rwx")
+            .args(["sandbox", "stop"])
+            .current_dir(root)
+            .status();
+        let still_active = Command::new("rwx")
+            .args(["sandbox", "list"])
+            .current_dir(root)
+            .output()
+            .map(|out| sandbox_listed_active(&String::from_utf8_lossy(&out.stdout), &config))
+            .unwrap_or(false);
+        if !still_active {
+            return;
+        }
+        if attempt == 2 {
+            eprintln!(
+                "affected-checks: the RWX sandbox for {config} is still active; \
+                 stop it with `rwx sandbox stop` (it is billed while active)"
+            );
+        }
+    }
+}
+
 pub(crate) fn run(root: &Path, args: &[String]) -> ExitCode {
     let mut base = "origin/main".to_string();
     let mut explicit: Vec<String> = Vec::new();
@@ -561,11 +736,26 @@ pub(crate) fn run(root: &Path, args: &[String]) -> ExitCode {
         explicit.dedup();
         ("as given".to_string(), explicit)
     };
-    print!("{}", render(&origin, &paths));
+    let opt_in = std::env::var(REMOTE_ENV).ok();
+    let ready = match opt_in.as_deref().map(str::trim) {
+        Some("rwx") => probe(root),
+        _ => Readiness::default(),
+    };
+    let (runner, note) = choose_runner(opt_in.as_deref(), ready);
+    let plan = for_runner(runner, plan(&paths));
+    print!("{}", render_with(&origin, &paths, &plan, note.as_deref()));
     if execute_plan {
         use std::io::Write;
         let _ = std::io::stdout().flush();
-        return execute(root, &plan(&paths));
+        let status = execute(root, &plan);
+        let used_sandbox = plan
+            .iter()
+            .any(|c| c.first().map(String::as_str) == Some("rwx"));
+        let keep = std::env::var(REMOTE_KEEP_ENV).is_ok_and(|v| v.trim() == "1");
+        if used_sandbox && !keep {
+            stop_sandbox(root);
+        }
+        return status;
     }
     ExitCode::SUCCESS
 }
@@ -1293,5 +1483,133 @@ mod tests {
                 "XTASK_TESTS must exclude {package}"
             );
         }
+    }
+
+    // --- the opt-in RWX runner ---------------------------------------------
+
+    fn ready() -> Readiness {
+        Readiness {
+            cli: true,
+            logged_in: true,
+            config: true,
+        }
+    }
+
+    #[test]
+    fn unset_or_empty_opt_in_runs_locally_without_a_note() {
+        for opt_in in [None, Some(""), Some("  ")] {
+            assert_eq!(
+                choose_runner(opt_in, ready()),
+                (Runner::Local, None),
+                "{opt_in:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rwx_opt_in_with_everything_ready_runs_in_the_sandbox_and_says_so() {
+        let (runner, note) = choose_runner(Some("rwx"), ready());
+        assert_eq!(runner, Runner::Rwx);
+        assert!(note.expect("a note").contains("RWX sandbox"));
+    }
+
+    #[test]
+    fn rwx_opt_in_falls_back_to_local_and_names_what_is_missing() {
+        for (readiness, missing) in [
+            (
+                Readiness {
+                    cli: false,
+                    ..ready()
+                },
+                "not on PATH",
+            ),
+            (
+                Readiness {
+                    logged_in: false,
+                    ..ready()
+                },
+                "not logged in",
+            ),
+            (
+                Readiness {
+                    config: false,
+                    ..ready()
+                },
+                "does not exist",
+            ),
+        ] {
+            let (runner, note) = choose_runner(Some("rwx"), readiness);
+            assert_eq!(runner, Runner::Local, "{missing}");
+            let note = note.expect("a fallback is never silent");
+            assert!(
+                note.contains(missing) && note.contains("runs locally"),
+                "{note}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_cli_is_not_also_reported_as_a_failed_login() {
+        let (_, note) = choose_runner(Some("rwx"), Readiness::default());
+        let note = note.expect("a note");
+        assert!(note.contains("not on PATH"), "{note}");
+        assert!(!note.contains("not logged in"), "{note}");
+    }
+
+    #[test]
+    fn an_unknown_runner_runs_locally_and_says_so() {
+        let (runner, note) = choose_runner(Some("buildkite"), ready());
+        assert_eq!(runner, Runner::Local);
+        assert!(note.expect("a note").contains("names no known runner"));
+    }
+
+    #[test]
+    fn rwx_wraps_the_test_commands_and_leaves_fmt_and_clippy_local() {
+        let full = for_runner(Runner::Rwx, FULL_GATES.iter().map(|c| argv(c)).collect());
+        let lines: Vec<String> = full.iter().map(|c| shell_line(c)).collect();
+        assert_eq!(lines[0], "cargo fmt --check");
+        assert!(lines[1].starts_with("cargo clippy "), "{}", lines[1]);
+        assert_eq!(lines[2], "rwx sandbox exec -- cargo test-fast");
+
+        let prefix = argv(&["rwx", "sandbox", "exec", "--"]);
+        let text = for_runner(Runner::Rwx, plan(&paths(&["docs/quick-start.md"])));
+        assert!(!text.is_empty());
+        for command in &text {
+            assert_eq!(command[..prefix.len()], prefix[..], "{command:?}");
+            assert_eq!(
+                command[prefix.len()..prefix.len() + 2],
+                argv(&["cargo", "nextest"])[..]
+            );
+        }
+    }
+
+    #[test]
+    fn local_leaves_the_plan_unchanged() {
+        let local = plan(&paths(&["src/ui.rs"]));
+        assert_eq!(for_runner(Runner::Local, local.clone()), local);
+    }
+
+    #[test]
+    fn the_report_prints_the_note_and_exactly_the_commands_it_executes() {
+        let changed = paths(&["src/ui.rs"]);
+        let wrapped = for_runner(Runner::Rwx, plan(&changed));
+        let report = render_with("as given", &changed, &wrapped, Some("remote note"));
+        assert!(report.contains("# remote note\n"), "{report}");
+        let printed: Vec<&str> = report.lines().filter(|l| !l.starts_with('#')).collect();
+        let expected: Vec<String> = wrapped.iter().map(|c| shell_line(c)).collect();
+        assert_eq!(printed, expected);
+    }
+
+    #[test]
+    fn the_sandbox_listing_is_read_for_this_checkouts_config_only() {
+        let listing = "RUN      STATUS     CONFIG                    BRANCH\n\
+                       01a1     active     /w/a/.rwx/sandbox.yml rwx\n\
+                       01b2     stopped    /w/b/.rwx/sandbox.yml rwx\n";
+        assert!(sandbox_listed_active(listing, "/w/a/.rwx/sandbox.yml"));
+        assert!(!sandbox_listed_active(listing, "/w/b/.rwx/sandbox.yml"));
+        assert!(!sandbox_listed_active(
+            "No sandbox sessions found.\n",
+            "/w/a/.rwx/sandbox.yml"
+        ));
     }
 }
