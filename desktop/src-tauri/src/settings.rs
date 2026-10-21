@@ -505,7 +505,8 @@ pub const OPENAI_COMMAND_MODEL: &str = "gpt-5-mini";
 /// above is that configuration.
 pub const OPENAI_COMMAND_REASONING_EFFORT: &str = "minimal";
 
-/// The speech stage: which transcriber, where it is, and which model.
+/// The speech stage: which transcriber, where it is, which model, and which
+/// language it is told the speech is in.
 ///
 /// Its [`Default`] is the **keyless local container**, which is the product
 /// decision PRD #802's provider work turned on: the feature is try-able on the
@@ -518,6 +519,10 @@ pub struct TranscriptionSettings {
     pub backend: TranscriptionBackend,
     pub endpoint: ServiceUrl,
     pub model: ModelId,
+    /// Not part of a backend's preset: picking another backend keeps it, since
+    /// the language is the speaker's and not the service's. See
+    /// [`SpeechLanguage`].
+    pub language: SpeechLanguage,
 }
 
 impl TranscriptionSettings {
@@ -545,6 +550,7 @@ impl TranscriptionSettings {
             backend,
             endpoint: ServiceUrl::parse(endpoint).expect("a valid preset endpoint"),
             model: ModelId::parse(model).expect("a valid preset model"),
+            language: SpeechLanguage::default(),
         }
     }
 }
@@ -563,6 +569,7 @@ impl<'de> Deserialize<'de> for TranscriptionSettings {
             endpoint: doc.endpoint.unwrap_or(preset.endpoint),
             model: doc.model.unwrap_or(preset.model),
             backend: preset.backend,
+            language: doc.language.unwrap_or(preset.language),
         };
         // The pairing the keyless backend IS, enforced where the value is
         // built rather than where it is used. See [`KEYLESS_OFF_MACHINE`].
@@ -626,6 +633,11 @@ struct StageDocument<B> {
     /// have an effect. A well-formed one there is read and dropped, exactly as
     /// any unknown key is.
     max_tokens: Option<TokenCeiling>,
+    /// The speech language, which **only the speech stage reads** — the
+    /// mirror of `max_tokens`, declared here for the same reason, at the same
+    /// cost: a well-formed `language` under `[voice.intent]` is read and
+    /// dropped, and an over-length one is refused there as it is here.
+    language: Option<SpeechLanguage>,
 }
 
 impl<B> Default for StageDocument<B> {
@@ -635,6 +647,7 @@ impl<B> Default for StageDocument<B> {
             endpoint: None,
             model: None,
             max_tokens: None,
+            language: None,
         }
     }
 }
@@ -690,6 +703,7 @@ impl<B> StageSpec<B> {
                 endpoint: None,
                 model: None,
                 max_tokens: None,
+                language: None,
             },
             Self::Table(document) => document,
         }
@@ -1323,6 +1337,82 @@ impl VoiceToken for ReadingConsent {
     }
 }
 
+/// Every token [`SpeechLanguage`] stores: `auto`, then the ISO-639-1 code of
+/// each language OpenAI documents its speech-to-text as supporting, which the
+/// local container's Whisper models accept under the same codes.
+///
+/// A closed list rather than any two letters, because a code the service does
+/// not know is a 400 on every utterance, and that is a broken microphone
+/// rather than a setting. `desktop/src/lib/speechLanguages.json` holds the
+/// same codes with the names the panel shows, pinned by
+/// `the_speech_languages_match_the_frontends_copy`.
+pub const SPEECH_LANGUAGE_TOKENS: [&str; 58] = [
+    "auto", "af", "ar", "hy", "az", "be", "bs", "bg", "ca", "zh", "hr", "cs", "da", "nl", "en",
+    "et", "fi", "fr", "gl", "de", "el", "he", "hi", "hu", "is", "id", "it", "ja", "kn", "kk", "ko",
+    "lv", "lt", "mk", "ms", "mr", "mi", "ne", "no", "fa", "pl", "pt", "ro", "ru", "sr", "sk", "sl",
+    "es", "sw", "sv", "tl", "ta", "th", "tr", "uk", "ur", "vi", "cy",
+];
+
+/// The language every transcription request names (issue #1458) — Settings →
+/// Voice → **Language**, stored as `[voice.transcription] language`.
+///
+/// **English by default**, which is the pin PR #1451 added: with no `language`
+/// field, Whisper-family models guess the language per utterance, and a short
+/// command in an accent is what they guess wrong — "Select the directory …"
+/// spoken with a Serbian accent came back as "Selectajte directory …". Every
+/// command phrase this app recognises is English, so English stays the
+/// default; another language is for someone who dictates prompts in it, and
+/// the panel says what that costs commands.
+///
+/// **Auto** sends no `language` field at all, so the service detects it per
+/// utterance — for someone who switches languages and accepts that risk.
+///
+/// A code from [`SPEECH_LANGUAGE_TOKENS`], never free text: an unknown token
+/// folds to English the way every `[voice]` token folds to its default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpeechLanguage(Option<&'static str>);
+
+impl SpeechLanguage {
+    /// The service detects the language of each utterance.
+    pub const AUTO: Self = Self(None);
+    /// English, the default.
+    pub const ENGLISH: Self = Self(Some("en"));
+
+    /// The ISO-639-1 code a request names, or `None` for [`Self::AUTO`], which
+    /// names none.
+    pub fn code(self) -> Option<&'static str> {
+        self.0
+    }
+}
+
+impl Default for SpeechLanguage {
+    fn default() -> Self {
+        Self::ENGLISH
+    }
+}
+
+impl VoiceToken for SpeechLanguage {
+    const TOKENS: &'static [&'static str] = &SPEECH_LANGUAGE_TOKENS;
+    const LABEL: &'static str = "a speech language";
+
+    fn as_str(self) -> &'static str {
+        self.0.unwrap_or("auto")
+    }
+
+    fn from_str_lossy(raw: &str) -> Self {
+        let raw = raw.trim().to_ascii_lowercase();
+        if raw == "auto" {
+            return Self::AUTO;
+        }
+        // The stored value is the table's own `&'static str`, so a code is
+        // always one of the list and never a copy of what the document said.
+        SPEECH_LANGUAGE_TOKENS[1..]
+            .iter()
+            .find(|code| **code == raw)
+            .map_or_else(Self::default, |code| Self(Some(code)))
+    }
+}
+
 macro_rules! voice_token_serde {
     ($($ty:ty),+ $(,)?) => {$(
         impl $ty {
@@ -1346,7 +1436,7 @@ macro_rules! voice_token_serde {
     )+};
 }
 
-// Seven identical serde impls, written once. The macro generates NO struct and
+// Eight identical serde impls, written once. The macro generates NO struct and
 // NO field — see [`VoiceToken`] for why that boundary matters to the
 // linkage-check scanner that reads this file as text.
 voice_token_serde!(
@@ -1356,7 +1446,8 @@ voice_token_serde!(
     LabelSharing,
     SpeechSource,
     ReadingConsent,
-    ReadingNotice
+    ReadingNotice,
+    SpeechLanguage
 );
 
 /// The whole settings document.
@@ -5044,6 +5135,8 @@ mod tests {
                     "backend": "local",
                     "endpoint": LOCAL_SPEECH_ENDPOINT,
                     "model": LOCAL_SPEECH_MODEL,
+                    // Absent from the document, so English (issue #1458).
+                    "language": "en",
                 },
                 // Absent from the document above, so this build's default:
                 // the observed names ARE sent (PRD #1223, audit finding A1).
@@ -5877,6 +5970,93 @@ mod tests {
         );
         assert_eq!(ReadingNotice::default(), ReadingNotice::Pending);
         round_trips::<ReadingNotice>();
+        assert_eq!(SpeechLanguage::default(), SpeechLanguage::ENGLISH);
+        round_trips::<SpeechLanguage>();
+    }
+
+    /// The speech languages are listed twice — here as tokens, and in
+    /// `desktop/src/lib/speechLanguages.json` with the name the Language select
+    /// shows for each — so the two are pinned code for code, for
+    /// `the_voice_tokens_match_the_frontends_copy`'s reason: a code the panel
+    /// offers that this side does not know folds to English, and the user's
+    /// choice silently does not stick.
+    #[test]
+    fn the_speech_languages_match_the_frontends_copy() {
+        #[derive(Deserialize)]
+        struct Row {
+            code: String,
+            name: String,
+        }
+        let rows: Vec<Row> =
+            serde_json::from_str(include_str!("../../src/lib/speechLanguages.json"))
+                .expect("speechLanguages.json parses");
+        let codes: Vec<&str> = rows.iter().map(|row| row.code.as_str()).collect();
+        assert_eq!(
+            codes,
+            SPEECH_LANGUAGE_TOKENS[1..],
+            "keep desktop/src/lib/speechLanguages.json identical to SPEECH_LANGUAGE_TOKENS"
+        );
+        assert!(rows.iter().all(|row| !row.name.trim().is_empty()));
+
+        // `auto` is the one token that names no language.
+        assert_eq!(SPEECH_LANGUAGE_TOKENS[0], "auto");
+        assert_eq!(SpeechLanguage::from_str_lossy("auto").code(), None);
+        for code in &SPEECH_LANGUAGE_TOKENS[1..] {
+            assert_eq!(SpeechLanguage::from_str_lossy(code).code(), Some(*code));
+        }
+        // Folding, as every `[voice]` token does: a name or an unlisted code
+        // is not an error, it is the default.
+        for raw in ["serbian", "xx", "", "en-US"] {
+            assert_eq!(
+                SpeechLanguage::from_str_lossy(raw),
+                SpeechLanguage::ENGLISH,
+                "{raw}"
+            );
+        }
+    }
+
+    /// Scenario: a document chooses Serbian for speech; it loads as Serbian,
+    /// survives a save, and a document that names no language — every one
+    /// written before issue #1458 — reads as English.
+    #[test]
+    fn the_speech_language_is_stored_and_defaults_to_english() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(
+            &path,
+            "version = 1\n\n[voice.transcription]\nbackend = \"remote\"\nlanguage = \"sr\"\n",
+        )
+        .unwrap();
+        let (loaded, problem) = load_document(&path);
+        assert!(problem.is_none(), "{problem:?}");
+        let transcription = loaded.voice.clone().expect("present").transcription;
+        assert_eq!(transcription.language.code(), Some("sr"));
+        // The backend's preset still fills what the document left out.
+        assert_eq!(transcription.endpoint.as_str(), HOSTED_SPEECH_ENDPOINT);
+
+        let written = toml_edit::ser::to_string(&loaded).expect("serializes");
+        assert!(written.contains("language = \"sr\""), "{written}");
+
+        std::fs::write(
+            &path,
+            "version = 1\n\n[voice.transcription]\nbackend = \"remote\"\n",
+        )
+        .unwrap();
+        let (loaded, problem) = load_document(&path);
+        assert!(problem.is_none(), "{problem:?}");
+        assert_eq!(
+            loaded.voice.expect("present").transcription.language,
+            SpeechLanguage::ENGLISH
+        );
+
+        // Auto is stored as its token and names no language.
+        let auto: TranscriptionSettings =
+            serde_json::from_value(serde_json::json!({ "language": "auto" })).expect("parses");
+        assert_eq!(auto.language, SpeechLanguage::AUTO);
+        assert_eq!(
+            serde_json::to_value(&auto).expect("serializes")["language"],
+            "auto"
+        );
     }
 
     /// The preset endpoints and models are duplicated in
@@ -8319,6 +8499,7 @@ forms it is.";
                     backend: TranscriptionBackend::Remote,
                     endpoint: ServiceUrl::parse(HOSTED_SPEECH_ENDPOINT).unwrap(),
                     model: ModelId::parse(HOSTED_SPEECH_MODEL).unwrap(),
+                    language: SpeechLanguage::from_str_lossy("sr"),
                 },
                 labels: LabelSharing::Withheld,
                 speech: SpeechSource::Provider,
@@ -9228,6 +9409,7 @@ max_tokens = 1024
 backend = \"remote\"
 endpoint = \"https://api.openai.com/v1/audio/transcriptions\"
 model = \"whisper-1\"
+language = \"sr\"
 
 [zoom]
 level = 1.0

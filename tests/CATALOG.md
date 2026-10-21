@@ -22,10 +22,10 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 
 #### session/pr
 
-##### session/pr/001 — The daemon resolves the exact branch PR and serves its state and review.
+##### session/pr/001 — The daemon resolves the exact branch PR and serves its state, review and CI checks.
 - **Layer:** L2 headless, lane 1 (deterministic).
 - **Agent:** none (synthetic cat agent, strict offline gh stub).
-- **Asserts:** ListAgents live.pull_request carries the exact branch's open PR in preference to terminal PRs; draft, merged, closed, review decisions, absent review and highest-number fallback are mapped correctly. The stub requires explicit repository, all states and all required JSON fields.
+- **Asserts:** ListAgents live.pull_request carries the exact branch's open PR in preference to terminal PRs; draft, merged, closed, review decisions, absent review and highest-number fallback are mapped correctly; the winning PR's `statusCheckRollup` (check runs and a commit status) is served as its CI summary, failing first, with per-bucket counts (issue #1781). The stub requires explicit repository, all states and all required JSON fields, `statusCheckRollup` included.
 - **Does not assert:** periodic refresh (`session/pr/003`) or TUI rendering.
 - **Platform coverage:** mac+linux.
 
@@ -43,17 +43,17 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the particular event variant or metadata key used, browser invocation or real GitHub latency.
 - **Platform coverage:** mac+linux.
 
-##### session/pr/004 — A dashboard card shows the PR and o opens its URL.
+##### session/pr/004 — A dashboard card shows the PR with its CI and review, and o opens its URL.
 - **Layer:** L2 PTY-attached, lane 1 (deterministic).
 - **Agent:** none (synthetic cat agent, offline gh stub and BROWSER recorder).
-- **Asserts:** the real TUI displays `#1234 ⊙ ◐`; o on the selected card invokes BROWSER with the exact PR URL; the same key on a default-branch card spawns no opener and leaves Help usable.
+- **Asserts:** the real TUI displays `#1234 ⊙ ✓ ◉` for an open PR with passing CI awaiting review, with the review cell in inverse video and the CI cell not (issue #1781); o on the selected card invokes BROWSER with the exact PR URL; the same key on a default-branch card spawns no opener and leaves Help usable.
 - **Does not assert:** a real browser opening, real-agent execution or reel eligibility.
 - **Platform coverage:** mac+linux.
 
 ##### session/pr/005 — An interactive Haiku agent visibly works beside its pull request badge. [reel]
 - **Layer:** L2 PTY-attached, lane 2 (real agent).
 - **Agent:** Claude Code (interactive Haiku; strict offline gh stub).
-- **Asserts:** a genuine agent on a fixture PR branch lists the files and reveals a uniquely named sentinel omitted from its prompt; the attached TUI displays that filename together with `#1234 ⊙ ◐`.
+- **Asserts:** a genuine agent on a fixture PR branch lists the files and reveals a uniquely named sentinel omitted from its prompt; the attached TUI displays that filename together with `#1234 ⊙ ✓ ◉`.
 - **Does not assert:** real GitHub authentication or network access, a browser opening, or live PR polling transitions.
 - **Platform coverage:** mac+linux.
 
@@ -170,8 +170,15 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### dashboard/pane/016 — A card shows its pull request number with state and review glyphs at roomy and narrow widths.
 - **Layer:** L1 (ratatui TestBackend + insta).
 - **Agent:** none (synthetic SessionState).
-- **Asserts:** an open, review-required PR shows `#1234` at 80 and 30 columns; snapshots pin both sides of the review/state/stats/omission width boundaries and all lifecycle/review combinations, including Unknown (`?`) and absent review.
-- **Does not assert:** daemon resolution or browser invocation (`session/pr/*`).
+- **Asserts:** an open, review-required PR shows `#1234 ⊙ ◉` at 80 and 30 columns; snapshots pin both sides of the review/state/stats/omission width boundaries and all lifecycle/review combinations (`✓`, `±`, `◉`), including Unknown (`?`) and absent review.
+- **Does not assert:** daemon resolution or browser invocation (`session/pr/*`); CI glyphs (`dashboard/pane/017`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/pane/017 — A card shows its pull request's CI result beside the review, which alone is filled.
+- **Layer:** L1 (ratatui TestBackend + insta).
+- **Agent:** none (synthetic SessionState).
+- **Asserts:** every CI result draws GitHub's mark in its colour between the state and the review (`✓` green, `✗` red, `●` yellow, `?` dark grey); the review cell is `REVERSED` and the CI cell is not, so an approval and passing CI differ; a PR with checks and no review shows the CI mark alone; narrowing drops the review, then CI, then the state, keeping the number, with snapshots of each boundary (issue #1781).
+- **Does not assert:** how `statusCheckRollup` becomes the CI result (`session/pr/001` and the `pull_request` unit tests).
 - **Platform coverage:** mac+linux+windows.
 
 #### dashboard/stats
@@ -3959,6 +3966,14 @@ without depending on the config struct API.
 - **Why it exists:** the L2 counterpart of `orchestration/delegate/050`, through the real CLI's exit code. Confirmed red on `main` at `e0b143e9` (`exit=Some(1)`, "every worker it reached still owes a work-done for an earlier delegation").
 - **Does not assert:** what the orchestrator's pane shows for the refusal; the TUI opening the successor's pane itself (the test sends the `StartAgent` a TUI would send).
 - **Platform coverage:** mac+linux (unix-only PTY/UDS, `python3` stand-in roles).
+
+##### orchestration/delegate/052 — An addendum sent with `delegate --supersede` to a `clear = true` worker that is working on a task restarts the worker, and the new agent gets the addendum without the original task; a `clear = false` worker keeps its agent but owes a `work-done` for each task (issue #1784).
+- **Layer:** fast integration (`tests/delegate_respawn_recovery.rs`; the real `handle_delegate_with_state` against an in-process daemon whose roles were started through the real `StartAgent`, and the worker's tasks fetched and acknowledged from its inbox as an agent's component does).
+- **Agent:** none: `cat` stand-ins for both roles, because what is under test is which agent the daemon hands the addendum to, not what an agent does with it.
+- **Asserts:** for a `clear = true` `coder`: the original task is dispatched and taken, so the worker owes a `work-done`; a plain delegate of the addendum is refused with `coder` in `busy`; the `--supersede` delegate is dispatched; the addendum is taken by a different agent than the one that took the original task, that agent is no longer running, and both the delivered text and `worker-task-coder.md` carry the addendum without the original task; after one `work-done`, a plain delegate is not refused as busy. Control: the same steps on a `clear = false` `coder` hand the addendum to the agent that took the original task, which is still running, and after one `work-done` a plain delegate IS refused as busy, because the addendum is a task of its own (the orchestrator's instructions say so; PR #1785 review).
+- **Why it exists:** issue #1784. Confirmed red when written to assert what the user wanted (`left: "4"`, `right: "3"`: the agent that was working was replaced), and green with the same assertions on `clear = false`, so the restart comes from `clear = true` and not from `--supersede`. It pins `--supersede`'s meaning, which the issue keeps and the orchestrator's instructions warn about; an addendum that keeps a `clear = true` worker's agent needs its own path, which is scheduled after PRD #1666.
+- **Does not assert:** a real agent losing its conversation (a `cat` has none; the agent being replaced is what loses it); the orchestrator's instructions (`orchestrator_context` unit tests cover those); a `--supersede` before the worker took its task.
+- **Platform coverage:** mac+linux (unix-only PTYs).
 
 #### orchestration/work-done
 

@@ -82,7 +82,14 @@ import {
   type VoiceSecretId,
   type VoiceSettingsDto,
   type VoiceStageDto,
+  type VoiceTranscriptionStageDto,
 } from "../lib/bridge";
+import {
+  AUTO_SPEECH_LANGUAGE,
+  DEFAULT_SPEECH_LANGUAGE,
+  SPEECH_LANGUAGES,
+  isEnglishOnlySpeechModel,
+} from "../lib/speechLanguages";
 import { useSettingsBridge } from "../lib/settingsBridge";
 import type { SettingsPanelProps } from "../lib/settingsContract";
 
@@ -201,6 +208,26 @@ export const INTENT_DISCLOSURE_WITHHELD = "It sends none of the names on screen.
  */
 export const INTENT_DISCLOSURE_QUESTION = "While the agent on screen waits on a question, what you say is sent with that question, usually including the command the agent wants to run, whether the names on screen are sent or not.";
 
+/**
+ * What the Language row says under it (issue #1458), or nothing while it is
+ * English, the default that costs nothing. Every command phrase the app
+ * recognises is English, so another language is a consequence the user acts
+ * on — commands may be misheard — and an English-only model (a `.en` Whisper
+ * build, such as the local default) is one that cannot do what was chosen.
+ */
+export const languageHint = (language: string, model: string): string | undefined => {
+  if (language === DEFAULT_SPEECH_LANGUAGE) return undefined;
+  const name = language === AUTO_SPEECH_LANGUAGE
+    ? undefined
+    : SPEECH_LANGUAGES.find((candidate) => candidate.code === language)?.name ?? language;
+  const choice = name === undefined
+    ? "The language is detected for each thing you say, so a short command may be misheard."
+    : `Commands are English, so with ${name} they may be misheard.`;
+  return isEnglishOnlySpeechModel(model)
+    ? `${choice} The model ${model} understands English only: choose a multilingual model, such as one without \u201c.en\u201d at the end.`
+    : choice;
+};
+
 /** The token the speech backend takes when it authenticates with a key. */
 const KEYED = "remote";
 
@@ -286,17 +313,20 @@ export function VoicePanel({ settings, onSave, saveError }: SettingsPanelProps) 
 
   const saveVoice = (next: VoiceSettingsDto) => onSave({ ...settings, voice: next });
 
-  const saveStage = (stage: Stage, next: Partial<VoiceIntentStageDto>) =>
+  const saveStage = (stage: Stage, next: Partial<VoiceIntentStageDto & VoiceTranscriptionStageDto>) =>
     saveVoice({ ...voice, [stage]: { ...voice[stage], ...next } });
 
   // A backend brings its own coordinates with it — see the file's header. A
   // backend with no preset (one a newer build wrote) keeps what is stored
-  // rather than losing it to a fabricated default.
+  // rather than losing it to a fabricated default. The preset is laid over
+  // what is stored rather than replacing it, so a field no preset names —
+  // the speech language — stays the speaker's choice across the switch.
   const chooseBackend = (stage: Stage, backend: string) =>
     saveVoice({
       ...voice,
-      [stage]: VOICE_STAGE_PRESETS[stage][backend] ?? { ...voice[stage], backend },
+      [stage]: { ...voice[stage], ...(VOICE_STAGE_PRESETS[stage][backend] ?? { backend }) },
     });
+  const speechLanguageHint = languageHint(voice.transcription.language, voice.transcription.model);
 
   return (
     <div className="settings-body" data-testid="voice-body">
@@ -329,6 +359,25 @@ export function VoicePanel({ settings, onSave, saveError }: SettingsPanelProps) 
       )}
 
       <StageFields stage="transcription" value={voice.transcription} onSave={saveStage} />
+
+      {/* Issue #1458: the language every request names. English by default,
+          which is what commands are spoken in; Auto names none. */}
+      <div className="settings-row">
+        <label htmlFor="voice-transcription-language">Language</label>
+        <select
+          id="voice-transcription-language"
+          value={voice.transcription.language}
+          onChange={(event) => saveStage("transcription", { language: event.target.value })}
+        >
+          <option value={AUTO_SPEECH_LANGUAGE}>Auto-detect</option>
+          {SPEECH_LANGUAGES.map((language) => (
+            <option key={language.code} value={language.code}>{language.name}</option>
+          ))}
+        </select>
+      </div>
+      {speechLanguageHint && (
+        <p className="settings-hint" data-testid="voice-language-hint">{speechLanguageHint}</p>
+      )}
 
       {needsKey("transcription", voice.transcription) && (
         <SecretRow id="voice-transcription" stage="transcription" endpoint={voice.transcription.endpoint} />
