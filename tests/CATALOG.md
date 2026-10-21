@@ -7659,6 +7659,19 @@ Since PRD #1666 S5 the deck types nothing into the orchestrator: its idle, waiti
 - **Does not assert:** desktop reading controls, summaries, speech, permission/error announcements, failed turns, or other agents' reply sources.
 - **Platform coverage:** mac+linux (`e2e,e2e-live,unix`-gated `e2e_prompt_keys_live.rs`); requires local Pi and `ANTHROPIC_API_KEY` and runs nowhere in CI.
 
+#### voice/desktop-phrases
+
+Live real-backend tests in `desktop/src-tauri/tests/voice_phrase_fixtures.rs`, named here by test because linkage-check does not walk the desktop crate, as in `question/desktop`. **Layer:** L2 backend integration, lane 2 by nature: these call the shipping default Commands backend (currently OpenAI `gpt-5-mini`) with the developer's credential. Opt in locally with `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`; the live backend calls never run in CI and skip during ordinary `cargo test-fast` runs. These tests exercise command outcomes and meaning verdicts, without a rendered desktop or PTY-attached agent.
+
+- **`voice_phrase_fixtures_match_the_default_backend`** — validates the checked-in phrases and planted fleet, then checks each fixture's expected action, outcome and parameters against the default backend with the deck shown or hidden as specified.
+- **`voice_paraphrase_fixtures_match_the_default_backend`** — checks unlisted and whole-sentence paraphrases against their expected outcomes, including mixed-content refusals and hostile observed directory names.
+- **`voice_submit_words_in_passing_are_refused_by_the_real_judge`** — bypasses command selection and checks meaning directly: submit words inside dictation receive zero yes votes in five samples, while the standalone send control receives at least three.
+- **`voice_parameterless_steering_is_refused_by_the_real_judge`** — checks that "open docs" over the New agent directory listing receives zero yes votes in five samples for each original parameterless steering action under its shipping strictness.
+- **`voice_contextual_and_whole_controls_are_refused_by_the_real_judge`** — checks that contextual close, unasked destructive actions and mixed-content controls receive zero yes votes in five samples, while each standalone positive control receives at least three.
+- **`voice_submit_words_in_passing_are_refused_by_the_production_pipeline`** — forces submit picks through the shipping handler after local intercepts with real meaning votes: dictating a submit word dispatches nothing in five samples, while the standalone send control submits each time.
+- **`voice_parameterless_steering_is_refused_by_the_production_pipeline`** — forces the original parameterless steering picks for "open docs" through the shipping handler over the New agent dialog and requires refusal in five samples per pick.
+- **`voice_contextual_and_whole_controls_are_refused_by_the_production_pipeline`** — forces picks through the shipping handler with real meaning votes: contextual and destructive negatives dispatch nothing, opening an existing agent neither opens nor starts a New agent form, mixed-content reading-on is refused, mixed-content dictation/reading-off/hush may dispatch their own reversible row with rates reported, and standalone positives dispatch in every sample.
+
 ### Test harness teardown (issue #1566)
 
 #### harness/teardown
