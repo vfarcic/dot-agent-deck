@@ -48,6 +48,6 @@ When `DAD_REMOTE_EXEC=rwx` is set, run the commit gates through `cargo xtask aff
 
 ### Stopping
 
-By default `--run` stops the sandbox when it finishes, because a sandbox is billed per second while active, idle included. `DAD_REMOTE_EXEC_KEEP=1` leaves it running so the next run starts warm (the table's last row); it then stops on its own after 15 minutes without activity. Check `rwx sandbox list` when you are done: `rwx sandbox stop` can time out and leave the sandbox active, which is why `--run` checks the listing and stops it a second time.
+A sandbox is billed per second while active, idle included, so it is stopped as soon as the work is done: `--run` stops it when it finishes, and after an ad-hoc `rwx sandbox exec` run `rwx sandbox stop` yourself. The next run starts a fresh sandbox (the table's cold row), which is the right trade, since fixing a failure can take any amount of time. `DAD_REMOTE_EXEC_KEEP=1` leaves it running for a tight loop of reruns (the warm row). Either way the sandbox stops itself after 5 minutes without activity; a running command counts as activity, so that cannot cut a long run off. Check `rwx sandbox list` when you are done: `rwx sandbox stop` can time out and leave the sandbox active, which is why `--run` checks the listing and stops it a second time.
 
 The sandbox sees uncommitted changes in the worktree, so it stands in for a local run before a commit.

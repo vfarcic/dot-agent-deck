@@ -67,6 +67,9 @@ tasks:
       disk: 150gb
     env:
       DAD_REQUIRE_GO_TASK: "1"
-    # Billed per second while alive, idle included; stop after 15 idle minutes
-    # rather than the default 30.
-    run: rwx-sandbox --inactivity-timeout 15m
+    # Billed per second while alive, idle included. `affected-checks --run`
+    # stops it when it finishes; this is the backstop for everything else (an
+    # interrupted run, an ad-hoc `rwx sandbox exec`). A running command counts
+    # as activity (measured 2026-10-22: a 3-minute command survived a 1-minute
+    # timeout), so a short timeout cannot cut a long test run off.
+    run: rwx-sandbox --inactivity-timeout 5m
