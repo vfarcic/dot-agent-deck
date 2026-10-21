@@ -1408,16 +1408,44 @@ pub struct DaemonClient {
     /// client predating focus-driven sizing does.
     client_id: Option<String>,
     /// PRD #1666 part 2 (`lifecycle/handshake/011`): set by
-    /// [`Self::with_protocol_gate`]. When `true`, every request that attaches,
-    /// lists, starts or subscribes goes on a connection whose own `Hello`
-    /// (with `follow_on`) answered this binary's
-    /// [`crate::daemon_protocol::PROTOCOL_VERSION`] — see
-    /// [`Self::admitted_connect`]. `false` (every constructor's default) leaves
-    /// those requests unchecked, which is the one-shot CLI's deliberate policy:
-    /// `daemon status`, `schedule run-now` and the like send their request
-    /// straight to whatever daemon answers, with no protocol check before it,
-    /// so that a user can still reach a daemon of another build to inspect it
-    /// or recover from it.
+    /// [`Self::with_protocol_gate`]. When `true`, the requests below go on a
+    /// connection whose own `Hello` (with `follow_on`) answered this binary's
+    /// [`crate::daemon_protocol::PROTOCOL_VERSION`] and passed
+    /// [`Self::admission`] — see [`Self::admitted_connect`]. `false` (every
+    /// constructor's default) leaves them unchecked, which is the one-shot
+    /// CLI's deliberate policy: `daemon status`, `schedule run-now` and the like
+    /// send their request straight to whatever daemon answers, with no protocol
+    /// check before it, so that a user can still reach a daemon of another build
+    /// to inspect it or recover from it.
+    ///
+    /// **Gated:** attaches ([`Self::attach_as_viewer`] and its wrappers);
+    /// listings ([`Self::list_agents_detailed`], [`Self::list_inbox`]);
+    /// subscriptions ([`Self::subscribe_events`],
+    /// [`Self::subscribe_events_with_snapshot`],
+    /// [`Self::subscribe_turn_replies`]); starts and preparation (every
+    /// `StartAgent` and `StartPreparedAgent` sender,
+    /// [`Self::prepare_orchestration`]); and the requests that create, change or
+    /// end state the deck holds for an agent: [`Self::post_message`],
+    /// [`Self::inbox_action`], [`Self::answer_question_while`],
+    /// [`Self::stop_agent`], [`Self::set_agent_label`],
+    /// [`Self::seed_last_command`] and [`Self::record_orchestrator_context`].
+    /// Stop and rename are gated rather than bound to a daemon identity: an
+    /// agent id is a per-daemon counter, so a replacement reuses it, and a
+    /// refused replacement now receives neither request at all.
+    ///
+    /// **Not gated, each with its reason at the call:** what reads `Hello`
+    /// itself, which is the gate's own input ([`Self::capabilities`],
+    /// [`Self::hook_binary_notices`], [`Self::probe_running`]); read-only
+    /// discovery whose results only lead to a gated start
+    /// ([`Self::list_projects`], [`Self::resolve_project`],
+    /// [`Self::list_directories`], [`Self::new_agent_options`],
+    /// [`Self::host_metrics`]); two best-effort session controls that change
+    /// state but name only this client's own focus or viewer
+    /// ([`Self::focus_gained_while`], [`Self::resize_agent_as_viewer`]); and the
+    /// verbs that exist to reach a daemon of another build, sent by the CLI or
+    /// the TUI's daemon Stop only ([`Self::reload_schedules`],
+    /// [`Self::run_now`], [`Self::close_agents`], [`Self::send_shutdown`],
+    /// [`Self::stop_daemon`], [`Self::restart_daemon`]).
     protocol_gate: bool,
     /// PRD #1666 part 2: what a gated `Hello` must also satisfy, beyond this
     /// binary's protocol — set by [`Self::with_protocol_gate_admitting`].
@@ -1518,8 +1546,10 @@ impl DaemonClient {
     }
 
     /// PRD #1666 part 2 (`lifecycle/handshake/011`): admit this handle's
-    /// attaches, listings, starts and subscriptions only on a positive protocol
-    /// check made on the connection that carries them.
+    /// attaches, listings, starts, subscriptions and agent-state mutations
+    /// only on a positive protocol check made on the connection that carries
+    /// them. The `protocol_gate` field lists exactly which requests that is,
+    /// and which stay ungated and why.
     ///
     /// For a long-lived client — the TUI, the desktop's terminals — whose
     /// daemon may be replaced under it by another build after its startup
@@ -1764,6 +1794,8 @@ impl DaemonClient {
     /// mutating subcommands call this after an atomic write so the daemon picks
     /// the change up live.
     pub async fn reload_schedules(&self) -> Result<Vec<String>, ClientError> {
+        // Ungated by design: sent only by the one-shot CLI (`schedule reload`), whose
+        // policy is to reach a daemon of another build — see `protocol_gate`.
         let (mut rd, mut wr) = self.connect().await?;
         let resp = issue_command(&mut rd, &mut wr, &AttachRequest::ReloadSchedules).await?;
         if !resp.ok {
@@ -1778,6 +1810,8 @@ impl DaemonClient {
     /// PRD #127 M1.5: fire a registered scheduled task now (the
     /// `schedule run-now` door). Errors if no such task is registered.
     pub async fn run_now(&self, name: &str) -> Result<RunNowOutcome, ClientError> {
+        // Ungated by design: sent only by the one-shot CLI (`schedule run-now`), whose
+        // policy is to reach a daemon of another build — see `protocol_gate`.
         let (mut rd, mut wr) = self.connect().await?;
         let resp = issue_command(
             &mut rd,
@@ -1923,7 +1957,7 @@ impl DaemonClient {
         {
             return Ok(GatedQuery::Unsupported);
         }
-        let (mut rd, mut wr) = self.connect().await?;
+        let (mut rd, mut wr) = self.admitted_connect().await?;
         let resp = issue_command(
             &mut rd,
             &mut wr,
@@ -1964,7 +1998,7 @@ impl DaemonClient {
         {
             return Ok(GatedQuery::Unsupported);
         }
-        let (mut rd, mut wr) = self.connect().await?;
+        let (mut rd, mut wr) = self.admitted_connect().await?;
         let resp = issue_command(
             &mut rd,
             &mut wr,
@@ -2043,7 +2077,7 @@ impl DaemonClient {
                 request_id,
             }
         };
-        let (mut rd, mut wr) = self.connect().await?;
+        let (mut rd, mut wr) = self.admitted_connect().await?;
         let resp = issue_command(&mut rd, &mut wr, &request).await?;
         match resp.inbox_action {
             Some(reply) if resp.ok => Ok(GatedQuery::Answered(reply)),
@@ -2182,6 +2216,8 @@ impl DaemonClient {
     pub async fn hook_binary_notices(
         &self,
     ) -> Result<Option<Vec<crate::hook_binary::HookBinaryNotice>>, ClientError> {
+        // Ungated: a read of `Hello`'s own notices, and a `Hello` is what the gate
+        // itself sends; nothing here changes state on the daemon.
         let (mut rd, mut wr) = self.connect().await?;
         let resp = issue_command(
             &mut rd,
@@ -2249,6 +2285,8 @@ impl DaemonClient {
     /// A transport failure or an `ok: false` handshake is `Err`, exactly as for
     /// [`Self::capabilities`], and stores nothing.
     async fn fresh_capabilities(&self) -> Result<DaemonCapabilities, ClientError> {
+        // Ungated: this IS a `Hello`, the gate's own input. Its answer decides
+        // what to withhold, never what is admitted on another connection.
         let (mut rd, mut wr) = self.connect().await?;
         let resp = issue_command(
             &mut rd,
@@ -2362,6 +2400,8 @@ impl DaemonClient {
     pub async fn list_projects(&self) -> Result<crate::event::ProjectListing, ClientError> {
         self.require_capability(crate::daemon_protocol::CAP_LIST_PROJECTS)
             .await?;
+        // Ungated: read-only discovery (both PRD #1666 part 2 reviews accept it). A
+        // listed project is a hint; the start it leads to is gated.
         let (mut rd, mut wr) = self.connect().await?;
         let resp = issue_command(&mut rd, &mut wr, &AttachRequest::ListProjects {}).await?;
         if !resp.ok {
@@ -2393,6 +2433,8 @@ impl DaemonClient {
     ) -> Result<crate::event::ResolvedProject, ClientError> {
         self.require_capability(crate::daemon_protocol::CAP_RESOLVE_PROJECT)
             .await?;
+        // Ungated: read-only resolution (both PRD #1666 part 2 reviews accept it).
+        // The preparation and start that use the answer are gated.
         let (mut rd, mut wr) = self.connect().await?;
         let resp = issue_command(
             &mut rd,
@@ -2624,6 +2666,10 @@ impl DaemonClient {
         cols: u16,
         viewer: Option<&str>,
     ) -> Result<Option<(u16, u16)>, ClientError> {
+        // Ungated, deliberately: a best-effort, idempotent geometry update the next
+        // resize reconciles; the desktop sends its viewer token, which a daemon
+        // that did not issue it ignores. It does change state, so it is an
+        // exception, not a read — see `protocol_gate`.
         let (mut rd, mut wr) = self.connect().await?;
         let resp = issue_command(
             &mut rd,
@@ -2701,6 +2747,10 @@ impl DaemonClient {
         {
             return Ok(FocusReport::Withheld);
         }
+        // Ungated, deliberately: claims focus for THIS client id, not for another
+        // client or agent, and is reported on every focus change. It does change
+        // state (whose viewport sizes the agents), so it is an exception, not a
+        // read — see `protocol_gate`.
         let (mut rd, mut wr) = self.connect().await?;
         if !still_wanted() {
             return Ok(FocusReport::Superseded);
@@ -2747,7 +2797,9 @@ impl DaemonClient {
         {
             return Ok(AnswerReport::Withheld);
         }
-        let (mut rd, mut wr) = self.connect().await?;
+        // Admitted first, then `still_wanted`: the wait for the gate's `Hello`
+        // is part of the window a cancelled answer must still be dropped in.
+        let (mut rd, mut wr) = self.admitted_connect().await?;
         if !still_wanted() {
             return Ok(AnswerReport::Superseded);
         }
@@ -2800,6 +2852,8 @@ impl DaemonClient {
         {
             return Ok(HostMetricsReport::NotAvailable);
         }
+        // Ungated: read-only host observation with bounded reply validation (both
+        // PRD #1666 part 2 reviews accept it).
         let (mut rd, mut wr) = self.connect().await?;
         let resp = issue_command(&mut rd, &mut wr, &AttachRequest::HostMetrics).await?;
         if !resp.ok {
@@ -2853,7 +2907,7 @@ impl DaemonClient {
         let context_path = context_path
             .to_str()
             .ok_or_else(|| ClientError::Malformed("the context path is not valid UTF-8".into()))?;
-        let (mut rd, mut wr) = self.connect().await?;
+        let (mut rd, mut wr) = self.admitted_connect().await?;
         let resp = issue_command(
             &mut rd,
             &mut wr,
@@ -2917,6 +2971,8 @@ impl DaemonClient {
         {
             return Ok(GatedQuery::Unsupported);
         }
+        // Ungated: read-only directory browsing (both PRD #1666 part 2 reviews
+        // accept it); starting an agent in what it lists is gated.
         let (mut rd, mut wr) = self.connect().await?;
         let resp = issue_command(
             &mut rd,
@@ -2968,6 +3024,8 @@ impl DaemonClient {
         {
             return Ok(GatedQuery::Unsupported);
         }
+        // Ungated: read-only form pre-fill (both PRD #1666 part 2 reviews accept
+        // it); the start the form leads to is gated.
         let (mut rd, mut wr) = self.connect().await?;
         let resp = issue_command(&mut rd, &mut wr, &AttachRequest::NewAgentOptions {}).await?;
         if !resp.ok {
@@ -2994,7 +3052,7 @@ impl DaemonClient {
         display_name: Option<String>,
         cwd: Option<String>,
     ) -> Result<(), ClientError> {
-        let (mut rd, mut wr) = self.connect().await?;
+        let (mut rd, mut wr) = self.admitted_connect().await?;
         let resp = issue_command(
             &mut rd,
             &mut wr,
@@ -3046,6 +3104,9 @@ impl DaemonClient {
         // One connection for the check and the request (review on PR #1681):
         // a second connection could reach a daemon that replaced this one
         // between them. `follow_on` keeps this one open for the request.
+        // Not `admitted_connect`: this verb carries its own authority checks and
+        // refusals, and is sent by the CLI only, whose policy is to reach a
+        // daemon of another build — see `protocol_gate`.
         let (mut rd, mut wr) = self
             .connect()
             .await
@@ -3097,8 +3158,12 @@ impl DaemonClient {
         }
     }
 
+    /// Stop agent `id`. On a gated handle the request goes only to a daemon
+    /// admitted on its own connection (PRD #1666 part 2): agent ids are a
+    /// per-daemon counter, so a replacement the client would refuse may hold an
+    /// unrelated agent under the same id, and must not be sent the stop.
     pub async fn stop_agent(&self, id: &str) -> Result<(), ClientError> {
-        let (mut rd, mut wr) = self.connect().await?;
+        let (mut rd, mut wr) = self.admitted_connect().await?;
         let resp = issue_command(
             &mut rd,
             &mut wr,
@@ -3273,6 +3338,8 @@ impl DaemonClient {
     /// is asynchronous from that point (SIGTERM grace + SIGKILL) but
     /// the user's commit has been acknowledged.
     pub async fn send_shutdown(&self) -> Result<(), ClientError> {
+        // Ungated by design: stopping the daemon is how a user recovers from one of
+        // another build, so it must reach that daemon. The desktop does not send it.
         let (mut rd, mut wr) = self.connect().await?;
         write_frame(&mut wr, KIND_SHUTDOWN, &[]).await?;
         // Bound the wait at 1s — the daemon writes the ack BEFORE
@@ -3371,6 +3438,8 @@ impl DaemonClient {
             expected_version: req.expected_version,
             successor: req.successor,
         };
+        // Ungated by design: restarting the daemon is how a user moves off one of
+        // another build, so it must reach that daemon. Sent by the CLI only.
         let (mut rd, mut wr) = tokio::time::timeout_at(deadline, self.connect())
             .await
             .map_err(|_| ClientError::TimedOut(limit))??;
@@ -3426,6 +3495,7 @@ impl DaemonClient {
     /// "Not running" is a connect that finds no endpoint or is refused; any
     /// other transport failure, or an `ok = false` handshake, is `Err`.
     pub async fn probe_running(&self) -> Result<Option<AttachResponse>, ClientError> {
+        // Ungated by design: a liveness probe that reads `Hello` and nothing else.
         let (mut rd, mut wr) = match self.connect().await {
             Ok(halves) => halves,
             Err(e)
@@ -8292,5 +8362,139 @@ mod protocol_gate_tests {
         let client = DaemonClient::new(newer.path.clone());
         let _ = client.list_agents().await;
         assert_eq!(newer.recorded(), vec!["0:list-agents".to_string()]);
+    }
+
+    /// Every request that creates, changes or ends state the deck holds for an
+    /// agent, called once on `client`, as `(op, result)`.
+    async fn every_acting_verb(
+        client: &DaemonClient,
+    ) -> Vec<(&'static str, Result<(), ClientError>)> {
+        vec![
+            (
+                "post-message",
+                client
+                    .post_message(
+                        "pane",
+                        Some("7"),
+                        "subject",
+                        "body",
+                        None,
+                        crate::inbox_hub::PostOrigin::OrchestratorRemit,
+                    )
+                    .await
+                    .map(drop),
+            ),
+            (
+                "inbox-retry",
+                client
+                    .inbox_action("pane", "7", "m-1", 1, true, "press-1")
+                    .await
+                    .map(drop),
+            ),
+            (
+                "inbox-cancel",
+                client
+                    .inbox_action("pane", "7", "m-1", 1, false, "press-2")
+                    .await
+                    .map(drop),
+            ),
+            (
+                "answer-question",
+                client
+                    .answer_question_while(|| true, "7", "q-1", None, Vec::new(), false)
+                    .await
+                    .map(drop),
+            ),
+            ("stop-agent", client.stop_agent("7").await),
+            (
+                "set-agent-label",
+                client
+                    .set_agent_label("7", Some("renamed".into()), None)
+                    .await,
+            ),
+            (
+                "seed-last-command",
+                client.seed_last_command("cat").await.map(drop),
+            ),
+            (
+                "record-orchestrator-context",
+                client
+                    .record_orchestrator_context("pane", std::path::Path::new("/ctx.md"))
+                    .await
+                    .map(drop),
+            ),
+        ]
+    }
+
+    /// Scenario: a gated client (the TUI's, the desktop's) posts a message,
+    /// retries and cancels one, answers a question, stops and relabels agent 7
+    /// and records its last command and orchestrator context, against a daemon
+    /// that answers `Hello` on the next protocol and serves every verb besides.
+    /// Each call is a protocol mismatch and the daemon receives none of them;
+    /// against a matching daemon each reaches it, as the control.
+    #[tokio::test]
+    async fn a_gated_client_sends_no_agent_mutation_to_a_daemon_on_another_protocol() {
+        let newer = GateDaemon::spawn(|_| GateHello::Newer);
+        let client = DaemonClient::new(newer.path.clone()).with_protocol_gate();
+        for (verb, result) in every_acting_verb(&client).await {
+            assert!(
+                matches!(result, Err(ClientError::ProtocolMismatch { .. })),
+                "{verb} on a daemon on another protocol must be a mismatch: {result:?}"
+            );
+        }
+        assert_eq!(
+            newer.recorded(),
+            Vec::<String>::new(),
+            "a daemon on another protocol received an agent mutation"
+        );
+
+        let matching = GateDaemon::spawn(|_| GateHello::Matching);
+        let client = DaemonClient::new(matching.path.clone()).with_protocol_gate();
+        let verbs = every_acting_verb(&client).await;
+        let reached: Vec<String> = matching
+            .recorded()
+            .iter()
+            .map(|r| r.split(':').nth(1).unwrap().to_string())
+            .collect();
+        let expected: Vec<String> = verbs.iter().map(|(op, _)| op.to_string()).collect();
+        assert_eq!(
+            reached, expected,
+            "control: every mutation reaches a matching daemon"
+        );
+    }
+
+    /// Scenario: a gated client lists agent 7 on a matching daemon, which is
+    /// then replaced by one on the next protocol that also runs an agent 7.
+    /// Stopping or relabelling 7 is refused and the replacement receives
+    /// neither request: only the checked listing was ever served.
+    #[tokio::test]
+    async fn a_stop_or_relabel_after_a_checked_listing_never_reaches_the_replacement() {
+        for relabel in [false, true] {
+            let daemon = GateDaemon::spawn(|i| {
+                if i == 0 {
+                    GateHello::Matching
+                } else {
+                    GateHello::Newer
+                }
+            });
+            let client = DaemonClient::new(daemon.path.clone()).with_protocol_gate();
+            client.list_agents().await.expect("the checked listing");
+            let acted = if relabel {
+                client
+                    .set_agent_label("7", Some("renamed".into()), None)
+                    .await
+            } else {
+                client.stop_agent("7").await
+            };
+            assert!(
+                matches!(acted, Err(ClientError::ProtocolMismatch { .. })),
+                "relabel={relabel}: {acted:?}"
+            );
+            assert_eq!(
+                daemon.recorded(),
+                vec!["0:list-agents".to_string()],
+                "relabel={relabel}: the replacement received the request"
+            );
+        }
     }
 }

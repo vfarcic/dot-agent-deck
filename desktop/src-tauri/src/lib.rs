@@ -30,6 +30,10 @@ mod secrets;
 // Tests only: the counted sweep that keeps `dto::DeckScope` from decaying into
 // a convention (issue #1116). No item outside `#[cfg(test)]`, so it adds
 // nothing to a normal build.
+// Tests only: the held client's acting requests against a replaced daemon
+// (PRD #1666 part 2).
+#[cfg(all(test, unix))]
+mod request_admission_tests;
 #[cfg(test)]
 mod selection_capture;
 mod selection_saves;
@@ -4782,6 +4786,36 @@ async fn apply_selection(app: &AppHandle, state: &DesktopState) {
     refresh_and_emit(app, &state.daemon).await;
 }
 
+/// The `RenameAgent` arm of [`desktop_run_action`] minus the webview: read the
+/// agent's cwd from the deck's listing, then relabel it keeping that cwd.
+///
+/// Both requests are gated on the held client (PRD #1666 part 2), each on its
+/// own connection: a daemon replaced between the listing and the relabel is
+/// classified again before it is sent `SetAgentLabel`, so a refused
+/// replacement that reuses the agent's id is not relabelled.
+async fn rename_agent_action(
+    links: &DaemonLinks,
+    agent_id: &str,
+    display_name: String,
+) -> Result<(), String> {
+    let daemon = trusted_daemon(links).await?;
+    daemon.require_compatible()?;
+    let existing_cwd = daemon
+        .client
+        .list_agents()
+        .await
+        .map_err(|error| safe_message(error.to_string()))?
+        .into_iter()
+        .find(|record| record.id == agent_id)
+        .ok_or_else(|| format!("agent not found: {agent_id}"))?
+        .cwd;
+    daemon
+        .client
+        .set_agent_label(agent_id, Some(display_name), existing_cwd)
+        .await
+        .map_err(|error| safe_message(error.to_string()))
+}
+
 /// Stop one agent on the selected deck, and tear down **that deck's** terminal
 /// session for it.
 ///
@@ -6202,22 +6236,7 @@ async fn desktop_run_action(
                         .into(),
                 );
             }
-            let daemon = trusted_daemon(&state.daemon).await?;
-            daemon.require_compatible()?;
-            let existing_cwd = daemon
-                .client
-                .list_agents()
-                .await
-                .map_err(|error| safe_message(error.to_string()))?
-                .into_iter()
-                .find(|record| record.id == agent_id)
-                .ok_or_else(|| format!("agent not found: {agent_id}"))?
-                .cwd;
-            daemon
-                .client
-                .set_agent_label(&agent_id, Some(display_name), existing_cwd)
-                .await
-                .map_err(|error| safe_message(error.to_string()))?;
+            rename_agent_action(&state.daemon, &agent_id, display_name).await?;
             result_agent_id = Some(agent_id);
         }
         DesktopAction::AttachTerminal {
