@@ -232,6 +232,11 @@ pub enum PaneLostReason {
     /// No live agent claimed this `pane_id` within
     /// [`REATTACH_LOOKUP_TOTAL_BUDGET`] — the agent is gone daemon-side.
     AgentGone,
+    /// PRD #1666 part 2 (`lifecycle/handshake/011`): the daemon answering at
+    /// the end of [`REATTACH_LOOKUP_TOTAL_BUDGET`] speaks another attach
+    /// protocol than this binary, so the pane was never attached to it. The
+    /// footer's refusal names both protocols.
+    ProtocolMismatch,
 }
 
 impl PaneLostReason {
@@ -243,6 +248,9 @@ impl PaneLostReason {
             }
             Self::AgentGone => {
                 "Agent is no longer running — pane is disconnected. Close it to start over."
+            }
+            Self::ProtocolMismatch => {
+                "The daemon now speaks another attach protocol — not attaching; pane is disconnected."
             }
         }
     }
@@ -3360,7 +3368,14 @@ async fn run_pane_io_task(
                 // `PaneLostReason` would be a better message, but it changes
                 // rendered pane/status strings and belongs with its own L1
                 // snapshot coverage rather than riding along on a logging fix.
-                *lost.lock().unwrap() = Some(PaneLostReason::AgentGone);
+                // A daemon on another attach protocol is the exception: the
+                // agent may well be alive, and saying it is gone would send
+                // the user after the wrong fault.
+                *lost.lock().unwrap() = Some(if gave_up.protocol_mismatch.is_some() {
+                    PaneLostReason::ProtocolMismatch
+                } else {
+                    PaneLostReason::AgentGone
+                });
                 break 'outer;
             }
         }
@@ -3425,6 +3440,10 @@ struct ReattachGiveUp {
     last_list_error: Option<String>,
     /// Last `attach` error, cleared by an authoritative no-agent answer.
     last_attach_error: Option<String>,
+    /// PRD #1666 part 2: the last attempt found the daemon on another attach
+    /// protocol (daemon's, this binary's), so it listed and attached nothing.
+    /// Trailing, like the rest: cleared by an attempt whose check passed.
+    protocol_mismatch: Option<(Option<u32>, u32)>,
 }
 
 impl ReattachGiveUp {
@@ -3475,7 +3494,9 @@ impl ReattachGiveUp {
 
     /// The `reason` field for the terminal give-up log.
     fn reason(&self) -> &'static str {
-        if self.daemon_unreachable() {
+        if self.protocol_mismatch.is_some() {
+            "protocol-mismatch"
+        } else if self.daemon_unreachable() {
             "daemon-unreachable"
         } else if self.attach_failing() {
             "attach-failing"
@@ -3489,7 +3510,9 @@ impl ReattachGiveUp {
     /// error at all: the daemon answered and simply had no agent, which is an
     /// absence of failure, not a failure.
     fn reported_error(&self) -> &str {
-        if self.daemon_unreachable() {
+        if self.protocol_mismatch.is_some() {
+            "the daemon speaks another attach protocol"
+        } else if self.daemon_unreachable() {
             self.last_list_error.as_deref().unwrap_or("none")
         } else if self.attach_failing() {
             self.last_attach_error.as_deref().unwrap_or("none")
@@ -3531,8 +3554,44 @@ async fn resolve_and_reattach(
     // initial `None` would be provably dead — `-D warnings` rejects it.
     let mut last_list_error: Option<String>;
     let mut last_attach_error: Option<String> = None;
+    let mut protocol_mismatch;
     loop {
         attempts = attempts.saturating_add(1);
+        // PRD #1666 part 2 (`lifecycle/handshake/011`): issue #405's protocol
+        // check before every lookup — this pane's stream ended, and the daemon
+        // now answering may be another build. One on another protocol is asked
+        // nothing more and attached to never; the attempt counts, and the
+        // lookup is retried, so a daemon on this binary's protocol that
+        // replaces it within the budget is still taken up. A check that could
+        // not be made at all falls through to the lookup, which reports the
+        // daemon's reachability as it did.
+        match client.check_protocol().await {
+            Err(crate::daemon_client::ClientError::ProtocolMismatch { daemon, local }) => {
+                tracing::debug!(
+                    daemon_protocol = ?daemon,
+                    local_protocol = local,
+                    "auto-reattach: the daemon speaks another attach protocol; not attaching"
+                );
+                protocol_mismatch = Some((daemon, local));
+                last_list_error = None;
+                if start.elapsed() >= REATTACH_LOOKUP_TOTAL_BUDGET {
+                    return Err(ReattachGiveUp {
+                        attempts,
+                        list_errors,
+                        trailing_list_errors,
+                        attach_errors,
+                        trailing_attach_errors,
+                        last_list_error,
+                        last_attach_error,
+                        protocol_mismatch,
+                    });
+                }
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(REATTACH_LOOKUP_MAX_DELAY);
+                continue;
+            }
+            Ok(_) | Err(_) => protocol_mismatch = None,
+        }
         match client.list_agents().await {
             Ok(records) => {
                 // The daemon answered, so it is reachable AS OF NOW. Anything it
@@ -3592,6 +3651,7 @@ async fn resolve_and_reattach(
                 trailing_attach_errors,
                 last_list_error,
                 last_attach_error,
+                protocol_mismatch,
             });
         }
         tokio::time::sleep(delay).await;
@@ -4602,6 +4662,7 @@ mod tests {
             attach_errors: 0,
             last_list_error: Some("connection refused".into()),
             last_attach_error: None,
+            protocol_mismatch: None,
         };
         assert!(all_failed.daemon_unreachable());
         assert_eq!(all_failed.reason(), "daemon-unreachable");
@@ -4623,6 +4684,7 @@ mod tests {
             attach_errors: 0,
             last_list_error: Some("connection refused".into()),
             last_attach_error: None,
+            protocol_mismatch: None,
         };
         assert!(
             died_after_first_success.daemon_unreachable(),
@@ -4654,6 +4716,7 @@ mod tests {
             trailing_attach_errors: 0,
             last_list_error: None,
             last_attach_error: Some("attach refused".into()),
+            protocol_mismatch: None,
         };
         assert!(!agent_vanished_after_an_attach_failure.attach_failing());
         assert_eq!(
@@ -4688,6 +4751,7 @@ mod tests {
             trailing_attach_errors: 1,
             last_list_error: Some("connection refused".into()),
             last_attach_error: Some("attach refused".into()),
+            protocol_mismatch: None,
         };
         assert_eq!(both_faults_recorded.reason(), "daemon-unreachable");
         assert_eq!(
@@ -4712,6 +4776,7 @@ mod tests {
             attach_errors: 0,
             last_list_error: Some("earlier blip".into()),
             last_attach_error: None,
+            protocol_mismatch: None,
         };
         assert!(!recovered.daemon_unreachable());
         assert_eq!(recovered.reason(), "no-live-agent");
@@ -4732,6 +4797,7 @@ mod tests {
             trailing_attach_errors: 5,
             last_list_error: None,
             last_attach_error: Some("attach refused".into()),
+            protocol_mismatch: None,
         };
         assert!(!attach_broken.daemon_unreachable());
         assert!(attach_broken.attach_failing());
@@ -4757,6 +4823,7 @@ mod tests {
             trailing_attach_errors: 1,
             last_list_error: Some("connection refused".into()),
             last_attach_error: Some("attach refused".into()),
+            protocol_mismatch: None,
         };
         assert_eq!(
             daemon_died_after_an_attach_failure.reason(),
@@ -4777,6 +4844,7 @@ mod tests {
             trailing_attach_errors: 1,
             last_list_error: None,
             last_attach_error: Some("attach refused".into()),
+            protocol_mismatch: None,
         };
         assert_eq!(
             attach_fault_with_a_recovered_blip.reason(),
@@ -4797,6 +4865,7 @@ mod tests {
             attach_errors: 0,
             last_list_error: Some("transient".into()),
             last_attach_error: None,
+            protocol_mismatch: None,
         };
         assert!(!answered.daemon_unreachable());
         assert_eq!(answered.reason(), "no-live-agent");
@@ -4809,6 +4878,7 @@ mod tests {
             attach_errors: 0,
             last_list_error: None,
             last_attach_error: None,
+            protocol_mismatch: None,
         };
         assert_eq!(clean.reason(), "no-live-agent");
 
@@ -4820,6 +4890,7 @@ mod tests {
             attach_errors: 0,
             last_list_error: None,
             last_attach_error: None,
+            protocol_mismatch: None,
         };
         assert!(
             !never_asked.daemon_unreachable(),

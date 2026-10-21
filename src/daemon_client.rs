@@ -60,6 +60,14 @@ pub enum ClientError {
         "no answer was read after the request was sent ({0}); unknown whether the daemon acted on it"
     )]
     Unanswered(String),
+    /// PRD #1666 part 2 (`lifecycle/handshake/011`): the daemon answered
+    /// [`DaemonClient::check_protocol`]'s `Hello` on another attach protocol
+    /// than this binary's (issue #405's exact equality), so nothing is
+    /// attached to it. `daemon` is `None` when the reply carried no
+    /// `server_version`. Worded as the startup refusal words it
+    /// ([`crate::build_version_handshake::HandshakeError::ProtocolMismatch`]).
+    #[error("{}", crate::build_version_handshake::HandshakeError::ProtocolMismatch { daemon: *daemon, local: *local })]
+    ProtocolMismatch { daemon: Option<u32>, local: u32 },
 }
 
 /// PRD #1589: why [`DaemonClient::close_agents`] could not get a report.
@@ -2139,6 +2147,44 @@ impl DaemonClient {
         capabilities
     }
 
+    /// PRD #1666 part 2 (`lifecycle/handshake/011`): issue #405's protocol
+    /// check, for a client that is about to attach to whatever daemon now
+    /// answers at this endpoint — a reconnect, which may reach a daemon
+    /// replaced since the startup handshake. One `Hello`, answered from its
+    /// own reply: `Ok` only when the daemon's `server_version` equals this
+    /// binary's [`crate::daemon_protocol::PROTOCOL_VERSION`], with the
+    /// capabilities that reply advertised, which replace the cached set (it
+    /// may describe the daemon this one replaced), and
+    /// [`ClientError::ProtocolMismatch`] otherwise, which drops the cached set.
+    pub async fn check_protocol(&self) -> Result<DaemonCapabilities, ClientError> {
+        let local = crate::daemon_protocol::PROTOCOL_VERSION;
+        let (mut rd, mut wr) = self.connect().await?;
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::Hello {
+                client_version: local,
+                client_build_version: None,
+                follow_on: false,
+            },
+        )
+        .await?;
+        if !resp.ok {
+            self.invalidate_capabilities();
+            return Err(ClientError::Server(resp.error.unwrap_or_else(|| {
+                "handshake failed while checking the protocol".into()
+            })));
+        }
+        if resp.server_version != Some(local) {
+            self.invalidate_capabilities();
+            return Err(ClientError::ProtocolMismatch {
+                daemon: resp.server_version,
+                local,
+            });
+        }
+        Ok(self.store_capabilities_from_hello(&resp))
+    }
+
     /// Drop the captured set, so the next [`Self::capabilities`] re-handshakes.
     /// Call this on reconnect: the daemon behind an unchanged socket path may be
     /// a different process, and a different build.
@@ -3023,12 +3069,17 @@ impl DaemonClient {
     /// replaced between that `Hello` and the request refuses the unknown variant,
     /// which comes back as [`ClientError::Server`] and opens nothing.
     ///
+    /// PRD #1666 part 2 (`lifecycle/handshake/011`): that `Hello` is also
+    /// issue #405's protocol check ([`Self::check_protocol`]). A daemon on
+    /// another attach protocol is [`ClientError::ProtocolMismatch`], and is
+    /// sent nothing further, the fallback included.
+    ///
     /// The records are sanitised exactly as [`Self::list_agents`]'s are.
     pub async fn subscribe_events_with_snapshot(
         &self,
     ) -> Result<GatedQuery<(EventSubscription, Vec<AgentRecord>)>, ClientError> {
         if !self
-            .fresh_capabilities()
+            .check_protocol()
             .await?
             .supports(crate::daemon_protocol::CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT)
         {

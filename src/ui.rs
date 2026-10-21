@@ -12974,6 +12974,17 @@ pub fn run_tui(
         } else {
             (frame_area, None)
         };
+        // PRD #1666 part 2 (`lifecycle/handshake/011`): one row above those for
+        // a reconnect that found the daemon on another attach protocol, on
+        // every view, since nothing this TUI shows is live while it lasts.
+        let protocol_refusal = snapshot.protocol_refusal;
+        let (frame_area, protocol_refusal_area) = if protocol_refusal.is_some() {
+            let chunks =
+                Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(frame_area);
+            (chunks[0], Some(chunks[1]))
+        } else {
+            (frame_area, None)
+        };
         let embedded_panes = pane.as_any().downcast_ref::<EmbeddedPaneController>();
         let all_pane_ids = embedded_panes.map(|e| e.pane_ids()).unwrap_or_default();
         let focused_pane_id = embedded_panes.and_then(|e| e.focused_pane_id());
@@ -13020,6 +13031,13 @@ pub fn run_tui(
             }
             if let Some(notice_area) = hook_notice_area {
                 render_hook_notice(frame, &snapshot.hook_binary_notices, notice_area);
+            }
+            if let (Some(refusal), Some(area)) = (protocol_refusal, protocol_refusal_area) {
+                frame.render_widget(
+                    Paragraph::new(protocol_refusal_line(refusal))
+                        .style(Style::default().fg(Color::Yellow)),
+                    area,
+                );
             }
         })?;
         tick = tick.wrapping_add(1);
@@ -20762,6 +20780,21 @@ pub fn render_experimental_footer_to_buffer(
 /// so a second notice is counted rather than drawn, and that count is never
 /// cut. A remedy is shown whole or not at all: when the row is narrow, the
 /// facts (agents, path, versions) are what get shorter, the path first.
+/// PRD #1666 part 2 (`lifecycle/handshake/011`): the footer row a reconnect's
+/// protocol refusal draws ([`crate::state::AppState::protocol_refusal`]). Its
+/// first clause is the startup refusal's own sentence (issue #405), so the two
+/// say it the same way; the facts come first, so a narrow terminal cuts the
+/// remedy rather than either number.
+pub fn protocol_refusal_line(refusal: crate::state::ProtocolRefusal) -> String {
+    format!(
+        "⚠ Not attaching: {}. Attach with the daemon's own build, or run `dot-agent-deck daemon stop` (which stops its agents) and relaunch.",
+        crate::build_version_handshake::HandshakeError::ProtocolMismatch {
+            daemon: refusal.daemon,
+            local: refusal.local,
+        }
+    )
+}
+
 fn render_hook_notice(
     frame: &mut Frame,
     notices: &[crate::hook_binary::HookBinaryNotice],

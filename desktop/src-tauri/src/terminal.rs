@@ -1214,13 +1214,24 @@ pub(crate) async fn attach(
 
 /// Shared lifecycle seam so socket tests run the reader's actual end cleanup,
 /// including any future trust invalidation, without requiring a webview.
+///
+/// PRD #1666 part 2 (`lifecycle/handshake/011`): a stream that ended may mean
+/// the daemon behind the endpoint went away and another took its socket, so
+/// the endpoint's held handshake is dropped here, before the tile can ask to
+/// reopen. The reopen then classifies the daemon now answering afresh — issue
+/// #405's protocol check included — instead of reusing trust from the one this
+/// stream belonged to, which the event watcher may not have dropped yet.
 async fn terminal_stream_ended(state: &DesktopState, session_id: &str, generation: u64) {
+    let mut ended = None;
     if let Ok(mut sessions) = state.sessions()
         && sessions
             .get(session_id)
             .is_some_and(|session| session.generation == generation)
     {
-        sessions.remove(session_id);
+        ended = sessions.remove(session_id);
+    }
+    if let Some(session) = ended {
+        state.daemon.invalidate(&session.endpoint).await;
     }
 }
 

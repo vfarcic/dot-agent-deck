@@ -22,6 +22,16 @@
 //!    Error, or Unknown (no hook yet), nor the Idle of a Codex wrapper's
 //!    fork-time start alone — and its session has not declared the pane
 //!    history-only or view-only;
+//!    - part 2 (`inbox/doorbell/008`): that Idle is what the card presents;
+//!      the generation must also be ready by its OWN reports, kept per
+//!      generation outside the event journal
+//!      ([`crate::state::AppState::doorbell_readiness`]). Its own Idle makes
+//!      it ready; so does its own `SessionStart`, except for an agent that
+//!      posts it before its prompt is up (Claude Code), which is then rung
+//!      only while the writer recognises that prompt on screen. A
+//!      placeholder card, the shell monitor's frames (which can carry a
+//!      predecessor's session) and a wrapper's boot report establish none of
+//!      it, and neither does how long the card or process has existed;
 //!    - until the agent's own hooks have reported for this generation, an
 //!      agent whose spec names a composer (Codex) is written to only while that
 //!      composer is on screen: its wrapper reports Idle as soon as Codex takes
@@ -31,6 +41,17 @@
 //! 4. the user has no unsent draft in the pane — with no cap: the doorbell
 //!    waits for the user however long they take;
 //! 5. the ring is due on the schedule ([`DoorbellConfig::schedule`]).
+//!
+//! Conditions 2 to 4 are asked again under the pane's writer before each step
+//! of a write (the pre-ring CR, the line, its submit CR), after the wait
+//! between steps, and so is condition 1 for the **one message the ring
+//! names**: if it was fetched or acknowledged since the decision, the rest of
+//! the ring is withheld even while other mail stays queued (part 2,
+//! `inbox/doorbell/031`). A human keystroke that arrives while the doorbell
+//! holds the writer withholds the rest too. These are checks before each
+//! write, not one transaction with the inbox: an acknowledgement that lands
+//! between the last check and the PTY taking that step's bytes does not stop
+//! that one step.
 //!
 //! It is **coalesced per agent**: one ring covers every queued message, and the
 //! schedule restarts only once the queue has emptied.
@@ -71,7 +92,7 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 
-use crate::agent_pty::{AgentPtyRegistry, DoorbellWrite};
+use crate::agent_pty::{AgentPtyRegistry, DoorbellReady, DoorbellWrite};
 use crate::inbox_hub::DoorbellFacts;
 use crate::state::SharedState;
 
@@ -206,7 +227,8 @@ fn ignored(variable: &str) {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Facts {
     pub inbox: DoorbellFacts,
-    /// The last hook-reported status is Idle.
+    /// The last hook-reported status is Idle, and the generation is ready by
+    /// its own reports or rung only through its composer gate.
     pub idle: bool,
     /// The user has an unsent draft in the pane.
     pub draft: bool,
@@ -319,8 +341,9 @@ pub fn decide(bell: &Bell, facts: &Facts, config: &DoorbellConfig, now: Instant)
 /// Whether a native component leaves the doorbell to ring for this agent at
 /// `now`: none is armed, and none announced `Native` within the last
 /// [`DoorbellConfig::arm_grace`]. [`decide`] asks it, and a write asks it
-/// again under the writer before each byte of a ring, so a component that
-/// arms or announces while the ring waits for the writer stops it.
+/// again under the writer before each step of a ring, with the ring's own
+/// message still queued, so a component that arms or announces, or a fetch
+/// of that message, while the ring waits for the writer stops it.
 pub fn ring_still_admitted(inbox: &DoorbellFacts, config: &DoorbellConfig, now: Instant) -> bool {
     // PRD #1666 §11: an incompatible integration gets no doorbell; its mail
     // waits queued under the card's notice.
@@ -610,12 +633,22 @@ async fn run_tick(
     // PRD #1666 S5: a pane whose session declared it cannot take input
     // (history-only or view-only) is never rung, whatever its status says —
     // the line would land in no live conversation.
-    let admissions: Vec<(Option<crate::state::DoorbellAdmission>, bool)> = {
+    // Part 2 (`inbox/doorbell/008`): and the generation's own readiness, kept
+    // apart from the Idle its card presents. One with none is rung only
+    // through its agent's composer gate, and the writer checks what is left on
+    // screen.
+    let admissions: Vec<(Option<crate::state::DoorbellAdmission>, DoorbellReady, bool)> = {
         let state = state.read().await;
         keys.iter()
             .map(|(pane, agent)| {
+                let ready = match state.doorbell_readiness(agent, pane) {
+                    (_, Some(prompt)) => DoorbellReady::Screen(prompt),
+                    (crate::state::ReadinessLevel::Unproven, None) => DoorbellReady::Unproven,
+                    _ => DoorbellReady::Ready,
+                };
                 (
                     state.doorbell_admission(agent, pane),
+                    ready,
                     status_explains_waiting(state.agent_status(agent, pane).as_ref()),
                 )
             })
@@ -623,10 +656,12 @@ async fn run_tick(
     };
     #[cfg(not(feature = "e2e"))]
     let now = Instant::now();
-    for ((pane, agent), (admission, explained)) in keys.into_iter().zip(admissions) {
+    for ((pane, agent), (admission, ready, explained)) in keys.into_iter().zip(admissions) {
         let facts = Facts {
             inbox: hub.doorbell_facts(&pane, &agent),
-            idle: admission.is_some(),
+            idle: admission.is_some()
+                && (!matches!(ready, DoorbellReady::Unproven)
+                    || registry.has_doorbell_composer(&agent)),
             draft: registry.draft_pending(&pane),
         };
         let (action, stranded) = {
@@ -661,6 +696,7 @@ async fn run_tick(
         let slots = Arc::clone(slots);
         let state = Arc::clone(state);
         let config = config.clone();
+        // The queue as this tick's decision saw it, not as the write left it.
         let queued = facts.inbox.queued;
         tokio::spawn(async move {
             #[cfg(feature = "e2e")]
@@ -677,30 +713,42 @@ async fn run_tick(
                 pause_rering_for_test(&pane, "decided").await;
             }
             // PRD #1666 hardening H3: re-asked under the writer before every
-            // byte. The same admission (nothing happened to the pane since
+            // step. The same admission (nothing happened to the pane since
             // this tick) and, for a ring, still no native component armed or
-            // inside the arm grace of an announcement.
-            let ring = matches!(action, Action::Ring { .. });
+            // inside the arm grace of an announcement. Part 2
+            // (`inbox/doorbell/031`): and the message this ring names still
+            // queued for this generation, from a fresh query each time. Other
+            // queued mail does not keep it alive: a ring is never typed for a
+            // message that was fetched or acknowledged since the decision.
+            // The query takes and drops the hub's lock; nothing here holds it
+            // across the writer's sleeps or writes.
+            let selected = match &action {
+                Action::Ring { id, .. } => Some(id.clone()),
+                _ => None,
+            };
             let still_admitted = || {
                 let state = Arc::clone(&state);
                 let registry = Arc::clone(&registry);
                 let (pane, agent) = (pane.clone(), agent.clone());
                 let config = config.clone();
+                let selected = selected.clone();
                 async move {
-                    admission.is_some()
-                        && state.read().await.doorbell_admission(&agent, &pane) == admission
-                        && (!ring
-                            || ring_still_admitted(
-                                &registry.inbox().doorbell_facts(&pane, &agent),
-                                &config,
-                                Instant::now(),
-                            ))
+                    let now = state.read().await.doorbell_admission(&agent, &pane);
+                    admission
+                        .zip(now)
+                        .is_some_and(|(decided, now)| decided.still_holds(&now))
+                        && selected.is_none_or(|id| {
+                            let facts = registry.inbox().doorbell_facts(&pane, &agent);
+                            facts.queued.contains(&id)
+                                && ring_still_admitted(&facts, &config, Instant::now())
+                        })
                 }
             };
             let outcome = registry
-                .write_doorbell(
+                .write_doorbell_when_ready(
                     &pane,
                     &agent,
+                    ready,
                     pre_cr,
                     stranded.as_deref(),
                     line.as_deref(),
@@ -731,9 +779,15 @@ async fn run_tick(
                 // one more lone CR. One that failed is recorded as having left
                 // its own line; if it failed before typing it, an earlier line
                 // still in the box no longer matches, and the composer gate
-                // holds.
+                // holds. A ring withdrawn after its line went in but before its
+                // submit is likewise rung, with its line left in the box.
                 (
-                    DoorbellWrite::Written | DoorbellWrite::Flushed | DoorbellWrite::Failed,
+                    DoorbellWrite::Written
+                    | DoorbellWrite::Flushed
+                    | DoorbellWrite::Failed
+                    | DoorbellWrite::Cancelled {
+                        line_typed: true, ..
+                    },
                     Action::Ring { id, .. },
                 ) => {
                     slot.bell.rang(Instant::now(), &queued);
@@ -743,15 +797,57 @@ async fn run_tick(
                         line
                     };
                     registry.inbox().note_ring(&pane, &agent);
+                    match outcome {
+                        DoorbellWrite::Written | DoorbellWrite::Flushed => info!(
+                            pane_id = %pane,
+                            agent_id = %agent,
+                            message_id = %id,
+                            queued_at_decision = queued.len(),
+                            rings = slot.bell.rings,
+                            pre_cr,
+                            ?outcome,
+                            "doorbell rang"
+                        ),
+                        DoorbellWrite::Cancelled { steps_written, .. } => info!(
+                            pane_id = %pane,
+                            agent_id = %agent,
+                            message_id = %id,
+                            queued_at_decision = queued.len(),
+                            rings = slot.bell.rings,
+                            pre_cr,
+                            steps_written,
+                            "doorbell ring withdrawn after its line was typed; its submit was withheld"
+                        ),
+                        _ => warn!(
+                            pane_id = %pane,
+                            agent_id = %agent,
+                            message_id = %id,
+                            queued_at_decision = queued.len(),
+                            rings = slot.bell.rings,
+                            pre_cr,
+                            "doorbell ring failed part-way or could not be encoded"
+                        ),
+                    }
+                }
+                // Part 2 (`inbox/doorbell/031`): only the pre-ring CR went in
+                // before the ring was withdrawn, so no line of this ring is in
+                // the box and nothing is recorded as rung. The CR may have
+                // submitted an earlier stranded line, or been swallowed, so
+                // that line stays recorded and the bell owes what it owed.
+                (
+                    DoorbellWrite::Cancelled {
+                        steps_written,
+                        line_typed: false,
+                    },
+                    Action::Ring { id, .. },
+                ) => {
                     info!(
                         pane_id = %pane,
                         agent_id = %agent,
                         message_id = %id,
-                        queued = queued.len(),
-                        rings = slot.bell.rings,
-                        pre_cr,
-                        ?outcome,
-                        "doorbell rang"
+                        queued_at_decision = queued.len(),
+                        steps_written,
+                        "doorbell ring withdrawn after its pre-ring CR; no line was typed"
                     );
                 }
                 (DoorbellWrite::Written, _) => {

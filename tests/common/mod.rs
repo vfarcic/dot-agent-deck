@@ -11912,14 +11912,28 @@ pub fn claude_hook_line(bin: &str, payload_json: &str) -> String {
 }
 
 /// [`claude_hook_line`] for the common case: the `SessionStart` event that acts
-/// as the agent-ready signal the spawn-time prompt gate waits on.
+/// as the agent-ready signal the spawn-time prompt gate waits on, followed by
+/// [`CLAUDE_PROMPT_FRAME`], since Claude Code draws its prompt after it.
 #[allow(dead_code)]
 pub fn claude_session_start_line(bin: &str, session_id: &str) -> String {
-    claude_hook_line(
-        bin,
-        &format!(r#"{{"hook_event_name":"SessionStart","session_id":"{session_id}"}}"#),
+    format!(
+        "{}{CLAUDE_PROMPT_FRAME}",
+        claude_hook_line(
+            bin,
+            &format!(r#"{{"hook_event_name":"SessionStart","session_id":"{session_id}"}}"#),
+        )
     )
 }
+
+/// PRD #1666 part 2: a shell line that draws Claude Code's empty prompt box
+/// the way 2.1.300 does (a rule, the `❯` marker, a rule), for a stand-in that
+/// plays Claude Code. Claude Code posts its `SessionStart` before that box is
+/// up, so the doorbell rings a generation that has only started once
+/// `dot_agent_deck::agent_registry::claude_prompt_on_screen` finds it; a
+/// stand-in that reports only `SessionStart` draws it after, as the agent does.
+#[allow(dead_code)]
+pub const CLAUDE_PROMPT_FRAME: &str =
+    "printf '%s\\n❯\\n%s\\n' '────────────────────' '────────────────────'\n";
 
 /// The [`write_late_announcing_agent`] log line meaning "my PTY input queue was
 /// EMPTY at the instant I announced myself" — i.e. nothing was written before an
@@ -11985,7 +11999,9 @@ pub const LATE_ANNOUNCE_RECEIVED: &str = "received|";
 /// 2. the genuine one after the delay — the first event that actually establishes
 ///    `AppState::pane_hook_session_id` for the pane.
 ///
-/// After announcing it reads stdin forever, logging each line and reporting it
+/// After announcing it draws Claude Code's prompt box ([`CLAUDE_PROMPT_FRAME`]),
+/// which the doorbell waits for in a Claude Code generation that has only
+/// started (PRD #1666 part 2). Then it reads stdin forever, logging each line and reporting it
 /// back as a `UserPromptSubmit`, so a delivery can genuinely CONFIRM and the
 /// card's prompt history becomes the user-altitude evidence.
 ///
@@ -12017,6 +12033,7 @@ pub fn write_late_announcing_agent(
         &format!(
             "{prologue}\
              {genuine_start}\
+             {CLAUDE_PROMPT_FRAME}\
              while IFS= read -r line; do\n\
              \x20 printf 'received|%s\\n' \"$line\" >> \"$log\"\n\
              \x20 {json_escape}\n\
@@ -12073,6 +12090,7 @@ pub fn write_late_announcing_paste_agent(
         &format!(
             "{prologue}\
              {genuine_start}\
+             {CLAUDE_PROMPT_FRAME}\
              paste_open=$(printf '\\033[200~')\n\
              paste_close=$(printf '\\033[201~')\n\
              in_paste=0\n\

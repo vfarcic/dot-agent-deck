@@ -17,9 +17,9 @@
 
 use std::time::Duration;
 
-use crate::daemon_client::DaemonClient;
+use crate::daemon_client::{ClientError, DaemonClient};
 use crate::event::{AgentEvent, BroadcastMsg};
-use crate::state::SharedState;
+use crate::state::{ProtocolRefusal, SharedState};
 
 /// How [`run`] paces its reconnects, and the e2e seam that makes it miss events.
 #[derive(Clone, Copy)]
@@ -75,6 +75,34 @@ pub async fn run(client: DaemonClient, state: SharedState, config: SubscriberCon
         } else {
             subscribe(&client, &state).await
         };
+        // PRD #1666 part 2 (`lifecycle/handshake/011`): every subscription, the
+        // first included, is opened only after issue #405's protocol check
+        // passed on its own `Hello` (`DaemonClient::check_protocol`): the
+        // daemon answering now may have replaced the one the startup handshake
+        // checked. A daemon on another protocol is sent nothing more; the TUI
+        // shows the refusal and keeps checking at the backoff, so a daemon on
+        // this binary's protocol is taken up again once one answers.
+        match &subscribed {
+            Ok(_) => {
+                if state.write().await.protocol_refusal.take().is_some() {
+                    tracing::info!(
+                        "subscribe_events: the daemon speaks this binary's attach protocol again"
+                    );
+                }
+            }
+            Err(Some(refusal)) => {
+                let mut state = state.write().await;
+                if state.protocol_refusal != Some(*refusal) {
+                    tracing::warn!(
+                        daemon_protocol = ?refusal.daemon,
+                        local_protocol = refusal.local,
+                        "subscribe_events: the daemon speaks another attach protocol; not subscribing"
+                    );
+                }
+                state.protocol_refusal = Some(*refusal);
+            }
+            Err(None) => {}
+        }
         // On `Err` the failure was logged where it happened. Qodo on #1553: a
         // resync that could not read the daemon's agents leaves this state
         // unreconciled, so it does not settle on the new stream as if it were;
@@ -182,7 +210,7 @@ pub async fn run(client: DaemonClient, state: SharedState, config: SubscriberCon
 async fn subscribe(
     client: &DaemonClient,
     state: &SharedState,
-) -> Result<crate::daemon_client::EventSubscription, ()> {
+) -> Result<crate::daemon_client::EventSubscription, Option<ProtocolRefusal>> {
     use crate::daemon_client::GatedQuery;
     match tokio::time::timeout(RESYNC_LIST_TIMEOUT, client.subscribe_events_with_snapshot()).await {
         Ok(Ok(GatedQuery::Answered((sub, records)))) => {
@@ -191,17 +219,21 @@ async fn subscribe(
         }
         Ok(Ok(GatedQuery::Unsupported)) => client.subscribe_events().await.map_err(|e| {
             tracing::debug!(error = %e, "subscribe_events: subscribe failed, retrying");
+            None
         }),
+        Ok(Err(ClientError::ProtocolMismatch { daemon, local })) => {
+            Err(Some(ProtocolRefusal { daemon, local }))
+        }
         Ok(Err(e)) => {
             tracing::debug!(error = %e, "subscribe_events: subscribe failed, retrying");
-            Err(())
+            Err(None)
         }
         Err(_) => {
             tracing::warn!(
                 timeout_ms = RESYNC_LIST_TIMEOUT.as_millis() as u64,
                 "subscribe_events: the first subscription timed out, retrying"
             );
-            Err(())
+            Err(None)
         }
     }
 }
@@ -251,15 +283,16 @@ async fn seed_hook_binary_notices(client: &DaemonClient, state: &SharedState) {
 async fn resubscribe(
     client: &DaemonClient,
     state: &SharedState,
-) -> Result<crate::daemon_client::EventSubscription, ()> {
+) -> Result<crate::daemon_client::EventSubscription, Option<ProtocolRefusal>> {
     match subscribe_with_snapshot(client).await {
         Ok((sub, records)) => {
             state.write().await.resync_after_event_gap(&records);
             Ok(sub)
         }
+        Err(ResyncFailure::Protocol(refusal)) => Err(Some(refusal)),
         Err(ResyncFailure::Subscribe(e)) => {
             tracing::debug!(error = %e, "subscribe_events: subscribe failed, retrying");
-            Err(())
+            Err(None)
         }
         Err(ResyncFailure::Snapshot(e)) => {
             tracing::warn!(
@@ -267,7 +300,7 @@ async fn resubscribe(
                 "subscribe_events: resync after reconnect could not list agents, retrying"
             );
             state.write().await.note_event_stream_gap();
-            Err(())
+            Err(None)
         }
         Err(ResyncFailure::TimedOut) => {
             tracing::warn!(
@@ -275,13 +308,16 @@ async fn resubscribe(
                 "subscribe_events: resync after reconnect timed out listing agents, retrying"
             );
             state.write().await.note_event_stream_gap();
-            Err(())
+            Err(None)
         }
     }
 }
 
 /// Why [`subscribe_with_snapshot`] could not hand back a stream and a snapshot.
 enum ResyncFailure {
+    /// PRD #1666 part 2: the daemon speaks another attach protocol, so nothing
+    /// was opened or asked of it past its `Hello`.
+    Protocol(ProtocolRefusal),
     /// No subscription could be opened: the daemon could not be reached for
     /// the ordered request, or the fallback's plain subscribe failed.
     Subscribe(crate::daemon_client::ClientError),
@@ -324,6 +360,9 @@ async fn subscribe_with_snapshot(
         // quietly, with no further gap recorded on every backoff.
         Ok(Err(e @ (ClientError::Io(_) | ClientError::SocketMissing(_)))) => {
             Err(ResyncFailure::Subscribe(e))
+        }
+        Ok(Err(ClientError::ProtocolMismatch { daemon, local })) => {
+            Err(ResyncFailure::Protocol(ProtocolRefusal { daemon, local }))
         }
         Ok(Err(e)) => Err(ResyncFailure::Snapshot(e)),
         Err(_) => Err(ResyncFailure::TimedOut),

@@ -1548,6 +1548,17 @@ pub struct AppState {
     /// it. Forgotten with the pane, so it does not grow by one entry per pane
     /// id ever seen.
     pane_event_epochs: HashMap<String, u64>,
+    /// PRD #1666 part 2 (`inbox/doorbell/008`): per pane, what each recent
+    /// agent generation's OWN hooks have shown of its readiness for input,
+    /// newest generation first and at most [`MAX_READINESS_GENERATIONS`] of
+    /// them ([`Self::doorbell_readiness`]). Kept outside the bounded
+    /// [`SessionState::recent_events`] journal and outside any one card, so
+    /// neither shell-monitor frames pushing a native report out of the journal
+    /// nor `/clear` ending the card it arrived on forgets it, and keyed by the
+    /// generation the event names, so a predecessor's report, on a card a
+    /// successor's frames later reach, never speaks for that successor.
+    /// Forgotten with the pane.
+    pane_doorbell_ready: HashMap<String, Vec<GenerationReadiness>>,
     /// Remembers started_at per pane so a `/clear` restart keeps its position.
     pane_started_at: HashMap<String, DateTime<Utc>>,
     /// Issue #1507: per pane, the daemon registry id its card-surfacing
@@ -1590,6 +1601,13 @@ pub struct AppState {
     /// from `Hello` and replaced by each `HookBinaryNotice` broadcast. Drawn as
     /// one dashboard footer row while non-empty.
     pub hook_binary_notices: Vec<crate::hook_binary::HookBinaryNotice>,
+    /// PRD #1666 part 2 (`lifecycle/handshake/011`), a client's side: the
+    /// daemon now answering at this TUI's endpoint speaks another attach
+    /// protocol, found when the event subscriber reconnected
+    /// ([`crate::daemon_client::DaemonClient::check_protocol`]), so it has not
+    /// resubscribed. Drawn as a footer row on every view while set; cleared
+    /// once a reconnect finds a daemon on this binary's protocol.
+    pub protocol_refusal: Option<ProtocolRefusal>,
     /// Pane ids this process holds as its OWN: panes it registered itself
     /// ([`Self::register_pane`] — a TUI's own panes, the desktop fold's, the
     /// daemon's orchestration role panes), plus, in a process with no
@@ -1927,11 +1945,110 @@ pub struct AppState {
 
 pub type SharedState = Arc<RwLock<AppState>>;
 
+/// PRD #1666 part 2: the two attach protocols a reconnect found apart
+/// ([`AppState::protocol_refusal`]). `daemon` is `None` when the daemon's
+/// reply carried no `server_version`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtocolRefusal {
+    pub daemon: Option<u32>,
+    pub local: u32,
+}
+
 /// PRD #1666 hardening H3: what [`AppState::doorbell_admission`] grants — a
-/// pane fit for the doorbell, as of one event count.
+/// pane fit for the doorbell, as of one event count, and how far its
+/// generation has shown it is ready (part 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DoorbellAdmission {
     epoch: u64,
+    readiness: ReadinessLevel,
+}
+
+impl DoorbellAdmission {
+    /// How far the admitted generation's own hooks have shown it is ready.
+    pub fn readiness(&self) -> ReadinessLevel {
+        self.readiness
+    }
+
+    /// Whether `now`, asked again before a later step of the write this
+    /// admission was decided on, still grants it: the same event count, and
+    /// readiness no lower. A generation that shows more readiness while the
+    /// write is in flight (its own Idle arriving) does not stop it; any
+    /// change to what the pane's cards present does.
+    pub fn still_holds(&self, now: &DoorbellAdmission) -> bool {
+        now.epoch == self.epoch && now.readiness >= self.readiness
+    }
+}
+
+/// PRD #1666 part 2 (`inbox/doorbell/008`): how far an agent generation has
+/// shown, by its OWN reports, that it takes input — the readiness the doorbell
+/// needs, kept apart from the Idle a card presents. A placeholder card, the
+/// shell monitor's frames and a wrapper's boot report present Idle without
+/// establishing any of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ReadinessLevel {
+    /// Nothing from the generation's own hooks. Only an agent whose writer
+    /// recognises its empty composer on screen (Codex) may be rung, and only
+    /// while it does.
+    Unproven,
+    /// Its own `SessionStart`, from an agent that posts it before its prompt
+    /// is up (Claude Code): ready once the writer recognises that prompt on
+    /// screen ([`crate::agent_registry::AgentSpec::doorbell_ready_screen`]).
+    StartedOnScreen,
+    /// Its own Idle, or its own `SessionStart` from an agent with no ready
+    /// screen of its own to wait for.
+    Ready,
+}
+
+/// What one generation's own hooks have shown ([`AppState::pane_doorbell_ready`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GenerationReadiness {
+    agent_id: String,
+    /// The type its own report named, which says what its `SessionStart` is
+    /// worth.
+    agent_type: AgentType,
+    /// Its own Idle has arrived, not only its `SessionStart`.
+    idled: bool,
+}
+
+/// Recognises, in a pane's screen rows, what an agent shows when it is ready
+/// ([`crate::agent_registry::AgentSpec::doorbell_ready_screen`]).
+pub type ScreenRecogniser = fn(&[String]) -> bool;
+
+/// How many generations per pane [`AppState::pane_doorbell_ready`] keeps: the
+/// live one and the few before it whose late reports can still arrive.
+const MAX_READINESS_GENERATIONS: usize = 4;
+
+/// One generation's own report of readiness ([`readiness_report`]).
+struct ReadinessReport {
+    pane_id: String,
+    agent_id: String,
+    agent_type: AgentType,
+    idled: bool,
+}
+
+/// PRD #1666 part 2: what `event` shows of its generation's readiness, when it
+/// is one of that generation's own reports — not a wrapper's start or
+/// classified output, not a daemon-synthetic frame (the shell monitor's pair
+/// among them) — and shows it: a
+/// `SessionStart` or an Idle naming its pane and its generation.
+fn readiness_report(event: &AgentEvent) -> Option<ReadinessReport> {
+    let idled = match event.event_type {
+        EventType::Idle => true,
+        EventType::SessionStart => false,
+        _ => return None,
+    };
+    if event.is_wrapper_session_start()
+        || event.is_wrapper_output_classified()
+        || event.is_daemon_synthetic()
+    {
+        return None;
+    }
+    Some(ReadinessReport {
+        pane_id: event.pane_id.clone()?,
+        agent_id: event.agent_id.clone()?,
+        agent_type: event.agent_type.clone(),
+        idled,
+    })
 }
 
 /// Bytes of the human-readable half of a role slug that survive into the
@@ -7168,12 +7285,74 @@ impl AppState {
     /// again right before each byte and get the SAME admission back only when
     /// nothing the doorbell reads has changed since the decision — not even a
     /// turn that started and ended in between.
+    ///
+    /// Part 2 (`inbox/doorbell/008`): the Idle a card presents is not the
+    /// generation's readiness. The admission carries that separately
+    /// ([`DoorbellAdmission::readiness`], from [`Self::doorbell_readiness`]),
+    /// and the doorbell and its writer withhold every byte from a generation
+    /// whose readiness is short of what its agent needs. It is read from the
+    /// generation's own reports alone, never from how long its card or
+    /// process has existed.
     pub fn doorbell_admission(&self, agent_id: &str, pane_id: &str) -> Option<DoorbellAdmission> {
         (self.agent_doorbell_idle(agent_id, pane_id)
             && self.pane_writable(pane_id) == Writable::Live)
             .then(|| DoorbellAdmission {
                 epoch: self.pane_event_epochs.get(pane_id).copied().unwrap_or(0),
+                readiness: self.doorbell_readiness(agent_id, pane_id).0,
             })
+    }
+
+    /// PRD #1666 part 2 (`inbox/doorbell/008`): how far generation `agent_id`
+    /// in `pane_id` has shown, by its own hooks, that it takes input, and, for
+    /// [`ReadinessLevel::StartedOnScreen`], the screen that completes it.
+    /// [`ReadinessLevel::Ready`] after its own Idle, or after its own
+    /// `SessionStart` when its agent has no ready screen to wait for;
+    /// [`ReadinessLevel::Unproven`] with neither, whatever its card presents.
+    pub fn doorbell_readiness(
+        &self,
+        agent_id: &str,
+        pane_id: &str,
+    ) -> (ReadinessLevel, Option<ScreenRecogniser>) {
+        let Some(generation) = self
+            .pane_doorbell_ready
+            .get(pane_id)
+            .and_then(|generations| generations.iter().find(|g| g.agent_id == agent_id))
+        else {
+            return (ReadinessLevel::Unproven, None);
+        };
+        if generation.idled {
+            return (ReadinessLevel::Ready, None);
+        }
+        match crate::agent_registry::spec(&generation.agent_type).doorbell_ready_screen {
+            Some(screen) => (ReadinessLevel::StartedOnScreen, Some(screen)),
+            None => (ReadinessLevel::Ready, None),
+        }
+    }
+
+    /// PRD #1666 part 2: fold one generation's own report of readiness
+    /// ([`readiness_report`]) into [`Self::pane_doorbell_ready`].
+    fn note_generation_readiness(&mut self, report: ReadinessReport) {
+        let generations = self.pane_doorbell_ready.entry(report.pane_id).or_default();
+        match generations
+            .iter_mut()
+            .find(|g| g.agent_id == report.agent_id)
+        {
+            Some(generation) => {
+                generation.idled |= report.idled;
+                generation.agent_type = report.agent_type;
+            }
+            None => {
+                generations.insert(
+                    0,
+                    GenerationReadiness {
+                        agent_id: report.agent_id,
+                        agent_type: report.agent_type,
+                        idled: report.idled,
+                    },
+                );
+                generations.truncate(MAX_READINESS_GENERATIONS);
+            }
+        }
     }
 
     pub fn agent_status(&self, agent_id: &str, pane_id: &str) -> Option<SessionStatus> {
@@ -7570,6 +7749,7 @@ impl AppState {
         self.untagged_status_panes.remove(pane_id);
         self.waiting_superseded_sessions.remove(pane_id);
         self.pane_event_epochs.remove(pane_id);
+        self.pane_doorbell_ready.remove(pane_id);
     }
 
     /// Issue #697: apply the daemon's announcement that it evicted the unproven
@@ -7953,6 +8133,7 @@ impl AppState {
         // at 0 cannot satisfy an admission captured for the previous agent:
         // the doorbell's writer re-checks the agent that owns the pane.
         self.pane_event_epochs.remove(pane_id);
+        self.pane_doorbell_ready.remove(pane_id);
         if !self
             .sessions
             .values()
@@ -9449,6 +9630,7 @@ impl AppState {
         self.pane_surfaced_agent_seq.remove(pane_id);
         self.pane_inboxes.remove(pane_id);
         self.pane_event_epochs.remove(pane_id);
+        self.pane_doorbell_ready.remove(pane_id);
         self.pane_role_map.remove(pane_id);
         self.pane_cwd_map.remove(pane_id);
         self.orchestrator_pane_ids.remove(pane_id);
@@ -13205,6 +13387,10 @@ impl AppState {
         // both are done with, just below.
         let provenance_pane = event.pane_id.clone();
         let provenance_untagged = event.agent_id.is_none();
+        // PRD #1666 part 2: the generation's own report of readiness, recorded
+        // once the `session` borrow is done. An outside card's frames speak for
+        // no deck generation.
+        let readiness = (!unproven).then(|| readiness_report(&event)).flatten();
 
         // Whether this frame ASSERTED a status, as opposed to leaving whatever
         // the session already had. Only an assertion may move the provenance
@@ -13325,6 +13511,9 @@ impl AppState {
         // frame. A frame that asserted nothing changes nothing here, so it can
         // neither launder an untagged status into a trusted one nor cast doubt
         // on a status it did not write.
+        if let Some(report) = readiness {
+            self.note_generation_readiness(report);
+        }
         if asserted_status && let Some(pane_id) = provenance_pane {
             if provenance_untagged {
                 self.untagged_status_panes.insert(pane_id);

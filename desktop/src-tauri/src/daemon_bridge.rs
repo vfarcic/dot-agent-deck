@@ -103,13 +103,23 @@ pub(crate) struct TrustedDaemon {
 impl TrustedDaemon {
     pub(crate) fn require_compatible(&self) -> Result<(), String> {
         if self.connection.status == ConnectionStatus::Connected {
-            Ok(())
-        } else {
-            Err(self
-                .connection
-                .error
-                .clone()
-                .unwrap_or_else(|| "the daemon is not protocol-compatible".into()))
+            return Ok(());
+        }
+        let error = self
+            .connection
+            .error
+            .clone()
+            .unwrap_or_else(|| "the daemon is not protocol-compatible".into());
+        // PRD #1666 part 2 (`lifecycle/handshake/011`): a refusal on the attach
+        // protocol names both numbers, in the words the TUI's refusal uses
+        // (issue #405), so a user moving between the two clients reads the
+        // same fact the same way.
+        let client = self.connection.client_protocol_version;
+        match self.connection.server_protocol_version {
+            Some(server) if server != client => Err(format!(
+                "{error} Not attaching: the daemon speaks attach protocol v{server}, but this app speaks v{client}."
+            )),
+            _ => Err(error),
         }
     }
 

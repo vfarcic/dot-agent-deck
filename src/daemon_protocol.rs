@@ -590,10 +590,18 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// The check is written at each site rather than shared, because it is one
 /// equality; the two are meant to stay the same rule, and a directional one was
 /// rejected for the reason `build_version_handshake`'s `ProtocolCheck` gives.
+/// PRD #1666 part 2 (`lifecycle/handshake/011`): both clients re-run that
+/// check when a daemon replaced mid-session is reached again. The TUI's event
+/// subscriber and its panes' auto-reattach ask
+/// [`crate::daemon_client::DaemonClient::check_protocol`] before they
+/// subscribe or attach, and a mismatch attaches nothing and shows a refusal
+/// naming both numbers; the desktop drops an endpoint's held handshake when a
+/// terminal stream or its event watcher's subscription ends, so the next
+/// attach classifies the daemon then answering.
 /// What it does **not** cover: the one-shot CLI subcommands (`delegate`,
 /// `work-done`, `agent-event`, `daemon status`, …), which send their request
-/// without that handshake, and a TUI whose daemon is replaced mid-session, whose
-/// reconnects do not re-run it.
+/// without that handshake, and the TUI's other requests (a listing, a resize,
+/// a start), which are sent on whatever answers without a check of their own.
 ///
 /// Before #491, [`crate::connect::probe_remote_protocol`] compared a remote's
 /// `server_version` against the laptop's and hard-failed on a difference, and
@@ -8517,6 +8525,11 @@ async fn handle_attach_stream(
                     enqueue_reject(&reject_tx, b"history-only");
                     continue;
                 }
+                // PRD #1666 part 2 (`inbox/doorbell/031`): counted in flight
+                // from before it waits for the writer until it is written or
+                // refused, so a doorbell holding the writer between its steps
+                // withholds the rest rather than typing ahead of it.
+                let _in_flight = registry.human_frame_arriving(&pane_id);
                 #[cfg(feature = "e2e")]
                 crate::doorbell::record_for_test(&format!("human-arrived {pane_id}"));
                 let w = writer.lock().await;

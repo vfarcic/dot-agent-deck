@@ -4706,9 +4706,12 @@ fn status_011_live_subscriber_updates_the_rendered_inbox_card() {
             // subscribing. An old daemon advertises none and receives the plain
             // subscription on the next connection. Also accept the pre-probe
             // subscriber so this test keeps its rendered-card claim on either
-            // side of that production change.
+            // side of that production change. The probe is also the protocol
+            // check (PRD #1666 part 2), so it is answered on this build's
+            // protocol, as any daemon a subscription may follow does.
             let request = if matches!(request, AttachRequest::Hello { .. }) {
-                write_frame(&mut stream, KIND_RESP, &serde_json::to_vec(&AttachResponse::ok()).unwrap())
+                let hello = AttachResponse::hello(dot_agent_deck::daemon_protocol::PROTOCOL_VERSION);
+                write_frame(&mut stream, KIND_RESP, &serde_json::to_vec(&hello).unwrap())
                     .await.unwrap();
                 drop(stream);
                 stream = listener.accept().await.unwrap().0;

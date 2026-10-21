@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -2425,14 +2425,51 @@ pub enum DoorbellWrite {
     NotReading,
     /// PRD #1666 S7: the agent has not reported through its own hooks yet and
     /// its composer is not on screen, so whatever is there — a start dialog,
-    /// known or not — gets no byte; nothing was written.
+    /// known or not — gets no byte; nothing was written. Part 2: likewise a
+    /// generation not yet ready ([`DoorbellReady`]) whose ready screen is not
+    /// on screen, or that has no screen the writer could recognise.
     NoComposer,
     /// PRD #1666 hardening H3: between the doorbell's decision and the write
     /// the pane stopped being fit for it — a status changed, a dialog opened,
-    /// or a native component armed; nothing was written.
+    /// a native component armed, the message a ring names left the queue, or
+    /// a human frame arrived; nothing was written.
     NotAdmitted,
+    /// PRD #1666 part 2 (`inbox/doorbell/031`): the pane stopped being fit for
+    /// the write after some of its steps went in (the same reasons as
+    /// [`DoorbellWrite::NotAdmitted`]), so the rest were withheld.
+    /// `steps_written` steps went in, in order; `line_typed` says whether the
+    /// ring's line was among them (its submit CR was then not).
+    Cancelled { steps_written: u8, line_typed: bool },
     /// A write failed part-way or could not be encoded.
     Failed,
+}
+
+/// PRD #1666 part 2 (`inbox/doorbell/008`): what the doorbell's generation
+/// has shown of its readiness ([`crate::state::AppState::doorbell_readiness`]),
+/// as far as [`AgentPtyRegistry::write_doorbell`] still has to check it on
+/// screen.
+#[derive(Debug, Clone, Copy)]
+pub enum DoorbellReady {
+    /// Its own hooks showed it ready: nothing more to check.
+    Ready,
+    /// Its own `SessionStart` only, from an agent whose prompt comes up later:
+    /// written to only while this recognises that prompt on screen.
+    Screen(fn(&[String]) -> bool),
+    /// Nothing from its own hooks: written to only through the agent's
+    /// composer gate ([`crate::agent_registry::AgentSpec::doorbell_composer`]),
+    /// and never by an agent without one.
+    Unproven,
+}
+
+/// A human attach frame in flight for a pane
+/// ([`AgentPtyRegistry::human_frame_arriving`]); dropping it ends that.
+#[must_use]
+pub struct HumanFrameInFlight(Arc<AtomicUsize>);
+
+impl Drop for HumanFrameInFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// PRD #20 R20-003/R20-006: the live target that currently owns a pane, resolved
@@ -5447,6 +5484,13 @@ pub struct AgentPtyRegistry {
     /// is what makes the record atomic with respect to writer handoff (H1). See
     /// [`PaneInputState`].
     pane_input: Arc<Mutex<PaneInputState>>,
+    /// PRD #1666 part 2 (`inbox/doorbell/031`): per pane, the human attach
+    /// frames that have arrived and not yet finished with the pane's writer
+    /// ([`Self::human_frame_arriving`]). A frame counts from before it waits
+    /// for the writer, so a doorbell holding the writer between its steps sees
+    /// the keystroke queued behind it, which [`Self::draft_pending`] cannot
+    /// until the frame is written.
+    human_frames_in_flight: Mutex<HashMap<String, Arc<AtomicUsize>>>,
     /// Issue #525: how long a guarded delivery waits on one PTY write before
     /// it stops waiting — [`PTY_WRITE_STALL_BOUND`], lowered by tests. In
     /// milliseconds so a test can change it through the `Arc` every caller
@@ -7339,6 +7383,7 @@ impl AgentPtyRegistry {
             shutting_down: AtomicBool::new(false),
             admission_frozen: AtomicBool::new(false),
             pane_input: Arc::new(Mutex::new(PaneInputState::default())),
+            human_frames_in_flight: Mutex::default(),
             pty_write_stall_bound_ms: AtomicU64::new(PTY_WRITE_STALL_BOUND.as_millis() as u64),
             repaint_nudges: Mutex::new(HashMap::new()),
             repaint_nudge_gap_ms: AtomicU64::new(
@@ -9244,6 +9289,33 @@ impl AgentPtyRegistry {
         self.pane_input.lock().unwrap().draft_pending(pane_id_env)
     }
 
+    /// PRD #1666 part 2 (`inbox/doorbell/031`): a human attach frame for
+    /// `pane_id_env` has arrived and is about to wait for the pane's writer.
+    /// It counts as in flight until the returned guard drops, which the
+    /// caller does once the frame is written or refused.
+    pub fn human_frame_arriving(&self, pane_id_env: &str) -> HumanFrameInFlight {
+        let count = Arc::clone(
+            self.human_frames_in_flight
+                .lock()
+                .unwrap()
+                .entry(pane_id_env.to_string())
+                .or_default(),
+        );
+        count.fetch_add(1, Ordering::SeqCst);
+        HumanFrameInFlight(count)
+    }
+
+    /// Whether a human attach frame for `pane_id_env` is in flight
+    /// ([`Self::human_frame_arriving`]): read by the doorbell under the pane's
+    /// writer, where an in-flight frame is one queued behind it.
+    pub fn human_frame_in_flight(&self, pane_id_env: &str) -> bool {
+        self.human_frames_in_flight
+            .lock()
+            .unwrap()
+            .get(pane_id_env)
+            .is_some_and(|count| count.load(Ordering::SeqCst) > 0)
+    }
+
     /// PRD #1666: generation `agent_id` reported `edge` of a turn on
     /// `pane_id_env`. Applied to the pane's input stream only while that
     /// generation is the pane's live owner: an Idle from a replaced agent ends
@@ -10611,6 +10683,36 @@ impl AgentPtyRegistry {
         F: Fn() -> Fut,
         Fut: std::future::Future<Output = bool>,
     {
+        self.write_doorbell_when_ready(
+            pane_id,
+            expected_agent_id,
+            DoorbellReady::Ready,
+            pre_cr,
+            stranded,
+            line,
+            still_admitted,
+        )
+        .await
+    }
+
+    /// [`Self::write_doorbell`] for a generation whose readiness is `ready`
+    /// (PRD #1666 part 2, `inbox/doorbell/008`): one not yet ready by its own
+    /// hooks gets no byte unless the screen shows it is ([`DoorbellReady`]).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn write_doorbell_when_ready<F, Fut>(
+        &self,
+        pane_id: &str,
+        expected_agent_id: &str,
+        ready: DoorbellReady,
+        pre_cr: bool,
+        stranded: Option<&str>,
+        line: Option<&str>,
+        still_admitted: F,
+    ) -> DoorbellWrite
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
         let owner = |target: &PaneWriterTarget| {
             target.agent_id == expected_agent_id && !target.exited.load(Ordering::SeqCst)
         };
@@ -10660,7 +10762,22 @@ impl AgentPtyRegistry {
         // is what submits it, so it goes alone, and no second line is typed
         // on top.
         let mut flush_only = false;
-        if let Some((empty, recognise)) = self.doorbell_composer_gate(expected_agent_id) {
+        let gate = self.doorbell_composer_gate(expected_agent_id);
+        // PRD #1666 part 2 (`inbox/doorbell/008`): a generation not yet ready
+        // by its own hooks gets no byte unless the screen shows it is: its
+        // agent's prompt for one that only started, its composer gate below
+        // for one with no report at all, and nothing for an agent with
+        // neither. Read once, under the writer, before the first step.
+        match ready {
+            DoorbellReady::Ready => {}
+            DoorbellReady::Screen(prompt) => match self.screen_rows(expected_agent_id).await {
+                Some((rows, _)) if prompt(&rows) => {}
+                _ => return DoorbellWrite::NoComposer,
+            },
+            DoorbellReady::Unproven if gate.is_some() => {}
+            DoorbellReady::Unproven => return DoorbellWrite::NoComposer,
+        }
+        if let Some((empty, recognise)) = gate {
             match self.screen_rows(expected_agent_id).await {
                 Some((rows, _)) if empty(&rows) => {}
                 Some((rows, cursor))
@@ -10679,11 +10796,24 @@ impl AgentPtyRegistry {
         if pre_cr {
             steps.push(b"\r");
         }
+        // The step after which the ring's line is in the box.
+        let line_step = steps.len();
         if let Some(payload) = payload.as_deref().filter(|_| !flush_only) {
             steps.push(payload);
             steps.push(b"\r");
         }
         let mut sink = w.daemon(stall);
+        // What withholding the steps from `n` on leaves behind.
+        let withdrawn = |n: usize| {
+            if n == 0 {
+                DoorbellWrite::NotAdmitted
+            } else {
+                DoorbellWrite::Cancelled {
+                    steps_written: u8::try_from(n).unwrap_or(u8::MAX),
+                    line_typed: payload.is_some() && !flush_only && n > line_step,
+                }
+            }
+        };
         for (n, bytes) in steps.into_iter().enumerate() {
             #[cfg(feature = "e2e")]
             if pre_cr && line.is_some() && n == 1 {
@@ -10702,15 +10832,19 @@ impl AgentPtyRegistry {
                 crate::doorbell::pause_rering_for_test(pane_id, phase).await;
             }
             // PRD #1666 hardening H3: the admission the doorbell decided on
-            // is asked for again under the writer before EVERY byte — the
-            // pre-ring CR, the line, its submit and a cleanup CR — so a dialog
-            // or a turn that started while this write waited gets nothing.
-            if !still_admitted().await {
-                return if n == 0 {
-                    DoorbellWrite::NotAdmitted
-                } else {
-                    DoorbellWrite::Failed
-                };
+            // is asked for again under the writer before EVERY step — the
+            // pre-ring CR, the line, its submit and a cleanup CR — and after
+            // the wait between steps, so a dialog or a turn that started, or
+            // (part 2, `inbox/doorbell/031`) the ring's own message leaving the
+            // queue, stops what is left. A human frame that arrived while this
+            // write holds the writer is queued behind it: the keystroke is not
+            // in the draft tracker yet, so it is asked for separately, and the
+            // remaining steps are left to the user.
+            if self.human_frame_in_flight(pane_id)
+                || self.draft_pending(pane_id)
+                || !still_admitted().await
+            {
+                return withdrawn(n);
             }
             match sink.write_tracked(bytes).await {
                 WriteProgress::Complete => {}
@@ -12418,6 +12552,13 @@ impl AgentPtyRegistry {
                 pixel_height: 0,
             });
         }
+    }
+
+    /// PRD #1666 part 2: whether `agent_id`'s doorbell writes go through a
+    /// composer gate ([`Self::write_doorbell`]), the one way a generation with
+    /// no readiness of its own may be rung.
+    pub fn has_doorbell_composer(&self, agent_id: &str) -> bool {
+        self.doorbell_composer_gate(agent_id).is_some()
     }
 
     /// PRD #1666 S7: the composer recogniser the doorbell must satisfy before
