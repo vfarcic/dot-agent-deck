@@ -77,8 +77,9 @@ pub struct IntentRequest<'a> {
 /// [`super::openai::response_schema`] asks for `params` as a list of `{"name",
 /// "value"}` pairs, one per param the user referred to, which is the shortest
 /// reply strict mode can express (see its doc comment). The list is read into
-/// the same map, and a list that names one param twice is refused: two values
-/// for one param, reduced to one by position, would be an answer nobody gave.
+/// the same map, and a params object or list that names one param twice is
+/// refused — with a value or a `null` either time: two answers for one param,
+/// reduced to one by position, would be an answer nobody gave.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct IntentAnswer {
     pub action: String,
@@ -87,7 +88,7 @@ pub struct IntentAnswer {
 }
 
 /// [`IntentAnswer::params`] as either shape arrives — an object, with its
-/// `null`s removed, or a list of named values, each name once.
+/// `null`s removed, or a list of named values — each name once.
 ///
 /// A non-string, non-null value is still an error — `{"agent": 7}` is a backend
 /// that did not honour the schema, and reading it as absent would turn a
@@ -96,7 +97,7 @@ fn params_without_nulls<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<BTreeMap<String, String>, D::Error> {
     match AnsweredParams::deserialize(deserializer)? {
-        AnsweredParams::Named(params) => Ok(params
+        AnsweredParams::Named(NamedParams(params)) => Ok(params
             .into_iter()
             .filter_map(|(name, value)| value.map(|value| (name, value)))
             .collect()),
@@ -116,8 +117,40 @@ fn params_without_nulls<'de, D: serde::Deserializer<'de>>(
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum AnsweredParams {
-    Named(BTreeMap<String, Option<String>>),
+    Named(NamedParams),
     Listed(Vec<ListedParam>),
+}
+
+/// A params object, read entry by entry so that a name written twice is
+/// refused before a map keeps one of its values: `{"agent": "tester",
+/// "agent": "coder"}` read into a map is whichever came last, and a `null`
+/// after a value would erase it.
+struct NamedParams(BTreeMap<String, Option<String>>);
+
+impl<'de> Deserialize<'de> for NamedParams {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_map(NamedParamsVisitor)
+    }
+}
+
+struct NamedParamsVisitor;
+
+impl<'de> serde::de::Visitor<'de> for NamedParamsVisitor {
+    type Value = NamedParams;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an object naming each param once")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<NamedParams, A::Error> {
+        let mut named = BTreeMap::new();
+        while let Some((name, value)) = map.next_entry::<String, Option<String>>()? {
+            if named.insert(name, value).is_some() {
+                return Err(serde::de::Error::custom("a param named twice"));
+            }
+        }
+        Ok(NamedParams(named))
+    }
 }
 
 /// One entry of a listed `params`.
@@ -781,6 +814,26 @@ mod tests {
             serde_json::from_str::<IntentAnswer>(r#"{"action":"open_agent","params":{"agent":7}}"#)
                 .is_err()
         );
+    }
+
+    /// Scenario: a params object writes one name twice — two values, or a
+    /// value and a `null` in either order, or two `null`s. Each is malformed,
+    /// as a list naming one param twice is, rather than read as whichever
+    /// came last.
+    #[test]
+    fn voice_resolver_answer_refuses_an_object_naming_a_param_twice() {
+        for twice in [
+            r#"{"agent":"tester","agent":"coder"}"#,
+            r#"{"agent":"tester","agent":null}"#,
+            r#"{"agent":null,"agent":"coder"}"#,
+            r#"{"agent":null,"agent":null}"#,
+        ] {
+            let reply = format!(r#"{{"action":"open_agent","params":{twice}}}"#);
+            assert!(
+                serde_json::from_str::<IntentAnswer>(&reply).is_err(),
+                "{reply}"
+            );
+        }
     }
 
     /// Scenario: params answered as a list of named values — the shape

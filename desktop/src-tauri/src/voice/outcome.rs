@@ -38,7 +38,7 @@
 //! `invoke` target and the resolved params; the frontend dispatches it where a
 //! click dispatches one (M2/M6).
 
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
@@ -1274,7 +1274,7 @@ async fn after_local_intercepts(
     let judged = Judged {
         first,
         second: Second::NotAwaited,
-        open: Cell::new(false),
+        open: RefCell::default(),
         transcript: transcript.text().to_string(),
         directories,
         new_agent,
@@ -1290,23 +1290,20 @@ async fn after_local_intercepts(
                 Ok(second) => Second::Answered(second),
                 Err(error) => Second::Failed(error),
             },
-            open: Cell::new(false),
+            open: RefCell::default(),
             ..judged
         };
         outcome = decide(&picked, &judged);
         // A refusal the missing vote decided is the app failing to check,
-        // not the user's words failing to ask.
-        if let Some(error) = judged.unchecked() {
-            outcome = match outcome {
-                VoiceOutcome::ActionUngrounded {
-                    action, transcript, ..
-                } => VoiceOutcome::meaning_unchecked(
-                    transcript,
-                    table.row(&action).unwrap_or(row),
-                    error,
-                ),
-                outcome => outcome,
-            };
+        // not the user's words failing to ask — said of the row whose own
+        // question that vote left undecided ([`Judged::unchecked`]).
+        if let VoiceOutcome::ActionUngrounded {
+            action, transcript, ..
+        } = &outcome
+            && let Some((unchecked, error)) =
+                judged.unchecked(table, table.row(action).unwrap_or(row))
+        {
+            outcome = VoiceOutcome::meaning_unchecked(transcript.clone(), unchecked, error);
         }
     }
     // What the user waited for is both calls.
@@ -3666,7 +3663,7 @@ enum Second {
     /// that needs two votes is refused, and one that needs one keeps the first
     /// vote's answer. When such a question is what refused the pick, the
     /// refusal is that the app could not check, not that the words did not
-    /// ask ([`Judged::unchecked`]).
+    /// ask — said of the row that question was about ([`Judged::unchecked`]).
     Failed(IntentError),
 }
 
@@ -3688,10 +3685,10 @@ enum Second {
 struct Judged<'d> {
     first: MeaningVerdict,
     second: Second,
-    /// Whether a question was asked whose answer the second vote could have
-    /// changed — a first `yes` that needs two votes, or a first `no` that
-    /// needs one.
-    open: Cell<bool>,
+    /// The questions asked whose answer the second vote could have changed —
+    /// a first `yes` that needs two votes, or a first `no` that needs one —
+    /// as the action and strictness each was asked about, in the order asked.
+    open: RefCell<Vec<(String, Strictness)>>,
     transcript: String,
     directories: Option<&'d VoiceDirectories>,
     new_agent: Option<&'d VoiceNewAgent>,
@@ -3731,8 +3728,9 @@ impl Judged<'_> {
             ),
             None => true,
         };
-        // The guards first: a pick they refuse is refused whatever the votes
-        // say, so its refusal is never put down to a vote that failed.
+        // The guards first: a row they refuse is refused whatever the votes
+        // say, so no question about it is left open for a failed vote to
+        // decide ([`Judged::unchecked`]).
         self.guards_hold(row) && meant()
     }
 
@@ -3744,7 +3742,9 @@ impl Judged<'_> {
             Second::Answered(second) => second.asks(action, strictness),
             Second::NotAwaited | Second::Failed(_) => {
                 if first == two_votes {
-                    self.open.set(true);
+                    self.open
+                        .borrow_mut()
+                        .push((action.to_string(), strictness));
                 }
                 // Not yet waited for, the first vote's answer stands until
                 // the caller decides again.
@@ -3764,17 +3764,47 @@ impl Judged<'_> {
     /// Whether a decision made on the first vote alone asked a question the
     /// second could answer differently ([`Second::NotAwaited`]).
     fn needs_second(&self) -> bool {
-        matches!(self.second, Second::NotAwaited) && self.open.get()
+        matches!(self.second, Second::NotAwaited) && !self.open.borrow().is_empty()
     }
 
-    /// The second vote's error, when it failed and a question it could have
-    /// answered differently was asked — so a refusal was decided by the vote
-    /// the app could not get, not by the user's words.
-    fn unchecked(&self) -> Option<&IntentError> {
-        match &self.second {
-            Second::Failed(error) if self.open.get() => Some(error),
-            _ => None,
+    /// The row the app could not check and the second vote's error, when that
+    /// vote failed and a refusal of `refused` was decided by it rather than by
+    /// the user's words.
+    ///
+    /// **The refused row's own question first.** When the failed vote left
+    /// `refused`'s own question undecided — under the strictness it was read
+    /// with, and with its guards holding — the refusal is that row's
+    /// could-not-check. Otherwise its refusal was definitive (a guard, or a
+    /// readable `no` that one more vote could not turn), and the vote that
+    /// failed was only needed for a row examined in its place, a reading or
+    /// a redirect target: that row is named, the first one asked, since it is
+    /// the one a second `yes` could have run — "close the tester agent"
+    /// forced as a stop the guard refuses, beside a `close` reading whose
+    /// second vote failed, could not check that it asks to close, and the
+    /// stop it never asked for is not what went unchecked. Neither case runs
+    /// anything, and a row whose guards do not hold is never named.
+    fn unchecked<'t>(
+        &self,
+        table: &'t CommandTable,
+        refused: &'t CommandRow,
+    ) -> Option<(&'t CommandRow, &IntentError)> {
+        let Second::Failed(error) = &self.second else {
+            return None;
+        };
+        let open = self.open.borrow();
+        let left_open = |row: &CommandRow| {
+            self.guards_hold(row)
+                && row
+                    .meaning_for(self.directories, self.new_agent)
+                    .is_some_and(|(strictness, _)| open.contains(&(row.id.clone(), strictness)))
+        };
+        if left_open(refused) {
+            return Some((refused, error));
         }
+        open.iter()
+            .filter_map(|(action, _)| table.row(action))
+            .find(|row| row.id != refused.id && left_open(row))
+            .map(|row| (row, error))
     }
 
     /// Whether `row`'s refuse-only guards hold for this transcript, whatever
@@ -17650,7 +17680,7 @@ mod tests {
         let judged = Judged {
             first: yes(),
             second: Second::Answered(yes()),
-            open: Cell::new(false),
+            open: RefCell::default(),
             transcript: "Close".to_string(),
             directories: None,
             new_agent: None,
@@ -18955,6 +18985,80 @@ mod tests {
             .await;
             assert!(
                 matches!(&outcome, VoiceOutcome::Dispatch { action, .. } if action == acts),
+                "{said}: {outcome:?}"
+            );
+        }
+    }
+
+    /// Scenario: a pick refused on its own terms — a stop forced for "close
+    /// the tester agent", which the stop's guard refuses, and "go back" over
+    /// the New agent dialog on an agent's pane, picked as the Daemons screen
+    /// the first vote does not list — beside a `close` examined in its place,
+    /// which the first vote lists and needs a second `yes` for. When the
+    /// second vote fails or never answers, the refusal is that the app could
+    /// not check the close, never the pick; a readable second `no` refuses the
+    /// pick as not asked for, and a second `yes` closes.
+    #[tokio::test(start_paused = true)]
+    async fn voice_outcome_a_failed_vote_for_an_alternative_is_not_put_down_to_the_pick() {
+        use Vote::{Fails, Hangs, Lists};
+        let close = table().row(CLOSE_ROW).expect("present");
+        let cases = [
+            (
+                "close the tester agent",
+                Screen::Overview,
+                false,
+                IntentAnswer::new("stop_agent").with_param("agent", "tester"),
+            ),
+            (
+                "go back",
+                Screen::Agent,
+                true,
+                IntentAnswer::new(OPEN_DECK_ROW),
+            ),
+        ];
+        for (said, screen, form, answer) in cases {
+            let picked = table().row(&answer.action).expect("present");
+            for second in [Fails, Hangs] {
+                let (outcome, _) = voted(
+                    said,
+                    screen,
+                    &fleet(),
+                    form,
+                    answer.clone(),
+                    [Lists(&[CLOSE_ROW]), second],
+                )
+                .await;
+                assert!(
+                    matches!(&outcome, VoiceOutcome::ResolutionFailed { sentence, .. }
+                        if sentence.contains(&format!("could not check that this asks to {}", close.asks_to))
+                            && !sentence.contains(&picked.asks_to)),
+                    "{said}: {second:?}: {outcome:?}"
+                );
+            }
+            let (outcome, _) = voted(
+                said,
+                screen,
+                &fleet(),
+                form,
+                answer.clone(),
+                [Lists(&[CLOSE_ROW]), Lists(&[])],
+            )
+            .await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::ActionUngrounded { action, .. } if *action == answer.action),
+                "{said}: {outcome:?}"
+            );
+            let (outcome, _) = voted(
+                said,
+                screen,
+                &fleet(),
+                form,
+                answer.clone(),
+                [Lists(&[CLOSE_ROW]), Lists(&[CLOSE_ROW])],
+            )
+            .await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Dispatch { action, .. } if action == CLOSE_ROW),
                 "{said}: {outcome:?}"
             );
         }

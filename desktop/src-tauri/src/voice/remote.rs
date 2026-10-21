@@ -233,13 +233,10 @@ impl RemoteResolver {
                 reasoning_effort,
             ),
         };
-        let payload = self.post(body).await?;
-        match self.protocol {
-            Protocol::Anthropic => parse_response(&payload, self.max_tokens),
-            Protocol::OpenAiCompatible { .. } => {
-                super::openai::parse_response(&payload, self.max_tokens)
-            }
-        }
+        // Read from the bytes rather than from `post`'s JSON, for the meaning
+        // check's reason ([`answer_from_reply`]).
+        let (status, reply) = self.post_for_bytes(body).await?;
+        answer_from_reply(self.protocol, status, &reply, self.max_tokens)
     }
 
     /// PRD #1631: the question call — the same transport, credential and
@@ -632,6 +629,35 @@ pub fn parse_response(
     })
 }
 
+/// The answer out of a command reply's bytes, as they arrived: refused when
+/// any object in them writes a key twice
+/// ([`super::meaning::keys_written_once`]), then read in `protocol`. What
+/// [`RemoteResolver`] reads every command reply with.
+///
+/// `serde_json` keeps one occurrence of a repeated key, so an Anthropic tool
+/// call whose input named a param twice — `{"agent": "tester", "agent":
+/// "coder"}` — would reach [`IntentAnswer`] already reduced to whichever came
+/// last, and its own refusal of a repeated param could not see it. The
+/// OpenAI-compatible answer is JSON inside a string, which [`IntentAnswer`]
+/// reads from its text, repeats included.
+fn answer_from_reply(
+    protocol: Protocol,
+    status: reqwest::StatusCode,
+    reply: &[u8],
+    max_tokens: TokenCeiling,
+) -> Result<IntentAnswer, IntentError> {
+    if status.is_success() && !super::meaning::keys_written_once(reply) {
+        return Err(IntentError::Backend(
+            "the command backend picked an action this build could not read".into(),
+        ));
+    }
+    let payload = read_reply(status, reply)?;
+    match protocol {
+        Protocol::Anthropic => parse_response(&payload, max_tokens),
+        Protocol::OpenAiCompatible { .. } => super::openai::parse_response(&payload, max_tokens),
+    }
+}
+
 /// What a non-2xx reply becomes.
 ///
 /// The API's own `error.message` is quoted because it is the difference between
@@ -989,6 +1015,73 @@ mod tests {
         .expect("parses");
         assert_eq!(answer.action, "open_agent");
         assert_eq!(answer.params.get("agent"), Some(&"tester".to_string()));
+    }
+
+    /// Scenario: a command reply names the agent param twice — two values, or
+    /// a value and a `null` in either order — as an object or as a list, in
+    /// an Anthropic tool call and in an OpenAI-compatible answer. Read from
+    /// the reply's bytes as the resolver reads it, each is refused rather
+    /// than kept by position; the same replies naming it once still parse.
+    #[test]
+    fn voice_remote_a_command_reply_naming_a_param_twice_is_refused() {
+        let ok = reqwest::StatusCode::OK;
+        let anthropic = |params: &str| {
+            format!(
+                r#"{{"stop_reason": "tool_use", "content": [{{"type": "tool_use", "id": "toolu_1", "name": "{TOOL_NAME}", "input": {{"action": "open_agent", "params": {params}}}}}]}}"#
+            )
+        };
+        let openai = |params: &str| {
+            json!({
+                "choices": [{
+                    "finish_reason": "stop",
+                    "message": {
+                        "content": format!(r#"{{"action": "open_agent", "params": {params}}}"#),
+                    },
+                }],
+            })
+            .to_string()
+        };
+        let openai_protocol = Protocol::OpenAiCompatible {
+            reasoning_effort: None,
+        };
+        for twice in [
+            r#"{"agent": "tester", "agent": "coder"}"#,
+            r#"{"agent": "tester", "agent": null}"#,
+            r#"{"agent": null, "agent": "coder"}"#,
+            r#"[{"name": "agent", "value": "tester"}, {"name": "agent", "value": "coder"}]"#,
+        ] {
+            for (protocol, reply) in [
+                (Protocol::Anthropic, anthropic(twice)),
+                (openai_protocol, openai(twice)),
+            ] {
+                let read =
+                    answer_from_reply(protocol, ok, reply.as_bytes(), TokenCeiling::default());
+                assert!(
+                    matches!(&read, Err(IntentError::Backend(detail))
+                        if detail.contains("could not read")),
+                    "{protocol:?}: {twice}: {read:?}"
+                );
+            }
+        }
+        for once in [
+            r#"{"agent": "coder"}"#,
+            r#"{"agent": "coder", "deck": null}"#,
+            r#"[{"name": "agent", "value": "coder"}]"#,
+        ] {
+            for (protocol, reply) in [
+                (Protocol::Anthropic, anthropic(once)),
+                (openai_protocol, openai(once)),
+            ] {
+                let answer =
+                    answer_from_reply(protocol, ok, reply.as_bytes(), TokenCeiling::default())
+                        .expect("parses");
+                assert_eq!(
+                    answer.params,
+                    std::collections::BTreeMap::from([("agent".to_string(), "coder".to_string())]),
+                    "{protocol:?}: {once}"
+                );
+            }
+        }
     }
 
     #[test]
