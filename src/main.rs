@@ -2895,10 +2895,10 @@ async fn run_tui_session() -> ExitCode {
         }
     }
 
-    let pane_controller: Arc<dyn PaneController> = Arc::new(EmbeddedPaneController::new(
-        attach_path.clone(),
-        tokio::runtime::Handle::current(),
-    ));
+    let pane_controller: Arc<dyn PaneController> = Arc::new(
+        EmbeddedPaneController::new(attach_path.clone(), tokio::runtime::Handle::current())
+            .with_protocol_gate(),
+    );
     let tui_state = state.clone();
     let tui_result = tokio::task::spawn_blocking(move || {
         run_tui(tui_state, pane_controller, config, keybindings)
@@ -2936,7 +2936,13 @@ fn spawn_event_subscriber(
         applied: Some(e2e_subscriber_applied),
         ..SubscriberConfig::default()
     };
-    tokio::spawn(run(DaemonClient::new(attach_path), state, config));
+    // PRD #1666 part 2 (`lifecycle/handshake/011`): every subscription,
+    // listing included, rides a connection whose own `Hello` passed.
+    tokio::spawn(run(
+        DaemonClient::new(attach_path).with_protocol_gate(),
+        state,
+        config,
+    ));
 }
 
 /// Issue #621 e2e seam: make this subscriber miss a conversation's events, the

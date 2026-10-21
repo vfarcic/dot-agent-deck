@@ -906,6 +906,21 @@ impl EmbeddedPaneController {
         }
     }
 
+    /// PRD #1666 part 2 (`lifecycle/handshake/011`): every pane this controller
+    /// starts, attaches, hydrates or reattaches, and every listing behind
+    /// those, is admitted only by a positive protocol check on the connection
+    /// that carries it ([`DaemonClient::with_protocol_gate`]). The TUI builds
+    /// its controller this way: the daemon behind its socket can be replaced
+    /// by another build at any time after the startup handshake, and a footer
+    /// saying so blocks nothing by itself.
+    ///
+    /// Closing an attached pane keeps its own ungated `stop-agent`, so a person
+    /// can still stop the agent of a pane they already have open.
+    pub fn with_protocol_gate(mut self) -> Self {
+        self.client = self.client.with_protocol_gate();
+        self
+    }
+
     /// Issue #1540: a handle the New agent form reads its pre-fill through —
     /// on this controller's own client, so it asks the very daemon the TUI is
     /// attached to, local or remote.
@@ -3559,39 +3574,55 @@ async fn resolve_and_reattach(
         attempts = attempts.saturating_add(1);
         // PRD #1666 part 2 (`lifecycle/handshake/011`): issue #405's protocol
         // check before every lookup — this pane's stream ended, and the daemon
-        // now answering may be another build. One on another protocol is asked
-        // nothing more and attached to never; the attempt counts, and the
-        // lookup is retried, so a daemon on this binary's protocol that
-        // replaces it within the budget is still taken up. A check that could
-        // not be made at all falls through to the lookup, which reports the
-        // daemon's reachability as it did.
-        match client.check_protocol().await {
-            Err(crate::daemon_client::ClientError::ProtocolMismatch { daemon, local }) => {
-                tracing::debug!(
-                    daemon_protocol = ?daemon,
-                    local_protocol = local,
-                    "auto-reattach: the daemon speaks another attach protocol; not attaching"
-                );
-                protocol_mismatch = Some((daemon, local));
-                last_list_error = None;
-                if start.elapsed() >= REATTACH_LOOKUP_TOTAL_BUDGET {
-                    return Err(ReattachGiveUp {
-                        attempts,
-                        list_errors,
-                        trailing_list_errors,
-                        attach_errors,
-                        trailing_attach_errors,
-                        last_list_error,
-                        last_attach_error,
-                        protocol_mismatch,
-                    });
+        // now answering may be another build. Only a positive answer lets the
+        // lookup run: one on another protocol is asked nothing more and
+        // attached to never, and a check that could not be made at all — a
+        // refused, garbled or cut-off `Hello`, or no daemon — is no answer, so
+        // it is counted as a failed lookup and retried, never taken as leave
+        // to attach. A daemon on this binary's protocol that answers within the
+        // budget is still taken up. On the TUI's gated client
+        // ([`DaemonClient::with_protocol_gate`]) the lookup and the attach
+        // each repeat the check on their own connection, so a daemon replaced
+        // after this one is refused too.
+        if let Err(e) = client.check_protocol().await {
+            match e {
+                crate::daemon_client::ClientError::ProtocolMismatch { daemon, local } => {
+                    tracing::debug!(
+                        daemon_protocol = ?daemon,
+                        local_protocol = local,
+                        "auto-reattach: the daemon speaks another attach protocol; not attaching"
+                    );
+                    protocol_mismatch = Some((daemon, local));
+                    last_list_error = None;
                 }
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(REATTACH_LOOKUP_MAX_DELAY);
-                continue;
+                e => {
+                    protocol_mismatch = None;
+                    list_errors = list_errors.saturating_add(1);
+                    trailing_list_errors = trailing_list_errors.saturating_add(1);
+                    last_list_error = Some(e.to_string());
+                    tracing::debug!(
+                        error = %e,
+                        "auto-reattach: the protocol check failed; not attaching, retrying after backoff"
+                    );
+                }
             }
-            Ok(_) | Err(_) => protocol_mismatch = None,
+            if start.elapsed() >= REATTACH_LOOKUP_TOTAL_BUDGET {
+                return Err(ReattachGiveUp {
+                    attempts,
+                    list_errors,
+                    trailing_list_errors,
+                    attach_errors,
+                    trailing_attach_errors,
+                    last_list_error,
+                    last_attach_error,
+                    protocol_mismatch,
+                });
+            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(REATTACH_LOOKUP_MAX_DELAY);
+            continue;
         }
+        protocol_mismatch = None;
         match client.list_agents().await {
             Ok(records) => {
                 // The daemon answered, so it is reachable AS OF NOW. Anything it
@@ -3615,6 +3646,10 @@ async fn resolve_and_reattach(
                     }
                     Some(new_id) => match client.attach_as_viewer(&new_id, viewport).await {
                         Ok(conn) => return Ok((new_id, conn)),
+                        Err(crate::daemon_client::ClientError::ProtocolMismatch {
+                            daemon,
+                            local,
+                        }) => protocol_mismatch = Some((daemon, local)),
                         Err(e) => {
                             // Counted, not just logged: the agent demonstrably
                             // EXISTS, so a give-up here must not be reported as
@@ -3630,6 +3665,12 @@ async fn resolve_and_reattach(
                         }
                     },
                 }
+            }
+            // The gated lookup's own check found a daemon on another
+            // protocol: one replaced since the check above.
+            Err(crate::daemon_client::ClientError::ProtocolMismatch { daemon, local }) => {
+                protocol_mismatch = Some((daemon, local));
+                last_list_error = None;
             }
             Err(e) => {
                 list_errors = list_errors.saturating_add(1);
@@ -6346,5 +6387,104 @@ mod tests {
             drop((controller, other));
             registry.shutdown_all();
         }
+    }
+}
+
+/// PRD #1666 part 2 (`lifecycle/handshake/011`): the TUI's own attach, listing
+/// and start paths, against the scripted daemons of
+/// [`crate::daemon_client::gate_fixture`].
+#[cfg(all(test, unix))]
+mod protocol_gate_tests {
+    use super::*;
+    use crate::daemon_client::gate_fixture::{GateDaemon, GateHello};
+    use crate::pane::PaneController;
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build the test runtime")
+    }
+
+    /// Scenario: a pane's stream ended and auto-reattach starts looking for
+    /// its agent, on a daemon whose `Hello` is refused, answered with garbage,
+    /// or never answered — while its listing and attach verbs work. No check
+    /// passed, so for the whole retry window it lists nothing and attaches
+    /// nothing; a daemon whose check passes is reattached at once (control).
+    #[tokio::test]
+    async fn reattach_attaches_only_after_a_positive_protocol_check() {
+        for hello in [GateHello::Refused, GateHello::Garbled, GateHello::Silent] {
+            let daemon = GateDaemon::spawn(move |_| hello);
+            // Ungated, so this pins the reattach loop's own check rather than
+            // the client's gate.
+            let client = DaemonClient::new(daemon.path.clone());
+            let outcome = tokio::time::timeout(
+                Duration::from_millis(1500),
+                resolve_and_reattach(&client, "pane", None),
+            )
+            .await;
+            assert!(
+                !matches!(outcome, Ok(Ok(_))),
+                "{hello:?}: reattached without a positive protocol check"
+            );
+            assert_eq!(
+                daemon.recorded(),
+                Vec::<String>::new(),
+                "{hello:?}: listed or attached without a positive protocol check"
+            );
+        }
+        let daemon = GateDaemon::spawn(|_| GateHello::Matching);
+        let client = DaemonClient::new(daemon.path.clone());
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            resolve_and_reattach(&client, "pane", None),
+        )
+        .await;
+        assert!(
+            matches!(outcome, Ok(Ok(_))),
+            "control: a passing check must reattach"
+        );
+    }
+
+    /// Scenario: the TUI's pane controller, after the daemon behind its socket
+    /// was replaced by one on the next attach protocol, is asked to open a new
+    /// agent pane, to hydrate every pane from the daemon, and to hydrate one
+    /// pane. Nothing is started, listed or attached on that daemon; the same
+    /// asks on a daemon on this protocol reach it (control).
+    #[test]
+    fn a_gated_controller_starts_lists_and_attaches_nothing_on_another_protocol() {
+        let runtime = runtime();
+        let daemon = runtime.block_on(async { GateDaemon::spawn(|_| GateHello::Newer) });
+        let controller = EmbeddedPaneController::new(daemon.path.clone(), runtime.handle().clone())
+            .with_protocol_gate();
+        let created = controller.create_pane(Some("cat"), None);
+        assert!(
+            created.is_err(),
+            "a new pane on another protocol: {created:?}"
+        );
+        assert!(controller.hydrate_from_daemon().is_empty());
+        assert!(!controller.hydrate_pane("pane"));
+        assert_eq!(
+            daemon.recorded(),
+            Vec::<String>::new(),
+            "the TUI started, listed or attached on a daemon on another protocol"
+        );
+
+        let matching = runtime.block_on(async { GateDaemon::spawn(|_| GateHello::Matching) });
+        let controller =
+            EmbeddedPaneController::new(matching.path.clone(), runtime.handle().clone())
+                .with_protocol_gate();
+        let _ = controller.create_pane(Some("cat"), None);
+        let _ = controller.hydrate_pane("pane");
+        let reached = matching.recorded();
+        for op in ["start-agent", "list-agents", "attach-stream"] {
+            assert!(
+                reached.iter().any(|r| r.ends_with(&format!(":{op}"))),
+                "control: {op} must reach a matching daemon: {reached:?}"
+            );
+        }
+        drop(controller);
+        drop(runtime);
     }
 }

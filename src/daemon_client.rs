@@ -1400,6 +1400,14 @@ pub struct DaemonClient {
     /// `client_id` on an attach and cannot claim focus, which is exactly what a
     /// client predating focus-driven sizing does.
     client_id: Option<String>,
+    /// PRD #1666 part 2 (`lifecycle/handshake/011`): set by
+    /// [`Self::with_protocol_gate`]. When `true`, every request that attaches,
+    /// lists, starts or subscribes goes on a connection whose own `Hello`
+    /// (with `follow_on`) answered this binary's
+    /// [`crate::daemon_protocol::PROTOCOL_VERSION`] — see
+    /// [`Self::admitted_connect`]. `false` (every constructor's default) is the
+    /// one-shot CLI's policy: one command, after its own startup check.
+    protocol_gate: bool,
 }
 
 impl DaemonClient {
@@ -1416,6 +1424,7 @@ impl DaemonClient {
             presence: LOCAL_ENDPOINT_PRESENCE,
             capabilities: Arc::new(Mutex::new(None)),
             client_id: None,
+            protocol_gate: false,
         }
     }
 
@@ -1434,6 +1443,7 @@ impl DaemonClient {
             presence: endpoint.presence(),
             capabilities: Arc::new(Mutex::new(None)),
             client_id: None,
+            protocol_gate: false,
         })
     }
 
@@ -1464,6 +1474,7 @@ impl DaemonClient {
             presence: connection.presence(),
             capabilities: Arc::new(Mutex::new(None)),
             client_id: None,
+            protocol_gate: false,
         }
     }
 
@@ -1479,6 +1490,25 @@ impl DaemonClient {
     /// ignores the key.
     pub fn with_client_id(mut self, client_id: impl Into<String>) -> Self {
         self.client_id = Some(client_id.into());
+        self
+    }
+
+    /// PRD #1666 part 2 (`lifecycle/handshake/011`): admit this handle's
+    /// attaches, listings, starts and subscriptions only on a positive protocol
+    /// check made on the connection that carries them.
+    ///
+    /// For a long-lived client — the TUI, the desktop's terminals — whose
+    /// daemon may be replaced under it by another build after its startup
+    /// handshake. Each such request opens with `Hello { follow_on: true }` and
+    /// is written on that same connection only when the reply is `ok`, names
+    /// this binary's protocol and advertises
+    /// [`crate::daemon_protocol::CAP_HELLO_FOLLOW_ON`]; anything else — another
+    /// protocol ([`ClientError::ProtocolMismatch`]), a refused, garbled or cut
+    /// off `Hello` — sends the request nowhere. A check on its own connection
+    /// would not do: a daemon replaced between it and the request would get
+    /// the request unchecked.
+    pub fn with_protocol_gate(mut self) -> Self {
+        self.protocol_gate = true;
         self
     }
 
@@ -1531,6 +1561,78 @@ impl DaemonClient {
             .split_transport())
     }
 
+    /// A connection for a request [`Self::with_protocol_gate`] covers: a plain
+    /// [`Self::connect`] on an ungated handle, and on a gated one a connection
+    /// whose own `Hello` passed [`Self::protocol_hello`], left open for the
+    /// request.
+    async fn admitted_connect(
+        &self,
+    ) -> Result<(TransportReadHalf, TransportWriteHalf), ClientError> {
+        if !self.protocol_gate {
+            return Ok(self.connect().await?);
+        }
+        let (rd, wr, _) = self.protocol_hello(true).await?;
+        Ok((rd, wr))
+    }
+
+    /// Issue #405's protocol check on a fresh connection: one `Hello`, `Ok`
+    /// only when the reply is `ok` and its `server_version` equals this
+    /// binary's [`crate::daemon_protocol::PROTOCOL_VERSION`]. The capabilities
+    /// it advertised replace the cached set; a check that fails in any way
+    /// drops it, since it may describe the daemon this one replaced.
+    ///
+    /// With `follow_on`, the connection is returned for one more request, and
+    /// the reply must also advertise
+    /// [`crate::daemon_protocol::CAP_HELLO_FOLLOW_ON`]: a daemon that does not
+    /// closes the connection after the reply, and the request must not go
+    /// anywhere else.
+    async fn protocol_hello(
+        &self,
+        follow_on: bool,
+    ) -> Result<(TransportReadHalf, TransportWriteHalf, DaemonCapabilities), ClientError> {
+        let local = crate::daemon_protocol::PROTOCOL_VERSION;
+        let checked = async {
+            let (mut rd, mut wr) = self.connect().await?;
+            let resp = issue_command(
+                &mut rd,
+                &mut wr,
+                &AttachRequest::Hello {
+                    client_version: local,
+                    client_build_version: None,
+                    follow_on,
+                },
+            )
+            .await?;
+            if !resp.ok {
+                return Err(ClientError::Server(resp.error.unwrap_or_else(|| {
+                    "handshake failed while checking the protocol".into()
+                })));
+            }
+            if resp.server_version != Some(local) {
+                return Err(ClientError::ProtocolMismatch {
+                    daemon: resp.server_version,
+                    local,
+                });
+            }
+            Ok((rd, wr, resp))
+        };
+        let (rd, wr, resp) = match checked.await {
+            Ok(checked) => checked,
+            Err(e) => {
+                self.invalidate_capabilities();
+                return Err(e);
+            }
+        };
+        let capabilities = self.store_capabilities_from_hello(&resp);
+        if follow_on && !capabilities.supports(crate::daemon_protocol::CAP_HELLO_FOLLOW_ON) {
+            return Err(ClientError::Server(
+                "the daemon cannot serve a request on the connection that checked its protocol"
+                    .into(),
+            ));
+        }
+        Ok((rd, wr, capabilities))
+    }
+
     /// List daemon-side agents. Returns one [`AgentRecord`] per agent,
     /// preferring the daemon's new `agent_records` field (which carries
     /// each agent's spawn-time `DOT_AGENT_DECK_PANE_ID`). Falls back to
@@ -1559,7 +1661,7 @@ impl DaemonClient {
     /// the rest. Both go down one code path, so the sanitisation and the
     /// older-daemon fallback below cannot differ between them.
     pub async fn list_agents_detailed(&self) -> Result<AgentListing, ClientError> {
-        let (mut rd, mut wr) = self.connect().await?;
+        let (mut rd, mut wr) = self.admitted_connect().await?;
         let resp = issue_command(&mut rd, &mut wr, &AttachRequest::ListAgents).await?;
         if !resp.ok {
             return Err(ClientError::Server(
@@ -1919,7 +2021,7 @@ impl DaemonClient {
         {
             return Ok(GatedQuery::Unsupported);
         }
-        let (mut rd, mut wr) = self.connect().await?;
+        let (mut rd, mut wr) = self.admitted_connect().await?;
         let resp = issue_command(
             &mut rd,
             &mut wr,
@@ -2007,7 +2109,7 @@ impl DaemonClient {
             authoring_kind,
             client_seeded_kind,
         } = kind;
-        let (mut rd, mut wr) = self.connect().await?;
+        let (mut rd, mut wr) = self.admitted_connect().await?;
         let req = AttachRequest::StartAgent {
             command: opts.command,
             cwd: opts.cwd,
@@ -2156,33 +2258,14 @@ impl DaemonClient {
     /// capabilities that reply advertised, which replace the cached set (it
     /// may describe the daemon this one replaced), and
     /// [`ClientError::ProtocolMismatch`] otherwise, which drops the cached set.
+    ///
+    /// The verdict is about the daemon that answered THIS connection, which
+    /// the check closes. A request sent afterwards on a connection of its own
+    /// is not covered by it; [`Self::with_protocol_gate`] is what binds the
+    /// check to the request.
     pub async fn check_protocol(&self) -> Result<DaemonCapabilities, ClientError> {
-        let local = crate::daemon_protocol::PROTOCOL_VERSION;
-        let (mut rd, mut wr) = self.connect().await?;
-        let resp = issue_command(
-            &mut rd,
-            &mut wr,
-            &AttachRequest::Hello {
-                client_version: local,
-                client_build_version: None,
-                follow_on: false,
-            },
-        )
-        .await?;
-        if !resp.ok {
-            self.invalidate_capabilities();
-            return Err(ClientError::Server(resp.error.unwrap_or_else(|| {
-                "handshake failed while checking the protocol".into()
-            })));
-        }
-        if resp.server_version != Some(local) {
-            self.invalidate_capabilities();
-            return Err(ClientError::ProtocolMismatch {
-                daemon: resp.server_version,
-                local,
-            });
-        }
-        Ok(self.store_capabilities_from_hello(&resp))
+        let (_, _, capabilities) = self.protocol_hello(false).await?;
+        Ok(capabilities)
     }
 
     /// Drop the captured set, so the next [`Self::capabilities`] re-handshakes.
@@ -2315,7 +2398,7 @@ impl DaemonClient {
             .capabilities()
             .await?
             .prepare_orchestration_spelling()?;
-        let (mut rd, mut wr) = self.connect().await?;
+        let (mut rd, mut wr) = self.admitted_connect().await?;
         let resp = issue_command(
             &mut rd,
             &mut wr,
@@ -2451,7 +2534,7 @@ impl DaemonClient {
             seed: opts.seed,
             use_configured_command,
         };
-        let (mut rd, mut wr) = self.connect().await?;
+        let (mut rd, mut wr) = self.admitted_connect().await?;
         let resp = issue_command(&mut rd, &mut wr, &req).await?;
         if !resp.ok {
             return Err(ClientError::Server(
@@ -2994,7 +3077,7 @@ impl DaemonClient {
     /// closes the stream (`KIND_STREAM_END` carrying the reason) or
     /// either side drops the socket.
     pub async fn subscribe_events(&self) -> Result<EventSubscription, ClientError> {
-        let (mut rd, mut wr) = self.connect().await?;
+        let (mut rd, mut wr) = self.admitted_connect().await?;
         let resp = issue_command(&mut rd, &mut wr, &AttachRequest::SubscribeEvents).await?;
         if !resp.ok {
             return Err(ClientError::Server(
@@ -3036,7 +3119,7 @@ impl DaemonClient {
         {
             return Ok(GatedQuery::Unsupported);
         }
-        let (mut rd, mut wr) = self.connect().await?;
+        let (mut rd, mut wr) = self.admitted_connect().await?;
         let resp = issue_command(
             &mut rd,
             &mut wr,
@@ -3078,14 +3161,22 @@ impl DaemonClient {
     pub async fn subscribe_events_with_snapshot(
         &self,
     ) -> Result<GatedQuery<(EventSubscription, Vec<AgentRecord>)>, ClientError> {
-        if !self
-            .check_protocol()
-            .await?
-            .supports(crate::daemon_protocol::CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT)
-        {
+        // A gated handle sends the request on the connection whose `Hello` it
+        // checked; an ungated one checks on its own connection first, as it
+        // did before the gate existed.
+        let (capabilities, connection) = if self.protocol_gate {
+            let (rd, wr, capabilities) = self.protocol_hello(true).await?;
+            (capabilities, Some((rd, wr)))
+        } else {
+            (self.check_protocol().await?, None)
+        };
+        if !capabilities.supports(crate::daemon_protocol::CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT) {
             return Ok(GatedQuery::Unsupported);
         }
-        let (mut rd, mut wr) = self.connect().await?;
+        let (mut rd, mut wr) = match connection {
+            Some(connection) => connection,
+            None => self.connect().await?,
+        };
         let resp = issue_command(
             &mut rd,
             &mut wr,
@@ -3403,7 +3494,7 @@ impl DaemonClient {
         viewport: Option<(u16, u16)>,
         geometry_updates: bool,
     ) -> Result<AttachConnection, ClientError> {
-        let (mut rd, mut wr) = self.connect().await?;
+        let (mut rd, mut wr) = self.admitted_connect().await?;
         let resp = issue_command(
             &mut rd,
             &mut wr,
@@ -3901,7 +3992,7 @@ mod tests {
     /// inside that window inherits 0o600, breaking later binds. Hold this
     /// across tempdir+bind for any in-process attach server.
     #[cfg(unix)]
-    static BIND_LOCK: Mutex<()> = Mutex::new(());
+    pub(super) static BIND_LOCK: Mutex<()> = Mutex::new(());
 
     #[cfg(unix)]
     async fn spawn_test_server() -> (TempDir, PathBuf, Arc<AgentPtyRegistry>) {
@@ -4109,6 +4200,7 @@ mod tests {
             presence: EndpointPresence::NoFilesystemName,
             capabilities: Arc::new(Mutex::new(None)),
             client_id: None,
+            protocol_gate: false,
         };
         assert!(
             pipe_client.ensure_socket_exists().is_ok(),
@@ -4122,6 +4214,7 @@ mod tests {
             presence: EndpointPresence::Elsewhere,
             capabilities: Arc::new(Mutex::new(None)),
             client_id: None,
+            protocol_gate: false,
         };
         assert!(
             remote_client.ensure_socket_exists().is_ok(),
@@ -7778,5 +7871,329 @@ start = true
                 AnswerReport::Refused(crate::question::AnswerRefusal::AgentNotFound)
             );
         });
+    }
+}
+
+/// PRD #1666 part 2 (`lifecycle/handshake/011`): a scripted daemon for the
+/// protocol-gate pins here and in [`crate::embedded_pane`]. Each accepted
+/// connection is answered by the [`GateHello`] its index maps to, and every
+/// request that is not a `Hello` is recorded as `"<connection>:<op>"` — the
+/// pins' evidence of what reached which daemon.
+#[cfg(all(test, unix))]
+pub(crate) mod gate_fixture {
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    use crate::daemon_protocol::{
+        AttachResponse, KIND_REQ, PROTOCOL_VERSION, bind_attach_listener, read_frame, write_frame,
+        write_resp,
+    };
+
+    /// How one connection answers a `Hello`.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum GateHello {
+        /// An `ok` reply naming this protocol, advertising every capability
+        /// (the follow-on included), and serving the follow-on — a daemon
+        /// running this binary's protocol.
+        Matching,
+        /// The same reply naming the NEXT protocol: an incompatible
+        /// replacement that still serves every verb, follow-on included.
+        Newer,
+        /// `ok: false`.
+        Refused,
+        /// A reply frame whose body is not JSON.
+        Garbled,
+        /// The connection closes without a reply.
+        Silent,
+        /// A matching, `ok` reply that does not advertise the follow-on. An
+        /// older daemon closes after it; this one keeps the connection open
+        /// and records any request written on it.
+        NoFollowOn,
+    }
+
+    pub(crate) struct GateDaemon {
+        _dir: tempfile::TempDir,
+        pub(crate) path: PathBuf,
+        pub(crate) recorded: Arc<Mutex<Vec<String>>>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl GateDaemon {
+        /// Serve `plan(i)` on the `i`th connection (from 0). Records carry a
+        /// `pane_id_env` of `pane` so a lookup by pane finds an agent.
+        pub(crate) fn spawn(plan: impl Fn(usize) -> GateHello + Send + Sync + 'static) -> Self {
+            let (dir, path, listener) = {
+                let _g = super::tests::BIND_LOCK
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("gate.sock");
+                let listener = bind_attach_listener(&path).expect("bind the scripted daemon");
+                (dir, path, listener)
+            };
+            let recorded = Arc::new(Mutex::new(Vec::new()));
+            let log = Arc::clone(&recorded);
+            let server = tokio::spawn(async move {
+                let mut index = 0usize;
+                while let Ok(mut stream) = listener.accept().await {
+                    let this = index;
+                    index += 1;
+                    let hello = plan(this);
+                    let log = Arc::clone(&log);
+                    tokio::spawn(async move {
+                        let mut follow_on = true;
+                        while std::mem::take(&mut follow_on) {
+                            let Ok(Some((KIND_REQ, payload))) = read_frame(&mut stream).await
+                            else {
+                                return;
+                            };
+                            let request: serde_json::Value =
+                                serde_json::from_slice(&payload).expect("a JSON request");
+                            let op = request["op"].as_str().unwrap_or("?").to_string();
+                            if op != "hello" {
+                                log.lock().unwrap().push(format!("{this}:{op}"));
+                                let reply = match op.as_str() {
+                                    "list-agents" | "subscribe-events-with-snapshot" => {
+                                        AttachResponse::agent_records(vec![
+                                            serde_json::from_value(serde_json::json!({
+                                                "id": "7",
+                                                "pane_id_env": "pane",
+                                                "rows": 24,
+                                                "cols": 80,
+                                            }))
+                                            .expect("a minimal agent record"),
+                                        ])
+                                    }
+                                    "start-agent" => AttachResponse {
+                                        id: Some("7".into()),
+                                        ..AttachResponse::ok()
+                                    },
+                                    _ => AttachResponse::ok(),
+                                };
+                                let _ = write_resp(&mut stream, &reply).await;
+                                // Hold a stream open, as the daemon would.
+                                let _ = read_frame(&mut stream).await;
+                                return;
+                            }
+                            let mut reply =
+                                AttachResponse::hello(PROTOCOL_VERSION).with_capabilities();
+                            match hello {
+                                GateHello::Matching => {}
+                                GateHello::Newer => {
+                                    reply.server_version = Some(PROTOCOL_VERSION + 1)
+                                }
+                                GateHello::Refused => reply = AttachResponse::err("not today"),
+                                GateHello::Garbled => {
+                                    let _ = write_frame(
+                                        &mut stream,
+                                        crate::daemon_protocol::KIND_RESP,
+                                        b"{not json",
+                                    )
+                                    .await;
+                                    return;
+                                }
+                                GateHello::Silent => return,
+                                GateHello::NoFollowOn => {
+                                    // Kept open, unlike an older daemon, so a
+                                    // request the client should have withheld
+                                    // is recorded rather than lost.
+                                    reply = AttachResponse::hello(PROTOCOL_VERSION);
+                                    let _ = write_resp(&mut stream, &reply).await;
+                                    follow_on = true;
+                                    continue;
+                                }
+                            }
+                            let _ = write_resp(&mut stream, &reply).await;
+                            follow_on = request["follow_on"] == true;
+                        }
+                    });
+                }
+            });
+            Self {
+                _dir: dir,
+                path,
+                recorded,
+                server,
+            }
+        }
+
+        pub(crate) fn recorded(&self) -> Vec<String> {
+            self.recorded.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for GateDaemon {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod protocol_gate_tests {
+    use super::gate_fixture::{GateDaemon, GateHello};
+    use super::*;
+
+    fn start() -> StartAgentOptions {
+        StartAgentOptions {
+            command: Some("cat".into()),
+            cwd: None,
+            display_name: None,
+            rows: 24,
+            cols: 80,
+            env: Vec::new(),
+            tab_membership: None,
+            agent_type: None,
+            seed: None,
+        }
+    }
+
+    /// Every verb the gate covers, called once on `client`; what each
+    /// returned is ignored — the daemon's record is the evidence.
+    async fn every_gated_verb(
+        client: &DaemonClient,
+    ) -> Vec<(&'static str, Result<(), ClientError>)> {
+        vec![
+            ("list-agents", client.list_agents().await.map(drop)),
+            (
+                "attach",
+                client.attach_as_viewer("7", Some((24, 80))).await.map(drop),
+            ),
+            (
+                "attach-pending",
+                client.attach_pending_viewport("7").await.map(drop),
+            ),
+            ("start-agent", client.start_agent(start()).await.map(drop)),
+            (
+                "form-start",
+                client.start_form_agent(start()).await.map(drop),
+            ),
+            ("subscribe", client.subscribe_events().await.map(drop)),
+            (
+                "subscribe-snapshot",
+                client.subscribe_events_with_snapshot().await.map(drop),
+            ),
+            (
+                "turn-replies",
+                client.subscribe_turn_replies("7").await.map(drop),
+            ),
+            ("list-inbox", client.list_inbox(None).await.map(drop)),
+        ]
+    }
+
+    /// Scenario: a gated client (the TUI's, the desktop terminal's) asks a
+    /// daemon that answers `Hello` on the next attach protocol, and serves
+    /// every verb besides, to list, attach, start and subscribe. Each call is
+    /// refused as a protocol mismatch and the daemon receives none of those
+    /// requests; the same calls on a matching daemon reach it, as the control.
+    #[tokio::test]
+    async fn a_gated_client_sends_nothing_protected_to_a_daemon_on_another_protocol() {
+        let newer = GateDaemon::spawn(|_| GateHello::Newer);
+        let client = DaemonClient::new(newer.path.clone()).with_protocol_gate();
+        for (verb, result) in every_gated_verb(&client).await {
+            assert!(
+                matches!(result, Err(ClientError::ProtocolMismatch { .. })),
+                "{verb} on a daemon on another protocol must be a mismatch: {result:?}"
+            );
+        }
+        assert_eq!(
+            newer.recorded(),
+            Vec::<String>::new(),
+            "a daemon on another protocol received a protected request"
+        );
+
+        let matching = GateDaemon::spawn(|_| GateHello::Matching);
+        let client = DaemonClient::new(matching.path.clone()).with_protocol_gate();
+        let _ = every_gated_verb(&client).await;
+        let reached: Vec<String> = matching
+            .recorded()
+            .iter()
+            .map(|r| r.split(':').nth(1).unwrap().to_string())
+            .collect();
+        for op in [
+            "list-agents",
+            "attach-stream",
+            "start-agent",
+            "subscribe-events",
+            "subscribe-events-with-snapshot",
+            "subscribe-turn-replies",
+            "list-inbox",
+        ] {
+            assert!(
+                reached.iter().any(|r| r == op),
+                "control: {op} must reach a matching daemon: {reached:?}"
+            );
+        }
+    }
+
+    /// Scenario: the daemon that answers a gated client's `Hello` on this
+    /// protocol is replaced, before the client's next connection, by one on the
+    /// next protocol. A list, an attach, a start and a subscription each go on
+    /// the connection whose `Hello` passed — none reaches the replacement.
+    #[tokio::test]
+    async fn a_gated_request_rides_the_connection_its_check_approved() {
+        for verb in 0..4 {
+            // Connection 0 is the checked daemon; every later connection is
+            // its incompatible replacement.
+            let daemon = GateDaemon::spawn(|i| {
+                if i == 0 {
+                    GateHello::Matching
+                } else {
+                    GateHello::Newer
+                }
+            });
+            let client = DaemonClient::new(daemon.path.clone()).with_protocol_gate();
+            match verb {
+                0 => drop(client.list_agents().await),
+                1 => drop(client.attach_as_viewer("7", None).await),
+                2 => drop(client.start_agent(start()).await),
+                _ => drop(client.subscribe_events_with_snapshot().await),
+            }
+            let recorded = daemon.recorded();
+            assert!(
+                !recorded.is_empty() && recorded.iter().all(|r| r.starts_with("0:")),
+                "verb {verb}: the request must go on the connection whose Hello passed, \
+                 never to the daemon answering a later one: {recorded:?}"
+            );
+        }
+    }
+
+    /// Scenario: a gated client's `Hello` is refused, answered with garbage,
+    /// left unanswered, or answered without the follow-on, by a daemon that
+    /// otherwise serves listings and attaches. None of those is a positive
+    /// check, so the listing and the attach are never sent.
+    #[tokio::test]
+    async fn a_gated_client_takes_no_answer_for_a_compatible_one() {
+        for hello in [
+            GateHello::Refused,
+            GateHello::Garbled,
+            GateHello::Silent,
+            GateHello::NoFollowOn,
+        ] {
+            let daemon = GateDaemon::spawn(move |_| hello);
+            let client = DaemonClient::new(daemon.path.clone()).with_protocol_gate();
+            let listed = client.list_agents().await;
+            let attached = client.attach_as_viewer("7", None).await;
+            assert!(
+                listed.is_err() && attached.is_err(),
+                "{hello:?}: a failed check must fail the request: {listed:?}"
+            );
+            assert_eq!(
+                daemon.recorded(),
+                Vec::<String>::new(),
+                "{hello:?}: no request may follow a check that did not pass"
+            );
+        }
+    }
+
+    /// Scenario: the one-shot CLI's client is not gated: a listing goes to a
+    /// daemon on another protocol as it always did, after the CLI's own
+    /// startup check — the deliberate exception, pinned so it stays a choice.
+    #[tokio::test]
+    async fn an_ungated_client_keeps_the_one_shot_policy() {
+        let newer = GateDaemon::spawn(|_| GateHello::Newer);
+        let client = DaemonClient::new(newer.path.clone());
+        let _ = client.list_agents().await;
+        assert_eq!(newer.recorded(), vec!["0:list-agents".to_string()]);
     }
 }

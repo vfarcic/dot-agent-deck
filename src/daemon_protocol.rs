@@ -5238,6 +5238,8 @@ async fn handle_connection(
 
     match req {
         AttachRequest::ListAgents => {
+            #[cfg(feature = "e2e")]
+            crate::doorbell::record_for_test("list-agents");
             let mut records = registry.agent_records();
             // PRD #162: enrich each registry record with the daemon's live,
             // event-derived session state so a reconnecting TUI restores the
@@ -5428,6 +5430,8 @@ async fn handle_connection(
             client_seeded_kind,
             remember_command,
         } => {
+            #[cfg(feature = "e2e")]
+            crate::doorbell::record_for_test("start-agent");
             // PRD #92 F1 followup hardening: refuse to start a new agent
             // while the registry's `shutting_down` latch is set. The
             // latch is flipped at the start of `shutdown_all_graceful`
@@ -6683,6 +6687,8 @@ async fn handle_connection(
             write_resp(&mut stream, &resp).await?;
         }
         AttachRequest::RunNow { name } => {
+            #[cfg(feature = "e2e")]
+            crate::doorbell::record_for_test("run-now");
             // PRD #127 M1.5: fire the task now (the `schedule run-now` door).
             // Both started and skipped-still-running mean the task IS
             // registered → ok=true (so `wait_for_schedule_registered` and the

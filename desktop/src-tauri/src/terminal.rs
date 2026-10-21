@@ -737,6 +737,10 @@ fn rejection_notice(reason: &[u8]) -> Vec<u8> {
 struct Established {
     result: TerminalAttachResult,
     stream: Option<dot_agent_deck::platform::transport::TransportReadHalf>,
+    /// PRD #1666 part 2: the deck `stream` belongs to, for its reader to
+    /// distrust when the stream ends — held by the reader itself, because the
+    /// session record that also names it can be removed before then.
+    endpoint: Endpoint,
     /// PRD #1105 M11: the focus claim this attach started, if the window was
     /// focused. Production lets it run; it is carried out only so a test can
     /// wait for it rather than poll the daemon. Those tests are Unix-only.
@@ -791,6 +795,7 @@ async fn establish(
             && session.endpoint.identity() == deck
     }) {
         return Ok(Established {
+            endpoint: scope.endpoint().clone(),
             result: TerminalAttachResult {
                 session_id: session_id.clone(),
                 agent_id,
@@ -823,16 +828,30 @@ async fn establish(
     // the daemon applies as an unattributed override across every other client.
     // Registering now and contributing a constraint on the first resize is the
     // difference between joining the policy and overriding it.
+    //
+    // PRD #1666 part 2 (`lifecycle/handshake/011`): and only on a connection
+    // whose own `Hello` names this build's attach protocol
+    // (`DaemonClient::with_protocol_gate`). The classification above may be up
+    // to `HANDSHAKE_REVALIDATE_INTERVAL` old and may describe a daemon that has
+    // since been replaced at this socket by another build, which would
+    // otherwise be handed a terminal on the strength of its predecessor's reply.
+    let client =
+        dot_agent_deck::daemon_client::DaemonClient::clone(&daemon.client).with_protocol_gate();
     let connection = match viewport {
-        Some(viewport) => {
-            daemon
-                .client
-                .attach_as_viewer(&agent_id, Some(viewport))
-                .await
-        }
-        None => daemon.client.attach_pending_viewport(&agent_id).await,
+        Some(viewport) => client.attach_as_viewer(&agent_id, Some(viewport)).await,
+        None => client.attach_pending_viewport(&agent_id).await,
     }
-    .map_err(|error| safe_message(error.to_string()))?;
+    .map_err(|error| match error {
+        // In the words `TrustedDaemon::require_compatible` refuses with, so the
+        // tile reads the same whichever check caught the daemon.
+        dot_agent_deck::daemon_client::ClientError::ProtocolMismatch {
+            daemon: Some(server),
+            local,
+        } => format!(
+            "Not attaching: the daemon speaks attach protocol v{server}, but this app speaks v{local}."
+        ),
+        error => safe_message(error.to_string()),
+    })?;
     let viewer = connection.viewer().map(|v| v.to_string());
     let applied = connection.applied();
     let (reader, writer) = connection.into_split();
@@ -879,6 +898,7 @@ async fn establish(
 
     Ok(Established {
         focus_claim,
+        endpoint: scope.endpoint().clone(),
         result: TerminalAttachResult {
             session_id,
             agent_id,
@@ -1063,8 +1083,12 @@ pub(crate) async fn attach(
     // watching it and tells this tile whenever that changes.
     viewport: Option<(u16, u16)>,
 ) -> Result<TerminalAttachResult, String> {
-    let Established { result, stream, .. } =
-        establish(state, deck_id, agent_id, &on_output, viewport).await?;
+    let Established {
+        result,
+        stream,
+        endpoint,
+        ..
+    } = establish(state, deck_id, agent_id, &on_output, viewport).await?;
     let Some(mut reader) = stream else {
         // A reused session: the caller already has a live stream task and an
         // `Attached` event from the attach that created it.
@@ -1089,38 +1113,30 @@ pub(crate) async fn attach(
     let session_for_stream = session_id.clone();
     let agent_for_stream = agent_id.clone();
     tauri::async_runtime::spawn(async move {
-        loop {
+        let ended = loop {
             match read_frame(&mut reader).await {
                 Ok(Some((KIND_STREAM_OUT, data))) => {
                     if let Err(error) = on_output.send(Response::new(data)) {
-                        emit_terminal_state(
-                            &app_for_stream,
-                            TerminalStateEvent {
-                                session_id: session_for_stream.clone(),
-                                agent_id: agent_for_stream.clone(),
-                                generation,
-                                state: TerminalState::Error,
-                                message: Some(safe_message(format!(
-                                    "terminal output channel closed: {error}"
-                                ))),
-                            },
-                        );
-                        break;
-                    }
-                }
-                Ok(Some((KIND_STREAM_END, reason))) => {
-                    emit_terminal_state(
-                        &app_for_stream,
-                        TerminalStateEvent {
+                        break TerminalStateEvent {
                             session_id: session_for_stream.clone(),
                             agent_id: agent_for_stream.clone(),
                             generation,
-                            state: TerminalState::End,
-                            message: (!reason.is_empty())
-                                .then(|| safe_message(String::from_utf8_lossy(&reason))),
-                        },
-                    );
-                    break;
+                            state: TerminalState::Error,
+                            message: Some(safe_message(format!(
+                                "terminal output channel closed: {error}"
+                            ))),
+                        };
+                    }
+                }
+                Ok(Some((KIND_STREAM_END, reason))) => {
+                    break TerminalStateEvent {
+                        session_id: session_for_stream.clone(),
+                        agent_id: agent_for_stream.clone(),
+                        generation,
+                        state: TerminalState::End,
+                        message: (!reason.is_empty())
+                            .then(|| safe_message(String::from_utf8_lossy(&reason))),
+                    };
                 }
                 // PRD #882: the daemon applied a new geometry for this agent.
                 // Non-terminal, like a rejection — the stream stays open and
@@ -1146,81 +1162,90 @@ pub(crate) async fn attach(
                     // output. Surface the reason in-band without tearing down
                     // the session or changing the frontend lifecycle contract.
                     if let Err(error) = on_output.send(Response::new(rejection_notice(&reason))) {
-                        emit_terminal_state(
-                            &app_for_stream,
-                            TerminalStateEvent {
-                                session_id: session_for_stream.clone(),
-                                agent_id: agent_for_stream.clone(),
-                                generation,
-                                state: TerminalState::Error,
-                                message: Some(safe_message(format!(
-                                    "terminal output channel closed: {error}"
-                                ))),
-                            },
-                        );
-                        break;
+                        break TerminalStateEvent {
+                            session_id: session_for_stream.clone(),
+                            agent_id: agent_for_stream.clone(),
+                            generation,
+                            state: TerminalState::Error,
+                            message: Some(safe_message(format!(
+                                "terminal output channel closed: {error}"
+                            ))),
+                        };
                     }
                 }
                 Ok(None) => {
-                    emit_terminal_state(
-                        &app_for_stream,
-                        TerminalStateEvent {
-                            session_id: session_for_stream.clone(),
-                            agent_id: agent_for_stream.clone(),
-                            generation,
-                            state: TerminalState::End,
-                            message: None,
-                        },
-                    );
-                    break;
+                    break TerminalStateEvent {
+                        session_id: session_for_stream.clone(),
+                        agent_id: agent_for_stream.clone(),
+                        generation,
+                        state: TerminalState::End,
+                        message: None,
+                    };
                 }
                 Ok(Some((kind, _))) => {
-                    emit_terminal_state(
-                        &app_for_stream,
-                        TerminalStateEvent {
-                            session_id: session_for_stream.clone(),
-                            agent_id: agent_for_stream.clone(),
-                            generation,
-                            state: TerminalState::Error,
-                            message: Some(format!(
-                                "unexpected terminal frame kind 0x{kind:02x} from the daemon"
-                            )),
-                        },
-                    );
-                    break;
+                    break TerminalStateEvent {
+                        session_id: session_for_stream.clone(),
+                        agent_id: agent_for_stream.clone(),
+                        generation,
+                        state: TerminalState::Error,
+                        message: Some(format!(
+                            "unexpected terminal frame kind 0x{kind:02x} from the daemon"
+                        )),
+                    };
                 }
                 Err(error) => {
-                    emit_terminal_state(
-                        &app_for_stream,
-                        TerminalStateEvent {
-                            session_id: session_for_stream.clone(),
-                            agent_id: agent_for_stream.clone(),
-                            generation,
-                            state: TerminalState::Error,
-                            message: Some(safe_message(error.to_string())),
-                        },
-                    );
-                    break;
+                    break TerminalStateEvent {
+                        session_id: session_for_stream.clone(),
+                        agent_id: agent_for_stream.clone(),
+                        generation,
+                        state: TerminalState::Error,
+                        message: Some(safe_message(error.to_string())),
+                    };
                 }
             }
-        }
+        };
 
         let state = app_for_stream.state::<DesktopState>();
-        terminal_stream_ended(&state, &session_for_stream, generation).await;
+        finish_terminal_stream(&state, &endpoint, &session_for_stream, ended, |event| {
+            emit_terminal_state(&app_for_stream, event)
+        })
+        .await;
     });
 
     Ok(result)
 }
 
-/// Shared lifecycle seam so socket tests run the reader's actual end cleanup,
-/// including any future trust invalidation, without requiring a webview.
+/// How a terminal's reader ends, in order: distrust the deck, forget the
+/// session, then `publish` the `ended` event — the End or Error the tile reopens
+/// on. Split from the reader so a test can run it without a webview.
 ///
 /// PRD #1666 part 2 (`lifecycle/handshake/011`): a stream that ended may mean
-/// the daemon behind the endpoint went away and another took its socket, so
-/// the endpoint's held handshake is dropped here, before the tile can ask to
-/// reopen. The reopen then classifies the daemon now answering afresh — issue
-/// #405's protocol check included — instead of reusing trust from the one this
-/// stream belonged to, which the event watcher may not have dropped yet.
+/// the daemon behind `endpoint` went away and another build took its socket.
+/// The held handshake for `endpoint` is dropped FIRST, from the reader's own
+/// copy of the deck — not from the session record, which a detach or a reopen
+/// on another channel may already have removed — and the event is published
+/// only after that has finished, so a reopen it prompts classifies the daemon
+/// now answering afresh, issue #405's protocol check included, instead of the
+/// one this stream belonged to. A reopen that is not prompted by this event can
+/// still find the old classification held; its attach checks the protocol on
+/// its own connection all the same (see [`establish`]).
+async fn finish_terminal_stream(
+    state: &DesktopState,
+    endpoint: &Endpoint,
+    session_id: &str,
+    ended: TerminalStateEvent,
+    publish: impl FnOnce(TerminalStateEvent),
+) {
+    state.daemon.invalidate(endpoint).await;
+    terminal_stream_ended(state, session_id, ended.generation).await;
+    publish(ended);
+}
+
+/// Forget `session_id` if it is still the stream of `generation`, so an old
+/// reader never removes a newer session, and distrust its deck as well.
+/// [`finish_terminal_stream`] has already distrusted the deck by the time a
+/// reader calls this; doing it again here keeps this seam whole for a caller
+/// that only has the session.
 async fn terminal_stream_ended(state: &DesktopState, session_id: &str, generation: u64) {
     let mut ended = None;
     if let Ok(mut sessions) = state.sessions()
@@ -2327,6 +2352,179 @@ mod tests {
         Channel::new(|_body: tauri::ipc::InvokeResponseBody| Ok(()))
     }
 
+    /// Scenario: a terminal is open on a deck the app trusts, and its stream
+    /// ends — once with the tile still attached, once after the tile was
+    /// detached, which removes the session record first. Either way the deck's
+    /// held handshake is gone by the time the End event is published, so a
+    /// reopen it prompts handshakes afresh, and the session is forgotten.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stream_end_distrusts_its_deck_before_it_is_published() {
+        use dot_agent_deck::daemon_protocol::AttachResponse;
+        use std::time::Duration;
+
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        for detached_first in [false, true] {
+            let (_dir, socket) = scratch_socket("dad-end-order");
+            let (listener, _local_deck) = bind_local_deck(&socket);
+            crate::dto::apply_settings_selection(&crate::settings::DesktopSettings::default());
+            let state = DesktopState::default();
+            state.daemon.pin_cache_age_for_test(Duration::ZERO);
+            let daemon = tokio::spawn(async move {
+                let _hello = answer_one(&listener, matching_hello(), None, None).await;
+                let (_, writer) = answer_one(&listener, AttachResponse::ok(), None, None).await;
+                (listener, writer)
+            });
+            let channel = fixture_channel();
+            let first = tokio::time::timeout(
+                Duration::from_secs(5),
+                establish(&state, None, "planner".into(), &channel, None),
+            )
+            .await
+            .expect("bounded attach")
+            .expect("a compatible terminal");
+            let _daemon = daemon.await.expect("scripted daemon");
+            assert_eq!(
+                state.daemon.held().await,
+                1,
+                "precondition: the deck is trusted"
+            );
+            let session_id = first.result.session_id.clone();
+            if detached_first {
+                assert!(detach(&state, &session_id).await.expect("detach"));
+            }
+            let mut held_at_publish = None;
+            finish_terminal_stream(
+                &state,
+                &first.endpoint,
+                &session_id,
+                TerminalStateEvent {
+                    session_id: session_id.clone(),
+                    agent_id: "planner".into(),
+                    generation: first.result.generation,
+                    state: TerminalState::End,
+                    message: None,
+                },
+                |_| held_at_publish = Some(state.daemon.held_now()),
+            )
+            .await;
+            assert_eq!(
+                held_at_publish,
+                Some(Some(0)),
+                "detached_first={detached_first}: the End event was published while the deck's \
+                 handshake was still held"
+            );
+            assert!(
+                !state
+                    .sessions()
+                    .expect("sessions")
+                    .contains_key(&session_id),
+                "the ended session must be forgotten"
+            );
+        }
+    }
+
+    /// Scenario: a terminal is open on a trusted deck when the daemon behind
+    /// its socket is replaced by one on the next attach protocol, and before
+    /// anything has distrusted the deck the tile reopens on another channel.
+    /// The reopen is refused, naming both protocols, and the replacement is
+    /// sent no attach — the held handshake does not admit it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_reopen_on_still_held_trust_checks_the_protocol_on_its_own_attach() {
+        use dot_agent_deck::daemon_protocol::{
+            AttachResponse, KIND_REQ, KIND_RESP, PROTOCOL_VERSION,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Duration;
+
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let (_dir, socket) = scratch_socket("dad-held-skew");
+        let (listener, _local_deck) = bind_local_deck(&socket);
+        crate::dto::apply_settings_selection(&crate::settings::DesktopSettings::default());
+        let state = DesktopState::default();
+        state.daemon.pin_cache_age_for_test(Duration::ZERO);
+        let original = tokio::spawn(async move {
+            let _hello = answer_one(&listener, matching_hello(), None, None).await;
+            let (_, writer) = answer_one(&listener, AttachResponse::ok(), None, None).await;
+            writer
+        });
+        let first_channel = fixture_channel();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            establish(&state, None, "planner".into(), &first_channel, None),
+        )
+        .await
+        .expect("bounded attach")
+        .expect("a compatible terminal");
+        let _old_writer = original.await.expect("original scripted daemon");
+        assert_eq!(
+            state.daemon.held().await,
+            1,
+            "precondition: the deck is trusted"
+        );
+
+        std::fs::remove_file(&socket).unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let admissions = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&admissions);
+        let replacement = tokio::spawn(async move {
+            let mut streams = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                let (reader, writer) = stream.into_split();
+                let mut reader =
+                    dot_agent_deck::platform::transport::TransportReadHalf::new(reader);
+                let mut writer = TransportWriteHalf::new(writer);
+                let mut follow_on = true;
+                while std::mem::take(&mut follow_on) {
+                    let Some((KIND_REQ, payload)) = read_frame(&mut reader).await.unwrap() else {
+                        break;
+                    };
+                    let request: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                    let reply = if request["op"] == "hello" {
+                        follow_on = request["follow_on"] == true;
+                        let mut hello = matching_hello().with_capabilities();
+                        hello.server_version = Some(PROTOCOL_VERSION + 1);
+                        hello
+                    } else {
+                        if request["op"] == "attach-stream" {
+                            count.fetch_add(1, Ordering::SeqCst);
+                        }
+                        AttachResponse::ok()
+                    };
+                    write_frame(&mut writer, KIND_RESP, &serde_json::to_vec(&reply).unwrap())
+                        .await
+                        .unwrap();
+                }
+                streams.push(writer);
+            }
+        });
+        let reopened = tokio::time::timeout(
+            Duration::from_secs(5),
+            establish(&state, None, "planner".into(), &fixture_channel(), None),
+        )
+        .await
+        .expect("bounded reopen");
+        replacement.abort();
+        assert_eq!(
+            admissions.load(Ordering::SeqCst),
+            0,
+            "a reopen on held trust attached to a daemon on another protocol"
+        );
+        let Err(refusal) = reopened else {
+            panic!("a reopen against a daemon on another protocol must be refused");
+        };
+        assert!(
+            refusal.ends_with(&format!(
+                "Not attaching: the daemon speaks attach protocol v{}, but this app speaks v{PROTOCOL_VERSION}.",
+                PROTOCOL_VERSION + 1
+            )),
+            "the refusal must name both protocols in the app's words: {refusal}"
+        );
+    }
+
     /// Scenario: With cached-handshake age pinned to zero at its actual lookup, a terminal reaches EOF and its daemon socket is replaced before watcher invalidation. Reopening must refuse a different protocol with zero attach requests; the same-protocol control must really reopen a terminal stream, and cache expiry cannot satisfy either case.
     #[cfg(unix)]
     #[tokio::test]
@@ -2392,26 +2590,35 @@ mod tests {
                     let mut reader =
                         dot_agent_deck::platform::transport::TransportReadHalf::new(reader);
                     let mut writer = TransportWriteHalf::new(writer);
-                    let Some((KIND_REQ, payload)) = read_frame(&mut reader).await.unwrap() else {
-                        continue;
-                    };
-                    let request: serde_json::Value = serde_json::from_slice(&payload).unwrap();
-                    let reply = match request["op"].as_str().unwrap() {
-                        "hello" => {
-                            hello_count.fetch_add(1, Ordering::SeqCst);
-                            let mut hello = matching_hello();
-                            hello.server_version = Some(protocol);
-                            hello
-                        }
-                        "attach-stream" => {
-                            count.fetch_add(1, Ordering::SeqCst);
-                            AttachResponse::ok()
-                        }
-                        _ => AttachResponse::ok(),
-                    };
-                    write_frame(&mut writer, KIND_RESP, &serde_json::to_vec(&reply).unwrap())
-                        .await
-                        .unwrap();
+                    // As the real daemon does: a `Hello` with `follow_on` is
+                    // answered and then one more request is served on the same
+                    // connection (PRD #1589's follow-on, which the desktop's
+                    // terminal attach now opens with).
+                    let mut follow_on = true;
+                    while std::mem::take(&mut follow_on) {
+                        let Some((KIND_REQ, payload)) = read_frame(&mut reader).await.unwrap()
+                        else {
+                            break;
+                        };
+                        let request: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                        let reply = match request["op"].as_str().unwrap() {
+                            "hello" => {
+                                hello_count.fetch_add(1, Ordering::SeqCst);
+                                follow_on = request["follow_on"] == true;
+                                let mut hello = matching_hello().with_capabilities();
+                                hello.server_version = Some(protocol);
+                                hello
+                            }
+                            "attach-stream" => {
+                                count.fetch_add(1, Ordering::SeqCst);
+                                AttachResponse::ok()
+                            }
+                            _ => AttachResponse::ok(),
+                        };
+                        write_frame(&mut writer, KIND_RESP, &serde_json::to_vec(&reply).unwrap())
+                            .await
+                            .unwrap();
+                    }
                     streams.push(writer);
                 }
             });
@@ -2487,11 +2694,29 @@ mod tests {
         let (reader, writer) = stream.into_split();
         let mut reader = dot_agent_deck::platform::transport::TransportReadHalf::new(reader);
         let mut writer = TransportWriteHalf::new(writer);
-        let (kind, payload) = read_frame(&mut reader)
+        let (kind, mut payload) = read_frame(&mut reader)
             .await
             .expect("read the request frame")
             .expect("the client sent a frame");
         assert_eq!(kind, KIND_REQ, "the desktop opens with a request frame");
+        // PRD #1666 part 2: a terminal attach opens with its own protocol check
+        // (`Hello` with `follow_on`), answered as the real daemon answers it —
+        // this build's protocol, the follow-on advertised — and the request
+        // that follows on the same connection is the one `reply` answers.
+        let request: serde_json::Value = serde_json::from_slice(&payload).expect("a JSON request");
+        if request["op"] == "hello" && request["follow_on"] == true {
+            let checked = serde_json::to_vec(&matching_hello().with_capabilities())
+                .expect("serialize the protocol check's reply");
+            write_frame(&mut writer, KIND_RESP, &checked)
+                .await
+                .expect("answer the protocol check");
+            let (kind, follow_on) = read_frame(&mut reader)
+                .await
+                .expect("read the follow-on request")
+                .expect("the client sent its request on the checked connection");
+            assert_eq!(kind, KIND_REQ, "the follow-on is a request frame");
+            payload = follow_on;
+        }
         if let Some(arrived) = arrived {
             let _ = arrived.send(());
         }

@@ -157,12 +157,27 @@ async fn handle_connection(
         serde_json::from_slice(&payload).expect("decode scripted daemon request");
 
     match request {
-        AttachRequest::Hello { .. } => {
+        AttachRequest::Hello { follow_on, .. } => {
             let summary = RunningAgentsSummary::from_records(&records.lock().unwrap());
-            let response = AttachResponse::hello(PROTOCOL_VERSION).with_running_agents(summary);
+            let response = AttachResponse::hello(PROTOCOL_VERSION)
+                .with_capabilities()
+                .with_running_agents(summary);
             write_resp(&mut stream, &response)
                 .await
                 .expect("reply to Hello");
+            // As the real daemon does (PRD #1589's follow-on): serve the one
+            // request the TUI's protocol-gated client sends on this connection.
+            if follow_on {
+                Box::pin(handle_connection(
+                    stream,
+                    records,
+                    stop_requests,
+                    next_spawn,
+                    fail_pending,
+                    stop_script,
+                ))
+                .await;
+            }
         }
         AttachRequest::ListAgents => {
             if matches!(stop_script, StopScript::DoneUnverified)

@@ -77,11 +77,13 @@ pub async fn run(client: DaemonClient, state: SharedState, config: SubscriberCon
         };
         // PRD #1666 part 2 (`lifecycle/handshake/011`): every subscription, the
         // first included, is opened only after issue #405's protocol check
-        // passed on its own `Hello` (`DaemonClient::check_protocol`): the
-        // daemon answering now may have replaced the one the startup handshake
-        // checked. A daemon on another protocol is sent nothing more; the TUI
-        // shows the refusal and keeps checking at the backoff, so a daemon on
-        // this binary's protocol is taken up again once one answers.
+        // passed: the daemon answering now may have replaced the one the
+        // startup handshake checked. On the TUI's gated client
+        // (`DaemonClient::with_protocol_gate`) that check is the `Hello` on the
+        // very connection the subscription then rides. A daemon on another
+        // protocol is sent nothing more; the TUI shows the refusal and keeps
+        // checking at the backoff, so a daemon on this binary's protocol is
+        // taken up again once one answers.
         match &subscribed {
             Ok(_) => {
                 if state.write().await.protocol_refusal.take().is_some() {
@@ -217,9 +219,14 @@ async fn subscribe(
             state.write().await.take_inbox_snapshot(&records);
             Ok(sub)
         }
-        Ok(Ok(GatedQuery::Unsupported)) => client.subscribe_events().await.map_err(|e| {
-            tracing::debug!(error = %e, "subscribe_events: subscribe failed, retrying");
-            None
+        Ok(Ok(GatedQuery::Unsupported)) => client.subscribe_events().await.map_err(|e| match e {
+            ClientError::ProtocolMismatch { daemon, local } => {
+                Some(ProtocolRefusal { daemon, local })
+            }
+            e => {
+                tracing::debug!(error = %e, "subscribe_events: subscribe failed, retrying");
+                None
+            }
         }),
         Ok(Err(ClientError::ProtocolMismatch { daemon, local })) => {
             Err(Some(ProtocolRefusal { daemon, local }))
@@ -344,12 +351,20 @@ async fn subscribe_with_snapshot(
     match tokio::time::timeout(RESYNC_LIST_TIMEOUT, client.subscribe_events_with_snapshot()).await {
         Ok(Ok(GatedQuery::Answered(answer))) => Ok(answer),
         Ok(Ok(GatedQuery::Unsupported)) => {
-            let sub = client
-                .subscribe_events()
-                .await
-                .map_err(ResyncFailure::Subscribe)?;
+            // A gated client's fallback requests check the protocol on their
+            // own connections, and a daemon replaced in between is refused as
+            // the ordered request would have been.
+            let sub = client.subscribe_events().await.map_err(|e| match e {
+                ClientError::ProtocolMismatch { daemon, local } => {
+                    ResyncFailure::Protocol(ProtocolRefusal { daemon, local })
+                }
+                e => ResyncFailure::Subscribe(e),
+            })?;
             match tokio::time::timeout(RESYNC_LIST_TIMEOUT, client.list_agents()).await {
                 Ok(Ok(records)) => Ok((sub, records)),
+                Ok(Err(ClientError::ProtocolMismatch { daemon, local })) => {
+                    Err(ResyncFailure::Protocol(ProtocolRefusal { daemon, local }))
+                }
                 Ok(Err(e)) => Err(ResyncFailure::Snapshot(e)),
                 Err(_) => Err(ResyncFailure::TimedOut),
             }

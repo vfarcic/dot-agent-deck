@@ -599,3 +599,107 @@ fn handshake_011_reconnect_rechecks_protocol_before_reattaching() {
         );
     }
 }
+
+/// Scenario: Replace the daemon under an open TUI with one on the next attach protocol and wait for the TUI's refusal, then open the New Agent form and submit it. The replacement must receive no start, listing, attach or subscription from the TUI at any point — the form's own hints included — and no new pane may open.
+#[spec("lifecycle/handshake/012")]
+#[test]
+fn handshake_012_refused_daemon_gets_no_new_pane_start_or_listing() {
+    use inbox::*;
+    let own = dot_agent_deck::daemon_protocol::PROTOCOL_VERSION;
+    let newer = own + 1;
+    let mut original = spawn_daemon_at_build_and_protocol(NEW_BUILD, own);
+    let old = pane(&original, "before-replacement");
+    status(&original, &old, "idle", "claude_code");
+    let deck = TuiDeck::builder()
+        .with_env(
+            "DOT_AGENT_DECK_ATTACH_SOCKET",
+            original.attach_socket.to_string_lossy().to_string(),
+        )
+        .with_env(
+            "DOT_AGENT_DECK_SOCKET",
+            original.hook_socket.to_string_lossy().to_string(),
+        )
+        .with_env("DOT_AGENT_DECK_BUILD_ID_OVERRIDE", NEW_BUILD)
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("before-replacement");
+
+    let reply = original
+        .send_attach_request(&AttachRequest::StopDaemon { force: true })
+        .expect("stop only the fixture-owned daemon");
+    assert!(reply.ok, "fixture stop: {reply:?}");
+    assert!(
+        original.wait_for_exit(Duration::from_secs(10)),
+        "fixture daemon must stop"
+    );
+    let replacement = spawn_daemon_serve_with_env(
+        None,
+        "0",
+        &[
+            ("DOT_AGENT_DECK_BUILD_ID_OVERRIDE", NEW_BUILD),
+            (
+                "DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_DIR",
+                "reconnect-observations",
+            ),
+            (
+                "DOT_AGENT_DECK_TEST_PROTOCOL_VERSION_OVERRIDE",
+                &newer.to_string(),
+            ),
+            (
+                "DOT_AGENT_DECK_ATTACH_SOCKET",
+                original.attach_socket.to_str().unwrap(),
+            ),
+            (
+                "DOT_AGENT_DECK_SOCKET",
+                original.hook_socket.to_str().unwrap(),
+            ),
+        ],
+    );
+    let observations = replacement.home.join("reconnect-observations/observations");
+    let admitted = || {
+        std::fs::read_to_string(&observations)
+            .unwrap_or_default()
+            .lines()
+            .filter(|s| {
+                [
+                    "attach-stream",
+                    "subscribe-events",
+                    "list-agents",
+                    "start-agent",
+                    "run-now",
+                ]
+                .iter()
+                .any(|op| s.starts_with(op))
+            })
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    deck.wait_for_string(&format!("daemon speaks attach protocol v{newer}"));
+    deck.wait_for_string("Not attaching");
+    assert_eq!(
+        admitted(),
+        Vec::<String>::new(),
+        "the refused daemon was admitted a request before the user acted"
+    );
+
+    // New agent: the directory picker, then the form, then Submit.
+    deck.send_keys(b"\x0e");
+    deck.send_keys(b" ");
+    deck.wait_for_string("┌ New Agent");
+    deck.send_keys(b"\t");
+    deck.send_keys(&[0x7f; 96]);
+    deck.send_keys(b"refused-new-pane");
+    let (col, row) = deck.wait_for_in_grid("[Submit]");
+    deck.click(col, row);
+    deck.wait_for_absence("[Submit]");
+    assert!(
+        !common::wait_until(Duration::from_secs(3), || !admitted().is_empty()),
+        "the refused daemon was asked to start, list or attach after New Agent: {:?}\n{}",
+        admitted(),
+        deck.snapshot_grid()
+    );
+    assert!(
+        !deck.snapshot_grid().contains("refused-new-pane"),
+        "no pane may open on a refused daemon:\n{}",
+        deck.snapshot_grid()
+    );
+}

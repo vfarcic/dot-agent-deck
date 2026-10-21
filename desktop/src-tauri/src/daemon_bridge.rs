@@ -344,6 +344,14 @@ pub(crate) struct DaemonLinks {
     /// reads the stored answer; a local deck is asked afresh each time, since
     /// asking is one connect on its socket.
     reasons: std::sync::Mutex<HashMap<EndpointIdentity, StoredReason>>,
+    /// PRD #1666 part 2 (`lifecycle/handshake/011`): how many times
+    /// [`Self::invalidate`] has run for each deck. [`Self::trusted`] reads it
+    /// before it handshakes and publishes only if it has not moved, so a
+    /// handshake that was already in flight when its deck was distrusted
+    /// cannot hold the old classification afterwards. Bumped and compared
+    /// under the `links` lock, so the two are exact against each other, as
+    /// `invalidate_all`'s epoch is.
+    invalidations: std::sync::Mutex<HashMap<EndpointIdentity, u64>>,
 }
 
 /// How long a remote deck's stored [`DisconnectedReason`] stands before its
@@ -397,6 +405,7 @@ impl Default for DaemonLinks {
             #[cfg(test)]
             test_cache_lookups: std::sync::Mutex::new(Vec::new()),
             reasons: std::sync::Mutex::new(HashMap::new()),
+            invalidations: std::sync::Mutex::new(HashMap::new()),
         }
     }
 }
@@ -618,6 +627,9 @@ impl DaemonLinks {
             // readable during the window in which it is being replaced.
             links.remove(&key);
         }
+        // Read after the removal, under no lock `invalidate` waits on, and
+        // compared at the publish below under the `links` lock it bumps under.
+        let invalidated_at = self.invalidation_epoch(&key);
         let established = Arc::new(establish(endpoint, &self.tunnels).await?);
         self.handshakes.fetch_add(1, Ordering::Relaxed);
         let mut links = self.links.lock().await;
@@ -644,8 +656,13 @@ impl DaemonLinks {
         // `ssh` child, for a deck nothing observes. Returning the link without
         // holding it is the right fallback: the caller gets its answer and
         // everything it stands on dies with the request.
+        //
+        // PRD #1666 part 2: and only if this deck was not distrusted while the
+        // handshake ran — a terminal stream that ended meanwhile says the
+        // daemon this reply came from may already have been replaced.
         if established.connection.status == ConnectionStatus::Connected
             && self.tunnels.generation().current() == wanted_at
+            && self.invalidation_epoch(&key) == invalidated_at
         {
             links.insert(key, Arc::clone(&established));
         }
@@ -683,8 +700,32 @@ impl DaemonLinks {
 
     /// Forget the link for `endpoint`, so the next [`Self::trusted`] handshakes
     /// again.
+    ///
+    /// PRD #1666 part 2: and supersede a handshake for it already in flight,
+    /// which would otherwise hold its classification after this returns (the
+    /// `invalidations` field).
     pub(crate) async fn invalidate(&self, endpoint: &Endpoint) {
-        self.links.lock().await.remove(&endpoint.identity());
+        let key = endpoint.identity();
+        let mut links = self.links.lock().await;
+        {
+            let mut invalidations = self
+                .invalidations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let epoch = invalidations.entry(key.clone()).or_default();
+            *epoch = epoch.wrapping_add(1);
+        }
+        links.remove(&key);
+    }
+
+    /// How many times `key` has been [`Self::invalidate`]d.
+    fn invalidation_epoch(&self, key: &EndpointIdentity) -> u64 {
+        self.invalidations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Forget every link. Used where the reason to distrust the held state is
@@ -711,6 +752,13 @@ impl DaemonLinks {
     #[cfg(test)]
     pub(crate) async fn held(&self) -> usize {
         self.links.lock().await.len()
+    }
+
+    /// [`Self::held`] from synchronous code, such as a publish callback;
+    /// `None` while someone else holds the map.
+    #[cfg(test)]
+    pub(crate) fn held_now(&self) -> Option<usize> {
+        self.links.try_lock().ok().map(|links| links.len())
     }
 
     /// How many handshakes have been performed since this store was created.
@@ -3704,6 +3752,67 @@ mod tests {
         assert_eq!(links.handshake_count(), 2);
         assert_eq!(daemon.await.expect("no panic"), 2);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Scenario: a handshake for a deck is in flight — its `Hello` has reached
+    /// the daemon, whose reply is held — when the deck is distrusted (a
+    /// terminal on it ended). The reply then arrives as Connected. The caller
+    /// gets its answer, but nothing is held for the deck afterwards, so the
+    /// next ask handshakes again; without the distrust, it is held (control).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_in_flight_handshake_holds_nothing_once_its_deck_is_distrusted() {
+        use dot_agent_deck::daemon_protocol::{KIND_RESP, read_frame, write_frame};
+        for distrust in [true, false] {
+            let (dir, socket) = scratch_socket("gfix-in-flight");
+            let listener = bind_trusted(&socket);
+            let (arrived_tx, arrived) = tokio::sync::oneshot::channel::<()>();
+            let (release, release_rx) = tokio::sync::oneshot::channel::<()>();
+            let daemon = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("accept the handshake");
+                let (reader, writer) = stream.into_split();
+                let mut reader =
+                    dot_agent_deck::platform::transport::TransportReadHalf::new(reader);
+                let mut writer =
+                    dot_agent_deck::platform::transport::TransportWriteHalf::new(writer);
+                read_frame(&mut reader)
+                    .await
+                    .expect("read the Hello")
+                    .expect("a Hello frame");
+                let _ = arrived_tx.send(());
+                let _ = release_rx.await;
+                write_frame(
+                    &mut writer,
+                    KIND_RESP,
+                    &serde_json::to_vec(&matching_hello()).expect("encode"),
+                )
+                .await
+                .expect("answer the Hello");
+            });
+            let links = Arc::new(DaemonLinks::default());
+            let endpoint = Endpoint::Local(LocalEndpoint::at(&socket));
+            let asking = tokio::spawn({
+                let links = Arc::clone(&links);
+                let endpoint = endpoint.clone();
+                async move { links.trusted(&endpoint).await.map(|_| ()) }
+            });
+            arrived.await.expect("the Hello reached the daemon");
+            if distrust {
+                links.invalidate(&endpoint).await;
+            }
+            let _ = release.send(());
+            asking
+                .await
+                .expect("no panic")
+                .expect("the in-flight caller still gets its answer");
+            daemon.await.expect("no panic");
+            assert_eq!(
+                links.held().await,
+                usize::from(!distrust),
+                "distrust={distrust}: a handshake in flight across a distrust must not hold its classification"
+            );
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     /// A failed re-establishment must not resurrect the link it was replacing.

@@ -3163,6 +3163,13 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** compatibility with a real previous-release binary, desktop webview rendering, or behavior after the bounded refusal observation window.
 - **Platform coverage:** mac+linux.
 
+##### lifecycle/handshake/012 — A daemon the TUI refuses on reconnect receives no new pane's start, listing or attach.
+- **Layer:** L2 lane 1 (`tests/e2e_handshake.rs`), real TUI in a PTY and isolated daemon processes replaced at the same socket.
+- **Agent:** none (a raw Python stand-in for the pane that was open before the replacement; no agent executable or credential).
+- **Asserts:** after the replacement on the next attach protocol is refused in the footer, the e2e-only observation seam records no `attach-stream`, `subscribe-events*`, `list-agents`, `start-agent` or `run-now` from the TUI — before the user acts, and for three seconds after the New Agent form is submitted, its directory hints included — and no pane named in the form opens. The unit pins `daemon_client::protocol_gate_tests::*` (every gated verb against a mismatched, a refused/garbled/silent/no-follow-on, and a replaced-between-check-and-request daemon) and `embedded_pane::protocol_gate_tests::*` (reattach fail-closed; the gated controller's start, hydration and pane hydration) cover the paths this PTY test does not drive.
+- **Does not assert:** hydration of an orchestration role pane through the PTY (unit-pinned), the one-shot CLI's deliberately ungated policy (unit-pinned by `an_ungated_client_keeps_the_one_shot_policy`), or compatibility with a real previous-release binary.
+- **Platform coverage:** mac+linux.
+
 #### lifecycle/login-path
 
 ##### lifecycle/login-path/001 — A dashboard new-pane whose command is a bare binary living only in the user's login-shell PATH spawns successfully when the daemon was launched without that dir on PATH (PRD #170 M1.3).

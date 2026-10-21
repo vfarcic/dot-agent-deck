@@ -781,31 +781,77 @@ fn send_daemon_request_blocking_with_timeout(
     req: &crate::daemon_protocol::AttachRequest,
     timeout: std::time::Duration,
 ) -> std::io::Result<crate::daemon_protocol::AttachResponse> {
-    use crate::daemon_protocol::KIND_REQ;
-    use std::io::Write;
-
     // Issue #1121: the client-side resolution, so this best-effort request
     // reaches the same daemon the TUI attached to when that daemon is an older
     // build still listening at the pre-#1121 fallback spelling.
     let path = crate::endpoint_resolve::client_attach_socket_path();
+    send_daemon_request_blocking_at(&path, req, timeout)
+}
+
+/// [`send_daemon_request_blocking_with_timeout`] against the daemon at `path`.
+fn send_daemon_request_blocking_at(
+    path: &Path,
+    req: &crate::daemon_protocol::AttachRequest,
+    timeout: std::time::Duration,
+) -> std::io::Result<crate::daemon_protocol::AttachResponse> {
     // Issue #435: `timeout` is a per-operation deadline, and connect is one of
     // the operations. Connecting through the bare `IpcClient::connect` left it
     // outside the budget entirely — on Unix that call blocks uninterruptibly
     // when the daemon's accept queue is full, so a wedged daemon could hang
     // this synchronous TUI key path forever despite the deadline two lines
     // below.
-    let mut stream = crate::platform::ipc::IpcClient::connect_timeout(&path, timeout)?;
+    let mut stream = crate::platform::ipc::IpcClient::connect_timeout(path, timeout)?;
     stream.set_timeouts(timeout)?;
 
+    // PRD #1666 part 2 (`lifecycle/handshake/011`): the TUI's one-shot
+    // requests — the listings behind its form hints, Run now's start — are
+    // admitted the way its pane client's are
+    // (`DaemonClient::with_protocol_gate`): only after this connection's own
+    // `Hello` named this binary's attach protocol, and on this connection, so
+    // a daemon replaced by another build since the startup handshake is sent
+    // nothing. A failed check is an `Err`, which every caller already treats
+    // as a down daemon.
+    let local = crate::daemon_protocol::PROTOCOL_VERSION;
+    write_req_frame_blocking(
+        &mut stream,
+        &crate::daemon_protocol::AttachRequest::Hello {
+            client_version: local,
+            client_build_version: None,
+            follow_on: true,
+        },
+    )?;
+    let hello = read_resp_frame_blocking(&mut stream)?;
+    if !hello.ok
+        || hello.server_version != Some(local)
+        || !hello.capabilities.as_ref().is_some_and(|caps| {
+            caps.iter()
+                .any(|c| c == crate::daemon_protocol::CAP_HELLO_FOLLOW_ON)
+        })
+    {
+        return Err(std::io::Error::other(format!(
+            "the daemon did not confirm attach protocol v{local} on this connection (it reported {})",
+            hello
+                .server_version
+                .map_or_else(|| "none".to_string(), |v| format!("v{v}"))
+        )));
+    }
+
+    write_req_frame_blocking(&mut stream, req)?;
+    read_resp_frame_blocking(&mut stream)
+}
+
+/// Write one `KIND_REQ` frame carrying `req` to a synchronous writer.
+fn write_req_frame_blocking<W: std::io::Write>(
+    w: &mut W,
+    req: &crate::daemon_protocol::AttachRequest,
+) -> std::io::Result<()> {
     let payload = serde_json::to_vec(req).map_err(std::io::Error::other)?;
     let mut header = [0u8; 5];
-    header[0] = KIND_REQ;
+    header[0] = crate::daemon_protocol::KIND_REQ;
     header[1..5].copy_from_slice(&(payload.len() as u32).to_be_bytes());
-    stream.write_all(&header)?;
-    stream.write_all(&payload)?;
-    stream.flush()?;
-
-    read_resp_frame_blocking(&mut stream)
+    w.write_all(&header)?;
+    w.write_all(&payload)?;
+    w.flush()
 }
 
 /// Read one `KIND_RESP` frame off a synchronous reader and decode its body.
@@ -40485,5 +40531,62 @@ mod upgrade_dialog_tests {
             covered_dim,
             "at some width the badge covers a dimmed button, or this test proves nothing"
         );
+    }
+}
+
+/// PRD #1666 part 2 (`lifecycle/handshake/012`): the TUI's synchronous one-shot
+/// requests, against the scripted daemons of
+/// [`crate::daemon_client::gate_fixture`].
+#[cfg(all(test, unix))]
+mod one_shot_protocol_gate_tests {
+    use super::*;
+    use crate::daemon_client::gate_fixture::{GateDaemon, GateHello};
+
+    /// Scenario: the TUI's one-shot listing (the New Agent form's hints, the
+    /// schedules manager's live tasks) is sent to a daemon whose `Hello`
+    /// names the next attach protocol, is refused, garbled, unanswered, or
+    /// lacks the follow-on. Each fails and the daemon receives no listing; a
+    /// daemon on this protocol gets it on the connection its `Hello` was
+    /// answered on (control).
+    #[test]
+    fn a_one_shot_request_goes_only_where_its_own_hello_passed() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build the test runtime");
+        let timeout = std::time::Duration::from_secs(2);
+        for hello in [
+            GateHello::Newer,
+            GateHello::Refused,
+            GateHello::Garbled,
+            GateHello::Silent,
+            GateHello::NoFollowOn,
+        ] {
+            let daemon = runtime.block_on(async { GateDaemon::spawn(move |_| hello) });
+            let sent = send_daemon_request_blocking_at(
+                &daemon.path,
+                &crate::daemon_protocol::AttachRequest::ListAgents,
+                timeout,
+            );
+            assert!(
+                sent.is_err(),
+                "{hello:?}: a failed check must fail the request"
+            );
+            assert_eq!(
+                daemon.recorded(),
+                Vec::<String>::new(),
+                "{hello:?}: a listing followed a check that did not pass"
+            );
+        }
+        let daemon = runtime.block_on(async { GateDaemon::spawn(|_| GateHello::Matching) });
+        let sent = send_daemon_request_blocking_at(
+            &daemon.path,
+            &crate::daemon_protocol::AttachRequest::ListAgents,
+            timeout,
+        )
+        .expect("control: a matching daemon answers the listing");
+        assert!(sent.ok);
+        assert_eq!(daemon.recorded(), vec!["0:list-agents".to_string()]);
     }
 }
