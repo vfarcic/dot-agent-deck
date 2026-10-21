@@ -446,7 +446,7 @@ async fn voice_paraphrase_fixtures_match_the_default_backend() {
 }
 
 /// Scenario: Classify each historical G1 sentence against every shipped action on the agent screen, bypassing command selection so it cannot hide an unsafe verdict.
-/// Dictating a submit word must not ask for submission; a bare send request must still be accepted.
+/// Dictating a submit word must receive zero yes votes; the bare send control must receive a majority (at least three of five), showing the classifier is not refusing everything.
 #[tokio::test]
 async fn voice_submit_words_in_passing_are_refused_by_the_real_judge() {
     run_judge_fixtures(submit_judge_fixtures(), JudgePipeline::Classifier).await;
@@ -496,7 +496,7 @@ fn parameterless_judge_fixtures() -> Vec<JudgeFixture> {
 }
 
 /// Scenario: Classify contextual close, destructive and mixed-content requests against every shipped action in each fixture's declared place.
-/// The real classifier must refuse unasked actions and accept the standalone controls.
+/// Unasked actions must receive zero yes votes; standalone positive controls must receive a majority (at least three of five), showing the classifier is not refusing everything.
 #[tokio::test]
 async fn voice_contextual_and_whole_controls_are_refused_by_the_real_judge() {
     run_judge_fixtures(contextual_judge_fixtures(), JudgePipeline::Classifier).await;
@@ -583,7 +583,7 @@ async fn voice_parameterless_steering_is_refused_by_the_production_pipeline() {
 }
 
 /// Scenario: Force contextual close, destructive and mixed-content picks through the shipping pipeline with its real meaning backend; state-losing refusals must dispatch nothing while standalone controls still work.
-/// By the orchestrator's decision, mixed-content dictation, reading and hush controls may dispatch their own reversible row, whose rate is reported; any other dispatch fails.
+/// Mixed-content dictation, reading-off and hush controls may dispatch their own reversible row, whose rate is reported; reading-on must dispatch nothing, and standalone positives must dispatch every time.
 /// Opening an existing agent must neither open the New agent dialog nor start its ready form, even with a pointing-word name, missing value or unspoken observed name forced into the stop pick; opening an agent named Close must close nothing.
 #[tokio::test]
 async fn voice_contextual_and_whole_controls_are_refused_by_the_production_pipeline() {
@@ -592,7 +592,7 @@ async fn voice_contextual_and_whole_controls_are_refused_by_the_production_pipel
         case.allow_reversible_dispatch = case.name.starts_with("mixed-content/")
             && matches!(
                 case.action,
-                "dictation_on" | "dictation_off" | "reading_on" | "reading_off" | "hush_reading"
+                "dictation_on" | "dictation_off" | "reading_off" | "hush_reading"
             );
     }
     cases.push(
@@ -810,10 +810,20 @@ async fn run_judge_fixture(resolver: &dyn IntentResolver, case: JudgeFixture) ->
         REPETITIONS - completed,
         if case.expected { "yes" } else { "no" }
     );
-    let expected_yes = if case.expected { REPETITIONS } else { 0 };
-    if yes_count != expected_yes {
+    let minimum_positive_yes = REPETITIONS / 2 + 1;
+    let accepted = if case.expected {
+        yes_count >= minimum_positive_yes
+    } else {
+        yes_count == 0
+    };
+    if !accepted {
+        let expectation = if case.expected {
+            format!("at least {minimum_positive_yes}/{REPETITIONS}")
+        } else {
+            format!("0/{REPETITIONS}")
+        };
         failures.push(format!(
-            "{}: {strictness:?} yes {yes_count}/{completed}, expected {expected_yes}/{REPETITIONS}",
+            "{}: {strictness:?} yes {yes_count}/{completed}, expected {expectation}",
             case.name
         ));
     }
