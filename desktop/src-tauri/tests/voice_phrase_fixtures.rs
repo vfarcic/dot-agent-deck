@@ -423,7 +423,7 @@ fn offered_values(outcome: &VoiceOutcome) -> Option<Vec<String>> {
 /// live-model gate. With local opt-in, verify outcomes through the shipping
 /// keyed API backend with the deck shown or hidden as each fixture specifies.
 #[tokio::test]
-async fn voice_phrase_fixtures_match_the_default_backend() {
+async fn voice_desktop_phrases_001_phrase_fixtures_match_the_default_backend() {
     run_fixtures(manifest()).await;
 }
 
@@ -431,7 +431,7 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
 /// resulting action, including whole-sentence commands. Mixed-content requests
 /// and hostile observed names must never cause an unasked action to run.
 #[tokio::test]
-async fn voice_paraphrase_fixtures_match_the_default_backend() {
+async fn voice_desktop_phrases_002_paraphrase_fixtures_match_the_default_backend() {
     let mut fixtures: FixtureManifest =
         toml_edit::de::from_str(PARAPHRASES).expect("voice paraphrase fixture manifest must parse");
     // Reuse the existing F1 directory-steering controls, without maintaining
@@ -446,9 +446,9 @@ async fn voice_paraphrase_fixtures_match_the_default_backend() {
 }
 
 /// Scenario: Classify start sentences over the open New agent form, bypassing command selection, and read only whether each says where to start or names what to start.
-/// Measure ten pairs per sentence because production refuses the form's echoed deck when either classifier vote names a target: named targets must refuse in at least nine pairs, while bare starts may refuse in at most one.
+/// Measure ten pairs per sentence: production forgives the form's echoed deck only with two readable no-target votes, so named targets must refuse in at least nine pairs, while bare starts may refuse in at most one.
 #[tokio::test]
-async fn voice_a_named_start_target_is_read_by_the_real_judge() {
+async fn voice_desktop_phrases_006_a_named_start_target_is_read_by_the_real_judge() {
     let Some(resolver) = live_api_resolver() else {
         return;
     };
@@ -536,7 +536,7 @@ async fn run_target_judge_fixture(
     let mut refusing_pairs = 0;
     let mut completed = 0;
     for pair in 1..=PAIRS {
-        let mut names_target = false;
+        let mut no_target_votes = 0;
         for vote in 1..=VOTES_PER_PAIR {
             let request = MeaningRequest::new(&transcript, table(), &actions).at(Place::of(
                 Screen::Overview,
@@ -552,14 +552,14 @@ async fn run_target_judge_fixture(
                 Ok(Ok(verdict)) => {
                     let yes = !verdict.names_no_target();
                     completed += 1;
-                    names_target |= yes;
+                    no_target_votes += usize::from(!yes);
                     eprintln!(
                         "names-target: {said} | pair {pair}/{PAIRS} vote {vote}/{VOTES_PER_PAIR} | {}",
                         if yes { "yes" } else { "no" }
                     );
                 }
-                // Failed votes count as neither answer; too few readable votes
-                // still fails the case rather than looking like a correct refusal.
+                // Failed votes cannot forgive the echoed deck. Keep readable
+                // votes separate so backend failures cannot prove correct refusal.
                 Ok(Err(error)) => {
                     eprintln!(
                         "names-target: {said} | pair {pair}/{PAIRS} vote {vote}/{VOTES_PER_PAIR} | {error:?}"
@@ -572,7 +572,7 @@ async fn run_target_judge_fixture(
                 }
             }
         }
-        refusing_pairs += usize::from(names_target);
+        refusing_pairs += usize::from(no_target_votes != VOTES_PER_PAIR);
     }
     let total_votes = PAIRS * VOTES_PER_PAIR;
     if completed <= total_votes / 2 {
@@ -589,7 +589,7 @@ async fn run_target_judge_fixture(
             "at most 1/10"
         }
     );
-    // Production forgives the form's echoed deck only when both votes say no.
+    // Production forgives the form's echoed deck only with two readable no votes.
     // Measure that pair decision, tolerating at most one wrong pair per case.
     let accepted = if named {
         refusing_pairs >= PAIRS - 1
@@ -609,10 +609,87 @@ async fn run_target_judge_fixture(
     failures
 }
 
+/// Scenario: Score bare starts with scripted pairs of readable no votes, target votes, backend errors and timeouts without calling a live model.
+/// Only two readable no votes may forgive the echoed deck; too few readable votes must also fail the independent availability check.
+#[tokio::test(start_paused = true)]
+async fn target_judge_fixture_requires_two_readable_no_votes() {
+    use dot_agent_deck_desktop::voice::{meaning::MeaningVerdict, resolver::IntentError};
+
+    struct ScriptedVotes {
+        votes: Vec<&'static str>,
+        next: AtomicUsize,
+    }
+
+    impl IntentResolver for ScriptedVotes {
+        fn resolve<'a>(&'a self, _request: IntentRequest<'a>) -> ResolveFuture<'a> {
+            panic!("target fixture must bypass command selection")
+        }
+
+        fn judge_meaning<'a>(&'a self, request: MeaningRequest<'a>) -> MeaningFuture<'a> {
+            let vote = self.votes[self.next.fetch_add(1, Ordering::Relaxed)];
+            Box::pin(async move {
+                match vote {
+                    "error" => Err(IntentError::Backend("scripted failure".into())),
+                    "timeout" => std::future::pending().await,
+                    names_target => MeaningVerdict::read(
+                        &request,
+                        &serde_json::json!({"yes": [], "only": "no", "names_target": names_target}),
+                    ),
+                }
+            })
+        }
+
+        fn backend_name(&self) -> &'static str {
+            "stub"
+        }
+    }
+
+    for (vote, failed_votes, expected) in [
+        ("no", 0, vec![]),
+        (
+            "yes",
+            2,
+            vec!["start it: refusing pairs 2/10, expected at most 1/10"],
+        ),
+        (
+            "error",
+            2,
+            vec!["start it: refusing pairs 2/10, expected at most 1/10"],
+        ),
+        (
+            "timeout",
+            2,
+            vec!["start it: refusing pairs 2/10, expected at most 1/10"],
+        ),
+        (
+            "error",
+            10,
+            vec![
+                "start it: only 10/20 readable votes",
+                "start it: refusing pairs 10/10, expected at most 1/10",
+            ],
+        ),
+    ] {
+        let mut votes = vec!["no"; 20];
+        for pair in 0..failed_votes {
+            votes[pair * 2] = vote;
+        }
+        let resolver = ScriptedVotes {
+            votes,
+            next: AtomicUsize::new(0),
+        };
+        assert_eq!(
+            run_target_judge_fixture(&resolver, "start it", false).await,
+            expected,
+            "{vote}, {failed_votes} failed votes"
+        );
+    }
+}
+
 /// Scenario: Classify each historical G1 sentence against every shipped action on the agent screen, bypassing command selection so it cannot hide an unsafe verdict.
 /// Dictating a submit word must receive zero yes votes; the bare send control must receive a majority (at least three of five), showing the classifier is not refusing everything.
 #[tokio::test]
-async fn voice_submit_words_in_passing_are_refused_by_the_real_judge() {
+async fn voice_desktop_phrases_003_submit_words_in_passing_are_refused_by_the_real_judge() {
     run_judge_fixtures(submit_judge_fixtures(), JudgePipeline::Classifier).await;
 }
 
@@ -635,7 +712,7 @@ fn submit_judge_fixtures() -> Vec<JudgeFixture> {
 /// Scenario: Classify "open docs" against every shipped action over the New agent directory listing.
 /// Each original F1 parameterless action must be refused under its shipping strictness without relying on command-model no-match.
 #[tokio::test]
-async fn voice_parameterless_steering_is_refused_by_the_real_judge() {
+async fn voice_desktop_phrases_004_parameterless_steering_is_refused_by_the_real_judge() {
     run_judge_fixtures(parameterless_judge_fixtures(), JudgePipeline::Classifier).await;
 }
 
@@ -662,7 +739,7 @@ fn parameterless_judge_fixtures() -> Vec<JudgeFixture> {
 /// Scenario: Classify contextual close, destructive and mixed-content requests against every shipped action in each fixture's declared place.
 /// Unasked actions must receive zero yes votes; standalone positive controls must receive a majority (at least three of five), showing the classifier is not refusing everything.
 #[tokio::test]
-async fn voice_contextual_and_whole_controls_are_refused_by_the_real_judge() {
+async fn voice_desktop_phrases_005_contextual_and_whole_controls_are_refused_by_the_real_judge() {
     run_judge_fixtures(contextual_judge_fixtures(), JudgePipeline::Classifier).await;
 }
 
@@ -734,7 +811,8 @@ fn contextual_judge_fixtures() -> Vec<JudgeFixture> {
 /// intercepts, including its parallel meaning votes; dictating a submit word must
 /// dispatch nothing, while the standalone send control still submits.
 #[tokio::test]
-async fn voice_submit_words_in_passing_are_refused_by_the_production_pipeline() {
+async fn voice_desktop_phrases_007_submit_words_in_passing_are_refused_by_the_production_pipeline()
+{
     run_judge_fixtures(submit_judge_fixtures(), JudgePipeline::Production).await;
 }
 
@@ -742,7 +820,7 @@ async fn voice_submit_words_in_passing_are_refused_by_the_production_pipeline() 
 /// dialog through the shipping pipeline after local intercepts, including parallel meaning votes;
 /// none may dispatch an action the user did not ask for.
 #[tokio::test]
-async fn voice_parameterless_steering_is_refused_by_the_production_pipeline() {
+async fn voice_desktop_phrases_008_parameterless_steering_is_refused_by_the_production_pipeline() {
     run_judge_fixtures(parameterless_judge_fixtures(), JudgePipeline::Production).await;
 }
 
@@ -750,7 +828,8 @@ async fn voice_parameterless_steering_is_refused_by_the_production_pipeline() {
 /// Mixed-content dictation, reading-off and hush controls may dispatch their own reversible row, whose rate is reported; reading-on must dispatch nothing, and standalone positives must dispatch every time.
 /// Opening an existing agent must neither open the New agent dialog nor start its ready form, even with a pointing-word name, missing value or unspoken observed name forced into the stop pick; opening an agent named Close must close nothing.
 #[tokio::test]
-async fn voice_contextual_and_whole_controls_are_refused_by_the_production_pipeline() {
+async fn voice_desktop_phrases_009_contextual_and_whole_controls_are_refused_by_the_production_pipeline()
+ {
     let mut cases = contextual_judge_fixtures();
     for case in &mut cases {
         case.allow_reversible_dispatch = case.name.starts_with("mixed-content/")
