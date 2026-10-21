@@ -156,6 +156,7 @@ pub fn run(root: &Path) -> Vec<String> {
     walk(
         root,
         &root.join(DESKTOP_SRC),
+        "rule 18",
         &mut production,
         &mut findings,
     );
@@ -165,12 +166,23 @@ pub fn run(root: &Path) -> Vec<String> {
     check(&Sources { production })
 }
 
-fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, String>, findings: &mut Vec<String>) {
+/// Every production `.ts`/`.tsx` under `dir`, keyed by repo-relative path.
+///
+/// `rule` names the rule in each finding, because rule 14's control-site
+/// ratchet ([`crate::voice_control_sites`]) walks the same tree with this same
+/// walk rather than a second copy of it.
+pub(crate) fn walk(
+    root: &Path,
+    dir: &Path,
+    rule: &str,
+    out: &mut BTreeMap<String, String>,
+    findings: &mut Vec<String>,
+) {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) => {
             findings.push(format!(
-                "could not list {}: {error} — rule 18 cannot see a directory it cannot read, so this is a \
+                "could not list {}: {error} — {rule} cannot see a directory it cannot read, so this is a \
                  failure rather than a skip",
                 dir.display()
             ));
@@ -197,7 +209,7 @@ fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, String>, findings: &
             }
         };
         if file_type.is_dir() {
-            walk(root, &path, out, findings);
+            walk(root, &path, rule, out, findings);
             continue;
         }
         // `file_type` does not follow a symlink, so a linked directory is
@@ -211,7 +223,7 @@ fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, String>, findings: &
             match std::fs::metadata(&path) {
                 Ok(target) if target.is_dir() => {
                     findings.push(format!(
-                        "{} is a symlink to a directory — rule 18 does not follow directory links, so the \
+                        "{} is a symlink to a directory — {rule} does not follow directory links, so the \
                          sources behind it would go unscanned. Replace it with a real directory",
                         path.display()
                     ));
@@ -220,7 +232,7 @@ fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, String>, findings: &
                 Ok(_) => {}
                 Err(error) => {
                     findings.push(format!(
-                        "{} is a symlink rule 18 cannot resolve: {error}",
+                        "{} is a symlink {rule} cannot resolve: {error}",
                         path.display()
                     ));
                     continue;
@@ -240,7 +252,7 @@ fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, String>, findings: &
                 out.insert(rel, text);
             }
             Err(error) => findings.push(format!(
-                "could not read {rel}: {error} — rule 18 cannot see a file it cannot read"
+                "could not read {rel}: {error} — {rule} cannot see a file it cannot read"
             )),
         }
     }
@@ -742,7 +754,7 @@ fn is_dismissal(masked: &str, after_name: usize) -> bool {
 }
 
 /// The bracket closing the one at `open`, over masked text.
-fn matching(masked: &str, open: usize) -> Option<usize> {
+pub(crate) fn matching(masked: &str, open: usize) -> Option<usize> {
     let bytes = masked.as_bytes();
     let mut depth = 0usize;
     for (offset, byte) in bytes[open..].iter().enumerate() {
@@ -760,7 +772,7 @@ fn matching(masked: &str, open: usize) -> Option<usize> {
     None
 }
 
-fn line_of(masked: &str, at: usize) -> usize {
+pub(crate) fn line_of(masked: &str, at: usize) -> usize {
     masked.as_bytes()[..at]
         .iter()
         .filter(|byte| **byte == b'\n')
@@ -779,9 +791,14 @@ fn joined(values: &BTreeSet<String>) -> String {
 /// The lexer's output: the text with every comment, string, template-literal
 /// text and regex literal blanked to spaces (newlines kept, byte length kept,
 /// so an offset means the same thing in both), and why it gave up, if it did.
-struct Lexed {
-    masked: String,
-    problem: Option<String>,
+pub(crate) struct Lexed {
+    pub(crate) masked: String,
+    pub(crate) problem: Option<String>,
+    /// The byte ranges of the comments, delimiters included. Rule 14's
+    /// control-site ratchet uses them to tell text the lexer blanked as a
+    /// comment from text it blanked as a string — the second can be JSX text
+    /// two apostrophes paired up, which hides code.
+    pub(crate) comments: Vec<Range<usize>>,
 }
 
 /// Blank everything in `text` that is not code.
@@ -797,7 +814,7 @@ struct Lexed {
 /// It refuses rather than guesses: ending inside a comment, string or
 /// template, or with unbalanced brackets, is reported, because every assertion
 /// above reads structure off this output.
-fn mask_tsx(text: &str) -> Lexed {
+pub(crate) fn mask_tsx(text: &str) -> Lexed {
     #[derive(Clone, Copy, PartialEq)]
     enum State {
         Code,
@@ -816,6 +833,8 @@ fn mask_tsx(text: &str) -> Lexed {
     };
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
+    let mut comments: Vec<Range<usize>> = Vec::new();
+    let mut comment_start = 0usize;
     let mut state = State::Code;
     // One entry per open `${`: how many `{` deep the expression is.
     let mut templates: Vec<usize> = Vec::new();
@@ -831,12 +850,14 @@ fn mask_tsx(text: &str) -> Lexed {
             State::Code => {
                 if character == '/' && next == Some('*') {
                     state = State::Block;
+                    comment_start = out.len();
                     out.push_str("  ");
                     at += 2;
                     continue;
                 }
                 if character == '/' && next == Some('/') {
                     state = State::Line;
+                    comment_start = out.len();
                     out.push_str("  ");
                     at += 2;
                     continue;
@@ -884,6 +905,7 @@ fn mask_tsx(text: &str) -> Lexed {
             State::Line => {
                 if character == '\n' {
                     state = State::Code;
+                    comments.push(comment_start..out.len());
                 }
                 blank(&mut out, character);
             }
@@ -891,6 +913,7 @@ fn mask_tsx(text: &str) -> Lexed {
                 if character == '*' && next == Some('/') {
                     state = State::Code;
                     out.push_str("  ");
+                    comments.push(comment_start..out.len());
                     at += 2;
                     continue;
                 }
@@ -972,9 +995,13 @@ fn mask_tsx(text: &str) -> Lexed {
                 )
             })
     };
+    if matches!(state, State::Line | State::Block) {
+        comments.push(comment_start..out.len());
+    }
     Lexed {
         masked: out,
         problem,
+        comments,
     }
 }
 
@@ -1074,6 +1101,7 @@ export function Shell() {
         walk(
             &repo_root(),
             &repo_root().join(DESKTOP_SRC),
+            "rule 18",
             &mut production,
             &mut Vec::new(),
         );
@@ -1436,7 +1464,7 @@ export function Shell() {
         std::os::unix::fs::symlink(&elsewhere, src.join("linked")).expect("symlink");
         let mut out = BTreeMap::new();
         let mut findings = Vec::new();
-        walk(tree.path(), &src, &mut out, &mut findings);
+        walk(tree.path(), &src, "rule 18", &mut out, &mut findings);
         assert_eq!(findings.len(), 1, "{findings:#?}");
         assert!(
             findings[0].contains("symlink to a directory"),

@@ -258,6 +258,12 @@ pub const HEALTH_WARN: Color = Color::Yellow;
 /// PRD #1258: a host reading past its critical threshold — the error role's red.
 pub const HEALTH_CRITICAL: Color = STATUS_ERROR;
 
+/// Issue #1781: GitHub's amber, for a pull request's pending checks and a
+/// review it still needs. Yellow is the ANSI slot for it, with the light-theme
+/// caveat [`STATUS_WAITING`] records; the badge's glyph shapes carry the
+/// meaning, so the colour never says it alone.
+pub const PR_ATTENTION: Color = Color::Yellow;
+
 /// PRD #1258: the colour of a host reading at `level`. Named ANSI colours, so a
 /// terminal theme remaps them like every other status colour. Never the only
 /// signal: the overlay writes the level's word beside every non-ok value.

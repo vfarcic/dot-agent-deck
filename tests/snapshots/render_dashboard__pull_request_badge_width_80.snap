@@ -1,6 +1,5 @@
 ---
 source: tests/render_dashboard.rs
-assertion_line: 92
 expression: rendered
 ---
 ┏ ▸ 1 ClaudeCode · api-svc ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ ● Thinking ┓
@@ -10,4 +9,4 @@ expression: rendered
 ┃                                                                              ┃
 ┃                                                                              ┃
 ┃                                                                              ┃
-┗ #1234 ⊙ ◐ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 1h  Tools: 14 ┛
+┗ #1234 ⊙ ◉ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 1h  Tools: 14 ┛

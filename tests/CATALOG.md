@@ -22,10 +22,10 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 
 #### session/pr
 
-##### session/pr/001 — The daemon resolves the exact branch PR and serves its state and review.
+##### session/pr/001 — The daemon resolves the exact branch PR and serves its state, review and CI checks.
 - **Layer:** L2 headless, lane 1 (deterministic).
 - **Agent:** none (synthetic cat agent, strict offline gh stub).
-- **Asserts:** ListAgents live.pull_request carries the exact branch's open PR in preference to terminal PRs; draft, merged, closed, review decisions, absent review and highest-number fallback are mapped correctly. The stub requires explicit repository, all states and all required JSON fields.
+- **Asserts:** ListAgents live.pull_request carries the exact branch's open PR in preference to terminal PRs; draft, merged, closed, review decisions, absent review and highest-number fallback are mapped correctly; the winning PR's `statusCheckRollup` (check runs and a commit status) is served as its CI summary, failing first, with per-bucket counts (issue #1781). The stub requires explicit repository, all states and all required JSON fields, `statusCheckRollup` included.
 - **Does not assert:** periodic refresh (`session/pr/003`) or TUI rendering.
 - **Platform coverage:** mac+linux.
 
@@ -43,17 +43,17 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the particular event variant or metadata key used, browser invocation or real GitHub latency.
 - **Platform coverage:** mac+linux.
 
-##### session/pr/004 — A dashboard card shows the PR and o opens its URL.
+##### session/pr/004 — A dashboard card shows the PR with its CI and review, and o opens its URL.
 - **Layer:** L2 PTY-attached, lane 1 (deterministic).
 - **Agent:** none (synthetic cat agent, offline gh stub and BROWSER recorder).
-- **Asserts:** the real TUI displays `#1234 ⊙ ◐`; o on the selected card invokes BROWSER with the exact PR URL; the same key on a default-branch card spawns no opener and leaves Help usable.
+- **Asserts:** the real TUI displays `#1234 ⊙ ✓ ◉` for an open PR with passing CI awaiting review, with the review cell in inverse video and the CI cell not (issue #1781); o on the selected card invokes BROWSER with the exact PR URL; the same key on a default-branch card spawns no opener and leaves Help usable.
 - **Does not assert:** a real browser opening, real-agent execution or reel eligibility.
 - **Platform coverage:** mac+linux.
 
 ##### session/pr/005 — An interactive Haiku agent visibly works beside its pull request badge. [reel]
 - **Layer:** L2 PTY-attached, lane 2 (real agent).
 - **Agent:** Claude Code (interactive Haiku; strict offline gh stub).
-- **Asserts:** a genuine agent on a fixture PR branch lists the files and reveals a uniquely named sentinel omitted from its prompt; the attached TUI displays that filename together with `#1234 ⊙ ◐`.
+- **Asserts:** a genuine agent on a fixture PR branch lists the files and reveals a uniquely named sentinel omitted from its prompt; the attached TUI displays that filename together with `#1234 ⊙ ✓ ◉`.
 - **Does not assert:** real GitHub authentication or network access, a browser opening, or live PR polling transitions.
 - **Platform coverage:** mac+linux.
 
@@ -170,8 +170,15 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### dashboard/pane/016 — A card shows its pull request number with state and review glyphs at roomy and narrow widths.
 - **Layer:** L1 (ratatui TestBackend + insta).
 - **Agent:** none (synthetic SessionState).
-- **Asserts:** an open, review-required PR shows `#1234` at 80 and 30 columns; snapshots pin both sides of the review/state/stats/omission width boundaries and all lifecycle/review combinations, including Unknown (`?`) and absent review.
-- **Does not assert:** daemon resolution or browser invocation (`session/pr/*`).
+- **Asserts:** an open, review-required PR shows `#1234 ⊙ ◉` at 80 and 30 columns; snapshots pin both sides of the review/state/stats/omission width boundaries and all lifecycle/review combinations (`✓`, `±`, `◉`), including Unknown (`?`) and absent review.
+- **Does not assert:** daemon resolution or browser invocation (`session/pr/*`); CI glyphs (`dashboard/pane/017`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/pane/017 — A card shows its pull request's CI result beside the review, which alone is filled.
+- **Layer:** L1 (ratatui TestBackend + insta).
+- **Agent:** none (synthetic SessionState).
+- **Asserts:** every CI result draws GitHub's mark in its colour between the state and the review (`✓` green, `✗` red, `●` yellow, `?` dark grey); the review cell is `REVERSED` and the CI cell is not, so an approval and passing CI differ; a PR with checks and no review shows the CI mark alone; narrowing drops the review, then CI, then the state, keeping the number, with snapshots of each boundary (issue #1781).
+- **Does not assert:** how `statusCheckRollup` becomes the CI result (`session/pr/001` and the `pull_request` unit tests).
 - **Platform coverage:** mac+linux+windows.
 
 #### dashboard/stats
@@ -1494,6 +1501,43 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Does not assert:** the exact exit code or the rest of the message wording; the connect-failure path (`daemon/status/003`); the live-agent paths (`daemon/status/001`/`002`/`005`); that the CLI closes its own connection on the way out.
 - **Platform coverage:** mac+linux.
 
+#### daemon/service
+
+##### daemon/service/001 — `dot-agent-deck daemon install` writes a unit that runs the installed deck with the idle shutdown off and the shell's endpoint overrides, and enables a running service without stopping or restarting it.
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL CLI as a subprocess in an isolated `HOME`/`XDG_CONFIG_HOME`, with stand-in `systemctl` and `loginctl` on `PATH` that record their calls; no daemon, no PTY, no LLM, no `e2e` feature gate).
+- **Agent:** none.
+- **Asserts:** the unit lands at `$XDG_CONFIG_HOME/systemd/user/dot-agent-deck.service`; its one `ExecStart` names the `~/.local/bin` install rather than the cargo artifact it links to; its `Environment` lines are exactly the idle-shutdown `0` and the four endpoint and directory overrides set in the shell (`DOT_AGENT_DECK_SOCKET`, `DOT_AGENT_DECK_ATTACH_SOCKET`, `DOT_AGENT_DECK_STATE_DIR`, `XDG_CONFIG_HOME`); `Restart=on-failure` and `WantedBy=default.target`; `systemctl` is asked to `daemon-reload` and `enable` and never to stop, restart, kill or `--now` anything when the service is already active; the lingering advice is printed when `loginctl` reports `no`.
+- **Does not assert:** that systemd accepts the unit or runs it (the PRD's recorded real-systemd verification); the start path (`daemon/service/004`); launchd.
+- **Platform coverage:** linux.
+
+##### daemon/service/002 — `dot-agent-deck daemon uninstall` removes the unit and disables the service without stopping the daemon, and is a successful no-op when nothing is installed.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `/001`).
+- **Agent:** none.
+- **Asserts:** the unit file is gone; `systemctl` got `disable` and never a stop, restart, kill or `--now`; with the service still active the output says the daemon is still running and names `daemon stop`; a second uninstall succeeds and says nothing is installed.
+- **Does not assert:** launchd's unload decision (unit-tested in `daemon_service::tests`).
+- **Platform coverage:** linux.
+
+##### daemon/service/003 — `dot-agent-deck daemon install` refuses a relative endpoint override before writing anything.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `/001`).
+- **Agent:** none.
+- **Asserts:** a relative `DOT_AGENT_DECK_STATE_DIR` fails the command with an error naming the variable and not clap's usage banner, no unit is written, and `systemctl` is never called.
+- **Does not assert:** the other override variables (unit-tested in `daemon_service::tests`).
+- **Platform coverage:** linux.
+
+##### daemon/service/005 — `dot-agent-deck daemon install` refuses, before enabling anything, when systemd loads the unit from a file other than the one it wrote.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `/001`, with the stand-in reporting a different `FragmentPath`).
+- **Agent:** none.
+- **Asserts:** the command fails naming both the file it wrote and the file systemd reports, and `systemctl` is never asked to `enable`. This is the case of a shell whose `XDG_CONFIG_HOME` the systemd user manager does not share, or an older unit earlier in systemd's search path.
+- **Does not assert:** which directories a real systemd searches.
+- **Platform coverage:** linux.
+
+##### daemon/service/004 — `dot-agent-deck daemon install` reports success only once the started daemon answers, and a second install beside it starts nothing.
+- **Layer:** L2 headless, lane 1 (deterministic): the REAL CLI as a subprocess, with a stand-in `systemctl` whose `enable --now` starts the `daemon serve` the generated unit describes (its `ExecStart`, `Environment` and `WorkingDirectory`); no PTY, no LLM.
+- **Agent:** none.
+- **Asserts:** the first install exits 0 saying the daemon runs as `dot-agent-deck.service`, and `daemon probe` then reports it running at the sandbox endpoint; a second install exits 0, says the service was not started, calls `enable` without `--now`, and the stand-in was asked to start exactly once.
+- **Does not assert:** boot or login start (systemd's own behaviour, not run here); restart after a crash or an upgrade (the PRD's recorded real-systemd verification); launchd.
+- **Platform coverage:** linux.
+
 #### daemon/endpoint
 
 ##### daemon/endpoint/001 — `dot-agent-deck daemon endpoint` refuses a stale inode no daemon is listening on, and leaves it alone.
@@ -1594,6 +1638,13 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Agent:** none (one worktree on a canned `MERGED` PR, clean, measured twice — once with its marker intact, once after that marker is truncated to zero bytes in place).
 - **Asserts:** a **fixture precondition** that the creation call returned `WorktreeCreation::Created` and that the marker it wrote starts out a non-empty file; a **control** that with that intact marker the entry reads `owned: true` / `verdict: "remove"` — without it, "foreign after truncation" could equally mean the worktree was never owned at all; a second **fixture precondition** that the truncated marker is still a zero-byte *file* on disk, ruling out "the marker was simply removed", which is the already-covered plain foreign case (`005`); then that the same entry now reads `owned: false` and `verdict: "ask"`; and finally that a bare `worktree reclaim` leaves the directory on disk, so the assertion reaches the deletion path and not only the report. Pins issue #946: the ownership gate was `is_file()` alone, so a failed marker write — `std::fs::write` is `File::create` + `write_all`, and `File::create` truncates before the first byte lands — left a file that read as `Ours`, sending a merged, clean worktree to `Verdict::Remove`, the branch with no confirmation, in exactly the case whose warning promised the operator one.
 - **Does not assert:** the write-failure path itself, or which `MarkerWriteError` arm a given failure carries (`src/worktree_owner.rs`'s unit tests stage a real `ENOSPC` through `/dev/full` and an unremovable leftover through a read-only metadata dir); a *partial but non-empty* marker, which still reads as a claim by design — closing that would take the temp-and-rename dance the module argues against.
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/012 — A merged pull request from a FORK whose branch shares this worktree's branch name does not make the worktree reclaimable.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`).
+- **Agent:** none (a deck-owned, clean worktree whose stub `gh` reply lists only a `MERGED` pull request carrying `isCrossRepository: true` — the shape `gh pr list --head <branch>` returns when a contributor's fork opened a pull request from a branch named like ours).
+- **Asserts:** a **fixture precondition** that the entry reads `owned: true` and `clean: true`, so PR state is the only gate deciding the verdict; then that `worktree list --json` reports `pr_state: "no_pr"` and `verdict: "keep"`; that the directory survives `worktree reclaim --yes`; and, as a **control**, that with the branch's own `MERGED` pull request listed beside the fork's the same entry reads `merged` / `remove`, so the `keep` is the fork filter's doing. Pins issue #1687: the reclaim's PR lookup matched on `headRefName` alone, so a stranger's merged fork PR read as this branch's and sent the worktree to the unattended `remove` verdict.
+- **Does not assert:** an entry that omits `isCrossRepository` (fails closed to `unresolvable`; unit-tested as `parse_pr_state_without_is_cross_repository_is_unresolvable` in `src/worktree_reclaim.rs`); the PR badge's own fork filter (`pull_request::tests::a_pull_request_from_a_fork_is_not_the_branchs`).
 - **Platform coverage:** mac+linux.
 
 ### Prompts
@@ -1975,11 +2026,11 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** authoring seed delivery or the spawned agent's command behavior.
 - **Platform coverage:** mac+linux.
 
-##### prompt/new-pane/009 — The built-in `[schedule]` Mode chip stays fully visible inside the modal even when the chip row is wider than the modal (overflow regression guard).
-- **Layer:** L2 (no public L1 render seam for the dialog — same constraint as `prompt/new-pane/007`; the real TUI is driven via PTY keystrokes and asserted on the rendered vt100 grid).
-- **Agent:** none (drives Ctrl+n → dir-picker → new-pane form, then cycles the Mode field to the `schedule` option).
-- **Asserts:** with two long orchestration chips widening the Mode row beyond the capped modal, selecting the trailing `[schedule]` option leaves that chip fully visible between the modal borders. This passes with wrapping or windowing.
-- **Does not assert:** the exact layout used to keep the chip visible (wrap vs. window/scroll); the visibility of the non-selected chips when the row overflows; the authoring hint text (covered by `prompt/new-pane/007`).
+##### prompt/new-pane/009 — Every Mode chip, the built-in `[schedule]` included, stays fully visible inside the modal at 80 columns, where the chip row is wider than the capped modal and wraps onto further rows (PRD #168).
+- **Layer:** L2 (the real dialog is driven via PTY keystrokes and asserted on the rendered vt100 grid; the L1 half of the wrap is `render/layout/007`).
+- **Agent:** none (drives Ctrl+n → dir-picker → new-pane form at 80×24, then cycles the Mode field to the `schedule` option).
+- **Asserts:** with two long orchestration chips widening the Mode row past the modal's 90%-of-terminal cap at 80 columns, selecting the trailing `[schedule]` option leaves every chip — `[No mode]`, both `[Orch: …]` chips, `[schedule]` and `[dispatcher]` — fully visible between the modal borders, and the chips occupy more than one row.
+- **Does not assert:** which chip lands on which row; the selected-chip highlight and click rects on a wrapped row (covered at L1 by `ui::tests::new_pane_form_wrapped_mode_chips_keep_highlight_and_click_targets`); the authoring hint text (covered by `prompt/new-pane/007`).
 - **Platform coverage:** mac+linux.
 
 ##### prompt/new-pane/010 — The new-pane Mode cycler offers an experimental `schedule: issues` issue-dispatch authoring option only when the experimental flag is ON; it is hidden when OFF while the plain `[schedule]` option still shows (PRD #120).
@@ -3347,6 +3398,13 @@ note).
 - **Does not assert:** the geometry arithmetic itself (covered by `orchestration/layout/008`); the PTY dims the same layout drives (covered by `orchestration/layout/010`); the live rendered grid and the key that produces it (covered by the PTY-attached `tabs/orchestration/011`).
 - **Platform coverage:** mac+linux+windows.
 
+##### render/layout/007 — A new-pane Mode chip row wider than the capped modal wraps onto further rows instead of clipping, and the fields below re-flow (PRD #168).
+- **Layer:** L1 (in-process `TestBackend` via `render_new_pane_form_to_buffer`; no PTY, no subprocess). Structural assertions first, an `insta` snapshot of the frame after them.
+- **Agent:** none (renders the new-pane form with four long orchestration names into an 80×30 buffer).
+- **Asserts:** every Mode chip — `[No mode]`, the four `[Orch: …]` chips, `[schedule]` and `[dispatcher]` — renders whole, exactly once, between the modal's `│ … │` borders; the chips occupy more than one row; and the `Name:` and `Command:` fields still render on rows of their own below them.
+- **Does not assert:** the highlight and click rects of a chip on a wrapped row (covered by `ui::tests::new_pane_form_wrapped_mode_chips_keep_highlight_and_click_targets`); the live binary at 80 columns (covered by `prompt/new-pane/009`); behaviour on a terminal too short for the form (covered by `render/layout/005`).
+- **Platform coverage:** mac+linux+windows.
+
 #### render/seam-bound
 
 ##### render/seam-bound/001 — An exported `*_to_buffer` render seam with two caller-controlled axes bounds its dimensions instead of allocating them; the four one-row seams deliberately do not (issue #748).
@@ -3908,6 +3966,14 @@ without depending on the config struct API.
 - **Why it exists:** the L2 counterpart of `orchestration/delegate/050`, through the real CLI's exit code. Confirmed red on `main` at `e0b143e9` (`exit=Some(1)`, "every worker it reached still owes a work-done for an earlier delegation").
 - **Does not assert:** what the orchestrator's pane shows for the refusal; the TUI opening the successor's pane itself (the test sends the `StartAgent` a TUI would send).
 - **Platform coverage:** mac+linux (unix-only PTY/UDS, `python3` stand-in roles).
+
+##### orchestration/delegate/052 — An addendum sent with `delegate --supersede` to a `clear = true` worker that is working on a task restarts the worker, and the new agent gets the addendum without the original task; a `clear = false` worker keeps its agent but owes a `work-done` for each task (issue #1784).
+- **Layer:** fast integration (`tests/delegate_respawn_recovery.rs`; the real `handle_delegate_with_state` against an in-process daemon whose roles were started through the real `StartAgent`, and the worker's tasks fetched and acknowledged from its inbox as an agent's component does).
+- **Agent:** none: `cat` stand-ins for both roles, because what is under test is which agent the daemon hands the addendum to, not what an agent does with it.
+- **Asserts:** for a `clear = true` `coder`: the original task is dispatched and taken, so the worker owes a `work-done`; a plain delegate of the addendum is refused with `coder` in `busy`; the `--supersede` delegate is dispatched; the addendum is taken by a different agent than the one that took the original task, that agent is no longer running, and both the delivered text and `worker-task-coder.md` carry the addendum without the original task; after one `work-done`, a plain delegate is not refused as busy. Control: the same steps on a `clear = false` `coder` hand the addendum to the agent that took the original task, which is still running, and after one `work-done` a plain delegate IS refused as busy, because the addendum is a task of its own (the orchestrator's instructions say so; PR #1785 review).
+- **Why it exists:** issue #1784. Confirmed red when written to assert what the user wanted (`left: "4"`, `right: "3"`: the agent that was working was replaced), and green with the same assertions on `clear = false`, so the restart comes from `clear = true` and not from `--supersede`. It pins `--supersede`'s meaning, which the issue keeps and the orchestrator's instructions warn about; an addendum that keeps a `clear = true` worker's agent needs its own path, which is scheduled after PRD #1666.
+- **Does not assert:** a real agent losing its conversation (a `cat` has none; the agent being replaced is what loses it); the orchestrator's instructions (`orchestrator_context` unit tests cover those); a `--supersede` before the worker took its task.
+- **Platform coverage:** mac+linux (unix-only PTYs).
 
 #### orchestration/work-done
 

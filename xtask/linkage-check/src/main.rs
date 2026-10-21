@@ -283,6 +283,12 @@ mod voice_capability_state;
 /// carries a live rule — rule 14 in [`RULES`] — as well as its own
 /// planted-bad-input tests.
 mod voice_command_registry;
+/// Issue #1701: rule 14's control-site ratchet. An `onClick`-family handler
+/// in production `.tsx` under `desktop/src` is one `VOICE_ACTIONS` dispatch,
+/// only stops its event, or is listed, with a reason, in `voice-control-sites.toml`,
+/// which only shrinks. Run from [`voice_command_registry::run`], with its own
+/// planted-bad-input tests.
+mod voice_control_sites;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -1013,9 +1019,13 @@ const RULES: &[Rule] = &[
                   other — PRD #802 M3. Every `invoke` in `commands.toml` names a `VOICE_ACTIONS` \
                   key, every `screens` entry is a `DeckView` `kind`, every param `kind` is a \
                   `ParamKind`, every registry entry is classified by a row or a written \
-                  `no_voice` reason, and the registry literal stays statically readable. It \
-                  proves the registry is CONSISTENT, not that it is COMPLETE; see \
-                  `voice_command_registry`.",
+                  `no_voice` reason, and the registry literal stays statically readable. Its \
+                  control-site ratchet (issue #1701) fails on an `onClick`-family handler in \
+                  `desktop/src` `.tsx` that is not one `VOICE_ACTIONS` dispatch unless it only stops its \
+                  event or appears, with a reason, in `xtask/linkage-check/voice-control-sites.toml`, \
+                  which only shrinks. Neither \
+                  half proves every capability is voice-reachable; see `voice_command_registry` \
+                  and `voice_control_sites`.",
         check: rule_voice_command_registry,
     },
     Rule {
@@ -1297,9 +1307,9 @@ fn rule_voice_capability_state(inputs: &Inputs) -> Vec<String> {
     voice_capability_state::run(&inputs.root)
 }
 
-/// Rule 14 (PRD #802 M3). Read straight off its own four files for rule 12's
-/// reason — a different tree, and an input going missing must be reported
-/// rather than quietly emptying the rule.
+/// Rule 14 (PRD #802 M3, and issue #1701's control-site ratchet). Read straight
+/// off its own files for rule 12's reason — a different tree, and an input
+/// going missing must be reported rather than quietly emptying the rule.
 fn rule_voice_command_registry(inputs: &Inputs) -> Vec<String> {
     voice_command_registry::run(&inputs.root)
 }

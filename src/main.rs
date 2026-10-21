@@ -596,6 +596,14 @@ enum DaemonCmd {
         #[arg(long)]
         force: bool,
     },
+    /// Run the daemon as a user service (systemd on Linux, launchd on
+    /// macOS), so it starts at login and comes back after a crash or an
+    /// upgrade. Starts it now unless a daemon is already running; never stops
+    /// one (PRD #143).
+    Install,
+    /// Remove the service `install` set up, so the daemon no longer starts at
+    /// login. A daemon it started keeps running until `daemon stop`.
+    Uninstall,
     /// Print the attach endpoint this host's daemon is listening on, and
     /// print it **only** when a live daemon answered there.
     ///
@@ -2356,6 +2364,8 @@ fn main() -> ExitCode {
             DaemonCmd::Stop { force } => run_daemon_stop_cli(force),
             DaemonCmd::Restart { force } => run_daemon_restart_cli(force),
             DaemonCmd::Status { json } => run_daemon_status_cli(json),
+            DaemonCmd::Install => run_daemon_install_cli(),
+            DaemonCmd::Uninstall => run_daemon_uninstall_cli(),
             DaemonCmd::Endpoint => run_daemon_endpoint_cli(),
             DaemonCmd::Probe { json } => run_daemon_probe_cli(json),
             DaemonCmd::RestartInstalled {
@@ -3746,6 +3756,28 @@ async fn run_close_cli(args: dot_agent_deck::close_cli::CloseArgs) -> ExitCode {
     print!("{}", output.stdout);
     eprint!("{}", output.stderr);
     ExitCode::from(output.code)
+}
+
+#[tokio::main]
+async fn run_daemon_install_cli() -> ExitCode {
+    match dot_agent_deck::daemon_service::run_install().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("daemon install: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[tokio::main]
+async fn run_daemon_uninstall_cli() -> ExitCode {
+    match dot_agent_deck::daemon_service::run_uninstall().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("daemon uninstall: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// `dot-agent-deck daemon stop [--force]` — PRD #103 Phase 3 (M3.2).

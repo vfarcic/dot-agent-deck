@@ -113,17 +113,19 @@ What can go wrong in the pane:
 
 ## Pull requests
 
-When an agent works on a branch that has a pull request on GitHub, the app shows a badge for it on the agent's row on the Dashboard and in the header of its pane. The badge is the pull request's number between an icon for its state (open, draft, merged or closed) and an icon for its review (approved, changes requested or review required). Hover it to read the same in words, for example `Pull request #1234: open, review required`.
+When an agent works on a branch that has a pull request on GitHub, the app shows a badge for it on the agent's row on the Dashboard and in the header of its pane. The badge is GitHub's icon for the pull request's state (open, draft, merged or closed), its number, then its CI checks as GitHub's pull request list shows them (a green check when they passed, a red cross when one failed, an amber dot while they run) and its review (approved, changes requested or review required) in a filled circle, all in GitHub's icons and colours. The circle is what tells an approval from passing CI, since both are a check mark. A pull request without CI checks shows no CI icon, and one with no review yet shows no review icon. Hover the badge to read the same in words, with how many checks are in each result, for example `Pull request #1234: open, review required; CI: 1 failing, 24 passing`. The CI result is GitHub's overall one, so a failing check that is not required for merging still shows the red cross.
 
-The badge appears by itself: you do not link the pull request. An agent gets one when its working directory is a git repository with a GitHub `origin`, it is on a branch other than the repository's default branch, and that branch has a pull request. The badge follows the pull request, so a review or a merge shows up on it within about a minute. If you expect a badge and there is none, see [Troubleshooting → An agent has a pull request but no badge](../troubleshooting.md#an-agent-has-a-pull-request-but-no-badge).
+The TUI shows the same badge on the bottom border of the agent's card, as glyphs in the same order: the number, the state, the CI result (`✓` passed, `✗` failed, `●` running) and the review (`✓` approved, `±` changes requested, `◉` review required) on a filled cell, for example `#1234 ⊙ ✓ ◉`. The TUI has no tooltip, so it shows no counts; see [Session Management → Pull request badge](../session-management.md#pull-request-badge) for every glyph.
+
+The badge appears by itself: you do not link the pull request. An agent gets one when its working directory is a git repository with a GitHub `origin`, it is on a branch other than the repository's default branch, and that branch has a pull request. The badge follows the pull request, so a review, a CI result or a merge shows up on it within about a minute. If you expect a badge and there is none, see [Troubleshooting → An agent has a pull request but no badge](../troubleshooting.md#an-agent-has-a-pull-request-but-no-badge).
 
 **TUI:**
 
-![TUI card showing open pull request #1234 awaiting review beside the implementation agent's pane](/img/pull-request-badge-tui.png)
+![TUI card showing open pull request #1234 with passing CI, awaiting review, beside the implementation agent's pane](/img/pull-request-badge-tui.png)
 
 **Desktop:**
 
-![Dashboard row showing the implementation agent's open pull request #1234 awaiting review](/img/pull-request-badge-desktop.png)
+![Dashboard row showing the implementation agent's open pull request #1234 with passing CI, awaiting review](/img/pull-request-badge-desktop.png)
 
 ### Read a pull request in the app
 
