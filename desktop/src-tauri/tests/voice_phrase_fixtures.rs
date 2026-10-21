@@ -89,6 +89,9 @@ const API_KEY_ENV: &str = "OPENAI_API_KEY";
 const MIN_FIXTURE_COUNT: usize = 30;
 const PENDING_OPEN_SETTINGS_ACTION: &str = "open_settings";
 const PER_FIXTURE_GRACE: Duration = Duration::from_secs(15);
+// Each production utterance can send two meaning requests in parallel.
+// Keep at most two utterances in flight under the backend's 2M TPM limit.
+const MAX_CONCURRENT_UTTERANCES: usize = 2;
 /// The short reason class the webview declares for the planted deck that
 /// cannot take a new agent — `DECK_SHORT_REASON.disconnected` in
 /// `desktop/src/lib/newAgent.ts` (PR #1451 round 3, change 6).
@@ -546,6 +549,7 @@ fn contextual_judge_fixtures() -> Vec<JudgeFixture> {
         ("submit_prompt", "transmit the current prompt", false),
         ("reading_on", "narrate future agent updates aloud", false),
         ("reading_off", "disable spoken agent updates", false),
+        ("hush_reading", "silence the app's speech", false),
         ("discard_new_agent", "throw away this draft", true),
     ] {
         cases.push(JudgeFixture::new("standalone", action, said, true, dialog));
@@ -578,12 +582,19 @@ async fn voice_parameterless_steering_is_refused_by_the_production_pipeline() {
     run_judge_fixtures(parameterless_judge_fixtures(), JudgePipeline::Production).await;
 }
 
-/// Scenario: Force contextual close, destructive and mixed-content picks
-/// through the shipping pipeline with its real meaning backend; refusals must dispatch nothing while standalone controls still work.
+/// Scenario: Force contextual close, destructive and mixed-content picks through the shipping pipeline with its real meaning backend; state-losing refusals must dispatch nothing while standalone controls still work.
+/// By the orchestrator's decision, mixed-content dictation, reading and hush controls may dispatch their own reversible row, whose rate is reported; any other dispatch fails.
 /// Opening an existing agent must neither open the New agent dialog nor start its ready form, even with a pointing-word name, missing value or unspoken observed name forced into the stop pick; opening an agent named Close must close nothing.
 #[tokio::test]
 async fn voice_contextual_and_whole_controls_are_refused_by_the_production_pipeline() {
     let mut cases = contextual_judge_fixtures();
+    for case in &mut cases {
+        case.allow_reversible_dispatch = case.name.starts_with("mixed-content/")
+            && matches!(
+                case.action,
+                "dictation_on" | "dictation_off" | "reading_on" | "reading_off" | "hush_reading"
+            );
+    }
     cases.push(
         JudgeFixture::new(
             "destructive-ready-form",
@@ -652,6 +663,7 @@ struct JudgeFixture {
     action: &'static str,
     said: String,
     expected: bool,
+    allow_reversible_dispatch: bool,
     dialog: bool,
     ready_form: bool,
     agent_label: Option<&'static str>,
@@ -665,6 +677,7 @@ impl JudgeFixture {
             action,
             said: said.to_string(),
             expected,
+            allow_reversible_dispatch: false,
             dialog,
             ready_form: false,
             agent_label: None,
@@ -726,7 +739,7 @@ async fn run_judge_fixtures(cases: Vec<JudgeFixture>, pipeline: JudgePipeline) {
         });
         // Bound request concurrency while five independent samples per case
         // keep a one-off unsafe yes visible. No retry-to-green.
-        if tasks.len() == 4 {
+        if tasks.len() == MAX_CONCURRENT_UTTERANCES {
             failures.extend(
                 tasks
                     .join_next()
@@ -922,7 +935,9 @@ async fn run_production_judge_fixture(
                     // refused stop must not dispatch close, open_new_agent or
                     // start_new_agent instead. A positive control must still
                     // dispatch its original action.
-                    VoiceOutcome::Dispatch { action, .. } => case.expected && action == case.action,
+                    VoiceOutcome::Dispatch { action, .. } => {
+                        (case.expected || case.allow_reversible_dispatch) && action == case.action
+                    }
                     VoiceOutcome::ActionUngrounded { .. } => !case.expected,
                     // Availability, missing params and backend failure cannot
                     // disguise a yes for an unasked action as a safety pass.
@@ -939,7 +954,13 @@ async fn run_production_judge_fixture(
                         "{} run {repetition}/{REPETITIONS}: expected {} with a completed meaning check, \
                          got action={action:?} outcome={kind} picks={picks} votes={votes}: {}",
                         case.name,
-                        if case.expected { "dispatch of the forced action" } else { "action_ungrounded" },
+                        if case.expected {
+                            "dispatch of the forced action"
+                        } else if case.allow_reversible_dispatch {
+                            "action_ungrounded or dispatch of only the reversible forced action"
+                        } else {
+                            "action_ungrounded"
+                        },
                         result.outcome.sentence(),
                     ));
                 }
@@ -955,7 +976,13 @@ async fn run_production_judge_fixture(
         "forced-production rate: {} | dispatch {dispatches}/{REPETITIONS} | \
          refused {refusals}/{REPETITIONS} | expected {}",
         case.name,
-        if case.expected { "dispatch" } else { "refusal" },
+        if case.expected {
+            "dispatch"
+        } else if case.allow_reversible_dispatch {
+            "refusal or reversible forced-row dispatch (rate reported)"
+        } else {
+            "refusal"
+        },
     );
     failures
 }
