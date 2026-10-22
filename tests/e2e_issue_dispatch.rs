@@ -164,8 +164,10 @@ elif kind == 'PATCH':
              if c['id'] == int(comment_id)]
     if len(found) != 1:
         fail('HTTP 404: Not Found')
-    found[0]['body'] = args[5][5:]
-    found[0]['updated_at'] = '2026-10-22T00:00:01Z'
+    # GitHub leaves updated_at unchanged when an edit repeats the same body.
+    if found[0]['body'] != args[5][5:]:
+        found[0]['body'] = args[5][5:]
+        found[0]['updated_at'] = '2026-10-22T00:00:01Z'
 temporary = state_file.with_suffix('.tmp')
 temporary.write_text(json.dumps(state))
 temporary.replace(state_file)
@@ -1218,7 +1220,7 @@ fn dispatch_007_one_issue_fails_others_dispatch() {
 
 /// Scenario: Copy a genuine claim from a separate issue into issue 7 as a comment authored by another GitHub account, then dispatch issue 7.
 /// The deck leaves the forged record untouched and POSTs its own authenticated record.
-/// Close issue 7's agent and fire again: the worktree and agent return, and only the deck-owned record is PATCHed.
+/// Close issue 7's agent and fire again: the worktree and agent return, and only the deck-owned record is PATCHed with a changed body and a later update time.
 #[spec("scheduler/dispatch/008")]
 #[test]
 fn dispatch_008_refire_after_close_redispatches() {
@@ -1354,9 +1356,12 @@ fn dispatch_008_refire_after_close_redispatches() {
             let records = own_records();
             comment_writes(&stub, "PATCH") == 1
                 && records.len() == 1
-                && records[0]["updated_at"] != first_record["updated_at"]
+                && records[0]["updated_at"].as_str().unwrap()
+                    > first_record["updated_at"].as_str().unwrap()
+                && records[0]["body"] != first_record["body"]
         }),
-        "re-claim must PATCH and persist the existing comment edit; gh calls: {:?}",
+        "re-claim must PATCH a changed body and advance updated_at on the existing record; first record: {first_record:?}; current records: {:?}; gh calls: {:?}",
+        own_records(),
         stub.calls()
     );
     let records = own_records();
