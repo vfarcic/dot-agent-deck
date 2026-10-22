@@ -269,9 +269,21 @@ Run `dot-agent-deck hooks install` after upgrading, then restart the agent; for 
 
 The doorbell waits while the agent is busy, a permission or dialog answer is needed, or you have an unsent draft, and after an agent starts until it shows it is ready: Claude Code once its input box is on screen after it starts, or once it ends a turn; Codex once its empty input box is on screen; other agents once they report that they have started. Send or clear the draft and answer the prompt. When messages have waited a couple of minutes while the agent is not working, the TUI card and the desktop tile both say `waiting to wake: send it a prompt`: send the agent any prompt and it takes its messages at that turn. Codex also waits for a recognised empty input box; if a future Codex UI is not recognised, send the first prompt yourself so messages can arrive at turn end. Claude Code is the same at start-up: if the deck does not recognise its input box, for example after a Claude Code update changes how the box looks, the deck sends no first doorbell and the message waits, even though you can see the box. Type the agent's first prompt yourself, or press Enter in its empty input box, in the TUI or the desktop app; the agent takes its messages at that turn, and the doorbell works from then on. If Claude Code's own wake-up is working, its messages arrive without the doorbell anyway. With untrusted Codex hooks, the model must run `inbox fetch` and its sandbox needs `network_access = true`, as described below.
 
-### An inbox integration is refused with `inbox_not_agent_process`
+### An inbox request is refused
 
-Run the agent inside its deck pane and restart it after `dot-agent-deck hooks install`. Run its inbox integration as part of that agent, for example through a command the agent executes; a separate terminal with a copy of the pane's environment can be refused. This applies to agents launched from either the TUI or desktop app. If a launcher moves the integration into a separate background service, keep it with the managed agent instead.
+An agent's hooks, plugin, extension and tool shell take its deck messages by running `dot-agent-deck` with the deck environment of the agent's pane. On Linux and macOS the deck accepts such a request from any process that carries that pane's current deck environment and runs as the same user as the deck, including a process the agent started outside its pane, such as Claude Code's background session.
+
+When the deck refuses one of the agent's own requests while messages wait for the agent, the TUI card and the desktop tile both say `Messages can't reach this agent`, the cause, and `Restart it from the deck; messages addressed to it are not handed to the restarted agent, so have them sent again.` In the TUI, press `i` on the card to read the whole notice if the card cuts it off. The command that was refused prints the cause and what to do, with a code:
+
+- `inbox_other_user`: the request came from a process running as another user. Run it as the user that runs the deck.
+- `inbox_peer_unidentified`: the deck could not identify the process that made the request, for example because it exited before the deck answered. Run the command again from the agent's pane and let it finish.
+- `inbox_component_not_caller`: the agent's integration named a process other than its own as the one that receives messages. Run the inbox command from the agent's own integration.
+- `inbox_nested_agent`: an agent of the same kind running inside the agent asked for its messages. Run the inbox command from the pane's own agent, not from an agent it started.
+- `inbox_not_agent_process`: the request came from a process outside the agent, on a system where the deck cannot check which user runs it. Run it from the agent's own pane.
+
+If the notice stays after the cause is fixed, restart the agent from the deck, in the TUI or the desktop app. Messages already addressed to it are not handed to the restarted agent: an orchestrator is told about each of its tasks among them, and others have to be sent again.
+
+Some refusals do not mark any card, because the deck cannot tell which agent the request is from: a request carrying another pane's deck environment (`token_names_another_pane`), none at all (`missing_token`), or that of an agent the deck has since restarted or a daemon that has since been replaced (`unknown_token`). The command prints the refusal; run it from the agent's current pane, or restart an agent that outlived the daemon that started it.
 
 ### Codex events not showing
 
