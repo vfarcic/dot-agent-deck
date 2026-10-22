@@ -100,11 +100,21 @@ impl Session {
         let Some(json) = lines.next() else {
             return false;
         };
-        // Fetch flushes one JSON line before acknowledgement. It may be
-        // interrupted before the exit marker; the independent inbox listing
-        // must still correlate the recovered id with acknowledged state.
-        if !matches!(lines.next(), None | Some("exit=0")) || lines.next().is_some() {
-            return false;
+        // Fetch flushes one JSON line before acknowledgement, which can write
+        // diagnostics to stderr. Keep those lines, but refuse another JSON
+        // value (including a partial object/array) or a failed/misplaced exit
+        // marker. The independent inbox listing must still prove acknowledgement.
+        while let Some(line) = lines.next() {
+            let line = line.trim();
+            if line.starts_with("exit=") {
+                if line != "exit=0" || lines.next().is_some() {
+                    return false;
+                }
+            } else if line.starts_with(['{', '['])
+                || serde_json::from_str::<serde_json::Value>(line).is_ok()
+            {
+                return false;
+            }
         }
         let Ok(doc) = serde_json::from_str::<serde_json::Value>(json) else {
             return false;
@@ -296,6 +306,8 @@ mod tests {
             ("diagnostic-second-json", format!("{complete}{diagnostic}{json}\nexit=0\n"), "1", false),
             ("partial-second-json", format!("{complete}{diagnostic}  {{\"messages\":["), "1", false),
             ("second-json-array", format!("{complete}{diagnostic} []\nexit=0\n"), "1", false),
+            ("partial-second-array", format!("{complete}{diagnostic}  ["), "1", false),
+            ("second-json-scalar", format!("{complete}{diagnostic}null\nexit=0\n"), "1", false),
             ("same-line-json", format!("pane=2\nattempt=1\n{json}{json}\n"), "1", false),
             ("partial-json-diagnostic", format!("pane=2\nattempt=1\n{{\"messages\":[\n{diagnostic}exit=0\n"), "1", false),
             ("trailing-junk", format!("{complete}exit=0\nerror\n"), "1", false),
