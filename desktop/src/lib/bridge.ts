@@ -2966,8 +2966,9 @@ class FixtureDeckBridge implements DeckBridge {
   async subscribe(onFleet: FleetListener, onTerminal: TerminalListener): Promise<Unsubscribe> {
     this.fleetListeners.add(onFleet);
     this.terminalListeners.add(onTerminal);
-    // PRD #1666 part 2: the `docs-restart` deck's daemon restarts once, after
-    // the app has shown its first listing, so the restart notice has agents to name.
+    // PRD #1666 part 2: the `docs-restart` deck's daemon restarts once,
+    // `FIXTURE_RESTART_AFTER_MS` after this subscription (a delay, not a wait
+    // for a painted listing), so the restart notice has agents to name.
     if (this.fixtureState === "docs-restart" && !this.restartScheduled) {
       this.restartScheduled = true;
       setTimeout(() => {

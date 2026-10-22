@@ -526,6 +526,7 @@ fn raw_stdout() -> std::io::Result<std::fs::File> {
 }
 
 /// The spool the deck pinned for this pane's agent.
+#[cfg(unix)]
 fn pinned_spool() -> crate::inbox_oneshot::Pinned {
     let pane = std::env::var(DOT_AGENT_DECK_PANE_ID).unwrap_or_default();
     let agent = std::env::var(DOT_AGENT_DECK_AGENT_ID).unwrap_or_default();

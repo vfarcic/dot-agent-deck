@@ -3947,7 +3947,9 @@ fn process_identity() -> Result<String, String> {
 /// `/proc/<pid>/stat`, whose start time is the 20th field after the
 /// parenthesised command name (which may itself hold spaces and parentheses,
 /// so the fields are counted from its last `)`). The `boot-` prefix keeps it
-/// apart from the 32 hex characters of a random identity.
+/// apart from the 32 hex characters of a random identity. Only Linux reads
+/// these inputs; the tests run it on every platform.
+#[cfg(any(target_os = "linux", test))]
 fn process_identity_of(boot_id: &str, pid: u32, stat: &str) -> Result<String, String> {
     let boot_id = boot_id.trim();
     if boot_id.is_empty() {

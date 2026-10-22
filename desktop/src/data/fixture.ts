@@ -778,7 +778,7 @@ const docsRestartAgents: AgentSession[] = [
   { ...crowdedAgent({ id: "2", displayName: "docs-review", role: "Claude code", cli: "claude", status: "idle", cwd: "/home/dev/demo-project", toolCount: 0, upForMinutes: 9, quietForMinutes: 2, lastUserPrompt: "Review the retry section of the docs.", tab: { kind: "dashboard" } }), incarnation: "docs-before" },
 ];
 
-/** How long after the app subscribes the `docs-restart` deck restarts: after the first listing has been shown. */
+/** How long after the app subscribes the `docs-restart` deck restarts. A delay counted from the subscription, not from any frame: it waits for nothing to be drawn, and the shot waits for the notice instead. */
 export const FIXTURE_RESTART_AFTER_MS = 1000;
 
 /**

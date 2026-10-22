@@ -5530,7 +5530,7 @@ impl IngestOrder {
     }
 
     /// How many connections are pending.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn pending(&self) -> usize {
         self.pending.lock().unwrap_or_else(|e| e.into_inner()).len()
     }

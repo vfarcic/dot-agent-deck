@@ -900,7 +900,7 @@ pub fn reported_connection_lost() -> bool {
 
 /// Forget what this process said, so a test can tell which notice a later
 /// step says.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn forget_reports() {
     for said in [
         &REPORTED_UNSUPPORTED,

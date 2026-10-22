@@ -167,6 +167,67 @@ fn close_confirm_002_real_cancel_preserves_and_confirm_closes() {
     }
 }
 
+/// Scenario: Launch one live card with the experimental flag on, press Ctrl+W, then shrink the terminal to 64×2, where the `experimental: on` label covers the dialog's [Close] button. A click where that button was drawn closes nothing: back at 80×24 the dialog is still open and the agent alive. A click on the whole [Close] at 80×24 then closes it (control).
+#[spec("prompt/close-confirm/010")]
+#[test]
+fn close_confirm_010_a_close_button_the_footer_covers_takes_no_click() {
+    let mut deck = TuiDeck::builder()
+        .with_pty_size(80, 24)
+        .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
+        .with_continue_session("covered-close-target", "cat")
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("[Command Mode Ctrl+D]");
+    deck.send_keys(b"\x04");
+    deck.wait_for_string("covered-close-target");
+    deck.wait_for_string("experimental: on");
+    deck.send_keys(b"\x17");
+    deck.wait_for_string("Close selected agent?");
+
+    // At 64×2 the dialog has no room: its button row lands on the bottom row,
+    // [Close] at columns 13..19, and the label is painted over columns 0..15.
+    deck.resize(64, 2);
+    deck.wait_until_grid_then_hold(
+        "64×2: the label covers the start of [Close]",
+        Duration::from_millis(500),
+        |grid| {
+            grid.lines().nth(1).is_some_and(|row| {
+                row.starts_with("experimental: on")
+                    && row.contains("ose]")
+                    && !row.contains("[Close]")
+            })
+        },
+    );
+    deck.click(14, 1);
+    deck.resize(80, 24);
+    deck.wait_until_grid_then_hold(
+        "the dialog is still open after the click",
+        Duration::from_secs(1),
+        |grid| grid.contains("Close selected agent?") && grid.contains("[Close]"),
+    );
+    assert!(
+        common::wait_for_agent_display_name(
+            deck.attach_socket_path(),
+            "covered-close-target",
+            true,
+            Duration::from_secs(1),
+        ),
+        "a click on a [Close] the experimental label covered closed the agent"
+    );
+
+    // Control: the whole button closes it.
+    let (col, row) = deck.wait_for_in_grid("[Close]");
+    deck.click(col + 1, row);
+    assert!(
+        common::wait_for_agent_display_name(
+            deck.attach_socket_path(),
+            "covered-close-target",
+            false,
+            Duration::from_secs(5),
+        ),
+        "control: a click on the whole [Close] did not close the agent"
+    );
+}
+
 /// Scenario: Launch one live card at a roomy width, click the real persistent `[Close w/Ctrl+W]` button, cancel, then press Ctrl+W. Both production input paths must display the same Cancel-default close modal while leaving the agent alive until explicit confirmation.
 #[spec("prompt/close-confirm/003")]
 #[test]

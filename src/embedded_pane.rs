@@ -1325,7 +1325,7 @@ impl EmbeddedPaneController {
 
     /// Test-only: record that `pane_id`'s agent was lost for `reason`, as
     /// the pane's reattach does, without waiting out a reattach.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn mark_pane_lost_for_test(&self, pane_id: &str, reason: PaneLostReason) {
         let panes = self.panes.lock().unwrap();
         *panes

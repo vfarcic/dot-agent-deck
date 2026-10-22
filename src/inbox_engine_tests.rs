@@ -4582,6 +4582,7 @@ async fn boundary_061_an_exact_commit_needs_a_released_attempt_and_its_receipt()
 /// batch is issued and staged only by the clock's tick, which then writes
 /// its caps files itself. A generation other than `p`/`a` expects an
 /// integration soon, which wakes the clock once the test has posted.
+#[cfg(unix)]
 fn hub_staged_by_its_clock(
     ack_wait: Duration,
 ) -> (

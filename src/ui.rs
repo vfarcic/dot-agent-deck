@@ -1802,10 +1802,11 @@ struct UiState {
     /// laid out above them rather than over them ([`overlay_area`]).
     restart_notice_area: Option<Rect>,
     /// PRD #1666 part 2 (G-fix7f): which of the open confirmation's choices
-    /// the last frame showed, with the mode it drew them for; G-fix7h: read
-    /// back from that frame once it is finished ([`ConfirmChoices::shown`]).
-    /// [`refuse_undrawn_choice`] refuses the keys that would move to or confirm
-    /// one it did not show.
+    /// the last frame showed, with the mode it drew them for; G-fix7i: read
+    /// back from that frame as it was flushed to the terminal
+    /// ([`record_flushed_confirmation`]). [`refuse_undrawn_choice`] refuses
+    /// Down and Enter onto one it did not show, and Stop's `y` while its Yes
+    /// is not shown.
     ///
     /// G-fix7g: also the confirmations' render-before-input gate, which was
     /// the close confirmation's alone (PRD #241 review F5). Cleared when a
@@ -1813,6 +1814,11 @@ struct UiState {
     /// a record for another mode, means this opening of the open confirmation
     /// has not been drawn yet ([`confirmation_awaits_frame`]).
     confirm_choices_drawn: Option<(UiMode, ChoicesShown)>,
+    /// PRD #1666 part 2 (G-fix7i): what the draw in progress put in the open
+    /// confirmation — its choices and its buttons — with the mode it drew. It
+    /// counts for nothing until [`record_flushed_confirmation`] reads it back
+    /// from the frame as flushed, which takes it.
+    confirm_drawing: Option<(UiMode, ConfirmDrawing)>,
     /// PRD #341 M6: which pane the user was typing into as of the previous
     /// [`reconcile_pane_input_scrollback`] frame — `Some(pane_id)` while `mode ==
     /// PaneInput` with a focused pane, `None` otherwise. A change in this value is
@@ -2400,6 +2406,7 @@ impl UiState {
             restart_notice: None,
             restart_notice_area: None,
             confirm_choices_drawn: None,
+            confirm_drawing: None,
             last_pane_input_target: None,
             // PRD #113 revision: defaults to card 0 so first-launch Enter (before
             // anything has been selected) targets the first card, unchanged.
@@ -13703,36 +13710,20 @@ pub fn run_tui(
         // value — reading it twice opened a TOCTOU window where the ~2s watcher
         // could flip it between the reads, cropping the main content by a row.
         let features_snap = crate::features::current();
-        let (frame_area, experimental_footer_area) = if features_snap.experimental {
-            let chunks = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)])
-                .split(full_frame_area);
-            (chunks[0], Some(chunks[1]))
-        } else {
-            (full_frame_area, None)
-        };
         // Issue #1637: one row above that for the hook-binary notice, on the
         // dashboard only and only while the daemon reports one, so every other
-        // frame keeps its layout.
+        // frame keeps its layout. PRD #1666 part 2 (`lifecycle/handshake/011`):
+        // one row above those for a protocol refusal, on every view, since
+        // nothing this TUI shows is live while it lasts.
         let show_hook_notice = !snapshot.hook_binary_notices.is_empty()
             && matches!(tab_view, ActiveTabView::Dashboard { zoomed: false, .. });
-        let (frame_area, hook_notice_area) = if show_hook_notice {
-            let chunks =
-                Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(frame_area);
-            (chunks[0], Some(chunks[1]))
-        } else {
-            (frame_area, None)
-        };
-        // PRD #1666 part 2 (`lifecycle/handshake/011`): one row above those for
-        // a reconnect that found the daemon on another attach protocol, on
-        // every view, since nothing this TUI shows is live while it lasts.
         let protocol_refusal = snapshot.protocol_refusal;
-        let (frame_area, protocol_refusal_area) = if protocol_refusal.is_some() {
-            let chunks =
-                Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(frame_area);
-            (chunks[0], Some(chunks[1]))
-        } else {
-            (frame_area, None)
-        };
+        let (frame_area, footer_rows) = FooterRows::reserve(
+            full_frame_area,
+            features_snap.experimental,
+            show_hook_notice,
+            protocol_refusal.is_some(),
+        );
         let embedded_panes = pane.as_any().downcast_ref::<EmbeddedPaneController>();
         let all_pane_ids = embedded_panes.map(|e| e.pane_ids()).unwrap_or_default();
         let focused_pane_id = embedded_panes.and_then(|e| e.focused_pane_id());
@@ -13765,7 +13756,7 @@ pub fn run_tui(
                 let _ = event::read()?;
             }
         }
-        terminal.draw(|frame| {
+        let completed = terminal.draw(|frame| {
             render_frame(
                 frame,
                 &snapshot,
@@ -13781,23 +13772,16 @@ pub fn run_tui(
                 // every card on it measures `Last:` against the same instant.
                 Utc::now(),
             );
-            // PRD #139: draw the experimental footer into the reserved bottom
-            // row (disjoint from `frame_layout`), using the SAME flag snapshot
-            // the reservation above used.
-            if let Some(footer_area) = experimental_footer_area {
-                render_experimental_footer(frame, &features_snap, footer_area);
-            }
-            if let Some(notice_area) = hook_notice_area {
-                render_hook_notice(frame, &snapshot.hook_binary_notices, notice_area);
-            }
-            if let (Some(refusal), Some(area)) = (protocol_refusal, protocol_refusal_area) {
-                frame.render_widget(
-                    Paragraph::new(protocol_refusal_line(refusal))
-                        .style(Style::default().fg(Color::Yellow)),
-                    area,
-                );
-            }
+            footer_rows.render(
+                frame,
+                &features_snap,
+                &snapshot.hook_binary_notices,
+                protocol_refusal,
+            );
         })?;
+        // PRD #1666 part 2 (G-fix7i): the open confirmation's record and click
+        // targets come from the frame as flushed, after every write above.
+        record_flushed_confirmation(&mut ui, completed.buffer);
         tick = tick.wrapping_add(1);
 
         // Bell transition detection
@@ -16369,7 +16353,7 @@ fn overlay_area(frame: &mut Frame, ui: &mut UiState) -> Rect {
 /// its column, row by row from the first row showing one. Drawn into a blank
 /// scratch buffer, so nothing reaches the screen. The directory picker's scroll
 /// and what the upgrade dialog counts as seen are restored afterwards; the
-/// click targets and the confirmation record ([`UiState::confirm_choices_drawn`])
+/// click targets and the confirmation drawing ([`UiState::confirm_drawing`])
 /// it writes are temporary, overwritten by the final draw that always follows
 /// in [`render_overlays`]. Two areas whose drawings are equal show
 /// the same text, choices, buttons and borders, wherever each centres them;
@@ -16421,12 +16405,13 @@ fn render_overlays(frame: &mut Frame, ui: &mut UiState) {
         let full = frame.area();
         ui.modal_button_rects = render_restart_notice_overlay(frame, full, notice, &ui.keybindings);
     }
-    // PRD #241 review F5, G-fix7g: records which of an open confirmation's
-    // choices this frame shows. The record is the render gate: until a frame
-    // has recorded the open confirmation, the run loop drains its input rather
-    // than feed it (see the drain at the top of the event loop). It is written
-    // inside the draw, before the frame reaches the terminal, and says nothing
-    // about when any later input arrived.
+    // PRD #241 review F5, G-fix7g: an open confirmation's drawing becomes the
+    // record of which choices this frame shows. The record is the render gate:
+    // until a frame has recorded the open confirmation, the run loop drains its
+    // input rather than feed it (see the drain at the top of the event loop).
+    // G-fix7i: it is written once the frame is flushed
+    // ([`record_flushed_confirmation`]), and says nothing about when any later
+    // input arrived.
     draw_modal(frame, area, ui);
 }
 
@@ -16477,22 +16462,21 @@ fn draw_modal(frame: &mut Frame, area: Rect, ui: &mut UiState) {
     if ui.mode == UiMode::StarPrompt {
         ui.modal_button_rects = render_star_prompt(frame, area);
     }
-    let mut confirm_choices = None;
-    let confirmation = |ui: &mut UiState, drawn: ConfirmDrawing| {
-        ui.modal_button_rects = drawn.buttons;
-        Some(drawn.choices)
-    };
+    // G-fix7i: a confirmation's buttons are not click targets yet, nor its
+    // choices counted: both wait for the frame as flushed.
+    let mut confirmation = None;
     if ui.mode == UiMode::ConfigGenPrompt {
-        let drawn = render_config_gen_prompt(frame, area, ui.config_gen_selected);
-        confirm_choices = confirmation(ui, drawn);
+        confirmation = Some(render_config_gen_prompt(
+            frame,
+            area,
+            ui.config_gen_selected,
+        ));
     }
     if ui.mode == UiMode::QuitConfirm {
-        let drawn = render_quit_confirm(frame, area, ui.quit_confirm_selected);
-        confirm_choices = confirmation(ui, drawn);
+        confirmation = Some(render_quit_confirm(frame, area, ui.quit_confirm_selected));
     }
     if ui.mode == UiMode::CloseConfirm {
-        let drawn = render_close_confirm(frame, area, &ui.close_confirm);
-        confirm_choices = confirmation(ui, drawn);
+        confirmation = Some(render_close_confirm(frame, area, &ui.close_confirm));
     }
     if ui.mode == UiMode::Upgrade
         && let Some(dialog) = ui.upgrade_dialog.as_mut()
@@ -16505,18 +16489,39 @@ fn draw_modal(frame: &mut Frame, area: Rect, ui: &mut UiState) {
     if ui.mode == UiMode::StopConfirm {
         // M5 adds no buttons to the secondary Stop-confirm dialog (not in the
         // contract); its keystrokes (y/n/Enter/Esc) remain the only path.
-        confirm_choices = Some(render_stop_confirm(
-            frame,
-            area,
-            ui.stop_confirm_selected,
-            ui.stop_confirm_agent_count,
-        ));
+        confirmation = Some(ConfirmDrawing {
+            buttons: Vec::new(),
+            choices: render_stop_confirm(
+                frame,
+                area,
+                ui.stop_confirm_selected,
+                ui.stop_confirm_agent_count,
+            ),
+        });
     }
-    // G-fix7f, G-fix7h: read back from the buffer once everything this frame
-    // draws is in it (the modal is drawn last), so the record is of the choices
-    // the finished frame shows, after the button row.
-    ui.confirm_choices_drawn =
-        confirm_choices.map(|choices| (ui.mode, choices.shown(frame.buffer_mut())));
+    ui.confirm_drawing = confirmation.map(|drawing| (ui.mode, drawing));
+}
+
+/// PRD #1666 part 2 (G-fix7i): record what the open confirmation showed in
+/// `flushed`, the buffer the draw just sent to the terminal, once every write
+/// of that draw is in it — the experimental footer, the hook notice and the
+/// protocol-refusal row the run loop paints after [`render_frame`], and
+/// anything a later change paints there. A choice counts only when its marker
+/// and whole label are intact in the popup
+/// ([`UiState::confirm_choices_drawn`]), and a button is a click target only
+/// when its whole label is intact in the popup at the place it was drawn; the
+/// rest are refused for keys and the mouse alike. Takes the draw's
+/// [`UiState::confirm_drawing`]: a draw that drew no confirmation leaves no
+/// record.
+fn record_flushed_confirmation(ui: &mut UiState, flushed: &Buffer) {
+    ui.confirm_choices_drawn = match ui.confirm_drawing.take() {
+        Some((mode, drawing)) => {
+            let (shown, buttons) = drawing.read_back(flushed);
+            ui.modal_button_rects = buttons;
+            Some((mode, shown))
+        }
+        None => None,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -18317,9 +18322,11 @@ const CONFIG_GEN_CONFIRM: ConfirmLayout = ConfirmLayout {
 };
 
 /// PRD #1666 part 2 (G-fix7h): where a confirmation's renderer put each of its
-/// choices, so the finished frame can be read back for which of them it shows.
+/// choices, so the frame as flushed can be read back for which of them it
+/// shows.
 struct ConfirmChoices {
-    /// The popup inside its border; a choice outside it is not the dialog's.
+    /// The popup inside its border; a choice or button outside it is not the
+    /// dialog's.
     inner: Rect,
     /// Each choice's column, row (`None` past the last representable row) and
     /// marker-and-label text, in choice order.
@@ -18330,25 +18337,28 @@ impl ConfirmChoices {
     /// Which choices `buf` shows: a choice counts only when its marker and its
     /// whole label are inside the popup and every one of their cells still
     /// reads as the renderer wrote it — so one a narrow popup clips, a short
-    /// one leaves out, or the button row paints over does not.
-    fn shown(&self, buf: &ratatui::buffer::Buffer) -> ChoicesShown {
+    /// one leaves out, or the button row or a footer row paints over does not.
+    fn shown(&self, buf: &Buffer) -> ChoicesShown {
         let mut shown = ChoicesShown::default();
         for (i, (x, row, text)) in self.cells.iter().enumerate() {
-            let Some(y) = *row else { continue };
-            let width = text.chars().count();
-            let fits = y >= self.inner.top()
-                && y < self.inner.bottom()
-                && usize::from(*x) + width <= usize::from(self.inner.right());
-            let intact = fits
-                && text.chars().zip(*x..).all(|(ch, x)| {
-                    buf.cell((x, y))
-                        .is_some_and(|cell| cell.symbol().chars().eq([ch]))
-                });
-            if intact {
+            if row.is_some_and(|y| self.intact(*x, y, text, buf)) {
                 shown.insert(i);
             }
         }
         shown
+    }
+
+    /// Whether `text`, written from column `x` of row `y`, lies wholly inside
+    /// the popup and every one of its cells in `buf` still reads as written.
+    fn intact(&self, x: u16, y: u16, text: &str, buf: &Buffer) -> bool {
+        let fits = y >= self.inner.top()
+            && y < self.inner.bottom()
+            && x >= self.inner.left()
+            && usize::from(x) + text.chars().count() <= usize::from(self.inner.right());
+        fits && text.chars().zip(x..).all(|(ch, x)| {
+            buf.cell((x, y))
+                .is_some_and(|cell| cell.symbol().chars().eq([ch]))
+        })
     }
 }
 
@@ -18370,10 +18380,47 @@ impl ChoicesShown {
 }
 
 /// PRD #1666 part 2 (G-fix7h): what a confirmation's renderer drew: its
-/// buttons' click targets and where it put its choices.
+/// buttons and where it put its choices. G-fix7i: neither counts until
+/// [`record_flushed_confirmation`] reads them back from the frame as flushed.
 struct ConfirmDrawing {
-    buttons: Vec<(Action, Rect)>,
+    /// Each button's click target, with the label it wrote there.
+    buttons: Vec<(Action, Rect, String)>,
     choices: ConfirmChoices,
+}
+
+impl ConfirmDrawing {
+    /// The choices `flushed` shows, and the click targets of the buttons it
+    /// shows whole inside the popup where they were drawn.
+    fn read_back(self, flushed: &Buffer) -> (ChoicesShown, Vec<(Action, Rect)>) {
+        let buttons = self
+            .buttons
+            .into_iter()
+            .filter(|(_, rect, label)| {
+                rect.height == 1
+                    && usize::from(rect.width) == label.chars().count()
+                    && self.choices.intact(rect.x, rect.y, label, flushed)
+            })
+            .map(|(action, rect, _)| (action, rect))
+            .collect();
+        (self.choices.shown(flushed), buttons)
+    }
+}
+
+/// PRD #1666 part 2 (G-fix7i): draw a confirmation's `buttons` on `row` as
+/// [`render_modal_button_row`] does, each paired with the label it wrote.
+fn render_confirm_buttons(
+    frame: &mut Frame,
+    buttons: &[Button],
+    row: Rect,
+) -> Vec<(Action, Rect, String)> {
+    // Every confirmation button is enabled, so the row draws a prefix of
+    // `buttons`, in order; one the row has no room for is dropped whole.
+    debug_assert!(buttons.iter().all(|button| button.enabled));
+    render_modal_button_row(frame, buttons, row, 1)
+        .into_iter()
+        .zip(buttons)
+        .map(|((action, rect), button)| (action, rect, button.display_label()))
+        .collect()
 }
 
 /// PRD #1666 part 2 (G-fix7g): whether the open confirmation has not been
@@ -18388,11 +18435,12 @@ fn confirmation_awaits_frame(ui: &UiState) -> bool {
         .is_some_and(|(mode, _)| mode == ui.mode)
 }
 
-/// PRD #1666 part 2 (G-fix7f): refuse a key that would move to, or confirm, a
-/// choice the open confirmation's last frame did not show — a terminal too
-/// small for its popup clips the lower choices or shows no label at all, and
-/// G-fix7h: a short popup's button row paints over a choice — and Stop's `y`
-/// while its Yes is not shown. Escape and the dialogs' own way back are not
+/// PRD #1666 part 2 (G-fix7f): refuse Down/`j` onto, and Enter on, a choice
+/// the open confirmation's last frame did not show — a terminal too small for
+/// its popup clips the lower choices or shows no label at all, and G-fix7h: a
+/// short popup's button row paints over a choice — and Stop's `y` while its
+/// Yes is not shown. Up/`k` is not refused, so it can move onto a hidden
+/// choice, where Enter is. Escape and the dialogs' own way back are not
 /// refused. G-fix7g: before this opening's first frame none of its choices
 /// counts as shown.
 fn refuse_undrawn_choice(key: &KeyEvent, ui: &UiState) -> Option<Action> {
@@ -18498,7 +18546,7 @@ fn render_quit_confirm(frame: &mut Frame, area: Rect, selected: usize) -> Confir
         height: 1,
     };
     ConfirmDrawing {
-        buttons: render_modal_button_row(frame, &buttons, btn_row, 1),
+        buttons: render_confirm_buttons(frame, &buttons, btn_row),
         choices: QUIT_CONFIRM.choices(popup_area, 0, options.map(|(label, _)| label), selected),
     }
 }
@@ -18610,7 +18658,7 @@ fn render_close_confirm(
         height: 1,
     };
     ConfirmDrawing {
-        buttons: render_modal_button_row(frame, &buttons, btn_row, 1),
+        buttons: render_confirm_buttons(frame, &buttons, btn_row),
         choices: CLOSE_CONFIRM.choices(
             popup_area,
             kept_lines,
@@ -18843,7 +18891,7 @@ fn render_config_gen_prompt(frame: &mut Frame, area: Rect, selected: usize) -> C
         height: 1,
     };
     ConfirmDrawing {
-        buttons: render_modal_button_row(frame, &buttons, btn_row, 1),
+        buttons: render_confirm_buttons(frame, &buttons, btn_row),
         choices: CONFIG_GEN_CONFIRM.choices(
             popup_area,
             0,
@@ -22134,6 +22182,73 @@ pub fn render_stats_bar_to_buffer(
         let area = frame.area();
         render_stats_bar(frame, stats, area);
     })
+}
+
+/// The rows the run loop reserves below the frame's layout, bottom up, and
+/// paints after [`render_frame`] in the same draw. PRD #1666 part 2 (G-fix7i):
+/// one type for both, so the L1 tests draw the footer the run loop draws.
+#[derive(Debug, Clone, Copy, Default)]
+struct FooterRows {
+    experimental: Option<Rect>,
+    hook_notice: Option<Rect>,
+    protocol_refusal: Option<Rect>,
+}
+
+impl FooterRows {
+    /// Reserve the rows `full` needs and return the area left for the layout.
+    ///
+    /// PRD #139 M4.1 + PRD #84: the bottom row for the `experimental: on`
+    /// label when the flag is on; when off the layout is byte-for-byte the
+    /// pre-feature baseline. Issue #1637: one row above that for the
+    /// hook-binary notice. PRD #1666 part 2 (`lifecycle/handshake/011`): one
+    /// row above those for a reconnect that found the daemon on another attach
+    /// protocol.
+    fn reserve(
+        full: Rect,
+        experimental: bool,
+        hook_notice: bool,
+        protocol_refusal: bool,
+    ) -> (Rect, Self) {
+        let mut area = full;
+        let mut take = |wanted: bool| {
+            wanted.then(|| {
+                let chunks =
+                    Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(area);
+                area = chunks[0];
+                chunks[1]
+            })
+        };
+        let rows = FooterRows {
+            experimental: take(experimental),
+            hook_notice: take(hook_notice),
+            protocol_refusal: take(protocol_refusal),
+        };
+        (area, rows)
+    }
+
+    /// Paint the reserved rows. `features` must be the snapshot the
+    /// reservation used (Greptile P2), so the gate and the label agree.
+    fn render(
+        &self,
+        frame: &mut Frame,
+        features: &Features,
+        hook_notices: &[crate::hook_binary::HookBinaryNotice],
+        protocol_refusal: Option<crate::state::ProtocolRefusal>,
+    ) {
+        if let Some(area) = self.experimental {
+            render_experimental_footer(frame, features, area);
+        }
+        if let Some(area) = self.hook_notice {
+            render_hook_notice(frame, hook_notices, area);
+        }
+        if let (Some(refusal), Some(area)) = (protocol_refusal, self.protocol_refusal) {
+            frame.render_widget(
+                Paragraph::new(protocol_refusal_line(refusal))
+                    .style(Style::default().fg(Color::Yellow)),
+                area,
+            );
+        }
+    }
 }
 
 /// PRD #139 M4.1 — render the throwaway experimental footer into `area`.
@@ -40894,7 +41009,9 @@ mod tests {
     }
 
     /// The key of the card the active tab highlights after one render-loop
-    /// selection step ([`reconcile_frame_selection`]).
+    /// selection step ([`reconcile_frame_selection`]). Its one caller uses the
+    /// Unix-only restart fixture.
+    #[cfg(unix)]
     fn frame_selected_key(
         ui: &mut UiState,
         tab_manager: &mut TabManager,
@@ -40919,6 +41036,8 @@ mod tests {
     }
 
     /// Scenario: A same-build restart drops this TUI's stopped cards, panes and emptied unit tab locally, keeps a new-process tab active, leaves the worktree files intact and shows one notice naming the stopped agents, while a same-process reconnect keeps them (control). The remembered Dashboard key is cleared even while another tab stays active, so a reused key inherits neither name nor selection. A queued orchestration attaches only on its originating process, and a placeholder learned from that actual attach can post to its process but refuses a successor that reuses its ids.
+    // The restart fixture is a Unix-socket daemon.
+    #[cfg(unix)]
     #[spec("lifecycle/handshake/013")]
     #[test]
     fn handshake_013_a_restart_drops_its_agents_locally_with_one_notice() {
@@ -41479,6 +41598,8 @@ mod tests {
     }
 
     /// Scenario: A TUI attaches a pane on deck process `a`, then receives its placeholder after the stream is on `b`, whose agent reuses its ids. If the stream previously knew `a`, the stale placeholder drops that attachment and names it once; if the stream never knew `a`, the placeholder waits, but the attachment's own reattach-loss signal still removes the pane and visibly names its agent before another stream opens, without evicting `b`'s card or sending it anything. Opening the stream later preserves that one notice, and without a restart the placeholder is the existing card (controls).
+    // The restart fixture is a Unix-socket daemon.
+    #[cfg(unix)]
     #[spec("lifecycle/handshake/013")]
     #[test]
     fn handshake_013_a_late_placeholder_never_evicts_the_restarted_decks_card() {
@@ -41808,6 +41929,8 @@ mod tests {
     }
 
     /// Scenario: before any event stream is open, a TUI's own panes on deck process `a` hand in their placeholders, which wait for the stream. The user closes the orchestration tab with Ctrl+W and confirms; or the deck announces one pane closed; or the deck restarts and the pane's reattach finds another process, and the user dismisses the notice that names it. When the stream then opens — on `a`, or on the restarted `b` — no card comes back for the closed pane and nothing is named again. Without the close, the same open draws the held cards (control).
+    // The restart fixture is a Unix-socket daemon.
+    #[cfg(unix)]
     #[spec("lifecycle/handshake/013")]
     #[test]
     fn handshake_013_a_closed_panes_held_placeholder_is_never_drawn() {
@@ -41945,6 +42068,8 @@ mod tests {
     }
 
     /// Scenario: a TUI has eight panes on deck process `a`, each with a card drawn before any stream named a process. The deck restarts, and their reattachments find `b` before the event stream notices, either together or with one pane delayed until the next frame. Each batch is named in pane order and the later batch appends without losing or repeating earlier names.
+    // The restart fixture is a Unix-socket daemon.
+    #[cfg(unix)]
     #[spec("lifecycle/handshake/013")]
     #[test]
     fn handshake_013_lost_panes_are_named_in_pane_order() {
@@ -42068,11 +42193,45 @@ mod tests {
     /// A frame `width`×`height` of the empty dashboard in `ui`'s mode, drawn by
     /// the production [`render_frame`], as text rows.
     fn draw_sized(ui: &mut UiState, width: u16, height: u16) -> Vec<String> {
+        draw_with_footer(ui, width, height, false, &[])
+    }
+
+    /// [`draw_sized`] with the run loop's footer rows: the experimental label
+    /// when `experimental`, and `hook_notices`' row. Laid out, painted after
+    /// [`render_frame`] and read back from the flushed frame
+    /// ([`record_flushed_confirmation`]) as the run loop does.
+    fn draw_with_footer(
+        ui: &mut UiState,
+        width: u16,
+        height: u16,
+        experimental: bool,
+        hook_notices: &[crate::hook_binary::HookBinaryNotice],
+    ) -> Vec<String> {
+        draw_then_paint(ui, width, height, experimental, hook_notices, |_| {})
+    }
+
+    /// [`draw_with_footer`], with `late` painting into the frame after the
+    /// footer rows, as a later overlay of the run loop's draw would.
+    fn draw_then_paint(
+        ui: &mut UiState,
+        width: u16,
+        height: u16,
+        experimental: bool,
+        hook_notices: &[crate::hook_binary::HookBinaryNotice],
+        late: impl FnOnce(&mut Frame),
+    ) -> Vec<String> {
         let state = AppState::default();
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         let filtered = filter_sessions(&state, ui);
-        let bar_rows = bottom_bar_rows(ui, width, height);
-        terminal
+        let features = Features::test_with(experimental);
+        let (area, footer) = FooterRows::reserve(
+            Rect::new(0, 0, width, height),
+            experimental,
+            !hook_notices.is_empty(),
+            false,
+        );
+        let bar_rows = bottom_bar_rows(ui, area.width, area.height);
+        let completed = terminal
             .draw(|frame| {
                 let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
                 let tab_view = ActiveTabView::Dashboard {
@@ -42086,7 +42245,7 @@ mod tests {
                     orchestration_statuses: vec![],
                 };
                 let layout = compute_frame_layout(
-                    frame.area(),
+                    area,
                     &tab_view,
                     &tab_bar,
                     &[],
@@ -42106,9 +42265,12 @@ mod tests {
                     &tab_bar,
                     &layout,
                     Utc::now(),
-                )
+                );
+                footer.render(frame, &features, hook_notices, None);
+                late(frame);
             })
             .unwrap();
+        record_flushed_confirmation(ui, completed.buffer);
         let buffer = terminal.backend().buffer();
         (0..height)
             .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
@@ -42685,6 +42847,274 @@ mod tests {
         }
     }
 
+    /// A hook-binary notice long enough to fill an 80-column footer row.
+    fn wide_hook_notice() -> crate::hook_binary::HookBinaryNotice {
+        crate::hook_binary::HookBinaryNotice {
+            binary: "/usr/local/bin/dot-agent-deck".into(),
+            agents: vec!["api-fix".into(), "docs-review".into()],
+            version: Some("0.45.0".into()),
+            daemon_version: "0.47.1".into(),
+            reason: crate::hook_binary::HookBinaryReason::Older,
+            remedy: "Run:".into(),
+            command: Some("brew upgrade dot-agent-deck".into()),
+        }
+    }
+
+    /// What a mouse Down at `at` does while `ui`'s modal is open, as the run
+    /// loop resolves it: the modal's own click targets only.
+    fn modal_click(ui: &UiState, (col, row): (u16, u16)) -> Option<Action> {
+        assert!(modal_owns_clicks(&ui.mode), "{:?} owns no clicks", ui.mode);
+        hit_test_button(&ui.modal_button_rects, col, row)
+    }
+
+    /// Where `rows` show `text`, as (column, row) of its first cell.
+    fn find_in_rows(rows: &[String], text: &str) -> Option<(u16, u16)> {
+        rows.iter().enumerate().find_map(|(y, row)| {
+            let at = row.find(text)?;
+            Some((row[..at].chars().count() as u16, y as u16))
+        })
+    }
+
+    /// Scenario: an armed Close confirmation is drawn in a 64×2 terminal with the experimental label on, and in an 80×2 one with a hook notice; the footer row the run loop paints after the dialog covers its [Close] button. A click where the button was recorded closes nothing. With the same footer at 80×24 the [Close] button is whole and a click on it confirms (control).
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_a_confirmation_button_a_footer_row_covers_takes_no_click() {
+        let notice = [wide_hook_notice()];
+        // GF7H-A01 (64×2, experimental: on) and GF7H-R01 (80×2, hook notice),
+        // each with the click on the [Close] target the dialog drew.
+        struct Case<'a> {
+            footer: &'a str,
+            size: (u16, u16),
+            experimental: bool,
+            notices: &'a [crate::hook_binary::HookBinaryNotice],
+            /// Where the click lands: on the recorded [Close] target.
+            at: (u16, u16),
+        }
+        let cases = [
+            Case {
+                footer: "experimental label",
+                size: (64, 2),
+                experimental: true,
+                notices: &[],
+                at: (14, 1),
+            },
+            Case {
+                footer: "hook notice",
+                size: (80, 2),
+                experimental: false,
+                notices: &notice,
+                at: (20, 1),
+            },
+        ];
+        for Case {
+            footer,
+            size: (width, height),
+            experimental,
+            notices,
+            at,
+        } in cases
+        {
+            let mut ui = default_ui();
+            ui.mode = UiMode::CloseConfirm;
+            let rows = draw_with_footer(&mut ui, width, height, experimental, notices);
+            let shown = rows.join("\n");
+            assert!(
+                !shown.contains("[Close]"),
+                "precondition, {footer}: [Close] is whole:\n{shown}"
+            );
+            let covering = if experimental {
+                "experimental: on"
+            } else {
+                "dot-agent-deck"
+            };
+            assert!(
+                rows[usize::from(at.1)].contains(covering),
+                "precondition, {footer}: the footer row is not drawn:\n{shown}"
+            );
+            assert!(
+                modal_click(&ui, at).is_none(),
+                "{footer}: a click on the covered [Close] still confirms:\n{shown}"
+            );
+            assert_eq!(
+                ui.confirm_choices_drawn,
+                Some((UiMode::CloseConfirm, ChoicesShown::default())),
+                "{footer}: the frame counted a choice:\n{shown}"
+            );
+
+            // Control: the same footer at 80×24 leaves [Close] whole.
+            let mut ui = default_ui();
+            ui.mode = UiMode::CloseConfirm;
+            let rows = draw_with_footer(&mut ui, 80, 24, experimental, notices);
+            assert!(
+                rows[23].contains(covering) || rows[22].contains(covering),
+                "control, {footer}: the footer row is not drawn:\n{}",
+                rows.join("\n")
+            );
+            let (col, row) = find_in_rows(&rows, "[Close]").expect("control: [Close] is drawn");
+            assert!(
+                matches!(
+                    modal_click(&ui, (col + 1, row)),
+                    Some(Action::ConfirmCloseSelected)
+                ),
+                "control, {footer}: a click on the whole [Close] does not confirm"
+            );
+        }
+    }
+
+    /// Scenario: a Close confirmation is drawn at 80×24, then something painted later in the same draw covers part of its [Close] button inside the dialog. A click on that button closes nothing, while [Cancel], still whole, works; with nothing painted over it, [Close] confirms (control).
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_a_button_painted_over_later_in_the_draw_takes_no_click() {
+        for covered in [true, false] {
+            let mut ui = default_ui();
+            ui.mode = UiMode::CloseConfirm;
+            let rows = draw_sized(&mut ui, 80, 24);
+            let close = find_in_rows(&rows, "[Close]").expect("[Close] is drawn");
+            let cancel = find_in_rows(&rows, "[Cancel]").expect("[Cancel] is drawn");
+            let rows = draw_then_paint(&mut ui, 80, 24, false, &[], |frame| {
+                if covered {
+                    frame.render_widget(
+                        Paragraph::new("late"),
+                        Rect::new(close.0 + 2, close.1, 4, 1),
+                    );
+                }
+            });
+            let shown = rows.join("\n");
+            assert_eq!(
+                shown.contains("[Close]"),
+                !covered,
+                "precondition, covered {covered}:\n{shown}"
+            );
+            let clicked = modal_click(&ui, (close.0 + 1, close.1));
+            if covered {
+                assert!(
+                    clicked.is_none(),
+                    "a click on a [Close] painted over after the dialog confirms:\n{shown}"
+                );
+            } else {
+                assert!(
+                    matches!(clicked, Some(Action::ConfirmCloseSelected)),
+                    "control: a click on the whole [Close] does not confirm"
+                );
+            }
+            assert!(
+                matches!(
+                    modal_click(&ui, (cancel.0 + 1, cancel.1)),
+                    Some(Action::DismissModal)
+                ),
+                "covered {covered}: the whole [Cancel] takes no click:\n{shown}"
+            );
+        }
+    }
+
+    /// Scenario: Quit, Close, Stop and ConfigGen are each drawn in a sweep of small terminals, with no footer row, the experimental label, a hook notice, and both. In every final frame each button left clickable reads whole inside the popup where it was recorded, and each choice counted is on screen; at 80×24 every button is clickable (control).
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_every_clickable_confirmation_button_is_whole_in_the_final_frame() {
+        let notice = [wide_hook_notice()];
+        let label_of = |action: &Action| match action {
+            Action::DetachAndQuit => "[Detach]",
+            Action::RequestStop => "[Stop]",
+            Action::DismissModal => "[Cancel]",
+            Action::ConfirmCloseSelected => "[Close]",
+            Action::ConfigGenConfirm => "[Yes]",
+            Action::ConfigGenDismiss => "[No]",
+            Action::ConfigGenSuppress => "[Never]",
+            other => panic!("a confirmation button fires {other:?}"),
+        };
+        let dialogs: [(UiMode, &[&str], usize); 4] = [
+            (UiMode::QuitConfirm, &["Detach", "Stop", "Cancel"], 3),
+            (UiMode::CloseConfirm, &["Cancel", "Close"], 2),
+            (UiMode::StopConfirm, &["No", "Yes"], 0),
+            (UiMode::ConfigGenPrompt, &["Yes", "No", "Never"], 3),
+        ];
+        let footers: [(bool, &[_]); 4] =
+            [(false, &[]), (true, &[]), (false, &notice), (true, &notice)];
+        let widths = [8u16, 12, 16, 20, 24, 32, 40, 48, 56, 64, 68, 72, 80, 100];
+        let mut targets = 0;
+        let mut covered_frames = 0;
+        for (mode, labels, buttons) in dialogs {
+            for (experimental, notices) in footers {
+                for width in widths {
+                    for height in 1u16..=16 {
+                        let mut ui = default_ui();
+                        ui.mode = mode;
+                        ui.stop_confirm_agent_count = 2;
+                        let rows = draw_with_footer(&mut ui, width, height, experimental, notices);
+                        let shown = rows.join("\n");
+                        let at = format!(
+                            "{mode:?} {width}×{height}, experimental {experimental}, notice {}",
+                            !notices.is_empty()
+                        );
+                        let cells = |x: u16, y: u16, width: u16| -> String {
+                            rows[usize::from(y)]
+                                .chars()
+                                .skip(usize::from(x))
+                                .take(usize::from(width))
+                                .collect()
+                        };
+                        for (action, rect) in &ui.modal_button_rects {
+                            targets += 1;
+                            assert_eq!(
+                                cells(rect.x, rect.y, rect.width),
+                                label_of(action),
+                                "{at}: a clickable button is not whole:\n{shown}"
+                            );
+                            // Inside the popup: its left border two columns
+                            // before the row's first button.
+                            let first = ui
+                                .modal_button_rects
+                                .iter()
+                                .map(|(_, rect)| rect.x)
+                                .min()
+                                .unwrap_or(rect.x);
+                            assert_eq!(
+                                cells(first.saturating_sub(2), rect.y, 1),
+                                "│",
+                                "{at}: a clickable button is outside the popup:\n{shown}"
+                            );
+                        }
+                        let (drawn_for, counted) = ui
+                            .confirm_choices_drawn
+                            .expect("the frame drew the confirmation");
+                        assert_eq!(drawn_for, mode, "{at}");
+                        for (i, label) in labels.iter().enumerate() {
+                            let marker = if i == 0 { '>' } else { ' ' };
+                            if counted.contains(i) {
+                                assert!(
+                                    shown.contains(&format!("{marker} {label}")),
+                                    "{at}: counted {label:?}, which is not on screen:\n{shown}"
+                                );
+                            }
+                        }
+                        let footer_on_button_row =
+                            buttons > 0 && height <= 4 && (experimental || !notices.is_empty());
+                        if footer_on_button_row {
+                            covered_frames += 1;
+                        }
+                    }
+                }
+            }
+            // Control: 80×24 leaves every button clickable, with either footer.
+            for (experimental, notices) in footers {
+                let mut ui = default_ui();
+                ui.mode = mode;
+                ui.stop_confirm_agent_count = 2;
+                draw_with_footer(&mut ui, 80, 24, experimental, notices);
+                assert_eq!(
+                    ui.modal_button_rects.len(),
+                    buttons,
+                    "control {mode:?}: not every button is clickable at 80×24"
+                );
+            }
+        }
+        assert!(targets > 0, "the sweep recorded no click target at all");
+        assert!(
+            covered_frames > 0,
+            "the sweep drew no footer on a button row"
+        );
+    }
+
     /// Scenario: with a restart notice held in its footer rows, the user opens the upgrade dialog in a 60×24 terminal, narrower than the dialog needs. The dialog asks for a larger terminal above the notice, which stays in view: no draw clears it.
     #[spec("lifecycle/handshake/013")]
     #[test]
@@ -42818,6 +43248,8 @@ mod tests {
     }
 
     /// Scenario: a dashboard card for this TUI's own pane is selected while that pane is focused. The deck restarts as the same build; its new agent takes the focused pane's id, and another of its agents sorts first. In the frame before the drop and after it, the old pane's focus never selects the new agent's card: the selection falls back to the first card, as a closed card's does, and Enter targets that card, not the new agent. When the deck did not restart, the focused pane still selects its card (control).
+    // The restart fixture is a Unix-socket daemon.
+    #[cfg(unix)]
     #[spec("lifecycle/handshake/013")]
     #[test]
     fn handshake_013_a_lost_panes_focus_never_selects_its_successors_card() {

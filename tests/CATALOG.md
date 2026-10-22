@@ -1757,6 +1757,13 @@ Issue #1794: a daemon must not be left half-alive — hook endpoint up, no attac
 - **Does not assert:** the widening itself, or the wording variants (`prompt/close-confirm/007`).
 - **Platform coverage:** mac+linux+windows.
 
+##### prompt/close-confirm/010 — A `[Close]` button that a footer row paints over takes no click.
+- **Layer:** L2 (real-binary PTY; production draw, the experimental footer row painted after the dialog, SGR mouse decoding and dispatch).
+- **Agent:** none (continued `cat` pane).
+- **Asserts:** with the experimental flag on, a Close confirmation shrunk to 64×2 has its `[Close]` button partly covered by the `experimental: on` label; a click on the place the button was drawn leaves the dialog open and the daemon agent alive. At 80×24 a click on the whole `[Close]` closes it (control).
+- **Does not assert:** the hook-notice and protocol-refusal rows, the other three confirmations or other sizes (`lifecycle/handshake/013`'s L1 sweep covers those).
+- **Platform coverage:** mac+linux.
+
 ##### prompt/close-confirm/009 — A respawn under Pi's STABLE producer key closes nothing, because the armed target is a generation and not a session id (issue #317).
 - **Layer:** L2 (real-binary PTY plus two synthetic `SessionStart` frames delivered through the real daemon hook socket under one pane-derived producer key).
 - **Agent:** none (continued `cat` pane; the hook frames give the same pane two successive agent generations in rendered state).
