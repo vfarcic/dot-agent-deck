@@ -1737,17 +1737,19 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_commit_notice_never_says_no_message_was_taken() {
-        for committed in [
-            Committed::Withheld,
-            Committed::Lost,
-            Committed::TimedOut,
-        ] {
+        for committed in [Committed::Withheld, Committed::Lost, Committed::TimedOut] {
             let notice = committed_notice(committed).unwrap();
             for not in ["no message was taken", "took no message"] {
-                assert!(!notice.contains(not), "{committed:?} says {not:?}: {notice}");
+                assert!(
+                    !notice.contains(not),
+                    "{committed:?} says {not:?}: {notice}"
+                );
             }
             for says in ["did not confirm", "took no further message"] {
-                assert!(notice.contains(says), "{committed:?} lacks {says:?}: {notice}");
+                assert!(
+                    notice.contains(says),
+                    "{committed:?} lacks {says:?}: {notice}"
+                );
             }
         }
     }

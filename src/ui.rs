@@ -28413,7 +28413,11 @@ mod tests {
             h.live = listed("Idle")[0].live.clone();
             h.incarnation = named(attached_on);
             seed_hydrated_card(&mut st, &h);
-            assert_eq!(card(&st), vec![SessionStatus::Idle], "{attached_on}: drawn at once");
+            assert_eq!(
+                card(&st),
+                vec![SessionStatus::Idle],
+                "{attached_on}: drawn at once"
+            );
 
             st.learn_stream_incarnation(named("a"));
             if attached_on == "b" {
