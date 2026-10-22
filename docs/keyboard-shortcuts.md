@@ -224,6 +224,8 @@ While filtering: `Enter` stops editing and keeps the filter, `Backspace` deletes
 | **Host of this deck** | `m` (or `Ctrl+M`) | `Esc`, `q`, `m` or `Ctrl+M` closes it |
 | **Restart notice** | `a`, or `[Agents]` in the footer, while the footer says the deck restarted | `Up` / `Down` (or `k` / `j`) and `PageUp` / `PageDown` scroll the list · `c` dismisses the notice · `Esc`, `q` or `a` closes the list and keeps the notice |
 
+The **Quit**, **Close**, **Stop** and configuration confirmations ignore keys pressed before they appeared, so a key you typed ahead does not choose for you. In a terminal too small to show one of their choices, the keys that would pick it do nothing: press `Esc`, or make the terminal larger. This applies to the TUI's dialogs.
+
 ## Customizing Keybindings
 
 Remap shortcuts in an optional file:

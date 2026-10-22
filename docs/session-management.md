@@ -95,7 +95,7 @@ Long turns affect delivery in both clients:
 - If a task reported as not delivered arrives after all, the orchestrator is told, and the TUI card or desktop tile leaves its delivery error state once no other delivery error remains.
 - A message OpenCode or Pi has kept for an hour without starting on it shows a one-time reminder with **Retry** and **Cancel**; it is not an error, and the agent may still be working on it.
 
-When the deck cannot tell whether an OpenCode or Pi agent got a message, the card or tile says `✉ delivery uncertain`; when a Pi agent has stayed idle for a few minutes without starting on a message the deck handed it, it says `✉ may not have reached the agent`. Both offer **Retry** and **Cancel**, except that a message the deck has already sent as many times as it allows offers only **Cancel**; post it again if it is still needed. Press `i` on the TUI card, or use the tile's buttons. [Orchestration → Delivery](orchestration.md#delivery-in-the-tui-and-desktop-app) explains what each choice does.
+When the deck cannot tell whether a Claude Code, OpenCode or Pi agent got a message, the card or tile says `✉ delivery uncertain`; when a Pi agent has stayed idle for a few minutes without starting on a message the deck handed it, it says `✉ may not have reached the agent`. Both offer **Retry** and **Cancel**, except that a message the deck has already sent as many times as it allows offers only **Cancel**; post it again if it is still needed. Press `i` on the TUI card, or use the tile's buttons. [Orchestration → Delivery](orchestration.md#delivery-in-the-tui-and-desktop-app) explains what each choice does.
 
 ## What a TUI card shows
 

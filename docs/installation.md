@@ -438,6 +438,20 @@ If you keep an older daemon, features added by the newer release may not work ag
 
 If the upgrade moved the binary to a new path (for example, you switched from a download to Homebrew), run `dot-agent-deck hooks install` for each agent you use so the hooks point at the new path. When the upgraded desktop app finds the daemon on this machine running the older release, it restarts the daemon onto its own version as the TUI does, asking first when agents are running ([Desktop app → Daemons → Upgrade the CLI and the daemon on this machine](desktop/daemons.md#upgrade-the-cli-and-the-daemon-on-this-machine)); if its Dashboard says **Incompatible daemon**, see [Keep the app and the daemon on the same release](#keep-the-app-and-the-daemon-on-the-same-release).
 
+### When the deck, the app and the hooks are on different releases
+
+Some releases change how the deck's parts talk to each other, and then an older part and a newer one refuse to work together rather than misread each other. Each part says so, and the usual fix is to bring the older part up to the newer release:
+
+| What is older | What you see | What to do |
+|---|---|---|
+| The daemon, compared with the TUI | When the TUI starts, the mismatch prompt says `This binary cannot attach to it`; if the daemon is replaced while the TUI is open, a footer row says `⚠ Not attaching: daemon speaks attach protocol vN, but this binary speaks vM` | Restart the daemon on the new release (`S` in the prompt, which stops its agents), or keep using the TUI release the daemon came from. See [Troubleshooting](troubleshooting.md#daemon-speaks-attach-protocol-vn-but-this-binary-speaks-vm). |
+| The TUI, compared with the daemon | The same refusal, naming the two protocols | Run the TUI from the daemon's release. |
+| The daemon or the desktop app, compared with the other | **Incompatible daemon** on the Dashboard, saying which of the two is older and that the two cannot work together | Update the older one ([Keep the app and the daemon on the same release](#keep-the-app-and-the-daemon-on-the-same-release)); for a remote daemon older than the app, press **Upgrade**. |
+| Claude Code's hooks, compared with the daemon | The agent's card or tile says `this agent's deck hooks run a dot-agent-deck too old for its messages`, with the command to run, and the agent's messages wait | Run the command it names, usually `dot-agent-deck hooks install --agent claude-code`, then restart the agent. See [A card says the deck integration is out of date, too old, or not connected](troubleshooting.md#a-card-says-the-deck-integration-is-out-of-date-too-old-or-not-connected). |
+| The daemon, compared with Claude Code's hooks | Claude Code shows an error from the deck's hook saying the deck daemon did not answer in time or did not confirm that it serves message receipts, and the agent's messages wait | Restart the daemon on the hooks' release, or run `dot-agent-deck hooks install --agent claude-code` with the release the daemon runs, then restart the agent. See [Claude Code shows an error from the deck's hook](troubleshooting.md#claude-code-shows-an-error-from-the-decks-hook). |
+
+On a remote host, upgrade the remote deck before connecting to it from a newer desktop app.
+
 ## Versioning
 
 While the version is `0.x`:

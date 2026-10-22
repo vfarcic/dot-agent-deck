@@ -77,7 +77,7 @@ What each status means, and which agents can report Blocked, is on [Session Mana
 
 ## Message delivery and handoffs
 
-Agent tiles show `✉N queued` while messages await acknowledgement, and `✉ delivered` when received and nothing remains pending. If delivery fails, the tile reads **error** and shows `not delivered: …`. When the deck cannot tell whether a message reached an OpenCode or Pi agent (`✉ delivery uncertain`), or a Pi agent has stayed idle without starting on one (`✉ may not have reached the agent`), the tile lists each such message with its explanation and **Retry** and **Cancel** buttons. The TUI cards show the same states, with **Error** as the status and `✉N` on narrow cards, and list the messages when you press `i`.
+Agent tiles show `✉N queued` while messages await acknowledgement, and `✉ delivered` when received and nothing remains pending. If delivery fails, the tile reads **error** and shows `not delivered: …`. When the deck cannot tell whether a message reached a Claude Code, OpenCode or Pi agent (`✉ delivery uncertain`), or a Pi agent has stayed idle without starting on one (`✉ may not have reached the agent`), the tile lists each such message with its explanation and **Retry** and **Cancel** buttons. The TUI cards show the same states, with **Error** as the status and `✉N` on narrow cards, and list the messages when you press `i`.
 
 The handoff rail tracks worker handoffs with `delegated · queued`, `delivered · working`, `work-done` and `not delivered`. It is a desktop surface; in the TUI, follow the role cards and the orchestrator's pane. A delivered message is a receipt, so read the worker's report before treating its work as complete.
 
@@ -172,3 +172,5 @@ A daemon section shows one of these instead of its agents:
 | **No agents are running yet** | The daemon is healthy and runs no agents. This is what a fresh install looks like. | Press **New agent**. |
 
 ![The desktop app's dashboard with a healthy daemon and no agents: “No agents are running yet”](/img/dashboard-empty-desktop.png)
+
+When a daemon restarts while the app is connected to it, the agents it was running can no longer be reached, so the app removes their tiles and open panes and shows one notice in the corner naming each of them, with its role and orchestration, such as `The deck restarted; these agents were stopped: coder (worker in team), api-fix.` The notice lists every agent, scrolling when the list is long, and stays until you close it with its `×`; agents a later restart stops join it. Nothing is stopped or deleted to remove them. The TUI shows the same notice above its footer. See [The deck restarted and its agents disappeared](../troubleshooting.md#the-deck-restarted-and-its-agents-disappeared).
