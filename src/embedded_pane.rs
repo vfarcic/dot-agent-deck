@@ -7756,12 +7756,16 @@ mod incarnation_binding_tests {
             if restarted {
                 daemon.restart_as("b");
             }
+            // Neither rename is answered before both are sent; otherwise the
+            // first can settle alone and is then rightly its own last.
+            daemon.hold();
             controller
                 .rename_pane(&pane, "first")
                 .expect("taken locally");
             controller
                 .rename_pane(&pane, "second")
                 .expect("taken locally");
+            daemon.release();
             let answers = std::cell::RefCell::new(Vec::new());
             wait_for("both renames to be answered", || {
                 answers

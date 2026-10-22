@@ -8904,6 +8904,9 @@ pub(crate) mod restart_fixture {
         /// Every request but `hello`, as `(process, request)`.
         requests: Arc<Mutex<Vec<(&'static str, serde_json::Value)>>>,
         script: Arc<Mutex<Script>>,
+        /// Open unless [`Self::hold`] closed it: a connection accepted while
+        /// it is closed is answered only once it opens.
+        gate: Arc<tokio::sync::watch::Sender<bool>>,
         server: tokio::task::JoinHandle<()>,
     }
 
@@ -8961,17 +8964,21 @@ pub(crate) mod restart_fixture {
                 current: first,
                 ..Script::default()
             }));
+            let gate = Arc::new(tokio::sync::watch::channel(true).0);
             let server = {
                 let recorded = Arc::clone(&recorded);
                 let requests = Arc::clone(&requests);
                 let script = Arc::clone(&script);
+                let gate = Arc::clone(&gate);
                 tokio::spawn(async move {
                     while let Ok(mut stream) = listener.accept().await {
                         let process = script.lock().unwrap().current;
                         let recorded = Arc::clone(&recorded);
                         let requests = Arc::clone(&requests);
                         let script = Arc::clone(&script);
+                        let mut open = gate.subscribe();
                         tokio::spawn(async move {
+                            let _ = open.wait_for(|open| *open).await;
                             let mut follow_on = true;
                             while std::mem::take(&mut follow_on) {
                                 let Ok(Some((KIND_REQ, payload))) = read_frame(&mut stream).await
@@ -9039,8 +9046,22 @@ pub(crate) mod restart_fixture {
                 recorded,
                 requests,
                 script,
+                gate,
                 server,
             }
+        }
+
+        /// Connections accepted from now on wait, unanswered, until
+        /// [`Self::release`]. This fixture answers one request per
+        /// connection, so that is every answer asked for meanwhile.
+        pub(crate) fn hold(&self) {
+            self.gate.send_replace(false);
+        }
+
+        /// Answer the connections [`Self::hold`] kept waiting, and every one
+        /// after them.
+        pub(crate) fn release(&self) {
+            self.gate.send_replace(true);
         }
 
         /// The daemon restarts now: every connection accepted from here on is
