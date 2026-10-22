@@ -47,7 +47,7 @@ fn handshake_013_the_restart_notice_has_a_footer_row_of_its_own() {
     );
 }
 
-/// Scenario: A deck restart stopped five agents while the user types a filter. The filter's field and the notice are both in the footer: the notice names the first three agents and says there are two more, and at ninety columns its buttons take a row of their own below it rather than cut it short. Typing `ac` into Filter or Rename edits the field and keeps the notice without command-mode key hints; Help and confirmation dialogs also retain their keyboard ownership and leave the notice visible.
+/// Scenario: A deck restart stopped five agents while the user types a filter; the field and the notice share the footer without stealing typed `ac`. Help and confirmation dialogs retain keyboard ownership and leave the notice visible when both fit. At forty rows Help instead draws completely over the notice, which returns when Help closes.
 #[spec("lifecycle/handshake/013")]
 #[test]
 fn handshake_013_the_restart_notice_shows_beside_a_text_field() {
@@ -98,7 +98,7 @@ fn handshake_013_the_restart_notice_shows_beside_a_text_field() {
             None,
             &[key(KeyCode::Char('a')), key(KeyCode::Char('c'))],
             120,
-            40,
+            if mode == UiMode::Help { 48 } else { 40 },
         );
         for frame in &frames[1..] {
             let shown = text(frame);
@@ -113,6 +113,50 @@ fn handshake_013_the_restart_notice_shows_beside_a_text_field() {
             assert!(!shown.contains("│ Restart notice"), "{mode:?}: {shown}");
         }
     }
+    let help = render_restart_notice_key_sequence_to_buffers(
+        &["coder", "reviewer"],
+        UiMode::Help,
+        None,
+        &[key(KeyCode::Esc)],
+        120,
+        40,
+    );
+    let open = text(&help[0]);
+    let without_notice =
+        render_restart_notice_key_sequence_to_buffers(&[], UiMode::Help, None, &[], 120, 40);
+    let help_rows = |shown: &str| {
+        shown
+            .lines()
+            .filter_map(|line| {
+                let start = line.find('│')?;
+                let end = line.rfind('│')?;
+                Some(line[start..end + '│'.len_utf8()].to_string())
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        help_rows(&open),
+        help_rows(&text(&without_notice[0])),
+        "the notice clipped Help content"
+    );
+    assert!(
+        open.lines()
+            .any(|line| line.contains("a / c") && line.contains("Restart notice: list / dismiss")),
+        "Help lost its last binding: {open}"
+    );
+    assert!(
+        open.contains("Press ? or Esc"),
+        "Help lost its closing hint: {open}"
+    );
+    assert!(
+        !open.contains("these agents were stopped:"),
+        "Help did not take the full frame: {open}"
+    );
+    let closed = text(&help[1]);
+    assert!(
+        closed.contains("these agents were stopped: coder, reviewer."),
+        "closing Help lost the notice: {closed}"
+    );
 }
 
 /// Scenario: A deck restart stopped twenty agents, more than a sixteen-row terminal shows at once. Press `a` to open the list of every agent the notice names, then PageDown to its end: the title says which of the twenty are shown and the last agent is on screen. Escape closes the list and the footer still shows the notice.

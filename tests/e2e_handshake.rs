@@ -946,7 +946,7 @@ fn handshake_013_the_held_notice_survives_filter_and_joins_later_restarts() {
     );
 }
 
-/// Scenario: Start an empty TUI and surface a card without attaching it, then restart its private daemon reusing its ids. With event subscriptions held, stale close, digit and Enter refuse visibly and leave the successor alive with no input; the same-process actions still work (controls). Once subscriptions resume, the old card disappears with one notice, selection falls back to an earlier fresh card rather than the same-pane successor, and Enter opens only that earlier card.
+/// Scenario: Start an empty TUI and surface a card without attaching it, then restart its private daemon reusing its ids. With event subscriptions held, stale close, digit and Enter refuse visibly and leave the successor alive with no input; same-process actions still work, and a closed card stays closed through a resync that discovers a new agent. Once subscriptions resume after a restart, the old card disappears with one notice, selection falls back to an earlier fresh card named `first` rather than the same-pane successor, and Enter opens only that earlier card.
 #[spec("lifecycle/handshake/013")]
 #[test]
 fn handshake_013_a_never_attached_card_refuses_close_digit_and_enter_after_restart() {
@@ -996,13 +996,43 @@ fn handshake_013_a_never_attached_card_refuses_close_digit_and_enter_after_resta
                         deck.wait_for_string("Close selected agent?");
                         deck.send_keys(b"\x1b[B\r");
                         deck.wait_for_string("No active agents");
+                        assert_eq!(proxy.attach_count(), 0, "control: close needs no attach");
+                        let subscribed = proxy.subscription_count();
+                        proxy.hold_events(true);
+                        proxy.disconnect();
+                        let fresh = pane(&original, "after-close-resync");
+                        proxy.hold_events(false);
+                        deck.wait_until_grid(
+                            "resync discovers the fresh card without reviving the closed one",
+                            |grid| {
+                                proxy.subscription_count() > subscribed
+                                    && grid.contains("after-close-resync")
+                                    && grid.contains("1 agent(s)")
+                            },
+                        );
+                        let grid = deck.snapshot_grid();
+                        assert!(
+                            !grid
+                                .lines()
+                                .any(|line| (line.contains('┌') || line.contains('┏'))
+                                    && line.contains("never-attached-card")),
+                            "a card closed in this TUI returned after resync: {grid}"
+                        );
+                        assert!(
+                            !grid.contains("The deck restarted"),
+                            "same-process resync claimed a restart: {grid}"
+                        );
                         assert!(wait_for_agent_display_name(
                             &original.attach_socket,
                             "never-attached-card",
                             false,
                             Duration::from_secs(5)
                         ));
-                        assert_eq!(proxy.attach_count(), 0, "control: close needs no attach");
+                        drained(&fresh);
+                        assert!(
+                            std::fs::read(&fresh.capture).unwrap().is_empty(),
+                            "resync sent input to the fresh agent"
+                        );
                     }
                     "digit" | "enter" | "drop" => {
                         deck.send_keys(if action == "digit" { b"1" } else { b"\r" });
@@ -1061,13 +1091,13 @@ fn handshake_013_a_never_attached_card_refuses_close_digit_and_enter_after_resta
                 status(&successor, earlier, "session_start", "claude_code");
                 status(&successor, earlier, "idle", "claude_code");
                 status(&successor, &new, "thinking", "claude_code");
-                let earlier_title = format!("doorbell-{}", earlier.agent);
+                let earlier_title = "first";
                 deck.wait_until_grid("drop notice and two fresh cards", |grid| {
                     grid.contains(
                         "The deck restarted; these agents were stopped: never-attached-card.",
                     ) && grid.contains("2 agent(s)")
                         && grid.contains("Thinking")
-                        && grid.contains(&earlier_title)
+                        && grid.contains(earlier_title)
                 });
                 let grid = deck.snapshot_grid();
                 // The old label is allowed in the notice, never in a card.
@@ -1081,7 +1111,7 @@ fn handshake_013_a_never_attached_card_refuses_close_digit_and_enter_after_resta
                 assert!(
                     grid.lines().any(|line| line
                         .split(['┌', '┏'])
-                        .any(|card| { card.contains('▸') && card.contains(&earlier_title) })),
+                        .any(|card| { card.contains('▸') && card.contains(earlier_title) })),
                     "selection inherited the same-pane successor instead of falling back: {grid}"
                 );
                 assert!(!grid.contains(" Gone "), "retired card was kept: {grid}");
@@ -1262,7 +1292,7 @@ fn handshake_013_auto_reattach_never_adopts_a_same_pane_successor() {
     );
 }
 
-/// Scenario: Rename an attached agent successfully, then restart its private daemon as the same build. Hold its original terminal transport and event subscriptions so a stale rename can be refused visibly before the restart is learned, then release them: the old card and pane disappear with a notice naming the confirmed label, and the successor remains alive, unrenamed and receives no input.
+/// Scenario: Rename an attached agent successfully, then restart its private daemon as the same build. Hold its original terminal transport and event subscriptions so a stale rename can be refused visibly before the restart is learned, then release them: the old card and pane disappear with a notice naming the confirmed label, and a successor card appears with its own name. Open and cancel a fresh Rename editor, then open New Agent; the successor remains alive, unrenamed and receives no terminal input.
 #[spec("lifecycle/handshake/013")]
 #[test]
 fn handshake_013_a_stale_rename_shows_the_gone_sentence() {
@@ -1330,10 +1360,22 @@ fn handshake_013_a_stale_rename_shows_the_gone_sentence() {
     proxy.hold_events(false);
     proxy.hold_terminal_eof(false);
     deck.wait_for_string("The deck restarted; these agents were stopped: rename-control.");
-    deck.wait_for_string("No active agents");
+    deck.wait_until_grid("the successor has its own named card", |grid| {
+        grid.lines().any(|line| {
+            (line.contains('┌') || line.contains('┏')) && line.contains("rename-successor")
+        })
+    });
     deck.send_keys(b"r");
-    // A subsequent key opens a known form, proving r was processed without
-    // leaving a stale rename editor accepting the user's next keystrokes.
+    deck.wait_for_string("Rename:");
+    let editor = deck.snapshot_grid();
+    assert!(
+        !editor.contains("stale-rename"),
+        "the fresh Rename editor retained the refused draft: {editor}"
+    );
+    deck.send_keys(b"\x1b");
+    deck.wait_until_grid("Escape closes the fresh Rename editor", |grid| {
+        !grid.contains("Rename:")
+    });
     deck.send_keys(b"\x0e");
     deck.wait_for_string("Select Directory");
     let grid = deck.snapshot_grid();
@@ -1342,10 +1384,18 @@ fn handshake_013_a_stale_rename_shows_the_gone_sentence() {
         "stale rename editor stayed open: {grid}"
     );
     assert!(
-        !grid
-            .lines()
-            .any(|line| line.contains('│') && line.contains("rename-control")),
+        !grid.lines().any(
+            |line| (line.contains('│') || line.contains('┌') || line.contains('┏'))
+                && line.contains("rename-control")
+        ),
         "old card was kept: {grid}"
+    );
+    assert!(
+        !grid.lines().any(
+            |line| (line.contains('│') || line.contains('┌') || line.contains('┏'))
+                && line.contains("stale-rename")
+        ),
+        "refused title appeared on a card: {grid}"
     );
     assert!(
         wait_for_agent_display_name(
