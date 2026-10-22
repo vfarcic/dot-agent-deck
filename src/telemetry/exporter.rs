@@ -38,11 +38,13 @@
 //! goes back into the buffer, and the final flush sends it with the runs the
 //! shutdown ends, within the shutdown's budget rather than after the export
 //! timeout. The spans the shutdown ends wait for room in the export queue
-//! within that budget instead of being dropped when it is full.
+//! within that budget instead of being dropped when it is full. The budget
+//! also ends early enough for the daemon to exit inside the window its stop
+//! client waits for: see [`Telemetry::shutdown`].
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -77,6 +79,15 @@ pub const RETRY_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 pub const RETRY_MAX_BACKOFF: Duration = Duration::from_secs(5);
 /// How much of the shutdown budget cancelling the run-context probes may use.
 const PROBE_SHUTDOWN_BUDGET: Duration = Duration::from_millis(500);
+/// How long a stop client waits for the daemon to exit after asking it to
+/// stop: `daemon stop`'s `STOP_GRACE_TIMEOUT` (`src/daemon_stop.rs:52`) and the
+/// build-mismatch prompt's, whichever is tighter. Past it plain `daemon stop`
+/// reports a timeout and `daemon stop --force` kills the daemon mid-teardown.
+const STOP_CLIENT_WINDOW: Duration = crate::agent_pty::DAEMON_STOP_POLL_BUDGET;
+/// What the final flush leaves of [`STOP_CLIENT_WINDOW`] for the rest of the
+/// daemon's teardown after it: closing its sockets, stopping what is left and
+/// exiting, while the client samples only every 100 ms.
+pub const SHUTDOWN_HEADROOM: Duration = Duration::from_millis(500);
 /// Bytes of a successful answer read, at most, for its partial-success report.
 const MAX_RESPONSE_BODY: usize = 64 * 1024;
 /// Characters of a backend's own error message logged, at most.
@@ -217,6 +228,9 @@ struct Exporting {
     commands: mpsc::UnboundedSender<Command>,
     probes: Probes,
     ingest: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// When the daemon was first asked to stop, if it was by a signal — see
+    /// [`Telemetry::teardown_began`].
+    teardown_began: OnceLock<std::time::Instant>,
 }
 
 /// See the module docs. Cheap to share: clone the `Arc` it is held in.
@@ -565,15 +579,37 @@ impl Telemetry {
         }
     }
 
-    /// Daemon shutdown, bounded by `budget` in all: make an export in flight
-    /// give way, cancel the run-context probes (killing their processes), end
-    /// every open run as `daemon_shutdown` once the events already broadcast
-    /// are applied, and send what the exporter holds, retrying only while the
-    /// budget lasts.
+    /// The daemon was asked to stop at `at`: a stop client's window opened
+    /// then, and its teardown — stopping every agent first — runs before
+    /// [`Self::shutdown`] is called. The first call counts.
+    pub fn teardown_began(&self, at: std::time::Instant) {
+        if let Some(exporting) = &self.exporting {
+            let _ = exporting.teardown_began.set(at);
+        }
+    }
+
+    /// Daemon shutdown, bounded in all by `budget`, or by what is left of the
+    /// stop client's window when that is less — the window since
+    /// [`Self::teardown_began`] (since now when it was not called), less
+    /// [`SHUTDOWN_HEADROOM`] — so a slow backend cannot make the daemon's
+    /// stop time out: what it has not taken by then is dropped, and logged.
+    ///
+    /// Make an export in flight give way, cancel the run-context probes
+    /// (killing their processes), end every open run as `daemon_shutdown` once
+    /// the events already broadcast are applied, and send what the exporter
+    /// holds, retrying only while the budget lasts. Returns as soon as that is
+    /// done, at once when nothing is pending.
     pub async fn shutdown(&self, budget: Duration) {
         let Some(exporting) = &self.exporting else {
             return;
         };
+        let now = std::time::Instant::now();
+        let began = exporting.teardown_began.get().copied().unwrap_or(now);
+        let budget = budget.min(
+            STOP_CLIENT_WINDOW
+                .saturating_sub(now.saturating_duration_since(began))
+                .saturating_sub(SHUTDOWN_HEADROOM),
+        );
         let deadline = deadline_after(budget);
         exporting.shared.stopping.send_replace(true);
         exporting
@@ -783,6 +819,7 @@ fn start_exporting(
         commands,
         probes: Probes::new(settings.probes),
         ingest: Mutex::new(Some(ingest)),
+        teardown_began: OnceLock::new(),
     })
 }
 
@@ -3054,6 +3091,79 @@ mod tests {
             "the final run was sent"
         );
         exporter.abort();
+    }
+
+    /// A telemetry handle exporting over HTTP to `addr`, with the default
+    /// export timeout.
+    fn exporting_to(addr: std::net::SocketAddr) -> Arc<Telemetry> {
+        let endpoint = format!("http://{addr}");
+        let telemetry = Telemetry::start(&env(&[("OTEL_EXPORTER_OTLP_ENDPOINT", &endpoint)]));
+        assert!(telemetry.is_exporting());
+        Arc::new(telemetry)
+    }
+
+    /// Qodo on PR #1814: the daemon stopped late in a stop client's window —
+    /// its agents took their grace — and the backend stalls the final flush.
+    /// The shutdown keeps to what is left of the window, not to the budget it
+    /// was given, and says the spans were dropped.
+    #[tokio::test]
+    async fn a_stalled_flush_keeps_to_what_is_left_of_the_stop_window() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let logs = Captured::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new(
+                "dot_agent_deck::telemetry=trace",
+            ))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(move || writer.clone()),
+            );
+        let _guard = crate::test_isolation::capture_tracing_on_this_thread(subscriber);
+
+        let (addr, mut requests) = stalling_receiver().await;
+        let telemetry = exporting_to(addr);
+        begin(&telemetry, generation("p1", "a1"), &[]);
+        telemetry.settled().await;
+        let left = Duration::from_millis(300);
+        telemetry.teardown_began(
+            std::time::Instant::now() - (STOP_CLIENT_WINDOW - SHUTDOWN_HEADROOM - left),
+        );
+
+        let started = std::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            telemetry.shutdown(Duration::from_secs(60)),
+        )
+        .await
+        .expect("the shutdown kept to the stop window");
+        let took = started.elapsed();
+        assert!(took < left + Duration::from_millis(700), "{took:?}");
+        assert!(
+            requests.try_recv().is_ok(),
+            "the final flush reached the backend, which held it"
+        );
+        let logged = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("spans dropped"), "{logged}");
+    }
+
+    /// With nothing to send, the shutdown returns at once, whatever its
+    /// budget, even with the backend stalling.
+    #[tokio::test]
+    async fn a_shutdown_with_nothing_pending_returns_at_once() {
+        let (addr, mut requests) = stalling_receiver().await;
+        let telemetry = exporting_to(addr);
+        let started = std::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            telemetry.shutdown(Duration::from_secs(60)),
+        )
+        .await
+        .expect("the shutdown returned");
+        let took = started.elapsed();
+        assert!(took < Duration::from_millis(500), "{took:?}");
+        assert!(requests.try_recv().is_err(), "nothing was sent");
     }
 
     /// Thread 3: a 200 that reports spans the backend did not accept, in

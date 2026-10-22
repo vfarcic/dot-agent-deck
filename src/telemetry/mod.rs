@@ -68,8 +68,42 @@ pub fn start_for_daemon(
     if telemetry.is_enabled() {
         registry.set_telemetry(Arc::clone(&telemetry));
     }
+    if telemetry.is_exporting() {
+        note_termination_signal(&telemetry);
+    }
     telemetry
 }
+
+/// Tell `telemetry` when a termination signal reaches the daemon: `daemon
+/// stop` and the build-mismatch prompt stop it with one and wait a fixed
+/// window for it to exit, which the final flush must fit in. Only listens:
+/// the daemon's own signal watch, which installs handlers for both signals
+/// whether or not telemetry is on, does the stopping.
+#[cfg(unix)]
+fn note_termination_signal(telemetry: &Arc<Telemetry>) {
+    use tokio::signal::unix::{SignalKind, signal};
+    let (Ok(mut sigterm), Ok(mut sigint)) = (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::interrupt()),
+    ) else {
+        return;
+    };
+    let telemetry = Arc::downgrade(telemetry);
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = sigterm.recv() => {}
+            _ = sigint.recv() => {}
+        }
+        if let Some(telemetry) = telemetry.upgrade() {
+            telemetry.teardown_began(std::time::Instant::now());
+        }
+    });
+}
+
+/// Here a stop arrives as a `KIND_SHUTDOWN` frame, which telemetry does not
+/// see, so the flush is sized from when it starts.
+#[cfg(not(unix))]
+fn note_termination_signal(_telemetry: &Arc<Telemetry>) {}
 
 /// The spawn path, before the agent process exists: prepare this generation's
 /// run and add its identity to the agent's environment. `None` when telemetry
