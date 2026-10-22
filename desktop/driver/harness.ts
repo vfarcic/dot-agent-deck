@@ -11,6 +11,7 @@
 
 import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { connect, createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -134,16 +135,16 @@ async function freePorts(count: number): Promise<number[]> {
 }
 
 /**
- * Issue #1795 — throw if the native driver logged that it could not bind its
- * port, for use inside the readiness probe. tauri-driver stays up with nothing
- * behind it, so `assertRunning` sees no exit, and without this the wait's
- * timeout would name no cause: the line is in `driver.log` and nowhere else.
+ * Issue #1795 — the line in `log` where the native driver said it could not
+ * bind its port, if it did. tauri-driver stays up with nothing behind it, so
+ * `assertRunning` sees no exit, and the line is in `driver.log` and nowhere
+ * else. Read asynchronously because it runs on every readiness poll.
  */
-function assertNativeDriverListening(log: string): void {
-  const failure = readFileSync(log, "utf8")
+async function nativeDriverBindFailure(log: string): Promise<string | undefined> {
+  return (await readFile(log, "utf8"))
     .split("\n")
-    .find((line) => line.includes("Unable to listen for HTTP server"));
-  if (failure) throw new Error(`the native driver could not bind its port: ${failure.trim()}`);
+    .find((line) => line.includes("Unable to listen for HTTP server"))
+    ?.trim();
 }
 
 function run(file: string, args: string[], env: NodeJS.ProcessEnv): Promise<{ code: number; stdout: string }> {
@@ -371,11 +372,15 @@ export class Deck {
       driverLog,
     );
     const base = `http://127.0.0.1:${port}`;
-    await waitFor("tauri-driver to accept sessions", async () => {
+    // A bind failure is an answer, not a retry: `waitFor` retries a probe that
+    // throws until its deadline, so the probe returns it and it is thrown here.
+    const { bindFailure } = await waitFor("tauri-driver to accept sessions", async () => {
       assertRunning(this.driver, "tauri-driver");
-      assertNativeDriverListening(driverLog);
-      return serverReady(base);
+      const failure = await nativeDriverBindFailure(driverLog);
+      if (failure) return { bindFailure: failure };
+      return (await serverReady(base)) && { bindFailure: undefined };
     });
+    if (bindFailure) throw new Error(`the native driver could not bind its port: ${bindFailure}`);
     this.session = await Session.open(base, paths.app);
     // Past `about:blank` first: the webview's initial empty document is
     // complete, and already carries the Tauri internals, before the app's own
