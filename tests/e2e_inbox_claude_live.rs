@@ -341,11 +341,11 @@ fn claude_014_live_killed_waiter_falls_back_to_injection() {
     );
 }
 
-/// The pids from `pid`'s parent up, read with `ps`.
+/// The pids from `pid`'s parent up, read with `ps`, at most 64 of them.
 fn ancestors_of(pid: u32) -> Vec<u32> {
     let mut chain = Vec::new();
     let mut current = pid;
-    for _ in 0..64 {
+    while chain.len() < 64 {
         let out = std::process::Command::new("ps")
             .args(["-o", "ppid=", "-p", &current.to_string()])
             .output()
