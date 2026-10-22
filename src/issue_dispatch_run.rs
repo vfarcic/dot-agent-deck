@@ -1531,7 +1531,7 @@ async fn write_claim_record(
 ) -> Result<(), String> {
     use crate::issue_dispatch::{
         authenticated_user_argv, create_claim_record_argv, edit_claim_record_argv,
-        find_own_claim_record, issue_comments_argv, parse_authenticated_user_id,
+        find_own_claim_record, issue_comments_argv, next_claim_time, parse_authenticated_user_id,
         render_claim_record, sanitize_claim_error,
     };
     if run.account.is_none() {
@@ -1555,9 +1555,17 @@ async fn write_claim_record(
     .await?;
     let own = find_own_claim_record(&comments, task_name, &run.host_id, user_id)
         .map_err(|e| sanitize_claim_error(&e))?;
-    let body = render_claim_record(task_name, &run.host_id, chrono::Utc::now());
+    let claimed_at = next_claim_time(
+        chrono::Utc::now(),
+        own.as_ref().and_then(|record| record.claimed_at),
+    );
+    let body = render_claim_record(task_name, &run.host_id, claimed_at);
     match own {
-        Some(id) => {
+        Some(record) => {
+            let id = record.id;
+            // Guaranteed by `next_claim_time`: an edit that repeated the body
+            // would leave `updated_at`, the claim's clock, where it was.
+            debug_assert_ne!(body, record.body, "a re-claim must change the record");
             gh_claim_call(
                 &edit_claim_record_argv(repo, id, &body),
                 "editing the claim comment",

@@ -353,8 +353,10 @@ pub struct ClaimRecord {
 ///
 /// The claim time is what makes a re-claim's body differ from the record it
 /// edits: GitHub leaves a comment's `updated_at` alone when an edit repeats the
-/// same body, and `updated_at` is the claim's clock. It carries milliseconds so
-/// two claims within one second still differ.
+/// same body, and `updated_at` is the claim's clock. It carries milliseconds,
+/// and a re-claim takes its time from [`next_claim_time`], which is at least a
+/// millisecond past the time the edited record carries, so the two bodies
+/// differ even when the wall clock repeats or steps back.
 pub fn render_claim_record(
     task: &str,
     host_id: &str,
@@ -370,6 +372,23 @@ pub fn render_claim_record(
         quote(host_id),
         quote(&claimed_at)
     )
+}
+
+/// The claim time to write when `previous` is the claim time of the record
+/// being edited (`None` for a new record, or one with no readable time):
+/// `now`, unless that is not past `previous`, in which case one millisecond
+/// after `previous`. The record renders its time to the millisecond, so the
+/// result always renders differently from the time the edited record holds —
+/// a wall clock that repeats a millisecond, or is corrected backwards, cannot
+/// re-render the same body. A record whose time is in the future therefore
+/// carries each re-claim one millisecond further until the clock catches up.
+pub fn next_claim_time(
+    now: chrono::DateTime<chrono::Utc>,
+    previous: Option<chrono::DateTime<chrono::Utc>>,
+) -> chrono::DateTime<chrono::Utc> {
+    previous
+        .and_then(|previous| previous.checked_add_signed(chrono::Duration::milliseconds(1)))
+        .map_or(now, |floor| now.max(floor))
 }
 
 /// Parse a comment body as a claimant record. Only a body whose first line is
@@ -407,12 +426,23 @@ pub fn parse_claim_record(body: &str) -> Option<ClaimRecord> {
     })
 }
 
+/// This deck's own claimant record, as [`find_own_claim_record`] found it: the
+/// comment's id, its body as GitHub returned it, and the claim time that body
+/// carries, if any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnClaimRecord {
+    pub id: u64,
+    pub body: String,
+    pub claimed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// Find this deck's own claimant record in the output of
-/// [`issue_comments_argv`], returning its comment id. A record is this deck's
-/// only when its body names the same `task` AND the same `host_id` AND the
-/// comment was written by the account `user_id` (PRD #421 amendment item 7),
-/// whatever claim time it carries, or none. A body is anyone's to copy, so a
-/// matching body by someone else is skipped and the search goes on.
+/// [`issue_comments_argv`], returning its comment id, body and claim time. A
+/// record is this deck's only when its body names the same `task` AND the
+/// same `host_id` AND the comment was written by the account `user_id` (PRD
+/// #421 amendment item 7), whatever claim time it carries, or none. A body is
+/// anyone's to copy, so a matching body by someone else is skipped and the
+/// search goes on.
 ///
 /// `gh api --paginate` prints one JSON array per page back to back, and every
 /// page is parsed even after an own record turns up, so a stream that goes bad
@@ -424,7 +454,7 @@ pub fn find_own_claim_record(
     task: &str,
     host_id: &str,
     user_id: u64,
-) -> Result<Option<u64>, String> {
+) -> Result<Option<OwnClaimRecord>, String> {
     #[derive(serde::Deserialize)]
     struct Author {
         id: u64,
@@ -446,17 +476,18 @@ pub fn find_own_claim_record(
         if own.is_some() {
             continue;
         }
-        own = page
-            .into_iter()
-            .find(|comment| {
-                comment.user.as_ref().is_some_and(|user| user.id == user_id)
-                    && comment
-                        .body
-                        .as_deref()
-                        .and_then(parse_claim_record)
-                        .is_some_and(|record| record.task == task && record.host == host_id)
+        own = page.into_iter().find_map(|comment| {
+            if !comment.user.as_ref().is_some_and(|user| user.id == user_id) {
+                return None;
+            }
+            let body = comment.body?;
+            let record = parse_claim_record(&body)?;
+            (record.task == task && record.host == host_id).then_some(OwnClaimRecord {
+                id: comment.id,
+                body,
+                claimed_at: record.claimed_at,
             })
-            .map(|comment| comment.id);
+        });
     }
     Ok(own)
 }
@@ -956,7 +987,9 @@ mod tests {
 
     #[test]
     fn a_re_claim_renders_a_body_that_differs_from_the_record_it_edits() {
-        // GitHub moves `updated_at` only when an edit changes the body.
+        // GitHub moves `updated_at` only when an edit changes the body. A
+        // later millisecond renders a different body; `next_claim_time` is
+        // what makes the re-claim's time a later one.
         assert_ne!(
             render_claim_record("t", "h", at("2026-10-22T05:00:13.000Z")),
             render_claim_record("t", "h", at("2026-10-22T05:00:13.001Z")),
@@ -1056,6 +1089,12 @@ mod tests {
         serde_json::json!({"id": id, "user": {"id": user, "login": "x"}, "body": body})
     }
 
+    /// The comment id [`find_own_claim_record`] picks, for the tests that are
+    /// about which comment matches rather than what it carries.
+    fn own_id(json: &str, task: &str, host: &str, user: u64) -> Result<Option<u64>, String> {
+        find_own_claim_record(json, task, host, user).map(|own| own.map(|record| record.id))
+    }
+
     #[test]
     fn find_own_claim_record_requires_same_task_host_and_author() {
         let own = render_claim_record("task", "host", t0());
@@ -1069,16 +1108,10 @@ mod tests {
             {"id": 5, "body": null, "user": null},
         ])
         .to_string();
-        assert_eq!(
-            find_own_claim_record(&json, "task", "host", ME),
-            Ok(Some(4))
-        );
-        assert_eq!(
-            find_own_claim_record(&json, "task", "nowhere", ME),
-            Ok(None)
-        );
-        assert_eq!(find_own_claim_record(&json, "task", "host", 999), Ok(None));
-        assert_eq!(find_own_claim_record("[]", "task", "host", ME), Ok(None));
+        assert_eq!(own_id(&json, "task", "host", ME), Ok(Some(4)));
+        assert_eq!(own_id(&json, "task", "nowhere", ME), Ok(None));
+        assert_eq!(own_id(&json, "task", "host", 999), Ok(None));
+        assert_eq!(own_id("[]", "task", "host", ME), Ok(None));
     }
 
     #[test]
@@ -1087,18 +1120,105 @@ mod tests {
         // existed, is still this deck's own: the time is not part of the match.
         let earlier = render_claim_record("task", "host", at("2025-01-01T00:00:00.000Z"));
         let json = serde_json::json!([comment(4, ME, &earlier)]).to_string();
-        assert_eq!(
-            find_own_claim_record(&json, "task", "host", ME),
-            Ok(Some(4))
-        );
+        assert_eq!(own_id(&json, "task", "host", ME), Ok(Some(4)));
         let legacy = format!(
             "{CLAIM_RECORD_MARKER}\nAn agent was dispatched.\n\n- Task: \"task\"\n- Machine: \"host\"\n"
         );
         let json = serde_json::json!([comment(6, ME, &legacy)]).to_string();
+        assert_eq!(own_id(&json, "task", "host", ME), Ok(Some(6)));
+    }
+
+    #[test]
+    fn find_own_claim_record_returns_the_record_body_and_claim_time() {
+        let when = at("2026-10-22T05:00:13.250Z");
+        let own = render_claim_record("task", "host", when);
+        let json = serde_json::json!([comment(4, ME, &own)]).to_string();
         assert_eq!(
             find_own_claim_record(&json, "task", "host", ME),
-            Ok(Some(6))
+            Ok(Some(OwnClaimRecord {
+                id: 4,
+                body: own,
+                claimed_at: Some(when),
+            }))
         );
+    }
+
+    #[test]
+    fn next_claim_time_is_now_when_the_clock_moved_forward() {
+        let previous = at("2026-10-22T05:00:13.000Z");
+        let now = at("2026-10-22T05:00:14.500Z");
+        assert_eq!(next_claim_time(now, Some(previous)), now);
+        // Exactly one millisecond on is already strictly later.
+        let now = at("2026-10-22T05:00:13.001Z");
+        assert_eq!(next_claim_time(now, Some(previous)), now);
+    }
+
+    #[test]
+    fn next_claim_time_is_strictly_later_when_the_clock_repeats() {
+        let previous = at("2026-10-22T05:00:13.250Z");
+        let next = next_claim_time(previous, Some(previous));
+        assert_eq!(next, at("2026-10-22T05:00:13.251Z"));
+        // Within the same millisecond the clock has not moved either.
+        let next = next_claim_time(at("2026-10-22T05:00:13.250900Z"), Some(previous));
+        assert!(next > previous, "{next}");
+        assert_ne!(
+            render_claim_record("t", "h", next),
+            render_claim_record("t", "h", previous),
+            "the same millisecond twice must still change the body"
+        );
+    }
+
+    #[test]
+    fn next_claim_time_is_previous_plus_one_ms_when_the_clock_stepped_back() {
+        let previous = at("2026-10-22T05:00:13.250Z");
+        let now = at("2026-10-22T04:59:00.000Z");
+        assert_eq!(
+            next_claim_time(now, Some(previous)),
+            at("2026-10-22T05:00:13.251Z")
+        );
+        assert_ne!(
+            render_claim_record("t", "h", next_claim_time(now, Some(previous))),
+            render_claim_record("t", "h", previous),
+        );
+    }
+
+    #[test]
+    fn next_claim_time_is_now_for_a_record_without_a_claim_time() {
+        let now = t0();
+        assert_eq!(next_claim_time(now, None), now);
+        // A legacy record, and one whose time does not parse, carry no time
+        // to step past: the re-claim's body differs because it gains the field.
+        let legacy = format!(
+            "{CLAIM_RECORD_MARKER}\nAn agent was dispatched to work on this issue by \
+             dot-agent-deck on machine `h`.\n\n- Task: \"t\"\n- Machine: \"h\"\n"
+        );
+        let garbled = format!("{legacy}- Claimed at: \"yesterday\"\n");
+        for old in [legacy, garbled] {
+            let json = serde_json::json!([comment(7, ME, &old)]).to_string();
+            let own = find_own_claim_record(&json, "t", "h", ME).unwrap().unwrap();
+            assert_eq!(own.claimed_at, None);
+            let body = render_claim_record("t", "h", next_claim_time(now, own.claimed_at));
+            assert_ne!(body, own.body);
+        }
+    }
+
+    #[test]
+    fn a_re_claim_through_the_lookup_never_repeats_the_body() {
+        // The path `write_claim_record` takes: find the own record, step past
+        // its time, render. A clock frozen on the record's own millisecond, or
+        // set behind it, still yields a different body.
+        let previous = at("2026-10-22T05:00:13.250Z");
+        let old = render_claim_record("t", "h", previous);
+        let json = serde_json::json!([comment(7, ME, &old)]).to_string();
+        let own = find_own_claim_record(&json, "t", "h", ME).unwrap().unwrap();
+        for now in [
+            previous,
+            at("2026-10-22T05:00:13.250999Z"),
+            at("2020-01-01T00:00:00Z"),
+        ] {
+            let body = render_claim_record("t", "h", next_claim_time(now, own.claimed_at));
+            assert_ne!(body, own.body, "clock at {now}");
+        }
     }
 
     #[test]
@@ -1111,15 +1231,12 @@ mod tests {
         ])
         .to_string();
         assert_eq!(
-            find_own_claim_record(&forged_first, "task", "host", ME),
+            own_id(&forged_first, "task", "host", ME),
             Ok(Some(3)),
             "the forged and the authorless copies are skipped; the genuine one is found"
         );
         let forged_only = serde_json::json!([comment(1, 99999, &body)]).to_string();
-        assert_eq!(
-            find_own_claim_record(&forged_only, "task", "host", ME),
-            Ok(None)
-        );
+        assert_eq!(own_id(&forged_only, "task", "host", ME), Ok(None));
     }
 
     #[test]
@@ -1127,7 +1244,7 @@ mod tests {
         let page1 = serde_json::json!([comment(1, ME, "first page")]);
         let page2 = serde_json::json!([comment(9, ME, &render_claim_record("t", "h", t0()))]);
         let stream = format!("{page1}\n{page2}\n");
-        assert_eq!(find_own_claim_record(&stream, "t", "h", ME), Ok(Some(9)));
+        assert_eq!(own_id(&stream, "t", "h", ME), Ok(Some(9)));
     }
 
     #[test]
