@@ -689,6 +689,21 @@ impl Ran {
 
 #[cfg(unix)]
 impl OneShotBatch {
+    /// Report every attempt `not_handed` on `connection` without writing a
+    /// byte: a one-shot that took the batch but cannot open its output (its
+    /// stdout or stderr could not be duplicated) says so, and the deck
+    /// requeues the batch at once rather than waiting out its grant.
+    pub fn decline(&self, connection: &mut Connection, receiver: Receiver) -> Ran {
+        let outputs = vec![Output::NotHanded; self.len()];
+        let line = self.controls(&outputs, receiver, None);
+        let _ = connection.send(&line, Instant::now() + RECEIPTS_ANSWER_WAIT);
+        connection.finish();
+        Ran {
+            outputs,
+            error: None,
+        }
+    }
+
     /// The whole one-shot sequence on `connection` (part 2 §1.1, §1.2): ask
     /// `may` for every attempt and read the answers; with nothing awaited
     /// after them, fence each block right before its first byte and write
@@ -1083,6 +1098,10 @@ pub struct Connection {
     unread: Option<Box<InboxWaitReply>>,
     ended: bool,
     next_q: u64,
+    /// A line [`Connection::send`] gave up on partway: the next line sent
+    /// starts with the newline that ends it, so the deck discards the cut
+    /// line and reads the next one whole.
+    cut: bool,
 }
 
 #[cfg(unix)]
@@ -1203,6 +1222,7 @@ impl Connection {
             unread: None,
             ended: false,
             next_q: 1,
+            cut: false,
         })
     }
 
@@ -1274,9 +1294,9 @@ impl Connection {
     /// [`io::ErrorKind::TimedOut`] (a deck that does not read).
     /// The clock is checked before each piece is written, and each write is
     /// given the time that is left as its timeout; a line given up on is not
-    /// continued later.
+    /// continued later, and the next line sent first ends it.
     pub fn send(&mut self, line: &str, deadline: Instant) -> io::Result<()> {
-        let line = format!("{line}\n");
+        let line = format!("{}{line}\n", if self.cut { "\n" } else { "" });
         let mut rest = line.as_bytes();
         let sent = loop {
             if rest.is_empty() {
@@ -1305,6 +1325,11 @@ impl Connection {
             }
         };
         let _ = self.stream.set_write_timeout(None);
+        if sent.is_ok() {
+            self.cut = false;
+        } else if rest.len() < line.len() {
+            self.cut = true;
+        }
         sent
     }
 
@@ -2220,6 +2245,89 @@ pub(crate) mod tests {
             "a cut line is never handed over"
         );
         assert!(cut.ended());
+    }
+
+    /// A one-shot's connection and the deck's end of it.
+    #[cfg(unix)]
+    pub(crate) fn connection_pair() -> (Connection, std::os::unix::net::UnixStream) {
+        let (ours, deck) = std::os::unix::net::UnixStream::pair().unwrap();
+        (Connection::over(ours, MAX_LINE_BYTES).unwrap(), deck)
+    }
+
+    /// Every control line the deck reads on `deck` until the one-shot closes
+    /// its side, as the daemon parses them: a line that is not a control is
+    /// skipped.
+    #[cfg(unix)]
+    pub(crate) fn controls_read(deck: std::os::unix::net::UnixStream) -> Vec<InboxStreamControl> {
+        use std::io::BufRead;
+        io::BufReader::new(deck)
+            .lines()
+            .map_while(Result::ok)
+            .filter_map(|line| serde_json::from_str(&line).ok())
+            .collect()
+    }
+
+    /// Qodo on PR #1817 (finding 18): a one-shot that took a batch and then
+    /// cannot open its output reports every attempt not handed, so the deck
+    /// requeues them at once rather than waiting out their grant.
+    #[cfg(unix)]
+    #[test]
+    fn a_batch_with_nowhere_to_go_is_reported_not_handed() {
+        for receiver in [Receiver::Hook, Receiver::Waiter] {
+            let batch = two_blocks();
+            let (mut connection, deck) = connection_pair();
+            let ran = batch.decline(&mut connection, receiver);
+            assert!(!ran.handed_any(), "{receiver:?}");
+            drop(connection);
+            let controls = controls_read(deck);
+            assert_eq!(controls.len(), 1, "{receiver:?}: {controls:?}");
+            assert_eq!(controls[0].not_handed, batch.attempts(), "{receiver:?}");
+            assert!(controls[0].handed.is_empty() && controls[0].committed.is_empty());
+        }
+    }
+
+    /// Qodo on PR #1817 (finding 19): a line given up on partway, as a deck
+    /// that stopped reading leaves one, is ended before the next line is
+    /// sent, so the deck reads that next line (the one-shot's report) whole
+    /// rather than appended to the cut one.
+    #[cfg(unix)]
+    #[test]
+    fn a_line_after_a_cut_one_is_read_whole() {
+        let (mut connection, mut deck) = connection_pair();
+        let long = format!("{{\"may\":\"{}\"}}", "x".repeat(4 << 20));
+        let cut = connection.send(&long, Instant::now() + Duration::from_millis(200));
+        assert_eq!(
+            cut.map_err(|error| error.kind()),
+            Err(io::ErrorKind::TimedOut),
+            "precondition: the deck reads nothing, so the long line is cut"
+        );
+        let reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            io::Read::read_to_end(&mut deck, &mut bytes).unwrap();
+            bytes
+        });
+        let report = control_line(&InboxStreamControl {
+            not_handed: vec![at(ID1, 1, 1)],
+            ..InboxStreamControl::default()
+        });
+        connection
+            .send(&report, Instant::now() + Duration::from_secs(5))
+            .expect("the report is sent");
+        connection.finish();
+        let bytes = reader.join().unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        let controls: Vec<InboxStreamControl> = text
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        assert_eq!(
+            controls
+                .iter()
+                .map(|c| c.not_handed.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![at(ID1, 1, 1)]],
+            "the report is read as a line of its own"
+        );
     }
 
     /// Scenario: Read the deck's once line through the one-shot's reader:

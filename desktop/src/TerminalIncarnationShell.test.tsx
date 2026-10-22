@@ -34,6 +34,7 @@ function deckOf(process: "process-a" | "process-b"): DeckSnapshot {
   const snapshot = createFixtureSnapshot("connected");
   return {
     ...snapshot,
+    connection: { ...snapshot.connection, incarnation: process },
     agents: snapshot.agents.map((agent) => ({
       ...agent,
       incarnation: process,
@@ -94,6 +95,40 @@ describe("terminal viewports across a deck restart that reuses an agent id", () 
     expect(planners()).toHaveLength(before + 1);
     expect(planners().at(-1)).toMatchObject({ incarnation: "process-b" });
     expect(screen.getByTestId("terminal-planner")).toHaveAttribute("data-incarnation", "process-b");
+  });
+
+  /** Scenario: the user switches process A's Planner tile to Diff, and refreshes or briefly loses its listing without losing that choice. After a restart, process B opens on Terminal and keeps its own choice; showing A's fixture again verifies that its retired choice was forgotten. */
+  it("opens the successor's tile on its terminal, not its predecessor's tab", async () => {
+    const deck = harness();
+    const { rerender } = render(<DeckShell runtime={deck.runtime("process-a")} initialView={{ kind: "deck" }} />);
+    await waitFor(() => expect(screen.getByTestId("terminal-planner")).toBeInTheDocument());
+    fireEvent.click(within(screen.getByTestId("agent-tile-planner")).getByRole("tab", { name: "Diff" }));
+    expect(screen.queryByTestId("terminal-planner")).toBeNull();
+
+    await act(async () => { rerender(<DeckShell runtime={deck.runtime("process-a")} initialView={{ kind: "deck" }} />); });
+    expect(screen.queryByTestId("terminal-planner"), "the same process keeps the chosen tab").toBeNull();
+
+    for (const status of ["disconnected", "connected"] as const) {
+      const empty = deck.runtime("process-a");
+      empty.snapshot = { ...empty.snapshot, connection: { ...empty.snapshot.connection, status }, agents: [] };
+      empty.fleet = [empty.snapshot];
+      await act(async () => { rerender(<DeckShell runtime={empty} initialView={{ kind: "deck" }} />); });
+      await act(async () => { rerender(<DeckShell runtime={deck.runtime("process-a")} initialView={{ kind: "deck" }} />); });
+      expect(screen.queryByTestId("terminal-planner"), `${status} with no listing keeps the same process's choice`).toBeNull();
+    }
+
+    await act(async () => { rerender(<DeckShell runtime={deck.runtime("process-b")} initialView={{ kind: "deck" }} />); });
+    expect(screen.getByTestId("terminal-planner")).toHaveAttribute("data-incarnation", "process-b");
+    expect(deck.declared().filter((target) => target.agentId === "planner").at(-1)).toMatchObject({ incarnation: "process-b" });
+
+    fireEvent.click(within(screen.getByTestId("agent-tile-successor")).getByRole("tab", { name: "Diff" }));
+    await act(async () => { rerender(<DeckShell runtime={deck.runtime("process-b")} initialView={{ kind: "deck" }} />); });
+    expect(screen.queryByTestId("terminal-planner"), "the successor keeps its current tab choice").toBeNull();
+
+    // Replaying a retired fixture probes retained choices through the rendered
+    // tab, without inspecting React state or coupling this pin to its storage.
+    await act(async () => { rerender(<DeckShell runtime={deck.runtime("process-a")} initialView={{ kind: "deck" }} />); });
+    expect(within(screen.getByTestId("agent-tile-planner")).getByRole("tab", { name: "Terminal" }), "a retired process's tab choice has been discarded").toHaveAttribute("aria-selected", "true");
   });
 
   /** Scenario: after a restart the user opens the successor's Planner row from the overview. Its pane's terminal is mounted for process B, not for the process that listed the id before. */

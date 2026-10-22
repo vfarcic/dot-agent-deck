@@ -8,7 +8,7 @@ user-invocable: true
 
 ## Instructions
 
-You are helping create a Product Requirements Document (PRD) for a new feature. **In this repository the PRD is its GitHub issue**: the issue body is the project management document — milestone tracking and implementation plan — and its comments are the record of progress and decisions. Nothing is written under `prds/` and nothing is committed (issue #1591).
+You are helping create a Product Requirements Document (PRD) for a new feature. **In this repository the PRD is its GitHub issue**: the issue body is the project management document — milestone tracking and the plan, written as what changes for the user rather than where in the code — and its comments are the record of progress and decisions. Nothing is written under `prds/` and nothing is committed (issue #1591).
 
 The layout of an issue PRD — what goes in the body, what goes in comments, how to edit the body without losing someone else's edit — is in [`../prd-start/issue-prd.md`](../prd-start/issue-prd.md); read it before writing the body. Older PRDs that already have a `prds/<n>-*.md` file keep it; this skill never creates one.
 
@@ -28,9 +28,11 @@ Create the GitHub issue immediately to get the issue ID, with the short initial 
 Work through the template sections below with the user, then write the result as the issue body, following [`../prd-start/issue-prd.md`](../prd-start/issue-prd.md) ("The body" and "Editing the body"): write it to `.dot-agent-deck/prd-[issue-id]-body.md` with your file-writing tool and `gh issue edit [issue-id] --body-file` that file. Write as you go — after each agreed section rather than once at the end — so a session that ends early has not lost the discussion.
 
 ### Step 4: Create PRD as a Project Management Document
-Work through the PRD template focusing on project management, milestone tracking, and implementation planning. Documentation updates should be included as part of the implementation milestones.
+Work through the PRD template focusing on project management and milestone tracking: what changes for the user, the scope, the constraints the PRD exists to enforce, dependencies and risks, milestones as testable outcomes, and how success is validated. Documentation updates should be included as part of the milestones. Technical design the user offers along the way (files to change, types, functions, an architecture) does not go in the body: record it in a dated `### PRD decision` comment when it settles a choice, otherwise in a `### PRD progress` comment ([`issue-prd.md`](../prd-start/issue-prd.md), "Comments"), and write only what it changes for the user into the body.
 
 **Key Principle**: Focus on 5-10 major milestones rather than exhaustive task lists. Each milestone should represent meaningful progress that can be clearly validated.
+
+**What, not where**: the body says what changes for the user and why, not where in the code. Write no file paths, type or function names, code snippets or line numbers, except names the user sees (a CLI flag, a config key, a command) and constraints the PRD exists to enforce (e.g. "no `PROTOCOL_VERSION` bump"). Decisions keep their rationale. Code-level detail written now can go stale before anyone implements it, and the agent that starts the PRD reads the code anyway; notes on what was built and where belong later, in `### PRD progress` comments ([`issue-prd.md`](../prd-start/issue-prd.md), "The body").
 
 **Consider Including** (when applicable to the project/feature):
 - **Tests** - If the project has tests, include a milestone for test coverage of new functionality
@@ -85,14 +87,16 @@ It must print `SOURCE=issue`. `SOURCE=none` names what is missing in `REASON=` �
 ### PRD Planning Questions
 1. **Problem Understanding**: "What specific problem does this feature solve for users?"
 2. **User Impact**: "Walk me through the complete user journey — what will change for them?"
-3. **Technical Scope**: "What are the core technical changes required?"
+3. **Scope**: "What is in scope and what is out? Is there a constraint this PRD exists to enforce?"
 4. **Documentation Impact**: "Which existing docs need updates? What new docs are needed?"
-5. **Integration Points**: "How does this feature integrate with existing systems?"
+5. **Integration Points**: "Which existing features or workflows does this change for the user, and which must keep working as they do?"
 6. **Success Criteria**: "How will we know this feature is working well?"
-7. **Implementation Phases**: "How can we deliver value incrementally?"
+7. **Delivery Phases**: "How can we deliver value incrementally — what can a user do after each milestone?"
 8. **Risk Assessment**: "What are the main risks and how do we mitigate them?"
 9. **Dependencies**: "What other systems or features does this depend on?"
 10. **Validation Strategy**: "How will we test and validate the implementation?"
+
+The answers fill the body as what changes for the user. When an answer is technical design, it goes in a comment as Step 4 says, not in the body.
 
 ### Discussion Tips:
 - **Clarify ambiguity**: If something isn't clear, ask follow-up questions until you understand
