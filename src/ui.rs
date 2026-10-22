@@ -1803,8 +1803,14 @@ struct UiState {
     restart_notice_area: Option<Rect>,
     /// PRD #1666 part 2 (G-fix7f): how many of the open confirmation's
     /// choices the last frame drew, with the mode it drew them for
-    /// ([`confirm_choices_drawn`]). A choice it did not draw cannot be moved
-    /// to or confirmed ([`refuse_undrawn_choice`]).
+    /// ([`confirm_choices_drawn`]); [`refuse_undrawn_choice`] refuses the keys
+    /// that would move to or confirm one it did not draw.
+    ///
+    /// G-fix7g: also the confirmations' render-before-input gate, which was
+    /// the close confirmation's alone (PRD #241 review F5). Cleared when a
+    /// confirmation opens and whenever an event changes the mode, so `None`, or
+    /// a record for another mode, means this opening of the open confirmation
+    /// has not been drawn yet ([`confirmation_awaits_frame`]).
     confirm_choices_drawn: Option<(UiMode, usize)>,
     /// PRD #341 M6: which pane the user was typing into as of the previous
     /// [`reconcile_pane_input_scrollback`] frame — `Some(pane_id)` while `mode ==
@@ -2059,15 +2065,6 @@ struct UiState {
     /// closes THIS and only this — never whatever happens to be selected by the
     /// time the user answers. Cleared on every exit from the dialog.
     close_confirm_target: Option<CloseTarget>,
-    /// PRD #241 review F5: has the armed close confirmation been drawn yet?
-    ///
-    /// The run loop drains a whole input burst before re-rendering, so without
-    /// this the keystroke queued behind the `Ctrl+W` (or behind the `[Close]` /
-    /// tab-strip `×` click) that armed the dialog would be delivered to a modal
-    /// the user has never seen. While it is `false`, `run_tui` discards pending
-    /// input and re-renders instead of reading; `render_overlays` sets it the
-    /// first time the dialog actually reaches the screen.
-    close_confirm_displayed: bool,
     /// PRD #92 F1: selected option in the secondary Stop-confirmation
     /// dialog (0=No, 1=Yes). Defaults to No — the safer default for the
     /// destructive choice. Only meaningful when `mode == StopConfirm`.
@@ -2450,7 +2447,6 @@ impl UiState {
             quit_confirm_selected: 0,
             close_confirm: CloseConfirmState::default(),
             close_confirm_target: None,
-            close_confirm_displayed: false,
             stop_confirm_selected: 0,
             stop_confirm_agent_count: 0,
             orchestration_prompted: HashSet::new(),
@@ -6150,7 +6146,7 @@ fn arm_close_confirmation(
         ..prompt
     };
     ui.close_confirm_target = Some(target);
-    ui.close_confirm_displayed = false;
+    ui.confirm_choices_drawn = None;
     ui.mode = UiMode::CloseConfirm;
 }
 
@@ -10196,7 +10192,7 @@ fn dispatch_action(
             // the target also disarms it, so a second confirmation cannot
             // replay against a stale identity.
             ui.mode = UiMode::Normal;
-            ui.close_confirm_displayed = false;
+            ui.confirm_choices_drawn = None;
             let target = ui.close_confirm_target.take();
             // Issue #717: the ARM-TIME preview is deliberately NOT carried out
             // of the dialog and reused as the post-close report. The agent is
@@ -11122,7 +11118,7 @@ fn dispatch_action(
             // so a later `ConfirmCloseSelected` can never replay a target the
             // user already declined. Harmless for every other modal.
             ui.close_confirm_target = None;
-            ui.close_confirm_displayed = false;
+            ui.confirm_choices_drawn = None;
             ui.mode = UiMode::Normal;
         }
         // config-gen [Yes]: send the prompt to the pending target pane.
@@ -12125,6 +12121,7 @@ fn handle_key_event(
     // the banner's decay rule is about the mode the user was in when they
     // pressed the key, not the one they landed in.
     let was_command_mode = ui.mode == UiMode::Normal;
+    let mode_before = ui.mode;
 
     // PRD #40: snapshot the active keybindings for this keypress (cheap
     // HashMap clone; config is immutable for the session) so the mapper
@@ -12339,7 +12336,7 @@ fn handle_key_event(
             // the user.
             UiMode::CloseConfirm if is_ctrl_c => {
                 ui.close_confirm_target = None;
-                ui.close_confirm_displayed = false;
+                ui.confirm_choices_drawn = None;
                 ui.quit_confirm_selected = 0;
                 ui.mode = UiMode::QuitConfirm;
                 Action::Continue
@@ -12382,7 +12379,7 @@ fn handle_key_event(
         }
     }
 
-    dispatch_action(
+    let flow = dispatch_action(
         action.unwrap_or(Action::Continue),
         ui,
         pane,
@@ -12392,7 +12389,13 @@ fn handle_key_event(
         filtered,
         selected_id.as_deref(),
         frame_area,
-    )
+    );
+    // PRD #1666 part 2 (G-fix7g): as the run loop does between events, so a
+    // confirmation this key left and reopened waits for its own frame.
+    if ui.mode != mode_before {
+        ui.confirm_choices_drawn = None;
+    }
+    flow
 }
 
 pub fn run_tui(
@@ -13743,6 +13746,16 @@ pub fn run_tui(
         if let Some(embedded) = embedded_panes {
             resize_panes_to_layout(&frame_layout, embedded);
         }
+        // PRD #1666 part 2 (G-fix7g): input still queued behind the event that
+        // opened a confirmation predates its first frame, so it is dropped
+        // rather than answering a dialog the user has not seen — whichever path
+        // opened it, the key path's break to re-render included. The gate at
+        // the top of the event loop covers the paths that keep reading.
+        if confirmation_awaits_frame(&ui) {
+            while crossterm::event::poll(std::time::Duration::from_millis(0))? {
+                let _ = event::read()?;
+            }
+        }
         terminal.draw(|frame| {
             render_frame(
                 frame,
@@ -14140,7 +14153,17 @@ pub fn run_tui(
         }
 
         // Process events in a tight loop until the queue is empty.
+        // G-fix7g: the mode the last frame drew, or the last event left.
+        let mut seen_mode = ui.mode;
         loop {
+            // PRD #1666 part 2 (G-fix7g): an event that changed the mode makes
+            // whatever the last frame drew of a confirmation another opening's,
+            // so a confirmation left and reopened within one burst waits for
+            // its own frame.
+            if ui.mode != seen_mode {
+                ui.confirm_choices_drawn = None;
+                seen_mode = ui.mode;
+            }
             // PRD #341 M3 (code-review finding 1): observe the command-mode edge
             // once per EVENT, whatever its kind, before anything reads or writes
             // the banner's decay state. `handle_key_event` repeats this for the key
@@ -14156,17 +14179,16 @@ pub fn run_tui(
             observe_command_mode_edge(&mut ui, std::time::Instant::now());
 
             // PRD #241 review F5: never let input that PREDATES the close
-            // confirmation answer it. This drain loop deliberately processes a
+            // confirmation answer it. G-fix7g: nor any other confirmation's. This drain loop deliberately processes a
             // whole input burst without re-rendering, so the keystroke queued
             // behind the `Ctrl+W` / `[Close]` click / tab-strip `×` that armed
             // the dialog would otherwise be delivered to a modal that has not
             // been drawn — confirming a destructive close the user never saw.
             // Discard whatever is still buffered and break out to render first;
-            // `render_overlays` sets the flag once the dialog is actually on
-            // screen. (The dialog also has no `y` shortcut, so even if this
-            // were bypassed a single stray keystroke could at worst hit the
-            // default Cancel.)
-            if ui.mode == UiMode::CloseConfirm && !ui.close_confirm_displayed {
+            // `render_overlays` records the dialog once it is actually on
+            // screen. (Should a key reach it first anyway, `refuse_undrawn_choice`
+            // counts none of its choices as drawn.)
+            if confirmation_awaits_frame(&ui) {
                 while crossterm::event::poll(std::time::Duration::from_millis(0))? {
                     let _ = event::read()?;
                 }
@@ -16336,9 +16358,11 @@ fn overlay_area(frame: &mut Frame, ui: &mut UiState) -> Rect {
 
 /// What the open modal shows when laid out in `area`: each visible symbol with
 /// its column, row by row from the first row showing one. Drawn into a blank
-/// scratch buffer, and on copies of the state drawing moves (the directory
-/// picker's scroll and what the upgrade dialog counts as seen), so nothing
-/// reaches the screen or the state. Two areas whose drawings are equal show
+/// scratch buffer, so nothing reaches the screen. The directory picker's scroll
+/// and what the upgrade dialog counts as seen are restored afterwards; the
+/// click targets and the confirmation record ([`UiState::confirm_choices_drawn`])
+/// it writes are temporary, overwritten by the final draw that always follows
+/// in [`render_overlays`]. Two areas whose drawings are equal show
 /// the same text, choices, buttons and borders, wherever each centres them;
 /// cleared cells are not compared, as a dialog that clears all of its area
 /// shows nothing more in a taller one.
@@ -16388,14 +16412,11 @@ fn render_overlays(frame: &mut Frame, ui: &mut UiState) {
         let full = frame.area();
         ui.modal_button_rects = render_restart_notice_overlay(frame, full, notice, &ui.keybindings);
     }
+    // PRD #241 review F5, G-fix7g: records what this frame drew of an open
+    // confirmation, so input arriving from here on is an answer to it. Until
+    // then the run loop feeds it nothing (see the drain at the top of the event
+    // loop).
     draw_modal(frame, area, ui);
-    if ui.mode == UiMode::CloseConfirm {
-        // PRD #241 review F5: the dialog has now reached the screen, so input
-        // arriving from here on is a genuine answer to it. Until this flip, the
-        // run loop refuses to feed it anything (see the drain at the top of the
-        // event loop).
-        ui.close_confirm_displayed = true;
-    }
 }
 
 /// Draw the open modal overlay in `area`, recording its click targets on `ui`.
@@ -18212,14 +18233,19 @@ fn modal_rect(desired_w: u16, desired_h: u16, terminal: Rect, min_w: u16, min_h:
 }
 
 /// PRD #1666 part 2 (G-fix7f): the rows of a confirmation dialog that lists its
-/// choices one per row, which its renderer and [`confirm_choices_drawn`] both
-/// read, so what is drawn and what may be chosen cannot drift apart.
+/// choices one per row. Its renderer takes its height from here, and
+/// [`confirm_choices_drawn`] counts from the same numbers.
 struct ConfirmLayout {
     /// The popup's height when the frame has room, borders included.
     rows: u16,
     /// The text line, inside the border, of the first choice.
     first_choice: usize,
     choices: usize,
+    /// G-fix7g: the columns inside the border a choice's line needs to show
+    /// its selection marker and its whole label: the two-space indent, the
+    /// marker, a space and the longest label. Each of these popups wants more
+    /// columns than that, so only a narrow terminal leaves fewer.
+    label_cols: u16,
 }
 
 impl ConfirmLayout {
@@ -18229,9 +18255,11 @@ impl ConfirmLayout {
         (self.rows + extra).min(area.height.saturating_sub(4))
     }
 
-    /// How many choices a popup laid out in `area` draws inside its border.
+    /// How many choices a popup laid out in `area` draws inside its border,
+    /// each with its marker and whole label. G-fix7g: none when the popup,
+    /// `area.width - 4` wide at most, is too narrow to show a label.
     fn choices_drawn(&self, extra: u16, area: Rect) -> usize {
-        if area.width.saturating_sub(4) <= 2 {
+        if area.width.saturating_sub(4).saturating_sub(2) < self.label_cols {
             return 0;
         }
         let inner = usize::from(self.popup_height(extra, area).saturating_sub(2));
@@ -18245,21 +18273,29 @@ const QUIT_CONFIRM: ConfirmLayout = ConfirmLayout {
     rows: 10,
     first_choice: 3,
     choices: 3,
+    // "Detach" / "Cancel".
+    label_cols: 4 + 6,
 };
 const CLOSE_CONFIRM: ConfirmLayout = ConfirmLayout {
     rows: 9,
     first_choice: 3,
     choices: CLOSE_CONFIRM_OPTION_COUNT,
+    // "Cancel".
+    label_cols: 4 + 6,
 };
 const STOP_CONFIRM: ConfirmLayout = ConfirmLayout {
     rows: 10,
     first_choice: 4,
     choices: 2,
+    // "Yes".
+    label_cols: 4 + 3,
 };
 const CONFIG_GEN_CONFIRM: ConfirmLayout = ConfirmLayout {
     rows: 14,
     first_choice: 5,
     choices: 3,
+    // "Never".
+    label_cols: 4 + 5,
 };
 
 /// PRD #1666 part 2 (G-fix7f): how many of the open confirmation's choices a
@@ -18281,17 +18317,30 @@ fn confirm_choices_drawn(ui: &UiState, area: Rect) -> Option<usize> {
     }
 }
 
+/// PRD #1666 part 2 (G-fix7g): whether the open confirmation has not been
+/// drawn since it opened — [`UiState::confirm_choices_drawn`] holds no record
+/// for its mode. Never for any other mode.
+fn confirmation_awaits_frame(ui: &UiState) -> bool {
+    matches!(
+        ui.mode,
+        UiMode::QuitConfirm | UiMode::CloseConfirm | UiMode::StopConfirm | UiMode::ConfigGenPrompt
+    ) && !ui
+        .confirm_choices_drawn
+        .is_some_and(|(mode, _)| mode == ui.mode)
+}
+
 /// PRD #1666 part 2 (G-fix7f): refuse a key that would move to, or confirm, a
 /// choice the open confirmation's last frame did not draw — a terminal too
-/// small for its popup clips the lower choices — and Stop's `y` while its Yes
-/// is not drawn. Escape and the dialogs' own way back are never refused. Before
-/// a dialog's first frame nothing is recorded for it, and its keys act as
-/// before.
+/// small for its popup clips the lower choices, or too narrow shows no label
+/// at all — and Stop's `y` while its Yes is not drawn. Escape and the dialogs'
+/// own way back are not refused. G-fix7g: before this opening's first frame
+/// none of its choices counts as drawn.
 fn refuse_undrawn_choice(key: &KeyEvent, ui: &UiState) -> Option<Action> {
-    let (mode, drawn) = ui.confirm_choices_drawn?;
-    if mode != ui.mode {
-        return None;
-    }
+    let mode = ui.mode;
+    let drawn = ui
+        .confirm_choices_drawn
+        .filter(|(drawn_for, _)| *drawn_for == mode)
+        .map_or(0, |(_, drawn)| drawn);
     let selected = match mode {
         UiMode::QuitConfirm => ui.quit_confirm_selected,
         UiMode::CloseConfirm => ui.close_confirm.selected,
@@ -42101,6 +42150,161 @@ mod tests {
             press(&mut ui, KeyCode::Esc);
             assert_eq!(ui.mode, UiMode::QuitConfirm, "Escape no longer returns");
         }
+    }
+
+    /// Scenario: with one managed agent, a burst of Ctrl+C, Down, Enter and `y` reaches the dashboard with no frame drawn between the keys. The Quit dialog opens and nothing else happens. Once Quit is drawn, Down and Enter open the Stop confirmation, and `y`, Down and Enter do nothing until Stop has been drawn; after that frame `y` stops (control). Opening Stop with Quit's [Stop] button behaves the same. In an 8×14 terminal, where Stop's popup is too narrow to show No or Yes, `y`, Down and Enter are refused even after a frame, and Escape still returns to Quit; at 80×24 Down and Enter stop (control).
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_a_confirmation_takes_no_choice_its_frame_has_not_shown() {
+        use tokio::sync::RwLock;
+        enum Input {
+            Key(KeyCode, KeyModifiers),
+            Click(Action),
+        }
+        let pc = Arc::new(OpenTabPC::new());
+        let mut tab_manager = TabManager::new(pc.clone());
+        let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+        let mut snapshot = AppState::default();
+        snapshot.seed_hydrated_session("p".into(), None, None, Some("1".into()), None);
+        let mut send = |ui: &mut UiState, input: Input, (width, height): (u16, u16)| {
+            let area = Rect::new(0, 0, width, height);
+            match input {
+                Input::Key(code, modifiers) => handle_key_event(
+                    KeyEvent::new(code, modifiers),
+                    ui,
+                    &*pc,
+                    &state,
+                    &mut tab_manager,
+                    &snapshot,
+                    &[],
+                    area,
+                ),
+                Input::Click(action) => dispatch_action(
+                    action,
+                    ui,
+                    &*pc,
+                    &state,
+                    &mut tab_manager,
+                    &snapshot,
+                    &[],
+                    None,
+                    area,
+                ),
+            }
+        };
+        let key = |code: KeyCode| Input::Key(code, KeyModifiers::NONE);
+        let normal = (80u16, 24u16);
+        let refused = |ui: &UiState, flow: Flow, mode: UiMode, what: &str| {
+            assert_eq!(flow, Flow::Continue, "{what}: acted");
+            assert_eq!(ui.mode, mode, "{what}: changed the dialog");
+            assert_eq!(ui.quit_confirm_selected, 0, "{what}: moved Quit");
+            assert_eq!(ui.stop_confirm_selected, 0, "{what}: moved Stop");
+        };
+
+        // The keyboard burst from the dashboard.
+        let mut ui = default_ui();
+        draw_sized(&mut ui, normal.0, normal.1);
+        send(
+            &mut ui,
+            Input::Key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            normal,
+        );
+        assert_eq!(
+            ui.mode,
+            UiMode::QuitConfirm,
+            "precondition: Ctrl+C opens Quit"
+        );
+        for code in [KeyCode::Down, KeyCode::Enter, KeyCode::Char('y')] {
+            let flow = send(&mut ui, key(code), normal);
+            refused(
+                &ui,
+                flow,
+                UiMode::QuitConfirm,
+                &format!("undrawn Quit, {code:?}"),
+            );
+        }
+        let rows = draw_sized(&mut ui, normal.0, normal.1).join("\n");
+        assert!(rows.contains("> Detach"), "Quit is not drawn:\n{rows}");
+        send(&mut ui, key(KeyCode::Down), normal);
+        assert_eq!(
+            ui.quit_confirm_selected, 1,
+            "control: drawn Quit refused Down"
+        );
+        send(&mut ui, key(KeyCode::Enter), normal);
+        assert_eq!(
+            ui.mode,
+            UiMode::StopConfirm,
+            "control: drawn Quit refused Enter"
+        );
+        ui.quit_confirm_selected = 0;
+        for code in [KeyCode::Char('y'), KeyCode::Down, KeyCode::Enter] {
+            let flow = send(&mut ui, key(code), normal);
+            refused(
+                &ui,
+                flow,
+                UiMode::StopConfirm,
+                &format!("undrawn Stop, {code:?}"),
+            );
+        }
+        draw_sized(&mut ui, normal.0, normal.1);
+        assert_eq!(
+            send(&mut ui, key(KeyCode::Char('y')), normal),
+            Flow::Break,
+            "control: `y` on the drawn Stop did not stop"
+        );
+
+        // Quit's [Stop] button, then a `y` before Stop's first frame.
+        let mut ui = default_ui();
+        ui.mode = UiMode::QuitConfirm;
+        draw_sized(&mut ui, normal.0, normal.1);
+        send(&mut ui, Input::Click(Action::RequestStop), normal);
+        assert_eq!(
+            ui.mode,
+            UiMode::StopConfirm,
+            "precondition: [Stop] opens Stop"
+        );
+        let flow = send(&mut ui, key(KeyCode::Char('y')), normal);
+        refused(&ui, flow, UiMode::StopConfirm, "`y` after [Stop]");
+        draw_sized(&mut ui, normal.0, normal.1);
+        assert_eq!(
+            send(&mut ui, key(KeyCode::Char('y')), normal),
+            Flow::Break,
+            "control: `y` on the drawn Stop did not stop"
+        );
+
+        // Drawn, but too narrow to show a choice.
+        let tiny = (8u16, 14u16);
+        let mut ui = default_ui();
+        ui.mode = UiMode::StopConfirm;
+        ui.stop_confirm_agent_count = 2;
+        let rows = draw_sized(&mut ui, tiny.0, tiny.1).join("\n");
+        assert!(
+            !rows.contains("Yes") && !rows.contains("> No"),
+            "precondition: 8×14 shows a choice:\n{rows}"
+        );
+        assert_eq!(
+            ui.confirm_choices_drawn.map(|(mode, _)| mode),
+            Some(UiMode::StopConfirm),
+            "precondition: the 8×14 frame drew no Stop dialog"
+        );
+        for code in [KeyCode::Char('y'), KeyCode::Down, KeyCode::Enter] {
+            let flow = send(&mut ui, key(code), tiny);
+            refused(&ui, flow, UiMode::StopConfirm, &format!("8×14, {code:?}"));
+        }
+        send(&mut ui, key(KeyCode::Esc), tiny);
+        assert_eq!(ui.mode, UiMode::QuitConfirm, "Escape no longer returns");
+
+        // Control: the same dialog at a normal size.
+        let mut ui = default_ui();
+        ui.mode = UiMode::StopConfirm;
+        ui.stop_confirm_agent_count = 2;
+        draw_sized(&mut ui, normal.0, normal.1);
+        send(&mut ui, key(KeyCode::Down), normal);
+        assert_eq!(
+            send(&mut ui, key(KeyCode::Enter), normal),
+            Flow::Break,
+            "control: Down and Enter on the drawn Yes did not stop"
+        );
     }
 
     /// Scenario: with a restart notice held in its footer rows, the user opens the upgrade dialog in a 60×24 terminal, narrower than the dialog needs. The dialog asks for a larger terminal above the notice, which stays in view: no draw clears it.

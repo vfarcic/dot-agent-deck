@@ -1917,6 +1917,13 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** SIGTERM vs SIGKILL escalation (covered by `lifecycle/stop/003`).
 - **Platform coverage:** mac+linux.
 
+##### prompt/quit/006 — Input queued before the Quit or Stop dialog's first frame chooses nothing in it (PRD #1666 part 2).
+- **Layer:** L2.
+- **Agent:** none (synthetic — one running `cat` card).
+- **Asserts:** Ctrl+C, Down, Enter and `y` sent in one write leave the Quit dialog open on Detach with no Stop confirmation and the agent alive; a `[Stop]` click and a `y` in one write leave the Stop confirmation open on No with the agent alive; a `y` after that confirmation is drawn stops the deck.
+- **Does not assert:** the close confirmation's own burst (`prompt/close-confirm/004`), the configuration prompt, or a confirmation too small to show its choices (the L1 `lifecycle/handshake/013` pins).
+- **Platform coverage:** linux.
+
 #### prompt/dir-picker
 
 ##### prompt/dir-picker/001 — `Ctrl+n` opens the new-pane flow; the directory picker is the first step and lists the start directory's entries.

@@ -1450,6 +1450,74 @@ mod tests {
         );
     }
 
+    /// Scenario: after a gap the deck's snapshot lists an idle agent with no card, and the TUI cards it. The agent then reports it is thinking, with no new session start, and its card says Thinking; a later resync whose snapshot says it waits for input moves the card there. A report applied while the stream comes from another deck process does not update the card: the card is dropped for the restart notice, and the report draws that process's own card (control).
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_a_carded_unseen_agent_takes_its_later_reports() {
+        use crate::daemon_client::Incarnation;
+        let named = |process: &str| Incarnation::from(Some(process.to_string()));
+        let listed = |status: &str| -> Vec<AgentRecord> {
+            serde_json::from_value(serde_json::json!([{
+                "id": "1",
+                "pane_id_env": "unseen",
+                "live": { "status": status, "tool_count": 0 },
+            }]))
+            .unwrap()
+        };
+        let on = |tui: &AppState| {
+            tui.sessions
+                .values()
+                .filter(|card| card.pane_id.as_deref() == Some("unseen"))
+                .map(|card| (card.status.clone(), card.incarnation.clone()))
+                .collect::<Vec<_>>()
+        };
+        let now = Utc::now().timestamp();
+        for replaced in [false, true] {
+            let mut tui = AppState::default();
+            tui.learn_stream_incarnation(named("b"));
+            tui.card_unseen_agents(&listed("Idle"));
+            assert_eq!(
+                on(&tui),
+                vec![(SessionStatus::Idle, named("b"))],
+                "precondition"
+            );
+            if replaced {
+                // Not through `learn_stream_incarnation`, which drops the card
+                // itself: the report's own guard is what this pins.
+                tui.stream_incarnation = named("c");
+            }
+            tui.apply_event(event_on(
+                "unseen",
+                "1",
+                "turn",
+                EventType::Thinking,
+                now + 1,
+            ));
+            if replaced {
+                assert_eq!(
+                    on(&tui),
+                    vec![(SessionStatus::Thinking, named("c"))],
+                    "control: another process's report updated the card"
+                );
+                let dropped = tui.take_restart_drops();
+                assert_eq!(dropped.len(), 1, "control: the card was not dropped");
+                assert_eq!(dropped[0].incarnation, named("b"));
+                continue;
+            }
+            assert_eq!(
+                on(&tui),
+                vec![(SessionStatus::Thinking, named("b"))],
+                "the carded agent's report was refused"
+            );
+            tui.resync_after_event_gap(&listed("WaitingForInput"));
+            assert_eq!(
+                on(&tui),
+                vec![(SessionStatus::WaitingForInput, named("b"))],
+                "a later resync did not refresh the card"
+            );
+        }
+    }
+
     /// Scenario: the TUI holds a card for agent `1` on `pane-1` learned from deck process `a`, its stream's process, and then gets the placeholder card for a pane it attached on `b` with the same pane and agent id — the deck restarted as the same build, and the stream has not noticed yet. The placeholder is not the old card and does not replace it: it waits, and the old card stays, until the stream itself moves to `b`; then the old card is dropped and queued for the restart notice, and the placeholder is drawn bound to `b`. A placeholder learned from `a` itself is the card already there (control).
     #[spec("lifecycle/handshake/013")]
     #[test]

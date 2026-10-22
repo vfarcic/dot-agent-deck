@@ -8269,6 +8269,12 @@ impl AppState {
     /// across a deck restart, or a lagged stream — had no card until the TUI
     /// restarted. An orchestration role's record is left alone: its tab is
     /// built from the deck's surface, not from a listing.
+    ///
+    /// G-fix7g: its pane is admitted as that start would have admitted it
+    /// ([`Self::apply_event`]'s unmarked-start branch), so the agent's later
+    /// status reports reach the card and a later resync refreshes it. The card
+    /// keeps the stream's process: a report on a stream from another one drops
+    /// it instead ([`Self::drop_cards_replaced_by`]).
     pub fn card_unseen_agents(&mut self, records: &[crate::agent_pty::AgentRecord]) {
         if self.agent_ownership.is_some() {
             return;
@@ -8310,6 +8316,7 @@ impl AppState {
                     .entry(pane_id.to_string())
                     .or_insert(seq);
             }
+            self.managed_pane_ids.insert(pane_id.to_string());
         }
     }
 
