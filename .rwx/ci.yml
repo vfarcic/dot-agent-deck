@@ -9,8 +9,10 @@
 # tasks on 16 CPUs took the run from 6.3 to 5.0 minutes, at roughly twice the
 # cost).
 #
-# Keep the versions below in step with ci.yml (Renovate does not update this
-# file).
+# The versions below are pinned in devbox.json and .github/workflows/ too.
+# renovate.json's RWX customManagers bump them with the other copies, and
+# scripts/check-pin-lockstep.sh (run by `cargo test-fast`) fails when the Rust
+# toolchain, nextest, pnpm or go-task disagree with devbox.json.
 
 # Two triggers:
 # - a pull request: this run replaces the Linux jobs of
@@ -148,7 +150,7 @@ tasks:
 
   - key: go-task
     run: |
-      curl -LsSf https://github.com/go-task/task/releases/download/v3.54.0/task_linux_amd64.tar.gz \
+      curl -LsSf https://github.com/go-task/task/releases/download/v3.53.1/task_linux_amd64.tar.gz \
         | sudo tar zxf - -C /usr/local/bin task
       task --version
 

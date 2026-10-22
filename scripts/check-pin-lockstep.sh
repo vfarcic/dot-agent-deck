@@ -28,7 +28,14 @@
 # against what renovate.json's pnpm regex extracts from the same files.
 # `--toolchain-sites` does the same for the Rust toolchain scanner, which
 # `pin_lockstep.rs` compares against renovate.json's workflow `rustc` regex
-# (issue #1478).
+# (issue #1478). `--rwx-sites` does the same for the RWX configs, below.
+#
+# RWX (docs/develop/rwx.md) is a THIRD place the toolchain is pinned:
+# `.rwx/ci.yml` and `.rwx/sandbox.yml` install the Rust toolchain, nextest,
+# pnpm and go-task by exact version in their own syntax. Their sites join the
+# CI side of each class, so devbox.json, .github/workflows/ and .rwx/ must all
+# agree. go-task is a class only against RWX: the workflows install it as a
+# floating `3.x` through arduino/setup-task, which pins nothing to compare.
 #
 # WHERE IT RUNS
 #
@@ -67,7 +74,7 @@
 # this script never needs touching when a pin moves — only when a new pin class
 # starts being duplicated across the two.
 #
-# Usage: scripts/check-pin-lockstep.sh [--pnpm-sites | --toolchain-sites] [REPO_ROOT]
+# Usage: scripts/check-pin-lockstep.sh [--pnpm-sites | --toolchain-sites | --rwx-sites] [REPO_ROOT]
 # Exit:  0 = the pins agree, 1 = they do not (details on stderr).
 
 set -euo pipefail
@@ -83,6 +90,10 @@ case "${1:-}" in
     ;;
   --toolchain-sites)
     toolchain_sites_only=1
+    shift
+    ;;
+  --rwx-sites)
+    rwx_sites_only=1
     shift
     ;;
 esac
@@ -579,6 +590,54 @@ devbox_pins() {
   ' "$root/devbox.json"
 }
 
+# The RWX configs: `.rwx/` top level, the same file set renovate.json's RWX
+# customManagers match (`/^\.rwx/[^/]+\.ya?ml$/`). No `.rwx/` directory, no
+# sites, which is what every fixture in pin_lockstep.rs that predates RWX is.
+rwx_files() {
+  local f
+  for f in "$root"/.rwx/*.yml "$root"/.rwx/*.yaml; do
+    [ -f "$f" ] && printf '%s\n' "$f"
+  done
+}
+
+# Emits "<file>:<line> <version>" per RWX site of one pin. `$1` is an ERE for
+# what precedes the version, exactly what renovate.json's matching RWX
+# customManager puts before its `currentValue`, and `$2` names the pin in
+# errors. A line that carries the prefix without an exact X.Y.Z after it is an
+# error rather than a non-site: Renovate's regex would skip it, so the pin
+# would silently stop being bumped. Full-line comments are excluded, as
+# everywhere else here.
+scan_rwx() {
+  local prefix="$1" what="$2" f hit lineno rest token value
+  while IFS= read -r f; do
+    while IFS= read -r hit; do
+      lineno="${hit%%:*}"
+      rest="${hit#*:}"
+      while IFS= read -r token; do
+        value="$(printf '%s' "$token" | sed -E "s#^${prefix}##")"
+        value="${value%%[!0-9.]*}"
+        if ! printf '%s' "$value" | grep -qE "$SEMVER"; then
+          printf '%s%s:%s has an unreadable %s pin: %s. renovate.json matches an exact X.Y.Z here; anything else silently stops being tracked.\n' \
+            "$SCAN_ERR" "${f#"$root"/}" "$lineno" "$what" "'$token'"
+          continue
+        fi
+        printf '%s:%s %s\n' "${f#"$root"/}" "$lineno" "$value"
+      # `-e`: a prefix can start with `--` (rustup's `--default-toolchain`).
+      done < <(printf '%s' "$rest" | grep -oE -e "${prefix}[^[:space:]\"'/]*" || true)
+    done < <(pin_lines "$prefix" "$f")
+  done < <(rwx_files)
+}
+
+# The RWX sites of each class. The Rust toolchain has two spellings there:
+# `rust-lang/install`'s `rust-version:` and rustup's `--default-toolchain`.
+scan_rwx_toolchain() {
+  scan_rwx 'rust-version:[[:space:]]*' 'Rust toolchain'
+  scan_rwx '--default-toolchain[[:space:]]+' 'Rust toolchain'
+}
+scan_rwx_nextest() { scan_rwx 'get\.nexte\.st/' 'cargo-nextest'; }
+scan_rwx_pnpm() { scan_rwx 'pnpm@' 'pnpm'; }
+scan_rwx_gotask() { scan_rwx 'go-task/task/releases/download/v' 'go-task'; }
+
 # Emits "devbox.json(<name>) <version>" per named package in devbox.json.
 scan_devbox() {
   local name value found pins
@@ -658,17 +717,24 @@ if [ "${toolchain_sites_only:-0}" -eq 1 ]; then
   scan_workflow_toolchain
   exit 0
 fi
+if [ "${rwx_sites_only:-0}" -eq 1 ]; then
+  scan_rwx_toolchain
+  scan_rwx_nextest
+  scan_rwx_pnpm
+  scan_rwx_gotask
+  exit 0
+fi
 
 # `rustc`/`cargo`/`clippy`/`rustfmt` are four devbox packages carrying ONE
 # toolchain version, and the workflows express the same thing as a single
 # `toolchain:` input, so they are one class with four devbox sites.
 compare "Rust toolchain" \
   "$(scan_devbox rustc cargo clippy rustfmt)" \
-  "$(scan_workflow_toolchain)"
+  "$(scan_workflow_toolchain; scan_rwx_toolchain)"
 
 compare "cargo-nextest" \
   "$(scan_devbox cargo-nextest)" \
-  "$(scan_workflow_nextest)"
+  "$(scan_workflow_nextest; scan_rwx_nextest)"
 
 # pnpm is the desktop app's package manager: devbox.json's `pnpm` is what a
 # `devbox shell` runs `pnpm install` / `pnpm test` with, and
@@ -676,12 +742,19 @@ compare "cargo-nextest" \
 # the release's desktop bundle run them with (issue #1262).
 compare "pnpm" \
   "$(scan_devbox pnpm)" \
-  "$(scan_workflow_pnpm)"
+  "$(scan_workflow_pnpm; scan_rwx_pnpm)"
+
+# go-task runs the repository's Taskfile-based tests (`DAD_REQUIRE_GO_TASK`).
+# Compared only where RWX pins it, since nothing else in CI does.
+gotask_rwx="$(scan_rwx_gotask)"
+if [ -n "$gotask_rwx" ]; then
+  compare "go-task" "$(scan_devbox go-task)" "$gotask_rwx"
+fi
 
 if [ "$fail" -ne 0 ]; then
   cat >&2 <<'EOF'
 
-The pins in devbox.json and .github/workflows/ must match exactly: `cargo
+The pins in devbox.json, .github/workflows/ and .rwx/ must match exactly: `cargo
 test-fast` / `cargo test-e2e` in a devbox shell and `cargo nextest run` in CI
 are supposed to be the same claim, and so are `pnpm install` / `pnpm test` in
 desktop/, and they are not while these disagree.

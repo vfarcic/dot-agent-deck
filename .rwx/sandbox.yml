@@ -55,7 +55,7 @@ tasks:
 
   - key: go-task
     run: |
-      curl -LsSf https://github.com/go-task/task/releases/download/v3.54.0/task_linux_amd64.tar.gz \
+      curl -LsSf https://github.com/go-task/task/releases/download/v3.53.1/task_linux_amd64.tar.gz \
         | sudo tar zxf - -C /usr/local/bin task
       task --version
 

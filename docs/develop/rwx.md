@@ -40,6 +40,7 @@ Flipping the switch is a one-line pull request, and it takes effect on that pull
 - **RWX tests the PR's head commit; GitHub Actions tests the PR merged into its base.** A PR that is green on its head and red once merged with a moved `main` is caught by the overlap check before a merge (CLAUDE.md rule 8) and by `main`'s push run.
 - **A pull request from a fork needs someone to start its RWX run by hand** in the RWX UI.
 - **Tool caches live in the vault `dot_agent_deck_rwx_eval`**, whose "Allow public repositories" setting must stay on for GitHub-triggered runs on this public repository.
+- **Versions stay in step with local.** `.rwx/ci.yml` and `.rwx/sandbox.yml` pin the toolchain a third time, after `devbox.json` and the workflows. renovate.json's RWX customManagers bump them in the same grouped PRs as the other copies (every RWX bump is held for a human), and `scripts/check-pin-lockstep.sh` fails `cargo test-fast` when the Rust toolchain, nextest, pnpm or go-task in `.rwx/` disagree with `devbox.json`. RWX's own package versions (`git/clone`, `nodejs/install`, `rust-lang/install`) have no Renovate datasource and are bumped by hand.
 - **Reading a red:** RWX's failures are not in `gh run view`. `gh pr checks <n>` lists `RWX: linux` with a link to the run, and `rwx results <run-id>` (or `rwx logs <task-id>`) shows what failed.
 
 ## Sandboxed runs for agents
