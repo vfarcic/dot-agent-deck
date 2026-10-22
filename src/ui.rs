@@ -431,6 +431,7 @@ struct TabBarInfo {
     orchestration_statuses: Vec<Option<Vec<SessionStatus>>>,
 }
 
+#[derive(Clone)]
 struct DirPickerState {
     current_dir: PathBuf,
     entries: Vec<PathBuf>,
@@ -1800,6 +1801,11 @@ struct UiState {
     /// rows, if it drew them ([`render_bottom_bar`]), so a modal overlay is
     /// laid out above them rather than over them ([`overlay_area`]).
     restart_notice_area: Option<Rect>,
+    /// PRD #1666 part 2 (G-fix7f): how many of the open confirmation's
+    /// choices the last frame drew, with the mode it drew them for
+    /// ([`confirm_choices_drawn`]). A choice it did not draw cannot be moved
+    /// to or confirmed ([`refuse_undrawn_choice`]).
+    confirm_choices_drawn: Option<(UiMode, usize)>,
     /// PRD #341 M6: which pane the user was typing into as of the previous
     /// [`reconcile_pane_input_scrollback`] frame — `Some(pane_id)` while `mode ==
     /// PaneInput` with a focused pane, `None` otherwise. A change in this value is
@@ -2395,6 +2401,7 @@ impl UiState {
             last_focused_pane_id: None,
             restart_notice: None,
             restart_notice_area: None,
+            confirm_choices_drawn: None,
             last_pane_input_target: None,
             // PRD #113 revision: defaults to card 0 so first-launch Enter (before
             // anything has been selected) targets the first card, unchanged.
@@ -4049,6 +4056,11 @@ fn apply_pane_closure(
     }
     {
         let mut st = state.blocking_write();
+        // PRD #1666 part 2 (G-fix7f): the attachment that handed in any held
+        // placeholder for this pane is gone.
+        if forgot_attachment {
+            st.retire_held_placeholders(pane_id);
+        }
         // Again, for anything the render thread drew on this pane since the
         // subscriber's pass (a surface grown into it this frame).
         st.sessions.retain(|_, s| {
@@ -4130,9 +4142,10 @@ fn process_restart_drops(
     tab_manager: &mut TabManager,
     ui: &mut UiState,
 ) {
-    // In pane order, as the event subscriber queues its drops in key order, so
-    // the notice names agents in an order that does not depend on the
-    // controller's map or on which of the two noticed the restart first.
+    // In pane order, so the notice does not name lost panes in the order of
+    // the controller's map. The event subscriber's own drops, queued in card
+    // key order, are named before these, so when both report one restart the
+    // notice's order is not one sort over all of them.
     let mut lost_panes = pane.panes_lost_to_restart();
     lost_panes.sort_by(|a, b| a.0.cmp(&b.0));
     if lost_panes.is_empty() && state.blocking_read().pending_restart_drops.is_empty() {
@@ -4262,6 +4275,9 @@ fn process_restart_drops(
     for pane_id in &panes {
         left_focused_pane |= focused.as_deref() == Some(pane_id.as_str());
         pane.forget_pane(pane_id);
+        // G-fix7f: named here, so a placeholder its attachment handed in is not
+        // drawn, or named again, when the stream next opens.
+        state.blocking_write().retire_held_placeholders(pane_id);
         if let Some(outcome) = tab_manager.forget_externally_closed_pane(pane_id) {
             left_active_tab |= outcome.tab_removed && outcome.was_active;
             if outcome.tab_removed {
@@ -9584,6 +9600,43 @@ pub fn hit_test_button(button_rects: &[(Action, Rect)], col: u16, row: u16) -> O
         .find_map(|(action, rect)| point_in_rect(rect, col, row).then(|| action.clone()))
 }
 
+/// Whether a click in `mode` goes only to the open modal's own buttons
+/// (`UiState::modal_button_rects`) and is otherwise consumed, never reaching
+/// the bottom bar's buttons — the restart notice's `[Agents]` and `[Dismiss]`
+/// among them (PRD #1666 part 2, G-fix7f) — or the dashboard behind it. The
+/// directory picker and the new-agent form route their own clicks the same way
+/// before this is asked.
+fn modal_owns_clicks(mode: &UiMode) -> bool {
+    matches!(
+        mode,
+        UiMode::QuitConfirm
+            | UiMode::StopConfirm
+            // PRD #241 M3: its [Cancel]/[Close] buttons live in
+            // `modal_button_rects`; any miss is consumed here
+            // rather than falling through to the pane behind it.
+            | UiMode::CloseConfirm
+            | UiMode::ConfigGenPrompt
+            | UiMode::StarPrompt
+            | UiMode::Help
+            // PRD #1258 M3: the host overlay's [Close] button lives
+            // in `modal_button_rects`, like help's.
+            | UiMode::HostMetrics
+            // PRD #1666 §6.4: so do the deck-messages picker's.
+            | UiMode::InboxAttention
+            // PRD #1666 part 2 (G-fix7d): and the restart
+            // notice list's.
+            | UiMode::RestartNotice
+            // PRD #127 finding #4: the Schedules dialog is a
+            // topmost modal too — its [Add]/[Edit]/[Delete]/[Run now]
+            // buttons live in `modal_button_rects` and any miss is
+            // consumed here rather than reaching the pane behind it.
+            | UiMode::ScheduledTasks
+            // Issue #1635: the upgrade dialog's buttons live in
+            // `modal_button_rects` too.
+            | UiMode::Upgrade
+    )
+}
+
 /// PRD #80 review FIX 5 / issue #142: whether `mode` puts a **blocking overlay**
 /// (a modal, the directory picker, or the new-pane form) on top of the deck, so
 /// mouse-wheel events must not reach the pane rendered behind it. Scroll in
@@ -9719,6 +9772,9 @@ fn close_tab_by_index(
             let mut st = state.blocking_write();
             for id in &outcome.closed {
                 st.unregister_pane(id);
+                // PRD #1666 part 2 (G-fix7f): a card still waiting for the
+                // stream goes with its pane, rather than coming back later.
+                st.retire_held_placeholders(id);
             }
             // Drop only the sessions whose pane was actually closed; failed
             // panes keep their card/session so the user can retry.
@@ -12178,6 +12234,12 @@ fn handle_key_event(
     // otherwise be indistinguishable from an unbound key.
     let claimed_before_mode_handler = action.is_some();
 
+    // PRD #1666 part 2 (G-fix7f): a confirmation's choice the screen does not
+    // show is not chosen.
+    if action.is_none() && !is_ctrl_c {
+        action = refuse_undrawn_choice(&key, ui);
+    }
+
     // Mode-specific key handling (only when no shortcut claimed the key).
     if action.is_none() {
         action = Some(match ui.mode {
@@ -14401,34 +14463,7 @@ pub fn run_tui(
                     continue;
                 }
 
-                let modal_active = matches!(
-                    ui.mode,
-                    UiMode::QuitConfirm
-                        | UiMode::StopConfirm
-                        // PRD #241 M3: its [Cancel]/[Close] buttons live in
-                        // `modal_button_rects`; any miss is consumed here
-                        // rather than falling through to the pane behind it.
-                        | UiMode::CloseConfirm
-                        | UiMode::ConfigGenPrompt
-                        | UiMode::StarPrompt
-                        | UiMode::Help
-                        // PRD #1258 M3: the host overlay's [Close] button lives
-                        // in `modal_button_rects`, like help's.
-                        | UiMode::HostMetrics
-                        // PRD #1666 §6.4: so do the deck-messages picker's.
-                        | UiMode::InboxAttention
-                        // PRD #1666 part 2 (G-fix7d): and the restart
-                        // notice list's.
-                        | UiMode::RestartNotice
-                        // PRD #127 finding #4: the Schedules dialog is a
-                        // topmost modal too — its [Add]/[Edit]/[Delete]/[Run now]
-                        // buttons live in `modal_button_rects` and any miss is
-                        // consumed here rather than reaching the pane behind it.
-                        | UiMode::ScheduledTasks
-                        // Issue #1635: the upgrade dialog's buttons live in
-                        // `modal_button_rects` too.
-                        | UiMode::Upgrade
-                );
+                let modal_active = modal_owns_clicks(&ui.mode);
                 // PRD #80 M6: in the inline-edit modes the bottom row IS the
                 // input; its [Apply]/[Cancel] / [Save]/[Cancel] buttons live in
                 // `button_rects`, and any other click is consumed below so it
@@ -16267,20 +16302,71 @@ fn render_frame(
     render_overlays(frame, ui);
 }
 
-/// PRD #1666 part 2 (G-fix7e): the frame a modal overlay is laid out in — all
-/// of it, or the part above the restart notice's rows when this frame drew them
+/// PRD #1666 part 2 (G-fix7e): the frame a modal overlay is laid out in — the
+/// part above the restart notice's rows when this frame drew them
 /// ([`UiState::restart_notice_area`]), so the notice stays in view above Help
-/// and the other dialogs, as the desktop's toast floats above its dialogs. The
+/// and the other dialogs, as the desktop's toast floats above its dialogs; the
 /// overlay keeps its own keys meanwhile.
-fn overlay_area(frame: &Frame, ui: &UiState) -> Rect {
-    let area = frame.area();
-    match ui.restart_notice_area {
-        Some(notice) if notice.y > area.y => Rect {
-            height: notice.y - area.y,
-            ..area
+///
+/// G-fix7f: only when the modal shows there the same symbols, column for
+/// column, as over the whole frame ([`modal_drawing`]). One that would lose a row, a choice or a
+/// button to the notice's rows is laid out over the whole frame as before the
+/// notice existed, covering the notice while it is open; the notice is still
+/// held, and is back once the modal closes.
+fn overlay_area(frame: &mut Frame, ui: &mut UiState) -> Rect {
+    let full = frame.area();
+    let above = match ui.restart_notice_area {
+        Some(notice) if notice.y > full.y => Rect {
+            height: notice.y - full.y,
+            ..full
         },
-        _ => area,
+        _ => return full,
+    };
+    // Nothing to lay out: no modal is open, or it is the notice's own list,
+    // which is drawn over the whole frame.
+    if !overlay_blocks_mouse(&ui.mode) || ui.mode == UiMode::RestartNotice {
+        return full;
     }
+    if modal_drawing(frame, above, ui) == modal_drawing(frame, full, ui) {
+        above
+    } else {
+        full
+    }
+}
+
+/// What the open modal shows when laid out in `area`: each visible symbol with
+/// its column, row by row from the first row showing one. Drawn into a blank
+/// scratch buffer, and on copies of the state drawing moves (the directory
+/// picker's scroll and what the upgrade dialog counts as seen), so nothing
+/// reaches the screen or the state. Two areas whose drawings are equal show
+/// the same text, choices, buttons and borders, wherever each centres them;
+/// cleared cells are not compared, as a dialog that clears all of its area
+/// shows nothing more in a taller one.
+fn modal_drawing(frame: &mut Frame, area: Rect, ui: &mut UiState) -> Vec<Vec<(u16, String)>> {
+    let mut scratch = ratatui::buffer::Buffer::empty(frame.area());
+    std::mem::swap(frame.buffer_mut(), &mut scratch);
+    let picker = ui.dir_picker.clone();
+    let upgrade = ui.upgrade_dialog.clone();
+    draw_modal(frame, area, ui);
+    ui.dir_picker = picker;
+    ui.upgrade_dialog = upgrade;
+    std::mem::swap(frame.buffer_mut(), &mut scratch);
+    let drawn = scratch.area;
+    let mut rows: Vec<Vec<(u16, String)>> = (drawn.top()..drawn.bottom())
+        .map(|y| {
+            (drawn.left()..drawn.right())
+                .filter_map(|x| {
+                    let symbol = scratch[(x, y)].symbol();
+                    (!symbol.trim().is_empty()).then(|| (x, symbol.to_string()))
+                })
+                .collect()
+        })
+        .collect();
+    while rows.last().is_some_and(Vec::is_empty) {
+        rows.pop();
+    }
+    let first = rows.iter().take_while(|row| row.is_empty()).count();
+    rows.split_off(first)
 }
 
 fn render_overlays(frame: &mut Frame, ui: &mut UiState) {
@@ -16295,6 +16381,26 @@ fn render_overlays(frame: &mut Frame, ui: &mut UiState) {
     ui.form_field_rects.clear();
     ui.form_chip_rects.clear();
     ui.form_button_rects.clear();
+    if ui.mode == UiMode::RestartNotice
+        && let Some(notice) = ui.restart_notice.as_mut()
+    {
+        // The notice's own list: nothing it would cover needs to stay in view.
+        let full = frame.area();
+        ui.modal_button_rects = render_restart_notice_overlay(frame, full, notice, &ui.keybindings);
+    }
+    draw_modal(frame, area, ui);
+    if ui.mode == UiMode::CloseConfirm {
+        // PRD #241 review F5: the dialog has now reached the screen, so input
+        // arriving from here on is a genuine answer to it. Until this flip, the
+        // run loop refuses to feed it anything (see the drain at the top of the
+        // event loop).
+        ui.close_confirm_displayed = true;
+    }
+}
+
+/// Draw the open modal overlay in `area`, recording its click targets on `ui`.
+/// The restart notice's own list is drawn by [`render_overlays`].
+fn draw_modal(frame: &mut Frame, area: Rect, ui: &mut UiState) {
     if ui.mode == UiMode::Help {
         ui.modal_button_rects = render_help_overlay(frame, area, &ui.keybindings);
     }
@@ -16305,13 +16411,6 @@ fn render_overlays(frame: &mut Frame, ui: &mut UiState) {
         && let Some(dialog) = ui.inbox_attention.as_ref()
     {
         ui.modal_button_rects = render_inbox_attention_overlay(frame, area, dialog);
-    }
-    if ui.mode == UiMode::RestartNotice
-        && let Some(notice) = ui.restart_notice.as_mut()
-    {
-        // The notice's own list: nothing it would cover needs to stay in view.
-        let full = frame.area();
-        ui.modal_button_rects = render_restart_notice_overlay(frame, full, notice, &ui.keybindings);
     }
     if ui.mode == UiMode::DirPicker {
         // Capture the picker's row/button rects after the `dir_picker` borrow
@@ -16354,11 +16453,6 @@ fn render_overlays(frame: &mut Frame, ui: &mut UiState) {
     }
     if ui.mode == UiMode::CloseConfirm {
         ui.modal_button_rects = render_close_confirm(frame, area, &ui.close_confirm);
-        // PRD #241 review F5: the dialog has now reached the screen, so input
-        // arriving from here on is a genuine answer to it. Until this flip, the
-        // run loop refuses to feed it anything (see the drain at the top of the
-        // event loop).
-        ui.close_confirm_displayed = true;
     }
     if ui.mode == UiMode::Upgrade
         && let Some(dialog) = ui.upgrade_dialog.as_mut()
@@ -16378,6 +16472,8 @@ fn render_overlays(frame: &mut Frame, ui: &mut UiState) {
             ui.stop_confirm_agent_count,
         );
     }
+    // G-fix7f: after drawing, so the record is this frame's.
+    ui.confirm_choices_drawn = confirm_choices_drawn(ui, area).map(|drawn| (ui.mode, drawn));
 }
 
 // ---------------------------------------------------------------------------
@@ -18115,9 +18211,106 @@ fn modal_rect(desired_w: u16, desired_h: u16, terminal: Rect, min_w: u16, min_h:
     }
 }
 
+/// PRD #1666 part 2 (G-fix7f): the rows of a confirmation dialog that lists its
+/// choices one per row, which its renderer and [`confirm_choices_drawn`] both
+/// read, so what is drawn and what may be chosen cannot drift apart.
+struct ConfirmLayout {
+    /// The popup's height when the frame has room, borders included.
+    rows: u16,
+    /// The text line, inside the border, of the first choice.
+    first_choice: usize,
+    choices: usize,
+}
+
+impl ConfirmLayout {
+    /// The popup's height in `area`, with `extra` rows added above the choices
+    /// (the close dialog's kept-worktree warning).
+    fn popup_height(&self, extra: u16, area: Rect) -> u16 {
+        (self.rows + extra).min(area.height.saturating_sub(4))
+    }
+
+    /// How many choices a popup laid out in `area` draws inside its border.
+    fn choices_drawn(&self, extra: u16, area: Rect) -> usize {
+        if area.width.saturating_sub(4) <= 2 {
+            return 0;
+        }
+        let inner = usize::from(self.popup_height(extra, area).saturating_sub(2));
+        inner
+            .saturating_sub(self.first_choice + usize::from(extra))
+            .min(self.choices)
+    }
+}
+
+const QUIT_CONFIRM: ConfirmLayout = ConfirmLayout {
+    rows: 10,
+    first_choice: 3,
+    choices: 3,
+};
+const CLOSE_CONFIRM: ConfirmLayout = ConfirmLayout {
+    rows: 9,
+    first_choice: 3,
+    choices: CLOSE_CONFIRM_OPTION_COUNT,
+};
+const STOP_CONFIRM: ConfirmLayout = ConfirmLayout {
+    rows: 10,
+    first_choice: 4,
+    choices: 2,
+};
+const CONFIG_GEN_CONFIRM: ConfirmLayout = ConfirmLayout {
+    rows: 14,
+    first_choice: 5,
+    choices: 3,
+};
+
+/// PRD #1666 part 2 (G-fix7f): how many of the open confirmation's choices a
+/// frame drawing it in `area` shows; `None` for any other mode.
+fn confirm_choices_drawn(ui: &UiState, area: Rect) -> Option<usize> {
+    match ui.mode {
+        UiMode::QuitConfirm => Some(QUIT_CONFIRM.choices_drawn(0, area)),
+        UiMode::CloseConfirm => {
+            let kept = if ui.close_confirm.kept_worktree.is_some() {
+                3
+            } else {
+                0
+            };
+            Some(CLOSE_CONFIRM.choices_drawn(kept, area))
+        }
+        UiMode::StopConfirm => Some(STOP_CONFIRM.choices_drawn(0, area)),
+        UiMode::ConfigGenPrompt => Some(CONFIG_GEN_CONFIRM.choices_drawn(0, area)),
+        _ => None,
+    }
+}
+
+/// PRD #1666 part 2 (G-fix7f): refuse a key that would move to, or confirm, a
+/// choice the open confirmation's last frame did not draw — a terminal too
+/// small for its popup clips the lower choices — and Stop's `y` while its Yes
+/// is not drawn. Escape and the dialogs' own way back are never refused. Before
+/// a dialog's first frame nothing is recorded for it, and its keys act as
+/// before.
+fn refuse_undrawn_choice(key: &KeyEvent, ui: &UiState) -> Option<Action> {
+    let (mode, drawn) = ui.confirm_choices_drawn?;
+    if mode != ui.mode {
+        return None;
+    }
+    let selected = match mode {
+        UiMode::QuitConfirm => ui.quit_confirm_selected,
+        UiMode::CloseConfirm => ui.close_confirm.selected,
+        UiMode::StopConfirm => ui.stop_confirm_selected,
+        UiMode::ConfigGenPrompt => ui.config_gen_selected,
+        _ => return None,
+    };
+    let refused = match key.code {
+        KeyCode::Down | KeyCode::Char('j') => selected + 1 >= drawn,
+        KeyCode::Enter => selected >= drawn,
+        KeyCode::Char('y') | KeyCode::Char('Y') => mode == UiMode::StopConfirm && drawn < 2,
+        _ => false,
+    };
+    refused.then_some(Action::Continue)
+}
+
 fn render_quit_confirm(frame: &mut Frame, area: Rect, selected: usize) -> Vec<(Action, Rect)> {
     let popup_width = 64u16.min(area.width.saturating_sub(4));
-    let popup_height = 10u16.min(area.height.saturating_sub(4));
+    let popup_height = QUIT_CONFIRM.popup_height(0, area);
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
@@ -18221,7 +18414,7 @@ fn render_close_confirm(
         .try_into()
         .unwrap_or(u16::MAX);
     let popup_width = want_width.max(64).min(area.width.saturating_sub(4));
-    let popup_height = (9u16 + kept_lines).min(area.height.saturating_sub(4));
+    let popup_height = CLOSE_CONFIRM.popup_height(kept_lines, area);
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
@@ -18311,7 +18504,7 @@ fn render_close_confirm(
 /// terminated. Default selection is No (index 0).
 fn render_stop_confirm(frame: &mut Frame, area: Rect, selected: usize, agent_count: usize) {
     let popup_width = 68u16.min(area.width.saturating_sub(4));
-    let popup_height = 10u16.min(area.height.saturating_sub(4));
+    let popup_height = STOP_CONFIRM.popup_height(0, area);
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
@@ -18449,7 +18642,7 @@ fn render_star_prompt(frame: &mut Frame, area: Rect) -> Vec<(Action, Rect)> {
 
 fn render_config_gen_prompt(frame: &mut Frame, area: Rect, selected: usize) -> Vec<(Action, Rect)> {
     let popup_width = 60u16.min(area.width.saturating_sub(4));
-    let popup_height = 14u16.min(area.height.saturating_sub(4));
+    let popup_height = CONFIG_GEN_CONFIRM.popup_height(0, area);
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
@@ -19507,6 +19700,10 @@ fn render_host_metrics_overlay(
 /// or [`RESTART_NOTICE_LIST_MAX_WIDTH`], so a long name is read in full; the list
 /// scrolls by visual line from `notice.scroll`, clamped here to the last
 /// screenful.
+/// What the restart notice's list says in a popup with no row left for an
+/// agent's name.
+const RESTART_NOTICE_LIST_TOO_SHORT: &str = "Make the terminal taller to see the agents.";
+
 fn render_restart_notice_overlay(
     frame: &mut Frame,
     area: Rect,
@@ -19593,6 +19790,17 @@ fn render_restart_notice_overlay(
             .iter()
             .map(|(_, row)| Line::styled(row.clone(), text_primary())),
     );
+    // PRD #1666 part 2 (G-fix7f): a popup with no row left for the list says
+    // how to see it, rather than showing its opening words over nothing.
+    if shown == 0 && !rows.is_empty() {
+        lines = crate::upgrade_dialog::wrap(
+            RESTART_NOTICE_LIST_TOO_SHORT,
+            usize::from(inner.width.saturating_sub(2)),
+        )
+        .into_iter()
+        .map(|row| Line::styled(format!("  {row}"), Style::default().fg(Color::Yellow)))
+        .collect();
+    }
     let body_height = inner.height.saturating_sub(footer_height);
     frame.render_widget(
         Paragraph::new(lines),
@@ -19804,6 +20012,16 @@ fn render_dir_picker(
 
     // Screen y of line index `n` within the popup (inside the top border).
     let line_y = |n: usize| popup_area.y + 1 + n as u16;
+    // PRD #1666 part 2 (G-fix7f): whether line `n` is inside the popup's
+    // border. A popup too short for every reserved line clips the rest, and a
+    // row or button there is neither drawn nor clickable — written past the
+    // popup, it landed on whatever was below, the restart notice's rows
+    // included.
+    let inside = |n: usize| {
+        u16::try_from(n)
+            .ok()
+            .is_some_and(|n| n < popup_area.height.saturating_sub(2))
+    };
     let row_x = popup_area.x + 1;
     let row_width = popup_area.width.saturating_sub(2);
     let mut row_rects: Vec<(usize, Rect)> = Vec::new();
@@ -19844,6 +20062,9 @@ fn render_dir_picker(
             let suffix = if is_parent { "" } else { "/" };
             let line_idx = lines.len();
             lines.push(Line::styled(format!("{prefix}{name}{suffix}"), style));
+            if !inside(line_idx) {
+                continue;
+            }
             // Record this row's clickable rect, keyed by its filtered-list
             // index `i` (== what `picker.selected` holds).
             row_rects.push((
@@ -19891,6 +20112,9 @@ fn render_dir_picker(
         Button::new("Cancel", "", Action::PickerCancel, true),
         Button::new("Filter", "", Action::PickerFilter, true),
     ];
+    if !inside(button_line_idx) {
+        return (row_rects, Vec::new());
+    }
     let btn_row = Rect {
         x: row_x,
         y: line_y(button_line_idx),
@@ -41447,6 +41671,143 @@ mod tests {
         assert!(st.held_placeholders.is_empty() && st.take_restart_drops().is_empty());
     }
 
+    /// Scenario: before any event stream is open, a TUI's own panes on deck process `a` hand in their placeholders, which wait for the stream. The user closes the orchestration tab with Ctrl+W and confirms; or the deck announces one pane closed; or the deck restarts and the pane's reattach finds another process, and the user dismisses the notice that names it. When the stream then opens — on `a`, or on the restarted `b` — no card comes back for the closed pane and nothing is named again. Without the close, the same open draws the held cards (control).
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_a_closed_panes_held_placeholder_is_never_drawn() {
+        use crate::daemon_client::Incarnation;
+        use crate::daemon_client::restart_fixture::RestartingDaemon;
+        use crate::embedded_pane::{EmbeddedPaneController, PaneLostReason};
+        use tokio::sync::RwLock;
+        let named = |process: &str| Incarnation::from(Some(process.to_string()));
+        let hold = |state: &SharedState, panes: &[String]| {
+            let mut st = state.blocking_write();
+            for pane in panes {
+                st.register_pane(pane.clone());
+                st.insert_placeholder_session_learned(
+                    pane.clone(),
+                    None,
+                    None,
+                    Some("1".into()),
+                    named("a"),
+                );
+            }
+            assert_eq!(st.held_placeholders.len(), panes.len(), "precondition");
+        };
+        let cards_on = |state: &SharedState, panes: &[String]| {
+            state
+                .blocking_read()
+                .sessions
+                .values()
+                .filter(|card| {
+                    card.pane_id
+                        .as_deref()
+                        .is_some_and(|p| panes.iter().any(|pane| pane == p))
+                })
+                .count()
+        };
+
+        // Ctrl+W on the orchestration tab, confirmed.
+        for (closed, stream) in [(false, "a"), (true, "a"), (true, "b")] {
+            let pc = Arc::new(OpenTabPC::new());
+            let mut tab_manager = TabManager::new(pc.clone());
+            let (_, roles) = tab_manager
+                .open_orchestration_tab(&orch_config_local("orch"), "/work", None, None, (24, 80))
+                .expect("open an orchestration tab");
+            let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+            hold(&state, &roles);
+            let mut ui = default_ui();
+            if closed {
+                let snapshot = state.blocking_read().clone();
+                for action in [Action::CloseSelected, Action::ConfirmCloseSelected] {
+                    dispatch_action(
+                        action,
+                        &mut ui,
+                        &*pc,
+                        &state,
+                        &mut tab_manager,
+                        &snapshot,
+                        &[],
+                        None,
+                        Rect::new(0, 0, 80, 24),
+                    );
+                }
+                assert_eq!(tab_manager.tab_count(), 1, "precondition: the tab closed");
+            }
+            let mut st = state.blocking_write();
+            st.learn_stream_incarnation(named(stream));
+            let stale = st.take_restart_drops();
+            drop(st);
+            if !closed {
+                assert_eq!(cards_on(&state, &roles), roles.len(), "control: drawn");
+                continue;
+            }
+            assert_eq!(
+                cards_on(&state, &roles),
+                0,
+                "tab close, stream on {stream}: a closed role's card came back"
+            );
+            assert!(stale.is_empty(), "tab close, stream on {stream}: {stale:?}");
+        }
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        // The deck announces the pane closed; or the pane is lost to a restart.
+        for (lost, stream) in [(false, "a"), (false, "b"), (true, "a"), (true, "b")] {
+            let daemon = runtime.block_on(async { RestartingDaemon::spawn("a") });
+            let controller = Arc::new(
+                EmbeddedPaneController::new(daemon.path.clone(), runtime.handle().clone())
+                    .with_protocol_gate(),
+            );
+            let pane = controller
+                .create_pane(Some("cat"), None)
+                .expect("a pane on a");
+            let pc: Arc<dyn PaneController> = controller.clone();
+            let mut tab_manager = TabManager::new(pc.clone());
+            let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+            hold(&state, std::slice::from_ref(&pane));
+            let mut ui = default_ui();
+            ui.pane_display_names.insert(pane.clone(), "old".into());
+            if lost {
+                daemon.restart_as("b");
+                controller.mark_pane_lost_for_test(&pane, PaneLostReason::DeckRestarted);
+                process_restart_drops(&state, &*pc, &mut tab_manager, &mut ui);
+                assert_eq!(
+                    restart_notice_text(&ui).as_deref(),
+                    Some("The deck restarted; these agents were stopped: old."),
+                    "precondition: the lost pane is named"
+                );
+                ui.restart_notice = None;
+            } else {
+                let closure = crate::state::PaneClosure {
+                    pane_id: pane.clone(),
+                    agent_id: controller.pane_agent_id(&pane),
+                    queued_at: chrono::Utc::now(),
+                };
+                apply_pane_closure(&state, &*pc, &mut tab_manager, &mut ui, &closure);
+            }
+            assert!(pc.pane_agent_id(&pane).is_none(), "precondition: forgotten");
+            state
+                .blocking_write()
+                .learn_stream_incarnation(named(stream));
+            process_restart_drops(&state, &*pc, &mut tab_manager, &mut ui);
+            let path = if lost { "lost pane" } else { "announced close" };
+            assert_eq!(
+                cards_on(&state, std::slice::from_ref(&pane)),
+                0,
+                "{path}, stream on {stream}: the forgotten pane's card came back"
+            );
+            assert!(
+                ui.restart_notice.is_none(),
+                "{path}, stream on {stream}: named again: {:?}",
+                restart_notice_text(&ui)
+            );
+        }
+    }
+
     /// Scenario: a TUI has eight panes on deck process `a`, each with a card drawn before any stream named a process. The deck restarts, and every pane's reattach finds `b` answering before the event stream has noticed. The one notice names the eight agents in pane order, not in the order the pane controller happens to hold them.
     #[spec("lifecycle/handshake/013")]
     #[test]
@@ -41544,6 +41905,333 @@ mod tests {
                 assert_eq!(items, None, "the picker showed another process's rows");
                 assert_eq!(ui.mode, UiMode::Normal);
             }
+        }
+    }
+
+    /// A frame `width`×`height` of the empty dashboard in `ui`'s mode, drawn by
+    /// the production [`render_frame`], as text rows.
+    fn draw_sized(ui: &mut UiState, width: u16, height: u16) -> Vec<String> {
+        let state = AppState::default();
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let filtered = filter_sessions(&state, ui);
+        let bar_rows = bottom_bar_rows(ui, width, height);
+        terminal
+            .draw(|frame| {
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                let tab_view = ActiveTabView::Dashboard {
+                    exclude_pane_ids: vec![],
+                    zoomed: false,
+                };
+                let tab_bar = TabBarInfo {
+                    show: false,
+                    labels: vec!["Dashboard".into()],
+                    active_index: 0,
+                    orchestration_statuses: vec![],
+                };
+                let layout = compute_frame_layout(
+                    frame.area(),
+                    &tab_view,
+                    &tab_bar,
+                    &[],
+                    PaneLayout::Stacked,
+                    None,
+                    bar_rows,
+                );
+                render_frame(
+                    frame,
+                    &state,
+                    ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    &tab_view,
+                    &tab_bar,
+                    &layout,
+                    Utc::now(),
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    /// A UI holding a restart notice that names five agents, too long for its
+    /// buttons to share the summary's row at 80 columns, with a status message.
+    fn ui_with_long_restart_notice(mode: UiMode) -> UiState {
+        let mut ui = default_ui();
+        let mut notice = RestartNotice::default();
+        for (i, label) in ["coordinator", "reviewer", "tester", "writer", "release"]
+            .iter()
+            .enumerate()
+        {
+            notice.join(
+                StoppedIdentity {
+                    pane: Some(format!("p{i}")),
+                    key: None,
+                    agent: Some(i.to_string()),
+                    process: crate::daemon_client::Incarnation::from(Some("old".to_string())),
+                },
+                crate::daemon_client::StoppedAgent {
+                    label: (*label).to_string(),
+                    role: None,
+                    orchestration: None,
+                },
+            );
+        }
+        ui.restart_notice = Some(notice);
+        ui.status_message = Some(("an ordinary status".into(), std::time::Instant::now()));
+        ui.mode = mode;
+        ui
+    }
+
+    const LONG_NOTICE: &str = "The deck restarted; these agents were stopped: coordinator";
+
+    /// Scenario: with a restart notice held in two footer rows and a status line, the user picks Stop and reaches its confirmation. In an 80×14 terminal the dialog does not fit above the notice, so it is laid out over the whole frame as it was before the notice existed: No and Yes are both on screen, Down visibly moves to Yes and Enter stops. In an 80×24 terminal it fits above the notice, which stays in view beside both choices. The notice is held through both.
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_a_confirmation_that_does_not_fit_above_the_notice_keeps_every_choice() {
+        use tokio::sync::RwLock;
+        for (height, fits) in [(14u16, false), (24, true)] {
+            let mut ui = ui_with_long_restart_notice(UiMode::StopConfirm);
+            ui.stop_confirm_agent_count = 3;
+            let rows = draw_sized(&mut ui, 80, height);
+            let notice = ui.restart_notice_area.expect("the notice was drawn");
+            assert!(notice.height >= 2, "precondition: two notice rows");
+            let shown = rows.join("\n");
+            let choice = |rows: &[String], label: &str| {
+                rows.iter()
+                    .find(|row| row.contains(&format!(" {label} ")) && row.contains('\u{2014}'))
+                    .cloned()
+            };
+            assert!(
+                choice(&rows, "No").is_some_and(|row| row.contains("> No")),
+                "{height}: No is not shown selected:\n{shown}"
+            );
+            assert!(
+                choice(&rows, "Yes").is_some(),
+                "{height}: Yes is not on screen:\n{shown}"
+            );
+            assert_eq!(
+                shown.contains(LONG_NOTICE),
+                fits,
+                "{height}: the notice's visibility beside the dialog:\n{shown}"
+            );
+
+            let pc = Arc::new(OpenTabPC::new());
+            let mut tab_manager = TabManager::new(pc.clone());
+            let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+            let snapshot = AppState::default();
+            let area = Rect::new(0, 0, 80, height);
+            let mut press = |ui: &mut UiState, code: KeyCode| {
+                handle_key_event(
+                    KeyEvent::new(code, KeyModifiers::NONE),
+                    ui,
+                    &*pc,
+                    &state,
+                    &mut tab_manager,
+                    &snapshot,
+                    &[],
+                    area,
+                )
+            };
+            assert_eq!(press(&mut ui, KeyCode::Down), Flow::Continue);
+            let rows = draw_sized(&mut ui, 80, height);
+            assert!(
+                choice(&rows, "Yes").is_some_and(|row| row.contains("> Yes")),
+                "{height}: Down selected a Yes the screen does not show:\n{}",
+                rows.join("\n")
+            );
+            assert!(
+                ui.restart_notice.is_some(),
+                "{height}: the notice was let go"
+            );
+            assert_eq!(
+                press(&mut ui, KeyCode::Enter),
+                Flow::Break,
+                "{height}: Enter on the shown Yes did not stop"
+            );
+        }
+    }
+
+    /// Scenario: a terminal so short that even over the whole frame the Stop confirmation clips its Yes. Down cannot move to the Yes the screen does not show, and neither Enter nor `y` stops the deck; Escape still returns to the Quit dialog. At a height that shows Yes, Down and Enter stop as before (control).
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_a_confirmation_choice_the_screen_does_not_show_is_never_taken() {
+        use tokio::sync::RwLock;
+        for (height, shown) in [(10u16, false), (14, true)] {
+            let mut ui = default_ui();
+            ui.mode = UiMode::StopConfirm;
+            ui.stop_confirm_agent_count = 2;
+            let rows = draw_sized(&mut ui, 80, height).join("\n");
+            assert_eq!(rows.contains("Yes"), shown, "precondition:\n{rows}");
+            let pc = Arc::new(OpenTabPC::new());
+            let mut tab_manager = TabManager::new(pc.clone());
+            let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+            let snapshot = AppState::default();
+            let area = Rect::new(0, 0, 80, height);
+            let mut press = |ui: &mut UiState, code: KeyCode| {
+                handle_key_event(
+                    KeyEvent::new(code, KeyModifiers::NONE),
+                    ui,
+                    &*pc,
+                    &state,
+                    &mut tab_manager,
+                    &snapshot,
+                    &[],
+                    area,
+                )
+            };
+            if shown {
+                press(&mut ui, KeyCode::Down);
+                assert_eq!(press(&mut ui, KeyCode::Enter), Flow::Break, "control");
+                continue;
+            }
+            for code in [KeyCode::Down, KeyCode::Enter, KeyCode::Char('y')] {
+                assert_eq!(
+                    press(&mut ui, code),
+                    Flow::Continue,
+                    "{code:?} acted on a Yes the screen does not show"
+                );
+                assert_eq!(ui.mode, UiMode::StopConfirm);
+                assert_eq!(ui.stop_confirm_selected, 0, "{code:?} moved to Yes");
+            }
+            press(&mut ui, KeyCode::Esc);
+            assert_eq!(ui.mode, UiMode::QuitConfirm, "Escape no longer returns");
+        }
+    }
+
+    /// Scenario: with a restart notice held in its footer rows, the user opens the upgrade dialog in a 60×24 terminal, narrower than the dialog needs. The dialog asks for a larger terminal above the notice, which stays in view: no draw clears it.
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_the_upgrade_dialogs_too_small_state_keeps_the_notice() {
+        use crate::self_upgrade::{
+            CopyKind, InstallMethod, Installation, PlanOptions, Platform, ProvenanceCheck, plan,
+        };
+        let installation = Installation {
+            copy: CopyKind::Cli,
+            executable: PathBuf::from("/home/u/.local/bin/dot-agent-deck"),
+            version: "0.46.0".into(),
+            platform: Some(Platform::LinuxAmd64),
+            method: InstallMethod::DownloadedWritable {
+                binary: PathBuf::from("/home/u/.local/bin/dot-agent-deck"),
+            },
+            tools: Default::default(),
+        };
+        let options = PlanOptions {
+            staging_root: PathBuf::from("/home/u/.local/state/dot-agent-deck/upgrade"),
+            can_prompt_for_privilege: false,
+            provenance: ProvenanceCheck::Unavailable {
+                reason: crate::self_upgrade::verify::GH_NOT_INSTALLED.into(),
+            },
+        };
+        let plan = plan::plan(&installation, &"0.47.0".into(), &options);
+        let mut ui = ui_with_long_restart_notice(UiMode::Upgrade);
+        ui.upgrade_dialog = Some(crate::upgrade_dialog::UpgradeDialog::new(vec![plan]));
+        let rows = draw_sized(&mut ui, 60, 24).join("\n");
+        assert!(
+            rows.contains("The terminal is too small"),
+            "precondition: the too-small state\n{rows}"
+        );
+        assert!(
+            rows.contains("The deck restarted; these agents"),
+            "the upgrade dialog cleared the notice:\n{rows}"
+        );
+        assert!(ui.restart_notice.is_some());
+    }
+
+    /// Scenario: with the restart notice's `[Agents]` and `[Dismiss]` in the footer, every mode that puts a modal over the deck routes a click to that modal alone — its own buttons, or nothing — so a click on the notice's buttons while a dialog is open acts on nothing behind it. The directory picker and the new-agent form route clicks to themselves first. Without a modal the footer's buttons take clicks (control).
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_a_modal_keeps_clicks_from_the_notices_buttons() {
+        for mode in [
+            UiMode::Normal,
+            UiMode::Filter,
+            UiMode::Rename,
+            UiMode::PaneInput,
+            UiMode::QuitConfirm,
+            UiMode::StopConfirm,
+            UiMode::CloseConfirm,
+            UiMode::ConfigGenPrompt,
+            UiMode::StarPrompt,
+            UiMode::Help,
+            UiMode::DirPicker,
+            UiMode::NewPaneForm,
+            UiMode::HostMetrics,
+            UiMode::ScheduledTasks,
+            UiMode::Upgrade,
+            UiMode::InboxAttention,
+            UiMode::RestartNotice,
+        ] {
+            let routed_first = matches!(mode, UiMode::DirPicker | UiMode::NewPaneForm);
+            assert_eq!(
+                modal_owns_clicks(&mode) || routed_first,
+                overlay_blocks_mouse(&mode),
+                "{mode:?}: a click over its modal can reach the footer's buttons"
+            );
+        }
+    }
+
+    /// Scenario: the user opens the restart notice's list in a terminal so short that no row is left for an agent's name. The list says to make the terminal taller instead of showing its opening words over nothing; at a height with room it lists the agents (control).
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_a_restart_list_with_no_room_says_how_to_see_it() {
+        for (height, room) in [(8u16, false), (16, true)] {
+            let frames = render_restart_notice_key_sequence_to_buffers(
+                &["coder", "reviewer"],
+                UiMode::RestartNotice,
+                None,
+                &[],
+                40,
+                height,
+            );
+            let buffer = &frames[0];
+            let text: String = (0..height)
+                .map(|y| (0..40).map(|x| buffer[(x, y)].symbol()).collect::<String>() + "\n")
+                .collect();
+            assert_eq!(
+                text.contains("Make the terminal taller"),
+                !room,
+                "{height}:\n{text}"
+            );
+            assert_eq!(text.contains("coder"), room, "{height}:\n{text}");
+        }
+    }
+
+    /// Scenario: the directory picker is opened in an area only seven rows tall, above two rows that show something else. Its rows and buttons that do not fit inside its border are neither drawn nor clickable, and nothing below the area is written.
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_the_directory_picker_writes_only_inside_its_popup() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["alpha", "beta", "gamma"] {
+            std::fs::create_dir(dir.path().join(name)).unwrap();
+        }
+        let mut picker = DirPickerState::new(dir.path().to_path_buf());
+        let mut terminal = Terminal::new(TestBackend::new(120, 10)).unwrap();
+        let mut targets = (Vec::new(), Vec::new());
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    Paragraph::new(vec![Line::from("X".repeat(120)); 10]),
+                    frame.area(),
+                );
+                targets = render_dir_picker(frame, Rect::new(0, 0, 120, 7), &mut picker);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        for y in 7..10 {
+            let row: String = (0..120).map(|x| buffer[(x, y)].symbol()).collect();
+            assert_eq!(row, "X".repeat(120), "row {y} was written: {row}");
+        }
+        let (rows, buttons) = targets;
+        for rect in rows
+            .iter()
+            .map(|(_, r)| r)
+            .chain(buttons.iter().map(|(_, r)| r))
+        {
+            assert!(rect.y < 7 - 1, "a click target past the popup: {rect:?}");
         }
     }
 

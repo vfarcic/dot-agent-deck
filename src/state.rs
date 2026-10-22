@@ -417,11 +417,12 @@ const MAX_PENDING_ORCHESTRATION_SURFACES: usize = 64;
 /// stale when the stream next opens.
 const MAX_REPLACED_PROCESSES: usize = 16;
 
-/// PRD #1666 part 2 (G-fix7e): cap on [`AppState::held_placeholders`]. One is
-/// held per pane and process, so this is reached only by more panes started or
-/// attached between two stream opens than any tab holds. Past it the oldest is
-/// let go unresolved: it is neither drawn nor reported, and its pane keeps its
-/// local attachment.
+/// PRD #1666 part 2 (G-fix7e): cap on [`AppState::held_placeholders`], which
+/// holds one entry per pane and process from when its pane is started or
+/// attached until the stream next opens on a named process, or its pane is
+/// closed, forgotten or lost (G-fix7f). Past it the oldest is let go
+/// unresolved: it is neither drawn nor reported, and its pane keeps its local
+/// attachment.
 const MAX_HELD_PLACEHOLDERS: usize = 64;
 
 /// PRD #1223: cap on [`AppState::pending_pane_closures`], for the same reason
@@ -1901,7 +1902,8 @@ pub struct AppState {
     /// older only the stream can tell: when it next opens, a placeholder from
     /// its process is drawn and every other one is stale
     /// ([`Self::learn_stream_incarnation`]). One per pane and process; the
-    /// oldest is let go past [`MAX_HELD_PLACEHOLDERS`].
+    /// oldest is let go past [`MAX_HELD_PLACEHOLDERS`], and G-fix7f: each is let
+    /// go with its pane ([`Self::retire_held_placeholders`]).
     pub held_placeholders: Vec<HeldPlaceholder>,
     /// Issue #717: dispatched worktrees a close LEFT ON DISK, waiting to be
     /// reported on the status line. Filled by the event subscriber (which has no
@@ -8260,6 +8262,57 @@ impl AppState {
         }
     }
 
+    /// PRD #1666 part 2 (G-fix7f): give each agent the resync's snapshot
+    /// `records` lists on a pane with no card a card of its own, as the deck's
+    /// card-surfacing start would have drawn it had the stream been open when it
+    /// was broadcast. Without it an agent started while the stream was down —
+    /// across a deck restart, or a lagged stream — had no card until the TUI
+    /// restarted. An orchestration role's record is left alone: its tab is
+    /// built from the deck's surface, not from a listing.
+    pub fn card_unseen_agents(&mut self, records: &[crate::agent_pty::AgentRecord]) {
+        if self.agent_ownership.is_some() {
+            return;
+        }
+        for record in records {
+            let Some(pane_id) = record.pane_id_env.as_deref() else {
+                continue;
+            };
+            if matches!(
+                record.tab_membership,
+                Some(crate::agent_pty::TabMembership::Orchestration { .. })
+            ) || self
+                .sessions
+                .values()
+                .any(|card| card.pane_id.as_deref() == Some(pane_id))
+            {
+                continue;
+            }
+            self.seed_hydrated_session(
+                pane_id.to_string(),
+                record.cwd.clone(),
+                record.agent_type.clone(),
+                Some(record.id.clone()),
+                record.live.as_ref(),
+            );
+            let name = record
+                .display_name
+                .as_deref()
+                .and_then(crate::untrusted_text::sanitize_display_name);
+            if let Some(card) = self
+                .sessions
+                .get_mut(&placeholder_session_id(pane_id))
+                .filter(|card| card.display_name.is_none())
+            {
+                card.display_name = name;
+            }
+            if let Ok(seq) = record.id.parse::<u64>() {
+                self.pane_surfaced_agent_seq
+                    .entry(pane_id.to_string())
+                    .or_insert(seq);
+            }
+        }
+    }
+
     /// PRD #120: record a daemon-spawned orchestration for the render loop to
     /// build into a live tab. Called from the event subscriber, which receives
     /// the [`BroadcastMsg::OrchestrationSurface`] but cannot touch the
@@ -10071,7 +10124,20 @@ impl AppState {
             self.sessions.remove(&id);
             self.retire_removed_card_background(&id);
         }
+        // PRD #1666 part 2 (G-fix7f): and the cards still waiting to be drawn.
+        self.retire_held_placeholders(pane_id);
         n
+    }
+
+    /// PRD #1666 part 2 (G-fix7f): let go every placeholder held for `pane_id`
+    /// ([`Self::held_placeholders`]). Each was handed in by this client's own
+    /// attachment for that pane, so once the pane is closed, forgotten or lost
+    /// none of them has anything left to draw — and drawn when the stream next
+    /// opened on its process, it would bring back the card of an agent the user
+    /// closed, or name a dropped one in the restart notice a second time.
+    pub fn retire_held_placeholders(&mut self, pane_id: &str) {
+        self.held_placeholders
+            .retain(|held| held.pane_id != pane_id);
     }
 
     /// PRD #126 + #140: the **orchestration** cwd for `orchestrator_pane_id` —

@@ -324,6 +324,9 @@ async fn resubscribe(
             let dropped = state.learn_stream_incarnation(learned_from(&sub));
             state.resync_after_event_gap(&records);
             state.seed_successor_cards(&dropped, &records);
+            // G-fix7f: and an agent whose card-surfacing start was broadcast
+            // while no stream was open gets the card it missed.
+            state.card_unseen_agents(&records);
             Ok(sub)
         }
         Err(ResyncFailure::Protocol(refusal)) => Err(Some(refusal)),
@@ -1366,6 +1369,85 @@ mod tests {
                 Some(crate::pane::BoundPane::new("pane-1", named("b")))
             );
         }
+    }
+
+    /// Scenario: the TUI's event stream opens on deck process `a` with no cards, then ends; while it is down, an agent is started on `pane-1` — the deck's card-surfacing start is broadcast to no one. When the stream comes back, on the restarted `b` or on `a` again, the resync's snapshot lists that agent and it has a card bound to the stream's process, rather than none until the TUI restarts.
+    #[spec("lifecycle/handshake/013")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handshake_013_an_agent_started_while_the_stream_was_down_gets_a_card() {
+        use crate::daemon_client::Incarnation;
+        use crate::daemon_client::restart_fixture::RestartingDaemon;
+        let named = |process: &str| Incarnation::from(Some(process.to_string()));
+        for restarted in [false, true] {
+            let daemon = RestartingDaemon::spawn("a");
+            let client = DaemonClient::new(daemon.path.clone()).with_protocol_gate();
+            let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+            let first = subscribe(&client, &state).await.expect("the first stream");
+            assert!(state.read().await.sessions.is_empty());
+            drop(first);
+            state.write().await.note_event_stream_gap();
+            let process = if restarted { "b" } else { "a" };
+            if restarted {
+                daemon.restart_as("b");
+            }
+            let _second = resubscribe(&client, &state)
+                .await
+                .expect("the resubscription");
+            let state = state.read().await;
+            let cards: Vec<_> = state
+                .sessions
+                .values()
+                .filter(|card| card.pane_id.as_deref() == Some("pane-1"))
+                .map(|card| (card.agent_id.clone(), card.incarnation.clone()))
+                .collect();
+            assert_eq!(
+                cards,
+                vec![(Some("1".to_string()), named(process))],
+                "restarted={restarted}: the agent started while the stream was down has no card"
+            );
+        }
+    }
+
+    /// Scenario: after a gap, the deck's snapshot lists a named agent with no card, an orchestration role with no card, and an agent whose pane already has the card its start drew, with no agent id. Only the first gets a new card, titled with its name; the role waits for its tab, and the carded pane keeps its one card and its name.
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_unseen_agents_are_carded_once_and_roles_are_left_to_their_tab() {
+        use crate::daemon_client::Incarnation;
+        let mut tui = AppState::default();
+        tui.learn_stream_incarnation(Incarnation::from(Some("b".to_string())));
+        tui.apply_event(event_on("carded", "3", "card", EventType::SessionStart, 1));
+        // As the deck's card-surfacing start draws it: no agent id, its name.
+        if let Some(card) = tui.sessions.get_mut("card") {
+            card.agent_id = None;
+            card.display_name = Some("surfaced".into());
+        }
+        let records: Vec<AgentRecord> = serde_json::from_value(serde_json::json!([
+            { "id": "1", "pane_id_env": "named", "display_name": "held-successor" },
+            { "id": "2", "pane_id_env": "role", "tab_membership": {
+                "kind": "orchestration", "name": "o", "role_index": 0,
+                "role_name": "lead", "is_start_role": true } },
+            { "id": "3", "pane_id_env": "carded" },
+        ]))
+        .unwrap();
+        tui.card_unseen_agents(&records);
+        let on = |pane: &str| {
+            tui.sessions
+                .values()
+                .filter(|card| card.pane_id.as_deref() == Some(pane))
+                .map(|card| card.display_name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(on("named"), vec![Some("held-successor".to_string())]);
+        assert_eq!(
+            on("role"),
+            Vec::<Option<String>>::new(),
+            "a role was carded"
+        );
+        assert_eq!(
+            on("carded"),
+            vec![Some("surfaced".to_string())],
+            "a carded pane got a second card, or lost its own"
+        );
     }
 
     /// Scenario: the TUI holds a card for agent `1` on `pane-1` learned from deck process `a`, its stream's process, and then gets the placeholder card for a pane it attached on `b` with the same pane and agent id — the deck restarted as the same build, and the stream has not noticed yet. The placeholder is not the old card and does not replace it: it waits, and the old card stays, until the stream itself moves to `b`; then the old card is dropped and queued for the restart notice, and the placeholder is drawn bound to `b`. A placeholder learned from `a` itself is the card already there (control).

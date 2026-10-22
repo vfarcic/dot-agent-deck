@@ -865,7 +865,7 @@ pub fn render(
         };
         // One body row, the marker row and the hint, the border, the margin.
         let needed = u16::try_from(rows + 1 + 2 + 2 + 2).unwrap_or(u16::MAX);
-        return render_too_small(frame, phase, &title, needed);
+        return render_too_small(frame, area, phase, &title, needed);
     }
     let (mut footer, buttons, first_button_row) = footer_rows(dialog, phase, text_width);
 
@@ -966,15 +966,16 @@ fn push_wrapped(out: &mut Vec<Line<'static>>, text: &str, width: usize, style: S
 
 /// The dialog in a terminal too small to show the plan: what size it needs
 /// (`rows` tall, [`MIN_COLUMNS`] wide), and Close. While an upgrade runs there
-/// is nothing to close, as in the full dialog. Drawn over the whole frame,
-/// wrapped to it.
+/// is nothing to close, as in the full dialog. Drawn over all of `area`, the
+/// area the dialog was given, wrapped to it (PRD #1666 part 2, G-fix7f: not
+/// over the whole frame, which would clear the restart notice's rows below it).
 fn render_too_small(
     frame: &mut Frame,
+    area: Rect,
     phase: Phase,
     title: &str,
     rows: u16,
 ) -> Vec<(UpgradeChoice, Rect)> {
-    let area = frame.area();
     let width = usize::from(area.width);
     let mut text: Vec<Line<'static>> = Vec::new();
     push_wrapped(
