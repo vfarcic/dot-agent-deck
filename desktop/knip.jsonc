@@ -1,0 +1,17 @@
+// knip's configuration for `/code-cleanup` (.claude/skills/code-cleanup/find-targets.sh,
+// which pins the knip version). Each entry below records a false positive knip
+// reports without it, with the reason; a finding that is wrong for a reason not
+// listed here gets its own entry and reason, never a broad ignore.
+{
+  "$schema": "https://unpkg.com/knip@6/schema-jsonc.json",
+  "playwright": {
+    // `pnpm test:browser` runs the first; the docs-screenshots command
+    // (xtask/screenshots) runs the second, whose `testDir`, `*.shot.ts` match
+    // and `globalSetup` make the files under screenshots/ entry points. knip
+    // reads only playwright.config.ts unless told otherwise.
+    "config": ["playwright.config.ts", "playwright.screenshots.config.ts"]
+  },
+  // The `webkit-warm-up` setup project in playwright.config.ts selects this file
+  // by a `testMatch` regex, which knip's Playwright plugin does not resolve.
+  "entry": ["e2e/webkit-warm-up.setup.ts"]
+}

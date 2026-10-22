@@ -698,3 +698,15 @@ Give the runner, per unit: PRD number, the shape it was dispatched in and the fl
 - **Anything you excluded, and why** — in-flight collisions, PRDs with no PRD behind the label (no file and no PRD content in the issue), and any candidate abandoned at step 6 or 8 over an assignee collision or a refused dispatch.
 - **The base every unit was cut from, as a distance from `origin/main`** — the sha, plus `0 behind` after step 0b fast-forwarded it or `N behind` when step 0b declined to move it, measured at the moment the batch was dispatched rather than now. Report it when the base was already current too: nothing else distinguishes a base that was checked from one nobody looked at, and a bare branch name distinguishes neither. Where `dispatch`'s own success line names the base (`…, cut from main at c701932`), quote that rather than recomputing it — and read a missing clause as an older build or a failed probe, never as a base that is fine.
 - **Anything you could not verify**, including a checkout step 0b declined to move and which precondition stopped it, and any list you could not confirm was untruncated.
+
+## Step 10 — End of run: dispatch the cleanup units
+
+**A PRD queue run ends with the end-of-run step defined once in [`code-cleanup`](../code-cleanup/SKILL.md), section "At the end of a dispatch run"**, exactly as `/issue-queue` runs end. Follow it from this pane rather than composing cleanup tasks here; it holds when the step starts, the second pass of [`dispatch-base`](../dispatch-base/SKILL.md), the off-limits list, the frequency guard and why it is skipped before a release.
+
+What this queue adds to it:
+
+- **It starts once every PRD unit of this run has finished**: its PR merged, closed or waiting for a person, or the unit stopped without one. Read that from the PRs (`gh pr list --head <branch> --state all`) rather than waiting for a report in this pane. PRD units run for hours, so if the runner leaves before then, the step does not run in this session; say in step 9's report that it is still owed.
+- **The off-limits list is the one this run's tasks carried**, if the runner gave one.
+- **Report the cleanup units** as step 9 reports the PRD units, the modes the frequency guard skipped included.
+
+**The runner can skip this step for a run** by saying so; say in step 9's report that no cleanup units went out.

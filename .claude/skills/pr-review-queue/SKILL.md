@@ -574,3 +574,15 @@ Report the base too, as a distance from `origin/main` rather than a branch name:
 Also report, plainly: every PR skipped and why — closed since listing, become someone else's homework, or already under a live unit (name that unit) — every PR excluded at step 1, and the number dispatched against the number the user asked for if they differ.
 
 **Never write anything that implies results will report back here** — no "I'll let you know when they finish", no "waiting for the verdicts", no summary table with an empty Verdict column waiting to be filled. There is no mechanism behind any of those sentences. If the user wants a consolidated view later, they ask each pane, or re-attach to it.
+
+## Step 9 — End of run: dispatch the cleanup units
+
+**A review queue run ends with the end-of-run step defined once in [`code-cleanup`](../code-cleanup/SKILL.md), section "At the end of a dispatch run"**, exactly as `/issue-queue` runs end. Follow it from this pane rather than composing cleanup tasks here; it holds when the step starts, the second pass of [`dispatch-base`](../dispatch-base/SKILL.md), the off-limits list, the frequency guard and why it is skipped before a release.
+
+What this queue adds to it:
+
+- **It starts once every unit of this run has finished**: the PR it worked on merged, closed or waiting for a person, and the unit stopped. Read that from the PRs and the units' tabs rather than waiting for a report in this pane (step 8). If the runner leaves before then, the step does not run in this session; say so in step 8's report.
+- **The off-limits list is the one this run's tasks carried**, if the runner gave one.
+- **Report the cleanup units** as step 8 reports the review units, the modes the frequency guard skipped included.
+
+**The runner can skip this step for a run** by saying so; say in step 8's report that no cleanup units went out.
