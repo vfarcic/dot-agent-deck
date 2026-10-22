@@ -10,8 +10,8 @@
 //! Picking "two" is not a reference the transcript supports in the usual sense,
 //! so it is validated against the list this app put on screen, not against the
 //! utterance. **That is a different check from reference grounding** (removed
-//! 2026-09-24 — `voice-first-design.md` §6) and from action grounding
-//! (`action_grounded`): it asks *is this answer one of the entries offered, and
+//! 2026-09-24 — `voice-first-design.md` §6) and from action grounding (the
+//! meaning check, `super::meaning`): it asks *is this answer one of the entries offered, and
 //! does it name exactly one?* It does not reinstate reference grounding, and it
 //! must not be skipped because "grounding was removed".
 //!
