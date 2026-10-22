@@ -576,8 +576,8 @@ lands, whether or not that check has passed. PR #1208 landed a lockfile update
 inside Renovate's renovate/stability-days window by the same gap. So read
 `gh pr checks <n>` before arming, and if an unrequired check is pending and
 matters, leave the PR DISARMED rather than arming it. Auto-merge also runs no
-overlap check (.claude/skills/issue-queue/SKILL.md, "The overlap check before a
-merge"): it merges on whatever CI the PR has when the approval lands, even if
+overlap check (.claude/skills/merge-pr/SKILL.md, "The overlap check before a
+merge") and no watch of main's CI run after the merge: it merges on whatever CI the PR has when the approval lands, even if
 `main` has changed the PR's files since.
 ```
 

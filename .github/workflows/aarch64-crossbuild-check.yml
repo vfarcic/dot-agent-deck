@@ -51,7 +51,38 @@ permissions:
   contents: read
 
 jobs:
+  # `.github/ci-backend` moves a pull request's Linux jobs to RWX
+  # (docs/develop/rwx.md); `.rwx/ci.yml` runs this check there under the same
+  # path filter. A dispatch always runs here.
+  backend:
+    runs-on: ubuntu-latest
+    outputs:
+      linux_backend: ${{ steps.backend.outputs.linux_backend }}
+    steps:
+      - id: backend
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          # The PR's HEAD, not `github.sha` (the merge commit): RWX reads the
+          # file at the head, and both sides must make the same choice. Read
+          # at the merge commit, a PR cut before `main` switched to `rwx`
+          # would make GHA skip its Linux jobs while RWX, reading `gha` at
+          # the head, skipped its own, and nothing would run.
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          backend=gha
+          if [ "$EVENT" = pull_request ]; then
+            file=$(gh api -H 'Accept: application/vnd.github.raw' \
+              "repos/$REPO/contents/.github/ci-backend?ref=$SHA" 2>/dev/null \
+              | tr -d '[:space:]' || true)
+            [ "$file" = rwx ] && backend=rwx
+          fi
+          echo "linux_backend=$backend" | tee -a "$GITHUB_OUTPUT"
+
   aarch64-crossbuild:
+    needs: backend
+    if: needs.backend.outputs.linux_backend != 'rwx'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
