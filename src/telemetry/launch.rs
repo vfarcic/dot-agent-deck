@@ -53,6 +53,17 @@ pub const PI_TELEMETRY_ENV: &str = "DOT_AGENT_DECK_PI_TELEMETRY";
 /// on Pi's export, and the `PATH` the shim directory goes in front of.
 pub const LAUNCH_ENV_KEYS: [&str; 2] = [PI_TELEMETRY_ENV, "PATH"];
 
+/// The variables naming where Codex's and Devin's configurations live, read
+/// as paths: exactly as set ([`path_value`]).
+pub const CONFIG_HOME_ENV_KEYS: [&str; 3] = ["CODEX_HOME", "HOME", "XDG_CONFIG_HOME"];
+
+/// The value of `key`, one of [`CONFIG_HOME_ENV_KEYS`], in `env`, exactly as
+/// set — a directory's name may begin or end with a space — or `None` when it
+/// is absent or empty.
+fn path_value<'a>(env: &'a EnvMap, key: &str) -> Option<&'a str> {
+    env.get(key).map(String::as_str).filter(|v| !v.is_empty())
+}
+
 /// The prefix of the per-run Devin configuration files.
 pub const DEVIN_CONFIG_PREFIX: &str = "devin-";
 
@@ -191,9 +202,9 @@ pub fn codex_args(args: &[OsString], env: &EnvMap) -> Vec<String> {
 /// path.
 fn codex_home(env: &EnvMap) -> Option<PathBuf> {
     let absolute = |value: &str| Some(PathBuf::from(value)).filter(|p| p.is_absolute());
-    match non_empty(env, "CODEX_HOME") {
+    match path_value(env, "CODEX_HOME") {
         Some(value) => absolute(value),
-        None => Some(absolute(non_empty(env, "HOME")?)?.join(".codex")),
+        None => Some(absolute(path_value(env, "HOME")?)?.join(".codex")),
     }
 }
 
@@ -300,12 +311,12 @@ pub fn devin_args(args: &[OsString], env: &EnvMap, run: &DevinRun<'_>) -> Option
 
 /// Devin's user configuration file, resolved as Devin resolves it.
 fn devin_user_config(env: &EnvMap) -> Option<PathBuf> {
-    if let Some(xdg) = non_empty(env, "XDG_CONFIG_HOME").map(Path::new)
+    if let Some(xdg) = path_value(env, "XDG_CONFIG_HOME").map(Path::new)
         && xdg.is_absolute()
     {
         return Some(xdg.join("devin").join("config.json"));
     }
-    let home = Path::new(non_empty(env, "HOME")?);
+    let home = Path::new(path_value(env, "HOME")?);
     if !home.is_absolute() {
         return None;
     }
@@ -1293,6 +1304,48 @@ mod tests {
         assert_eq!(
             devin_user_config(&e),
             Some(PathBuf::from("/h/.config/devin/config.json"))
+        );
+    }
+
+    /// A configuration home is read exactly as set: a directory whose name
+    /// ends in a space is that directory, not the one without the space, so
+    /// an opt-out there is honoured. Empty is unset.
+    #[test]
+    fn configuration_homes_are_read_exactly_as_set() {
+        let root = tempfile::tempdir().unwrap();
+        let spaced = format!("{} ", root.path().join("conf").display());
+        std::fs::create_dir_all(Path::new(&spaced).join("devin")).unwrap();
+        std::fs::write(
+            Path::new(&spaced).join("config.toml"),
+            "[otel]\ntrace_exporter = \"none\"\nmetrics_exporter = \"none\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            Path::new(&spaced).join("devin/config.json"),
+            r#"{"otel":{"enabled":false}}"#,
+        )
+        .unwrap();
+        let endpoint = ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://c:4318");
+        assert_eq!(codex(&[("CODEX_HOME", &spaced), endpoint]), "", "Codex");
+        let home = root.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let state = root.path().join("state");
+        let devin =
+            |pairs: &[(&str, &str)]| devin_args(&[], &devin_env(&home, pairs), &run(&state));
+        assert_eq!(devin(&[("XDG_CONFIG_HOME", &spaced)]), None, "Devin");
+        let e = env(&[("HOME", "/h "), ("XDG_CONFIG_HOME", "")]);
+        assert_eq!(
+            devin_user_config(&e),
+            Some(PathBuf::from("/h /.config/devin/config.json"))
+        );
+        assert_eq!(
+            codex_home(&env(&[("HOME", "/h"), ("CODEX_HOME", "")])),
+            Some(PathBuf::from("/h/.codex"))
+        );
+        assert_eq!(
+            codex_home(&env(&[("CODEX_HOME", " /c")])),
+            None,
+            "not absolute"
         );
     }
 

@@ -1407,7 +1407,7 @@ fn launch_test_shell(root: &Path) -> std::path::PathBuf {
     shell
 }
 
-/// Scenario: Start a Codex recorder directly and through scripts that call codex by name, change CODEX_HOME or opt out of trace export, and through an absolute executable path. Inspect the real argv and environment for safe signal activation, preserved arguments and user choices, no header secret or logs exporter, and unchanged PATH/argv when export is off.
+/// Scenario: Start a Codex recorder directly and through scripts that call codex by name, change CODEX_HOME, opt out of trace export or put the real Codex's directory in front of PATH, and through an absolute executable path. Inspect the real argv and environment for safe signal activation, preserved arguments and user choices, no header secret or logs exporter, and unchanged PATH/argv when export is off.
 #[spec("telemetry/otlp/016")]
 #[test]
 fn telemetry_otlp_016_codex_launch_enables_only_safe_signals() {
@@ -1418,6 +1418,7 @@ fn telemetry_otlp_016_codex_launch_enables_only_safe_signals() {
         "user-config",
         "script-home",
         "script-traces-none",
+        "script-prepend",
         "absolute",
         "off",
     ] {
@@ -1450,6 +1451,12 @@ fn telemetry_otlp_016_codex_launch_enables_only_safe_signals() {
                 shell_quote(alt_home.to_str().unwrap())
             ),
             "script-traces-none" => "export OTEL_TRACES_EXPORTER=none\n".to_string(),
+            // The documented limit: the real Codex's directory ahead of the
+            // deck's on PATH finds the real one first.
+            "script-prepend" => format!(
+                "export PATH={}:\"$PATH\"\n",
+                shell_quote(bin.to_str().unwrap())
+            ),
             _ => "export FOO=1\n".to_string(),
         };
         write_executable(&wrapper, &format!("#!/bin/sh\n{setup}codex \"$@\"\n"));
@@ -1493,7 +1500,18 @@ fn telemetry_otlp_016_codex_launch_enables_only_safe_signals() {
             .iter()
             .map(|arg| arg.as_str().unwrap())
             .collect();
-        assert_launch_path(&record, &deck, &original_path, enabled);
+        if case == "script-prepend" {
+            let entries: Vec<_> = std::env::split_paths(record["env"]["PATH"].as_str().unwrap())
+                .take(2)
+                .collect();
+            assert_eq!(
+                entries,
+                [bin.clone(), deck.workdir().join("state/telemetry/bin")],
+                "the script's own directory ahead of the deck's"
+            );
+        } else {
+            assert_launch_path(&record, &deck, &original_path, enabled);
+        }
         assert_eq!(
             record["env"]["CODEX_HOME"],
             if case == "script-home" {
@@ -1506,7 +1524,10 @@ fn telemetry_otlp_016_codex_launch_enables_only_safe_signals() {
         if !matches!(case, "plain" | "user-config" | "absolute") {
             assert_eq!(
                 record["env"]["FOO"],
-                if case == "script-home" || case == "script-traces-none" {
+                if matches!(
+                    case,
+                    "script-home" | "script-traces-none" | "script-prepend"
+                ) {
                     Value::Null
                 } else {
                     json!("1")
@@ -1549,7 +1570,12 @@ fn telemetry_otlp_016_codex_launch_enables_only_safe_signals() {
             "{case}: preserve original argv"
         );
         close(&deck, &agent(&deck));
-        if enabled && !matches!(case, "user-config" | "script-home" | "absolute") {
+        if enabled
+            && !matches!(
+                case,
+                "user-config" | "script-home" | "script-prepend" | "absolute"
+            )
+        {
             assert_eq!(
                 overrides.len(),
                 if case == "script-traces-none" { 1 } else { 2 },
@@ -1588,7 +1614,7 @@ fn telemetry_otlp_016_codex_launch_enables_only_safe_signals() {
         } else {
             assert!(
                 overrides.is_empty(),
-                "{case}: off/user-owned/absolute launch must not receive overrides: {argv:?}"
+                "{case}: off/user-owned/absolute/shadowed launch must not receive overrides: {argv:?}"
             );
             if !enabled {
                 assert!(record["env"].get("OTEL_RESOURCE_ATTRIBUTES").is_none());

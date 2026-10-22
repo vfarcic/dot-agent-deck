@@ -10,20 +10,26 @@
 //! That entrypoint:
 //!
 //! 1. finds the real program: the first executable file of that name on
-//!    `PATH` outside the shim directory ([`resolve`]) — none is the shell's
-//!    `command not found` and status 127;
+//!    `PATH` that is not a deck shim script, in the shim directory or any
+//!    other ([`resolve`]) — none is the shell's `command not found` and
+//!    status 127;
 //! 2. decides from its own environment — the agent's real one, after any
 //!    script or launcher — what the agent needs ([`super::launch`]), unless
 //!    this program was already shimmed further up its process tree
-//!    ([`GUARD_ENV`]);
+//!    ([`GUARD_ENV`]), or the real program is a shell script of the user's
+//!    that may change that environment before the agent reads it
+//!    ([`launcher_is_certain`]), or the environment holds a value the
+//!    decision cannot read exactly;
 //! 3. replaces itself with the real program, those arguments in front of the
 //!    user's own, so signals, the exit status and the terminal are the
 //!    program's own.
 //!
 //! Anything that goes wrong in step 2 runs the program unchanged: the shim
-//! never stops an agent from starting. A script that calls the agent by an
-//! absolute path, or replaces `PATH` rather than adding to it, does not reach
-//! the shim. There is no shim on Windows.
+//! never stops an agent from starting. The one refusal is a process tree that
+//! has passed through the shim [`MAX_HOPS`] times, which would otherwise keep
+//! re-entering it. A script that calls the agent by an absolute path,
+//! replaces `PATH`, or puts a directory holding the real agent in front of
+//! the shim's, does not reach the shim. There is no shim on Windows.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -51,6 +57,22 @@ pub const RUN_ID_ENV: &str = "DOT_AGENT_DECK_TELEMETRY_RUN_ID";
 /// (a wrapper of the user's called `codex`, say) gets the deck's additions
 /// once.
 pub const GUARD_ENV: &str = "DOT_AGENT_DECK_TELEMETRY_SHIMMED";
+
+/// How many times one process tree may pass through the shim — the entries
+/// in [`GUARD_ENV`] — before the shim refuses to run the program again: far
+/// more than agents starting agents need, and a bound on anything that keeps
+/// bringing a launch back to the shim.
+pub const MAX_HOPS: usize = 16;
+
+/// The interpreters, by file name, of the scripts the shim does not add to:
+/// shells, in which a user's wrapper named for the agent may set its
+/// configuration home before running it.
+const SHELLS: [&str; 12] = [
+    "sh", "bash", "dash", "zsh", "ksh", "mksh", "fish", "ash", "busybox", "csh", "tcsh", "yash",
+];
+
+/// How much of a candidate program the shim reads to tell what it is.
+const HEAD_LEN: u64 = 16 * 1024;
 
 /// Write the shim scripts into `config_dir`'s [`DIR_NAME`], each running the
 /// deck at `deck`, and return that directory: owner-only, as are the scripts.
@@ -131,17 +153,27 @@ fn run(name: &str, dir: &Path, args: Vec<OsString>) -> ExitCode {
     use std::os::unix::process::CommandExt;
     let path = std::env::var_os("PATH");
     let guard = std::env::var_os(GUARD_ENV);
-    let Some(plan) = plan(
+    let env = super::config::process_env();
+    let plan = match plan(
         name,
         dir,
         args,
         path.as_deref(),
         guard.as_deref(),
-        &super::config::process_env(),
+        exact_env().then_some(&env),
         std::process::id(),
-    ) else {
-        eprintln!("{name}: command not found");
-        return ExitCode::from(127);
+    ) {
+        Ok(plan) => plan,
+        Err(Refused::NotFound) => {
+            eprintln!("{name}: command not found");
+            return ExitCode::from(127);
+        }
+        Err(Refused::TooManyHops) => {
+            eprintln!(
+                "{name}: not started: dot-agent-deck's telemetry shim was reached {MAX_HOPS} times in this process tree, so something keeps running it again instead of {name}; check the {name} entries on PATH"
+            );
+            return ExitCode::from(126);
+        }
     };
     let e = std::process::Command::new(&plan.program)
         .arg0(name)
@@ -162,26 +194,58 @@ fn run(name: &str, _dir: &Path, _args: Vec<OsString>) -> ExitCode {
     ExitCode::from(127)
 }
 
+/// Whether the decision can read every variable it uses exactly as the agent
+/// will: [`super::config::process_env`] leaves out a value that is not UTF-8,
+/// which for a configuration home or an `OTEL_*` variable would have the
+/// decision read another configuration than the agent's.
+#[cfg(unix)]
+fn exact_env() -> bool {
+    std::env::vars_os().all(|(key, value)| {
+        value.to_str().is_some()
+            || !key.to_str().is_some_and(|k| {
+                k.starts_with("OTEL_") || super::launch::CONFIG_HOME_ENV_KEYS.contains(&k)
+            })
+    })
+}
+
+/// Why the shim runs no program.
+#[derive(Debug, PartialEq, Eq)]
+enum Refused {
+    /// No real program of that name on `PATH`.
+    NotFound,
+    /// The process tree has passed through the shim [`MAX_HOPS`] times.
+    TooManyHops,
+}
+
 /// The shim's plan for `name` called with `args`, with `PATH` = `path`,
-/// [`GUARD_ENV`] = `guard` and the environment `env`; the program will have
-/// process id `pid`. `None` when there is no real program to run.
+/// [`GUARD_ENV`] = `guard` and the environment `env` — `None` when it cannot
+/// be read exactly, which adds nothing; the program will have process id
+/// `pid`.
 fn plan(
     name: &str,
     dir: &Path,
     args: Vec<OsString>,
     path: Option<&OsStr>,
     guard: Option<&OsStr>,
-    env: &EnvMap,
+    env: Option<&EnvMap>,
     pid: u32,
-) -> Option<Plan> {
-    let program = resolve(name, path, dir)?;
-    let already = guard.is_some_and(|g| g.to_string_lossy().split(':').any(|n| n == name));
-    let added = if already {
-        Vec::new()
-    } else {
-        additions(name, dir, &args, env, pid)
+) -> Result<Plan, Refused> {
+    let shimmed = guard.map(|g| g.to_string_lossy().into_owned());
+    let shimmed: Vec<&str> = shimmed
+        .as_deref()
+        .map(|g| g.split(':').filter(|n| !n.is_empty()).collect())
+        .unwrap_or_default();
+    if shimmed.len() >= MAX_HOPS {
+        return Err(Refused::TooManyHops);
+    }
+    let program = resolve(name, path, dir).ok_or(Refused::NotFound)?;
+    let added = match env {
+        Some(env) if !shimmed.contains(&name) && launcher_is_certain(&program) => {
+            additions(name, dir, &args, env, pid)
+        }
+        _ => Vec::new(),
     };
-    Some(Plan {
+    Ok(Plan {
         program,
         args: added.into_iter().map(OsString::from).chain(args).collect(),
     })
@@ -227,11 +291,13 @@ fn guarded(guard: Option<&OsStr>, name: &str) -> OsString {
     }
 }
 
-/// The program `name` as a shell would find it on `path`, skipping the shim
-/// directory `dir`: a file that, symlinks resolved, is in that directory —
-/// so an entry that is the directory, or a symlink to it, or a link to one of
-/// its scripts, is passed over. An empty entry is the current directory, as
-/// for the shell.
+/// The program `name` as a shell would find it on `path`, skipping the
+/// deck's shims: a file that, symlinks resolved, is in the shim directory
+/// `dir` — so an entry that is the directory, or a symlink to it, or a link
+/// to one of its scripts, is passed over — and any file that reads as a shim
+/// script ([`is_shim_script`]), so another deck's shim directory, or a copy
+/// or a hard link of a script, is passed over too. An empty entry is the
+/// current directory, as for the shell.
 fn resolve(name: &str, path: Option<&OsStr>, dir: &Path) -> Option<PathBuf> {
     let shim = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     std::env::split_paths(path?)
@@ -245,7 +311,116 @@ fn resolve(name: &str, path: Option<&OsStr>, dir: &Path) -> Option<PathBuf> {
         .find(|candidate| {
             std::fs::canonicalize(candidate).is_ok_and(|c| c.parent() != Some(shim.as_path()))
                 && is_executable_file(candidate)
+                && !head(candidate).is_some_and(|h| is_shim_script(&h))
         })
+}
+
+/// The first [`HEAD_LEN`] bytes of the file at `path`, or `None` when it
+/// cannot be read.
+fn head(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(HEAD_LEN)
+        .read_to_end(&mut out)
+        .ok()?;
+    Some(out)
+}
+
+/// Whether `head`, the start of a file, is a shim script as [`script`] writes
+/// them, whichever deck and directory it names.
+fn is_shim_script(head: &[u8]) -> bool {
+    let needle = format!(" {SUBCOMMAND} ");
+    head.starts_with(b"#!")
+        && head.split(|b| *b == b'\n').any(|line| {
+            line.starts_with(b"exec ") && line.windows(needle.len()).any(|w| w == needle.as_bytes())
+        })
+}
+
+/// Whether the shim can be sure that `program`, the real program it is about
+/// to run, is the agent, not a user's script that may set the agent's
+/// configuration home, or anything else the decision reads, before running
+/// it — in which case the decision would have read the wrong configuration.
+/// Sure of a native executable and of a script for an interpreter that is not
+/// a shell (Codex's npm launcher is a Node script); not of a shell script,
+/// unless it is one Nix generated ([`is_nix_store_path`]), nor of a file it
+/// cannot read or tell apart.
+fn launcher_is_certain(program: &Path) -> bool {
+    let (Some(head), Ok(canonical)) = (head(program), std::fs::canonicalize(program)) else {
+        return false;
+    };
+    match launcher_kind(&head) {
+        Some(Launcher::Native | Launcher::Interpreted) => true,
+        Some(Launcher::Shell) => is_nix_store_path(&canonical),
+        None => false,
+    }
+}
+
+/// What a program is, from `head`, the start of its file.
+#[derive(Debug, PartialEq, Eq)]
+enum Launcher {
+    /// An ELF or Mach-O executable.
+    Native,
+    /// A script whose interpreter is a shell ([`SHELLS`]).
+    Shell,
+    /// A script for another interpreter.
+    Interpreted,
+}
+
+/// What `head` is the start of, or `None` when it cannot tell: no `#!` line it
+/// can read, or `env` given anything but a program and `-S`, or a quoted one
+/// — a variable it sets is a change the decision did not see.
+fn launcher_kind(head: &[u8]) -> Option<Launcher> {
+    const MAGICS: [[u8; 4]; 6] = [
+        [0x7f, b'E', b'L', b'F'],
+        [0xfe, 0xed, 0xfa, 0xce],
+        [0xfe, 0xed, 0xfa, 0xcf],
+        [0xce, 0xfa, 0xed, 0xfe],
+        [0xcf, 0xfa, 0xed, 0xfe],
+        [0xca, 0xfe, 0xba, 0xbe],
+    ];
+    if MAGICS.iter().any(|m| head.starts_with(m)) {
+        return Some(Launcher::Native);
+    }
+    let line = head.strip_prefix(b"#!")?;
+    let line = std::str::from_utf8(line.split(|b| *b == b'\n').next()?).ok()?;
+    let mut words = line.split_whitespace();
+    let base = |word: &str| word.rsplit('/').next().unwrap_or(word).to_string();
+    let mut interpreter = base(words.next()?);
+    if interpreter == "env" {
+        let mut words = words.peekable();
+        if let Some(split) = words.peek().and_then(|w| w.strip_prefix("-S")) {
+            let split = split.to_string();
+            words.next();
+            if !split.is_empty() {
+                interpreter = split;
+            } else {
+                interpreter = words.next()?.to_string();
+            }
+        } else {
+            interpreter = words.next()?.to_string();
+        }
+        if interpreter.starts_with('-') || interpreter.contains(['=', '"', '\'', '\\']) {
+            return None;
+        }
+        interpreter = base(&interpreter);
+    }
+    if interpreter.is_empty() {
+        return None;
+    }
+    Some(if SHELLS.contains(&interpreter.as_str()) {
+        Launcher::Shell
+    } else {
+        Launcher::Interpreted
+    })
+}
+
+/// Whether `canonical`, a program's path with symlinks resolved, is in the Nix
+/// store, whose scripts Nix generated (devbox's launchers among them) rather
+/// than the user wrote.
+fn is_nix_store_path(canonical: &Path) -> bool {
+    canonical.starts_with("/nix/store/")
 }
 
 /// Whether `path` is, symlinks followed, a regular file this process may
@@ -275,8 +450,9 @@ mod tests {
 
     const RUN: &str = "0123456789abcdef0123456789abcdef";
 
+    /// A stand-in for a real agent: a Node script, as npm installs Codex.
     fn executable(path: &Path) {
-        crate::test_isolation::write_script(path, "#!/bin/sh\n").unwrap();
+        crate::test_isolation::write_script(path, "#!/usr/bin/env node\n").unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
@@ -340,14 +516,14 @@ mod tests {
             env(&all)
         }
 
-        fn plan(&self, name: &str, args: &[&str], env: &EnvMap) -> Option<Plan> {
+        fn plan(&self, name: &str, args: &[&str], env: &EnvMap) -> Result<Plan, Refused> {
             plan(
                 name,
                 &self.shim,
                 os(args),
                 Some(&self.path()),
                 None,
-                env,
+                Some(env),
                 42,
             )
         }
@@ -479,14 +655,14 @@ mod tests {
                 Vec::new(),
                 Some(&only_shim),
                 None,
-                &f.env(&[]),
+                Some(&f.env(&[])),
                 1
             ),
-            None
+            Err(Refused::NotFound)
         );
         assert!(
             f.plan("codex", &[], &f.env(&[]))
-                .is_some_and(|p| p.program == f.real.join("codex"))
+                .is_ok_and(|p| p.program == f.real.join("codex"))
         );
     }
 
@@ -518,10 +694,10 @@ mod tests {
         )
         .unwrap();
         let args = ["--yolo", "a b"];
-        let unchanged = |name: &str, plan: Option<Plan>| {
+        let unchanged = |name: &str, plan: Result<Plan, Refused>| {
             assert_eq!(
                 plan,
-                Some(Plan {
+                Ok(Plan {
                     program: f.real.join(name),
                     args: os(&args),
                 })
@@ -556,10 +732,10 @@ mod tests {
                 os(&args),
                 Some(&f.path()),
                 Some(&guard),
-                &f.env(&[]),
+                Some(&f.env(&[])),
                 1
             ),
-            Some(Plan {
+            Ok(Plan {
                 program: f.real.join("codex"),
                 args: os(&args),
             })
@@ -579,7 +755,7 @@ mod tests {
             Vec::new(),
             Some(&f.path()),
             Some(&codex_shimmed),
-            &f.env(&[]),
+            Some(&f.env(&[])),
             1,
         )
         .unwrap();
@@ -606,5 +782,145 @@ mod tests {
         super::super::launch::remove_run_config_files(&f.telemetry, RUN);
         assert!(!config.exists(), "the daemon removes it with the run");
         assert!(f.shim.join("devin").exists(), "and leaves the shim alone");
+    }
+    /// Two deck installations on one `PATH`, and a shim script copied or
+    /// hard-linked outside its directory: each is passed over, so the real
+    /// program is found and nothing runs the shim again.
+    #[test]
+    fn resolution_skips_every_decks_shim_scripts() {
+        let f = fixture();
+        let root = f.telemetry.parent().unwrap();
+        let other = install(&root.join("other-telemetry"), "/other/deck").unwrap();
+        let path = path_of(&[&f.shim, &other, &f.real]);
+        assert_eq!(
+            resolve("codex", Some(&path), &f.shim),
+            Some(f.real.join("codex"))
+        );
+        assert_eq!(
+            resolve("codex", Some(&path), &other),
+            Some(f.real.join("codex")),
+            "and from the other installation's side"
+        );
+        let copied = root.join("copied");
+        std::fs::create_dir(&copied).unwrap();
+        std::fs::copy(f.shim.join("codex"), copied.join("codex")).unwrap();
+        let linked = root.join("hard-linked");
+        std::fs::create_dir(&linked).unwrap();
+        std::fs::hard_link(f.shim.join("codex"), linked.join("codex")).unwrap();
+        let path = path_of(&[&copied, &linked, &f.shim, &f.real]);
+        assert_eq!(
+            resolve("codex", Some(&path), &f.shim),
+            Some(f.real.join("codex"))
+        );
+        assert!(is_shim_script(script("/d", "/x", "devin").as_bytes()));
+        assert!(!is_shim_script(b"#!/bin/sh\nexec codex \"$@\"\n"));
+    }
+
+    /// A process tree that keeps coming back to the shim is refused once it
+    /// has passed through it [`MAX_HOPS`] times, rather than run again.
+    #[test]
+    fn the_shim_refuses_a_launch_that_keeps_coming_back() {
+        let f = fixture();
+        let hops = |n: usize| OsString::from(vec!["codex"; n].join(":"));
+        let run = |guard: &OsString| {
+            plan(
+                "codex",
+                &f.shim,
+                Vec::new(),
+                Some(&f.path()),
+                Some(guard),
+                Some(&f.env(&[])),
+                1,
+            )
+        };
+        assert!(run(&hops(MAX_HOPS - 1)).is_ok());
+        assert_eq!(run(&hops(MAX_HOPS)), Err(Refused::TooManyHops));
+    }
+
+    /// What the real program is decides whether the shim may add to it.
+    #[test]
+    fn the_launcher_kind_comes_from_the_start_of_the_file() {
+        let cases: [(&[u8], Option<Launcher>); 18] = [
+            (b"\x7fELF\x02\x01", Some(Launcher::Native)),
+            (b"\xcf\xfa\xed\xfe....", Some(Launcher::Native)),
+            (b"\xca\xfe\xba\xbe....", Some(Launcher::Native)),
+            (
+                b"#!/usr/bin/env node\n// codex",
+                Some(Launcher::Interpreted),
+            ),
+            (b"#!/usr/local/bin/node", Some(Launcher::Interpreted)),
+            (
+                b"#!/usr/bin/env -S node --no-warnings\n",
+                Some(Launcher::Interpreted),
+            ),
+            (b"#!/usr/bin/env python3\n", Some(Launcher::Interpreted)),
+            (b"#!/bin/sh\nexport CODEX_HOME=/x\n", Some(Launcher::Shell)),
+            (b"#! /bin/bash -e\n", Some(Launcher::Shell)),
+            (b"#!/usr/bin/env dash\n", Some(Launcher::Shell)),
+            (b"#!/usr/bin/env -S zsh -f\n", Some(Launcher::Shell)),
+            (
+                b"#!/nix/store/abc-bash-5.2/bin/bash -e\n",
+                Some(Launcher::Shell),
+            ),
+            (b"#!/usr/bin/env CODEX_HOME=/x node\n", None),
+            (b"#!/usr/bin/env -i node\n", None),
+            (b"#!/usr/bin/env -S \"bash -e\"\n", None),
+            (b"#!\n", None),
+            (b"echo no interpreter line\n", None),
+            (b"", None),
+        ];
+        for (head, kind) in cases {
+            assert_eq!(
+                launcher_kind(head),
+                kind,
+                "{}",
+                String::from_utf8_lossy(head)
+            );
+        }
+        assert!(is_nix_store_path(Path::new(
+            "/nix/store/0abc-codex-0.1/bin/codex"
+        )));
+        assert!(!is_nix_store_path(Path::new("/home/u/nix/store/codex")));
+        assert!(!is_nix_store_path(Path::new("/nix/storefront/codex")));
+    }
+
+    /// A `codex` that is a shell script of the user's — which may set
+    /// `CODEX_HOME` to a configuration that opts out before running the real
+    /// one — runs unchanged; so do a file the shim cannot read and an
+    /// environment the decision cannot read exactly. A Node launcher, as npm
+    /// installs Codex, gets the additions.
+    #[test]
+    fn only_a_launcher_the_shim_is_sure_of_gets_the_additions() {
+        let f = fixture();
+        let args = ["exec"];
+        let gets = |plan: Result<Plan, Refused>| plan.unwrap().args.len() > args.len();
+        assert!(gets(f.plan("codex", &args, &f.env(&[]))), "a Node launcher");
+        let wrapper = f.real.join("codex");
+        crate::test_isolation::write_script(
+            &wrapper,
+            "#!/bin/sh\nexport CODEX_HOME=/opted/out\nexec /opt/codex \"$@\"\n",
+        )
+        .unwrap();
+        assert!(
+            !gets(f.plan("codex", &args, &f.env(&[]))),
+            "a shell wrapper"
+        );
+        crate::test_isolation::write_script(f.real.join("devin"), "#!/usr/bin/env bash\n").unwrap();
+        assert!(!gets(f.plan("devin", &args, &f.env(&[]))), "Devin's too");
+        executable(&wrapper);
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o111)).unwrap();
+        if std::fs::File::open(&wrapper).is_err() {
+            assert!(!gets(f.plan("codex", &args, &f.env(&[]))), "unreadable");
+        }
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let inexact = plan("codex", &f.shim, os(&args), Some(&f.path()), None, None, 1);
+        assert_eq!(
+            inexact,
+            Ok(Plan {
+                program: wrapper,
+                args: os(&args)
+            }),
+            "an environment it cannot read exactly"
+        );
     }
 }

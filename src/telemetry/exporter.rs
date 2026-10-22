@@ -474,8 +474,10 @@ impl Telemetry {
         );
         env.extend(super::launch::extra_env(&start.agent, &base));
         if let Some(shim) = self.shim_dir.as_deref().and_then(Path::to_str)
-            && let Some(path) = base.get("PATH").filter(|p| !p.is_empty())
+            && let Some(path) = base.get("PATH")
         {
+            // An empty `PATH` is the current directory, and stays so after
+            // the shim: `<shim>:` ends in an empty entry.
             env.push(("PATH".to_string(), format!("{shim}:{path}")));
             env.push((super::shim::RUN_ID_ENV.to_string(), start.run_id.clone()));
         }
@@ -1822,6 +1824,16 @@ mod tests {
         let own = [("PATH".to_string(), "/mine".to_string())];
         let run = telemetry.prepare_run(run_start("p2"), &own, None).unwrap();
         assert_eq!(get(&run.env, "PATH"), Some("/state/telemetry/bin:/mine"));
+        // An empty PATH is the current directory, and still is after the shim.
+        let empty = [("PATH".to_string(), String::new())];
+        let run = telemetry
+            .prepare_run(run_start("p4"), &empty, None)
+            .unwrap();
+        assert_eq!(get(&run.env, "PATH"), Some("/state/telemetry/bin:"));
+        assert_eq!(
+            get(&run.env, super::super::shim::RUN_ID_ENV),
+            Some(run.run_id.as_str())
+        );
         let run = plain.prepare_run(run_start("p3"), &[], None).unwrap();
         assert_eq!(get(&run.env, "PATH"), None, "no shim, no PATH");
         assert_eq!(get(&run.env, super::super::shim::RUN_ID_ENV), None);
