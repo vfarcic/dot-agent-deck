@@ -111,6 +111,145 @@ fn recording_retention_preserves_failed_evidence_across_passing_reruns() {
     );
 }
 
+/// Scenario: Retain recent failures while trimming a mix of successful and
+/// expired failed recordings to the count cap, oldest first. Once their
+/// protection expires, those failures become eligible for the same pruning.
+#[test]
+fn recording_retention_prunes_oldest_runs_and_protects_recent_failures() {
+    let root = tempfile::tempdir().unwrap();
+    let runs = root.path().join("runs");
+    let plant = |time: u64, outcome: &str| {
+        let dir = runs.join(format!("run-{time:020}-fixture"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("provenance.json"),
+            serde_json::json!({
+                "outcome": outcome, "recorded_at_unix": time
+            })
+            .to_string(),
+        )
+        .unwrap();
+        dir
+    };
+    let oldest_pass = plant(1, "passed");
+    let expired_failure = plant(2, "failed");
+    let newest_pass = plant(999, "passed");
+    let recent_failures = [
+        plant(990, "failed"),
+        plant(991, "failed"),
+        plant(992, "failed"),
+    ];
+    recording_evidence::prune_recordings(root.path(), 1000, 2, 100).unwrap();
+    assert!(!oldest_pass.exists());
+    assert!(!expired_failure.exists());
+    assert!(
+        !newest_pass.exists(),
+        "protected failures may exceed the soft cap"
+    );
+    assert!(recent_failures.iter().all(|path| path.exists()));
+    recording_evidence::prune_recordings(root.path(), 1090, 2, 100).unwrap();
+    assert!(
+        !recent_failures[0].exists(),
+        "failure expires exactly at the protection boundary"
+    );
+    assert!(recent_failures[1..].iter().all(|path| path.exists()));
+    recording_evidence::prune_recordings(root.path(), 2000, 1, 100).unwrap();
+    assert!(
+        !recent_failures[1].exists(),
+        "eligible runs are pruned oldest first"
+    );
+    assert!(recent_failures[2].exists());
+}
+
+/// Scenario: An interrupted recording has no usable provenance, and another
+/// failed recording has a timestamp ahead of the clock. Both stay protected
+/// rather than being mistaken for disposable successful runs.
+#[test]
+fn recording_retention_protects_incomplete_and_future_dated_failures() {
+    let root = tempfile::tempdir().unwrap();
+    for name in [
+        "run-00000000000000001000-incomplete",
+        "run-00000000000000002000-future",
+    ] {
+        std::fs::create_dir_all(root.path().join("runs").join(name)).unwrap();
+    }
+    recording_evidence::prune_recordings(root.path(), 1000, 0, 100).unwrap();
+    assert_eq!(
+        std::fs::read_dir(root.path().join("runs")).unwrap().count(),
+        2
+    );
+}
+
+/// Scenario: An archive directory or session transcript points outside its
+/// sandbox through a symlink. Pruning refuses that archive, and metadata
+/// collection ignores the linked transcript without reading its contents.
+#[cfg(unix)]
+#[test]
+fn recording_evidence_does_not_follow_archive_or_transcript_symlinks() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let preserved = outside.path().join("run-00000000000000000001-old");
+    std::fs::create_dir(&preserved).unwrap();
+    std::os::unix::fs::symlink(outside.path(), root.path().join("runs")).unwrap();
+    assert!(recording_evidence::prune_recordings(root.path(), 1000, 0, 0).is_err());
+    assert!(preserved.exists());
+    let projects = root.path().join(".claude/projects");
+    std::fs::create_dir_all(&projects).unwrap();
+    let transcript = outside.path().join("host.jsonl");
+    std::fs::write(&transcript, "{\"permissionMode\":\"auto\"}\n").unwrap();
+    std::os::unix::fs::symlink(transcript, projects.join("linked.jsonl")).unwrap();
+    assert!(recording_evidence::claude_session_provenance(root.path()).is_empty());
+}
+
+/// Scenario: Claude's settings request auto mode, but the session transcript
+/// reports default and then acceptEdits, an actual model and a version. The
+/// provenance keeps the observed mode history and latest mode, ignoring settings.
+#[test]
+fn recording_provenance_carries_observed_claude_mode_version_and_model() {
+    let home = tempfile::tempdir().unwrap();
+    let project = home.path().join(".claude/projects/fixture");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        home.path().join(".claude/settings.json"),
+        r#"{"permissions":{"defaultMode":"auto"}}"#,
+    )
+    .unwrap();
+    std::fs::write(project.join("session.jsonl"), concat!(
+        "{\"type\":\"user\",\"sessionId\":\"fixture-session\",\"permissionMode\":\"default\",\"version\":\"2.1.309\"}\n",
+        "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-haiku-4-5-20251001\",\"content\":\"private transcript text\"}}\n",
+        "{\"type\":\"user\",\"permissionMode\":\"acceptEdits\"}\n",
+        "{partial final record"
+    )).unwrap();
+    let sessions = recording_evidence::claude_session_provenance(home.path());
+    assert_eq!(sessions.len(), 1);
+    let session = &sessions[0];
+    assert_eq!(session["session_id"], "fixture-session");
+    assert_eq!(session["permissionMode"], "acceptEdits");
+    assert_eq!(
+        session["permission_modes"],
+        serde_json::json!(["default", "acceptEdits"])
+    );
+    assert_eq!(session["version"], "2.1.309");
+    assert_eq!(session["model"], "claude-haiku-4-5-20251001");
+    assert_eq!(
+        session["models"],
+        serde_json::json!(["claude-haiku-4-5-20251001"])
+    );
+    assert!(
+        !serde_json::to_string(&sessions)
+            .unwrap()
+            .contains("private transcript text")
+    );
+    std::fs::write(project.join("session.jsonl"), "{\"type\":\"system\"}\n").unwrap();
+    let unknown = recording_evidence::claude_session_provenance(home.path());
+    assert!(
+        unknown[0]["permissionMode"].is_null(),
+        "missing mode is unknown, not the configured auto default"
+    );
+    assert!(unknown[0]["version"].is_null());
+    assert_eq!(unknown[0]["models"], serde_json::json!([]));
+}
+
 // -----------------------------------------------------------------------
 // Issue #322 — harness temp-root containment and cleanup
 // -----------------------------------------------------------------------

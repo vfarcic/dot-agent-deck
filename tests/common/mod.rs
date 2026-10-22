@@ -43,6 +43,8 @@ pub(crate) mod load_context;
 /// while a Tokio runtime is alive. The module header has the rule.
 pub mod env_write;
 
+pub(crate) mod recording_evidence;
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -766,6 +768,9 @@ pub struct TuiDeck {
     cols: u16,
     rows: u16,
     record_on_success: bool,
+    /// Save session metadata on success when the builder imported Claude auth,
+    /// including an empty observation list if Claude never wrote a transcript.
+    record_claude_provenance: bool,
     /// Exact secret values learned from imported auth files. Recording artifacts
     /// are scrubbed immediately before they are written so an agent or provider
     /// that echoes a credential cannot persist it in `full-stream.cast`.
@@ -780,7 +785,7 @@ pub struct TuiDeck {
     /// lazy-spawned daemon both append to (PRD #1258). The harness points it at
     /// `deck.log` in the test's own temp root so a red says where the time went;
     /// dumped beside `daemon.log`. `None` when a test's `with_env` gave it a
-    /// value that is not an absolute path (`1`, a relative name).
+    /// value that selects the host's default log (`1`, an empty string).
     deck_log_path: Option<PathBuf>,
 }
 
@@ -1400,8 +1405,15 @@ impl TuiDeck {
             .map(PathBuf::from);
         let deck_log_path = final_env
             .get("DOT_AGENT_DECK_LOG")
+            .filter(|value| !value.is_empty() && *value != "1")
             .map(PathBuf::from)
-            .filter(|path| path.is_absolute());
+            .map(|path| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    work.join(path)
+                }
+            });
         for (k, v) in final_env {
             cmd.env(k, v);
         }
@@ -1513,6 +1525,9 @@ impl TuiDeck {
             cols: builder.cols,
             rows: builder.rows,
             record_on_success,
+            record_claude_provenance: builder
+                .credential_imports
+                .contains(&CredentialImport::ClaudeCode),
             recording_redactions,
             daemon_log_path,
             deck_log_path,
@@ -2683,7 +2698,6 @@ impl Drop for TuiDeck {
         // or unconditionally when `DOT_AGENT_DECK_RECORD=1` (developer
         // opt-in for capturing successful runs).
         let panicking = std::thread::panicking();
-        let should_dump = panicking || self.record_on_success;
         // Issue #808: the outcome the provenance sidecar records. See
         // [`RecordingOutcome`] for what this observation is and is not — it is
         // "the harness was not unwinding a panic when the deck was dropped",
@@ -2727,16 +2741,12 @@ impl Drop for TuiDeck {
             let _ = h.join();
         }
 
+        let has_claude_sessions = self.home.join(".claude/projects").is_dir();
+        let should_dump = panicking || self.record_on_success;
         if should_dump {
-            // M4.3 flattened layout: each test gets its own per-test
-            // subdirectory under `.dot-agent-deck/recordings/`, so
-            // the cast and any failure artifacts sit alongside the
-            // generated `.md`. `.dot-agent-deck/` is gitignored, so
-            // the dump is purely developer-machine state — like
-            // `target/`. The per-run subdir from M2.1 is gone:
-            // concurrent `cargo test-e2e` on the same checkout is
-            // not a real-world workflow, and the per-test path means
-            // a re-run simply replaces the previous artifacts.
+            // The flat files are the current reel-compatible recording. The
+            // next launch archives them before clearing; later reruns cannot
+            // overwrite the archived evidence (#1815).
             let recordings_dir =
                 workspace_recordings_root().join(sanitize_test_name(&self.test_name));
             if let Err(e) = self.dump_recordings(&recordings_dir, outcome) {
@@ -2762,6 +2772,15 @@ impl Drop for TuiDeck {
             // demand. `harness/teardown/001` pins this.
             if !panicking {
                 regenerate_paired_doc(&self.test_name);
+            }
+        } else if self.record_claude_provenance || has_claude_sessions {
+            // Successful real-Claude runs retain metadata even without an
+            // opt-in cast. Missing transcript observations remain explicit.
+            let dir = workspace_recordings_root().join(sanitize_test_name(&self.test_name));
+            if let Err(error) = std::fs::create_dir_all(&dir)
+                .and_then(|()| self.write_provenance(&dir, outcome, &self.artifact_redactions()))
+            {
+                eprintln!("[tui-harness] failed to write Claude provenance to {dir:?}: {error}");
             }
         }
     }
@@ -3364,9 +3383,10 @@ impl TuiDeck {
     ///   revision; it is here for the case `commit` cannot pin, which is a
     ///   `dirty` tree, and so that a future adapter can enforce a floor over
     ///   casts kept across revisions.
-    /// * `recorded_at_unix` — epoch seconds. Reported, never thresholded: a
-    ///   clip recorded at this commit is publishable however old it is, and any
-    ///   age limit would be an arbitrary number that refuses correct clips.
+    /// * `recorded_at_unix` — epoch seconds. Archive retention uses this to
+    ///   protect recent failures. The reel's publish checks impose no age limit.
+    /// * `claude_sessions` — session-transcript observations of permission mode,
+    ///   Claude version and model; unknown observations remain null/empty.
     ///
     /// **This is not a defence against a local author.** Every field is written
     /// into a gitignored directory by this process, so whoever can write the
@@ -3394,15 +3414,14 @@ impl TuiDeck {
             "run_id": std::env::var("NEXTEST_RUN_ID").unwrap_or_else(|_| "unknown".to_string()),
             "redaction_version": RECORDING_REDACTION_VERSION,
             "recorded_at_unix": recorded_at_unix,
+            "claude_sessions": recording_evidence::claude_session_provenance(&self.home),
         });
         let mut bytes = serde_json::to_vec_pretty(&provenance)?;
         bytes.push(b'\n');
-        // No field here carries process output, so there is nothing a
-        // credential could have reached — but every other artifact in this dump
-        // goes through the redactor, and an exception is how the next field
-        // added here would quietly become the one that does not. If a value ever
-        // did match, the sidecar is corrupted and the adapter refuses the clip,
-        // which is the safe direction.
+        // Session metadata is agent-produced. Apply the same registered-value
+        // redactor as the other artifacts rather than assuming these fields
+        // cannot carry a credential. A match that corrupts the JSON makes the
+        // adapter refuse the clip.
         let bytes = redact_known_credentials_bytes(&bytes, redactions);
         atomic_write(&dir.join("provenance.json"), &bytes)
     }
@@ -5456,14 +5475,8 @@ fn copy_dir_recursively(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Workspace-relative `.dot-agent-deck/recordings/` resolved to an
-/// ABSOLUTE path at harness construction time. The fixture-copy step
-/// `cwd`s the deck into a per-test tempdir, so any relative path here
-/// would land artifacts in the wrong place. M4.3: artifacts moved
-/// from `target/test-recordings/<run-id>/<test>/` to
-/// `.dot-agent-deck/recordings/<test>/` — gitignored dev-time state,
-/// no per-run subdir (concurrent runs on one checkout aren't a
-/// real-world workflow).
+/// Absolute workspace path: the deck itself runs in a temporary fixture.
+/// Current artifacts live under `<test>/`, older runs under `<test>/runs/`.
 fn workspace_recordings_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join(".dot-agent-deck")
@@ -5587,63 +5600,15 @@ pub fn recording_build_commit(build_id: &str) -> (Option<&str>, bool) {
 /// adapter applies the same floor to the value it compares against.
 const MIN_BUILD_COMMIT_LEN: usize = 7;
 
-/// Delete the artifacts a PREVIOUS run of `test_name` left in its recordings
-/// directory, before this run can produce any of its own.
+/// Archive the previous run, then clear the current artifacts before spawning
+/// (#1815). Clearing keeps interrupted or skipped runs from exposing an older
+/// cast at the reel's usual path (#805); archiving keeps failure diagnostics
+/// available after reruns. Either operation failing aborts the launch.
 ///
-/// # Why this exists (PR #805 audit blocker 3)
-///
-/// `TuiDeck` keeps its cast in memory and writes artifacts only from `Drop`, and
-/// only when the test panicked or `DOT_AGENT_DECK_RECORD` is set. Nothing used
-/// to remove the previous run's files at launch, so every route that ends a run
-/// without reaching `Drop` — a `SIGKILL`, a nextest timeout, a Ctrl-C, a
-/// runtime skip before launch, a re-recording that failed — left the OLD
-/// `full-stream.cast` sitting there. `.claude/skills/demo-reel-adapter` then
-/// selects a cast on **path existence** plus branch scope and a `[reel]` marker;
-/// it records no run identity, no commit, no timestamp and no proof that the
-/// test passed, and the engine performs no redaction of its own. So a cast
-/// written by a revision that predates the redaction fixes could survive an
-/// interrupted current run and still be stitched into a video and uploaded to
-/// YouTube with its link in the PR body and the public release notes. (The
-/// upload is PRIVATE by default now, so widening it beyond the channel owner
-/// and the accounts they deliberately share it with is a human step — that
-/// reduces the blast radius, it does not make a stale cast correct.)
-///
-/// Clearing at launch kills that at the source: after this call the artifact
-/// either belongs to the current run or does not exist. **It is the cheap half,
-/// and it does not close the case.** The other half — the adapter verifying
-/// provenance (run identity, commit, and that the cast came from a test that
-/// actually PASSED in the current run) rather than trusting `test -f` — is issue
-/// #808 and is deliberately not built here. TWO residual routes still leave a
-/// stale artifact in place, and both want provenance rather than another
-/// discard:
-///
-///   1. A **filtered** run never selects the test at all, so nothing on this
-///      path executes and an unselected test's older cast is untouched.
-///   2. The **preflight expression** of `skip_unless!` is evaluated before
-///      `_skip_if_err` is entered — `skip_unless!(check_claude_available())`
-///      calls the check first and only then hands the `Result` over — so a kill
-///      or an abort inside a `check_*_available`, or inside an importer it calls,
-///      happens BEFORE the skip-path discard runs.
-///
-/// A third route — a deletion that FAILS — used to be a way for a stale artifact
-/// to survive this function itself, and is closed by the panic below.
-///
-/// **It fails CLOSED.** A `NotFound` is the ordinary case and says nothing; any
-/// OTHER error means a stale artifact may have SURVIVED, which is the exact
-/// failure this function exists to prevent, so it PANICS and the test fails.
-///
-/// That reverses the original stance, which warned to stderr and continued on
-/// the ground that "a harness that refuses to start over an unwritable
-/// gitignored directory would be worse than one that says so". PR #805's second
-/// security audit named that a fail-open and it was right. A warning only helps
-/// if somebody reads it; the run that printed it continues to completion, gets
-/// reported as PASSED, and the artifact it could not remove still satisfies the
-/// adapter's `test -f` — so the stale cast is published exactly as if nothing had
-/// been attempted. Failing to remove a stale credential-bearing artifact is
-/// precisely the case where continuing is wrong. The cost is a harness that
-/// refuses to start over an unwritable `.dot-agent-deck/recordings/<test>/`,
-/// which is a trivially fixable state and, unlike the warning, never a silent
-/// one.
+/// A filtered-out test does not reach this function, and a preflight expression
+/// can die before the skip helper calls it. The adapter's provenance checks
+/// remain necessary for those cases (#808). Archives are outside its flat
+/// selection paths; the paired `test.md` stays where the doc generator puts it.
 fn discard_previous_recording(test_name: &str) {
     // The panic below is the failure mode of this function, so it has to reach
     // the redacting output seam like every other harness panic. Cheap (a
@@ -5654,6 +5619,9 @@ fn discard_previous_recording(test_name: &str) {
 }
 
 pub(crate) fn discard_recording_dir(dir: &Path) {
+    recording_evidence::archive_before_discard(dir).unwrap_or_else(|error| {
+        panic!("could not discard the previous recording at {}: {error} — refusing to run because its evidence could not be archived", dir.display())
+    });
     for name in RECORDING_ARTIFACTS {
         let path = dir.join(name);
         match std::fs::remove_file(&path) {
