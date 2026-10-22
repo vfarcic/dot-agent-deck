@@ -14,9 +14,12 @@
 //! it). [`harden`] switches each of those off for these two commands, and the
 //! remote URL is read as configured (`git config`), without `insteadOf`
 //! rewriting. The lazy fetch is switched off by `GIT_NO_LAZY_FETCH`, which Git
-//! honours from 2.45; on an older Git, `protocol.allow=never` is the remaining
-//! defence, and a repository's `protocol.<name>.allow` overrides it for that
-//! protocol.
+//! honours from 2.45; on an older Git, the remaining defence is
+//! `protocol.allow=never` with a `protocol.<name>.allow=never` for each
+//! transport Git ships ([`HARDENING_CONFIG`]), given on the command line, which
+//! takes precedence over a repository's own `protocol.<name>.allow` for those
+//! names. A repository can still allow a scheme outside that list, which runs a
+//! `git-remote-<scheme>` helper only if one is installed.
 //!
 //! **This assumes a trusted `git`.** The probes run the `git` the daemon's
 //! `PATH` resolves first, with the inherited global and system configuration;
@@ -38,8 +41,10 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::sync::{Semaphore, watch};
 
-/// The instruction files whose last commit is `deck.instructions.commit`.
-pub const INSTRUCTION_PATHS: [&str; 3] = ["CLAUDE.md", "AGENTS.md", ".claude/skills"];
+/// The instruction files whose last commit is `deck.instructions.commit`, at
+/// the root of the repository whatever directory in it the agent runs from.
+pub const INSTRUCTION_PATHS: [&str; 3] =
+    [":(top)CLAUDE.md", ":(top)AGENTS.md", ":(top).claude/skills"];
 
 /// How long one git command may run before it is killed.
 pub const PROBE_DEADLINE: Duration = Duration::from_secs(5);
@@ -55,15 +60,24 @@ const REAP_WAIT: Duration = Duration::from_secs(1);
 
 /// `-c` overrides that keep a read-only git command from running anything
 /// configuration names.
-pub const HARDENING_CONFIG: [&str; 5] = [
+pub const HARDENING_CONFIG: [&str; 13] = [
     "log.showSignature=false",
     "core.fsmonitor=false",
     "credential.helper=",
-    // No transport by default: defence in depth behind `GIT_NO_LAZY_FETCH`,
-    // which a Git older than 2.45 ignores. A specific
-    // `protocol.<name>.allow` in the repository's configuration still wins
-    // over this for its protocol.
+    // No transport: defence in depth behind `GIT_NO_LAZY_FETCH`, which a Git
+    // older than 2.45 ignores. `protocol.allow` is only the default, which a
+    // repository's `protocol.<name>.allow` overrides for that name, so each
+    // transport Git ships is named as well; a `-c` on the command line takes
+    // precedence over the repository's configuration for the same key.
     "protocol.allow=never",
+    "protocol.ext.allow=never",
+    "protocol.file.allow=never",
+    "protocol.ssh.allow=never",
+    "protocol.git.allow=never",
+    "protocol.http.allow=never",
+    "protocol.https.allow=never",
+    "protocol.ftp.allow=never",
+    "protocol.ftps.allow=never",
     "core.untrackedCache=false",
 ];
 
@@ -75,10 +89,15 @@ pub const HARDENING_ENV: [(&str, &str); 3] = [
 ];
 
 /// Environment removed for the probes: configuration injected through the
-/// environment, and programs named by it.
-pub const HARDENING_ENV_REMOVED: [&str; 9] = [
+/// environment, programs named by it, and the switches that would read
+/// [`INSTRUCTION_PATHS`] as something other than root-anchored pathspecs.
+pub const HARDENING_ENV_REMOVED: [&str; 13] = [
     "GIT_CONFIG_PARAMETERS",
     "GIT_CONFIG_COUNT",
+    "GIT_LITERAL_PATHSPECS",
+    "GIT_GLOB_PATHSPECS",
+    "GIT_NOGLOB_PATHSPECS",
+    "GIT_ICASE_PATHSPECS",
     "GIT_EXTERNAL_DIFF",
     "GIT_PAGER",
     "GIT_ASKPASS",
@@ -489,6 +508,62 @@ mod tests {
         assert_eq!(context.repository_name.as_deref(), Some("my-repo"));
     }
 
+    /// An agent working in a subdirectory of its repository gets the commit of
+    /// the repository's own instruction files, not of paths under its
+    /// directory.
+    #[tokio::test]
+    async fn a_run_in_a_subdirectory_reads_the_root_instructions() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        let (repo, rules_commit) = repo_with_rules(scratch.path());
+        let nested = repo.join("crates").join("inner");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("lib.rs"), "x").unwrap();
+        git(&repo, scratch.path(), &["add", "crates"]);
+        git(&repo, scratch.path(), &["commit", "--quiet", "-m", "code"]);
+        assert_eq!(
+            resolve(&nested).await.instructions_commit.as_deref(),
+            Some(rules_commit.as_str())
+        );
+    }
+
+    /// A repository's own `protocol.<name>.allow=always` does not reopen a
+    /// transport for a probe, on any Git: the control shows that it overrides
+    /// a bare `protocol.allow=never`.
+    #[tokio::test]
+    async fn a_repository_cannot_allow_a_transport_back() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        let (source, _) = repo_with_rules(scratch.path());
+        let checkout = scratch.path().join("other");
+        std::fs::create_dir_all(&checkout).unwrap();
+        git(&checkout, scratch.path(), &["init", "--quiet"]);
+        git(
+            &checkout,
+            scratch.path(),
+            &["config", "protocol.file.allow", "always"],
+        );
+        let url = format!("file://{}", source.display());
+        let control = crate::git_env::fixture_git(&checkout, scratch.path())
+            .args(["-c", "protocol.allow=never", "ls-remote", &url])
+            .output()
+            .unwrap();
+        assert!(
+            control.status.success(),
+            "the repository's setting wins over the default alone: {}",
+            String::from_utf8_lossy(&control.stderr)
+        );
+        // `output`, not `status`: the probe's stdout is piped, and a pipe no one
+        // reads would fail the command for a reason of its own.
+        let probed = probe_command(&ProbeSettings::default(), &checkout, &["ls-remote", &url])
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            !probed.status.success() && probed.stdout.is_empty(),
+            "a probe reached a transport: {}",
+            String::from_utf8_lossy(&probed.stdout)
+        );
+    }
+
     #[tokio::test]
     async fn a_missing_directory_resolves_to_nothing() {
         let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
@@ -517,6 +592,15 @@ mod tests {
                 .position(|w| w[0] == "-c" && w[1] == config)
                 .unwrap_or_else(|| panic!("-c {config} missing: {args:?}"));
             assert!(at < subcommand, "-c {config} must precede the subcommand");
+        }
+        for protocol in ["ext", "file", "ssh", "git", "http", "https"] {
+            let config = format!("protocol.{protocol}.allow=never");
+            assert!(
+                args[..subcommand]
+                    .windows(2)
+                    .any(|w| w[0] == "-c" && w[1] == config),
+                "-c {config} missing: {args:?}"
+            );
         }
         assert!(args[..subcommand].contains(&"--no-pager".to_string()));
         let envs: std::collections::HashMap<String, Option<String>> = std

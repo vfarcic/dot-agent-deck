@@ -6,7 +6,11 @@
 //! user's `OTEL_*` configuration already reaches it unchanged. What this adds is
 //! only what differs from that: `OTEL_RESOURCE_ATTRIBUTES` with the run's
 //! identity merged in, and, for Claude Code, the switches that turn its
-//! telemetry on — each one only when the user has not set it.
+//! telemetry on — each one only when the user has not set it, and a signal's
+//! exporter only when the user gave that signal somewhere to go: the general
+//! endpoint or the signal's own. A traces-only configuration is the user's
+//! choice of where traces go, not a destination for metrics and logs, which
+//! would otherwise fall back to `http://localhost:4318`.
 //!
 //! Content switches (`OTEL_LOG_USER_PROMPTS`, `OTEL_LOG_TOOL_DETAILS` and their
 //! like) are never set. A user who set one themselves still passes it through,
@@ -14,18 +18,38 @@
 
 use crate::event::AgentType;
 
-use super::config::{EnvMap, OTEL_EXPORTER_OTLP_PROTOCOL, OTEL_RESOURCE_ATTRIBUTES, non_empty};
+use super::config::{
+    EnvMap, OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_PROTOCOL, OTEL_RESOURCE_ATTRIBUTES,
+    non_empty,
+};
 use super::resource::merge_resource_attributes;
 use super::tracker::{OrchestrationInfo, agent_name};
 use super::{AttrKey, SCHEMA_VERSION, TelemetryConfig};
 
-/// The Claude Code variables the deck sets when the user has not, besides the
-/// protocol, which takes the deck's effective value.
-pub const CLAUDE_CODE_SWITCHES: [(&str, &str); 3] = [
-    ("CLAUDE_CODE_ENABLE_TELEMETRY", "1"),
-    ("OTEL_METRICS_EXPORTER", "otlp"),
-    ("OTEL_LOGS_EXPORTER", "otlp"),
+/// Claude Code's signal exporters the deck switches on, each with the
+/// endpoint variable for that signal alone. Either it or
+/// `OTEL_EXPORTER_OTLP_ENDPOINT` must be set for the deck to switch it on.
+pub const CLAUDE_CODE_SIGNALS: [(&str, &str, &str); 2] = [
+    (
+        "OTEL_METRICS_EXPORTER",
+        "otlp",
+        "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+    ),
+    (
+        "OTEL_LOGS_EXPORTER",
+        "otlp",
+        "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+    ),
 ];
+
+/// Claude Code's own switch, set when the deck switches on one of
+/// [`CLAUDE_CODE_SIGNALS`].
+pub const CLAUDE_CODE_ENABLE_TELEMETRY: (&str, &str) = ("CLAUDE_CODE_ENABLE_TELEMETRY", "1");
+
+/// The protocol the deck gives Claude Code when the user set none: the OTLP
+/// default. Never the traces-only protocol, which describes the traces
+/// endpoint and nothing else.
+pub const CLAUDE_CODE_DEFAULT_PROTOCOL: &str = "http/protobuf";
 
 /// Variables that make an agent's telemetry carry content. Listed so a test can
 /// assert none of them is ever produced here.
@@ -52,9 +76,9 @@ pub fn agent_env(
     identity: &RunIdentity<'_>,
     host: Option<&str>,
 ) -> Vec<(String, String)> {
-    let Some(config) = config else {
+    if config.is_none() {
         return Vec::new();
-    };
+    }
     let mut deck_pairs: Vec<(String, String)> = vec![
         (AttrKey::RunId.as_str().into(), identity.run_id.into()),
         (AttrKey::PaneId.as_str().into(), identity.pane_id.into()),
@@ -87,11 +111,31 @@ pub fn agent_env(
         merge_resource_attributes(non_empty(base_env, OTEL_RESOURCE_ATTRIBUTES), &deck_pairs),
     )];
     if *identity.agent == AgentType::ClaudeCode {
-        let protocol = (OTEL_EXPORTER_OTLP_PROTOCOL, config.protocol.as_env_value());
-        for (key, value) in CLAUDE_CODE_SWITCHES.into_iter().chain([protocol]) {
-            if non_empty(base_env, key).is_none() {
-                out.push((key.to_string(), value.to_string()));
-            }
+        out.extend(claude_code_switches(base_env));
+    }
+    out
+}
+
+/// The Claude Code switches to add to `base_env`: each signal exporter the
+/// user left unset whose signal has an endpoint, and, when there is one, the
+/// telemetry switch and the protocol, if the user left those unset too.
+fn claude_code_switches(base_env: &EnvMap) -> Vec<(String, String)> {
+    let unset = |key: &str| non_empty(base_env, key).is_none();
+    let general = !unset(OTEL_EXPORTER_OTLP_ENDPOINT);
+    let mut out: Vec<(String, String)> = CLAUDE_CODE_SIGNALS
+        .into_iter()
+        .filter(|(exporter, _, endpoint)| unset(exporter) && (general || !unset(endpoint)))
+        .map(|(exporter, value, _)| (exporter.to_string(), value.to_string()))
+        .collect();
+    if out.is_empty() {
+        return out;
+    }
+    for (key, value) in [
+        CLAUDE_CODE_ENABLE_TELEMETRY,
+        (OTEL_EXPORTER_OTLP_PROTOCOL, CLAUDE_CODE_DEFAULT_PROTOCOL),
+    ] {
+        if unset(key) {
+            out.push((key.to_string(), value.to_string()));
         }
     }
     out
@@ -152,8 +196,10 @@ mod tests {
             orchestrator: true,
         };
         let base = env(&[
+            (OTEL_EXPORTER_OTLP_ENDPOINT, "http://c:4318"),
             (OTEL_RESOURCE_ATTRIBUTES, "team=platform,deck.run.id=stale"),
             ("OTEL_LOGS_EXPORTER", "none"),
+            ("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "http/json"),
         ]);
         let out = agent_env(
             Some(&config(&[(
@@ -194,10 +240,74 @@ mod tests {
             None,
             "the user's value stands"
         );
-        assert_eq!(get(&out, OTEL_EXPORTER_OTLP_PROTOCOL), Some("http/json"));
+        assert_eq!(
+            get(&out, OTEL_EXPORTER_OTLP_PROTOCOL),
+            Some("http/protobuf"),
+            "the default, not the traces-only protocol"
+        );
         for key in CONTENT_SWITCHES {
             assert_eq!(get(&out, key), None);
         }
+    }
+
+    /// A traces-only endpoint sends Claude Code's metrics and logs nowhere the
+    /// user named, so neither is switched on; each signal's own endpoint
+    /// switches on that signal alone; and the protocol given is the user's
+    /// general one or the default, never the traces-only one.
+    #[test]
+    fn claude_signals_are_switched_on_only_where_they_have_an_endpoint() {
+        let traces_only = [
+            (
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                "http://t:4318/v1/traces",
+            ),
+            ("OTEL_EXPORTER_OTLP_TRACES_HEADERS", "k=v"),
+            ("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "http/json"),
+        ];
+        let switches = |extra: &[(&str, &str)]| {
+            let mut pairs = traces_only.to_vec();
+            pairs.extend_from_slice(extra);
+            let base = env(&pairs);
+            let config = TelemetryConfig::from_env(&base).unwrap();
+            let out = agent_env(
+                Some(&config),
+                &base,
+                &identity(&AgentType::ClaudeCode, None),
+                None,
+            );
+            [
+                "CLAUDE_CODE_ENABLE_TELEMETRY",
+                "OTEL_METRICS_EXPORTER",
+                "OTEL_LOGS_EXPORTER",
+                OTEL_EXPORTER_OTLP_PROTOCOL,
+            ]
+            .map(|key| get(&out, key).map(str::to_string))
+        };
+        let on = |v: &str| Some(v.to_string());
+        assert_eq!(switches(&[]), [None, None, None, None]);
+        assert_eq!(
+            switches(&[("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "http://l:4318/v1/logs")]),
+            [on("1"), None, on("otlp"), on("http/protobuf")]
+        );
+        assert_eq!(
+            switches(&[(
+                "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+                "http://m:4318/v1/metrics"
+            )]),
+            [on("1"), on("otlp"), None, on("http/protobuf")]
+        );
+        assert_eq!(
+            switches(&[(OTEL_EXPORTER_OTLP_ENDPOINT, "http://c:4318")]),
+            [on("1"), on("otlp"), on("otlp"), on("http/protobuf")]
+        );
+        assert_eq!(
+            switches(&[
+                (OTEL_EXPORTER_OTLP_ENDPOINT, "http://c:4318"),
+                (OTEL_EXPORTER_OTLP_PROTOCOL, "http/json"),
+            ]),
+            [on("1"), on("otlp"), on("otlp"), None],
+            "the user's general protocol reaches Claude Code unchanged"
+        );
     }
 
     #[test]

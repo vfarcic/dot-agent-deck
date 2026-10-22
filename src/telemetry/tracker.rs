@@ -375,8 +375,18 @@ impl RunTracker {
     }
 
     /// Apply one event from the daemon's broadcast.
+    ///
+    /// An event that names no pane is applied by its session, as the daemon
+    /// applies one from an agent it owns: to the run whose own cards hold that
+    /// session on the run's pane, when exactly one does. The run's copy names
+    /// the pane, which a card state with panes of its own needs to admit it.
     pub fn observe_event(&mut self, event: &AgentEvent, now: u64) {
         let Some(pane_id) = event.pane_id.as_deref() else {
+            if let Some(pane_id) = self.pane_holding_session(&event.session_id) {
+                let mut event = event.clone();
+                event.pane_id = Some(pane_id.clone());
+                self.apply_to_run(&pane_id, &event, now);
+            }
             return;
         };
         // A prepared run takes the events of its own generation, and, while
@@ -394,6 +404,25 @@ impl RunTracker {
             }
             return;
         }
+        self.apply_to_run(pane_id, event, now);
+    }
+
+    /// The pane of the one open run whose cards hold `session_id` on that
+    /// pane. `None` when no run does, or more than one.
+    fn pane_holding_session(&self, session_id: &str) -> Option<String> {
+        let mut holding = self.runs.iter().filter(|(pane_id, run)| {
+            run.cards
+                .sessions
+                .get(session_id)
+                .is_some_and(|s| s.pane_id.as_deref() == Some(pane_id.as_str()))
+        });
+        let (pane_id, _) = holding.next()?;
+        holding.next().is_none().then(|| pane_id.clone())
+    }
+
+    /// Apply `event` to the run open on `pane_id`, unless it names another
+    /// generation of the pane.
+    fn apply_to_run(&mut self, pane_id: &str, event: &AgentEvent, now: u64) {
         let Some(run) = self.runs.get_mut(pane_id) else {
             return;
         };
@@ -1205,6 +1234,54 @@ pub(crate) mod tests {
             ]),
             Some(AttrValue::Int(10)),
             "an older clear is ignored too"
+        );
+    }
+
+    /// An event that names no pane changes the status of the run whose card
+    /// holds its session — and of no run when its session is nobody's.
+    #[test]
+    fn a_status_change_that_names_no_pane_lands_on_its_sessions_run() {
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        tracker.begin_run(start("p2"), 0);
+        tracker.observe_event(&event("p1", EventType::SessionStart), 1);
+        tracker.observe_event(&event("p1", EventType::ToolStart), 2);
+        tracker.observe_event(&event("p2", EventType::SessionStart), 2);
+        let paneless = |session: &str, event_type| {
+            let mut e = event("p1", event_type);
+            e.pane_id = None;
+            e.session_id = session.to_string();
+            e
+        };
+        tracker.observe_event(&paneless("session-p1", EventType::Idle), 3);
+        tracker.observe_event(&paneless("session-elsewhere", EventType::ToolStart), 4);
+        tracker.end_all(EndReason::Exited, 5);
+        let spans = tracker.take_finished();
+        let of_pane = |pane: &str| -> Vec<SpanRecord> {
+            spans
+                .iter()
+                .filter(|s| attr(s, AttrKey::PaneId) == Some(&AttrValue::Str(pane.into())))
+                .cloned()
+                .collect()
+        };
+        let p1 = of_pane("p1");
+        assert_eq!(
+            statuses(&p1).last(),
+            Some(&AttrValue::Str("idle".into())),
+            "{:?}",
+            statuses(&p1)
+        );
+        let idle = p1
+            .iter()
+            .rev()
+            .find(|s| attr(s, AttrKey::Status) == Some(&AttrValue::Str("idle".into())))
+            .unwrap();
+        assert_eq!(idle.start_unix_nanos, 3);
+        let p2 = of_pane("p2");
+        assert!(
+            !statuses(&p2).contains(&AttrValue::Str("working".into())),
+            "{:?}",
+            statuses(&p2)
         );
     }
 

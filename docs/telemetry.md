@@ -30,6 +30,7 @@ The deck does not send its own data over `grpc`. With the protocol set to `grpc`
 - **No client certificates.** The deck does not read `OTEL_EXPORTER_OTLP_CERTIFICATE`, `OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE` or `OTEL_EXPORTER_OTLP_CLIENT_KEY`, or their `_TRACES_` forms, so it cannot reach a backend that requires a client certificate (mutual TLS). To send to one, run an [OpenTelemetry Collector](#trim-what-is-sent) on the same machine, point the deck at it over `http://127.0.0.1:4318`, and give the Collector the certificates.
 - **No redirects.** If the endpoint answers with a redirect, the deck does not follow it: that send fails, and the log says so. The deck sends your headers to the URL you configured and nowhere else.
 - **Retries.** When a send fails because the backend cannot be reached or is busy (HTTP 429, 502, 503 or 504), the deck tries again with growing pauses until `OTEL_EXPORTER_OTLP_TIMEOUT` runs out. A `Retry-After` the backend sends as a number of seconds sets the pause instead; one sent as a date is ignored, and the usual pause applies. Any other answer, and a send still failing at the timeout, drops that batch of spans.
+- **Spans the backend turns down.** A backend can accept a send but report that it rejected some of the spans, for example because they were too old. The log then says how many it rejected and the backend's reason (`telemetry: the OTLP backend did not accept every span`); the deck does not send those spans again.
 
 ### Where to set the variables
 
@@ -110,7 +111,7 @@ A run starts when the deck starts an agent in a pane and ends when the agent exi
 | `deck.orchestration.name` | The orchestration's name. |
 | `deck.orchestration.id` | The id of that run of the orchestration, the same for every role in it. |
 | `deck.orchestrator` | `true` for the orchestration's orchestrator, `false` for its other roles. |
-| `deck.instructions.commit` | The commit that last changed `CLAUDE.md`, `AGENTS.md` or `.claude/skills` in the agent's directory, so you can compare runs before and after an instructions change. Absent outside a git repository or when none of those has any history. |
+| `deck.instructions.commit` | The commit that last changed `CLAUDE.md`, `AGENTS.md` or `.claude/skills` at the root of the agent's repository, whichever directory in it the agent runs from, so you can compare runs before and after an instructions change. Absent outside a git repository or when none of those has any history. |
 | `vcs.repository.name` | The repository's name, taken from the last part of its `origin` remote (`dot-agent-deck` for `git@github.com:vfarcic/dot-agent-deck.git`). The remote's URL itself is never sent. |
 | `deck.pr.number` | The pull request the agent's branch has, once the deck has found it (the same pull request the card's badge shows). |
 | `deck.run.end_reason` | `exited` (the agent exited by itself), `closed` (its pane was closed), `daemon_shutdown`, or `unknown`, for example when the agent was restarted in its pane. |
@@ -152,7 +153,7 @@ Because the agents get the same endpoint and headers, an agent that reads them s
 
 | Agent | Sends its own telemetry | Joins the deck's run | What is missing |
 | --- | --- | --- | --- |
-| Claude Code | Yes. The deck turns on its metrics and events (see below). | Yes: Claude Code puts `OTEL_RESOURCE_ATTRIBUTES` on every metric and event. | Its traces are a beta you turn on yourself. |
+| Claude Code | Yes, with `OTEL_EXPORTER_OTLP_ENDPOINT` set: the deck turns on its metrics and events (see below). | Yes: Claude Code puts `OTEL_RESOURCE_ATTRIBUTES` on every metric and event. | Its traces are a beta you turn on yourself. |
 | OpenCode | Yes, whenever `OTEL_EXPORTER_OTLP_ENDPOINT` is set: its logs and traces. | Yes: OpenCode puts `OTEL_RESOURCE_ATTRIBUTES` on what it sends. | No token or cost metrics; see below. |
 | Codex | Only when you configure it in Codex's own `~/.codex/config.toml`. | Expected, not yet confirmed. | Takes its endpoint from its own configuration, not from the deck's variables. |
 | Devin | Yes, when the `OTEL_EXPORTER_OTLP_*` variables are set (Devin for Terminal 3000.11.1 and later): agent events and metrics. | Unknown: Devin does not document whether it uses `OTEL_RESOURCE_ATTRIBUTES`. | The join is not confirmed. |
@@ -160,7 +161,9 @@ Because the agents get the same endpoint and headers, an agent that reads them s
 
 ### Claude Code
 
-With telemetry on, the deck sets `CLAUDE_CODE_ENABLE_TELEMETRY=1`, `OTEL_METRICS_EXPORTER=otlp`, `OTEL_LOGS_EXPORTER=otlp` and `OTEL_EXPORTER_OTLP_PROTOCOL` (the deck's own protocol) for the Claude Code agents it starts, each one only when you have not set it yourself. Claude Code then sends its metrics (tokens, cost, sessions, lines changed) and events (API requests with model and cost, tool decisions and results) to your backend, tagged with the run's `deck.run.id`. In Honeycomb its events land in a `claude-code` dataset and its metrics in the environment's metrics dataset.
+With telemetry on and `OTEL_EXPORTER_OTLP_ENDPOINT` set, the deck sets `CLAUDE_CODE_ENABLE_TELEMETRY=1`, `OTEL_METRICS_EXPORTER=otlp`, `OTEL_LOGS_EXPORTER=otlp` and `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` for the Claude Code agents it starts, each one only when you have not set it yourself. Claude Code then sends its metrics (tokens, cost, sessions, lines changed) and events (API requests with model and cost, tool decisions and results) to your backend, tagged with the run's `deck.run.id`. In Honeycomb its events land in a `claude-code` dataset and its metrics in the environment's metrics dataset.
+
+If you set only `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, the deck leaves Claude Code's metrics and events off, because you have not said where they should go. To have the deck turn on just one of them, set its own endpoint, `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` or `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`. The protocol the deck sets is `http/protobuf`, the default, even when `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` names another, because that variable is for traces only; set `OTEL_EXPORTER_OTLP_PROTOCOL` yourself to choose the one Claude Code uses.
 
 The deck never turns on Claude Code's content switches (`OTEL_LOG_USER_PROMPTS`, `OTEL_LOG_TOOL_DETAILS` and the others in [Claude Code's monitoring docs](https://code.claude.com/docs/en/monitoring-usage)), so by default Claude Code sends no prompt text and no tool arguments. If you set one of them yourself in the daemon's environment, the deck passes it through unchanged, and Claude Code then sends that content.
 

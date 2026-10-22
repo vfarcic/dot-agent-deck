@@ -31,14 +31,21 @@
 //! 504), honouring `Retry-After`, until the export timeout or, at shutdown, the
 //! remaining flush budget runs out. Redirects are not followed: a 3xx answer is
 //! a failed export, so a header meant for the configured endpoint never goes
-//! anywhere else.
+//! anywhere else. A success that reports spans the backend did not accept (the
+//! OTLP `partial_success`) is logged like a failure and not retried.
+//!
+//! **Shutdown.** An export in flight when shutdown begins gives way: its batch
+//! goes back into the buffer, and the final flush sends it with the runs the
+//! shutdown ends, within the shutdown's budget rather than after the export
+//! timeout. The spans the shutdown ends wait for room in the export queue
+//! within that budget instead of being dropped when it is full.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 use crate::event::BroadcastMsg;
@@ -70,6 +77,10 @@ pub const RETRY_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 pub const RETRY_MAX_BACKOFF: Duration = Duration::from_secs(5);
 /// How much of the shutdown budget cancelling the run-context probes may use.
 const PROBE_SHUTDOWN_BUDGET: Duration = Duration::from_millis(500);
+/// Bytes of a successful answer read, at most, for its partial-success report.
+const MAX_RESPONSE_BODY: usize = 64 * 1024;
+/// Characters of a backend's own error message logged, at most.
+const MAX_LOGGED_ERROR_MESSAGE: usize = 256;
 
 enum ExportMsg {
     Span(Box<SpanRecord>),
@@ -87,6 +98,8 @@ enum Command {
     Commit {
         run_id: String,
     },
+    /// Stamped when it is applied, after the events broadcast before it, so
+    /// none of them lands after the run's end.
     End {
         pane_id: String,
         agent_id: Option<String>,
@@ -94,7 +107,6 @@ enum Command {
         run_id: Option<String>,
         reason: EndReason,
         exit_code: Option<i32>,
-        now: u64,
     },
     /// `run_id` on `pane_id` has human input waiting ([`PaneInput::pending`]).
     HumanInput {
@@ -104,11 +116,17 @@ enum Command {
     /// Acknowledged once everything sent before it, broadcast included, is
     /// applied.
     Barrier(oneshot::Sender<()>),
+    /// End every run, stamped like [`Command::End`], and hand the spans that
+    /// finishes back to [`Telemetry::shutdown`] to queue.
     Shutdown {
-        now: u64,
-        ack: oneshot::Sender<()>,
+        ack: oneshot::Sender<Vec<SpanRecord>>,
     },
 }
+
+/// A test seam pausing a task at one point: signal the first half, then wait
+/// for the second.
+#[cfg(test)]
+type Gate = (oneshot::Sender<()>, std::sync::mpsc::Receiver<()>);
 
 /// A run's input filter, from its commit until the tracker ends the run,
 /// with the generation it is for.
@@ -181,10 +199,17 @@ struct Shared {
     filters: Arc<Filters>,
     /// Wakes the ingest task to time a lone `ESC` that a write left held.
     escape_held: tokio::sync::Notify,
+    /// Turned true as shutdown begins: an export in flight gives way to the
+    /// final flush.
+    stopping: watch::Sender<bool>,
     /// Test seam: pauses the ingest task once inside its `escape_held`
     /// branch, after signalling the first half, until the second receives.
     #[cfg(test)]
-    timer_gate: Mutex<Option<(oneshot::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    timer_gate: Mutex<Option<Gate>>,
+    /// Test seam: pauses the ingest task once the command queue first polls
+    /// empty, before the other branches are polled.
+    #[cfg(test)]
+    command_gate: Mutex<Option<Gate>>,
 }
 
 struct Exporting {
@@ -244,6 +269,10 @@ struct Settings {
     /// Test seam: hand finished spans here instead of to an HTTP exporter.
     #[cfg(test)]
     sink: Option<mpsc::Sender<ExportMsg>>,
+    /// Test seam: armed before the ingest task first runs; see
+    /// [`Shared::command_gate`].
+    #[cfg(test)]
+    command_gate: Option<Gate>,
 }
 
 impl Telemetry {
@@ -513,7 +542,6 @@ impl Telemetry {
             run_id,
             reason,
             exit_code,
-            now: now_unix_nanos(),
         });
     }
 
@@ -537,36 +565,58 @@ impl Telemetry {
         }
     }
 
-    /// Daemon shutdown, bounded by `budget` in all: cancel the run-context
-    /// probes (killing their processes), end every open run as
-    /// `daemon_shutdown` once the events already broadcast are applied, and
-    /// send what the exporter holds, retrying only while the budget lasts.
+    /// Daemon shutdown, bounded by `budget` in all: make an export in flight
+    /// give way, cancel the run-context probes (killing their processes), end
+    /// every open run as `daemon_shutdown` once the events already broadcast
+    /// are applied, and send what the exporter holds, retrying only while the
+    /// budget lasts.
     pub async fn shutdown(&self, budget: Duration) {
         let Some(exporting) = &self.exporting else {
             return;
         };
         let deadline = deadline_after(budget);
+        exporting.shared.stopping.send_replace(true);
         exporting
             .probes
             .shutdown(budget.min(PROBE_SHUTDOWN_BUDGET))
             .await;
         let (ack, ended) = oneshot::channel();
-        let sent = exporting.commands.send(Command::Shutdown {
-            now: now_unix_nanos(),
-            ack,
-        });
-        if sent.is_ok() && tokio::time::timeout_at(deadline, ended).await.is_err() {
-            tracing::warn!("telemetry: open runs could not be ended in time; spans dropped");
+        let mut last = Vec::new();
+        if exporting.commands.send(Command::Shutdown { ack }).is_ok() {
+            match tokio::time::timeout_at(deadline, ended).await {
+                Ok(Ok(spans)) => last = spans,
+                Ok(Err(_)) => {}
+                Err(_) => {
+                    tracing::warn!(
+                        "telemetry: open runs could not be ended in time; spans dropped"
+                    );
+                }
+            }
         }
-        let (ack, flushed) = oneshot::channel();
-        if exporting
-            .shared
-            .queue
-            .try_send(ExportMsg::Flush { ack, deadline })
-            .is_ok()
-            && tokio::time::timeout_at(deadline, flushed).await.is_err()
-        {
-            tracing::warn!("telemetry: the final flush did not finish in time; spans dropped");
+        // Awaited, not tried: a queue still full of what a slow backend left
+        // is drained by the exporter while the budget lasts.
+        let queue = &exporting.shared.queue;
+        let mut unqueued = last.len();
+        let flushed = tokio::time::timeout_at(deadline, async {
+            for span in last {
+                queue.send(ExportMsg::Span(Box::new(span))).await.ok()?;
+                unqueued -= 1;
+            }
+            let (ack, flushed) = oneshot::channel();
+            queue.send(ExportMsg::Flush { ack, deadline }).await.ok()?;
+            flushed.await.ok()
+        })
+        .await;
+        if !matches!(flushed, Ok(Some(()))) {
+            if unqueued > 0 {
+                tracing::warn!(
+                    spans = unqueued,
+                    "telemetry: the export queue stayed full at shutdown; the final runs and \
+                     the flush were dropped"
+                );
+            } else {
+                tracing::warn!("telemetry: the final flush did not finish in time; spans dropped");
+            }
         }
         if let Some(ingest) = exporting
             .ingest
@@ -626,10 +676,11 @@ impl Shared {
     /// giving its ESC up and the run counting it.
     ///
     /// A filter whose run the tracker has not opened yet — its
-    /// [`Command::Commit`] still queued behind a timer the task had already
-    /// picked — is left as it is: the tracker would drop what it gave up.
-    /// Its ESC is still timed: the write that left it held woke the task
-    /// after that Commit was sent, and the task applies commands first.
+    /// [`Command::Commit`] still queued — is left as it is: the tracker would
+    /// drop what it gave up. Its ESC is timed once the run opens: applying a
+    /// Commit wakes the task again, because the wake the write sent can be
+    /// taken by the task before the Commit is — `biased` orders the branches
+    /// it polls, not a command's arrival against a wake.
     fn settle_escapes(&self, at: std::time::Instant) -> Option<std::time::Instant> {
         let mut next_due: Option<std::time::Instant> = None;
         self.with_tracker(|t| {
@@ -699,13 +750,14 @@ fn start_exporting(
     host: Option<&str>,
     settings: Settings,
 ) -> Result<Exporting, reqwest::Error> {
+    let (stopping, stop) = watch::channel(false);
     #[cfg(test)]
     let queue = match settings.sink {
         Some(sink) => sink,
-        None => spawn_exporter(config, host, settings.retry)?,
+        None => spawn_exporter(config, host, settings.retry, stop)?,
     };
     #[cfg(not(test))]
-    let queue = spawn_exporter(config, host, settings.retry)?;
+    let queue = spawn_exporter(config, host, settings.retry, stop)?;
     let filters: Arc<Filters> = Arc::default();
     let mut tracker = RunTracker::new();
     let held = Arc::clone(&filters);
@@ -718,8 +770,11 @@ fn start_exporting(
         dropped: Mutex::new(RateLimitedLog::new(ERROR_LOG_INTERVAL)),
         filters,
         escape_held: tokio::sync::Notify::new(),
+        stopping,
         #[cfg(test)]
         timer_gate: Mutex::new(None),
+        #[cfg(test)]
+        command_gate: Mutex::new(settings.command_gate),
     });
     let (commands, rx) = mpsc::unbounded_channel();
     let ingest = tokio::spawn(run_ingest(Arc::clone(&shared), rx));
@@ -743,7 +798,7 @@ async fn run_ingest(shared: Arc<Shared>, mut commands: mpsc::UnboundedReceiver<C
     loop {
         tokio::select! {
             biased;
-            command = commands.recv() => {
+            command = next_command(&shared, &mut commands) => {
                 let Some(command) = command else { break };
                 if let Command::Subscribe(rx) = command {
                     events = Some(rx);
@@ -774,6 +829,34 @@ async fn run_ingest(shared: Arc<Shared>, mut commands: mpsc::UnboundedReceiver<C
             },
         }
     }
+}
+
+#[cfg(not(test))]
+async fn next_command(
+    _shared: &Shared,
+    commands: &mut mpsc::UnboundedReceiver<Command>,
+) -> Option<Command> {
+    commands.recv().await
+}
+
+/// [`mpsc::UnboundedReceiver::recv`], paused once at [`Shared::command_gate`]
+/// the first time it finds the queue empty.
+#[cfg(test)]
+async fn next_command(
+    shared: &Shared,
+    commands: &mut mpsc::UnboundedReceiver<Command>,
+) -> Option<Command> {
+    std::future::poll_fn(|cx| {
+        let polled = commands.poll_recv(cx);
+        if polled.is_pending()
+            && let Some((entered, resume)) = shared.command_gate.lock().unwrap().take()
+        {
+            let _ = entered.send(());
+            let _ = resume.recv();
+        }
+        polled
+    })
+    .await
 }
 
 async fn sleep_until(due: Option<std::time::Instant>) {
@@ -828,15 +911,20 @@ async fn drain(shared: &Shared, events: &mut Option<broadcast::Receiver<Broadcas
 fn apply(shared: &Shared, command: Command) -> bool {
     match command {
         Command::Subscribe(_) => {}
-        Command::Commit { run_id } => shared.with_tracker(|t| t.commit_run(&run_id)),
+        Command::Commit { run_id } => {
+            shared.with_tracker(|t| t.commit_run(&run_id));
+            // An Escape written into the run before this may already be held,
+            // its wake taken while the run was not open: time it now.
+            shared.escape_held.notify_one();
+        }
         Command::End {
             pane_id,
             agent_id,
             run_id,
             reason,
             exit_code,
-            now,
         } => {
+            let now = now_unix_nanos();
             shared.with_tracker(|t| {
                 t.end_agent_run(&pane_id, agent_id.as_deref(), reason, exit_code, now)
             });
@@ -848,12 +936,20 @@ fn apply(shared: &Shared, command: Command) -> bool {
         Command::Barrier(ack) => {
             let _ = ack.send(());
         }
-        Command::Shutdown { now, ack } => {
+        Command::Shutdown { ack } => {
             // A run's last key, a lone ESC still in its window, is counted as
             // the tracker ends the run.
-            shared.with_tracker(|t| t.end_all(EndReason::DaemonShutdown, now));
+            let finished = {
+                let mut tracker = shared.tracker.lock().unwrap_or_else(|p| p.into_inner());
+                tracker.end_all(EndReason::DaemonShutdown, now_unix_nanos());
+                tracker.take_finished()
+            };
             shared.lock_filters().clear();
-            let _ = ack.send(());
+            // Queued by `shutdown`, which can wait for room; when it stopped
+            // waiting for these, as best it can.
+            if let Err(finished) = ack.send(finished) {
+                shared.enqueue(finished);
+            }
             return false;
         }
     }
@@ -928,10 +1024,12 @@ fn build_client(config: &TelemetryConfig) -> Result<reqwest::Client, reqwest::Er
         .build()
 }
 
+/// `stop` is [`Shared::stopping`]'s receiving end.
 fn spawn_exporter(
     config: &TelemetryConfig,
     host: Option<&str>,
     retry: RetryPolicy,
+    stop: watch::Receiver<bool>,
 ) -> Result<mpsc::Sender<ExportMsg>, reqwest::Error> {
     let (tx, rx) = mpsc::channel(QUEUE_CAPACITY);
     let sender = Sender {
@@ -942,6 +1040,7 @@ fn spawn_exporter(
         timeout: config.timeout,
         retry,
         errors: RateLimitedLog::new(ERROR_LOG_INTERVAL),
+        stop,
         #[cfg(test)]
         panic_on_send: false,
     };
@@ -971,6 +1070,12 @@ enum SendOutcome {
     Delivered {
         attempts: u32,
     },
+    /// Delivered, and the backend's answer reports spans it did not accept,
+    /// or a warning (the OTLP `partial_success`). Not retried.
+    PartiallyRejected {
+        attempts: u32,
+        rejected: i64,
+    },
     /// The backend answered with a status that is not retried (a 3xx among
     /// them).
     Rejected {
@@ -982,6 +1087,9 @@ enum SendOutcome {
     },
     /// A failure that is not retried, other than an HTTP status.
     Failed,
+    /// Shutdown began first: the batch is back in the buffer, for the final
+    /// flush to send.
+    Deferred,
 }
 
 struct Sender {
@@ -992,6 +1100,8 @@ struct Sender {
     timeout: Duration,
     retry: RetryPolicy,
     errors: RateLimitedLog,
+    /// True once shutdown has begun ([`Shared::stopping`]).
+    stop: watch::Receiver<bool>,
     /// Test seam: every send panics once it has taken its batch.
     #[cfg(test)]
     panic_on_send: bool,
@@ -1035,9 +1145,31 @@ fn jittered(backoff: Duration) -> Duration {
     backoff.mul_f64(0.5 + 0.5 * fraction)
 }
 
+/// Resolves once `stop` is true; never, when its sender is gone first.
+async fn stopped(stop: &mut watch::Receiver<bool>) {
+    if stop.wait_for(|stopping| *stopping).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// A backend's own error message, for a log line: control characters dropped
+/// and at most [`MAX_LOGGED_ERROR_MESSAGE`] characters kept.
+fn logged_message(message: &str) -> String {
+    let mut chars = message.chars().filter(|c| !c.is_control());
+    let mut out: String = chars.by_ref().take(MAX_LOGGED_ERROR_MESSAGE).collect();
+    if chars.next().is_some() {
+        out.push('…');
+    }
+    if out.trim().is_empty() {
+        out = "it gave no reason".to_string();
+    }
+    out
+}
+
 impl Sender {
     /// Send `batch`, retrying transient failures until the export timeout or
-    /// `flush_deadline`, whichever comes first.
+    /// `flush_deadline`, whichever comes first. A send that is not part of a
+    /// flush gives way once shutdown begins, leaving `batch` as it was.
     async fn send(
         &mut self,
         batch: &mut Vec<SpanRecord>,
@@ -1045,6 +1177,9 @@ impl Sender {
     ) -> Option<SendOutcome> {
         if batch.is_empty() {
             return None;
+        }
+        if flush_deadline.is_none() && *self.stop.borrow() {
+            return Some(SendOutcome::Deferred);
         }
         let spans = std::mem::take(batch);
         #[cfg(test)]
@@ -1063,6 +1198,52 @@ impl Sender {
         if let Some(flush) = flush_deadline {
             deadline = deadline.min(flush);
         }
+        let attempts = self.deliver(body, content_type, deadline);
+        let delivered = if flush_deadline.is_some() {
+            Some(attempts.await)
+        } else {
+            let mut stop = self.stop.clone();
+            tokio::select! {
+                biased;
+                () = stopped(&mut stop) => None,
+                done = attempts => Some(done),
+            }
+        };
+        let Some((outcome, attempts, failure)) = delivered else {
+            *batch = spans;
+            return Some(SendOutcome::Deferred);
+        };
+        let reportable = !matches!(outcome, SendOutcome::Delivered { .. });
+        if reportable && let Some(suppressed) = self.errors.record(std::time::Instant::now()) {
+            if let SendOutcome::PartiallyRejected { rejected, .. } = outcome {
+                tracing::warn!(
+                    spans = spans.len(),
+                    rejected,
+                    suppressed_failures = suppressed,
+                    endpoint = %redacted_endpoint(&self.endpoint),
+                    "telemetry: the OTLP backend did not accept every span: {failure}"
+                );
+            } else {
+                tracing::warn!(
+                    spans = spans.len(),
+                    attempts,
+                    suppressed_failures = suppressed,
+                    endpoint = %redacted_endpoint(&self.endpoint),
+                    "telemetry: OTLP export failed: {failure}"
+                );
+            }
+        }
+        Some(outcome)
+    }
+
+    /// The attempts of one export: how it ended, how many there were, and
+    /// what to log about it.
+    async fn deliver(
+        &self,
+        body: Vec<u8>,
+        content_type: &str,
+        deadline: Instant,
+    ) -> (SendOutcome, u32, String) {
         let mut backoff = self.retry.initial;
         let mut attempts = 0u32;
         let mut failure = String::new();
@@ -1082,7 +1263,22 @@ impl Sender {
                 .await;
             let wait = match result {
                 Ok(response) if response.status().is_success() => {
-                    break SendOutcome::Delivered { attempts };
+                    match self.partial_success(response).await {
+                        Some(partial)
+                            if partial.rejected_spans > 0 || !partial.error_message.is_empty() =>
+                        {
+                            failure = format!(
+                                "{} rejected; the backend said: {}",
+                                partial.rejected_spans,
+                                logged_message(&partial.error_message)
+                            );
+                            break SendOutcome::PartiallyRejected {
+                                attempts,
+                                rejected: partial.rejected_spans,
+                            };
+                        }
+                        _ => break SendOutcome::Delivered { attempts },
+                    }
                 }
                 Ok(response) if is_retryable_status(response.status().as_u16()) => {
                     failure = format!("the backend answered HTTP {}", response.status().as_u16());
@@ -1113,18 +1309,28 @@ impl Sender {
             tokio::time::sleep(wait).await;
             backoff = (backoff * 2).min(self.retry.max);
         };
-        if !matches!(outcome, SendOutcome::Delivered { .. })
-            && let Some(suppressed) = self.errors.record(std::time::Instant::now())
-        {
-            tracing::warn!(
-                spans = spans.len(),
-                attempts,
-                suppressed_failures = suppressed,
-                endpoint = %redacted_endpoint(&self.endpoint),
-                "telemetry: OTLP export failed: {failure}"
-            );
+        (outcome, attempts, failure)
+    }
+
+    /// What a successful answer reports the backend did not accept, from at
+    /// most [`MAX_RESPONSE_BODY`] bytes of it, in the configured protocol's
+    /// format. `None` when it reports nothing, or cannot be read.
+    async fn partial_success(
+        &self,
+        mut response: reqwest::Response,
+    ) -> Option<otlp::PartialSuccess> {
+        let mut body = Vec::new();
+        while body.len() < MAX_RESPONSE_BODY {
+            let Ok(Some(chunk)) = response.chunk().await else {
+                break;
+            };
+            let room = MAX_RESPONSE_BODY - body.len();
+            body.extend_from_slice(&chunk[..chunk.len().min(room)]);
         }
-        Some(outcome)
+        match self.protocol {
+            Protocol::HttpJson => otlp::decode_partial_success_json(&body),
+            _ => otlp::decode_partial_success_protobuf(&body),
+        }
     }
 }
 
@@ -1770,6 +1976,181 @@ mod tests {
         assert_eq!(times, vec![written, written + 6_000_000_000]);
     }
 
+    /// Threads 4 / 10: a run's end is stamped when the ingest task applies
+    /// it, after the statuses broadcast before it, so no status starts or ends
+    /// after its run, nor does any event on the run.
+    #[tokio::test]
+    async fn no_status_outlives_its_run() {
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        let (tx, events) = broadcast::channel(16);
+        telemetry.subscribe(events);
+        begin(&telemetry, generation("p1", "a1"), &[]);
+        telemetry.settled().await;
+        tx.send(of("p1", "a1", EventType::SessionStart)).unwrap();
+        tx.send(of("p1", "a1", EventType::ToolStart)).unwrap();
+        telemetry.end_run("p1", Some("a1"), EndReason::Exited, None);
+        // The ingest task, on this thread, reads the broadcasts only after
+        // this, a clock tick at least after the end_run call.
+        std::thread::sleep(Duration::from_millis(2));
+        telemetry.settled().await;
+        let spans = captured(&mut rx);
+        let run = spans.iter().find(|s| s.name == SPAN_AGENT_RUN).unwrap();
+        let end = run.end_unix_nanos;
+        assert!(!statuses(&spans).is_empty());
+        for status in spans.iter().filter(|s| s.name == SPAN_AGENT_STATUS) {
+            assert!(
+                status.start_unix_nanos <= end && status.end_unix_nanos <= end,
+                "{} .. {} past the run's end {end}",
+                status.start_unix_nanos,
+                status.end_unix_nanos
+            );
+        }
+        for event in &run.events {
+            assert!(event.time_unix_nanos <= end, "{} past {end}", event.name);
+        }
+    }
+
+    /// Threads 2 / 9: shutdown with the export queue full — a backend slow
+    /// enough to have left it so — waits for room within its budget for the
+    /// final runs and the flush, instead of dropping both.
+    #[tokio::test]
+    async fn the_final_runs_wait_for_room_in_a_full_queue() {
+        let (sink, mut rx) = mpsc::channel(1);
+        let telemetry = Arc::new(Telemetry::start_with(
+            &env(&ON),
+            Settings {
+                sink: Some(sink.clone()),
+                ..Settings::default()
+            },
+        ));
+        let shared = Arc::clone(&telemetry.exporting.as_ref().unwrap().shared);
+        begin(&telemetry, generation("p1", "a1"), &[]);
+        telemetry.settled().await;
+        for span in one_span() {
+            sink.send(ExportMsg::Span(Box::new(span))).await.unwrap();
+        }
+        let mut shutting = tokio::spawn({
+            let telemetry = Arc::clone(&telemetry);
+            async move { telemetry.shutdown(Duration::from_secs(60)).await }
+        });
+        eventually("the shutdown ended the run", || {
+            shared.tracker.lock().unwrap().held() == (0, 0)
+        })
+        .await;
+        // The exporter catches up only now.
+        let mut spans = Vec::new();
+        let mut flushed = false;
+        let mut take = |msg: ExportMsg| match msg {
+            ExportMsg::Span(span) => spans.push(*span),
+            ExportMsg::Flush { ack, .. } => {
+                let _ = ack.send(());
+                flushed = true;
+            }
+        };
+        loop {
+            tokio::select! {
+                msg = rx.recv() => match msg {
+                    Some(msg) => take(msg),
+                    None => break,
+                },
+                _ = &mut shutting => break,
+            }
+        }
+        while let Ok(msg) = rx.try_recv() {
+            take(msg);
+        }
+        assert!(flushed, "the final flush was queued");
+        let reasons: Vec<_> = spans
+            .iter()
+            .filter(|s| s.name == SPAN_AGENT_RUN)
+            .filter_map(|s| attr(s, AttrKey::EndReason).cloned())
+            .collect();
+        assert!(
+            reasons.contains(&AttrValue::Str("daemon_shutdown".into())),
+            "{reasons:?}"
+        );
+    }
+
+    /// Threads 2 / 9: a queue that stays full for the whole budget costs the
+    /// final runs, and the log says so; the shutdown still keeps its budget.
+    #[tokio::test]
+    async fn a_queue_that_stays_full_at_shutdown_is_reported() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let logs = Captured::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new(
+                "dot_agent_deck::telemetry=trace",
+            ))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(move || writer.clone()),
+            );
+        let _guard = crate::test_isolation::capture_tracing_on_this_thread(subscriber);
+
+        let (sink, _never_read) = mpsc::channel(1);
+        let telemetry = Arc::new(Telemetry::start_with(
+            &env(&ON),
+            Settings {
+                sink: Some(sink.clone()),
+                ..Settings::default()
+            },
+        ));
+        begin(&telemetry, generation("p1", "a1"), &[]);
+        telemetry.settled().await;
+        for span in one_span() {
+            sink.send(ExportMsg::Span(Box::new(span))).await.unwrap();
+        }
+        let started = std::time::Instant::now();
+        telemetry.shutdown(Duration::from_millis(300)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        let logged = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logged.contains("the export queue stayed full at shutdown"),
+            "{logged}"
+        );
+    }
+
+    /// N13: the ingest task can find the command queue empty, a new run be
+    /// committed and a lone ESC written into it, and the task then take the
+    /// write's wake before the run's Commit — `biased` orders the polls, not
+    /// the Commit's arrival against the wake. The Escape is still settled by
+    /// its window, with nothing else written and the run still open.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_escape_whose_wake_beats_its_runs_commit_still_settles() {
+        let (entered, polled_empty) = oneshot::channel();
+        let (resume, paused) = std::sync::mpsc::channel();
+        let (sink, mut rx) = mpsc::channel(QUEUE_CAPACITY);
+        let telemetry = Arc::new(Telemetry::start_with(
+            &env(&ON),
+            Settings {
+                sink: Some(sink),
+                command_gate: Some((entered, paused)),
+                ..Settings::default()
+            },
+        ));
+        let shared = Arc::clone(&telemetry.exporting.as_ref().unwrap().shared);
+        polled_empty.await.unwrap();
+        begin(&telemetry, generation("p1", "new"), &[]);
+        telemetry.observe_client_input("p1", b"\x1b");
+        resume.send(()).unwrap();
+        eventually("the Escape settled by its window", || {
+            shared.lock_filters()["p1"]
+                .iter()
+                .all(|input| input.escape.is_none() && !input.filter.is_holding())
+        })
+        .await;
+        assert!(shared.tracker.lock().unwrap().run_id("p1").is_some());
+        telemetry.end_run("p1", Some("new"), EndReason::Exited, None);
+        telemetry.settled().await;
+        assert_eq!(interventions(&captured(&mut rx)).0, Some(AttrValue::Int(1)));
+    }
+
     /// N11: an End that names no agent cleans up the run it ended and no
     /// other — not a newer generation's held Escape whose own End is queued
     /// behind it.
@@ -2071,6 +2452,13 @@ mod tests {
     async fn receiver(
         responses: Vec<String>,
     ) -> (std::net::SocketAddr, mpsc::UnboundedReceiver<Request>) {
+        receiver_answering(responses.into_iter().map(|r| (r, Vec::new())).collect()).await
+    }
+
+    /// [`receiver`], each answer with a body.
+    async fn receiver_answering(
+        responses: Vec<(String, Vec<u8>)>,
+    ) -> (std::net::SocketAddr, mpsc::UnboundedReceiver<Request>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
@@ -2083,15 +2471,16 @@ mod tests {
                 let Some(request) = read_request(&mut socket).await else {
                     continue;
                 };
-                let response = &responses[served.min(responses.len() - 1)];
+                let (response, body) = &responses[served.min(responses.len() - 1)];
                 served += 1;
                 let _ = tx.send(request);
-                let _ = socket
-                    .write_all(
-                        format!("{response}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
-                            .as_bytes(),
-                    )
-                    .await;
+                let mut answer = format!(
+                    "{response}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                answer.extend_from_slice(body);
+                let _ = socket.write_all(&answer).await;
                 let _ = socket.shutdown().await;
             }
         });
@@ -2118,6 +2507,7 @@ mod tests {
                 max: Duration::from_millis(80),
             },
             errors: RateLimitedLog::new(ERROR_LOG_INTERVAL),
+            stop: watch::channel(false).1,
             panic_on_send: false,
         }
     }
@@ -2309,7 +2699,13 @@ mod tests {
             &format!("http://{addr}/v1/traces"),
         )]))
         .unwrap();
-        let queue = spawn_exporter(&config, Some("h"), RetryPolicy::default()).unwrap();
+        let queue = spawn_exporter(
+            &config,
+            Some("h"),
+            RetryPolicy::default(),
+            watch::channel(false).1,
+        )
+        .unwrap();
         for _ in 0..2 {
             for span in one_span() {
                 queue.send(ExportMsg::Span(Box::new(span))).await.unwrap();
@@ -2413,6 +2809,180 @@ mod tests {
         let logged = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
         let warned = logged.matches("failed unexpectedly").count();
         assert_eq!(warned, 1, "five panics inside one interval: {logged}");
+    }
+
+    /// A loopback receiver that takes the first request and never answers
+    /// it, and answers every later one with 200.
+    async fn stalling_receiver() -> (std::net::SocketAddr, mpsc::UnboundedReceiver<Request>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut held = None;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let Some(request) = read_request(&mut socket).await else {
+                    continue;
+                };
+                let _ = tx.send(request);
+                if held.is_none() {
+                    held = Some(socket);
+                    continue;
+                }
+                let _ = socket
+                    .write_all(
+                        format!("{OK}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                            .as_bytes(),
+                    )
+                    .await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (addr, rx)
+    }
+
+    /// Threads 1 / 15: an export the backend leaves hanging when shutdown
+    /// begins gives way, and the final flush sends both its batch and the
+    /// final run within the flush's budget, not after the export timeout.
+    #[tokio::test]
+    async fn an_export_in_flight_gives_way_to_the_final_flush() {
+        let (addr, mut requests) = stalling_receiver().await;
+        let mut sender = sender_for(
+            format!("http://{addr}/v1/traces"),
+            "",
+            Duration::from_secs(600),
+        );
+        let (stopping, stop) = watch::channel(false);
+        sender.stop = stop;
+        let (queue, rx) = mpsc::channel(QUEUE_CAPACITY);
+        let exporter = tokio::spawn(run_exporter(sender, rx));
+        // A full batch is sent at once; the backend takes it and never answers.
+        for _ in 0..MAX_BATCH {
+            for span in one_span() {
+                queue.send(ExportMsg::Span(Box::new(span))).await.unwrap();
+            }
+        }
+        let hung = requests.recv().await.unwrap();
+
+        stopping.send_replace(true);
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(crate::telemetry::tracker::tests::start("final"), 1);
+        tracker.end_run("final", EndReason::DaemonShutdown, None, 2);
+        for span in tracker.take_finished() {
+            queue.send(ExportMsg::Span(Box::new(span))).await.unwrap();
+        }
+        let (ack, done) = oneshot::channel();
+        queue
+            .send(ExportMsg::Flush {
+                ack,
+                deadline: Instant::now() + Duration::from_secs(30),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(60), done)
+            .await
+            .expect("the flush finished inside its budget")
+            .unwrap();
+        let flushed: Vec<Request> = std::iter::from_fn(|| requests.try_recv().ok()).collect();
+        let has = |body: &[u8], needle: &[u8]| body.windows(needle.len()).any(|w| w == needle);
+        assert!(
+            flushed.iter().any(|r| r.body == hung.body),
+            "the batch in flight was sent again"
+        );
+        assert!(
+            flushed.iter().any(|r| has(&r.body, b"run-final")),
+            "the final run was sent"
+        );
+        exporter.abort();
+    }
+
+    /// Thread 3: a 200 that reports spans the backend did not accept, in
+    /// either encoding, is logged at the error rate, with the backend's message
+    /// capped, and not retried.
+    #[tokio::test]
+    async fn a_partial_success_is_logged_and_not_retried() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let logs = Captured::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new(
+                "dot_agent_deck::telemetry=trace",
+            ))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(move || writer.clone()),
+            );
+        let _guard = crate::test_isolation::capture_tracing_on_this_thread(subscriber);
+
+        let long = "x".repeat(1000);
+        let json =
+            format!(r#"{{"partialSuccess":{{"rejectedSpans":"1","errorMessage":"{long}"}}}}"#);
+        let (addr, mut requests) = receiver_answering(vec![(OK.into(), json.into_bytes())]).await;
+        let mut sender = sender_for(
+            format!("http://{addr}/v1/traces"),
+            "",
+            Duration::from_secs(5),
+        );
+        sender.protocol = Protocol::HttpJson;
+        for _ in 0..2 {
+            assert_eq!(
+                sender.send(&mut one_span(), None).await,
+                Some(SendOutcome::PartiallyRejected {
+                    attempts: 1,
+                    rejected: 1
+                })
+            );
+        }
+        assert_eq!(
+            std::iter::from_fn(|| requests.try_recv().ok()).count(),
+            2,
+            "one request per send"
+        );
+
+        // ExportTraceServiceResponse { partial_success: { rejected_spans: 2,
+        // error_message: "late" } }.
+        let protobuf = vec![0x0a, 0x08, 0x08, 0x02, 0x12, 0x04, b'l', b'a', b't', b'e'];
+        let (addr, _requests) = receiver_answering(vec![(OK.into(), protobuf)]).await;
+        let mut sender = sender_for(
+            format!("http://{addr}/v1/traces"),
+            "",
+            Duration::from_secs(5),
+        );
+        assert_eq!(
+            sender.send(&mut one_span(), None).await,
+            Some(SendOutcome::PartiallyRejected {
+                attempts: 1,
+                rejected: 2
+            })
+        );
+
+        // Nothing reported, or a report of nothing, is plain delivery.
+        for body in [Vec::new(), br#"{"partialSuccess":{}}"#.to_vec()] {
+            let (addr, _requests) = receiver_answering(vec![(OK.into(), body)]).await;
+            let mut sender = sender_for(
+                format!("http://{addr}/v1/traces"),
+                "",
+                Duration::from_secs(5),
+            );
+            sender.protocol = Protocol::HttpJson;
+            assert_eq!(
+                sender.send(&mut one_span(), None).await,
+                Some(SendOutcome::Delivered { attempts: 1 })
+            );
+        }
+
+        let logged = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            logged.matches("did not accept every span").count(),
+            2,
+            "once per sender inside the interval: {logged}"
+        );
+        assert!(logged.contains("late"), "{logged}");
+        assert!(logged.contains(&format!("{}…", "x".repeat(MAX_LOGGED_ERROR_MESSAGE))));
+        assert!(!logged.contains(&"x".repeat(MAX_LOGGED_ERROR_MESSAGE + 1)));
     }
 
     /// A rejection that is not transient is not retried.

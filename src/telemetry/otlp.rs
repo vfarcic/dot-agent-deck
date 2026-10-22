@@ -1,5 +1,7 @@
 //! OTLP encoding of an `ExportTraceServiceRequest`: protobuf for
-//! `http/protobuf`, the OTLP/JSON mapping for `http/json`.
+//! `http/protobuf`, the OTLP/JSON mapping for `http/json`; and decoding of the
+//! one part of the `ExportTraceServiceResponse` the deck reads, its
+//! `partial_success`.
 //!
 //! Only the fields the deck fills are written. Field numbers are those of
 //! `opentelemetry/proto/trace/v1/trace.proto`, `common/v1/common.proto`,
@@ -17,6 +19,7 @@ const SCOPE_NAME: &str = "dot-agent-deck";
 const WIRE_VARINT: u8 = 0;
 const WIRE_FIXED64: u8 = 1;
 const WIRE_LEN: u8 = 2;
+const WIRE_FIXED32: u8 = 5;
 
 fn put_varint(buf: &mut Vec<u8>, mut value: u64) {
     while value >= 0x80 {
@@ -172,6 +175,111 @@ pub fn encode_json(resource: &[ResourceAttribute], spans: &[SpanRecord]) -> Vec<
         }],
     });
     serde_json::to_vec(&body).expect("a JSON value always serializes")
+}
+
+/// The `partial_success` of an `ExportTraceServiceResponse`: spans the
+/// backend did not accept, and its message about them (or a warning, with
+/// none rejected).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PartialSuccess {
+    pub rejected_spans: i64,
+    pub error_message: String,
+}
+
+/// One field of a protobuf message, as far as a response is read.
+enum Wire<'a> {
+    Varint(u64),
+    Bytes(&'a [u8]),
+    Other,
+}
+
+fn read_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut value = 0u64;
+    for shift in (0..64).step_by(7) {
+        let byte = *buf.get(*pos)?;
+        *pos += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// The fields of a protobuf message, by number; `None` when it is malformed.
+fn read_fields(buf: &[u8]) -> Option<Vec<(u64, Wire<'_>)>> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    let skip = |pos: &mut usize, n: usize| {
+        *pos = pos.checked_add(n).filter(|end| *end <= buf.len())?;
+        Some(Wire::Other)
+    };
+    while pos < buf.len() {
+        let tag = read_varint(buf, &mut pos)?;
+        let value = match (tag & 7) as u8 {
+            WIRE_VARINT => Wire::Varint(read_varint(buf, &mut pos)?),
+            WIRE_FIXED64 => skip(&mut pos, 8)?,
+            WIRE_FIXED32 => skip(&mut pos, 4)?,
+            WIRE_LEN => {
+                let len = usize::try_from(read_varint(buf, &mut pos)?).ok()?;
+                let end = pos.checked_add(len).filter(|end| *end <= buf.len())?;
+                let bytes = &buf[pos..end];
+                pos = end;
+                Wire::Bytes(bytes)
+            }
+            _ => return None,
+        };
+        out.push((tag >> 3, value));
+    }
+    Some(out)
+}
+
+/// The `partial_success` (field 1) of a protobuf `ExportTraceServiceResponse`;
+/// `None` when the body has none or is not such a message.
+pub fn decode_partial_success_protobuf(body: &[u8]) -> Option<PartialSuccess> {
+    let partial = read_fields(body)?
+        .into_iter()
+        .filter_map(|(field, value)| match (field, value) {
+            (1, Wire::Bytes(bytes)) => Some(bytes),
+            _ => None,
+        })
+        .next_back()?;
+    let mut out = PartialSuccess::default();
+    for (field, value) in read_fields(partial)? {
+        match (field, value) {
+            (1, Wire::Varint(rejected)) => out.rejected_spans = rejected as i64,
+            (2, Wire::Bytes(message)) => {
+                out.error_message = String::from_utf8_lossy(message).into_owned();
+            }
+            _ => {}
+        }
+    }
+    Some(out)
+}
+
+/// The `partialSuccess` of an OTLP/JSON `ExportTraceServiceResponse`, under
+/// either spelling the JSON mapping allows; `None` when the body has none or is
+/// not JSON. The count may be a string, as the mapping writes an `int64`, or a
+/// number.
+pub fn decode_partial_success_json(body: &[u8]) -> Option<PartialSuccess> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let field = |v: &'_ serde_json::Value, camel: &str, snake: &str| {
+        v.get(camel).or_else(|| v.get(snake)).cloned()
+    };
+    let partial = field(&value, "partialSuccess", "partial_success")?;
+    let rejected_spans = match field(&partial, "rejectedSpans", "rejected_spans") {
+        Some(serde_json::Value::String(count)) => count.trim().parse().unwrap_or(0),
+        Some(serde_json::Value::Number(count)) => count.as_i64().unwrap_or(0),
+        _ => 0,
+    };
+    let error_message = match field(&partial, "errorMessage", "error_message") {
+        Some(serde_json::Value::String(message)) => message,
+        _ => String::new(),
+    };
+    Some(PartialSuccess {
+        rejected_spans,
+        error_message,
+    })
 }
 
 #[cfg(test)]
@@ -649,5 +757,49 @@ pub(crate) mod tests {
             }
         }
         let _ = AgentType::None;
+    }
+
+    /// A response's `partial_success`, in both encodings: the count and the
+    /// message read back, a missing field read as none, and a body that is not
+    /// a response read as no report rather than a failure.
+    #[test]
+    fn partial_success_decodes_from_either_encoding() {
+        let mut partial = Vec::new();
+        put_varint_field(&mut partial, 1, 3);
+        put_bytes(&mut partial, 2, b"bad span");
+        let mut response = Vec::new();
+        put_fixed64(&mut response, 9, 7);
+        put_bytes(&mut response, 1, &partial);
+        assert_eq!(
+            decode_partial_success_protobuf(&response),
+            Some(PartialSuccess {
+                rejected_spans: 3,
+                error_message: "bad span".into()
+            })
+        );
+        assert_eq!(decode_partial_success_protobuf(&[]), None);
+        assert_eq!(decode_partial_success_protobuf(&[0x0a, 0x05, 0x08]), None);
+        assert_eq!(decode_partial_success_protobuf(&[0xff; 12]), None);
+
+        for (body, expected) in [
+            (
+                r#"{"partialSuccess":{"rejectedSpans":"2","errorMessage":"too old"}}"#,
+                Some((2, "too old")),
+            ),
+            (r#"{"partial_success":{"rejected_spans":4}}"#, Some((4, ""))),
+            (r#"{"partialSuccess":{}}"#, Some((0, ""))),
+            ("{}", None),
+            ("", None),
+            ("not json", None),
+        ] {
+            assert_eq!(
+                decode_partial_success_json(body.as_bytes()),
+                expected.map(|(rejected_spans, message)| PartialSuccess {
+                    rejected_spans,
+                    error_message: message.into()
+                }),
+                "{body}"
+            );
+        }
     }
 }
