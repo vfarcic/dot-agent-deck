@@ -79,15 +79,17 @@ Edit the newest body, and change only what you came to change. Fetch it with its
 
 ```bash
 mkdir -p .dot-agent-deck     # absent in a fresh checkout or a new worktree
-gh issue view <n> --json body --jq .body > .dot-agent-deck/prd-<n>-body.md
+gh issue view <n> --json body --template '{{.body}}' > .dot-agent-deck/prd-<n>-body.md
 gh issue view <n> --json updatedAt --jq .updatedAt     # note this value
 ```
+
+The body is read with `--template '{{.body}}'`, not `--jq .body`, because `--jq` appends a newline the stored body does not have: a fetched body would gain one on every write back, and the read-back below would report a difference after a successful write.
 
 Change that file with your file-editing tool. Then, **just before writing it back, read `updatedAt` again**: if it moved, someone else wrote to the issue meanwhile — discard your copy, fetch again, and re-apply your change. A comment moves it too, so this sometimes repeats work that needed no repeating; that is the cheaper error. Only when it has not moved:
 
 ```bash
 gh issue edit <n> --body-file .dot-agent-deck/prd-<n>-body.md
-gh issue view <n> --json body --jq .body | diff - .dot-agent-deck/prd-<n>-body.md && rm .dot-agent-deck/prd-<n>-body.md
+gh issue view <n> --json body --template '{{.body}}' | diff - .dot-agent-deck/prd-<n>-body.md && rm .dot-agent-deck/prd-<n>-body.md
 ```
 
 **This narrows the race and does not close it.** GitHub offers no conditional write for an issue body, so an edit landing between the last `updatedAt` read and `gh issue edit` is still lost, silently, and the read-back cannot tell — it confirms only that the body is now yours. That residual window is seconds wide where an unchecked fetch-edit-write is as wide as the editing session, and it is why everything append-only goes in comments: keep body edits to the plan itself, and rare. Never write the body with `--body "…"` or a heredoc: PRD text is full of backticks and `$`, which the shell rewrites before `gh` sees them. `.dot-agent-deck/` is ignored by git, so the scratch file never reaches a commit.
