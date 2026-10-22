@@ -62,7 +62,8 @@ network:
 #
 # What was wrong was the conclusion that the cap could be declined. It cannot:
 # the schema is `exclusiveMinimum: 0`, so there is no "unlimited" value, and AWF
-# clamps anything above 10000 regardless. 10000 is therefore the highest
+# clamps anything above 10000 regardless (source below, under "THE CLAMP IS
+# DOCUMENTED UPSTREAM"). 10000 is therefore the highest
 # reachable ceiling, and it is stated HERE rather than left to a repository
 # variable so that it is visible in the file it governs and shows up in a diff.
 #
@@ -91,17 +92,34 @@ network:
 # ceiling -- and the claim a few lines above says AWF clamps anything over
 # 10000, which would make that inert.
 #
-# THAT CLAIM IS UNVERIFIED. It arrived with #1058 asserted rather than measured,
-# and could not be checked from here: no local awf schema, `gh aw forecast`
-# reports zero runs of history, and no run log prints a credit total. Issue
-# #1217 exists to settle it.
+# THE CLAMP IS DOCUMENTED UPSTREAM (checked 2026-10-22, issue #1217). It arrived
+# with #1058 asserted rather than measured. The source is the firewall config
+# schema this lock pins (`$schema` in the generated awf-config.json):
+# https://github.com/github/gh-aw-firewall/releases/download/v0.27.44/awf-config.schema.json
+# whose `apiProxy.maxAiCredits` description reads "AWF also enforces a
+# non-overridable hard cap of 10,000 AI credits; values above 10,000 are
+# effectively clamped." That is upstream documentation, not a runtime
+# measurement: no run here has been driven past 10000 to watch it stop. Re-read
+# that description whenever a recompile moves the pinned firewall version.
+# The compiler is no check on it either way: on 2026-09-21 `gh aw compile`
+# accepted 40000 with no warning and wrote it into the lock (#1217).
 #
-# Until it is settled the ceiling stays where it is, because the failure is
-# ASYMMETRIC. Telling the agent it has more credits than are enforced makes it
-# plan a deeper pass, hit `403 Maximum AI credits exceeded`, and emit NOTHING --
-# and the prompt below is explicit that no verdict is strictly worse than a
-# shallow one. Telling it less than it has only wastes headroom. So the number
-# in the prompt must never exceed what is certainly enforced.
+# So the ceiling stays where it is, and would even if the clamp were in doubt,
+# because the failure is ASYMMETRIC. Telling the agent it has more credits than
+# are enforced makes it plan a deeper pass, hit the proxy's 403, and emit
+# NOTHING -- and the prompt below is explicit that no verdict is strictly worse
+# than a shallow one. Telling it less than it has only wastes headroom. So the
+# number in the prompt must never exceed what is certainly enforced.
+#
+# KEEP THE PROXY'S ERROR TEXT OUT OF THE PROMPT BODY (issue #1774). gh-aw's
+# conclusion job scans the tail of the agent's stdio log for
+# /maximum ai credits exceeded/i (`MAX_AI_CREDITS_EXCEEDED_STDIO_RE` in gh-aw's
+# actions/setup/js/ai_credits_context.cjs, v0.86.2) and, on a match, files an
+# "exceeded max AI credits" failure. The body used to quote that error, so an
+# agent that echoed its own instructions turned a successful review into a
+# false credit failure (#1131, #1219, #1613). Describe the limit in other words
+# below the closing `---`. These comments are frontmatter, which the runtime
+# import strips before the prompt is built, so the quotes up here are safe.
 #
 # `timeout-minutes` is raised because it is a GitHub Actions timeout: enforced
 # by the runner, subject to no clamp, and verifiable from the workflow file.
@@ -185,7 +203,7 @@ That line is the result of `independent_review_at`, the predicate the vote job e
 
 ## Your budget, and what running out costs
 
-You have **10000 AI credits** for this run, and a 45-minute wall clock. Both are hard: the API proxy returns `403 Maximum AI credits exceeded` on the request that crosses the line, and everything after it fails.
+You have **10000 AI credits** for this run, and a 45-minute wall clock. Both are hard: the API proxy refuses the request that crosses the line with an HTTP 403, and everything after it fails.
 
 **Overrunning produces NO verdict at all — not a shallow one, nothing.** The comment is the only artefact of this run, so an overrun before you write it means the pull request is treated as unreviewed and nobody is told why. A shallow verdict always beats silence. This is not hypothetical: on 2026-09-13 a review of a 70-file pull request died at 1011 credits having written nothing.
 
