@@ -9834,6 +9834,14 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** the stderr and exit status of the real hook (inbox/claude/028, /037, /043).
 - **Platform coverage:** mac+linux.
 
+##### inbox/claude/046 — Claude Code outside the deck's recorded process tree still takes and acknowledges its messages. [reel]
+- **Layer:** L2 real agent, lane 2 (PTY-attached).
+- **Agent:** Claude Code, Haiku.
+- **Asserts:** with the pane's process a `sleep` and Claude Code started by a subshell that exits, `ps` shows Claude outside that process's tree; an idle native waiter armed from Claude's own hook (outside the tree) wakes it for a posted task with no doorbell; the sentinel is appended once, the message is acknowledged after one hand-over and the card shows ✉ (PRD #1666 part 3, R-1).
+- **Test:** `claude_046_live_outside_the_recorded_tree_takes_and_acknowledges` in `tests/e2e_inbox_claude_live.rs`.
+- **Does not assert:** Claude Code's own background session host or `/resume` (a stand-in that keeps the same process relationship and environment), or other agents.
+- **Platform coverage:** mac+linux.
+
 ##### inbox/claude/011 — Idle interactive Haiku wakes natively, acts once and labels the deck task. [reel]
 - **Layer:** L2 real agent, lane 2 (PTY-attached).
 - **Agent:** Claude Code, Haiku.

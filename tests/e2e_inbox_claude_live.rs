@@ -19,11 +19,33 @@ struct Claude {
     deck: common::TuiDeck,
 }
 
+/// The Claude Code command every test here runs.
+const CLAUDE: &str = "claude --model claude-haiku-4-5-20251001 --allowedTools Bash Read Write";
+
 impl Claude {
     fn new() -> Self {
-        let command = common::capability_export_command(
-            "exec claude --model claude-haiku-4-5-20251001 --allowedTools Bash Read Write",
-        );
+        Self::launch(&common::capability_export_command(&format!(
+            "exec {CLAUDE}"
+        )))
+    }
+
+    /// PRD #1666 part 3 (R-1): Claude Code in the pane, but outside the
+    /// process tree the deck recorded for it. The pane's process records its
+    /// pid and becomes `sleep`; Claude Code is started in a subshell that
+    /// exits at once, so it is re-parented away from that process while it
+    /// keeps the pane's terminal and environment — the shape of Claude Code's
+    /// background session host, whose hooks and tool shell run outside the
+    /// deck's agent. Claude Code records its own pid.
+    fn detached() -> Self {
+        Self::launch(&common::capability_export_command(&format!(
+            "printf '%s' \"$$\" > root.pid; \
+             ( exec {CLAUDE} < /dev/tty & printf '%s' \"$!\" > claude.pid ); \
+             exec sleep 86400"
+        )))
+    }
+
+    fn launch(command: &str) -> Self {
+        let command = command.to_string();
         let deck = common::TuiDeck::builder()
             .with_pty_size(180, 50)
             .with_imported_claude_credentials()
@@ -317,4 +339,67 @@ fn claude_014_live_killed_waiter_falls_back_to_injection() {
             .to_string()
             .contains("waiting, run:")
     );
+}
+
+/// The pids from `pid`'s parent up, read with `ps`.
+fn ancestors_of(pid: u32) -> Vec<u32> {
+    let mut chain = Vec::new();
+    let mut current = pid;
+    for _ in 0..64 {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "ppid=", "-p", &current.to_string()])
+            .output()
+            .expect("ps");
+        let Ok(parent) = String::from_utf8_lossy(&out.stdout).trim().parse::<u32>() else {
+            break;
+        };
+        chain.push(parent);
+        if parent <= 1 {
+            break;
+        }
+        current = parent;
+    }
+    chain
+}
+
+/// Kills the detached Claude Code by its own recorded pid when the test ends,
+/// whatever the deck's teardown did.
+struct KillOnDrop(u32);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        // SAFETY: a plain `kill(2)` on the pid this test's Claude recorded.
+        unsafe {
+            libc::kill(self.0 as libc::pid_t, libc::SIGTERM);
+        }
+    }
+}
+
+/// Scenario: Start genuine interactive Haiku in a deck pane through a launcher that lets go of it, so Claude Code runs outside the process tree the deck recorded for the pane while it keeps the pane's terminal and environment, as Claude Code's background session host does. Leave it idle and post a sentinel-writing inbox task without typing into the pane. Its hooks and its tool shell, all outside that tree, must still take the task: Claude visibly works, writes the sentinel once, the message is acknowledged after one hand-over and the card labels it.
+#[spec("inbox/claude/046")]
+#[test]
+fn claude_046_live_outside_the_recorded_tree_takes_and_acknowledges() {
+    skip_unless!(common::check_claude_available());
+    let claude = Claude::detached();
+    let read = |name: &str| {
+        std::fs::read_to_string(claude.deck.workdir().join(name))
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+    };
+    let (root, agent) = (read("root.pid").unwrap(), read("claude.pid").unwrap());
+    let _kill = KillOnDrop(agent);
+    let chain = ancestors_of(agent);
+    assert!(
+        !chain.contains(&root),
+        "Claude Code {agent} must run outside the pane's recorded process {root}; its ancestors: \
+         {chain:?}"
+    );
+    let name = "detached-claude-5d7a19.txt";
+    let id = claude.post(&claude.directive(name));
+    claude.deck.wait_for_strings_in_order_then_any_within(
+        &["Thinking", "Working"],
+        &["Bash"],
+        BUDGET,
+    );
+    claude.done(&id, name, true);
 }
