@@ -3316,6 +3316,13 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** what `TerminalWidget` draws (covered by `render/widget/*`); the daemon resizing the child PTY (covered by `resize/sigwinch/002` and `resize/layout/002`); how a real agent redraws after a resize; column changes.
 - **Platform coverage:** mac+linux+windows.
 
+##### resize/layout/004 — A terminal that shrinks while a frame is being drawn does not crash the TUI.
+- **Layer:** L1 (the run loop's own `draw_frame` — footer reservation, `compute_frame_layout`, `resize_panes_to_layout`, `render_frame`, the footer rows and `record_flushed_confirmation` — through a `Terminal` over a scripted-size `TestBackend`; no PTY, no subprocess, no daemon). Lives in `src/ui.rs`'s own `#[cfg(test)]` module because `draw_frame` and `FrameSources` are module-private.
+- **Agent:** none.
+- **Asserts:** with the backend reporting 80x24 to the frame's first size read and 64x2 to every read after it — the shrink landing between the size the frame is laid out at and the size it is drawn into, the window `e2e_pane_close::close_confirm_010` occasionally hit on a loaded runner — the empty dashboard with the experimental footer on draws that frame and the next without a panic, and the next frame is 64x2 with `experimental: on` on its bottom row. Before the fix the frame panicked at `index is (10, 20)`, the bottom bar's `Button::render_text` writing at its 80x24 coordinates into the 64x2 buffer.
+- **Does not assert:** a real terminal's SIGWINCH (covered by `resize/sigwinch/*`); the layout's contents at either size (covered by `render/layout/*`); event-handling paths that read the frame area outside a draw, such as mouse hit tests, which write no cells.
+- **Platform coverage:** mac+linux+windows.
+
 #### resize/policy
 
 ##### resize/policy/001 — A smaller second client attached to the same agent shrinks that agent for every client as the focusless fallback (PRD #882).
