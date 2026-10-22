@@ -6907,7 +6907,7 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 
 ##### scheduler/dispatch/001 — Firing an `issue_dispatch` task clones the repo, creates a per-issue worktree on `agent/issue-<n>`, and spawns an agent into it with the substituted prompt (PRD #120 M2.1–M2.3).
 
-- **Claim coverage (PRD #421 Phase 2):** starts with no repo labels; asserts the persisted issue label, exactly one forced provisioning call per fire, and provisioning before issue edit. The offline stub rejects adding an unprovisioned label.
+- **Claim coverage (PRD #421 Phase 2):** dispatches two issues in each of two cases: no repo labels, and a triage token denied provisioning an existing label. Both issues receive the label and their prompts; each run attempts forced provisioning exactly once before its first issue edit, even when provisioning fails. The offline stub rejects adding an unprovisioned label.
 - **Layer:** L2 (headless `dot-agent-deck daemon serve` driven via the `RunNow` control message — no PTY/grid, same shape as `scheduler/spawn/*`). All GitHub access is isolated offline behind a stub `gh` on PATH (`issue list`/`pr list` → canned JSON; `repo clone` → `git clone` of a local one-commit fixture remote that carries a committed `.dot-agent-deck.toml`).
 - **Agent:** none (run-now; the fixture orchestration role runs `cat`, which echoes the delivered prompt).
 - **Asserts:** (PRD #1666 S5: the deck posts the prompt, task, remit or notice to the target pane's inbox instead of typing it, and the test reads that inbox over the attach socket; where this entry says it is delivered to, reaches or lands in a pane, read posted to that pane's inbox.) the repo is cloned to `<working_dir>/<name>`, the worktree appears at `<clone>/.worktrees/issue-7` with branch `agent/issue-7` (via `git`), and an `orchestrator`-role agent rooted at that worktree (`orchestration_cwd`) receives the substituted per-issue prompt (`ISSUEDISPATCH-7`, echoed by `cat`).
@@ -6961,9 +6961,9 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 
 ##### scheduler/dispatch/008 — An issue dispatched, then closed without a PR (worktree removed, branch left behind), is re-dispatched on a later fire: the worktree is re-created and an agent spawns again, with no failure surfaced (PRD #120 B1 — `worktree add` must tolerate the leftover `agent/issue-<n>` branch).
 
-- **Claim coverage (PRD #421 Phase 2):** first dispatch POSTs one marker comment containing the task name; re-dispatch PATCHes that same ID and leaves exactly one marker comment, without a fixture write to GitHub between fires.
+- **Claim coverage (PRD #421 Phase 2):** a preliminary dispatch to issue 6 supplies a genuine claim body, including this daemon's host field. Issue 7 is seeded with a byte-copy authored by another account; dispatch must ignore that forgery and POST its own authenticated record. Re-dispatch PATCHes the deck-owned ID, leaves one own record beside the unchanged foreign comment, and never PATCHes the foreign ID. GitHub state is not fixture-edited between issue 7's dispatch and re-dispatch.
 - **Layer:** L2 (as `scheduler/dispatch/001`; first run-now to dispatch, `StopAgent` to close, second run-now while the stub still reports the issue open with no PR).
-- **Agent:** none (run-now ×2 + `StopAgent`; observes the re-created worktree, a re-spawned orchestrator, and daemon stderr).
+- **Agent:** none (source-claim run-now, issue-7 run-now ×2 + `StopAgent`; orchestration roles run `cat`; observes persisted GitHub comments, the re-created worktree, a re-spawned orchestrator, and daemon stderr).
 - **Asserts:** after close the worktree is gone but branch `agent/issue-7` survives; the second fire re-creates the issue-7 worktree and spawns the orchestrator again; no per-issue failure (`failed:` / "already exists") is surfaced.
 - **Does not assert:** the exact branch-reattach git mechanics (probe vs. retry-without-`-b`) — only the observable re-dispatch; behavior when an open PR exists (covered by `scheduler/dispatch/003`).
 - **Platform coverage:** mac+linux.
@@ -7049,6 +7049,14 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** none.
 - **Asserts:** issue worktree preparation is reached, dispatch failure is surfaced, no agent runs for the issue, and no label provisioning, issue edit or comment write occurs.
 - **Does not assert:** failures before spawn (covered by scheduler/dispatch/007); a real agent or real GitHub.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/031 — A hanging claim call times out without holding the next issue in the dispatch queue.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_issue_dispatch.rs`), real daemon and offline gh stub hanging only issue 7's label write.
+- **Agent:** none (orchestration roles run `cat`).
+- **Asserts:** with `DOT_AGENT_DECK_ISSUE_CLAIM_TIMEOUT_MS=1500`, issues 7 and 8 both spawn agents; issue 8 spawns within 20 seconds of observing the hanging call and receives its prompt and GitHub claim; exactly one claim-failure notification names issue 7's timed-out label step and both claim outcomes, separately from dispatch failure.
+- **Does not assert:** real GitHub latency, live agents, other timed-out claim steps, output budgets or notification sanitisation.
 - **Platform coverage:** mac+linux.
 
 #### scheduler/pi
