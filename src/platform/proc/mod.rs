@@ -162,6 +162,16 @@ pub use windows::{
     terminate_child_with_grace_and_wait, terminate_pid,
 };
 
+/// R2-fix4 (U2): the parent a placement walk follows ([`ancestry_with`]).
+/// [`parent_pid_of`] itself on Unix; on Windows `None`, not `Some(0)`, for a
+/// recorded parent that cannot be opened or whose pid was reused.
+#[cfg(unix)]
+pub fn placement_parent_of(pid: u32) -> Option<u32> {
+    parent_pid_of(pid)
+}
+#[cfg(windows)]
+pub use windows::placement_parent_of;
+
 /// PR #1735 second review: whether [`parent_pid_of`] reads parents on this
 /// platform: Linux (`/proc`), macOS (`proc_pidinfo`) and Windows (a Toolhelp
 /// snapshot). Elsewhere it always answers `None`, so [`descends_from`] can
@@ -177,30 +187,62 @@ pub fn descends_from(pid: u32, root: u32) -> Option<bool> {
     descends_from_with(pid, root, parent_pid_of)
 }
 
-/// [`descends_from`] over any parent lookup.
+/// [`descends_from`] over any parent lookup. A walk that runs out of steps
+/// ([`Ancestry::TooDeep`]) answers `Some(false)`, as a top-of-tree end does.
 pub fn descends_from_with(
     pid: u32,
     root: u32,
     parent_of: impl Fn(u32) -> Option<u32>,
 ) -> Option<bool> {
-    /// Deeper than any real agent's process tree; bounds a walk through a
-    /// table that changed under it.
-    const MAX_DEPTH: usize = 128;
+    match ancestry_with(pid, root, parent_of) {
+        Ancestry::Descends => Some(true),
+        Ancestry::Outside | Ancestry::TooDeep => Some(false),
+        Ancestry::Unreadable => None,
+    }
+}
+
+/// How a walk up from a process toward a root ended ([`ancestry_with`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ancestry {
+    /// The process is the root or descends from it.
+    Descends,
+    /// The walk reached a process with no parent to follow (pid 0 or 1, or
+    /// one that is its own parent) without meeting the root.
+    Outside,
+    /// A parent could not be read: the platform cannot, or a process on the
+    /// way exited.
+    Unreadable,
+    /// The walk took [`MAX_ANCESTRY_DEPTH`] steps without ending; a deeper
+    /// tree, or a table that changed under the walk.
+    TooDeep,
+}
+
+/// How many parents [`ancestry_with`] follows before answering
+/// [`Ancestry::TooDeep`]. A bound on the walk, not on how deep a process
+/// tree can be.
+pub const MAX_ANCESTRY_DEPTH: usize = 128;
+
+/// Walk `pid`'s parents with `parent_of` toward `root`, and say how the walk
+/// ended. Unlike [`descends_from_with`] it keeps a walk that ran out of steps
+/// apart from one that ended outside `root`'s tree.
+pub fn ancestry_with(pid: u32, root: u32, parent_of: impl Fn(u32) -> Option<u32>) -> Ancestry {
     let mut current = pid;
-    for _ in 0..MAX_DEPTH {
+    for _ in 0..MAX_ANCESTRY_DEPTH {
         if current == root {
-            return Some(true);
+            return Ancestry::Descends;
         }
         if current <= 1 {
-            return Some(false);
+            return Ancestry::Outside;
         }
-        let parent = parent_of(current)?;
+        let Some(parent) = parent_of(current) else {
+            return Ancestry::Unreadable;
+        };
         if parent == current {
-            return Some(false);
+            return Ancestry::Outside;
         }
         current = parent;
     }
-    Some(false)
+    Ancestry::TooDeep
 }
 
 /// A [`portable_pty::Child`] stand-in over a real [`std::process::Child`], so the
@@ -265,6 +307,23 @@ pub(crate) mod test_child {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R2-fix4 (U2): a walk that runs out of steps is told apart from one
+    /// that ends outside the root's tree, and from one that cannot read a
+    /// parent; [`descends_from_with`] still answers it `Some(false)`.
+    #[test]
+    fn ancestry_tells_a_walk_out_of_steps_from_one_outside() {
+        let chain = |pid: u32| match pid {
+            100..300 => Some(pid + 1),
+            300 => Some(7),
+            _ => None,
+        };
+        assert_eq!(ancestry_with(100, 7, chain), Ancestry::TooDeep);
+        assert_eq!(descends_from_with(100, 7, chain), Some(false));
+        assert_eq!(ancestry_with(250, 7, chain), Ancestry::Descends);
+        assert_eq!(ancestry_with(250, 9, chain), Ancestry::Unreadable);
+        assert_eq!(ancestry_with(250, 9, |_| Some(1)), Ancestry::Outside);
+    }
 
     /// PRD #163 M3 — the platform seam `daemon stop` is built on. On Unix the
     /// graceful step MUST stay a signal: that is the property that lets

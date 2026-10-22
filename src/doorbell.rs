@@ -22,6 +22,16 @@
 //!    Error, or Unknown (no hook yet), nor the Idle of a Codex wrapper's
 //!    fork-time start alone — and its session has not declared the pane
 //!    history-only or view-only;
+//!    - part 2 (`inbox/doorbell/008`): that Idle is what the card presents;
+//!      the generation must also be ready by its OWN reports, kept per
+//!      generation outside the event journal
+//!      ([`crate::state::AppState::doorbell_readiness`]). Its own Idle makes
+//!      it ready; so does its own `SessionStart`, except for an agent that
+//!      posts it before its prompt is up (Claude Code), which is then rung
+//!      only while the writer recognises that prompt on screen. A
+//!      placeholder card, the shell monitor's frames (which can carry a
+//!      predecessor's session) and a wrapper's boot report establish none of
+//!      it, and neither does how long the card or process has existed;
 //!    - until the agent's own hooks have reported for this generation, an
 //!      agent whose spec names a composer (Codex) is written to only while that
 //!      composer is on screen: its wrapper reports Idle as soon as Codex takes
@@ -31,6 +41,17 @@
 //! 4. the user has no unsent draft in the pane — with no cap: the doorbell
 //!    waits for the user however long they take;
 //! 5. the ring is due on the schedule ([`DoorbellConfig::schedule`]).
+//!
+//! Conditions 2 to 4 are asked again under the pane's writer before each step
+//! of a write (the pre-ring CR, the line, its submit CR), after the wait
+//! between steps, and so is condition 1 for the **one message the ring
+//! names**: if it was fetched or acknowledged since the decision, the rest of
+//! the ring is withheld even while other mail stays queued (part 2,
+//! `inbox/doorbell/031`). A human keystroke that arrives while the doorbell
+//! holds the writer withholds the rest too. These are checks before each
+//! write, not one transaction with the inbox: an acknowledgement that lands
+//! between the last check and the PTY taking that step's bytes does not stop
+//! that one step.
 //!
 //! It is **coalesced per agent**: one ring covers every queued message, and the
 //! schedule restarts only once the queue has emptied.
@@ -71,7 +92,7 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 
-use crate::agent_pty::{AgentPtyRegistry, DoorbellWrite};
+use crate::agent_pty::{AgentPtyRegistry, DoorbellReady, DoorbellWrite};
 use crate::inbox_hub::DoorbellFacts;
 use crate::state::SharedState;
 
@@ -206,7 +227,8 @@ fn ignored(variable: &str) {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Facts {
     pub inbox: DoorbellFacts,
-    /// The last hook-reported status is Idle.
+    /// The last hook-reported status is Idle, and the generation is ready by
+    /// its own reports or rung only through its composer gate.
     pub idle: bool,
     /// The user has an unsent draft in the pane.
     pub draft: bool,
@@ -319,8 +341,9 @@ pub fn decide(bell: &Bell, facts: &Facts, config: &DoorbellConfig, now: Instant)
 /// Whether a native component leaves the doorbell to ring for this agent at
 /// `now`: none is armed, and none announced `Native` within the last
 /// [`DoorbellConfig::arm_grace`]. [`decide`] asks it, and a write asks it
-/// again under the writer before each byte of a ring, so a component that
-/// arms or announces while the ring waits for the writer stops it.
+/// again under the writer before each step of a ring, with the ring's own
+/// message still queued, so a component that arms or announces, or a fetch
+/// of that message, while the ring waits for the writer stops it.
 pub fn ring_still_admitted(inbox: &DoorbellFacts, config: &DoorbellConfig, now: Instant) -> bool {
     // PRD #1666 §11: an incompatible integration gets no doorbell; its mail
     // waits queued under the card's notice.
@@ -423,6 +446,70 @@ fn status_explains_waiting(status: Option<&crate::state::SessionStatus>) -> bool
 
 type AgentKey = (String, String);
 
+/// E2E interleave fixture, configured below HOME by the isolated harness.
+/// Directory checks assume a trusted fixture filesystem, including marker leaves.
+/// The caller holds neither the app-state nor inbox-hub lock while parked.
+#[cfg(feature = "e2e")]
+pub(crate) async fn pause_rering_for_test(pane: &str, phase: &str) {
+    if std::env::var("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_PANE").as_deref() != Ok(pane) {
+        return;
+    }
+    let Some(root) = test_control_root() else {
+        return;
+    };
+    if std::fs::remove_file(root.join(format!("{phase}.armed"))).is_err() {
+        return;
+    }
+    std::fs::write(root.join(format!("{phase}.reached")), b"").expect("report ring barrier");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    while !root.join(format!("{phase}.release")).exists() {
+        if tokio::time::Instant::now() >= deadline {
+            std::fs::write(root.join(format!("{phase}.timed-out")), b"barrier timeout")
+                .expect("report barrier timeout");
+            panic!("doorbell test barrier {phase} timed out after 8s for pane {pane}");
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+#[cfg(feature = "e2e")]
+fn test_control_root() -> Option<std::path::PathBuf> {
+    let root = std::env::var_os("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_DIR")?;
+    let root = std::path::PathBuf::from(root);
+    // Check the configured directory under HOME. The harness supplies a private
+    // HOME and trusted marker leaves; this is not a no-follow filesystem boundary.
+    if root.components().count() != 1
+        || !matches!(
+            root.components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
+        return None;
+    }
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("fixture HOME"));
+    let root = home.join(root);
+    std::fs::create_dir_all(&root).ok()?;
+    let canonical = root.canonicalize().ok()?;
+    if !canonical.starts_with(home.canonicalize().expect("fixture HOME exists")) {
+        return None;
+    }
+    Some(root)
+}
+
+/// Append-only observations, enabled by fixture configuration under HOME.
+#[cfg(feature = "e2e")]
+pub(crate) fn record_for_test(event: &str) {
+    use std::io::Write;
+    if let Some(root) = test_control_root() {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(root.join("observations"))
+            .expect("open test observations");
+        writeln!(file, "{event}").expect("record test observation");
+    }
+}
+
 #[derive(Default)]
 struct Slot {
     bell: Bell,
@@ -430,6 +517,31 @@ struct Slot {
     busy: bool,
     /// PR #1735 fifth review (R5).
     stall: StallClock,
+}
+
+// Test-only cancellation cleanup: a seam timeout/panic must not strand a
+// logical busy slot, even when it unwinds while holding the pane writer.
+#[cfg(feature = "e2e")]
+struct TestBusyGuard {
+    slots: Arc<Mutex<HashMap<AgentKey, Slot>>>,
+    key: Option<AgentKey>,
+}
+
+#[cfg(feature = "e2e")]
+impl Drop for TestBusyGuard {
+    fn drop(&mut self) {
+        let Some(key) = self.key.take() else {
+            return;
+        };
+        if let Some(slot) = self
+            .slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&key)
+        {
+            slot.busy = false;
+        }
+    }
 }
 
 /// Run the doorbell for as long as the returned task lives.
@@ -440,11 +552,49 @@ pub fn spawn(
 ) -> tokio::task::JoinHandle<()> {
     let slots: Arc<Mutex<HashMap<AgentKey, Slot>>> = Arc::default();
     tokio::spawn(async move {
+        #[cfg(feature = "e2e")]
+        let clock_origin = Instant::now();
         let mut tick = tokio::time::interval(config.tick);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
+            #[cfg(feature = "e2e")]
+            let now = Instant::now();
+            // Advance policy age without sleeping. With e2e enabled, a
+            // configured daemon reads this trusted fixture file.
+            #[cfg(feature = "e2e")]
+            let clock_step = test_control_root().and_then(|root| {
+                let ms = std::fs::read_to_string(root.join("clock-ms"))
+                    .ok()?
+                    .parse::<u64>()
+                    .ok()?;
+                Some((root, ms))
+            });
+            #[cfg(feature = "e2e")]
+            let now = clock_step
+                .as_ref()
+                .map_or(now, |(_, ms)| clock_origin + Duration::from_millis(*ms));
+            #[cfg(feature = "e2e")]
+            run_tick(&registry, &state, &config, &slots, now).await;
+            #[cfg(not(feature = "e2e"))]
             run_tick(&registry, &state, &config, &slots).await;
+            #[cfg(feature = "e2e")]
+            if let Some((root, ms)) = clock_step {
+                // Stop scheduling this controlled step while its attempts are
+                // in flight. In particular, a writer-only readiness guard may
+                // withhold every attempt; let that child finish before acking,
+                // including on a one-worker runtime.
+                while slots
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .values()
+                    .any(|slot| slot.busy)
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                std::fs::write(root.join("clock-observed"), ms.to_string())
+                    .expect("report completed policy tick");
+            }
         }
     })
 }
@@ -454,6 +604,7 @@ async fn run_tick(
     state: &SharedState,
     config: &DoorbellConfig,
     slots: &Arc<Mutex<HashMap<AgentKey, Slot>>>,
+    #[cfg(feature = "e2e")] now: Instant,
 ) {
     let hub = registry.inbox();
     // Every agent generation with queued messages, plus every one the doorbell
@@ -482,22 +633,35 @@ async fn run_tick(
     // PRD #1666 S5: a pane whose session declared it cannot take input
     // (history-only or view-only) is never rung, whatever its status says —
     // the line would land in no live conversation.
-    let admissions: Vec<(Option<crate::state::DoorbellAdmission>, bool)> = {
+    // Part 2 (`inbox/doorbell/008`): and the generation's own readiness, kept
+    // apart from the Idle its card presents. One with none is rung only
+    // through its agent's composer gate, and the writer checks what is left on
+    // screen.
+    let admissions: Vec<(Option<crate::state::DoorbellAdmission>, DoorbellReady, bool)> = {
         let state = state.read().await;
         keys.iter()
             .map(|(pane, agent)| {
+                let ready = match state.doorbell_readiness(agent, pane) {
+                    (_, Some(prompt)) => DoorbellReady::Screen(prompt),
+                    (crate::state::ReadinessLevel::Unproven, None) => DoorbellReady::Unproven,
+                    _ => DoorbellReady::Ready,
+                };
                 (
                     state.doorbell_admission(agent, pane),
+                    ready,
                     status_explains_waiting(state.agent_status(agent, pane).as_ref()),
                 )
             })
             .collect()
     };
+    #[cfg(not(feature = "e2e"))]
     let now = Instant::now();
-    for ((pane, agent), (admission, explained)) in keys.into_iter().zip(admissions) {
+    for ((pane, agent), (admission, ready, explained)) in keys.into_iter().zip(admissions) {
         let facts = Facts {
             inbox: hub.doorbell_facts(&pane, &agent),
-            idle: admission.is_some(),
+            idle: admission.is_some()
+                && (!matches!(ready, DoorbellReady::Unproven)
+                    || registry.has_doorbell_composer(&agent)),
             draft: registry.draft_pending(&pane),
         };
         let (action, stranded) = {
@@ -532,44 +696,76 @@ async fn run_tick(
         let slots = Arc::clone(slots);
         let state = Arc::clone(state);
         let config = config.clone();
+        // The queue as this tick's decision saw it, not as the write left it.
         let queued = facts.inbox.queued;
         tokio::spawn(async move {
+            #[cfg(feature = "e2e")]
+            let mut _busy_guard = TestBusyGuard {
+                slots: Arc::clone(&slots),
+                key: Some((pane.clone(), agent.clone())),
+            };
             let (pre_cr, line) = match &action {
                 Action::Ring { id, pre_cr } => (*pre_cr, Some(doorbell_line(id))),
                 _ => (true, None),
             };
+            #[cfg(feature = "e2e")]
+            if pre_cr && line.is_some() {
+                pause_rering_for_test(&pane, "decided").await;
+            }
             // PRD #1666 hardening H3: re-asked under the writer before every
-            // byte. The same admission (nothing happened to the pane since
+            // step. The same admission (nothing happened to the pane since
             // this tick) and, for a ring, still no native component armed or
-            // inside the arm grace of an announcement.
-            let ring = matches!(action, Action::Ring { .. });
+            // inside the arm grace of an announcement. Part 2
+            // (`inbox/doorbell/031`): and the message this ring names still
+            // queued for this generation, from a fresh query each time. Other
+            // queued mail does not keep it alive: a ring is never typed for a
+            // message that was fetched or acknowledged since the decision.
+            // The query takes and drops the hub's lock; nothing here holds it
+            // across the writer's sleeps or writes.
+            let selected = match &action {
+                Action::Ring { id, .. } => Some(id.clone()),
+                _ => None,
+            };
             let still_admitted = || {
                 let state = Arc::clone(&state);
                 let registry = Arc::clone(&registry);
                 let (pane, agent) = (pane.clone(), agent.clone());
                 let config = config.clone();
+                let selected = selected.clone();
                 async move {
-                    admission.is_some()
-                        && state.read().await.doorbell_admission(&agent, &pane) == admission
-                        && (!ring
-                            || ring_still_admitted(
-                                &registry.inbox().doorbell_facts(&pane, &agent),
-                                &config,
-                                Instant::now(),
-                            ))
+                    let now = state.read().await.doorbell_admission(&agent, &pane);
+                    admission
+                        .zip(now)
+                        .is_some_and(|(decided, now)| decided.still_holds(&now))
+                        && selected.is_none_or(|id| {
+                            let facts = registry.inbox().doorbell_facts(&pane, &agent);
+                            facts.queued.contains(&id)
+                                && ring_still_admitted(&facts, &config, Instant::now())
+                        })
                 }
             };
             let outcome = registry
-                .write_doorbell(
+                .write_doorbell_when_ready(
                     &pane,
                     &agent,
+                    ready,
                     pre_cr,
                     stranded.as_deref(),
                     line.as_deref(),
                     still_admitted,
                 )
                 .await;
+            // The writer has been dropped; busy remains set so a completed
+            // attempt can be inspected without a later retry changing bytes.
+            #[cfg(feature = "e2e")]
+            pause_rering_for_test(&pane, "completed").await;
             let mut slots = slots.lock().unwrap_or_else(|e| e.into_inner());
+            #[cfg(feature = "e2e")]
+            {
+                // Normal completion owns the slot lock: disarm before making
+                // it available, so Drop cannot clear a newer attempt's busy bit.
+                _busy_guard.key = None;
+            }
             let Some(slot) = slots.get_mut(&(pane.clone(), agent.clone())) else {
                 return;
             };
@@ -583,9 +779,15 @@ async fn run_tick(
                 // one more lone CR. One that failed is recorded as having left
                 // its own line; if it failed before typing it, an earlier line
                 // still in the box no longer matches, and the composer gate
-                // holds.
+                // holds. A ring withdrawn after its line went in but before its
+                // submit is likewise rung, with its line left in the box.
                 (
-                    DoorbellWrite::Written | DoorbellWrite::Flushed | DoorbellWrite::Failed,
+                    DoorbellWrite::Written
+                    | DoorbellWrite::Flushed
+                    | DoorbellWrite::Failed
+                    | DoorbellWrite::Cancelled {
+                        line_typed: true, ..
+                    },
                     Action::Ring { id, .. },
                 ) => {
                     slot.bell.rang(Instant::now(), &queued);
@@ -595,15 +797,57 @@ async fn run_tick(
                         line
                     };
                     registry.inbox().note_ring(&pane, &agent);
+                    match outcome {
+                        DoorbellWrite::Written | DoorbellWrite::Flushed => info!(
+                            pane_id = %pane,
+                            agent_id = %agent,
+                            message_id = %id,
+                            queued_at_decision = queued.len(),
+                            rings = slot.bell.rings,
+                            pre_cr,
+                            ?outcome,
+                            "doorbell rang"
+                        ),
+                        DoorbellWrite::Cancelled { steps_written, .. } => info!(
+                            pane_id = %pane,
+                            agent_id = %agent,
+                            message_id = %id,
+                            queued_at_decision = queued.len(),
+                            rings = slot.bell.rings,
+                            pre_cr,
+                            steps_written,
+                            "doorbell ring withdrawn after its line was typed; its submit was withheld"
+                        ),
+                        _ => warn!(
+                            pane_id = %pane,
+                            agent_id = %agent,
+                            message_id = %id,
+                            queued_at_decision = queued.len(),
+                            rings = slot.bell.rings,
+                            pre_cr,
+                            "doorbell ring failed part-way or could not be encoded"
+                        ),
+                    }
+                }
+                // Part 2 (`inbox/doorbell/031`): only the pre-ring CR went in
+                // before the ring was withdrawn, so no line of this ring is in
+                // the box and nothing is recorded as rung. The CR may have
+                // submitted an earlier stranded line, or been swallowed, so
+                // that line stays recorded and the bell owes what it owed.
+                (
+                    DoorbellWrite::Cancelled {
+                        steps_written,
+                        line_typed: false,
+                    },
+                    Action::Ring { id, .. },
+                ) => {
                     info!(
                         pane_id = %pane,
                         agent_id = %agent,
                         message_id = %id,
-                        queued = queued.len(),
-                        rings = slot.bell.rings,
-                        pre_cr,
-                        ?outcome,
-                        "doorbell rang"
+                        queued_at_decision = queued.len(),
+                        steps_written,
+                        "doorbell ring withdrawn after its pre-ring CR; no line was typed"
                     );
                 }
                 (DoorbellWrite::Written, _) => {

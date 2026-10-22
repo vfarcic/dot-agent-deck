@@ -1,7 +1,7 @@
 import type { ConnectionView } from "../types";
 
 /** The Connect anyway confirmation, shared by the Daemons screen and the dashboard so the two cannot drift. */
-export const CONNECT_ANYWAY_BODY = "This daemon and this app are different versions, so this app may show some of this daemon's information wrongly. Agent Deck will connect and keep a warning on screen until you quit the app; nothing is remembered after that.";
+export const CONNECT_ANYWAY_BODY = "This daemon and this app are different versions, so this app may show some of this daemon's information wrongly. Agent Deck will connect, keep a warning on screen, and also connect to any other daemon it refuses for the same reason, until you quit the app; nothing is remembered after that.";
 
 /** Issue #1490 — the Start daemon confirmation, shared by the Daemons screen and the dashboard. `host` is the reason's, verbatim. */
 export function startDaemonConfirmCopy(host: string): { title: string; body: string } {

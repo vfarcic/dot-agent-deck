@@ -53,6 +53,10 @@
 //! carry no raw `sleep` (linkage-check Decision 21 / rule 5).
 
 mod common;
+#[path = "support/inbox_doorbell.rs"]
+mod inbox;
+#[path = "support/reconnect.rs"]
+mod reconnect;
 
 use std::time::Duration;
 
@@ -475,5 +479,1071 @@ fn handshake_010_protocol_skew_with_matching_build_restarts_silently() {
         daemon.wait_for_exit(Duration::from_secs(10)),
         "a daemon on another attach protocol must be restarted, not attached to, even when \
          its build id matches"
+    );
+}
+
+/// Scenario: Drop the TUI's transports while its original daemon and agent keep running, then type into the reconnected pane and see its reply. Separately replace the daemon with an incompatible one: it must admit zero terminal/event streams throughout the attempt and show a persistent refusal associating the daemon and client versions; a same-protocol replacement is deliberately not a continuity control.
+#[spec("lifecycle/handshake/011")]
+#[test]
+fn handshake_011_reconnect_rechecks_protocol_before_reattaching() {
+    use inbox::*;
+    let own = dot_agent_deck::daemon_protocol::PROTOCOL_VERSION;
+    // Exercise the positive reconnect control before reaching the RED case.
+    for protocol in [own, own + 1] {
+        let mut original = spawn_daemon_at_build_and_protocol(NEW_BUILD, own);
+        let old = pane(&original, "before-replacement");
+        status(&original, &old, "idle", "claude_code");
+        let proxy = reconnect::AttachProxy::new(&original.attach_socket);
+        let deck = TuiDeck::builder()
+            .with_env(
+                "DOT_AGENT_DECK_ATTACH_SOCKET",
+                if protocol == own {
+                    &proxy.socket
+                } else {
+                    &original.attach_socket
+                }
+                .to_string_lossy()
+                .to_string(),
+            )
+            .with_env(
+                "DOT_AGENT_DECK_SOCKET",
+                original.hook_socket.to_string_lossy().to_string(),
+            )
+            .with_env("DOT_AGENT_DECK_BUILD_ID_OVERRIDE", NEW_BUILD)
+            .with_env("RUST_LOG", "dot_agent_deck=debug")
+            .launch_with_fixture("minimal");
+        deck.wait_for_string("before-replacement");
+
+        if protocol == own {
+            let previous = proxy.attach_count();
+            assert!(previous > 0, "control: original terminal attached");
+            proxy.disconnect();
+            assert!(
+                common::wait_until(Duration::from_secs(10), || proxy.attach_count() > previous),
+                "same-incarnation terminal must reattach after transient disconnect"
+            );
+            deck.send_keys(b"\r");
+            deck.wait_for_string("[Command Mode Ctrl+D]");
+            deck.send_keys(b"SAME-INCARNATION-RECONNECTED-9f71\r");
+            deck.wait_for_string("SUBMITTED:SAME-INCARNATION-RECONNECTED-9f71");
+            assert!(
+                original.is_alive_public(),
+                "control: original daemon survives"
+            );
+            assert!(
+                std::fs::read_to_string(&old.capture)
+                    .unwrap()
+                    .contains("SAME-INCARNATION-RECONNECTED-9f71")
+            );
+            continue;
+        }
+
+        let reply = original
+            .send_attach_request(&AttachRequest::StopDaemon { force: true })
+            .expect("stop only the fixture-owned daemon");
+        assert!(reply.ok, "fixture stop: {reply:?}");
+        assert!(
+            original.wait_for_exit(Duration::from_secs(10)),
+            "fixture daemon must stop"
+        );
+        let replacement = spawn_daemon_serve_with_env(
+            None,
+            "0",
+            &[
+                ("DOT_AGENT_DECK_BUILD_ID_OVERRIDE", NEW_BUILD),
+                (
+                    "DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_DIR",
+                    "reconnect-observations",
+                ),
+                (
+                    "DOT_AGENT_DECK_TEST_PROTOCOL_VERSION_OVERRIDE",
+                    &protocol.to_string(),
+                ),
+                (
+                    "DOT_AGENT_DECK_ATTACH_SOCKET",
+                    original.attach_socket.to_str().unwrap(),
+                ),
+                (
+                    "DOT_AGENT_DECK_SOCKET",
+                    original.hook_socket.to_str().unwrap(),
+                ),
+            ],
+        );
+        let name = if protocol == own {
+            "replacement-peer-a"
+        } else {
+            "replacement-peer-b"
+        };
+        let sentinel = format!("PTY-ONLY-REPLACEMENT-9f71-{protocol}");
+        // Recreate the pane the user already had open. The stand-in paints
+        // its label periodically, so reattachment is visible from live output
+        // as well as a replayed snapshot, including when daemon ids restart at 1.
+        let new = pane_with(
+            &replacement,
+            &old.id,
+            serde_json::json!({
+                "display_name":name, "env":[["DOORBELL_STANDIN_LABEL", sentinel]]
+            }),
+        );
+        status(&replacement, &new, "idle", "claude_code");
+        let observations = replacement.home.join("reconnect-observations/observations");
+        let admission_count = || {
+            std::fs::read_to_string(&observations)
+                .unwrap_or_default()
+                .lines()
+                .filter(|s| s.starts_with("attach-stream ") || s.starts_with("subscribe-events"))
+                .count()
+        };
+        let refusal_visible = |grid: &str| {
+            let low = grid.to_lowercase();
+            let associated = (low.contains(&format!("daemon v{protocol}"))
+                && low.contains(&format!("client v{own}")))
+                || (low.contains(&format!("daemon speaks attach protocol v{protocol}"))
+                    && low.contains(&format!("binary speaks v{own}")));
+            low.contains("protocol")
+                && associated
+                && ["refus", "incompatib", "cannot", "not attaching"]
+                    .iter()
+                    .any(|word| low.contains(word))
+        };
+        let refused = deck.wait_for_grid_predicate_within(Duration::from_secs(10), refusal_visible);
+        let grid = deck.snapshot_grid();
+        assert_eq!(
+            admission_count(),
+            0,
+            "incompatible reconnect admitted terminal/event streams before refusal: {}; refusal_visible={refused}; grid={grid}",
+            std::fs::read_to_string(&observations).unwrap_or_default()
+        );
+        assert!(
+            refused && !grid.contains(&sentinel),
+            "protocol-skew reconnect must refuse daemon v{protocol}, name client v{own}, and never reattach; replacement_visible={}; grid=\n{grid}",
+            grid.contains(&sentinel)
+        );
+        assert!(
+            !common::wait_until(Duration::from_secs(2), || {
+                let grid = deck.snapshot_grid();
+                admission_count() != 0 || grid.contains(&sentinel) || !refusal_visible(&grid)
+            }),
+            "refusal must stay visible without any incompatible attach admission across retry window"
+        );
+    }
+}
+
+/// Scenario: Attach an agent in the real TUI and restart its isolated daemon with the same binary, recycling the agent id in a different pane. Its card and a genuinely dispatched unit disappear with one notice while the unit’s git worktree, committed files and branch survive, and the successor stays alive, unrenamed and receives no input; a fresh TUI can still close that successor (control).
+#[spec("lifecycle/handshake/013")]
+#[test]
+fn handshake_013_ctrl_w_after_a_same_build_restart_preserves_the_successor() {
+    use inbox::*;
+    let mut original = spawn_daemon_at_build(NEW_BUILD);
+    // The daemon and every checkout below belong to this test's private root.
+    assert!(
+        common::fixture_git(&original.home, &original.home)
+            .arg("init")
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    std::fs::write(
+        original.home.join(".gitignore"),
+        "*\n!.gitignore\n!restart-worktree.txt\n",
+    )
+    .unwrap();
+    std::fs::write(
+        original.home.join("restart-worktree.txt"),
+        "committed unit work\n",
+    )
+    .unwrap();
+    common::commit_fixture_repo(&original.home);
+    let old = pane_with(
+        &original,
+        "old-restart-pane",
+        serde_json::json!({"env":[["DOORBELL_STANDIN_LABEL", "OLD-ATTACHED-PTY-1666"]]}),
+    );
+    let old_agent = old.agent.clone();
+    let deck = launch_tui_against(&original, NEW_BUILD);
+    deck.wait_for_string("OLD-ATTACHED-PTY-1666");
+
+    struct OwnedWorktree(std::path::PathBuf);
+    impl Drop for OwnedWorktree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let worktree = OwnedWorktree(
+        original
+            .home
+            .parent()
+            .unwrap()
+            .join("home-dispatch-restart-kept-unit"),
+    );
+    let admitted = hook(
+        &original,
+        serde_json::json!({
+            "message_type": "dispatch", "pane_id": old.id, "token": old.token,
+            "name": "restart-kept-unit", "task": "Wait for the test to stop this stand-in.",
+            "shape": { "kind": "single_agent" }, "timestamp": chrono::Utc::now(),
+        }),
+    );
+    assert_eq!(
+        admitted["accepted"], true,
+        "fixture dispatch admission: {admitted}"
+    );
+    deck.wait_for_string("restart-kept-unit");
+    deck.wait_for_string("2 agent(s)");
+    assert!(
+        worktree.0.join(".git").is_file(),
+        "dispatch must make a real git worktree"
+    );
+    let source_repo = original.home.clone();
+    let branch = || {
+        let output = common::fixture_git(&source_repo, &source_repo)
+            .args(["rev-parse", "refs/heads/agent/dispatch-restart-kept-unit"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "the dispatched unit's branch disappeared"
+        );
+        output.stdout
+    };
+    let branch_before = branch();
+
+    assert!(
+        original
+            .send_attach_request(&AttachRequest::StopDaemon { force: true })
+            .unwrap()
+            .ok
+    );
+    assert!(original.wait_for_exit(Duration::from_secs(10)));
+    // Finish old fixture cleanup before its unbound stop could hit a reused id.
+    drop(old);
+    let successor = spawn_daemon_serve_with_env(
+        None,
+        "0",
+        &[
+            ("DOT_AGENT_DECK_BUILD_ID_OVERRIDE", NEW_BUILD),
+            (
+                "DOT_AGENT_DECK_ATTACH_SOCKET",
+                original.attach_socket.to_str().unwrap(),
+            ),
+            (
+                "DOT_AGENT_DECK_SOCKET",
+                original.hook_socket.to_str().unwrap(),
+            ),
+        ],
+    );
+    let new = pane(&successor, "successor-other-pane");
+    assert_eq!(
+        new.agent, old_agent,
+        "precondition: daemon recycles the agent id"
+    );
+    deck.wait_until_grid(
+        "one restart notice names the attached agent and dispatched unit",
+        |grid| {
+            grid.contains("The deck restarted; these agents were stopped:")
+                && grid.contains("old-restart-pane")
+                && grid.contains("restart-kept-unit")
+        },
+    );
+    assert_eq!(
+        std::fs::read_to_string(worktree.0.join("restart-worktree.txt")).unwrap(),
+        "committed unit work\n",
+        "restart drop removed the unit's worktree contents"
+    );
+    assert!(
+        worktree.0.join(".git").is_file(),
+        "restart drop removed the unit's git worktree"
+    );
+    assert_eq!(
+        branch(),
+        branch_before,
+        "restart drop changed the unit's branch"
+    );
+    let grid = deck.snapshot_grid();
+    assert!(
+        !grid.contains("OLD-ATTACHED-PTY-1666"),
+        "old pane stayed open: {grid}"
+    );
+    assert!(
+        !grid.contains("Close selected agent?"),
+        "drop prompted a daemon close: {grid}"
+    );
+    assert!(
+        !grid.contains(dot_agent_deck::daemon_client::AGENT_GONE_AFTER_RESTART),
+        "{grid}"
+    );
+    assert!(
+        wait_for_agent_display_name(
+            &successor.attach_socket,
+            "successor-other-pane",
+            true,
+            Duration::from_secs(5)
+        ),
+        "dropping the old pane must leave the successor alive and unrenamed"
+    );
+    assert!(
+        std::fs::read(&new.capture).unwrap().is_empty(),
+        "drop sent successor input"
+    );
+    let fresh = launch_tui_against(&successor, NEW_BUILD);
+    fresh.wait_for_string("successor-other-pane");
+    fresh.send_keys(b"\x17");
+    fresh.wait_for_string("Close selected agent?");
+    fresh.send_keys(b"\x1b[B\r");
+    fresh.wait_for_string("No active agents");
+    assert!(
+        wait_for_agent_display_name(
+            &successor.attach_socket,
+            "successor-other-pane",
+            false,
+            Duration::from_secs(5)
+        ),
+        "control: a fresh card closes the successor agent"
+    );
+}
+
+/// Scenario: Restart the private deck while typing a filter with twelve agents listed. The notice stays in a footer row beside the field, independent of the expiring status slot, and remains after Escape; `a` opens a scrollable list containing every name regardless of drop order, Escape keeps the notice, and a second restart keeps every earlier name alongside its new one before `c` dismisses it. While the notice is held, typing `ac` into the successor's pane still reaches that pane.
+#[spec("lifecycle/handshake/013")]
+#[test]
+fn handshake_013_the_held_notice_survives_filter_and_joins_later_restarts() {
+    use inbox::*;
+    let mut original = spawn_daemon_at_build(NEW_BUILD);
+    let names: Vec<String> = (0..12).map(|i| format!("held-{i:02}")).collect();
+    let old: Vec<_> = names.iter().map(|name| pane(&original, name)).collect();
+    let deck = TuiDeck::builder()
+        .with_pty_size(120, 18)
+        .with_env(
+            "DOT_AGENT_DECK_ATTACH_SOCKET",
+            original.attach_socket.to_string_lossy(),
+        )
+        .with_env(
+            "DOT_AGENT_DECK_SOCKET",
+            original.hook_socket.to_string_lossy(),
+        )
+        .with_env("DOT_AGENT_DECK_BUILD_ID_OVERRIDE", NEW_BUILD)
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("12 agent(s)");
+    deck.send_keys(b"/ac");
+    deck.wait_until_grid("control: filter receives a and c before a restart", |g| {
+        g.contains("/ ac")
+    });
+    assert!(!deck.snapshot_grid().contains("The deck restarted"));
+
+    assert!(
+        original
+            .send_attach_request(&AttachRequest::StopDaemon { force: true })
+            .unwrap()
+            .ok
+    );
+    assert!(original.wait_for_exit(Duration::from_secs(10)));
+    drop(old);
+    let mut successor = spawn_daemon_serve_with_env(
+        None,
+        "0",
+        &[
+            ("DOT_AGENT_DECK_BUILD_ID_OVERRIDE", NEW_BUILD),
+            (
+                "DOT_AGENT_DECK_ATTACH_SOCKET",
+                original.attach_socket.to_str().unwrap(),
+            ),
+            (
+                "DOT_AGENT_DECK_SOCKET",
+                original.hook_socket.to_str().unwrap(),
+            ),
+        ],
+    );
+    let prefix = "The deck restarted; these agents were stopped: ";
+    deck.wait_until_grid("held notice has its own row while Filter owns input", |g| {
+        g.contains("/ ac")
+            && g.lines().any(|line| {
+                line.contains(prefix) && line.contains("and 9 more.") && !line.contains("/ ac")
+            })
+    });
+    // Reattachments can discover the restart in different frames. Each batch
+    // is sorted, then appended to the held notice; the combined list need not
+    // be alphabetical. Pin the three distinct names and total, then keep this
+    // exact summary through edits and the full-list round trip.
+    let grid = deck.snapshot_grid();
+    let summary = grid
+        .lines()
+        .find_map(|line| {
+            let (_, rest) = line.split_once(prefix)?;
+            let (shown, _) = rest.split_once(" and 9 more.")?;
+            let shown: Vec<_> = shown.split(", ").collect();
+            assert_eq!(shown.len(), 3, "footer did not name three agents: {line}");
+            assert_eq!(
+                shown.iter().collect::<std::collections::HashSet<_>>().len(),
+                3,
+                "footer repeated an agent: {line}"
+            );
+            assert!(
+                shown.iter().all(|name| names.iter().any(|n| n == name)),
+                "footer named an agent the restart did not stop: {line}"
+            );
+            Some(format!("{prefix}{} and 9 more.", shown.join(", ")))
+        })
+        .expect("the held summary disappeared");
+    // Read each rendered page, waiting for its visible range to advance. This
+    // checks every name without assuming which one appears on which page.
+    let read_list = |expected: &[String]| {
+        let mut seen = std::collections::HashSet::new();
+        for first in 1..=expected.len() {
+            let title = format!("Restart notice · {first}–");
+            deck.wait_until_grid("scrollable restart list advances", |g| g.contains(&title));
+            let grid = deck.snapshot_grid();
+            for line in grid.lines() {
+                let name = line.trim().trim_matches('│').trim();
+                if expected.iter().any(|expected| expected == name) {
+                    seen.insert(name.to_string());
+                }
+            }
+            if seen.len() == expected.len() {
+                break;
+            }
+            deck.send_keys(b"\x1b[B");
+        }
+        for name in expected {
+            assert!(seen.contains(name), "full list omitted {name}: {seen:?}");
+        }
+    };
+    // This pins the held footer rather than waiting out the old 15-second
+    // status timer: that status slot is not rendered in Filter mode.
+    deck.send_keys(b"ac");
+    deck.wait_until_grid("notice keys remain field input", |g| {
+        g.contains("/ acac") && g.contains(&summary)
+    });
+    deck.send_keys(b"\x1b");
+    deck.wait_until_grid("leaving Filter keeps the notice", |g| {
+        !g.contains("/ acac") && g.contains(&summary)
+    });
+    deck.send_keys(b"a");
+    read_list(&names);
+    deck.send_keys(b"\x1b");
+    deck.wait_until_grid("closing the list keeps the footer", |g| {
+        g.contains(&summary) && !g.contains("Restart notice")
+    });
+    // A fresh successor card is a control for pane input with the notice held.
+    let new = pane(&successor, "held-successor");
+    deck.send_keys(b"/\r");
+    deck.wait_for_string("held-successor");
+    deck.send_keys(b"\r");
+    deck.wait_for_string("[Command Mode Ctrl+D]");
+    deck.send_keys(b"ac\r");
+    deck.wait_for_string("SUBMITTED:ac");
+    assert!(deck.snapshot_grid().contains("and 9 more."));
+    deck.send_keys(b"\x04");
+    assert!(
+        successor
+            .send_attach_request(&AttachRequest::StopDaemon { force: true })
+            .unwrap()
+            .ok
+    );
+    assert!(successor.wait_for_exit(Duration::from_secs(10)));
+    drop(new);
+    let mut final_deck = spawn_daemon_serve_with_env(
+        None,
+        "0",
+        &[
+            ("DOT_AGENT_DECK_BUILD_ID_OVERRIDE", NEW_BUILD),
+            (
+                "DOT_AGENT_DECK_ATTACH_SOCKET",
+                original.attach_socket.to_str().unwrap(),
+            ),
+            (
+                "DOT_AGENT_DECK_SOCKET",
+                original.hook_socket.to_str().unwrap(),
+            ),
+        ],
+    );
+    deck.wait_until_grid("later restart joins the held notice", |g| {
+        g.contains("and 10 more.")
+    });
+    deck.send_keys(b"a");
+    let mut joined = names.clone();
+    joined.push("held-successor".into());
+    read_list(&joined);
+    deck.send_keys(b"\x1b");
+    deck.wait_until_grid("second Escape keeps accumulated footer", |g| {
+        g.contains("and 10 more.")
+    });
+    deck.send_keys(b"c");
+    deck.wait_until_grid("dismiss removes the held notice", |g| {
+        !g.contains("The deck restarted") && !g.contains("[Agents a]")
+    });
+    assert!(
+        final_deck.is_alive_public(),
+        "dismiss must leave the restarted fixture running"
+    );
+}
+
+/// Scenario: Start an empty TUI and surface a card without attaching it, then restart its private daemon reusing its ids. With event subscriptions held, stale close, digit and Enter refuse visibly and leave the successor alive with no input; same-process actions still work, and a closed card stays closed through a resync that discovers a new agent. Once subscriptions resume after a restart, the old card disappears with one notice, selection falls back to an earlier fresh card named `first` rather than the same-pane successor, and Enter opens only that earlier card.
+#[spec("lifecycle/handshake/013")]
+#[test]
+fn handshake_013_a_never_attached_card_refuses_close_digit_and_enter_after_restart() {
+    use inbox::*;
+    for action in ["close", "digit", "enter", "drop"] {
+        for restarted in [false, true] {
+            let mut original = spawn_daemon_at_build(NEW_BUILD);
+            // Reserve agent 1 so the replacement can list a card before the
+            // same-pane, same-agent-id successor in the selection case.
+            if action == "drop" {
+                drop(pane(&original, "reserve-earlier-id"));
+            }
+            let proxy = reconnect::AttachProxy::new(&original.attach_socket);
+            let deck = TuiDeck::builder()
+                .with_env(
+                    "DOT_AGENT_DECK_ATTACH_SOCKET",
+                    proxy.socket.to_string_lossy().to_string(),
+                )
+                .with_env(
+                    "DOT_AGENT_DECK_SOCKET",
+                    original.hook_socket.to_string_lossy().to_string(),
+                )
+                .with_env("DOT_AGENT_DECK_BUILD_ID_OVERRIDE", NEW_BUILD)
+                .launch_with_fixture("minimal");
+            deck.wait_for_string("No active agents");
+            let old = pane_with(
+                &original,
+                "never-attached-card",
+                serde_json::json!({"env":[["DOORBELL_STANDIN_LABEL", "ORIGINAL-NEVER-ATTACHED-1666"]]}),
+            );
+            deck.wait_for_string("never-attached-card");
+            deck.send_keys(b"\x1b[B");
+            deck.wait_until_grid("old never-attached card selected before restart", |grid| {
+                grid.lines()
+                    .any(|line| line.contains('▸') && line.contains("never-attached-card"))
+            });
+            assert_eq!(
+                proxy.attach_count(),
+                0,
+                "precondition: this TUI never attached the card"
+            );
+            let old_id = old.agent.clone();
+            if !restarted {
+                match action {
+                    "close" => {
+                        deck.send_keys(b"\x17");
+                        deck.wait_for_string("Close selected agent?");
+                        deck.send_keys(b"\x1b[B\r");
+                        deck.wait_for_string("No active agents");
+                        assert_eq!(proxy.attach_count(), 0, "control: close needs no attach");
+                        let subscribed = proxy.subscription_count();
+                        proxy.hold_events(true);
+                        proxy.disconnect();
+                        let fresh = pane(&original, "after-close-resync");
+                        proxy.hold_events(false);
+                        deck.wait_until_grid(
+                            "resync discovers the fresh card without reviving the closed one",
+                            |grid| {
+                                proxy.subscription_count() > subscribed
+                                    && grid.contains("after-close-resync")
+                                    && grid.contains("1 agent(s)")
+                            },
+                        );
+                        let grid = deck.snapshot_grid();
+                        assert!(
+                            !grid
+                                .lines()
+                                .any(|line| (line.contains('┌') || line.contains('┏'))
+                                    && line.contains("never-attached-card")),
+                            "a card closed in this TUI returned after resync: {grid}"
+                        );
+                        assert!(
+                            !grid.contains("The deck restarted"),
+                            "same-process resync claimed a restart: {grid}"
+                        );
+                        assert!(wait_for_agent_display_name(
+                            &original.attach_socket,
+                            "never-attached-card",
+                            false,
+                            Duration::from_secs(5)
+                        ));
+                        drained(&fresh);
+                        assert!(
+                            std::fs::read(&fresh.capture).unwrap().is_empty(),
+                            "resync sent input to the fresh agent"
+                        );
+                    }
+                    "digit" | "enter" | "drop" => {
+                        deck.send_keys(if action == "digit" { b"1" } else { b"\r" });
+                        deck.wait_for_string("ORIGINAL-NEVER-ATTACHED-1666");
+                        assert!(
+                            proxy.attach_count() > 0,
+                            "control: {action} attaches the original agent"
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+                continue;
+            }
+
+            proxy.hold_events(true);
+            assert!(
+                original
+                    .send_attach_request(&AttachRequest::StopDaemon { force: true })
+                    .unwrap()
+                    .ok
+            );
+            assert!(original.wait_for_exit(Duration::from_secs(10)));
+            drop(old);
+            let successor = spawn_daemon_serve_with_env(
+                None,
+                "0",
+                &[
+                    ("DOT_AGENT_DECK_BUILD_ID_OVERRIDE", NEW_BUILD),
+                    (
+                        "DOT_AGENT_DECK_ATTACH_SOCKET",
+                        original.attach_socket.to_str().unwrap(),
+                    ),
+                    (
+                        "DOT_AGENT_DECK_SOCKET",
+                        original.hook_socket.to_str().unwrap(),
+                    ),
+                ],
+            );
+            let earlier = (action == "drop").then(|| pane_with(
+                &successor, "first",
+                serde_json::json!({"env":[["DOORBELL_STANDIN_LABEL", "EARLIER-FRESH-PTY-1666"]]}),
+            ));
+            let new = pane_with(
+                &successor,
+                "never-attached-card",
+                serde_json::json!({"display_name":"successor-own-card", "env":[["DOORBELL_STANDIN_LABEL", "SUCCESSOR-NEVER-ATTACHED-1666"]]}),
+            );
+            assert_eq!(new.agent, old_id, "precondition: both ids are reused");
+            if let Some(earlier) = earlier.as_ref() {
+                proxy.hold_events(false);
+                deck.wait_for_string(
+                    "The deck restarted; these agents were stopped: never-attached-card.",
+                );
+                // Neither fresh pane was managed by this TUI. Report after
+                // the notice proves the subscriber reads the new stream.
+                status(&successor, earlier, "session_start", "claude_code");
+                status(&successor, earlier, "idle", "claude_code");
+                status(&successor, &new, "thinking", "claude_code");
+                let earlier_title = "first";
+                deck.wait_until_grid("drop notice and two fresh cards", |grid| {
+                    grid.contains(
+                        "The deck restarted; these agents were stopped: never-attached-card.",
+                    ) && grid.contains("2 agent(s)")
+                        && grid.contains("Thinking")
+                        && grid.contains(earlier_title)
+                });
+                let grid = deck.snapshot_grid();
+                // The old label is allowed in the notice, never in a card.
+                assert!(
+                    !grid
+                        .lines()
+                        .any(|line| (line.contains('┌') || line.contains('┏'))
+                            && line.contains("never-attached-card")),
+                    "old card was kept: {grid}"
+                );
+                assert!(
+                    grid.lines().any(|line| line
+                        .split(['┌', '┏'])
+                        .any(|card| { card.contains('▸') && card.contains(earlier_title) })),
+                    "selection inherited the same-pane successor instead of falling back: {grid}"
+                );
+                assert!(!grid.contains(" Gone "), "retired card was kept: {grid}");
+                assert_eq!(proxy.attach_count(), 0, "drop attached an agent");
+                deck.send_keys(b"\r");
+                deck.wait_for_string("EARLIER-FRESH-PTY-1666");
+                assert_eq!(
+                    proxy.attach_count(),
+                    1,
+                    "Enter must attach only the earlier fresh card"
+                );
+            } else {
+                match action {
+                    "close" => {
+                        deck.send_keys(b"\x17");
+                        deck.wait_for_string("Close selected agent?");
+                        deck.send_keys(b"\x1b[B\r");
+                    }
+                    "digit" => deck.send_keys(b"1"),
+                    "enter" => deck.send_keys(b"\r"),
+                    _ => unreachable!(),
+                }
+                deck.wait_for_string(dot_agent_deck::daemon_client::AGENT_GONE_AFTER_RESTART);
+                assert_eq!(
+                    proxy.attach_count(),
+                    0,
+                    "{action}: stale action attached a terminal"
+                );
+                proxy.hold_events(false);
+            }
+            let grid = deck.snapshot_grid();
+            assert!(
+                !grid.contains("SUCCESSOR-NEVER-ATTACHED-1666"),
+                "{action}: successor output appeared in old pane: {grid}"
+            );
+            assert!(
+                wait_for_agent_display_name(
+                    &successor.attach_socket,
+                    "successor-own-card",
+                    true,
+                    Duration::from_secs(5)
+                ),
+                "{action}: successor must stay alive and unrenamed"
+            );
+            drained(&new);
+            assert!(
+                std::fs::read(&new.capture).unwrap().is_empty(),
+                "{action}: successor must receive no terminal input"
+            );
+        }
+    }
+}
+
+/// Scenario: Keep a terminal open while its private daemon restarts using both recycled ids, and type during the disconnect. The old pane closes with the single restart notice, without a per-pane gone sentence, successor output or migrated input; holding event subscriptions makes the reattach refusal itself drive this visible outcome.
+#[spec("lifecycle/handshake/013")]
+#[test]
+fn handshake_013_auto_reattach_never_adopts_a_same_pane_successor() {
+    use inbox::*;
+    let mut original = spawn_daemon_at_build(NEW_BUILD);
+    let old = pane_with(
+        &original,
+        "reused-pane",
+        serde_json::json!({"env":[["DOORBELL_STANDIN_LABEL", "ORIGINAL-PTY-1666"]]}),
+    );
+    let old_id = old.agent.clone();
+    let proxy = reconnect::AttachProxy::new(&original.attach_socket);
+    let deck = TuiDeck::builder()
+        .with_env(
+            "DOT_AGENT_DECK_ATTACH_SOCKET",
+            proxy.socket.to_string_lossy().to_string(),
+        )
+        .with_env(
+            "DOT_AGENT_DECK_SOCKET",
+            original.hook_socket.to_string_lossy().to_string(),
+        )
+        .with_env("DOT_AGENT_DECK_BUILD_ID_OVERRIDE", NEW_BUILD)
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("ORIGINAL-PTY-1666");
+    deck.send_keys(b"\r");
+    deck.wait_for_string("[Command Mode Ctrl+D]");
+    assert!(common::wait_until(Duration::from_secs(10), || proxy
+        .subscription_count()
+        > 0));
+    let subscriptions = proxy.subscription_count();
+    proxy.hold_events(true);
+    assert!(
+        original
+            .send_attach_request(&AttachRequest::StopDaemon { force: true })
+            .unwrap()
+            .ok
+    );
+    assert!(original.wait_for_exit(Duration::from_secs(10)));
+    drop(old);
+    deck.send_keys(b"QUEUED-FOR-ORIGINAL-1666\r");
+    let successor = spawn_daemon_serve_with_env(
+        None,
+        "0",
+        &[
+            ("DOT_AGENT_DECK_BUILD_ID_OVERRIDE", NEW_BUILD),
+            (
+                "DOT_AGENT_DECK_ATTACH_SOCKET",
+                original.attach_socket.to_str().unwrap(),
+            ),
+            (
+                "DOT_AGENT_DECK_SOCKET",
+                original.hook_socket.to_str().unwrap(),
+            ),
+        ],
+    );
+    let new = pane_with(
+        &successor,
+        "reused-pane",
+        serde_json::json!({"env":[["DOORBELL_STANDIN_LABEL", "SUCCESSOR-PTY-1666"]]}),
+    );
+    assert_eq!(
+        new.agent, old_id,
+        "precondition: agent and pane ids are reused"
+    );
+    let notice = "The deck restarted; these agents were stopped: reused-pane.";
+    deck.wait_until_grid(
+        "reattach drops old pane with only the restart notice",
+        |grid| {
+            assert!(
+                !grid.contains(dot_agent_deck::daemon_client::AGENT_GONE_AFTER_RESTART),
+                "reattach leaked its per-pane gone sentence: {grid}"
+            );
+            assert!(
+                !grid.contains("SUCCESSOR-PTY-1666"),
+                "old pane adopted successor: {grid}"
+            );
+            grid.contains(notice)
+        },
+    );
+    let grid = deck.snapshot_grid();
+    assert!(
+        !grid.contains("ORIGINAL-PTY-1666"),
+        "old pane stayed open: {grid}"
+    );
+    assert!(
+        !grid.contains("[Command Mode Ctrl+D]"),
+        "input mode survived its lost pane: {grid}"
+    );
+    proxy.hold_events(false);
+    assert!(common::wait_until(Duration::from_secs(10), || proxy
+        .subscription_count()
+        > subscriptions));
+    // A fresh event makes the next rendered frame an observable barrier:
+    // a warning queued after the first notice must not replace it later.
+    status(&successor, &new, "session_start", "claude_code");
+    status(&successor, &new, "thinking", "claude_code");
+    deck.wait_for_string("Thinking");
+    let grid = deck.snapshot_grid();
+    assert!(
+        grid.contains(notice),
+        "the restart notice was replaced: {grid}"
+    );
+    assert!(
+        !grid.contains(dot_agent_deck::daemon_client::AGENT_GONE_AFTER_RESTART),
+        "reattach leaked a later per-pane gone sentence: {grid}"
+    );
+    assert!(
+        !grid.contains("SUCCESSOR-PTY-1666"),
+        "old pane adopted successor: {grid}"
+    );
+    assert!(
+        wait_for_agent_display_name(
+            &successor.attach_socket,
+            "reused-pane",
+            true,
+            Duration::from_secs(5)
+        ),
+        "drop must leave successor alive and unrenamed"
+    );
+    drained(&new);
+    assert!(
+        std::fs::read(&new.capture).unwrap().is_empty(),
+        "buffered input migrated"
+    );
+}
+
+/// Scenario: Rename an attached agent successfully, then restart its private daemon as the same build. Hold its original terminal transport and event subscriptions so a stale rename can be refused visibly before the restart is learned, then release them: the old card and pane disappear with a notice naming the confirmed label, and a successor card appears with its own name. Open and cancel a fresh Rename editor, then open New Agent; the successor remains alive, unrenamed and receives no terminal input.
+#[spec("lifecycle/handshake/013")]
+#[test]
+fn handshake_013_a_stale_rename_shows_the_gone_sentence() {
+    use inbox::*;
+    let mut original = spawn_daemon_at_build(NEW_BUILD);
+    let old = pane(&original, "rename-original");
+    let old_agent = old.agent.clone();
+    let proxy = reconnect::AttachProxy::new(&original.attach_socket);
+    let deck = TuiDeck::builder()
+        .with_env(
+            "DOT_AGENT_DECK_ATTACH_SOCKET",
+            proxy.socket.to_string_lossy().to_string(),
+        )
+        .with_env(
+            "DOT_AGENT_DECK_SOCKET",
+            original.hook_socket.to_string_lossy().to_string(),
+        )
+        .with_env("DOT_AGENT_DECK_BUILD_ID_OVERRIDE", NEW_BUILD)
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("rename-original");
+    deck.send_keys(b"r");
+    deck.wait_for_string("Rename:");
+    deck.send_keys(b"rename-control\r");
+    deck.wait_for_string("rename-control");
+    assert!(
+        wait_for_agent_display_name(
+            &original.attach_socket,
+            "rename-control",
+            true,
+            Duration::from_secs(5)
+        ),
+        "same-incarnation rename control"
+    );
+    proxy.hold_events(true);
+    proxy.hold_terminal_eof(true);
+    assert!(
+        original
+            .send_attach_request(&AttachRequest::StopDaemon { force: true })
+            .unwrap()
+            .ok
+    );
+    assert!(original.wait_for_exit(Duration::from_secs(10)));
+    drop(old);
+    let successor = spawn_daemon_serve_with_env(
+        None,
+        "0",
+        &[
+            ("DOT_AGENT_DECK_BUILD_ID_OVERRIDE", NEW_BUILD),
+            (
+                "DOT_AGENT_DECK_ATTACH_SOCKET",
+                original.attach_socket.to_str().unwrap(),
+            ),
+            (
+                "DOT_AGENT_DECK_SOCKET",
+                original.hook_socket.to_str().unwrap(),
+            ),
+        ],
+    );
+    let new = pane(&successor, "rename-successor");
+    assert_eq!(new.agent, old_agent, "precondition: agent id reused");
+    deck.send_keys(b"r");
+    deck.wait_for_string("Rename:");
+    deck.send_keys(b"stale-rename\r");
+    deck.wait_for_string(dot_agent_deck::daemon_client::AGENT_GONE_AFTER_RESTART);
+    proxy.hold_events(false);
+    proxy.hold_terminal_eof(false);
+    deck.wait_for_string("The deck restarted; these agents were stopped: rename-control.");
+    deck.wait_until_grid("the successor has its own named card", |grid| {
+        grid.lines().any(|line| {
+            (line.contains('┌') || line.contains('┏')) && line.contains("rename-successor")
+        })
+    });
+    deck.send_keys(b"r");
+    deck.wait_for_string("Rename:");
+    let editor = deck.snapshot_grid();
+    assert!(
+        !editor.contains("stale-rename"),
+        "the fresh Rename editor retained the refused draft: {editor}"
+    );
+    deck.send_keys(b"\x1b");
+    deck.wait_until_grid("Escape closes the fresh Rename editor", |grid| {
+        !grid.contains("Rename:")
+    });
+    deck.send_keys(b"\x0e");
+    deck.wait_for_string("Select Directory");
+    let grid = deck.snapshot_grid();
+    assert!(
+        !grid.contains("Rename:"),
+        "stale rename editor stayed open: {grid}"
+    );
+    assert!(
+        !grid.lines().any(
+            |line| (line.contains('│') || line.contains('┌') || line.contains('┏'))
+                && line.contains("rename-control")
+        ),
+        "old card was kept: {grid}"
+    );
+    assert!(
+        !grid.lines().any(
+            |line| (line.contains('│') || line.contains('┌') || line.contains('┏'))
+                && line.contains("stale-rename")
+        ),
+        "refused title appeared on a card: {grid}"
+    );
+    assert!(
+        wait_for_agent_display_name(
+            &successor.attach_socket,
+            "rename-successor",
+            true,
+            Duration::from_secs(5)
+        ),
+        "stale rename must not relabel successor"
+    );
+    drained(&new);
+    assert!(
+        std::fs::read(&new.capture).unwrap().is_empty(),
+        "rename sent successor input"
+    );
+}
+
+/// Scenario: Replace the daemon under an open TUI with one on the next attach protocol and wait for the TUI's refusal, then open the New Agent form and submit it. The replacement must receive no start, listing, attach or subscription from the TUI at any point — the form's own hints included — and no new pane may open.
+#[spec("lifecycle/handshake/012")]
+#[test]
+fn handshake_012_refused_daemon_gets_no_new_pane_start_or_listing() {
+    use inbox::*;
+    let own = dot_agent_deck::daemon_protocol::PROTOCOL_VERSION;
+    let newer = own + 1;
+    let mut original = spawn_daemon_at_build_and_protocol(NEW_BUILD, own);
+    let old = pane(&original, "before-replacement");
+    status(&original, &old, "idle", "claude_code");
+    let deck = TuiDeck::builder()
+        .with_env(
+            "DOT_AGENT_DECK_ATTACH_SOCKET",
+            original.attach_socket.to_string_lossy().to_string(),
+        )
+        .with_env(
+            "DOT_AGENT_DECK_SOCKET",
+            original.hook_socket.to_string_lossy().to_string(),
+        )
+        .with_env("DOT_AGENT_DECK_BUILD_ID_OVERRIDE", NEW_BUILD)
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("before-replacement");
+
+    let reply = original
+        .send_attach_request(&AttachRequest::StopDaemon { force: true })
+        .expect("stop only the fixture-owned daemon");
+    assert!(reply.ok, "fixture stop: {reply:?}");
+    assert!(
+        original.wait_for_exit(Duration::from_secs(10)),
+        "fixture daemon must stop"
+    );
+    let replacement = spawn_daemon_serve_with_env(
+        None,
+        "0",
+        &[
+            ("DOT_AGENT_DECK_BUILD_ID_OVERRIDE", NEW_BUILD),
+            (
+                "DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_DIR",
+                "reconnect-observations",
+            ),
+            (
+                "DOT_AGENT_DECK_TEST_PROTOCOL_VERSION_OVERRIDE",
+                &newer.to_string(),
+            ),
+            (
+                "DOT_AGENT_DECK_ATTACH_SOCKET",
+                original.attach_socket.to_str().unwrap(),
+            ),
+            (
+                "DOT_AGENT_DECK_SOCKET",
+                original.hook_socket.to_str().unwrap(),
+            ),
+        ],
+    );
+    let observations = replacement.home.join("reconnect-observations/observations");
+    let admitted = || {
+        std::fs::read_to_string(&observations)
+            .unwrap_or_default()
+            .lines()
+            .filter(|s| {
+                [
+                    "attach-stream",
+                    "subscribe-events",
+                    "list-agents",
+                    "start-agent",
+                    "run-now",
+                ]
+                .iter()
+                .any(|op| s.starts_with(op))
+            })
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    deck.wait_for_string(&format!("daemon speaks attach protocol v{newer}"));
+    deck.wait_for_string("Not attaching");
+    assert_eq!(
+        admitted(),
+        Vec::<String>::new(),
+        "the refused daemon was admitted a request before the user acted"
+    );
+
+    // New agent: the directory picker, then the form, then Submit.
+    deck.send_keys(b"\x0e");
+    deck.send_keys(b" ");
+    deck.wait_for_string("┌ New Agent");
+    deck.send_keys(b"\t");
+    deck.send_keys(&[0x7f; 96]);
+    deck.send_keys(b"refused-new-pane");
+    let (col, row) = deck.wait_for_in_grid("[Submit]");
+    deck.click(col, row);
+    deck.wait_for_absence("[Submit]");
+    assert!(
+        !common::wait_until(Duration::from_secs(3), || !admitted().is_empty()),
+        "the refused daemon was asked to start, list or attach after New Agent: {:?}\n{}",
+        admitted(),
+        deck.snapshot_grid()
+    );
+    assert!(
+        !deck.snapshot_grid().contains("refused-new-pane"),
+        "no pane may open on a refused daemon:\n{}",
+        deck.snapshot_grid()
     );
 }

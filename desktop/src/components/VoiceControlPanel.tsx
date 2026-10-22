@@ -93,7 +93,9 @@ import { useReadingMode } from "../hooks/useReadingMode";
 import type { VoicePaneAgent } from "../lib/promptKeys";
 import { QUESTION_ALWAYS_DECLINED, QUESTION_ANSWER_CANCELLED, QUESTION_CANCEL_FAILED, QUESTION_COUNTDOWN_STOPPED, QUESTION_MOVED_ON, QUESTION_SAY_CONFIRM, questionLost, questionLostSentence, questionOptionsToSay, saysCancel, saysConfirm, type PendingQuestionDto, type QuestionSelectionDto, type QuestionTextSlotDto, type VoiceQuestionTarget } from "../lib/voiceQuestion";
 import { ConfirmDialog } from "./ConfirmDialog";
-import { desktopFeaturesOf, type DeckFleet, type DeckRuntimeState } from "../types";
+import { desktopFeaturesOf, type AgentTarget, type DeckFleet, type DeckRuntimeState } from "../types";
+import { agentKey, boundAgentKey, sameIncarnation } from "../lib/agentKey";
+import { AGENT_GONE_AFTER_RESTART } from "../lib/agentIdentity";
 
 /**
  * How long an Undo stays on offer, in milliseconds.
@@ -802,16 +804,21 @@ class StoppedPartway extends Error {
   }
 }
 
-/** The key one agent's prompt record and terminal writes are kept under. */
-function paneKey(aim: { deckId: string; agentId: string }): string {
-  return `${aim.deckId}\u0000${aim.agentId}`;
+/**
+ * The key one agent's prompt record and terminal writes are kept under: the
+ * agent AS ITS DAEMON PROCESS LISTED IT (`boundAgentKey`, PRD #1666 part 2,
+ * G-fix7), so what voice wrote into an agent is never read as written into a
+ * restarted deck's agent with the same id.
+ */
+function paneKey(aim: AgentAddress): string {
+  return boundAgentKey(aim);
 }
 /**
  * PRD #1541 — the key one incarnation of an agent's write line is kept under:
  * a replaced agent gets a line of its own, so it never waits behind (or is
  * reserved by) a write to the agent it replaced.
  */
-function lineKey(aim: { deckId: string; agentId: string }, spawnedAtMs: number | undefined): string {
+function lineKey(aim: AgentAddress, spawnedAtMs: number | undefined): string {
   return `${paneKey(aim)}\u0000${spawnedAtMs ?? ""}`;
 }
 
@@ -987,9 +994,11 @@ const OPEN_DECK_COMMAND = "open_deck";
  *
  * The composite identity, never the bare agent id: ids collide across decks,
  * and typing a user's words into the wrong machine's namesake is the worst
- * version of that collision this app has.
+ * version of that collision this app has. And bound to the daemon process
+ * ({@link AgentAddress}), so a restarted deck's agent under the same id is not
+ * the one the words were meant for.
  */
-type Pending = { deckId: string; agentId: string; label: string };
+type Pending = AgentAddress & { label: string };
 
 /**
  * PRD #1260 review — whether two spawn times name different incarnations of
@@ -1002,11 +1011,48 @@ function incarnationsDiffer(was: number | undefined, now: number | undefined): b
   return was !== undefined && now !== undefined && was !== now;
 }
 
-/** One agent, by the composite identity — never the bare id, which collides across decks. */
-type AgentAddress = { deckId: string; agentId: string };
+/**
+ * One agent, by the composite identity — never the bare id, which collides
+ * across decks — AS ONE DAEMON PROCESS LISTED IT (PRD #1666 part 2, G-fix7):
+ * `incarnation` is that process, `undefined` for a deck that named none. A
+ * restarted deck numbers an unrelated agent with the same id, and every write,
+ * prompt record and pending send aimed at this address refuses it. Required,
+ * so every address says which process it names.
+ */
+type AgentAddress = { deckId: string; agentId: string; incarnation: string | undefined };
 
-function shows(pane: VoicePane | undefined, aim: AgentAddress): pane is VoicePane {
+/** The pane on screen as an address: its agent, as the process that listed it. */
+function paneAddress(pane: VoicePane): AgentAddress {
+  return { deckId: pane.deckId, agentId: pane.agentId, incarnation: pane.incarnation };
+}
+
+/** Whether `pane` shows `aim`'s deck and id, whatever process listed it. */
+function showsAgent(pane: VoicePane | undefined, aim: AgentAddress): pane is VoicePane {
   return pane !== undefined && pane.deckId === aim.deckId && pane.agentId === aim.agentId;
+}
+
+/** Whether `pane` shows `aim`: its deck and id, listed by the same daemon process. */
+function shows(pane: VoicePane | undefined, aim: AgentAddress): pane is VoicePane {
+  return showsAgent(pane, aim) && sameIncarnation(pane.incarnation, aim.incarnation);
+}
+
+/**
+ * PRD #1666 part 2 (G-fix7) — one agent as the host lists it: its spawn time,
+ * when the deck reports one, and the daemon process that listed it. Kept in
+ * {@link VoiceContext.incarnations} by `agentKey(deckId, agentId)`.
+ */
+export type AgentIncarnation = { spawnedAtMs?: number; process?: string };
+
+/**
+ * Whether two listings of one `(deckId, agentId)` are different agents: a
+ * different daemon process (strictly — a deck that stopped or started naming
+ * itself is one too), or two known, different spawn times. A missing spawn
+ * time never hides a different process.
+ */
+function agentReplaced(was: AgentIncarnation, now: AgentIncarnation): Lost | undefined {
+  if (!sameIncarnation(was.process, now.process)) return { code: "restarted", why: AGENT_GONE_AFTER_RESTART };
+  if (incarnationsDiffer(was.spawnedAtMs, now.spawnedAtMs)) return { code: "agent", why: "the agent was replaced" };
+  return undefined;
 }
 
 /**
@@ -1017,9 +1063,10 @@ function shows(pane: VoicePane | undefined, aim: AgentAddress): pane is VoicePan
  * compared; everything else is what {@link contextLost} compares.
  *
  * `generation` is the dictation mode's instance (see `modeGeneration`) and
- * `incarnations` every agent's `spawnedAtMs` on the selected deck — both as
- * they stood at the declaration, which for a numbered choice is the FIRST
- * utterance, not the moment the answer came back.
+ * `incarnations` every listed agent's spawn time and daemon process, by
+ * `agentKey(deckId, agentId)` across the fleet (PRD #1666 part 2, G-fix7) —
+ * both as they stood at the declaration, which for a numbered choice is the
+ * FIRST utterance, not the moment the answer came back.
  */
 type VoiceContext = {
   screen: VoiceScreen;
@@ -1030,7 +1077,13 @@ type VoiceContext = {
   pane: VoicePane | undefined;
   deck: string | undefined;
   confirmation: boolean;
-  incarnations: Readonly<Record<string, number | undefined>>;
+  incarnations: Readonly<Record<string, AgentIncarnation>>;
+  /**
+   * PRD #1666 part 2 (G-fix7d): the daemon process each connected deck in the
+   * fleet is, by deck id — so an agent no longer listed by a deck that has
+   * become another process is told apart as gone with its deck's restart.
+   */
+  deckProcesses?: Readonly<Record<string, string | undefined>>;
 };
 
 /**
@@ -1040,10 +1093,15 @@ type VoiceContext = {
  * resolved directly or chosen from a list — whose params name that agent on
  * the selected deck (see {@link dispatchLost}).
  */
-type Touches = { answer?: true; pane?: AgentAddress; agent?: string };
+type Touches = { answer?: true; pane?: AgentAddress; agent?: { deckId: string | undefined; agentId: string } };
 
-/** Why {@link contextLost} refused: a code the caller picks its sentence by, and the reason in words. */
-type Lost = { code: "screen" | "dialog" | "mode" | "confirmation" | "pane" | "replaced" | "blocked" | "hidden" | "deck" | "agent" | "gone"; why: string };
+/**
+ * Why {@link contextLost} refused: a code the caller picks its sentence by, and
+ * the reason in words. `restarted` (PRD #1666 part 2, G-fix7) is a different
+ * daemon process listing the agent's id: the agent is gone with its deck's
+ * restart, and its `why` is the TUI's sentence for it.
+ */
+type Lost = { code: "screen" | "dialog" | "mode" | "confirmation" | "pane" | "replaced" | "restarted" | "blocked" | "hidden" | "deck" | "agent" | "gone"; why: string };
 
 /**
  * PRD #1260/#1261 review, rounds 4-5 — THE gate. Every side effect an
@@ -1086,7 +1144,11 @@ export function contextLost(was: VoiceContext, now: VoiceContext, touches: Touch
   const aim = touches.pane;
   if (aim) {
     if (now.confirmation) return { code: "confirmation", why: "a confirmation is open" };
-    if (!shows(was.pane, aim) || !shows(now.pane, aim)) return { code: "pane", why: now.pane === undefined ? "the pane closed" : "the pane on screen changed" };
+    if (!showsAgent(was.pane, aim) || !showsAgent(now.pane, aim)) return { code: "pane", why: now.pane === undefined ? "the pane closed" : "the pane on screen changed" };
+    /* PRD #1666 part 2 (G-fix7): the same deck and id, listed by another
+       daemon process than the one `aim` was learned from, or than the pane's
+       at the declaration — a restarted deck's agent, never this one. */
+    if (!sameIncarnation(aim.incarnation, now.pane.incarnation) || !sameIncarnation(was.pane.incarnation, now.pane.incarnation)) return { code: "restarted", why: AGENT_GONE_AFTER_RESTART };
     if (incarnationsDiffer(was.pane.spawnedAtMs, now.pane.spawnedAtMs)) return { code: "replaced", why: "the agent in the pane was replaced" };
     if (now.pane.inputBlocked !== undefined && was.pane.inputBlocked === undefined) return { code: "blocked", why: `the pane stopped taking input: ${now.pane.inputBlocked}` };
     /* PR #1451 (Qodo) — a pane showing another tab refuses whether or not it
@@ -1096,8 +1158,19 @@ export function contextLost(was: VoiceContext, now: VoiceContext, touches: Touch
     if (now.pane.terminalHidden) return { code: "hidden", why: "its terminal is not shown" };
   }
   if ((aim || touches.agent !== undefined) && now.deck !== was.deck) return { code: "deck", why: "the deck changed" };
-  if (touches.agent !== undefined && touches.agent in was.incarnations && !(touches.agent in now.incarnations)) return { code: "gone", why: "the agent is gone" };
-  if (touches.agent !== undefined && incarnationsDiffer(was.incarnations[touches.agent], now.incarnations[touches.agent])) return { code: "agent", why: "the agent was replaced" };
+  if (touches.agent !== undefined) {
+    const key = agentKey(touches.agent.deckId, touches.agent.agentId);
+    const before = was.incarnations[key];
+    const after = now.incarnations[key];
+    if (before !== undefined && after === undefined) {
+      /* G-fix7d: its deck is another process now — a restart stopped it, and
+         the sentence is the one every other restart refusal says. */
+      const deckNow = touches.agent.deckId === undefined ? undefined : now.deckProcesses?.[touches.agent.deckId];
+      if (before.process !== undefined && deckNow !== undefined && deckNow !== before.process) return { code: "restarted", why: AGENT_GONE_AFTER_RESTART };
+      return { code: "gone", why: "the agent is gone" };
+    }
+    if (before !== undefined && after !== undefined) return agentReplaced(before, after);
+  }
   return undefined;
 }
 
@@ -1125,10 +1198,33 @@ function dispatchLost(was: VoiceContext, now: VoiceContext, params: readonly Voi
   if (params.some((param) => param.kind === "deck_ref") && now.deck !== was.deck) return { code: "deck", why: "the deck changed" };
   for (const param of params) {
     if (!AGENT_TARGETING_KINDS.has(param.kind)) continue;
-    const moved = contextLost(was, now, { agent: param.value });
+    /* A numbered dashboard row names its own deck; a resolved one is the
+       selected deck's at the declaration. */
+    const agent = { deckId: param.deckId ?? was.deck, agentId: param.value };
+    const moved = contextLost(was, now, { agent });
     if (moved) return moved;
+    /* A param that already names its process (G-fix7) holds to it. */
+    const listed = now.incarnations[agentKey(agent.deckId, agent.agentId)];
+    if ("incarnation" in param && listed !== undefined && !sameIncarnation(param.incarnation, listed.process)) return { code: "restarted", why: AGENT_GONE_AFTER_RESTART };
   }
   return undefined;
+}
+
+/**
+ * PRD #1666 part 2 (G-fix7) — `params` with every agent they name bound to the
+ * daemon process that listed it when the utterance was `declared`: the
+ * `incarnation` key, which the host's dispatch carries to the view it opens,
+ * the stop it confirms and the pane it types into. So an action resolved
+ * before a deck restart that reuses the agent's id refuses the successor
+ * instead of re-learning its process from whatever is listed when it runs.
+ * A param whose agent the declaration did not list is left as it came.
+ */
+function bindAgentParams(params: readonly VoiceResolvedParamDto[], declared: VoiceContext): VoiceResolvedParamDto[] {
+  return params.map((param) => {
+    if (!AGENT_TARGETING_KINDS.has(param.kind) || "incarnation" in param) return param;
+    const listed = declared.incarnations[agentKey(param.deckId ?? declared.deck, param.value)];
+    return listed === undefined ? param : { ...param, incarnation: listed.process };
+  });
 }
 
 /** What the report says when the gate refuses a resolved answer, or a pane write it dispatched, before anything ran. */
@@ -1171,7 +1267,7 @@ function choiceRefusal(lost: Lost): string {
  * `questionLabel`: what a sentence about `question` calls the agent
  * ({@link questionAgentName}, issue #1668); `label` when absent.
  */
-export type VoicePane = { deckId: string; agentId: string; label: string; inputBlocked?: string; spawnedAtMs?: number; terminalHidden?: boolean; question?: PendingQuestionDto; questionLabel?: string } & VoicePaneAgent;
+export type VoicePane = { deckId: string; agentId: string; label: string; inputBlocked?: string; spawnedAtMs?: number; terminalHidden?: boolean; question?: PendingQuestionDto; questionLabel?: string; incarnation?: string } & VoicePaneAgent;
 
 /**
  * PRD #1260 — the voice panel's state, the one model #1260, #1261 and #1184
@@ -1428,12 +1524,15 @@ interface VoiceControlPanelProps {
    * share it with the lists that render differently while it is on. */
   onVoiceChange?: (on: boolean) => void;
   /**
-   * PRD #1261 review, round 4 — the incarnation (`spawnedAtMs`) of every
-   * agent on the selected deck as the host sees it now, by agent id; absent or
-   * `undefined` where none is reported. Captured with every declaration, so a
-   * chosen agent entry whose agent was replaced since is refused.
+   * PRD #1261 review, round 4 — every listed agent's incarnation as the host
+   * sees it now: its spawn time, and (PRD #1666 part 2, G-fix7) the daemon
+   * process that listed it, by `agentKey(deckId, agentId)` across the fleet.
+   * Captured with every declaration, so a chosen or resolved agent whose
+   * deck restarted, or which was replaced under its id, since is refused, and
+   * every agent a dispatch names is bound to its process
+   * ({@link bindAgentParams}).
    */
-  agentIncarnations?: () => Readonly<Record<string, number | undefined>>;
+  agentIncarnations?: () => Readonly<Record<string, AgentIncarnation>>;
   /**
    * PR #1451 round 3, change 3 — the numbered list on screen now, with its
    * generation. Read when the microphone opens, again while nobody has spoken
@@ -1514,6 +1613,8 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   endpointsRef.current = endpoints;
   const agentIncarnationsRef = useRef(agentIncarnations);
   agentIncarnationsRef.current = agentIncarnations;
+  const fleetRef = useRef(fleet);
+  fleetRef.current = fleet;
   const numberedRef = useRef(numbered);
   numberedRef.current = numbered;
   const pagesRef = useRef(pages);
@@ -1740,11 +1841,20 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   /** The host's view of the pane and the deck, for the entry check. */
   const paneRef = useRef(pane);
   paneRef.current = pane;
-  /** PRD #1541 — the incarnation of `aim` when it is the pane on screen. */
+  /** PRD #1541 — the spawn time of `aim` when it is the pane on screen (its own process included). */
   const incarnationOf = useCallback((aim: AgentAddress) => {
     const shown = paneRef.current;
     return shows(shown, aim) ? shown.spawnedAtMs : undefined;
   }, []);
+  /**
+   * PRD #1666 part 2 (G-fix6, G-fix7) — `aim` as a terminal target, bound to
+   * the daemon process `aim` itself was learned from: the pane's at the
+   * declaration, carried on the address since. Never the process of the pane
+   * on screen when the write goes out, which after a deck restart can be a
+   * successor's: its write finds no session for the target and rejects as
+   * not attached, so nothing reaches a restarted deck's agent with that id.
+   */
+  const boundTarget = useCallback((aim: AgentAddress): AgentTarget => ({ deckId: aim.deckId, agentId: aim.agentId, incarnation: aim.incarnation }), []);
   /**
    * PRD #1631 — the question `aim`'s agent waits on, when `aim` is the pane on
    * screen: its label and whether voice can take the answer
@@ -1845,7 +1955,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    */
   const guardedSend = useCallback((aim: AgentAddress, data: string, check: () => string | undefined): { sent: PaneWrite; done: Promise<void> } => {
     let why: string | undefined;
-    const write = sendTerminalInput(aim, data, () => {
+    const write = sendTerminalInput(boundTarget(aim), data, () => {
       why = check();
       return why === undefined;
     });
@@ -1855,7 +1965,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       throw cause;
     });
     return { sent, done };
-  }, [notePaneWrite, sendTerminalInput]);
+  }, [boundTarget, notePaneWrite, sendTerminalInput]);
   /** PRD #1541 — every agent's {@link PromptRecord}, by {@link paneKey}. */
   const prompts = useRef(new Map<string, PromptRecord>());
   /** The record for `aim` as it is now: a fresh one when the agent was replaced since. */
@@ -1983,6 +2093,9 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     deck: selectedDeckRef.current,
     confirmation: confirmationRef.current,
     incarnations: agentIncarnationsRef.current?.() ?? {},
+    deckProcesses: Object.fromEntries((fleetRef.current ?? [])
+      .filter(({ connection }) => connection.deckId !== undefined && connection.status === "connected")
+      .map(({ connection }) => [connection.deckId as string, connection.incarnation])),
   }), []);
   /** Take the numbered list on screen as the one heard, with the context it stands in. */
   const hearNumbers = useCallback(() => {
@@ -2004,7 +2117,9 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     const outer = dispatching.current;
     dispatching.current = declared;
     try {
-      return onDispatch(outcome, declared.directories, declared.newAgent);
+      /* G-fix7: every agent the outcome names, bound to the process that
+         listed it at the declaration (the gate above held it there). */
+      return onDispatch({ ...outcome, params: bindAgentParams(outcome.params, declared) }, declared.directories, declared.newAgent);
     } finally {
       dispatching.current = outer;
       /* PR #1451 round 3, change 4 — what voice just did may have changed the
@@ -2022,6 +2137,18 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   }, [hearNumbers, onDispatch]);
   /** The pane seams' gate: the dispatch's declaration against now, for writes to `aim`. */
   const paneLost = useCallback((aim: AgentAddress) => contextLost(dispatching.current ?? current(), current(), { pane: aim }), [current]);
+  /**
+   * PRD #1666 part 2 (G-fix7) — the agent a dispatch `target` names, as an
+   * address bound to its daemon process: the target's own where it carries
+   * one, and otherwise the process of the pane the utterance was declared on
+   * when that pane shows the target's agent. A target with neither is bound
+   * to no process, which no named pane matches.
+   */
+  const aimOf = useCallback((target: { deckId: string; agentId: string; incarnation?: string }): AgentAddress => {
+    if ("incarnation" in target) return { deckId: target.deckId, agentId: target.agentId, incarnation: target.incarnation };
+    const declared = (dispatching.current ?? current()).pane;
+    return { deckId: target.deckId, agentId: target.agentId, incarnation: declared && declared.deckId === target.deckId && declared.agentId === target.agentId ? declared.incarnation : undefined };
+  }, [current]);
 
   /**
    * PRD #1631 — the answer being given to the question on screen, if any
@@ -2109,7 +2236,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     const held = questionFormRef.current;
     if (!held) return undefined;
     return questionLost(
-      { deckId: held.target.deckId, agentId: held.target.agentId, questionId: held.target.questionId, revision: held.target.revision, spawnedAtMs: held.spawnedAtMs, inputBlocked: held.inputBlocked, deck: held.deck },
+      { deckId: held.target.deckId, agentId: held.target.agentId, questionId: held.target.questionId, revision: held.target.revision, spawnedAtMs: held.spawnedAtMs, inputBlocked: held.inputBlocked, deck: held.deck, incarnation: held.target.incarnation },
       { pane: paneRef.current, confirmation: confirmationRef.current, deck: selectedDeckRef.current },
     );
   }, []);
@@ -2194,7 +2321,8 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   /*
     PRD #1631 — the staleness rule: the answer, its confirmation and its
     countdown are dropped, with nothing sent, the moment the question waiting
-    is no longer the one answered, the pane changes or its agent is replaced,
+    is no longer the one answered, the pane changes, the deck restarts under
+    it or its agent is replaced,
     the pane stops taking input — its deck stopped answering, say (issue
     #1726) — a confirmation opens, or the selected deck changes. Each is
     something the host already hands down, so this subscribes rather than
@@ -2206,6 +2334,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   const paneQuestionDeck = pane?.deckId;
   const paneQuestionAgent = pane?.agentId;
   const paneQuestionSpawned = pane?.spawnedAtMs;
+  const paneQuestionIncarnation = pane?.incarnation;
   const paneQuestionBlocked = pane?.inputBlocked;
   const paneQuestionHidden = pane?.terminalHidden;
   useEffect(() => {
@@ -2220,7 +2349,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
        cancel it. */
     if (!lost || (lost.code === "question" && questionFormRef.current?.sending)) return;
     dropQuestion(questionLostSentence(lost));
-  }, [answerLost, confirmationOpen, dropQuestion, paneQuestionAgent, paneQuestionBlocked, paneQuestionDeck, paneQuestionHidden, paneQuestionId, paneQuestionRevision, paneQuestionSpawned, selectedDeckId]);
+  }, [answerLost, confirmationOpen, dropQuestion, paneQuestionAgent, paneQuestionBlocked, paneQuestionDeck, paneQuestionHidden, paneQuestionId, paneQuestionIncarnation, paneQuestionRevision, paneQuestionSpawned, selectedDeckId]);
 
   /**
    * PRD #1631 — an utterance said while the agent on screen waits on a
@@ -2279,7 +2408,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       setProblem(QUESTION_SAY_CONFIRM);
       return true;
     }
-    const target: VoiceQuestionTarget = { deckId: shown.deckId, agentId: shown.agentId, agent: shown.questionLabel ?? shown.label, questionId: question.id, revision: question.revision };
+    const target: VoiceQuestionTarget = { deckId: shown.deckId, agentId: shown.agentId, agent: shown.questionLabel ?? shown.label, questionId: question.id, revision: question.revision, ...(shown.incarnation ? { incarnation: shown.incarnation } : {}) };
     const spawnedAtMs = shown.spawnedAtMs;
     const inputBlocked = shown.inputBlocked;
     const deck = selectedDeckRef.current;
@@ -2300,7 +2429,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
        confirmation opened or the deck changed while the answer was worked
        out opens no countdown or confirmation over it (PR #1698 review). */
     const lost = questionLost(
-      { deckId: target.deckId, agentId: target.agentId, questionId: target.questionId, revision: target.revision, spawnedAtMs, inputBlocked, deck },
+      { deckId: target.deckId, agentId: target.agentId, questionId: target.questionId, revision: target.revision, spawnedAtMs, inputBlocked, deck, incarnation: target.incarnation },
       { pane: paneRef.current, confirmation: confirmationRef.current, deck: selectedDeckRef.current },
     );
     if (lost) {
@@ -2593,7 +2722,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       return;
     }
     try {
-      const target = { deckId: aim.deckId, agentId: aim.agentId };
+      const target = boundTarget(aim);
       const sent = sendTerminalInput(target, VOICE_DICTATION_SUBMIT);
       notePaneWrite(target, VOICE_DICTATION_SUBMIT.length, sent);
       await sent;
@@ -2605,7 +2734,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       if (sendEpoch.current !== epoch || modeGeneration.current !== generation) return;
       setProblem(sentenceOf(cause));
     }
-  }, [notePaneWrite, noteSent, questionWaiting, resetPrompt, sendTerminalInput]);
+  }, [boundTarget, notePaneWrite, noteSent, questionWaiting, resetPrompt, sendTerminalInput]);
   /**
    * Press Enter once every typed write since the last send has landed — the
    * guarded half of a spoken send, shared by "send it" and a trailing send
@@ -2740,13 +2869,16 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   const paneAgentId = pane?.agentId;
   const paneBlocked = pane?.inputBlocked;
   const paneSpawnedAtMs = pane?.spawnedAtMs;
+  /* G-fix7: the daemon process that listed the pane's agent — a restarted
+     deck's agent under the same id ends the mode and calls off a send. */
+  const paneProcess = pane?.incarnation;
   const paneHidden = pane?.terminalHidden;
   useEffect(() => {
     const mode = panelStateRef.current;
     const lost = mode.kind === "dictating" ? contextLost(mode.declared, current(), { pane: mode.target }) : undefined;
     if (lost) endDictation(lost.why);
     callOffLostSend();
-  }, [callOffLostSend, confirmationOpen, current, endDictation, paneAgentId, paneBlocked, paneDeckId, paneHidden, paneSpawnedAtMs, panelState, pending, selectedDeckId]);
+  }, [callOffLostSend, confirmationOpen, current, endDictation, paneAgentId, paneBlocked, paneDeckId, paneHidden, paneProcess, paneSpawnedAtMs, panelState, pending, selectedDeckId]);
 
   /* The host marks the pane it is typing into; a panel going away takes the
      mode with it, so it must not leave the mark behind. */
@@ -3764,7 +3896,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       if (asked) throw new QuestionWaits(voiceQuestionWaitingNoTyping(asked.label, asked.reach, asked.options));
       const record = promptFor(aim, incarnationOf(aim));
       if (sends) emptyRecord(record, false, PROMPT_EMPTIED.sent);
-      const target = { deckId: aim.deckId, agentId: aim.agentId };
+      const target = boundTarget(aim);
       const written = sendTerminalInput(target, typed);
       const write: PromptWrite = { text: typed, sent: notePaneWrite(target, typed.length, written) };
       if (!sends) record.writes.push(write);
@@ -3775,7 +3907,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         throw cause;
       }
     });
-  }, [incarnationOf, notePaneWrite, onPane, paneLost, promptFor, questionWaiting, resetPrompt, sendTerminalInput]);
+  }, [boundTarget, incarnationOf, notePaneWrite, onPane, paneLost, promptFor, questionWaiting, resetPrompt, sendTerminalInput]);
   const typeIntoAgent = useCallback((target: VoiceDispatchTarget) => {
     const mode = panelStateRef.current;
     /* PRD #1260 — while dictating, the words go to the mode's own target and
@@ -3783,7 +3915,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
        say more, and sending is "send it" or their own Enter. */
     const aim: Pending = mode.kind === "dictating"
       ? mode.target
-      : { deckId: target.deckId, agentId: target.agentId, label: target.agentLabel ?? target.agentId };
+      : { ...aimOf(target), label: target.agentLabel ?? target.agentId };
     /* The gate, before a single character is written: the pane on screen now
        must be the one this utterance was declared on, showing the same agent,
        with no confirmation open. A refusal is reported in place of the
@@ -3893,7 +4025,8 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     cancelPendingSend();
     setPending(undefined);
     stopNudge(true);
-    const lost = paneLost(target);
+    const aim = aimOf(target);
+    const lost = paneLost(aim);
     if (lost) {
       reportRefused(answerRefusal(lost));
       return;
@@ -3903,7 +4036,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
        its dialog would pick the highlighted option, past the grounding, the
        countdown and the "always allow" confirmation answering by voice goes
        through, so nothing is pressed — whichever path resolved the submit. */
-    const waiting = questionWaiting(target);
+    const waiting = questionWaiting(aim);
     if (waiting) {
       reportRefused(voiceQuestionWaitingNoEnter(waiting.label, waiting.reach, waiting.options));
       return;
@@ -3911,10 +4044,10 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     /* PRD #1541 — what voice typed is on its way out, so there is nothing
        left to scratch; the prompt is known to be empty only once the Enter
        has actually been pressed (`submitDictation`). */
-    resetPrompt(target, false, PROMPT_EMPTIED.sent);
+    resetPrompt(aim, false, PROMPT_EMPTIED.sent);
     /* After the words this Enter is meant to send. */
-    submitAfterWrites({ deckId: target.deckId, agentId: target.agentId, label: target.agentLabel ?? target.agentId });
-  }, [cancelPendingSend, paneLost, questionWaiting, reportRefused, resetPrompt, setPending, stopNudge, submitAfterWrites]);
+    submitAfterWrites({ ...aim, label: target.agentLabel ?? target.agentId });
+  }, [aimOf, cancelPendingSend, paneLost, questionWaiting, reportRefused, resetPrompt, setPending, stopNudge, submitAfterWrites]);
 
   /**
    * PRD #1541 — the checks every prompt command makes before it writes
@@ -3926,7 +4059,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * answers `undefined`.
    */
   const promptCommand = useCallback((target: VoiceDispatchTarget, command: "interrupt" | "clear" | "scratch") => {
-    const aim: AgentAddress = { deckId: target.deckId, agentId: target.agentId };
+    const aim = aimOf(target);
     const lost = paneLost(aim);
     const shown = paneRef.current;
     if (lost || !shows(shown, aim)) {
@@ -4323,7 +4456,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   useEffect(() => {
     const shown = paneRef.current;
     if (!shown) return;
-    const record = prompts.current.get(paneKey(shown));
+    const record = prompts.current.get(paneKey(paneAddress(shown)));
     if (record && !incarnationsDiffer(record.spawnedAtMs, shown.spawnedAtMs)) {
       if (paneTurn === "working" && record.turn !== undefined && record.turn !== "working") record.epoch += 1;
       record.turn = paneTurn;
@@ -4332,7 +4465,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     if (!interrupted?.latched) return;
     if (paneTurn !== "working") interrupted.sawIdle = true;
     else if (interrupted.sawIdle) interrupted.latched = false;
-  }, [paneDeckId, paneAgentId, paneSpawnedAtMs, paneTurn]);
+  }, [paneDeckId, paneAgentId, paneSpawnedAtMs, paneProcess, paneTurn]);
   /*
     PRD #1541 — let go of what is kept for agents the fleet no longer has
     (retired: gone from its deck, or its deck gone) and for incarnations it
@@ -4363,11 +4496,13 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     if (!fleet) return;
     const live = new Map<string, number | undefined>();
     for (const { connection: { deckId }, agents } of fleet) {
-      if (deckId !== undefined) for (const agent of agents) live.set(paneKey({ deckId, agentId: agent.id }), agent.spawnedAtMs);
+      if (deckId !== undefined) for (const agent of agents) live.set(paneKey({ deckId, agentId: agent.id, incarnation: agent.incarnation }), agent.spawnedAtMs);
     }
-    /* The pane on screen is live whatever the fleet says. */
+    /* The pane on screen is live whatever the fleet says. An agent listed by
+       another daemon process than the one a key was kept for (G-fix7) is not
+       that key's agent: its key is not live, and goes as a retired one does. */
     const shown = paneRef.current;
-    if (shown && !live.has(paneKey(shown))) live.set(paneKey(shown), shown.spawnedAtMs);
+    if (shown && !live.has(paneKey(paneAddress(shown)))) live.set(paneKey(paneAddress(shown)), shown.spawnedAtMs);
     const replaced = (pane: string, spawnedAtMs: number | undefined) => live.has(pane) && incarnationsDiffer(spawnedAtMs, live.get(pane));
     for (const [key, line] of paneLines.current) if (replaced(line.pane, line.spawnedAtMs)) paneLines.current.delete(key);
     const now = Date.now();
@@ -4409,7 +4544,8 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   const startDictation = useCallback((target: VoiceDispatchTarget) => {
     const shown = paneRef.current;
     const label = target.agentLabel ?? shown?.label ?? target.agentId;
-    const lost = paneLost(target);
+    const aim = aimOf(target);
+    const lost = paneLost(aim);
     if (lost || !shown) {
       reportRefused(lost?.code === "replaced" ? VOICE_PANE_REPLACED : dictationRefused(label, `${lost?.why ?? "its pane is not the one on screen"}.`));
       return;
@@ -4421,8 +4557,8 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     cancelPendingSend();
     setPending(undefined);
     const declared = current();
-    setPanelState({ kind: "dictating", target: { deckId: target.deckId, agentId: target.agentId, label }, declared });
-  }, [cancelPendingSend, current, paneLost, reportRefused, setPanelState, setPending]);
+    setPanelState({ kind: "dictating", target: { ...aim, label }, declared });
+  }, [aimOf, cancelPendingSend, current, paneLost, reportRefused, setPanelState, setPending]);
   /**
    * PRD #1260 — leave the dictation mode by voice. Answered in this surface's
    * own words (the `refusedRef` path), because only the surface knows whose

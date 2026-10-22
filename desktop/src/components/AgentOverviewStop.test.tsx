@@ -16,6 +16,7 @@ function role(deckId: string, id: string, roleName: string, roleIndex: number): 
     ...createFixtureStartedAgent({ id, daemonId: deckId, displayName: roleName, command: "claude", cwd: "/home/build/demo-project" }),
     tab: { kind: "orchestration", orchestrationId: "orc-loop", name: "loop", displayTitle: "demo-project-orchestrator-1", roleName, roleIndex, isStartRole: roleIndex === 0, cwd: "/home/build/demo-project" },
     inOrchestration: true,
+    incarnation: "listed-process-a",
   };
 }
 
@@ -58,11 +59,11 @@ describe("stopping from the overview (PRD #1223 U4)", () => {
    * Scenario: on the fleet, press the stop control on the planner role's row —
    * an agent on the REMOTE deck. A confirmation names the agent and that daemon;
    * Cancel sends nothing. Pressed again and confirmed, it sends one
-   * `stop_agent` naming the remote deck and the agent's own id.
+   * `stop_agent` naming the remote deck, agent id and the process captured when the confirmation opened, even if a refreshed row belongs to a successor.
    */
   it("confirms a stop and sends it to the daemon the agent is on", async () => {
     const runAction = vi.fn(async (): Promise<DeckActionResult> => ({ ok: true }));
-    render(<AgentOverview runtime={runtime(runAction)} onNavigate={vi.fn()} />);
+    const { rerender } = render(<AgentOverview runtime={runtime(runAction)} onNavigate={vi.fn()} />);
 
     const stop = within(row(FIXTURE_REMOTE_DAEMON_ID, "41")).getByTestId("overview-stop-agent");
     expect(stop).toHaveAccessibleName("Close planner agent");
@@ -75,10 +76,12 @@ describe("stopping from the overview (PRD #1223 U4)", () => {
     expect(runAction).not.toHaveBeenCalled();
 
     fireEvent.click(stop);
+    const successor = fleetWithOrchestration().map((deck) => ({ ...deck, agents: deck.agents.map((agent) => ({ ...agent, incarnation: "successor-process-b" })) }));
+    rerender(<AgentOverview runtime={runtime(runAction, successor)} onNavigate={vi.fn()} />);
     await act(async () => fireEvent.click(within(confirmation()!).getByRole("button", { name: "Close agent" })));
 
     expect(runAction).toHaveBeenCalledTimes(1);
-    expect(runAction).toHaveBeenCalledWith({ type: "stop_agent", deckId: FIXTURE_REMOTE_DAEMON_ID, agentId: "41" });
+    expect(runAction).toHaveBeenCalledWith({ type: "stop_agent", deckId: FIXTURE_REMOTE_DAEMON_ID, agentId: "41", incarnation: "listed-process-a" });
     expect(confirmation()).toBeNull();
   });
 
@@ -87,11 +90,11 @@ describe("stopping from the overview (PRD #1223 U4)", () => {
    * plainly that it stops EVERY role and names both; confirmed, one
    * `stop_orchestration` names the remote deck and both roles with their
    * names. Every orchestration card offers a Close; a plain agent's group
-   * offers none.
+   * offers none. A refresh after opening the confirmation must preserve each captured role's incarnation.
    */
   it("confirms closing an orchestration, naming every role, and stops them all on its deck", async () => {
     const runAction = vi.fn(async (): Promise<DeckActionResult> => ({ ok: true }));
-    render(<AgentOverview runtime={runtime(runAction)} onNavigate={vi.fn()} />);
+    const { rerender } = render(<AgentOverview runtime={runtime(runAction)} onNavigate={vi.fn()} />);
 
     const remoteGroup = screen.getAllByTestId("daemon-group").find((group) => group.getAttribute("data-daemon-id") === FIXTURE_REMOTE_DAEMON_ID)!;
     const orchestrationCards = [...remoteGroup.querySelectorAll("[data-group-kind='orchestration']")];
@@ -105,12 +108,14 @@ describe("stopping from the overview (PRD #1223 U4)", () => {
     const dialog = confirmation()!;
     expect(dialog).toHaveTextContent("Close demo-project-orchestrator-1?");
     expect(dialog).toHaveTextContent("This stops every role of this orchestration on dev@build-box — all 2 of its roles: planner, builder.");
+    const successor = fleetWithOrchestration().map((deck) => ({ ...deck, agents: deck.agents.map((agent) => ({ ...agent, incarnation: "successor-process-b" })) }));
+    rerender(<AgentOverview runtime={runtime(runAction, successor)} onNavigate={vi.fn()} />);
     await act(async () => fireEvent.click(within(dialog).getByRole("button", { name: "Close all 2 roles" })));
 
     expect(runAction).toHaveBeenCalledWith({
       type: "stop_orchestration",
       deckId: FIXTURE_REMOTE_DAEMON_ID,
-      roles: [{ agentId: "41", name: "planner" }, { agentId: "42", name: "builder" }],
+      roles: [{ agentId: "41", name: "planner", incarnation: "listed-process-a" }, { agentId: "42", name: "builder", incarnation: "listed-process-a" }],
     });
   });
 
@@ -138,5 +143,38 @@ describe("stopping from the overview (PRD #1223 U4)", () => {
 
     await act(async () => settle("refused"));
     expect(confirmation()).toBeNull();
+  });
+});
+
+describe("a spoken stop holds to the daemon process it named (PRD #1666 part 2, G-fix7)", () => {
+  /**
+   * Scenario: voice hands the overview a stop (and a close) for the planner
+   * role as daemon process A listed it, but the deck now lists an unrelated
+   * agent under that id from process B. No confirmation opens and the answer
+   * says the agent is gone with its deck's restart. The same targets naming
+   * the process that lists them now (control) open their confirmations.
+   */
+  it.each([
+    ["successor-process-b", false],
+    ["listed-process-a", true],
+  ] as const)("opens a spoken stop only for the process it named (deck lists %s)", async (listedBy, opens) => {
+    const { STOP_TARGET_RESTARTED } = await import("./AgentOverview");
+    const channel: { current: Record<string, unknown> | undefined } = { current: undefined };
+    const fleet = fleetWithOrchestration().map((deck) => ({ ...deck, agents: deck.agents.map((agent) => ({ ...agent, incarnation: listedBy })) }));
+    const runAction = vi.fn(async (): Promise<DeckActionResult> => ({ ok: true }));
+    render(<AgentOverview runtime={runtime(runAction, fleet)} onNavigate={vi.fn()} voiceChannel={channel as never} />);
+    const voice = channel.current as { confirmStopAgent: (target: object) => string | undefined; confirmCloseOrchestration: (target: object) => string | undefined };
+    const target = { deckId: FIXTURE_REMOTE_DAEMON_ID, agentId: "41", from: "overview" };
+
+    let answer: string | undefined;
+    act(() => { answer = voice.confirmStopAgent({ ...target, incarnation: "listed-process-a" }); });
+    expect(answer).toBe(opens ? undefined : STOP_TARGET_RESTARTED);
+    expect(confirmation() !== null).toBe(opens);
+    if (opens) fireEvent.click(within(confirmation()!).getByRole("button", { name: "Cancel" }));
+
+    act(() => { answer = voice.confirmCloseOrchestration({ ...target, orchestrationAgentId: "41", orchestrationIncarnation: "listed-process-a" }); });
+    expect(answer).toBe(opens ? undefined : STOP_TARGET_RESTARTED);
+    expect(confirmation() !== null).toBe(opens);
+    expect(runAction).not.toHaveBeenCalled();
   });
 });

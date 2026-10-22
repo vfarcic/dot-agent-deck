@@ -429,7 +429,7 @@ describe("voice control panel", () => {
       await flush();
       expect(screen.getByRole("button", { name: /stop typing/i })).toBeVisible();
       const write = vi.mocked(deck.sendTerminalInput);
-      const target = { deckId: snapshot.connection.deckId!, agentId: "planner" };
+      const target = { deckId: snapshot.connection.deckId!, agentId: "planner", incarnation: undefined };
       const say = async (said: string) => {
         const before = voice.voiceStop.mock.calls.length;
         steps.push({ outcome: heard(said) });

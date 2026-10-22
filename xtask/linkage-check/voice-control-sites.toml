@@ -101,6 +101,12 @@ reason = "Dismisses the status toast: a dismissal."
 [[site]]
 file = "desktop/src/App.tsx"
 handler = "onClick"
+code = "onDismissRestart"
+reason = "Dismisses the toast naming the agents a deck restart stopped: a dismissal."
+
+[[site]]
+file = "desktop/src/App.tsx"
+handler = "onClick"
 code = "onClose"
 reason = "Events drawer close X: a dismissal (the drawer's opening half is VOICE_ACTIONS.toggleEvidenceDrawer)."
 

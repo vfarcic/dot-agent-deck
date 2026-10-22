@@ -76,11 +76,12 @@ fn pane_003_empty_dashboard_never_opens_close_confirmation() {
     );
 }
 
-/// Scenario: Launch one live dashboard card and drive Ctrl+W through the real binary twice. Enter on the Cancel-default modal must preserve the card and daemon agent, while a fresh Ctrl+W followed by Down+Enter must remove both.
+/// Scenario: Launch one live dashboard card and drive Ctrl+W through the real binary twice. Enter on the Cancel-default modal preserves the card and daemon agent, while a fresh Ctrl+W followed by Down+Enter removes both at 80×24. Repeat with another card at 16×12: after Down, Enter may close it only if the final frame actually shows the Close choice, rather than covering it with Cancel.
 #[spec("prompt/close-confirm/002")]
 #[test]
 fn close_confirm_002_real_cancel_preserves_and_confirm_closes() {
     let deck = TuiDeck::builder()
+        .with_pty_size(80, 24)
         .with_continue_session("confirm-target", "cat")
         .launch_with_fixture("minimal");
     deck.wait_for_string("[Command Mode Ctrl+D]");
@@ -114,6 +115,116 @@ fn close_confirm_002_real_cancel_preserves_and_confirm_closes() {
             Duration::from_secs(5),
         ),
         "Down+Enter on Close must remove the daemon agent"
+    );
+
+    let mut tiny = TuiDeck::builder()
+        .with_pty_size(80, 24)
+        .with_continue_session("tiny-close-target", "cat")
+        .launch_with_fixture("minimal");
+    tiny.wait_for_string("[Command Mode Ctrl+D]");
+    tiny.send_keys(b"\x04");
+    tiny.wait_for_string("tiny-close-target");
+    tiny.send_keys(b"\x17");
+    tiny.wait_for_string("Close selected agent?");
+    tiny.resize(16, 12);
+    tiny.wait_until_grid("16×12 Close confirmation is drawn", |grid| {
+        grid.contains("┌ Close") && grid.contains("Cancel") && !grid.contains("tiny-close-target")
+    });
+    let before = tiny.snapshot_grid();
+    tiny.send_keys(b"\x1b[B");
+    tiny.wait_until_grid_then_hold(
+        "16×12 Close stays open after Down",
+        Duration::from_secs(1),
+        |grid| grid.contains("┌ Close") && grid.contains("Cancel"),
+    );
+    let selected = tiny.snapshot_grid();
+    let close_shown = selected.contains("> Close") || selected.contains("[Close]");
+    // Escape after Enter leaves an undrawn-choice refusal or Cancel without
+    // closing the agent. It cannot undo an accepted destructive Close.
+    tiny.send_keys(b"\r\x1b");
+    tiny.resize(80, 24);
+    tiny.wait_until_grid("close answer has settled back on the dashboard", |grid| {
+        !grid.contains("Close selected agent?")
+            && (grid.contains("tiny-close-target") || grid.contains("No active agents"))
+    });
+    if !close_shown {
+        assert!(
+            common::wait_for_agent_display_name(
+                tiny.attach_socket_path(),
+                "tiny-close-target",
+                true,
+                Duration::from_secs(5),
+            ),
+            "Enter closed an agent whose Close choice was covered by Cancel.\n\
+             Before Down:\n{before}\nAfter Down:\n{selected}\nAfter Enter:\n{}",
+            tiny.snapshot_grid()
+        );
+        let settled = tiny.snapshot_grid();
+        assert!(
+            settled.contains("tiny-close-target"),
+            "the refused close lost its card: {settled}"
+        );
+    }
+}
+
+/// Scenario: Launch one live card with the experimental flag on, press Ctrl+W, then shrink the terminal to 64×2, where the `experimental: on` label covers the dialog's [Close] button. A click where that button was drawn closes nothing: back at 80×24 the dialog is still open and the agent alive. A click on the whole [Close] at 80×24 then closes it (control).
+#[spec("prompt/close-confirm/010")]
+#[test]
+fn close_confirm_010_a_close_button_the_footer_covers_takes_no_click() {
+    let mut deck = TuiDeck::builder()
+        .with_pty_size(80, 24)
+        .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
+        .with_continue_session("covered-close-target", "cat")
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("[Command Mode Ctrl+D]");
+    deck.send_keys(b"\x04");
+    deck.wait_for_string("covered-close-target");
+    deck.wait_for_string("experimental: on");
+    deck.send_keys(b"\x17");
+    deck.wait_for_string("Close selected agent?");
+
+    // At 64×2 the dialog has no room: its button row lands on the bottom row,
+    // [Close] at columns 13..19, and the label is painted over columns 0..15.
+    deck.resize(64, 2);
+    deck.wait_until_grid_then_hold(
+        "64×2: the label covers the start of [Close]",
+        Duration::from_millis(500),
+        |grid| {
+            grid.lines().nth(1).is_some_and(|row| {
+                row.starts_with("experimental: on")
+                    && row.contains("ose]")
+                    && !row.contains("[Close]")
+            })
+        },
+    );
+    deck.click(14, 1);
+    deck.resize(80, 24);
+    deck.wait_until_grid_then_hold(
+        "the dialog is still open after the click",
+        Duration::from_secs(1),
+        |grid| grid.contains("Close selected agent?") && grid.contains("[Close]"),
+    );
+    assert!(
+        common::wait_for_agent_display_name(
+            deck.attach_socket_path(),
+            "covered-close-target",
+            true,
+            Duration::from_secs(1),
+        ),
+        "a click on a [Close] the experimental label covered closed the agent"
+    );
+
+    // Control: the whole button closes it.
+    let (col, row) = deck.wait_for_in_grid("[Close]");
+    deck.click(col + 1, row);
+    assert!(
+        common::wait_for_agent_display_name(
+            deck.attach_socket_path(),
+            "covered-close-target",
+            false,
+            Duration::from_secs(5),
+        ),
+        "control: a click on the whole [Close] did not close the agent"
     );
 }
 

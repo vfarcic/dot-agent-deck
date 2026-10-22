@@ -297,7 +297,7 @@ describe("TerminalViewport editing and paste shortcuts (issue #1422)", () => {
   it.each(["mac", "windows", "linux"] as const)("%s: follows the program's application cursor mode", async (platform) => {
     onPlatform(platform);
     const { sent, press } = mountTerminal();
-    const terminal = getTerminal(undefined, "agent-1");
+    const terminal = getTerminal(undefined, "agent-1", undefined);
     if (!terminal) throw new Error("the terminal did not register");
     const programWrites = (data: string) => new Promise<void>((resolve) => terminal.write(data, resolve));
     const named = (row: { key: string; modifiers: string[] }) => `${[...row.modifiers, row.key].join("+")}`;
@@ -408,7 +408,7 @@ describe("TerminalViewport plain Ctrl+C over a selection (issue 1705)", () => {
 
   async function mountWithSelection() {
     const mounted = mountTerminal();
-    const terminal = getTerminal(undefined, "agent-1");
+    const terminal = getTerminal(undefined, "agent-1", undefined);
     if (!terminal) throw new Error("the viewport registered no terminal");
     await new Promise<void>((resolve) => terminal.write("exit status 0", resolve));
     terminal.select(0, 0, "exit status 0".length);

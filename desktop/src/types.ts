@@ -73,7 +73,9 @@ export type AgentInbox = {
   /** PRD #1666 §6.5: the deck messages waiting on the user's Retry or Cancel. */
   attention?: InboxAttentionItem[];
   /** PRD #1666 §11: why the agent's integration takes no deck messages yet. */
-  integration?: "cli_too_old" | "adapter_too_old" | "not_armed" | "refresh_failed" | "refresh_failed_pi";
+  integration?: "cli_too_old" | "adapter_too_old" | "not_armed" | "refresh_failed" | "refresh_failed_pi" | "hooks_too_old";
+  /** PRD #1666 part 2 §2.7: the command that fixes `integration`, when the deck names one. */
+  integrationCommand?: string;
   /** PRD #1666 §3: the deck's error recording receipts for this agent. */
   receiptsDegraded?: string;
   /** PRD #1666 §7: delivered messages whose evidence pauses hand-outs. */
@@ -201,6 +203,15 @@ export interface ConnectionView {
    */
   pending?: boolean;
   message?: string;
+  /**
+   * PRD #1666 part 2 (G-fix7c) — on a connected deck, the daemon process whose
+   * listing this snapshot carries; the same value its agents' `incarnation`
+   * holds, stated for the deck so that one listing nobody still names it.
+   * Another process than the last one seen means the deck restarted
+   * (`lib/restartDrop.ts`). Absent from a deck that names none, and from a
+   * snapshot that is not connected.
+   */
+  incarnation?: string;
   /**
    * The technical half of an incompatible daemon's `message`: the declared
    * compatibility breaks by name, the protocol number on each side and the two
@@ -674,8 +685,17 @@ export type DeckView =
    * overview merges every observed deck's agents and an agent id is per-daemon
    * monotonic: `agentId` alone names an agent on the selected deck and a
    * DIFFERENT agent on any other. M6's cross-deck switch is what consumes it.
+   *
+   * `incarnation` is PRD #1666 part 2 (G-fix6): the daemon process that listed
+   * the agent when the view was opened, because a restarted deck reuses agent
+   * ids too. The view resolves its record only under that incarnation, so a
+   * newer snapshot that lists an unrelated agent under the same id is the open
+   * agent GONE, never the open agent. The key is absent only on a view nothing
+   * has bound yet; `DeckShell` binds every view it is handed
+   * (`bindViewIncarnation`), and a key holding `undefined` is a deck that named
+   * no process, on which the backend sends no action.
    */
-  | { kind: "agent"; deckId: string; agentId: string; from: "deck" | "overview" };
+  | { kind: "agent"; deckId: string; agentId: string; from: "deck" | "overview"; incarnation?: string };
 
 /**
  * An agent's tab membership exactly as the daemon reports it, mirroring
@@ -1009,6 +1029,15 @@ export interface AgentSession {
   inOrchestration?: boolean;
   /** HONEST. True for the orchestration's start role — the coordinator an operator should message. */
   isStartRole?: boolean;
+  /**
+   * HONEST. The daemon process that listed this agent (PRD #1666 part 2). A
+   * restarted deck numbers its agents from 1 again, so an action on this agent
+   * carries this value, captured when the action was offered, and the desktop
+   * sends the action only to that process — opening its terminal included.
+   * Absent from a deck that names none, and then the desktop sends no action
+   * on the agent at all.
+   */
+  incarnation?: string;
 }
 
 export interface EvidenceItem {
@@ -1260,7 +1289,7 @@ export type DeckAction =
    * resolves as it resolves a start's: never from the selection, so an agent on
    * another deck can be stopped from the overview under All Decks.
    */
-  | { type: "stop_agent"; deckId: string; agentId: string }
+  | { type: "stop_agent"; deckId: string; agentId: string; incarnation?: string }
   /**
    * PRD #1223 U4 — close a whole orchestration: stop every one of `roles` on the
    * deck `deckId` names, concurrently. There is no orchestration-wide daemon
@@ -1269,8 +1298,8 @@ export type DeckAction =
    * rejection, which arrives as a `LaunchCleanupError`; `name` is what it is
    * named as.
    */
-  | { type: "stop_orchestration"; deckId: string; roles: { agentId: string; name: string }[] }
-  | { type: "rename_agent"; agentId: string; displayName: string };
+  | { type: "stop_orchestration"; deckId: string; roles: { agentId: string; name: string; incarnation?: string }[] }
+  | { type: "rename_agent"; agentId: string; displayName: string; incarnation?: string };
 
 /**
  * Whether an agent's pane takes input. The terminal reads `history-only` and
@@ -1297,6 +1326,16 @@ export interface DeckActionResult {
    * consumer keys it as `(deckId, agentId)`, never alone.
    */
   agentId?: string;
+  /**
+   * PRD #1666 part 2 (G-fix7): for a start, the daemon process that answered
+   * it — the one that minted {@link agentId}. The key is present on every
+   * start's result (holding `undefined` for a deck that named no process) and
+   * absent on every other action's. A consumer waiting for the started agent
+   * to be listed, or opening it, matches `(deckId, agentId, agentIncarnation)`:
+   * a restarted deck lists an unrelated agent under the same id, and that one
+   * is not the agent this start made.
+   */
+  agentIncarnation?: string;
 }
 
 /** Operator-facing explanation of a non-delivered outcome. */
@@ -1375,6 +1414,15 @@ export interface TerminalChunk {
    * producer implicitly meant.
    */
   deckId?: string;
+  /**
+   * PRD #1666 part 2 (G-fix7): the daemon process whose attach produced these
+   * bytes — the incarnation of the session's target, stamped by the bridge
+   * with the deck. A restarted deck reuses agent ids, so the runtime files
+   * the chunk under the bound pair, and a viewport for a successor with the
+   * same id never reads the previous process's output. Absent is a deck that
+   * named no process, which is its own key.
+   */
+  incarnation?: string;
   data: Uint8Array;
   stream: "output" | "end" | "error";
   operation: "append" | "replace";
@@ -1398,8 +1446,14 @@ export interface TerminalBuffer {
  * xterm, under B's correctly resolved heading. See {@link agentKey}.
  */
 export interface TerminalFeed {
-  get(deckId: string | undefined, agentId: string): TerminalBuffer | undefined;
-  subscribe(deckId: string | undefined, agentId: string, listener: (buffer: TerminalBuffer) => void): () => void;
+  /**
+   * `incarnation` (PRD #1666 part 2, G-fix7) is the daemon process the agent
+   * was listed by: buffers are keyed by `boundAgentKey`, so a restarted deck's
+   * agent with the same id has a backlog of its own and never the previous
+   * process's. Required, so every reader says which process it is reading.
+   */
+  get(deckId: string | undefined, agentId: string, incarnation: string | undefined): TerminalBuffer | undefined;
+  subscribe(deckId: string | undefined, agentId: string, incarnation: string | undefined, listener: (buffer: TerminalBuffer) => void): () => void;
 }
 
 /**
@@ -1430,6 +1484,11 @@ export interface TerminalFeed {
 export interface AgentTarget {
   deckId: string;
   agentId: string;
+  /**
+   * PRD #1666 part 2: the daemon process the agent was listed by, for an
+   * action that must not reach a restarted deck's agent with the same id.
+   */
+  incarnation: string | undefined;
 }
 
 /**
@@ -1518,7 +1577,10 @@ export interface DeckRuntimeState {
   resizeTerminal: (target: AgentTarget, cols: number, rows: number) => Promise<void>;
   /**
    * PRD #882 — the geometry the daemon has APPLIED per agent, keyed by
-   * `agentKey(deckId, agentId)`.
+   * `boundAgentKey({ deckId, agentId, incarnation })`: the deck since PRD
+   * #1105's security audit, and the daemon process since PRD #1666 part 2
+   * (G-fix7), so a restarted deck's agent under the same id never inherits the
+   * previous process's grid.
    *
    * **The deck is part of that key since PRD #1105's security audit.** Nothing
    * evicts an entry per agent, so a pane opened for deck B's `planner` applied

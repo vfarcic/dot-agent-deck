@@ -528,7 +528,7 @@ fn letters_005_each_default_letter_command_has_its_ctrl_form() {
 
 /// Every [`UiMode`]. [`every_ui_mode_is_listed`] stops a new mode from being
 /// left out of it silently.
-const EVERY_UI_MODE: [UiMode; 16] = [
+const EVERY_UI_MODE: [UiMode; 17] = [
     UiMode::Normal,
     UiMode::Filter,
     UiMode::Help,
@@ -545,6 +545,7 @@ const EVERY_UI_MODE: [UiMode; 16] = [
     UiMode::HostMetrics,
     UiMode::Upgrade,
     UiMode::InboxAttention,
+    UiMode::RestartNotice,
 ];
 
 /// Fails to compile when `UiMode` gains a variant, so [`EVERY_UI_MODE`] is
@@ -567,6 +568,7 @@ fn every_ui_mode_is_listed(mode: UiMode) {
         | UiMode::CloseConfirm
         | UiMode::HostMetrics
         | UiMode::Upgrade
-        | UiMode::InboxAttention => {}
+        | UiMode::InboxAttention
+        | UiMode::RestartNotice => {}
     }
 }

@@ -35,3 +35,36 @@
 export function agentKey(deckId: string | undefined, agentId: string): string {
   return `${deckId ?? ""}\0${agentId}`;
 }
+
+/**
+ * PRD #1666 part 2 (G-fix6) — the key of one agent AS ONE DAEMON PROCESS
+ * LISTED IT: {@link agentKey} plus the incarnation of the response the id came
+ * from.
+ *
+ * A restarted deck — the same build included — numbers its agents from 1
+ * again, so `(deckId, agentId)` names the old process's agent and an unrelated
+ * successor alike. Every cache that turns a held id into a daemon request (the
+ * bridge's terminal sessions, their attach bookkeeping, their input and resize
+ * queues) is keyed by this instead, so a session attached for one incarnation
+ * is never handed to a target from another, and a target never re-derives its
+ * incarnation from a newer listing.
+ *
+ * An absent incarnation is its own key, never a wildcard: a deck that names no
+ * process matches only itself, and the backend refuses every action on it
+ * anyway. Like {@link agentKey}, never split back apart.
+ */
+export function boundAgentKey(target: { deckId: string | undefined; agentId: string; incarnation: string | undefined }): string {
+  return `${agentKey(target.deckId, target.agentId)}\0${target.incarnation ?? ""}`;
+}
+
+/**
+ * PRD #1666 part 2 (G-fix6) — whether two incarnations name the same daemon
+ * process, for a holder deciding whether a newer record is still the agent it
+ * holds. Strict equality: a value against an absent one is a different process
+ * (a deck that stopped or started naming itself), and two absent ones are the
+ * same unnamed deck — on which the backend sends no action at all
+ * (`AGENT_IDENTITY_UNKNOWN`), so treating them alike lets nothing through.
+ */
+export function sameIncarnation(held: string | undefined, current: string | undefined): boolean {
+  return held === current;
+}

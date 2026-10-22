@@ -109,6 +109,21 @@ pub const REFRESH_FAILED: &str = "the deck could not update this agent's deck in
 pub const REFRESH_FAILED_PI: &str = "the deck could not update this agent's Pi extension: run dot-agent-deck orchestrator setup with the same HOME and PI_CODING_AGENT_DIR as the agent to see why, then restart the agent";
 /// PRD #1666 §11: the capability probe proved the agent's CLI lacks the flag.
 pub const CLI_TOO_OLD: &str = "the dot-agent-deck command this agent runs does not support this deck's integration: upgrade dot-agent-deck, then restart the agent";
+/// PRD #1666 part 2 §2.7: the agent's deck hooks run a dot-agent-deck older
+/// than this deck's messages need; [`hooks_too_old_text`] adds the fix.
+pub const HOOKS_TOO_OLD: &str =
+    "this agent's deck hooks run a dot-agent-deck too old for its messages";
+/// [`HOOKS_TOO_OLD`]'s fix when the deck can name no command to run.
+pub const HOOKS_TOO_OLD_UPGRADE: &str = "upgrade the dot-agent-deck the hooks run, or run hooks install from the copy you want them to use, then restart the agent";
+
+/// [`HOOKS_TOO_OLD`] with its fix: `command`, the deck's own `hooks install`
+/// line, when it has one.
+pub fn hooks_too_old_text(command: Option<&str>) -> String {
+    match command {
+        Some(command) => format!("{HOOKS_TOO_OLD}: run {command}, then restart the agent"),
+        None => format!("{HOOKS_TOO_OLD}: {HOOKS_TOO_OLD_UPGRADE}"),
+    }
+}
 /// PRD #1666 §11: a reversible readiness notice, cleared by a registration.
 pub const NOT_ARMED: &str =
     "this agent's deck integration has not connected yet; its messages wait until it does";
@@ -152,6 +167,8 @@ pub enum IntegrationNotice {
     NotArmed,
     RefreshFailed,
     RefreshFailedPi,
+    /// Part 2 §2.7: shown with its command ([`hooks_too_old_text`]).
+    HooksTooOld,
 }
 
 impl IntegrationNotice {
@@ -162,6 +179,7 @@ impl IntegrationNotice {
             IntegrationNotice::NotArmed => NOT_ARMED,
             IntegrationNotice::RefreshFailed => REFRESH_FAILED,
             IntegrationNotice::RefreshFailedPi => REFRESH_FAILED_PI,
+            IntegrationNotice::HooksTooOld => HOOKS_TOO_OLD,
         }
     }
 
@@ -172,6 +190,7 @@ impl IntegrationNotice {
             IntegrationNotice::NotArmed => 3,
             IntegrationNotice::RefreshFailed => 4,
             IntegrationNotice::RefreshFailedPi => 5,
+            IntegrationNotice::HooksTooOld => 6,
         }
     }
 
@@ -183,6 +202,7 @@ impl IntegrationNotice {
             3 => Some(Some(IntegrationNotice::NotArmed)),
             4 => Some(Some(IntegrationNotice::RefreshFailed)),
             5 => Some(Some(IntegrationNotice::RefreshFailedPi)),
+            6 => Some(Some(IntegrationNotice::HooksTooOld)),
             _ => None,
         }
     }
@@ -236,6 +256,9 @@ pub const CARD_INBOX_METADATA_KEY: &str = "inbox_card";
 /// Beside [`CARD_INBOX_METADATA_KEY`]: the deck's receipt-storage error, when
 /// [`CardInbox::receipts_degraded`] holds one.
 pub const CARD_INBOX_DEGRADED_METADATA_KEY: &str = "inbox_card_degraded";
+/// Beside [`CARD_INBOX_METADATA_KEY`]: the command that fixes the integration
+/// notice, when [`CardInbox::integration_command`] holds one.
+pub const CARD_INBOX_COMMAND_METADATA_KEY: &str = "inbox_card_command";
 
 /// What a card shows of its agent's inbox.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -258,6 +281,8 @@ pub struct CardInbox {
     pub not_started: usize,
     /// PRD #1666 §11: why the agent's integration cannot take messages yet.
     pub integration: Option<IntegrationNotice>,
+    /// Part 2 §2.7: the command that fixes `integration`.
+    pub integration_command: Option<String>,
     /// PRD #1666 §7: delivered messages whose evidence pauses hand-outs.
     pub evidence_paused: Option<usize>,
     /// PRD #1666 §3: the deck's receipt-storage error for this agent.
@@ -306,6 +331,9 @@ impl CardInbox {
     /// means, held_long attention, then failed receipt storage — the first
     /// that holds.
     pub fn notice_text(&self) -> Option<String> {
+        if self.integration == Some(IntegrationNotice::HooksTooOld) {
+            return Some(hooks_too_old_text(self.integration_command.as_deref()));
+        }
         if let Some(notice) = self.integration {
             return Some(notice.text().to_string());
         }
@@ -435,6 +463,8 @@ mod tests {
         assert_eq!(words["notArmed"], NOT_ARMED);
         assert_eq!(words["refreshFailed"], REFRESH_FAILED);
         assert_eq!(words["refreshFailedPi"], REFRESH_FAILED_PI);
+        assert_eq!(words["hooksTooOld"], HOOKS_TOO_OLD);
+        assert_eq!(words["hooksTooOldUpgrade"], HOOKS_TOO_OLD_UPGRADE);
         assert_eq!(words["receiptsDegraded"], RECEIPTS_DEGRADED);
         assert_eq!(
             words["evidencePaused"]
@@ -535,7 +565,7 @@ mod tests {
             "-1,0",
             "1,0,2",
             "1,0,1,0",
-            "1,0,0,0,0,6,-",
+            "1,0,0,0,0,7,-",
             "1,0,0,0,0,0,x",
             "1,0,0,1,0,0,-,0,2",
             "1,0,0,1,0,0,-,0,x",

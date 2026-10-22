@@ -25,6 +25,7 @@ vi.mock("./TerminalViewport", () => ({
 }));
 
 import { DeckShell as AppDeckShell } from "../App";
+import { AGENTS_STOPPED_BY_RESTART } from "../lib/agentIdentity";
 
 // The existing command cases cover the experimental deck. The shipped-default
 // cases below clear this query parameter in their nested beforeEach.
@@ -1321,6 +1322,49 @@ describe("typing into the open agent", () => {
     expect(screen.getByTestId("voice-report")).toHaveTextContent(`The agent in ${PLANNER_LABEL}'s pane was replaced, so nothing was sent. What was typed went to the agent it replaced.`);
     await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS * 2); });
     expect(sendTerminalInput).toHaveBeenCalledTimes(1);
+  });
+
+  /** Scenario (PRD #1666 part 2, G-fix7): one-shot words are typed into
+   * Planner as daemon process A listed it; the deck then restarts as process B
+   * and lists an unrelated Planner under the same id, with the same spawn time.
+   * No countdown runs and no Enter is pressed into B's prompt, and the report
+   * says the send was called off (the pane, bound to A, closes as gone). The
+   * same process re-listing it (control) still sends. */
+  it.each([
+    ["process-b", false],
+    ["process-a", true],
+  ] as const)("holds a one-shot send to its daemon process (listed again by %s)", async (process, sends) => {
+    const voice = microphone(["open the planner"]);
+    const said = "type run the login tests";
+    let settleTyped: () => void = () => {};
+    const sendTerminalInput = vi.fn(async (_target: { deckId: string; agentId: string; incarnation?: string }, text: string) => {
+      if (text !== VOICE_DICTATION_SUBMIT) await new Promise<void>((resolve) => { settleTyped = resolve; });
+    });
+    const listed = (incarnation: string) => {
+      const snapshot = plannerWithSpawnTime();
+      snapshot.agents = snapshot.agents.map((agent) => ({ ...agent, incarnation }));
+      return snapshot;
+    };
+    const first = listed("process-a");
+    const deck = runtime(speaking({ [said]: dictated(said, "type") }), voice, { sendTerminalInput, snapshot: first, fleet: [first] });
+    const { rerender } = render(<DeckShell runtime={deck} />);
+    await openPlanner(voice);
+    voice.deliver(said);
+    await completeUtterance();
+    expect(sendTerminalInput).toHaveBeenCalledWith({ deckId: DECK_ID, agentId: "planner", incarnation: "process-a" }, "run the login tests ");
+
+    const next = listed(process);
+    rerender(<DeckShell runtime={{ ...deck, snapshot: next, fleet: [next] }} />);
+    await act(async () => { settleTyped(); await Promise.resolve(); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS * 2); });
+    if (sends) {
+      expect(sendTerminalInput.mock.calls.at(-1)).toEqual([{ deckId: DECK_ID, agentId: "planner", incarnation: "process-a" }, VOICE_DICTATION_SUBMIT]);
+      return;
+    }
+    expect(sendTerminalInput.mock.calls.map(([, text]) => text), "nothing may be pressed into the successor's prompt").toEqual(["run the login tests "]);
+    expect(sendTerminalInput.mock.calls.every(([target]) => target.incarnation === "process-a")).toBe(true);
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(/called off|gone \(the deck restarted\)/);
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Nothing was sent");
   });
 
   /** Scenario: the user leaves Planner's pane or selects another deck while a
@@ -4435,6 +4479,94 @@ describe("PRD #802 D5 — a spoken stop opens a confirmation; a spoken start sta
       ? "Nothing ran — the agent was replaced. Say it again."
       : "Nothing ran — the deck changed. Say it again.");
     expect(screen.getByTestId("voice-report")).not.toHaveTextContent(answer.outcome.kind === "dispatch" ? answer.outcome.sentence : "Confirm");
+  });
+
+  /** Scenario (PRD #1666 part 2, G-fix7): a spoken stop or close is still
+   * resolving when the deck restarts as another daemon process and lists an
+   * unrelated agent under the same id — with no spawn time reported, so only
+   * the process tells them apart. No confirmation opens and the report says
+   * the agent is gone. The same process listing it again (control) opens the
+   * confirmation, and confirming stops the agent as that process listed it. */
+  it.each([
+    ["stop_agent", "process-b"],
+    ["stop_agent", "process-a"],
+    ["close_orchestration", "process-b"],
+    ["close_orchestration", "process-a"],
+  ] as const)("holds a direct %s to its daemon process (listed again by %s)", async (action, process) => {
+    const voice = microphone([]);
+    const { deck, runAction, snapshot } = d5Deck(voice);
+    const listed = (incarnation: string) => ({ ...snapshot, agents: snapshot.agents.map((agent) => ({ ...agent, spawnedAtMs: undefined, incarnation })) });
+    const first = listed("process-a");
+    const target = first.agents.find((agent) => agent.id === "planner") ?? first.agents[0];
+    const utterance = `${action === "stop_agent" ? "stop" : "close"} ${target.id}`;
+    const answer = action === "stop_agent"
+      ? dispatch(action, "confirmStopAgent", `Confirm stopping ${target.id} — nothing has been stopped yet.`, utterance,
+        [{ name: "agent", kind: "agent_ref", spoken: target.id, value: target.id, label: target.displayName ?? target.id }])
+      : dispatch(action, "confirmCloseOrchestration", "Confirm closing review — nothing has been stopped yet.", utterance,
+        [{ name: "orchestration", kind: "orchestration_ref", spoken: first.agents[0].id, value: first.agents[0].id, label: "review" }]);
+    let settle: (result: VoiceResultDto) => void = () => {};
+    const resolveVoice: ResolveVoice = vi.fn(() => new Promise<VoiceResultDto>((resolve) => { settle = resolve; }));
+    const pendingDeck = { ...deck, resolveVoice, snapshot: first, fleet: [first] };
+    const { rerender } = render(<DeckShell runtime={pendingDeck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    voice.deliver(utterance);
+    await completeUtterance();
+    expect(confirmation()).toBeNull();
+
+    const next = listed(process);
+    rerender(<DeckShell runtime={{ ...pendingDeck, snapshot: next, fleet: [next] }} initialView={{ kind: "overview" }} />);
+    await act(async () => { settle(answer); await Promise.resolve(); });
+    await flush();
+
+    if (process === "process-b") {
+      expect(confirmation(), "no confirmation may open for a restarted deck's agent").toBeNull();
+      expect(runAction).not.toHaveBeenCalled();
+      expect(screen.getByTestId("voice-report")).toHaveTextContent("Nothing ran — that agent is gone (the deck restarted). Say it again.");
+      return;
+    }
+    expect(confirmation()).not.toBeNull();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: action === "stop_agent" ? "Close agent" : "Close all 2 roles" }));
+      await Promise.resolve();
+    });
+    await flush();
+    expect(runAction).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(runAction.mock.calls[0][0])).toContain("process-a");
+  });
+
+  /** Scenario (PRD #1666 part 2, G-fix7c): a spoken stop is still resolving when the deck restarts as another process, whose listing either reuses its agent id or lists nobody. The app shows the one restart notice naming the stopped agent, and the voice report still says that agent is gone; nothing is sent. When the same process lists it again (control), there is no notice and the confirmation opens. */
+  it.each([["process-b", false], ["process-b", true], ["process-a", false]] as const)("says a voice stop on an agent the restart dropped is gone, beside the restart notice (listed again by %s; empty: %s)", async (process, empty) => {
+    const voice = microphone([]);
+    const { deck, runAction, snapshot } = d5Deck(voice);
+    const listed = (incarnation: string, agents = snapshot.agents) => ({ ...snapshot, connection: { ...snapshot.connection, incarnation }, agents: agents.map((agent) => ({ ...agent, spawnedAtMs: undefined, incarnation })) });
+    const first = listed("process-a");
+    const target = first.agents.find((agent) => agent.id === "planner") ?? first.agents[0];
+    const utterance = `stop ${target.id}`;
+    const answer = dispatch("stop_agent", "confirmStopAgent", `Confirm stopping ${target.id} — nothing has been stopped yet.`, utterance,
+      [{ name: "agent", kind: "agent_ref", spoken: target.id, value: target.id, label: target.displayName ?? target.id }]);
+    let settle: (result: VoiceResultDto) => void = () => {};
+    const resolveVoice: ResolveVoice = vi.fn(() => new Promise<VoiceResultDto>((resolve) => { settle = resolve; }));
+    const pendingDeck = { ...deck, resolveVoice, snapshot: first, fleet: [first] };
+    const { rerender } = render(<DeckShell runtime={pendingDeck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    voice.deliver(utterance);
+    await completeUtterance();
+
+    const next = listed(process, empty ? [] : snapshot.agents);
+    rerender(<DeckShell runtime={{ ...pendingDeck, snapshot: next, fleet: [next] }} initialView={{ kind: "overview" }} />);
+    await act(async () => { settle(answer); await Promise.resolve(); });
+    await flush();
+
+    if (process === "process-b") {
+      expect(screen.getByTestId("restart-toast")).toHaveTextContent(`${AGENTS_STOPPED_BY_RESTART}: `);
+      expect(screen.getByTestId("restart-toast")).toHaveTextContent(target.displayName);
+      expect(confirmation(), "no confirmation may open for a restarted deck's agent").toBeNull();
+      expect(runAction).not.toHaveBeenCalled();
+      expect(screen.getByTestId("voice-report")).toHaveTextContent("Nothing ran — that agent is gone (the deck restarted). Say it again.");
+      return;
+    }
+    expect(screen.queryByTestId("restart-toast")).toBeNull();
+    expect(confirmation()).not.toBeNull();
   });
 
   /**

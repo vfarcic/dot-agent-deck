@@ -10629,6 +10629,28 @@ pub fn spawn_daemon_serve_with_env(
     let mut hook_socket = work.join("hook.sock");
     let mut attach_socket = work.join("attach.sock");
     let schedules_path = work.join("schedules.toml");
+    // Create the doorbell seam before socket binding can temporarily mask
+    // the owner's directory search bit with the daemon's process-wide umask.
+    if let Some((_, name)) = extra_env
+        .iter()
+        .rev()
+        .find(|(key, _)| *key == "DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_DIR")
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let name = Path::new(name);
+        assert!(
+            name.components().count() == 1
+                && matches!(
+                    name.components().next(),
+                    Some(std::path::Component::Normal(_))
+                ),
+            "doorbell seam must be a directory directly under fixture HOME"
+        );
+        let controls = home.join(name);
+        std::fs::create_dir(&controls).expect("create doorbell controls before daemon startup");
+        std::fs::set_permissions(&controls, std::fs::Permissions::from_mode(0o700))
+            .expect("make doorbell controls searchable by fixture owner");
+    }
     if let Some(toml) = initial_schedules_toml {
         std::fs::write(&schedules_path, toml).expect("seed schedules.toml");
     }
@@ -11912,14 +11934,66 @@ pub fn claude_hook_line(bin: &str, payload_json: &str) -> String {
 }
 
 /// [`claude_hook_line`] for the common case: the `SessionStart` event that acts
-/// as the agent-ready signal the spawn-time prompt gate waits on.
+/// as the agent-ready signal the spawn-time prompt gate waits on, followed by
+/// [`CLAUDE_PROMPT_FRAME`], since Claude Code draws its prompt after it.
 #[allow(dead_code)]
 pub fn claude_session_start_line(bin: &str, session_id: &str) -> String {
-    claude_hook_line(
-        bin,
-        &format!(r#"{{"hook_event_name":"SessionStart","session_id":"{session_id}"}}"#),
+    format!(
+        "{}{CLAUDE_PROMPT_FRAME}",
+        claude_hook_line(
+            bin,
+            &format!(r#"{{"hook_event_name":"SessionStart","session_id":"{session_id}"}}"#),
+        )
     )
 }
+
+/// The command that draws [`CLAUDE_PROMPT_FRAME`]'s box, once.
+macro_rules! claude_prompt_draw {
+    () => {
+        "printf '%s\\n❯\\n%s\\n' '────────────────────' '────────────────────'"
+    };
+}
+
+/// PRD #1666 part 2: a shell line that draws Claude Code's empty prompt box
+/// the way 2.1.300 does (a rule, the `❯` marker, a rule), for a stand-in that
+/// plays Claude Code. Claude Code posts its `SessionStart` before that box is
+/// up, so the doorbell rings a generation that has only started once
+/// `dot_agent_deck::agent_registry::claude_prompt_on_screen` finds it; a
+/// stand-in that reports only `SessionStart` draws it after, as the agent does.
+///
+/// It also repaints the box in place on `SIGWINCH`, as Claude Code does: a
+/// resize clears the daemon's copy of the pane's output (the attach that sizes
+/// a new pane is one), so a box drawn before it is no longer there for the
+/// doorbell to find. Drawn once only, the box was lost whenever the attach's
+/// resize landed after it, and the first prompt was never rung
+/// (`scheduler/form/007`, red on PR #1817).
+///
+/// The repaint runs in a background subshell parked in `wait`, because `sh`
+/// runs a trap only once its current command returns, and the stand-ins spend
+/// their life blocked in `read`; `wait` is interrupted by a trapped signal. As
+/// an asynchronous list of a shell without job control, the subshell shares the
+/// terminal's foreground process group, so it is sent both the `SIGWINCH` and
+/// the hangup that ends it when the pane closes.
+///
+/// The subshell draws the first box too, after installing its trap, so no
+/// resize falls between a box and the trap that would repaint it: one before
+/// the trap is cleared before the box is drawn. The stand-in still waits for
+/// that box before its next line: the subshell holds the pipe to `cat` until
+/// the box is out, and then writes to the terminal through fd 9.
+///
+/// Its loop checks once a second whether the stand-in's shell (`$$`) is still
+/// there, and ends after it is gone. A stand-in shell that has exited but is
+/// not yet reaped, or whose PID is reused, keeps it running until the pane's
+/// hangup, and each resize can leave one `sleep 1` running out its second.
+#[allow(dead_code)]
+pub const CLAUDE_PROMPT_FRAME: &str = concat!(
+    "exec 9>&1\n{ ( trap \"printf '\\033[H\\033[2J' >&9; ",
+    claude_prompt_draw!(),
+    " >&9\" WINCH; ",
+    claude_prompt_draw!(),
+    " >&9; exec >&9; while kill -0 $$ 2>/dev/null; do sleep 1 & wait $!; done ) & } \
+     | cat >/dev/null\n"
+);
 
 /// The [`write_late_announcing_agent`] log line meaning "my PTY input queue was
 /// EMPTY at the instant I announced myself" — i.e. nothing was written before an
@@ -11985,7 +12059,9 @@ pub const LATE_ANNOUNCE_RECEIVED: &str = "received|";
 /// 2. the genuine one after the delay — the first event that actually establishes
 ///    `AppState::pane_hook_session_id` for the pane.
 ///
-/// After announcing it reads stdin forever, logging each line and reporting it
+/// After announcing it draws Claude Code's prompt box ([`CLAUDE_PROMPT_FRAME`]),
+/// which the doorbell waits for in a Claude Code generation that has only
+/// started (PRD #1666 part 2). Then it reads stdin forever, logging each line and reporting it
 /// back as a `UserPromptSubmit`, so a delivery can genuinely CONFIRM and the
 /// card's prompt history becomes the user-altitude evidence.
 ///
@@ -12017,6 +12093,7 @@ pub fn write_late_announcing_agent(
         &format!(
             "{prologue}\
              {genuine_start}\
+             {CLAUDE_PROMPT_FRAME}\
              while IFS= read -r line; do\n\
              \x20 printf 'received|%s\\n' \"$line\" >> \"$log\"\n\
              \x20 {json_escape}\n\
@@ -12073,6 +12150,7 @@ pub fn write_late_announcing_paste_agent(
         &format!(
             "{prologue}\
              {genuine_start}\
+             {CLAUDE_PROMPT_FRAME}\
              paste_open=$(printf '\\033[200~')\n\
              paste_close=$(printf '\\033[201~')\n\
              in_paste=0\n\

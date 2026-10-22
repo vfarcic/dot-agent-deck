@@ -83,6 +83,7 @@ pub mod inbox_attempts;
 pub mod inbox_cli;
 pub mod inbox_display;
 pub mod inbox_hub;
+pub mod inbox_oneshot;
 pub mod inbox_prompt;
 pub mod inbox_pubsub;
 pub mod inbox_receipt;

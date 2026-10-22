@@ -20,9 +20,9 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::agent_view::AgentView;
 use crate::dto::{
-    BootstrapOptions, ConnectionStatus, DesktopConnection, DesktopSnapshot, HostMetricsReportDto,
-    deck_path_text, deck_wire_id, disconnected_snapshot_because, map_agent, observed_fleet,
-    observed_fleet_decks, safe_message, selection_fields, unconfigured_fleet,
+    BootstrapOptions, ConnectionStatus, DesktopAgent, DesktopConnection, DesktopSnapshot,
+    HostMetricsReportDto, deck_path_text, deck_wire_id, disconnected_snapshot_because, map_agent,
+    observed_fleet, observed_fleet_decks, safe_message, selection_fields, unconfigured_fleet,
 };
 use crate::endpoint_tunnels::{EndpointTunnels, TunnelLease};
 
@@ -103,13 +103,23 @@ pub(crate) struct TrustedDaemon {
 impl TrustedDaemon {
     pub(crate) fn require_compatible(&self) -> Result<(), String> {
         if self.connection.status == ConnectionStatus::Connected {
-            Ok(())
-        } else {
-            Err(self
-                .connection
-                .error
-                .clone()
-                .unwrap_or_else(|| "the daemon is not protocol-compatible".into()))
+            return Ok(());
+        }
+        let error = self
+            .connection
+            .error
+            .clone()
+            .unwrap_or_else(|| "the daemon is not protocol-compatible".into());
+        // PRD #1666 part 2 (`lifecycle/handshake/011`): a refusal on the attach
+        // protocol names both numbers, in the words the TUI's refusal uses
+        // (issue #405), so a user moving between the two clients reads the
+        // same fact the same way.
+        let client = self.connection.client_protocol_version;
+        match self.connection.server_protocol_version {
+            Some(server) if server != client => Err(format!(
+                "{error} Not attaching: the daemon speaks attach protocol v{server}, but this app speaks v{client}."
+            )),
+            _ => Err(error),
         }
     }
 
@@ -323,12 +333,25 @@ pub(crate) struct DaemonLinks {
     /// Total handshakes performed, for tests and for the milestone's
     /// before/after measurement. Never read by production logic.
     handshakes: AtomicUsize,
+    // Per-instance clock seam. No process environment or global clock changes.
+    #[cfg(test)]
+    test_cache_age: std::sync::Mutex<Option<Duration>>,
+    #[cfg(test)]
+    test_cache_lookups: std::sync::Mutex<Vec<Duration>>,
     /// Issue #1490: the last answer to "why is this remote deck not
     /// connected?", by deck. Asking costs ssh round trips, so the deck's
     /// watcher asks at most every [`REMOTE_REASON_TTL`] and every snapshot
     /// reads the stored answer; a local deck is asked afresh each time, since
     /// asking is one connect on its socket.
     reasons: std::sync::Mutex<HashMap<EndpointIdentity, StoredReason>>,
+    /// PRD #1666 part 2 (`lifecycle/handshake/011`): how many times
+    /// [`Self::invalidate`] has run for each deck. [`Self::trusted`] reads it
+    /// before it handshakes and publishes only if it has not moved, so a
+    /// handshake that was already in flight when its deck was distrusted
+    /// cannot hold the old classification afterwards. Bumped and compared
+    /// under the `links` lock, so the two are exact against each other, as
+    /// `invalidate_all`'s epoch is.
+    invalidations: std::sync::Mutex<HashMap<EndpointIdentity, u64>>,
 }
 
 /// How long a remote deck's stored [`DisconnectedReason`] stands before its
@@ -377,12 +400,39 @@ impl Default for DaemonLinks {
             gates: std::sync::Mutex::new(HashMap::new()),
             tunnels: Arc::new(EndpointTunnels::default()),
             handshakes: AtomicUsize::new(0),
+            #[cfg(test)]
+            test_cache_age: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_cache_lookups: std::sync::Mutex::new(Vec::new()),
             reasons: std::sync::Mutex::new(HashMap::new()),
+            invalidations: std::sync::Mutex::new(HashMap::new()),
         }
     }
 }
 
 impl DaemonLinks {
+    #[cfg(test)]
+    pub(crate) fn pin_cache_age_for_test(&self, age: Duration) {
+        *self.test_cache_age.lock().unwrap() = Some(age);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assert_fresh_cache_clock_for_test(&self) {
+        assert_eq!(
+            *self.test_cache_age.lock().unwrap(),
+            Some(Duration::ZERO),
+            "stale-cache reproduction must stay inside the five-second cache lifetime"
+        );
+        assert!(
+            self.test_cache_lookups
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|age| *age == Duration::ZERO),
+            "a cached lookup aged out: expiry is not evidence of EOF invalidation"
+        );
+    }
+
     /// Why `endpoint`'s deck is not connected (issue #1490). A local deck is
     /// asked now; a remote one answers from what its watcher last stored, or
     /// "not checked yet" before the first answer.
@@ -561,16 +611,25 @@ impl DaemonLinks {
         let _establishing = gate.lock().await;
         {
             let mut links = self.links.lock().await;
-            if let Some(held) = links.get(&key)
-                && held.is_fresh(Instant::now())
-            {
-                return Ok(Arc::clone(held));
+            if let Some(held) = links.get(&key) {
+                let now = Instant::now();
+                #[cfg(test)]
+                let now = self.test_cache_age.lock().unwrap().map_or(now, |age| {
+                    self.test_cache_lookups.lock().unwrap().push(age);
+                    held.established + age
+                });
+                if held.is_fresh(now) {
+                    return Ok(Arc::clone(held));
+                }
             }
             // Removed BEFORE the handshake and while nothing else can be
             // establishing for this deck, so a stale classification is never
             // readable during the window in which it is being replaced.
             links.remove(&key);
         }
+        // Read after the removal, under no lock `invalidate` waits on, and
+        // compared at the publish below under the `links` lock it bumps under.
+        let invalidated_at = self.invalidation_epoch(&key);
         let established = Arc::new(establish(endpoint, &self.tunnels).await?);
         self.handshakes.fetch_add(1, Ordering::Relaxed);
         let mut links = self.links.lock().await;
@@ -597,8 +656,13 @@ impl DaemonLinks {
         // `ssh` child, for a deck nothing observes. Returning the link without
         // holding it is the right fallback: the caller gets its answer and
         // everything it stands on dies with the request.
+        //
+        // PRD #1666 part 2: and only if this deck was not distrusted while the
+        // handshake ran — a terminal stream that ended meanwhile says the
+        // daemon this reply came from may already have been replaced.
         if established.connection.status == ConnectionStatus::Connected
             && self.tunnels.generation().current() == wanted_at
+            && self.invalidation_epoch(&key) == invalidated_at
         {
             links.insert(key, Arc::clone(&established));
         }
@@ -636,8 +700,32 @@ impl DaemonLinks {
 
     /// Forget the link for `endpoint`, so the next [`Self::trusted`] handshakes
     /// again.
+    ///
+    /// PRD #1666 part 2: and supersede a handshake for it already in flight,
+    /// which would otherwise hold its classification after this returns (the
+    /// `invalidations` field).
     pub(crate) async fn invalidate(&self, endpoint: &Endpoint) {
-        self.links.lock().await.remove(&endpoint.identity());
+        let key = endpoint.identity();
+        let mut links = self.links.lock().await;
+        {
+            let mut invalidations = self
+                .invalidations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let epoch = invalidations.entry(key.clone()).or_default();
+            *epoch = epoch.wrapping_add(1);
+        }
+        links.remove(&key);
+    }
+
+    /// How many times `key` has been [`Self::invalidate`]d.
+    fn invalidation_epoch(&self, key: &EndpointIdentity) -> u64 {
+        self.invalidations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Forget every link. Used where the reason to distrust the held state is
@@ -664,6 +752,13 @@ impl DaemonLinks {
     #[cfg(test)]
     pub(crate) async fn held(&self) -> usize {
         self.links.lock().await.len()
+    }
+
+    /// [`Self::held`] from synchronous code, such as a publish callback;
+    /// `None` while someone else holds the map.
+    #[cfg(test)]
+    pub(crate) fn held_now(&self) -> Option<usize> {
+        self.links.try_lock().ok().map(|links| links.len())
     }
 
     /// How many handshakes have been performed since this store was created.
@@ -1238,6 +1333,26 @@ fn hook_binary_notices(response: &AttachResponse) -> Vec<crate::dto::HookBinaryN
         .collect()
 }
 
+/// The held client's admission ([`DaemonClient::with_protocol_gate_admitting`]):
+/// the `Hello` that opens a gated request's own connection, classified exactly
+/// as the connect-time handshake is — protocol, declared contract breaks, and
+/// whichever allowance is armed at the moment of the request. Refused in the
+/// classification's own sentence, so a request refused here reads the same as
+/// the deck's connection banner.
+fn admits_on_its_own_connection(response: &AttachResponse) -> Result<(), String> {
+    let info = classify_handshake(
+        response,
+        &dot_agent_deck::build_id::local_build_id(),
+        build_mismatch_allowance(),
+    );
+    match info.status {
+        ConnectionStatus::Connected => Ok(()),
+        _ => Err(info
+            .error
+            .unwrap_or_else(|| "the daemon is not compatible with this app".into())),
+    }
+}
+
 /// [`classify_handshake`] with the process-wide allowance read, for
 /// `endpoint_test`'s pure classification tests.
 ///
@@ -1298,6 +1413,9 @@ fn connection_from_handshake(endpoint: &Endpoint, handshake: HandshakeInfo) -> D
         // A daemon answered the handshake, so this is no disconnected deck.
         disconnected_reason: None,
         hook_binary_notices: handshake.hook_binary_notices,
+        // A handshake lists nothing; `connected_snapshot` names the process
+        // whose listing the snapshot carries.
+        incarnation: dot_agent_deck::daemon_client::Incarnation::default(),
     }
 }
 
@@ -1472,10 +1590,19 @@ async fn establish(
     // attach made through the link names the desktop. No capability check is
     // needed for that: an older daemon's `AttachRequest` does not deny unknown
     // fields, so it decodes the attach and ignores `client_id`.
+    //
+    // PRD #1666 part 2: and gated, with this module's own classification as the
+    // admission. Every attach, agent listing, start and subscription this link
+    // carries — the watcher's, the snapshot's, New agent's, an orchestration
+    // launch's, voice's — goes on a connection whose own `Hello` the daemon
+    // answered and `classify_handshake` accepted, so a daemon that replaced
+    // this one after the reply above is refused on that request exactly as it
+    // would be at connect, contract breaks and `Connect anyway` included.
     let client = transport
         .client()
         .map_err(safe_message)?
-        .with_client_id(desktop_client_id());
+        .with_client_id(desktop_client_id())
+        .with_protocol_gate_admitting(admits_on_its_own_connection);
     // PRD #819 M5/M6: capture the advertised set from THIS reply.
     //
     // Its invalidation rule used to be satisfied structurally by accident —
@@ -1646,7 +1773,13 @@ pub(crate) async fn snapshot_with(
         if view.needs_fetch(tokio::time::Instant::now()).is_none() {
             let records = view.records();
             let host = held_host_metrics(view);
-            return connected_snapshot(connection, records, view.schedule_revision(), host);
+            return connected_snapshot(
+                connection,
+                records,
+                view.schedule_revision(),
+                host,
+                view.incarnation().cloned(),
+            );
         }
         // PRD #1258 M4: the host sample rides the same refreshes the list does —
         // the first one, every reconcile tick and every refetch — and is asked
@@ -1665,7 +1798,13 @@ pub(crate) async fn snapshot_with(
                 view.install(listing, now);
                 view.install_host_metrics(host, now);
                 let host = held_host_metrics(view);
-                connected_snapshot(connection, view.records(), view.schedule_revision(), host)
+                connected_snapshot(
+                    connection,
+                    view.records(),
+                    view.schedule_revision(),
+                    host,
+                    view.incarnation().cloned(),
+                )
             }
             Err(error) => {
                 // The fetch failed, so the view's demand stands: it was never
@@ -1690,6 +1829,7 @@ pub(crate) async fn snapshot_with(
             listing.records,
             listing.schedule_revision,
             host.map(|report| HostMetricsReportDto::from_report(&report, Duration::ZERO)),
+            listing.incarnation,
         ),
         Err(error) => {
             // The held link just failed to carry a request. Whatever is at the
@@ -1764,18 +1904,35 @@ fn held_host_metrics(view: &AgentView) -> Option<HostMetricsReportDto> {
     })
 }
 
+///
+/// PRD #1666 part 2 (G-fix4): every row is stamped with `incarnation`, the
+/// daemon process whose reply `records` is, so an action the webview sends
+/// back for one of them is bound to that process. `None` — a listing over an
+/// unbound, ungated handle, which the held client never is — stamps a daemon
+/// that named no process, and an action bound to that is refused outright
+/// (PRD #1666 part 2, G-fix5: `ClientError::DaemonUnnamed`).
 fn connected_snapshot(
     connection: DesktopConnection,
     records: Vec<dot_agent_deck::daemon_client::AgentRecord>,
     schedule_revision: Option<u64>,
     host_metrics: Option<HostMetricsReportDto>,
+    incarnation: Option<dot_agent_deck::daemon_client::Incarnation>,
 ) -> DesktopSnapshot {
+    let incarnation = incarnation.unwrap_or_default();
     DesktopSnapshot {
         connection: DesktopConnection {
             running_agent_count: Some(records.len()),
+            // G-fix7c: the deck's process, stated even when it lists no agent.
+            incarnation: incarnation.clone(),
             ..connection
         },
-        agents: records.into_iter().map(map_agent).collect(),
+        agents: records
+            .into_iter()
+            .map(|record| DesktopAgent {
+                incarnation: incarnation.clone(),
+                ..map_agent(record)
+            })
+            .collect(),
         // Issue #887: carried beside the records it arrived with — including on
         // the cached path, where the view replays the revision from the reply
         // that installed those records. A fresh revision beside a cached list
@@ -2056,6 +2213,11 @@ pub(crate) async fn bootstrap(options: &BootstrapOptions, links: &DaemonLinks) -
     start_and_snapshot(scope.endpoint(), links).await.1
 }
 
+/// The allowance switches' test guard, for `terminal`'s tests of the held
+/// client's admission under Connect anyway.
+#[cfg(test)]
+pub(crate) use tests::AllowanceGuard;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2071,10 +2233,10 @@ mod tests {
 
     /// Holds the lock and restores BOTH switches on drop, including on a panic,
     /// so one failing assertion cannot leave the rest of the module armed.
-    struct AllowanceGuard(#[allow(dead_code)] MutexGuard<'static, ()>);
+    pub(crate) struct AllowanceGuard(#[allow(dead_code)] MutexGuard<'static, ()>);
 
     impl AllowanceGuard {
-        fn acquire() -> Self {
+        pub(crate) fn acquire() -> Self {
             let guard = ALLOWANCE_LOCK
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
@@ -3451,6 +3613,13 @@ mod tests {
     /// which is the finding that decided this milestone's shape. A helper that
     /// looped on one connection would be modelling a daemon that does not
     /// exist.
+    ///
+    /// The one exception is the daemon's own: a `Hello { follow_on: true }` —
+    /// what the held client's gate opens every listing, start, attach and
+    /// subscription with (PRD #1666 part 2) — is answered with the `Hello` this
+    /// daemon last gave, plus `hello-follow-on`, and the request after it on
+    /// the same connection takes the next scripted reply. So a gated request
+    /// still costs one connection and one reply from `replies`.
     #[cfg(unix)]
     async fn scripted_daemon_sequence(
         listener: tokio::net::UnixListener,
@@ -3458,21 +3627,58 @@ mod tests {
     ) -> usize {
         use dot_agent_deck::daemon_protocol::{KIND_REQ, KIND_RESP, read_frame, write_frame};
         let mut accepted = 0usize;
+        let mut last_hello: Option<AttachResponse> = None;
         for reply in replies {
             let (stream, _peer) = listener.accept().await.expect("accept one client");
             accepted += 1;
             let (mut reader, mut writer) = stream.into_split();
-            let (kind, _payload) = read_frame(&mut reader)
+            let (kind, payload) = read_frame(&mut reader)
                 .await
                 .expect("read the request frame")
                 .expect("the client sent a frame");
             assert_eq!(kind, KIND_REQ);
+            let request: AttachRequest =
+                serde_json::from_slice(&payload).expect("decode the request");
+            match request {
+                AttachRequest::Hello {
+                    follow_on: true, ..
+                } => {
+                    let gate = with_follow_on(last_hello.clone().unwrap_or_else(matching_hello));
+                    let encoded = serde_json::to_vec(&gate).expect("serialize the gate's Hello");
+                    write_frame(&mut writer, KIND_RESP, &encoded)
+                        .await
+                        .expect("answer the gate's Hello");
+                    let (kind, _payload) = read_frame(&mut reader)
+                        .await
+                        .expect("read the follow-on frame")
+                        .expect("a passed gate sends its request");
+                    assert_eq!(kind, KIND_REQ);
+                }
+                AttachRequest::Hello { .. } => last_hello = Some(reply.clone()),
+                _ => {}
+            }
             let encoded = serde_json::to_vec(&reply).expect("serialize the reply");
             write_frame(&mut writer, KIND_RESP, &encoded)
                 .await
                 .expect("answer the client");
         }
         accepted
+    }
+
+    /// `reply`, advertising `hello-follow-on` as well: what a protocol-12 daemon
+    /// answers the `Hello` a gated request opens its connection with, so the
+    /// request can follow on that connection (PRD #1666 part 2).
+    #[cfg(unix)]
+    fn with_follow_on(mut reply: AttachResponse) -> AttachResponse {
+        let capabilities = reply.capabilities.get_or_insert_with(Vec::new);
+        let follow_on = dot_agent_deck::daemon_protocol::CAP_HELLO_FOLLOW_ON;
+        if !capabilities
+            .iter()
+            .any(|capability| capability == follow_on)
+        {
+            capabilities.push(follow_on.to_string());
+        }
+        reply
     }
 
     /// One row in a `ListAgents` reply. Only the fields the snapshot mapping
@@ -3657,6 +3863,67 @@ mod tests {
         assert_eq!(links.handshake_count(), 2);
         assert_eq!(daemon.await.expect("no panic"), 2);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Scenario: a handshake for a deck is in flight — its `Hello` has reached
+    /// the daemon, whose reply is held — when the deck is distrusted (a
+    /// terminal on it ended). The reply then arrives as Connected. The caller
+    /// gets its answer, but nothing is held for the deck afterwards, so the
+    /// next ask handshakes again; without the distrust, it is held (control).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_in_flight_handshake_holds_nothing_once_its_deck_is_distrusted() {
+        use dot_agent_deck::daemon_protocol::{KIND_RESP, read_frame, write_frame};
+        for distrust in [true, false] {
+            let (dir, socket) = scratch_socket("gfix-in-flight");
+            let listener = bind_trusted(&socket);
+            let (arrived_tx, arrived) = tokio::sync::oneshot::channel::<()>();
+            let (release, release_rx) = tokio::sync::oneshot::channel::<()>();
+            let daemon = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("accept the handshake");
+                let (reader, writer) = stream.into_split();
+                let mut reader =
+                    dot_agent_deck::platform::transport::TransportReadHalf::new(reader);
+                let mut writer =
+                    dot_agent_deck::platform::transport::TransportWriteHalf::new(writer);
+                read_frame(&mut reader)
+                    .await
+                    .expect("read the Hello")
+                    .expect("a Hello frame");
+                let _ = arrived_tx.send(());
+                let _ = release_rx.await;
+                write_frame(
+                    &mut writer,
+                    KIND_RESP,
+                    &serde_json::to_vec(&matching_hello()).expect("encode"),
+                )
+                .await
+                .expect("answer the Hello");
+            });
+            let links = Arc::new(DaemonLinks::default());
+            let endpoint = Endpoint::Local(LocalEndpoint::at(&socket));
+            let asking = tokio::spawn({
+                let links = Arc::clone(&links);
+                let endpoint = endpoint.clone();
+                async move { links.trusted(&endpoint).await.map(|_| ()) }
+            });
+            arrived.await.expect("the Hello reached the daemon");
+            if distrust {
+                links.invalidate(&endpoint).await;
+            }
+            let _ = release.send(());
+            asking
+                .await
+                .expect("no panic")
+                .expect("the in-flight caller still gets its answer");
+            daemon.await.expect("no panic");
+            assert_eq!(
+                links.held().await,
+                usize::from(!distrust),
+                "distrust={distrust}: a handshake in flight across a distrust must not hold its classification"
+            );
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     /// A failed re-establishment must not resurrect the link it was replacing.
@@ -3904,6 +4171,11 @@ mod tests {
     /// stated here because a figure that ignored the revalidation would not be
     /// comparable to the baseline it is quoted against.
     ///
+    /// PRD #1666 part 2: each listing connection now opens with the gate's own
+    /// `Hello` and carries the listing as its follow-on — a second exchange on
+    /// the same connection, so the connection count stands, and `hellos` below
+    /// counts only the handshakes that classify the deck.
+    ///
     /// What this does NOT claim is that the listing connection could also have
     /// been held. It could not: the daemon's `handle_connection` answers exactly
     /// one request per connection and then returns, so 1.0 is the floor a client
@@ -3911,8 +4183,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn ten_refreshes_cost_one_handshake_and_ten_listings() {
-        use dot_agent_deck::daemon_protocol::{KIND_REQ, KIND_RESP, read_frame, write_frame};
-
         const REFRESHES: usize = 10;
 
         let (dir, socket) = scratch_socket("m4a-measure");
@@ -3927,28 +4197,16 @@ mod tests {
                     accepted = listener.accept() => {
                         let (stream, _peer) = accepted.expect("accept one client");
                         let (mut rd, mut wr) = stream.into_split();
-                        let (kind, payload) = read_frame(&mut rd)
-                            .await
-                            .expect("read the request frame")
-                            .expect("the client sent a frame");
-                        assert_eq!(kind, KIND_REQ);
-                        let request: AttachRequest =
-                            serde_json::from_slice(&payload).expect("decode the request");
-                        let reply = match request {
-                            AttachRequest::Hello { .. } => {
-                                hellos += 1;
-                                matching_hello()
-                            }
+                        let reply = |request| match request {
                             AttachRequest::ListAgents => {
                                 listings += 1;
                                 AttachResponse::agent_records(vec![listed_agent("a", "pane-a")])
                             }
                             other => panic!("the snapshot path sent an unexpected request: {other:?}"),
                         };
-                        let encoded = serde_json::to_vec(&reply).expect("serialize the reply");
-                        write_frame(&mut wr, KIND_RESP, &encoded)
-                            .await
-                            .expect("answer the client");
+                        if serve_gated_or_hello(&mut rd, &mut wr, reply).await {
+                            hellos += 1;
+                        }
                     }
                 }
             }
@@ -3992,13 +4250,18 @@ mod tests {
     /// Unlike `scripted_daemon_sequence` it is not told in advance how many
     /// connections to expect, because the whole point of the M4(b) tests is that
     /// the number is no longer one per refresh.
+    ///
+    /// `hellos` counts the handshakes that classify the deck. A listing must
+    /// arrive as the follow-on of the gate's `Hello { follow_on: true }` on its
+    /// own connection (PRD #1666 part 2), and a listing sent on an unchecked
+    /// connection panics the daemon, so every test using it also pins that the
+    /// snapshot's listing is gated.
     #[cfg(unix)]
     async fn counting_daemon(
         listener: tokio::net::UnixListener,
         records: Vec<dot_agent_deck::daemon_client::AgentRecord>,
         mut stop: tokio::sync::oneshot::Receiver<()>,
     ) -> (usize, usize) {
-        use dot_agent_deck::daemon_protocol::{KIND_REQ, KIND_RESP, read_frame, write_frame};
         let (mut hellos, mut listings) = (0usize, 0usize);
         loop {
             tokio::select! {
@@ -4006,30 +4269,63 @@ mod tests {
                 accepted = listener.accept() => {
                     let (stream, _peer) = accepted.expect("accept one client");
                     let (mut rd, mut wr) = stream.into_split();
-                    let (kind, payload) = read_frame(&mut rd)
-                        .await
-                        .expect("read the request frame")
-                        .expect("the client sent a frame");
-                    assert_eq!(kind, KIND_REQ);
-                    let request: AttachRequest =
-                        serde_json::from_slice(&payload).expect("decode the request");
-                    let reply = match request {
-                        AttachRequest::Hello { .. } => {
-                            hellos += 1;
-                            matching_hello()
-                        }
+                    let reply = |request| match request {
                         AttachRequest::ListAgents => {
                             listings += 1;
                             AttachResponse::agent_records(records.clone())
                         }
                         other => panic!("the snapshot path sent an unexpected request: {other:?}"),
                     };
-                    let encoded = serde_json::to_vec(&reply).expect("serialize the reply");
-                    write_frame(&mut wr, KIND_RESP, &encoded)
-                        .await
-                        .expect("answer the client");
+                    if serve_gated_or_hello(&mut rd, &mut wr, reply).await {
+                        hellos += 1;
+                    }
                 }
             }
+        }
+    }
+
+    /// One connection of a counting daemon: a `Hello` that is not a gate's is
+    /// answered with [`matching_hello`] and returns `true`; a gate's
+    /// `Hello { follow_on: true }` is answered with it plus `hello-follow-on`,
+    /// and the request after it with `reply`. Any other first frame is a
+    /// request sent without the gate's check, and panics.
+    #[cfg(unix)]
+    async fn serve_gated_or_hello(
+        rd: &mut tokio::net::unix::OwnedReadHalf,
+        wr: &mut tokio::net::unix::OwnedWriteHalf,
+        reply: impl FnOnce(AttachRequest) -> AttachResponse,
+    ) -> bool {
+        use dot_agent_deck::daemon_protocol::{KIND_REQ, KIND_RESP, read_frame, write_frame};
+        async fn request(rd: &mut tokio::net::unix::OwnedReadHalf) -> AttachRequest {
+            let (kind, payload) = read_frame(rd)
+                .await
+                .expect("read the request frame")
+                .expect("the client sent a frame");
+            assert_eq!(kind, KIND_REQ);
+            serde_json::from_slice(&payload).expect("decode the request")
+        }
+        async fn answer(wr: &mut tokio::net::unix::OwnedWriteHalf, reply: &AttachResponse) {
+            let encoded = serde_json::to_vec(reply).expect("serialize the reply");
+            write_frame(wr, KIND_RESP, &encoded)
+                .await
+                .expect("answer the client");
+        }
+        match request(rd).await {
+            AttachRequest::Hello {
+                follow_on: false, ..
+            } => {
+                answer(wr, &matching_hello()).await;
+                true
+            }
+            AttachRequest::Hello { .. } => {
+                answer(wr, &with_follow_on(matching_hello())).await;
+                let followed = request(rd).await;
+                answer(wr, &reply(followed)).await;
+                false
+            }
+            other => panic!(
+                "a request reached the daemon on a connection the gate never checked: {other:?}"
+            ),
         }
     }
 
@@ -5027,6 +5323,16 @@ mod tests {
             }
         }
 
+        /// The daemon process this deck's `Hello` names (PRD #1666 part 2,
+        /// G-fix4) — what a snapshot of it stamps on its rows, and so what an
+        /// action on one of its agents is bound to. Every `RealDeck` serves
+        /// from this test process, so they all name the same one.
+        fn incarnation(&self) -> dot_agent_deck::daemon_client::Incarnation {
+            dot_agent_deck::daemon_client::Incarnation::from(Some(
+                dot_agent_deck::daemon_protocol::daemon_instance_id().to_string(),
+            ))
+        }
+
         /// A real PTY child under this daemon's registry, and the **registry's**
         /// own id for it.
         ///
@@ -5062,6 +5368,37 @@ mod tests {
             self.kill_server();
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    /// Scenario: a real deck with no agents is snapshotted. Its connection
+    /// still names the daemon process that answered, so a restarted deck that
+    /// lists nobody is told apart from the process before it; a deck that is
+    /// not answering names none.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_connected_snapshot_names_its_process_even_with_no_agents() {
+        let deck = RealDeck::start("g7c-process");
+        let links = DaemonLinks::default();
+        let snapshot = snapshot_of(&deck.endpoint, &links).await;
+        let expected = deck.incarnation();
+        let endpoint = deck.endpoint.clone();
+        deck.shutdown();
+
+        assert_eq!(snapshot.connection.status, ConnectionStatus::Connected);
+        assert!(snapshot.agents.is_empty());
+        assert_eq!(snapshot.connection.incarnation, expected);
+        assert_eq!(
+            serde_json::to_value(&snapshot).unwrap()["connection"]["incarnation"],
+            serde_json::json!(expected.as_deref().expect("a named process"))
+        );
+
+        let gone = crate::dto::disconnected_snapshot(&endpoint, "not answering");
+        assert!(gone.connection.incarnation.is_unnamed());
+        assert!(
+            serde_json::to_value(&gone).unwrap()["connection"]
+                .get("incarnation")
+                .is_none()
+        );
     }
 
     /// The real-daemon sibling of
@@ -6014,10 +6351,13 @@ mod tests {
             .await;
         let remote_wire = deck_wire_id(&remote_endpoint);
 
+        let incarnation = remote.incarnation();
         let unknown =
-            crate::stop_agent_action(&state, "deck-ffffffffffffffff", &remote_agent).await;
+            crate::stop_agent_action(&state, "deck-ffffffffffffffff", &remote_agent, &incarnation)
+                .await;
         let after_unknown = (live_ids(&local), live_ids(&remote));
-        let stopped = crate::stop_agent_action(&state, &remote_wire, &remote_agent).await;
+        let stopped =
+            crate::stop_agent_action(&state, &remote_wire, &remote_agent, &incarnation).await;
         let on_local = live_ids(&local);
         let on_remote = live_ids(&remote);
         local.shutdown();
@@ -6078,10 +6418,12 @@ mod tests {
             crate::dto::StopOrchestrationRole {
                 agent_id: planner.clone(),
                 name: "planner".into(),
+                incarnation: remote.incarnation(),
             },
             crate::dto::StopOrchestrationRole {
                 agent_id: builder.clone(),
                 name: "builder".into(),
+                incarnation: remote.incarnation(),
             },
         ];
 
@@ -6641,55 +6983,63 @@ mod tests {
                     let mut minted = 0u32;
                     while let Ok((stream, _peer)) = listener.accept().await {
                         let (mut reader, mut writer) = stream.into_split();
-                        let Ok(Some((KIND_REQ, payload))) = read_frame(&mut reader).await else {
-                            continue;
-                        };
-                        let request: serde_json::Value =
-                            serde_json::from_slice(&payload).unwrap_or_default();
-                        let response = match request["op"].as_str() {
-                            Some("hello") => {
-                                let mut reply = AttachResponse::hello(PROTOCOL_VERSION)
-                                    .with_running_agents(RunningAgentsSummary::default());
-                                reply.capabilities = Some(
-                                    DAEMON_CAPABILITIES
-                                        .iter()
-                                        .filter(|cap| **cap != CAP_LAST_COMMAND)
-                                        .map(|cap| (*cap).to_string())
-                                        .collect(),
-                                );
-                                reply
+                        // A gate's `Hello { follow_on: true }` is followed by
+                        // one more request on this connection (PRD #1666 part 2).
+                        let mut follow_on = true;
+                        while std::mem::take(&mut follow_on) {
+                            let Ok(Some((KIND_REQ, payload))) = read_frame(&mut reader).await
+                            else {
+                                break;
+                            };
+                            let request: serde_json::Value =
+                                serde_json::from_slice(&payload).unwrap_or_default();
+                            follow_on = request["op"] == "hello" && request["follow_on"] == true;
+                            let response = match request["op"].as_str() {
+                                Some("hello") => {
+                                    let mut reply = AttachResponse::hello(PROTOCOL_VERSION)
+                                        .with_running_agents(RunningAgentsSummary::default());
+                                    reply.capabilities = Some(
+                                        DAEMON_CAPABILITIES
+                                            .iter()
+                                            .filter(|cap| **cap != CAP_LAST_COMMAND)
+                                            .map(|cap| (*cap).to_string())
+                                            .collect(),
+                                    );
+                                    reply
+                                }
+                                Some("start-agent")
+                                    if request["display_name"] == Self::REFUSED_NAME =>
+                                {
+                                    AttachResponse::err("start-agent: refused by the fixture")
+                                }
+                                Some("start-agent") => {
+                                    minted += 1;
+                                    AttachResponse::with_id(format!("pre-1540-{minted}"))
+                                }
+                                Some("new-agent-options") => {
+                                    let mut reply = AttachResponse::ok();
+                                    reply.new_agent_options = Some(NewAgentOptions {
+                                        default_command: None,
+                                        default_dir: None,
+                                        agents: Vec::new(),
+                                        experimental: false,
+                                        authoring_kinds: vec!["schedule".into()],
+                                        last_command: None,
+                                    });
+                                    reply
+                                }
+                                _ => AttachResponse::err("malformed request: unknown variant"),
+                            };
+                            if request["op"] != "hello" {
+                                requests
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .push(request);
                             }
-                            Some("start-agent")
-                                if request["display_name"] == Self::REFUSED_NAME =>
-                            {
-                                AttachResponse::err("start-agent: refused by the fixture")
-                            }
-                            Some("start-agent") => {
-                                minted += 1;
-                                AttachResponse::with_id(format!("pre-1540-{minted}"))
-                            }
-                            Some("new-agent-options") => {
-                                let mut reply = AttachResponse::ok();
-                                reply.new_agent_options = Some(NewAgentOptions {
-                                    default_command: None,
-                                    default_dir: None,
-                                    agents: Vec::new(),
-                                    experimental: false,
-                                    authoring_kinds: vec!["schedule".into()],
-                                    last_command: None,
-                                });
-                                reply
-                            }
-                            _ => AttachResponse::err("malformed request: unknown variant"),
-                        };
-                        if request["op"] != "hello" {
-                            requests
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .push(request);
+                            let encoded =
+                                serde_json::to_vec(&response).expect("serialize the reply");
+                            let _ = write_frame(&mut writer, KIND_RESP, &encoded).await;
                         }
-                        let encoded = serde_json::to_vec(&response).expect("serialize the reply");
-                        let _ = write_frame(&mut writer, KIND_RESP, &encoded).await;
                     }
                 })
             };
@@ -7813,14 +8163,15 @@ start = true
             .expect("stop the agent");
     }
 
-    /// Issue #1472, the success half over a scripted socket so it runs
-    /// everywhere: a deck one declared break behind is refused, Connect anyway
-    /// handshakes it again and lists its agents, and nothing is reported as a
-    /// failure.
+    /// Scenario: a deck one declared break behind is refused while a different deck is selected. Connect anyway handshakes and lists the refused deck, returns its identity and reports no failure; the selected deck receives no protected request.
     #[cfg(unix)]
     #[tokio::test]
     async fn connect_anyway_connects_the_refused_deck_and_reports_no_failure() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
         let _guard = AllowanceGuard::acquire();
+        let selected = SwappedDeck::start("ca-selected", matching_hello());
+        let _local_deck = crate::local_deck::test_override::point_local_deck_at(&selected.socket);
+        crate::dto::apply_settings_selection(&crate::settings::DesktopSettings::default());
         let (dir, socket) = scratch_socket("ca-ok");
         let listener = bind_trusted(&socket);
         let listing = AttachResponse::agent_records(vec![listed_agent("agent-a", "pane-a")]);
@@ -7839,7 +8190,19 @@ start = true
         assert_eq!(refused.connection.status, ConnectionStatus::Incompatible);
 
         let connected = connect_anyway(&links, &endpoint).await;
+        let sent_to_selected = selected.protected_sent();
+        selected.shutdown();
         assert_eq!(connected.connection.status, ConnectionStatus::Connected);
+        assert_eq!(
+            connected.connection.deck_id,
+            deck_wire_id(&endpoint),
+            "Connect anyway must answer for the refused deck"
+        );
+        assert_eq!(connected.connection.socket_path, endpoint.describe());
+        assert!(
+            sent_to_selected.is_empty(),
+            "Connect anyway sent the selected deck {sent_to_selected:?}"
+        );
         assert_eq!(connected.agents.len(), 1, "the deck's agents are listed");
         assert_eq!(connect_anyway_failure(&connected.connection), None);
         assert_eq!(daemon.await.expect("no panic"), 3);
@@ -8251,5 +8614,414 @@ start = true
         assert!(connection.disconnected_reason.is_none());
         let value = serde_json::to_value(&connection).unwrap();
         assert!(value.get("disconnectedReason").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #1666 part 2 — the held client's requests are admitted on their own
+    // connection, by the same classification that admitted the deck.
+    // -----------------------------------------------------------------------
+
+    /// The requests a replaced daemon must never be sent once the app has
+    /// stopped being able to say it is compatible: every one the held client's
+    /// gate covers.
+    #[cfg(unix)]
+    const PROTECTED_OPS: &[&str] = &[
+        "list-agents",
+        "subscribe-events",
+        "subscribe-turn-replies",
+        "start-agent",
+        "start-prepared-agent",
+        "prepare-orchestration",
+        "attach-stream",
+        "list-inbox",
+    ];
+
+    /// A deck whose daemon is replaced at its socket right after the app's
+    /// first handshake: the first connection is answered by a daemon this build
+    /// classifies `Connected`, and every later one by `replacement`, which
+    /// otherwise serves what it is asked — a listing, a subscription, a start,
+    /// an attach — as a daemon that kept the familiar request variants would.
+    /// Every request after the replacement is recorded by its `op`, `Hello`s
+    /// apart, which are counted.
+    #[cfg(unix)]
+    struct SwappedDeck {
+        dir: std::path::PathBuf,
+        socket: std::path::PathBuf,
+        sent_to_replacement: Arc<std::sync::Mutex<Vec<String>>>,
+        replacement_hellos: Arc<AtomicUsize>,
+        unchecked_protected: Arc<AtomicUsize>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    #[cfg(unix)]
+    impl SwappedDeck {
+        fn start(tag: &str, replacement: AttachResponse) -> Self {
+            use dot_agent_deck::daemon_protocol::{KIND_REQ, KIND_RESP, read_frame, write_frame};
+            let (dir, socket) = scratch_socket(tag);
+            let listener = bind_trusted(&socket);
+            let sent_to_replacement = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let replacement_hellos = Arc::new(AtomicUsize::new(0));
+            let unchecked_protected = Arc::new(AtomicUsize::new(0));
+            let replacement = with_follow_on(replacement);
+            let server = {
+                let sent = Arc::clone(&sent_to_replacement);
+                let hellos = Arc::clone(&replacement_hellos);
+                let unchecked = Arc::clone(&unchecked_protected);
+                tokio::spawn(async move {
+                    let mut swapped = false;
+                    // Held so a subscription or an attach stays open while the
+                    // test reads what was sent.
+                    let mut open = Vec::new();
+                    while let Ok((stream, _peer)) = listener.accept().await {
+                        let (mut reader, mut writer) = stream.into_split();
+                        let mut follow_on = true;
+                        let mut checked = false;
+                        while std::mem::take(&mut follow_on) {
+                            let Ok(Some((KIND_REQ, payload))) = read_frame(&mut reader).await
+                            else {
+                                break;
+                            };
+                            let request: serde_json::Value =
+                                serde_json::from_slice(&payload).unwrap_or_default();
+                            let op = request["op"].as_str().unwrap_or_default().to_string();
+                            let reply = if op == "hello" {
+                                checked = true;
+                                follow_on = request["follow_on"] == true;
+                                if swapped {
+                                    hellos.fetch_add(1, Ordering::SeqCst);
+                                    replacement.clone()
+                                } else {
+                                    with_follow_on(matching_hello())
+                                }
+                            } else {
+                                if swapped {
+                                    if !checked && PROTECTED_OPS.contains(&op.as_str()) {
+                                        unchecked.fetch_add(1, Ordering::SeqCst);
+                                    }
+                                    sent.lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .push(op.clone());
+                                }
+                                match op.as_str() {
+                                    "list-agents" => {
+                                        AttachResponse::agent_records(vec![listed_agent(
+                                            "replacement-1",
+                                            "pane-replacement",
+                                        )])
+                                    }
+                                    "start-agent" => {
+                                        AttachResponse::with_id("replacement-started".into())
+                                    }
+                                    _ => AttachResponse::ok(),
+                                }
+                            };
+                            let encoded = serde_json::to_vec(&reply).expect("serialize the reply");
+                            let _ = write_frame(&mut writer, KIND_RESP, &encoded).await;
+                        }
+                        open.push(writer);
+                        swapped = true;
+                    }
+                })
+            };
+            Self {
+                dir,
+                socket,
+                sent_to_replacement,
+                replacement_hellos,
+                unchecked_protected,
+                server,
+            }
+        }
+
+        fn endpoint(&self) -> Endpoint {
+            Endpoint::Local(LocalEndpoint::at(&self.socket))
+        }
+
+        /// What the replacement was sent that the gate exists to withhold.
+        fn protected_sent(&self) -> Vec<String> {
+            self.sent_to_replacement
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter(|op| PROTECTED_OPS.contains(&op.as_str()))
+                .cloned()
+                .collect()
+        }
+
+        fn unchecked_protected_sent(&self) -> usize {
+            self.unchecked_protected.load(Ordering::SeqCst)
+        }
+
+        fn shutdown(self) {
+            self.server.abort();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// The three replacements the swap pins run against: the same build (the
+    /// control, which must be served), the next attach protocol, and the same
+    /// protocol one declared contract break behind.
+    #[cfg(unix)]
+    fn replacements() -> [(&'static str, AttachResponse, bool); 3] {
+        let mut newer = matching_hello();
+        newer.server_version = Some(PROTOCOL_VERSION + 1);
+        [
+            ("the same build", matching_hello(), true),
+            ("the next attach protocol", newer, false),
+            (
+                "one declared contract break behind",
+                hello_from_a_deck_one_declared_break_behind(),
+                false,
+            ),
+        ]
+    }
+
+    /// Scenario: the app classifies a deck `Connected`, and before the deck
+    /// watcher subscribes to its events the daemon at the socket is replaced —
+    /// by one on the next attach protocol, or by one on the same protocol a
+    /// declared contract break behind. The watcher's subscription, on the link
+    /// that still holds the first daemon's classification, is refused and the
+    /// replacement is sent no subscription; replaced by the same build, the
+    /// subscription goes through on the connection that answered its Hello.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_watcher_subscription_after_a_swap_sends_the_replacement_nothing() {
+        let _guard = AllowanceGuard::acquire();
+        for (name, replacement, served) in replacements() {
+            let deck = SwappedDeck::start("gf2-sub", replacement);
+            let links = DaemonLinks::default();
+            let endpoint = deck.endpoint();
+
+            // The watcher's own two steps, in its order (`spawn_deck_watcher`).
+            let daemon = links.trusted(&endpoint).await.expect("the first daemon");
+            daemon
+                .require_compatible()
+                .expect("precondition: the first daemon is compatible");
+            let subscription =
+                bounded_reply("SubscribeEvents", daemon.client.subscribe_events()).await;
+            let protected = deck.protected_sent();
+            let hellos = deck.replacement_hellos.load(Ordering::SeqCst);
+            let unchecked = deck.unchecked_protected_sent();
+            deck.shutdown();
+
+            assert_eq!(
+                unchecked, 0,
+                "{name}: subscription on an unchecked connection"
+            );
+            assert!(
+                hellos > 0,
+                "{name}: precondition: the subscription went to the replacement"
+            );
+            if served {
+                assert!(subscription.is_ok(), "{name}: {:?}", subscription.err());
+                assert_eq!(protected, vec!["subscribe-events".to_string()], "{name}");
+            } else {
+                assert!(
+                    subscription.is_err(),
+                    "{name}: the watcher subscribed to a daemon the app would refuse"
+                );
+                assert_eq!(
+                    protected,
+                    Vec::<String>::new(),
+                    "{name}: the replacement was sent a protected request"
+                );
+            }
+        }
+    }
+
+    /// Scenario: the app classifies a deck `Connected`, and the daemon at the
+    /// socket is replaced before the snapshot lists its agents — by one on the
+    /// next attach protocol, or one a declared contract break behind. The
+    /// listing is refused and never sent, the snapshot shows no agents, and the
+    /// next snapshot shows the deck refused rather than connected; replaced by
+    /// the same build, the replacement's agent is listed on a checked connection.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_snapshot_listing_after_a_swap_sends_the_replacement_nothing() {
+        let _guard = AllowanceGuard::acquire();
+        for (name, replacement, served) in replacements() {
+            let deck = SwappedDeck::start("gf2-list", replacement);
+            let links = DaemonLinks::default();
+            let endpoint = deck.endpoint();
+
+            let first = snapshot_of(&endpoint, &links).await;
+            let second = snapshot_of(&endpoint, &links).await;
+            let protected = deck.protected_sent();
+            let hellos = deck.replacement_hellos.load(Ordering::SeqCst);
+            let unchecked = deck.unchecked_protected_sent();
+            deck.shutdown();
+
+            assert!(hellos > 0, "{name}: the listing checked the replacement");
+            assert_eq!(unchecked, 0, "{name}: listing on an unchecked connection");
+            if served {
+                assert_eq!(
+                    first.connection.status,
+                    ConnectionStatus::Connected,
+                    "{name}"
+                );
+                assert_eq!(first.agents.len(), 1, "{name}");
+                assert!(protected.contains(&"list-agents".to_string()), "{name}");
+            } else {
+                assert_ne!(
+                    first.connection.status,
+                    ConnectionStatus::Connected,
+                    "{name}: the replacement's listing was shown under the first daemon's \
+                     classification"
+                );
+                assert!(first.agents.is_empty(), "{name}");
+                assert_eq!(
+                    second.connection.status,
+                    ConnectionStatus::Incompatible,
+                    "{name}: the next snapshot classifies the replacement"
+                );
+                assert_eq!(
+                    protected,
+                    Vec::<String>::new(),
+                    "{name}: the replacement was sent a protected request"
+                );
+            }
+        }
+    }
+
+    /// Scenario: the user presses Start in the New agent dialog on a deck the
+    /// app has just classified `Connected`, and the daemon at the socket is
+    /// replaced between that handshake and the start — by one on the next
+    /// attach protocol, or one a declared contract break behind. The start is
+    /// refused and the replacement starts nothing; replaced by the same build,
+    /// the agent starts there on the connection that answered its Hello.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_new_agent_start_after_a_swap_sends_the_replacement_nothing() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let _guard = AllowanceGuard::acquire();
+        for (name, replacement, served) in replacements() {
+            let deck = SwappedDeck::start("gf2-start", replacement);
+            let _local_deck = crate::local_deck::test_override::point_local_deck_at(&deck.socket);
+            crate::dto::apply_settings_selection(&crate::settings::DesktopSettings::default());
+            let state = crate::terminal::DesktopState::default();
+            let wire = deck_wire_id(&deck.endpoint());
+
+            let started = crate::start_agent_action(&state, &wire, plain_start("gf2-new")).await;
+            let protected = deck.protected_sent();
+            let hellos = deck.replacement_hellos.load(Ordering::SeqCst);
+            let unchecked = deck.unchecked_protected_sent();
+            deck.shutdown();
+
+            assert_eq!(unchecked, 0, "{name}: start on an unchecked connection");
+            assert!(
+                hellos > 0,
+                "{name}: precondition: the start went to the replacement"
+            );
+            if served {
+                assert!(started.is_ok(), "{name}: {:?}", started.err());
+                assert_eq!(protected, vec!["start-agent".to_string()], "{name}");
+            } else {
+                assert!(
+                    started.is_err(),
+                    "{name}: New agent started an agent on a daemon the app would refuse"
+                );
+                assert_eq!(
+                    protected,
+                    Vec::<String>::new(),
+                    "{name}: the replacement was sent a protected request"
+                );
+            }
+        }
+    }
+
+    /// Scenario: with Connect anyway chosen for the session, the snapshot lists agents and New agent starts on a replacement one declared contract break behind, each on a checked connection. A replacement on the next protocol is still refused, and a second deck on that protocol receives no listing, subscription or start under the session allowance.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connect_anyway_admits_the_requests_of_a_deck_a_break_behind() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let _guard = AllowanceGuard::acquire();
+        allow_build_mismatch_this_session();
+        for (name, replacement, _) in replacements() {
+            let protocol_mismatch = replacement.server_version != Some(PROTOCOL_VERSION);
+            let deck = SwappedDeck::start("gf2-allow", replacement);
+            let _local_deck = crate::local_deck::test_override::point_local_deck_at(&deck.socket);
+            crate::dto::apply_settings_selection(&crate::settings::DesktopSettings::default());
+            let state = crate::terminal::DesktopState::default();
+            let endpoint = deck.endpoint();
+
+            let snapshot = snapshot_of(&endpoint, &state.daemon).await;
+            let started = crate::start_agent_action(
+                &state,
+                &deck_wire_id(&endpoint),
+                plain_start("gf2-allow"),
+            )
+            .await;
+            let protected = deck.protected_sent();
+            let unchecked = deck.unchecked_protected_sent();
+            deck.shutdown();
+
+            assert_eq!(
+                unchecked, 0,
+                "{name}: allowed request on an unchecked connection"
+            );
+            if protocol_mismatch {
+                assert_ne!(snapshot.connection.status, ConnectionStatus::Connected);
+                assert!(snapshot.agents.is_empty());
+                assert!(
+                    started.is_err(),
+                    "Connect anyway must not bypass the replacement protocol"
+                );
+                assert!(
+                    protected.is_empty(),
+                    "the protocol replacement received {protected:?}"
+                );
+                continue;
+            }
+            assert_eq!(snapshot.connection.status, ConnectionStatus::Connected);
+            assert_eq!(
+                snapshot.agents.len(),
+                1,
+                "the replacement's agent is listed"
+            );
+            assert!(started.is_ok(), "{:?}", started.err());
+            assert_eq!(
+                protected,
+                vec!["list-agents".to_string(), "start-agent".to_string()]
+            );
+        }
+
+        let mut newer = matching_hello();
+        newer.server_version = Some(PROTOCOL_VERSION + 1);
+        let other = SwappedDeck::start("gf2-other-protocol", newer);
+        let links = DaemonLinks::default();
+        let endpoint = other.endpoint();
+        let daemon = links
+            .trusted(&endpoint)
+            .await
+            .expect("the other deck initially matches");
+        daemon
+            .require_compatible()
+            .expect("the other deck is held as compatible");
+        let listed = daemon.client.list_agents_detailed().await;
+        let subscribed = daemon.client.subscribe_events().await;
+        let started = daemon.client.start_agent(Default::default()).await;
+        let protected = other.protected_sent();
+        let hellos = other.replacement_hellos.load(Ordering::SeqCst);
+        other.shutdown();
+        assert_eq!(
+            hellos, 3,
+            "each request checks the other deck's replacement"
+        );
+        assert!(
+            listed.is_err(),
+            "the session allowance leaked to another deck's protocol"
+        );
+        assert!(
+            subscribed.is_err(),
+            "the session allowance let another protocol subscribe"
+        );
+        assert!(
+            started.is_err(),
+            "the session allowance let another protocol start"
+        );
+        assert!(
+            protected.is_empty(),
+            "the other protocol received {protected:?}"
+        );
     }
 }

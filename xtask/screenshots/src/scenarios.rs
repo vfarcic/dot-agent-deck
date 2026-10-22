@@ -191,6 +191,11 @@ pub const SCENARIOS: &[Scenario] = &[
         description: "The host of a deck: the TUI's Host of this deck overlay and the desktop Dashboard's Host button opened, for one fixed sample.",
         clients: &[Client::Tui, Client::Desktop],
     },
+    Scenario {
+        name: "restart-notice",
+        description: "The deck restarted while the client was attached: the notice naming the two agents the restart stopped, api-fix and docs-review, in the TUI's footer row and the desktop's corner notice, over a deck now running none.",
+        clients: &[Client::Tui, Client::Desktop],
+    },
 ];
 
 /// Look a scenario up by name.

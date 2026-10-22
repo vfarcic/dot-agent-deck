@@ -56,7 +56,10 @@ export function useShownTerminals(
   setShownTerminals: (targets: AgentTarget[]) => Promise<void>,
   targets: AgentTarget[] | undefined,
 ): void {
-  const key = targets?.map((target) => agentKey(target.deckId, target.agentId)).join("\n");
+  // PRD #1666 part 2 (G-fix5): the incarnation is part of the key, so a row
+  // listed by a restarted deck — a new process under the same agent id — is
+  // declared again and its terminal attached to that process.
+  const key = targets?.map((target) => `${agentKey(target.deckId, target.agentId)}\u0000${target.incarnation ?? ""}`).join("\n");
   const latest = useRef(targets);
   latest.current = targets;
   useEffect(() => {

@@ -2,6 +2,7 @@ import type { AuthoringKind, ConnectionView, DaemonOrchestration, DeckDirectoryE
 import type { VoiceDeckChoiceDto } from "./bridge";
 import { DISPLAY_LIMITS, deckName, displayIdentity, displayText } from "./displayText";
 import { orchestrationTitle } from "./agentNames";
+import { sameIncarnation } from "./agentKey";
 
 /**
  * PRD #1223 M4/M5 — the rules of the New agent flow, kept out of the component
@@ -473,9 +474,15 @@ export function isDeckGoneError(message: string): boolean {
   return message.startsWith(DECK_GONE_PREFIX);
 }
 
-/** Whether `deckId`'s fleet entry lists `agentId` — the composite identity, never the bare id. */
-export function fleetLists(fleet: DeckFleet, deckId: string, agentId: string): boolean {
-  return fleet.some((deck) => deck.connection.deckId === deckId && deck.agents.some((agent) => agent.id === agentId));
+/**
+ * Whether `deckId`'s fleet entry lists the agent a start made — the composite
+ * identity, never the bare id: `agentId` AS the daemon process `incarnation`
+ * names (PRD #1666 part 2, G-fix7). A deck restarted since the start numbers
+ * an unrelated agent with the same id; that row is not the started agent, so
+ * it never satisfies the wait and is never opened as if it were.
+ */
+export function fleetLists(fleet: DeckFleet, deckId: string, agentId: string, incarnation: string | undefined): boolean {
+  return fleet.some((deck) => deck.connection.deckId === deckId && deck.agents.some((agent) => agent.id === agentId && sameIncarnation(incarnation, agent.incarnation)));
 }
 
 /**

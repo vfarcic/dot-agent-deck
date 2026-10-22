@@ -579,6 +579,7 @@ fn pane_004_card_title_row() {
         pending_question: None,
         pull_request: None,
         pull_request_revision: 0,
+        incarnation: Default::default(),
     };
     // The 80-cell buffer leaves ample room for the full bottom-border stats
     // title. Height comes from the density tier itself so the snapshot's
@@ -632,6 +633,7 @@ fn card_stats_session(cwd: &str) -> SessionState {
         pending_question: None,
         pull_request: None,
         pull_request_revision: 0,
+        incarnation: Default::default(),
     }
 }
 
@@ -1649,6 +1651,7 @@ fn placeholder_card(selected: bool) -> ratatui::buffer::Buffer {
         pending_question: None,
         pull_request: None,
         pull_request_revision: 0,
+        incarnation: Default::default(),
     };
     let width: u16 = 40;
     let density = CardDensityKind::Normal;
@@ -1846,6 +1849,7 @@ fn pane_007_pi_card_shows_pi_identity() {
         pending_question: None,
         pull_request: None,
         pull_request_revision: 0,
+        incarnation: Default::default(),
     };
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
@@ -1915,6 +1919,7 @@ fn pane_008_codex_card_shows_colored_identity_badge() {
         pending_question: None,
         pull_request: None,
         pull_request_revision: 0,
+        incarnation: Default::default(),
     };
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
@@ -2179,6 +2184,7 @@ fn palette_session(status: SessionStatus) -> SessionState {
         pending_question: None,
         pull_request: None,
         pull_request_revision: 0,
+        incarnation: Default::default(),
     }
 }
 
@@ -3070,6 +3076,7 @@ fn pane_005_highlight_follows_selected_session_id() {
         pending_question: None,
         pull_request: None,
         pull_request_revision: 0,
+        incarnation: Default::default(),
     };
     let s1 = make("sess-alpha", "pane-1", "1", "/home/dev/alpha");
     let s2 = make("sess-beta", "pane-2", "2", "/home/dev/beta");
@@ -3283,6 +3290,7 @@ fn filled_session() -> SessionState {
         pending_question: None,
         pull_request: None,
         pull_request_revision: 0,
+        incarnation: Default::default(),
     }
 }
 
@@ -4053,6 +4061,7 @@ fn pane_013_declared_agent_fallback_yields_to_observed_agent() {
         pending_question: None,
         pull_request: None,
         pull_request_revision: 0,
+        incarnation: Default::default(),
     };
     let density = CardDensityKind::Normal;
     let render = |session: &SessionState, declared_agent_type: Option<&AgentType>| {
@@ -4405,6 +4414,7 @@ fn role_session(index: usize, role: &str) -> SessionState {
         pending_question: None,
         pull_request: None,
         pull_request_revision: 0,
+        incarnation: Default::default(),
     }
 }
 
@@ -4827,9 +4837,12 @@ fn status_011_live_subscriber_updates_the_rendered_inbox_card() {
             // subscribing. An old daemon advertises none and receives the plain
             // subscription on the next connection. Also accept the pre-probe
             // subscriber so this test keeps its rendered-card claim on either
-            // side of that production change.
+            // side of that production change. The probe is also the protocol
+            // check (PRD #1666 part 2), so it is answered on this build's
+            // protocol, as any daemon a subscription may follow does.
             let request = if matches!(request, AttachRequest::Hello { .. }) {
-                write_frame(&mut stream, KIND_RESP, &serde_json::to_vec(&AttachResponse::ok()).unwrap())
+                let hello = AttachResponse::hello(dot_agent_deck::daemon_protocol::PROTOCOL_VERSION);
+                write_frame(&mut stream, KIND_RESP, &serde_json::to_vec(&hello).unwrap())
                     .await.unwrap();
                 drop(stream);
                 stream = listener.accept().await.unwrap().0;

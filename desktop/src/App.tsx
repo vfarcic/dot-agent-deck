@@ -42,7 +42,7 @@ import { HandoffRail } from "./components/HandoffRail";
 import { SelectDeckNote } from "./components/SelectDeckNote";
 import { ProfilesPanel, ProjectsPanel, PromptLibraryPanel, OrchestrationPanel } from "./components/ConfigurationPanels";
 import { SettingsSheet } from "./components/SettingsSheet";
-import { VoiceControlPanel, type VoicePane } from "./components/VoiceControlPanel";
+import { VoiceControlPanel, type AgentIncarnation, type VoicePane } from "./components/VoiceControlPanel";
 import { PullRequestBrowser, pullRequestBrowserCovered, type PullRequestBrowserSession } from "./components/PullRequestBrowser";
 import { OpenPullRequest, PrBrowserHostContext } from "./lib/prBrowser";
 import { SelfUpgradeDialog } from "./components/SelfUpgradeDialog";
@@ -51,7 +51,7 @@ import { tauriSelfUpgradeApi } from "./lib/selfUpgrade";
 import { fixtureSelfUpgradeApi } from "./data/fixture";
 import { useSelfUpgradeCheck } from "./hooks/useSelfUpgradeCheck";
 import { SettingsBridgeProvider } from "./lib/settingsBridge";
-import { DISPLAY_LIMITS, deckName, displayActivity, displayText } from "./lib/displayText";
+import { DISPLAY_LIMITS, deckName, displayActivity, displayText, sanitizeText } from "./lib/displayText";
 import { voicePaneAgent } from "./lib/promptKeys";
 import { CONNECT_ANYWAY_BODY, disconnectedDetails, disconnectedRemedy, incompatibleRemedy, startDaemonConfirmCopy } from "./lib/connectionRemedy";
 import { upgradeKindOf, upgradeOffered } from "./lib/upgrade";
@@ -74,10 +74,12 @@ import { DialogNumbered, useNumberedList, useNumbersShown, VoiceChoiceOpen, Voic
 import { usePager, VoicePagingContext, type VoicePaging } from "./hooks/useVoicePages";
 import { NO_NUMBERED_LIST, sameNumberedSections, type VoiceNumberedEntryDto, type VoiceNumberedListDto, type VoiceNumberedSectionDto } from "./lib/voiceNumbers";
 import { offPageSentence, offPageTarget, pageMarker, pageSlice, pageTurnRefusal, type VoiceOffPageItem, type VoicePager } from "./lib/voicePages";
-import { agentKey } from "./lib/agentKey";
+import { agentKey, boundAgentKey } from "./lib/agentKey";
 import { dashboardFilterFromParams } from "./lib/dashboardFilter";
 import { VOICE_ACTIONS, dispatchVoiceAction, saysCommand, type DashboardScroll, type DeckOverlay, type NewAgentVoice, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoiceOverviewContext, type VoicePanelContext, type VoiceScreenContext, type PullRequestContext } from "./lib/voiceActions";
 import { terminalInputState, unreachableDeckTerminalState } from "./lib/terminalInput";
+import { useRestartNotice } from "./hooks/useRestartNotice";
+import { bindViewIncarnation, viewAgent, viewAgentReplaced, viewBound } from "./lib/viewIdentity";
 import { applyAppearance } from "./lib/appearance";
 import { desktopOrchestrationPlatformIssue } from "./lib/platform";
 import { selectsAllDecks } from "./lib/endpoints";
@@ -240,7 +242,17 @@ function useKeyboardInput(send: DeckRuntimeState["sendTerminalInput"]): DeckRunt
 }
 
 export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = { kind: "overview" } }: { runtime: DeckRuntimeState; orchestrationPlatformIssue?: string; initialView?: DeckView }) {
-  const [requestedView, setView] = useState<DeckView>(initialView);
+  /* PRD #1666 part 2 (G-fix6): the latest fleet, for binding a view to the
+     incarnation of the record it opens at the moment it is asked for. */
+  const fleetNow = useRef(runtime.fleet);
+  fleetNow.current = runtime.fleet;
+  // voice-registry-exempt: the store behind `setView`, the registry-owned setter every navigation writes through; nothing else writes it
+  const [requestedView, setRequestedView] = useState<DeckView>(() => bindViewIncarnation(initialView, runtime.fleet));
+  /* Every navigation goes through here, so no agent view is ever held without
+     the incarnation of the record it was opened on (`bindViewIncarnation`). */
+  const setView = useCallback((next: DeckView | ((current: DeckView) => DeckView)) => {
+    setRequestedView((current) => bindViewIncarnation(typeof next === "function" ? next(current) : next, fleetNow.current));
+  }, []);
   /**
    * Issue #1198 — the app's experimental surfaces, read once at startup. The
    * deck is one of them, so while it is hidden a view that names it — an
@@ -480,7 +492,25 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * pane resolved the agent and rendered nothing when it failed, while the
    * declaration never asked and went on naming it.
    */
-  const paneAgent = agentView && paneDeck ? paneDeck.agents.find((candidate) => candidate.id === agentView.agentId) : undefined;
+  const paneAgent = agentView && paneDeck ? viewAgent(paneDeck.agents, agentView) : undefined;
+  /**
+   * PRD #1666 part 2 (G-fix6) — the open view's deck now lists its agent id
+   * under ANOTHER incarnation: the deck restarted and reused the id for an
+   * unrelated agent. The view's agent is gone. `paneAgent` above does not
+   * resolve to the newcomer, so nothing below renders it, declares its
+   * terminal or routes input to it, and the pane is not drawn at all, not even
+   * from a held record, for the commit before `paneAgentRetired` closes it
+   * (G-fix7c: the user's decision is that a pane of an agent a restart stopped
+   * closes, and the restart notice says which agents went). Only a fresh
+   * selection of the newcomer's own row opens it.
+   */
+  const paneAgentReplaced = agentView !== undefined && paneDeck !== undefined && paneDeck.connection.status === "connected" && viewAgentReplaced(paneDeck.agents, agentView);
+  /* A view nothing bound yet — its agent was not listed when it was asked
+     for — is bound by the first record that lists it. */
+  useEffect(() => {
+    // voice-registry-exempt: an invariant, not a control — it binds the view already open to the incarnation of the record it shows, and opens nothing
+    if (agentView && !viewBound(agentView) && paneAgent) setView(() => ({ ...agentView, incarnation: paneAgent.incarnation }));
+  }, [agentView, paneAgent, setView]);
   /**
    * Issue #1143 — the last record this pane's deck gave, so the pane can still
    * be a pane while that deck is not answering.
@@ -524,6 +554,15 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * with its remedy reachable`.
    */
   const heldPaneAgent = useHeldAgentRecord(agentView, paneAgent);
+  /**
+   * PRD #1666 part 2 (G-fix7c) — the one notice naming the agents a deck
+   * restart stopped, on whichever screen is up. Their rows are gone with the
+   * restarted deck's listing, and an open pane of one closes
+   * (`paneAgentRetired`); this says why. It asks no deck to stop or close
+   * anything (G-fix7d); a closed pane's terminal is withdrawn from the shown
+   * set, which detaches that terminal's own connection only.
+   */
+  const restart = useRestartNotice(runtime.fleet);
   /** The record the pane RENDERS: the deck's current answer, else its last one. */
   const paneAgentShown = paneAgent ?? heldPaneAgent?.agent;
   /**
@@ -550,7 +589,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * of panes that do.
    */
   const overviewShown = base === "overview"
-    ? (agentView && paneAgent && paneDeckAttachable ? [{ deckId: agentView.deckId, agentId: agentView.agentId }] : [])
+    ? (agentView && paneAgent && paneDeckAttachable ? [{ deckId: agentView.deckId, agentId: agentView.agentId, incarnation: paneAgent.incarnation }] : [])
     : undefined;
   useShownTerminals(runtime.setShownTerminals, overviewShown);
   /**
@@ -796,7 +835,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    */
   // voice-registry-exempt: a mirror of the open pane's own tab, written only by the screen's report so the voice panel can see it; it switches nothing
   const [paneTab, setPaneTab] = useState<PanelTab>("terminal");
-  const paneShownAgent = base === "overview" ? (paneDeck ? paneAgentShown : undefined) : paneAgent;
+  const paneShownAgent = base === "overview" ? (paneDeck && !paneAgentReplaced ? paneAgentShown : undefined) : paneAgent;
   const paneInput = agentView && paneShownAgent ? terminalInputState(paneShownAgent) : undefined;
   const voicePane = useMemo<VoicePane | undefined>(() => (agentView && paneShownAgent && paneInput
     ? {
@@ -821,6 +860,9 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       /* Issue #1668 — sentences about that question name the agent as
          Reading does: an orchestration agent by its run's title too. */
       questionLabel: questionAgentName(paneShownAgent),
+      /* PRD #1666 part 2 — the daemon process that listed the agent, so an
+         answer reaches that process or nothing. */
+      ...(paneShownAgent.incarnation ? { incarnation: paneShownAgent.incarnation } : {}),
     }
     : undefined), [agentView, heldPaneAgent, paneDeckAttachable, paneInput, paneShownAgent, paneTab, prBrowser]);
   /**
@@ -863,7 +905,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     .flatMap((deck) => {
       const deckId = deck.connection.deckId;
       if (deckId === undefined) return [];
-      return deck.agents.map((agent) => ({ deckId, agentId: agent.id, label: agentSpokenName(agent, READING_LABEL_MAX_CHARS), incarnation: agent.spawnedAtMs }));
+      return deck.agents.map((agent) => ({ deckId, agentId: agent.id, label: agentSpokenName(agent, READING_LABEL_MAX_CHARS), incarnation: agent.spawnedAtMs, ...(agent.incarnation ? { deckProcess: agent.incarnation } : {}) }));
     }), [allDecksSelected, runtime.fleet, selectedDeckId]);
   /* Audit A7 — the decks being viewed, so what was still to be said about a
      deck the user moved away from is dropped. Joined into one string so the
@@ -1033,6 +1075,13 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
          rows span every deck, where a resolved agent is the selected deck's. */
       deckId: agent ? (agent.deckId ?? selectedDeckId ?? "") : (agentView?.deckId ?? selectedDeckId ?? ""),
       agentId: agent?.value ?? agentView?.agentId ?? "",
+      /* PRD #1666 part 2 (G-fix6): the open pane's own target keeps the
+         incarnation the view was opened on. G-fix7: a resolved `agent_ref`
+         carries the process the voice panel bound it to when the utterance
+         was declared (`bindAgentParams`), so the view it opens, the stop it
+         confirms and the pane it types into refuse a restarted deck's agent
+         under the same id. */
+      ...(agent ? ("incarnation" in agent ? { incarnation: agent.incarnation } : {}) : agentView && viewBound(agentView) ? { incarnation: agentView.incarnation } : {}),
       from: base === "overview" ? "overview" : "deck",
       /* What the DECK calls it, which is what Rust resolved the spoken words
          against — never the spoken words themselves. A surface that named the
@@ -1061,7 +1110,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       ...(namedMode ? { modeId: namedMode.value } : {}),
       ...(namedAgentType ? { agentTypeId: namedAgentType.value } : {}),
       ...(declaredForm ? { declaredForm: { deckId: declaredForm.deckId, path: declaredForm.path } } : {}),
-      ...(namedOrchestration ? { orchestrationAgentId: namedOrchestration.value } : {}),
+      ...(namedOrchestration ? { orchestrationAgentId: namedOrchestration.value, ...("incarnation" in namedOrchestration ? { orchestrationIncarnation: namedOrchestration.incarnation } : {}) } : {}),
       ...(outcome.invoke === FILTER_DASHBOARD_INVOKE ? { dashboardFilter: dashboardFilterFromParams(outcome.params) } : {}),
     };
     let moved = false;
@@ -1161,12 +1210,16 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   /* PRD #1195 — the Deck selector's section as it renders, not as it is on
      disk: `save` applies an edit at once and writes it behind. */
   const readEndpoints = useCallback(() => latestSettings.current.settings.endpoints, []);
-  /* PRD #1261 review, round 4 — every agent's incarnation on the selected
-     deck, read when an utterance is declared and again when a chosen entry
-     runs, so an entry whose agent was replaced under its id is refused. */
-  const latestAgents = useRef(runtime.snapshot.agents);
-  latestAgents.current = runtime.snapshot.agents;
-  const readAgentIncarnations = useCallback(() => Object.fromEntries(latestAgents.current.map((agent) => [agent.id, agent.spawnedAtMs])), []);
+  /* PRD #1261 review, round 4 — every agent's incarnation, read when an
+     utterance is declared and again when a chosen entry runs, so an entry
+     whose agent was replaced under its id is refused. PRD #1666 part 2
+     (G-fix7): across the fleet, by the composite key, with the daemon process
+     that listed it beside the spawn time — so a deck restart that reuses the
+     id is refused even where no spawn time is reported, and the voice panel
+     binds every agent a dispatch names to that process. */
+  const latestFleet = useRef(runtime.fleet);
+  latestFleet.current = runtime.fleet;
+  const readAgentIncarnations = useCallback(() => Object.fromEntries(latestFleet.current.flatMap((deck) => deck.agents.map((agent): [string, AgentIncarnation] => [agentKey(agent.daemonId, agent.id), { spawnedAtMs: agent.spawnedAtMs, process: agent.incarnation }]))), []);
   /**
    * PR #1451 round 3, change 3 — the numbered list on screen: the New agent
    * dialog's while it declares one, the screen's otherwise (see
@@ -1208,7 +1261,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   }, []);
   /* The COMPOSITE identity, never the bare id. See `deckPaneRetargeted` above
      and `DeckSurface`'s own promotion condition. */
-  const openAgent = agentView ? { deckId: agentView.deckId, agentId: agentView.agentId } : undefined;
+  const openAgent = agentView ? { deckId: agentView.deckId, agentId: agentView.agentId, ...(viewBound(agentView) ? { incarnation: agentView.incarnation } : {}) } : undefined;
   const screenNode = base === "overview"
     ? (
       <>
@@ -1221,7 +1274,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
           one live `TerminalViewport` for the agent, which is the property M3
           actually requires.
         */}
-        {agentView && paneDeck && paneAgentShown && <OverviewAgentPane runtime={runtime} view={agentView} deck={paneDeck} agent={paneAgentShown} held={heldPaneAgent} attached={paneDeckAttachable} onClose={closeAgentView} onTabShown={setPaneTab} />}
+        {agentView && paneDeck && paneAgentShown && !paneAgentReplaced && <OverviewAgentPane runtime={runtime} view={agentView} deck={paneDeck} agent={paneAgentShown} held={heldPaneAgent} attached={paneDeckAttachable} onClose={closeAgentView} onTabShown={setPaneTab} />}
         {/*
           PRD #1223 audit W2 — the runtime's last failure, on THIS screen too.
 
@@ -1238,11 +1291,11 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
           mounted together, so there is at most one toast. The cleanup
           warnings ride with it but outlive it (issue #1234).
         */}
-        <Toast message={runtime.error} onDismiss={runtime.clearError} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} />
+        <Toast message={runtime.error} onDismiss={runtime.clearError} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} restart={restart.notice} onDismissRestart={restart.dismiss} />
       </>
     )
     // voice-registry-exempt: the deck's navigator, which it names as `navigate` in its own registry context and dispatches through `VOICE_ACTIONS`
-    : <DeckSurface runtime={runtime} settings={settings} orchestrationPlatformIssue={orchestrationPlatformIssue} onNavigate={setView} openAgent={openAgent} onCloseAgent={closeAgent} voiceChannel={deckVoiceContext} overlays={deckOverlays} onConfirmationChange={setConfirmationOpen} onPaneTabChange={setPaneTab} />;
+    : <DeckSurface runtime={runtime} settings={settings} orchestrationPlatformIssue={orchestrationPlatformIssue} onNavigate={setView} openAgent={openAgent} onCloseAgent={closeAgent} voiceChannel={deckVoiceContext} overlays={deckOverlays} onConfirmationChange={setConfirmationOpen} onPaneTabChange={setPaneTab} restartNotice={restart.notice} onDismissRestartNotice={restart.dismiss} />;
   /*
     PRD #802 M6 — the voice surface is a SIBLING of the screen switch, and this
     shape is the whole of that decision.
@@ -1428,7 +1481,7 @@ function OverviewAgentPane({ runtime, view, deck, agent, held, attached, onClose
       onTabChange={setTab}
       onTerminalInput={keyboardInput}
       onTerminalResize={runtime.resizeTerminal}
-      appliedGeometry={runtime.appliedGeometry?.[agentKey(view.deckId, agent.id)]}
+      appliedGeometry={runtime.appliedGeometry?.[boundAgentKey({ deckId: view.deckId, agentId: agent.id, incarnation: agent.incarnation })]}
       /* The evidence drawer is the deck's, and no screen is mounted here that
          could open it — so the handoffs tab lists evidence and selecting one
          does nothing, rather than pretending at a drawer that is not there.
@@ -1556,7 +1609,7 @@ export function ControlDeck(props: { runtime: DeckRuntimeState; orchestrationPla
   );
 }
 
-export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = desktopOrchestrationPlatformIssue(), onNavigate, openAgent, onCloseAgent, voiceChannel, overlays: shellOverlays, onConfirmationChange, onPaneTabChange }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; orchestrationPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgent?: { deckId: string; agentId: string }; onCloseAgent?: () => void; voiceChannel?: VoiceContextChannel; overlays?: ScreenOverlays; onConfirmationChange?: (open: boolean) => void; onPaneTabChange?: (tab: PanelTab) => void }) {
+export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = desktopOrchestrationPlatformIssue(), onNavigate, openAgent, onCloseAgent, voiceChannel, overlays: shellOverlays, onConfirmationChange, onPaneTabChange, restartNotice, onDismissRestartNotice }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; orchestrationPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgent?: { deckId: string; agentId: string; incarnation?: string }; onCloseAgent?: () => void; voiceChannel?: VoiceContextChannel; overlays?: ScreenOverlays; onConfirmationChange?: (open: boolean) => void; onPaneTabChange?: (tab: PanelTab) => void; restartNotice?: string; onDismissRestartNotice?: () => void }) {
   const { mode, setShownTerminals } = runtime;
   const keyboardInput = useKeyboardInput(runtime.sendTerminalInput);
   // #1083: this screen cannot merge across decks, so under All Decks it shows
@@ -1594,7 +1647,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
    * the comparison `DeckShell` makes — expressed per tile, at the seam that
    * decides what the user sees, rather than trusted from the caller.
    */
-  const paneAgentId = openAgent && snapshot.agents.some((agent) => agent.id === openAgent.agentId && agent.daemonId === openAgent.deckId)
+  const paneAgentId = openAgent && snapshot.agents.some((agent) => agent.daemonId === openAgent.deckId && viewAgent([agent], { kind: "agent", from: "deck", ...openAgent }) !== undefined)
     ? openAgent.agentId
     : undefined;
   /*
@@ -1858,7 +1911,9 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
     /* The agent's OWN deck, which on this screen is always the selected one —
        written as the agent's rather than read off the connection so the
        declaration cannot drift from what the tile actually mounted. */
-    .map((agent) => ({ deckId: agent.daemonId, agentId: agent.id }));
+    /* PRD #1666 part 2 (G-fix5): with the daemon process that listed the row,
+       so the terminal opened for it is bound to that process. */
+    .map((agent) => ({ deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation }));
 
   /**
    * ONE call per render commit carrying ALL the shown ids, never one call per
@@ -1940,8 +1995,8 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
     }
   };
 
-  const renameAgent = async (agentId: string, displayName: string) => {
-    await perform({ type: "rename_agent", agentId, displayName }, `Agent renamed to ${displayName}.`);
+  const renameAgent = async (agentId: string, displayName: string, incarnation?: string) => {
+    await perform({ type: "rename_agent", agentId, displayName, incarnation }, `Agent renamed to ${displayName}.`);
   };
 
   /**
@@ -2101,7 +2156,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
       body: `This sends a stop request to ${selectedAgent.displayName}. Unsaved terminal work may be interrupted.`,
       label: "Close agent",
       busyLabel: "Stopping…",
-      action: async () => { await perform({ type: "stop_agent", deckId: snapshot.connection.deckId ?? "", agentId: selectedAgent.id }, `${selectedAgent.role} close requested.`); },
+      action: async () => { await perform({ type: "stop_agent", deckId: snapshot.connection.deckId ?? "", agentId: selectedAgent.id, incarnation: selectedAgent.incarnation }, `${selectedAgent.role} close requested.`); },
     });
   };
 
@@ -2489,7 +2544,11 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
               */}
               {snapshot.agents.map((agent, index) => (
                 <AgentPaneFrame
-                  key={agent.id}
+                  /* With the daemon process (PRD #1666 part 2, G-fix7): a
+                     restarted deck's agent under the same id is a different
+                     agent, so it gets a fresh frame and terminal rather than
+                     inheriting the previous process's. */
+                  key={`${agent.id}\u0000${agent.incarnation ?? ""}`}
                   open={agent.id === paneAgentId}
                   panePresent={paneAgentId !== undefined}
                   agent={agent}
@@ -2507,7 +2566,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
                   onTabChange={(tab) => setTabs((current) => ({ ...current, [agent.id]: tab }))}
                   onTerminalInput={keyboardInput}
                   onTerminalResize={runtime.resizeTerminal}
-                  appliedGeometry={runtime.appliedGeometry?.[agentKey(agent.daemonId, agent.id)]}
+                  appliedGeometry={runtime.appliedGeometry?.[boundAgentKey({ deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation })]}
                   onEvidenceSelect={(id) => { setSelectedEvidenceId(id); VOICE_ACTIONS.toggleEvidenceDrawer.run(voiceContext, { open: true }); }}
                   onRename={mode === "live" ? renameAgent : undefined}
                   onInboxAction={runtime.inboxAction}
@@ -2519,7 +2578,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
                     `.agent-tile:not(.is-selected) { display: none }` for the
                     promoted tile without relying on a specificity race.
                   */
-                  onOpen={onNavigate && (() => VOICE_ACTIONS.openAgent.run(voiceContext, { deckId: agent.daemonId, agentId: agent.id, from: "deck" }))}
+                  onOpen={onNavigate && (() => VOICE_ACTIONS.openAgent.run(voiceContext, { deckId: agent.daemonId, agentId: agent.id, from: "deck", incarnation: agent.incarnation }))}
                   onClose={onCloseAgent && (() => VOICE_ACTIONS.closeAgentView.run(voiceContext))}
                 />
               ))}
@@ -2559,7 +2618,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
           mounts its own copy of this over `runtime.error` alone (audit W2) —
           it has no notice of its own, and it is not mounted at the same time
           as this one. */}
-      <Toast message={notice || runtime.error} detail={notice ? noticeState?.detail : undefined} onDismiss={dismissToast} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} />
+      <Toast message={notice || runtime.error} detail={notice ? noticeState?.detail : undefined} onDismiss={dismissToast} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} restart={restartNotice} onDismissRestart={onDismissRestartNotice} />
     </div>
   );
 }
@@ -2585,15 +2644,15 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
  * while a warning that roles may still be running ends only when the user
  * dismisses THAT warning.
  */
-function Toast({ message, detail, onDismiss, warnings, onDismissWarning }: { message?: string; detail?: string; onDismiss: () => void; warnings?: readonly CleanupWarningEntry[]; onDismissWarning?: (id: number) => void }) {
+function Toast({ message, detail, onDismiss, warnings, onDismissWarning, restart, onDismissRestart }: { message?: string; detail?: string; onDismiss: () => void; warnings?: readonly CleanupWarningEntry[]; onDismissWarning?: (id: number) => void; restart?: string; onDismissRestart?: () => void }) {
   /* The newest entries are at the bottom, so an overflowing stack is kept
      scrolled there whenever something is added or the message changes. */
   const stack = useRef<HTMLDivElement>(null);
   const newestWarning = warnings?.at(-1)?.id;
   useEffect(() => {
     if (stack.current) stack.current.scrollTop = stack.current.scrollHeight;
-  }, [newestWarning, message]);
-  if (!message && !warnings?.length) return null;
+  }, [newestWarning, message, restart]);
+  if (!message && !warnings?.length && !restart) return null;
   return (
     <div className="toast-stack" ref={stack}>
       {warnings?.map((warning) => (
@@ -2603,6 +2662,21 @@ function Toast({ message, detail, onDismiss, warnings, onDismissWarning }: { mes
           <button aria-label="Dismiss cleanup warning" onClick={() => onDismissWarning?.(warning.id)}><X size={14} /></button>
         </div>
       ))}
+      {/* PRD #1666 part 2 (G-fix7c): the agents a deck restart stopped, in a
+          slot of its own so an action's sentence never replaces it unseen. */}
+      {restart && (
+        <div className="toast toast-restart" data-testid="restart-toast" role="status">
+          <AlertTriangle size={15} />
+          <div className="toast-body">
+            {/* G-fix7d: every agent the notice names, unclamped — the last
+                ones are as much the point as the first — in a body that
+                scrolls when the list is long. `useRestartNotice` clamps each
+                name it takes. */}
+            <span>{sanitizeText(restart)}</span>
+          </div>
+          <button aria-label="Dismiss restart notice" onClick={onDismissRestart}><X size={14} /></button>
+        </div>
+      )}
       {message && (
         <div className="toast" data-testid="toast" role="status">
           <AlertTriangle size={15} />

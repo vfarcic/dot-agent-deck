@@ -1,0 +1,14 @@
+---
+source: tests/render_restart_notice.rs
+expression: shown
+---
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                         No active agents. Press Ctrl+n to create an agent.                         
+                                                                                                    
+                                                                                                    
+                                                                                                    
+The deck restarted; these agents were stopped: coder, reviewer.               [Agents a] [Dismiss c]
+ COMMAND  [Back to Pane d/Ctrl+D] [New Agent n/Ctrl+N] [Close w/Ctrl+W] [Toggle Layout t/Ctrl+T]    
+[Help ?] [Quit Ctrl+C] [Filter /] [Rename r] [Generate g] [Schedules s]

@@ -694,15 +694,31 @@ pub fn executable_of(_pid: u32) -> Option<std::path::PathBuf> {
 /// not query it), or that started after `pid` did (its pid was reused), is
 /// answered as `Some(0)`: the walk in [`super::descends_from_with`] then ends
 /// as "not a descendant", as an orphan reparented to init does on Linux.
+/// [`placement_parent_of`] answers `None` there instead.
 pub fn parent_pid_of(pid: u32) -> Option<u32> {
+    followable_parent(pid).map(|parent| parent.unwrap_or(0))
+}
+
+/// R2-fix4 (U2): [`parent_pid_of`] for a walk that must not read "cannot
+/// follow" as "outside": `None` where that answers `Some(0)` for a recorded
+/// parent that cannot be opened or started after `pid` did, so the walk ends
+/// [`super::Ancestry::Unreadable`]. A recorded parent of 0 stays `Some(0)`.
+pub fn placement_parent_of(pid: u32) -> Option<u32> {
+    followable_parent(pid).flatten()
+}
+
+/// `pid`'s recorded parent, `Some(None)` when the walk cannot follow it (it
+/// cannot be opened, or started after `pid` did), and `None` when the
+/// snapshot does not list `pid`.
+fn followable_parent(pid: u32) -> Option<Option<u32>> {
     let recorded = recorded_parent(pid)?;
     if recorded == 0 {
-        return Some(0);
+        return Some(Some(0));
     }
     match (creation_time(pid), creation_time(recorded)) {
-        (_, None) => Some(0),
-        (Some(child_started), Some(parent_started)) if parent_started > child_started => Some(0),
-        _ => Some(recorded),
+        (_, None) => Some(None),
+        (Some(child_started), Some(parent_started)) if parent_started > child_started => Some(None),
+        _ => Some(Some(recorded)),
     }
 }
 

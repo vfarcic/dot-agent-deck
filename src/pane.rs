@@ -3,6 +3,7 @@ use std::any::Any;
 use thiserror::Error;
 
 use crate::agent_pty::TabMembership;
+use crate::daemon_client::Incarnation;
 use crate::event::AgentType;
 
 #[derive(Debug, Error)]
@@ -15,6 +16,10 @@ pub enum PaneError {
     ParseError(String),
     #[error("Pane control not available")]
     NotAvailable,
+    /// PRD #1666 part 2 (G-fix7): the action was refused, and the card it was
+    /// aimed at stays as it is. The message is the sentence to show.
+    #[error("{0}")]
+    Refused(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,6 +297,41 @@ impl Default for AgentSpawnOptions<'_> {
     }
 }
 
+/// PRD #1666 part 2 (G-fix6): a pane id as the UI holds it, together with the
+/// daemon process ([`Incarnation`]) of the response that produced it — the
+/// event stream that painted the card, or the listing or attach that named it.
+///
+/// A pane id is not an agent identity: a restarted daemon, the same build
+/// included, can hold an unrelated agent under the same pane id. So every
+/// controller call that turns a held pane id into a daemon request takes this
+/// pair, and the request reaches the process the id came from or nothing. A
+/// controller that attached the pane itself binds to the process it attached
+/// on, which is the same process for a card it learned from that daemon; an
+/// [`Incarnation::UNNAMED`] stamp — a card learned from no named process —
+/// sends nothing on a gated controller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundPane {
+    pub pane_id: String,
+    pub incarnation: Incarnation,
+}
+
+impl BoundPane {
+    pub fn new(pane_id: impl Into<String>, incarnation: Incarnation) -> Self {
+        Self {
+            pane_id: pane_id.into(),
+            incarnation,
+        }
+    }
+
+    /// A pane id the controller produced itself — a role pane it started or
+    /// attached — which no card stamp speaks for. The controller's own record
+    /// of the attach binds it; with no record, a gated controller sends
+    /// nothing.
+    pub fn held_by_controller(pane_id: impl Into<String>) -> Self {
+        Self::new(pane_id, Incarnation::UNNAMED)
+    }
+}
+
 pub trait PaneController: Send + Sync {
     fn focus_pane(&self, pane_id: &str) -> Result<(), PaneError>;
     /// PRD #83: the id of the pane that currently holds process-wide
@@ -323,7 +363,12 @@ pub trait PaneController: Send + Sync {
     /// impossible to cover in a fast-tier test. The default returns `false`
     /// ("nothing to attach"), preserving the old behaviour for render-only
     /// fixtures and local-PTY mocks.
-    fn try_hydrate_pane(&self, _pane_id: &str) -> bool {
+    ///
+    /// PRD #1666 part 2 (G-fix6): `card` carries the daemon process the card
+    /// was learned from; the agent is looked up and attached on that process
+    /// only, so a restarted daemon's agent under the same pane id is never
+    /// adopted.
+    fn try_hydrate_pane(&self, _card: &BoundPane) -> bool {
         false
     }
     /// PRD #76 M2.15 fixup pass 2 G1 — legacy single-call entry point.
@@ -431,6 +476,42 @@ pub trait PaneController: Send + Sync {
         false
     }
     fn close_pane(&self, pane_id: &str) -> Result<(), PaneError>;
+    /// PRD #1666 part 2 (G-fix6): close the pane behind a dashboard card. Like
+    /// [`Self::close_pane`], except that a card with no local pane stops its
+    /// agent only on the daemon process the card was learned from. The default
+    /// is `close_pane`, for controllers with no daemon behind them.
+    fn close_card(&self, card: &BoundPane) -> Result<(), PaneError> {
+        self.close_pane(&card.pane_id)
+    }
+    /// PRD #1666 part 2 (G-fix7): focus the local pane behind a dashboard
+    /// card, only when it is the card's — attached on the daemon process the
+    /// card was learned from. The default is [`Self::focus_pane`], for
+    /// controllers with no daemon behind them.
+    fn focus_card(&self, card: &BoundPane) -> Result<(), PaneError> {
+        self.focus_pane(&card.pane_id)
+    }
+    /// PRD #1666 part 2 (G-fix7c): whether the local pane under `card`'s pane
+    /// id is the card's, so a focus on that pane may select the card: attached
+    /// on the daemon process the card was learned from. The default is `true`,
+    /// for controllers with no daemon behind them, where a pane id names one
+    /// pane.
+    fn local_pane_is_cards(&self, _card: &BoundPane) -> bool {
+        true
+    }
+    /// PRD #1666 part 2 (G-fix7): the daemon process this controller attached
+    /// `pane_id` on, for a card it draws for a pane it started or attached
+    /// itself. `None` when it holds no such pane or learned no process — the
+    /// default, for controllers with no daemon behind them.
+    fn pane_incarnation(&self, _pane_id: &str) -> Option<crate::daemon_client::Incarnation> {
+        None
+    }
+    /// PRD #1666 part 2 (G-fix7c): the local panes whose agent a deck restart
+    /// took — the reattach found another daemon process answering — each with
+    /// the process it was attached on, for the render loop to drop with the
+    /// restart's notice. The default holds none.
+    fn panes_lost_to_restart(&self) -> Vec<(String, Option<crate::daemon_client::Incarnation>)> {
+        Vec::new()
+    }
     fn list_panes(&self) -> Result<Vec<PaneInfo>, PaneError>;
     fn resize_pane(
         &self,
@@ -459,13 +540,16 @@ pub trait PaneController: Send + Sync {
     /// overrides it to send the report on its runtime.
     fn report_orchestrator_context(&self, _pane_id: &str, _context_path: &std::path::Path) {}
     /// PRD #1666 S5: post a deck-generated message — a seed, an orchestrator's
-    /// role context, the configuration request — to `pane_id`'s inbox, bound to
+    /// role context, the configuration request — to `pane`'s inbox, bound to
     /// the agent the pane holds now. Answers the message id. The default has no
     /// inbox behind it and refuses; the daemon-backed `EmbeddedPaneController`
     /// overrides it.
+    ///
+    /// PRD #1666 part 2 (G-fix6): posted only on the daemon process `pane` was
+    /// learned from ([`BoundPane`]).
     fn post_message(
         &self,
-        _pane_id: &str,
+        _pane: &BoundPane,
         _subject: &str,
         _body: &str,
         _origin: crate::inbox_hub::PostOrigin,

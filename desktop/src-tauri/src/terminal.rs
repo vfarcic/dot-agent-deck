@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use dot_agent_deck::daemon_client::{Endpoint, EndpointIdentity, FocusReport};
+use dot_agent_deck::daemon_client::{Endpoint, EndpointIdentity, FocusReport, Incarnation};
 use dot_agent_deck::daemon_protocol::{
     KIND_DETACH, KIND_GEOMETRY, KIND_STREAM_END, KIND_STREAM_IN, KIND_STREAM_OUT,
     KIND_STREAM_REJECT, parse_geometry_frame, read_frame, write_frame,
@@ -125,6 +125,13 @@ struct TerminalSession {
     /// show the same agent, so the token is what tells them apart — the process
     /// identity behind the connection cannot.
     viewer: Option<String>,
+    /// PRD #1666 part 2 (G-fix4): the daemon process that accepted the attach
+    /// and issued [`Self::viewer`], from the `Hello` on the attach's own
+    /// connection. Viewer tokens and agent ids are per-process counters, so
+    /// [`resize`] is bound to it: a successor that issued the same token to
+    /// another client's viewer of an unrelated agent is sent nothing. `None`
+    /// only for a session no gated attach produced (test fixtures).
+    incarnation: Option<dot_agent_deck::daemon_client::Incarnation>,
     /// PRD #741 M9 — a lease of this session's own on the transport it streams
     /// over.
     ///
@@ -737,6 +744,10 @@ fn rejection_notice(reason: &[u8]) -> Vec<u8> {
 struct Established {
     result: TerminalAttachResult,
     stream: Option<dot_agent_deck::platform::transport::TransportReadHalf>,
+    /// PRD #1666 part 2: the deck `stream` belongs to, for its reader to
+    /// distrust when the stream ends — held by the reader itself, because the
+    /// session record that also names it can be removed before then.
+    endpoint: Endpoint,
     /// PRD #1105 M11: the focus claim this attach started, if the window was
     /// focused. Production lets it run; it is carried out only so a test can
     /// wait for it rather than poll the daemon. Those tests are Unix-only.
@@ -763,6 +774,11 @@ async fn establish(
     state: &DesktopState,
     deck_id: Option<String>,
     agent_id: String,
+    // PRD #1666 part 2 (G-fix5): the daemon process that listed the card being
+    // opened (`DesktopAgent::incarnation`). The attach is bound to it, so a
+    // card from before a restart opens nothing on the successor's agent with
+    // the same id: no terminal, no PTY bytes either way, and the gone sentence.
+    incarnation: Incarnation,
     on_output: &Channel<Response>,
     viewport: Option<(u16, u16)>,
 ) -> Result<Established, String> {
@@ -784,13 +800,20 @@ async fn establish(
     let channel_id = on_output.id();
     // The deck is part of the reuse check for the same reason it is part of the
     // registry key: `(agent_id, channel_id)` alone would answer "you already
-    // have this" for another deck's namesake.
+    // have this" for another deck's namesake. So is the daemon process (G-fix5):
+    // a session attached on another incarnation is a namesake on a successor,
+    // and is replaced below by an attach bound to the card's own.
     if let Some((session_id, session)) = state.sessions()?.iter().find(|(_, session)| {
         session.agent_id == agent_id
             && session.channel_id == channel_id
             && session.endpoint.identity() == deck
+            && session
+                .incarnation
+                .as_ref()
+                .is_some_and(|attached| attached.same_process(&incarnation))
     }) {
         return Ok(Established {
+            endpoint: scope.endpoint().clone(),
             result: TerminalAttachResult {
                 session_id: session_id.clone(),
                 agent_id,
@@ -805,8 +828,9 @@ async fn establish(
             focus_claim: None,
         });
     }
-    // This deck's earlier session for this agent, never another deck's.
-    detach_agent_on(state, &deck, &agent_id).await;
+    // This deck's earlier session for this agent, never another deck's, and
+    // never one attached on another daemon process (G-fix6).
+    detach_agent_on(state, &deck, &agent_id, &incarnation).await;
     let daemon = state.daemon.trusted(scope.endpoint()).await?;
     daemon.require_compatible()?;
     // PRD #882: a half-measured tile (one axis zero) declares nothing rather
@@ -823,17 +847,39 @@ async fn establish(
     // the daemon applies as an unattributed override across every other client.
     // Registering now and contributing a constraint on the first resize is the
     // difference between joining the policy and overriding it.
+    //
+    // PRD #1666 part 2 (`lifecycle/handshake/011`): and only on a connection
+    // whose own `Hello` the desktop's classification accepts — the held client
+    // is gated with it (`daemon_bridge::establish`). The classification above
+    // may be up to `HANDSHAKE_REVALIDATE_INTERVAL` old and may describe a
+    // daemon that has since been replaced at this socket by another build,
+    // which would otherwise be handed a terminal on the strength of its
+    // predecessor's reply.
+    //
+    // PRD #1666 part 2 (G-fix5): and only on the daemon process that listed the
+    // card, checked on that same connection, so a successor that numbered an
+    // unrelated agent with this id is sent nothing but the `Hello`.
+    let client = daemon.client.bound_to(incarnation);
     let connection = match viewport {
-        Some(viewport) => {
-            daemon
-                .client
-                .attach_as_viewer(&agent_id, Some(viewport))
-                .await
-        }
-        None => daemon.client.attach_pending_viewport(&agent_id).await,
+        Some(viewport) => client.attach_as_viewer(&agent_id, Some(viewport)).await,
+        None => client.attach_pending_viewport(&agent_id).await,
     }
-    .map_err(|error| safe_message(error.to_string()))?;
+    .map_err(|error| match error {
+        // In the words `TrustedDaemon::require_compatible` refuses with, so the
+        // tile reads the same whichever check caught the daemon.
+        dot_agent_deck::daemon_client::ClientError::ProtocolMismatch {
+            daemon: Some(server),
+            local,
+        } => format!(
+            "Not attaching: the daemon speaks attach protocol v{server}, but this app speaks v{local}."
+        ),
+        // The classification's own sentence, which is already safe for the
+        // webview (`classify_handshake` composes it through `safe_message`).
+        dot_agent_deck::daemon_client::ClientError::NotAdmitted(reason) => reason,
+        error => safe_message(error.to_string()),
+    })?;
     let viewer = connection.viewer().map(|v| v.to_string());
+    let incarnation = connection.incarnation().cloned();
     let applied = connection.applied();
     let (reader, writer) = connection.into_split();
     let generation = state.next_generation.fetch_add(1, Ordering::Relaxed);
@@ -847,6 +893,7 @@ async fn establish(
         generation,
         writer: Arc::new(AsyncMutex::new(writer)),
         viewer,
+        incarnation,
         _transport: transport,
     };
     match state.publish_scoped_session(session_id.clone(), session, &scope) {
@@ -879,6 +926,7 @@ async fn establish(
 
     Ok(Established {
         focus_claim,
+        endpoint: scope.endpoint().clone(),
         result: TerminalAttachResult {
             session_id,
             agent_id,
@@ -1056,6 +1104,9 @@ pub(crate) async fn attach(
     // and why the resolution is against the observed set.
     deck_id: Option<String>,
     agent_id: String,
+    // PRD #1666 part 2 (G-fix5): the opened card's daemon process; see
+    // [`establish`].
+    incarnation: Incarnation,
     on_output: Channel<Response>,
     // PRD #882 — the geometry this tile can draw the agent at, measured by
     // `FitAddon` in the webview. Declaring it registers the tile as a viewer, so
@@ -1063,8 +1114,12 @@ pub(crate) async fn attach(
     // watching it and tells this tile whenever that changes.
     viewport: Option<(u16, u16)>,
 ) -> Result<TerminalAttachResult, String> {
-    let Established { result, stream, .. } =
-        establish(state, deck_id, agent_id, &on_output, viewport).await?;
+    let Established {
+        result,
+        stream,
+        endpoint,
+        ..
+    } = establish(state, deck_id, agent_id, incarnation, &on_output, viewport).await?;
     let Some(mut reader) = stream else {
         // A reused session: the caller already has a live stream task and an
         // `Attached` event from the attach that created it.
@@ -1089,38 +1144,30 @@ pub(crate) async fn attach(
     let session_for_stream = session_id.clone();
     let agent_for_stream = agent_id.clone();
     tauri::async_runtime::spawn(async move {
-        loop {
+        let ended = loop {
             match read_frame(&mut reader).await {
                 Ok(Some((KIND_STREAM_OUT, data))) => {
                     if let Err(error) = on_output.send(Response::new(data)) {
-                        emit_terminal_state(
-                            &app_for_stream,
-                            TerminalStateEvent {
-                                session_id: session_for_stream.clone(),
-                                agent_id: agent_for_stream.clone(),
-                                generation,
-                                state: TerminalState::Error,
-                                message: Some(safe_message(format!(
-                                    "terminal output channel closed: {error}"
-                                ))),
-                            },
-                        );
-                        break;
-                    }
-                }
-                Ok(Some((KIND_STREAM_END, reason))) => {
-                    emit_terminal_state(
-                        &app_for_stream,
-                        TerminalStateEvent {
+                        break TerminalStateEvent {
                             session_id: session_for_stream.clone(),
                             agent_id: agent_for_stream.clone(),
                             generation,
-                            state: TerminalState::End,
-                            message: (!reason.is_empty())
-                                .then(|| safe_message(String::from_utf8_lossy(&reason))),
-                        },
-                    );
-                    break;
+                            state: TerminalState::Error,
+                            message: Some(safe_message(format!(
+                                "terminal output channel closed: {error}"
+                            ))),
+                        };
+                    }
+                }
+                Ok(Some((KIND_STREAM_END, reason))) => {
+                    break TerminalStateEvent {
+                        session_id: session_for_stream.clone(),
+                        agent_id: agent_for_stream.clone(),
+                        generation,
+                        state: TerminalState::End,
+                        message: (!reason.is_empty())
+                            .then(|| safe_message(String::from_utf8_lossy(&reason))),
+                    };
                 }
                 // PRD #882: the daemon applied a new geometry for this agent.
                 // Non-terminal, like a rejection — the stream stays open and
@@ -1146,76 +1193,102 @@ pub(crate) async fn attach(
                     // output. Surface the reason in-band without tearing down
                     // the session or changing the frontend lifecycle contract.
                     if let Err(error) = on_output.send(Response::new(rejection_notice(&reason))) {
-                        emit_terminal_state(
-                            &app_for_stream,
-                            TerminalStateEvent {
-                                session_id: session_for_stream.clone(),
-                                agent_id: agent_for_stream.clone(),
-                                generation,
-                                state: TerminalState::Error,
-                                message: Some(safe_message(format!(
-                                    "terminal output channel closed: {error}"
-                                ))),
-                            },
-                        );
-                        break;
+                        break TerminalStateEvent {
+                            session_id: session_for_stream.clone(),
+                            agent_id: agent_for_stream.clone(),
+                            generation,
+                            state: TerminalState::Error,
+                            message: Some(safe_message(format!(
+                                "terminal output channel closed: {error}"
+                            ))),
+                        };
                     }
                 }
                 Ok(None) => {
-                    emit_terminal_state(
-                        &app_for_stream,
-                        TerminalStateEvent {
-                            session_id: session_for_stream.clone(),
-                            agent_id: agent_for_stream.clone(),
-                            generation,
-                            state: TerminalState::End,
-                            message: None,
-                        },
-                    );
-                    break;
+                    break TerminalStateEvent {
+                        session_id: session_for_stream.clone(),
+                        agent_id: agent_for_stream.clone(),
+                        generation,
+                        state: TerminalState::End,
+                        message: None,
+                    };
                 }
                 Ok(Some((kind, _))) => {
-                    emit_terminal_state(
-                        &app_for_stream,
-                        TerminalStateEvent {
-                            session_id: session_for_stream.clone(),
-                            agent_id: agent_for_stream.clone(),
-                            generation,
-                            state: TerminalState::Error,
-                            message: Some(format!(
-                                "unexpected terminal frame kind 0x{kind:02x} from the daemon"
-                            )),
-                        },
-                    );
-                    break;
+                    break TerminalStateEvent {
+                        session_id: session_for_stream.clone(),
+                        agent_id: agent_for_stream.clone(),
+                        generation,
+                        state: TerminalState::Error,
+                        message: Some(format!(
+                            "unexpected terminal frame kind 0x{kind:02x} from the daemon"
+                        )),
+                    };
                 }
                 Err(error) => {
-                    emit_terminal_state(
-                        &app_for_stream,
-                        TerminalStateEvent {
-                            session_id: session_for_stream.clone(),
-                            agent_id: agent_for_stream.clone(),
-                            generation,
-                            state: TerminalState::Error,
-                            message: Some(safe_message(error.to_string())),
-                        },
-                    );
-                    break;
+                    break TerminalStateEvent {
+                        session_id: session_for_stream.clone(),
+                        agent_id: agent_for_stream.clone(),
+                        generation,
+                        state: TerminalState::Error,
+                        message: Some(safe_message(error.to_string())),
+                    };
                 }
             }
-        }
+        };
 
         let state = app_for_stream.state::<DesktopState>();
-        if let Ok(mut sessions) = state.sessions()
-            && sessions
-                .get(&session_for_stream)
-                .is_some_and(|session| session.generation == generation)
-        {
-            sessions.remove(&session_for_stream);
-        }
+        finish_terminal_stream(&state, &endpoint, &session_for_stream, ended, |event| {
+            emit_terminal_state(&app_for_stream, event)
+        })
+        .await;
     });
 
     Ok(result)
+}
+
+/// How a terminal's reader ends, in order: distrust the deck, forget the
+/// session, then `publish` the `ended` event — the End or Error the tile reopens
+/// on. Split from the reader so a test can run it without a webview.
+///
+/// PRD #1666 part 2 (`lifecycle/handshake/011`): a stream that ended may mean
+/// the daemon behind `endpoint` went away and another build took its socket.
+/// The held handshake for `endpoint` is dropped FIRST, from the reader's own
+/// copy of the deck — not from the session record, which a detach or a reopen
+/// on another channel may already have removed — and the event is published
+/// only after that has finished, so a reopen it prompts classifies the daemon
+/// now answering afresh, issue #405's protocol check included, instead of the
+/// one this stream belonged to. A reopen that is not prompted by this event can
+/// still find the old classification held; its attach checks the protocol on
+/// its own connection all the same (see [`establish`]).
+async fn finish_terminal_stream(
+    state: &DesktopState,
+    endpoint: &Endpoint,
+    session_id: &str,
+    ended: TerminalStateEvent,
+    publish: impl FnOnce(TerminalStateEvent),
+) {
+    state.daemon.invalidate(endpoint).await;
+    terminal_stream_ended(state, session_id, ended.generation).await;
+    publish(ended);
+}
+
+/// Forget `session_id` if it is still the stream of `generation`, so an old
+/// reader never removes a newer session, and distrust its deck as well.
+/// [`finish_terminal_stream`] has already distrusted the deck by the time a
+/// reader calls this; doing it again here keeps this seam whole for a caller
+/// that only has the session.
+async fn terminal_stream_ended(state: &DesktopState, session_id: &str, generation: u64) {
+    let mut ended = None;
+    if let Ok(mut sessions) = state.sessions()
+        && sessions
+            .get(session_id)
+            .is_some_and(|session| session.generation == generation)
+    {
+        ended = sessions.remove(session_id);
+    }
+    if let Some(session) = ended {
+        state.daemon.invalidate(&session.endpoint).await;
+    }
 }
 
 /// A best-effort DETACH over a session that was built and then **not**
@@ -1272,7 +1345,7 @@ pub(crate) async fn resize(
     rows: u16,
 ) -> Result<(), String> {
     let (rows, cols) = validate_dimensions(rows, cols)?;
-    let (agent_id, viewer, endpoint) = state
+    let (agent_id, viewer, endpoint, incarnation) = state
         .sessions()?
         .get(session_id)
         .map(|session| {
@@ -1280,6 +1353,7 @@ pub(crate) async fn resize(
                 session.agent_id.clone(),
                 session.viewer.clone(),
                 session.endpoint.clone(),
+                session.incarnation.clone(),
             )
         })
         .ok_or_else(|| format!("terminal session not found: {}", safe_message(session_id)))?;
@@ -1290,8 +1364,16 @@ pub(crate) async fn resize(
     // it actually applied; the frontend learns that number from the
     // `desktop://terminal-geometry` event the daemon pushes to every viewer,
     // including this one, so nothing is returned here.
-    daemon
-        .client
+    //
+    // PRD #1666 part 2 (G-fix4): bound to the process that issued the token.
+    // The fields above were copied before the awaits, so a restart since — the
+    // same build included — would otherwise put this geometry on whichever
+    // viewer and agent the successor numbered the same.
+    let client = match incarnation {
+        Some(incarnation) => daemon.client.bound_to(incarnation),
+        None => (*daemon.client).clone(),
+    };
+    client
         .resize_agent_as_viewer(&agent_id, rows, cols, viewer.as_deref())
         .await
         .map(|_| ())
@@ -1308,15 +1390,32 @@ pub(crate) async fn detach(state: &DesktopState, session_id: &str) -> Result<boo
     Ok(true)
 }
 
-/// Every session for one agent **on one deck**.
+/// Every session for one agent **on one deck**, attached on the daemon process
+/// `incarnation` names.
 ///
 /// The deck term is PRD #1105's: without it this tore down another machine's
 /// live pane whenever its agent happened to share an id, which is the ordinary
-/// case rather than a contrived one.
-pub(crate) async fn detach_agent_on(state: &DesktopState, deck: &EndpointIdentity, agent_id: &str) {
+/// case rather than a contrived one. The process term is PRD #1666 part 2's
+/// (G-fix6), for the same reason one level down: a restarted daemon numbers an
+/// unrelated agent with the same id, and stopping, or opening a stale card of,
+/// the old one must not end the new one's terminal. A session that recorded no
+/// process is matched as before.
+pub(crate) async fn detach_agent_on(
+    state: &DesktopState,
+    deck: &EndpointIdentity,
+    agent_id: &str,
+    incarnation: &Incarnation,
+) {
     detach_matching(
         state,
-        |session| session.agent_id == agent_id && session.endpoint.identity() == *deck,
+        |session| {
+            session.agent_id == agent_id
+                && session.endpoint.identity() == *deck
+                && session
+                    .incarnation
+                    .as_ref()
+                    .is_none_or(|attached| attached.same_process(incarnation))
+        },
         || false,
     )
     .await;
@@ -1493,6 +1592,7 @@ mod tests {
             writer: Arc::new(AsyncMutex::new(writer)),
             // Test seam: no attach happened, so there is no viewer token.
             viewer: None,
+            incarnation: None,
             _transport: transport,
         }
     }
@@ -1810,11 +1910,36 @@ mod tests {
             )
             .unwrap();
 
-        detach_agent_on(&state, &deck_a.identity(), "planner").await;
+        detach_agent_on(&state, &deck_a.identity(), "planner", &Incarnation::UNNAMED).await;
 
         let sessions = state.sessions().unwrap();
         assert_eq!(sessions.len(), 1);
         assert!(sessions.contains_key("terminal-b"));
+    }
+
+    /// Scenario: one deck holds two terminal sessions for agent `planner` — one attached on the daemon process `a` before a same-build restart, one on its successor `b`. Detaching `a`'s agent, as a stop on it or a stale card's open does, ends only `a`'s session and leaves `b`'s terminal open.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn handshake_013_detaching_an_agent_leaves_a_successors_namesake() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let lease = fixture_lease().await;
+        let state = DesktopState::default();
+        let deck = fixture_deck("/tmp/dot-agent-deck-detach-incarnation.sock");
+        let named = |process: &str| Incarnation::from(Some(process.to_string()));
+        for (id, process) in [("terminal-a", "a"), ("terminal-b", "b")] {
+            let mut session = fixture_session_on(deck.clone(), "planner", 1, Arc::clone(&lease));
+            session.incarnation = Some(named(process));
+            state.insert_unique_session(id.into(), session).unwrap();
+        }
+
+        detach_agent_on(&state, &deck.identity(), "planner", &named("a")).await;
+
+        let sessions = state.sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert!(
+            sessions.contains_key("terminal-b"),
+            "the successor's terminal was ended"
+        );
     }
 
     /// PRD #1105's `detach_all` decision, as a test rather than a comment: a
@@ -2310,6 +2435,508 @@ mod tests {
         Channel::new(|_body: tauri::ipc::InvokeResponseBody| Ok(()))
     }
 
+    /// Scenario: a terminal is open on a deck the app trusts, and its stream
+    /// ends — once with the tile still attached, once after the tile was
+    /// detached, which removes the session record first. Either way the deck's
+    /// held handshake is gone by the time the End event is published, so a
+    /// reopen it prompts handshakes afresh, and the session is forgotten.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stream_end_distrusts_its_deck_before_it_is_published() {
+        use dot_agent_deck::daemon_protocol::AttachResponse;
+        use std::time::Duration;
+
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        for detached_first in [false, true] {
+            let (_dir, socket) = scratch_socket("dad-end-order");
+            let (listener, _local_deck) = bind_local_deck(&socket);
+            crate::dto::apply_settings_selection(&crate::settings::DesktopSettings::default());
+            let state = DesktopState::default();
+            state.daemon.pin_cache_age_for_test(Duration::ZERO);
+            let daemon = tokio::spawn(async move {
+                let _hello = answer_one(&listener, matching_hello(), None, None).await;
+                let (_, writer) = answer_one(&listener, AttachResponse::ok(), None, None).await;
+                (listener, writer)
+            });
+            let channel = fixture_channel();
+            let first = tokio::time::timeout(
+                Duration::from_secs(5),
+                establish(
+                    &state,
+                    None,
+                    "planner".into(),
+                    fixture_incarnation(),
+                    &channel,
+                    None,
+                ),
+            )
+            .await
+            .expect("bounded attach")
+            .expect("a compatible terminal");
+            let _daemon = daemon.await.expect("scripted daemon");
+            assert_eq!(
+                state.daemon.held().await,
+                1,
+                "precondition: the deck is trusted"
+            );
+            let session_id = first.result.session_id.clone();
+            if detached_first {
+                assert!(detach(&state, &session_id).await.expect("detach"));
+            }
+            let mut held_at_publish = None;
+            finish_terminal_stream(
+                &state,
+                &first.endpoint,
+                &session_id,
+                TerminalStateEvent {
+                    session_id: session_id.clone(),
+                    agent_id: "planner".into(),
+                    generation: first.result.generation,
+                    state: TerminalState::End,
+                    message: None,
+                },
+                |_| held_at_publish = Some(state.daemon.held_now()),
+            )
+            .await;
+            assert_eq!(
+                held_at_publish,
+                Some(Some(0)),
+                "detached_first={detached_first}: the End event was published while the deck's \
+                 handshake was still held"
+            );
+            assert!(
+                !state
+                    .sessions()
+                    .expect("sessions")
+                    .contains_key(&session_id),
+                "the ended session must be forgotten"
+            );
+        }
+    }
+
+    /// Scenario: a terminal is open on a trusted deck when the daemon behind
+    /// its socket is replaced by one on the next attach protocol, and before
+    /// anything has distrusted the deck the tile reopens on another channel.
+    /// The reopen is refused, naming both protocols, and the replacement is
+    /// sent no attach — the held handshake does not admit it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_reopen_on_still_held_trust_checks_the_protocol_on_its_own_attach() {
+        use dot_agent_deck::daemon_protocol::{
+            AttachResponse, KIND_REQ, KIND_RESP, PROTOCOL_VERSION,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Duration;
+
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let (_dir, socket) = scratch_socket("dad-held-skew");
+        let (listener, _local_deck) = bind_local_deck(&socket);
+        crate::dto::apply_settings_selection(&crate::settings::DesktopSettings::default());
+        let state = DesktopState::default();
+        state.daemon.pin_cache_age_for_test(Duration::ZERO);
+        let original = tokio::spawn(async move {
+            let _hello = answer_one(&listener, matching_hello(), None, None).await;
+            let (_, writer) = answer_one(&listener, AttachResponse::ok(), None, None).await;
+            writer
+        });
+        let first_channel = fixture_channel();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            establish(
+                &state,
+                None,
+                "planner".into(),
+                fixture_incarnation(),
+                &first_channel,
+                None,
+            ),
+        )
+        .await
+        .expect("bounded attach")
+        .expect("a compatible terminal");
+        let _old_writer = original.await.expect("original scripted daemon");
+        assert_eq!(
+            state.daemon.held().await,
+            1,
+            "precondition: the deck is trusted"
+        );
+
+        std::fs::remove_file(&socket).unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let admissions = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&admissions);
+        let replacement = tokio::spawn(async move {
+            let mut streams = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                let (reader, writer) = stream.into_split();
+                let mut reader =
+                    dot_agent_deck::platform::transport::TransportReadHalf::new(reader);
+                let mut writer = TransportWriteHalf::new(writer);
+                let mut follow_on = true;
+                while std::mem::take(&mut follow_on) {
+                    let Some((KIND_REQ, payload)) = read_frame(&mut reader).await.unwrap() else {
+                        break;
+                    };
+                    let request: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                    let reply = if request["op"] == "hello" {
+                        follow_on = request["follow_on"] == true;
+                        let mut hello = matching_hello().with_capabilities();
+                        hello.server_version = Some(PROTOCOL_VERSION + 1);
+                        hello
+                    } else {
+                        if request["op"] == "attach-stream" {
+                            count.fetch_add(1, Ordering::SeqCst);
+                        }
+                        AttachResponse::ok()
+                    };
+                    write_frame(&mut writer, KIND_RESP, &serde_json::to_vec(&reply).unwrap())
+                        .await
+                        .unwrap();
+                }
+                streams.push(writer);
+            }
+        });
+        let reopened = tokio::time::timeout(
+            Duration::from_secs(5),
+            establish(
+                &state,
+                None,
+                "planner".into(),
+                fixture_incarnation(),
+                &fixture_channel(),
+                None,
+            ),
+        )
+        .await
+        .expect("bounded reopen");
+        replacement.abort();
+        assert_eq!(
+            admissions.load(Ordering::SeqCst),
+            0,
+            "a reopen on held trust attached to a daemon on another protocol"
+        );
+        let Err(refusal) = reopened else {
+            panic!("a reopen against a daemon on another protocol must be refused");
+        };
+        assert!(
+            refusal.ends_with(&format!(
+                "Not attaching: the daemon speaks attach protocol v{}, but this app speaks v{PROTOCOL_VERSION}.",
+                PROTOCOL_VERSION + 1
+            )),
+            "the refusal must name both protocols in the app's words: {refusal}"
+        );
+    }
+
+    /// Scenario: a terminal is open on a trusted deck when the daemon behind
+    /// its socket is replaced by one on the same attach protocol but one
+    /// declared contract break behind — a pairing the app refuses at connect —
+    /// and the tile reopens on another channel before anything distrusts the
+    /// deck. The reopen is refused in the connection banner's words and the
+    /// replacement is sent no attach. With Connect anyway chosen for the
+    /// session, the same reopen attaches on its checked connection, while a
+    /// replacement on the next protocol is still refused with no attach.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_reopen_against_a_contract_break_is_refused_as_connect_refuses_it() {
+        use dot_agent_deck::daemon_protocol::{AttachResponse, KIND_REQ, KIND_RESP};
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Duration;
+
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        for (connect_anyway, next_protocol) in [(false, false), (true, false), (true, true)] {
+            let _allowance = crate::daemon_bridge::AllowanceGuard::acquire();
+            let (_dir, socket) = scratch_socket("dad-held-break");
+            let (listener, _local_deck) = bind_local_deck(&socket);
+            crate::dto::apply_settings_selection(&crate::settings::DesktopSettings::default());
+            let state = DesktopState::default();
+            state.daemon.pin_cache_age_for_test(Duration::ZERO);
+            let original = tokio::spawn(async move {
+                let _hello = answer_one(&listener, matching_hello(), None, None).await;
+                let (_, writer) = answer_one(&listener, AttachResponse::ok(), None, None).await;
+                writer
+            });
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                establish(
+                    &state,
+                    None,
+                    "planner".into(),
+                    fixture_incarnation(),
+                    &fixture_channel(),
+                    None,
+                ),
+            )
+            .await
+            .expect("bounded attach")
+            .expect("a compatible terminal");
+            let _old_writer = original.await.expect("original scripted daemon");
+            assert_eq!(
+                state.daemon.held().await,
+                1,
+                "precondition: the deck is trusted"
+            );
+            if connect_anyway {
+                crate::daemon_bridge::allow_build_mismatch_this_session();
+            }
+
+            std::fs::remove_file(&socket).unwrap();
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let admissions = Arc::new(AtomicUsize::new(0));
+            let count = Arc::clone(&admissions);
+            let unchecked = Arc::new(AtomicUsize::new(0));
+            let unchecked_count = Arc::clone(&unchecked);
+            let replacement = tokio::spawn(async move {
+                let mut streams = Vec::new();
+                while let Ok((stream, _)) = listener.accept().await {
+                    let (reader, writer) = stream.into_split();
+                    let mut reader =
+                        dot_agent_deck::platform::transport::TransportReadHalf::new(reader);
+                    let mut writer = TransportWriteHalf::new(writer);
+                    let mut follow_on = true;
+                    let mut checked = false;
+                    while std::mem::take(&mut follow_on) {
+                        let Some((KIND_REQ, payload)) = read_frame(&mut reader).await.unwrap()
+                        else {
+                            break;
+                        };
+                        let request: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                        let reply = if request["op"] == "hello" {
+                            checked = true;
+                            follow_on = request["follow_on"] == true;
+                            let mut hello =
+                                crate::daemon_bridge::hello_from_a_deck_one_declared_break_behind()
+                                    .with_capabilities();
+                            hello.build_version = matching_hello().build_version;
+                            // The replacement under test differs by its contract,
+                            // not by its process (PRD #1666 part 2, G-fix5).
+                            hello.instance_id = matching_hello().instance_id;
+                            if next_protocol {
+                                hello.server_version =
+                                    Some(dot_agent_deck::daemon_protocol::PROTOCOL_VERSION + 1);
+                            }
+                            hello
+                        } else {
+                            if request["op"] == "attach-stream" {
+                                count.fetch_add(1, Ordering::SeqCst);
+                                if !checked {
+                                    unchecked_count.fetch_add(1, Ordering::SeqCst);
+                                }
+                            }
+                            AttachResponse::ok()
+                        };
+                        write_frame(&mut writer, KIND_RESP, &serde_json::to_vec(&reply).unwrap())
+                            .await
+                            .unwrap();
+                    }
+                    streams.push(writer);
+                }
+            });
+            let reopened = tokio::time::timeout(
+                Duration::from_secs(5),
+                establish(
+                    &state,
+                    None,
+                    "planner".into(),
+                    fixture_incarnation(),
+                    &fixture_channel(),
+                    None,
+                ),
+            )
+            .await
+            .expect("bounded reopen");
+            replacement.abort();
+
+            assert_eq!(
+                unchecked.load(Ordering::SeqCst),
+                0,
+                "reopen attached on an unchecked connection"
+            );
+            if connect_anyway && !next_protocol {
+                assert!(
+                    reopened.is_ok(),
+                    "Connect anyway admits the deck on every request: {:?}",
+                    reopened.err()
+                );
+                assert_eq!(admissions.load(Ordering::SeqCst), 1);
+                continue;
+            }
+            assert_eq!(
+                admissions.load(Ordering::SeqCst),
+                0,
+                "a reopen on held trust attached to a daemon the app refuses at connect"
+            );
+            let Err(refusal) = reopened else {
+                panic!("a reopen against a declared contract break must be refused");
+            };
+            if next_protocol {
+                assert!(
+                    refusal.contains("Not attaching: the daemon speaks attach protocol"),
+                    "{refusal}"
+                );
+                continue;
+            }
+            assert!(
+                refusal.contains("The app has not connected"),
+                "the refusal must be the connection banner's: {refusal}"
+            );
+        }
+    }
+
+    /// Scenario: With cached-handshake age pinned to zero at its actual lookup, a terminal reaches EOF and its daemon socket is replaced before watcher invalidation. Reopening must refuse a different protocol with zero attach requests; the same-protocol control must really reopen a terminal stream, and cache expiry cannot satisfy either case.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_reopen_after_eof_rechecks_protocol_before_cached_trust() {
+        use dot_agent_deck::daemon_protocol::{
+            AttachResponse, KIND_REQ, KIND_RESP, PROTOCOL_VERSION,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Duration;
+
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        for protocol in [PROTOCOL_VERSION, PROTOCOL_VERSION + 1] {
+            let (_dir, socket) = scratch_socket("dad-eof-skew");
+            let (listener, _local_deck) = bind_local_deck(&socket);
+            crate::dto::apply_settings_selection(&crate::settings::DesktopSettings::default());
+            let state = DesktopState::default();
+            state.daemon.pin_cache_age_for_test(Duration::ZERO);
+            let original = tokio::spawn(async move {
+                let _hello = answer_one(&listener, matching_hello(), None, None).await;
+                let (_, writer) = answer_one(&listener, AttachResponse::ok(), None, None).await;
+                // Returning drops the listener; the test chooses when this
+                // terminal's final writer closes, independent of any watcher.
+                writer
+            });
+            let channel = fixture_channel();
+            let mut first = tokio::time::timeout(
+                Duration::from_secs(5),
+                establish(
+                    &state,
+                    None,
+                    "planner".into(),
+                    fixture_incarnation(),
+                    &channel,
+                    None,
+                ),
+            )
+            .await
+            .expect("bounded initial attach")
+            .expect("initial compatible terminal");
+            let old_writer = original.await.expect("original scripted daemon");
+            drop(old_writer);
+            let eof = tokio::time::timeout(
+                Duration::from_secs(5),
+                read_frame(
+                    first
+                        .stream
+                        .as_mut()
+                        .expect("actual initial terminal stream"),
+                ),
+            )
+            .await
+            .expect("terminal must reach EOF")
+            .expect("read EOF");
+            assert!(eof.is_none(), "old terminal genuinely reached EOF");
+            // Run the reader's real cleanup. No independent watcher runs;
+            // a fix at this EOF boundary or at reopen can satisfy the pin.
+            terminal_stream_ended(&state, &first.result.session_id, first.result.generation).await;
+            std::fs::remove_file(&socket).unwrap();
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let admissions = Arc::new(AtomicUsize::new(0));
+            let count = Arc::clone(&admissions);
+            let hellos = Arc::new(AtomicUsize::new(0));
+            let hello_count = Arc::clone(&hellos);
+            let replacement = tokio::spawn(async move {
+                let mut streams = Vec::new();
+                while let Ok((stream, _)) = listener.accept().await {
+                    let (reader, writer) = stream.into_split();
+                    let mut reader =
+                        dot_agent_deck::platform::transport::TransportReadHalf::new(reader);
+                    let mut writer = TransportWriteHalf::new(writer);
+                    // As the real daemon does: a `Hello` with `follow_on` is
+                    // answered and then one more request is served on the same
+                    // connection (PRD #1589's follow-on, which the desktop's
+                    // terminal attach now opens with).
+                    let mut follow_on = true;
+                    while std::mem::take(&mut follow_on) {
+                        let Some((KIND_REQ, payload)) = read_frame(&mut reader).await.unwrap()
+                        else {
+                            break;
+                        };
+                        let request: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                        let reply = match request["op"].as_str().unwrap() {
+                            "hello" => {
+                                hello_count.fetch_add(1, Ordering::SeqCst);
+                                follow_on = request["follow_on"] == true;
+                                let mut hello = matching_hello().with_capabilities();
+                                hello.server_version = Some(protocol);
+                                hello
+                            }
+                            "attach-stream" => {
+                                count.fetch_add(1, Ordering::SeqCst);
+                                AttachResponse::ok()
+                            }
+                            _ => AttachResponse::ok(),
+                        };
+                        write_frame(&mut writer, KIND_RESP, &serde_json::to_vec(&reply).unwrap())
+                            .await
+                            .unwrap();
+                    }
+                    streams.push(writer);
+                }
+            });
+            let reopened = tokio::time::timeout(
+                Duration::from_secs(5),
+                establish(
+                    &state,
+                    None,
+                    "planner".into(),
+                    fixture_incarnation(),
+                    &channel,
+                    None,
+                ),
+            )
+            .await
+            .expect("bounded terminal reopen");
+            replacement.abort();
+            state.daemon.assert_fresh_cache_clock_for_test();
+            if protocol != PROTOCOL_VERSION && reopened.is_ok() {
+                assert_eq!(
+                    hellos.load(Ordering::SeqCst),
+                    0,
+                    "successful incompatible reopen must reproduce cached-trust reuse, not fresh Hello admission"
+                );
+            }
+            if protocol == PROTOCOL_VERSION {
+                let attached = reopened.expect("same-version terminal must reopen");
+                assert!(
+                    attached.stream.is_some(),
+                    "control must open an actual terminal stream"
+                );
+                assert_eq!(admissions.load(Ordering::SeqCst), 1);
+            } else {
+                assert_eq!(
+                    admissions.load(Ordering::SeqCst),
+                    0,
+                    "desktop terminal reopened against incompatible daemon using cached trust before watcher invalidation"
+                );
+                let Err(refusal) = reopened else {
+                    panic!("incompatible terminal must refuse");
+                };
+                assert!(
+                    refusal.contains(&protocol.to_string())
+                        && refusal.contains(&PROTOCOL_VERSION.to_string()),
+                    "refusal must name both versions: {refusal}"
+                );
+            }
+        }
+    }
+
     /// A `Hello` reply this build classifies as `Connected`, so
     /// `require_compatible()` passes.
     #[cfg(unix)]
@@ -2318,14 +2945,32 @@ mod tests {
         let mut reply = AttachResponse::hello(PROTOCOL_VERSION)
             .with_running_agents(dot_agent_deck::daemon_protocol::RunningAgentsSummary::default());
         reply.build_version = Some(dot_agent_deck::build_id::local_build_id());
+        reply.instance_id = Some(FIXTURE_PROCESS.to_string());
         reply
+    }
+
+    /// The daemon process every scripted deck's `Hello` names
+    /// ([`matching_hello`]), so a terminal opened on one of its cards is bound
+    /// to it (PRD #1666 part 2, G-fix5).
+    const FIXTURE_PROCESS: &str = "fixture-process";
+
+    fn fixture_incarnation() -> Incarnation {
+        Incarnation::from(Some(FIXTURE_PROCESS.to_string()))
+    }
+
+    /// The daemon process of a deck served in this test process by the real
+    /// attach handler, which names this process.
+    fn this_process() -> Incarnation {
+        Incarnation::from(Some(
+            dot_agent_deck::daemon_protocol::daemon_instance_id().to_string(),
+        ))
     }
 
     /// Answer one connection with one reply, after `hold` resolves.
     ///
-    /// One request per connection is not a simplification — the real daemon's
-    /// `handle_connection` reads exactly ONE frame, dispatches it and returns.
-    /// `hold` is what lets a test stand inside the window between a request
+    /// A protocol-gated attach first exchanges a follow-on Hello on this
+    /// connection; `reply` answers the request after that check. Ungated
+    /// requests receive `reply` directly. `hold` lets a test stand between a request
     /// arriving and its answer, which is where both defects live.
     #[cfg(unix)]
     async fn answer_one(
@@ -2342,11 +2987,29 @@ mod tests {
         let (reader, writer) = stream.into_split();
         let mut reader = dot_agent_deck::platform::transport::TransportReadHalf::new(reader);
         let mut writer = TransportWriteHalf::new(writer);
-        let (kind, payload) = read_frame(&mut reader)
+        let (kind, mut payload) = read_frame(&mut reader)
             .await
             .expect("read the request frame")
             .expect("the client sent a frame");
         assert_eq!(kind, KIND_REQ, "the desktop opens with a request frame");
+        // PRD #1666 part 2: a terminal attach opens with its own protocol check
+        // (`Hello` with `follow_on`), answered as the real daemon answers it —
+        // this build's protocol, the follow-on advertised — and the request
+        // that follows on the same connection is the one `reply` answers.
+        let request: serde_json::Value = serde_json::from_slice(&payload).expect("a JSON request");
+        if request["op"] == "hello" && request["follow_on"] == true {
+            let checked = serde_json::to_vec(&matching_hello().with_capabilities())
+                .expect("serialize the protocol check's reply");
+            write_frame(&mut writer, KIND_RESP, &checked)
+                .await
+                .expect("answer the protocol check");
+            let (kind, follow_on) = read_frame(&mut reader)
+                .await
+                .expect("read the follow-on request")
+                .expect("the client sent its request on the checked connection");
+            assert_eq!(kind, KIND_REQ, "the follow-on is a request frame");
+            payload = follow_on;
+        }
         if let Some(arrived) = arrived {
             let _ = arrived.send(());
         }
@@ -2442,7 +3105,10 @@ mod tests {
         // selection move below is then doubly irrelevant to which deck is
         // stopped, and this test still pins which deck's session is detached.
         let wire_a = crate::dto::deck_wire_id(&deck_a);
-        let stopping = crate::stop_agent_action(&state, &wire_a, "planner");
+        // The row the scripted deck listed carries the process its `Hello`
+        // names (PRD #1666 part 2, G-fix4/G-fix5).
+        let listed = fixture_incarnation();
+        let stopping = crate::stop_agent_action(&state, &wire_a, "planner", &listed);
         let moving = async {
             stop_arrived_rx
                 .await
@@ -2554,7 +3220,14 @@ mod tests {
         });
 
         let channel = fixture_channel();
-        let attaching = establish(&state, Some(wire_a), "planner".into(), &channel, None);
+        let attaching = establish(
+            &state,
+            Some(wire_a),
+            "planner".into(),
+            fixture_incarnation(),
+            &channel,
+            None,
+        );
         let removing = async {
             attach_arrived_rx
                 .await
@@ -2625,7 +3298,14 @@ mod tests {
         let ahead = state.attach_gate.lock().await;
 
         let channel = fixture_channel();
-        let attaching = establish(&state, Some(wire_a), "planner".into(), &channel, None);
+        let attaching = establish(
+            &state,
+            Some(wire_a),
+            "planner".into(),
+            fixture_incarnation(),
+            &channel,
+            None,
+        );
         let removing = async {
             // The attach is now parked on the gate with its scope captured.
             crate::dto::apply_settings_selection(&fleet_selecting(
@@ -2916,9 +3596,16 @@ mod tests {
         let state = DesktopState::default();
 
         let channel = fixture_channel();
-        establish(&state, None, agent_a.clone(), &channel, Some((22, 153)))
-            .await
-            .expect("attach a pane on deck A");
+        establish(
+            &state,
+            None,
+            agent_a.clone(),
+            this_process(),
+            &channel,
+            Some((22, 153)),
+        )
+        .await
+        .expect("attach a pane on deck A");
         let link_b = state
             .daemon
             .trusted(&deck_b.endpoint)
@@ -3177,9 +3864,16 @@ mod tests {
         let state = DesktopState::default();
         let channel = fixture_channel();
 
-        let unfocused = establish(&state, None, agent.clone(), &channel, Some((22, 153)))
-            .await
-            .expect("attach while unfocused");
+        let unfocused = establish(
+            &state,
+            None,
+            agent.clone(),
+            this_process(),
+            &channel,
+            Some((22, 153)),
+        )
+        .await
+        .expect("attach while unfocused");
         assert!(
             unfocused.focus_claim.is_none(),
             "an unfocused window claims nothing"
@@ -3192,13 +3886,217 @@ mod tests {
         );
         assert_eq!(deck.registry.focused_client(), None);
 
-        let focused = establish(&state, None, agent, &channel, Some((22, 153)))
-            .await
-            .expect("attach while focused");
+        let focused = establish(
+            &state,
+            None,
+            agent,
+            this_process(),
+            &channel,
+            Some((22, 153)),
+        )
+        .await
+        .expect("attach while focused");
         let claim = focused
             .focus_claim
             .expect("a pane opened in a focused window claims focus on its deck");
         assert_eq!(claim.await.expect("claim task"), Ok(FocusReport::Recorded));
         assert_eq!(deck.registry.focused_client().as_deref(), Some(desktop));
+    }
+
+    /// Scenario: a card is listed before a same-build restart, then Open is requested for its recycled agent id. No successor terminal may be established, no PTY output or keyboard input may cross, and the returned failure must say that the agent is gone; a card opened on its original incarnation still works.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn handshake_013_opening_a_stale_card_transfers_no_pty_bytes() {
+        use crate::restart_binding_tests::RestartingDeck;
+        use dot_agent_deck::daemon_client::AGENT_GONE_AFTER_RESTART;
+        use dot_agent_deck::daemon_protocol::{KIND_STREAM_OUT, read_frame};
+        use std::time::Duration;
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        for restarted in [false, true] {
+            let deck = RestartingDeck::start("g5-open", "a");
+            deck.enable_terminal_probe();
+            let _local = crate::local_deck::test_override::point_local_deck_at(&deck.socket);
+            crate::dto::apply_settings_selection(&crate::settings::DesktopSettings::default());
+            let state = DesktopState::default();
+            let card = crate::daemon_bridge::snapshot_of(&deck.endpoint(), &state.daemon)
+                .await
+                .agents
+                .into_iter()
+                .find(|card| card.id == "1")
+                .unwrap();
+            assert_eq!(card.incarnation.as_deref(), Some("a"));
+            if restarted {
+                deck.restart_as("b");
+            }
+            // These are the existing terminal-open caller's arguments from the
+            // selected card; carrying card.incarnation is part of the repair.
+            let opened = establish(
+                &state,
+                Some(crate::dto::deck_wire_id(&deck.endpoint())),
+                card.id,
+                card.incarnation,
+                &fixture_channel(),
+                Some((24, 80)),
+            )
+            .await;
+            let mut received = Vec::new();
+            let failure = match opened {
+                Err(error) => Some(error),
+                Ok(mut opened) => {
+                    write(&state, &opened.result.session_id, b"OLD-CARD-INPUT")
+                        .await
+                        .expect("admitted terminal writer");
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        let process = if restarted { "b" } else { "a" };
+                        while !deck
+                            .received_by(process)
+                            .iter()
+                            .any(|op| op == "pty-input:OLD-CARD-INPUT")
+                        {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("fixture observes the terminal keyboard delivery");
+                    if let Some(reader) = opened.stream.as_mut()
+                        && let Ok(Ok(Some((KIND_STREAM_OUT, bytes)))) =
+                            tokio::time::timeout(Duration::from_secs(5), read_frame(reader)).await
+                    {
+                        received = bytes;
+                    }
+                    detach(&state, &opened.result.session_id).await.unwrap();
+                    None
+                }
+            };
+            if restarted {
+                assert!(
+                    failure.as_deref() == Some(AGENT_GONE_AFTER_RESTART)
+                        && received.is_empty()
+                        && deck.received_by("b").is_empty(),
+                    "stale card opened successor terminal; failure={failure:?}; output={received:?}; successor_received={:?}",
+                    deck.received_by("b")
+                );
+            } else {
+                assert!(
+                    failure.is_none() && received == b"SUCCESSOR-PTY-1666",
+                    "control: current card terminal works"
+                );
+            }
+        }
+    }
+
+    /// Scenario (PRD #1666 part 2, G-fix5): a terminal is open on agent `1` of a deck, the deck restarts as the same build, and the tile opens agent `1` again from the restarted deck's own row, on the same channel. The open session from before the restart is not reused for it: the restarted deck gets an attach of its own. Reopening the same row without a restart reuses the session (control).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn handshake_013_a_session_from_before_a_restart_is_not_reused_for_its_successor() {
+        use crate::restart_binding_tests::RestartingDeck;
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        for restarted in [false, true] {
+            let deck = RestartingDeck::start("g5-reuse", "a");
+            let _local = crate::local_deck::test_override::point_local_deck_at(&deck.socket);
+            crate::dto::apply_settings_selection(&crate::settings::DesktopSettings::default());
+            let state = DesktopState::default();
+            let channel = fixture_channel();
+            let process = |name: &str| Incarnation::from(Some(name.to_string()));
+            establish(
+                &state,
+                None,
+                "1".into(),
+                process("a"),
+                &channel,
+                Some((24, 80)),
+            )
+            .await
+            .expect("a terminal on the first process");
+            let current = if restarted {
+                deck.restart_as("b");
+                "b"
+            } else {
+                "a"
+            };
+            let reopened = establish(
+                &state,
+                None,
+                "1".into(),
+                process(current),
+                &channel,
+                Some((24, 80)),
+            )
+            .await
+            .expect("the current row opens");
+            if restarted {
+                assert!(
+                    !reopened.result.reused,
+                    "the session from before the restart was reused for its successor"
+                );
+                assert!(
+                    deck.received_by("b").contains(&"attach-stream".to_string()),
+                    "the restarted deck gets an attach of its own: {:?}",
+                    deck.received_by("b")
+                );
+            } else {
+                assert!(
+                    reopened.result.reused,
+                    "control: the same row reuses its session"
+                );
+            }
+        }
+    }
+
+    /// Scenario (PRD #1666 part 2, G-fix4): a terminal is open on agent `1`
+    /// with viewer `v1`, and the deck restarts as the same build, whose own
+    /// agent `1` has another client's viewer `v1`. The tile's next resize is
+    /// sent to nobody and fails as "that agent is gone (the deck restarted)";
+    /// a terminal on a deck that did not restart resizes its agent (control).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn handshake_013_a_resize_after_a_restart_moves_no_recycled_viewer() {
+        use crate::restart_binding_tests::RestartingDeck;
+        use dot_agent_deck::daemon_client::AGENT_GONE_AFTER_RESTART;
+        use std::time::Duration;
+
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        for restarted in [true, false] {
+            let deck = RestartingDeck::start("g4-resize", "a");
+            let _local = crate::local_deck::test_override::point_local_deck_at(&deck.socket);
+            crate::dto::apply_settings_selection(&crate::settings::DesktopSettings::default());
+            let state = DesktopState::default();
+            let established = tokio::time::timeout(
+                Duration::from_secs(5),
+                establish(
+                    &state,
+                    None,
+                    "1".into(),
+                    Incarnation::from(Some("a".to_string())),
+                    &fixture_channel(),
+                    Some((24, 80)),
+                ),
+            )
+            .await
+            .expect("bounded attach")
+            .expect("a terminal on the first process");
+            let session_id = established.result.session_id.clone();
+            if restarted {
+                deck.restart_as("b");
+            }
+            let resized = resize(&state, &session_id, 100, 30).await;
+            if restarted {
+                assert_eq!(resized.err().as_deref(), Some(AGENT_GONE_AFTER_RESTART));
+                assert!(deck.hellos("b") > 0, "precondition: the resize asked b");
+                assert_eq!(
+                    deck.received_by("b"),
+                    Vec::<String>::new(),
+                    "the restarted daemon was sent the tile's geometry"
+                );
+            } else {
+                resized.expect("control: the resize lands");
+                assert_eq!(
+                    deck.received_by("a"),
+                    vec!["attach-stream".to_string(), "resize".to_string()],
+                    "control"
+                );
+            }
+            drop(established);
+        }
     }
 }

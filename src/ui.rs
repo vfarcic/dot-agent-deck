@@ -377,6 +377,10 @@ pub enum UiMode {
     /// wait on the user's Retry or Cancel, opened by the `inbox_attention` key
     /// (default `i`). Its state lives in `UiState::inbox_attention`.
     InboxAttention,
+    /// PRD #1666 part 2 (G-fix7d): the list of every agent the restart notice
+    /// names, opened by the `restart_notice` key (default `a`) or the footer's
+    /// `[Agents]` button. Its state lives in `UiState::restart_notice`.
+    RestartNotice,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -427,6 +431,7 @@ struct TabBarInfo {
     orchestration_statuses: Vec<Option<Vec<SessionStatus>>>,
 }
 
+#[derive(Clone)]
 struct DirPickerState {
     current_dir: PathBuf,
     entries: Vec<PathBuf>,
@@ -781,31 +786,77 @@ fn send_daemon_request_blocking_with_timeout(
     req: &crate::daemon_protocol::AttachRequest,
     timeout: std::time::Duration,
 ) -> std::io::Result<crate::daemon_protocol::AttachResponse> {
-    use crate::daemon_protocol::KIND_REQ;
-    use std::io::Write;
-
     // Issue #1121: the client-side resolution, so this best-effort request
     // reaches the same daemon the TUI attached to when that daemon is an older
     // build still listening at the pre-#1121 fallback spelling.
     let path = crate::endpoint_resolve::client_attach_socket_path();
+    send_daemon_request_blocking_at(&path, req, timeout)
+}
+
+/// [`send_daemon_request_blocking_with_timeout`] against the daemon at `path`.
+fn send_daemon_request_blocking_at(
+    path: &Path,
+    req: &crate::daemon_protocol::AttachRequest,
+    timeout: std::time::Duration,
+) -> std::io::Result<crate::daemon_protocol::AttachResponse> {
     // Issue #435: `timeout` is a per-operation deadline, and connect is one of
     // the operations. Connecting through the bare `IpcClient::connect` left it
     // outside the budget entirely — on Unix that call blocks uninterruptibly
     // when the daemon's accept queue is full, so a wedged daemon could hang
     // this synchronous TUI key path forever despite the deadline two lines
     // below.
-    let mut stream = crate::platform::ipc::IpcClient::connect_timeout(&path, timeout)?;
+    let mut stream = crate::platform::ipc::IpcClient::connect_timeout(path, timeout)?;
     stream.set_timeouts(timeout)?;
 
+    // PRD #1666 part 2 (`lifecycle/handshake/011`): the TUI's one-shot
+    // requests — the listings behind its form hints, Run now's start — are
+    // admitted the way its pane client's are
+    // (`DaemonClient::with_protocol_gate`): only after this connection's own
+    // `Hello` named this binary's attach protocol, and on this connection, so
+    // a daemon replaced by another build since the startup handshake is sent
+    // nothing. A failed check is an `Err`, which every caller already treats
+    // as a down daemon.
+    let local = crate::daemon_protocol::PROTOCOL_VERSION;
+    write_req_frame_blocking(
+        &mut stream,
+        &crate::daemon_protocol::AttachRequest::Hello {
+            client_version: local,
+            client_build_version: None,
+            follow_on: true,
+        },
+    )?;
+    let hello = read_resp_frame_blocking(&mut stream)?;
+    if !hello.ok
+        || hello.server_version != Some(local)
+        || !hello.capabilities.as_ref().is_some_and(|caps| {
+            caps.iter()
+                .any(|c| c == crate::daemon_protocol::CAP_HELLO_FOLLOW_ON)
+        })
+    {
+        return Err(std::io::Error::other(format!(
+            "the daemon did not confirm attach protocol v{local} on this connection (it reported {})",
+            hello
+                .server_version
+                .map_or_else(|| "none".to_string(), |v| format!("v{v}"))
+        )));
+    }
+
+    write_req_frame_blocking(&mut stream, req)?;
+    read_resp_frame_blocking(&mut stream)
+}
+
+/// Write one `KIND_REQ` frame carrying `req` to a synchronous writer.
+fn write_req_frame_blocking<W: std::io::Write>(
+    w: &mut W,
+    req: &crate::daemon_protocol::AttachRequest,
+) -> std::io::Result<()> {
     let payload = serde_json::to_vec(req).map_err(std::io::Error::other)?;
     let mut header = [0u8; 5];
-    header[0] = KIND_REQ;
+    header[0] = crate::daemon_protocol::KIND_REQ;
     header[1..5].copy_from_slice(&(payload.len() as u32).to_be_bytes());
-    stream.write_all(&header)?;
-    stream.write_all(&payload)?;
-    stream.flush()?;
-
-    read_resp_frame_blocking(&mut stream)
+    w.write_all(&header)?;
+    w.write_all(&payload)?;
+    w.flush()
 }
 
 /// Read one `KIND_RESP` frame off a synchronous reader and decode its body.
@@ -1740,6 +1791,34 @@ struct UiState {
     /// Without this, switching away and back re-armed the
     /// highlight a tab switch had cleared (violating SC1).
     last_focused_pane_id: Option<String>,
+    /// PRD #1666 part 2 (G-fix7c): the notice naming the agents deck restarts
+    /// stopped ([`process_restart_drops`]). G-fix7d: in footer rows of its own
+    /// rather than the expiring status line, in every mode where the frame has
+    /// room for them, until the user dismisses it — agents later drops take
+    /// join it meanwhile.
+    restart_notice: Option<RestartNotice>,
+    /// PRD #1666 part 2 (G-fix7e): where this frame drew the restart notice's
+    /// rows, if it drew them ([`render_bottom_bar`]), so a modal overlay is
+    /// laid out above them rather than over them ([`overlay_area`]).
+    restart_notice_area: Option<Rect>,
+    /// PRD #1666 part 2 (G-fix7f): which of the open confirmation's choices
+    /// the last frame showed, with the mode it drew them for; G-fix7i: read
+    /// back from that frame as it was flushed to the terminal
+    /// ([`record_flushed_confirmation`]). [`refuse_undrawn_choice`] refuses
+    /// Down and Enter onto one it did not show, and Stop's `y` while its Yes
+    /// is not shown.
+    ///
+    /// G-fix7g: also the confirmations' render-before-input gate, which was
+    /// the close confirmation's alone (PRD #241 review F5). Cleared when a
+    /// confirmation opens and whenever an event changes the mode, so `None`, or
+    /// a record for another mode, means this opening of the open confirmation
+    /// has not been drawn yet ([`confirmation_awaits_frame`]).
+    confirm_choices_drawn: Option<(UiMode, ChoicesShown)>,
+    /// PRD #1666 part 2 (G-fix7i): what the draw in progress put in the open
+    /// confirmation — its choices and its buttons — with the mode it drew. It
+    /// counts for nothing until [`record_flushed_confirmation`] reads it back
+    /// from the frame as flushed, which takes it.
+    confirm_drawing: Option<(UiMode, ConfirmDrawing)>,
     /// PRD #341 M6: which pane the user was typing into as of the previous
     /// [`reconcile_pane_input_scrollback`] frame — `Some(pane_id)` while `mode ==
     /// PaneInput` with a focused pane, `None` otherwise. A change in this value is
@@ -1802,6 +1881,12 @@ struct UiState {
     pane_names: HashMap<String, String>,
     /// Maps pane_id → display name; survives session restarts (e.g. /clear).
     pane_display_names: HashMap<String, String>,
+    /// PRD #1666 part 2 (G-fix6): what the dashboard's names for a pane were
+    /// before its last rename — the card's session id and its
+    /// `display_names` / `pane_display_names` entries — so a rename the deck
+    /// refuses after the call returned can be taken back
+    /// ([`EmbeddedPaneController::take_rename_refusals`]).
+    renamed_from: HashMap<String, (String, Option<String>, Option<String>)>,
     /// Issue #308: maps pane_id → the agent type its config DECLARED
     /// (`agent = "…"` on the role), for panes that made a declaration.
     ///
@@ -1968,8 +2053,10 @@ struct UiState {
     star_prompt_state: config::StarPromptState,
     /// Config generation state — tracks directories where user chose "Never".
     config_gen_state: config::ConfigGenState,
-    /// Pane ID + cwd for the pending config-gen modal prompt.
-    config_gen_target: Option<(String, String)>,
+    /// Pane ID + cwd for the pending config-gen modal prompt. PRD #1666 part 2
+    /// (G-fix6): the pane id with the daemon process its card was learned
+    /// from, so the request is posted there or nowhere.
+    config_gen_target: Option<(crate::pane::BoundPane, String)>,
     /// Selected option index in the config-gen modal (0=Yes, 1=No, 2=Never).
     config_gen_selected: usize,
     /// Selected option in quit confirm modal (0=Detach, 1=Stop, 2=Cancel).
@@ -1985,15 +2072,6 @@ struct UiState {
     /// closes THIS and only this — never whatever happens to be selected by the
     /// time the user answers. Cleared on every exit from the dialog.
     close_confirm_target: Option<CloseTarget>,
-    /// PRD #241 review F5: has the armed close confirmation been drawn yet?
-    ///
-    /// The run loop drains a whole input burst before re-rendering, so without
-    /// this the keystroke queued behind the `Ctrl+W` (or behind the `[Close]` /
-    /// tab-strip `×` click) that armed the dialog would be delivered to a modal
-    /// the user has never seen. While it is `false`, `run_tui` discards pending
-    /// input and re-renders instead of reading; `render_overlays` sets it the
-    /// first time the dialog actually reaches the screen.
-    close_confirm_displayed: bool,
     /// PRD #92 F1: selected option in the secondary Stop-confirmation
     /// dialog (0=No, 1=Yes). Defaults to No — the safer default for the
     /// destructive choice. Only meaningful when `mode == StopConfirm`.
@@ -2157,9 +2235,85 @@ struct UiState {
 struct InboxAttentionDialog {
     pane_id: String,
     agent_id: String,
+    /// PRD #1666 part 2 (G-fix6): the daemon process the card the picker was
+    /// opened on was learned from — what every press it makes is bound to.
+    incarnation: crate::daemon_client::Incarnation,
     items: Vec<crate::inbox_hub::InboxAttentionItem>,
     selected: usize,
     answer: Option<String>,
+}
+
+/// PRD #1666 part 2 (G-fix7d) — the one notice naming the agents deck restarts
+/// stopped, held until the user dismisses it, as the desktop app's restart
+/// toast is (CLAUDE.md rule 22). Agents a later drop takes join it while it is
+/// held, each once ([`StoppedIdentity`]). The footer shows its first names
+/// ([`crate::daemon_client::agents_stopped_by_restart_summary`]); the overlay
+/// lists every one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RestartNotice {
+    agents: Vec<(StoppedIdentity, crate::daemon_client::StoppedAgent)>,
+    /// The first line of the list the overlay shows.
+    scroll: usize,
+}
+
+impl RestartNotice {
+    /// The notice's full sentence, naming every agent.
+    #[cfg(test)]
+    fn text(&self) -> String {
+        crate::daemon_client::agents_stopped_by_restart_notice(&self.agent_names())
+    }
+
+    /// What the footer shows: the first names, and how many more there are.
+    fn summary(&self) -> String {
+        crate::daemon_client::agents_stopped_by_restart_summary(&self.agent_names())
+    }
+
+    fn agent_names(&self) -> Vec<crate::daemon_client::StoppedAgent> {
+        self.agents.iter().map(|(_, agent)| agent.clone()).collect()
+    }
+
+    /// Add `agent` unless the notice already names the agent `identity` is.
+    fn join(&mut self, identity: StoppedIdentity, agent: crate::daemon_client::StoppedAgent) {
+        if !self
+            .agents
+            .iter()
+            .any(|(held, _)| held.same_agent(&identity))
+        {
+            self.agents.push((identity, agent));
+        }
+    }
+}
+
+/// PRD #1666 part 2 (G-fix7d): which agent a [`RestartNotice`] entry is. Two
+/// entries are one agent when they ran under the same daemon process and
+/// either are on the same pane with registry ids that do not differ (an id one
+/// side never learned counts as a match), or both have no pane and the same
+/// card key ([`Self::same_agent`]). So the cards and the local pane one agent
+/// leaves on its pane are named once, and two agents sharing a label are both
+/// named; one agent's cards on two different panes are named twice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoppedIdentity {
+    pane: Option<String>,
+    key: Option<String>,
+    agent: Option<String>,
+    process: crate::daemon_client::Incarnation,
+}
+
+impl StoppedIdentity {
+    fn same_agent(&self, other: &Self) -> bool {
+        if self.process != other.process {
+            return false;
+        }
+        match (&self.pane, &other.pane) {
+            // An id one side never learned does not make them two agents.
+            (Some(a), Some(b)) => {
+                a == b
+                    && (self.agent.is_none() || other.agent.is_none() || self.agent == other.agent)
+            }
+            (None, None) => self.key == other.key,
+            _ => false,
+        }
+    }
 }
 
 /// PRD #1258 M3 — the host overlay's content.
@@ -2249,6 +2403,10 @@ impl UiState {
             // first-launch UX is unchanged.
             selected_index: Some(0),
             last_focused_pane_id: None,
+            restart_notice: None,
+            restart_notice_area: None,
+            confirm_choices_drawn: None,
+            confirm_drawing: None,
             last_pane_input_target: None,
             // PRD #113 revision: defaults to card 0 so first-launch Enter (before
             // anything has been selected) targets the first card, unchanged.
@@ -2270,6 +2428,7 @@ impl UiState {
             submitted_orchestration_form: None,
             pane_names: HashMap::new(),
             pane_display_names: HashMap::new(),
+            renamed_from: HashMap::new(),
             pane_declared_agent: HashMap::new(),
             pane_metadata: HashMap::new(),
             config,
@@ -2296,7 +2455,6 @@ impl UiState {
             quit_confirm_selected: 0,
             close_confirm: CloseConfirmState::default(),
             close_confirm_target: None,
-            close_confirm_displayed: false,
             stop_confirm_selected: 0,
             stop_confirm_agent_count: 0,
             orchestration_prompted: HashSet::new(),
@@ -3359,6 +3517,20 @@ pub struct HydrationPartition {
     pub rejections: Vec<HydrationRejection>,
 }
 
+/// Seed startup hydration's card for `h`, learned from the daemon process
+/// that accepted its attach
+/// ([`crate::state::AppState::seed_hydrated_session_learned`]).
+fn seed_hydrated_card(st: &mut crate::state::AppState, h: &HydratedPane) {
+    st.seed_hydrated_session_learned(
+        h.pane_id.clone(),
+        h.cwd.clone(),
+        h.agent_type.clone(),
+        Some(h.agent_id.clone()),
+        h.live.as_ref(),
+        h.incarnation.clone(),
+    );
+}
+
 /// PRD #76 M2.12: partition hydrated daemon panes into dashboard /
 /// orchestration buckets based on each agent's recorded
 /// `tab_membership`. Pure function for testability.
@@ -3740,8 +3912,10 @@ fn post_orchestrator_prompt(
     let Some(prompt) = orchestrator_prompt.clone() else {
         return;
     };
+    // PRD #1666 part 2 (G-fix6): the start role's pane is one this controller
+    // started or attached, and its record of that attach binds the post.
     match pane.post_message(
-        &start_pane_id,
+        &crate::pane::BoundPane::held_by_controller(start_pane_id.clone()),
         "your role as orchestrator",
         &prompt,
         crate::inbox_hub::PostOrigin::OrchestratorRemit,
@@ -3831,7 +4005,8 @@ fn process_pending_orchestration_surfaces(
         }
         st.pending_orchestration_surfaces.remove(0)
     };
-    surface_one_orchestration(state, embedded, tab_manager, surface, ui);
+    let (surface, learned_from) = surface;
+    surface_one_orchestration(state, embedded, tab_manager, surface, &learned_from, ui);
 }
 
 /// PRD #1223: the render-thread half of a daemon pane-closed announcement —
@@ -3899,6 +4074,11 @@ fn apply_pane_closure(
     }
     {
         let mut st = state.blocking_write();
+        // PRD #1666 part 2 (G-fix7f): the attachment that handed in any held
+        // placeholder for this pane is gone.
+        if forgot_attachment {
+            st.retire_held_placeholders(pane_id);
+        }
         // Again, for anything the render thread drew on this pane since the
         // subscriber's pass (a surface grown into it this frame).
         st.sessions.retain(|_, s| {
@@ -3952,6 +4132,229 @@ fn apply_pane_closure(
             "Closed a tab whose agents were stopped by another client".to_string(),
             std::time::Instant::now(),
         ));
+    }
+    ui.mark_session_dirty();
+}
+
+/// PRD #1666 part 2 (G-fix7c): the render-thread half of a deck restart — drop
+/// what the restart took and say so once.
+///
+/// The event subscriber has already removed every card learned from the
+/// replaced daemon process ([`AppState::pending_restart_drops`]); the pane
+/// controller marks each local pane whose reattach found another process
+/// answering ([`PaneController::panes_lost_to_restart`]). This drops, locally,
+/// each such pane's attachment — closing this client's own connection for it,
+/// which reaches no other agent — its slot in an orchestration tab — and the
+/// tab, once no live pane is left in it, with [`apply_pane_closure`]'s focus
+/// rule — and the dashboard names and selection that would otherwise pass to
+/// an agent the restarted deck runs under a reused pane id or card key. No
+/// stop or close is asked of either daemon, and no unit or orchestration
+/// cleanup runs, so a dispatched unit's worktree and branch stay on disk.
+///
+/// The agents dropped are named in one notice ([`RestartNotice`]), entries
+/// [`StoppedIdentity::same_agent`] counts as one agent once; drops that arrive
+/// before the user dismisses it join it.
+fn process_restart_drops(
+    state: &SharedState,
+    pane: &dyn PaneController,
+    tab_manager: &mut TabManager,
+    ui: &mut UiState,
+) {
+    // In pane order, so the notice does not name lost panes in the order of
+    // the controller's map. The event subscriber's own drops, queued in card
+    // key order, are named before these, so when both report one restart the
+    // notice's order is not one sort over all of them.
+    let mut lost_panes = pane.panes_lost_to_restart();
+    lost_panes.sort_by(|a, b| a.0.cmp(&b.0));
+    if lost_panes.is_empty() && state.blocking_read().pending_restart_drops.is_empty() {
+        return;
+    }
+    let mut dropped = state.blocking_write().take_restart_drops();
+    // The local panes to drop: each lost to the restart, and each a dropped
+    // card was attached through — its own process's pane under its pane id.
+    let mut panes: Vec<String> = Vec::new();
+    for (pane_id, attached_on) in &lost_panes {
+        panes.push(pane_id.clone());
+        // A card on the lost pane that the subscriber kept — learned from no
+        // named process — or that is still the lost attachment's own is
+        // that agent's card, and goes with it.
+        let mut st = state.blocking_write();
+        let cards: Vec<String> = st
+            .sessions
+            .iter()
+            .filter(|(_, card)| {
+                card.pane_id.as_deref() == Some(pane_id.as_str())
+                    && (card.incarnation.is_unnamed()
+                        || attached_on
+                            .as_ref()
+                            .is_some_and(|process| card.incarnation.same_process(process)))
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in cards {
+            if let Some(card) = st.sessions.remove(&key) {
+                dropped.push(crate::state::RestartDroppedCard {
+                    key,
+                    held: true,
+                    pane_id: card.pane_id,
+                    agent_id: card.agent_id,
+                    display_name: card.display_name,
+                    agent_type: card.agent_type,
+                    incarnation: card.incarnation,
+                });
+            }
+        }
+    }
+    for card in &dropped {
+        if let Some(pane_id) = card.pane_id.as_deref()
+            && !panes.iter().any(|p| p == pane_id)
+            && pane
+                .pane_incarnation(pane_id)
+                .is_some_and(|process| card.incarnation.same_process(&process))
+        {
+            panes.push(pane_id.to_string());
+        }
+    }
+
+    // Name each agent before its tab slot and names go — once per process and
+    // pane, or per process and card key for a card with no pane
+    // (`StoppedIdentity::same_agent`).
+    let mut stopped = RestartNotice::default();
+    let mut named_panes: HashSet<String> = HashSet::new();
+    for card in &dropped {
+        let pane_id = card.pane_id.as_deref();
+        // A card drawn before any stream named a process goes with the lost
+        // attachment it was on, and is that attachment's agent.
+        let process = if card.incarnation.is_unnamed() {
+            pane_id
+                .and_then(|p| pane.pane_incarnation(p))
+                .unwrap_or_default()
+        } else {
+            card.incarnation.clone()
+        };
+        let identity = StoppedIdentity {
+            pane: card.pane_id.clone(),
+            key: card.pane_id.is_none().then(|| card.key.clone()),
+            agent: card.agent_id.clone(),
+            process,
+        };
+        let label = card
+            .held
+            .then(|| ui.display_names.get(&card.key).cloned())
+            .flatten()
+            .or_else(|| card.display_name.clone())
+            .or_else(|| pane_id.and_then(|p| ui.pane_display_names.get(p).cloned()))
+            .unwrap_or_else(|| {
+                format!(
+                    "{} · {}",
+                    card.agent_type,
+                    crate::submitted_prompt::truncate_on_char_boundary(&card.key, 11)
+                )
+            });
+        let (role, orchestration) = pane_id
+            .and_then(|p| tab_manager.role_of_pane(p))
+            .map_or((None, None), |(role, name)| (Some(role), Some(name)));
+        named_panes.extend(pane_id.map(str::to_string));
+        stopped.join(
+            identity,
+            crate::daemon_client::StoppedAgent {
+                label,
+                role,
+                orchestration,
+            },
+        );
+    }
+    for pane_id in panes.iter().filter(|p| !named_panes.contains(*p)) {
+        let (role, orchestration) = tab_manager
+            .role_of_pane(pane_id)
+            .map_or((None, None), |(role, name)| (Some(role), Some(name)));
+        stopped.join(
+            StoppedIdentity {
+                pane: Some(pane_id.clone()),
+                key: None,
+                agent: pane.pane_agent_id(pane_id),
+                process: pane.pane_incarnation(pane_id).unwrap_or_default(),
+            },
+            crate::daemon_client::StoppedAgent {
+                label: ui
+                    .pane_display_names
+                    .get(pane_id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("pane {pane_id}")),
+                role,
+                orchestration,
+            },
+        );
+    }
+
+    let focused = pane.focused_pane_id();
+    let mut left_active_tab = false;
+    let mut left_focused_pane = false;
+    for pane_id in &panes {
+        left_focused_pane |= focused.as_deref() == Some(pane_id.as_str());
+        pane.forget_pane(pane_id);
+        // G-fix7f: named here, so a placeholder its attachment handed in is not
+        // drawn, or named again, when the stream next opens.
+        state.blocking_write().retire_held_placeholders(pane_id);
+        if let Some(outcome) = tab_manager.forget_externally_closed_pane(pane_id) {
+            left_active_tab |= outcome.tab_removed && outcome.was_active;
+            if outcome.tab_removed {
+                let mut st = state.blocking_write();
+                for dead in &outcome.dead_slot_pane_ids {
+                    st.remove_sessions_for_pane(dead);
+                }
+            }
+        }
+        let mut st = state.blocking_write();
+        if !st
+            .sessions
+            .values()
+            .any(|s| s.pane_id.as_deref() == Some(pane_id.as_str()))
+        {
+            st.unregister_pane(pane_id);
+        }
+    }
+    // The names and selection the dropped cards held: a key or pane id the
+    // restarted deck reuses must not hand them to its agent. The Dashboard
+    // remembers its selection while another tab is active too. A stale
+    // placeholder held none, and its key may be a live card's.
+    for card in dropped.iter().filter(|card| card.held) {
+        ui.display_names.remove(&card.key);
+        for tab in tab_manager.tabs_mut() {
+            if let Tab::Dashboard {
+                selected_session_id,
+                ..
+            } = tab
+                && selected_session_id.as_deref() == Some(card.key.as_str())
+            {
+                *selected_session_id = None;
+            }
+        }
+    }
+    let dropped_panes: HashSet<&str> = panes
+        .iter()
+        .map(String::as_str)
+        .chain(dropped.iter().filter_map(|card| card.pane_id.as_deref()))
+        .collect();
+    // A local pane still under the id after the drop is the restarted deck's,
+    // and keeps its own.
+    for pane_id in dropped_panes
+        .into_iter()
+        .filter(|p| pane.pane_agent_id(p).is_none())
+    {
+        ui.pane_metadata.remove(pane_id);
+        ui.pane_declared_agent.remove(pane_id);
+        ui.pane_display_names.remove(pane_id);
+        ui.pane_names.remove(pane_id);
+    }
+    if ui.mode == UiMode::PaneInput && (left_active_tab || left_focused_pane) {
+        ui.mode = UiMode::Normal;
+    }
+    if !stopped.agents.is_empty() {
+        let notice = ui.restart_notice.get_or_insert_with(RestartNotice::default);
+        for (identity, agent) in stopped.agents {
+            notice.join(identity, agent);
+        }
     }
     ui.mark_session_dirty();
 }
@@ -4014,11 +4417,17 @@ fn adopt_context_path_into_owning_tab(
 /// Build one live orchestration tab from a daemon [`OrchestrationSurface`].
 /// Idempotent on the role pane ids, so a duplicate broadcast (or a race with a
 /// reconnect that already hydrated the tab) doesn't double-build.
+///
+/// PRD #1666 part 2 (G-fix6): `learned_from` is the daemon process whose stream
+/// carried the surface. Each role pane is attached on that process only, so a
+/// surface queued before a restart attaches nothing on a successor that reuses
+/// its pane ids.
 fn surface_one_orchestration(
     state: &SharedState,
     embedded: &EmbeddedPaneController,
     tab_manager: &mut TabManager,
     surface: OrchestrationSurface,
+    learned_from: &crate::daemon_client::Incarnation,
     ui: &mut UiState,
 ) {
     // Idempotency: skip if an existing tab already owns any of this surface's
@@ -4173,7 +4582,10 @@ fn surface_one_orchestration(
                 continue;
             }
             let role_config = &orch_config.roles[role.role_index];
-            if !embedded.hydrate_pane(&role.pane_id) {
+            if !embedded.hydrate_pane(&crate::pane::BoundPane::new(
+                role.pane_id.clone(),
+                learned_from.clone(),
+            )) {
                 // This used to be silently dropped — no tab slot, no card,
                 // no dead-slot placeholder, and no log line — while the
                 // daemon holds a live, registered agent that `delegate --to
@@ -4214,16 +4626,21 @@ fn surface_one_orchestration(
                 // simply hasn't yet) would otherwise stay invisible even
                 // though its pane is live and hydrated.
                 let agent_id = embedded.pane_agent_id(&role.pane_id);
+                // PRD #1666 part 2 (G-fix7): stamped from the attach that
+                // produced the pane, not the stream open now.
+                let attached_on = embedded.pane_incarnation(&role.pane_id);
                 let mut st = state.blocking_write();
                 if let Some(dead) = replaced_dead_slot.as_deref() {
                     st.remove_sessions_for_pane(dead);
                 }
                 st.register_pane(role.pane_id.clone());
-                st.insert_placeholder_session(
+                let learned_from = attached_on.unwrap_or_else(|| st.stream_incarnation.clone());
+                st.insert_placeholder_session_learned(
                     role.pane_id.clone(),
                     Some(surface.cwd.clone()),
                     None,
                     agent_id,
+                    learned_from,
                 );
                 // Issue #462 — the reference note for all five TUI-side
                 // registrations of these maps; the other four cite it.
@@ -4411,7 +4828,10 @@ fn surface_one_orchestration(
         // `hydrate_pane` attaches the daemon agent carrying this pane id and
         // wires its PTY locally — the same attach + scrollback-replay path as
         // reconnect hydration, so the live agent renders in the tab.
-        if embedded.hydrate_pane(&role.pane_id) {
+        if embedded.hydrate_pane(&crate::pane::BoundPane::new(
+            role.pane_id.clone(),
+            learned_from.clone(),
+        )) {
             role_pane_ids[role.role_index] = Some(role.pane_id.clone());
         } else {
             tracing::debug!(
@@ -4582,6 +5002,10 @@ pub enum Action {
     /// applied any local-state mutation (e.g. a typed character).
     Continue,
     Quit,
+    /// PRD #1666 part 2 (G-fix7h): the footer's `[Quit Ctrl+C]` button. Opens
+    /// the Quit confirmation, as Ctrl+C on the dashboard does, rather than
+    /// exiting at once as [`Action::Quit`] does.
+    RequestQuit,
     /// PRD #76, M2.5: detach every stream-backed pane (sending an explicit
     /// `KIND_DETACH` frame so the daemon distinguishes voluntary detach
     /// from abrupt disconnect) and then exit. Local-PTY panes are torn
@@ -4741,7 +5165,7 @@ pub enum Action {
     /// inline would bloat every `Action` value (`clippy::large_enum_variant`).
     SpawnPane(Box<NewPaneRequest>),
     SendConfigGenPrompt {
-        pane_id: String,
+        pane: crate::pane::BoundPane,
         cwd: String,
     },
     RequestConfigGen,
@@ -4795,6 +5219,16 @@ pub enum Action {
     InboxAttentionMove(bool),
     /// PRD #1666 §6.4: Retry (`true`) or Cancel the row under the cursor.
     InboxAttentionAct(bool),
+    /// PRD #1666 part 2 (G-fix7d): open the list of every agent the restart
+    /// notice names — its key (default `a`) and its footer `[Agents]` button.
+    OpenRestartNotice,
+    /// PRD #1666 part 2 (G-fix7d): close that list; the notice stays.
+    CloseRestartNotice,
+    /// PRD #1666 part 2 (G-fix7d): dismiss the restart notice — its key
+    /// (default `c`) and its `[Dismiss]` buttons.
+    DismissRestartNotice,
+    /// PRD #1666 part 2 (G-fix7d): scroll the list by this many lines.
+    RestartNoticeScroll(isize),
     /// Issue #1635: open the upgrade dialog. Shared by the `open_upgrade` key
     /// (default `u`) and a click on the footer's update badge.
     OpenUpgrade,
@@ -5738,7 +6172,7 @@ fn arm_close_confirmation(
         ..prompt
     };
     ui.close_confirm_target = Some(target);
-    ui.close_confirm_displayed = false;
+    ui.confirm_choices_drawn = None;
     ui.mode = UiMode::CloseConfirm;
 }
 
@@ -6379,8 +6813,8 @@ fn handle_config_gen_prompt_key(key: KeyEvent, ui: &mut UiState) -> Action {
             0 => {
                 // Yes — send prompt and focus pane.
                 ui.mode = UiMode::Normal;
-                if let Some((pane_id, cwd)) = ui.config_gen_target.take() {
-                    return Action::SendConfigGenPrompt { pane_id, cwd };
+                if let Some((pane, cwd)) = ui.config_gen_target.take() {
+                    return Action::SendConfigGenPrompt { pane, cwd };
                 }
                 Action::Continue
             }
@@ -6855,11 +7289,16 @@ fn focus_deck(
             // attach below always operates on it. Routed through the trait's
             // `try_hydrate_pane` rather than a downcast so a mock can exercise
             // this path — see the trait method's docs.
-            let mut focus_result = pane.focus_pane(pane_id);
+            // PRD #1666 part 2 (G-fix6): on the daemon process the card was
+            // learned from only.
+            // G-fix7: and a local pane under the same id focuses only when it
+            // is the card's own.
+            let card = crate::pane::BoundPane::new(pane_id.clone(), session.incarnation.clone());
+            let mut focus_result = pane.focus_card(&card);
             if let Err(PaneError::CommandFailed(_)) = focus_result
-                && pane.try_hydrate_pane(pane_id)
+                && pane.try_hydrate_pane(&card)
             {
-                focus_result = pane.focus_pane(pane_id);
+                focus_result = pane.focus_card(&card);
             }
             match focus_result {
                 Ok(()) => {
@@ -6878,6 +7317,9 @@ fn focus_deck(
                     // terminal::size()` + hardcoded `(term_w * 67 / 100)` /
                     // `saturating_sub(3)` math that used to live here diverged
                     // from the real layout and produced off-by-one-column PTYs.
+                }
+                Err(PaneError::Refused(msg)) => {
+                    ui.status_message = Some((msg, std::time::Instant::now()));
                 }
                 Err(PaneError::CommandFailed(ref msg)) => {
                     state.blocking_write().sessions.remove(*sid);
@@ -6918,9 +7360,11 @@ fn mirror_selection_into_focus(
     if ui.selected_index != prev_selected_index
         && let Some(idx) = ui.selected_index
         && let Some((_, session)) = filtered.get(idx)
-        && let Some(pane_id) = session.pane_id.as_ref()
+        && let Some(card) = session.bound_pane()
     {
-        let _ = pane.focus_pane(pane_id);
+        // PRD #1666 part 2 (G-fix7): a local pane under the card's pane id
+        // that another process's agent runs in is not the card's.
+        let _ = pane.focus_card(&card);
     }
 }
 
@@ -7171,6 +7615,93 @@ fn reconcile_dashboard_selection(
     {
         ui.selected_index = Some(idx);
     }
+}
+
+/// The cards the active tab shows, in render order: every card filtered in
+/// ([`filter_sessions`]) except an orchestration's role cards on the
+/// Dashboard, and an orchestration tab's role cards in role order.
+fn tab_scoped_cards<'a>(
+    snapshot: &'a AppState,
+    ui: &UiState,
+    tab_manager: &TabManager,
+) -> Vec<(&'a String, &'a SessionState)> {
+    let all_filtered = filter_sessions(snapshot, ui);
+    match tab_manager.active_tab() {
+        Tab::Dashboard { .. } => {
+            let exclude = tab_manager.all_managed_pane_ids();
+            // Follow-up to 0d5e651 (auditor finding #2): synthetic
+            // dead-slot placeholders live on the orchestration tab
+            // only. `all_managed_pane_ids` deliberately skips them
+            // (close_tab can't `close_pane` a synthetic id), so we
+            // must filter them out here too — otherwise the
+            // "No agent" ghost card leaks onto the Dashboard.
+            all_filtered
+                .into_iter()
+                .filter(|(_, s)| {
+                    s.pane_id
+                        .as_ref()
+                        .is_none_or(|pid| !exclude.contains(pid) && !is_dead_slot_pane_id(pid))
+                })
+                .collect()
+        }
+        Tab::Orchestration { role_pane_ids, .. } => {
+            let mut orch_filtered: Vec<_> = all_filtered
+                .into_iter()
+                .filter(|(_, s)| {
+                    s.pane_id
+                        .as_ref()
+                        .is_some_and(|pid| role_pane_ids.contains(pid))
+                })
+                .collect();
+            sort_by_role_order(&mut orch_filtered, role_pane_ids);
+            orch_filtered
+        }
+    }
+}
+
+/// PRD #1666 part 2 (G-fix7c): the focused pane id, as the selection reconcile
+/// may read it. A focus selects the card under its pane id only when the pane
+/// was attached on that card's daemon process
+/// ([`PaneController::local_pane_is_cards`]): the replaced deck's pane, still
+/// focused in the frames before [`process_restart_drops`] drops it, is another
+/// agent's pane under the id the restarted deck reuses, and selects nothing —
+/// so the restarted deck's agent never takes the selection by pane id. A focus
+/// with no card under it is passed on as it is: an orchestration tab remembers
+/// a role by pane, not a card.
+fn focus_for_selection<'a>(
+    pane: &dyn PaneController,
+    focused_pane_id: Option<&'a str>,
+    filtered: &[(&String, &SessionState)],
+) -> Option<&'a str> {
+    let fid = focused_pane_id?;
+    match filtered
+        .iter()
+        .find(|(_, s)| s.pane_id.as_deref() == Some(fid))
+        .and_then(|(_, s)| s.bound_pane())
+    {
+        Some(card) => pane.local_pane_is_cards(&card).then_some(fid),
+        None => Some(fid),
+    }
+}
+
+/// The render loop's per-frame selection step: read the controller's focus,
+/// keep only a focus that is its card's ([`focus_for_selection`]), and
+/// reconcile the active tab's selection with it
+/// ([`reconcile_dashboard_selection`]). `filtered` is
+/// [`tab_scoped_cards`]'s answer for the frame.
+fn reconcile_frame_selection(
+    ui: &mut UiState,
+    tab_manager: &mut TabManager,
+    pane: &dyn PaneController,
+    filtered: &[(&String, &SessionState)],
+) {
+    let focused_pane_now = pane.focused_pane_id();
+    let focus = focus_for_selection(pane, focused_pane_now.as_deref(), filtered);
+    let filtered_ids: Vec<(&str, Option<&str>)> = filtered
+        .iter()
+        .map(|(id, s)| (id.as_str(), s.pane_id.as_deref()))
+        .collect();
+    reconcile_dashboard_selection(ui, tab_manager.active_tab_mut(), focus, &filtered_ids);
 }
 
 /// PRD #341 M6 — a pane you are TYPING into must be showing live output.
@@ -7486,6 +8017,16 @@ fn handle_normal_key(
     if kb.matches(KbAction::InboxAttention, &key) && total > 0 {
         return Action::OpenInboxAttention;
     }
+    // PRD #1666 part 2 (G-fix7d): the restart notice's list (default `a`) and
+    // its dismissal (default `c`), only while the footer shows the notice.
+    if ui.restart_notice.is_some() {
+        if kb.matches(KbAction::RestartNotice, &key) {
+            return Action::OpenRestartNotice;
+        }
+        if kb.matches(KbAction::DismissRestartNotice, &key) {
+            return Action::DismissRestartNotice;
+        }
+    }
     // Issue #1635: open the upgrade dialog the footer badge names (default
     // `u`), shared with a click on the badge.
     if pressed(KbAction::OpenUpgrade) {
@@ -7652,6 +8193,31 @@ fn handle_inbox_attention_key(key: KeyEvent, ui: &mut UiState, kb: &KeybindingCo
     }
 }
 
+/// PRD #1666 part 2 (G-fix7d): keys while the restart notice's list is up —
+/// `j`/`k` (or the arrows) and PageUp/PageDown scroll it, the dismiss key
+/// dismisses the notice, and Escape, `q` or the list's own key close the list
+/// and leave the notice; Ctrl+C keeps its PRD #40 safety net.
+fn handle_restart_notice_key(key: KeyEvent, ui: &mut UiState, kb: &KeybindingConfig) -> Action {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        ui.quit_confirm_selected = 0;
+        ui.mode = UiMode::QuitConfirm;
+        return Action::Continue;
+    }
+    match key.code {
+        _ if kb.matches(KbAction::DismissRestartNotice, &key) => Action::DismissRestartNotice,
+        KeyCode::Esc | KeyCode::Char('q') => Action::CloseRestartNotice,
+        _ if kb.matches(KbAction::RestartNotice, &key) => Action::CloseRestartNotice,
+        KeyCode::Down | KeyCode::Char('j') => Action::RestartNoticeScroll(1),
+        KeyCode::Up | KeyCode::Char('k') => Action::RestartNoticeScroll(-1),
+        KeyCode::PageDown => Action::RestartNoticeScroll(RESTART_NOTICE_PAGE),
+        KeyCode::PageUp => Action::RestartNoticeScroll(-RESTART_NOTICE_PAGE),
+        _ => Action::Continue,
+    }
+}
+
+/// How far PageUp/PageDown move the restart notice's list.
+const RESTART_NOTICE_PAGE: isize = 10;
+
 /// PRD #1666 §6.4: one Retry or Cancel the picker sends: the row's message at
 /// the revision it showed.
 #[doc(hidden)]
@@ -7703,6 +8269,20 @@ fn poll_inbox_attention(ui: &mut UiState, snapshot: &AppState) {
     let Some(dialog) = ui.inbox_attention.as_mut() else {
         return;
     };
+    // PRD #1666 part 2 (G-fix7d): the rows the state holds come from the
+    // stream's daemon process. From another one than the card the picker was
+    // opened on — a restarted deck reusing its pane and agent ids — they are
+    // another agent's, so the picker closes rather than show them; between
+    // two streams there are none to read, so it keeps the rows it has.
+    if dialog.incarnation != snapshot.stream_incarnation {
+        if !snapshot.stream_incarnation.is_unnamed() {
+            ui.inbox_attention = None;
+            if ui.mode == UiMode::InboxAttention {
+                ui.mode = UiMode::Normal;
+            }
+        }
+        return;
+    }
     // An answer for another pane or agent than the open picker's is not its
     // own (PR #1735 review 4301453654).
     if let Some(answer) = answer
@@ -7993,6 +8573,46 @@ fn cancel_new_pane_form(ui: &mut UiState) {
 /// M2.11 reviewer P1 & P2.4).
 fn rename_commit_value(key: KeyEvent, rename_text: &str) -> Option<String> {
     matches!(key.code, KeyCode::Enter).then(|| rename_text.to_string())
+}
+
+/// PRD #1666 part 2 (G-fix6): put back the dashboard names `pane_id` had
+/// before its last rename, which the deck refused after the rename was shown.
+/// PRD #1666 part 2 (G-fix7): bring the dashboard's names for a pane in line
+/// with the deck's answer to one of its renames. A refusal with no rename of
+/// the pane left unanswered takes the names back; one with a rename still
+/// unanswered waits for it. A confirmation while another is unanswered makes
+/// its label the one a later refusal goes back to; [`commit_rename`] keeps the
+/// way back across overlapping renames rather than recording each optimistic
+/// name as the next one's.
+fn settle_rename(ui: &mut UiState, answer: crate::embedded_pane::RenameSettled) {
+    match answer.label {
+        None if answer.last => take_back_rename(ui, &answer.pane_id),
+        None => {}
+        Some(_) if answer.last => {
+            ui.renamed_from.remove(&answer.pane_id);
+        }
+        Some(label) => {
+            if let Some(entry) = ui.renamed_from.get_mut(&answer.pane_id) {
+                let label = (!label.is_empty()).then_some(label);
+                entry.1 = label.clone();
+                entry.2 = label;
+            }
+        }
+    }
+}
+
+fn take_back_rename(ui: &mut UiState, pane_id: &str) {
+    let Some((sid, display, pane_display)) = ui.renamed_from.remove(pane_id) else {
+        return;
+    };
+    match display {
+        Some(name) => ui.display_names.insert(sid, name),
+        None => ui.display_names.remove(&sid),
+    };
+    match pane_display {
+        Some(name) => ui.pane_display_names.insert(pane_id.to_string(), name),
+        None => ui.pane_display_names.remove(pane_id),
+    };
 }
 
 /// Apply a [`RenameOutcome`] returned by `PaneController::rename_pane`
@@ -9002,6 +9622,43 @@ pub fn hit_test_button(button_rects: &[(Action, Rect)], col: u16, row: u16) -> O
         .find_map(|(action, rect)| point_in_rect(rect, col, row).then(|| action.clone()))
 }
 
+/// Whether a click in `mode` goes only to the open modal's own buttons
+/// (`UiState::modal_button_rects`) and is otherwise consumed, never reaching
+/// the bottom bar's buttons — the restart notice's `[Agents]` and `[Dismiss]`
+/// among them (PRD #1666 part 2, G-fix7f) — or the dashboard behind it. The
+/// directory picker and the new-agent form route their own clicks the same way
+/// before this is asked.
+fn modal_owns_clicks(mode: &UiMode) -> bool {
+    matches!(
+        mode,
+        UiMode::QuitConfirm
+            | UiMode::StopConfirm
+            // PRD #241 M3: its [Cancel]/[Close] buttons live in
+            // `modal_button_rects`; any miss is consumed here
+            // rather than falling through to the pane behind it.
+            | UiMode::CloseConfirm
+            | UiMode::ConfigGenPrompt
+            | UiMode::StarPrompt
+            | UiMode::Help
+            // PRD #1258 M3: the host overlay's [Close] button lives
+            // in `modal_button_rects`, like help's.
+            | UiMode::HostMetrics
+            // PRD #1666 §6.4: so do the deck-messages picker's.
+            | UiMode::InboxAttention
+            // PRD #1666 part 2 (G-fix7d): and the restart
+            // notice list's.
+            | UiMode::RestartNotice
+            // PRD #127 finding #4: the Schedules dialog is a
+            // topmost modal too — its [Add]/[Edit]/[Delete]/[Run now]
+            // buttons live in `modal_button_rects` and any miss is
+            // consumed here rather than reaching the pane behind it.
+            | UiMode::ScheduledTasks
+            // Issue #1635: the upgrade dialog's buttons live in
+            // `modal_button_rects` too.
+            | UiMode::Upgrade
+    )
+}
+
 /// PRD #80 review FIX 5 / issue #142: whether `mode` puts a **blocking overlay**
 /// (a modal, the directory picker, or the new-pane form) on top of the deck, so
 /// mouse-wheel events must not reach the pane rendered behind it. Scroll in
@@ -9035,7 +9692,9 @@ fn overlay_blocks_mouse(mode: &UiMode) -> bool {
         // Issue #1635: the upgrade dialog is a topmost modal.
         | UiMode::Upgrade
         // PRD #1666 §6.4: the deck-messages picker is a topmost modal too.
-        | UiMode::InboxAttention => true,
+        | UiMode::InboxAttention
+        // PRD #1666 part 2 (G-fix7d): so is the restart notice's list.
+        | UiMode::RestartNotice => true,
         UiMode::Normal | UiMode::Filter | UiMode::Rename | UiMode::PaneInput => false,
     }
 }
@@ -9135,6 +9794,9 @@ fn close_tab_by_index(
             let mut st = state.blocking_write();
             for id in &outcome.closed {
                 st.unregister_pane(id);
+                // PRD #1666 part 2 (G-fix7f): a card still waiting for the
+                // stream goes with its pane, rather than coming back later.
+                st.retire_held_placeholders(id);
             }
             // Drop only the sessions whose pane was actually closed; failed
             // panes keep their card/session so the user can retry.
@@ -9246,17 +9908,21 @@ fn perform_stop_and_quit(ui: &mut UiState, pane: &dyn PaneController) -> Flow {
 /// (Enter-on-Yes via the key handler) and `Action::ConfigGenConfirm` (the
 /// `[Yes]` button).
 fn send_config_gen_prompt(
-    pane_id: &str,
+    card: &crate::pane::BoundPane,
     cwd: &str,
     ui: &mut UiState,
     pane: &dyn PaneController,
     tab_manager: &mut TabManager,
 ) {
+    let pane_id = card.pane_id.as_str();
     let prompt = crate::config_gen::config_gen_prompt(cwd);
     // PRD #1666 S5: the request is a message in the agent's inbox, not text
     // typed into its pane; the agent takes it the way it takes any other.
+    // PRD #1666 part 2 (G-fix6): posted on the daemon process the selected
+    // card was learned from, so a detached or never-attached card posts nothing
+    // to a restarted daemon's agent under the same pane id.
     match pane.post_message(
-        pane_id,
+        card,
         "configuration request",
         &prompt,
         crate::inbox_hub::PostOrigin::ConfigGen,
@@ -9311,13 +9977,23 @@ fn commit_rename(
         && let Some(ref pane_id) = session.pane_id
     {
         match pane.rename_pane(pane_id, new_name) {
-            Ok(outcome) => apply_rename_outcome(
-                &mut ui.display_names,
-                &mut ui.pane_display_names,
-                sid,
-                pane_id,
-                outcome,
-            ),
+            Ok(outcome) => {
+                // G-fix7: the names from before the first rename the deck has
+                // not answered yet, not the optimistic name of that rename.
+                let previous = (
+                    sid.to_string(),
+                    ui.display_names.get(sid).cloned(),
+                    ui.pane_display_names.get(pane_id).cloned(),
+                );
+                ui.renamed_from.entry(pane_id.clone()).or_insert(previous);
+                apply_rename_outcome(
+                    &mut ui.display_names,
+                    &mut ui.pane_display_names,
+                    sid,
+                    pane_id,
+                    outcome,
+                )
+            }
             Err(e) => {
                 tracing::debug!(
                     pane_id = %pane_id,
@@ -9542,7 +10218,7 @@ fn dispatch_action(
             // the target also disarms it, so a second confirmation cannot
             // replay against a stale identity.
             ui.mode = UiMode::Normal;
-            ui.close_confirm_displayed = false;
+            ui.confirm_choices_drawn = None;
             let target = ui.close_confirm_target.take();
             // Issue #717: the ARM-TIME preview is deliberately NOT carried out
             // of the dialog and reused as the post-close report. The agent is
@@ -9589,7 +10265,19 @@ fn dispatch_action(
                     session_id,
                     pane_id,
                 }) => {
-                    match pane.close_pane(&pane_id) {
+                    // PRD #1666 part 2 (G-fix6): the close carries the daemon
+                    // process the armed card was learned from, so a card with
+                    // no local pane stops nothing on a restarted daemon that
+                    // reuses its pane id.
+                    let card = crate::pane::BoundPane::new(
+                        pane_id.clone(),
+                        snapshot
+                            .sessions
+                            .get(&session_id)
+                            .map(|card| card.incarnation.clone())
+                            .unwrap_or_default(),
+                    );
+                    match pane.close_card(&card) {
                         Ok(()) => {
                             let mut st = state.blocking_write();
                             st.sessions.remove(&session_id);
@@ -9606,6 +10294,11 @@ fn dispatch_action(
                                 format!("Closed agent {pane_id}"),
                                 std::time::Instant::now(),
                             ));
+                        }
+                        // G-fix7: the local pane under this id is another
+                        // process's agent; the card stays, and says why.
+                        Err(PaneError::Refused(msg)) => {
+                            ui.status_message = Some((msg, std::time::Instant::now()));
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -9755,6 +10448,10 @@ fn dispatch_action(
             // the pre-draw `resize_panes_to_layout` re-sizes it next frame.
         }
         Action::Quit => return Flow::Break,
+        Action::RequestQuit => {
+            ui.quit_confirm_selected = 0;
+            ui.mode = UiMode::QuitConfirm;
+        }
         Action::DetachAndQuit => {
             // M2.5: emit explicit `KIND_DETACH` frames for every
             // stream-backed pane so the daemon distinguishes
@@ -9845,11 +10542,18 @@ fn dispatch_action(
                     // bare delete, so pressing Enter on a live-but-unwired card
                     // destroyed it. Attach the daemon's pane first and retry, so
                     // the delete arm is reached only by genuinely dead cards.
-                    let mut focus_result = pane.focus_pane(pane_id);
+                    //
+                    // PRD #1666 part 2 (G-fix6): on the daemon process the card
+                    // was learned from only.
+                    // G-fix7: and a local pane under the same id focuses
+                    // only when it is the card's own.
+                    let card =
+                        crate::pane::BoundPane::new(pane_id.clone(), session.incarnation.clone());
+                    let mut focus_result = pane.focus_card(&card);
                     if let Err(PaneError::CommandFailed(_)) = focus_result
-                        && pane.try_hydrate_pane(pane_id)
+                        && pane.try_hydrate_pane(&card)
                     {
-                        focus_result = pane.focus_pane(pane_id);
+                        focus_result = pane.focus_card(&card);
                     }
                     match focus_result {
                         Ok(()) => {
@@ -9861,6 +10565,9 @@ fn dispatch_action(
                                 ),
                                 std::time::Instant::now(),
                             ));
+                        }
+                        Err(PaneError::Refused(msg)) => {
+                            ui.status_message = Some((msg, std::time::Instant::now()));
                         }
                         Err(PaneError::CommandFailed(ref msg)) => {
                             state.blocking_write().sessions.remove(sid);
@@ -9887,10 +10594,10 @@ fn dispatch_action(
         Action::RequestConfigGen => {
             if let Some(sid) = selected_id
                 && let Some(session) = snapshot.sessions.get(sid)
-                && let Some(ref pane_id) = session.pane_id
+                && let Some(card) = session.bound_pane()
                 && let Some(ref cwd) = session.cwd
             {
-                ui.config_gen_target = Some((pane_id.clone(), cwd.clone()));
+                ui.config_gen_target = Some((card, cwd.clone()));
                 ui.config_gen_selected = 0;
                 ui.mode = UiMode::ConfigGenPrompt;
             } else {
@@ -10063,6 +10770,12 @@ fn dispatch_action(
                                 .iter()
                                 .map(|id| pane.pane_agent_id(id))
                                 .collect();
+                            // PRD #1666 part 2 (G-fix7): each card stamped
+                            // from the attach that produced its pane.
+                            let role_attached_on: Vec<_> = role_pane_ids
+                                .iter()
+                                .map(|id| pane.pane_incarnation(id))
+                                .collect();
                             {
                                 let mut st = state.blocking_write();
                                 // PRD #76 M2.13: `open_orchestration_tab`
@@ -10072,15 +10785,20 @@ fn dispatch_action(
                                 // right type. The local placeholder stays
                                 // at `None` until each role's first
                                 // `SessionStart` hook fires.
-                                for (id, agent_id) in
-                                    role_pane_ids.iter().zip(role_agent_ids.iter())
+                                for ((id, agent_id), attached_on) in role_pane_ids
+                                    .iter()
+                                    .zip(role_agent_ids.iter())
+                                    .zip(role_attached_on)
                                 {
                                     st.register_pane(id.clone());
-                                    st.insert_placeholder_session(
+                                    let learned_from = attached_on
+                                        .unwrap_or_else(|| st.stream_incarnation.clone());
+                                    st.insert_placeholder_session_learned(
                                         id.clone(),
                                         Some(dir_str.clone()),
                                         None,
                                         agent_id.clone(),
+                                        learned_from,
                                     );
                                 }
                                 // Register pane-to-role and pane-to-cwd
@@ -10321,14 +11039,20 @@ fn dispatch_action(
                             // freshly-spawned agent's first
                             // `SessionStart`.
                             let new_agent_id = pane.pane_agent_id(&new_id);
+                            // PRD #1666 part 2 (G-fix7): stamped from the
+                            // attach that produced the pane.
+                            let attached_on = pane.pane_incarnation(&new_id);
                             {
                                 let mut st = state.blocking_write();
                                 st.register_pane(new_id.clone());
-                                st.insert_placeholder_session(
+                                let learned_from =
+                                    attached_on.unwrap_or_else(|| st.stream_incarnation.clone());
+                                st.insert_placeholder_session_learned(
                                     new_id.clone(),
                                     Some(dir_str.clone()),
                                     None,
                                     new_agent_id,
+                                    learned_from,
                                 );
                             }
                             ui.pane_display_names
@@ -10399,8 +11123,8 @@ fn dispatch_action(
                 } // close else (non-orchestration path)
             }
         }
-        Action::SendConfigGenPrompt { pane_id, cwd } => {
-            send_config_gen_prompt(&pane_id, &cwd, ui, pane, tab_manager);
+        Action::SendConfigGenPrompt { pane: card, cwd } => {
+            send_config_gen_prompt(&card, &cwd, ui, pane, tab_manager);
         }
         // ===== PRD #80 M5: modal button actions =====
         // quit-confirm [Stop]: resolve like Enter-on-Stop — straight to
@@ -10424,14 +11148,14 @@ fn dispatch_action(
             // so a later `ConfirmCloseSelected` can never replay a target the
             // user already declined. Harmless for every other modal.
             ui.close_confirm_target = None;
-            ui.close_confirm_displayed = false;
+            ui.confirm_choices_drawn = None;
             ui.mode = UiMode::Normal;
         }
         // config-gen [Yes]: send the prompt to the pending target pane.
         Action::ConfigGenConfirm => {
             ui.mode = UiMode::Normal;
-            if let Some((pane_id, cwd)) = ui.config_gen_target.take() {
-                send_config_gen_prompt(&pane_id, &cwd, ui, pane, tab_manager);
+            if let Some((card, cwd)) = ui.config_gen_target.take() {
+                send_config_gen_prompt(&card, &cwd, ui, pane, tab_manager);
             }
         }
         // config-gen [No]: dismiss for now (hint stays on the card).
@@ -10653,16 +11377,17 @@ fn dispatch_action(
         Action::OpenInboxAttention => {
             let card = selected_id
                 .and_then(|sid| snapshot.sessions.get(sid))
-                .and_then(|session| session.pane_id.clone());
-            let found = card.and_then(|pane_id| {
-                let (agent, items) = snapshot.inbox_attention(&pane_id)?;
-                Some((pane_id, agent?.to_string(), items.to_vec()))
+                .and_then(SessionState::bound_pane);
+            let found = card.and_then(|card| {
+                let (agent, items) = snapshot.inbox_attention(&card.pane_id)?;
+                Some((card, agent?.to_string(), items.to_vec()))
             });
             match found {
-                Some((pane_id, agent_id, items)) => {
+                Some((card, agent_id, items)) => {
                     ui.inbox_attention = Some(InboxAttentionDialog {
-                        pane_id,
+                        pane_id: card.pane_id,
                         agent_id,
+                        incarnation: card.incarnation,
                         items,
                         selected: 0,
                         answer: None,
@@ -10700,19 +11425,46 @@ fn dispatch_action(
                 dialog.answer = Some(inbox_attention_retry_needs(dialog, frame_area).to_string());
                 return Flow::Continue;
             }
-            let press = ui
-                .inbox_attention
-                .as_ref()
-                .and_then(|dialog| inbox_attention_press(dialog, retry));
-            if let (Some(press), Some(sender)) = (press, ui.inbox_action_sender.as_ref()) {
+            let press = ui.inbox_attention.as_ref().and_then(|dialog| {
+                inbox_attention_press(dialog, retry)
+                    .map(|press| (press, dialog.incarnation.clone()))
+            });
+            if let (Some((press, incarnation)), Some(sender)) =
+                (press, ui.inbox_action_sender.as_ref())
+            {
+                // PRD #1666 part 2 (G-fix6): bound to the process the picker's
+                // card was learned from.
                 sender.send(
-                    &press.pane_id,
+                    &crate::pane::BoundPane::new(press.pane_id.clone(), incarnation),
                     &press.agent_id,
                     &press.message_id,
                     press.revision,
                     press.retry,
                     DAEMON_REQUEST_TIMEOUT,
                 );
+            }
+        }
+        Action::OpenRestartNotice => {
+            if let Some(notice) = ui.restart_notice.as_mut() {
+                notice.scroll = 0;
+                ui.mode = UiMode::RestartNotice;
+            }
+        }
+        Action::CloseRestartNotice => {
+            if ui.mode == UiMode::RestartNotice {
+                ui.mode = UiMode::Normal;
+            }
+        }
+        Action::DismissRestartNotice => {
+            ui.restart_notice = None;
+            if ui.mode == UiMode::RestartNotice {
+                ui.mode = UiMode::Normal;
+            }
+        }
+        Action::RestartNoticeScroll(by) => {
+            if let Some(notice) = ui.restart_notice.as_mut() {
+                // The overlay clamps it to the last screenful when it draws.
+                notice.scroll = notice.scroll.saturating_add_signed(by);
             }
         }
         Action::OpenUpgrade => open_upgrade_dialog(ui),
@@ -11399,6 +12151,7 @@ fn handle_key_event(
     // the banner's decay rule is about the mode the user was in when they
     // pressed the key, not the one they landed in.
     let was_command_mode = ui.mode == UiMode::Normal;
+    let mode_before = ui.mode;
 
     // PRD #40: snapshot the active keybindings for this keypress (cheap
     // HashMap clone; config is immutable for the session) so the mapper
@@ -11508,6 +12261,12 @@ fn handle_key_event(
     // otherwise be indistinguishable from an unbound key.
     let claimed_before_mode_handler = action.is_some();
 
+    // PRD #1666 part 2 (G-fix7f): a confirmation's choice the screen does not
+    // show is not chosen.
+    if action.is_none() && !is_ctrl_c {
+        action = refuse_undrawn_choice(&key, ui);
+    }
+
     // Mode-specific key handling (only when no shortcut claimed the key).
     if action.is_none() {
         action = Some(match ui.mode {
@@ -11607,7 +12366,7 @@ fn handle_key_event(
             // the user.
             UiMode::CloseConfirm if is_ctrl_c => {
                 ui.close_confirm_target = None;
-                ui.close_confirm_displayed = false;
+                ui.confirm_choices_drawn = None;
                 ui.quit_confirm_selected = 0;
                 ui.mode = UiMode::QuitConfirm;
                 Action::Continue
@@ -11616,6 +12375,7 @@ fn handle_key_event(
             UiMode::ScheduledTasks => handle_scheduled_tasks_key(key, ui),
             UiMode::HostMetrics => handle_host_metrics_key(key, ui, &kb),
             UiMode::InboxAttention => handle_inbox_attention_key(key, ui, &kb),
+            UiMode::RestartNotice => handle_restart_notice_key(key, ui, &kb),
             // Issue #1635: `Ctrl+C` keeps its PRD #40 safety net here too, even
             // while an upgrade runs; the running upgrade's dialog is kept so the
             // upgrade key reopens it on the same run.
@@ -11649,7 +12409,7 @@ fn handle_key_event(
         }
     }
 
-    dispatch_action(
+    let flow = dispatch_action(
         action.unwrap_or(Action::Continue),
         ui,
         pane,
@@ -11659,7 +12419,13 @@ fn handle_key_event(
         filtered,
         selected_id.as_deref(),
         frame_area,
-    )
+    );
+    // PRD #1666 part 2 (G-fix7g): as the run loop does between events, so a
+    // confirmation this key left and reopened waits for its own frame.
+    if ui.mode != mode_before {
+        ui.confirm_choices_drawn = None;
+    }
+    flow
 }
 
 pub fn run_tui(
@@ -11909,13 +12675,7 @@ pub fn run_tui(
             // the seeded card. Without this, it would carry `agent_id=None`
             // and a `SessionStart` with `Some(daemon-id)` would not match → a
             // second card would appear beside the hydrated one.
-            st.seed_hydrated_session(
-                h.pane_id.clone(),
-                h.cwd.clone(),
-                h.agent_type.clone(),
-                Some(h.agent_id.clone()),
-                h.live.as_ref(),
-            );
+            seed_hydrated_card(&mut st, h);
             drop(st);
             let display_name = h.display_name.clone().unwrap_or_else(|| h.agent_id.clone());
             ui.pane_display_names
@@ -12373,17 +13133,28 @@ pub fn run_tui(
                                     .iter()
                                     .map(|id| pane.pane_agent_id(id))
                                     .collect();
+                                // PRD #1666 part 2 (G-fix7): each card stamped
+                                // from the attach that produced its pane.
+                                let role_attached_on: Vec<_> = role_pane_ids
+                                    .iter()
+                                    .map(|id| pane.pane_incarnation(id))
+                                    .collect();
                                 {
                                     let mut st = state.blocking_write();
-                                    for (id, agent_id) in
-                                        role_pane_ids.iter().zip(role_agent_ids.iter())
+                                    for ((id, agent_id), attached_on) in role_pane_ids
+                                        .iter()
+                                        .zip(role_agent_ids.iter())
+                                        .zip(role_attached_on)
                                     {
                                         st.register_pane(id.clone());
-                                        st.insert_placeholder_session(
+                                        let learned_from = attached_on
+                                            .unwrap_or_else(|| st.stream_incarnation.clone());
+                                        st.insert_placeholder_session_learned(
                                             id.clone(),
                                             Some(saved_pane.dir.clone()),
                                             None,
                                             agent_id.clone(),
+                                            learned_from,
                                         );
                                     }
                                     // Issue #462: `pane_orchestration_map` is
@@ -12507,14 +13278,20 @@ pub fn run_tui(
                     // `pane_agent_id` only touches the controller's panes
                     // mutex.
                     let new_agent_id = pane.pane_agent_id(&new_id);
+                    // PRD #1666 part 2 (G-fix7): stamped from the attach that
+                    // produced the pane.
+                    let attached_on = pane.pane_incarnation(&new_id);
                     {
                         let mut st = state.blocking_write();
                         st.register_pane(new_id.clone());
-                        st.insert_placeholder_session(
+                        let learned_from =
+                            attached_on.unwrap_or_else(|| st.stream_incarnation.clone());
+                        st.insert_placeholder_session_learned(
                             new_id.clone(),
                             Some(saved_pane.dir.clone()),
                             agent_type,
                             new_agent_id,
+                            learned_from,
                         );
                     }
                     if !saved_pane.name.is_empty() {
@@ -12668,6 +13445,9 @@ pub fn run_tui(
         // client — after the surfaces, so a tab a pending surface still has to
         // build or grow is never judged empty before it exists.
         process_pending_pane_closures(&state, pane.as_ref(), &mut tab_manager, &mut ui);
+        // PRD #1666 part 2 (G-fix7c): drop what a deck restart took, before the
+        // snapshot below derives this frame's selection and names.
+        process_restart_drops(&state, pane.as_ref(), &mut tab_manager, &mut ui);
         // Issue #717: report a dispatched worktree the daemon actually left
         // on disk. Queued by the event subscriber, drained here because the
         // status line is `UiState`.
@@ -12676,7 +13456,13 @@ pub fn run_tui(
         // watches the browser.
         drain_pull_request_launch(&state, &mut ui);
 
-        let snapshot = state.blocking_read().clone();
+        let mut snapshot = state.blocking_read().clone();
+        // A restart the subscriber applied since the drop above is dropped
+        // before this frame reads a key or pane id it may reuse.
+        while !snapshot.pending_restart_drops.is_empty() {
+            process_restart_drops(&state, pane.as_ref(), &mut tab_manager, &mut ui);
+            snapshot = state.blocking_read().clone();
+        }
 
         // Issue #1635: the latest release check, and the result of an
         // upgrade the dialog started.
@@ -12705,39 +13491,8 @@ pub fn run_tui(
             }
         }
 
-        let all_filtered = filter_sessions(&snapshot, &ui);
         // Scope sessions to only those visible in the active tab.
-        let filtered: Vec<(&String, &SessionState)> = match tab_manager.active_tab() {
-            Tab::Dashboard { .. } => {
-                let exclude = tab_manager.all_managed_pane_ids();
-                // Follow-up to 0d5e651 (auditor finding #2): synthetic
-                // dead-slot placeholders live on the orchestration tab
-                // only. `all_managed_pane_ids` deliberately skips them
-                // (close_tab can't `close_pane` a synthetic id), so we
-                // must filter them out here too — otherwise the
-                // "No agent" ghost card leaks onto the Dashboard.
-                all_filtered
-                    .into_iter()
-                    .filter(|(_, s)| {
-                        s.pane_id
-                            .as_ref()
-                            .is_none_or(|pid| !exclude.contains(pid) && !is_dead_slot_pane_id(pid))
-                    })
-                    .collect()
-            }
-            Tab::Orchestration { role_pane_ids, .. } => {
-                let mut orch_filtered: Vec<_> = all_filtered
-                    .into_iter()
-                    .filter(|(_, s)| {
-                        s.pane_id
-                            .as_ref()
-                            .is_some_and(|pid| role_pane_ids.contains(pid))
-                    })
-                    .collect();
-                sort_by_role_order(&mut orch_filtered, role_pane_ids);
-                orch_filtered
-            }
-        };
+        let filtered = tab_scoped_cards(&snapshot, &ui, &tab_manager);
         let total = filtered.len();
 
         // Clamp selection. PRD #113: an active selection (`Some`) is clamped
@@ -12759,17 +13514,7 @@ pub fn run_tui(
         // longer snap the selection of another (the cross-tab leak this
         // PRD fixes). A remembered id that's no longer in the filtered
         // list is cleared and the selection falls back to the first card.
-        let focused_pane_now = pane.focused_pane_id();
-        let filtered_ids: Vec<(&str, Option<&str>)> = filtered
-            .iter()
-            .map(|(id, s)| (id.as_str(), s.pane_id.as_deref()))
-            .collect();
-        reconcile_dashboard_selection(
-            &mut ui,
-            tab_manager.active_tab_mut(),
-            focused_pane_now.as_deref(),
-            &filtered_ids,
-        );
+        reconcile_frame_selection(&mut ui, &mut tab_manager, &*pane, &filtered);
 
         // PRD #341 M6: before laying out or drawing anything, make sure the pane
         // we are about to paint a cursor into is looking at LIVE output. Runs
@@ -12973,25 +13718,20 @@ pub fn run_tui(
         // value — reading it twice opened a TOCTOU window where the ~2s watcher
         // could flip it between the reads, cropping the main content by a row.
         let features_snap = crate::features::current();
-        let (frame_area, experimental_footer_area) = if features_snap.experimental {
-            let chunks = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)])
-                .split(full_frame_area);
-            (chunks[0], Some(chunks[1]))
-        } else {
-            (full_frame_area, None)
-        };
         // Issue #1637: one row above that for the hook-binary notice, on the
         // dashboard only and only while the daemon reports one, so every other
-        // frame keeps its layout.
+        // frame keeps its layout. PRD #1666 part 2 (`lifecycle/handshake/011`):
+        // one row above those for a protocol refusal, on every view, since
+        // nothing this TUI shows is live while it lasts.
         let show_hook_notice = !snapshot.hook_binary_notices.is_empty()
             && matches!(tab_view, ActiveTabView::Dashboard { zoomed: false, .. });
-        let (frame_area, hook_notice_area) = if show_hook_notice {
-            let chunks =
-                Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(frame_area);
-            (chunks[0], Some(chunks[1]))
-        } else {
-            (frame_area, None)
-        };
+        let protocol_refusal = snapshot.protocol_refusal;
+        let (frame_area, footer_rows) = FooterRows::reserve(
+            full_frame_area,
+            features_snap.experimental,
+            show_hook_notice,
+            protocol_refusal.is_some(),
+        );
         let embedded_panes = pane.as_any().downcast_ref::<EmbeddedPaneController>();
         let all_pane_ids = embedded_panes.map(|e| e.pane_ids()).unwrap_or_default();
         let focused_pane_id = embedded_panes.and_then(|e| e.focused_pane_id());
@@ -13014,7 +13754,17 @@ pub fn run_tui(
         if let Some(embedded) = embedded_panes {
             resize_panes_to_layout(&frame_layout, embedded);
         }
-        terminal.draw(|frame| {
+        // PRD #1666 part 2 (G-fix7g): input still queued behind the event that
+        // opened a confirmation predates its first frame, so it is dropped
+        // rather than answering a dialog the user has not seen — whichever path
+        // opened it, the key path's break to re-render included. The gate at
+        // the top of the event loop covers the paths that keep reading.
+        if confirmation_awaits_frame(&ui) {
+            while crossterm::event::poll(std::time::Duration::from_millis(0))? {
+                let _ = event::read()?;
+            }
+        }
+        let completed = terminal.draw(|frame| {
             render_frame(
                 frame,
                 &snapshot,
@@ -13030,16 +13780,16 @@ pub fn run_tui(
                 // every card on it measures `Last:` against the same instant.
                 Utc::now(),
             );
-            // PRD #139: draw the experimental footer into the reserved bottom
-            // row (disjoint from `frame_layout`), using the SAME flag snapshot
-            // the reservation above used.
-            if let Some(footer_area) = experimental_footer_area {
-                render_experimental_footer(frame, &features_snap, footer_area);
-            }
-            if let Some(notice_area) = hook_notice_area {
-                render_hook_notice(frame, &snapshot.hook_binary_notices, notice_area);
-            }
+            footer_rows.render(
+                frame,
+                &features_snap,
+                &snapshot.hook_binary_notices,
+                protocol_refusal,
+            );
         })?;
+        // PRD #1666 part 2 (G-fix7i): the open confirmation's record and click
+        // targets come from the frame as flushed, after every write above.
+        record_flushed_confirmation(&mut ui, completed.buffer);
         tick = tick.wrapping_add(1);
 
         // Bell transition detection
@@ -13388,6 +14138,12 @@ pub fn run_tui(
             for warning in embedded.take_close_warnings() {
                 ui.status_message = Some((warning, std::time::Instant::now()));
             }
+            // PRD #1666 part 2 (G-fix6): a rename the deck refused after it
+            // was applied here is taken back, so the card keeps the name it
+            // had — as the desktop keeps the daemon's name when it refuses.
+            for answer in embedded.take_rename_answers() {
+                settle_rename(&mut ui, answer);
+            }
         }
 
         // Drain all pending events before re-rendering. This avoids a full
@@ -13398,7 +14154,17 @@ pub fn run_tui(
         }
 
         // Process events in a tight loop until the queue is empty.
+        // G-fix7g: the mode the last frame drew, or the last event left.
+        let mut seen_mode = ui.mode;
         loop {
+            // PRD #1666 part 2 (G-fix7g): an event that changed the mode makes
+            // whatever the last frame drew of a confirmation another opening's,
+            // so a confirmation left and reopened within one burst waits for
+            // its own frame.
+            if ui.mode != seen_mode {
+                ui.confirm_choices_drawn = None;
+                seen_mode = ui.mode;
+            }
             // PRD #341 M3 (code-review finding 1): observe the command-mode edge
             // once per EVENT, whatever its kind, before anything reads or writes
             // the banner's decay state. `handle_key_event` repeats this for the key
@@ -13414,17 +14180,16 @@ pub fn run_tui(
             observe_command_mode_edge(&mut ui, std::time::Instant::now());
 
             // PRD #241 review F5: never let input that PREDATES the close
-            // confirmation answer it. This drain loop deliberately processes a
+            // confirmation answer it. G-fix7g: nor any other confirmation's. This drain loop deliberately processes a
             // whole input burst without re-rendering, so the keystroke queued
             // behind the `Ctrl+W` / `[Close]` click / tab-strip `×` that armed
             // the dialog would otherwise be delivered to a modal that has not
             // been drawn — confirming a destructive close the user never saw.
             // Discard whatever is still buffered and break out to render first;
-            // `render_overlays` sets the flag once the dialog is actually on
-            // screen. (The dialog also has no `y` shortcut, so even if this
-            // were bypassed a single stray keystroke could at worst hit the
-            // default Cancel.)
-            if ui.mode == UiMode::CloseConfirm && !ui.close_confirm_displayed {
+            // `render_overlays` records the dialog once it is actually on
+            // screen. (Should a key reach it first anyway, `refuse_undrawn_choice`
+            // counts none of its choices as drawn.)
+            if confirmation_awaits_frame(&ui) {
                 while crossterm::event::poll(std::time::Duration::from_millis(0))? {
                     let _ = event::read()?;
                 }
@@ -13721,31 +14486,7 @@ pub fn run_tui(
                     continue;
                 }
 
-                let modal_active = matches!(
-                    ui.mode,
-                    UiMode::QuitConfirm
-                        | UiMode::StopConfirm
-                        // PRD #241 M3: its [Cancel]/[Close] buttons live in
-                        // `modal_button_rects`; any miss is consumed here
-                        // rather than falling through to the pane behind it.
-                        | UiMode::CloseConfirm
-                        | UiMode::ConfigGenPrompt
-                        | UiMode::StarPrompt
-                        | UiMode::Help
-                        // PRD #1258 M3: the host overlay's [Close] button lives
-                        // in `modal_button_rects`, like help's.
-                        | UiMode::HostMetrics
-                        // PRD #1666 §6.4: so do the deck-messages picker's.
-                        | UiMode::InboxAttention
-                        // PRD #127 finding #4: the Schedules dialog is a
-                        // topmost modal too — its [Add]/[Edit]/[Delete]/[Run now]
-                        // buttons live in `modal_button_rects` and any miss is
-                        // consumed here rather than reaching the pane behind it.
-                        | UiMode::ScheduledTasks
-                        // Issue #1635: the upgrade dialog's buttons live in
-                        // `modal_button_rects` too.
-                        | UiMode::Upgrade
-                );
+                let modal_active = modal_owns_clicks(&ui.mode);
                 // PRD #80 M6: in the inline-edit modes the bottom row IS the
                 // input; its [Apply]/[Cancel] / [Save]/[Cancel] buttons live in
                 // `button_rects`, and any other click is consumed below so it
@@ -15584,7 +16325,77 @@ fn render_frame(
     render_overlays(frame, ui);
 }
 
+/// PRD #1666 part 2 (G-fix7e): the frame a modal overlay is laid out in — the
+/// part above the restart notice's rows when this frame drew them
+/// ([`UiState::restart_notice_area`]), so the notice stays in view above Help
+/// and the other dialogs, as the desktop's toast floats above its dialogs; the
+/// overlay keeps its own keys meanwhile.
+///
+/// G-fix7f: only when the modal shows there the same symbols, column for
+/// column, as over the whole frame ([`modal_drawing`]). One that would lose a row, a choice or a
+/// button to the notice's rows is laid out over the whole frame as before the
+/// notice existed, covering the notice while it is open; the notice is still
+/// held, and is back once the modal closes.
+fn overlay_area(frame: &mut Frame, ui: &mut UiState) -> Rect {
+    let full = frame.area();
+    let above = match ui.restart_notice_area {
+        Some(notice) if notice.y > full.y => Rect {
+            height: notice.y - full.y,
+            ..full
+        },
+        _ => return full,
+    };
+    // Nothing to lay out: no modal is open, or it is the notice's own list,
+    // which is drawn over the whole frame.
+    if !overlay_blocks_mouse(&ui.mode) || ui.mode == UiMode::RestartNotice {
+        return full;
+    }
+    if modal_drawing(frame, above, ui) == modal_drawing(frame, full, ui) {
+        above
+    } else {
+        full
+    }
+}
+
+/// What the open modal shows when laid out in `area`: each visible symbol with
+/// its column, row by row from the first row showing one. Drawn into a blank
+/// scratch buffer, so nothing reaches the screen. The directory picker's scroll
+/// and what the upgrade dialog counts as seen are restored afterwards; the
+/// click targets and the confirmation drawing ([`UiState::confirm_drawing`])
+/// it writes are temporary, overwritten by the final draw that always follows
+/// in [`render_overlays`]. Two areas whose drawings are equal show
+/// the same text, choices, buttons and borders, wherever each centres them;
+/// cleared cells are not compared, as a dialog that clears all of its area
+/// shows nothing more in a taller one.
+fn modal_drawing(frame: &mut Frame, area: Rect, ui: &mut UiState) -> Vec<Vec<(u16, String)>> {
+    let mut scratch = ratatui::buffer::Buffer::empty(frame.area());
+    std::mem::swap(frame.buffer_mut(), &mut scratch);
+    let picker = ui.dir_picker.clone();
+    let upgrade = ui.upgrade_dialog.clone();
+    draw_modal(frame, area, ui);
+    ui.dir_picker = picker;
+    ui.upgrade_dialog = upgrade;
+    std::mem::swap(frame.buffer_mut(), &mut scratch);
+    let drawn = scratch.area;
+    let mut rows: Vec<Vec<(u16, String)>> = (drawn.top()..drawn.bottom())
+        .map(|y| {
+            (drawn.left()..drawn.right())
+                .filter_map(|x| {
+                    let symbol = scratch[(x, y)].symbol();
+                    (!symbol.trim().is_empty()).then(|| (x, symbol.to_string()))
+                })
+                .collect()
+        })
+        .collect();
+    while rows.last().is_some_and(Vec::is_empty) {
+        rows.pop();
+    }
+    let first = rows.iter().take_while(|row| row.is_empty()).count();
+    rows.split_off(first)
+}
+
 fn render_overlays(frame: &mut Frame, ui: &mut UiState) {
+    let area = overlay_area(frame, ui);
     // PRD #80 M5/M7: rebuilt below for whichever modal/overlay is shown;
     // cleared here so a click can't hit an affordance from a prior frame once
     // the overlay closes.
@@ -15595,16 +16406,36 @@ fn render_overlays(frame: &mut Frame, ui: &mut UiState) {
     ui.form_field_rects.clear();
     ui.form_chip_rects.clear();
     ui.form_button_rects.clear();
+    if ui.mode == UiMode::RestartNotice
+        && let Some(notice) = ui.restart_notice.as_mut()
+    {
+        // The notice's own list: nothing it would cover needs to stay in view.
+        let full = frame.area();
+        ui.modal_button_rects = render_restart_notice_overlay(frame, full, notice, &ui.keybindings);
+    }
+    // PRD #241 review F5, G-fix7g: an open confirmation's drawing becomes the
+    // record of which choices this frame shows. The record is the render gate:
+    // until a frame has recorded the open confirmation, the run loop drains its
+    // input rather than feed it (see the drain at the top of the event loop).
+    // G-fix7i: it is written once the frame is flushed
+    // ([`record_flushed_confirmation`]), and says nothing about when any later
+    // input arrived.
+    draw_modal(frame, area, ui);
+}
+
+/// Draw the open modal overlay in `area`, recording its click targets on `ui`.
+/// The restart notice's own list is drawn by [`render_overlays`].
+fn draw_modal(frame: &mut Frame, area: Rect, ui: &mut UiState) {
     if ui.mode == UiMode::Help {
-        ui.modal_button_rects = render_help_overlay(frame, &ui.keybindings);
+        ui.modal_button_rects = render_help_overlay(frame, area, &ui.keybindings);
     }
     if ui.mode == UiMode::HostMetrics {
-        ui.modal_button_rects = render_host_metrics_overlay(frame, &ui.host_metrics);
+        ui.modal_button_rects = render_host_metrics_overlay(frame, area, &ui.host_metrics);
     }
     if ui.mode == UiMode::InboxAttention
         && let Some(dialog) = ui.inbox_attention.as_ref()
     {
-        ui.modal_button_rects = render_inbox_attention_overlay(frame, dialog);
+        ui.modal_button_rects = render_inbox_attention_overlay(frame, area, dialog);
     }
     if ui.mode == UiMode::DirPicker {
         // Capture the picker's row/button rects after the `dir_picker` borrow
@@ -15612,7 +16443,7 @@ fn render_overlays(frame: &mut Frame, ui: &mut UiState) {
         let captured = ui
             .dir_picker
             .as_mut()
-            .map(|picker| render_dir_picker(frame, picker));
+            .map(|picker| render_dir_picker(frame, area, picker));
         if let Some((rows, buttons)) = captured {
             ui.picker_row_rects = rows;
             ui.picker_button_rects = buttons;
@@ -15624,7 +16455,7 @@ fn render_overlays(frame: &mut Frame, ui: &mut UiState) {
         let captured = ui
             .new_pane_form
             .as_ref()
-            .map(|form| render_new_pane_form(frame, form));
+            .map(|form| render_new_pane_form(frame, area, form));
         if let Some((fields, chips, buttons)) = captured {
             ui.form_field_rects = fields;
             ui.form_chip_rects = chips;
@@ -15632,31 +16463,33 @@ fn render_overlays(frame: &mut Frame, ui: &mut UiState) {
         }
     }
     if ui.mode == UiMode::ScheduledTasks {
-        let (button_rects, row_rects) = render_scheduled_tasks(frame, ui);
+        let (button_rects, row_rects) = render_scheduled_tasks(frame, area, ui);
         ui.modal_button_rects = button_rects;
         ui.scheduled_row_rects = row_rects;
     }
     if ui.mode == UiMode::StarPrompt {
-        ui.modal_button_rects = render_star_prompt(frame);
+        ui.modal_button_rects = render_star_prompt(frame, area);
     }
+    // G-fix7i: a confirmation's buttons are not click targets yet, nor its
+    // choices counted: both wait for the frame as flushed.
+    let mut confirmation = None;
     if ui.mode == UiMode::ConfigGenPrompt {
-        ui.modal_button_rects = render_config_gen_prompt(frame, ui.config_gen_selected);
+        confirmation = Some(render_config_gen_prompt(
+            frame,
+            area,
+            ui.config_gen_selected,
+        ));
     }
     if ui.mode == UiMode::QuitConfirm {
-        ui.modal_button_rects = render_quit_confirm(frame, ui.quit_confirm_selected);
+        confirmation = Some(render_quit_confirm(frame, area, ui.quit_confirm_selected));
     }
     if ui.mode == UiMode::CloseConfirm {
-        ui.modal_button_rects = render_close_confirm(frame, &ui.close_confirm);
-        // PRD #241 review F5: the dialog has now reached the screen, so input
-        // arriving from here on is a genuine answer to it. Until this flip, the
-        // run loop refuses to feed it anything (see the drain at the top of the
-        // event loop).
-        ui.close_confirm_displayed = true;
+        confirmation = Some(render_close_confirm(frame, area, &ui.close_confirm));
     }
     if ui.mode == UiMode::Upgrade
         && let Some(dialog) = ui.upgrade_dialog.as_mut()
     {
-        ui.modal_button_rects = crate::upgrade_dialog::render(frame, dialog)
+        ui.modal_button_rects = crate::upgrade_dialog::render(frame, area, dialog)
             .into_iter()
             .map(|(choice, rect)| (Action::UpgradeChoose(choice), rect))
             .collect();
@@ -15664,8 +16497,39 @@ fn render_overlays(frame: &mut Frame, ui: &mut UiState) {
     if ui.mode == UiMode::StopConfirm {
         // M5 adds no buttons to the secondary Stop-confirm dialog (not in the
         // contract); its keystrokes (y/n/Enter/Esc) remain the only path.
-        render_stop_confirm(frame, ui.stop_confirm_selected, ui.stop_confirm_agent_count);
+        confirmation = Some(ConfirmDrawing {
+            buttons: Vec::new(),
+            choices: render_stop_confirm(
+                frame,
+                area,
+                ui.stop_confirm_selected,
+                ui.stop_confirm_agent_count,
+            ),
+        });
     }
+    ui.confirm_drawing = confirmation.map(|drawing| (ui.mode, drawing));
+}
+
+/// PRD #1666 part 2 (G-fix7i): record what the open confirmation showed in
+/// `flushed`, the buffer the draw just sent to the terminal, once every write
+/// of that draw is in it — the experimental footer, the hook notice and the
+/// protocol-refusal row the run loop paints after [`render_frame`], and
+/// anything a later change paints there. A choice counts only when its marker
+/// and whole label are intact in the popup
+/// ([`UiState::confirm_choices_drawn`]), and a button is a click target only
+/// when its whole label is intact in the popup at the place it was drawn; the
+/// rest are refused for keys and the mouse alike. Takes the draw's
+/// [`UiState::confirm_drawing`]: a draw that drew no confirmation leaves no
+/// record.
+fn record_flushed_confirmation(ui: &mut UiState, flushed: &Buffer) {
+    ui.confirm_choices_drawn = match ui.confirm_drawing.take() {
+        Some((mode, drawing)) => {
+            let (shown, buttons) = drawing.read_back(flushed);
+            ui.modal_button_rects = buttons;
+            Some((mode, shown))
+        }
+        None => None,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -16780,8 +17644,9 @@ fn global_bar_buttons(
             true,
         ),
         // Quit is the non-overridable Ctrl+C modal trigger — not a remappable
-        // KbAction, so its label stays fixed.
-        Button::new("Quit", "Ctrl+C", Action::Quit, true),
+        // KbAction, so its label stays fixed. G-fix7h: a click opens the same
+        // confirmation the key does.
+        Button::new("Quit", "Ctrl+C", Action::RequestQuit, true),
     ]
 }
 
@@ -17102,11 +17967,60 @@ fn bottom_bar_rows(ui: &UiState, width: u16, frame_height: u16) -> u16 {
             rows.max(1)
         }
     };
+    // PRD #1666 part 2 (G-fix7d): the restart notice's own rows, above the bar
+    // in every mode (capped with the rest below).
+    let rows = rows
+        + ui.restart_notice.as_ref().map_or(0, |notice| {
+            restart_notice_rows(
+                notice,
+                &ui.keybindings,
+                restart_notice_keys_act(ui.mode),
+                width,
+            )
+        });
     // Reserve at most `frame_height - 1` rows so the content region keeps ≥1 row.
     rows.min(frame_height.saturating_sub(1))
 }
 
 fn render_bottom_bar(
+    frame: &mut Frame,
+    ui: &mut UiState,
+    area: Rect,
+    has_pane_control: bool,
+    extra_buttons: &[Button],
+) {
+    // PRD #1666 part 2 (G-fix7d): the restart notice takes the top rows in every
+    // mode — a text field's included, which would otherwise hide it — when the
+    // area has a row left for the bar below, and its buttons stay clickable
+    // beside whatever that bar records. G-fix7e: they name their keys only
+    // where the keys act on the notice — command mode, and its own list.
+    let keys = restart_notice_keys_act(ui.mode);
+    let notice_rows = ui.restart_notice.as_ref().map_or(0, |notice| {
+        restart_notice_rows(notice, &ui.keybindings, keys, area.width)
+    });
+    ui.restart_notice_area = None;
+    let (area, notice_rects) = match ui.restart_notice.as_ref() {
+        Some(notice) if notice_rows > 0 && area.height > notice_rows => {
+            let rows = Rect {
+                height: notice_rows,
+                ..area
+            };
+            let rects = render_restart_notice_row(frame, notice, &ui.keybindings, keys, rows);
+            ui.restart_notice_area = Some(rows);
+            let rest = Rect {
+                y: area.y + notice_rows,
+                height: area.height - notice_rows,
+                ..area
+            };
+            (rest, rects)
+        }
+        _ => (area, Vec::new()),
+    };
+    render_bottom_bar_below_notice(frame, ui, area, has_pane_control, extra_buttons);
+    ui.button_rects.extend(notice_rects);
+}
+
+fn render_bottom_bar_below_notice(
     frame: &mut Frame,
     ui: &mut UiState,
     area: Rect,
@@ -17354,10 +18268,216 @@ fn modal_rect(desired_w: u16, desired_h: u16, terminal: Rect, min_w: u16, min_h:
     }
 }
 
-fn render_quit_confirm(frame: &mut Frame, selected: usize) -> Vec<(Action, Rect)> {
-    let area = frame.area();
+/// PRD #1666 part 2 (G-fix7f): the rows of a confirmation dialog that lists its
+/// choices one per row. Its renderer takes its height and its choices' places
+/// from here.
+struct ConfirmLayout {
+    /// The popup's height when the frame has room, borders included.
+    rows: u16,
+    /// The text line, inside the border, of the first choice.
+    first_choice: u16,
+}
+
+impl ConfirmLayout {
+    /// The popup's height in `area`, with `extra` rows added above the choices
+    /// (the close dialog's kept-worktree warning).
+    fn popup_height(&self, extra: u16, area: Rect) -> u16 {
+        (self.rows + extra).min(area.height.saturating_sub(4))
+    }
+
+    /// Where a popup at `popup` puts each of `labels`' selection marker and
+    /// label, for [`ConfirmChoices::shown`] to read back once the frame is
+    /// drawn. Each choice's line is `"  {marker} {label}…"` inside the border.
+    fn choices<'a>(
+        &self,
+        popup: Rect,
+        extra: u16,
+        labels: impl IntoIterator<Item = &'a str>,
+        selected: usize,
+    ) -> ConfirmChoices {
+        let inner = popup.inner(ratatui::layout::Margin::new(1, 1));
+        let first = self.first_choice + extra;
+        let cells = labels
+            .into_iter()
+            .enumerate()
+            .map(|(i, label)| {
+                let marker = if i == selected { '>' } else { ' ' };
+                let row = u16::try_from(i)
+                    .ok()
+                    .and_then(|i| inner.y.checked_add(first)?.checked_add(i));
+                (inner.x.saturating_add(2), row, format!("{marker} {label}"))
+            })
+            .collect();
+        ConfirmChoices { inner, cells }
+    }
+}
+
+const QUIT_CONFIRM: ConfirmLayout = ConfirmLayout {
+    rows: 10,
+    first_choice: 3,
+};
+const CLOSE_CONFIRM: ConfirmLayout = ConfirmLayout {
+    rows: 9,
+    first_choice: 3,
+};
+const STOP_CONFIRM: ConfirmLayout = ConfirmLayout {
+    rows: 10,
+    first_choice: 4,
+};
+const CONFIG_GEN_CONFIRM: ConfirmLayout = ConfirmLayout {
+    rows: 14,
+    first_choice: 5,
+};
+
+/// PRD #1666 part 2 (G-fix7h): where a confirmation's renderer put each of its
+/// choices, so the frame as flushed can be read back for which of them it
+/// shows.
+struct ConfirmChoices {
+    /// The popup inside its border; a choice or button outside it is not the
+    /// dialog's.
+    inner: Rect,
+    /// Each choice's column, row (`None` past the last representable row) and
+    /// marker-and-label text, in choice order.
+    cells: Vec<(u16, Option<u16>, String)>,
+}
+
+impl ConfirmChoices {
+    /// Which choices `buf` shows: a choice counts only when its marker and its
+    /// whole label are inside the popup and every one of their cells still
+    /// reads as the renderer wrote it — so one a narrow popup clips, a short
+    /// one leaves out, or the button row or a footer row paints over does not.
+    fn shown(&self, buf: &Buffer) -> ChoicesShown {
+        let mut shown = ChoicesShown::default();
+        for (i, (x, row, text)) in self.cells.iter().enumerate() {
+            if row.is_some_and(|y| self.intact(*x, y, text, buf)) {
+                shown.insert(i);
+            }
+        }
+        shown
+    }
+
+    /// Whether `text`, written from column `x` of row `y`, lies wholly inside
+    /// the popup and every one of its cells in `buf` still reads as written.
+    fn intact(&self, x: u16, y: u16, text: &str, buf: &Buffer) -> bool {
+        let fits = y >= self.inner.top()
+            && y < self.inner.bottom()
+            && x >= self.inner.left()
+            && usize::from(x) + text.chars().count() <= usize::from(self.inner.right());
+        fits && text.chars().zip(x..).all(|(ch, x)| {
+            buf.cell((x, y))
+                .is_some_and(|cell| cell.symbol().chars().eq([ch]))
+        })
+    }
+}
+
+/// PRD #1666 part 2 (G-fix7h): the choices of a confirmation a frame showed,
+/// by index.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ChoicesShown(u8);
+
+impl ChoicesShown {
+    fn insert(&mut self, choice: usize) {
+        if choice < 8 {
+            self.0 |= 1 << choice;
+        }
+    }
+
+    fn contains(self, choice: usize) -> bool {
+        choice < 8 && self.0 & (1 << choice) != 0
+    }
+}
+
+/// PRD #1666 part 2 (G-fix7h): what a confirmation's renderer drew: its
+/// buttons and where it put its choices. G-fix7i: neither counts until
+/// [`record_flushed_confirmation`] reads them back from the frame as flushed.
+struct ConfirmDrawing {
+    /// Each button's click target, with the label it wrote there.
+    buttons: Vec<(Action, Rect, String)>,
+    choices: ConfirmChoices,
+}
+
+impl ConfirmDrawing {
+    /// The choices `flushed` shows, and the click targets of the buttons it
+    /// shows whole inside the popup where they were drawn.
+    fn read_back(self, flushed: &Buffer) -> (ChoicesShown, Vec<(Action, Rect)>) {
+        let buttons = self
+            .buttons
+            .into_iter()
+            .filter(|(_, rect, label)| {
+                rect.height == 1
+                    && usize::from(rect.width) == label.chars().count()
+                    && self.choices.intact(rect.x, rect.y, label, flushed)
+            })
+            .map(|(action, rect, _)| (action, rect))
+            .collect();
+        (self.choices.shown(flushed), buttons)
+    }
+}
+
+/// PRD #1666 part 2 (G-fix7i): draw a confirmation's `buttons` on `row` as
+/// [`render_modal_button_row`] does, each paired with the label it wrote.
+fn render_confirm_buttons(
+    frame: &mut Frame,
+    buttons: &[Button],
+    row: Rect,
+) -> Vec<(Action, Rect, String)> {
+    // Every confirmation button is enabled, so the row draws a prefix of
+    // `buttons`, in order; one the row has no room for is dropped whole.
+    debug_assert!(buttons.iter().all(|button| button.enabled));
+    render_modal_button_row(frame, buttons, row, 1)
+        .into_iter()
+        .zip(buttons)
+        .map(|((action, rect), button)| (action, rect, button.display_label()))
+        .collect()
+}
+
+/// PRD #1666 part 2 (G-fix7g): whether the open confirmation has not been
+/// drawn since it opened — [`UiState::confirm_choices_drawn`] holds no record
+/// for its mode. Never for any other mode.
+fn confirmation_awaits_frame(ui: &UiState) -> bool {
+    matches!(
+        ui.mode,
+        UiMode::QuitConfirm | UiMode::CloseConfirm | UiMode::StopConfirm | UiMode::ConfigGenPrompt
+    ) && !ui
+        .confirm_choices_drawn
+        .is_some_and(|(mode, _)| mode == ui.mode)
+}
+
+/// PRD #1666 part 2 (G-fix7f): refuse Down/`j` onto, and Enter on, a choice
+/// the open confirmation's last frame did not show — a terminal too small for
+/// its popup clips the lower choices or shows no label at all, and G-fix7h: a
+/// short popup's button row paints over a choice — and Stop's `y` while its
+/// Yes is not shown. Up/`k` is not refused, so it can move onto a hidden
+/// choice, where Enter is. Escape and the dialogs' own way back are not
+/// refused. G-fix7g: before this opening's first frame none of its choices
+/// counts as shown.
+fn refuse_undrawn_choice(key: &KeyEvent, ui: &UiState) -> Option<Action> {
+    let mode = ui.mode;
+    let shown = ui
+        .confirm_choices_drawn
+        .filter(|(drawn_for, _)| *drawn_for == mode)
+        .map_or(ChoicesShown::default(), |(_, shown)| shown);
+    let selected = match mode {
+        UiMode::QuitConfirm => ui.quit_confirm_selected,
+        UiMode::CloseConfirm => ui.close_confirm.selected,
+        UiMode::StopConfirm => ui.stop_confirm_selected,
+        UiMode::ConfigGenPrompt => ui.config_gen_selected,
+        _ => return None,
+    };
+    let refused = match key.code {
+        KeyCode::Down | KeyCode::Char('j') => !shown.contains(selected + 1),
+        KeyCode::Enter => !shown.contains(selected),
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            mode == UiMode::StopConfirm && !shown.contains(1)
+        }
+        _ => false,
+    };
+    refused.then_some(Action::Continue)
+}
+
+fn render_quit_confirm(frame: &mut Frame, area: Rect, selected: usize) -> ConfirmDrawing {
     let popup_width = 64u16.min(area.width.saturating_sub(4));
-    let popup_height = 10u16.min(area.height.saturating_sub(4));
+    let popup_height = QUIT_CONFIRM.popup_height(0, area);
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
@@ -17433,16 +18553,22 @@ fn render_quit_confirm(frame: &mut Frame, selected: usize) -> Vec<(Action, Rect)
         width: popup_area.width.saturating_sub(2),
         height: 1,
     };
-    render_modal_button_row(frame, &buttons, btn_row, 1)
+    ConfirmDrawing {
+        buttons: render_confirm_buttons(frame, &buttons, btn_row),
+        choices: QUIT_CONFIRM.choices(popup_area, 0, options.map(|(label, _)| label), selected),
+    }
 }
 
 /// PRD #241 M3: the close confirmation dialog. Same shape as
 /// [`render_quit_confirm`] — a centered popup with an option list, a keyboard
 /// hint row, and clickable buttons — with Cancel first and highlighted by
 /// default so the reflexive Enter is the harmless one.
-fn render_close_confirm(frame: &mut Frame, state: &CloseConfirmState) -> Vec<(Action, Rect)> {
+fn render_close_confirm(
+    frame: &mut Frame,
+    area: Rect,
+    state: &CloseConfirmState,
+) -> ConfirmDrawing {
     let selected = state.selected;
-    let area = frame.area();
     // Issue #717: the kept-worktree warning adds a headline and a path line.
     // The path is the actionable half — the user has to `cd` to it — so the
     // popup WIDENS to fit it rather than truncating by default, and only falls
@@ -17458,7 +18584,7 @@ fn render_close_confirm(frame: &mut Frame, state: &CloseConfirmState) -> Vec<(Ac
         .try_into()
         .unwrap_or(u16::MAX);
     let popup_width = want_width.max(64).min(area.width.saturating_sub(4));
-    let popup_height = (9u16 + kept_lines).min(area.height.saturating_sub(4));
+    let popup_height = CLOSE_CONFIRM.popup_height(kept_lines, area);
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
@@ -17539,17 +18665,29 @@ fn render_close_confirm(frame: &mut Frame, state: &CloseConfirmState) -> Vec<(Ac
         width: popup_area.width.saturating_sub(2),
         height: 1,
     };
-    render_modal_button_row(frame, &buttons, btn_row, 1)
+    ConfirmDrawing {
+        buttons: render_confirm_buttons(frame, &buttons, btn_row),
+        choices: CLOSE_CONFIRM.choices(
+            popup_area,
+            kept_lines,
+            close_confirm_options(state.scope).map(|(label, _)| label),
+            selected,
+        ),
+    }
 }
 
 /// PRD #92 F1: secondary y/n confirmation dialog when the user picked
 /// Stop with at least one managed agent alive. Renders the count
 /// explicitly so the user sees exactly how many agents are about to be
 /// terminated. Default selection is No (index 0).
-fn render_stop_confirm(frame: &mut Frame, selected: usize, agent_count: usize) {
-    let area = frame.area();
+fn render_stop_confirm(
+    frame: &mut Frame,
+    area: Rect,
+    selected: usize,
+    agent_count: usize,
+) -> ConfirmChoices {
     let popup_width = 68u16.min(area.width.saturating_sub(4));
-    let popup_height = 10u16.min(area.height.saturating_sub(4));
+    let popup_height = STOP_CONFIRM.popup_height(0, area);
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
@@ -17604,6 +18742,7 @@ fn render_stop_confirm(frame: &mut Frame, selected: usize, agent_count: usize) {
         .border_style(Style::default().fg(Color::Red));
     let paragraph = Paragraph::new(text).block(block);
     frame.render_widget(paragraph, popup_area);
+    STOP_CONFIRM.choices(popup_area, 0, options.map(|(label, _)| label), selected)
 }
 
 /// Width of the star prompt popup.
@@ -17631,8 +18770,7 @@ fn star_popup_width(area_width: u16, identity: &str) -> u16 {
     50u16.max(needed).min(area_width.saturating_sub(4))
 }
 
-fn render_star_prompt(frame: &mut Frame) -> Vec<(Action, Rect)> {
-    let area = frame.area();
+fn render_star_prompt(frame: &mut Frame, area: Rect) -> Vec<(Action, Rect)> {
     let popup_width = star_popup_width(area.width, repo_identity::DISPLAY);
     let popup_height = 10u16.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
@@ -17686,10 +18824,9 @@ fn render_star_prompt(frame: &mut Frame) -> Vec<(Action, Rect)> {
     render_modal_button_row(frame, &buttons, btn_row, 1)
 }
 
-fn render_config_gen_prompt(frame: &mut Frame, selected: usize) -> Vec<(Action, Rect)> {
-    let area = frame.area();
+fn render_config_gen_prompt(frame: &mut Frame, area: Rect, selected: usize) -> ConfirmDrawing {
     let popup_width = 60u16.min(area.width.saturating_sub(4));
-    let popup_height = 14u16.min(area.height.saturating_sub(4));
+    let popup_height = CONFIG_GEN_CONFIRM.popup_height(0, area);
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
@@ -17761,7 +18898,15 @@ fn render_config_gen_prompt(frame: &mut Frame, selected: usize) -> Vec<(Action, 
         width: popup_area.width.saturating_sub(2),
         height: 1,
     };
-    render_modal_button_row(frame, &buttons, btn_row, 1)
+    ConfirmDrawing {
+        buttons: render_confirm_buttons(frame, &buttons, btn_row),
+        choices: CONFIG_GEN_CONFIRM.choices(
+            popup_area,
+            0,
+            options.map(|(label, _)| label),
+            selected,
+        ),
+    }
 }
 
 /// Format one help row: a key column (left-padded to a fixed width so the
@@ -17887,7 +19032,8 @@ pub fn render_help_overlay_with_bindings_to_buffer(
         .draw(|frame| {
             // The live overlay returns its clickable button rects; the
             // snapshot path doesn't need them.
-            let _ = render_help_overlay(frame, keybindings);
+            let frame_area = frame.area();
+            let _ = render_help_overlay(frame, frame_area, keybindings);
         })
         .expect("TestBackend draw should succeed");
     terminal.backend().buffer().clone()
@@ -17941,7 +19087,11 @@ pub fn render_hints_bar_for_mode_to_buffer(
     terminal.backend().buffer().clone()
 }
 
-fn render_help_overlay(frame: &mut Frame, keybindings: &KeybindingConfig) -> Vec<(Action, Rect)> {
+fn render_help_overlay(
+    frame: &mut Frame,
+    area: Rect,
+    keybindings: &KeybindingConfig,
+) -> Vec<(Action, Rect)> {
     let cyan = Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
@@ -18061,6 +19211,16 @@ fn render_help_overlay(frame: &mut Frame, keybindings: &KeybindingConfig) -> Vec
         // Issue #1635: opens the upgrade dialog while the footer's update
         // badge shows.
         help_key_line(&lettered(KbAction::OpenUpgrade), "Upgrade (update badge)"),
+        // PRD #1666 part 2 (G-fix7d): while the footer shows the restart
+        // notice.
+        help_key_line(
+            &format!(
+                "{} / {}",
+                n(KbAction::RestartNotice),
+                n(KbAction::DismissRestartNotice)
+            ),
+            "Restart notice: list / dismiss",
+        ),
         // PRD #341 M5: command mode is a real read-only inspect mode — the wheel
         // and these keys scroll the focused pane's own scrollback without ever
         // reaching the agent.
@@ -18109,7 +19269,6 @@ fn render_help_overlay(frame: &mut Frame, keybindings: &KeybindingConfig) -> Vec
         Line::from("  Restored automatically on launch."),
     ];
 
-    let area = frame.area();
     let column_width: u16 = 50;
     let popup_width = (column_width * 2 + 3).min(area.width.saturating_sub(2));
     let content_height = left.len().max(right.len()) as u16;
@@ -18596,9 +19755,9 @@ fn inbox_attention_retry_needs(dialog: &InboxAttentionDialog, area: Rect) -> &'s
 
 fn render_inbox_attention_overlay(
     frame: &mut Frame,
+    area: Rect,
     dialog: &InboxAttentionDialog,
 ) -> Vec<(Action, Rect)> {
-    let area = frame.area();
     let (popup_area, footer_height) = inbox_attention_geometry(dialog, area);
     frame.render_widget(Clear, popup_area);
     let (lines, shown, _) = inbox_attention_body(dialog, area);
@@ -18670,8 +19829,11 @@ fn render_inbox_attention_overlay(
     render_modal_button_row(frame, &buttons, btn_row, 2)
 }
 
-fn render_host_metrics_overlay(frame: &mut Frame, view: &HostMetricsView) -> Vec<(Action, Rect)> {
-    let area = frame.area();
+fn render_host_metrics_overlay(
+    frame: &mut Frame,
+    area: Rect,
+    view: &HostMetricsView,
+) -> Vec<(Action, Rect)> {
     // Wide enough for a disk row with its level word (PRD #1258).
     let popup_width = 72u16.min(area.width.saturating_sub(2));
     let lines = host_metrics_lines(view, popup_width.saturating_sub(2));
@@ -18723,6 +19885,269 @@ fn render_host_metrics_overlay(frame: &mut Frame, view: &HostMetricsView) -> Vec
     render_modal_button_row(frame, &close_button, btn_row, 2)
 }
 
+/// PRD #1666 part 2 (G-fix7d): the list of every agent the restart notice
+/// names under the notice's opening words, with `[Dismiss]` and `[Close]`.
+/// G-fix7e: each agent's entry — label, role and orchestration — wraps to the
+/// popup's width, which grows with the longest entry up to the terminal's width
+/// or [`RESTART_NOTICE_LIST_MAX_WIDTH`], so a long name is read in full; the list
+/// scrolls by visual line from `notice.scroll`, clamped here to the last
+/// screenful.
+/// What the restart notice's list says in a popup with no row left for an
+/// agent's name.
+const RESTART_NOTICE_LIST_TOO_SHORT: &str = "Make the terminal taller to see the agents.";
+
+fn render_restart_notice_overlay(
+    frame: &mut Frame,
+    area: Rect,
+    notice: &mut RestartNotice,
+    keybindings: &KeybindingConfig,
+) -> Vec<(Action, Rect)> {
+    let entries: Vec<String> = notice
+        .agents
+        .iter()
+        .map(|(_, agent)| agent.to_string())
+        .collect();
+    // As wide as the widest entry needs, from the list's usual width up to
+    // `RESTART_NOTICE_LIST_MAX_WIDTH`, and never wider than the frame.
+    let widest = entries
+        .iter()
+        .map(|entry| unicode_width::UnicodeWidthStr::width(entry.as_str()))
+        .max()
+        .unwrap_or(0)
+        .saturating_add(2 + 4);
+    let popup_width = u16::try_from(widest)
+        .unwrap_or(u16::MAX)
+        .clamp(RESTART_NOTICE_LIST_MIN_WIDTH, RESTART_NOTICE_LIST_MAX_WIDTH)
+        .min(area.width.saturating_sub(2));
+    // Inside the border, an entry's first row is indented by two columns and
+    // its continuation rows by four.
+    let text_width = usize::from(popup_width.saturating_sub(2 + 4));
+    let opening = crate::upgrade_dialog::wrap(
+        &format!("{}:", crate::daemon_client::AGENTS_STOPPED_BY_RESTART),
+        usize::from(popup_width.saturating_sub(2 + 2)),
+    );
+    // Each visual row of the list, with the index of the agent it belongs to.
+    let mut rows: Vec<(usize, String)> = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let wrapped = crate::upgrade_dialog::wrap(entry, text_width);
+        for (n, row) in wrapped.into_iter().enumerate() {
+            let indent = if n == 0 { "  " } else { "    " };
+            rows.push((index, format!("{indent}{row}")));
+        }
+    }
+    // The opening words and a blank row, the rows, then a blank row, the
+    // button row and the hint: plus the border. Counted in `usize` and clamped
+    // before narrowing.
+    let popup_height = rows
+        .len()
+        .saturating_add(opening.len() + 1 + 3 + 2)
+        .min(usize::from(area.height.saturating_sub(2))) as u16;
+    let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
+    let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+    let footer_height: u16 = 2;
+    let inner_height = popup_height.saturating_sub(2);
+    let shown =
+        usize::from(inner_height.saturating_sub(footer_height)).saturating_sub(opening.len() + 1);
+    notice.scroll = notice.scroll.min(rows.len().saturating_sub(shown));
+    let last = (notice.scroll + shown).min(rows.len());
+    let title = match (
+        rows.get(notice.scroll),
+        last.checked_sub(1).and_then(|l| rows.get(l)),
+    ) {
+        (Some((first, _)), Some((end, _))) if last - notice.scroll < rows.len() => format!(
+            " Restart notice · {}–{} of {} ",
+            first + 1,
+            end + 1,
+            notice.agents.len()
+        ),
+        _ => " Restart notice ".to_string(),
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let mut lines: Vec<Line> = opening
+        .into_iter()
+        .map(|row| Line::styled(format!("  {row}"), Style::default().fg(Color::Yellow)))
+        .collect();
+    lines.push(Line::from(""));
+    lines.extend(
+        rows[notice.scroll..last]
+            .iter()
+            .map(|(_, row)| Line::styled(row.clone(), text_primary())),
+    );
+    // PRD #1666 part 2 (G-fix7f): a popup with no row left for the list says
+    // how to see it, rather than showing its opening words over nothing.
+    if shown == 0 && !rows.is_empty() {
+        lines = crate::upgrade_dialog::wrap(
+            RESTART_NOTICE_LIST_TOO_SHORT,
+            usize::from(inner.width.saturating_sub(2)),
+        )
+        .into_iter()
+        .map(|row| Line::styled(format!("  {row}"), Style::default().fg(Color::Yellow)))
+        .collect();
+    }
+    let body_height = inner.height.saturating_sub(footer_height);
+    frame.render_widget(
+        Paragraph::new(lines),
+        Rect::new(inner.x, inner.y, inner.width, body_height),
+    );
+    let footer_area = Rect::new(
+        inner.x,
+        inner.y + body_height,
+        inner.width,
+        footer_height.min(inner.height),
+    );
+    if footer_area.height == 0 {
+        return Vec::new();
+    }
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(""),
+            Line::styled(
+                format!(
+                    "  j/k scroll · {} dismiss · Esc to close",
+                    display_notation(keybindings, KbAction::DismissRestartNotice)
+                ),
+                text_primary(),
+            ),
+        ]),
+        footer_area,
+    );
+    let buttons = [
+        Button::new(
+            "Dismiss",
+            button_shortcut_label(keybindings, KbAction::DismissRestartNotice),
+            Action::DismissRestartNotice,
+            true,
+        ),
+        Button::new("Close", "", Action::CloseRestartNotice, true),
+    ];
+    let btn_row = Rect {
+        x: footer_area.x,
+        y: footer_area.y,
+        width: footer_area.width,
+        height: 1,
+    };
+    render_modal_button_row(frame, &buttons, btn_row, 2)
+}
+
+/// PRD #1666 part 2 (G-fix7e): the restart notice list's width when every
+/// entry fits in it, and the widest it grows to for one that does not; past
+/// that, or past the frame's width, entries wrap.
+const RESTART_NOTICE_LIST_MIN_WIDTH: u16 = 72;
+const RESTART_NOTICE_LIST_MAX_WIDTH: u16 = 100;
+
+/// PRD #1666 part 2 (G-fix7e): whether the restart notice's keys act on it in
+/// `mode` — command mode (the dashboard or an orchestration tab) and the
+/// notice's own list. Elsewhere a text field, the pane or a dialog has them.
+fn restart_notice_keys_act(mode: UiMode) -> bool {
+    matches!(mode, UiMode::Normal | UiMode::RestartNotice)
+}
+
+/// PRD #1666 part 2 (G-fix7d): the restart notice's two buttons. G-fix7e:
+/// naming their keys only when `keys` ([`restart_notice_keys_act`]); otherwise
+/// they are for the mouse.
+fn restart_notice_buttons(keybindings: &KeybindingConfig, keys: bool) -> [Button; 2] {
+    let shortcut = |action| {
+        if keys {
+            button_shortcut_label(keybindings, action)
+        } else {
+            String::new()
+        }
+    };
+    [
+        Button::new(
+            "Agents",
+            shortcut(KbAction::RestartNotice),
+            Action::OpenRestartNotice,
+            true,
+        ),
+        Button::new(
+            "Dismiss",
+            shortcut(KbAction::DismissRestartNotice),
+            Action::DismissRestartNotice,
+            true,
+        ),
+    ]
+}
+
+/// The columns [`restart_notice_buttons`] take, with the gap before them.
+fn restart_notice_buttons_width(keybindings: &KeybindingConfig, keys: bool) -> u16 {
+    let buttons = restart_notice_buttons(keybindings, keys);
+    buttons
+        .iter()
+        .map(|b| b.display_label().chars().count() as u16)
+        .sum::<u16>()
+        + buttons.len() as u16
+}
+
+/// How many footer rows the restart notice takes at `width`: one, or two when
+/// its summary and buttons do not fit side by side, so the buttons are not
+/// drawn over the summary. A summary wider than `width` is still cut at the
+/// frame's edge; the list (`a`) names every agent.
+fn restart_notice_rows(
+    notice: &RestartNotice,
+    keybindings: &KeybindingConfig,
+    keys: bool,
+    width: u16,
+) -> u16 {
+    let summary = unicode_width::UnicodeWidthStr::width(notice.summary().as_str());
+    let buttons = usize::from(restart_notice_buttons_width(keybindings, keys));
+    if summary + buttons <= usize::from(width) {
+        1
+    } else {
+        2
+    }
+}
+
+/// PRD #1666 part 2 (G-fix7d): the restart notice's footer rows — its first
+/// names ([`RestartNotice::summary`]) and the `[Agents]` and `[Dismiss]`
+/// buttons, beside it or on a row of their own — drawn in every mode until the
+/// notice is dismissed, when the footer has room for them
+/// ([`render_bottom_bar`]).
+fn render_restart_notice_row(
+    frame: &mut Frame,
+    notice: &RestartNotice,
+    keybindings: &KeybindingConfig,
+    keys: bool,
+    area: Rect,
+) -> Vec<(Action, Rect)> {
+    frame.render_widget(Clear, area);
+    let buttons = restart_notice_buttons(keybindings, keys);
+    let text_area = if area.height >= 2 {
+        Rect { height: 1, ..area }
+    } else {
+        Rect {
+            width: area
+                .width
+                .saturating_sub(restart_notice_buttons_width(keybindings, keys)),
+            ..area
+        }
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            notice.summary(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        text_area,
+    );
+    let button_row = Rect {
+        y: area.y + area.height.saturating_sub(1),
+        height: 1,
+        ..area
+    };
+    render_right_aligned_buttons(frame, &buttons, button_row)
+}
+
 /// PRD #80 M7: clickable geometry returned by [`render_dir_picker`] — the row
 /// rects (each paired with its index into `DirPickerState.filtered_indices`)
 /// and the `[Confirm]`/`[Cancel]`/`[Filter]` button rects.
@@ -18733,8 +20158,11 @@ type PickerClickTargets = (Vec<(usize, Rect)>, Vec<(Action, Rect)>);
 /// `Rect` with its index into `filtered_indices` (matching
 /// `DirPickerState.selected`); `button_rects` carries the `[Confirm]` /
 /// `[Cancel]` / `[Filter]` affordances. PRD #80 M7.
-fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState) -> PickerClickTargets {
-    let area = frame.area();
+fn render_dir_picker(
+    frame: &mut Frame,
+    area: Rect,
+    picker: &mut DirPickerState,
+) -> PickerClickTargets {
     let popup_width = 60.min(area.width.saturating_sub(4));
     let popup_height = 20u16.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
@@ -18776,6 +20204,16 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState) -> PickerCl
 
     // Screen y of line index `n` within the popup (inside the top border).
     let line_y = |n: usize| popup_area.y + 1 + n as u16;
+    // PRD #1666 part 2 (G-fix7f): whether line `n` is inside the popup's
+    // border. A popup too short for every reserved line clips the rest, and a
+    // row or button there is neither drawn nor clickable — written past the
+    // popup, it landed on whatever was below, the restart notice's rows
+    // included.
+    let inside = |n: usize| {
+        u16::try_from(n)
+            .ok()
+            .is_some_and(|n| n < popup_area.height.saturating_sub(2))
+    };
     let row_x = popup_area.x + 1;
     let row_width = popup_area.width.saturating_sub(2);
     let mut row_rects: Vec<(usize, Rect)> = Vec::new();
@@ -18816,6 +20254,9 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState) -> PickerCl
             let suffix = if is_parent { "" } else { "/" };
             let line_idx = lines.len();
             lines.push(Line::styled(format!("{prefix}{name}{suffix}"), style));
+            if !inside(line_idx) {
+                continue;
+            }
             // Record this row's clickable rect, keyed by its filtered-list
             // index `i` (== what `picker.selected` holds).
             row_rects.push((
@@ -18863,6 +20304,9 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState) -> PickerCl
         Button::new("Cancel", "", Action::PickerCancel, true),
         Button::new("Filter", "", Action::PickerFilter, true),
     ];
+    if !inside(button_line_idx) {
+        return (row_rects, Vec::new());
+    }
     let btn_row = Rect {
         x: row_x,
         y: line_y(button_line_idx),
@@ -18935,8 +20379,11 @@ type ScheduledTasksClickTargets = (Vec<(Action, Rect)>, Vec<(usize, Rect)>);
 /// PRD #127 M3.3: also returns each schedule row's `(index, Rect)` to record in
 /// `UiState::scheduled_row_rects` so a click on a row re-selects it (keyboard
 /// parity for `j`/`k`); empty while the delete confirmation is armed.
-fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) -> ScheduledTasksClickTargets {
-    let area = frame.area();
+fn render_scheduled_tasks(
+    frame: &mut Frame,
+    area: Rect,
+    ui: &UiState,
+) -> ScheduledTasksClickTargets {
     // PRD #144: the manager dialog is content-sized via `modal_rect` (no fixed
     // 72-col cap). The list columns size to the widest schedule name / next-fire
     // cell so a long name renders un-clipped, and the modal grows wide enough to
@@ -19245,8 +20692,11 @@ type FormClickTargets = (
     Vec<(Action, Rect)>,
 );
 
-fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClickTargets {
-    let area = frame.area();
+fn render_new_pane_form(
+    frame: &mut Frame,
+    area: Rect,
+    form: &NewPaneFormState,
+) -> FormClickTargets {
     // PRD #170 (unify): the Scheduled-Tasks manager's Add/Edit reuse this form
     // MODE-LOCKED to schedule authoring — hide the Mode cycler + the Name field
     // and retitle the modal. The unlocked `Ctrl+n` form (the common case) is
@@ -20742,6 +22192,73 @@ pub fn render_stats_bar_to_buffer(
     })
 }
 
+/// The rows the run loop reserves below the frame's layout, bottom up, and
+/// paints after [`render_frame`] in the same draw. PRD #1666 part 2 (G-fix7i):
+/// one type for both, so the L1 tests draw the footer the run loop draws.
+#[derive(Debug, Clone, Copy, Default)]
+struct FooterRows {
+    experimental: Option<Rect>,
+    hook_notice: Option<Rect>,
+    protocol_refusal: Option<Rect>,
+}
+
+impl FooterRows {
+    /// Reserve the rows `full` needs and return the area left for the layout.
+    ///
+    /// PRD #139 M4.1 + PRD #84: the bottom row for the `experimental: on`
+    /// label when the flag is on; when off the layout is byte-for-byte the
+    /// pre-feature baseline. Issue #1637: one row above that for the
+    /// hook-binary notice. PRD #1666 part 2 (`lifecycle/handshake/011`): one
+    /// row above those for a reconnect that found the daemon on another attach
+    /// protocol.
+    fn reserve(
+        full: Rect,
+        experimental: bool,
+        hook_notice: bool,
+        protocol_refusal: bool,
+    ) -> (Rect, Self) {
+        let mut area = full;
+        let mut take = |wanted: bool| {
+            wanted.then(|| {
+                let chunks =
+                    Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(area);
+                area = chunks[0];
+                chunks[1]
+            })
+        };
+        let rows = FooterRows {
+            experimental: take(experimental),
+            hook_notice: take(hook_notice),
+            protocol_refusal: take(protocol_refusal),
+        };
+        (area, rows)
+    }
+
+    /// Paint the reserved rows. `features` must be the snapshot the
+    /// reservation used (Greptile P2), so the gate and the label agree.
+    fn render(
+        &self,
+        frame: &mut Frame,
+        features: &Features,
+        hook_notices: &[crate::hook_binary::HookBinaryNotice],
+        protocol_refusal: Option<crate::state::ProtocolRefusal>,
+    ) {
+        if let Some(area) = self.experimental {
+            render_experimental_footer(frame, features, area);
+        }
+        if let Some(area) = self.hook_notice {
+            render_hook_notice(frame, hook_notices, area);
+        }
+        if let (Some(refusal), Some(area)) = (protocol_refusal, self.protocol_refusal) {
+            frame.render_widget(
+                Paragraph::new(protocol_refusal_line(refusal))
+                    .style(Style::default().fg(Color::Yellow)),
+                area,
+            );
+        }
+    }
+}
+
 /// PRD #139 M4.1 — render the throwaway experimental footer into `area`.
 /// When `features.experimental` is set, draws the exact label
 /// `experimental: on`; otherwise renders nothing, leaving the row blank (the
@@ -20780,6 +22297,21 @@ pub fn render_experimental_footer_to_buffer(
 /// so a second notice is counted rather than drawn, and that count is never
 /// cut. A remedy is shown whole or not at all: when the row is narrow, the
 /// facts (agents, path, versions) are what get shorter, the path first.
+/// PRD #1666 part 2 (`lifecycle/handshake/011`): the footer row a reconnect's
+/// protocol refusal draws ([`crate::state::AppState::protocol_refusal`]). Its
+/// first clause is the startup refusal's own sentence (issue #405), so the two
+/// say it the same way; the facts come first, so a narrow terminal cuts the
+/// remedy rather than either number.
+pub fn protocol_refusal_line(refusal: crate::state::ProtocolRefusal) -> String {
+    format!(
+        "⚠ Not attaching: {}. Attach with the daemon's own build, or run `dot-agent-deck daemon stop` (which stops its agents) and relaunch.",
+        crate::build_version_handshake::HandshakeError::ProtocolMismatch {
+            daemon: refusal.daemon,
+            local: refusal.local,
+        }
+    )
+}
+
 fn render_hook_notice(
     frame: &mut Frame,
     notices: &[crate::hook_binary::HookBinaryNotice],
@@ -21039,7 +22571,8 @@ pub fn render_quit_confirm_to_buffer(
     height: u16,
 ) -> ratatui::buffer::Buffer {
     draw_to_buffer(width, height, |frame| {
-        render_quit_confirm(frame, selected);
+        let frame_area = frame.area();
+        render_quit_confirm(frame, frame_area, selected);
     })
 }
 
@@ -21059,7 +22592,8 @@ pub fn render_close_confirm_to_buffer(
     height: u16,
 ) -> ratatui::buffer::Buffer {
     draw_to_buffer(width, height, |frame| {
-        render_close_confirm(frame, state);
+        let frame_area = frame.area();
+        render_close_confirm(frame, frame_area, state);
     })
 }
 
@@ -21073,7 +22607,8 @@ pub fn render_stop_confirm_to_buffer(
     height: u16,
 ) -> ratatui::buffer::Buffer {
     draw_to_buffer(width, height, |frame| {
-        render_stop_confirm(frame, selected, agent_count);
+        let frame_area = frame.area();
+        render_stop_confirm(frame, frame_area, selected, agent_count);
     })
 }
 
@@ -21086,7 +22621,8 @@ pub fn render_upgrade_dialog_to_buffer(
     height: u16,
 ) -> ratatui::buffer::Buffer {
     draw_to_buffer(width, height, |frame| {
-        crate::upgrade_dialog::render(frame, dialog);
+        let frame_area = frame.area();
+        crate::upgrade_dialog::render(frame, frame_area, dialog);
     })
 }
 
@@ -21095,7 +22631,8 @@ pub fn render_upgrade_dialog_to_buffer(
 #[doc(hidden)]
 pub fn render_star_prompt_to_buffer(width: u16, height: u16) -> ratatui::buffer::Buffer {
     draw_to_buffer(width, height, |frame| {
-        render_star_prompt(frame);
+        let frame_area = frame.area();
+        render_star_prompt(frame, frame_area);
     })
 }
 
@@ -21108,7 +22645,8 @@ pub fn render_config_gen_prompt_to_buffer(
     height: u16,
 ) -> ratatui::buffer::Buffer {
     draw_to_buffer(width, height, |frame| {
-        render_config_gen_prompt(frame, selected);
+        let frame_area = frame.area();
+        render_config_gen_prompt(frame, frame_area, selected);
     })
 }
 
@@ -21633,6 +23171,7 @@ pub fn render_orchestration_frame_to_buffer(
                 pending_question: None,
                 pull_request: None,
                 pull_request_revision: 0,
+                incarnation: Default::default(),
             },
         );
         // Two different maps: the sidebar card reads `display_names` (keyed by
@@ -22430,6 +23969,7 @@ pub fn observe_dashboard_geometry(width: u16, height: u16, card_count: usize) ->
                 pending_question: None,
                 pull_request: None,
                 pull_request_revision: 0,
+                incarnation: Default::default(),
             },
         );
     }
@@ -23244,6 +24784,7 @@ pub fn render_inbox_attention_overlay_to_buffer(
     let dialog = InboxAttentionDialog {
         pane_id: "pane".into(),
         agent_id: "agent".into(),
+        incarnation: Default::default(),
         items: items.to_vec(),
         selected,
         answer: answer.map(str::to_string),
@@ -23252,7 +24793,8 @@ pub fn render_inbox_attention_overlay_to_buffer(
         Terminal::new(TestBackend::new(width, height)).expect("TestBackend should construct");
     terminal
         .draw(|frame| {
-            render_inbox_attention_overlay(frame, &dialog);
+            let frame_area = frame.area();
+            render_inbox_attention_overlay(frame, frame_area, &dialog);
         })
         .expect("TestBackend draw should succeed");
     terminal.backend().buffer().clone()
@@ -23358,7 +24900,8 @@ pub fn inbox_attention_run(
             Terminal::new(TestBackend::new(width, height)).expect("TestBackend should construct");
         terminal
             .draw(|frame| {
-                render_inbox_attention_overlay(frame, dialog);
+                let frame_area = frame.area();
+                render_inbox_attention_overlay(frame, frame_area, dialog);
             })
             .expect("TestBackend draw should succeed");
         terminal.backend().buffer().clone()
@@ -23416,7 +24959,8 @@ pub fn render_host_metrics_overlay_to_buffer(
         Terminal::new(TestBackend::new(width, height)).expect("TestBackend should construct");
     terminal
         .draw(|frame| {
-            render_host_metrics_overlay(frame, &view);
+            let frame_area = frame.area();
+            render_host_metrics_overlay(frame, frame_area, &view);
         })
         .expect("TestBackend draw should succeed");
     terminal.backend().buffer().clone()
@@ -23482,7 +25026,7 @@ pub fn render_host_metrics_key_sequence_to_buffers(
             bar_rows,
         );
         let filtered = filter_sessions(&state, ui);
-        terminal
+        let completed = terminal
             .draw(|frame| {
                 render_frame(
                     frame, &state, ui, &filtered, 0, true, &*ctrl, &tab_view, &tab_bar, &layout,
@@ -23490,6 +25034,138 @@ pub fn render_host_metrics_key_sequence_to_buffers(
                 );
             })
             .expect("TestBackend draw should succeed");
+        // As the run loop does: an open confirmation's record and click
+        // targets come from the flushed frame before the next key is handled.
+        record_flushed_confirmation(ui, completed.buffer);
+        terminal.backend().buffer().clone()
+    };
+
+    let mut frames = Vec::with_capacity(keys.len() + 1);
+    frames.push(draw(&mut ui));
+    for key in keys {
+        let filtered = filter_sessions(&state, &ui);
+        let _ = handle_key_event(
+            *key,
+            &mut ui,
+            &*ctrl,
+            &shared,
+            &mut tab_manager,
+            &state,
+            &filtered,
+            frame_area,
+        );
+        frames.push(draw(&mut ui));
+    }
+    frames
+}
+
+/// PRD #1666 part 2 (G-fix7d) L1 seam: start on an empty dashboard in `mode`
+/// whose restart notice names one agent per entry of `labels` (each on a pane
+/// of its own), with `status` on the status line, press `keys` one at a time
+/// through the production [`handle_key_event`] and draw each frame with the
+/// production [`render_frame`]. Returns the frame before the first key and one
+/// after each.
+#[doc(hidden)]
+pub fn render_restart_notice_key_sequence_to_buffers(
+    labels: &[&str],
+    mode: UiMode,
+    status: Option<&str>,
+    keys: &[KeyEvent],
+    width: u16,
+    height: u16,
+) -> Vec<ratatui::buffer::Buffer> {
+    let agents: Vec<crate::daemon_client::StoppedAgent> = labels
+        .iter()
+        .map(|label| crate::daemon_client::StoppedAgent {
+            label: (*label).to_string(),
+            role: None,
+            orchestration: None,
+        })
+        .collect();
+    render_restart_notice_agents_key_sequence_to_buffers(&agents, mode, status, keys, width, height)
+}
+
+/// [`render_restart_notice_key_sequence_to_buffers`] for a notice naming
+/// `agents`, each with its role and orchestration (PRD #1666 part 2, G-fix7e).
+#[doc(hidden)]
+pub fn render_restart_notice_agents_key_sequence_to_buffers(
+    agents: &[crate::daemon_client::StoppedAgent],
+    mode: UiMode,
+    status: Option<&str>,
+    keys: &[KeyEvent],
+    width: u16,
+    height: u16,
+) -> Vec<ratatui::buffer::Buffer> {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use std::sync::Arc;
+
+    let ctrl: Arc<EmbeddedPaneController> =
+        Arc::new(EmbeddedPaneController::for_render_seam_with_focused_pane(
+            BURST_SEAM_PANE_ID,
+            SCROLL_SEAM_ROWS,
+            SCROLL_SEAM_COLS,
+            b"",
+        ));
+    let mut tab_manager = TabManager::new(ctrl.clone() as Arc<dyn PaneController>);
+    let shared: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+    let state = AppState::default();
+    let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+    let mut notice = RestartNotice::default();
+    for (i, agent) in agents.iter().enumerate() {
+        notice.join(
+            StoppedIdentity {
+                pane: Some(format!("restart-seam-{i}")),
+                key: None,
+                agent: Some(i.to_string()),
+                process: crate::daemon_client::Incarnation::from(Some("replaced".to_string())),
+            },
+            agent.clone(),
+        );
+    }
+    ui.restart_notice = Some(notice);
+    ui.mode = mode;
+    ui.status_message = status.map(|s| (s.to_string(), std::time::Instant::now()));
+    // A fixed instant: the dashboard has no cards, so nothing measures against it.
+    let wall_now = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).expect("fixed instant");
+    let frame_area = Rect::new(0, 0, width, height);
+    let tab_view = ActiveTabView::Dashboard {
+        exclude_pane_ids: vec![],
+        zoomed: false,
+    };
+    let tab_bar = TabBarInfo {
+        show: false,
+        labels: vec!["Dashboard".into()],
+        active_index: 0,
+        orchestration_statuses: vec![],
+    };
+    let pane_ids: Vec<String> = Vec::new();
+    let mut terminal =
+        Terminal::new(TestBackend::new(width, height)).expect("TestBackend should construct");
+
+    let mut draw = |ui: &mut UiState| {
+        let bar_rows = bottom_bar_rows(ui, width, height);
+        let layout = compute_frame_layout(
+            frame_area,
+            &tab_view,
+            &tab_bar,
+            &pane_ids,
+            PaneLayout::Stacked,
+            None,
+            bar_rows,
+        );
+        let filtered = filter_sessions(&state, ui);
+        let completed = terminal
+            .draw(|frame| {
+                render_frame(
+                    frame, &state, ui, &filtered, 0, true, &*ctrl, &tab_view, &tab_bar, &layout,
+                    wall_now,
+                );
+            })
+            .expect("TestBackend draw should succeed");
+        // As the run loop does: an open confirmation's record and click
+        // targets come from the flushed frame before the next key is handled.
+        record_flushed_confirmation(ui, completed.buffer);
         terminal.backend().buffer().clone()
     };
 
@@ -23641,7 +25317,8 @@ fn render_overlay_to_buffer(
 pub fn render_help_overlay_to_buffer(width: u16, height: u16) -> ratatui::buffer::Buffer {
     let keybindings = KeybindingConfig::default();
     render_overlay_to_buffer(width, height, |frame| {
-        let _ = render_help_overlay(frame, &keybindings);
+        let frame_area = frame.area();
+        let _ = render_help_overlay(frame, frame_area, &keybindings);
     })
 }
 
@@ -23657,7 +25334,8 @@ pub fn render_dir_picker_to_buffer(
 ) -> ratatui::buffer::Buffer {
     let mut picker = DirPickerState::new(start);
     render_overlay_to_buffer(width, height, |frame| {
-        render_dir_picker(frame, &mut picker);
+        let frame_area = frame.area();
+        render_dir_picker(frame, frame_area, &mut picker);
     })
 }
 
@@ -23689,7 +25367,8 @@ pub fn render_new_pane_form_to_buffer(
         orchestrations,
     );
     render_overlay_to_buffer(width, height, |frame| {
-        render_new_pane_form(frame, &form);
+        let frame_area = frame.area();
+        render_new_pane_form(frame, frame_area, &form);
     })
 }
 
@@ -23740,7 +25419,8 @@ pub fn render_new_pane_orchestration_guard_to_buffer(
     // the guard applies to.
     form.selection_index = 1;
     render_overlay_to_buffer(width, height, |frame| {
-        render_new_pane_form(frame, &form);
+        let frame_area = frame.area();
+        render_new_pane_form(frame, frame_area, &form);
     })
 }
 
@@ -23788,7 +25468,8 @@ pub fn render_new_pane_orchestration_name_collision_to_buffer(
     // given — the state the guard applies to.
     form.selection_index = 1;
     render_overlay_to_buffer(width, height, |frame| {
-        render_new_pane_form(frame, &form);
+        let frame_area = frame.area();
+        render_new_pane_form(frame, frame_area, &form);
     })
 }
 
@@ -23821,7 +25502,8 @@ pub fn render_new_pane_form_schedule_to_buffer(
         existing,
     );
     render_overlay_to_buffer(width, height, |frame| {
-        render_new_pane_form(frame, &form);
+        let frame_area = frame.area();
+        render_new_pane_form(frame, frame_area, &form);
     })
 }
 
@@ -23837,6 +25519,7 @@ mod tests {
         ui.inbox_attention = Some(InboxAttentionDialog {
             pane_id: "p".to_string(),
             agent_id: "a".to_string(),
+            incarnation: Default::default(),
             items: Vec::new(),
             selected: 0,
             answer: None,
@@ -23999,7 +25682,8 @@ mod tests {
     fn schedule_manager_title_uses_glossary_word() {
         let ui = default_ui();
         let buffer = draw_to_buffer(80, 24, |frame| {
-            render_scheduled_tasks(frame, &ui);
+            let frame_area = frame.area();
+            render_scheduled_tasks(frame, frame_area, &ui);
         });
         let area = buffer.area();
         let mut rendered = String::new();
@@ -24040,7 +25724,8 @@ mod tests {
             let mut ui = default_ui();
             ui.scheduled_tasks = tasks;
             let buffer = draw_to_buffer(80, 24, |frame| {
-                render_scheduled_tasks(frame, &ui);
+                let frame_area = frame.area();
+                render_scheduled_tasks(frame, frame_area, &ui);
             });
             let area = buffer.area();
             let lines: Vec<String> = (0..area.height)
@@ -24198,7 +25883,8 @@ mod tests {
             vec![],
         );
         let grid = buffer_to_string(&render_overlay_to_buffer(100, 28, |frame| {
-            render_new_pane_form(frame, &form);
+            let frame_area = frame.area();
+            render_new_pane_form(frame, frame_area, &form);
         }));
         let row = grid
             .lines()
@@ -25053,6 +26739,7 @@ mod tests {
                 pending_question: None,
                 pull_request: None,
                 pull_request_revision: 0,
+                incarnation: Default::default(),
             },
         );
         state
@@ -26689,6 +28376,135 @@ mod tests {
             agent_type: None,
             live: None,
             orchestrator_context_path: None,
+            incarnation: crate::daemon_client::Incarnation::UNNAMED,
+        }
+    }
+
+    /// PR #1817 review 4347247784: startup hydration seeds a card for pane
+    /// `1`, attached on deck process `a`, before the event stream has opened.
+    /// The stream then opens on `a`, and after a later gap the resync's
+    /// snapshot says the agent waits for input: the card shows it. A card
+    /// attached on `b` while the stream opens on `a` is dropped for the
+    /// restart notice instead (control).
+    #[test]
+    fn a_card_hydrated_before_the_stream_opens_is_resynced_after_a_gap() {
+        use crate::daemon_client::Incarnation;
+        use crate::state::{AppState, SessionStatus};
+        let named = |process: &str| Incarnation::from(Some(process.to_string()));
+        let listed = |status: &str| -> Vec<crate::agent_pty::AgentRecord> {
+            serde_json::from_value(serde_json::json!([{
+                "id": "a-1",
+                "pane_id_env": "1",
+                "live": { "status": status, "tool_count": 0 },
+            }]))
+            .unwrap()
+        };
+        let card = |st: &AppState| {
+            st.sessions
+                .values()
+                .filter(|card| card.pane_id.as_deref() == Some("1"))
+                .map(|card| card.status.clone())
+                .collect::<Vec<_>>()
+        };
+        for attached_on in ["a", "b"] {
+            let mut st = AppState::default();
+            st.register_pane("1".to_string());
+            let mut h = hydrated("1", "a-1", None, None);
+            h.live = listed("Idle")[0].live.clone();
+            h.incarnation = named(attached_on);
+            seed_hydrated_card(&mut st, &h);
+            assert_eq!(
+                card(&st),
+                vec![SessionStatus::Idle],
+                "{attached_on}: drawn at once"
+            );
+
+            st.learn_stream_incarnation(named("a"));
+            if attached_on == "b" {
+                assert!(card(&st).is_empty(), "control: b's card was kept");
+                assert_eq!(st.take_restart_drops().len(), 1, "control");
+                continue;
+            }
+            st.resync_after_event_gap(&listed("WaitingForInput"));
+            assert_eq!(
+                card(&st),
+                vec![SessionStatus::WaitingForInput],
+                "the resync skipped the hydrated card"
+            );
+        }
+    }
+
+    /// PR #1817 review 4347247784 (U2): the stream opens on deck process `a`,
+    /// then reconnects to its successor `b`, which cards its own agent on pane
+    /// `1` waiting for input. A hydration of pane `1` attached on `a` (or on a
+    /// process no stream has named) arrives after that: `b`'s card keeps its
+    /// status, agent and process, and the pane keeps `b`'s hook generation.
+    /// The `a` card is queued for the restart notice; the other is held.
+    #[test]
+    fn a_delayed_hydration_leaves_a_successors_card_alone() {
+        use crate::daemon_client::Incarnation;
+        use crate::state::{AppState, SessionStatus};
+        let named = |process: &str| Incarnation::from(Some(process.to_string()));
+        let listed = |id: &str, status: &str, generation: &str| {
+            serde_json::from_value::<Vec<crate::agent_pty::AgentRecord>>(serde_json::json!([{
+                "id": id,
+                "pane_id_env": "1",
+                "live": {
+                    "status": status,
+                    "tool_count": 0,
+                    "hook_generation": {
+                        "session_id": generation,
+                        "established_ms": 1_700_000_000_000i64,
+                    },
+                },
+            }]))
+            .unwrap()
+        };
+        for attached_on in ["a", "c"] {
+            let mut st = AppState::default();
+            st.register_pane("1".to_string());
+            st.learn_stream_incarnation(named("a"));
+            st.learn_stream_incarnation(named("b"));
+            st.card_unseen_agents(&listed("b-1", "WaitingForInput", "gen-b"));
+
+            let mut h = hydrated("1", "a-1", None, None);
+            h.live = listed("a-1", "Working", "gen-a")[0].live.clone();
+            h.incarnation = named(attached_on);
+            seed_hydrated_card(&mut st, &h);
+
+            let cards = st
+                .sessions
+                .values()
+                .filter(|card| card.pane_id.as_deref() == Some("1"))
+                .map(|card| {
+                    (
+                        card.status.clone(),
+                        card.agent_id.clone(),
+                        card.incarnation.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                cards,
+                vec![(
+                    SessionStatus::WaitingForInput,
+                    Some("b-1".to_string()),
+                    named("b"),
+                )],
+                "{attached_on}: the delayed hydration changed b's card"
+            );
+            assert_eq!(
+                st.pane_hook_session_id("1").as_deref(),
+                Some("gen-b"),
+                "{attached_on}: the delayed hydration took the pane's generation"
+            );
+            let drops = st.take_restart_drops();
+            if attached_on == "a" {
+                assert_eq!(drops.len(), 1, "a's card was not queued");
+                assert_eq!(drops[0].agent_id.as_deref(), Some("a-1"));
+            } else {
+                assert!(drops.is_empty(), "a held card was queued as stale");
+            }
         }
     }
 
@@ -28592,6 +30408,7 @@ mod tests {
             pending_question: None,
             pull_request: None,
             pull_request_revision: 0,
+            incarnation: Default::default(),
         };
 
         let lines = recent_tool_lines(&session, 3);
@@ -29138,7 +30955,8 @@ mod tests {
         );
         let mut targets = None;
         let rendered = buffer_to_string(&render_overlay_to_buffer(80, 24, |frame| {
-            targets = Some(render_new_pane_form(frame, &form));
+            let frame_area = frame.area();
+            targets = Some(render_new_pane_form(frame, frame_area, &form));
         }));
 
         assert!(rendered.contains("Name:"), "got:\n{rendered}");
@@ -29204,7 +31022,8 @@ mod tests {
 
         let mut targets = None;
         let buf = render_overlay_to_buffer(80, 30, |frame| {
-            targets = Some(render_new_pane_form(frame, &form));
+            let frame_area = frame.area();
+            targets = Some(render_new_pane_form(frame, frame_area, &form));
         });
         let rendered = buffer_to_string(&buf);
         let (fields, chips, _) = targets.expect("rendered");
@@ -29256,7 +31075,8 @@ mod tests {
 
         let mut short = None;
         let short_buf = render_overlay_to_buffer(80, 6, |frame| {
-            short = Some(render_new_pane_form(frame, &form));
+            let frame_area = frame.area();
+            short = Some(render_new_pane_form(frame, frame_area, &form));
         });
         let short_rendered = buffer_to_string(&short_buf);
         let (short_fields, short_chips, _) = short.expect("rendered");
@@ -31113,7 +32933,7 @@ mod tests {
                 ))
             }
         }
-        fn try_hydrate_pane(&self, _id: &str) -> bool {
+        fn try_hydrate_pane(&self, _card: &crate::pane::BoundPane) -> bool {
             *self.hydrate_calls.lock().unwrap() += 1;
             if self.hydratable {
                 *self.wired.lock().unwrap() = true;
@@ -31637,6 +33457,7 @@ mod tests {
             pending_question: None,
             pull_request: None,
             pull_request_revision: 0,
+            incarnation: Default::default(),
         };
         let s0 = make("s0", "p0");
         let s1 = make("s1", "p1");
@@ -32433,6 +34254,7 @@ mod tests {
             pending_question: None,
             pull_request: None,
             pull_request_revision: 0,
+            incarnation: Default::default(),
         }
     }
 
@@ -32871,6 +34693,7 @@ mod tests {
             pending_question: None,
             pull_request: None,
             pull_request_revision: 0,
+            incarnation: Default::default(),
         };
 
         // Spacious: get all 3
@@ -32914,6 +34737,7 @@ mod tests {
             pending_question: None,
             pull_request: None,
             pull_request_revision: 0,
+            incarnation: Default::default(),
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -32948,6 +34772,7 @@ mod tests {
             pending_question: None,
             pull_request: None,
             pull_request_revision: 0,
+            incarnation: Default::default(),
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -35943,7 +37768,10 @@ mod tests {
         let mut ui = default_ui();
         ui.mode = UiMode::ConfigGenPrompt;
         ui.config_gen_selected = 0; // Yes
-        ui.config_gen_target = Some(("pane-1".to_string(), "/my/project".to_string()));
+        ui.config_gen_target = Some((
+            crate::pane::BoundPane::held_by_controller("pane-1"),
+            "/my/project".to_string(),
+        ));
 
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         let result = handle_config_gen_prompt_key(enter, &mut ui);
@@ -35951,8 +37779,8 @@ mod tests {
         assert_eq!(ui.mode, UiMode::Normal);
         assert!(ui.config_gen_target.is_none());
         assert!(
-            matches!(result, Action::SendConfigGenPrompt { ref pane_id, ref cwd }
-                if pane_id == "pane-1" && cwd == "/my/project")
+            matches!(result, Action::SendConfigGenPrompt { ref pane, ref cwd }
+                if pane.pane_id == "pane-1" && cwd == "/my/project")
         );
     }
 
@@ -35961,7 +37789,10 @@ mod tests {
         let mut ui = default_ui();
         ui.mode = UiMode::ConfigGenPrompt;
         ui.config_gen_selected = 1; // No
-        ui.config_gen_target = Some(("pane-1".to_string(), "/my/project".to_string()));
+        ui.config_gen_target = Some((
+            crate::pane::BoundPane::held_by_controller("pane-1"),
+            "/my/project".to_string(),
+        ));
 
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         let result = handle_config_gen_prompt_key(enter, &mut ui);
@@ -35988,7 +37819,10 @@ mod tests {
         let mut ui = default_ui();
         ui.mode = UiMode::ConfigGenPrompt;
         ui.config_gen_selected = 2; // Never
-        ui.config_gen_target = Some(("pane-1".to_string(), "/my/project".to_string()));
+        ui.config_gen_target = Some((
+            crate::pane::BoundPane::held_by_controller("pane-1"),
+            "/my/project".to_string(),
+        ));
 
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         let result = handle_config_gen_prompt_key(enter, &mut ui);
@@ -36026,7 +37860,10 @@ mod tests {
     fn config_gen_prompt_esc_dismisses() {
         let mut ui = default_ui();
         ui.mode = UiMode::ConfigGenPrompt;
-        ui.config_gen_target = Some(("pane-1".to_string(), "/my/project".to_string()));
+        ui.config_gen_target = Some((
+            crate::pane::BoundPane::held_by_controller("pane-1"),
+            "/my/project".to_string(),
+        ));
 
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         let result = handle_config_gen_prompt_key(esc, &mut ui);
@@ -36808,7 +38645,8 @@ mod tests {
         let collided = {
             let form = ui.new_pane_form.as_ref().expect("form still open");
             buffer_to_string(&render_overlay_to_buffer(100, 28, |frame| {
-                render_new_pane_form(frame, form);
+                let frame_area = frame.area();
+                render_new_pane_form(frame, frame_area, form);
             }))
         };
         assert!(
@@ -36834,7 +38672,8 @@ mod tests {
                 "control setup: `review-2` must not collide with the live `review`"
             );
             buffer_to_string(&render_overlay_to_buffer(100, 28, |frame| {
-                render_new_pane_form(frame, form);
+                let frame_area = frame.area();
+                render_new_pane_form(frame, frame_area, form);
             }))
         };
         assert!(
@@ -36990,7 +38829,8 @@ mod tests {
             "the refused title now counts as live, so the form's own guard holds it"
         );
         let rendered = buffer_to_string(&render_overlay_to_buffer(100, 28, |frame| {
-            render_new_pane_form(frame, form);
+            let frame_area = frame.area();
+            render_new_pane_form(frame, frame_area, form);
         }));
         assert!(
             rendered.contains(NAME_COLLISION_WARNING[0].trim()),
@@ -37332,7 +39172,8 @@ mod tests {
             | UiMode::CloseConfirm
             | UiMode::HostMetrics
             | UiMode::Upgrade
-            | UiMode::InboxAttention => mode,
+            | UiMode::InboxAttention
+            | UiMode::RestartNotice => mode,
         }
     }
 
@@ -37356,6 +39197,7 @@ mod tests {
             UiMode::HostMetrics,
             UiMode::Upgrade,
             UiMode::InboxAttention,
+            UiMode::RestartNotice,
         ]
         .into_iter()
         .map(assert_exhaustive_ui_mode)
@@ -38709,6 +40551,12 @@ mod tests {
         ui.status_message.as_ref().map(|(msg, _)| msg.as_str())
     }
 
+    /// PRD #1666 part 2 (G-fix7d): the full sentence of the restart notice the
+    /// TUI holds, naming every agent.
+    fn restart_notice_text(ui: &UiState) -> Option<String> {
+        ui.restart_notice.as_ref().map(RestartNotice::text)
+    }
+
     /// Scenario: Put two agents on the dashboard, apply a filter that matches
     /// neither, and draw the frame. The sidebar must say "No agents match
     /// filter." under a title counting `0/2 agent(s)` — the glossary's word,
@@ -39256,6 +41104,2418 @@ mod tests {
             Some("No pane linked to agent s0")
         );
         insta::assert_snapshot!(glossary_status_row(&state, &mut ui), @" COMMAND  No pane linked to agent s0");
+    }
+
+    /// Scenario: the user renames a dashboard card twice before the deck answers; then the deck refuses both. The card's names go back to the ones it had before the first rename, not to the first rename's. When the deck confirms the first and refuses the second, they go back to the first (control).
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_overlapping_refused_renames_restore_the_card_name_before_them() {
+        use crate::embedded_pane::RenameSettled;
+        for first_confirmed in [true, false] {
+            let snapshot = dashboard_snapshot(1);
+            let pc = stale_card_pc();
+            let mut ui = default_ui();
+            ui.display_names.insert("s0".into(), "orig".into());
+            ui.pane_display_names.insert("p0".into(), "orig".into());
+            commit_rename("first", &mut ui, &pc, &snapshot, Some("s0"));
+            commit_rename("second", &mut ui, &pc, &snapshot, Some("s0"));
+            assert_eq!(ui.display_names["s0"], "second");
+
+            settle_rename(
+                &mut ui,
+                RenameSettled {
+                    pane_id: "p0".into(),
+                    label: first_confirmed.then(|| "first".to_string()),
+                    last: false,
+                },
+            );
+            settle_rename(
+                &mut ui,
+                RenameSettled {
+                    pane_id: "p0".into(),
+                    label: None,
+                    last: true,
+                },
+            );
+
+            let expected = if first_confirmed { "first" } else { "orig" };
+            assert_eq!(
+                ui.display_names.get("s0").map(String::as_str),
+                Some(expected)
+            );
+            assert_eq!(
+                ui.pane_display_names.get("p0").map(String::as_str),
+                Some(expected)
+            );
+            assert!(ui.renamed_from.is_empty());
+        }
+    }
+
+    /// The key of the card the active tab highlights after one render-loop
+    /// selection step ([`reconcile_frame_selection`]). Its one caller uses the
+    /// Unix-only restart fixture.
+    #[cfg(unix)]
+    fn frame_selected_key(
+        ui: &mut UiState,
+        tab_manager: &mut TabManager,
+        pc: &dyn PaneController,
+        snapshot: &AppState,
+    ) -> Option<String> {
+        let filtered = tab_scoped_cards(snapshot, ui, tab_manager);
+        reconcile_frame_selection(ui, tab_manager, pc, &filtered);
+        ui.selected_index
+            .and_then(|idx| filtered.get(idx))
+            .map(|(id, _)| (*id).clone())
+    }
+
+    /// A card for `pane` (or none) learned from `process`, named `name`.
+    fn restart_card(key: &str, pane: Option<&str>, name: &str, process: &str) -> SessionState {
+        let mut card = make_session(SessionStatus::Idle);
+        card.session_id = key.into();
+        card.pane_id = pane.map(Into::into);
+        card.display_name = Some(name.into());
+        card.incarnation = crate::daemon_client::Incarnation::from(Some(process.to_string()));
+        card
+    }
+
+    /// Scenario: A same-build restart drops this TUI's stopped cards, panes and emptied unit tab locally, keeps a new-process tab active, leaves the worktree files intact and shows one notice naming the stopped agents, while a same-process reconnect keeps them (control). The remembered Dashboard key is cleared even while another tab stays active, so a reused key inherits neither name nor selection. A queued orchestration attaches only on its originating process, and a placeholder learned from that actual attach can post to its process but refuses a successor that reuses its ids.
+    // The restart fixture is a Unix-socket daemon.
+    #[cfg(unix)]
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_a_restart_drops_its_agents_locally_with_one_notice() {
+        use crate::daemon_client::Incarnation;
+        use crate::daemon_client::restart_fixture::RestartingDaemon;
+        use crate::embedded_pane::{EmbeddedPaneController, PaneLostReason};
+        use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
+        use tokio::sync::RwLock;
+        let named = |process: &str| Incarnation::from(Some(process.to_string()));
+        let role = |name: &str, start: bool| OrchestrationRoleConfig {
+            agent: None,
+            name: name.to_string(),
+            command: "cat".to_string(),
+            start,
+            description: None,
+            prompt_template: None,
+            clear: false,
+        };
+        let cfg = OrchestrationConfig {
+            default: false,
+            name: "team".to_string(),
+            roles: vec![role("orchestrator", true), role("worker", false)],
+        };
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        for (restarted, keep_other_active) in [(false, false), (true, false), (true, true)] {
+            let daemon = runtime.block_on(async { RestartingDaemon::spawn("a") });
+            let controller = Arc::new(
+                EmbeddedPaneController::new(daemon.path.clone(), runtime.handle().clone())
+                    .with_protocol_gate(),
+            );
+            let [solo, lead, coder, quiet] = ["solo", "lead", "coder", "quiet"].map(|_| {
+                controller
+                    .create_pane(Some("cat"), None)
+                    .expect("a pane on a")
+            });
+            controller
+                .focus_pane(&solo)
+                .expect("focus the standalone pane");
+            let pc: Arc<dyn PaneController> = controller.clone();
+            let worktree = tempfile::tempdir().unwrap();
+            std::fs::write(worktree.path().join(".git"), "gitdir: elsewhere").unwrap();
+            std::fs::write(worktree.path().join("work.txt"), "unit work").unwrap();
+            let mut tab_manager = TabManager::new(pc.clone());
+            tab_manager
+                .open_orchestration_tab_with_existing_role_panes(
+                    &cfg,
+                    worktree.path().to_str().unwrap(),
+                    vec![Some(lead.clone()), Some(coder.clone())],
+                    None,
+                    Some("unit-7"),
+                )
+                .expect("open the unit's tab");
+
+            let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+            {
+                let mut st = state.blocking_write();
+                st.learn_stream_incarnation(named("a"));
+                for pane in [&solo, &lead, &coder, &quiet] {
+                    st.register_pane(pane.clone());
+                }
+                for (key, pane, name) in [
+                    ("s-solo", Some(solo.as_str()), "solo"),
+                    ("s-lead", Some(lead.as_str()), "lead"),
+                    ("s-coder", Some(coder.as_str()), "coder"),
+                    ("s-far", None, "far-away"),
+                ] {
+                    st.sessions
+                        .insert(key.into(), restart_card(key, pane, name, "a"));
+                }
+                // A card drawn before any stream named a process: the stream
+                // keeps it, and its pane's lost reattach drops it.
+                let mut unnamed = restart_card("s-quiet", Some(&quiet), "quiet", "a");
+                unnamed.incarnation = Incarnation::UNNAMED;
+                st.sessions.insert("s-quiet".into(), unnamed);
+            }
+            let mut ui = default_ui();
+            ui.display_names.insert("s-solo".into(), "solo".into());
+            ui.display_names.insert("s-far".into(), "far-away".into());
+            ui.pane_display_names.insert(solo.clone(), "solo".into());
+            // Remembered by the Dashboard while the unit's tab is active.
+            assert!(matches!(
+                tab_manager.active_tab(),
+                Tab::Orchestration { .. }
+            ));
+            if let Tab::Dashboard {
+                selected_session_id,
+                ..
+            } = &mut tab_manager.tabs_mut()[0]
+            {
+                *selected_session_id = Some("s-far".into());
+            }
+
+            if restarted {
+                daemon.restart_as("b");
+                // The lead's reattach found `b` answering; the others are
+                // dropped through their cards.
+                controller.mark_pane_lost_for_test(&lead, PaneLostReason::DeckRestarted);
+                controller.mark_pane_lost_for_test(&quiet, PaneLostReason::DeckRestarted);
+            }
+            {
+                let mut st = state.blocking_write();
+                let panes = st.learn_stream_incarnation(named(if restarted { "b" } else { "a" }));
+                let record: crate::agent_pty::AgentRecord =
+                    serde_json::from_value(serde_json::json!({
+                        "id": "1", "pane_id_env": solo.clone(), "rows": 24, "cols": 80,
+                    }))
+                    .unwrap();
+                st.seed_successor_cards(&panes, &[record]);
+                if restarted {
+                    // The restarted deck reports an agent under the key the
+                    // selected card had.
+                    st.sessions
+                        .insert("s-far".into(), restart_card("s-far", None, "far-new", "b"));
+                }
+            }
+            // Keep another, new-process tab active while the old unit's tab
+            // goes. Returning to Dashboard before clearing its key would mask
+            // an active-tab-only implementation.
+            let surviving_pane = keep_other_active.then(|| {
+                let survivor = controller.create_pane(Some("cat"), None).unwrap();
+                let other = OrchestrationConfig {
+                    default: false,
+                    name: "unaffected".into(),
+                    roles: vec![role("orchestrator", true)],
+                };
+                tab_manager
+                    .open_orchestration_tab_with_existing_role_panes(
+                        &other,
+                        worktree.path().to_str().unwrap(),
+                        vec![Some(survivor.clone())],
+                        None,
+                        Some("other-unit"),
+                    )
+                    .unwrap();
+                survivor
+            });
+            let sent = (
+                daemon.received_by("a"),
+                daemon.received_by("b"),
+                daemon.hellos("b"),
+            );
+
+            process_restart_drops(&state, &*pc, &mut tab_manager, &mut ui);
+
+            assert_eq!(
+                (
+                    daemon.received_by("a"),
+                    daemon.received_by("b"),
+                    daemon.hellos("b"),
+                ),
+                sent,
+                "dropping sent the deck something"
+            );
+            assert!(
+                worktree.path().join("work.txt").exists() && worktree.path().join(".git").exists(),
+                "the unit's worktree was touched"
+            );
+            let st = state.blocking_read();
+            if !restarted {
+                assert_eq!(st.sessions.len(), 5, "control: nothing dropped");
+                assert_eq!(tab_manager.tab_count(), 2, "control: the tab stays");
+                for pane in [&solo, &lead, &coder, &quiet] {
+                    assert!(pc.pane_agent_id(pane).is_some(), "control: {pane} stays");
+                }
+                assert!(restart_notice_text(&ui).is_none(), "control: no notice");
+                continue;
+            }
+            for key in ["s-solo", "s-lead", "s-coder", "s-quiet"] {
+                assert!(!st.sessions.contains_key(key), "{key} was kept");
+            }
+            assert_eq!(
+                st.sessions["s-far"].incarnation,
+                named("b"),
+                "s-far was kept"
+            );
+            let successors: Vec<_> = st
+                .sessions
+                .values()
+                .filter(|card| card.pane_id.as_deref() == Some(solo.as_str()))
+                .collect();
+            assert_eq!(successors.len(), 1, "the new agent has a card of its own");
+            assert_eq!(successors[0].incarnation, named("b"));
+            for pane in [&solo, &lead, &coder, &quiet] {
+                assert!(
+                    pc.pane_agent_id(pane).is_none(),
+                    "{pane}'s local pane was kept"
+                );
+            }
+            assert_eq!(
+                tab_manager.tab_count(),
+                if keep_other_active { 2 } else { 1 },
+                "the stopped unit's tab was kept or another tab was removed"
+            );
+            assert_eq!(
+                restart_notice_text(&ui).as_deref(),
+                Some(
+                    "The deck restarted; these agents were stopped: coder (worker in team), \
+                     far-away, lead (orchestrator in team), solo, quiet."
+                )
+            );
+            assert!(!ui.display_names.contains_key("s-solo"));
+            assert!(
+                !ui.display_names.contains_key("s-far"),
+                "the new agent under the key would take the old one's name"
+            );
+            assert!(
+                !ui.pane_display_names.contains_key(&solo),
+                "the new agent on the pane would take the old one's name"
+            );
+            assert!(
+                matches!(
+                    &tab_manager.tabs()[0],
+                    Tab::Dashboard {
+                        selected_session_id: None,
+                        ..
+                    }
+                ),
+                "the new agent under the key would take the old one's selection"
+            );
+            if let Some(survivor) = surviving_pane {
+                assert!(
+                    matches!(tab_manager.active_tab(), Tab::Orchestration { name, .. } if name == "unaffected")
+                );
+                assert!(
+                    pc.pane_agent_id(&survivor).is_some(),
+                    "the unrelated pane was dropped"
+                );
+            }
+        }
+
+        // A queue stamp must also survive CONSUMPTION, not just storage.
+        // Drive the real render-thread consumer against a named fake deck.
+        for restarted in [false, true] {
+            let daemon = runtime.block_on(async { RestartingDaemon::spawn("a") });
+            let controller = Arc::new(
+                EmbeddedPaneController::new(daemon.path.clone(), runtime.handle().clone())
+                    .with_protocol_gate(),
+            );
+            let pc: Arc<dyn PaneController> = controller.clone();
+            let mut tabs = TabManager::new(pc.clone());
+            let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+            let cwd = tempfile::tempdir().unwrap();
+            {
+                let mut st = state.blocking_write();
+                st.learn_stream_incarnation(named("a"));
+                st.queue_orchestration_surface(crate::event::OrchestrationSurface {
+                    name: "queued-team".into(),
+                    cwd: cwd.path().to_string_lossy().into_owned(),
+                    display_title: None,
+                    orchestration_id: Some("queued-unit".into()),
+                    roles: vec![crate::event::OrchestrationSurfaceRole {
+                        pane_id: "pane-1".into(),
+                        role_index: 0,
+                        role_name: "orchestrator".into(),
+                        is_start_role: true,
+                    }],
+                    context_path: None,
+                });
+                if restarted {
+                    daemon.restart_as("b");
+                    st.learn_stream_incarnation(named("b"));
+                }
+            }
+            let mut ui = default_ui();
+            process_pending_orchestration_surfaces(&state, &pc, &mut tabs, &mut ui);
+            if restarted {
+                assert!(
+                    controller.pane_ids().is_empty(),
+                    "queued surface attached the successor"
+                );
+                assert_eq!(tabs.tab_count(), 1, "queued surface opened a successor tab");
+                assert!(
+                    daemon.received_by("b").is_empty(),
+                    "queued surface sent the successor an operation"
+                );
+            } else {
+                assert!(
+                    controller.pane_ids().contains(&"pane-1".to_string()),
+                    "control: queued surface attaches its own process"
+                );
+                assert_eq!(tabs.tab_count(), 2, "control: queued surface opens its tab");
+                // The first tab build waits for live roles' own hooks. Drive
+                // the placeholder seam used by own-spawn UI paths with the
+                // process the real controller just attached, then act on it.
+                state.blocking_write().insert_placeholder_session_learned(
+                    "pane-1".into(),
+                    None,
+                    None,
+                    controller.pane_agent_id("pane-1"),
+                    controller.pane_incarnation("pane-1").unwrap(),
+                );
+                let card = state
+                    .blocking_read()
+                    .sessions
+                    .values()
+                    .find(|card| card.pane_id.as_deref() == Some("pane-1"))
+                    .and_then(SessionState::bound_pane)
+                    .expect("the surfaced placeholder");
+                assert!(
+                    controller
+                        .post_message(
+                            &card,
+                            "same-process",
+                            "body",
+                            crate::inbox_hub::PostOrigin::ConfigGen
+                        )
+                        .is_ok()
+                );
+                daemon.restart_as("b");
+                assert!(
+                    controller
+                        .post_message(
+                            &card,
+                            "stale",
+                            "body",
+                            crate::inbox_hub::PostOrigin::ConfigGen
+                        )
+                        .is_err()
+                );
+                assert!(
+                    daemon.received_by("b").is_empty(),
+                    "placeholder action sent the successor an operation"
+                );
+            }
+        }
+    }
+
+    /// Draw one full dashboard frame for `state` / `ui` into a 100x24
+    /// `TestBackend`, with the bottom bar as tall as the production loop makes
+    /// it, and return every row, right-trimmed.
+    fn restart_frame_rows(state: &AppState, ui: &mut UiState) -> Vec<String> {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let filtered = filter_sessions(state, ui);
+        let bar_rows = bottom_bar_rows(ui, 100, 24);
+        terminal
+            .draw(|frame| {
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                let tab_view = ActiveTabView::Dashboard {
+                    exclude_pane_ids: vec![],
+                    zoomed: false,
+                };
+                let tab_bar = TabBarInfo {
+                    show: false,
+                    labels: vec!["Dashboard".into()],
+                    active_index: 0,
+                    orchestration_statuses: vec![],
+                };
+                let layout = compute_frame_layout(
+                    frame.area(),
+                    &tab_view,
+                    &tab_bar,
+                    &[],
+                    PaneLayout::Stacked,
+                    None,
+                    bar_rows,
+                );
+                render_frame(
+                    frame,
+                    state,
+                    ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    &tab_view,
+                    &tab_bar,
+                    &layout,
+                    Utc::now(),
+                )
+            })
+            .unwrap();
+        buffer_to_string(terminal.backend().buffer())
+            .lines()
+            .map(|row| row.trim_end().to_string())
+            .collect()
+    }
+
+    /// Press `key` through the production key funnel.
+    fn restart_press(
+        key: KeyEvent,
+        ui: &mut UiState,
+        pane: &dyn PaneController,
+        state: &SharedState,
+        tab_manager: &mut TabManager,
+    ) {
+        let snapshot = state.blocking_read().clone();
+        let filtered = filter_sessions(&snapshot, ui);
+        let _ = handle_key_event(
+            key,
+            ui,
+            pane,
+            state,
+            tab_manager,
+            &snapshot,
+            &filtered,
+            Rect::new(0, 0, 100, 24),
+        );
+    }
+
+    fn plain(ch: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)
+    }
+
+    /// Scenario: a deck restart is noticed in two frames — first one pane's reattach, then the event stream — and another status message is shown between them. The second frame's agents join the notice the first frame raised, so one notice names both, in a footer row of its own beside the other message. A notice the user dismissed with its key (`c`) is not extended: the second frame raises a new one naming only its agents (control).
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_a_restart_noticed_in_two_frames_shows_one_notice() {
+        use crate::daemon_client::Incarnation;
+        use tokio::sync::RwLock;
+        let named = |process: &str| Incarnation::from(Some(process.to_string()));
+        for dismissed in [false, true] {
+            let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+            {
+                let mut st = state.blocking_write();
+                st.learn_stream_incarnation(named("a"));
+                for (key, name) in [("k1", "first"), ("k2", "second")] {
+                    st.sessions
+                        .insert(key.into(), restart_card(key, None, name, "a"));
+                }
+                st.sessions.get_mut("k2").unwrap().incarnation = named("x");
+            }
+            let pc: Arc<dyn PaneController> = Arc::new(CapturingPaneController::new());
+            let mut tab_manager = TabManager::new(pc.clone());
+            let mut ui = default_ui();
+            state.blocking_write().learn_stream_incarnation(named("x"));
+            process_restart_drops(&state, &*pc, &mut tab_manager, &mut ui);
+            assert_eq!(
+                restart_notice_text(&ui).as_deref(),
+                Some("The deck restarted; these agents were stopped: first.")
+            );
+            ui.status_message = Some(("something else".into(), std::time::Instant::now()));
+            if dismissed {
+                restart_press(plain('c'), &mut ui, &*pc, &state, &mut tab_manager);
+                assert!(ui.restart_notice.is_none(), "the dismiss key kept it");
+            }
+            state.blocking_write().learn_stream_incarnation(named("b"));
+            process_restart_drops(&state, &*pc, &mut tab_manager, &mut ui);
+            let expected = if dismissed {
+                "The deck restarted; these agents were stopped: second."
+            } else {
+                "The deck restarted; these agents were stopped: first, second."
+            };
+            assert_eq!(restart_notice_text(&ui).as_deref(), Some(expected));
+            let rows = restart_frame_rows(&state.blocking_read(), &mut ui);
+            assert!(
+                rows.iter().any(|row| row.contains(expected)),
+                "the notice is not on screen: {rows:#?}"
+            );
+            assert!(
+                rows.iter().any(|row| row.contains("something else")),
+                "the other message is not on screen: {rows:#?}"
+            );
+        }
+    }
+
+    /// Scenario: a deck restart stops thirty agents while the user is typing a filter, and again while the user renames a card. The notice shows in its own footer row while the field is open — its first three names and "and 27 more" — and is still there after Escape leaves the field, and after another status message is shown. Its key (`a`) opens the list of every agent it names, which scrolls to the last one; Escape closes the list and keeps the notice, and its dismiss key (`c`) removes it from the footer. Before any restart there is no notice (control).
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_the_restart_notice_stays_until_the_user_dismisses_it() {
+        use crate::daemon_client::Incarnation;
+        use tokio::sync::RwLock;
+        let named = |process: &str| Incarnation::from(Some(process.to_string()));
+        let summary = "The deck restarted; these agents were stopped: agent-00, agent-01, agent-02 and 27 more.";
+        for mode in [UiMode::Filter, UiMode::Rename] {
+            let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+            {
+                let mut st = state.blocking_write();
+                st.learn_stream_incarnation(named("a"));
+                for i in 0..30 {
+                    let key = format!("k{i:02}");
+                    st.sessions.insert(
+                        key.clone(),
+                        restart_card(&key, None, &format!("agent-{i:02}"), "a"),
+                    );
+                }
+            }
+            let pc: Arc<dyn PaneController> = Arc::new(CapturingPaneController::new());
+            let mut tab_manager = TabManager::new(pc.clone());
+            let mut ui = default_ui();
+            ui.mode = mode;
+            process_restart_drops(&state, &*pc, &mut tab_manager, &mut ui);
+            let rows = restart_frame_rows(&state.blocking_read(), &mut ui);
+            assert!(
+                !rows.iter().any(|row| row.contains("The deck restarted")),
+                "control: a notice before any restart: {rows:#?}"
+            );
+
+            state.blocking_write().learn_stream_incarnation(named("b"));
+            process_restart_drops(&state, &*pc, &mut tab_manager, &mut ui);
+            assert_eq!(ui.mode, mode, "the restart left the field");
+            let shown = |ui: &mut UiState| {
+                restart_frame_rows(&state.blocking_read(), ui)
+                    .iter()
+                    .any(|row| row.contains(summary))
+            };
+            assert!(
+                shown(&mut ui),
+                "{mode:?}: the notice is hidden by the field"
+            );
+            restart_press(
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                &mut ui,
+                &*pc,
+                &state,
+                &mut tab_manager,
+            );
+            assert_eq!(ui.mode, UiMode::Normal);
+            assert!(shown(&mut ui), "{mode:?}: the notice went with the field");
+            ui.status_message = Some(("Created agent".into(), std::time::Instant::now()));
+            assert!(shown(&mut ui), "another status message erased the notice");
+            ui.status_message = None;
+
+            restart_press(plain('a'), &mut ui, &*pc, &state, &mut tab_manager);
+            assert_eq!(ui.mode, UiMode::RestartNotice, "the key opened no list");
+            let list = restart_frame_rows(&state.blocking_read(), &mut ui).join("\n");
+            assert!(list.contains("agent-00"), "{list}");
+            assert!(
+                !list.contains("agent-29"),
+                "thirty names fit one screen: {list}"
+            );
+            for _ in 0..3 {
+                restart_press(
+                    KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+                    &mut ui,
+                    &*pc,
+                    &state,
+                    &mut tab_manager,
+                );
+            }
+            let list = restart_frame_rows(&state.blocking_read(), &mut ui).join("\n");
+            assert!(
+                list.contains("agent-29"),
+                "the last agent is unreachable: {list}"
+            );
+            restart_press(
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                &mut ui,
+                &*pc,
+                &state,
+                &mut tab_manager,
+            );
+            assert_eq!(ui.mode, UiMode::Normal);
+            assert!(shown(&mut ui), "closing the list dismissed the notice");
+
+            restart_press(plain('c'), &mut ui, &*pc, &state, &mut tab_manager);
+            assert!(ui.restart_notice.is_none());
+            let rows = restart_frame_rows(&state.blocking_read(), &mut ui);
+            assert!(
+                !rows.iter().any(|row| row.contains("The deck restarted")),
+                "dismissed, but still on screen: {rows:#?}"
+            );
+        }
+    }
+
+    /// Scenario: A TUI attaches a pane on deck process `a`, then receives its placeholder after the stream is on `b`, whose agent reuses its ids. If the stream previously knew `a`, the stale placeholder drops that attachment and names it once; if the stream never knew `a`, the placeholder waits, but the attachment's own reattach-loss signal still removes the pane and visibly names its agent before another stream opens, without evicting `b`'s card or sending it anything. Opening the stream later preserves that one notice, and without a restart the placeholder is the existing card (controls).
+    // The restart fixture is a Unix-socket daemon.
+    #[cfg(unix)]
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_a_late_placeholder_never_evicts_the_restarted_decks_card() {
+        use crate::daemon_client::Incarnation;
+        use crate::daemon_client::restart_fixture::RestartingDaemon;
+        use crate::embedded_pane::{EmbeddedPaneController, PaneLostReason};
+        use tokio::sync::RwLock;
+        let named = |process: &str| Incarnation::from(Some(process.to_string()));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        for (restarted, old_card, stream_never_knew_a) in [
+            (false, true, false),
+            (true, true, false),
+            (true, false, false),
+            (true, false, true),
+        ] {
+            let daemon = runtime.block_on(async { RestartingDaemon::spawn("a") });
+            let controller = Arc::new(
+                EmbeddedPaneController::new(daemon.path.clone(), runtime.handle().clone())
+                    .with_protocol_gate(),
+            );
+            let pane = controller
+                .create_pane(Some("cat"), None)
+                .expect("a pane on a");
+            let agent_id = controller.pane_agent_id(&pane);
+            let attached_on = controller.pane_incarnation(&pane).expect("attached on a");
+            assert_eq!(attached_on, named("a"));
+            let pc: Arc<dyn PaneController> = controller.clone();
+            let mut tab_manager = TabManager::new(pc.clone());
+            let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+            {
+                let mut st = state.blocking_write();
+                st.learn_stream_incarnation(named(if stream_never_knew_a { "b" } else { "a" }));
+                st.register_pane(pane.clone());
+                if old_card {
+                    let mut old = restart_card("s-old", Some(&pane), "old", "a");
+                    old.agent_id = agent_id.clone();
+                    st.sessions.insert("s-old".into(), old);
+                }
+            }
+            let mut ui = default_ui();
+            ui.pane_display_names.insert(pane.clone(), "old".into());
+            if restarted {
+                daemon.restart_as("b");
+                let mut st = state.blocking_write();
+                st.learn_stream_incarnation(named("b"));
+                let mut new = restart_card("s-new", Some(&pane), "new", "b");
+                new.agent_id = agent_id.clone();
+                st.sessions.insert("s-new".into(), new);
+            }
+            let sent = (daemon.received_by("b"), daemon.hellos("b"));
+
+            let key = state.blocking_write().insert_placeholder_session_learned(
+                pane.clone(),
+                None,
+                None,
+                agent_id.clone(),
+                attached_on.clone(),
+            );
+            process_restart_drops(&state, &*pc, &mut tab_manager, &mut ui);
+
+            if stream_never_knew_a {
+                let rows = restart_frame_rows(&state.blocking_read(), &mut ui).join("\n");
+                assert!(
+                    !rows.contains("The deck restarted"),
+                    "the held placeholder alone reported a restart: {rows}"
+                );
+                assert!(
+                    pc.pane_agent_id(&pane).is_some(),
+                    "the held placeholder alone dropped the attachment"
+                );
+                // The L2 auto-reattach pin exercises the transport that emits
+                // this signal. Here it arrives with no drawn card for `a` and
+                // with the stream staying on `b`, so it must explain the loss
+                // independently of held-placeholder settlement.
+                controller.mark_pane_lost_for_test(&pane, PaneLostReason::DeckRestarted);
+                process_restart_drops(&state, &*pc, &mut tab_manager, &mut ui);
+            }
+
+            let st = state.blocking_read();
+            if !restarted {
+                assert_eq!(key, "s-old", "control: the card already there");
+                assert!(st.sessions.contains_key("s-old"));
+                assert!(ui.restart_notice.is_none(), "control: no notice");
+                continue;
+            }
+            assert_ne!(key, "s-new", "the late placeholder adopted b's card");
+            assert_eq!(
+                st.sessions
+                    .get("s-new")
+                    .map(|card| card.incarnation.clone()),
+                Some(named("b")),
+                "the late placeholder evicted the restarted deck's card"
+            );
+            assert!(
+                !st.sessions
+                    .values()
+                    .any(|card| card.incarnation.same_process(&named("a"))),
+                "a card of the replaced process was drawn"
+            );
+            assert_eq!(
+                (daemon.received_by("b"), daemon.hellos("b")),
+                sent,
+                "the drop sent the restarted deck something"
+            );
+            assert_eq!(
+                restart_notice_text(&ui).as_deref(),
+                Some("The deck restarted; these agents were stopped: old."),
+                "the notice named the wrong agents, or one twice"
+            );
+            assert!(
+                pc.pane_agent_id(&pane).is_none(),
+                "the replaced process's attachment was kept"
+            );
+            drop(st);
+            let expected = "The deck restarted; these agents were stopped: old.";
+            let rows = restart_frame_rows(&state.blocking_read(), &mut ui).join("\n");
+            assert!(
+                rows.contains(expected),
+                "the lost attachment has no visible explanation: {rows}"
+            );
+            if stream_never_knew_a {
+                state.blocking_write().learn_stream_incarnation(named("b"));
+                process_restart_drops(&state, &*pc, &mut tab_manager, &mut ui);
+                let rows = restart_frame_rows(&state.blocking_read(), &mut ui).join("\n");
+                assert!(
+                    rows.contains(expected) && !rows.contains("old, old"),
+                    "settling the held placeholder changed its explanation: {rows}"
+                );
+            }
+        }
+    }
+
+    /// The keys of the stale placeholders `st` queued for the restart notice,
+    /// draining them.
+    fn stale_placeholder_keys(
+        st: &mut AppState,
+    ) -> Vec<(String, crate::daemon_client::Incarnation)> {
+        st.take_restart_drops()
+            .into_iter()
+            .filter(|drop| !drop.held)
+            .map(|drop| (drop.key, drop.incarnation))
+            .collect()
+    }
+
+    /// Scenario: the event stream first opens on deck process `b`, whose agent has a card on pane P, and only then does an attach answered by process `a` hand in its placeholder for P — `a` was never named by the stream. The late placeholder neither evicts `b`'s card nor marks `b` replaced, and is not drawn; a later placeholder from `b` is drawn; when the stream next opens (on `b` again) the held `a` placeholder is reported as stale, and `b` is still not marked replaced.
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_a_placeholder_from_a_process_the_stream_never_named_evicts_nothing() {
+        use crate::daemon_client::Incarnation;
+        let named = |process: &str| Incarnation::from(Some(process.to_string()));
+        let mut st = AppState::default();
+        st.learn_stream_incarnation(named("b"));
+        st.sessions
+            .insert("s-b".into(), restart_card("s-b", Some("P"), "b-agent", "b"));
+
+        let key = st.insert_placeholder_session_learned(
+            "P".into(),
+            None,
+            None,
+            Some("1".into()),
+            named("a"),
+        );
+        assert_eq!(
+            st.sessions.get("s-b").map(|card| card.incarnation.clone()),
+            Some(named("b")),
+            "the late placeholder evicted the stream's own card"
+        );
+        assert!(
+            !st.process_replaced(&named("b")),
+            "the stream's process was marked replaced"
+        );
+        assert!(
+            !st.sessions.contains_key(&key),
+            "a placeholder of an unnamed process was drawn"
+        );
+        assert!(
+            stale_placeholder_keys(&mut st).is_empty(),
+            "reported stale without the stream's evidence"
+        );
+
+        // A later placeholder from the stream's own process is drawn.
+        st.insert_placeholder_session_learned("Q".into(), None, None, Some("2".into()), named("b"));
+        assert_eq!(
+            st.sessions
+                .get("pane-Q")
+                .map(|card| card.incarnation.clone()),
+            Some(named("b")),
+            "the stream's own placeholder was not drawn"
+        );
+
+        // The stream opening again settles the held one: `a` is not its process.
+        st.learn_stream_incarnation(Incarnation::UNNAMED);
+        assert!(
+            stale_placeholder_keys(&mut st).is_empty(),
+            "a gap settled the held placeholder"
+        );
+        st.learn_stream_incarnation(named("b"));
+        assert_eq!(stale_placeholder_keys(&mut st), vec![(key, named("a"))]);
+        assert!(!st.process_replaced(&named("b")));
+        assert!(
+            !st.process_replaced(&named("a")),
+            "only the stream's own processes are recorded"
+        );
+        assert!(st.sessions.contains_key("s-b") && st.sessions.contains_key("pane-Q"));
+        assert!(st.held_placeholders.is_empty());
+    }
+
+    /// Scenario: the event stream comes from deck process `a`, whose agent has a card on pane P, when an attach answered by the restarted deck `b` hands in its placeholder for P before the stream has noticed the restart. `a`'s card stays until the stream itself moves to `b`; then `a`'s card is dropped through that switch and `b`'s placeholder is drawn in its place.
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_a_newer_placeholder_waits_for_the_stream_to_switch() {
+        use crate::daemon_client::Incarnation;
+        let named = |process: &str| Incarnation::from(Some(process.to_string()));
+        let mut st = AppState::default();
+        st.learn_stream_incarnation(named("a"));
+        st.sessions
+            .insert("s-a".into(), restart_card("s-a", Some("P"), "a-agent", "a"));
+
+        let key = st.insert_placeholder_session_learned(
+            "P".into(),
+            None,
+            None,
+            Some("1".into()),
+            named("b"),
+        );
+        assert!(
+            st.sessions.contains_key("s-a"),
+            "a's card dropped before the stream switched"
+        );
+        assert!(
+            !st.sessions.contains_key(&key),
+            "b's placeholder drawn before the stream switched"
+        );
+        assert!(st.take_restart_drops().is_empty());
+        assert!(!st.process_replaced(&named("a")));
+
+        st.learn_stream_incarnation(named("b"));
+        assert!(
+            !st.sessions.contains_key("s-a"),
+            "the stream switch kept a's card"
+        );
+        assert_eq!(
+            st.sessions.get(&key).map(|card| card.incarnation.clone()),
+            Some(named("b")),
+            "b's held placeholder was not drawn once the stream named b"
+        );
+        let drops = st.take_restart_drops();
+        assert_eq!(
+            drops
+                .iter()
+                .map(|drop| (drop.key.as_str(), drop.held))
+                .collect::<Vec<_>>(),
+            vec![("s-a", true)],
+            "the switch dropped the wrong cards, or reported b's placeholder"
+        );
+        assert!(st.process_replaced(&named("a")));
+        assert!(!st.process_replaced(&named("b")));
+    }
+
+    /// Scenario: no event stream is open yet when an attach answered by deck process `a` hands in its placeholder for pane P. It is held — not drawn, not reported — through a further gap, and the stream decides: opening on `a` draws it; opening on `b` instead reports it as stale without recording `a` as replaced. A placeholder from the process the stream is open on is drawn at once (control).
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_a_placeholder_before_any_stream_waits_for_the_stream() {
+        use crate::daemon_client::Incarnation;
+        let named = |process: &str| Incarnation::from(Some(process.to_string()));
+        for stream in ["a", "b"] {
+            let mut st = AppState::default();
+            let key = st.insert_placeholder_session_learned(
+                "P".into(),
+                None,
+                None,
+                Some("1".into()),
+                named("a"),
+            );
+            assert!(
+                !st.sessions.contains_key(&key),
+                "{stream}: drawn before any stream"
+            );
+            st.learn_stream_incarnation(Incarnation::UNNAMED);
+            assert!(!st.sessions.contains_key(&key), "{stream}: drawn in a gap");
+            assert!(
+                st.take_restart_drops().is_empty(),
+                "{stream}: reported in a gap"
+            );
+
+            st.learn_stream_incarnation(named(stream));
+            if stream == "a" {
+                assert_eq!(
+                    st.sessions.get(&key).map(|card| card.incarnation.clone()),
+                    Some(named("a")),
+                    "the stream named a, but a's placeholder was not drawn"
+                );
+                assert!(stale_placeholder_keys(&mut st).is_empty());
+            } else {
+                assert!(
+                    !st.sessions.contains_key(&key),
+                    "a's placeholder drawn on b's stream"
+                );
+                assert_eq!(
+                    stale_placeholder_keys(&mut st),
+                    vec![(key.clone(), named("a"))]
+                );
+                assert!(!st.process_replaced(&named("a")));
+            }
+            assert!(st.held_placeholders.is_empty());
+        }
+
+        // Control: the stream's own process is drawn at once.
+        let mut st = AppState::default();
+        st.learn_stream_incarnation(named("a"));
+        let key = st.insert_placeholder_session_learned(
+            "P".into(),
+            None,
+            None,
+            Some("1".into()),
+            named("a"),
+        );
+        assert_eq!(
+            st.sessions.get(&key).map(|card| card.incarnation.clone()),
+            Some(named("a"))
+        );
+        assert!(st.held_placeholders.is_empty() && st.take_restart_drops().is_empty());
+    }
+
+    /// Scenario: before any event stream is open, a TUI's own panes on deck process `a` hand in their placeholders, which wait for the stream. The user closes the orchestration tab with Ctrl+W and confirms; or the deck announces one pane closed; or the deck restarts and the pane's reattach finds another process, and the user dismisses the notice that names it. When the stream then opens — on `a`, or on the restarted `b` — no card comes back for the closed pane and nothing is named again. Without the close, the same open draws the held cards (control).
+    // The restart fixture is a Unix-socket daemon.
+    #[cfg(unix)]
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_a_closed_panes_held_placeholder_is_never_drawn() {
+        use crate::daemon_client::Incarnation;
+        use crate::daemon_client::restart_fixture::RestartingDaemon;
+        use crate::embedded_pane::{EmbeddedPaneController, PaneLostReason};
+        use tokio::sync::RwLock;
+        let named = |process: &str| Incarnation::from(Some(process.to_string()));
+        let hold = |state: &SharedState, panes: &[String]| {
+            let mut st = state.blocking_write();
+            for pane in panes {
+                st.register_pane(pane.clone());
+                st.insert_placeholder_session_learned(
+                    pane.clone(),
+                    None,
+                    None,
+                    Some("1".into()),
+                    named("a"),
+                );
+            }
+            assert_eq!(st.held_placeholders.len(), panes.len(), "precondition");
+        };
+        let cards_on = |state: &SharedState, panes: &[String]| {
+            state
+                .blocking_read()
+                .sessions
+                .values()
+                .filter(|card| {
+                    card.pane_id
+                        .as_deref()
+                        .is_some_and(|p| panes.iter().any(|pane| pane == p))
+                })
+                .count()
+        };
+
+        // Ctrl+W on the orchestration tab, confirmed.
+        for (closed, stream) in [(false, "a"), (true, "a"), (true, "b")] {
+            let pc = Arc::new(OpenTabPC::new());
+            let mut tab_manager = TabManager::new(pc.clone());
+            let (_, roles) = tab_manager
+                .open_orchestration_tab(&orch_config_local("orch"), "/work", None, None, (24, 80))
+                .expect("open an orchestration tab");
+            let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+            hold(&state, &roles);
+            let mut ui = default_ui();
+            if closed {
+                let snapshot = state.blocking_read().clone();
+                for action in [Action::CloseSelected, Action::ConfirmCloseSelected] {
+                    dispatch_action(
+                        action,
+                        &mut ui,
+                        &*pc,
+                        &state,
+                        &mut tab_manager,
+                        &snapshot,
+                        &[],
+                        None,
+                        Rect::new(0, 0, 80, 24),
+                    );
+                }
+                assert_eq!(tab_manager.tab_count(), 1, "precondition: the tab closed");
+            }
+            let mut st = state.blocking_write();
+            st.learn_stream_incarnation(named(stream));
+            let stale = st.take_restart_drops();
+            drop(st);
+            if !closed {
+                assert_eq!(cards_on(&state, &roles), roles.len(), "control: drawn");
+                continue;
+            }
+            assert_eq!(
+                cards_on(&state, &roles),
+                0,
+                "tab close, stream on {stream}: a closed role's card came back"
+            );
+            assert!(stale.is_empty(), "tab close, stream on {stream}: {stale:?}");
+        }
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        // The deck announces the pane closed; or the pane is lost to a restart.
+        for (lost, stream) in [(false, "a"), (false, "b"), (true, "a"), (true, "b")] {
+            let daemon = runtime.block_on(async { RestartingDaemon::spawn("a") });
+            let controller = Arc::new(
+                EmbeddedPaneController::new(daemon.path.clone(), runtime.handle().clone())
+                    .with_protocol_gate(),
+            );
+            let pane = controller
+                .create_pane(Some("cat"), None)
+                .expect("a pane on a");
+            let pc: Arc<dyn PaneController> = controller.clone();
+            let mut tab_manager = TabManager::new(pc.clone());
+            let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+            hold(&state, std::slice::from_ref(&pane));
+            let mut ui = default_ui();
+            ui.pane_display_names.insert(pane.clone(), "old".into());
+            if lost {
+                daemon.restart_as("b");
+                controller.mark_pane_lost_for_test(&pane, PaneLostReason::DeckRestarted);
+                process_restart_drops(&state, &*pc, &mut tab_manager, &mut ui);
+                assert_eq!(
+                    restart_notice_text(&ui).as_deref(),
+                    Some("The deck restarted; these agents were stopped: old."),
+                    "precondition: the lost pane is named"
+                );
+                ui.restart_notice = None;
+            } else {
+                let closure = crate::state::PaneClosure {
+                    pane_id: pane.clone(),
+                    agent_id: controller.pane_agent_id(&pane),
+                    queued_at: chrono::Utc::now(),
+                };
+                apply_pane_closure(&state, &*pc, &mut tab_manager, &mut ui, &closure);
+            }
+            assert!(pc.pane_agent_id(&pane).is_none(), "precondition: forgotten");
+            state
+                .blocking_write()
+                .learn_stream_incarnation(named(stream));
+            process_restart_drops(&state, &*pc, &mut tab_manager, &mut ui);
+            let path = if lost { "lost pane" } else { "announced close" };
+            assert_eq!(
+                cards_on(&state, std::slice::from_ref(&pane)),
+                0,
+                "{path}, stream on {stream}: the forgotten pane's card came back"
+            );
+            assert!(
+                ui.restart_notice.is_none(),
+                "{path}, stream on {stream}: named again: {:?}",
+                restart_notice_text(&ui)
+            );
+        }
+    }
+
+    /// Scenario: a TUI has eight panes on deck process `a`, each with a card drawn before any stream named a process. The deck restarts, and their reattachments find `b` before the event stream notices, either together or with one pane delayed until the next frame. Each batch is named in pane order and the later batch appends without losing or repeating earlier names.
+    // The restart fixture is a Unix-socket daemon.
+    #[cfg(unix)]
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_lost_panes_are_named_in_pane_order() {
+        use crate::daemon_client::restart_fixture::RestartingDaemon;
+        use crate::embedded_pane::{EmbeddedPaneController, PaneLostReason};
+        use tokio::sync::RwLock;
+        for delayed in [false, true] {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            let daemon = runtime.block_on(async { RestartingDaemon::spawn("a") });
+            let controller = Arc::new(
+                EmbeddedPaneController::new(daemon.path.clone(), runtime.handle().clone())
+                    .with_protocol_gate(),
+            );
+            let pc: Arc<dyn PaneController> = controller.clone();
+            let mut tab_manager = TabManager::new(pc.clone());
+            let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+            let mut panes: Vec<String> = (0..8)
+                .map(|_| {
+                    controller
+                        .create_pane(Some("cat"), None)
+                        .expect("a pane on a")
+                })
+                .collect();
+            {
+                let mut st = state.blocking_write();
+                for pane in &panes {
+                    st.register_pane(pane.clone());
+                    let mut card = make_session(SessionStatus::Idle);
+                    card.session_id = format!("s-{pane}");
+                    card.pane_id = Some(pane.clone());
+                    card.display_name = Some(format!("agent-on-{pane}"));
+                    st.sessions.insert(card.session_id.clone(), card);
+                }
+            }
+            daemon.restart_as("b");
+            panes.sort();
+            for pane in &panes {
+                if delayed && pane == &panes[2] {
+                    continue;
+                }
+                controller.mark_pane_lost_for_test(pane, PaneLostReason::DeckRestarted);
+            }
+            let mut ui = default_ui();
+            process_restart_drops(&state, &*pc, &mut tab_manager, &mut ui);
+
+            if delayed {
+                let late = panes.remove(2);
+                let first_batch = restart_notice_text(&ui).unwrap();
+                assert!(
+                    !first_batch.contains(&format!("agent-on-{late}")),
+                    "delayed pane was already named: {first_batch}"
+                );
+                controller.mark_pane_lost_for_test(&late, PaneLostReason::DeckRestarted);
+                process_restart_drops(&state, &*pc, &mut tab_manager, &mut ui);
+                panes.push(late);
+            }
+            let names: Vec<String> = panes
+                .iter()
+                .map(|pane| format!("agent-on-{pane}"))
+                .collect();
+            assert_eq!(
+                restart_notice_text(&ui),
+                Some(format!(
+                    "The deck restarted; these agents were stopped: {}.",
+                    names.join(", ")
+                )),
+                "the notice's order follows the controller's map"
+            );
+            let rows = restart_frame_rows(&state.blocking_read(), &mut ui).join("\n");
+            assert!(
+                rows.contains("The deck restarted") && rows.contains("and 5 more."),
+                "footer did not keep the first batch's names: {rows}"
+            );
+        }
+    }
+
+    /// Scenario: the deck-messages picker is open on a card learned from deck process `a` when the event stream moves to `b`, a restarted deck reusing the card's pane and agent ids. The picker closes rather than show `b`'s rows; while the stream is between two processes it keeps the rows it has; while the stream is still `a` it stays open and refreshes (control).
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_the_inbox_picker_never_shows_another_processs_rows() {
+        use crate::daemon_client::Incarnation;
+        let named = |process: &str| Incarnation::from(Some(process.to_string()));
+        for stream in [named("a"), Incarnation::UNNAMED, named("b")] {
+            let mut ui = default_ui();
+            ui.mode = UiMode::InboxAttention;
+            ui.inbox_attention = Some(InboxAttentionDialog {
+                pane_id: "pane-1".into(),
+                agent_id: "1".into(),
+                incarnation: named("a"),
+                items: vec![crate::inbox_hub::InboxAttentionItem {
+                    message_id: "m-a".into(),
+                    revision: 1,
+                    kind: crate::inbox_display::AttentionKind::Uncertain,
+                    from_label: "lead".into(),
+                    subject: "a's message".into(),
+                    task_id: None,
+                }],
+                selected: 0,
+                answer: None,
+            });
+            let mut snapshot = AppState::default();
+            snapshot.stream_incarnation = stream.clone();
+            poll_inbox_attention(&mut ui, &snapshot);
+            let items = ui.inbox_attention.as_ref().map(|dialog| dialog.items.len());
+            if stream == named("a") {
+                assert_eq!(items, Some(0), "control: the picker refreshes");
+                assert_eq!(ui.mode, UiMode::InboxAttention);
+            } else if stream.is_unnamed() {
+                assert_eq!(items, Some(1), "between streams it keeps its rows");
+            } else {
+                assert_eq!(items, None, "the picker showed another process's rows");
+                assert_eq!(ui.mode, UiMode::Normal);
+            }
+        }
+    }
+
+    /// A frame `width`×`height` of the empty dashboard in `ui`'s mode, drawn by
+    /// the production [`render_frame`], as text rows.
+    fn draw_sized(ui: &mut UiState, width: u16, height: u16) -> Vec<String> {
+        draw_with_footer(ui, width, height, false, &[])
+    }
+
+    /// [`draw_sized`] with the run loop's footer rows: the experimental label
+    /// when `experimental`, and `hook_notices`' row. Laid out, painted after
+    /// [`render_frame`] and read back from the flushed frame
+    /// ([`record_flushed_confirmation`]) as the run loop does.
+    fn draw_with_footer(
+        ui: &mut UiState,
+        width: u16,
+        height: u16,
+        experimental: bool,
+        hook_notices: &[crate::hook_binary::HookBinaryNotice],
+    ) -> Vec<String> {
+        draw_then_paint(ui, width, height, experimental, hook_notices, |_| {})
+    }
+
+    /// [`draw_with_footer`], with `late` painting into the frame after the
+    /// footer rows, as a later overlay of the run loop's draw would.
+    fn draw_then_paint(
+        ui: &mut UiState,
+        width: u16,
+        height: u16,
+        experimental: bool,
+        hook_notices: &[crate::hook_binary::HookBinaryNotice],
+        late: impl FnOnce(&mut Frame),
+    ) -> Vec<String> {
+        let state = AppState::default();
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let filtered = filter_sessions(&state, ui);
+        let features = Features::test_with(experimental);
+        let (area, footer) = FooterRows::reserve(
+            Rect::new(0, 0, width, height),
+            experimental,
+            !hook_notices.is_empty(),
+            false,
+        );
+        let bar_rows = bottom_bar_rows(ui, area.width, area.height);
+        let completed = terminal
+            .draw(|frame| {
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                let tab_view = ActiveTabView::Dashboard {
+                    exclude_pane_ids: vec![],
+                    zoomed: false,
+                };
+                let tab_bar = TabBarInfo {
+                    show: false,
+                    labels: vec!["Dashboard".into()],
+                    active_index: 0,
+                    orchestration_statuses: vec![],
+                };
+                let layout = compute_frame_layout(
+                    area,
+                    &tab_view,
+                    &tab_bar,
+                    &[],
+                    PaneLayout::Stacked,
+                    None,
+                    bar_rows,
+                );
+                render_frame(
+                    frame,
+                    &state,
+                    ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    &tab_view,
+                    &tab_bar,
+                    &layout,
+                    Utc::now(),
+                );
+                footer.render(frame, &features, hook_notices, None);
+                late(frame);
+            })
+            .unwrap();
+        record_flushed_confirmation(ui, completed.buffer);
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    /// A UI holding a restart notice that names five agents, too long for its
+    /// buttons to share the summary's row at 80 columns, with a status message.
+    fn ui_with_long_restart_notice(mode: UiMode) -> UiState {
+        let mut ui = default_ui();
+        let mut notice = RestartNotice::default();
+        for (i, label) in ["coordinator", "reviewer", "tester", "writer", "release"]
+            .iter()
+            .enumerate()
+        {
+            notice.join(
+                StoppedIdentity {
+                    pane: Some(format!("p{i}")),
+                    key: None,
+                    agent: Some(i.to_string()),
+                    process: crate::daemon_client::Incarnation::from(Some("old".to_string())),
+                },
+                crate::daemon_client::StoppedAgent {
+                    label: (*label).to_string(),
+                    role: None,
+                    orchestration: None,
+                },
+            );
+        }
+        ui.restart_notice = Some(notice);
+        ui.status_message = Some(("an ordinary status".into(), std::time::Instant::now()));
+        ui.mode = mode;
+        ui
+    }
+
+    const LONG_NOTICE: &str = "The deck restarted; these agents were stopped: coordinator";
+
+    /// Scenario: with a restart notice held in two footer rows and a status line, the user picks Stop and reaches its confirmation. In an 80×14 terminal the dialog does not fit above the notice, so it is laid out over the whole frame as it was before the notice existed: No and Yes are both on screen, Down visibly moves to Yes and Enter stops. In an 80×24 terminal it fits above the notice, which stays in view beside both choices. The notice is held through both.
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_a_confirmation_that_does_not_fit_above_the_notice_keeps_every_choice() {
+        use tokio::sync::RwLock;
+        for (height, fits) in [(14u16, false), (24, true)] {
+            let mut ui = ui_with_long_restart_notice(UiMode::StopConfirm);
+            ui.stop_confirm_agent_count = 3;
+            let rows = draw_sized(&mut ui, 80, height);
+            let notice = ui.restart_notice_area.expect("the notice was drawn");
+            assert!(notice.height >= 2, "precondition: two notice rows");
+            let shown = rows.join("\n");
+            let choice = |rows: &[String], label: &str| {
+                rows.iter()
+                    .find(|row| row.contains(&format!(" {label} ")) && row.contains('\u{2014}'))
+                    .cloned()
+            };
+            assert!(
+                choice(&rows, "No").is_some_and(|row| row.contains("> No")),
+                "{height}: No is not shown selected:\n{shown}"
+            );
+            assert!(
+                choice(&rows, "Yes").is_some(),
+                "{height}: Yes is not on screen:\n{shown}"
+            );
+            assert_eq!(
+                shown.contains(LONG_NOTICE),
+                fits,
+                "{height}: the notice's visibility beside the dialog:\n{shown}"
+            );
+
+            let pc = Arc::new(OpenTabPC::new());
+            let mut tab_manager = TabManager::new(pc.clone());
+            let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+            let snapshot = AppState::default();
+            let area = Rect::new(0, 0, 80, height);
+            let mut press = |ui: &mut UiState, code: KeyCode| {
+                handle_key_event(
+                    KeyEvent::new(code, KeyModifiers::NONE),
+                    ui,
+                    &*pc,
+                    &state,
+                    &mut tab_manager,
+                    &snapshot,
+                    &[],
+                    area,
+                )
+            };
+            assert_eq!(press(&mut ui, KeyCode::Down), Flow::Continue);
+            let rows = draw_sized(&mut ui, 80, height);
+            assert!(
+                choice(&rows, "Yes").is_some_and(|row| row.contains("> Yes")),
+                "{height}: Down selected a Yes the screen does not show:\n{}",
+                rows.join("\n")
+            );
+            assert!(
+                ui.restart_notice.is_some(),
+                "{height}: the notice was let go"
+            );
+            assert_eq!(
+                press(&mut ui, KeyCode::Enter),
+                Flow::Break,
+                "{height}: Enter on the shown Yes did not stop"
+            );
+        }
+    }
+
+    /// Scenario: a terminal so short that even over the whole frame the Stop confirmation clips its Yes. Down cannot move to the Yes the screen does not show, and neither Enter nor `y` stops the deck; Escape still returns to the Quit dialog. At a height that shows Yes, Down and Enter stop as before (control).
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_a_confirmation_choice_the_screen_does_not_show_is_never_taken() {
+        use tokio::sync::RwLock;
+        for (height, shown) in [(10u16, false), (14, true)] {
+            let mut ui = default_ui();
+            ui.mode = UiMode::StopConfirm;
+            ui.stop_confirm_agent_count = 2;
+            let rows = draw_sized(&mut ui, 80, height).join("\n");
+            assert_eq!(rows.contains("Yes"), shown, "precondition:\n{rows}");
+            let pc = Arc::new(OpenTabPC::new());
+            let mut tab_manager = TabManager::new(pc.clone());
+            let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+            let snapshot = AppState::default();
+            let area = Rect::new(0, 0, 80, height);
+            let mut press = |ui: &mut UiState, code: KeyCode| {
+                handle_key_event(
+                    KeyEvent::new(code, KeyModifiers::NONE),
+                    ui,
+                    &*pc,
+                    &state,
+                    &mut tab_manager,
+                    &snapshot,
+                    &[],
+                    area,
+                )
+            };
+            if shown {
+                press(&mut ui, KeyCode::Down);
+                assert_eq!(press(&mut ui, KeyCode::Enter), Flow::Break, "control");
+                continue;
+            }
+            for code in [KeyCode::Down, KeyCode::Enter, KeyCode::Char('y')] {
+                assert_eq!(
+                    press(&mut ui, code),
+                    Flow::Continue,
+                    "{code:?} acted on a Yes the screen does not show"
+                );
+                assert_eq!(ui.mode, UiMode::StopConfirm);
+                assert_eq!(ui.stop_confirm_selected, 0, "{code:?} moved to Yes");
+            }
+            press(&mut ui, KeyCode::Esc);
+            assert_eq!(ui.mode, UiMode::QuitConfirm, "Escape no longer returns");
+        }
+    }
+
+    /// Scenario: With one managed agent, keys queued before Quit, Stop or ConfigGen's first frame choose nothing, including after a mouse opening or closing and reopening the same dialog without a frame. In an 8×14 terminal each dialog refuses choices whose labels are clipped. At 80×24 the drawn dialogs navigate and confirm normally, with Stop terminating only after a visible choice.
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_a_confirmation_takes_no_choice_its_frame_has_not_shown() {
+        use tokio::sync::RwLock;
+        enum Input {
+            Key(KeyCode, KeyModifiers),
+            Click(Action),
+        }
+        let pc = Arc::new(OpenTabPC::new());
+        let mut tab_manager = TabManager::new(pc.clone());
+        let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+        let mut snapshot = AppState::default();
+        snapshot.seed_hydrated_session(
+            "p".into(),
+            Some("/synthetic-config-target".into()),
+            None,
+            Some("1".into()),
+            None,
+        );
+        let selected = snapshot.sessions.keys().next().unwrap().clone();
+        let filtered: Vec<_> = snapshot.sessions.iter().collect();
+        let mut send = |ui: &mut UiState, input: Input, (width, height): (u16, u16)| {
+            let area = Rect::new(0, 0, width, height);
+            match input {
+                Input::Key(code, modifiers) => handle_key_event(
+                    KeyEvent::new(code, modifiers),
+                    ui,
+                    &*pc,
+                    &state,
+                    &mut tab_manager,
+                    &snapshot,
+                    &filtered,
+                    area,
+                ),
+                Input::Click(action) => dispatch_action(
+                    action,
+                    ui,
+                    &*pc,
+                    &state,
+                    &mut tab_manager,
+                    &snapshot,
+                    &filtered,
+                    Some(&selected),
+                    area,
+                ),
+            }
+        };
+        let key = |code: KeyCode| Input::Key(code, KeyModifiers::NONE);
+        let normal = (80u16, 24u16);
+        let refused = |ui: &UiState, flow: Flow, mode: UiMode, what: &str| {
+            assert_eq!(flow, Flow::Continue, "{what}: acted");
+            assert_eq!(ui.mode, mode, "{what}: changed the dialog");
+            assert_eq!(ui.quit_confirm_selected, 0, "{what}: moved Quit");
+            assert_eq!(ui.stop_confirm_selected, 0, "{what}: moved Stop");
+        };
+
+        // The keyboard burst from the dashboard.
+        let mut ui = default_ui();
+        draw_sized(&mut ui, normal.0, normal.1);
+        send(
+            &mut ui,
+            Input::Key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            normal,
+        );
+        assert_eq!(
+            ui.mode,
+            UiMode::QuitConfirm,
+            "precondition: Ctrl+C opens Quit"
+        );
+        for code in [KeyCode::Down, KeyCode::Enter, KeyCode::Char('y')] {
+            let flow = send(&mut ui, key(code), normal);
+            refused(
+                &ui,
+                flow,
+                UiMode::QuitConfirm,
+                &format!("undrawn Quit, {code:?}"),
+            );
+        }
+        let rows = draw_sized(&mut ui, normal.0, normal.1).join("\n");
+        assert!(rows.contains("> Detach"), "Quit is not drawn:\n{rows}");
+        send(&mut ui, key(KeyCode::Down), normal);
+        assert_eq!(
+            ui.quit_confirm_selected, 1,
+            "control: drawn Quit refused Down"
+        );
+        send(&mut ui, key(KeyCode::Enter), normal);
+        assert_eq!(
+            ui.mode,
+            UiMode::StopConfirm,
+            "control: drawn Quit refused Enter"
+        );
+        ui.quit_confirm_selected = 0;
+        for code in [KeyCode::Char('y'), KeyCode::Down, KeyCode::Enter] {
+            let flow = send(&mut ui, key(code), normal);
+            refused(
+                &ui,
+                flow,
+                UiMode::StopConfirm,
+                &format!("undrawn Stop, {code:?}"),
+            );
+        }
+        draw_sized(&mut ui, normal.0, normal.1);
+        assert_eq!(
+            send(&mut ui, key(KeyCode::Char('y')), normal),
+            Flow::Break,
+            "control: `y` on the drawn Stop did not stop"
+        );
+
+        // Quit's [Stop] button, then a `y` before Stop's first frame.
+        let mut ui = default_ui();
+        ui.mode = UiMode::QuitConfirm;
+        draw_sized(&mut ui, normal.0, normal.1);
+        send(&mut ui, Input::Click(Action::RequestStop), normal);
+        assert_eq!(
+            ui.mode,
+            UiMode::StopConfirm,
+            "precondition: [Stop] opens Stop"
+        );
+        let flow = send(&mut ui, key(KeyCode::Char('y')), normal);
+        refused(&ui, flow, UiMode::StopConfirm, "`y` after [Stop]");
+        draw_sized(&mut ui, normal.0, normal.1);
+        assert_eq!(
+            send(&mut ui, key(KeyCode::Char('y')), normal),
+            Flow::Break,
+            "control: `y` on the drawn Stop did not stop"
+        );
+
+        // Drawn, but too narrow to show a choice.
+        let tiny = (8u16, 14u16);
+        let mut ui = default_ui();
+        ui.mode = UiMode::StopConfirm;
+        ui.stop_confirm_agent_count = 2;
+        let rows = draw_sized(&mut ui, tiny.0, tiny.1).join("\n");
+        assert!(
+            !rows.contains("Yes") && !rows.contains("> No"),
+            "precondition: 8×14 shows a choice:\n{rows}"
+        );
+        assert_eq!(
+            ui.confirm_choices_drawn.map(|(mode, _)| mode),
+            Some(UiMode::StopConfirm),
+            "precondition: the 8×14 frame drew no Stop dialog"
+        );
+        for code in [KeyCode::Char('y'), KeyCode::Down, KeyCode::Enter] {
+            let flow = send(&mut ui, key(code), tiny);
+            refused(&ui, flow, UiMode::StopConfirm, &format!("8×14, {code:?}"));
+        }
+        send(&mut ui, key(KeyCode::Esc), tiny);
+        assert_eq!(ui.mode, UiMode::QuitConfirm, "Escape no longer returns");
+
+        // Control: the same dialog at a normal size.
+        let mut ui = default_ui();
+        ui.mode = UiMode::StopConfirm;
+        ui.stop_confirm_agent_count = 2;
+        draw_sized(&mut ui, normal.0, normal.1);
+        send(&mut ui, key(KeyCode::Down), normal);
+        assert_eq!(
+            send(&mut ui, key(KeyCode::Enter), normal),
+            Flow::Break,
+            "control: Down and Enter on the drawn Yes did not stop"
+        );
+
+        // ConfigGen's keyboard and mouse openings, including leaving and
+        // reopening the same mode before the next frame (a stale-record trap).
+        for mouse in [false, true] {
+            let mut ui = default_ui();
+            ui.selected_index = Some(0);
+            let open = || {
+                if mouse {
+                    Input::Click(Action::RequestConfigGen)
+                } else {
+                    key(KeyCode::Char('g'))
+                }
+            };
+            send(&mut ui, open(), normal);
+            assert_eq!(ui.mode, UiMode::ConfigGenPrompt, "ConfigGen did not open");
+            for code in [KeyCode::Down, KeyCode::Enter, KeyCode::Char('y')] {
+                send(&mut ui, key(code), normal);
+            }
+            let rows = draw_sized(&mut ui, normal.0, normal.1).join("\n");
+            assert!(
+                rows.contains("Generate .dot-agent-deck.toml") && rows.contains("> Yes"),
+                "undrawn ConfigGen took queued input (mouse={mouse}): {rows}"
+            );
+            send(&mut ui, key(KeyCode::Esc), normal);
+            send(&mut ui, open(), normal);
+            send(&mut ui, key(KeyCode::Down), normal);
+            send(&mut ui, key(KeyCode::Enter), normal);
+            let rows = draw_sized(&mut ui, normal.0, normal.1).join("\n");
+            assert!(
+                rows.contains("Generate .dot-agent-deck.toml") && rows.contains("> Yes"),
+                "reopened ConfigGen reused its previous frame (mouse={mouse}): {rows}"
+            );
+            send(&mut ui, key(KeyCode::Down), normal);
+            let rows = draw_sized(&mut ui, normal.0, normal.1).join("\n");
+            assert!(
+                rows.contains("> No"),
+                "control: ConfigGen refused drawn Down: {rows}"
+            );
+            send(&mut ui, key(KeyCode::Enter), normal);
+            assert_eq!(
+                ui.mode,
+                UiMode::Normal,
+                "control: ConfigGen's No did not close"
+            );
+        }
+
+        for mode in [UiMode::QuitConfirm, UiMode::ConfigGenPrompt] {
+            let mut ui = default_ui();
+            ui.mode = mode;
+            draw_sized(&mut ui, tiny.0, tiny.1);
+            for code in [KeyCode::Down, KeyCode::Enter, KeyCode::Char('y')] {
+                let flow = send(&mut ui, key(code), tiny);
+                assert_eq!(flow, Flow::Continue, "8×14 {mode:?}: {code:?} acted");
+                assert_eq!(
+                    ui.mode, mode,
+                    "8×14 {mode:?}: {code:?} chose a clipped label"
+                );
+            }
+            let rows = draw_sized(&mut ui, normal.0, normal.1).join("\n");
+            let expected = if mode == UiMode::QuitConfirm {
+                "> Detach"
+            } else {
+                "> Yes"
+            };
+            assert!(
+                rows.contains(expected),
+                "8×14 {mode:?} moved its selection: {rows}"
+            );
+            send(&mut ui, key(KeyCode::Esc), normal);
+            assert_eq!(
+                ui.mode,
+                UiMode::Normal,
+                "{mode:?}: Escape no longer cancels"
+            );
+        }
+    }
+
+    /// Scenario: Quit, Close and ConfigGen are drawn in terminals short enough that their button row lands on one of their choices, and Stop in one that clips its Yes. Each final frame hides that choice, and Down, Enter or `y` cannot pick it, while a choice the frame still shows can be confirmed. At 80×24 every choice is shown and each dialog navigates and confirms normally (control).
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_a_confirmation_counts_only_the_choices_its_final_frame_shows() {
+        use tokio::sync::RwLock;
+        let pc = Arc::new(OpenTabPC::new());
+        let mut tab_manager = TabManager::new(pc.clone());
+        let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+        let mut press = |ui: &mut UiState, code: KeyCode, (width, height): (u16, u16)| {
+            handle_key_event(
+                KeyEvent::new(code, KeyModifiers::NONE),
+                ui,
+                &*pc,
+                &state,
+                &mut tab_manager,
+                &snapshot,
+                &[],
+                Rect::new(0, 0, width, height),
+            )
+        };
+        let selected = |ui: &UiState| match ui.mode {
+            UiMode::QuitConfirm => ui.quit_confirm_selected,
+            UiMode::CloseConfirm => ui.close_confirm.selected,
+            UiMode::StopConfirm => ui.stop_confirm_selected,
+            _ => ui.config_gen_selected,
+        };
+        let select = |ui: &mut UiState, choice: usize| match ui.mode {
+            UiMode::QuitConfirm => ui.quit_confirm_selected = choice,
+            UiMode::CloseConfirm => ui.close_confirm.selected = choice,
+            UiMode::StopConfirm => ui.stop_confirm_selected = choice,
+            _ => ui.config_gen_selected = choice,
+        };
+        let open = |mode: UiMode| {
+            let mut ui = default_ui();
+            ui.mode = mode;
+            ui.stop_confirm_agent_count = 2;
+            ui
+        };
+        // The choice line as the renderer writes it, from its marker through its
+        // label: `"  > Close"` or `"    Close"`.
+        let line =
+            |label: &str, chosen: bool| format!("  {} {label}", if chosen { '>' } else { ' ' });
+        let shows = |rows: &[String], text: &str| rows.iter().any(|row| row.contains(text));
+
+        struct Case {
+            mode: UiMode,
+            small: (u16, u16),
+            labels: &'static [&'static str],
+            /// The choice the small frame hides.
+            hidden: usize,
+            /// A later choice it still shows, which confirms.
+            later: Option<usize>,
+        }
+        let cases = [
+            // [Detach] paints over Stop; Cancel, below it, is still shown.
+            Case {
+                mode: UiMode::QuitConfirm,
+                small: (16, 12),
+                labels: &["Detach", "Stop", "Cancel"],
+                hidden: 1,
+                later: Some(2),
+            },
+            // [Cancel] paints over Close: GF7G-R01.
+            Case {
+                mode: UiMode::CloseConfirm,
+                small: (16, 12),
+                labels: &["Cancel", "Close"],
+                hidden: 1,
+                later: None,
+            },
+            // Too short for Yes's row; Stop has no button row.
+            Case {
+                mode: UiMode::StopConfirm,
+                small: (80, 11),
+                labels: &["No", "Yes"],
+                hidden: 1,
+                later: None,
+            },
+            // [Yes] [No] [Never] paints over No; Never is still shown.
+            Case {
+                mode: UiMode::ConfigGenPrompt,
+                small: (80, 14),
+                labels: &["Yes", "No", "Never"],
+                hidden: 1,
+                later: Some(2),
+            },
+        ];
+        for Case {
+            mode,
+            small,
+            labels,
+            hidden,
+            later,
+        } in cases
+        {
+            // The hidden choice selected (as a larger frame could have left
+            // it), then the small frame drawn.
+            let mut ui = open(mode);
+            select(&mut ui, hidden);
+            let rows = draw_sized(&mut ui, small.0, small.1);
+            let shown = rows.join("\n");
+            assert!(
+                !shows(&rows, &line(labels[hidden], true)),
+                "precondition {mode:?}: the final frame shows {:?}:\n{shown}",
+                labels[hidden]
+            );
+            assert!(
+                shows(&rows, &line(labels[0], false)),
+                "precondition {mode:?}: the first choice is hidden too:\n{shown}"
+            );
+            let record = ui
+                .confirm_choices_drawn
+                .expect("the frame drew a confirmation");
+            assert_eq!(record.0, mode);
+            assert!(
+                record.1.contains(0),
+                "{mode:?}: the shown first choice is not counted"
+            );
+            assert!(
+                !record.1.contains(hidden),
+                "{mode:?}: counted a choice its final frame hides:\n{shown}"
+            );
+            for code in [KeyCode::Enter, KeyCode::Char('y')] {
+                assert_eq!(
+                    press(&mut ui, code, small),
+                    Flow::Continue,
+                    "{mode:?}: {code:?} acted"
+                );
+                assert_eq!(ui.mode, mode, "{mode:?}: {code:?} took the hidden choice");
+                assert_eq!(selected(&ui), hidden);
+            }
+
+            // From the first choice, Down cannot move onto the hidden one.
+            select(&mut ui, 0);
+            draw_sized(&mut ui, small.0, small.1);
+            press(&mut ui, KeyCode::Down, small);
+            assert_eq!(selected(&ui), 0, "{mode:?}: Down moved to a hidden choice");
+            assert_eq!(ui.mode, mode);
+
+            // A choice the frame still shows is confirmed as usual.
+            if let Some(later) = later {
+                select(&mut ui, later);
+                let rows = draw_sized(&mut ui, small.0, small.1);
+                assert!(
+                    shows(&rows, &line(labels[later], true)),
+                    "precondition {mode:?}: {:?} is hidden:\n{}",
+                    labels[later],
+                    rows.join("\n")
+                );
+                assert!(
+                    ui.confirm_choices_drawn
+                        .is_some_and(|(_, s)| s.contains(later))
+                );
+                press(&mut ui, KeyCode::Enter, small);
+                assert_ne!(
+                    ui.mode, mode,
+                    "{mode:?}: Enter on a shown choice was refused"
+                );
+            }
+
+            // Control: 80×24 shows every choice, and Down then Enter takes the
+            // one the small frame hid.
+            let normal = (80u16, 24u16);
+            let mut ui = open(mode);
+            let rows = draw_sized(&mut ui, normal.0, normal.1);
+            for (i, label) in labels.iter().enumerate() {
+                assert!(
+                    shows(&rows, &line(label, i == 0)),
+                    "control {mode:?}: {label:?} is not shown:\n{}",
+                    rows.join("\n")
+                );
+                assert!(ui.confirm_choices_drawn.is_some_and(|(_, s)| s.contains(i)));
+            }
+            press(&mut ui, KeyCode::Down, normal);
+            assert_eq!(selected(&ui), hidden, "control {mode:?}: Down was refused");
+            draw_sized(&mut ui, normal.0, normal.1);
+            let flow = press(&mut ui, KeyCode::Enter, normal);
+            // Quit's Stop with no agents, and Stop's Yes, end the deck.
+            let took = flow == Flow::Break || ui.mode != mode;
+            assert!(
+                took,
+                "control {mode:?}: Enter on the shown choice was refused"
+            );
+        }
+    }
+
+    /// A hook-binary notice long enough to fill an 80-column footer row.
+    fn wide_hook_notice() -> crate::hook_binary::HookBinaryNotice {
+        crate::hook_binary::HookBinaryNotice {
+            binary: "/usr/local/bin/dot-agent-deck".into(),
+            agents: vec!["api-fix".into(), "docs-review".into()],
+            version: Some("0.45.0".into()),
+            daemon_version: "0.47.1".into(),
+            reason: crate::hook_binary::HookBinaryReason::Older,
+            remedy: "Run:".into(),
+            command: Some("brew upgrade dot-agent-deck".into()),
+        }
+    }
+
+    /// What a mouse Down at `at` does while `ui`'s modal is open, as the run
+    /// loop resolves it: the modal's own click targets only.
+    fn modal_click(ui: &UiState, (col, row): (u16, u16)) -> Option<Action> {
+        assert!(modal_owns_clicks(&ui.mode), "{:?} owns no clicks", ui.mode);
+        hit_test_button(&ui.modal_button_rects, col, row)
+    }
+
+    /// Where `rows` show `text`, as (column, row) of its first cell.
+    fn find_in_rows(rows: &[String], text: &str) -> Option<(u16, u16)> {
+        rows.iter().enumerate().find_map(|(y, row)| {
+            let at = row.find(text)?;
+            Some((row[..at].chars().count() as u16, y as u16))
+        })
+    }
+
+    /// Scenario: an armed Close confirmation is drawn in a 64×2 terminal with the experimental label on, and in an 80×2 one with a hook notice; the footer row the run loop paints after the dialog covers its [Close] button. A click where the button was recorded closes nothing. With the same footer at 80×24 the [Close] button is whole and a click on it confirms (control).
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_a_confirmation_button_a_footer_row_covers_takes_no_click() {
+        let notice = [wide_hook_notice()];
+        // GF7H-A01 (64×2, experimental: on) and GF7H-R01 (80×2, hook notice),
+        // each with the click on the [Close] target the dialog drew.
+        struct Case<'a> {
+            footer: &'a str,
+            size: (u16, u16),
+            experimental: bool,
+            notices: &'a [crate::hook_binary::HookBinaryNotice],
+            /// Where the click lands: on the recorded [Close] target.
+            at: (u16, u16),
+        }
+        let cases = [
+            Case {
+                footer: "experimental label",
+                size: (64, 2),
+                experimental: true,
+                notices: &[],
+                at: (14, 1),
+            },
+            Case {
+                footer: "hook notice",
+                size: (80, 2),
+                experimental: false,
+                notices: &notice,
+                at: (20, 1),
+            },
+        ];
+        for Case {
+            footer,
+            size: (width, height),
+            experimental,
+            notices,
+            at,
+        } in cases
+        {
+            let mut ui = default_ui();
+            ui.mode = UiMode::CloseConfirm;
+            let rows = draw_with_footer(&mut ui, width, height, experimental, notices);
+            let shown = rows.join("\n");
+            assert!(
+                !shown.contains("[Close]"),
+                "precondition, {footer}: [Close] is whole:\n{shown}"
+            );
+            let covering = if experimental {
+                "experimental: on"
+            } else {
+                "dot-agent-deck"
+            };
+            assert!(
+                rows[usize::from(at.1)].contains(covering),
+                "precondition, {footer}: the footer row is not drawn:\n{shown}"
+            );
+            assert!(
+                modal_click(&ui, at).is_none(),
+                "{footer}: a click on the covered [Close] still confirms:\n{shown}"
+            );
+            assert_eq!(
+                ui.confirm_choices_drawn,
+                Some((UiMode::CloseConfirm, ChoicesShown::default())),
+                "{footer}: the frame counted a choice:\n{shown}"
+            );
+
+            // Control: the same footer at 80×24 leaves [Close] whole.
+            let mut ui = default_ui();
+            ui.mode = UiMode::CloseConfirm;
+            let rows = draw_with_footer(&mut ui, 80, 24, experimental, notices);
+            assert!(
+                rows[23].contains(covering) || rows[22].contains(covering),
+                "control, {footer}: the footer row is not drawn:\n{}",
+                rows.join("\n")
+            );
+            let (col, row) = find_in_rows(&rows, "[Close]").expect("control: [Close] is drawn");
+            assert!(
+                matches!(
+                    modal_click(&ui, (col + 1, row)),
+                    Some(Action::ConfirmCloseSelected)
+                ),
+                "control, {footer}: a click on the whole [Close] does not confirm"
+            );
+        }
+    }
+
+    /// Scenario: a Close confirmation is drawn at 80×24, then something painted later in the same draw covers part of its [Close] button inside the dialog, both on its first frame and after an earlier unobscured frame. A click on that button closes nothing, while [Cancel], still whole, works; with nothing painted over it, [Close] confirms (control).
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_a_button_painted_over_later_in_the_draw_takes_no_click() {
+        for (covered, warmed) in [(true, false), (true, true), (false, false), (false, true)] {
+            let mut probe = default_ui();
+            probe.mode = UiMode::CloseConfirm;
+            let rows = draw_sized(&mut probe, 80, 24);
+            let close = find_in_rows(&rows, "[Close]").expect("[Close] is drawn");
+            let cancel = find_in_rows(&rows, "[Cancel]").expect("[Cancel] is drawn");
+            let mut ui = default_ui();
+            ui.mode = UiMode::CloseConfirm;
+            if warmed {
+                draw_sized(&mut ui, 80, 24);
+            }
+            let rows = draw_then_paint(&mut ui, 80, 24, false, &[], |frame| {
+                if covered {
+                    frame.render_widget(
+                        Paragraph::new("late"),
+                        Rect::new(close.0 + 2, close.1, 4, 1),
+                    );
+                }
+            });
+            let shown = rows.join("\n");
+            assert_eq!(
+                shown.contains("[Close]"),
+                !covered,
+                "precondition, covered {covered}:\n{shown}"
+            );
+            let clicked = modal_click(&ui, (close.0 + 1, close.1));
+            if covered {
+                assert!(
+                    clicked.is_none(),
+                    "a click on a [Close] painted over after the dialog confirms:\n{shown}"
+                );
+            } else {
+                assert!(
+                    matches!(clicked, Some(Action::ConfirmCloseSelected)),
+                    "control: a click on the whole [Close] does not confirm"
+                );
+            }
+            assert!(
+                matches!(
+                    modal_click(&ui, (cancel.0 + 1, cancel.1)),
+                    Some(Action::DismissModal)
+                ),
+                "covered {covered}: the whole [Cancel] takes no click:\n{shown}"
+            );
+        }
+    }
+
+    /// Scenario: Quit, Close, Stop and ConfigGen are each drawn in a sweep of small terminals, with no footer row, the experimental label, a hook notice, and both. In every final frame each button left clickable reads whole inside the popup where it was recorded, and each choice counted is on screen; at 80×24 every button is clickable (control).
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_every_clickable_confirmation_button_is_whole_in_the_final_frame() {
+        let notice = [wide_hook_notice()];
+        let label_of = |action: &Action| match action {
+            Action::DetachAndQuit => "[Detach]",
+            Action::RequestStop => "[Stop]",
+            Action::DismissModal => "[Cancel]",
+            Action::ConfirmCloseSelected => "[Close]",
+            Action::ConfigGenConfirm => "[Yes]",
+            Action::ConfigGenDismiss => "[No]",
+            Action::ConfigGenSuppress => "[Never]",
+            other => panic!("a confirmation button fires {other:?}"),
+        };
+        let dialogs: [(UiMode, &[&str], usize); 4] = [
+            (UiMode::QuitConfirm, &["Detach", "Stop", "Cancel"], 3),
+            (UiMode::CloseConfirm, &["Cancel", "Close"], 2),
+            (UiMode::StopConfirm, &["No", "Yes"], 0),
+            (UiMode::ConfigGenPrompt, &["Yes", "No", "Never"], 3),
+        ];
+        let footers: [(bool, &[_]); 4] =
+            [(false, &[]), (true, &[]), (false, &notice), (true, &notice)];
+        let widths = [8u16, 12, 16, 20, 24, 32, 40, 48, 56, 64, 68, 72, 80, 100];
+        let mut targets = 0;
+        let mut covered_frames = 0;
+        for (mode, labels, buttons) in dialogs {
+            for (experimental, notices) in footers {
+                for width in widths {
+                    for height in 1u16..=16 {
+                        let mut ui = default_ui();
+                        ui.mode = mode;
+                        ui.stop_confirm_agent_count = 2;
+                        let rows = draw_with_footer(&mut ui, width, height, experimental, notices);
+                        let shown = rows.join("\n");
+                        let at = format!(
+                            "{mode:?} {width}×{height}, experimental {experimental}, notice {}",
+                            !notices.is_empty()
+                        );
+                        let cells = |x: u16, y: u16, width: u16| -> String {
+                            rows[usize::from(y)]
+                                .chars()
+                                .skip(usize::from(x))
+                                .take(usize::from(width))
+                                .collect()
+                        };
+                        for (action, rect) in &ui.modal_button_rects {
+                            targets += 1;
+                            assert_eq!(
+                                cells(rect.x, rect.y, rect.width),
+                                label_of(action),
+                                "{at}: a clickable button is not whole:\n{shown}"
+                            );
+                            // Inside the popup: its left border two columns
+                            // before the row's first button.
+                            let first = ui
+                                .modal_button_rects
+                                .iter()
+                                .map(|(_, rect)| rect.x)
+                                .min()
+                                .unwrap_or(rect.x);
+                            assert_eq!(
+                                cells(first.saturating_sub(2), rect.y, 1),
+                                "│",
+                                "{at}: a clickable button is outside the popup:\n{shown}"
+                            );
+                        }
+                        let (drawn_for, counted) = ui
+                            .confirm_choices_drawn
+                            .expect("the frame drew the confirmation");
+                        assert_eq!(drawn_for, mode, "{at}");
+                        for (i, label) in labels.iter().enumerate() {
+                            let marker = if i == 0 { '>' } else { ' ' };
+                            if counted.contains(i) {
+                                assert!(
+                                    shown.contains(&format!("{marker} {label}")),
+                                    "{at}: counted {label:?}, which is not on screen:\n{shown}"
+                                );
+                            }
+                        }
+                        let footer_on_button_row =
+                            buttons > 0 && height <= 4 && (experimental || !notices.is_empty());
+                        if footer_on_button_row {
+                            covered_frames += 1;
+                        }
+                    }
+                }
+            }
+            // Control: 80×24 leaves every button clickable, with either footer.
+            for (experimental, notices) in footers {
+                let mut ui = default_ui();
+                ui.mode = mode;
+                ui.stop_confirm_agent_count = 2;
+                draw_with_footer(&mut ui, 80, 24, experimental, notices);
+                assert_eq!(
+                    ui.modal_button_rects.len(),
+                    buttons,
+                    "control {mode:?}: not every button is clickable at 80×24"
+                );
+            }
+        }
+        assert!(targets > 0, "the sweep recorded no click target at all");
+        assert!(
+            covered_frames > 0,
+            "the sweep drew no footer on a button row"
+        );
+    }
+
+    /// Scenario: with a restart notice held in its footer rows, the user opens the upgrade dialog in a 60×24 terminal, narrower than the dialog needs. The dialog asks for a larger terminal above the notice, which stays in view: no draw clears it.
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_the_upgrade_dialogs_too_small_state_keeps_the_notice() {
+        use crate::self_upgrade::{
+            CopyKind, InstallMethod, Installation, PlanOptions, Platform, ProvenanceCheck, plan,
+        };
+        let installation = Installation {
+            copy: CopyKind::Cli,
+            executable: PathBuf::from("/home/u/.local/bin/dot-agent-deck"),
+            version: "0.46.0".into(),
+            platform: Some(Platform::LinuxAmd64),
+            method: InstallMethod::DownloadedWritable {
+                binary: PathBuf::from("/home/u/.local/bin/dot-agent-deck"),
+            },
+            tools: Default::default(),
+        };
+        let options = PlanOptions {
+            staging_root: PathBuf::from("/home/u/.local/state/dot-agent-deck/upgrade"),
+            can_prompt_for_privilege: false,
+            provenance: ProvenanceCheck::Unavailable {
+                reason: crate::self_upgrade::verify::GH_NOT_INSTALLED.into(),
+            },
+        };
+        let plan = plan::plan(&installation, &"0.47.0".into(), &options);
+        let mut ui = ui_with_long_restart_notice(UiMode::Upgrade);
+        ui.upgrade_dialog = Some(crate::upgrade_dialog::UpgradeDialog::new(vec![plan]));
+        let rows = draw_sized(&mut ui, 60, 24).join("\n");
+        assert!(
+            rows.contains("The terminal is too small"),
+            "precondition: the too-small state\n{rows}"
+        );
+        assert!(
+            rows.contains("The deck restarted; these agents"),
+            "the upgrade dialog cleared the notice:\n{rows}"
+        );
+        assert!(ui.restart_notice.is_some());
+    }
+
+    /// Scenario: with the restart notice's `[Agents]` and `[Dismiss]` in the footer, every mode that puts a modal over the deck routes a click to that modal alone — its own buttons, or nothing — so a click on the notice's buttons while a dialog is open acts on nothing behind it. The directory picker and the new-agent form route clicks to themselves first. Without a modal the footer's buttons take clicks (control).
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_a_modal_keeps_clicks_from_the_notices_buttons() {
+        for mode in [
+            UiMode::Normal,
+            UiMode::Filter,
+            UiMode::Rename,
+            UiMode::PaneInput,
+            UiMode::QuitConfirm,
+            UiMode::StopConfirm,
+            UiMode::CloseConfirm,
+            UiMode::ConfigGenPrompt,
+            UiMode::StarPrompt,
+            UiMode::Help,
+            UiMode::DirPicker,
+            UiMode::NewPaneForm,
+            UiMode::HostMetrics,
+            UiMode::ScheduledTasks,
+            UiMode::Upgrade,
+            UiMode::InboxAttention,
+            UiMode::RestartNotice,
+        ] {
+            let routed_first = matches!(mode, UiMode::DirPicker | UiMode::NewPaneForm);
+            assert_eq!(
+                modal_owns_clicks(&mode) || routed_first,
+                overlay_blocks_mouse(&mode),
+                "{mode:?}: a click over its modal can reach the footer's buttons"
+            );
+        }
+    }
+
+    /// Scenario: the user opens the restart notice's list in a terminal so short that no row is left for an agent's name. The list says to make the terminal taller instead of showing its opening words over nothing; at a height with room it lists the agents (control).
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_a_restart_list_with_no_room_says_how_to_see_it() {
+        for (height, room) in [(8u16, false), (16, true)] {
+            let frames = render_restart_notice_key_sequence_to_buffers(
+                &["coder", "reviewer"],
+                UiMode::RestartNotice,
+                None,
+                &[],
+                40,
+                height,
+            );
+            let buffer = &frames[0];
+            let text: String = (0..height)
+                .map(|y| (0..40).map(|x| buffer[(x, y)].symbol()).collect::<String>() + "\n")
+                .collect();
+            assert_eq!(
+                text.contains("Make the terminal taller"),
+                !room,
+                "{height}:\n{text}"
+            );
+            assert_eq!(text.contains("coder"), room, "{height}:\n{text}");
+        }
+    }
+
+    /// Scenario: the directory picker is opened in an area only seven rows tall, above two rows that show something else. Its rows and buttons that do not fit inside its border are neither drawn nor clickable, and nothing below the area is written.
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_the_directory_picker_writes_only_inside_its_popup() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["alpha", "beta", "gamma"] {
+            std::fs::create_dir(dir.path().join(name)).unwrap();
+        }
+        let mut picker = DirPickerState::new(dir.path().to_path_buf());
+        let mut terminal = Terminal::new(TestBackend::new(120, 10)).unwrap();
+        let mut targets = (Vec::new(), Vec::new());
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    Paragraph::new(vec![Line::from("X".repeat(120)); 10]),
+                    frame.area(),
+                );
+                targets = render_dir_picker(frame, Rect::new(0, 0, 120, 7), &mut picker);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        for y in 7..10 {
+            let row: String = (0..120).map(|x| buffer[(x, y)].symbol()).collect();
+            assert_eq!(row, "X".repeat(120), "row {y} was written: {row}");
+        }
+        let (rows, buttons) = targets;
+        for rect in rows
+            .iter()
+            .map(|(_, r)| r)
+            .chain(buttons.iter().map(|(_, r)| r))
+        {
+            assert!(rect.y < 7 - 1, "a click target past the popup: {rect:?}");
+        }
+    }
+
+    /// Scenario: a dashboard card for this TUI's own pane is selected while that pane is focused. The deck restarts as the same build; its new agent takes the focused pane's id, and another of its agents sorts first. In the frame before the drop and after it, the old pane's focus never selects the new agent's card: the selection falls back to the first card, as a closed card's does, and Enter targets that card, not the new agent. When the deck did not restart, the focused pane still selects its card (control).
+    // The restart fixture is a Unix-socket daemon.
+    #[cfg(unix)]
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_a_lost_panes_focus_never_selects_its_successors_card() {
+        use crate::daemon_client::Incarnation;
+        use crate::daemon_client::restart_fixture::RestartingDaemon;
+        use crate::embedded_pane::{EmbeddedPaneController, PaneLostReason};
+        use tokio::sync::RwLock;
+        let named = |process: &str| Incarnation::from(Some(process.to_string()));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        for restarted in [false, true] {
+            let daemon = runtime.block_on(async { RestartingDaemon::spawn("a") });
+            let controller = Arc::new(
+                EmbeddedPaneController::new(daemon.path.clone(), runtime.handle().clone())
+                    .with_protocol_gate(),
+            );
+            let pane = controller
+                .create_pane(Some("cat"), None)
+                .expect("this TUI's own pane on a");
+            controller.focus_pane(&pane).expect("focus the pane");
+            let pc: Arc<dyn PaneController> = controller.clone();
+            let mut tab_manager = TabManager::new(pc.clone());
+
+            let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+            {
+                let mut st = state.blocking_write();
+                st.learn_stream_incarnation(named("a"));
+                st.register_pane(pane.clone());
+                st.sessions
+                    .insert("s0".into(), restart_card("s0", Some(&pane), "mine", "a"));
+            }
+            let mut ui = default_ui();
+            ui.selected_index = Some(1);
+            if let Tab::Dashboard {
+                selected_session_id,
+                ..
+            } = tab_manager.active_tab_mut()
+            {
+                *selected_session_id = Some("s0".into());
+            }
+            let snapshot = state.blocking_read().clone();
+            assert_eq!(
+                frame_selected_key(&mut ui, &mut tab_manager, &*pc, &snapshot).as_deref(),
+                Some("s0"),
+                "precondition: the focused pane's card is selected"
+            );
+            if !restarted {
+                state.blocking_write().learn_stream_incarnation(named("a"));
+                let snapshot = state.blocking_read().clone();
+                for _ in 0..2 {
+                    assert_eq!(
+                        frame_selected_key(&mut ui, &mut tab_manager, &*pc, &snapshot).as_deref(),
+                        Some("s0"),
+                        "control: the focused pane selects its own card"
+                    );
+                }
+                continue;
+            }
+
+            daemon.restart_as("b");
+            controller.mark_pane_lost_for_test(&pane, PaneLostReason::DeckRestarted);
+            {
+                let mut st = state.blocking_write();
+                let panes = st.learn_stream_incarnation(named("b"));
+                let record: crate::agent_pty::AgentRecord =
+                    serde_json::from_value(serde_json::json!({
+                        "id": "1", "pane_id_env": pane.clone(), "rows": 24, "cols": 80,
+                    }))
+                    .unwrap();
+                st.seed_successor_cards(&panes, &[record]);
+                // Another agent of the restarted deck, whose agent 0 sorts
+                // ahead of the new agent's agent 1 on the pane: the first card.
+                let mut first = restart_card("s-first", None, "first", "b");
+                first.agent_id = Some("0".into());
+                st.sessions.insert("s-first".into(), first);
+            }
+            let successor = state
+                .blocking_read()
+                .sessions
+                .iter()
+                .find(|(_, s)| s.pane_id.as_deref() == Some(pane.as_str()))
+                .map(|(id, _)| id.clone())
+                .expect("the new agent's card on the pane");
+
+            // The frame before the drop: the lost pane is still focused.
+            assert_eq!(pc.focused_pane_id(), Some(pane.clone()));
+            let snapshot = state.blocking_read().clone();
+            for frame in 0..2 {
+                let selected = frame_selected_key(&mut ui, &mut tab_manager, &*pc, &snapshot);
+                assert_ne!(
+                    selected.as_deref(),
+                    Some(successor.as_str()),
+                    "frame {frame}: the lost pane's focus selected the new agent's card"
+                );
+            }
+
+            process_restart_drops(&state, &*pc, &mut tab_manager, &mut ui);
+            let snapshot = state.blocking_read().clone();
+            for _ in 0..2 {
+                assert_eq!(
+                    frame_selected_key(&mut ui, &mut tab_manager, &*pc, &snapshot).as_deref(),
+                    Some("s-first"),
+                    "the selection did not fall back to the first card"
+                );
+            }
+            let filtered = tab_scoped_cards(&snapshot, &ui, &tab_manager);
+            let target = dashboard_focus_target(&ui, filtered.len())
+                .and_then(|idx| filtered.get(idx))
+                .map(|(id, _)| (*id).clone());
+            assert_eq!(
+                target.as_deref(),
+                Some("s-first"),
+                "Enter targets the new agent"
+            );
+        }
     }
 
     /// Scenario: Ask for the config-generation prompt with no card selected.
@@ -40268,7 +44528,8 @@ mod upgrade_dialog_tests {
     fn draw_dialog(ui: &mut UiState) {
         let dialog = ui.upgrade_dialog.as_mut().expect("the dialog is open");
         draw_to_buffer(120, 40, |frame| {
-            crate::upgrade_dialog::render(frame, dialog);
+            let frame_area = frame.area();
+            crate::upgrade_dialog::render(frame, frame_area, dialog);
         });
     }
 
@@ -40452,5 +44713,62 @@ mod upgrade_dialog_tests {
             covered_dim,
             "at some width the badge covers a dimmed button, or this test proves nothing"
         );
+    }
+}
+
+/// PRD #1666 part 2 (`lifecycle/handshake/012`): the TUI's synchronous one-shot
+/// requests, against the scripted daemons of
+/// [`crate::daemon_client::gate_fixture`].
+#[cfg(all(test, unix))]
+mod one_shot_protocol_gate_tests {
+    use super::*;
+    use crate::daemon_client::gate_fixture::{GateDaemon, GateHello};
+
+    /// Scenario: the TUI's one-shot listing (the New Agent form's hints, the
+    /// schedules manager's live tasks) is sent to a daemon whose `Hello`
+    /// names the next attach protocol, is refused, garbled, unanswered, or
+    /// lacks the follow-on. Each fails and the daemon receives no listing; a
+    /// daemon on this protocol gets it on the connection its `Hello` was
+    /// answered on (control).
+    #[test]
+    fn a_one_shot_request_goes_only_where_its_own_hello_passed() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build the test runtime");
+        let timeout = std::time::Duration::from_secs(2);
+        for hello in [
+            GateHello::Newer,
+            GateHello::Refused,
+            GateHello::Garbled,
+            GateHello::Silent,
+            GateHello::NoFollowOn,
+        ] {
+            let daemon = runtime.block_on(async { GateDaemon::spawn(move |_| hello) });
+            let sent = send_daemon_request_blocking_at(
+                &daemon.path,
+                &crate::daemon_protocol::AttachRequest::ListAgents,
+                timeout,
+            );
+            assert!(
+                sent.is_err(),
+                "{hello:?}: a failed check must fail the request"
+            );
+            assert_eq!(
+                daemon.recorded(),
+                Vec::<String>::new(),
+                "{hello:?}: a listing followed a check that did not pass"
+            );
+        }
+        let daemon = runtime.block_on(async { GateDaemon::spawn(|_| GateHello::Matching) });
+        let sent = send_daemon_request_blocking_at(
+            &daemon.path,
+            &crate::daemon_protocol::AttachRequest::ListAgents,
+            timeout,
+        )
+        .expect("control: a matching daemon answers the listing");
+        assert!(sent.ok);
+        assert_eq!(daemon.recorded(), vec!["0:list-agents".to_string()]);
     }
 }

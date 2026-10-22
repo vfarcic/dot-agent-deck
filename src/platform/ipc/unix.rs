@@ -333,6 +333,13 @@ impl IpcClient {
         Ok(())
     }
 
+    /// The connected socket itself, for a caller that reads it on a thread of
+    /// its own and bounds each write by its own deadline
+    /// ([`crate::inbox_oneshot::Connection`]).
+    pub fn into_std(self) -> std::os::unix::net::UnixStream {
+        self.0
+    }
+
     /// Half-close the write side, leaving the read side open. Lift of the
     /// `stream.shutdown(std::net::Shutdown::Write)` call in
     /// `hook::request_from_socket`: after writing its single request line the
@@ -523,7 +530,7 @@ fn sockaddr_un(endpoint: &Path) -> io::Result<(libc::sockaddr_un, libc::socklen_
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
@@ -541,7 +548,7 @@ mod tests {
     /// is full — the one place the two Unixes genuinely differ, so the test
     /// asserts against what the platform actually did rather than guessing.
     #[derive(Debug, PartialEq, Eq)]
-    enum QueueFull {
+    pub(crate) enum QueueFull {
         /// Linux: a *blocking* `connect(2)` parks indefinitely. This is the
         /// hang issue #435 is about.
         Parks,
@@ -563,9 +570,9 @@ mod tests {
     /// The backlog is set to 1 via a raw `listen(2)` because
     /// `UnixListener::bind` hardcodes 128, and queuing 129 connections to reach
     /// the same state is slower and no more faithful.
-    struct SaturatedListener {
+    pub(crate) struct SaturatedListener {
         _dir: tempfile::TempDir,
-        path: std::path::PathBuf,
+        pub(crate) path: std::path::PathBuf,
         listener: UnixListener,
         /// Connections already sitting in the accept queue. Held so they are
         /// not closed, and so the queue stays full for the whole test.
@@ -576,7 +583,7 @@ mod tests {
         /// the send failing and the stream closing — which would drop a queued
         /// connection and could leave the queue short of full.
         _late: Vec<mpsc::Receiver<io::Result<UnixStream>>>,
-        behaviour: QueueFull,
+        pub(crate) behaviour: QueueFull,
     }
 
     /// One non-blocking `connect(2)` to `path`, the probe
@@ -600,7 +607,7 @@ mod tests {
     }
 
     impl SaturatedListener {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.path().join("saturated.sock");
 

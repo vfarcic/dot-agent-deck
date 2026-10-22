@@ -665,6 +665,60 @@ impl GenerationSpool {
         first.map_or(Ok(()), Err)
     }
 
+    /// Read an attempt's caps for a one-shot committer, found by its exact
+    /// `(msg, A, e)` (part 2 §2.8). Only [`CapsLookup::Found`] carries caps:
+    /// a file of any other shape is [`CapsLookup::Malformed`], and an entry
+    /// that is not a regular file is [`CapsLookup::Failed`], never followed.
+    pub fn read_caps_checked(&self, msg: &str, a: u32, e: u32) -> CapsLookup {
+        let name = match attempt_name(msg, a, e) {
+            Ok(name) => name,
+            Err(error) => return CapsLookup::Failed(error),
+        };
+        let info = match self.caps.entry(&name) {
+            Ok(info) => info,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return CapsLookup::Missing,
+            Err(error) => return CapsLookup::Failed(error),
+        };
+        if info.kind != fsdir::EntryKind::File {
+            return CapsLookup::Failed(invalid("a caps entry is not a regular file"));
+        }
+        if info.len > MAX_CAPS_BYTES {
+            return CapsLookup::Malformed;
+        }
+        let file = match self.caps.open_regular(&name) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return CapsLookup::Missing,
+            Err(error) => return CapsLookup::Failed(error),
+        };
+        let mut bytes = Vec::new();
+        if let Err(error) = file.take(MAX_CAPS_BYTES + 1).read_to_end(&mut bytes) {
+            return CapsLookup::Failed(error);
+        }
+        let parsed = std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(|text| text.strip_suffix('\n'))
+            .and_then(|text| text.split_once('\n'))
+            .and_then(|(handed, commit)| Some((Cap::from_hex(handed)?, Cap::from_hex(commit)?)));
+        match parsed {
+            Some((handed, commit)) => CapsLookup::Found(AttemptCaps { handed, commit }),
+            None => CapsLookup::Malformed,
+        }
+    }
+
+    /// Whether an attempt carries a revoke marker; any failure to tell is
+    /// [`RevokeState::Unreadable`], which a one-shot's fence refuses on
+    /// (part 2 §2.5).
+    pub fn revoke_state(&self, msg: &str, a: u32, e: u32) -> RevokeState {
+        match attempt_name(msg, a, e).and_then(|name| self.revoked.entry(&name)) {
+            Ok(info) if info.kind == fsdir::EntryKind::File => RevokeState::Revoked,
+            Ok(_) => RevokeState::Unreadable(invalid("a revoke marker is not a regular file")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => RevokeState::NotRevoked,
+            Err(error) => RevokeState::Unreadable(error),
+        }
+    }
+
+    /// Whether an attempt carries a revoke marker, any failure read as "not
+    /// revoked". A one-shot's fence reads [`Self::revoke_state`] instead.
     pub fn revoked(&self, msg: &str, a: u32, e: u32) -> bool {
         attempt_name(msg, a, e)
             .and_then(|name| self.revoked.entry(&name))
@@ -723,6 +777,34 @@ pub struct ScanPass {
     /// The first error this pass met.
     pub error: Option<String>,
 }
+
+/// What an exact lookup of one attempt's caps file found
+/// ([`GenerationSpool::read_caps_checked`]).
+#[derive(Debug)]
+pub enum CapsLookup {
+    Found(AttemptCaps),
+    /// No such file: the attempt was reclaimed, or was never a one-shot's.
+    /// Not evidence that the delivery never happened.
+    Missing,
+    /// A regular file that does not hold exactly two caps, one per line.
+    Malformed,
+    /// Not a regular file, or the lookup or read failed.
+    Failed(io::Error),
+}
+
+/// Whether an attempt carries a revoke marker
+/// ([`GenerationSpool::revoke_state`]).
+#[derive(Debug)]
+pub enum RevokeState {
+    Revoked,
+    NotRevoked,
+    /// The marker's name holds something other than a regular file, or the
+    /// lookup failed.
+    Unreadable(io::Error),
+}
+
+/// The largest caps file: two 32-hex-digit caps, each with its newline.
+const MAX_CAPS_BYTES: u64 = 66;
 
 /// Whether an attempt's receipt is known to be in the spool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -813,7 +895,7 @@ pub struct RecordScanner {
 }
 
 impl RecordScanner {
-    pub fn pass(&mut self, store: &mut EvidenceStore) -> ScanPass {
+    pub fn pass(&mut self, store: &mut impl Admit) -> ScanPass {
         let mut pass = ScanPass::default();
         if self.ended {
             self.ended = false;
@@ -933,13 +1015,14 @@ impl RecordScanner {
     /// without error **and** that lookup finds neither name; unknown
     /// otherwise. Directory enumeration is not a snapshot, so the lookup, not
     /// the scan, is what sees a record linked behind the cursor.
-    pub fn presence(&mut self, store: &mut EvidenceStore, msg: &str, a: u32, e: u32) -> Presence {
+    pub fn presence(&mut self, store: &mut impl Admit, msg: &str, a: u32, e: u32) -> Presence {
         self.presence_of(
             store,
             msg,
             a,
             e,
             &[RecordStage::Handed, RecordStage::Committed],
+            true,
         )
     }
 
@@ -949,21 +1032,39 @@ impl RecordScanner {
     /// it never stands in for this lookup.
     pub fn commit_presence(
         &mut self,
-        store: &mut EvidenceStore,
+        store: &mut impl Admit,
         msg: &str,
         a: u32,
         e: u32,
     ) -> Presence {
-        self.presence_of(store, msg, a, e, &[RecordStage::Committed])
+        self.presence_of(store, msg, a, e, &[RecordStage::Committed], true)
+    }
+
+    /// R2F-R03: [`Self::commit_presence`] that admits nothing into `store`.
+    /// A record it finds on the attempt's own commit cap answers `Found` and
+    /// is left for the clock's scan to admit, so the scan still hands that
+    /// commit to the attempt model even when the caller ends up applying
+    /// nothing — `inbox_committed` refusing an attempt that went not handed
+    /// meanwhile — and a commit that contradicts a not-handed witness is
+    /// still recorded as one.
+    pub fn commit_witnessed(
+        &mut self,
+        store: &mut impl Admit,
+        msg: &str,
+        a: u32,
+        e: u32,
+    ) -> Presence {
+        self.presence_of(store, msg, a, e, &[RecordStage::Committed], false)
     }
 
     fn presence_of(
         &mut self,
-        store: &mut EvidenceStore,
+        store: &mut impl Admit,
         msg: &str,
         a: u32,
         e: u32,
         stages: &[RecordStage],
+        admit: bool,
     ) -> Presence {
         if !valid_component(msg) {
             return Presence::Unknown;
@@ -990,7 +1091,11 @@ impl RecordScanner {
                 Ok(Fetched::Missing) => {}
                 Ok(Fetched::Body(body))
                     if matches!(
-                        store.admit(&body),
+                        if admit {
+                            store.admit(&body)
+                        } else {
+                            store.check(&body)
+                        },
                         Admission::Admitted | Admission::Duplicate
                     ) =>
                 {
@@ -1167,6 +1272,15 @@ impl EvidenceStore {
     /// that stage's cap — the commit cap for `Committed`, the hand-out cap for
     /// `Handed`, so a hand-out cap never proves a commit.
     pub fn admit(&mut self, body: &RecordBody) -> Admission {
+        let admission = self.check(body);
+        if admission == Admission::Admitted {
+            self.admitted.insert(body.key());
+        }
+        admission
+    }
+
+    /// What [`Self::admit`] would answer for `body`, admitting nothing.
+    pub fn check(&self, body: &RecordBody) -> Admission {
         let Some(issued) = self.issued.get(&(body.msg.clone(), body.a, body.e)) else {
             return Admission::NotIssued;
         };
@@ -1178,7 +1292,7 @@ impl EvidenceStore {
         if Cap::hash_hex(&body.cap) != *expected {
             return Admission::WrongCap;
         }
-        if !self.admitted.insert(body.key()) {
+        if self.admitted.contains(&body.key()) {
             return Admission::Duplicate;
         }
         Admission::Admitted
@@ -1201,6 +1315,43 @@ impl EvidenceStore {
     /// caps are kept under its key).
     pub fn entries(&self) -> usize {
         self.issued.len() + self.admitted.len()
+    }
+}
+
+/// Where a scan admits the records it reads ([`RecordScanner::pass`] and the
+/// lookups): an [`EvidenceStore`] itself, or one behind its lock, which is
+/// then taken for each admission alone, so the scan's file IO holds no lock
+/// the store's other users wait for (U1, R2-fix3).
+pub trait Admit {
+    /// [`EvidenceStore::admitted`].
+    fn admitted(&mut self, key: &RecordKey) -> bool;
+    /// [`EvidenceStore::admit`].
+    fn admit(&mut self, body: &RecordBody) -> Admission;
+    /// [`EvidenceStore::check`].
+    fn check(&mut self, body: &RecordBody) -> Admission;
+}
+
+impl Admit for EvidenceStore {
+    fn admitted(&mut self, key: &RecordKey) -> bool {
+        EvidenceStore::admitted(self, key)
+    }
+    fn admit(&mut self, body: &RecordBody) -> Admission {
+        EvidenceStore::admit(self, body)
+    }
+    fn check(&mut self, body: &RecordBody) -> Admission {
+        EvidenceStore::check(self, body)
+    }
+}
+
+impl Admit for &std::sync::Mutex<EvidenceStore> {
+    fn admitted(&mut self, key: &RecordKey) -> bool {
+        self.lock().unwrap_or_else(|e| e.into_inner()).admitted(key)
+    }
+    fn admit(&mut self, body: &RecordBody) -> Admission {
+        self.lock().unwrap_or_else(|e| e.into_inner()).admit(body)
+    }
+    fn check(&mut self, body: &RecordBody) -> Admission {
+        self.lock().unwrap_or_else(|e| e.into_inner()).check(body)
     }
 }
 
@@ -3045,5 +3196,95 @@ mod tests {
             assert!(root.join(format!("junk-{i}")).exists());
         }
         assert!(spool.instance_path().is_dir());
+    }
+
+    /// Scenario: Write the caps of two attempts of one message, then look
+    /// each up by its exact attempt; plant caps files that hold one line, a
+    /// non-hex cap, a third line and too many bytes, and entries that are a
+    /// directory, a FIFO and a symlink to a valid caps file; remove one
+    /// attempt. Each attempt is found with its own caps, never the other's;
+    /// every misshapen file is malformed; every entry that is not a regular
+    /// file fails without being followed; a removed attempt is missing.
+    #[spec("inbox/receipt/019")]
+    #[test]
+    fn receipt_019_a_one_shot_reads_its_caps_by_exact_attempt_and_fails_closed() {
+        let state = crate::test_temp::tempdir().unwrap();
+        let spool = Spool::start(state.path()).unwrap();
+        let generation = spool.generation("2", "agent-a").unwrap();
+        let mut store = EvidenceStore::default();
+        let first = store.issue("m-1", 1, 1).unwrap();
+        let second = store.issue("m-1", 1, 2).unwrap();
+        generation.write_caps("m-1", 1, 1, &first).unwrap();
+        generation.write_caps("m-1", 1, 2, &second).unwrap();
+        let found = |a: u32, e: u32| match generation.read_caps_checked("m-1", a, e) {
+            CapsLookup::Found(caps) => Some((caps.handed.hex(), caps.commit.hex())),
+            _ => None,
+        };
+        assert_eq!(
+            found(1, 1),
+            Some((first.handed.hex(), first.commit.hex())),
+            "1.1 reads its own caps"
+        );
+        assert_eq!(
+            found(1, 2),
+            Some((second.handed.hex(), second.commit.hex())),
+            "1.2 reads its own, never 1.1's"
+        );
+        assert!(matches!(
+            generation.read_caps_checked("m-1", 1, 3),
+            CapsLookup::Missing
+        ));
+
+        let caps = spool.instance_path().join("2").join("agent-a").join("caps");
+        let good = first.handed.hex();
+        for (msg, text) in [
+            ("m-one-line", format!("{good}\n")),
+            ("m-bad-hex", format!("{}zz\n{good}\n", &good[..30])),
+            ("m-third-line", format!("{good}\n{good}\n{good}\n")),
+            ("m-no-newline", format!("{good}\n{good}")),
+            ("m-oversized", format!("{good}\n{good}\n{}", " ".repeat(64))),
+        ] {
+            std::fs::write(caps.join(format!("{msg}.1.1")), text).unwrap();
+            assert!(
+                matches!(
+                    generation.read_caps_checked(msg, 1, 1),
+                    CapsLookup::Malformed
+                ),
+                "{msg} is malformed"
+            );
+        }
+
+        std::fs::create_dir(caps.join("m-dir.1.1")).unwrap();
+        assert!(matches!(
+            generation.read_caps_checked("m-dir", 1, 1),
+            CapsLookup::Failed(_)
+        ));
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            let fifo = caps.join("m-fifo.1.1");
+            let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+            // SAFETY: a valid NUL-terminated path and a mode.
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+            assert!(matches!(
+                generation.read_caps_checked("m-fifo", 1, 1),
+                CapsLookup::Failed(_)
+            ));
+            std::os::unix::fs::symlink(caps.join("m-1.1.1"), caps.join("m-link.1.1")).unwrap();
+            assert!(
+                matches!(
+                    generation.read_caps_checked("m-link", 1, 1),
+                    CapsLookup::Failed(_)
+                ),
+                "a link to valid caps is not followed"
+            );
+        }
+
+        generation.remove_attempt("m-1", 1, 1).unwrap();
+        assert!(matches!(
+            generation.read_caps_checked("m-1", 1, 1),
+            CapsLookup::Missing
+        ));
+        assert!(found(1, 2).is_some(), "its sibling's caps stay");
     }
 }
