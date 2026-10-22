@@ -922,8 +922,10 @@ pub fn stage_binary(src: &Path, dst: &Path) -> Result<String, String> {
 ///   — which also means the delegate crosses the new TUI's pane-input wire to
 ///   the old daemon on its way in, and carries genuine hook provenance (issue
 ///   #1077) rather than an impersonation the harness had to wave through.
-/// * `coder` is `cat`, so whatever the daemon writes into its PTY is echoed
-///   back verbatim and a delivered delegate is readable off the screen.
+/// * `coder` is a shell, because since PRD #1666 a delegate lands in the
+///   worker's inbox rather than in its PTY, and a worker takes it from there by
+///   running `inbox fetch` inside its own pane (tell 3, issue #1755). It was
+///   `cat` while delivery was typed, which echoed the delegate onto the screen.
 /// * `reviewer` is a shell, because `work-done` and `agent-event` have to be
 ///   issued from a WORKER pane, and the feedback the daemon writes back lands in
 ///   the orchestrator's pane where it is a separate, daemon-authored observable.
@@ -942,7 +944,7 @@ start = true
 
 [[orchestrations.roles]]
 name = "coder"
-command = "printf 'XVER_CODER_SENTINEL\\n'; exec cat"
+command = "printf 'XVER_CODER_SENTINEL\\n'; exec sh -i"
 
 [[orchestrations.roles]]
 name = "reviewer"
