@@ -1398,37 +1398,176 @@ const CLAIM_CALL_MAX_BYTES: usize = 256 * 1024;
 /// so this only bounds what the daemon holds while the call runs.
 const CLAIM_STDERR_MAX_BYTES: usize = 64 * 1024;
 
-/// [`CLAIM_CALL_TIMEOUT`], or the [`CLAIM_CALL_TIMEOUT_ENV`] override when it
-/// holds a positive number of milliseconds.
-fn claim_call_timeout_from(value: Option<&str>) -> Duration {
+/// The default total time all the claim calls of one run may take together
+/// (PRD #421 amendment item 12). [`CLAIM_CALL_TIMEOUT`] alone bounds each call,
+/// not their number, so a run of many issues against a GitHub that hangs every
+/// call would hold the scheduler for that bound times the calls; this caps it.
+const CLAIM_RUN_BUDGET: Duration = Duration::from_secs(120);
+
+/// Overrides [`CLAIM_RUN_BUDGET`], in milliseconds, for the same reason as
+/// [`CLAIM_CALL_TIMEOUT_ENV`]. A value that is not a positive integer is
+/// ignored.
+const CLAIM_RUN_BUDGET_ENV: &str = "DOT_AGENT_DECK_ISSUE_CLAIM_BUDGET_MS";
+
+/// What a claim step that ran out of [`ClaimBudget`] reports.
+const CLAIM_BUDGET_SPENT: &str = "the run's claim time budget was used up";
+
+/// A positive number of milliseconds, or `None` for anything else.
+fn positive_millis(value: Option<&str>) -> Option<Duration> {
     value
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|&ms| ms > 0)
         .map(Duration::from_millis)
-        .unwrap_or(CLAIM_CALL_TIMEOUT)
+}
+
+/// [`CLAIM_CALL_TIMEOUT`], or the [`CLAIM_CALL_TIMEOUT_ENV`] override when it
+/// holds a positive number of milliseconds.
+fn claim_call_timeout_from(value: Option<&str>) -> Duration {
+    positive_millis(value).unwrap_or(CLAIM_CALL_TIMEOUT)
+}
+
+/// [`CLAIM_RUN_BUDGET`], or the [`CLAIM_RUN_BUDGET_ENV`] override when it holds
+/// a positive number of milliseconds.
+fn claim_run_budget_from(value: Option<&str>) -> Duration {
+    positive_millis(value).unwrap_or(CLAIM_RUN_BUDGET)
+}
+
+/// The time the claim calls of one run share (PRD #421 amendment item 12):
+/// each call is bounded by the per-call bound or by what is left, whichever is
+/// shorter, and spends the time it actually took. Time between calls — the
+/// dispatching itself — spends none of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClaimBudget {
+    per_call: Duration,
+    remaining: Duration,
+}
+
+impl ClaimBudget {
+    /// The bound for the next call, or `None` once the budget is spent and no
+    /// further claim call may be made.
+    fn next_bound(&self) -> Option<Duration> {
+        (!self.remaining.is_zero()).then(|| self.per_call.min(self.remaining))
+    }
+
+    fn spend(&mut self, elapsed: Duration) {
+        self.remaining = self.remaining.saturating_sub(elapsed);
+    }
+
+    fn is_spent(&self) -> bool {
+        self.remaining.is_zero()
+    }
 }
 
 /// What the claims of one run share: the machine id the records name, the
-/// per-call bound, and the two lookups made at most once per run — the label
-/// provisioning (PRD #421 M2.6(a)) and the signed-in account (amendment item
-/// 6). Each lookup is made lazily, on the first claim that needs it, so a run
-/// that dispatches nothing makes no claim call at all, and its outcome —
-/// failure included — stands for the rest of the run.
+/// time budget every claim call draws from, and the two lookups made at most
+/// once per run — the label provisioning (PRD #421 M2.6(a)) and the signed-in
+/// account (amendment item 6). Each lookup is made lazily, on the first claim
+/// that needs it, so a run that dispatches nothing makes no claim call at all.
+/// A provisioning outcome, failure included, stands for the rest of the run,
+/// apart from the one retry [`ClaimRun::should_reprovision`] allows; only a
+/// successful account lookup is kept, so a failed one is tried again by the
+/// next claim that needs it (amendment item 13).
 struct ClaimRun {
     host_id: String,
-    bound: Duration,
+    budget: ClaimBudget,
     provisioned: Option<Result<(), String>>,
-    account: Option<Result<u64, String>>,
+    reprovisioned: bool,
+    account: Option<u64>,
 }
 
 impl ClaimRun {
     fn new(hostname: &str) -> Self {
+        Self::with_budget(
+            hostname,
+            ClaimBudget {
+                per_call: claim_call_timeout_from(
+                    std::env::var(CLAIM_CALL_TIMEOUT_ENV).ok().as_deref(),
+                ),
+                remaining: claim_run_budget_from(
+                    std::env::var(CLAIM_RUN_BUDGET_ENV).ok().as_deref(),
+                ),
+            },
+        )
+    }
+
+    fn with_budget(hostname: &str, budget: ClaimBudget) -> Self {
         Self {
             host_id: crate::issue_dispatch::claim_host_id(hostname),
-            bound: claim_call_timeout_from(std::env::var(CLAIM_CALL_TIMEOUT_ENV).ok().as_deref()),
+            budget,
             provisioned: None,
+            reprovisioned: false,
             account: None,
         }
+    }
+
+    /// Whether a failed label add is worth provisioning the label once more and
+    /// retrying the add (amendment item 14): only while provisioning has not
+    /// succeeded in this run, so the label may be missing, only once per run,
+    /// and only with budget left to make the calls.
+    fn should_reprovision(&self) -> bool {
+        !self.reprovisioned && !matches!(self.provisioned, Some(Ok(()))) && !self.budget.is_spent()
+    }
+
+    /// Keep the account a lookup resolved; a failed lookup leaves nothing
+    /// behind, so the next claim that needs a record looks it up again.
+    fn remember_account(&mut self, lookup: &Result<u64, String>) {
+        if let Ok(id) = lookup {
+            self.account = Some(*id);
+        }
+    }
+
+    /// One claim call within the run's budget ([`gh_claim_call`]), or the
+    /// step reported as skipped when the budget is already spent. A call that
+    /// fails as it spends the last of the budget says so as well, since a
+    /// timeout shortened by the budget is not the per-call bound's.
+    async fn call(
+        &mut self,
+        argv: &[String],
+        what: &str,
+        max_stdout: usize,
+    ) -> Result<String, String> {
+        let Some(bound) = self.budget.next_bound() else {
+            return Err(format!("{what} was skipped: {CLAIM_BUDGET_SPENT}"));
+        };
+        let started = std::time::Instant::now();
+        let result = gh_claim_call(argv, what, bound, max_stdout).await;
+        self.budget.spend(started.elapsed());
+        match result {
+            Err(error) if self.budget.is_spent() => Err(format!("{error}; {CLAIM_BUDGET_SPENT}")),
+            result => result,
+        }
+    }
+
+    /// Provision the claim label, logging a failure.
+    async fn provision(&mut self, task_name: &str, repo: &str) {
+        let outcome = self
+            .call(
+                &crate::issue_dispatch::claim_label_provision_argv(repo),
+                "creating the label",
+                CLAIM_CALL_MAX_BYTES,
+            )
+            .await
+            .map(drop);
+        if let Err(error) = &outcome {
+            tracing::warn!(
+                task = task_name,
+                repo,
+                error = %error,
+                "issue-dispatch: could not provision the claim label"
+            );
+        }
+        self.provisioned = Some(outcome);
+    }
+
+    /// Add the claim label to `issue`.
+    async fn add_label(&mut self, repo: &str, issue: u64) -> Result<(), String> {
+        self.call(
+            &crate::issue_dispatch::claim_issue_argv(repo, issue),
+            "adding the label",
+            CLAIM_CALL_MAX_BYTES,
+        )
+        .await
+        .map(drop)
     }
 }
 
@@ -1443,12 +1582,16 @@ impl ClaimRun {
 /// that helper, a failure is not left to a WARN alone: a claim that did not
 /// fully succeed raises exactly one [`NotifyEvent::IssueClaimFailed`] naming
 /// both outcomes (M2.6(b)), so a read-only token does not pass as a run of
-/// clean claims. Every call is bounded by `run.bound`, so a call that hangs is
-/// reported as its step's failure and the run moves on to the next issue.
+/// clean claims. Every call draws on `run.budget`, so a call that hangs is
+/// reported as its step's failure and the run moves on to the next issue, and
+/// once the run's budget is spent a claim makes no call and is reported as
+/// skipped.
 ///
 /// A failed provisioning does not stop the label write: a token that may apply
 /// labels without managing them (GitHub's triage role) still succeeds at the
-/// add when the label already exists.
+/// add when the label already exists. When the add fails as well, the label
+/// may be missing because provisioning failed transiently, so the label is
+/// provisioned once more and the add retried ([`ClaimRun::should_reprovision`]).
 async fn claim_issue(
     task_name: &str,
     repo: &str,
@@ -1456,35 +1599,35 @@ async fn claim_issue(
     run: &mut ClaimRun,
     notifier: &dyn Notifier,
 ) {
-    if run.provisioned.is_none() {
-        let outcome = gh_claim_call(
-            &crate::issue_dispatch::claim_label_provision_argv(repo),
-            "creating the label",
-            run.bound,
-            CLAIM_CALL_MAX_BYTES,
-        )
-        .await
-        .map(drop);
-        if let Err(error) = &outcome {
-            tracing::warn!(
-                task = task_name,
-                repo,
-                error = %error,
-                "issue-dispatch: could not provision the claim label"
-            );
-        }
-        run.provisioned = Some(outcome);
+    if run.budget.is_spent() {
+        let skipped = format!("the claim was skipped: {CLAIM_BUDGET_SPENT}");
+        tracing::warn!(
+            task = task_name,
+            repo,
+            issue,
+            "issue-dispatch: the issue was dispatched but {skipped}"
+        );
+        notifier.notify(NotifyEvent::IssueClaimFailed {
+            task: task_name.to_string(),
+            repo: repo.to_string(),
+            issue,
+            label_error: Some(skipped.clone()),
+            record_error: Some(skipped),
+        });
+        return;
     }
 
-    let label_error = gh_claim_call(
-        &crate::issue_dispatch::claim_issue_argv(repo, issue),
-        "adding the label",
-        run.bound,
-        CLAIM_CALL_MAX_BYTES,
-    )
-    .await
-    .err()
-    .map(|error| match &run.provisioned {
+    if run.provisioned.is_none() {
+        run.provision(task_name, repo).await;
+    }
+
+    let mut label = run.add_label(repo, issue).await;
+    if label.is_err() && run.should_reprovision() {
+        run.reprovisioned = true;
+        run.provision(task_name, repo).await;
+        label = run.add_label(repo, issue).await;
+    }
+    let label_error = label.err().map(|error| match &run.provisioned {
         Some(Err(provision)) => format!("{error}; earlier, {provision}"),
         _ => error,
     });
@@ -1534,25 +1677,30 @@ async fn write_claim_record(
         find_own_claim_record, issue_comments_argv, next_claim_time, parse_authenticated_user_id,
         render_claim_record, sanitize_claim_error,
     };
-    if run.account.is_none() {
-        let account = gh_claim_call(
-            &authenticated_user_argv(),
-            "looking up the signed-in GitHub account",
-            run.bound,
-            CLAIM_CALL_MAX_BYTES,
+    let user_id = match run.account {
+        Some(id) => id,
+        None => {
+            let lookup = run
+                .call(
+                    &authenticated_user_argv(),
+                    "looking up the signed-in GitHub account",
+                    CLAIM_CALL_MAX_BYTES,
+                )
+                .await
+                .and_then(|json| {
+                    parse_authenticated_user_id(&json).map_err(|e| sanitize_claim_error(&e))
+                });
+            run.remember_account(&lookup);
+            lookup?
+        }
+    };
+    let comments = run
+        .call(
+            &issue_comments_argv(repo, issue),
+            "reading the issue's comments",
+            CLAIM_COMMENTS_MAX_BYTES,
         )
-        .await
-        .and_then(|json| parse_authenticated_user_id(&json).map_err(|e| sanitize_claim_error(&e)));
-        run.account = Some(account);
-    }
-    let user_id = run.account.clone().expect("resolved above")?;
-    let comments = gh_claim_call(
-        &issue_comments_argv(repo, issue),
-        "reading the issue's comments",
-        run.bound,
-        CLAIM_COMMENTS_MAX_BYTES,
-    )
-    .await?;
+        .await?;
     let own = find_own_claim_record(&comments, task_name, &run.host_id, user_id)
         .map_err(|e| sanitize_claim_error(&e))?;
     let claimed_at = next_claim_time(
@@ -1566,10 +1714,9 @@ async fn write_claim_record(
             // Guaranteed by `next_claim_time`: an edit that repeated the body
             // would leave `updated_at`, the claim's clock, where it was.
             debug_assert_ne!(body, record.body, "a re-claim must change the record");
-            gh_claim_call(
+            run.call(
                 &edit_claim_record_argv(repo, id, &body),
                 "editing the claim comment",
-                run.bound,
                 CLAIM_CALL_MAX_BYTES,
             )
             .await?;
@@ -1582,13 +1729,13 @@ async fn write_claim_record(
             );
         }
         None => {
-            let created = gh_claim_call(
-                &create_claim_record_argv(repo, issue, &body),
-                "posting the claim comment",
-                run.bound,
-                CLAIM_CALL_MAX_BYTES,
-            )
-            .await?;
+            let created = run
+                .call(
+                    &create_claim_record_argv(repo, issue, &body),
+                    "posting the claim comment",
+                    CLAIM_CALL_MAX_BYTES,
+                )
+                .await?;
             // The id is for the log line only: a response it cannot be read
             // from does not make the posted record a failure.
             let comment_id = serde_json::from_str::<serde_json::Value>(&created)
@@ -3149,6 +3296,101 @@ mod tests {
                 "{ignored:?}"
             );
         }
+    }
+
+    /// Scenario: PRD #421 amendment item 12 — the run's claim budget is 120 s
+    /// unless the override holds a positive millisecond count.
+    #[test]
+    fn the_claim_run_budget_defaults_to_120s_and_takes_an_override() {
+        assert_eq!(claim_run_budget_from(None), Duration::from_secs(120));
+        assert_eq!(
+            claim_run_budget_from(Some("3000")),
+            Duration::from_millis(3000)
+        );
+        for ignored in ["", "0", "-5", "abc", "1.5"] {
+            assert_eq!(
+                claim_run_budget_from(Some(ignored)),
+                Duration::from_secs(120),
+                "{ignored:?}"
+            );
+        }
+    }
+
+    /// Scenario: PRD #421 amendment item 12 — each call is bounded by the
+    /// shorter of the per-call bound and what is left of the run's budget, and
+    /// once the calls have spent it, no further call gets a bound.
+    #[test]
+    fn a_claim_call_is_bounded_by_what_is_left_of_the_run_budget() {
+        let mut budget = ClaimBudget {
+            per_call: Duration::from_secs(5),
+            remaining: Duration::from_secs(12),
+        };
+        assert_eq!(budget.next_bound(), Some(Duration::from_secs(5)));
+        budget.spend(Duration::from_secs(5));
+        budget.spend(Duration::from_secs(5));
+        assert_eq!(budget.next_bound(), Some(Duration::from_secs(2)));
+        assert!(!budget.is_spent());
+        // A call overruns its bound slightly before it is reaped.
+        budget.spend(Duration::from_millis(2_050));
+        assert!(budget.is_spent());
+        assert_eq!(budget.next_bound(), None);
+    }
+
+    fn claim_run_with(remaining: Duration) -> ClaimRun {
+        ClaimRun::with_budget(
+            "host",
+            ClaimBudget {
+                per_call: Duration::from_secs(30),
+                remaining,
+            },
+        )
+    }
+
+    /// Scenario: PRD #421 amendment item 14 — a failed label add provisions
+    /// the label once more only while provisioning has not succeeded in the
+    /// run, only once per run, and only with budget left.
+    #[test]
+    fn a_failed_label_add_reprovisions_once_while_the_label_may_be_missing() {
+        let mut run = claim_run_with(Duration::from_secs(120));
+        run.provisioned = Some(Err("HTTP 502".into()));
+        assert!(run.should_reprovision(), "transient provisioning failure");
+        run.reprovisioned = true;
+        assert!(!run.should_reprovision(), "at most once per run");
+
+        let mut run = claim_run_with(Duration::from_secs(120));
+        run.provisioned = Some(Ok(()));
+        assert!(!run.should_reprovision(), "the label exists");
+
+        let mut run = claim_run_with(Duration::ZERO);
+        run.provisioned = Some(Err("HTTP 502".into()));
+        assert!(!run.should_reprovision(), "no budget left for the calls");
+    }
+
+    /// Scenario: PRD #421 amendment item 13 — only a successful account
+    /// lookup is kept for the rest of the run; a failed one is not, so the
+    /// next claim looks the account up again.
+    #[test]
+    fn only_a_successful_account_lookup_is_kept() {
+        let mut run = claim_run_with(Duration::from_secs(120));
+        run.remember_account(&Err("HTTP 502".into()));
+        assert_eq!(run.account, None);
+        run.remember_account(&Ok(54321));
+        assert_eq!(run.account, Some(54321));
+    }
+
+    /// Scenario: PRD #421 amendment item 12 — once the budget is spent, a
+    /// claim call is reported as skipped for the budget without running `gh`.
+    #[tokio::test]
+    async fn a_claim_call_after_the_budget_is_spent_is_skipped() {
+        let mut run = claim_run_with(Duration::ZERO);
+        let error = run
+            .call(&["--version".to_string()], "adding the label", 1024)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "adding the label was skipped: the run's claim time budget was used up"
+        );
     }
 
     /// Issue #692: the timed-out child is killed, not left running to race the
