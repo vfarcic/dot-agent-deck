@@ -1488,6 +1488,14 @@ async fn claim_issue(
         Some(Err(provision)) => format!("{error}; earlier, {provision}"),
         _ => error,
     });
+    if label_error.is_none() {
+        tracing::info!(
+            task = task_name,
+            repo,
+            issue,
+            "issue-dispatch: claim label added"
+        );
+    }
 
     let record_error = write_claim_record(task_name, repo, issue, run).await.err();
 
@@ -1547,25 +1555,47 @@ async fn write_claim_record(
     .await?;
     let own = find_own_claim_record(&comments, task_name, &run.host_id, user_id)
         .map_err(|e| sanitize_claim_error(&e))?;
-    let body = render_claim_record(task_name, &run.host_id);
+    let body = render_claim_record(task_name, &run.host_id, chrono::Utc::now());
     match own {
-        Some(id) => gh_claim_call(
-            &edit_claim_record_argv(repo, id, &body),
-            "editing the claim comment",
-            run.bound,
-            CLAIM_CALL_MAX_BYTES,
-        )
-        .await
-        .map(drop),
-        None => gh_claim_call(
-            &create_claim_record_argv(repo, issue, &body),
-            "posting the claim comment",
-            run.bound,
-            CLAIM_CALL_MAX_BYTES,
-        )
-        .await
-        .map(drop),
+        Some(id) => {
+            gh_claim_call(
+                &edit_claim_record_argv(repo, id, &body),
+                "editing the claim comment",
+                run.bound,
+                CLAIM_CALL_MAX_BYTES,
+            )
+            .await?;
+            tracing::info!(
+                task = task_name,
+                repo,
+                issue,
+                comment_id = id,
+                "issue-dispatch: claim record edited"
+            );
+        }
+        None => {
+            let created = gh_claim_call(
+                &create_claim_record_argv(repo, issue, &body),
+                "posting the claim comment",
+                run.bound,
+                CLAIM_CALL_MAX_BYTES,
+            )
+            .await?;
+            // The id is for the log line only: a response it cannot be read
+            // from does not make the posted record a failure.
+            let comment_id = serde_json::from_str::<serde_json::Value>(&created)
+                .ok()
+                .and_then(|comment| comment["id"].as_u64());
+            tracing::info!(
+                task = task_name,
+                repo,
+                issue,
+                comment_id = ?comment_id,
+                "issue-dispatch: claim record created"
+            );
+        }
     }
+    Ok(())
 }
 
 /// Run one `gh` call of the claim within `bound` and return its stdout, killing
