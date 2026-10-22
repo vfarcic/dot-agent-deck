@@ -513,7 +513,7 @@ pub struct Registration {
     /// Final attempts bound to a retired incarnation of the same slot that
     /// keep their late-commit verifier (§7) and are not reclaimed: a
     /// `HandedInert` one, and a `Fenced` one still verifying. Their late
-    /// commit still corrects the sender, and the context that holds such a
+    /// commit can still correct the sender, and the context that holds such a
     /// commit, its watcher having died with it, now answers on this
     /// incarnation. The caller hands each one's commit authority, and only
     /// that, to the new watcher: no stage, approval or callback comes with it.
@@ -1311,8 +1311,8 @@ impl AttemptModel {
     /// The fenced attempts of ended messages that still keep their late-commit
     /// verifier (§7): each is looked up in the spool, and only a lookup that
     /// finds no commit lets [`Self::tick_verified`] return its evidence, so a
-    /// receipt its incarnation published before a Cancel ended the message
-    /// still corrects the sender.
+    /// receipt its incarnation published before a Cancel ended the message is
+    /// still seen, and can correct the sender.
     ///
     /// An attempt whose commit authority was handed back to an incarnation
     /// that is still live is left out (r8k B02): that incarnation may yet
@@ -2053,8 +2053,9 @@ impl AttemptModel {
                 // A message that ran out of attempts on not-handed reports a
                 // commit now contradicts (PR #1735 review 4298669219) reached
                 // the agent after all: it settles, and whoever was told it was
-                // undeliverable is corrected through the hub's late-ack record
-                // when the inbox copy follows (reviewer R9T-03). An offer went
+                // undeliverable can be corrected through the hub's late-ack
+                // record, while that is retained, when the inbox copy follows
+                // (reviewer R9T-03). An offer went
                 // back to its pool and stays out of attempts.
                 if msg.state == MessageState::Undeliverable(UndeliverableReason::MaxDeliver)
                     && !msg.offer
@@ -2071,8 +2072,9 @@ impl AttemptModel {
                 }
                 if msg.state.is_terminal() {
                     // A message ended as cancelled reached the agent after
-                    // all, and whoever was told otherwise is told so; it
-                    // stays cancelled.
+                    // all, and whoever was told otherwise can be told so
+                    // while the hub still holds a route to them; it stays
+                    // cancelled.
                     let despite_cancel = match msg.state {
                         MessageState::Undeliverable(UndeliverableReason::Cancelled) => Some(true),
                         MessageState::Undeliverable(UndeliverableReason::MaxDeliver) => Some(false),

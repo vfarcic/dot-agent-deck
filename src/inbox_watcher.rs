@@ -15,7 +15,7 @@
 //! stage report that comes before this watcher has read its registration, or
 //! before the daemon's `rebound` answer for its attempt, waits for them, the
 //! attempt held meanwhile. A final attempt of an earlier watcher of the same
-//! slot whose late commit still corrects the sender comes in the registration
+//! slot whose late commit can still correct the sender comes in the registration
 //! as `correctable`, with its commit cap alone (r8k R8G-03): the cap stays
 //! here, so a commit the component reports again for it is published, and the
 //! component is forwarded the bare ref. A stage report for an attempt whose cap this

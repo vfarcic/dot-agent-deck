@@ -289,7 +289,8 @@ pub(super) struct Gen {
     /// uncertain (§6.6), so a later commit corrects it once while the task's
     /// delegate watch remains. An id goes when the watch does
     /// ([`forget_uncertain`]): a delegation with `--supersede` that retires it
-    /// leaves a later commit nothing to correct through.
+    /// ends the watch-based route, leaving a later commit only a retained
+    /// cancelled-task record to correct through, if the task has one.
     pub(super) uncertain_told: HashSet<String>,
 }
 
@@ -1424,7 +1425,7 @@ pub(super) struct Checked {
 
 /// T2/T3, then T4/T8/held_long and G3's not-started attention, for every generation: `checked` holds what
 /// each generation's spool IO found. Every commit found is applied first, so
-/// a receipt published for any issued attempt settles (or corrects) before
+/// a receipt published for any issued attempt settles (or can correct) before
 /// a lapse can repeat anything; only the candidates a completed check
 /// cleared may then count toward an automatic repeat.
 pub(super) fn tick(
@@ -1835,8 +1836,9 @@ pub(super) fn forget_uncertain(st: &mut HubState, id: &str) {
 
 /// Rule 1's correction (§2): a sender told otherwise hears the message
 /// reached its agent after all, while the task's delegate watch or its
-/// cancelled-task record remains. A task whose watch a newer delegation
-/// retired (superseded) has neither, and gets no correction.
+/// cancelled-task record remains. A newer delegation that retires (supersedes)
+/// the watch ends the watch-based route; such a task is corrected only through
+/// a cancelled-task record still retained for it.
 fn delivered_after_all(st: &mut HubState, key: &AgentKey, id: &str, despite_cancel: bool) {
     let told = st
         .receipts
@@ -1867,7 +1869,8 @@ fn delivered_after_all(st: &mut HubState, key: &AgentKey, id: &str, despite_canc
 }
 
 /// T3: an earlier holder of an offer committed after it was reassigned — the
-/// task reached it too (§2), and its offerer is told.
+/// task reached it too (§2), and its offerer is told while the hub still
+/// holds the offer.
 fn also_reached(st: &mut HubState, key: &AgentKey, id: &str, a: u32) {
     warn!(message_id = %id, a, pane_id = %key.0, "inbox: a reassigned offer also reached its earlier holder");
     let Some(offer) = st.offers.get(id) else {

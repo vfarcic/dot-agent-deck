@@ -155,7 +155,8 @@ pub const ALSO_REACHED_SUBJECT: &str = "task also reached an earlier worker";
 pub const CANCELLED_SUBJECT: &str = "task cancelled";
 
 /// How many cancelled tasks the hub remembers, so a commit after the Cancel
-/// still corrects their orchestrator (§2 "Late commit after Cancel").
+/// can still correct their orchestrator (§2 "Late commit after Cancel"); a
+/// task evicted past this bound has no record left to correct through.
 const MAX_CANCELLED_TASKS: usize = 256;
 
 /// The sender `reason` of a notice the deck itself writes to an agent; its
@@ -3942,8 +3943,8 @@ fn retire_delegates_locked(
 }
 
 /// End the watch on delegated task `id`, and the record that its orchestrator
-/// was told it is uncertain: a commit corrects through the watch, so without it
-/// that record is never read.
+/// was told it is uncertain: that record only affects a correction made through
+/// the watch, so without the watch it can affect no correction.
 fn remove_watch(st: &mut HubState, id: &str) -> Option<DelegateWatch> {
     let watch = st.delegates.remove(id)?;
     engine::forget_uncertain(st, id);
@@ -4063,7 +4064,8 @@ fn broadcast_wake_stall(st: &HubState, pane_id: &str, agent_id: &str, id: &str, 
 const UNDELIVERED_SUBJECT: &str = "task not delivered";
 
 /// PRD #1666 long-turn delivery: the subject of the correction an orchestrator
-/// gets when a task it was told was undeliverable reached its worker after all.
+/// can get when a task it was told was undeliverable reached its worker after
+/// all.
 pub const LATE_ACK_SUBJECT: &str = "task delivered after all";
 
 /// PRD #1666 S11: owe an offer's offerer the notice its state change calls
@@ -4268,8 +4270,8 @@ pub fn compose_uncertain_notice(message_id: &str, role: &str) -> String {
     )
 }
 
-/// PRD #1666 §2 rule 1: the correction an orchestrator gets when a task it was
-/// told was uncertain, or cancelled, reached its worker after all.
+/// PRD #1666 §2 rule 1: the correction an orchestrator can get when a task it
+/// was told was uncertain, or cancelled, reached its worker after all.
 pub fn compose_after_all_notice(message_id: &str, role: &str, despite_cancel: bool) -> String {
     let told = if despite_cancel {
         "it was delivered after all, despite Cancel"
@@ -4284,7 +4286,7 @@ pub fn compose_after_all_notice(message_id: &str, role: &str, despite_cancel: bo
     )
 }
 
-/// PRD #1666 §2 T3: the notice an offerer gets when the earlier holder of a
+/// PRD #1666 §2 T3: the notice an offerer can get when the earlier holder of a
 /// job reassigned after a positive not-handed witness received it after all.
 pub fn compose_also_reached_notice(message_id: &str, role: &str) -> String {
     format!(
@@ -4373,8 +4375,8 @@ fn remember_cancelled_task(st: &mut HubState, id: &str, to: Recipient, role: &st
 
 /// PRD #1666 long-turn delivery: a message reported undeliverable after
 /// `max_deliver` hand-overs was acknowledged after all ([`Inbox::ack`] records
-/// the late ack). The orchestrator told it was undeliverable gets a
-/// correction, the worker counts as having received a task
+/// the late ack). While its record is still held, the orchestrator told it
+/// was undeliverable gets a correction, the worker counts as having received a task
 /// (`received_since_done`), and the recipient's card is cleared once no other
 /// message it was told about is still owed a correction.
 fn settle_late_ack(st: &mut HubState, event: &InboxEvent) {
@@ -4535,7 +4537,7 @@ pub enum LateAckReport {
     Undeliverable,
 }
 
-/// PRD #1666 long-turn delivery: the correction an orchestrator gets when a
+/// PRD #1666 long-turn delivery: the correction an orchestrator can get when a
 /// task it was told had not reached its worker, or was undeliverable, is
 /// acknowledged by its worker after all.
 pub fn compose_late_ack_notice(message_id: &str, role: &str, report: LateAckReport) -> String {

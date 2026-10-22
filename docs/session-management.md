@@ -91,7 +91,7 @@ The `Prmt:` line on a TUI card shows `✉ <subject>` for a deck message. Its `Se
 
 Long turns affect delivery in both clients:
 
-- OpenCode and Pi can keep a message queued behind a busy turn without a not-delivered error during that wait, and do not receive another copy. Claude Code, with hooks from the same release as the deck, waits the same way: a message it has taken waits for its turn to end, and the deck neither sends it again nor reports it not delivered while the turn runs. With older hooks the deck cannot confirm this wait, so a message waiting behind a turn longer than about five minutes can be reported not delivered before it arrives; the orchestrator is then told it arrived.
+- OpenCode and Pi can keep a message queued behind a busy turn without a not-delivered error during that wait, and do not receive another copy. Claude Code, with hooks from the same release as the deck, waits the same way: a message it has taken waits for its turn to end, and the deck neither sends it again nor reports it not delivered while the turn runs. With older hooks the deck cannot confirm this wait, so a message waiting behind a turn longer than about five minutes can be reported not delivered before it arrives.
 - A task reported as not delivered can still arrive, so check the agent's pane before posting it again. If it arrives after all, the orchestrator may be told, and the TUI card or desktop tile may leave its delivery error state once no other delivery error remains.
 - A message Claude Code (with hooks from the deck's release), OpenCode or Pi has kept for an hour without starting on it shows a one-time reminder with **Retry** and **Cancel**; it is not an error, and the agent may still be working on it.
 
