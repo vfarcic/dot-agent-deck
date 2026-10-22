@@ -63,6 +63,54 @@ use std::time::Duration;
 
 use crate::common::*;
 
+/// Scenario: A failed run leaves a cast, grid, fixture, logs and provenance.
+/// Starting and completing a passing rerun clears the current files but keeps
+/// the failed run's original artifacts together in a separate archive.
+#[test]
+fn recording_retention_preserves_failed_evidence_across_passing_reruns() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path();
+    let artifacts = [
+        "full-stream.cast",
+        "final-grid.txt",
+        "final-grid.svg",
+        "fixture.toml",
+        "daemon.log",
+        "deck.log",
+    ];
+    for name in artifacts {
+        std::fs::write(dir.join(name), format!("failed {name}")).unwrap();
+    }
+    let failed = serde_json::json!({"outcome":"failed", "recorded_at_unix": 1}).to_string();
+    std::fs::write(dir.join("provenance.json"), &failed).unwrap();
+    std::fs::write(dir.join("test.md"), "paired doc").unwrap();
+    discard_recording_dir(dir);
+    for name in artifacts {
+        assert!(!dir.join(name).exists(), "latest files must be invalidated");
+        std::fs::write(dir.join(name), format!("passed {name}")).unwrap();
+    }
+    std::fs::write(dir.join("provenance.json"), r#"{"outcome":"passed"}"#).unwrap();
+    discard_recording_dir(dir);
+    let archives: Vec<_> = std::fs::read_dir(dir.join("runs"))
+        .expect("a failed recording must survive a passing rerun under runs/")
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    let archive = archives
+        .iter()
+        .find(|path| std::fs::read_to_string(path.join("provenance.json")).unwrap() == failed)
+        .expect("the failed run's provenance must survive the passing rerun");
+    for name in artifacts {
+        assert_eq!(
+            std::fs::read_to_string(archive.join(name)).unwrap(),
+            format!("failed {name}")
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(dir.join("test.md")).unwrap(),
+        "paired doc"
+    );
+}
+
 // -----------------------------------------------------------------------
 // Issue #322 — harness temp-root containment and cleanup
 // -----------------------------------------------------------------------

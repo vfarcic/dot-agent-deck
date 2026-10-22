@@ -5650,6 +5650,10 @@ fn discard_previous_recording(test_name: &str) {
     // `Once`), and this is the earliest thing `try_launch_inner` does.
     install_credential_redaction();
     let dir = workspace_recordings_root().join(sanitize_test_name(test_name));
+    discard_recording_dir(&dir);
+}
+
+pub(crate) fn discard_recording_dir(dir: &Path) {
     for name in RECORDING_ARTIFACTS {
         let path = dir.join(name);
         match std::fs::remove_file(&path) {
