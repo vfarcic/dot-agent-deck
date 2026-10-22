@@ -656,10 +656,10 @@ fn inbox_protocol_013_unattested_get_seed_hands_over_no_inbox_message() {
     }
 }
 
-/// Scenario: With the daemon binding inbox components to the pane's agent, a process outside the pane presents the pane's own token and agent id and tries to arm a stream, a once waiter and a Native announcement for it. Each must be refused as not the agent's process, nothing may arm, and the queued task stays Queued.
+/// Scenario: With the daemon's production admission on, a process outside the pane presents the pane's own token and agent id and tries to arm a stream, a once waiter and a Native announcement naming the agent's own process as the receiver. The agent's process is not the caller or one of its parents, so each is refused as naming another process, nothing may arm, and the queued task stays Queued.
 #[spec("inbox/protocol/014")]
 #[test]
-fn inbox_protocol_014_a_process_outside_the_agent_cannot_arm_its_inbox() {
+fn inbox_protocol_014_a_process_cannot_register_another_process_as_the_receiver() {
     let daemon = common::spawn_daemon_serve(None, "0");
     let pane = pane(&daemon, "bound", "exec /bin/cat");
     let id = post(&daemon, &pane, BODY);
@@ -671,7 +671,7 @@ fn inbox_protocol_014_a_process_outside_the_agent_cannot_arm_its_inbox() {
         req["pid"] = json!(pane.pid);
         let reply = line(&mut connect(&daemon, &req));
         assert_eq!(
-            reply["refused"], "inbox_not_agent_process",
+            reply["refused"], "inbox_component_not_caller",
             "{mode}: {reply}"
         );
         assert!(reply.get("messages").is_none_or(Value::is_null), "{reply}");
@@ -683,62 +683,39 @@ fn inbox_protocol_014_a_process_outside_the_agent_cannot_arm_its_inbox() {
     announce["pid"] = json!(pane.pid);
     let reply = hook(&daemon, announce);
     assert_eq!(reply["accepted"], false, "{reply}");
-    assert_eq!(reply["reason"], "inbox_not_agent_process", "{reply}");
+    assert_eq!(reply["reason"], "inbox_component_not_caller", "{reply}");
     armed(&daemon, &pane, 0);
     state(&daemon, &pane, &id, "queued");
 }
 
-/// Scenario: With the daemon binding inbox components to the pane's agent, a process outside the pane presents the pane's own token and agent id and tries to fetch, fetch-and-acknowledge, acknowledge and get-seed the agent's queued task. Each is refused and the task stays Queued; the real fetch command run inside the pane then takes and acknowledges it.
+/// Scenario: With the daemon's production admission on, a process outside the pane, running as the deck's own user and presenting the pane's current token and agent id, fetches the agent's queued task without acknowledging it, acknowledges it by id, and then takes a second task through the get-seed alias. Each is admitted: the first task is handed over and Acknowledged, and get-seed hands over the second and acknowledges it.
 #[spec("inbox/protocol/015")]
 #[test]
-fn inbox_protocol_015_a_process_outside_the_agent_cannot_take_its_mail() {
+fn inbox_protocol_015_the_panes_capability_takes_and_settles_its_mail_from_outside_it() {
     let daemon = common::spawn_daemon_serve(None, "0");
-    let script = daemon.home.join("fetch.sh");
-    std::fs::write(&script, "#!/bin/sh\nwhile [ ! -f fetch-go ]; do sleep 0.05; done\n\"$INBOX_TEST_BIN\" inbox fetch > fetch.stdout 2> fetch.stderr\nprintf '%s' \"$?\" > fetch.exit\nexec /bin/cat\n").unwrap();
-    // Quote only fixture-owned paths; the binary path contains no shell code.
-    let command = format!(
-        "INBOX_TEST_BIN='{}' /bin/sh '{}'",
-        env!("CARGO_BIN_EXE_dot-agent-deck").replace('\'', "'\\''"),
-        script.display()
-    );
-    let pane = pane(&daemon, "bound-mail", &command);
+    let pane = pane(&daemon, "bound-mail", "exec /bin/cat");
     let id = enqueue(&daemon, &pane);
-    for ack in [false, true] {
-        let mut fetch = request(&pane, "inbox_fetch");
-        fetch["consumer"] = json!("cli");
-        fetch["ack"] = json!(ack);
-        let reply = hook(&daemon, fetch);
-        assert_eq!(
-            reply["refused"], "inbox_not_agent_process",
-            "fetch ack={ack}: {reply}"
-        );
-        assert!(reply.get("messages").is_none_or(Value::is_null), "{reply}");
-    }
+    let mut fetch = request(&pane, "inbox_fetch");
+    fetch["consumer"] = json!("cli");
+    fetch["ack"] = json!(false);
+    let reply = hook(&daemon, fetch);
+    assert!(reply["refused"].is_null(), "fetch: {reply}");
+    blocks(&reply, &id);
+    state(&daemon, &pane, &id, "fetched");
     let mut ack = request(&pane, "ack");
     ack["delivery_id"] = json!(id);
     let reply = hook(&daemon, ack);
-    assert_eq!(reply["accepted"], false, "ack: {reply}");
-    assert_eq!(reply["reason"], "inbox_not_agent_process", "ack: {reply}");
-    let reply = hook(&daemon, request(&pane, "get_seed"));
-    assert!(reply["seed"].is_null(), "get_seed: {reply}");
-    state(&daemon, &pane, &id, "queued");
-    std::fs::write(daemon.home.join("fetch-go"), b"go").unwrap();
-    assert!(
-        common::wait_until(WAIT, || std::fs::read_to_string(
-            daemon.home.join("fetch.exit")
-        )
-        .is_ok_and(|text| !text.is_empty())),
-        "the in-pane fetch must complete"
-    );
-    let stderr = std::fs::read_to_string(daemon.home.join("fetch.stderr")).unwrap();
-    assert_eq!(
-        std::fs::read_to_string(daemon.home.join("fetch.exit")).unwrap(),
-        "0",
-        "in-pane fetch stderr: {stderr}"
-    );
-    let text = std::fs::read_to_string(daemon.home.join("fetch.stdout")).unwrap();
-    assert!(text.contains(BODY), "in-pane fetch output: {text}");
+    assert_eq!(reply["accepted"], true, "ack: {reply}");
     state(&daemon, &pane, &id, "acknowledged");
+    let second = post(&daemon, &pane, "SEED-SENTINEL-3b81: the second task");
+    let reply = hook(&daemon, request(&pane, "get_seed"));
+    assert!(
+        reply["seed"]
+            .as_str()
+            .is_some_and(|seed| seed.contains("SEED-SENTINEL-3b81")),
+        "get_seed: {reply}"
+    );
+    state(&daemon, &pane, &second, "acknowledged");
 }
 
 /// Scenario: With the daemon binding inbox components to the pane's agent, a process outside the pane sends a raw hook event with the pane's own token that names the agent's queued task as a prompt it observed. The task must stay Queued; the real Claude waiter, run inside the pane, is then handed the task, and the real Claude hook, run inside the pane for a prompt carrying the block the waiter wrote, commits it.
@@ -866,7 +843,7 @@ fn connect_from_an_exited_process(path: &Path) -> (BufReader<UnixStream>, u32) {
     }
 }
 
-/// Scenario: With the daemon binding inbox components to the pane's agent, a connection whose creator exited before it is used presents the pane's own token and tries to fetch, acknowledge, arm a waiter for and get-seed the agent's queued task, and to announce a native wake naming that exited creator. The daemon can no longer read who made the connection, so each is refused and the task stays Queued; the real receipt watcher then run inside the pane still registers and is handed the task.
+/// Scenario: With the daemon's production admission on, a connection whose creator exited before it is used presents the pane's own token and tries to fetch, acknowledge, arm a waiter for and get-seed the agent's queued task, and to announce a native wake naming that exited creator. The daemon can no longer identify the process that made the connection, so each is refused with that cause and the task stays Queued; the real receipt watcher then run inside the pane still registers and is handed the task.
 #[spec("inbox/protocol/017")]
 #[test]
 fn inbox_protocol_017_a_connection_of_unknown_ancestry_cannot_take_mail() {
@@ -909,20 +886,20 @@ fn inbox_protocol_017_a_connection_of_unknown_ancestry_cannot_take_mail() {
     fetch["ack"] = json!(true);
     let reply = send(&fetch);
     assert_eq!(
-        reply["refused"], "inbox_not_agent_process",
+        reply["refused"], "inbox_peer_unidentified",
         "fetch: {reply}"
     );
     assert!(reply.get("messages").is_none_or(Value::is_null), "{reply}");
     let mut ack = request(&pane, "ack");
     ack["delivery_id"] = json!(id);
     let reply = send(&ack);
-    assert_eq!(reply["reason"], "inbox_not_agent_process", "ack: {reply}");
+    assert_eq!(reply["reason"], "inbox_peer_unidentified", "ack: {reply}");
     let mut wait = request(&pane, "inbox_wait");
     wait["component"] = json!("pi_extension");
     wait["component_version"] = json!("synthetic");
     wait["mode"] = json!("once");
     let reply = send(&wait);
-    assert_eq!(reply["refused"], "inbox_not_agent_process", "wait: {reply}");
+    assert_eq!(reply["refused"], "inbox_peer_unidentified", "wait: {reply}");
     let reply = send(&request(&pane, "get_seed"));
     assert!(reply["seed"].is_null(), "get_seed: {reply}");
     // PR #1735 third review (F1): an announce naming the exited creator would
@@ -937,7 +914,7 @@ fn inbox_protocol_017_a_connection_of_unknown_ancestry_cannot_take_mail() {
     let reply = line(&mut socket);
     assert_eq!(reply["accepted"], false, "announce: {reply}");
     assert_eq!(
-        reply["reason"], "inbox_not_agent_process",
+        reply["reason"], "inbox_peer_unidentified",
         "announce: {reply}"
     );
     state(&daemon, &pane, &id, "queued");

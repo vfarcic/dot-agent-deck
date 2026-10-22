@@ -1562,6 +1562,19 @@ pub const CONTRACT_BREAKS: &[&str] = &[
     // not handed. Same request, same reply type; what moved is which acks
     // settle, for OpenCode and Pi as well as Claude Code.
     "1666-explicit-ack-requires-handed-attempt",
+    // PRD #1666 part 3 (R-1), at 12 without moving it. The inbox verbs used to
+    // admit only a process the deck could trace to the pane's agent through
+    // the process table, so Claude Code's background session host -- which
+    // runs a conversation outside the tree the deck recorded, with the pane's
+    // environment -- was refused `inbox_not_agent_process` and its mail
+    // queued for good. Membership is now the pane's current capability plus
+    // the deck's own OS user; the receiver checks, generation identity and the
+    // capability's token -> spawn -> pane binding are unchanged. Same requests,
+    // same replies; what moved is who is admitted, and the refusal codes
+    // (`inbox_other_user`, `inbox_peer_unidentified`,
+    // `inbox_component_not_caller`, `inbox_nested_agent`) that name the cause.
+    // `changelog.d/1666-pane-capability.breaking.md` is its fragment.
+    "1666-pane-capability-inbox-admission",
 ];
 
 /// What comparing this build's [`CONTRACT_BREAKS`] against a peer's found.

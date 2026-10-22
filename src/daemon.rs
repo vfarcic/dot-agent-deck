@@ -4835,14 +4835,81 @@ fn handle_inbox_ack(
     outcome.into()
 }
 
-/// PRD #1666: `inbox_fetch` — hand the attested agent its queued messages.
-/// PRD #1666 hardening M2: the refusal code for an inbox component whose
-/// process is not the pane's agent or one of its descendants.
-const INBOX_NOT_AGENT_PROCESS: &str = "inbox_not_agent_process";
+/// PRD #1666 part 3 (R-1): why the deck refused an inbox request whose token
+/// attests the pane, each cause with its own code and a message naming the
+/// remedy ([`Self::message`]).
+///
+/// Membership of a pane is the pane's current capability, which the gate
+/// ahead of these checks has resolved token → spawn record → pane, plus the
+/// deck's own OS user, as the kernel recorded it for the connection. Where
+/// the caller sits in the process table is not membership: Claude Code can
+/// run a conversation in a background session host outside the process tree
+/// the deck recorded for the pane, and that host's tool shell and hooks are
+/// still the pane's agent. Process identity still decides which instance is
+/// the agent's receiver ([`ComponentUse::Receiver`]), and whether the
+/// connecting process is still the one that connected
+/// ([`still_the_accepted_peer`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComponentRefusal {
+    /// The connecting process runs as another OS user than the deck's.
+    OtherUser,
+    /// Neither the pane's agent process tree nor the deck's own user can be
+    /// shown: a platform that does not read the client's user, where the
+    /// caller is outside the tree or the pane has no agent process.
+    NotMember,
+    /// The deck cannot tell which process made the connection, or that the
+    /// process is still the one that made it.
+    Unidentified,
+    /// The receiver instance the request names is neither the caller nor one
+    /// of its parents.
+    NotCaller,
+    /// An agent of the same kind as the receiver the request names sits
+    /// between it and the caller (audit F3).
+    NestedAgent,
+}
 
-/// [`INBOX_NOT_AGENT_PROCESS`]'s message.
-const INBOX_NOT_AGENT_PROCESS_MESSAGE: &str = "this process is not the pane's agent or one of its processes, so it may not receive \
-     the agent's inbox";
+impl ComponentRefusal {
+    fn code(self) -> &'static str {
+        match self {
+            ComponentRefusal::OtherUser => "inbox_other_user",
+            ComponentRefusal::NotMember => "inbox_not_agent_process",
+            ComponentRefusal::Unidentified => "inbox_peer_unidentified",
+            ComponentRefusal::NotCaller => "inbox_component_not_caller",
+            ComponentRefusal::NestedAgent => "inbox_nested_agent",
+        }
+    }
+
+    /// The cause and what to do about it, for the caller. Fixed text: it never
+    /// echoes a token, a pid or anything the request carried.
+    fn message(self) -> &'static str {
+        match self {
+            ComponentRefusal::OtherUser => {
+                "this process runs as a different OS user from the deck, and only the deck's own \
+                 user may use a pane's inbox; run it as the user that runs the deck"
+            }
+            ComponentRefusal::NotMember => {
+                "this process is not the pane's agent or one of its processes, and the deck cannot \
+                 confirm here that it runs as the deck's own user; run it from the agent's own pane"
+            }
+            ComponentRefusal::Unidentified => {
+                "the deck could not identify the process that made this connection: it may have \
+                 exited or handed the connection to another process, so it may not take or settle \
+                 the agent's messages; run the command again from the agent's own pane, and keep \
+                 it running until the deck answers"
+            }
+            ComponentRefusal::NotCaller => {
+                "the receiver this request names is not the process that sent it or one of its \
+                 parents, so the deck will not register it; run the inbox command from the agent's \
+                 own integration"
+            }
+            ComponentRefusal::NestedAgent => {
+                "an agent of the same kind sits between this process and the agent it names, so a \
+                 nested agent cannot act as that agent's receiver; run the receiver from the \
+                 pane's own agent, not from an agent it started"
+            }
+        }
+    }
+}
 
 /// PRD #1666 part 2: the refusal code of a receipt verb asking for what is
 /// not served on receipts — a wait other than Claude's once-waiter, or a
@@ -4861,42 +4928,42 @@ const ENV_TEST_UNBOUND_COMPONENTS: &str = "DOT_AGENT_DECK_INBOX_TEST_UNBOUND_COM
 /// Which inbox verb a component is admitted for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ComponentUse {
-    /// A post, or settling a job: the agent's own process tree may use its
-    /// token, tools included.
+    /// A post, or taking or settling the agent's mail: any member of the pane
+    /// may use its token, tools included.
     Cli,
     /// Arming a waiter or announcing a wake: registering the agent's native
-    /// receiver ([`admit_receiver_process`]).
+    /// receiver ([`receiver_instance`]).
     Receiver,
 }
 
-/// How much a component's ancestry must prove for an inbox verb.
+/// How much the deck must be able to show about a component for an inbox
+/// verb.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Evidence {
-    /// Refused only on a positive "not the agent's"; a walk that cannot say
-    /// admits. For the verbs that post or settle a job.
+    /// Refused only on a positive "no"; a check that cannot say admits. For
+    /// the verbs that post or settle a job.
     BestEffort,
-    /// PR #1735 second review: admitted only on a positive "the agent's". For
-    /// the verbs that take or settle the agent's own mail — fetch, ack,
-    /// get-seed and arming a waiter — and, since the third review, announcing
-    /// a wake, which pins the agent's receiver: a caller can make its ancestry
+    /// PR #1735 second review: admitted only on positive evidence. For the
+    /// verbs that take or settle the agent's own mail — fetch, ack, get-seed
+    /// and arming a waiter — and, since the third review, announcing a wake,
+    /// which pins the agent's receiver: a caller can make its identity
     /// unreadable on purpose, since a connection whose creator exited still
     /// reports that creator as its peer.
     Required,
 }
 
-/// [`admit_component_process`] — or [`admit_receiver_process`] for a
-/// receiver — on this platform's process table, unless the `e2e`-only
-/// [`ENV_TEST_UNBOUND_COMPONENTS`] knob is set. [`Evidence::Required`] falls
-/// back to [`Evidence::BestEffort`] on a platform without
-/// [`crate::platform::proc::ANCESTRY_LOOKUP`], where no caller could prove
-/// anything.
+/// [`admit_inbox_component_with`] on this platform's process table, unless
+/// the `e2e`-only [`ENV_TEST_UNBOUND_COMPONENTS`] knob is set.
+/// [`Evidence::Required`] falls back to [`Evidence::BestEffort`] on a
+/// platform without [`crate::platform::proc::ANCESTRY_LOOKUP`], where no
+/// caller could prove anything.
 fn admit_inbox_component(
     peer: Option<AcceptedPeer>,
     claimed: Option<u32>,
     root: Option<u32>,
     used_as: ComponentUse,
     evidence: Evidence,
-) -> Result<Option<u32>, &'static str> {
+) -> Result<Option<u32>, ComponentRefusal> {
     #[cfg(feature = "e2e")]
     if std::env::var(ENV_TEST_UNBOUND_COMPONENTS)
         .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
@@ -4919,18 +4986,26 @@ fn admit_inbox_component(
 /// cannot be read. A connection keeps reporting the process that made it after
 /// that process exits, and its pid can then be reused; the start time tells
 /// the process that connected from a later one holding the same number.
+///
+/// PRD #1666 part 3 (R-1): and whether it runs as the deck's own user, as the
+/// kernel recorded it when the connection was made
+/// ([`crate::platform::peercred::peer_is_same_user`]), `None` where that
+/// cannot be read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AcceptedPeer {
     pid: u32,
     started: Option<u64>,
+    same_user: Option<bool>,
 }
 
 impl AcceptedPeer {
-    /// The peer `pid` names, read now, as the connection is accepted.
-    fn accept(pid: Option<u32>) -> Option<Self> {
+    /// The peer `pid` names, read now, as the connection is accepted, running
+    /// as the deck's own user or not (`same_user`).
+    fn accept(pid: Option<u32>, same_user: Option<bool>) -> Option<Self> {
         pid.map(|pid| Self {
             pid,
             started: crate::platform::proc::process_start_of(pid),
+            same_user,
         })
     }
 }
@@ -4952,14 +5027,16 @@ const PLATFORM_LOOKUPS: ProcessLookups = ProcessLookups {
     started: crate::platform::proc::process_start_of,
 };
 
-/// [`admit_inbox_component`] over `lookups`, with `evidence` already settled
-/// for the platform.
+/// Whether the connecting process `peer` may use, for `used_as`, the token of
+/// the generation whose agent process is `root`; answers the receiver
+/// instance to arm or pin under, or `claimed` for [`ComponentUse::Cli`].
 ///
-/// PR #1735 third review (F2): the peer's ancestry is walked by its pid, so
-/// once the walk has answered, the peer must still be the process accepted
-/// ([`still_the_accepted_peer`]). Read after the walk, the same start time
-/// means that process was alive from the accept through the walk, so the walk
-/// read its ancestry and not a later process's that reuses its pid.
+/// [`admit_component`] decides membership and the receiver. Then, PR #1735
+/// third review (F2), the peer must still be the process accepted
+/// ([`still_the_accepted_peer`]): read after the process-table walks, the
+/// same start time means that process was alive from the accept through the
+/// walks, so they read its ancestry and not a later process's that reuses its
+/// pid.
 fn admit_inbox_component_with(
     peer: Option<AcceptedPeer>,
     claimed: Option<u32>,
@@ -4967,22 +5044,17 @@ fn admit_inbox_component_with(
     used_as: ComponentUse,
     evidence: Evidence,
     lookups: &ProcessLookups,
-) -> Result<Option<u32>, &'static str> {
-    let pid = peer.map(|peer| peer.pid);
-    let admitted = match used_as {
-        ComponentUse::Cli => {
-            admit_component_process(pid, claimed, root, lookups.descends, evidence)
-        }
-        ComponentUse::Receiver => admit_receiver_process(
-            pid,
-            claimed,
-            root,
-            lookups.descends,
-            lookups.parent_of,
-            lookups.executable_of,
-            evidence,
-        ),
-    }?;
+) -> Result<Option<u32>, ComponentRefusal> {
+    let admitted = admit_component(
+        peer,
+        claimed,
+        root,
+        used_as,
+        evidence,
+        lookups.descends,
+        lookups.parent_of,
+        lookups.executable_of,
+    )?;
     if let Some(peer) = peer {
         still_the_accepted_peer(peer, lookups.started, evidence)?;
     }
@@ -4998,29 +5070,27 @@ fn still_the_accepted_peer(
     peer: AcceptedPeer,
     started_of: fn(u32) -> Option<u64>,
     evidence: Evidence,
-) -> Result<(), &'static str> {
+) -> Result<(), ComponentRefusal> {
     match (peer.started, started_of(peer.pid)) {
         (Some(then), Some(now)) if then == now => Ok(()),
-        (Some(_), Some(_)) => {
-            Err("the connecting process has exited, and its process id now names another")
-        }
-        _ if evidence == Evidence::Required => Err("the connecting process cannot be identified"),
+        (Some(_), Some(_)) => Err(ComponentRefusal::Unidentified),
+        _ if evidence == Evidence::Required => Err(ComponentRefusal::Unidentified),
         _ => Ok(()),
     }
 }
 
 /// PR #1735 review: whether the connecting process `peer` may take or settle
-/// `agent_id`'s own mail — `inbox_fetch`, `ack` and the `get_seed` alias — on
-/// the same terms as the verbs that post ([`ComponentUse::Cli`]): only the
-/// agent's own process tree may use its token for them, and only on positive
-/// evidence that the caller is in it ([`Evidence::Required`]). Logs a refusal.
+/// `agent_id`'s own mail — `inbox_fetch`, `inbox_committed`, `ack` and the
+/// `get_seed` alias — on the same terms as the verbs that post
+/// ([`ComponentUse::Cli`]), but only on positive evidence
+/// ([`Evidence::Required`]). Logs a refusal.
 fn mail_taker_admitted(
     registry: &AgentPtyRegistry,
     peer: Option<AcceptedPeer>,
     agent_id: &str,
     verb: &str,
     pane_id: &str,
-) -> bool {
+) -> Result<(), ComponentRefusal> {
     match admit_inbox_component(
         peer,
         None,
@@ -5028,46 +5098,93 @@ fn mail_taker_admitted(
         ComponentUse::Cli,
         Evidence::Required,
     ) {
-        Ok(_) => true,
-        Err(why) => {
+        Ok(_) => Ok(()),
+        Err(refusal) => {
             warn!(
                 verb,
                 pane_id = %escape_id_for_log(pane_id),
-                why,
-                "hook socket: refused an inbox verb from outside the pane's agent"
+                reason = refusal.code(),
+                "hook socket: refused an inbox verb from a process the deck cannot admit for \
+                 the pane"
             );
-            false
+            Err(refusal)
         }
     }
 }
 
-/// Audit F3: [`admit_component_process`] for a component registering the
-/// agent's native receiver. Answers the instance the receiver is pinned by
-/// ([`receiver_instance`]), and refuses one with an agent of its own kind
-/// between it and the caller ([`nested_between`]).
+/// PRD #1666 part 3 (R-1): admit `peer` for `used_as` the token of the
+/// generation whose agent process is `root`. `claimed` is the receiver
+/// instance a [`ComponentUse::Receiver`] request names (the process that runs
+/// its watcher, which the stream is keyed by).
 ///
-/// Audit D1: this bounds registration to the agent's process tree; it does not
-/// tell the visible integration from another process the agent runs. A waiter
-/// started from the agent's own tool shell resolves to the agent, and a nested
-/// agent of another kind naming the outer agent's pid passes the same-kind
-/// check; either is then the same receiver as far as the pin can tell.
-fn admit_receiver_process(
-    peer: Option<u32>,
+/// **Membership.** The pane's agent process tree is membership, and so is the
+/// deck's own OS user: a peer outside the tree is admitted when the kernel
+/// recorded it as the deck's user ([`AcceptedPeer::same_user`]), since the
+/// gate ahead of this admitted its token as the pane's current capability.
+/// Another user is refused under either [`Evidence`]
+/// ([`ComponentRefusal::OtherUser`]). Where the user cannot be read (no peer,
+/// or a platform that does not read it), the process tree alone decides, as
+/// it did before: a positive "outside" refuses, and so, under
+/// [`Evidence::Required`], does a walk that cannot say, a pane with no agent
+/// process and a peer the kernel does not identify.
+///
+/// **The receiver** ([`ComponentUse::Receiver`]). The instance a request
+/// names must be the caller or one of its parents, and not a process above
+/// the agent's own, so a member cannot register an arbitrary process as the
+/// agent's receiver; it is pinned through
+/// hook shells to the process that runs them ([`receiver_instance`]); and a
+/// process between the caller and that instance running the instance's own
+/// executable — an agent of the same kind, started inside the one whose
+/// receiver it names — is refused ([`nested_between`], audit F3).
+#[allow(clippy::too_many_arguments)]
+fn admit_component(
+    peer: Option<AcceptedPeer>,
     claimed: Option<u32>,
     root: Option<u32>,
+    used_as: ComponentUse,
+    evidence: Evidence,
     descends: impl Fn(u32, u32) -> Option<bool>,
     parent_of: impl Fn(u32) -> Option<u32> + Copy,
     executable_of: impl Fn(u32) -> Option<std::path::PathBuf> + Copy,
-    evidence: Evidence,
-) -> Result<Option<u32>, &'static str> {
-    let instance = admit_component_process(peer, claimed, root, descends, evidence)?
-        .map(|claimed| receiver_instance(claimed, root, parent_of, executable_of));
-    if let (Some(peer), Some(instance)) = (peer, instance)
-        && nested_between(peer, instance, parent_of, executable_of) == Some(true)
-    {
-        return Err("an agent of the same kind sits between the caller and the component it names");
+) -> Result<Option<u32>, ComponentRefusal> {
+    let required = evidence == Evidence::Required;
+    let Some(peer) = peer else {
+        return if required {
+            Err(ComponentRefusal::Unidentified)
+        } else {
+            Ok(claimed)
+        };
+    };
+    let in_tree = root.map(|root| descends(peer.pid, root));
+    match (in_tree, peer.same_user) {
+        (Some(Some(true)), _) | (_, Some(true)) => {}
+        (_, Some(false)) => return Err(ComponentRefusal::OtherUser),
+        (Some(Some(false)), None) => return Err(ComponentRefusal::NotMember),
+        (None, None) if required => return Err(ComponentRefusal::NotMember),
+        (Some(None), None) if required => return Err(ComponentRefusal::Unidentified),
+        (_, None) => {}
     }
-    Ok(instance)
+    let Some(claimed) = claimed.filter(|_| used_as == ComponentUse::Receiver) else {
+        return Ok(claimed);
+    };
+    // Nor a process above the agent — the deck, a terminal, init — which the
+    // caller descends from as every process of the pane does.
+    if claimed <= 1
+        || root.is_some_and(|root| claimed != root && descends(root, claimed) == Some(true))
+    {
+        return Err(ComponentRefusal::NotCaller);
+    }
+    match descends(peer.pid, claimed) {
+        Some(true) => {}
+        Some(false) => return Err(ComponentRefusal::NotCaller),
+        None if required => return Err(ComponentRefusal::Unidentified),
+        None => {}
+    }
+    let instance = receiver_instance(claimed, root, parent_of, executable_of);
+    if nested_between(peer.pid, instance, parent_of, executable_of) == Some(true) {
+        return Err(ComponentRefusal::NestedAgent);
+    }
+    Ok(Some(instance))
 }
 
 /// Audit F3: the process an agent's receiver is pinned by — `claimed`, or,
@@ -5143,74 +5260,6 @@ fn nested_between(
         current = parent_of(current)?;
     }
     Some(false)
-}
-
-/// PRD #1666 hardening M2: bind an inbox component to the pane's managed
-/// agent. `peer` is the connecting process as the kernel reports it, `claimed`
-/// the component instance it names (the process that runs its watcher, which
-/// the stream is keyed by), and `root` the agent process the deck spawned.
-/// Each must be `root` or descend from it, and the claimed instance must be an
-/// ancestor of the caller (or the caller itself). Under
-/// [`Evidence::BestEffort`], where `descends` cannot say — a Unix other than
-/// Linux or macOS, or a process that exited during the walk — the check is
-/// skipped, as it is without a `peer` or a `root`. Under
-/// [`Evidence::Required`] each of those refuses. Windows reads parents from a
-/// process snapshot since PR #1735's review. Answers the instance to arm the
-/// stream under.
-fn admit_component_process(
-    peer: Option<u32>,
-    claimed: Option<u32>,
-    root: Option<u32>,
-    descends: impl Fn(u32, u32) -> Option<bool>,
-    evidence: Evidence,
-) -> Result<Option<u32>, &'static str> {
-    let required = evidence == Evidence::Required;
-    let Some(root) = root else {
-        return if required {
-            Err("the pane has no agent process to bind the caller to")
-        } else {
-            Ok(claimed)
-        };
-    };
-    // `Err(true)` for a positive "no", `Err(false)` for "cannot say" where
-    // the evidence must be positive.
-    let check = |pid: u32, ancestor: u32| match descends(pid, ancestor) {
-        Some(true) => Ok(()),
-        Some(false) => Err(true),
-        None if required => Err(false),
-        None => Ok(()),
-    };
-    const UNREADABLE: &str = "the caller's process ancestry cannot be read";
-    match peer {
-        Some(peer) => check(peer, root).map_err(|not| {
-            if not {
-                "the connecting process is not the agent's"
-            } else {
-                UNREADABLE
-            }
-        })?,
-        None if required => return Err("the connecting process cannot be identified"),
-        None => {}
-    }
-    if let Some(claimed) = claimed {
-        check(claimed, root).map_err(|not| {
-            if not {
-                "the named component process is not the agent's"
-            } else {
-                UNREADABLE
-            }
-        })?;
-        if let Some(peer) = peer {
-            check(peer, claimed).map_err(|not| {
-                if not {
-                    "the named component process is not the caller's"
-                } else {
-                    UNREADABLE
-                }
-            })?;
-        }
-    }
-    Ok(claimed)
 }
 
 /// PRD #1666 hardening H2: the inbox half of `get-seed` — the oldest message
@@ -5360,6 +5409,16 @@ fn claude_hook_fetch(
 /// yet). And only earlier connections from the agent's own process tree, or
 /// ones the deck cannot place ([`may_type_generation`], best-effort ancestry
 /// placement), hold one: a silent peer placed outside that tree does not.
+///
+/// PRD #1666 part 3 (R-1) admits a pane's members outside that tree, and
+/// leaves this placement as it is: until a connection's first line is read
+/// the deck has no token to place it by, and holding for every same-user peer
+/// would hold for every connection. So a Claude Code background session host
+/// whose SessionStart is still unread does not hold a stale hook's fetch, and
+/// that fetch is served the legacy way. H5 removes the legacy service, and
+/// with it the decision this hold waits to make; a hook that declares the
+/// one-shot integration, or a generation the spawn types as Claude Code, is
+/// never held.
 async fn route_hook_fetch(
     registry: &AgentPtyRegistry,
     req: &crate::event::InboxFetchRequest,
@@ -5892,9 +5951,12 @@ async fn run_hook_loop_with_limits(
                     //
                     // PR #1735 third review (F2): recorded with when that
                     // process started, so every later check names the process
-                    // that connected, not whatever reuses its pid.
+                    // that connected, not whatever reuses its pid. Part 3
+                    // (R-1): and whether it runs as the deck's user, which
+                    // with the pane's capability makes it a member of the pane.
                     let peer_pid = AcceptedPeer::accept(
                         crate::platform::peercred::peer_pid(&stream).ok(),
+                        crate::platform::peercred::peer_is_same_user(&stream),
                     );
                     ingest.place(peer_pid);
                     let (read_half, mut write_half) = tokio::io::split(stream);
@@ -6269,17 +6331,17 @@ async fn run_hook_loop_with_limits(
                                         Evidence::Required,
                                     ) {
                                         Ok(instance) => instance,
-                                        Err(why) => {
+                                        Err(refusal) => {
                                             warn!(
                                                 pane_id = %escape_id_for_log(&req.pane_id),
                                                 component = ?req.component,
-                                                why,
-                                                "hook socket: refused an inbox wait from outside \
-                                                 the pane's agent"
+                                                reason = refusal.code(),
+                                                "hook socket: refused an inbox wait the deck \
+                                                 cannot admit for the pane"
                                             );
                                             let reply = crate::event::InboxWaitReply::refused(
-                                                INBOX_NOT_AGENT_PROCESS,
-                                                INBOX_NOT_AGENT_PROCESS_MESSAGE,
+                                                refusal.code(),
+                                                refusal.message(),
                                             );
                                             if let Ok(json) = serde_json::to_string(&reply) {
                                                 let line = format!("{json}\n");
@@ -6340,18 +6402,18 @@ async fn run_hook_loop_with_limits(
                                         Evidence::Required,
                                     ) {
                                         Ok(instance) => instance,
-                                        Err(why) => {
+                                        Err(refusal) => {
                                         warn!(
                                             pane_id = %escape_id_for_log(&req.pane_id),
                                             component = ?req.component,
-                                            why,
-                                            "hook socket: refused an inbox announce from outside \
-                                             the pane's agent"
+                                            reason = refusal.code(),
+                                            "hook socket: refused an inbox announce the deck \
+                                             cannot admit for the pane"
                                         );
                                         if let Ok(json) =
                                             serde_json::to_string(&crate::event::SignalAck::refused(
-                                                INBOX_NOT_AGENT_PROCESS,
-                                                INBOX_NOT_AGENT_PROCESS_MESSAGE,
+                                                refusal.code(),
+                                                refusal.message(),
                                             ))
                                         {
                                             let line = format!("{json}\n");
@@ -6433,7 +6495,7 @@ async fn run_hook_loop_with_limits(
                                         .await
                                     };
                                     if route == HookRoute::OneShot {
-                                        if !mail_taker_admitted(
+                                        if let Err(refusal) = mail_taker_admitted(
                                             &pty_registry,
                                             peer_pid,
                                             &agent_id,
@@ -6441,8 +6503,8 @@ async fn run_hook_loop_with_limits(
                                             &req.pane_id,
                                         ) {
                                             let reply = crate::event::InboxWaitReply::refused(
-                                                INBOX_NOT_AGENT_PROCESS,
-                                                INBOX_NOT_AGENT_PROCESS_MESSAGE,
+                                                refusal.code(),
+                                                refusal.message(),
                                             );
                                             if let Ok(json) = serde_json::to_string(&reply) {
                                                 let line = format!("{json}\n");
@@ -6477,19 +6539,18 @@ async fn run_hook_loop_with_limits(
                                         .await;
                                         return;
                                     }
-                                    let reply = if mail_taker_admitted(
+                                    let reply = match mail_taker_admitted(
                                         &pty_registry,
                                         peer_pid,
                                         &agent_id,
                                         "inbox_fetch",
                                         &req.pane_id,
                                     ) {
-                                        handle_inbox_fetch(&pty_registry, &req, &agent_id)
-                                    } else {
-                                        crate::event::InboxWaitReply::refused(
-                                            INBOX_NOT_AGENT_PROCESS,
-                                            INBOX_NOT_AGENT_PROCESS_MESSAGE,
-                                        )
+                                        Ok(()) => handle_inbox_fetch(&pty_registry, &req, &agent_id),
+                                        Err(refusal) => crate::event::InboxWaitReply::refused(
+                                            refusal.code(),
+                                            refusal.message(),
+                                        ),
                                     };
                                     if let Ok(json) = serde_json::to_string(&reply) {
                                         let line = format!("{json}\n");
@@ -6501,10 +6562,11 @@ async fn run_hook_loop_with_limits(
                                     let Some(agent_id) = attested_agent else {
                                         continue;
                                     };
-                                    // Part 2 §1.3: admitted from the agent's own
-                                    // process tree, as `ack` is, for the
+                                    // Part 2 §1.3: admitted from a member of the
+                                    // pane (part 3, R-1: its current capability
+                                    // and the deck's user), as `ack` is, for the
                                     // generation the token attests. That makes
-                                    // it an in-tree, same-user authority, not
+                                    // it a same-user authority, not
                                     // proof that Claude's hook sent it; what it
                                     // may commit is bounded by the attempt's own
                                     // witness instead (R2-A01): released by the
@@ -6514,13 +6576,19 @@ async fn run_hook_loop_with_limits(
                                     // cannot read (no spool, or no scanner) is
                                     // the exception: it is degraded already, and
                                     // there the first two alone decide.
-                                    let reply = if mail_taker_admitted(
+                                    let admitted = mail_taker_admitted(
                                         &pty_registry,
                                         peer_pid,
                                         &agent_id,
                                         "inbox_committed",
                                         &req.pane_id,
-                                    ) {
+                                    );
+                                    let reply = if let Err(refusal) = admitted {
+                                        crate::event::InboxWaitReply::refused(
+                                            refusal.code(),
+                                            refusal.message(),
+                                        )
+                                    } else {
                                         let applied = pty_registry.inbox().one_shot_committed(
                                             &req.pane_id,
                                             &agent_id,
@@ -6535,11 +6603,6 @@ async fn run_hook_loop_with_limits(
                                             "Received a prompt's exact commits"
                                         );
                                         crate::event::InboxWaitReply::default()
-                                    } else {
-                                        crate::event::InboxWaitReply::refused(
-                                            INBOX_NOT_AGENT_PROCESS,
-                                            INBOX_NOT_AGENT_PROCESS_MESSAGE,
-                                        )
                                     };
                                     if let Ok(json) = serde_json::to_string(&reply) {
                                         let line = format!("{json}\n");
@@ -6576,10 +6639,10 @@ async fn run_hook_loop_with_limits(
                                         continue;
                                     };
                                     // Hardening M2 for the verbs that reach
-                                    // other agents or move a job between them:
-                                    // only the agent's own process tree may
-                                    // use its token.
-                                    if let Err(why) = admit_inbox_component(
+                                    // other agents or move a job between them,
+                                    // as part 3 (R-1) widened it: only a member
+                                    // of the pane may use its token.
+                                    if let Err(refusal) = admit_inbox_component(
                                         peer_pid,
                                         None,
                                         pty_registry.child_pid(&agent_id),
@@ -6589,13 +6652,13 @@ async fn run_hook_loop_with_limits(
                                         warn!(
                                             verb = msg.verb(),
                                             pane_id = %escape_id_for_log(msg.claimed_pane()),
-                                            why,
-                                            "hook socket: refused an inbox post from outside the \
-                                             pane's agent"
+                                            reason = refusal.code(),
+                                            "hook socket: refused an inbox post the deck cannot \
+                                             admit for the pane"
                                         );
                                         if let Some(json) = msg.provenance_refusal_reply(
-                                            INBOX_NOT_AGENT_PROCESS,
-                                            INBOX_NOT_AGENT_PROCESS_MESSAGE,
+                                            refusal.code(),
+                                            refusal.message(),
                                         ) {
                                             let line = format!("{json}\n");
                                             let _ = write_half.write_all(line.as_bytes()).await;
@@ -6992,26 +7055,24 @@ async fn run_hook_loop_with_limits(
                                     };
                                     // PRD #1666: every id is an inbox message's,
                                     // acknowledged for the agent the token attests,
-                                    // and only from that agent's own process tree
-                                    // (PR #1735 review).
+                                    // and only from a member of its pane (PR #1735
+                                    // review; part 3, R-1).
                                     let ack = match attested_agent_id {
-                                        Some(agent_id)
-                                            if !mail_taker_admitted(
-                                                &pty_registry,
-                                                peer_pid,
-                                                agent_id,
-                                                "ack",
-                                                &signal.pane_id,
-                                            ) =>
-                                        {
-                                            crate::event::SignalAck::refused(
-                                                INBOX_NOT_AGENT_PROCESS,
-                                                INBOX_NOT_AGENT_PROCESS_MESSAGE,
-                                            )
-                                        }
-                                        Some(agent_id) => crate::event::SignalAck::acknowledged(
-                                            handle_inbox_ack(&pty_registry, &signal, agent_id),
-                                        ),
+                                        Some(agent_id) => match mail_taker_admitted(
+                                            &pty_registry,
+                                            peer_pid,
+                                            agent_id,
+                                            "ack",
+                                            &signal.pane_id,
+                                        ) {
+                                            Err(refusal) => crate::event::SignalAck::refused(
+                                                refusal.code(),
+                                                refusal.message(),
+                                            ),
+                                            Ok(()) => crate::event::SignalAck::acknowledged(
+                                                handle_inbox_ack(&pty_registry, &signal, agent_id),
+                                            ),
+                                        },
                                         None => crate::event::SignalAck::acknowledged(
                                             crate::event::AckDelivery::Unknown,
                                         ),
@@ -7037,9 +7098,9 @@ async fn run_hook_loop_with_limits(
                                     // caller names or the pane's occupant
                                     // ([`get_seed_inbox_alias`]).
                                     //
-                                    // PR #1735 review: and only from that agent's
-                                    // own process tree; a refusal answers as "no
-                                    // seed pending" does.
+                                    // PR #1735 review: and only from a member of
+                                    // its pane; a refusal answers as "no seed
+                                    // pending" does.
                                     let attested = attested_agent.as_deref().filter(|agent| {
                                         mail_taker_admitted(
                                             &pty_registry,
@@ -7048,6 +7109,7 @@ async fn run_hook_loop_with_limits(
                                             "get_seed",
                                             &req.pane_id,
                                         )
+                                        .is_ok()
                                     });
                                     let pi = attested.is_some_and(|agent| {
                                         pi_generation(&pty_registry, &req.pane_id, agent)
@@ -7561,7 +7623,7 @@ mod ingest_order_tests {
         );
 
         let inside = order.admit();
-        inside.place(AcceptedPeer::accept(registry.child_pid(&agent)));
+        inside.place(AcceptedPeer::accept(registry.child_pid(&agent), Some(true)));
         let (routed, took) = route(inside).await;
         assert_eq!(routed, HookRoute::Legacy);
         assert!(
@@ -7570,7 +7632,7 @@ mod ingest_order_tests {
         );
 
         let outside = order.admit();
-        outside.place(AcceptedPeer::accept(Some(std::process::id())));
+        outside.place(AcceptedPeer::accept(Some(std::process::id()), Some(true)));
         let (routed, took) = route(outside).await;
         assert_eq!(routed, HookRoute::Legacy);
         assert!(
@@ -7609,7 +7671,11 @@ mod ingest_order_tests {
         let route =
             async |started: Option<u64>, may_type: &dyn Fn(&AcceptedPeer, Option<u32>) -> bool| {
                 let silent = order.admit();
-                silent.place(Some(AcceptedPeer { pid: PEER, started }));
+                silent.place(Some(AcceptedPeer {
+                    pid: PEER,
+                    started,
+                    same_user: Some(true),
+                }));
                 let mut fetch = order.admit();
                 fetch.settle();
                 let begun = tokio::time::Instant::now();
@@ -12335,11 +12401,24 @@ mod hook_ingestion_tests {
         );
     }
 
-    /// PRD #1666 hardening M2: a component is admitted only from the pane's
-    /// agent process tree, and only under an instance that is the caller's own
-    /// ancestry; where the platform cannot say, it is not checked.
+    /// The connecting process `pid` for [`admit_component`], running as the
+    /// deck's user or not (`same_user`); its start time is
+    /// [`still_the_accepted_peer`]'s business, not this function's.
+    fn peer(pid: u32, same_user: Option<bool>) -> Option<AcceptedPeer> {
+        Some(AcceptedPeer {
+            pid,
+            started: None,
+            same_user,
+        })
+    }
+
+    /// PRD #1666 hardening M2, where the deck cannot read the caller's user
+    /// (a platform that does not, as on Windows today): a component is
+    /// admitted only from the pane's agent process tree, and a receiver only
+    /// under an instance that is the caller's own ancestry; where the
+    /// platform cannot say, best effort does not check.
     #[test]
-    fn admit_component_process_binds_to_the_agent_process_tree() {
+    fn without_the_callers_user_the_agent_process_tree_decides() {
         // 1 ── 10 (agent) ── 11 (plugin host) ── 12 (watcher CLI)
         //  └── 20 (unrelated) ── 21
         let parents = |pid: u32| match pid {
@@ -12350,73 +12429,226 @@ mod hook_ingestion_tests {
             _ => None,
         };
         let descends = |pid, root| crate::platform::proc::descends_from_with(pid, root, parents);
+        let admit = |peer_pid: u32, claimed, root, used_as, evidence| {
+            admit_component(
+                peer(peer_pid, None),
+                claimed,
+                root,
+                used_as,
+                evidence,
+                descends,
+                parents,
+                |_| None,
+            )
+        };
+        use ComponentUse::{Cli, Receiver};
+        use Evidence::{BestEffort, Required};
         assert_eq!(
-            admit_component_process(Some(12), Some(11), Some(10), descends, Evidence::BestEffort),
+            admit(12, Some(11), Some(10), Receiver, BestEffort),
             Ok(Some(11))
         );
+        assert_eq!(admit(12, None, Some(10), Cli, BestEffort), Ok(None));
         assert_eq!(
-            admit_component_process(Some(12), None, Some(10), descends, Evidence::BestEffort),
-            Ok(None)
+            admit(21, None, Some(10), Cli, BestEffort),
+            Err(ComponentRefusal::NotMember)
         );
-        assert!(
-            admit_component_process(Some(21), Some(20), Some(10), descends, Evidence::BestEffort)
-                .is_err()
+        assert_eq!(
+            admit(21, Some(20), Some(10), Receiver, BestEffort),
+            Err(ComponentRefusal::NotMember)
         );
-        assert!(
-            admit_component_process(Some(12), Some(20), Some(10), descends, Evidence::BestEffort)
-                .is_err()
+        // A receiver names the caller or one of its parents, never a process
+        // the caller does not descend from nor one above the agent.
+        assert_eq!(
+            admit(12, Some(20), Some(10), Receiver, BestEffort),
+            Err(ComponentRefusal::NotCaller)
         );
-        assert!(
-            admit_component_process(Some(11), Some(12), Some(10), descends, Evidence::BestEffort)
-                .is_err()
+        assert_eq!(
+            admit(11, Some(12), Some(10), Receiver, BestEffort),
+            Err(ComponentRefusal::NotCaller)
         );
-        assert!(
-            admit_component_process(Some(12), Some(10), Some(10), descends, Evidence::BestEffort)
-                .is_ok()
+        assert_eq!(
+            admit(12, Some(1), Some(10), Receiver, BestEffort),
+            Err(ComponentRefusal::NotCaller)
+        );
+        assert_eq!(
+            admit(12, Some(10), Some(10), Receiver, BestEffort),
+            Ok(Some(10))
         );
         // Cannot say: unknown pids, or no agent process to check against.
         assert_eq!(
-            admit_component_process(Some(99), Some(98), Some(10), descends, Evidence::BestEffort),
+            admit(99, Some(98), Some(10), Receiver, BestEffort),
             Ok(Some(98))
         );
         assert_eq!(
-            admit_component_process(Some(21), Some(20), None, descends, Evidence::BestEffort),
+            admit(21, Some(20), None, Receiver, BestEffort),
             Ok(Some(20))
+        );
+        // PR #1735 second review: the verbs that take the agent's mail need
+        // positive evidence. A peer whose ancestry cannot be read — it exited,
+        // as a connection's creator can on purpose — is refused, and so are a
+        // missing peer and a pane with no agent process; the agent's own tree
+        // is still admitted.
+        assert_eq!(admit(12, None, Some(10), Cli, Required), Ok(None));
+        assert_eq!(
+            admit(12, Some(11), Some(10), Receiver, Required),
+            Ok(Some(11))
+        );
+        assert_eq!(admit(10, None, Some(10), Cli, Required), Ok(None));
+        assert_eq!(
+            admit(99, None, Some(10), Cli, Required),
+            Err(ComponentRefusal::Unidentified)
+        );
+        assert_eq!(
+            admit(12, None, None, Cli, Required),
+            Err(ComponentRefusal::NotMember)
+        );
+        assert_eq!(
+            admit(12, Some(98), Some(10), Receiver, Required),
+            Err(ComponentRefusal::NotCaller)
+        );
+        assert_eq!(
+            admit_component(
+                None,
+                None,
+                Some(10),
+                Cli,
+                Required,
+                descends,
+                parents,
+                |_| None
+            ),
+            Err(ComponentRefusal::Unidentified)
+        );
+        assert_eq!(
+            admit_component(
+                None,
+                None,
+                Some(10),
+                Cli,
+                BestEffort,
+                descends,
+                parents,
+                |_| None
+            ),
+            Ok(None)
         );
     }
 
-    /// PR #1735 second review: a verb that takes the agent's mail is admitted
-    /// only on positive evidence. A peer whose ancestry cannot be read — it
-    /// exited, as a connection's creator can on purpose — is refused, and so
-    /// are a missing peer and a pane with no agent process; the agent's own
-    /// tree is still admitted.
+    /// PRD #1666 part 3 (R-1): a process outside the agent's process tree is
+    /// a member of the pane when it runs as the deck's own user, since the
+    /// gate ahead of this admitted its token as the pane's current
+    /// capability — Claude Code's background session host, whose tool shell
+    /// and hooks the deck's recorded agent did not start, is one. It takes
+    /// and settles mail on positive evidence, and registers a receiver under
+    /// an instance that is its own ancestry; another user is refused under
+    /// either evidence, even with the token.
     #[test]
-    fn a_mail_taker_must_prove_it_is_the_agents() {
-        // 1 ── 10 (agent) ── 11 (hook shell) ── 12 (hook CLI); 99 exited.
+    fn a_capability_holder_outside_the_tree_must_be_the_decks_user() {
+        // 1 ── 10 (agent, the deck's front end)
+        //  └── 30 (background host) ── 31 sh (tool shell) ── 32 CLI
+        //  └── 40 (another user's process)
         let parents = |pid: u32| match pid {
-            10 => Some(1),
-            11 => Some(10),
-            12 => Some(11),
+            10 | 30 | 40 => Some(1),
+            31 => Some(30),
+            32 => Some(31),
             _ => None,
         };
+        let executables = |pid: u32| {
+            Some(std::path::PathBuf::from(match pid {
+                10 | 30 => "/opt/claude",
+                31 => "/bin/sh",
+                32 => "/opt/dot-agent-deck",
+                _ => return None,
+            }))
+        };
         let descends = |pid, root| crate::platform::proc::descends_from_with(pid, root, parents);
-        let required = |peer, claimed, root| {
-            admit_component_process(peer, claimed, root, descends, Evidence::Required)
+        let admit = |peer, claimed, used_as, evidence| {
+            admit_component(
+                peer,
+                claimed,
+                Some(10),
+                used_as,
+                evidence,
+                descends,
+                parents,
+                executables,
+            )
         };
-        assert_eq!(required(Some(12), None, Some(10)), Ok(None));
-        assert_eq!(required(Some(12), Some(11), Some(10)), Ok(Some(11)));
-        assert_eq!(required(Some(10), None, Some(10)), Ok(None));
-        assert!(required(Some(99), None, Some(10)).is_err());
-        assert!(required(None, None, Some(10)).is_err());
-        assert!(required(Some(12), None, None).is_err());
-        assert!(required(Some(12), Some(98), Some(10)).is_err());
-        // The same callers under best effort, as the posting verbs see them.
-        let best_effort = |peer, claimed, root| {
-            admit_component_process(peer, claimed, root, descends, Evidence::BestEffort)
-        };
-        assert!(best_effort(Some(99), None, Some(10)).is_ok());
-        assert!(best_effort(None, None, Some(10)).is_ok());
-        assert!(best_effort(Some(12), None, None).is_ok());
+        use ComponentUse::{Cli, Receiver};
+        use Evidence::{BestEffort, Required};
+        for evidence in [Required, BestEffort] {
+            assert_eq!(admit(peer(32, Some(true)), None, Cli, evidence), Ok(None));
+            // The tool shell's receiver resolves through the shell to the host.
+            assert_eq!(
+                admit(peer(32, Some(true)), Some(31), Receiver, evidence),
+                Ok(Some(30))
+            );
+            for claimed in [None, Some(30)] {
+                let used_as = if claimed.is_some() { Receiver } else { Cli };
+                assert_eq!(
+                    admit(peer(40, Some(false)), claimed, used_as, evidence),
+                    Err(ComponentRefusal::OtherUser),
+                    "{evidence:?} {used_as:?}"
+                );
+                assert_eq!(
+                    admit(peer(32, Some(false)), claimed, used_as, evidence),
+                    Err(ComponentRefusal::OtherUser),
+                    "{evidence:?} {used_as:?}"
+                );
+            }
+            // Its own receiver, not the deck's agent nor another process's.
+            assert_eq!(
+                admit(peer(32, Some(true)), Some(10), Receiver, evidence),
+                Err(ComponentRefusal::NotCaller)
+            );
+            assert_eq!(
+                admit(peer(32, Some(true)), Some(40), Receiver, evidence),
+                Err(ComponentRefusal::NotCaller)
+            );
+            assert_eq!(
+                admit(peer(32, Some(true)), Some(1), Receiver, evidence),
+                Err(ComponentRefusal::NotCaller)
+            );
+        }
+        // The agent's own tree stays a member whatever the user reads.
+        assert_eq!(admit(peer(10, Some(false)), None, Cli, Required), Ok(None));
+        // No root to check against: the user alone decides.
+        assert_eq!(
+            admit_component(
+                peer(32, Some(true)),
+                None,
+                None,
+                Cli,
+                Required,
+                descends,
+                parents,
+                executables
+            ),
+            Ok(None)
+        );
+    }
+
+    /// Every refusal names its own cause, and a fixed message that says what
+    /// to do about it and echoes nothing the request carried.
+    #[test]
+    fn each_component_refusal_has_its_own_code_and_a_remedy() {
+        let all = [
+            ComponentRefusal::OtherUser,
+            ComponentRefusal::NotMember,
+            ComponentRefusal::Unidentified,
+            ComponentRefusal::NotCaller,
+            ComponentRefusal::NestedAgent,
+        ];
+        let codes: std::collections::HashSet<_> = all.iter().map(|r| r.code()).collect();
+        assert_eq!(codes.len(), all.len(), "one code per cause");
+        for refusal in all {
+            assert!(refusal.code().starts_with("inbox_"), "{refusal:?}");
+            assert!(
+                refusal.message().contains("; run "),
+                "{refusal:?} names a remedy: {}",
+                refusal.message()
+            );
+        }
     }
 
     /// PR #1735 third review (F2): a connection's creator exited and its pid
@@ -12459,14 +12691,17 @@ mod hook_ingestion_tests {
         let reused = AcceptedPeer {
             pid: 12,
             started: Some(1000),
+            same_user: Some(true),
         };
         let accepted = AcceptedPeer {
             pid: 12,
             started: Some(2000),
+            same_user: Some(true),
         };
         let unread_at_accept = AcceptedPeer {
             pid: 12,
             started: None,
+            same_user: Some(true),
         };
         for evidence in [Evidence::Required, Evidence::BestEffort] {
             for (used_as, claimed) in [
@@ -12475,7 +12710,7 @@ mod hook_ingestion_tests {
             ] {
                 assert_eq!(
                     admit(Some(reused), claimed, used_as, evidence),
-                    Err("the connecting process has exited, and its process id now names another"),
+                    Err(ComponentRefusal::Unidentified),
                     "{used_as:?} {evidence:?}"
                 );
                 assert_eq!(
@@ -12506,6 +12741,7 @@ mod hook_ingestion_tests {
         let gone = AcceptedPeer {
             pid: 12,
             started: Some(2000),
+            same_user: Some(true),
         };
         let without_12 = ProcessLookups {
             started: |pid| (pid != 12).then_some(1),
@@ -12578,17 +12814,23 @@ mod hook_ingestion_tests {
             Some(std::path::PathBuf::from(exe))
         };
         let descends = |pid, root| crate::platform::proc::descends_from_with(pid, root, parents);
-        let admit = |peer, claimed, root| {
-            admit_receiver_process(
-                peer,
-                claimed,
-                root,
-                descends,
-                parents,
-                executables,
-                Evidence::BestEffort,
-            )
-        };
+        let receiver =
+            |peer_pid: Option<u32>,
+             claimed,
+             root,
+             executables: &dyn Fn(u32) -> Option<std::path::PathBuf>| {
+                admit_component(
+                    peer_pid.and_then(|pid| peer(pid, None)),
+                    claimed,
+                    root,
+                    ComponentUse::Receiver,
+                    Evidence::BestEffort,
+                    descends,
+                    parents,
+                    executables,
+                )
+            };
+        let admit = |peer, claimed, root| receiver(peer, claimed, root, &executables);
 
         // The outer agent's hooks, each through its own shell, naming the
         // shell or the agent: all are the agent's one receiver.
@@ -12599,7 +12841,10 @@ mod hook_ingestion_tests {
         assert_eq!(admit(Some(23), Some(22), Some(20)), Ok(Some(22)));
         // The nested agent of the same kind naming the outer agent as its
         // instance is refused.
-        assert!(admit(Some(14), Some(10), Some(10)).is_err());
+        assert_eq!(
+            admit(Some(14), Some(10), Some(10)),
+            Err(ComponentRefusal::NestedAgent)
+        );
         // Naming its own shell, or itself, it is the nested agent's own
         // instance, which the pin refuses once the outer agent has armed or
         // announced (`InboxHub::arm`).
@@ -12610,27 +12855,11 @@ mod hook_ingestion_tests {
         assert_eq!(admit(Some(19), Some(11), Some(10)), Ok(Some(10)));
         // A walk that cannot say does not refuse, and pins what was named.
         assert_eq!(
-            admit_receiver_process(
-                Some(14),
-                Some(10),
-                Some(10),
-                descends,
-                parents,
-                |_| None,
-                Evidence::BestEffort
-            ),
+            receiver(Some(14), Some(10), Some(10), &|_| None),
             Ok(Some(10))
         );
         assert_eq!(
-            admit_receiver_process(
-                Some(16),
-                Some(15),
-                Some(10),
-                descends,
-                parents,
-                |_| None,
-                Evidence::BestEffort
-            ),
+            receiver(Some(16), Some(15), Some(10), &|_| None),
             Ok(Some(15))
         );
     }

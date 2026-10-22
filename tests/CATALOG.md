@@ -8563,16 +8563,16 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 - **Asserts:** get_seed without a token, with or without an agent id, gets no seed and the task stays Queued.
 - **Platform coverage:** mac+linux.
 
-##### inbox/protocol/014 — A process outside the agent cannot arm its inbox.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), daemon with component binding on, hook-socket wait and announce from the test process.
+##### inbox/protocol/014 — A process cannot register another process as the agent's receiver.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), daemon with its production admission on, hook-socket wait and announce from the test process.
 - **Agent:** none (`cat` stand-in).
-- **Asserts:** a stream, a once waiter and a Native announcement presenting the pane's token from outside the agent's process tree are each refused as `inbox_not_agent_process`; nothing arms and the task stays Queued.
+- **Asserts:** a stream, a once waiter and a Native announcement presenting the pane's token from outside the agent's process tree and naming the agent's own process as the receiver are each refused as `inbox_component_not_caller`, since that process is not the caller or one of its parents; nothing arms and the task stays Queued.
 - **Platform coverage:** mac+linux.
 
-##### inbox/protocol/015 — A process outside the agent cannot take its mail.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), daemon with component binding on, hook-socket fetch, ack and get_seed from the test process, then the real fetch CLI inside the pane.
-- **Agent:** none (shell stand-in that waits for a fixture sentinel before fetching).
-- **Asserts:** fetch with and without ack and ack presenting the pane's token from outside the agent's process tree are refused as `inbox_not_agent_process`, get_seed answers no seed, and the task stays Queued; the in-pane fetch then prints it and it is Acknowledged.
+##### inbox/protocol/015 — The pane's capability takes and settles its mail from outside the agent's tree.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), daemon with its production admission on, hook-socket fetch, ack and get_seed from the test process, running as the deck's user outside every pane.
+- **Agent:** none (`cat` stand-in).
+- **Asserts:** with the pane's current token, a fetch without ack hands the task over (Fetched), an explicit ack of its id is accepted (Acknowledged), and get_seed hands over a second task and acknowledges it (PRD #1666 part 3, R-1). The refusals of a wrong, missing or earlier capability are `inbox/protocol/022`.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/protocol/016 — A raw event from outside the agent acknowledges nothing.
@@ -8582,9 +8582,9 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 - **Platform coverage:** mac+linux.
 
 ##### inbox/protocol/017 — A connection of unknown ancestry cannot take mail.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), daemon with component binding on; each request goes over a connection a forked child made and then exited from, so its ancestry cannot be read.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), daemon with its production admission on; each request goes over a connection a forked child made and then exited from, so its ancestry cannot be read.
 - **Agent:** none (shell stand-in, `exec`'d as the pane's process, that runs the real `inbox wait --agent pi --stream` once a fixture sentinel appears).
-- **Asserts:** fetch, ack and a once waiter are refused as `inbox_not_agent_process`, get_seed answers no seed, a native announce naming the exited creator is refused as `inbox_not_agent_process` (PR #1735 third review, F1), and the task stays Queued; the in-pane stream waiter then still arms.
+- **Asserts:** fetch, ack and a once waiter are refused as `inbox_peer_unidentified`, get_seed answers no seed, a native announce naming the exited creator is refused as `inbox_peer_unidentified` (PR #1735 third review, F1), and the task stays Queued; the in-pane stream waiter then still arms.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/protocol/018 — A dispatch the deck has no room to answer is refused.
@@ -8597,7 +8597,7 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 - **Layer:** Fast tier (`tests/inbox_process_identity.rs`), the real binary as `daemon serve` with its production binding on; the pane's agent is `xargs`, a program that is not a shell as a real agent is not, running two `/bin/sh -c` hook children, each running the real CLI.
 - **Agent:** none (`xargs` stand-in).
 - **Asserts:** the first hook shell's `inbox announce --agent pi` is accepted (`inbox_list` reports `wake: native`), and the second hook shell's `inbox wait --agent pi --stream` is admitted as the same receiver and takes the queued task. Peer discovery, the parent walk, start times and shell resolution are the platform's own.
-- **Does not assert:** a real agent, Windows, or the refusals of an outside or exited peer (`inbox/protocol/015`–`017`).
+- **Does not assert:** a real agent, Windows, a helper outside the agent's tree (`inbox/protocol/021`), or the refusals of a wrong capability or an exited peer (`inbox/protocol/022`, `/017`).
 - **Platform coverage:** mac+linux; the reason it is in the fast tier is that CI's `build-macos` runs the fast tier.
 
 ##### inbox/protocol/020 — Inbox actions are withheld from a daemon that does not advertise them.
@@ -11439,11 +11439,11 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Does not assert:** Large spill files or invalid claim TTL parsing.
 - **Platform coverage:** mac+linux.
 
-##### inbox/publish/006 — An unrelated process cannot publish or offer with a copied agent capability.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_pubsub.rs`), real daemon with process binding enabled.
+##### inbox/publish/006 — Only the pane's own capability publishes or offers from outside it.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_pubsub.rs`), real daemon with its production admission on, requests from the test process outside every pane.
 - **Agent:** synthetic PTY recorders.
-- **Asserts:** Both publish and offer refuse an outside process with inbox_not_agent_process, mint no delivery and leave subscribers empty.
-- **Does not assert:** Complete/release process binding or platform process-table fallback.
+- **Asserts:** publish and offer naming the orchestrator's pane with a worker's capability are refused `token_names_another_pane`, mint no delivery and leave subscribers empty; with the orchestrator's current capability the same outside process publishes, and both subscribers receive it (PRD #1666 part 3, R-1: the capability and the deck's user make it a member of the pane).
+- **Does not assert:** Complete/release, another OS user (the `daemon.rs` unit test `a_capability_holder_outside_the_tree_must_be_the_decks_user`), or Windows, where the deck does not read the caller's user and the process tree still decides.
 - **Platform coverage:** mac+linux.
 
 #### inbox/offer
