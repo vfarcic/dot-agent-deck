@@ -837,6 +837,22 @@ describe("the pull request browser by voice (PRD #1401)", () => {
     expect(context.closeAgentView).not.toHaveBeenCalled();
   });
 
+  /**
+   * Scenario: issue #1709 — an upgrade dialog on top that cannot close while
+   * its upgrade runs answers why, and "close" says that sentence instead of
+   * closing the pane under it.
+   */
+  it("reports an overlay's refusal to close, and closes nothing else", async () => {
+    const { dispatchVoiceAction } = await vi.importActual<typeof import("./voiceActions")>("./voiceActions");
+    const context = { ...base(), closeOverlay: vi.fn(() => "The upgrade is still running.") };
+
+    dispatchVoiceAction("closeTopmost", context, { ...target, agentViewOpen: true });
+    expect(context.closeOverlay).toHaveBeenCalledTimes(1);
+    expect(context.reportRefused).toHaveBeenCalledWith("The upgrade is still running.");
+    expect(context.closeAgentView).not.toHaveBeenCalled();
+    expect(context.reportNothingToClose).not.toHaveBeenCalled();
+  });
+
   /** Scenario: "close" on the browser is reported once the page has closed, not when it was asked for. */
   it("reports the browser's close once it has happened", async () => {
     const { dispatchVoiceAction, PULL_REQUEST_CLOSED, PULL_REQUEST_CLOSING } = await vi.importActual<typeof import("./voiceActions")>("./voiceActions");
