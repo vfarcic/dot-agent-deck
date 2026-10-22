@@ -96,6 +96,22 @@ describe("terminal viewports across a deck restart that reuses an agent id", () 
     expect(screen.getByTestId("terminal-planner")).toHaveAttribute("data-incarnation", "process-b");
   });
 
+  /** Scenario: the user switches process A's Planner tile to its Diff tab; the deck restarts and lists an unrelated Planner under the same id. The successor's tile opens on its terminal, for process B, rather than on the tab chosen for its predecessor (Qodo on PR #1817, finding 21). A snapshot from the same process (control) keeps the chosen tab. */
+  it("opens the successor's tile on its terminal, not its predecessor's tab", async () => {
+    const deck = harness();
+    const { rerender } = render(<DeckShell runtime={deck.runtime("process-a")} initialView={{ kind: "deck" }} />);
+    await waitFor(() => expect(screen.getByTestId("terminal-planner")).toBeInTheDocument());
+    fireEvent.click(within(screen.getByTestId("agent-tile-planner")).getByRole("tab", { name: "Diff" }));
+    expect(screen.queryByTestId("terminal-planner")).toBeNull();
+
+    await act(async () => { rerender(<DeckShell runtime={deck.runtime("process-a")} initialView={{ kind: "deck" }} />); });
+    expect(screen.queryByTestId("terminal-planner"), "the same process keeps the chosen tab").toBeNull();
+
+    await act(async () => { rerender(<DeckShell runtime={deck.runtime("process-b")} initialView={{ kind: "deck" }} />); });
+    expect(screen.getByTestId("terminal-planner")).toHaveAttribute("data-incarnation", "process-b");
+    expect(deck.declared().filter((target) => target.agentId === "planner").at(-1)).toMatchObject({ incarnation: "process-b" });
+  });
+
   /** Scenario: after a restart the user opens the successor's Planner row from the overview. Its pane's terminal is mounted for process B, not for the process that listed the id before. */
   it("opens the successor's pane with a terminal for its own process", async () => {
     const deck = harness();

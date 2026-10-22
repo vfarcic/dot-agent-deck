@@ -1609,6 +1609,11 @@ export function ControlDeck(props: { runtime: DeckRuntimeState; orchestrationPla
   );
 }
 
+/** A deck tile's identity: its agent id with the daemon process that listed it (PRD #1666 part 2, G-fix7). */
+function tileKey(agent: { id: string; incarnation?: string }): string {
+  return `${agent.id}\u0000${agent.incarnation ?? ""}`;
+}
+
 export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = desktopOrchestrationPlatformIssue(), onNavigate, openAgent, onCloseAgent, voiceChannel, overlays: shellOverlays, onConfirmationChange, onPaneTabChange, restartNotice, onDismissRestartNotice }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; orchestrationPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgent?: { deckId: string; agentId: string; incarnation?: string }; onCloseAgent?: () => void; voiceChannel?: VoiceContextChannel; overlays?: ScreenOverlays; onConfirmationChange?: (open: boolean) => void; onPaneTabChange?: (tab: PanelTab) => void; restartNotice?: string; onDismissRestartNotice?: () => void }) {
   const { mode, setShownTerminals } = runtime;
   const keyboardInput = useKeyboardInput(runtime.sendTerminalInput);
@@ -1699,7 +1704,12 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
   useNumberedList("screen", numberedTileSections);
   const tileNumbers = useNumbersShown("screen") && numberedTiles !== undefined;
   const [selectedAgentId, setSelectedAgentId] = useState("");
+  /* Each tile's panel tab, keyed like its frame: by agent id AND daemon
+     process (Qodo on PR #1817, finding 21), so an unrelated agent a restarted
+     deck lists under the same id opens on its terminal, not on the tab chosen
+     for its predecessor. */
   const [tabs, setTabs] = useState<Record<string, PanelTab>>({});
+  const tabOf = (agent: { id: string; incarnation?: string } | undefined) => (agent ? tabs[tileKey(agent)] : undefined) ?? "terminal";
   const [selectedEvidenceId, setSelectedEvidenceId] = useState(""); // voice-registry-exempt: which evidence item the drawer shows — a selection within the drawer, which the drawer's rows and J/K set
   const [evidenceOpen, setEvidenceOpen] = useState(evidenceOpenOnFirstLoad);
   const projectsOpen = overlays.open.projects ?? false;
@@ -1741,7 +1751,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
   /* The tab the pane SHOWS, not the stored one: since issue #1400 a stored
      tab naming a hidden panel falls back to Terminal through `shownPanelTab`,
      and the voice gate must read what is on screen. */
-  const shownPaneTab = paneAgentId === undefined ? "terminal" : shownPanelTab(tabs[paneAgentId] ?? "terminal", features.showAgentDetails);
+  const shownPaneTab = paneAgentId === undefined ? "terminal" : shownPanelTab(tabOf(snapshot.agents.find((agent) => agent.id === paneAgentId)), features.showAgentDetails);
   useEffect(() => { paneTabChanged.current?.(shownPaneTab); }, [shownPaneTab]);
   useEffect(() => () => { paneTabChanged.current?.("terminal"); }, []);
   const { profiles, updateProfile, resetProfiles } = useAgentProfiles(snapshot.profiles);
@@ -1907,7 +1917,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
    * since issue #1400, the tile's own `shownPanelTab` fallback with it.
    */
   const shownTerminals = snapshot.agents
-    .filter((agent) => shownPanelTab(tabs[agent.id] ?? "terminal", features.showAgentDetails) === "terminal")
+    .filter((agent) => shownPanelTab(tabOf(agent), features.showAgentDetails) === "terminal")
     /* The agent's OWN deck, which on this screen is always the selected one —
        written as the agent's rather than read off the connection so the
        declaration cannot drift from what the tile actually mounted. */
@@ -2045,7 +2055,8 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
      */
     focusTerminal: (agentId) => {
       setSelectedAgentId(agentId);
-      setTabs((current) => ({ ...current, [agentId]: "terminal" }));
+      const agent = snapshot.agents.find((candidate) => candidate.id === agentId);
+      if (agent) setTabs((current) => ({ ...current, [tileKey(agent)]: "terminal" }));
       setTerminalFocus((current) => ({ agentId, token: (current?.token ?? 0) + 1 }));
     },
     advanceFixture: () => { void perform({ type: "advance_fixture" }); },
@@ -2548,14 +2559,14 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
                      restarted deck's agent under the same id is a different
                      agent, so it gets a fresh frame and terminal rather than
                      inheriting the previous process's. */
-                  key={`${agent.id}\u0000${agent.incarnation ?? ""}`}
+                  key={tileKey(agent)}
                   open={agent.id === paneAgentId}
                   panePresent={paneAgentId !== undefined}
                   agent={agent}
                   showDetails={features.showAgentDetails}
                   mode={mode}
                   selected={agent.id === selectedAgentId}
-                  tab={tabs[agent.id] ?? "terminal"}
+                  tab={tabOf(agent)}
                   terminalFeed={runtime.terminalFeed}
                   evidence={snapshot.evidence}
                   terminalFocusToken={terminalFocus?.agentId === agent.id ? terminalFocus.token : 0}
@@ -2563,7 +2574,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
                   offPage={tilesPaged && (index < tileSlice.start || index >= tileSlice.end)}
                   onSelect={() => VOICE_ACTIONS.focusAgent.run(voiceContext, { agentId: agent.id })}
                   // voice-registry-exempt: a tile's own tab strip, a control inside one tile; `focusTerminal` writes the same map only to show the terminal it focuses
-                  onTabChange={(tab) => setTabs((current) => ({ ...current, [agent.id]: tab }))}
+                  onTabChange={(tab) => setTabs((current) => ({ ...current, [tileKey(agent)]: tab }))}
                   onTerminalInput={keyboardInput}
                   onTerminalResize={runtime.resizeTerminal}
                   appliedGeometry={runtime.appliedGeometry?.[boundAgentKey({ deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation })]}
