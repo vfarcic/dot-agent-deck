@@ -1609,9 +1609,9 @@ export function ControlDeck(props: { runtime: DeckRuntimeState; orchestrationPla
   );
 }
 
-/** A deck tile's identity: its agent id with the daemon process that listed it (PRD #1666 part 2, G-fix7). */
-function tileKey(agent: { id: string; incarnation?: string }): string {
-  return `${agent.id}\u0000${agent.incarnation ?? ""}`;
+/** A deck tile's identity: its deck, agent id and the daemon process that listed it. */
+function tileKey(agent: { daemonId: string; id: string; incarnation?: string }): string {
+  return `${agent.daemonId}\u0000${agent.id}\u0000${agent.incarnation ?? ""}`;
 }
 
 export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = desktopOrchestrationPlatformIssue(), onNavigate, openAgent, onCloseAgent, voiceChannel, overlays: shellOverlays, onConfirmationChange, onPaneTabChange, restartNotice, onDismissRestartNotice }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; orchestrationPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgent?: { deckId: string; agentId: string; incarnation?: string }; onCloseAgent?: () => void; voiceChannel?: VoiceContextChannel; overlays?: ScreenOverlays; onConfirmationChange?: (open: boolean) => void; onPaneTabChange?: (tab: PanelTab) => void; restartNotice?: string; onDismissRestartNotice?: () => void }) {
@@ -1709,7 +1709,25 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
      deck lists under the same id opens on its terminal, not on the tab chosen
      for its predecessor. */
   const [tabs, setTabs] = useState<Record<string, PanelTab>>({});
-  const tabOf = (agent: { id: string; incarnation?: string } | undefined) => (agent ? tabs[tileKey(agent)] : undefined) ?? "terminal";
+  const tabOf = (agent: { daemonId: string; id: string; incarnation?: string } | undefined) => (agent ? tabs[tileKey(agent)] : undefined) ?? "terminal";
+  // A connected listing names the current process even when it lists nobody.
+  // Forget that deck's retired choices; a disconnect or an unnamed listing
+  // does not establish a successor, so keep its choices until one is known.
+  useEffect(() => {
+    const processes = new Map(runtime.fleet.flatMap((deck) => deck.connection.status === "connected" && deck.connection.deckId !== undefined && deck.connection.incarnation !== undefined
+      ? [[deck.connection.deckId, deck.connection.incarnation] as const]
+      : []));
+    // voice-registry-exempt: a lifecycle invariant that forgets retired processes, not a tab-selection control
+    setTabs((current) => {
+      const entries = Object.entries(current);
+      const kept = entries.filter(([key]) => {
+        const [deckId, , incarnation] = key.split("\u0000");
+        const process = processes.get(deckId);
+        return process === undefined || process === incarnation;
+      });
+      return kept.length === entries.length ? current : Object.fromEntries(kept);
+    });
+  }, [runtime.fleet]);
   const [selectedEvidenceId, setSelectedEvidenceId] = useState(""); // voice-registry-exempt: which evidence item the drawer shows — a selection within the drawer, which the drawer's rows and J/K set
   const [evidenceOpen, setEvidenceOpen] = useState(evidenceOpenOnFirstLoad);
   const projectsOpen = overlays.open.projects ?? false;
