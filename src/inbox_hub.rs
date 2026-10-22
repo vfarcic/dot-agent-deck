@@ -500,8 +500,8 @@ struct HubState {
     owed_card_notices: Vec<crate::agent_pty::DeliveryNotice>,
     /// PRD #1666 long-turn delivery: messages that ran out of hand-overs, by
     /// message id and recipient pane, with whoever was told — bounded by
-    /// [`LATE_ACK_MAX_RECORDS`] and [`LATE_ACK_MEMORY`]. A late ack takes its
-    /// record and corrects them ([`settle_late_ack`]).
+    /// [`LATE_ACK_MAX_RECORDS`] and [`LATE_ACK_MEMORY`]. A late ack that finds
+    /// its record takes it and can correct them ([`settle_late_ack`]).
     late_acks: HashMap<(String, String), LateAck>,
     /// PRD #1666 §13 step 4: the receipt engine's generations, floors and
     /// pending spool work ([`engine`]).
@@ -4206,8 +4206,9 @@ fn settle_delegate(st: &mut HubState, event: &InboxEvent) {
     if end != DelegateEnd::Ended {
         // PRD #1666 long-turn delivery: its orchestrator was told the task
         // has not reached the worker, and it has. A task that ran out of
-        // hand-overs first has no watch left here; its late ack is corrected
-        // by [`settle_late_ack`] instead, so each task is corrected once.
+        // hand-overs first has no watch left here; its late ack can be
+        // corrected by [`settle_late_ack`] instead, while its late-ack record
+        // is retained, so each task is corrected at most once.
         if watch.notified
             && let Some(to) = watch.orchestrator
         {
@@ -4377,8 +4378,9 @@ fn remember_cancelled_task(st: &mut HubState, id: &str, to: Recipient, role: &st
 /// `max_deliver` hand-overs was acknowledged after all ([`Inbox::ack`] records
 /// the late ack). While its record is still held, the orchestrator told it
 /// was undeliverable gets a correction, the worker counts as having received a task
-/// (`received_since_done`), and the recipient's card is cleared once no other
-/// message it was told about is still owed a correction.
+/// (`received_since_done`), and a card the deck told can be cleared, once no
+/// other message it was told about is still owed a correction. Without the
+/// record, this function does none of these.
 fn settle_late_ack(st: &mut HubState, event: &InboxEvent) {
     if event.state != StateName::Acknowledged {
         return;

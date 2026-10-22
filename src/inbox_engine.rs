@@ -286,8 +286,8 @@ pub(super) struct Gen {
     /// §7: hand-outs are paused for room in the evidence store.
     pub(super) paused: bool,
     /// Delegated tasks whose orchestrator was told their delivery is
-    /// uncertain (§6.6), so a later commit corrects it once while the task's
-    /// delegate watch remains. An id goes when the watch does
+    /// uncertain (§6.6), so a later commit can correct it, at most once, while
+    /// the task's delegate watch remains. An id goes when the watch does
     /// ([`forget_uncertain`]): a delegation with `--supersede` that retires it
     /// ends the watch-based route, leaving a later commit only a retained
     /// cancelled-task record to correct through, if the task has one.
