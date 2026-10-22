@@ -8,7 +8,7 @@ user-invocable: true
 
 ## Instructions
 
-You are helping create a Product Requirements Document (PRD) for a new feature. **In this repository the PRD is its GitHub issue**: the issue body is the project management document — milestone tracking and implementation plan — and its comments are the record of progress and decisions. Nothing is written under `prds/` and nothing is committed (issue #1591).
+You are helping create a Product Requirements Document (PRD) for a new feature. **In this repository the PRD is its GitHub issue**: the issue body is the project management document — milestone tracking and the plan, written as what changes for the user rather than where in the code — and its comments are the record of progress and decisions. Nothing is written under `prds/` and nothing is committed (issue #1591).
 
 The layout of an issue PRD — what goes in the body, what goes in comments, how to edit the body without losing someone else's edit — is in [`../prd-start/issue-prd.md`](../prd-start/issue-prd.md); read it before writing the body. Older PRDs that already have a `prds/<n>-*.md` file keep it; this skill never creates one.
 
@@ -31,6 +31,8 @@ Work through the template sections below with the user, then write the result as
 Work through the PRD template focusing on project management, milestone tracking, and implementation planning. Documentation updates should be included as part of the implementation milestones.
 
 **Key Principle**: Focus on 5-10 major milestones rather than exhaustive task lists. Each milestone should represent meaningful progress that can be clearly validated.
+
+**What, not where**: the body says what changes for the user and why, not where in the code. Write no file paths, type or function names, code snippets or line numbers, except names the user sees (a CLI flag, a config key, a command) and constraints the PRD exists to enforce (e.g. "no `PROTOCOL_VERSION` bump"). Decisions keep their rationale. Code-level detail written now goes stale before anyone implements it, and the agent that starts the PRD reads the code anyway; notes on what was built and where belong later, in `### PRD progress` comments ([`issue-prd.md`](../prd-start/issue-prd.md), "The body").
 
 **Consider Including** (when applicable to the project/feature):
 - **Tests** - If the project has tests, include a milestone for test coverage of new functionality

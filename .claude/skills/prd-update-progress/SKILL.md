@@ -234,13 +234,15 @@ When applying updates:
 **For a file PRD**, edit the file; Step 8 commits it with the work.
 
 **For an issue PRD**, follow [`../prd-start/issue-prd.md`](../prd-start/issue-prd.md):
-1. **Tick the confirmed checkboxes in the body** — fetch it immediately before editing, change only those checkboxes (and any section a divergence in Step 5 changes), and write it back with `--body-file` ("Editing the body").
+1. **Tick the confirmed checkboxes in the body** — fetch it immediately before editing, change only those checkboxes (and any section a divergence in Step 5 changes, described by what changes for the user rather than where in the code), and write it back with `--body-file` ("Editing the body").
 2. **Post one progress comment** — `### PRD progress — YYYY-MM-DD`, carrying the completed items with their evidence (commits, files, tests named), the remaining work, and the completion status from Step 4. This is the record a file PRD kept in its own text; as a comment it cannot overwrite another agent's.
 3. **Record a divergence as a decision** — a `### PRD decision` comment, as `/prd-update-decisions` does, rather than only a line in the progress note.
 
 ## Step 7.5: Code Example Validation
 
-When updating PRDs based on implementation progress:
+**For an issue PRD, skip this step**: its body carries no code examples to validate ([`../prd-start/issue-prd.md`](../prd-start/issue-prd.md), "The body"), and what was built and where goes in Step 7's progress comment, not in the body.
+
+When updating a file PRD based on implementation progress:
 
 **CRITICAL**: Always check if code examples in PRD match current implementation
 
