@@ -82,7 +82,6 @@ The deck's runs appear in a dataset named `dot-agent-deck` (or your `OTEL_SERVIC
 - `WHERE name = agent.run`, `GROUP BY deck.role`, `VISUALIZE AVG(deck.interventions.count)` — which roles need you most.
 - `WHERE name = agent.status AND deck.status = blocked`, `GROUP BY host.name`, `VISUALIZE SUM(duration_ms)` — time spent waiting on a permission prompt, per machine.
 - `WHERE name = agent.operation`, `GROUP BY deck.operation.program, deck.operation.word`, `VISUALIZE SUM(duration_ms)` — where agents' shell time goes, for example how much of it `cargo test` takes against `cargo build`.
-- `WHERE name = agent.operation AND deck.operation.outcome = failure`, `GROUP BY deck.operation.program, deck.operation.word`, `VISUALIZE COUNT` — which commands fail most, for the agents that report failed commands ([`agent.operation`](#agentoperation)).
 - `WHERE name = agent.ci AND deck.ci.result exists`, `GROUP BY deck.ci.result`, `VISUALIZE HEATMAP(duration_ms)` — how long CI takes on the pull requests agents open; compare two periods to see what a change to your CI setup did.
 
 To see everything one run did, take its `deck.run.id` from an `agent.run` span and query all datasets in the environment with `WHERE deck.run.id = <that id>`: the deck's spans and the agent's own events come back together.
@@ -148,22 +147,21 @@ One span per shell command the agent ran, from when the agent started it to when
 | --- | --- |
 | `deck.operation.program` | The program the command runs, without its directory: `cargo`, `npm`, `gh`. |
 | `deck.operation.word` | The first argument after the program that is not an option: `test` in `cargo test --workspace`, `pr` in `gh pr checks`. |
-| `deck.operation.outcome` | `failure` when the agent reported that the command failed. Absent otherwise, including when the command was still running as its run ended. Absent does not mean the command succeeded: not every agent tells the deck when a command fails (see the table below). `success` is for an agent that reports every failed command, and none does yet, so it is not sent. |
 | `deck.run.id`, `deck.pane.id` | The run, as on `agent.status`. |
 
 The deck reads the first line of the command, up to a shell comment (`# …`), which it never reads. When it chains several commands, the first one that does more than set up the next is the one described: `cd`, `export`, `source`, `.`, `set` and `true` are skipped, and so are `VAR=value` assignments and an `env`, `sudo`, `command`, `time` or `nice` in front of the program, with their options and the options' values (`time -f '%e' cargo test` is `cargo test`). When the deck does not know one of those options, as with `env -S`, it sends no program and no word for that command, only the span and its duration. A command run through `sh -c` or `bash -c` is described by the script it runs, not by the arguments after the script, and a quoted argument stays one argument, so `cargo 'two words'` sends no word. A shell reading its script from standard input, as `bash -s`, sends only its own name, and when the program itself is not sent, its word is not sent either.
 
 The program and the word are each sent **only when they look like a command word**: lowercase letters, digits, `.`, `_` and `-`, starting with a letter or digit, and at most 32 characters. A path, a URL, a quoted message, anything with an uppercase letter, an `=` or a space, or anything longer is left out. That shape does not make a word safe: a short lowercase password, file name or host name has it too. So for programs whose arguments are usually text, patterns, files, hosts or credentials — `echo`, `printf`, `cat`, `grep`, `rg`, `sed`, `awk`, `curl`, `wget`, `redis-cli`, `base64`, `head`, `tail`, `xargs`, `ssh`, `scp`, `sftp` and `rsync` — the word is never sent, only the program. For any other program the word is its first argument that is not an option, which can be an option's value (`mysql -u admin` sends `admin`); if your agents run programs whose first argument can be private, drop `deck.operation.word` in a Collector ([Trim what is sent](#trim-what-is-sent)).
 
-Which agents report their shell commands, and which report a failed one:
+Which agents report their shell commands:
 
-| Agent | Shell commands become `agent.operation` spans | A failed command is marked `failure` |
-| --- | --- | --- |
-| Claude Code | Yes, its `Bash` tool. | No. Claude Code does not tell the deck when a command fails, so its operations carry no outcome, and the span of a failed command can last until the run ends. |
-| OpenCode | Yes, its `bash` tool. | No. OpenCode does not tell the deck whether a command failed. |
-| Codex | Yes, its shell tool, through the hooks the deck installs for Codex. Codex reports the command as its arguments joined with spaces, which loses where each argument ends, so for Codex the deck sends the program only, never a word, and no program either when it is not certain which word is the program (for example when the command starts with `cd`, a `VAR=value`, `env` or another shell). | Yes, when Codex's report of the command gives its non-zero exit code. A command Codex reports another way carries no outcome, even when it failed. |
-| Devin | Yes, its `exec` tool. | Not confirmed. The deck reads Devin's report of a command the way it reads Codex's, which has not been checked against a signed-in Devin. |
-| Pi | Yes, its `bash` tool, through the deck's Pi extension. | No. Pi does not tell the deck whether a command failed; Pi's own telemetry, which the deck's Pi extension sends, says whether each tool call succeeded ([Pi](#pi)). |
+| Agent | Shell commands become `agent.operation` spans |
+| --- | --- |
+| Claude Code | Yes, its `Bash` tool. |
+| OpenCode | Yes, its `bash` tool. |
+| Codex | Yes, its shell tool, through the hooks the deck installs for Codex. Codex reports the command as its arguments joined with spaces, which loses where each argument ends, so for Codex the deck sends the program only, never a word, and no program either when it is not certain which word is the program (for example when the command starts with `cd`, a `VAR=value`, `env` or another shell). |
+| Devin | Yes, its `exec` tool. |
+| Pi | Yes, its `bash` tool, through the deck's Pi extension. |
 
 ### `agent.ci`
 
@@ -188,7 +186,7 @@ The deck builds what it sends from the attributes on this page. The values of `O
 - secrets: API keys, the values of environment variables, and the values of your OTLP headers (those go to the endpoint you configured as headers, and to nothing else, and the deck does not write them to its log);
 - pane titles, status details, branch names, working-directory paths, remote URLs, or command lines.
 
-**The one exception for command lines** is what [`agent.operation`](#agentoperation) describes: for each shell command, the name of the program and its first argument (for Codex, the program only). The program and the argument are sent only when they have the shape of a command word (lowercase letters, digits, `.`, `_` and `-`, at most 32 characters), and the first argument of `echo`, `printf`, `cat`, `grep`, `rg`, `sed`, `awk`, `curl`, `wget`, `redis-cli`, `base64`, `head`, `tail`, `xargs`, `ssh`, `scp`, `sftp` and `rsync` is never sent. Whether the command failed is sent where the agent reports it, but never its exit code or its output. Nothing else from the command is sent, and the deck's telemetry does not log it. To drop even these, delete the `agent.operation` spans in a Collector ([Trim what is sent](#trim-what-is-sent)).
+**The one exception for command lines** is what [`agent.operation`](#agentoperation) describes: for each shell command, the name of the program and its first argument (for Codex, the program only). The program and the argument are sent only when they have the shape of a command word (lowercase letters, digits, `.`, `_` and `-`, at most 32 characters), and the first argument of `echo`, `printf`, `cat`, `grep`, `rg`, `sed`, `awk`, `curl`, `wget`, `redis-cli`, `base64`, `head`, `tail`, `xargs`, `ssh`, `scp`, `sftp` and `rsync` is never sent. Nothing else from the command is sent, and the deck's telemetry does not log it. To drop even these, delete the `agent.operation` spans in a Collector ([Trim what is sent](#trim-what-is-sent)).
 
 This covers what the **deck** sends to your backend. The deck's own log on your machine, when you turn it on, is separate from telemetry: it can record details of agents' tool calls, such as the first line of a command an agent ran ([Enabling Debug Logs](troubleshooting.md#enabling-debug-logs)). What an agent sends with its own telemetry is decided by that agent and its settings; see the next section.
 

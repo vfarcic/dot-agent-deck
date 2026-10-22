@@ -24,11 +24,7 @@
 //! as the event arrives ([`super::operation::classify_tool`]) and only the
 //! classification is kept: the copy of the event the tracker holds — in a
 //! run's cards, or waiting for its run to open — has the tool's detail and the
-//! command taken out. The operation says whether the command succeeded when
-//! its end proves it ([`super::operation::outcome`]): a failed call's `Error`
-//! ends it as a failure, which is only an operation's end, not a second status
-//! change; an operation ended any other way — its run ending, or the cap on
-//! open ones — says nothing.
+//! command taken out.
 //!
 //! **A run is prepared before its agent starts.** [`RunTracker::prepare_run`]
 //! is called before the agent process exists, so no event the agent causes can
@@ -51,9 +47,7 @@ use crate::event::{AgentEvent, AgentType, DAEMON_PANE_CLOSED_METADATA_KEY, Event
 use crate::state::{AppState, SessionStatus};
 
 use super::ci::{CiEffect, RunCi};
-use super::operation::{
-    Operation, Outcome, classify_tool, end_means_success, is_shell_tool, outcome,
-};
+use super::operation::{Operation, classify_tool, is_shell_tool};
 use super::run_context::RunContext;
 use super::span::{
     Attribute, SpanEventRecord, SpanId, SpanRecord, TraceId, new_span_id, new_trace_id,
@@ -693,7 +687,7 @@ impl RunTracker {
             self.finished.push(status_span(&run, open, now));
         }
         for open in std::mem::take(&mut run.operations) {
-            self.finished.push(operation_span(&run, open, None, now));
+            self.finished.push(operation_span(&run, open, now));
         }
         if let Some(effect) = run.ci.end_run() {
             record_ci(&mut run, effect, now, &mut self.finished);
@@ -772,7 +766,7 @@ impl RunTracker {
 /// an agent may name the call on its end only. An id seen before (a repeated
 /// end, the end of a call the cap ended, a start's id whose operation is gone)
 /// ends nothing. An end naming no call ends the oldest. A failed call ends as
-/// an `Error` event, which ends it the same way, as a failure.
+/// an `Error` event, which ends it the same way.
 fn observe_operation(
     run: &mut ActiveRun,
     kept: &KeptEvent,
@@ -792,7 +786,7 @@ fn observe_operation(
         EventType::ToolStart => {
             if run.operations.len() >= MAX_OPEN_OPERATIONS {
                 let oldest = run.operations.remove(0);
-                finished.push(operation_span(run, oldest, None, now));
+                finished.push(operation_span(run, oldest, now));
             }
             run.operations_count += 1;
             run.operations.push(OpenOperation {
@@ -820,10 +814,7 @@ fn observe_operation(
             };
             if let Some(i) = i {
                 let open = run.operations.remove(i);
-                // The agent that reported the end, not the one the run started
-                // as: it is the reporting path that decides what an end means.
-                let outcome = outcome(&event.event_type, end_means_success(&event.agent_type));
-                finished.push(operation_span(run, open, outcome, now));
+                finished.push(operation_span(run, open, now));
             }
         }
         _ => {}
@@ -995,12 +986,7 @@ fn status_span(run: &ActiveRun, open: OpenStatus, now: u64) -> SpanRecord {
     }
 }
 
-fn operation_span(
-    run: &ActiveRun,
-    open: OpenOperation,
-    outcome: Option<Outcome>,
-    now: u64,
-) -> SpanRecord {
+fn operation_span(run: &ActiveRun, open: OpenOperation, now: u64) -> SpanRecord {
     let mut attributes = identity_attributes(&run.start_info);
     attributes.extend(Attribute::opt_str(
         AttrKey::OperationProgram,
@@ -1009,10 +995,6 @@ fn operation_span(
     attributes.extend(Attribute::opt_str(
         AttrKey::OperationWord,
         open.operation.word.as_deref(),
-    ));
-    attributes.extend(Attribute::opt_str(
-        AttrKey::OperationOutcome,
-        outcome.map(Outcome::as_str),
     ));
     SpanRecord {
         trace_id: run.trace_id,
@@ -1934,15 +1916,7 @@ pub(crate) mod tests {
             vec![
                 (op_attrs(Some("rwx"), Some("sandbox")), 11, 13),
                 (op_attrs(Some("cargo"), Some("test")), 10, 15),
-                (
-                    [
-                        op_attrs(Some("echo"), None),
-                        vec![Attribute::str(AttrKey::OperationOutcome, "failure")],
-                    ]
-                    .concat(),
-                    16,
-                    17
-                ),
+                (op_attrs(Some("echo"), None), 16, 17),
                 (op_attrs(Some("cargo"), None), 18, 100),
             ]
         );
@@ -1959,115 +1933,6 @@ pub(crate) mod tests {
             attr(run, AttrKey::OperationsCount),
             Some(&AttrValue::Int(4))
         );
-    }
-
-    fn outcome_of(span: &SpanRecord) -> Option<&AttrValue> {
-        attr(span, AttrKey::OperationOutcome)
-    }
-
-    /// A failed call's `Error` ends its own operation as a failure, matched by
-    /// call id as a plain end is, and counts as no second operation; a plain
-    /// end from any agent says nothing, since no agent's failed commands all
-    /// reach the deck; and an operation its run ends, or the cap ends, says
-    /// nothing either. Only the program and word are kept of the command.
-    #[test]
-    fn an_operation_says_whether_its_command_failed_only_when_its_end_proves_it() {
-        for agent in [
-            AgentType::ClaudeCode,
-            AgentType::Codex,
-            AgentType::Devin,
-            AgentType::OpenCode,
-            AgentType::Pi,
-        ] {
-            let mut tracker = RunTracker::new();
-            tracker.begin_run(start("p1"), 0);
-            let call = |event_type, command: Option<&str>, call: &str| {
-                let mut e = shell("p1", event_type, "Bash", command, Some(call));
-                e.agent_type = agent.clone();
-                e
-            };
-            tracker.observe_event(&call(EventType::ToolStart, Some("make ok"), "ok"), 1);
-            tracker.observe_event(&call(EventType::ToolStart, Some("make bad"), "bad"), 2);
-            tracker.observe_event(&call(EventType::ToolStart, Some("make cut"), "cut"), 3);
-            // The failure names its own call, not the oldest open one.
-            tracker.observe_event(&call(EventType::Error, None, "bad"), 4);
-            tracker.observe_event(&call(EventType::ToolEnd, None, "ok"), 5);
-            tracker.end_run("p1", EndReason::Exited, None, 9);
-            let spans = tracker.take_finished();
-            let by_word = |word: &str| {
-                spans
-                    .iter()
-                    .find(|s| {
-                        s.name == SPAN_AGENT_OPERATION
-                            && attr(s, AttrKey::OperationWord) == Some(&AttrValue::Str(word.into()))
-                    })
-                    .unwrap_or_else(|| panic!("{agent:?}: an operation for {word}"))
-            };
-            let bad = by_word("bad");
-            assert_eq!(
-                outcome_of(bad),
-                Some(&AttrValue::Str("failure".into())),
-                "{agent:?}"
-            );
-            assert_eq!(
-                (bad.start_unix_nanos, bad.end_unix_nanos),
-                (2, 4),
-                "{agent:?}"
-            );
-            assert_eq!(outcome_of(by_word("ok")), None, "{agent:?}");
-            assert_eq!(by_word("ok").end_unix_nanos, 5, "{agent:?}");
-            let cut = by_word("cut");
-            assert_eq!(outcome_of(cut), None, "{agent:?}: ended by its run");
-            assert_eq!(cut.end_unix_nanos, 9, "{agent:?}");
-            assert_eq!(
-                attr(run_span_of(&spans), AttrKey::OperationsCount),
-                Some(&AttrValue::Int(3)),
-                "{agent:?}"
-            );
-        }
-
-        // An operation the cap on open ones ends says nothing.
-        let mut tracker = RunTracker::new();
-        tracker.begin_run(start("p1"), 0);
-        for i in 0..=MAX_OPEN_OPERATIONS as u64 {
-            tracker.observe_event(
-                &shell("p1", EventType::ToolStart, "Bash", Some("make"), None),
-                1 + i,
-            );
-        }
-        let evicted = tracker.take_finished();
-        assert_eq!(operations(&evicted).len(), 1);
-        assert_eq!(outcome_of(&evicted[0]), None);
-    }
-
-    /// A failed call's `Error` moves the card to Error exactly as before: one
-    /// status change, whether or not a shell operation was open for it.
-    #[test]
-    fn a_failed_call_is_one_status_change() {
-        let changes = |with_start: bool| {
-            let mut tracker = RunTracker::new();
-            tracker.begin_run(start("p1"), 0);
-            tracker.observe_event(&event("p1", EventType::SessionStart), 1);
-            if with_start {
-                tracker.observe_event(
-                    &shell("p1", EventType::ToolStart, "Bash", Some("make"), Some("c")),
-                    2,
-                );
-            } else {
-                tracker.observe_event(
-                    &shell("p1", EventType::ToolStart, "Read", Some("f"), Some("c")),
-                    2,
-                );
-            }
-            tracker.observe_event(&shell("p1", EventType::Error, "Bash", None, Some("c")), 3);
-            tracker.end_run("p1", EndReason::Exited, None, 4);
-            let spans = tracker.take_finished();
-            (
-                attr(run_span_of(&spans), AttrKey::StatusChangesCount).cloned(),
-                statuses(&spans),
-            )
-        };
-        assert_eq!(changes(true), changes(false));
     }
 
     /// An end naming a call ends that call's operation and no other: a

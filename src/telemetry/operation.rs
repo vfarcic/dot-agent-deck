@@ -26,14 +26,6 @@
 //! ([`SETUP_PROGRAMS`]) is the one classified — after its leading `VAR=value`
 //! assignments and an `env`, `sudo`, `command`, `time` or `nice` in front,
 //! with their options and the options' values.
-//!
-//! **Whether the command succeeded** is read from how its call ended
-//! ([`outcome`]), never from what it printed: a failed call is reported as the
-//! `Error` that replaces its `ToolEnd`, and a plain end counts as a success
-//! only for an agent whose failed calls all reach the deck that way
-//! ([`end_means_success`]). Its exit code and output are not kept.
-
-use crate::event::{AgentType, EventType};
 
 /// What [`classify`] keeps of a command.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -74,57 +66,6 @@ pub fn classify_tool(tool_name: Option<&str>, command: Option<&str>) -> Operatio
         classify_joined_argv(command)
     } else {
         classify(command)
-    }
-}
-
-/// Whether a shell command succeeded, as its end reported it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Outcome {
-    Success,
-    Failure,
-}
-
-impl Outcome {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Outcome::Success => "success",
-            Outcome::Failure => "failure",
-        }
-    }
-}
-
-/// The outcome a shell call's end gives its operation. A failed call ends as
-/// the `Error` the hook makes of a `PostToolUse` whose response reports a
-/// failure, which is a failure from any agent. A plain end is a success only
-/// when `end_means_success` ([`end_means_success`]); otherwise nothing is
-/// known.
-pub fn outcome(end: &EventType, end_means_success: bool) -> Option<Outcome> {
-    match end {
-        EventType::Error => Some(Outcome::Failure),
-        EventType::ToolEnd if end_means_success => Some(Outcome::Success),
-        _ => None,
-    }
-}
-
-/// Whether a plain end of `agent`'s shell call means the command succeeded:
-/// only where every failed command reaches the deck as a failure, so a plain
-/// end cannot be one the deck was not told about. No agent's path does that
-/// today.
-pub fn end_means_success(agent: &AgentType) -> bool {
-    match agent {
-        // A failed Bash call fires `PostToolUseFailure` instead of
-        // `PostToolUse` (measured on Claude Code 2.1.308), and the deck does
-        // not install that hook: the failure never reaches it.
-        AgentType::ClaudeCode => false,
-        // Only a response with an `Exit code: <n>` line reads as a failure;
-        // Codex's unified exec reports `Process exited with code <n>`, and its
-        // code-mode `exec` runs several commands in one call.
-        AgentType::Codex => false,
-        // The hook reads Devin's response the way it reads Codex's, but
-        // Devin's real failed-command response has not been measured.
-        AgentType::Devin => false,
-        // Their tool end carries no result at all.
-        AgentType::OpenCode | AgentType::Pi | AgentType::None => false,
     }
 }
 
@@ -1020,36 +961,5 @@ mod tests {
             assert!(!is_shell_tool(Some(name)), "{name}");
         }
         assert!(!is_shell_tool(None));
-    }
-
-    /// A failed call is a failure from any agent; a plain end is a success
-    /// only where it is known to mean one; any other end says nothing.
-    #[test]
-    fn an_end_gives_the_outcome_it_proves() {
-        for known in [true, false] {
-            assert_eq!(outcome(&EventType::Error, known), Some(Outcome::Failure));
-            assert_eq!(outcome(&EventType::SessionEnd, known), None);
-            assert_eq!(outcome(&EventType::ToolStart, known), None);
-        }
-        assert_eq!(outcome(&EventType::ToolEnd, true), Some(Outcome::Success));
-        assert_eq!(outcome(&EventType::ToolEnd, false), None);
-        assert_eq!(Outcome::Success.as_str(), "success");
-        assert_eq!(Outcome::Failure.as_str(), "failure");
-    }
-
-    /// No agent's plain end is read as a success: each one's failed command
-    /// can end without the deck being told it failed.
-    #[test]
-    fn no_agents_plain_end_is_a_success() {
-        for agent in [
-            AgentType::ClaudeCode,
-            AgentType::Codex,
-            AgentType::Devin,
-            AgentType::OpenCode,
-            AgentType::Pi,
-            AgentType::None,
-        ] {
-            assert!(!end_means_success(&agent), "{agent:?}");
-        }
     }
 }

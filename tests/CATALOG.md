@@ -115,9 +115,9 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 
 ##### telemetry/otlp/014 — Shell operation metadata classifies safe command shapes without exporting content.
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
-- **Agent:** shell/cat stand-in with synthetic shell-tool and Read hooks, plus two Codex `PreToolUse`/`PostToolUse` payloads run through the real `hook --agent codex` command.
-- **Asserts:** `deck.operation.outcome` is `failure` on the Codex call whose `PostToolUse` reports a non-zero exit, and absent on every plain end (the successful Codex call and every synthetic one), with the calls' output and `Exit code` absent from every request body; program/word classification, with `rwx sandbox exec -- …` and `rwx run …` classified as program `rwx` like any other command and no `deck.operation.runner` key on any span or in any request body, assignments/prefixes/segments, independent program/word shape filtering, the seven-program word deny-list, first-line handling, child identity/duration/count and absence of private/raw commands from captured bodies.
-- **Does not assert:** native hook availability for each agent, a real agent's failed-command report, or nested shell grammar.
+- **Agent:** shell/cat stand-in with synthetic shell-tool and Read hooks.
+- **Asserts:** program/word classification, with `rwx sandbox exec -- …` and `rwx run …` classified as program `rwx` like any other command and no `deck.operation.runner` key on any span or in any request body, assignments/prefixes/segments, independent program/word shape filtering, the seven-program word deny-list, first-line handling, child identity/duration/count and absence of private/raw commands from captured bodies.
+- **Does not assert:** native hook availability for each agent or nested shell grammar.
 - **Platform coverage:** mac+linux.
 
 ##### telemetry/otlp/015 — Polled PR check rollups export CI intervals, results and counters.
