@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { CircleStop } from "lucide-react";
 
 import { insideVoicePeer, OVERLAY_LAYER, useInertBackground } from "../hooks/useInertBackground";
@@ -35,5 +35,20 @@ export function ConfirmDialog({ state, onClose }: { state: ConfirmState; onClose
   const [inVoicePeer, setInVoicePeer] = useState<boolean>();
   const placed = useCallback((node: HTMLDivElement | null) => { if (node) setInVoicePeer(insideVoicePeer(node)); }, []);
   const ref = useInertBackground<HTMLElement>(inVoicePeer === false, OVERLAY_LAYER.dialog, onClose);
-  return <div ref={placed} className="dialog-backdrop" role="presentation" onMouseDown={onClose}><section ref={ref} tabIndex={-1} className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" onMouseDown={(event) => event.stopPropagation()}><div className="danger-icon"><CircleStop size={20} /></div><h2 id="confirm-title">{state.title}</h2><p>{state.body}</p><div><button className="button secondary" onClick={onClose}>Cancel</button><button className="button danger" disabled={busy} onClick={() => { setBusy(true); void state.action().finally(onClose); }}>{busy ? state.busyLabel : state.label}</button></div></section></div>;
+  /* The confirmation on screen now, or `undefined` once this dialog is gone.
+     An action settles after Cancel, a click outside or voice's "close" may
+     already have dismissed its confirmation, and a newer one may be up by
+     then: its completion closes only the confirmation it ran for (Qodo, PR #1804). */
+  const shown = useRef<ConfirmState | undefined>(state);
+  shown.current = state;
+  useEffect(() => {
+    shown.current = state;
+    return () => { shown.current = undefined; };
+  }, [state]);
+  const confirm = () => {
+    setBusy(true);
+    const asked = state;
+    void asked.action().finally(() => { if (shown.current === asked) onClose(); });
+  };
+  return <div ref={placed} className="dialog-backdrop" role="presentation" onMouseDown={onClose}><section ref={ref} tabIndex={-1} className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" onMouseDown={(event) => event.stopPropagation()}><div className="danger-icon"><CircleStop size={20} /></div><h2 id="confirm-title">{state.title}</h2><p>{state.body}</p><div><button className="button secondary" onClick={onClose}>Cancel</button><button className="button danger" disabled={busy} onClick={confirm}>{busy ? state.busyLabel : state.label}</button></div></section></div>;
 }

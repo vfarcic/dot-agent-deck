@@ -1,4 +1,4 @@
-import { act, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { OVERLAY_LAYER, topmostOverlayClose, useInertBackground, VOICE_PEER_PROPS } from "../hooks/useInertBackground";
@@ -46,6 +46,45 @@ describe("ConfirmDialog on the overlay stack", () => {
     act(() => { topmostOverlayClose()?.(); });
     expect(closeConfirm).toHaveBeenCalledTimes(1);
     expect(closePage).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Scenario: Qodo on PR #1804 — Confirm starts a slow action, "close" dismisses
+   * the confirmation while it runs, and a second confirmation opens; when the
+   * first action settles, the second confirmation is still open.
+   */
+  it("does not let a dismissed action close a newer confirmation", async () => {
+    let settle!: () => void;
+    const slow: ConfirmState = { ...STATE, action: () => new Promise<void>((resolve) => { settle = resolve; }) };
+    const second: ConfirmState = { ...STATE, title: "Close tester?" };
+    const onClose = vi.fn();
+    const { rerender } = render(<ConfirmDialog state={slow} onClose={onClose} />);
+    fireEvent.click(screen.getByRole("button", { name: "Close agent" }));
+    act(() => { topmostOverlayClose()?.(); });
+    expect(onClose).toHaveBeenCalledTimes(1);
+
+    rerender(<></>);
+    rerender(<ConfirmDialog state={second} onClose={onClose} />);
+    await act(async () => { settle(); });
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("Close tester?");
+
+    /* The same instance given a newer confirmation directly is not closed either. */
+    let settleAgain!: () => void;
+    rerender(<ConfirmDialog state={{ ...STATE, action: () => new Promise<void>((resolve) => { settleAgain = resolve; }) }} onClose={onClose} />);
+    fireEvent.click(screen.getByRole("button", { name: "Close agent" }));
+    rerender(<ConfirmDialog state={second} onClose={onClose} />);
+    await act(async () => { settleAgain(); });
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  /** Scenario: Confirm runs the action and, once it settles, closes the confirmation it ran for. */
+  it("closes once its own action settles", async () => {
+    const onClose = vi.fn();
+    render(<ConfirmDialog state={STATE} onClose={onClose} />);
+    fireEvent.click(screen.getByRole("button", { name: "Close agent" }));
+    await act(async () => undefined);
+    expect(onClose).toHaveBeenCalledTimes(1);
   });
 
   /** Scenario: The voice surface's own "Always allow?" confirmation stays off the stack: it fences nothing and "close" does not reach it, as before. */
