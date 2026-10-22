@@ -1463,6 +1463,7 @@ fn with_attached_tui(
         }
     };
     let coder_pane = expected_pane(ROLE_CODER)?;
+    let reviewer_pane = expected_pane(ROLE_REVIEWER)?;
     let orchestrator_pane = expected_pane(ROLE_ORCHESTRATOR)?;
     // The pane's shell is about to start the client CLI, which is a client.
     g.preconnect_logged(
@@ -1507,13 +1508,20 @@ fn with_attached_tui(
     // listing, read from a different pane, must then show that very message
     // acknowledged. The sentinel is checked in what the deck HANDED the worker;
     // judgement reads parsed fetch JSON, rather than terminal echo.
-    let coder_fetch = fetch_in_pane(g, tui, cast, ev, ROLE_CODER, &delegate_sentinel)?;
+    let coder_fetch = fetch_in_pane(
+        g,
+        tui,
+        cast,
+        ev,
+        (ROLE_CODER, coder_pane),
+        &delegate_sentinel,
+    )?;
     let listing = capture_in_pane(
         g,
         tui,
         cast,
         ev,
-        ROLE_ORCHESTRATOR,
+        (ROLE_ORCHESTRATOR, orchestrator_pane),
         "list-all",
         &format!(
             "{} inbox list --all --json; echo \"exit=$?\"",
@@ -1560,7 +1568,14 @@ fn with_attached_tui(
     // before it reports. That is recorded, not judged: tell 3 is the delegate's
     // tell. A successful fetch drains this delegate before `agent-event` below;
     // a timeout does not establish that the reviewer's inbox is empty.
-    let reviewer_fetch = fetch_in_pane(g, tui, cast, ev, ROLE_REVIEWER, &delegate_sentinel)?;
+    let reviewer_fetch = fetch_in_pane(
+        g,
+        tui,
+        cast,
+        ev,
+        (ROLE_REVIEWER, reviewer_pane),
+        &delegate_sentinel,
+    )?;
     ev.step(
         match reviewer_fetch
             .out
@@ -1595,14 +1610,20 @@ fn with_attached_tui(
     // The report goes to the orchestrator's inbox; the orchestrator takes it
     // and its own listing must show it acknowledged — tell 3's evidence, for
     // the report travelling the other way.
-    let orchestrator_fetch =
-        fetch_in_pane(g, tui, cast, ev, ROLE_ORCHESTRATOR, &work_done_sentinel)?;
+    let orchestrator_fetch = fetch_in_pane(
+        g,
+        tui,
+        cast,
+        ev,
+        (ROLE_ORCHESTRATOR, orchestrator_pane),
+        &work_done_sentinel,
+    )?;
     let orchestrator_listing = capture_in_pane(
         g,
         tui,
         cast,
         ev,
-        ROLE_ORCHESTRATOR,
+        (ROLE_ORCHESTRATOR, orchestrator_pane),
         "list",
         &format!(
             "{} inbox list --json; echo \"exit=$?\"",
@@ -3284,11 +3305,12 @@ pub(crate) fn capture_in_pane(
     tui: &pty::PtyDeck,
     cast: &Cast,
     ev: &mut Evidence,
-    role: &str,
+    role_pane: (&str, &str),
     what: &str,
     body: &str,
 ) -> Result<Captured, Abort> {
-    let session = CaptureSession::new(&g.sb.project, &format!("xver-{role}-{what}"));
+    let (role, pane) = role_pane;
+    let session = CaptureSession::new(&g.sb.project, &format!("xver-{role}-{what}"), pane);
     let mut refused = false;
     let mut text = None;
     let mut attempt = session
@@ -3322,13 +3344,19 @@ pub(crate) fn capture_in_pane(
                 break 'typings;
             }
             if Instant::now() >= retry_at {
-                // prepare holds the execution lease while removing stale .tmp
-                // and advancing the token. It refuses a still-running writer.
+                // prepare holds the execution lease while recovering complete
+                // hand-overs, removing incomplete .tmp and advancing the token.
+                // It refuses a still-running writer.
                 let interrupted = attempt.tmp.exists();
                 if let Some(next) = session.prepare(number + 1)? {
-                    // Publication can win the race just before prepare acquired
-                    // the lease. Prefer that result over another inbox fetch.
+                    // Publication can finish just before prepare takes the
+                    // lease, or prepare can recover a flushed hand-over whose
+                    // shell never renamed it. Prefer either over another fetch.
                     if let Ok(out) = std::fs::read_to_string(&attempt.out) {
+                        ev.step(format!(
+                            "`{role}` inbox {what} retained attempt {number}'s capture after \
+                             taking the execution lease; no replacement fetch was typed"
+                        ));
                         text = Some(out);
                         break 'typings;
                     }
@@ -3369,7 +3397,7 @@ fn fetch_in_pane(
     tui: &pty::PtyDeck,
     cast: &Cast,
     ev: &mut Evidence,
-    role: &str,
+    role: (&str, &str),
     sentinel: &str,
 ) -> Result<Captured, Abort> {
     let mut captured = Captured {

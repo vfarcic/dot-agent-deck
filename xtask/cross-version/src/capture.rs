@@ -18,6 +18,7 @@ pub(crate) struct Session {
     name: String,
     lock: PathBuf,
     token: PathBuf,
+    pane: String,
 }
 
 pub(crate) struct Attempt {
@@ -27,12 +28,13 @@ pub(crate) struct Attempt {
 }
 
 impl Session {
-    pub fn new(root: &Path, name: &str) -> Self {
+    pub fn new(root: &Path, name: &str, pane: &str) -> Self {
         Self {
             root: root.to_path_buf(),
             name: name.to_string(),
             lock: root.join(format!("{name}.lock")),
             token: root.join(format!("{name}.token")),
+            pane: pane.to_string(),
         }
     }
 
@@ -57,14 +59,26 @@ impl Session {
         }
     }
 
-    /// Remove abandoned temporary output and advance the token while holding
-    /// the same lease as the command. A live command refuses replacement.
+    /// Recover a complete hand-over from the current abandoned attempt before
+    /// removing temporary output and advancing the token under the execution
+    /// lease. A live command refuses replacement.
     pub fn prepare(&self, number: usize) -> Result<Option<Attempt>, String> {
         let Some(_lease) = self.lease()? else {
             return Ok(None);
         };
         for old in 1..number {
-            let tmp = self.attempt(old).tmp;
+            let attempt = self.attempt(old);
+            let tmp = attempt.tmp;
+            if std::fs::read_to_string(&self.token).ok().as_deref()
+                == Some(old.to_string().as_str())
+                && let Ok(text) = std::fs::read_to_string(&tmp)
+                && self.complete_hand_over(&text, old)
+                && !attempt.out.exists()
+            {
+                std::fs::rename(&tmp, &attempt.out)
+                    .map_err(|e| format!("recover abandoned {}: {e}", tmp.display()))?;
+                continue;
+            }
             match std::fs::remove_file(&tmp) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -74,6 +88,39 @@ impl Session {
         std::fs::write(&self.token, number.to_string())
             .map_err(|e| format!("advance capture token: {e}"))?;
         Ok(Some(self.attempt(number)))
+    }
+
+    fn complete_hand_over(&self, text: &str, number: usize) -> bool {
+        let mut lines = text.lines();
+        if lines.next() != Some(format!("pane={}", self.pane).as_str())
+            || lines.next() != Some(format!("attempt={number}").as_str())
+        {
+            return false;
+        }
+        let Some(json) = lines.next() else {
+            return false;
+        };
+        // Fetch flushes one JSON line before acknowledgement. It may be
+        // interrupted before the exit marker; the independent inbox listing
+        // must still correlate the recovered id with acknowledged state.
+        if !matches!(lines.next(), None | Some("exit=0")) || lines.next().is_some() {
+            return false;
+        }
+        let Ok(doc) = serde_json::from_str::<serde_json::Value>(json) else {
+            return false;
+        };
+        doc.get("messages")
+            .and_then(|m| m.as_array())
+            .is_some_and(|messages| {
+                !messages.is_empty()
+                    && messages.iter().all(|m| {
+                        ["id", "text"].iter().all(|key| {
+                            m.get(key)
+                                .and_then(|v| v.as_str())
+                                .is_some_and(|v| !v.is_empty())
+                        })
+                    })
+            })
     }
 
     fn attempt(&self, number: usize) -> Attempt {
@@ -89,8 +136,9 @@ impl Session {
     pub fn command(&self, attempt: &Attempt, body: &str, seconds: u64) -> String {
         let script = format!(
             "[ \"$(cat {})\" = {} ] || exit 0; \
-             {{ echo \"pane=$DOT_AGENT_DECK_PANE_ID\"; {body}; }} > {} 2>&1; mv {} {}",
+             {{ echo \"pane=$DOT_AGENT_DECK_PANE_ID\"; echo attempt={}; {body}; }} > {} 2>&1; mv {} {}",
             path_word(&self.token),
+            attempt.number,
             attempt.number,
             path_word(&attempt.tmp),
             path_word(&attempt.tmp),
@@ -129,7 +177,7 @@ mod tests {
     #[test]
     fn replacement_after_temporary_creation_publishes_only_the_new_attempt() {
         let root = scratch("replacement");
-        let session = Session::new(&root, "fetch");
+        let session = Session::new(&root, "fetch", "2");
         let first = session.prepare(1).unwrap().unwrap();
         let old = session.command(&first, "echo partial; exit 17", 10);
         assert!(!run(&old).status.success());
@@ -141,7 +189,7 @@ mod tests {
         assert!(run(&command).status.success());
         assert_eq!(
             std::fs::read_to_string(&second.out).unwrap(),
-            "pane=2\nreplacement\n"
+            "pane=2\nattempt=2\nreplacement\n"
         );
         assert!(!second.tmp.exists());
         assert!(run(&old).status.success());
@@ -150,7 +198,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
 
         let root = scratch("consumed-inbox");
-        let session = Session::new(&root, "fetch");
+        let session = Session::new(&root, "fetch", "2");
         let inbox = root.join("inbox.json");
         let message = r#"{"messages":[{"id":"m-consumed","text":"XVER-DELEGATE-consumed"}]}"#;
         std::fs::write(&inbox, message).unwrap();
@@ -198,7 +246,7 @@ mod tests {
     #[test]
     fn a_running_capture_cannot_be_duplicated_or_have_its_output_removed() {
         let root = scratch("running");
-        let session = Session::new(&root, "fetch");
+        let session = Session::new(&root, "fetch", "2");
         let first = session.prepare(1).unwrap().unwrap();
         std::fs::write(&first.tmp, "partial").unwrap();
         let lease = session.lease().unwrap().unwrap();
@@ -218,13 +266,61 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// Scenario: Interrupted captures contain complete, partial or unrelated JSON.
+    /// Recovery publishes a nonempty hand-over only when its pane and attempt
+    /// match the expected role and current token, preserving any existing publication.
+    #[test]
+    fn only_complete_current_pane_hand_overs_are_recovered() {
+        let json = r#"{"messages":[{"id":"m-consumed","text":"XVER-DELEGATE-consumed"}]}"#;
+        let complete = format!("pane=2\nattempt=1\n{json}\n");
+        for (tag, text, token, recover) in [
+            ("complete", complete.clone(), "1", true),
+            ("exit-zero", format!("{complete}exit=0\n"), "1", true),
+            ("wrong-pane", complete.replace("pane=2", "pane=3"), "1", false),
+            ("wrong-attempt", complete.replace("attempt=1", "attempt=7"), "1", false),
+            ("superseded", complete.clone(), "2", false),
+            ("missing-token", complete.clone(), "", false),
+            ("partial", "pane=2\nattempt=1\n{\"messages\":[".to_string(), "1", false),
+            ("empty-inbox", "pane=2\nattempt=1\n{\"messages\":[]}".to_string(), "1", false),
+            ("listing", "pane=2\nattempt=1\n{\"messages\":[{\"id\":\"m-consumed\",\"state\":\"acknowledged\"}]}".to_string(), "1", false),
+            ("empty-id", complete.replace("m-consumed", ""), "1", false),
+            ("exit-failure", format!("{complete}exit=17\n"), "1", false),
+            ("trailing-junk", format!("{complete}exit=0\nerror\n"), "1", false),
+        ] {
+            let root = scratch(tag);
+            let session = Session::new(&root, "fetch", "2");
+            let first = session.prepare(1).unwrap().unwrap();
+            std::fs::write(&first.tmp, &text).unwrap();
+            std::fs::write(&session.token, token).unwrap();
+            session.prepare(2).unwrap().unwrap();
+            assert_eq!(first.out.exists(), recover, "{tag}: {text}");
+            if recover {
+                assert_eq!(std::fs::read_to_string(&first.out).unwrap(), text, "{tag}");
+            }
+            assert!(!first.tmp.exists(), "{tag}");
+            std::fs::remove_dir_all(root).unwrap();
+        }
+        let root = scratch("published");
+        let session = Session::new(&root, "fetch", "2");
+        let first = session.prepare(1).unwrap().unwrap();
+        std::fs::write(&first.out, "already published").unwrap();
+        std::fs::write(&first.tmp, complete).unwrap();
+        session.prepare(2).unwrap().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&first.out).unwrap(),
+            "already published"
+        );
+        assert!(!first.tmp.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     /// Scenario: A custom run root contains spaces, apostrophes and shell syntax.
     /// The capture must publish in that directory and preserve literal output.
     #[test]
     fn shell_paths_and_body_are_quoted_as_literal_words() {
         let root = scratch("quote").join("it's a $(false); root");
         std::fs::create_dir_all(&root).unwrap();
-        let session = Session::new(&root, "fetch");
+        let session = Session::new(&root, "fetch", "2");
         let attempt = session.prepare(1).unwrap().unwrap();
         let text = "it's literal $(false); `false`";
         let command = session.command(
@@ -236,7 +332,7 @@ mod tests {
         assert!(output.status.success(), "{output:?}");
         assert_eq!(
             std::fs::read_to_string(&attempt.out).unwrap(),
-            format!("pane=2\n{text}\n")
+            format!("pane=2\nattempt=1\n{text}\n")
         );
         std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
     }
