@@ -1285,9 +1285,118 @@ fn worktree_reclaim_012_a_merged_fork_pr_with_the_same_branch_name_is_not_this_b
     );
 }
 
+/// Scenario: A contributor's checkout has `origin` on the upstream repository
+/// and pushes a deck-owned, clean worktree's branch to their fork, where its
+/// pull request was opened and has MERGED. `worktree list` reads that pull
+/// request as the branch's (`merged`, `remove`) and `worktree reclaim`
+/// removes the worktree; with no push remote, or a stranger's fork as the
+/// pull request's head, the same worktree is kept.
+#[spec("worktree/reclaim/013")]
+#[test]
+#[cfg(unix)]
+fn worktree_reclaim_013_a_merged_pr_from_the_fork_the_branch_is_pushed_to_is_this_branchs() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree_with_commit("wt-own-fork", "feat/own-fork");
+    fx.mark_owned(&wt); // clean by construction, owned: only PR state decides the verdict
+    git(
+        &fx.repo,
+        &[
+            "remote",
+            "add",
+            "fork",
+            "git@github.com:contributor/test-repo.git",
+        ],
+    );
+    let from = |owner: &str| {
+        format!(
+            r#"{{"state":"MERGED","headRefName":"feat/own-fork","isCrossRepository":true,
+                "headRepository":{{"id":"R_1","name":"test-repo"}},
+                "headRepositoryOwner":{{"id":"U_1","login":"{owner}"}}}}"#
+        )
+    };
+    let pr_and_verdict = |entry: &serde_json::Value| {
+        (
+            entry
+                .get("pr_state")
+                .and_then(|p| p.as_str())
+                .map(str::to_string),
+            entry
+                .get("verdict")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        )
+    };
+    let keep = (Some("no_pr".to_string()), Some("keep".to_string()));
+    fx.set_pr_entries("feat/own-fork", &from("contributor"));
+
+    // No push remote: the fork's pull request cannot be shown to be this
+    // branch's, so the worktree is kept, as before issue #1779.
+    let entry = verdict_entry(&fx, "wt-own-fork");
+    assert_eq!(
+        (
+            entry.get("owned").and_then(|o| o.as_bool()),
+            entry.get("clean").and_then(|c| c.as_bool()),
+        ),
+        (Some(true), Some(true)),
+        "fixture precondition: the worktree must be owned and clean, so that PR state is the \
+         only gate deciding its verdict; got entry:\n{entry}"
+    );
+    assert_eq!(
+        pr_and_verdict(&entry),
+        keep,
+        "with no push remote a fork's pull request is not this branch's; got entry:\n{entry}"
+    );
+
+    // Pushed to a fork whose owner did not open the pull request: kept.
+    git(
+        &fx.repo,
+        &["config", "branch.feat/own-fork.pushRemote", "fork"],
+    );
+    fx.set_pr_entries("feat/own-fork", &from("stranger"));
+    let entry = verdict_entry(&fx, "wt-own-fork");
+    assert_eq!(
+        pr_and_verdict(&entry),
+        keep,
+        "a stranger's fork is not the one the branch is pushed to; got entry:\n{entry}"
+    );
+    let out = fx.run(&["worktree", "reclaim", "--yes"]);
+    assert!(
+        wt.is_dir(),
+        "a worktree whose only merged pull request is a stranger's fork's must survive \
+         `reclaim --yes` — {} is gone\n{}",
+        wt.display(),
+        combined(&out)
+    );
+
+    // Pushed to the contributor's fork, which opened the merged pull request.
+    fx.set_pr_entries("feat/own-fork", &from("contributor"));
+    let entry = verdict_entry(&fx, "wt-own-fork");
+    assert_eq!(
+        pr_and_verdict(&entry),
+        (Some("merged".to_string()), Some("remove".to_string())),
+        "the merged pull request from the fork the branch is pushed to is this branch's; got \
+         entry:\n{entry}"
+    );
+    let out = fx.run(&["worktree", "reclaim"]);
+    assert!(
+        out.status.success(),
+        "`worktree reclaim` must succeed; got {:?} out={}",
+        out.status,
+        combined(&out)
+    );
+    assert!(
+        !wt.exists(),
+        "a deck-owned, clean worktree whose own fork pull request merged must be reclaimed — \
+         {} survived\n{}",
+        wt.display(),
+        combined(&out)
+    );
+}
+
 /// The `worktree list --json` entry whose `path` contains `needle`, panicking
 /// with the whole document when it is absent — used by `011` to take the same
-/// measurement twice, before and after the marker is truncated, and by `012`.
+/// measurement twice, before and after the marker is truncated, and by `012`
+/// and `013`.
 #[cfg(unix)]
 fn verdict_entry(fx: &Fixture, needle: &str) -> serde_json::Value {
     let out = fx.run(&["worktree", "list", "--json"]);

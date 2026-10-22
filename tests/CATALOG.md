@@ -57,6 +57,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** real GitHub authentication or network access, a browser opening, or live PR polling transitions.
 - **Platform coverage:** mac+linux.
 
+##### session/pr/006 — A pull request opened from the fork the branch is pushed to is the branch's badge.
+- **Layer:** L2 headless, lane 1 (deterministic).
+- **Agent:** none (synthetic cat agent, strict offline gh stub).
+- **Asserts:** with `origin` on the upstream repository and `branch.feat/x.pushRemote` naming a second GitHub remote, ListAgents live.pull_request carries the `isCrossRepository` pull request whose `headRepositoryOwner`/`headRepository` is that push remote's repository, in preference to a higher-numbered one from a stranger's fork with the same branch name (issue #1779).
+- **Does not assert:** TUI rendering (`session/pr/004`); a branch with no push remote, case-insensitive matching or a deleted fork (the `pull_request` unit tests); the worktree reclaimer's side of the same match (`worktree/reclaim/013`).
+- **Platform coverage:** mac+linux.
+
 ### Dashboard panes
 
 #### dashboard/pane
@@ -1676,7 +1683,14 @@ Issue #1794: a daemon must not be left half-alive — hook endpoint up, no attac
 - **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`).
 - **Agent:** none (a deck-owned, clean worktree whose stub `gh` reply lists only a `MERGED` pull request carrying `isCrossRepository: true` — the shape `gh pr list --head <branch>` returns when a contributor's fork opened a pull request from a branch named like ours).
 - **Asserts:** a **fixture precondition** that the entry reads `owned: true` and `clean: true`, so PR state is the only gate deciding the verdict; then that `worktree list --json` reports `pr_state: "no_pr"` and `verdict: "keep"`; that the directory survives `worktree reclaim --yes`; and, as a **control**, that with the branch's own `MERGED` pull request listed beside the fork's the same entry reads `merged` / `remove`, so the `keep` is the fork filter's doing. Pins issue #1687: the reclaim's PR lookup matched on `headRefName` alone, so a stranger's merged fork PR read as this branch's and sent the worktree to the unattended `remove` verdict.
-- **Does not assert:** an entry that omits `isCrossRepository` (fails closed to `unresolvable`; unit-tested as `parse_pr_state_without_is_cross_repository_is_unresolvable` in `src/worktree_reclaim.rs`); the PR badge's own fork filter (`pull_request::tests::a_pull_request_from_a_fork_is_not_the_branchs`).
+- **Does not assert:** an entry that omits `isCrossRepository` (fails closed to `unresolvable`; unit-tested as `parse_pr_state_without_is_cross_repository_is_unresolvable` in `src/worktree_reclaim.rs`); the PR badge's own fork filter (`pull_request::tests::a_pull_request_from_a_fork_is_not_the_branchs`); a fork pull request from the repository the branch is pushed to, which is the branch's own (`013`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/013 — A merged pull request from the fork the worktree's branch is pushed to is that branch's, so the worktree is reclaimed; no push remote, or a stranger's fork, still keeps it.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`).
+- **Agent:** none (a deck-owned, clean worktree in a checkout whose `origin` is the upstream repository and which has a second GitHub remote, `fork`; the stub `gh` reply lists one `MERGED` pull request carrying `isCrossRepository: true` and a `headRepository` / `headRepositoryOwner`, the shape `gh pr list --head <branch>` returns for a contributor's pull request opened from their fork).
+- **Asserts:** a **fixture precondition** that the entry reads `owned: true` and `clean: true`; that with no push remote configured the entry reads `no_pr` / `keep`; that with `branch.<name>.pushRemote` set to `fork` but the pull request's head owned by someone else it still reads `no_pr` / `keep` and the directory survives `worktree reclaim --yes`; then that with the pull request's head being the fork the branch is pushed to the entry reads `merged` / `remove` and a bare `worktree reclaim` removes the directory. Pins issue #1779: the fork filter from #1687 also ignored a contributor's own pull request when they pushed to their fork while `origin` was the upstream, so a merged worktree was kept forever.
+- **Does not assert:** a push remote resolved through `remote.pushDefault` or the branch's upstream remote rather than `branch.<name>.pushRemote` (git resolves all three into the one `%(push:remotename)` the lookup reads); case-insensitive owner matching, a deleted fork (`headRepository: null`) and the ambiguous own-plus-fork case (unit-tested as `parse_pr_state_matches_a_fork_pull_request_only_from_the_push_repository` in `src/worktree_reclaim.rs`); the PR badge's side of the same match (`pull_request::tests::a_pull_request_from_the_fork_the_branch_is_pushed_to_is_the_branchs`).
 - **Platform coverage:** mac+linux.
 
 ### Prompts
