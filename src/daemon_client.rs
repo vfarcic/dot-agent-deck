@@ -8901,6 +8901,8 @@ pub(crate) mod restart_fixture {
         _dir: tempfile::TempDir,
         pub(crate) path: PathBuf,
         recorded: Arc<Mutex<Vec<String>>>,
+        /// Every request but `hello`, as `(process, request)`.
+        requests: Arc<Mutex<Vec<(&'static str, serde_json::Value)>>>,
         script: Arc<Mutex<Script>>,
         server: tokio::task::JoinHandle<()>,
     }
@@ -8954,17 +8956,20 @@ pub(crate) mod restart_fixture {
                 (dir, path, listener)
             };
             let recorded = Arc::new(Mutex::new(Vec::new()));
+            let requests = Arc::new(Mutex::new(Vec::new()));
             let script = Arc::new(Mutex::new(Script {
                 current: first,
                 ..Script::default()
             }));
             let server = {
                 let recorded = Arc::clone(&recorded);
+                let requests = Arc::clone(&requests);
                 let script = Arc::clone(&script);
                 tokio::spawn(async move {
                     while let Ok(mut stream) = listener.accept().await {
                         let process = script.lock().unwrap().current;
                         let recorded = Arc::clone(&recorded);
+                        let requests = Arc::clone(&requests);
                         let script = Arc::clone(&script);
                         tokio::spawn(async move {
                             let mut follow_on = true;
@@ -9001,6 +9006,7 @@ pub(crate) mod restart_fixture {
                                     continue;
                                 }
                                 recorded.lock().unwrap().push(format!("{process}:{op}"));
+                                requests.lock().unwrap().push((process, request.clone()));
                                 let _ = write_resp(&mut stream, &serve(&op)).await;
                                 {
                                     let mut script = script.lock().unwrap();
@@ -9024,6 +9030,7 @@ pub(crate) mod restart_fixture {
                 _dir: dir,
                 path,
                 recorded,
+                requests,
                 script,
                 server,
             }
@@ -9055,6 +9062,17 @@ pub(crate) mod restart_fixture {
                 .unwrap()
                 .iter()
                 .filter_map(|entry| entry.strip_prefix(&prefix).map(str::to_string))
+                .collect()
+        }
+
+        /// The `op` requests `process` received, in order, whole.
+        pub(crate) fn requests_to(&self, process: &str, op: &str) -> Vec<serde_json::Value> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(by, request)| *by == process && request["op"] == op)
+                .map(|(_, request)| request.clone())
                 .collect()
         }
 

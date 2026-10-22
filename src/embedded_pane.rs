@@ -5199,10 +5199,15 @@ impl PaneController for EmbeddedPaneController {
         // the daemon process that agent runs under, and to nobody on a
         // successor. A pane with no local attachment — a detached card, or one
         // never attached here — is posted to on the process this controller
-        // attached it on, or else the one the card was learned from.
+        // attached it on, or else the one the card was learned from. A local
+        // pane attached on another process than the card's speaks for that
+        // process's agent, so it names none (PR #1817 review 4347326632).
         let pane_id = pane.pane_id.as_str();
         let client = self.held_client(pane);
-        let agent_id = self.pane_attachment(pane_id).map(|a| a.agent_id);
+        let agent_id = match self.local_pane_for(pane) {
+            LocalPaneFor::Card => self.pane_attachment(pane_id).map(|a| a.agent_id),
+            LocalPaneFor::Other | LocalPaneFor::None => None,
+        };
         let reply = self.runtime.block_on(async move {
             tokio::time::timeout(
                 POST_MESSAGE_TIMEOUT,
@@ -7730,6 +7735,51 @@ mod incarnation_binding_tests {
                     sent.contains(&"stop-agent".to_string()),
                     "control: {sent:?}"
                 );
+            }
+        }
+    }
+
+    /// PR #1817 review 4347326632: this TUI's pane `1` was attached on deck
+    /// process `a`, the deck restarted as `b`, and the dashboard's card for
+    /// pane `1` was learned from `b`. Posting to that card goes to `b` and
+    /// names no agent from `a`'s attach, which `b` would refuse as another
+    /// agent's. A card learned from `a` itself names the agent this TUI
+    /// attached (control).
+    #[test]
+    fn a_post_to_a_successors_card_names_no_agent_from_the_replaced_attach() {
+        let runtime = runtime();
+        for replaced in [false, true] {
+            let daemon = runtime.block_on(async { RestartingDaemon::spawn("a") });
+            let controller =
+                EmbeddedPaneController::new(daemon.path.clone(), runtime.handle().clone())
+                    .with_protocol_gate();
+            let pane = controller
+                .create_pane(Some("cat"), None)
+                .expect("this TUI's pane on a");
+            let attached = controller.pane_attachment(&pane).unwrap().agent_id;
+            let process = if replaced {
+                daemon.restart_as("b");
+                "b"
+            } else {
+                "a"
+            };
+            let card = BoundPane::new(pane.clone(), Incarnation::from(Some(process.to_string())));
+
+            let posted = controller.post_message(
+                &card,
+                "configuration request",
+                "body",
+                crate::inbox_hub::PostOrigin::ConfigGen,
+            );
+
+            assert!(posted.is_ok(), "{process}: {posted:?}");
+            let sent = daemon.requests_to(process, "post-message");
+            assert_eq!(sent.len(), 1, "{process}: {sent:?}");
+            let named = sent[0]["expected_agent_id"].as_str();
+            if replaced {
+                assert_eq!(named, None, "a's agent named to b: {sent:?}");
+            } else {
+                assert_eq!(named, Some(attached.as_str()), "control: {sent:?}");
             }
         }
     }
