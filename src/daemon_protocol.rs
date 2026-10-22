@@ -4179,9 +4179,14 @@ pub async fn serve_attach_with_restart(
     // PRD #1258: one host sample per attach server, shared by every connection
     // so a cache hit holds across clients and reconnects.
     let host_metrics = Arc::new(crate::host_metrics::HostMetricsCache::new());
+    // Issue #1794: an accept error that concerns one connection or a passing
+    // shortage (EMFILE, ECONNABORTED, ...) is retried after a capped delay;
+    // only an error about the listener itself ends the server.
+    let mut backoff = crate::attach_recovery::AcceptBackoff::default();
     loop {
         match listener.accept().await {
             Ok(stream) => {
+                backoff.after_success();
                 let registry = registry.clone();
                 let event_tx = event_tx.clone();
                 let counter = client_count.clone();
@@ -4241,10 +4246,13 @@ pub async fn serve_attach_with_restart(
                     }
                 });
             }
-            Err(e) => {
-                error!("attach accept failed: {e}");
-                return Err(e);
-            }
+            Err(e) => match backoff.after_error(&e) {
+                Some(delay) => tokio::time::sleep(delay).await,
+                None => {
+                    error!("attach accept failed: {e}");
+                    return Err(e);
+                }
+            },
         }
     }
 }
