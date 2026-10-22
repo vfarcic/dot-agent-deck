@@ -4409,28 +4409,55 @@ pub fn compose_undelivered_notice(
 
 /// PRD #1666 S5: the notice an orchestrator gets when a task it delegated can
 /// never be delivered.
+///
+/// Only a cancel whose every attempt was positively not handed rules out that
+/// the task reached the worker, and that is [`compose_cancelled_notice`]'s
+/// not-handed notice. For every other reason the deck may have handed the task
+/// over first (a fetch it never saw acknowledged, an attempt in flight), so the
+/// notice says the worker may have it and to check before re-delegating. Only a
+/// task that ran out of hand-overs promises a correction: its late ack is
+/// remembered for [`LATE_ACK_MEMORY`] ([`settle_late_ack`]); an exited worker's
+/// ack is refused.
 pub fn compose_undeliverable_notice(
     message_id: &str,
     role: &str,
     reason: UndeliverableReason,
 ) -> String {
-    let why = match reason {
-        UndeliverableReason::AgentExited => {
-            "the worker it was addressed to exited before acknowledging it"
-        }
-        UndeliverableReason::MaxDeliver => {
-            "it was handed to the worker the most times the deck allows and was never acknowledged"
-        }
-        UndeliverableReason::InboxShut => "the deck is shutting down",
-        UndeliverableReason::Superseded => "a newer task replaced it",
+    const CHECK: &str = "Check the worker's pane before you re-delegate or reassign it, or notify \
+                         the user.";
+    // The MaxDeliver notice says "within the next hour".
+    const _: () = assert!(LATE_ACK_MEMORY.as_secs() == 60 * 60);
+    let (why, may_have_it, told) = match reason {
         UndeliverableReason::Cancelled => {
-            "the user cancelled its delivery before it reached the worker"
+            return compose_cancelled_notice(message_id, role, false);
         }
+        UndeliverableReason::MaxDeliver => (
+            "it was handed to the worker the most times the deck allows and was never acknowledged",
+            "The deck will not deliver it again, but it may already have reached the worker, \
+             which may be working on it; its work-done can still arrive.",
+            " If the deck learns within the next hour that the worker received it, you will be \
+             told.",
+        ),
+        UndeliverableReason::AgentExited => (
+            "the worker it was addressed to exited before acknowledging it",
+            "It may have reached the worker before it exited, so some of the work may already \
+             be done.",
+            "",
+        ),
+        UndeliverableReason::InboxShut => (
+            "the deck is shutting down",
+            "It may already have reached the worker.",
+            "",
+        ),
+        UndeliverableReason::Superseded => (
+            "a newer task replaced it",
+            "It may already have reached the worker.",
+            "",
+        ),
     };
     format!(
-        "Task {message_id} to the worker in role {} is undeliverable: {why}. The worker did not \
-         receive it, and no work-done can arrive for it. Decide how to proceed - if this needs \
-         the user, notify the user; otherwise re-delegate or reassign the task.",
+        "Task {message_id} to the worker in role {} is undeliverable: {why}. {may_have_it} \
+         {CHECK}{told}",
         crate::state::quote_untrusted_role(role),
     )
 }
@@ -7492,6 +7519,120 @@ mod tests {
         );
         hub.tick();
         assert_eq!(corrections(&hub), 2, "one more correction, for this task");
+    }
+
+    /// The undeliverable notices the orchestrator holds, bodies included.
+    fn undeliverable_bodies(hub: &InboxHub) -> Vec<String> {
+        hub.list_with_bodies(Some("o"))
+            .into_iter()
+            .filter(|m| m.subject == UNDELIVERED_SUBJECT)
+            .filter_map(|m| m.text)
+            .filter(|text| text.contains("is undeliverable"))
+            .collect()
+    }
+
+    const CHECK_FIRST: &str =
+        "Check the worker's pane before you re-delegate or reassign it, or notify the user.";
+
+    /// PRD #1666 part 2: a task that ran out of hand-overs was handed to the
+    /// worker each time, so its notice says the worker may have it and its
+    /// work-done can still arrive, tells the orchestrator to check the pane
+    /// first, and promises the correction its late ack gets.
+    #[tokio::test]
+    async fn a_task_out_of_hand_overs_may_still_be_with_the_worker() {
+        let limits = InboxLimits {
+            max_deliver: 1,
+            ..InboxLimits::default()
+        };
+        let hub = InboxHub::new(deck(), limits, DEFAULT_KEEPALIVE);
+        let task = delegate(&hub, "TASK-OUT-OF-HAND-OVERS");
+        assert_eq!(
+            hub.fetch("w", "wa", Consumer::FetchCli, None, None).len(),
+            1
+        );
+        hub.run_out_ack_wait(task.as_str(), "w");
+        assert_eq!(state_in(&hub, "w", &task), StateName::Undeliverable);
+        let told = undeliverable_bodies(&hub);
+        assert_eq!(told.len(), 1, "{told:?}");
+        let body = &told[0];
+        assert!(body.contains(task.as_str()), "{body}");
+        assert!(
+            body.contains("may already have reached the worker")
+                && body.contains("its work-done can still arrive")
+                && body.contains(CHECK_FIRST)
+                && body.contains(
+                    "If the deck learns within the next hour that the worker received it, you \
+                     will be told."
+                ),
+            "{body}"
+        );
+        assert!(
+            !body.contains("did not receive") && !body.contains("no work-done can arrive"),
+            "{body}"
+        );
+    }
+
+    /// PRD #1666 part 2: a worker that exited may have taken its task before
+    /// it went, so the notice says so and tells the orchestrator to check the
+    /// pane first. Its ack would be refused, so no correction is promised.
+    #[tokio::test]
+    async fn a_task_whose_worker_exited_may_have_reached_it() {
+        let hub = hub();
+        let task = delegate(&hub, "TASK-WORKER-EXITED");
+        assert_eq!(
+            hub.fetch("w", "wa", Consumer::FetchCli, None, None).len(),
+            1
+        );
+        hub.agent_exited("w", "wa");
+        hub.post_owed_notices();
+        assert_eq!(state_in(&hub, "w", &task), StateName::Undeliverable);
+        let told = undeliverable_bodies(&hub);
+        assert_eq!(told.len(), 1, "{told:?}");
+        let body = &told[0];
+        assert!(
+            body.contains("may have reached the worker before it exited")
+                && body.contains(CHECK_FIRST),
+            "{body}"
+        );
+        assert!(
+            !body.contains("did not receive")
+                && !body.contains("no work-done can arrive")
+                && !body.contains("you will be told"),
+            "{body}"
+        );
+    }
+
+    /// PRD #1666 part 2: only a cancel the deck saw positively not handed rules
+    /// out that the worker received the task; every other reason's notice says
+    /// it may have reached the worker and to check first.
+    #[test]
+    fn an_undeliverable_notice_says_the_worker_did_not_receive_it_only_when_ruled_out() {
+        use UndeliverableReason::*;
+        for reason in [AgentExited, MaxDeliver, Superseded, InboxShut, Cancelled] {
+            let body = compose_undeliverable_notice("m-1", "coder", reason);
+            let ruled_out = reason == Cancelled;
+            assert_eq!(
+                body.contains("The worker did not receive it, and no work-done can arrive for it."),
+                ruled_out,
+                "{reason:?}: {body}"
+            );
+            assert_eq!(body.contains(CHECK_FIRST), !ruled_out, "{reason:?}: {body}");
+            assert_eq!(
+                body.contains("may have reached the worker")
+                    || body.contains("may already have reached the worker"),
+                !ruled_out,
+                "{reason:?}: {body}"
+            );
+            assert_eq!(
+                body.contains("you will be told"),
+                reason == MaxDeliver,
+                "{reason:?}: {body}"
+            );
+        }
+        assert_eq!(
+            compose_undeliverable_notice("m-1", "coder", Cancelled),
+            compose_cancelled_notice("m-1", "coder", false)
+        );
     }
 
     /// Reviewer nit: a delegation refused because the worker's agent no longer
