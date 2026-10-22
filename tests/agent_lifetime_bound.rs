@@ -570,6 +570,11 @@ fn ready_to_strand(listener: &UnixListener, pid: libc::pid_t) -> Result<(), Stri
                         "make the probe wrapper event stream blocking: {error}"
                     ));
                 }
+                // Best-effort bound, so a wrapper that connects and stalls is an
+                // `Err` the caller cleans up after rather than a hung test. XNU
+                // refuses it with EINVAL once the peer has closed, and a read
+                // from a closed peer cannot hang anyway, so a refusal is ignored.
+                let _ = stream.set_read_timeout(Some(probe_start_budget()));
                 let mut json = String::new();
                 if let Err(error) = stream.read_to_string(&mut json) {
                     return Err(format!("read probe wrapper event: {error}"));
