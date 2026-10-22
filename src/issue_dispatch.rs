@@ -376,11 +376,13 @@ pub fn render_claim_record(
 
 /// The claim time to write when `previous` is the claim time of the record
 /// being edited (`None` for a new record, or one with no readable time):
-/// `now`, unless that is not past `previous`, in which case one millisecond
-/// after `previous`. The record renders its time to the millisecond, so the
-/// result always renders differently from the time the edited record holds —
-/// a wall clock that repeats a millisecond, or is corrected backwards, cannot
-/// re-render the same body. A record whose time is in the future therefore
+/// `max(now, previous + 1 ms)` when there is a `previous`, and `now` when
+/// there is not. So `now` is used only when it is at least one millisecond
+/// past `previous` — a `now` that is past `previous` by less than that still
+/// yields `previous + 1 ms`. The record renders its time to the millisecond,
+/// so the result always renders differently from the time the edited record
+/// holds — a wall clock that repeats a millisecond, or is corrected
+/// backwards, cannot re-render the same body. A record whose time is in the future therefore
 /// carries each re-claim one millisecond further until the clock catches up.
 pub fn next_claim_time(
     now: chrono::DateTime<chrono::Utc>,
