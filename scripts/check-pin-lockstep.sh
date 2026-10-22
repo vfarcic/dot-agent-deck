@@ -614,8 +614,11 @@ scan_rwx() {
       lineno="${hit%%:*}"
       rest="${hit#*:}"
       while IFS= read -r token; do
+        # The whole token after the prefix, NOT its numeric head: the token
+        # already ends at the delimiter the pin is written with (a space, a
+        # quote or `/`), so anything left after an exact X.Y.Z, such as a
+        # pre-release `-beta.1`, is a different version and fails below.
         value="$(printf '%s' "$token" | sed -E "s#^${prefix}##")"
-        value="${value%%[!0-9.]*}"
         if ! printf '%s' "$value" | grep -qE "$SEMVER"; then
           printf '%s%s:%s has an unreadable %s pin: %s. renovate.json matches an exact X.Y.Z here; anything else silently stops being tracked.\n' \
             "$SCAN_ERR" "${f#"$root"/}" "$lineno" "$what" "'$token'"

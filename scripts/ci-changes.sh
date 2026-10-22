@@ -4,7 +4,8 @@
 # two cannot drift apart (docs/develop/rwx.md).
 #
 # Usage: scripts/ci-changes.sh <event> <author> < changed-paths
-#   <event>   pull_request, push, workflow_dispatch, or cli (an `rwx run`)
+#   <event>   pull_request, push, workflow_dispatch, cli (an `rwx run`) or cron
+#             (RWX's daily run on main)
 #   <author>  the pull request's author login; empty for anything else
 #   stdin     the changed paths, one per line, the files a PR view lists. Empty
 #             stdin means "unknown", which selects everything.
@@ -46,7 +47,7 @@ fi
 binary=false
 cargo=false
 case "$event" in
-  workflow_dispatch | cli)
+  workflow_dispatch | cli | cron)
     binary=true
     cargo=true
     ;;

@@ -1921,3 +1921,26 @@ fn a_drifted_rustup_toolchain_in_rwx_fails() {
         "the failure must name the version:\n{text}"
     );
 }
+
+/// A pre-release suffix is a different version, not the same one written
+/// longer: `1.97.1-beta.1` in `.rwx/` against devbox's `1.97.1` must fail, not
+/// read as `1.97.1` and pass (PR #1802 review).
+#[test]
+fn a_prerelease_rwx_pin_fails() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let rwx = rwx_config("1.97.1", "0.9.143", PNPM, "3.53.1")
+        .replace("rust-version: 1.97.1", "rust-version: 1.97.1-beta.1");
+    let out = rwx_fixture(&rwx).run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "a pre-release RWX pin must fail:\n{text}"
+    );
+    assert!(
+        text.contains("1.97.1-beta.1"),
+        "the failure must name the pin:\n{text}"
+    );
+}

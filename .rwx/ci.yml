@@ -42,16 +42,32 @@ on:
       trigger: cli
       base-sha: ""
       author: ""
+  # The run that writes the tool caches. The vault is locked to `main`, so a
+  # pull request's run reads the caches and cannot write them: a PR's
+  # build code cannot plant files a later PR restores (the RWX counterpart of
+  # ci.yml saving Rust caches only from `main`, #1743). Crons run on the
+  # default branch, so this daily full run repopulates every cache well
+  # inside its 48-hour lifetime, and is a daily RWX signal on `main` besides.
+  cron:
+    - key: main-tool-caches
+      schedule: '0 4 * * *'
+      init:
+        commit-sha: ${{ event.git.sha }}
+        trigger: cron
+        base-sha: ""
+        author: ""
 
 base:
   image: ubuntu:24.04
   config: rwx/base 1.2.0
 
-# Incremental `target/` and `~/.cargo` between runs — the counterpart of
+# Incremental `target/` and `~/.cargo` between runs, the counterpart of
 # Swatinem/rust-cache in ci.yml. Without it every content-cache miss compiles
-# from scratch. The vault holds no secrets; it must exist, be unlocked, and
-# have "Allow public repositories" on (it was deleted after the 2026-10-18
-# evaluation: `rwx vaults create --name dot_agent_deck_rwx_eval --unlocked`).
+# from scratch. The vault holds no secrets, but it is LOCKED, with `main` as
+# its only permitted branch: RWX lets a run write a tool cache only when the
+# vault is unlocked for it, so pull requests read and the daily cron on `main`
+# writes (docs/develop/rwx.md has the setup). Push-triggered and PR runs on a
+# public repository also need its "Allow public repositories" switch on.
 tool-cache:
   vault: dot_agent_deck_rwx_eval
 

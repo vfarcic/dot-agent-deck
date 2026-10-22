@@ -452,8 +452,12 @@ jobs:
           fi
           if [ "${changed}" = flake.nix ]; then
             lines=$(git diff --numstat "${GREEN_SHA}" HEAD -- flake.nix | awk '{print $1"/"$2}')
-            pin=$(git diff -U0 "${GREEN_SHA}" HEAD -- flake.nix | grep -cE '^\+[[:space:]]*version = "'"${VERSION}"'";[[:space:]]*$' || true)
-            if [ "${lines}" != "1/1" ] || [ "${pin}" != 1 ]; then
+            # The added line's value, compared as a STRING: SemVer build
+            # metadata (`0.40.2+build1`) carries a `+`, which in a regex would
+            # be a quantifier and refuse a pin this workflow wrote itself.
+            pinned=$(git diff -U0 "${GREEN_SHA}" HEAD -- flake.nix \
+              | sed -nE 's/^\+[[:space:]]*version = "([^"]*)";[[:space:]]*$/\1/p')
+            if [ "${lines}" != "1/1" ] || [ "${pinned}" != "${VERSION}" ]; then
               echo "::error::Refusing to tag: flake.nix differs from ${GREEN_SHA} by more than the version pin (${lines}). Nothing has been tagged."
               exit 1
             fi
