@@ -25,13 +25,21 @@
 on:
   github:
     pull_request:
+      # `RWX: linux` on the pull request, the name the ruleset requires
+      # (scripts/apply-branch-protection.sh).
+      status-checks:
+        name: linux
       init:
         commit-sha: ${{ event.git.sha }}
         trigger: pull_request
+        base-sha: ${{ event.github.pull_request.pull_request.base.sha }}
+        author: ${{ event.github.pull_request.pull_request.user.login }}
   cli:
     init:
       commit-sha: ${{ event.git.sha }}
       trigger: cli
+      base-sha: ""
+      author: ""
 
 base:
   image: ubuntu:24.04
@@ -67,19 +75,56 @@ tasks:
       # Some fast-tier tests run `git rev-parse --show-toplevel`.
       preserve-git-dir: true
 
-  # Active unless this is a pull request and `.github/ci-backend` does not say
-  # `rwx`. Every task below checks it; when inactive they are skipped and the
-  # run passes, which is what lets GitHub Actions be the active side instead.
+  # Full history, for the path classification below: the files a PR changes
+  # are the ones since its merge-base with the base. Kept apart from `code`,
+  # whose shallow clone every other task builds on.
+  - key: history
+    call: git/clone 2.2.0
+    with:
+      repository: https://github.com/vfarcic/dot-agent-deck.git
+      ref: ${{ init.commit-sha }}
+      preserve-git-dir: true
+      fetch-full-depth: true
+
+  # Which tasks this run needs, one value per group, read by each task's `if:`.
+  # Nothing runs unless the run is active: a pull request whose
+  # `.github/ci-backend` does not say `rwx` is GitHub Actions' to run, so every
+  # task is skipped and this run passes in seconds, which keeps RWX's check
+  # requirable either way. The paths are classified by scripts/ci-changes.sh,
+  # the script ci.yml's `changes` job runs, from the files the PR changes
+  # against the merge-base with its base, which is the list GitHub's PR view
+  # shows.
   - key: backend
-    use: code
+    use: history
+    env:
+      TRIGGER: ${{ init.trigger }}
+      BASE_SHA: ${{ init.base-sha }}
+      AUTHOR: ${{ init.author }}
     run: |
+      set -euo pipefail
       active=true
-      if [ "${{ init.trigger }}" = pull_request ] \
+      if [ "$TRIGGER" = pull_request ] \
           && [ "$(tr -d '[:space:]' < .github/ci-backend 2>/dev/null)" != rwx ]; then
         active=false
       fi
-      echo "trigger=${{ init.trigger }} active=$active"
-      printf '%s' "$active" > "$RWX_VALUES/active"
+      files=""
+      if [ "$TRIGGER" = pull_request ] && [ -n "$BASE_SHA" ]; then
+        # Fail safe: if the base cannot be fetched the list stays empty, which
+        # the script reads as "unknown" and answers with everything.
+        if git fetch -q origin "$BASE_SHA" && mb=$(git merge-base "$BASE_SHA" HEAD); then
+          files=$(git diff --name-only "$mb" HEAD)
+        fi
+      fi
+      printf '%s' "$files" | scripts/ci-changes.sh "$TRIGGER" "$AUTHOR" > changes.env
+      cat changes.env
+      . ./changes.env
+      put() { printf '%s' "$2" > "$RWX_VALUES/$1"; echo "$1=$2"; }
+      on() { [ "$active" = true ] && [ "$1" = true ] && echo true || echo false; }
+      put active "$active"
+      not_lock_only=$([ "$devbox_only" != true ] && [ "$flake_only" != true ] && echo true || echo false)
+      put rust "$(on "$not_lock_only")"
+      put nix "$(on "$([ "$devbox_only" != true ] && echo true || echo false)")"
+      put aarch64 "$(on "$cargo")"
 
   - key: rust
     call: rust-lang/install 1.1.1
@@ -108,12 +153,12 @@ tasks:
       task --version
 
   - key: fmt
-    if: ${{ tasks.backend.values.active == 'true' }}
+    if: ${{ tasks.backend.values.rust == 'true' }}
     use: [code, rust]
     run: cargo fmt --check
 
   - key: clippy
-    if: ${{ tasks.backend.values.active == 'true' }}
+    if: ${{ tasks.backend.values.rust == 'true' }}
     use: [system-packages, code, rust]
     tool-cache: ci-clippy-v2
     env:
@@ -121,18 +166,18 @@ tasks:
     run: cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings
 
   - key: build-release
-    if: ${{ tasks.backend.values.active == 'true' }}
+    if: ${{ tasks.backend.values.rust == 'true' }}
     use: [system-packages, code, rust]
     tool-cache: ci-build-release-v2
     run: cargo build --release
 
   - key: linkage-check
-    if: ${{ tasks.backend.values.active == 'true' }}
+    if: ${{ tasks.backend.values.rust == 'true' }}
     use: build-release
     run: cargo xtask linkage-check
 
   - key: test
-    if: ${{ tasks.backend.values.active == 'true' }}
+    if: ${{ tasks.backend.values.rust == 'true' }}
     use: [system-packages, code, rust, nextest, go-task, node]
     tool-cache: ci-test-v2
     env:
@@ -159,7 +204,7 @@ tasks:
   # archive, so they never build the tier: a cargo build there would rebuild
   # the workspace crates, whose sources get fresh mtimes in every task.
   - key: e2e-build
-    if: ${{ tasks.backend.values.active == 'true' }}
+    if: ${{ tasks.backend.values.rust == 'true' }}
     use: [system-packages, code, rust, nextest, node]
     tool-cache: ci-e2e-build-v2
     # The e2e `target/` plus its archive needs well over the default 50 GB.
@@ -180,7 +225,7 @@ tasks:
   # timing-sensitive e2e tests see the per-runner load they see in ci.yml, and
   # the speed-up comes from partitioning rather than from bigger machines.
   - key: e2e
-    if: ${{ tasks.backend.values.active == 'true' }}
+    if: ${{ tasks.backend.values.rust == 'true' }}
     use: e2e-build
     parallel:
       values:
@@ -214,3 +259,135 @@ tasks:
           options:
             language: Rust
             framework: cargo-nextest
+
+  # The cross-compiling tasks need more targets than `rust` installs, and
+  # `rust-lang/install` ships no `rustup` to add them, so these get a
+  # rustup-managed copy of the same toolchain.
+  - key: rustup
+    run: |
+      curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal \
+        --default-toolchain 1.98.1 \
+        --target x86_64-pc-windows-msvc --target aarch64-unknown-linux-gnu
+      echo "$HOME/.cargo/bin" >> "$RWX_ENV/PATH"
+
+  - key: pnpm
+    use: node
+    run: |
+      npm install -g pnpm@12.9.0
+      pnpm --version
+
+  # desktop/: the web app's unit tests and build (ci.yml's `desktop-web`).
+  - key: desktop-web
+    if: ${{ tasks.backend.values.rust == 'true' }}
+    use: [code, pnpm]
+    run: |
+      cd desktop
+      pnpm install --frozen-lockfile
+      pnpm test
+      pnpm build
+      ! grep -rl __dadDriver dist/
+
+  # desktop/: the Playwright suite in Chromium and WebKit (`desktop-browser`).
+  - key: desktop-browser
+    if: ${{ tasks.backend.values.rust == 'true' }}
+    use: [code, pnpm]
+    timeout: 20m
+    run: |
+      cd desktop
+      pnpm install --frozen-lockfile
+      pnpm exec playwright install --with-deps chromium webkit
+      pnpm test:browser:types
+      pnpm test:browser
+
+  # The desktop app driven through WebKitWebDriver under Xvfb
+  # (`desktop-driver`).
+  - key: desktop-driver
+    if: ${{ tasks.backend.values.rust == 'true' }}
+    use: [system-packages, code, rust, pnpm]
+    tool-cache: ci-desktop-driver-v1
+    timeout: 30m
+    env:
+      TAURI_DRIVER_VERSION: 2.0.6
+      CARGO_INCREMENTAL: "0"
+    run: |
+      sudo apt-get update
+      sudo apt-get install -y webkit2gtk-driver xvfb xclip xdotool
+      cargo install tauri-driver --locked --version "$TAURI_DRIVER_VERSION"
+      # `cargo install` puts it in Cargo's bin dir, which is not on PATH here.
+      export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+      cargo build --locked --bin dot-agent-deck
+      cd desktop
+      pnpm install --frozen-lockfile
+      pnpm test:driver:types
+      VITE_DAD_DRIVER_SEAM=1 pnpm tauri build --debug --no-bundle
+      DAD_DRIVER_NATIVE_DRIVER=/usr/bin/WebKitWebDriver \
+        xvfb-run -a -s "-screen 0 1920x1080x24 -dpi 96" pnpm test:driver
+
+  # Type-checks the workspace for Windows from Linux (`windows-cross-check`).
+  - key: windows-cross-check
+    if: ${{ tasks.backend.values.rust == 'true' }}
+    use: [system-packages, code, rustup]
+    tool-cache: ci-windows-cross-check-v1
+    run: |
+      set -euo pipefail
+      WINDOWS_CROSS_CHECK_TOOLCHAIN="$(rustup show home)/toolchains/$(rustup show active-toolchain | cut -d' ' -f1)"
+      export WINDOWS_CROSS_CHECK_TOOLCHAIN
+      scripts/windows-cross-check.sh
+
+  # `cargo audit` against the RustSec advisories (`security`).
+  - key: security
+    if: ${{ tasks.backend.values.rust == 'true' }}
+    use: [code, rust]
+    tool-cache: ci-security-v1
+    run: |
+      cargo install cargo-audit --locked
+      cargo audit
+
+  # Nix, single-user: a task has no init system for the daemon.
+  - key: nix-install
+    run: |
+      sudo install -d -o "$(id -u)" -g "$(id -g)" /nix
+      curl -fsSL https://releases.nixos.org/nix/nix-2.35.3/install | sh -s -- --no-daemon
+      echo "$HOME/.nix-profile/bin" >> "$RWX_ENV/PATH"
+    env:
+      NIX_CONFIG: experimental-features = nix-command flakes
+
+  # `nix flake check` (`nix`).
+  - key: nix
+    if: ${{ tasks.backend.values.nix == 'true' }}
+    use: [code, nix-install]
+    tool-cache: ci-nix-v1
+    env:
+      NIX_CONFIG: experimental-features = nix-command flakes
+    run: nix flake check -L --all-systems
+
+  # The toolchain pins agree, and the devbox shell works (`devbox`).
+  - key: devbox
+    if: ${{ tasks.backend.values.active == 'true' }}
+    use: [code, nix-install]
+    tool-cache: ci-devbox-v1
+    env:
+      NIX_CONFIG: experimental-features = nix-command flakes
+      DEVBOX_USE_VERSION: 0.18.4
+    run: |
+      scripts/check-pin-lockstep.sh
+      curl -fsSL https://get.jetify.com/devbox | bash -s -- -f
+      devbox run -- bash scripts/devbox-smoke.sh
+
+  # The aarch64 release build through `cross` (aarch64-crossbuild-check.yml),
+  # when the manifests or a CI definition changed.
+  - key: aarch64-crossbuild
+    if: ${{ tasks.backend.values.aarch64 == 'true' }}
+    use: [code, rustup]
+    docker: true
+    tool-cache: ci-aarch64-v1
+    run: |
+      set -euo pipefail
+      sudo apt-get update
+      sudo apt-get install -y file
+      cargo install cross --locked --version 0.2.5
+      export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+      cross build --release --target aarch64-unknown-linux-gnu
+      bin=target/aarch64-unknown-linux-gnu/release/dot-agent-deck
+      file "$bin" | grep -q 'ARM aarch64'
+      echo "OK: aarch64 binary produced"

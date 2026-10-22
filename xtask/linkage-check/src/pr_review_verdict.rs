@@ -64,7 +64,7 @@ fn run_py(body: &str) -> Output {
          from pr_review_common import (_is_trusted_verdict_comment, parse_verdict,\n\
         \x20    DENY_PATHS, already_reviewed_at, already_noticed_at, NO_VOTE_MARKER,\n\
         \x20    concat_json_documents, bot_rejection_is_stale,\n\
-        \x20    classify_check_runs, FALLBACK_REQUIRED_CONTEXTS,\n\
+        \x20    classify_check_runs, FALLBACK_REQUIRED_CONTEXTS, statuses_as_runs,\n\
         \x20    focus_pass_requested, coverage_gap,\n\
         \x20    NO_INDEPENDENT_REVIEW_MARKER, INSUFFICIENT_MARKER,\n\
         \x20    AUTO_MERGE_ARMED_MARKER,\n\
@@ -627,6 +627,33 @@ fn an_unrejected_pull_request_is_not_a_stale_rejection() {
 // anything at all — silently.
 // ---------------------------------------------------------------------------
 
+/// A required context that reports as a commit STATUS (RWX does) gates like a
+/// check run: the reviewer reads both, so a green status satisfies it, a
+/// pending one has not concluded, and a failing or erroring one blocks. Before
+/// this, statuses were never fetched and such a context read as never reported.
+#[test]
+fn a_required_context_reported_as_a_commit_status_gates_like_a_check_run() {
+    assert_py_ok(
+        "RWX = 'RWX: ci.yml (pull request)'\n\
+         req = REQ + (RWX,)\n\
+         def st(state, at):\n\
+        \x20   return {'context': RWX, 'state': state, 'updated_at': at, 'id': 1}\n\
+         green, why, _ = classify_check_runs(green_five(), req)\n\
+         assert not green and 'not concluded' in why, why\n\
+         ok = green_five() + statuses_as_runs([st('success', '2026-10-22T10:05:00Z'),\n\
+        \x20                                   st('pending', '2026-10-22T10:00:00Z')])\n\
+         green, why, _ = classify_check_runs(ok, req)\n\
+         assert green, why\n\
+         running = green_five() + statuses_as_runs([st('pending', '2026-10-22T10:00:00Z')])\n\
+         green, why, _ = classify_check_runs(running, req)\n\
+         assert not green and 'not concluded' in why, why\n\
+         for bad in ('failure', 'error'):\n\
+        \x20   runs = green_five() + statuses_as_runs([st(bad, '2026-10-22T10:05:00Z')])\n\
+        \x20   green, why, _ = classify_check_runs(runs, req)\n\
+        \x20   assert not green and RWX in why, (bad, why)",
+    );
+}
+
 /// The regression, in the exact shape PR #1076 had: all five required contexts
 /// green, one advisory job red. `devbox` died 15–18 seconds in on a `curl: (22)
 /// ... 504` from a third-party CDN inside someone else's action, on a diff that
@@ -933,7 +960,12 @@ fn the_fallback_list_matches_the_branch_protection_script() {
     let end = rest
         .find("}\"")
         .expect("the REQUIRED_CHECKS default should close with }\"");
-    let expected: Vec<&str> = rest[..end].split_whitespace().collect();
+    // Comma-separated, as the script splits it: a context can contain a space.
+    let expected: Vec<&str> = rest[..end]
+        .split(',')
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .collect();
     assert!(
         !expected.is_empty(),
         "parsed an empty REQUIRED_CHECKS default; the test's parser is broken, not the list"

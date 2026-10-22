@@ -130,10 +130,10 @@ bash .claude/skills/verify-pr/checks.sh --dir ../dot-agent-deck-pr-<n>
 
 Steps, cheapest first: `fmt`, `clippy` (both rule 2 — note clippy carries **both** e2e features, so it type-checks lane 2's files — the only step in this skill that compiles them, and CI-side the only thing that does, since no test reaching a real agent runs in any CI job), `build --release`, `test-fast` (rule 5's fast tier), `linkage-check` (rule 7), `windows-cross`, `audit`. It does not stop at the first failure — a review needs the whole picture. If the build fails, the test steps are marked `BLOCKED` rather than burning minutes restating it.
 
-**Lane 1 is CI's job, so READ its run rather than reproducing it.** The `e2e` step is **off by default** since issue #502: `ci.yml`'s `e2e-deterministic` job runs `cargo test-e2e` on every PR, so the signal already exists on the PR you are reviewing. Get it, and put it in the report as a row like any other gate:
+**Lane 1 is CI's job, so READ its run rather than reproducing it.** The `e2e` step is **off by default** since issue #502: `ci.yml`'s `e2e-deterministic` job runs `cargo test-e2e` on every PR, so the signal already exists on the PR you are reviewing. **When the PR's `.github/ci-backend` says `rwx`, that job reads `skipped` and the tier ran on RWX instead**, inside the `RWX: linux` status (its `e2e` tasks); read that one, with `rwx results <run-id>` from the link `gh pr checks` prints (docs/develop/rwx.md). Get it, and put it in the report as a row like any other gate:
 
 ```bash
-gh pr checks <n>                          # is e2e-deterministic green, red, or still running?
+gh pr checks <n>                          # is e2e-deterministic (or RWX: linux) green, red, or still running?
 gh run view <run-id> --log-failed         # what actually failed
 ```
 
@@ -246,8 +246,9 @@ Template:
 ## CI
 <per-job conclusions from `gh pr checks`, or "held for approval — released in Phase 1b" /
 "not approved, see blocking findings". Name the jobs the local run cannot replace:
-build-macos, security (cargo audit), and e2e-deterministic — lane 1
-is CI's job now, so quote its conclusion here rather than a local `e2e` row.
+security (cargo audit), and e2e-deterministic (or `RWX: linux` when the CI switch is on) —
+lane 1 is CI's job now, so quote its conclusion here rather than a local `e2e` row.
+`build-macos` does not run on pull requests; say so rather than reporting it as passed.
 State lane 2 explicitly: run by you with your own credentials (name the tests), or
 UNVERIFIED. Nothing in CI covers it.>
 

@@ -9,22 +9,38 @@ This repository can use [RWX](https://www.rwx.com) in two places, each behind it
 
 ## The CI backend switch
 
-`.github/ci-backend` decides which system runs the Linux jobs (`fmt`, `clippy`, `build-release`, `test`, `e2e-build`, the `e2e` shards and the `build` / `e2e-deterministic` aggregators) **for a pull request**. Pushes to `main` stay on GitHub Actions whatever the file says, so `main`'s post-merge verification and the cache saves from #1743 do not move.
+**Where each job runs.** `.github/ci-backend` decides which system runs a **pull request's** Linux jobs. Pushes to `main` run everything on GitHub Actions whatever the file says, so `main`'s post-merge verification and the cache saves from #1743 never depend on RWX.
 
-Both systems trigger on every pull request and both read the file at the commit they test:
+| job | pull request, `ci-backend=rwx` | pull request, `ci-backend=gha` | push to `main` |
+| --- | --- | --- | --- |
+| every Linux job in `ci.yml` (`fmt`, `clippy`, `build-release`, `test`, `e2e-build`, the `e2e` shards, `desktop-web`, `desktop-browser`, `desktop-driver`, `windows-cross-check`, `security`, `nix`, `devbox`) and `aarch64-crossbuild-check.yml` | RWX | GitHub Actions | GitHub Actions |
+| `cross-version` | GitHub Actions | GitHub Actions | GitHub Actions |
+| `build-macos` | not run | not run | GitHub Actions |
+| `build-windows` | `if: false` until Windows ships | | |
+| `changes`, `notify-main-red`, `docs.yml`, the reviewer, labeling, releases | GitHub Actions | GitHub Actions | GitHub Actions |
 
-- **GitHub Actions** (`.github/workflows/ci.yml`): the `changes` job reads the file through the API and exposes `linux_backend`. When it says `rwx`, each Linux job's `if:` is false, so the job is skipped — and a job skipped by its own `if:` satisfies a required check. `build-macos`, `build-windows`, `security`, `cross-version` and every other workflow ignore the switch.
-- **RWX** (`.rwx/ci.yml`): the `backend` task reads the file and writes `active`. Unless the file says `rwx`, every check task is skipped and the run passes in seconds, so RWX's check can be required whichever side is active.
+The exceptions, and why:
+
+- **`cross-version` stays on GitHub Actions.** Its harness contains the builds in unprivileged bubblewrap namespaces, and inside an RWX task bwrap cannot set up the network namespace (measured 2026-10-22: `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`).
+- **`docs.yml` stays.** `docs-preview.yml` deploys the preview from its uploaded artifact through `workflow_run`, which only a GitHub Actions run can feed.
+- **`build-macos` runs on `main`, not on pull requests.** RWX has no macOS runners, and on a pull request it was the slowest required check (5 to 18 minutes) for a 3% rate of macOS-only failures (545 runs, 2026-10-06 to 10-21). A macOS-only defect now surfaces on `main`: whoever merged watches that run and owns a red (the `merge-pr` skill), `notify-main-red` opens an issue, and `tag-release.yml` refuses to release a `main` whose run is not green.
+
+**How the switch works.** Both systems trigger on every pull request and both read the file at the commit they test:
+
+- **GitHub Actions** (`.github/workflows/ci.yml`): the `changes` job reads the file through the API and exposes `linux_backend`. When it says `rwx`, each Linux job's `if:` is false, so the job is skipped, and a job skipped by its own `if:` satisfies a required check. `aarch64-crossbuild-check.yml` has its own copy of that read.
+- **RWX** (`.rwx/ci.yml`): the `backend` task reads the file. Unless it says `rwx`, every check task is skipped and the run passes in seconds, so RWX's check, `RWX: linux`, can be required whichever side is active.
+- **Both skip the same jobs for the same change**: `scripts/ci-changes.sh` holds the path classification (a Renovate PR touching only the devbox or flake files, whether the change feeds the binary, whether the manifests changed), and both call it. GitHub Actions takes the PR's files from the API; RWX computes them against the merge-base with the PR's base, which is the same list.
 
 Flipping the switch is a one-line pull request, and it takes effect on that pull request itself.
 
 ### What to know before turning it on
 
-- **The ruleset has to name RWX's check.** `build` and `e2e-deterministic` are required contexts; with the switch on they pass as skipped, so the Linux verdict is RWX's check, and nothing blocks a merge on it until it is a required context too. Changing the ruleset needs an admin (`scripts/apply-branch-protection.sh`), and the agent reviewer's fallback list in `.github/scripts/pr_review_common.py` names the same contexts.
-- **Switch back before the credits run out.** A pull request that flips the file back to `gha` still runs on RWX until it merges; if RWX can no longer run, that PR's required RWX check never passes, and merging it needs an admin bypass.
-- **RWX tests the PR's head commit; GitHub Actions tests the PR merged into its base.** A PR that is green on its head and red once merged with a moved `main` is caught by `main`'s push run, which stays on GitHub Actions, and by the overlap check before a merge (CLAUDE.md rule 8).
+- **The ruleset has to require `RWX: linux`.** With the switch on, `build` and `e2e-deterministic` pass as skipped, so nothing blocks a merge on the Linux verdict until RWX's check is required too. `scripts/apply-branch-protection.sh`'s default list carries it, and the agent reviewer reads commit statuses (which is how RWX reports) as well as check runs. Applying the ruleset needs an admin, and only after `.rwx/ci.yml` is on `main`: a pull request whose branch lacks it gets no RWX run, so `RWX: linux` never reports and it cannot merge until it merges `main`.
+- **Switch back before the credits run out.** A pull request that flips the file back to `gha` still runs on RWX until it merges; if RWX can no longer run, that PR's required RWX check never passes, and merging it needs an admin bypass. The same holds for removing `RWX: linux` from the ruleset.
+- **RWX tests the PR's head commit; GitHub Actions tests the PR merged into its base.** A PR that is green on its head and red once merged with a moved `main` is caught by the overlap check before a merge (CLAUDE.md rule 8) and by `main`'s push run.
 - **A pull request from a fork needs someone to start its RWX run by hand** in the RWX UI.
 - **Tool caches live in the vault `dot_agent_deck_rwx_eval`**, whose "Allow public repositories" setting must stay on for GitHub-triggered runs on this public repository.
+- **Reading a red:** RWX's failures are not in `gh run view`. `gh pr checks <n>` lists `RWX: linux` with a link to the run, and `rwx results <run-id>` (or `rwx logs <task-id>`) shows what failed.
 
 ## Sandboxed runs for agents
 

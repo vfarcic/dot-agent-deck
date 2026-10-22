@@ -125,7 +125,18 @@ RENOVATE_APP_ID="${RENOVATE_APP_ID:-2740}"
 # The cost is the one this file already warns about two paragraphs up: it is a
 # fifth name a fork's CI must produce, and the ALLOW_NO_REQUIRED_CHECKS escape
 # hatch covers that case unchanged.
-REQUIRED_CHECKS="${REQUIRED_CHECKS-build build-macos build-windows security e2e-deterministic}"
+#
+# COMMA-separated, because a context name can contain spaces: RWX posts its
+# status as `RWX: linux` (`.rwx/ci.yml`, docs/develop/rwx.md), which is the
+# Linux verdict of a pull request whose `.github/ci-backend` says `rwx` and a
+# seconds-long pass otherwise, so it is requirable either way. `build-macos`
+# stays listed although it no longer runs on pull requests: a job skipped by its
+# own `if:` satisfies a required check, and it gates a merge-queue run.
+#
+# Apply this only after `.rwx/ci.yml` is on `main`: a pull request whose branch
+# lacks it gets no RWX run, so `RWX: linux` never reports and it cannot merge
+# until it merges `main`.
+REQUIRED_CHECKS="${REQUIRED_CHECKS-build,build-macos,build-windows,security,e2e-deterministic,RWX: linux}"
 
 # Acknowledge that an empty REQUIRED_CHECKS is intended. Without this set to
 # `true`, an empty (or whitespace-only) REQUIRED_CHECKS is a hard error rather
@@ -198,14 +209,25 @@ required_status_checks_rule_json() {
       return 1
       ;;
   esac
-  # Unquoted on purpose: word splitting is what turns the space-separated list
-  # into one entry per context. `set -f` around it because unquoted expansion
-  # also globs, and a stray `*` would otherwise become a list of filenames
-  # instead of failing the validation below.
+  # Unquoted on purpose, with IFS set to a comma: splitting is what turns the
+  # comma-separated list into one entry per context, and a name with a space
+  # in it stays whole. `set -f` around it because unquoted expansion also globs,
+  # and a stray `*` would otherwise become a list of filenames instead of
+  # failing the validation below. Each entry is then trimmed, and empty ones
+  # dropped, so `a, b,` means the same as `a,b`.
+  local old_ifs=$IFS trimmed=()
   set -f
+  IFS=,
   # shellcheck disable=SC2086
   set -- $REQUIRED_CHECKS
+  IFS=$old_ifs
   set +f
+  for ctx in "$@"; do
+    ctx="${ctx#"${ctx%%[![:space:]]*}"}"
+    ctx="${ctx%"${ctx##*[![:space:]]}"}"
+    [ -n "$ctx" ] && trimmed+=("$ctx")
+  done
+  set -- ${trimmed[@]+"${trimmed[@]}"}
   # Tested on the word count after splitting rather than with
   # `[ -z "$REQUIRED_CHECKS" ]`, so a whitespace-only value reaches the same
   # decision instead of slipping through as "omit the rule".
@@ -221,7 +243,7 @@ required_status_checks_rule_json() {
       echo >&2
       echo "  REQUIRED_CHECKS= ALLOW_NO_REQUIRED_CHECKS=true $0 apply" >&2
       echo >&2
-      echo "Otherwise leave REQUIRED_CHECKS unset for this repository's four defaults, or set" >&2
+      echo "Otherwise leave REQUIRED_CHECKS unset for this repository's defaults, or set" >&2
       echo "it to your own job names. See docs/develop/governance.md." >&2
       return 1
     fi

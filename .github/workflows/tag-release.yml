@@ -60,6 +60,8 @@ on:
 # were absent. Narrow it rather than inheriting the repository default.
 permissions:
   contents: read
+  # Reading main's CI run for the green-main gate below.
+  actions: read
 
 # Serialise with itself only. `release.yml` has its own `release` group and runs
 # in a separate workflow run triggered by the tag push, so it is not held here.
@@ -172,6 +174,39 @@ jobs:
             exit 1
           fi
           echo "main's tip matches the inspected tree."
+
+      # A release ships what `main` is, so `main` must be green: the CI run for
+      # the commit being released must have finished with every job passing.
+      # This is the only gate macOS has, since `build-macos` runs on pushes to
+      # `main` rather than on pull requests, and it is why a red `main` is fixed
+      # rather than released around. There is deliberately no override: rerun a
+      # flaky job (a rerun that passes turns the run green) or fix it, then
+      # dispatch again.
+      - name: Refuse to release a main that CI has not passed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          HEAD_SHA=$(git rev-parse HEAD)
+          run=$(gh api "repos/${REPO}/actions/workflows/ci.yml/runs?head_sha=${HEAD_SHA}&event=push&branch=main&per_page=1" \
+            --jq '.workflow_runs[0] // empty | "\(.id) \(.status) \(.conclusion) \(.html_url)"')
+          if [ -z "${run}" ]; then
+            echo "::error::Refusing to release: there is no CI run for main at ${HEAD_SHA}, so nothing says this commit builds and passes on every platform. Push-triggered ci.yml runs it for every commit on main; wait for it, or find out why it did not start."
+            exit 1
+          fi
+          read -r id status conclusion url <<< "${run}"
+          if [ "${status}" != completed ]; then
+            echo "::error::Refusing to release: CI for main at ${HEAD_SHA} is still ${status} (${url}). Dispatch again once it has finished green."
+            exit 1
+          fi
+          if [ "${conclusion}" != success ]; then
+            failed=$(gh api "repos/${REPO}/actions/runs/${id}/jobs?per_page=100&filter=latest" \
+              --jq '[.jobs[] | select(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out") | .name] | join(", ")')
+            echo "::error::Refusing to release: CI for main at ${HEAD_SHA} concluded ${conclusion} (${url}); failed: ${failed:-see the run}. Fix main (or rerun a flaky job until it passes), then dispatch again."
+            exit 1
+          fi
+          echo "CI for main at ${HEAD_SHA} passed: ${url}"
 
       - name: Validate the requested version
         id: input
