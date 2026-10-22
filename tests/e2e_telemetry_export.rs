@@ -1348,6 +1348,42 @@ print('TELEMETRY_LAUNCH_READY', flush=True)
 os.execvp('cat', ['cat'])
 "#;
 
+/// A `codex` at `path` as npm installs it: a link to `bin/codex.js` in an
+/// `@openai/codex` package under `root`, here holding `source`. The deck's
+/// shim adds to Codex only in a form it recognises, and this is one.
+fn npm_codex_stand_in(root: &Path, path: &Path, source: &str) {
+    let package = root.join("lib/node_modules/@openai/codex/bin");
+    std::fs::create_dir_all(&package).unwrap();
+    write_executable(&package.join("codex.js"), source);
+    std::os::unix::fs::symlink(package.join("codex.js"), path).unwrap();
+}
+
+/// A native `devin` at `path` that runs the script `script` with its own
+/// arguments, built with `cc`: the deck's shim adds to Devin only when it is
+/// a native program, and the recorder is a Python script.
+fn native_devin_stand_in(path: &Path, script: &Path) {
+    let script = script.to_str().unwrap();
+    assert!(
+        !script.contains(['"', '\\', '\n']),
+        "a C string literal: {script}"
+    );
+    let source = path.with_extension("c");
+    std::fs::write(
+        &source,
+        format!(
+            "#include <unistd.h>\nint main(int argc, char **argv) {{ (void)argc; execv(\"{script}\", argv); return 127; }}\n"
+        ),
+    )
+    .unwrap();
+    let out = std::process::Command::new("cc")
+        .arg("-o")
+        .arg(path)
+        .arg(&source)
+        .output()
+        .expect("cc on PATH to build the native Devin stand-in");
+    assert!(out.status.success(), "building the Devin stand-in: {out:?}");
+}
+
 fn launch_record(deck: &TuiDeck) -> Value {
     let path = deck.workdir().join("telemetry-launch.json");
     common::wait_for_file_contains(&path, "argv");
@@ -1387,7 +1423,7 @@ fn launch_test_shell(root: &Path) -> std::path::PathBuf {
     shell
 }
 
-/// Scenario: Start a Codex recorder directly and through scripts that call codex by name, change CODEX_HOME, opt out of trace export or put the real Codex's directory in front of PATH, and through an absolute executable path. Inspect the real argv and environment for safe signal activation, preserved arguments and user choices, no header secret or logs exporter, and unchanged PATH/argv when export is off.
+/// Scenario: Start a Codex recorder, installed where npm puts Codex's launcher, directly and through scripts that call codex by name, change CODEX_HOME, opt out of trace export or put the real Codex's directory in front of PATH, and through an absolute executable path. Inspect the real argv and environment for safe signal activation, preserved arguments and user choices, no header secret or logs exporter, and unchanged PATH/argv when export is off.
 #[spec("telemetry/otlp/016")]
 #[test]
 fn telemetry_otlp_016_codex_launch_enables_only_safe_signals() {
@@ -1416,7 +1452,7 @@ fn telemetry_otlp_016_codex_launch_enables_only_safe_signals() {
             "[otel]\nmetrics_exporter = \"none\"\n",
         )
         .unwrap();
-        write_executable(&bin.join("codex"), AGENT_LAUNCH_RECORDER);
+        npm_codex_stand_in(scratch.path(), &bin.join("codex"), AGENT_LAUNCH_RECORDER);
         if user_config {
             std::fs::write(
                 codex_home.join("config.toml"),
@@ -1603,7 +1639,7 @@ fn telemetry_otlp_016_codex_launch_enables_only_safe_signals() {
     }
 }
 
-/// Scenario: Start a Devin recorder directly and through scripts that call devin by name, select another config home, disable OTel or metrics, or supply their own config, plus an absolute-path launch and export off. Inspect argv, PATH and the private overlay for preserved user settings, identity, permissions and absent header secrets, then close the pane and require overlay removal.
+/// Scenario: Start a Devin recorder behind a native program directly and through scripts that call devin by name, select another config home, disable OTel or metrics, or supply their own config, plus an absolute-path launch and export off. Inspect argv, PATH and the private overlay for preserved user settings, identity, permissions and absent header secrets, then close the pane and require overlay removal.
 #[spec("telemetry/otlp/017")]
 #[test]
 fn telemetry_otlp_017_devin_launch_config_is_private_and_temporary() {
@@ -1633,7 +1669,9 @@ fn telemetry_otlp_017_devin_launch_config_is_private_and_temporary() {
             r#"{"theme_mode":"light"}"#,
         )
         .unwrap();
-        write_executable(&bin.join("devin"), AGENT_LAUNCH_RECORDER);
+        let recorder = scratch.path().join("devin-recorder.py");
+        write_executable(&recorder, AGENT_LAUNCH_RECORDER);
+        native_devin_stand_in(&bin.join("devin"), &recorder);
         let source = if user_otel {
             "{ // user choices\n\"theme_mode\": \"dark\", \"otel\": {\"endpoint\": \"http://127.0.0.1:9/user-owned\", \"disable_user_prompt_logging\": false, \"disable_tool_logging\": false, \"resource_attributes\": {\"user.marker\": \"preserved\"}}}"
         } else {

@@ -13,14 +13,20 @@ use dot_agent_deck::telemetry::shim;
 mod test_temp;
 
 /// A shim directory as the daemon installs it, and a directory holding a
-/// real `codex` with `script` as its body.
+/// real `codex` with `script` as its body, installed where npm installs
+/// Codex's launcher — `bin/codex.js` in an `@openai/codex` package, linked
+/// from the directory — which is one of the forms the shim adds to.
 fn fixture(root: &Path, script: &str) -> (PathBuf, PathBuf) {
     let deck = env!("CARGO_BIN_EXE_dot-agent-deck");
     let shim_dir = shim::install(&root.join("telemetry"), deck).unwrap();
+    let package = root.join("lib/node_modules/@openai/codex/bin");
+    std::fs::create_dir_all(&package).unwrap();
+    let launcher = package.join("codex.js");
+    std::fs::write(&launcher, script).unwrap();
+    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
     let real = root.join("real");
     std::fs::create_dir(&real).unwrap();
-    std::fs::write(real.join("codex"), script).unwrap();
-    std::fs::set_permissions(real.join("codex"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink(&launcher, real.join("codex")).unwrap();
     (shim_dir, real)
 }
 
@@ -35,11 +41,10 @@ fn on_path(name: &str) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// A stand-in for the real Codex that is not a shell script — the shim adds
-/// nothing to a shell script, which may be a user's wrapper — printing its
-/// `argv` one per line, then `guard=` and the shim's guard variable, and
-/// exiting with `status`. Python, by absolute path, so it runs on the
-/// cleared `PATH` these tests use.
+/// A stand-in for the real Codex, printing its `argv` one per line, then
+/// `guard=` and the shim's guard variable, and exiting with `status`.
+/// Python, by absolute path, so it runs on the cleared `PATH` these tests
+/// use; the shim adds to it because of where [`fixture`] puts it.
 fn recorder(status: u8) -> String {
     let python = on_path("python3").expect("python3 on PATH for the Codex stand-in");
     format!(
@@ -150,12 +155,14 @@ fn a_missing_program_is_command_not_found() {
     );
 }
 
-/// The resolved `codex` is the user's own shell wrapper that points
-/// `CODEX_HOME` at a configuration opting out of both exporters and then runs
-/// the real Codex by its full path: the shim cannot have read the
-/// configuration Codex will, so it adds nothing.
+/// The resolved `codex` is the user's own wrapper that points `CODEX_HOME`
+/// at a configuration opting out of both exporters and then runs the real
+/// Codex by its full path: the shim cannot have read the configuration Codex
+/// will, so it adds nothing — whether the wrapper is a shell script, a script
+/// for a shell under another name, or a Python script.
 #[test]
-fn a_users_shell_wrapper_named_codex_gets_nothing() {
+fn a_users_wrapper_named_codex_gets_nothing() {
+    let python = on_path("python3").expect("python3 on PATH for the Python wrapper");
     let root = test_temp::tempdir().unwrap();
     let (shim_dir, real) = fixture(root.path(), &recorder(0));
     let opted_out = root.path().join("opted-out");
@@ -165,49 +172,69 @@ fn a_users_shell_wrapper_named_codex_gets_nothing() {
         "[otel]\ntrace_exporter = \"none\"\nmetrics_exporter = \"none\"\n",
     )
     .unwrap();
-    let wrapper_dir = root.path().join("wrapper");
-    std::fs::create_dir(&wrapper_dir).unwrap();
-    std::fs::write(
-        wrapper_dir.join("codex"),
-        format!(
-            "#!/bin/sh\nexport CODEX_HOME='{}'\nexec '{}' \"$@\"\n",
-            opted_out.display(),
-            real.join("codex").display()
+    let custom_shell = root.path().join("custom-shell");
+    std::os::unix::fs::symlink("/bin/sh", &custom_shell).unwrap();
+    let shell_body = format!(
+        "export CODEX_HOME='{}'\nexec '{}' \"$@\"\n",
+        opted_out.display(),
+        real.join("codex").display()
+    );
+    let wrappers = [
+        ("shell", format!("#!/bin/sh\n{shell_body}")),
+        (
+            "aliased shell",
+            format!("#!{}\n{shell_body}", custom_shell.display()),
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(
-        wrapper_dir.join("codex"),
-        std::fs::Permissions::from_mode(0o755),
-    )
-    .unwrap();
+        (
+            "python",
+            format!(
+                "#!{}\nimport os, sys\nos.environ['CODEX_HOME'] = '{}'\nos.execv('{}', ['codex'] + sys.argv[1:])\n",
+                python.display(),
+                opted_out.display(),
+                real.join("codex").display()
+            ),
+        ),
+    ];
     let home = root.path().join("home");
     std::fs::create_dir(&home).unwrap();
-    let mut cmd = Command::new(shim_dir.join("codex"));
-    cmd.args(["a b", "--continue"])
-        .env_clear()
-        .env("PATH", path_of(&[&shim_dir, &wrapper_dir, &real]))
-        .env("HOME", &home)
-        .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://c:4318");
-    let out = output_within(&mut cmd);
-    assert!(out.status.success(), "{out:?}");
-    let stdout = String::from_utf8(out.stdout).unwrap();
-    let lines: Vec<&str> = stdout.lines().collect();
-    assert_eq!(
-        lines,
-        [
-            real.join("codex").to_str().unwrap(),
-            "a b",
-            "--continue",
-            "guard=codex"
-        ],
-        "the wrapper ran, the real Codex got no overrides"
-    );
+    for (what, body) in wrappers {
+        let wrapper_dir = root
+            .path()
+            .join(format!("wrapper-{}", what.replace(' ', "-")));
+        std::fs::create_dir(&wrapper_dir).unwrap();
+        std::fs::write(wrapper_dir.join("codex"), body).unwrap();
+        std::fs::set_permissions(
+            wrapper_dir.join("codex"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let mut cmd = Command::new(shim_dir.join("codex"));
+        cmd.args(["a b", "--continue"])
+            .env_clear()
+            .env("PATH", path_of(&[&shim_dir, &wrapper_dir, &real]))
+            .env("HOME", &home)
+            .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://c:4318");
+        let out = output_within(&mut cmd);
+        assert!(out.status.success(), "{what}: {out:?}");
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                real.join("codex").to_str().unwrap(),
+                "a b",
+                "--continue",
+                "guard=codex"
+            ],
+            "{what}: the wrapper ran, the real Codex got no overrides"
+        );
+    }
 }
 
-/// Codex as npm installs it — a Node script — gets the additions.
+/// Codex as npm installs it — a Node script in the `@openai/codex` package —
+/// gets the additions.
 #[test]
-fn a_node_launcher_gets_the_additions() {
+fn npms_codex_launcher_gets_the_additions() {
     let Some(node) = on_path("node") else {
         eprintln!("SKIP: node is not on PATH for the npm-style Codex launcher");
         return;

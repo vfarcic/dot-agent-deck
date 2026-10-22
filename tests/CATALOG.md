@@ -129,14 +129,14 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 
 ##### telemetry/otlp/016 — Codex launch activates traces and metrics while preserving user choices.
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
-- **Agent:** PATH stand-in named codex, launched directly, through a shell script calling codex by name, and by absolute path.
+- **Agent:** PATH stand-in named codex, a recorder linked from where npm installs Codex's launcher (`node_modules/@openai/codex/bin/codex.js`), launched directly, through a shell script calling codex by name, and by absolute path.
 - **Asserts:** scripted and plain launches activate safe trace/metric overrides with signal URLs and JSON protocol, preserve original arguments and header/run identity in env, and add no logs exporter or secret in argv. In-script CODEX_HOME and trace opt-outs take effect; absolute-path launches and a script putting the real Codex's directory ahead of the shim on PATH bypass activation; export off preserves PATH and argv with no shim directory on PATH.
 - **Does not assert:** real Codex export (018) or all TOML exporter forms.
 - **Platform coverage:** mac+linux.
 
 ##### telemetry/otlp/017 — Devin launch uses a private temporary metadata-only overlay.
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
-- **Agent:** PATH stand-in named devin recording argv, env and config content/mode through direct, scripted and absolute-path launches.
+- **Agent:** PATH stand-in named devin, a native program built with `cc` that runs a recorder, recording argv, env and config content/mode through direct, scripted and absolute-path launches.
 - **Asserts:** scripted and plain launches receive a 0600 overlay preserving JSONC settings, endpoint/resource identity and user OTel choices, excluding header values and disabling content logging by default; the overlay exists while running and is removed at pane close. In-script config-home, enabled:false, metric opt-outs and explicit --config are respected; absolute paths bypass activation; export off preserves PATH and argv without a shim directory.
 - **Does not assert:** authenticated Devin delivery (020) or crash-recovery cleanup.
 - **Platform coverage:** mac+linux.

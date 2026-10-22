@@ -16,10 +16,11 @@
 //! 2. decides from its own environment — the agent's real one, after any
 //!    script or launcher — what the agent needs ([`super::launch`]), unless
 //!    this program was already shimmed further up its process tree
-//!    ([`GUARD_ENV`]), or the real program is a shell script of the user's
-//!    that may change that environment before the agent reads it
-//!    ([`launcher_is_certain`]), or the environment holds a value the
-//!    decision cannot read exactly;
+//!    ([`GUARD_ENV`]), or the real program is not one of the forms the shim
+//!    recognises as the agent itself — a native program, npm's Codex
+//!    launcher, a Nix store script — and may be a wrapper that changes that
+//!    environment before the agent reads it ([`launcher_is_certain`]), or the
+//!    environment holds a value the decision cannot read exactly;
 //! 3. replaces itself with the real program, those arguments in front of the
 //!    user's own, so signals, the exit status and the terminal are the
 //!    program's own.
@@ -64,15 +65,13 @@ pub const GUARD_ENV: &str = "DOT_AGENT_DECK_TELEMETRY_SHIMMED";
 /// bringing a launch back to the shim.
 pub const MAX_HOPS: usize = 16;
 
-/// The interpreters, by file name, of the scripts the shim does not add to:
-/// shells, in which a user's wrapper named for the agent may set its
-/// configuration home before running it.
-const SHELLS: [&str; 12] = [
-    "sh", "bash", "dash", "zsh", "ksh", "mksh", "fish", "ash", "busybox", "csh", "tcsh", "yash",
-];
-
-/// How much of a candidate program the shim reads to tell what it is.
+/// How much of a candidate program the shim reads to tell whether it is a
+/// deck shim script.
 const HEAD_LEN: u64 = 16 * 1024;
+
+/// The largest script the shim reads in full to tell whether it may add to
+/// it; a larger one gets nothing.
+const SCRIPT_LIMIT: u64 = 64 * 1024;
 
 /// Write the shim scripts into `config_dir`'s [`DIR_NAME`], each running the
 /// deck at `deck`, and return that directory: owner-only, as are the scripts.
@@ -240,7 +239,7 @@ fn plan(
     }
     let program = resolve(name, path, dir).ok_or(Refused::NotFound)?;
     let added = match env {
-        Some(env) if !shimmed.contains(&name) && launcher_is_certain(&program) => {
+        Some(env) if !shimmed.contains(&name) && launcher_is_certain(name, &program) => {
             additions(name, dir, &args, env, pid)
         }
         _ => Vec::new(),
@@ -318,11 +317,17 @@ fn resolve(name: &str, path: Option<&OsStr>, dir: &Path) -> Option<PathBuf> {
 /// The first [`HEAD_LEN`] bytes of the file at `path`, or `None` when it
 /// cannot be read.
 fn head(path: &Path) -> Option<Vec<u8>> {
+    read_up_to(path, HEAD_LEN)
+}
+
+/// The file at `path` up to `limit` bytes and one more, so a caller can tell
+/// a file longer than `limit`; `None` when it cannot be read.
+fn read_up_to(path: &Path, limit: u64) -> Option<Vec<u8>> {
     use std::io::Read;
     let mut out = Vec::new();
     std::fs::File::open(path)
         .ok()?
-        .take(HEAD_LEN)
+        .take(limit + 1)
         .read_to_end(&mut out)
         .ok()?;
     Some(out)
@@ -338,40 +343,41 @@ fn is_shim_script(head: &[u8]) -> bool {
         })
 }
 
-/// Whether the shim can be sure that `program`, the real program it is about
-/// to run, is the agent, not a user's script that may set the agent's
-/// configuration home, or anything else the decision reads, before running
-/// it — in which case the decision would have read the wrong configuration.
-/// Sure of a native executable and of a script for an interpreter that is not
-/// a shell (Codex's npm launcher is a Node script); not of a shell script,
-/// unless it is one Nix generated ([`is_nix_store_path`]), nor of a file it
-/// cannot read or tell apart.
-fn launcher_is_certain(program: &Path) -> bool {
-    let (Some(head), Ok(canonical)) = (head(program), std::fs::canonicalize(program)) else {
+/// Whether `program`, the real `name` the shim is about to run, is one of the
+/// forms the shim adds to. Anything else may be a wrapper of the user's that
+/// changes the agent's configuration home, or anything else the decision
+/// reads, before running the agent, so the decision would have read the wrong
+/// configuration; the shim declines it rather than guess what it does. The
+/// forms, by the file with symlinks resolved:
+///
+/// - a native executable ([`is_native`]);
+/// - for Codex, npm's launcher: `bin/codex.js` in an `@openai/codex` package
+///   ([`is_codex_npm_launcher`]);
+/// - a script in the Nix store whose text names neither a configuration home
+///   nor an `OTEL_` variable ([`is_nix_store_path`],
+///   [`names_no_decision_variable`]).
+///
+/// A file it cannot read is none of them.
+fn launcher_is_certain(name: &str, program: &Path) -> bool {
+    let Ok(canonical) = std::fs::canonicalize(program) else {
         return false;
     };
-    match launcher_kind(&head) {
-        Some(Launcher::Native | Launcher::Interpreted) => true,
-        Some(Launcher::Shell) => is_nix_store_path(&canonical),
-        None => false,
-    }
+    read_up_to(&canonical, SCRIPT_LIMIT).is_some_and(|text| is_recognised(name, &canonical, &text))
 }
 
-/// What a program is, from `head`, the start of its file.
-#[derive(Debug, PartialEq, Eq)]
-enum Launcher {
-    /// An ELF or Mach-O executable.
-    Native,
-    /// A script whose interpreter is a shell ([`SHELLS`]).
-    Shell,
-    /// A script for another interpreter.
-    Interpreted,
+/// [`launcher_is_certain`] for the file at `canonical`, symlinks resolved,
+/// whose first [`SCRIPT_LIMIT`] bytes and one more are `text`.
+fn is_recognised(name: &str, canonical: &Path, text: &[u8]) -> bool {
+    is_native(text)
+        || (name == "codex" && is_codex_npm_launcher(canonical))
+        || (is_nix_store_path(canonical)
+            && text.starts_with(b"#!")
+            && text.len() as u64 <= SCRIPT_LIMIT
+            && names_no_decision_variable(text))
 }
 
-/// What `head` is the start of, or `None` when it cannot tell: no `#!` line it
-/// can read, or `env` given anything but a program and `-S`, or a quoted one
-/// — a variable it sets is a change the decision did not see.
-fn launcher_kind(head: &[u8]) -> Option<Launcher> {
+/// Whether `head`, the start of a file, is an ELF or Mach-O executable.
+fn is_native(head: &[u8]) -> bool {
     const MAGICS: [[u8; 4]; 6] = [
         [0x7f, b'E', b'L', b'F'],
         [0xfe, 0xed, 0xfa, 0xce],
@@ -380,47 +386,31 @@ fn launcher_kind(head: &[u8]) -> Option<Launcher> {
         [0xcf, 0xfa, 0xed, 0xfe],
         [0xca, 0xfe, 0xba, 0xbe],
     ];
-    if MAGICS.iter().any(|m| head.starts_with(m)) {
-        return Some(Launcher::Native);
-    }
-    let line = head.strip_prefix(b"#!")?;
-    let line = std::str::from_utf8(line.split(|b| *b == b'\n').next()?).ok()?;
-    let mut words = line.split_whitespace();
-    let base = |word: &str| word.rsplit('/').next().unwrap_or(word).to_string();
-    let mut interpreter = base(words.next()?);
-    if interpreter == "env" {
-        let mut words = words.peekable();
-        if let Some(split) = words.peek().and_then(|w| w.strip_prefix("-S")) {
-            let split = split.to_string();
-            words.next();
-            if !split.is_empty() {
-                interpreter = split;
-            } else {
-                interpreter = words.next()?.to_string();
-            }
-        } else {
-            interpreter = words.next()?.to_string();
-        }
-        if interpreter.starts_with('-') || interpreter.contains(['=', '"', '\'', '\\']) {
-            return None;
-        }
-        interpreter = base(&interpreter);
-    }
-    if interpreter.is_empty() {
-        return None;
-    }
-    Some(if SHELLS.contains(&interpreter.as_str()) {
-        Launcher::Shell
-    } else {
-        Launcher::Interpreted
-    })
+    MAGICS.iter().any(|m| head.starts_with(m))
+}
+
+/// Whether `canonical`, a program's path with symlinks resolved, is the
+/// launcher npm installs for Codex: the `bin` entry of the `@openai/codex`
+/// package, `bin/codex.js`, wherever the package's `node_modules` is.
+fn is_codex_npm_launcher(canonical: &Path) -> bool {
+    canonical.ends_with("node_modules/@openai/codex/bin/codex.js")
 }
 
 /// Whether `canonical`, a program's path with symlinks resolved, is in the Nix
-/// store, whose scripts Nix generated (devbox's launchers among them) rather
-/// than the user wrote.
+/// store, which Nix keeps read-only: a script there is one a Nix build wrote,
+/// not one edited in place.
 fn is_nix_store_path(canonical: &Path) -> bool {
     canonical.starts_with("/nix/store/")
+}
+
+/// Whether `text`, a script, names neither `HOME` (which `CODEX_HOME` and
+/// `XDG_CONFIG_HOME` contain) nor an `OTEL_` variable, the configuration the
+/// decision reads. A check of the text, not of what the script does: a script
+/// that runs another one that sets them is not caught.
+fn names_no_decision_variable(text: &[u8]) -> bool {
+    !["HOME", "OTEL_"]
+        .iter()
+        .any(|v| text.windows(v.len()).any(|w| w == v.as_bytes()))
 }
 
 /// Whether `path` is, symlinks followed, a regular file this process may
@@ -450,9 +440,10 @@ mod tests {
 
     const RUN: &str = "0123456789abcdef0123456789abcdef";
 
-    /// A stand-in for a real agent: a Node script, as npm installs Codex.
+    /// A stand-in for a real agent: a native program, as far as the start of
+    /// its file goes — the shim reads it and never runs it here.
     fn executable(path: &Path) {
-        crate::test_isolation::write_script(path, "#!/usr/bin/env node\n").unwrap();
+        crate::test_isolation::write_script(path, b"\x7fELF\x02\x01\x01\x00").unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
@@ -839,43 +830,31 @@ mod tests {
 
     /// What the real program is decides whether the shim may add to it.
     #[test]
-    fn the_launcher_kind_comes_from_the_start_of_the_file() {
-        let cases: [(&[u8], Option<Launcher>); 18] = [
-            (b"\x7fELF\x02\x01", Some(Launcher::Native)),
-            (b"\xcf\xfa\xed\xfe....", Some(Launcher::Native)),
-            (b"\xca\xfe\xba\xbe....", Some(Launcher::Native)),
-            (
-                b"#!/usr/bin/env node\n// codex",
-                Some(Launcher::Interpreted),
-            ),
-            (b"#!/usr/local/bin/node", Some(Launcher::Interpreted)),
-            (
-                b"#!/usr/bin/env -S node --no-warnings\n",
-                Some(Launcher::Interpreted),
-            ),
-            (b"#!/usr/bin/env python3\n", Some(Launcher::Interpreted)),
-            (b"#!/bin/sh\nexport CODEX_HOME=/x\n", Some(Launcher::Shell)),
-            (b"#! /bin/bash -e\n", Some(Launcher::Shell)),
-            (b"#!/usr/bin/env dash\n", Some(Launcher::Shell)),
-            (b"#!/usr/bin/env -S zsh -f\n", Some(Launcher::Shell)),
-            (
-                b"#!/nix/store/abc-bash-5.2/bin/bash -e\n",
-                Some(Launcher::Shell),
-            ),
-            (b"#!/usr/bin/env CODEX_HOME=/x node\n", None),
-            (b"#!/usr/bin/env -i node\n", None),
-            (b"#!/usr/bin/env -S \"bash -e\"\n", None),
-            (b"#!\n", None),
-            (b"echo no interpreter line\n", None),
-            (b"", None),
-        ];
-        for (head, kind) in cases {
-            assert_eq!(
-                launcher_kind(head),
-                kind,
-                "{}",
-                String::from_utf8_lossy(head)
-            );
+    fn the_recognised_forms_come_from_the_file_and_its_path() {
+        for head in [
+            &b"\x7fELF\x02\x01"[..],
+            b"\xcf\xfa\xed\xfe....",
+            b"\xca\xfe\xba\xbe....",
+        ] {
+            assert!(is_native(head), "{head:?}");
+        }
+        for head in [&b"#!/usr/bin/env node\n"[..], b"#!/bin/sh\n", b"ELF", b""] {
+            assert!(!is_native(head), "{head:?}");
+        }
+        assert!(is_codex_npm_launcher(Path::new(
+            "/usr/local/lib/node_modules/@openai/codex/bin/codex.js"
+        )));
+        assert!(is_codex_npm_launcher(Path::new(
+            "/h/.pnpm/node_modules/.pnpm/@openai+codex@1/node_modules/@openai/codex/bin/codex.js"
+        )));
+        for path in [
+            "/usr/local/lib/node_modules/@openai/codex/bin/other.js",
+            "/usr/local/lib/node_modules/@openai/codex-wrapper/bin/codex.js",
+            "/usr/local/lib/node_modules/codex/bin/codex.js",
+            "/home/u/@openai/codex/bin/codex.js",
+            "/usr/local/bin/codex",
+        ] {
+            assert!(!is_codex_npm_launcher(Path::new(path)), "{path}");
         }
         assert!(is_nix_store_path(Path::new(
             "/nix/store/0abc-codex-0.1/bin/codex"
@@ -884,33 +863,106 @@ mod tests {
         assert!(!is_nix_store_path(Path::new("/nix/storefront/codex")));
     }
 
-    /// A `codex` that is a shell script of the user's — which may set
-    /// `CODEX_HOME` to a configuration that opts out before running the real
-    /// one — runs unchanged; so do a file the shim cannot read and an
-    /// environment the decision cannot read exactly. A Node launcher, as npm
-    /// installs Codex, gets the additions.
+    /// A Nix store script is added to only when its text names none of the
+    /// variables the decision reads, and is small enough to read in full.
+    #[test]
+    fn a_nix_store_script_that_names_a_decision_variable_gets_nothing() {
+        let store = Path::new("/nix/store/0abc-codex-0.1/bin/codex");
+        let plain: &[u8] = b"#!/nix/store/x-bash/bin/bash -e\nexport PATH='/nix/store/y/bin':$PATH\nexec -a \"$0\" /nix/store/z/bin/.codex-wrapped \"$@\"\n";
+        for name in PROGRAMS {
+            assert!(is_recognised(name, store, plain), "{name}");
+        }
+        assert!(
+            !is_recognised("codex", Path::new("/opt/codex/bin/codex"), plain),
+            "the same script outside the store"
+        );
+        for text in [
+            &b"#!/bin/sh\nexport CODEX_HOME=/opted/out\nexec codex\n"[..],
+            b"#!/bin/sh\nexport XDG_CONFIG_HOME=/x\n",
+            b"#!/bin/sh\nHOME=/x exec codex\n",
+            b"#!/bin/sh\nexport OTEL_TRACES_EXPORTER=none\n",
+            b"no interpreter line\n",
+        ] {
+            assert!(
+                !is_recognised("codex", store, text),
+                "{}",
+                String::from_utf8_lossy(text)
+            );
+        }
+        let mut long = plain.to_vec();
+        long.resize(SCRIPT_LIMIT as usize + 1, b'#');
+        assert!(!is_recognised("codex", store, &long), "too long to read");
+    }
+
+    /// The real program as npm installs Codex: a `codex` on `PATH` that links
+    /// to `bin/codex.js` in an `@openai/codex` package under `root`.
+    fn npm_codex(root: &Path, on_path: &Path) {
+        let package = root.join("lib/node_modules/@openai/codex/bin");
+        std::fs::create_dir_all(&package).unwrap();
+        crate::test_isolation::write_script(package.join("codex.js"), "#!/usr/bin/env node\n")
+            .unwrap();
+        std::fs::set_permissions(
+            package.join("codex.js"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(on_path);
+        std::os::unix::fs::symlink(package.join("codex.js"), on_path).unwrap();
+    }
+
+    /// A native program gets the additions, and so does npm's Codex
+    /// launcher; any other script declines — a shell wrapper of the user's,
+    /// one whose interpreter is a shell under another name, a Python wrapper,
+    /// a Node script outside the `@openai/codex` package — because each may
+    /// set `CODEX_HOME` to a configuration that opts out before running the
+    /// real one. So do a file the shim cannot read and an environment the
+    /// decision cannot read exactly.
     #[test]
     fn only_a_launcher_the_shim_is_sure_of_gets_the_additions() {
         let f = fixture();
+        let root = f.telemetry.parent().unwrap();
         let args = ["exec"];
-        let gets = |plan: Result<Plan, Refused>| plan.unwrap().args.len() > args.len();
-        assert!(gets(f.plan("codex", &args, &f.env(&[]))), "a Node launcher");
+        let gets = |name: &str| f.plan(name, &args, &f.env(&[])).unwrap().args.len() > args.len();
+        assert!(gets("codex"), "a native program");
+        assert!(gets("devin"), "Devin's too");
         let wrapper = f.real.join("codex");
-        crate::test_isolation::write_script(
-            &wrapper,
-            "#!/bin/sh\nexport CODEX_HOME=/opted/out\nexec /opt/codex \"$@\"\n",
-        )
-        .unwrap();
-        assert!(
-            !gets(f.plan("codex", &args, &f.env(&[]))),
-            "a shell wrapper"
-        );
-        crate::test_isolation::write_script(f.real.join("devin"), "#!/usr/bin/env bash\n").unwrap();
-        assert!(!gets(f.plan("devin", &args, &f.env(&[]))), "Devin's too");
+        npm_codex(root, &wrapper);
+        assert!(gets("codex"), "npm's Codex launcher");
+        std::fs::remove_file(&wrapper).unwrap();
+        let shell = root.join("custom-shell");
+        std::os::unix::fs::symlink("/bin/sh", &shell).unwrap();
+        for (body, what) in [
+            (
+                "#!/bin/sh\nexport CODEX_HOME=/opted/out\nexec /opt/codex \"$@\"\n".to_string(),
+                "a shell wrapper",
+            ),
+            (
+                format!(
+                    "#!{}\nexport CODEX_HOME=/opted/out\nexec /opt/codex \"$@\"\n",
+                    shell.display()
+                ),
+                "a shell under another name",
+            ),
+            (
+                "#!/usr/bin/env python3\nimport os\nos.environ['CODEX_HOME'] = '/opted/out'\n"
+                    .to_string(),
+                "a Python wrapper",
+            ),
+            (
+                "#!/usr/bin/env node\nprocess.env.CODEX_HOME = '/opted/out';\n".to_string(),
+                "a Node script outside the package",
+            ),
+        ] {
+            crate::test_isolation::write_script(&wrapper, &body).unwrap();
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(!gets("codex"), "{what}");
+        }
+        npm_codex(root, &f.real.join("devin"));
+        assert!(!gets("devin"), "npm's Codex launcher is Codex's only");
         executable(&wrapper);
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o111)).unwrap();
         if std::fs::File::open(&wrapper).is_err() {
-            assert!(!gets(f.plan("codex", &args, &f.env(&[]))), "unreadable");
+            assert!(!gets("codex"), "unreadable");
         }
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
         let inexact = plan("codex", &f.shim, os(&args), Some(&f.path()), None, None, 1);
