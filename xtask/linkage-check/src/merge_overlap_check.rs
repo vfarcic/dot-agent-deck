@@ -4,8 +4,9 @@
 //! The ruleset does not require a branch to be up to date before it merges, so
 //! two PRs that are each green merged on 2026-10-04 and again on 2026-10-05
 //! and left `main` unable to compile its tests. The fix is a procedure, not
-//! code: `.claude/skills/issue-queue/SKILL.md` defines "The overlap check
-//! before a merge" once, and every other skill that merges points at it. Prose
+//! code: `.claude/skills/merge-pr/SKILL.md` defines "The overlap check before
+//! a merge" once, and every other skill that merges goes through that skill or
+//! names the check. Prose
 //! has no compiler, so a skill added later that merges, or an edit that drops
 //! the pointer, would lose the check without anything going red. These tests
 //! are that red.
@@ -85,14 +86,14 @@ mod tests {
 
     #[test]
     fn merge_overlap_check_002_the_section_carries_its_commands() {
-        let path = repo_root().join(".claude/skills/issue-queue/SKILL.md");
-        let text = fs::read_to_string(&path).expect("read issue-queue/SKILL.md");
-        let heading = format!("\n### {SECTION}\n");
+        let path = repo_root().join(".claude/skills/merge-pr/SKILL.md");
+        let text = fs::read_to_string(&path).expect("read merge-pr/SKILL.md");
+        let heading = format!("\n## {SECTION}\n");
         let start = text
             .find(&heading)
-            .unwrap_or_else(|| panic!("issue-queue/SKILL.md has no `### {SECTION}` heading"));
+            .unwrap_or_else(|| panic!("merge-pr/SKILL.md has no `## {SECTION}` heading"));
         let body = &text[start + heading.len()..];
-        let body = &body[..body.find("\n### ").unwrap_or(body.len())];
+        let body = &body[..body.find("\n## ").unwrap_or(body.len())];
         for needle in [
             // a failed read stops the check instead of reading as "no overlap"
             "set -euo pipefail",
@@ -113,13 +114,13 @@ mod tests {
         ] {
             assert!(
                 body.contains(needle),
-                "\"{SECTION}\" in issue-queue/SKILL.md no longer contains `{needle}`"
+                "\"{SECTION}\" in merge-pr/SKILL.md no longer contains `{needle}`"
             );
         }
         // macOS's system Bash 3.2 has no `mapfile`, and the check must run there.
         assert!(
             !body.contains("mapfile"),
-            "\"{SECTION}\" in issue-queue/SKILL.md uses `mapfile`, which Bash 3.2 lacks"
+            "\"{SECTION}\" in merge-pr/SKILL.md uses `mapfile`, which Bash 3.2 lacks"
         );
     }
 
@@ -131,9 +132,10 @@ mod tests {
             .filter(|(_, text)| merges_directly(text))
             .map(|(name, _)| name.as_str())
             .collect();
-        // The three that merge today. A shrinking list means the scan stopped
-        // seeing a merge, which would make the next assertion pass vacuously.
-        for expected in ["code-cleanup", "issue-queue", "land-prs"] {
+        // The two that run `gh pr merge` themselves today: merge-pr, and
+        // land-prs's admin case. A shrinking list means the scan stopped seeing
+        // a merge, which would make the next assertion pass vacuously.
+        for expected in ["land-prs", "merge-pr"] {
             assert!(
                 merging.contains(&expected),
                 "{expected}/SKILL.md no longer runs `gh pr merge` without `--auto`; \
@@ -148,8 +150,24 @@ mod tests {
         assert!(
             missing.is_empty(),
             "these skills merge a PR with `gh pr merge` but never name \"{SECTION}\" \
-             (.claude/skills/issue-queue/SKILL.md): {missing:?}"
+             (.claude/skills/merge-pr/SKILL.md): {missing:?}"
         );
+    }
+
+    /// The skills that merge without running `gh pr merge` themselves hand the
+    /// merge to merge-pr, which is what puts the overlap check and the watch of
+    /// `main`'s run after it in front of their merges.
+    #[test]
+    fn merge_overlap_check_005_the_skills_that_merge_go_through_merge_pr() {
+        for skill in ["code-cleanup", "issue-queue", "land-prs"] {
+            let text =
+                fs::read_to_string(repo_root().join(format!(".claude/skills/{skill}/SKILL.md")))
+                    .unwrap_or_else(|e| panic!("read {skill}/SKILL.md: {e}"));
+            assert!(
+                text.contains("merge-pr"),
+                "{skill}/SKILL.md merges PRs but no longer hands the merge to merge-pr"
+            );
+        }
     }
 
     #[test]
@@ -164,6 +182,10 @@ mod tests {
         assert!(
             text[rule_8..rule_9].contains(SECTION),
             "CLAUDE.md rule 8 no longer points a person merging by hand at \"{SECTION}\""
+        );
+        assert!(
+            text[rule_8..rule_9].contains("merge-pr"),
+            "CLAUDE.md rule 8 no longer names the merge-pr skill"
         );
     }
 }

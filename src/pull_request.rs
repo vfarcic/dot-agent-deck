@@ -15,7 +15,8 @@
 //! session whose working directory is a git repository on a branch other than
 //! `origin`'s default, with a GitHub `origin`, it asks `gh pr list --head
 //! <branch> --state all --repo <owner>/<repo>` and keeps the exact
-//! `headRefName` match ([`parse_pr_list`]). Results are cached per
+//! `headRefName` match from the repository itself or from the fork the branch
+//! is pushed to ([`parse_pr_list`]). Results are cached per
 //! (repository, branch), so sessions sharing a worktree share one call, and at
 //! most one `gh` runs per key at a time. An open or draft PR is re-read on a
 //! slow poll ([`DOT_AGENT_DECK_PR_REFRESH_SECS_ENV`]); a merged or closed one is
@@ -96,15 +97,41 @@ pub use crate::pull_request_info::{
 
 /// The `--json` fields the badge needs from `gh pr list`.
 /// `isCrossRepository` because `--head` matches a branch NAME, so a fork's
-/// pull request from a branch named like ours is listed too.
+/// pull request from a branch named like ours is listed too; the head
+/// repository and its owner because one fork's is ours, the one the branch is
+/// pushed to (issue #1779, [`is_push_repo`]).
 ///
 /// `statusCheckRollup` (issue #1781) is the heavy one: every check of the head
 /// commit, with its name, timestamps and URL. Measured against this
 /// repository's own open PR with 28 checks, it took the reply from 461 bytes
 /// to about 20 KB and the call from about 0.55–0.9 s to 0.87–1.4 s. The
 /// worktree reclaimer's lookup asks for its own, smaller list.
-pub(crate) const GH_PR_FIELDS: &str =
-    "number,state,isDraft,reviewDecision,url,headRefName,isCrossRepository,statusCheckRollup";
+pub(crate) const GH_PR_FIELDS: &str = "number,state,isDraft,reviewDecision,url,headRefName,\
+     isCrossRepository,headRepository,headRepositoryOwner,statusCheckRollup";
+
+/// Whether a fork's pull request is the branch's own: its head repository,
+/// `head_owner`/`head_name` as `gh` names them, is one of `push_repos`, the
+/// `owner/name`s the branch is pushed to (issue #1779). A contributor whose
+/// `origin` is the upstream repository pushes the branch to their fork and
+/// opens the pull request from there; a stranger's fork is a different
+/// repository. GitHub compares names case-insensitively, and so does this.
+/// Anything missing — no push remote, or a head repository `gh` does not
+/// name, as for a deleted fork — is no match, so that pull request stays
+/// someone else's.
+pub(crate) fn is_push_repo(
+    head_owner: Option<&str>,
+    head_name: Option<&str>,
+    push_repos: &[String],
+) -> bool {
+    let (Some(owner), Some(name)) = (head_owner, head_name) else {
+        return false;
+    };
+    push_repos.iter().any(|repo| {
+        repo.split_once('/').is_some_and(|(push_owner, push_name)| {
+            owner.eq_ignore_ascii_case(push_owner) && name.eq_ignore_ascii_case(push_name)
+        })
+    })
+}
 
 /// The arguments of `gh pr list` for `branch` of `repo_slug`, asking for
 /// `fields`. Shared with [`crate::worktree_reclaim`]'s PR lookup: `--state all`
@@ -172,6 +199,37 @@ pub(crate) struct PrKey {
     pub slug: String,
     /// The checked-out branch.
     pub branch: String,
+    /// `owner/name` of each GitHub repository the branch is pushed to: the
+    /// forks whose pull request is the branch's. Empty without a push remote.
+    pub push: Vec<String>,
+}
+
+/// What reading a directory's branch found: its key, and whether the push
+/// remote could be read at all. A `git` that could not run or outlived
+/// [`GIT_TIMEOUT`] leaves `push_known` false, and the monitor then keeps the
+/// push repositories it last read for the same branch ([`BranchProbe::resolve`])
+/// rather than let a slow `git` change the key, which would drop the badge and
+/// look the pull request up again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BranchProbe {
+    pub key: PrKey,
+    pub push_known: bool,
+}
+
+impl BranchProbe {
+    /// The key a directory has after this probe, given the one it had.
+    pub(crate) fn resolve(probe: Option<Self>, previous: Option<PrKey>) -> Option<PrKey> {
+        match (probe?, previous) {
+            (
+                Self {
+                    key,
+                    push_known: false,
+                },
+                Some(previous),
+            ) if previous.slug == key.slug && previous.branch == key.branch => Some(previous),
+            (probe, _) => Some(probe.key),
+        }
+    }
 }
 
 /// Whether `branch` is the remote's default. `default` is what
@@ -190,6 +248,13 @@ pub(crate) fn is_default_branch(branch: &str, default: Option<&str>) -> bool {
 /// dropped — so a timed-out probe, or one whose job is aborted, leaves no git
 /// behind.
 async fn git_line(cwd: &Path, args: &[&str]) -> Option<String> {
+    git_run(cwd, args).await.ok().flatten()
+}
+
+/// [`git_line`], telling a `git` that could not run or outlived
+/// [`GIT_TIMEOUT`] (`Err`) apart from one that failed or printed nothing
+/// (`Ok(None)`).
+async fn git_run(cwd: &Path, args: &[&str]) -> Result<Option<String>, ()> {
     let mut cmd = tokio::process::Command::from(git_at(cwd));
     cmd.args(args)
         .stdin(std::process::Stdio::null())
@@ -197,20 +262,22 @@ async fn git_line(cwd: &Path, args: &[&str]) -> Option<String> {
         .kill_on_drop(true);
     let out = tokio::time::timeout(GIT_TIMEOUT, cmd.output())
         .await
-        .ok()?
-        .ok()?;
+        .map_err(drop)?
+        .map_err(drop)?;
     if !out.status.success() {
-        return None;
+        return Ok(None);
     }
     let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!line.is_empty()).then_some(line)
+    Ok((!line.is_empty()).then_some(line))
 }
 
 /// The key `cwd`'s PR is looked up by, or `None` when it gets no badge: not a
 /// git repository, a detached `HEAD`, the remote's default branch, or an
-/// `origin` that is missing or not on GitHub. Each `git` it runs is bounded by
-/// [`GIT_TIMEOUT`] and killed when the future is dropped.
-pub(crate) async fn branch_key(cwd: &Path) -> Option<PrKey> {
+/// `origin` that is missing or not on GitHub. The branch's push remote, read
+/// as `worktree reclaim` reads it ([`crate::worktree_reclaim::push_remote_args`]),
+/// only adds to a key. Each `git` it runs is bounded by [`GIT_TIMEOUT`] and
+/// killed when the future is dropped.
+pub(crate) async fn branch_key(cwd: &Path) -> Option<BranchProbe> {
     // `symbolic-ref` fails on a detached HEAD and outside a repository alike.
     let branch = git_line(cwd, &["symbolic-ref", "--quiet", "--short", "HEAD"]).await?;
     let default = git_line(
@@ -231,7 +298,32 @@ pub(crate) async fn branch_key(cwd: &Path) -> Option<PrKey> {
     }
     let origin = git_line(cwd, &["remote", "get-url", "origin"]).await?;
     let slug = crate::worktree_reclaim::parse_github_owner_repo(&origin)?;
-    Some(PrKey { slug, branch })
+    let push = push_repos(cwd, &branch).await;
+    Some(BranchProbe {
+        push_known: push.is_ok(),
+        key: PrKey {
+            slug,
+            branch,
+            push: push.unwrap_or_default(),
+        },
+    })
+}
+
+/// `owner/name` of each GitHub repository `branch` is pushed to, or `Err`
+/// when a `git` could not run or outlived [`GIT_TIMEOUT`].
+async fn push_repos(cwd: &Path, branch: &str) -> Result<Vec<String>, ()> {
+    use crate::worktree_reclaim::{parse_push_remote, push_remote_args, push_repos_from_urls};
+    let branch_ref = format!("refs/heads/{branch}");
+    let Some(remote) = git_run(cwd, &push_remote_args(&branch_ref))
+        .await?
+        .and_then(|refs| parse_push_remote(&refs, &branch_ref))
+    else {
+        return Ok(Vec::new());
+    };
+    let urls = git_run(cwd, &["remote", "get-url", "--push", "--all", &remote]).await?;
+    Ok(urls
+        .map(|urls| push_repos_from_urls(&urls))
+        .unwrap_or_default())
 }
 
 #[derive(serde::Deserialize)]
@@ -248,10 +340,28 @@ struct GhPr {
     /// The PR's branch lives in a fork. Absent (an older `gh`) reads as not.
     #[serde(default)]
     is_cross_repository: bool,
+    /// The repository the PR's branch lives in; `null` once a fork is deleted.
+    #[serde(default)]
+    head_repository: Option<GhHeadRepository>,
+    /// Who owns that repository; `null` with it.
+    #[serde(default)]
+    head_repository_owner: Option<GhHeadOwner>,
     /// Every check of the head commit. Absent (an older `gh`) or null reads
     /// as no checks.
     #[serde(default)]
     status_check_rollup: Option<Vec<GhCheck>>,
+}
+
+#[derive(serde::Deserialize)]
+struct GhHeadRepository {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct GhHeadOwner {
+    #[serde(default)]
+    login: Option<String>,
 }
 
 /// One entry of `statusCheckRollup`: a check run (`status` and, once it has
@@ -411,16 +521,31 @@ impl GhPr {
 
 /// The PR `gh pr list --json` output reports for exactly `branch`, or `None`
 /// when it reports none. Only an exact `headRefName` match counts, from a
-/// branch of the repository itself: a fork's pull request from a branch with
-/// the same name is someone else's. Of several,
+/// branch of the repository itself or of one of `push_repos`, the forks the
+/// branch is pushed to ([`is_push_repo`]): any other fork's pull request from a branch
+/// with the same name is someone else's. Of several,
 /// an open (or draft) one wins, then the highest number. An entry with a state
 /// this build does not know, or a URL off `https://github.com/`, is skipped.
-pub fn parse_pr_list(json: &str, branch: &str) -> Result<Option<PullRequestInfo>, String> {
+pub fn parse_pr_list(
+    json: &str,
+    branch: &str,
+    push_repos: &[String],
+) -> Result<Option<PullRequestInfo>, String> {
     let entries: Vec<GhPr> =
         serde_json::from_str(json).map_err(|e| format!("could not parse gh output: {e}"))?;
     Ok(entries
         .into_iter()
-        .filter(|pr| pr.head_ref_name == branch && !pr.is_cross_repository)
+        .filter(|pr| {
+            pr.head_ref_name == branch
+                && (!pr.is_cross_repository
+                    || is_push_repo(
+                        pr.head_repository_owner
+                            .as_ref()
+                            .and_then(|o| o.login.as_deref()),
+                        pr.head_repository.as_ref().and_then(|r| r.name.as_deref()),
+                        push_repos,
+                    ))
+        })
         .filter_map(GhPr::into_info)
         .max_by_key(|pr| {
             let open = matches!(pr.state, PullRequestState::Open | PullRequestState::Draft);
@@ -443,7 +568,11 @@ async fn query_gh(cwd: PathBuf, key: PrKey) -> Result<Option<PullRequestInfo>, S
     if !out.status.success() {
         return Err(gh_failure(&out.status, &out.stderr));
     }
-    parse_pr_list(&String::from_utf8_lossy(&out.stdout), &key.branch)
+    parse_pr_list(
+        &String::from_utf8_lossy(&out.stdout),
+        &key.branch,
+        &key.push,
+    )
 }
 
 /// The error a failed `gh` reports. Its stderr is quoted into a log line, so
@@ -743,7 +872,7 @@ pub async fn run_pull_request_monitor(
 ) {
     let mut events = event_tx.subscribe();
     let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_JOBS));
-    let mut probes: JobPool<PathBuf, Option<PrKey>> = JobPool::new(permits.clone());
+    let mut probes: JobPool<PathBuf, Option<BranchProbe>> = JobPool::new(permits.clone());
     let mut lookups: JobPool<PrKey, Result<Option<PullRequestInfo>, String>> =
         JobPool::new(permits);
     // One timer for the monitor's life: a sleep rebuilt on every pass would
@@ -774,11 +903,11 @@ pub async fn run_pull_request_monitor(
                 Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => return,
             },
-            Some((cwd, key)) = probes.next() => {
+            Some((cwd, probe)) = probes.next() => {
                 // A directory dropped meanwhile had its job cancelled, so a
                 // result always has its entry.
                 if let Some(entry) = cwds.get_mut(&cwd) {
-                    entry.key = key;
+                    entry.key = BranchProbe::resolve(probe, entry.key.take());
                     entry.resolved_at = Some(Instant::now());
                 }
             }
@@ -1000,6 +1129,7 @@ mod tests {
             let pr = parse_pr_list(
                 &gh(json!([gh_pr(7, "feat/x", state, draft, review)])),
                 "feat/x",
+                &[],
             )
             .unwrap()
             .unwrap();
@@ -1019,13 +1149,19 @@ mod tests {
             gh_pr(1234, "feat/x", "OPEN", false, json!("REVIEW_REQUIRED")),
             gh_pr(1000, "feat/x", "CLOSED", false, serde_json::Value::Null),
         ]));
-        assert_eq!(parse_pr_list(&out, "feat/x").unwrap().unwrap().number, 1234);
+        assert_eq!(
+            parse_pr_list(&out, "feat/x", &[]).unwrap().unwrap().number,
+            1234
+        );
         // A draft is open too.
         let out = gh(json!([
             gh_pr(8000, "feat/x", "MERGED", false, json!("APPROVED")),
             gh_pr(1234, "feat/x", "OPEN", true, serde_json::Value::Null),
         ]));
-        assert_eq!(parse_pr_list(&out, "feat/x").unwrap().unwrap().number, 1234);
+        assert_eq!(
+            parse_pr_list(&out, "feat/x", &[]).unwrap().unwrap().number,
+            1234
+        );
     }
 
     #[test]
@@ -1036,18 +1172,19 @@ mod tests {
             gh_pr(1234, "feat/x", "MERGED", false, json!("APPROVED")),
             gh_pr(1100, "feat/x", "CLOSED", false, serde_json::Value::Null),
         ]));
-        let pr = parse_pr_list(&out, "feat/x").unwrap().unwrap();
+        let pr = parse_pr_list(&out, "feat/x", &[]).unwrap().unwrap();
         assert_eq!((pr.number, pr.state), (1234, PullRequestState::Merged));
     }
 
     #[test]
     fn no_match_unknown_states_and_foreign_urls_read_as_no_pr() {
         use serde_json::json;
-        assert_eq!(parse_pr_list("[]", "feat/x").unwrap(), None);
+        assert_eq!(parse_pr_list("[]", "feat/x", &[]).unwrap(), None);
         assert_eq!(
             parse_pr_list(
                 &gh(json!([gh_pr(1, "other", "OPEN", false, json!(""))])),
-                "feat/x"
+                "feat/x",
+                &[]
             )
             .unwrap(),
             None
@@ -1055,7 +1192,8 @@ mod tests {
         assert_eq!(
             parse_pr_list(
                 &gh(json!([gh_pr(1, "feat/x", "QUEUED", false, json!(""))])),
-                "feat/x"
+                "feat/x",
+                &[]
             )
             .unwrap(),
             None
@@ -1063,7 +1201,7 @@ mod tests {
         let mut foreign = gh_pr(1, "feat/x", "OPEN", false, json!(""));
         foreign["url"] = json!("https://evil.example/pull/1");
         assert_eq!(
-            parse_pr_list(&gh(json!([foreign])), "feat/x").unwrap(),
+            parse_pr_list(&gh(json!([foreign])), "feat/x", &[]).unwrap(),
             None
         );
     }
@@ -1086,17 +1224,114 @@ mod tests {
         let mut own = gh_pr(1234, "feat/x", "OPEN", false, json!(""));
         own["isCrossRepository"] = json!(false);
         assert_eq!(
-            parse_pr_list(&gh(json!([own, fork.clone()])), "feat/x")
+            parse_pr_list(&gh(json!([own, fork.clone()])), "feat/x", &[])
                 .unwrap()
                 .map(|pr| pr.number),
             Some(1234)
         );
-        assert_eq!(parse_pr_list(&gh(json!([fork])), "feat/x").unwrap(), None);
+        assert_eq!(
+            parse_pr_list(&gh(json!([fork])), "feat/x", &[]).unwrap(),
+            None
+        );
+    }
+
+    /// Scenario: the agent's branch is pushed to the contributor's fork while
+    /// `origin` is the upstream repository, and the pull request is opened
+    /// from that fork. The badge shows it; a stranger's fork with a branch of
+    /// the same name, or a branch with no push remote, still shows none
+    /// (issue #1779).
+    #[test]
+    fn a_pull_request_from_the_fork_the_branch_is_pushed_to_is_the_branchs() {
+        use serde_json::json;
+        assert!(
+            ["headRepository", "headRepositoryOwner"]
+                .iter()
+                .all(|wanted| GH_PR_FIELDS.split(',').any(|field| field == *wanted)),
+            "gh must be asked which repository each PR's branch lives in"
+        );
+        let from = |number, owner: &str| {
+            let mut pr = gh_pr(number, "feat/x", "OPEN", false, json!(""));
+            pr["isCrossRepository"] = json!(true);
+            pr["headRepository"] = json!({"id": "R_1", "name": "r"});
+            pr["headRepositoryOwner"] = json!({"id": "U_1", "login": owner});
+            pr
+        };
+        let number = |json: &str, push: &[&str]| {
+            let push: Vec<String> = push.iter().map(|p| p.to_string()).collect();
+            parse_pr_list(json, "feat/x", &push)
+                .unwrap()
+                .map(|pr| pr.number)
+        };
+        let both = gh(json!([from(1234, "me"), from(9000, "stranger")]));
+        assert_eq!(number(&both, &["me/r"]), Some(1234));
+        assert_eq!(number(&both, &["ME/R"]), Some(1234), "case-insensitive");
+        let stranger = gh(json!([from(9000, "stranger")]));
+        assert_eq!(number(&stranger, &["me/r"]), None);
+        assert_eq!(number(&both, &[]), None, "no push remote, no match");
+        assert_eq!(
+            number(&both, &["other/r", "me/r"]),
+            Some(1234),
+            "any of the push URLs"
+        );
+        let mut deleted = from(1234, "me");
+        deleted["headRepository"] = serde_json::Value::Null;
+        assert_eq!(number(&gh(json!([deleted])), &["me/r"]), None);
+    }
+
+    /// A probe whose push remote could not be read keeps the push
+    /// repositories the last probe read for the same branch, so a slow `git`
+    /// neither drops the badge nor costs another lookup (Qodo on PR #1805).
+    #[test]
+    fn an_unread_push_remote_keeps_the_previous_key_of_the_same_branch() {
+        let key = |branch: &str, push: &[&str]| PrKey {
+            slug: "o/r".into(),
+            branch: branch.into(),
+            push: push.iter().map(|p| p.to_string()).collect(),
+        };
+        let probe = |key, push_known| Some(BranchProbe { key, push_known });
+        let previous = Some(key("feat/x", &["me/r"]));
+        assert_eq!(
+            BranchProbe::resolve(probe(key("feat/x", &[]), false), previous.clone()),
+            previous,
+            "unread: the same branch keeps its push repositories"
+        );
+        assert_eq!(
+            BranchProbe::resolve(probe(key("feat/x", &[]), true), previous.clone()),
+            Some(key("feat/x", &[])),
+            "read and gone: the key changes"
+        );
+        assert_eq!(
+            BranchProbe::resolve(probe(key("feat/y", &[]), false), previous.clone()),
+            Some(key("feat/y", &[])),
+            "another branch is another key"
+        );
+        assert_eq!(
+            BranchProbe::resolve(probe(key("feat/x", &[]), false), None),
+            Some(key("feat/x", &[]))
+        );
+        assert_eq!(BranchProbe::resolve(None, previous), None);
+    }
+
+    #[test]
+    fn is_push_repo_needs_every_part_to_match() {
+        let me = ["me/r".to_string()];
+        assert!(is_push_repo(Some("me"), Some("r"), &me));
+        assert!(is_push_repo(
+            Some("me"),
+            Some("r"),
+            &["up/r".to_string(), "me/r".to_string()]
+        ));
+        assert!(!is_push_repo(Some("me"), Some("other"), &me));
+        assert!(!is_push_repo(Some("you"), Some("r"), &me));
+        assert!(!is_push_repo(None, Some("r"), &me));
+        assert!(!is_push_repo(Some("me"), None, &me));
+        assert!(!is_push_repo(Some("me"), Some("r"), &[]));
+        assert!(!is_push_repo(Some("me"), Some("r"), &["me".to_string()]));
     }
 
     #[test]
     fn unparsable_gh_output_is_an_error_not_no_pr() {
-        assert!(parse_pr_list("not json", "feat/x").is_err());
+        assert!(parse_pr_list("not json", "feat/x", &[]).is_err());
     }
 
     #[test]
@@ -1319,7 +1554,7 @@ mod tests {
                 "o/r",
                 "--json",
                 "number,state,isDraft,reviewDecision,url,headRefName,isCrossRepository,\
-                 statusCheckRollup",
+                 headRepository,headRepositoryOwner,statusCheckRollup",
             ]
         );
     }
@@ -1363,7 +1598,7 @@ mod tests {
     fn checks_of(rollup: serde_json::Value) -> Option<PullRequestChecks> {
         let mut pr = gh_pr(7, "feat/x", "OPEN", false, serde_json::json!(""));
         pr["statusCheckRollup"] = rollup;
-        parse_pr_list(&gh(serde_json::json!([pr])), "feat/x")
+        parse_pr_list(&gh(serde_json::json!([pr])), "feat/x", &[])
             .unwrap()
             .unwrap()
             .checks
@@ -1505,6 +1740,7 @@ mod tests {
         let pr = parse_pr_list(
             &gh(json!([gh_pr(7, "feat/x", "OPEN", false, json!(""))])),
             "feat/x",
+            &[],
         )
         .unwrap()
         .unwrap();
@@ -1792,11 +2028,46 @@ mod tests {
         git(&["checkout", "-q", "-b", "feat/x"]);
         assert_eq!(
             branch_key(&repo).await,
-            Some(PrKey {
-                slug: "o/r".into(),
-                branch: "feat/x".into()
-            })
+            Some(BranchProbe {
+                key: PrKey {
+                    slug: "o/r".into(),
+                    branch: "feat/x".into(),
+                    push: Vec::new(),
+                },
+                push_known: true,
+            }),
+            "a branch with no push remote"
         );
+        git(&["remote", "add", "fork", "https://github.com/me/r.git"]);
+        git(&["config", "branch.feat/x.pushRemote", "fork"]);
+        assert_eq!(
+            branch_key(&repo).await.map(|probe| probe.key.push),
+            Some(vec!["me/r".to_string()]),
+            "the fork the branch is pushed to"
+        );
+        // A remote with two push URLs pushes to both (Qodo on PR #1805).
+        git(&[
+            "remote",
+            "set-url",
+            "--add",
+            "--push",
+            "fork",
+            "git@github.com:me/r.git",
+        ]);
+        git(&[
+            "remote",
+            "set-url",
+            "--add",
+            "--push",
+            "fork",
+            "git@github.com:me/r-mirror.git",
+        ]);
+        assert_eq!(
+            branch_key(&repo).await.map(|probe| probe.key.push),
+            Some(vec!["me/r".to_string(), "me/r-mirror".to_string()]),
+            "every push URL of the push remote"
+        );
+        git(&["config", "--unset", "branch.feat/x.pushRemote"]);
         git(&["remote", "set-url", "origin", "https://gitlab.com/o/r.git"]);
         assert_eq!(branch_key(&repo).await, None, "a non-GitHub origin");
         git(&["remote", "set-url", "origin", "https://github.com/o/r.git"]);

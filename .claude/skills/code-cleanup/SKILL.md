@@ -129,7 +129,8 @@ copying them. Add the tests covering what you touched, found via
 tests/CATALOG.md, the #[spec] annotations or `cargo xtask list-tests`, and NAMED in your report,
 including `cargo test-e2e-live <filter>` for any lane-2 test you change or whose covered code you
 change. There is NO full-tier obligation before the PR: do not run `cargo test-e2e` in full; CI's
-e2e-deterministic job runs lane 1 on every PR, so read that run rather than reproducing it. Run
+e2e-deterministic job (or, with .github/ci-backend at rwx, the RWX: linux status) runs lane 1 on
+every PR, so read that run rather than reproducing it. Run
 `cargo xtask linkage-check` when you touch anything under tests/ or a #[spec] test.
 
 A test or check that goes red while you work is in scope under CLAUDE.md rule 6, whoever caused it
@@ -157,8 +158,9 @@ on each thread and resolve it. Bound every wait.
 FINISH:
 - code: take the PR to merged by the procedure in .claude/skills/issue-queue/SKILL.md, subsection
   "Bug-fix units review, fix and merge their own PR", steps 1 to 5, as adapted in this skill's
-  "Finishing" section, including the subsection "The overlap check before a merge" that its
-  step 3 runs. Never `--auto`, never `--admin`.
+  "Finishing" section; its step 3 merges through .claude/skills/merge-pr/SKILL.md, which runs
+  "The overlap check before a merge" and then watches main's CI run for the merge commit, a red
+  one being this unit's to fix. Never `--auto`, never `--admin`.
 - tests: request the agent review (`gh workflow run pr-review-batch.yml -f pr_number=<n>
   -f dry_run=false`; request again if the run ends `cancelled`), address what it raises (at most
   three rounds), then STOP at the PR for a person, approved or not. Do not merge, do not arm
@@ -251,7 +253,7 @@ No changelog fragment: no user-observable change (CLAUDE.md rule 19).
 
 ### 5. Finishing
 
-- **code**: follow `/issue-queue`'s "Bug-fix units review, fix and merge their own PR", steps 1 to 5, with two adaptations. A cleanup PR closes no issue, so step 5 checks only that the PR reads `MERGED`. And its class re-check reads: if review shows the change alters behaviour, or would need a changelog fragment, a `.breaking.md` or a `PROTOCOL_VERSION` bump, back the change out of the PR or stop at the PR and say why. Everything else holds as written there: approved, every check on the current head done and the five required contexts passed, no `DENY_PATHS` file, no `needs-human-eye`, the overlap check that `/issue-queue`'s "The overlap check before a merge" defines (when `main` gained a commit touching the PR's files, update the branch and go back for CI and the approval), `gh pr merge <n> --squash --match-head-commit <sha>`, never `--auto` and never `--admin`; otherwise stop and report.
+- **code**: follow `/issue-queue`'s "Bug-fix units review, fix and merge their own PR", steps 1 to 5, with two adaptations. A cleanup PR closes no issue, so step 5 checks only that the PR reads `MERGED`. And its class re-check reads: if review shows the change alters behaviour, or would need a changelog fragment, a `.breaking.md` or a `PROTOCOL_VERSION` bump, back the change out of the PR or stop at the PR and say why. Everything else holds as written there: approved, no `DENY_PATHS` file, no `needs-human-eye`, and the merge itself through `/merge-pr` (`.claude/skills/merge-pr/SKILL.md`), which checks every context the ruleset requires for the current head, runs "The overlap check before a merge" (when `main` gained a commit touching the PR's files, update the branch and go back for CI and the approval), merges pinned to the checked head and watches `main`'s CI run for the merge commit, a red one being this unit's to fix; never `--auto` and never `--admin`; otherwise stop and report.
 - **tests**: request the agent review and address it (at most three rounds), then stop at the PR for a person. That is the current policy (see "The three modes"); the unit does not merge or arm auto-merge even when the PR is approved.
 - **instructions**: a PR that changes `CLAUDE.md` stops at the PR for a person: `CLAUDE.md` is on `DENY_PATHS`, so the merge procedure would stop there anyway, and the reviewer normally marks such a PR `needs-human-eye` as well. A PR that changes only skills or `docs/develop/` finishes as the code mode does.
 

@@ -33,6 +33,11 @@
 //!      with the remaining issues. One issue never aborts the rest.
 //!   7. **M1.3** — per-issue success / skip / failure events are surfaced through
 //!      #127's existing [`Notifier`] seam (no parallel notification system).
+//!   8. **PRD #421 Phase 2** — after a successful spawn, claim the issue on
+//!      GitHub: provision the `agent-deck/claimed` label just in time, add it,
+//!      and write or edit this deck's claimant comment. Best-effort and never
+//!      fatal, with one notification per issue whose claim fell short. Nothing
+//!      ever removes the label or the comment.
 //!
 //! All GitHub/git access goes through the `gh` / `git` binaries resolved from
 //! `PATH`, inheriting the daemon's environment — that is exactly what lets the
@@ -551,6 +556,12 @@ pub async fn run_issue_dispatch(
     // dispatched): already-claimed issues inside the cap are skipped, yielding a
     // clean "≤ max_per_run concurrent in-flight" ceiling (PRD concurrency model —
     // today's run only picks up slots yesterday's run vacated).
+    // PRD #421 M2.6(a) — the claim label is provisioned just in time: once per
+    // run, plus at most one re-attempt when a later label add fails while it has
+    // not succeeded, and only in a run that is about to write a claim, so a fire
+    // that dispatches nothing makes no GitHub write at all (#483).
+    let mut claim_run = ClaimRun::new(&local_hostname());
+
     for issue in issues.into_iter().take(cfg.max_per_run) {
         loop {
             // M3.2 — per-issue error boundary: one failure never aborts the rest.
@@ -571,6 +582,19 @@ pub async fn run_issue_dispatch(
             .await
             {
                 Ok(IssueOutcome::Handled) => break,
+                // The claim is written before the success is surfaced, so
+                // "dispatched" is the issue's last word in this run: nothing
+                // writes to GitHub for it after that line.
+                Ok(IssueOutcome::Dispatched) => {
+                    claim_issue(task_name, &cfg.repo, issue, &mut claim_run, notifier).await;
+                    // M1.3 — surface the per-issue dispatch success.
+                    notifier.notify(NotifyEvent::IssueDispatched {
+                        task: task_name.to_string(),
+                        repo: cfg.repo.clone(),
+                        issue,
+                    });
+                    break;
+                }
                 Err(message) => {
                     notifier.notify(NotifyEvent::IssueDispatchFailed {
                         task: task_name.to_string(),
@@ -844,8 +868,12 @@ async fn abandoned_generation_if_unused(
 /// What [`dispatch_one_issue`] did with an issue it did not fail on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IssueOutcome {
-    /// Dispatched, or skipped as already claimed (the skip is surfaced there).
+    /// Skipped as already claimed (the skip is surfaced there).
     Handled,
+    /// An agent was spawned for the issue, so the caller claims it on GitHub
+    /// (PRD #421 M2.2) — never on any other outcome — and surfaces the
+    /// dispatch.
+    Dispatched,
     /// PRD #1487 re-check, reviewer R3: refused because the daemon is
     /// restarting. The issue's worktree was removed again, so the slot stays
     /// open for the next attempt — this daemon's, if the restart is called
@@ -853,8 +881,9 @@ enum IssueOutcome {
     DeferredForRestart,
 }
 
-/// Process one candidate issue. `Ok(Handled)` means it was dispatched OR
-/// skipped (a skip is surfaced here, not treated as an error), and
+/// Process one candidate issue. `Ok(Dispatched)` means an agent was spawned,
+/// `Ok(Handled)` that it was skipped (a skip is surfaced here, not treated as
+/// an error), and
 /// `Ok(DeferredForRestart)` that the daemon refused the agent for now; `Err` is
 /// a per-issue failure for the caller to surface through the notifier (M3.2).
 #[allow(clippy::too_many_arguments)]
@@ -1019,13 +1048,8 @@ async fn dispatch_one_issue(
         .await;
     }
 
-    // M1.3 — surface the per-issue dispatch success.
-    notifier.notify(NotifyEvent::IssueDispatched {
-        task: task_name.to_string(),
-        repo: cfg.repo.clone(),
-        issue,
-    });
-    Ok(IssueOutcome::Handled)
+    // M1.3 — the caller claims the issue and then surfaces the success.
+    Ok(IssueOutcome::Dispatched)
 }
 
 /// S5: resolve the task's `working_dir` to an ABSOLUTE workspace root. The
@@ -1343,6 +1367,473 @@ fn parse_open_pr_present(json: &str) -> Result<bool, String> {
         .as_array()
         .ok_or_else(|| "`gh pr list` did not return a JSON array".to_string())?;
     Ok(!arr.is_empty())
+}
+
+/// The default bound on ONE `gh` call of the claim (PRD #421 amendment item 9),
+/// independent of [`SUBPROCESS_TIMEOUT`]. A claim call is an API request, small
+/// next to a clone, and the claim runs between one issue's dispatch and
+/// the next issue's, so a hung call here holds up every issue after it: the
+/// bound is what keeps a stuck claim from delaying the rest of the run by
+/// more than a few of these.
+const CLAIM_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Overrides [`CLAIM_CALL_TIMEOUT`], in milliseconds — what lets a test drive
+/// the timeout without a 30-second wait. A value that is not a positive
+/// integer is ignored.
+const CLAIM_CALL_TIMEOUT_ENV: &str = "DOT_AGENT_DECK_ISSUE_CLAIM_TIMEOUT_MS";
+
+/// The most `gh api --paginate` may print for one issue's comments before the
+/// call is killed (PRD #421 amendment item 10). Far above what a typical issue's
+/// comments print, and low enough that a runaway listing's captured output
+/// stays bounded in the daemon's memory.
+const CLAIM_COMMENTS_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// The most any other claim call may print on stdout before it is killed. What
+/// those calls print is one small JSON object (the account, the written
+/// comment), a line, or nothing, so this is far above any real answer.
+const CLAIM_CALL_MAX_BYTES: usize = 256 * 1024;
+
+/// How much of a claim call's stderr is kept for its diagnostic; the rest is
+/// read and discarded (see [`OutputCaps::stderr`]). The diagnostic built from it
+/// is cut much shorter still ([`crate::issue_dispatch::sanitize_claim_error`]),
+/// so this only bounds what the daemon holds while the call runs.
+const CLAIM_STDERR_MAX_BYTES: usize = 64 * 1024;
+
+/// The default total time all the claim calls of one run may take together
+/// (PRD #421 amendment item 12). [`CLAIM_CALL_TIMEOUT`] alone bounds each call,
+/// not their number, so a run of many issues against a GitHub that hangs every
+/// call would hold the scheduler for that bound times the calls; this caps it.
+const CLAIM_RUN_BUDGET: Duration = Duration::from_secs(120);
+
+/// Overrides [`CLAIM_RUN_BUDGET`], in milliseconds, for the same reason as
+/// [`CLAIM_CALL_TIMEOUT_ENV`]. A value that is not a positive integer is
+/// ignored.
+const CLAIM_RUN_BUDGET_ENV: &str = "DOT_AGENT_DECK_ISSUE_CLAIM_BUDGET_MS";
+
+/// What a claim step that ran out of [`ClaimBudget`] reports.
+const CLAIM_BUDGET_SPENT: &str = "the run's claim time budget was used up";
+
+/// A positive number of milliseconds, or `None` for anything else.
+fn positive_millis(value: Option<&str>) -> Option<Duration> {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .map(Duration::from_millis)
+}
+
+/// [`CLAIM_CALL_TIMEOUT`], or the [`CLAIM_CALL_TIMEOUT_ENV`] override when it
+/// holds a positive number of milliseconds.
+fn claim_call_timeout_from(value: Option<&str>) -> Duration {
+    positive_millis(value).unwrap_or(CLAIM_CALL_TIMEOUT)
+}
+
+/// [`CLAIM_RUN_BUDGET`], or the [`CLAIM_RUN_BUDGET_ENV`] override when it holds
+/// a positive number of milliseconds.
+fn claim_run_budget_from(value: Option<&str>) -> Duration {
+    positive_millis(value).unwrap_or(CLAIM_RUN_BUDGET)
+}
+
+/// The time the claim calls of one run share (PRD #421 amendment item 12):
+/// each call is bounded by the per-call bound or by what is left, whichever is
+/// shorter, and spends the time it actually took. Time between calls — the
+/// dispatching itself — spends none of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClaimBudget {
+    per_call: Duration,
+    remaining: Duration,
+}
+
+impl ClaimBudget {
+    /// The bound for the next call, or `None` once the budget is spent and no
+    /// further claim call may be made.
+    fn next_bound(&self) -> Option<Duration> {
+        (!self.remaining.is_zero()).then(|| self.per_call.min(self.remaining))
+    }
+
+    fn spend(&mut self, elapsed: Duration) {
+        self.remaining = self.remaining.saturating_sub(elapsed);
+    }
+
+    fn is_spent(&self) -> bool {
+        self.remaining.is_zero()
+    }
+}
+
+/// What the claims of one run share: the machine id the records name, the
+/// time budget every claim call draws from, and two lookups — the label
+/// provisioning (PRD #421 M2.6(a)) and the signed-in account (amendment item
+/// 6). Each is made lazily, on the first claim that needs it, so a run that
+/// dispatches nothing makes no claim call at all. Provisioning is attempted
+/// once per run, plus at most one re-attempt when a later label add fails while
+/// provisioning has not succeeded ([`ClaimRun::should_reprovision`], amendment
+/// item 14); its outcome otherwise stands for the rest of the run. Only a
+/// successful account lookup is cached, so a failed one is retried by the next
+/// claim that needs a record (amendment item 13).
+struct ClaimRun {
+    host_id: String,
+    budget: ClaimBudget,
+    provisioned: Option<Result<(), String>>,
+    reprovisioned: bool,
+    account: Option<u64>,
+}
+
+impl ClaimRun {
+    fn new(hostname: &str) -> Self {
+        Self::with_budget(
+            hostname,
+            ClaimBudget {
+                per_call: claim_call_timeout_from(
+                    std::env::var(CLAIM_CALL_TIMEOUT_ENV).ok().as_deref(),
+                ),
+                remaining: claim_run_budget_from(
+                    std::env::var(CLAIM_RUN_BUDGET_ENV).ok().as_deref(),
+                ),
+            },
+        )
+    }
+
+    fn with_budget(hostname: &str, budget: ClaimBudget) -> Self {
+        Self {
+            host_id: crate::issue_dispatch::claim_host_id(hostname),
+            budget,
+            provisioned: None,
+            reprovisioned: false,
+            account: None,
+        }
+    }
+
+    /// Whether a failed label add is worth provisioning the label once more and
+    /// retrying the add (amendment item 14): only while provisioning has not
+    /// succeeded in this run, so the label may be missing, only once per run,
+    /// and only with budget left to make the calls.
+    fn should_reprovision(&self) -> bool {
+        !self.reprovisioned && !matches!(self.provisioned, Some(Ok(()))) && !self.budget.is_spent()
+    }
+
+    /// Keep the account a lookup resolved; a failed lookup leaves nothing
+    /// behind, so the next claim that needs a record looks it up again.
+    fn remember_account(&mut self, lookup: &Result<u64, String>) {
+        if let Ok(id) = lookup {
+            self.account = Some(*id);
+        }
+    }
+
+    /// One claim call within the run's budget ([`gh_claim_call`]), or the
+    /// step reported as skipped when the budget is already spent. A call that
+    /// fails as it spends the last of the budget says so as well, since a
+    /// timeout shortened by the budget is not the per-call bound's.
+    async fn call(
+        &mut self,
+        argv: &[String],
+        what: &str,
+        max_stdout: usize,
+    ) -> Result<String, String> {
+        let Some(bound) = self.budget.next_bound() else {
+            return Err(format!("{what} was skipped: {CLAIM_BUDGET_SPENT}"));
+        };
+        let started = std::time::Instant::now();
+        let result = gh_claim_call(argv, what, bound, max_stdout).await;
+        self.budget.spend(started.elapsed());
+        match result {
+            Err(error) if self.budget.is_spent() => Err(format!("{error}; {CLAIM_BUDGET_SPENT}")),
+            result => result,
+        }
+    }
+
+    /// Provision the claim label, logging a failure.
+    async fn provision(&mut self, task_name: &str, repo: &str) {
+        let outcome = self
+            .call(
+                &crate::issue_dispatch::claim_label_provision_argv(repo),
+                "creating the label",
+                CLAIM_CALL_MAX_BYTES,
+            )
+            .await
+            .map(drop);
+        if let Err(error) = &outcome {
+            tracing::warn!(
+                task = task_name,
+                repo,
+                error = %error,
+                "issue-dispatch: could not provision the claim label"
+            );
+        }
+        self.provisioned = Some(outcome);
+    }
+
+    /// Add the claim label to `issue`.
+    async fn add_label(&mut self, repo: &str, issue: u64) -> Result<(), String> {
+        self.call(
+            &crate::issue_dispatch::claim_issue_argv(repo, issue),
+            "adding the label",
+            CLAIM_CALL_MAX_BYTES,
+        )
+        .await
+        .map(drop)
+    }
+}
+
+/// PRD #421 M2.2 — claim a just-dispatched issue on GitHub: provision the
+/// label (before the first claim write of the run, and at most once more if a
+/// label add fails while provisioning has not succeeded), add it to the issue,
+/// then write this deck's claimant record — editing its existing one if the
+/// issue already carries it, posting a new one otherwise.
+///
+/// Called only after `spawn` returned `Ok`, so a failed dispatch never leaves
+/// a claim. Every step is best-effort in the way [`ensure_worktrees_excluded`]
+/// is: a failure never fails the dispatch, which genuinely succeeded. Unlike
+/// that helper, a failure is not left to a WARN alone: a claim that did not
+/// fully succeed raises exactly one [`NotifyEvent::IssueClaimFailed`] naming
+/// both outcomes (M2.6(b)), so a read-only token does not pass as a run of
+/// clean claims. Every call draws on `run.budget`, so a call that hangs is
+/// reported as its step's failure and the run moves on to the next issue, and
+/// once the run's budget is spent a claim makes no call and is reported as
+/// skipped.
+///
+/// A failed provisioning does not stop the label write: a token that may apply
+/// labels without managing them (GitHub's triage role) still succeeds at the
+/// add when the label already exists. When the add fails as well, the label
+/// may be missing because provisioning failed transiently, so the label is
+/// provisioned once more and the add retried ([`ClaimRun::should_reprovision`]).
+async fn claim_issue(
+    task_name: &str,
+    repo: &str,
+    issue: u64,
+    run: &mut ClaimRun,
+    notifier: &dyn Notifier,
+) {
+    if run.budget.is_spent() {
+        let skipped = format!("the claim was skipped: {CLAIM_BUDGET_SPENT}");
+        tracing::warn!(
+            task = task_name,
+            repo,
+            issue,
+            "issue-dispatch: the issue was dispatched but {skipped}"
+        );
+        notifier.notify(NotifyEvent::IssueClaimFailed {
+            task: task_name.to_string(),
+            repo: repo.to_string(),
+            issue,
+            label_error: Some(skipped.clone()),
+            record_error: Some(skipped),
+        });
+        return;
+    }
+
+    if run.provisioned.is_none() {
+        run.provision(task_name, repo).await;
+    }
+
+    let mut label = run.add_label(repo, issue).await;
+    if label.is_err() && run.should_reprovision() {
+        run.reprovisioned = true;
+        run.provision(task_name, repo).await;
+        label = run.add_label(repo, issue).await;
+    }
+    let label_error = label.err().map(|error| match &run.provisioned {
+        Some(Err(provision)) => format!("{error}; earlier, {provision}"),
+        _ => error,
+    });
+    if label_error.is_none() {
+        tracing::info!(
+            task = task_name,
+            repo,
+            issue,
+            "issue-dispatch: claim label added"
+        );
+    }
+
+    let record_error = write_claim_record(task_name, repo, issue, run).await.err();
+
+    if label_error.is_some() || record_error.is_some() {
+        tracing::warn!(
+            task = task_name,
+            repo,
+            issue,
+            label_error = ?label_error,
+            record_error = ?record_error,
+            "issue-dispatch: the issue was dispatched but its claim did not fully succeed"
+        );
+        notifier.notify(NotifyEvent::IssueClaimFailed {
+            task: task_name.to_string(),
+            repo: repo.to_string(),
+            issue,
+            label_error,
+            record_error,
+        });
+    }
+}
+
+/// Write this deck's claimant record on `issue`: read the comments to find a
+/// record this deck wrote — same task, same machine id, authored by the account
+/// `gh` is signed in with — and edit it if there is one, so a re-claim never
+/// appends a second record. If the account or the comments cannot be read,
+/// nothing is posted: a blind post is how a duplicate record would appear.
+async fn write_claim_record(
+    task_name: &str,
+    repo: &str,
+    issue: u64,
+    run: &mut ClaimRun,
+) -> Result<(), String> {
+    use crate::issue_dispatch::{
+        authenticated_user_argv, create_claim_record_argv, edit_claim_record_argv,
+        find_own_claim_record, issue_comments_argv, next_claim_time, parse_authenticated_user_id,
+        render_claim_record, sanitize_claim_error,
+    };
+    let user_id = match run.account {
+        Some(id) => id,
+        None => {
+            let lookup = run
+                .call(
+                    &authenticated_user_argv(),
+                    "looking up the signed-in GitHub account",
+                    CLAIM_CALL_MAX_BYTES,
+                )
+                .await
+                .and_then(|json| {
+                    parse_authenticated_user_id(&json).map_err(|e| sanitize_claim_error(&e))
+                });
+            run.remember_account(&lookup);
+            lookup?
+        }
+    };
+    let comments = run
+        .call(
+            &issue_comments_argv(repo, issue),
+            "reading the issue's comments",
+            CLAIM_COMMENTS_MAX_BYTES,
+        )
+        .await?;
+    let own = find_own_claim_record(&comments, task_name, &run.host_id, user_id)
+        .map_err(|e| sanitize_claim_error(&e))?;
+    let claimed_at = next_claim_time(
+        chrono::Utc::now(),
+        own.as_ref().and_then(|record| record.claimed_at),
+    );
+    let body = render_claim_record(task_name, &run.host_id, claimed_at);
+    match own {
+        Some(record) => {
+            let id = record.id;
+            // Guaranteed by `next_claim_time`: an edit that repeated the body
+            // would leave `updated_at`, the claim's clock, where it was.
+            debug_assert_ne!(body, record.body, "a re-claim must change the record");
+            run.call(
+                &edit_claim_record_argv(repo, id, &body),
+                "editing the claim comment",
+                CLAIM_CALL_MAX_BYTES,
+            )
+            .await?;
+            tracing::info!(
+                task = task_name,
+                repo,
+                issue,
+                comment_id = id,
+                "issue-dispatch: claim record edited"
+            );
+        }
+        None => {
+            let created = run
+                .call(
+                    &create_claim_record_argv(repo, issue, &body),
+                    "posting the claim comment",
+                    CLAIM_CALL_MAX_BYTES,
+                )
+                .await?;
+            // The id is for the log line only: a response it cannot be read
+            // from does not make the posted record a failure.
+            let comment_id = serde_json::from_str::<serde_json::Value>(&created)
+                .ok()
+                .and_then(|comment| comment["id"].as_u64());
+            tracing::info!(
+                task = task_name,
+                repo,
+                issue,
+                comment_id = ?comment_id,
+                "issue-dispatch: claim record created"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Run one `gh` call of the claim within `bound` and return its stdout, killing
+/// the call if it prints more than `max_stdout` bytes; at most
+/// [`CLAIM_STDERR_MAX_BYTES`] of its stderr are kept. Its error names the
+/// step (`what`) instead of echoing the argv, which for a comment write carries
+/// the whole multi-line body, is folded onto one line so the notification
+/// built from it stays a single line, and is sanitised
+/// ([`crate::issue_dispatch::sanitize_claim_error`]) because it quotes `gh`'s
+/// stderr.
+async fn gh_claim_call(
+    argv: &[String],
+    what: &str,
+    bound: Duration,
+    max_stdout: usize,
+) -> Result<String, String> {
+    use crate::issue_dispatch::sanitize_claim_error;
+    let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let one_line = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    match output_within_capped(
+        tokio::process::Command::new("gh"),
+        "gh",
+        &args,
+        bound,
+        OutputCaps {
+            stdout: Some(max_stdout),
+            stderr: Some(CLAIM_STDERR_MAX_BYTES),
+        },
+    )
+    .await
+    {
+        Ok(output) if output.status.success() => {
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        }
+        Ok(output) => Err(sanitize_claim_error(&format!(
+            "{what} failed ({}): {}",
+            output.status,
+            one_line(&String::from_utf8_lossy(&output.stderr))
+        ))),
+        Err(error) if is_subprocess_timeout(&error) => Err(format!(
+            "{what} timed out after {}s and was killed",
+            bound.as_secs_f64()
+        )),
+        Err(error) if is_subprocess_overflow(&error) => Err(format!(
+            "{what} failed: its output passed {max_stdout} bytes and the call was killed"
+        )),
+        Err(error) => Err(sanitize_claim_error(&format!(
+            "{what} failed: {}",
+            one_line(&error)
+        ))),
+    }
+}
+
+/// The host name a claimant record names, read in-process — no `hostname`
+/// binary resolved from `PATH` on this unattended path. Falls back to
+/// `unknown-host`, which still keeps one record per task on that machine.
+fn local_hostname() -> String {
+    #[cfg(unix)]
+    {
+        let mut buf = [0u8; 256];
+        // SAFETY: `buf` is valid for `buf.len()` bytes for the whole call, and
+        // `gethostname` writes at most that many.
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+        if rc == 0 {
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            let name = String::from_utf8_lossy(&buf[..end]).trim().to_string();
+            if !name.is_empty() {
+                return name;
+            }
+        }
+    }
+    #[cfg(windows)]
+    if let Some(name) = std::env::var("COMPUTERNAME")
+        .ok()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+    {
+        return name;
+    }
+    "unknown-host".to_string()
 }
 
 /// Outcome of [`create_worktree`].
@@ -2172,16 +2663,154 @@ fn is_subprocess_timeout(err: &str) -> bool {
 /// has no process-group kill in this code, so there the direct child alone is
 /// killed.
 ///
+/// **The direct child is not reaped until both pipes have been drained.** The
+/// run reads stdout and stderr to end-of-file first, and only then waits for
+/// the child. So whenever the group is signalled — on a timeout, on an
+/// overflow, or because the caller dropped the run part-way — the child is
+/// still unreaped, a zombie at worst, and its pid, which is the group's id,
+/// cannot have been reissued: the signal reaches this command's group and no
+/// other, including when the child exited early and a backgrounded descendant
+/// still holds a pipe open. Waiting alongside the drains instead would let the
+/// child be reaped first, leaving either a stale id to signal or no id at all
+/// and the descendant running.
+///
 /// The `.output()`-equivalent defaults are set explicitly because `spawn` does
 /// not imply them: stdin is `/dev/null`, so nothing can block reading it, and
-/// both output streams are captured. The whole run — the exit AND the two
-/// pipes draining — sits under the bound, so a descendant that keeps a pipe
+/// both output streams are captured. The whole run — the two pipes draining
+/// and then the exit — sits under the bound, so a descendant that keeps a pipe
 /// open after the child exits cannot stretch the wait past it either.
 async fn output_within(
+    cmd: tokio::process::Command,
+    program: &str,
+    args: &[&str],
+    bound: Duration,
+) -> Result<std::process::Output, String> {
+    output_within_capped(cmd, program, args, bound, OutputCaps::UNBOUNDED).await
+}
+
+/// The prefix of the error [`output_within_capped`] returns when it killed a
+/// command for printing more than its stdout cap — see
+/// [`is_subprocess_overflow`].
+const SUBPROCESS_OVERFLOW_MARKER: &str = "output too large: ";
+
+/// Whether `err` is the error [`output_within_capped`] returns when it killed
+/// a command for printing more than its stdout cap.
+fn is_subprocess_overflow(err: &str) -> bool {
+    err.starts_with(SUBPROCESS_OVERFLOW_MARKER)
+}
+
+/// How much of each output stream [`output_within_capped`] keeps. `None` keeps
+/// all of it.
+#[derive(Clone, Copy)]
+struct OutputCaps {
+    /// Past this many bytes of stdout the command is killed and reported with
+    /// [`SUBPROCESS_OVERFLOW_MARKER`]: stdout is the result, so a truncated
+    /// capture must never pass for the whole of it.
+    stdout: Option<usize>,
+    /// Past this many bytes of stderr the rest is read and discarded, and the
+    /// capture ends with a note of how many bytes were dropped. Stderr is only
+    /// ever a diagnostic, and a command that is merely chatty there (`gh` with
+    /// `GH_DEBUG` set) still succeeds.
+    stderr: Option<usize>,
+}
+
+impl OutputCaps {
+    /// Keep everything — what [`output_within`]'s callers get.
+    const UNBOUNDED: Self = Self {
+        stdout: None,
+        stderr: None,
+    };
+}
+
+/// The process group of a spawned command, `SIGKILL`ed when this is dropped
+/// unless [`GroupKill::disarm`] ran first — see [`output_within`] for why the
+/// id stays the command's own while this is armed. A no-op off Unix.
+struct GroupKill(Option<u32>);
+
+impl GroupKill {
+    fn kill(&self) {
+        let Some(pid) = self.0 else {
+            return;
+        };
+        #[cfg(all(test, unix))]
+        group_kill_probe::record(pid);
+        #[cfg(unix)]
+        // SAFETY: kill(2) with a negative pid signals the process group
+        // `process_group(0)` created, whose id is the child's pid. SIGKILL has
+        // no failure mode beyond ESRCH/EPERM, both ignored: ESRCH means
+        // everything in it has already exited. Every holder of an armed guard
+        // keeps the child unreaped, so the id cannot name anybody else's group.
+        unsafe {
+            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+        }
+        #[cfg(not(unix))]
+        let _ = pid;
+    }
+
+    /// The child has been reaped, so its id is no longer this command's.
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for GroupKill {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// Test-only record, per thread, of whether each [`GroupKill::kill`] found the
+/// leader still unreaped. A killed descendant cannot show that: a group
+/// outlives its reaped leader while any member is left, so a signal sent after
+/// the reap still reaches the descendant.
+#[cfg(all(test, unix))]
+mod group_kill_probe {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static SIGNALS: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn record(pid: u32) {
+        let unreaped = loop {
+            // SAFETY: an all-zero `siginfo_t` is a valid out-parameter, and
+            // `WNOWAIT` leaves the child waitable, so this reaps nothing. It
+            // returns 0 for a child that is running or a zombie, and fails
+            // with ECHILD once the child has been reaped.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let rc = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    libc::id_t::from(pid),
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if rc == 0 {
+                break true;
+            }
+            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                break false;
+            }
+        };
+        SIGNALS.with(|signals| signals.borrow_mut().push(unreaped));
+    }
+
+    /// The signals recorded on this thread since the last call.
+    pub(super) fn take() -> Vec<bool> {
+        SIGNALS.with(|signals| std::mem::take(&mut *signals.borrow_mut()))
+    }
+}
+
+/// [`output_within`] with caps on the bytes captured from each stream (see
+/// [`OutputCaps`]). A command that prints more stdout than its cap is killed
+/// and reaped the way a timed-out one is.
+async fn output_within_capped(
     mut cmd: tokio::process::Command,
     program: &str,
     args: &[&str],
     bound: Duration,
+    caps: OutputCaps,
 ) -> Result<std::process::Output, String> {
     use std::process::Stdio;
     use tokio::io::AsyncReadExt;
@@ -2196,9 +2825,11 @@ async fn output_within(
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to run `{program}`: {e}"))?;
-    let pid = child.id();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
+    // Declared after `child`, so it is dropped first: a run dropped part-way
+    // signals the group before dropping `child` can reap the leader.
+    let mut group = GroupKill(child.id());
 
     async fn drain(pipe: Option<impl tokio::io::AsyncRead + Unpin>) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -2208,42 +2839,95 @@ async fn output_within(
         buf
     }
 
+    /// The stdout cap was exceeded.
+    struct Overflow;
+
+    /// [`drain`], reading at most one byte past `cap` so an overflow is
+    /// detected without buffering the rest of the stream.
+    async fn drain_capped(
+        pipe: Option<impl tokio::io::AsyncRead + Unpin>,
+        cap: Option<usize>,
+    ) -> Result<Vec<u8>, Overflow> {
+        let Some(cap) = cap else {
+            return Ok(drain(pipe).await);
+        };
+        let mut buf = Vec::new();
+        if let Some(pipe) = pipe {
+            let limit = u64::try_from(cap).unwrap_or(u64::MAX).saturating_add(1);
+            let _ = pipe.take(limit).read_to_end(&mut buf).await;
+        }
+        if buf.len() > cap {
+            return Err(Overflow);
+        }
+        Ok(buf)
+    }
+
+    /// [`drain`], keeping the first `cap` bytes and reading the rest to
+    /// end-of-file into nothing, so the command never blocks on a full pipe.
+    async fn drain_prefix(
+        pipe: Option<impl tokio::io::AsyncRead + Unpin>,
+        cap: Option<usize>,
+    ) -> Vec<u8> {
+        let Some(cap) = cap else {
+            return drain(pipe).await;
+        };
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let limit = u64::try_from(cap).unwrap_or(u64::MAX);
+            let _ = (&mut pipe).take(limit).read_to_end(&mut buf).await;
+            let discarded = tokio::io::copy(&mut pipe, &mut tokio::io::sink())
+                .await
+                .unwrap_or(0);
+            if discarded > 0 {
+                buf.extend_from_slice(format!(" [{discarded} more bytes discarded]").as_bytes());
+            }
+        }
+        buf
+    }
+
     let outcome = tokio::time::timeout(bound, async {
-        tokio::join!(child.wait(), drain(stdout), drain(stderr))
+        let stderr = async { Ok(drain_prefix(stderr, caps.stderr).await) };
+        let (stdout, stderr) = tokio::try_join!(drain_capped(stdout, caps.stdout), stderr)?;
+        // Only now that both pipes are at end-of-file — see `output_within`.
+        Ok::<_, Overflow>((child.wait().await, stdout, stderr))
     })
     .await;
-    match outcome {
-        Ok((status, stdout, stderr)) => Ok(std::process::Output {
-            status: status.map_err(|e| format!("failed to run `{program}`: {e}"))?,
-            stdout,
-            stderr,
-        }),
-        Err(_) => {
-            #[cfg(unix)]
-            if let Some(pid) = pid {
-                // SAFETY: kill(2) with a negative pid signals the process group
-                // `process_group(0)` created above, whose id is the child's pid.
-                // SIGKILL has no failure mode beyond ESRCH/EPERM, both ignored:
-                // ESRCH means everything in it has already exited. The id cannot
-                // name somebody else's group, because the child is not yet reaped
-                // — `wait` below does that — so the pid is still ours.
-                unsafe {
-                    libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-                }
+    let reason = match outcome {
+        Ok(Ok((status, stdout, stderr))) => {
+            // `id()` turns `None` once `wait` has reaped the child. A `wait`
+            // that failed may not have, and then the guard still kills the
+            // group as this returns.
+            if child.id().is_none() {
+                group.disarm();
             }
-            #[cfg(not(unix))]
-            let _ = pid;
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            Err(format!(
-                "{SUBPROCESS_TIMEOUT_MARKER}`{program} {}` did not finish within {}s and was \
-                 killed; it is treated as failed so the task's later fires are not blocked \
-                 behind it",
-                args.join(" "),
-                bound.as_secs_f64()
-            ))
+            return Ok(std::process::Output {
+                status: status.map_err(|e| format!("failed to run `{program}`: {e}"))?,
+                stdout,
+                stderr,
+            });
         }
+        Ok(Err(Overflow)) => format!(
+            "{SUBPROCESS_OVERFLOW_MARKER}`{program} {}` printed more than {} bytes and was killed",
+            args.join(" "),
+            caps.stdout.unwrap_or_default()
+        ),
+        Err(_) => format!(
+            "{SUBPROCESS_TIMEOUT_MARKER}`{program} {}` did not finish within {}s and was \
+             killed; it is treated as failed so the task's later fires are not blocked \
+             behind it",
+            args.join(" "),
+            bound.as_secs_f64()
+        ),
+    };
+    // Unreaped on both arms: an overflow is found before `wait` starts, and a
+    // timeout cancels a `wait` that had not returned.
+    group.kill();
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    if child.id().is_none() {
+        group.disarm();
     }
+    Err(reason)
 }
 
 /// Run a subprocess that must exit zero and return its captured stdout. Accepts
@@ -2396,6 +3080,320 @@ mod tests {
         .await
         .expect_err("the capturing variant must be bounded too");
         assert!(err.contains("did not finish within"), "{err}");
+    }
+
+    /// Scenario: PRD #421 amendment item 10 — a command capped at 1000 bytes of
+    /// stdout prints far more and keeps running; it is killed promptly and
+    /// reported as an overflow, never returned as a truncated capture. Output
+    /// at the cap itself is returned whole.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_subprocess_past_its_stdout_cap_is_killed_and_reported() {
+        let started = std::time::Instant::now();
+        let err = output_within_capped(
+            tokio::process::Command::new("sh"),
+            "sh",
+            &["-c", "head -c 5000 /dev/zero; sleep 30"],
+            Duration::from_secs(20),
+            stdout_cap(1000),
+        )
+        .await
+        .expect_err("5000 bytes must not pass a 1000-byte cap");
+        assert!(is_subprocess_overflow(&err), "{err}");
+        assert!(!is_subprocess_timeout(&err), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "an overflow must end the call, took {:?}",
+            started.elapsed()
+        );
+
+        let out = output_within_capped(
+            tokio::process::Command::new("sh"),
+            "sh",
+            &["-c", "head -c 1000 /dev/zero"],
+            Duration::from_secs(20),
+            stdout_cap(1000),
+        )
+        .await
+        .expect("output at the cap is accepted");
+        assert_eq!(out.stdout.len(), 1000);
+    }
+
+    fn stdout_cap(bytes: usize) -> OutputCaps {
+        OutputCaps {
+            stdout: Some(bytes),
+            stderr: None,
+        }
+    }
+
+    /// Scenario: PRD #421 review round 2 — the command's leader exits at once,
+    /// leaving a backgrounded descendant that holds the pipes open and would
+    /// touch a marker a second later; the bound expires first. The descendant
+    /// is killed, and the group is signalled while the leader is still
+    /// unreaped — the id was this command's, not a stale one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timed_out_subprocess_whose_leader_exited_first_takes_its_descendant_with_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("descendant-survived");
+        let script = format!("(sleep 1; touch '{}') & exit 0", marker.display());
+        let started = std::time::Instant::now();
+        let err = output_within(
+            tokio::process::Command::new("sh"),
+            "sh",
+            &["-c", &script],
+            Duration::from_millis(200),
+        )
+        .await
+        .expect_err("the descendant holds the pipes past the bound");
+        assert!(is_subprocess_timeout(&err), "{err}");
+        assert_eq!(group_kill_probe::take(), [true]);
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "the bound must end the wait, took {:?}",
+            started.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            !marker.exists(),
+            "the descendant of a leader that had already exited survived the timeout"
+        );
+    }
+
+    /// Scenario: PRD #421 review round 2 — the leader exits at once; its
+    /// backgrounded descendant then prints past a 1000-byte stdout cap and
+    /// would touch a marker a second later. The call is reported as an
+    /// overflow, and the descendant is killed with it rather than left running
+    /// behind an error that says the call was killed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_subprocess_overflowing_after_its_leader_exited_takes_its_descendant_with_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("descendant-survived");
+        let script = format!(
+            "(sleep 0.3; head -c 5000 /dev/zero; sleep 1; touch '{}') & exit 0",
+            marker.display()
+        );
+        let err = output_within_capped(
+            tokio::process::Command::new("sh"),
+            "sh",
+            &["-c", &script],
+            Duration::from_secs(20),
+            stdout_cap(1000),
+        )
+        .await
+        .expect_err("5000 bytes must not pass a 1000-byte cap");
+        assert!(is_subprocess_overflow(&err), "{err}");
+        assert_eq!(group_kill_probe::take(), [true]);
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        assert!(
+            !marker.exists(),
+            "the overflowing descendant of an exited leader was left running"
+        );
+    }
+
+    /// Scenario: PRD #421 review round 3 — the leader exits at once, leaving a
+    /// backgrounded descendant that holds the pipes open, touches a readiness
+    /// file and would touch a marker a second later. The caller drops the
+    /// unbounded call long before its bound, and the descendant is killed with
+    /// it rather than left running behind a run nobody is waiting on. The group
+    /// is signalled while the leader is still unreaped, so its id cannot have
+    /// been reissued to anybody else.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dropped_call_whose_leader_exited_first_takes_its_descendant_with_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ready = dir.path().join("descendant-ready");
+        let marker = dir.path().join("descendant-survived");
+        let script = format!(
+            "(sleep 0.2; touch '{}'; sleep 1; touch '{}') & exit 0",
+            ready.display(),
+            marker.display()
+        );
+        let args = ["-c", script.as_str()];
+        let mut call = Box::pin(output_within(
+            tokio::process::Command::new("sh"),
+            "sh",
+            &args,
+            Duration::from_secs(60),
+        ));
+        let started = std::time::Instant::now();
+        while !ready.exists() {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the descendant never signalled readiness"
+            );
+            if let Ok(result) = tokio::time::timeout(Duration::from_millis(20), &mut call).await {
+                panic!("the call ended while the descendant held its pipes: {result:?}");
+            }
+        }
+        group_kill_probe::take();
+        drop(call);
+        assert_eq!(
+            group_kill_probe::take(),
+            [true],
+            "dropping the call must signal the group once, before the leader is reaped"
+        );
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        assert!(
+            !marker.exists(),
+            "the descendant of an exited leader outlived the dropped call"
+        );
+    }
+
+    /// Scenario: PRD #421 review round 2 — a command floods stderr with 10 MB
+    /// and then succeeds. With a 4 KiB stderr cap it is still a success: its
+    /// stdout comes back whole, and its stderr is the first 4 KiB plus a note
+    /// of how many bytes were discarded, not the whole flood.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stderr_flood_keeps_a_bounded_prefix_and_the_call_succeeds() {
+        let out = output_within_capped(
+            tokio::process::Command::new("sh"),
+            "sh",
+            &[
+                "-c",
+                "head -c 10000000 /dev/zero | tr '\\0' e >&2; echo done",
+            ],
+            Duration::from_secs(20),
+            OutputCaps {
+                stdout: Some(1000),
+                stderr: Some(4096),
+            },
+        )
+        .await
+        .expect("a stderr flood is not a failure");
+        assert!(out.status.success(), "{:?}", out.status);
+        assert_eq!(out.stdout, b"done\n");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.starts_with(&"e".repeat(4096)),
+            "the prefix is kept: {:?}",
+            &stderr[..64.min(stderr.len())]
+        );
+        assert!(
+            stderr.ends_with(" [9995904 more bytes discarded]"),
+            "{:?}",
+            &stderr[4096..]
+        );
+        assert!(
+            out.stderr.len() < 4096 + 64,
+            "{} bytes kept",
+            out.stderr.len()
+        );
+    }
+
+    /// Scenario: PRD #421 amendment item 9 — the claim-call bound is 30 s
+    /// unless the override holds a positive millisecond count.
+    #[test]
+    fn the_claim_call_timeout_defaults_to_30s_and_takes_an_override() {
+        assert_eq!(claim_call_timeout_from(None), Duration::from_secs(30));
+        assert_eq!(
+            claim_call_timeout_from(Some("1500")),
+            Duration::from_millis(1500)
+        );
+        for ignored in ["", "0", "-5", "abc", "1.5"] {
+            assert_eq!(
+                claim_call_timeout_from(Some(ignored)),
+                Duration::from_secs(30),
+                "{ignored:?}"
+            );
+        }
+    }
+
+    /// Scenario: PRD #421 amendment item 12 — the run's claim budget is 120 s
+    /// unless the override holds a positive millisecond count.
+    #[test]
+    fn the_claim_run_budget_defaults_to_120s_and_takes_an_override() {
+        assert_eq!(claim_run_budget_from(None), Duration::from_secs(120));
+        assert_eq!(
+            claim_run_budget_from(Some("3000")),
+            Duration::from_millis(3000)
+        );
+        for ignored in ["", "0", "-5", "abc", "1.5"] {
+            assert_eq!(
+                claim_run_budget_from(Some(ignored)),
+                Duration::from_secs(120),
+                "{ignored:?}"
+            );
+        }
+    }
+
+    /// Scenario: PRD #421 amendment item 12 — each call is bounded by the
+    /// shorter of the per-call bound and what is left of the run's budget, and
+    /// once the calls have spent it, no further call gets a bound.
+    #[test]
+    fn a_claim_call_is_bounded_by_what_is_left_of_the_run_budget() {
+        let mut budget = ClaimBudget {
+            per_call: Duration::from_secs(5),
+            remaining: Duration::from_secs(12),
+        };
+        assert_eq!(budget.next_bound(), Some(Duration::from_secs(5)));
+        budget.spend(Duration::from_secs(5));
+        budget.spend(Duration::from_secs(5));
+        assert_eq!(budget.next_bound(), Some(Duration::from_secs(2)));
+        assert!(!budget.is_spent());
+        // A call overruns its bound slightly before it is reaped.
+        budget.spend(Duration::from_millis(2_050));
+        assert!(budget.is_spent());
+        assert_eq!(budget.next_bound(), None);
+    }
+
+    fn claim_run_with(remaining: Duration) -> ClaimRun {
+        ClaimRun::with_budget(
+            "host",
+            ClaimBudget {
+                per_call: Duration::from_secs(30),
+                remaining,
+            },
+        )
+    }
+
+    /// Scenario: PRD #421 amendment item 14 — a failed label add provisions
+    /// the label once more only while provisioning has not succeeded in the
+    /// run, only once per run, and only with budget left.
+    #[test]
+    fn a_failed_label_add_reprovisions_once_while_the_label_may_be_missing() {
+        let mut run = claim_run_with(Duration::from_secs(120));
+        run.provisioned = Some(Err("HTTP 502".into()));
+        assert!(run.should_reprovision(), "transient provisioning failure");
+        run.reprovisioned = true;
+        assert!(!run.should_reprovision(), "at most once per run");
+
+        let mut run = claim_run_with(Duration::from_secs(120));
+        run.provisioned = Some(Ok(()));
+        assert!(!run.should_reprovision(), "the label exists");
+
+        let mut run = claim_run_with(Duration::ZERO);
+        run.provisioned = Some(Err("HTTP 502".into()));
+        assert!(!run.should_reprovision(), "no budget left for the calls");
+    }
+
+    /// Scenario: PRD #421 amendment item 13 — only a successful account
+    /// lookup is kept for the rest of the run; a failed one is not, so the
+    /// next claim looks the account up again.
+    #[test]
+    fn only_a_successful_account_lookup_is_kept() {
+        let mut run = claim_run_with(Duration::from_secs(120));
+        run.remember_account(&Err("HTTP 502".into()));
+        assert_eq!(run.account, None);
+        run.remember_account(&Ok(54321));
+        assert_eq!(run.account, Some(54321));
+    }
+
+    /// Scenario: PRD #421 amendment item 12 — once the budget is spent, a
+    /// claim call is reported as skipped for the budget without running `gh`.
+    #[tokio::test]
+    async fn a_claim_call_after_the_budget_is_spent_is_skipped() {
+        let mut run = claim_run_with(Duration::ZERO);
+        let error = run
+            .call(&["--version".to_string()], "adding the label", 1024)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "adding the label was skipped: the run's claim time budget was used up"
+        );
     }
 
     /// Issue #692: the timed-out child is killed, not left running to race the
