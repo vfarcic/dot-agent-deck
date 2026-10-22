@@ -3180,14 +3180,24 @@ pub(crate) fn unlock_worker_entry(
 /// press, so a slow redraw never earns a second toggle that would undo the
 /// first.
 pub(crate) fn ensure_command_mode(deck: &pty::PtyDeck) -> bool {
+    confirm_command_mode(
+        || deck.grid(),
+        |pred| deck.wait_for_grid(STEP_TIMEOUT, pred),
+        || deck.send(b"\x04"),
+    )
+}
+
+fn confirm_command_mode(
+    mut grid: impl FnMut() -> String,
+    mut wait: impl FnMut(&dyn Fn(&str) -> bool) -> bool,
+    mut toggle: impl FnMut(),
+) -> bool {
     for _ in 0..3 {
-        if footer_mode(&deck.grid()) == Some(FooterMode::Command) {
+        if footer_mode(&grid()) == Some(FooterMode::Command) {
             return true;
         }
-        deck.send(b"\x04"); // Ctrl+D: PaneInput -> command mode
-        if deck.wait_for_grid(STEP_TIMEOUT, |g| {
-            footer_mode(g) == Some(FooterMode::Command)
-        }) {
+        toggle();
+        if wait(&|g| footer_mode(g) == Some(FooterMode::Command)) {
             return true;
         }
     }
@@ -3698,6 +3708,7 @@ mod tests {
     }
 
     #[test]
+    /// Scenario: A reattached deck has painted its pane title but not its COMMAND footer. Focusing and typing must run the command without a leading focus digit in the shell; an unreadable footer or an unconfirmed toggle must stop input.
     fn footer_mode_reads_the_chip_on_the_bottom_row_only() {
         let command =
             grid_with_footer(" COMMAND  [Back to Pane Ctrl+D] [New Agent Ctrl+N] [Close Ctrl+W]");
@@ -3706,6 +3717,36 @@ mod tests {
             " TYPING  PaneInput mode — type to interact, Ctrl+d for dashboard   [Command Mode Ctrl+D]",
         );
         assert_eq!(footer_mode(&typing), Some(FooterMode::Typing));
+
+        // The PTY reader can expose the first frame halfway through its draw.
+        // The deck is already in command mode; its footer has not arrived yet.
+        let painted = RefCell::new(String::from("┌orchestrator\n$ "));
+        let actual_mode = RefCell::new(FooterMode::Command);
+        let command_frame = grid_with_footer(" COMMAND  [New Agent Ctrl+N]");
+        assert!(confirm_command_mode(
+            || painted.borrow().clone(),
+            |pred| {
+                // Finish the frame that predates any queued key.
+                *painted.borrow_mut() = command_frame.clone();
+                pred(&painted.borrow())
+            },
+            || {
+                let next = match *actual_mode.borrow() {
+                    FooterMode::Command => FooterMode::Typing,
+                    FooterMode::Typing => FooterMode::Command,
+                };
+                *actual_mode.borrow_mut() = next;
+            },
+        ));
+        let mut shell_input = String::new();
+        if *actual_mode.borrow() == FooterMode::Typing {
+            shell_input.push('1');
+        }
+        shell_input.push_str("dot-agent-deck delegate");
+        assert_eq!(
+            shell_input, "dot-agent-deck delegate",
+            "the focus digit leaked into the shell before the command"
+        );
     }
 
     #[test]
