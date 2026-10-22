@@ -496,8 +496,17 @@ impl OneShotInjection {
     /// straight to stdout: a block whose bytes all went and were flushed is
     /// committed, one partly written is possibly handed, one refused at its
     /// fence or never started is not handed (part 2 §1.2).
-    pub fn print(mut self) {
-        let Ok(mut stdout) = raw_stdout() else {
+    pub fn print(self) {
+        self.print_to(raw_stdout());
+    }
+
+    /// [`Self::print`] to `stdout`, this process's stdout if it could be
+    /// opened; if it could not, nothing is written and the deck is told the
+    /// batch was not handed.
+    fn print_to(mut self, stdout: std::io::Result<std::fs::File>) {
+        let Ok(mut stdout) = stdout else {
+            self.batch
+                .decline(&mut self.connection, crate::inbox_oneshot::Receiver::Hook);
             return;
         };
         let parts = hook_output_parts(&self.hook_event_name, &self.framing, &self.batch);
@@ -937,6 +946,41 @@ mod tests {
             );
             assert!(!request.ack, "{consumer:?}");
         }
+    }
+
+    /// Qodo on PR #1817 (finding 18): a doorbell hook that took a batch and
+    /// cannot open its stdout tells the deck it handed nothing, so the deck
+    /// requeues the batch at once instead of after its grant runs out.
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_without_its_stdout_reports_its_batch_not_handed() {
+        use crate::event::{InboxDelivery, InboxDeliveryAttempt};
+        let (connection, deck) = crate::inbox_oneshot::tests::connection_pair();
+        let batch = crate::inbox_oneshot::OneShotBatch::new(vec![InboxDelivery {
+            id: ID.to_string(),
+            subject: "s".to_string(),
+            from: "the orchestrator".to_string(),
+            text: "body".to_string(),
+            attempt: Some(InboxDeliveryAttempt {
+                a: 1,
+                e: 1,
+                d: 1,
+                repeat: false,
+                caps: None,
+            }),
+        }]);
+        let attempts = batch.attempts();
+        let injection = OneShotInjection {
+            connection,
+            batch,
+            grant_ttl: std::time::Duration::from_secs(60),
+            framing: "framing".to_string(),
+            hook_event_name: "UserPromptSubmit".to_string(),
+        };
+        injection.print_to(Err(std::io::Error::other("no descriptor left")));
+        let controls = crate::inbox_oneshot::tests::controls_read(deck);
+        assert_eq!(controls.len(), 1, "{controls:?}");
+        assert_eq!(controls[0].not_handed, attempts);
     }
 
     /// Scenario: Claude's prompt hook hands a two-message batch over as additionalContext, one block's body full of characters JSON escapes. Its pieces, joined, are exactly the JSON the hook prints for the framing and both blocks, then a newline, each block a piece of its own; none of the batch's caps is in them or in the batch's debug output. Written to an output that fails partway through the second block, the first block is possibly handed (the hook's JSON never closed) and the second possibly handed too.
