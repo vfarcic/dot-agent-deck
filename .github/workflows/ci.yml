@@ -342,8 +342,8 @@ jobs:
       - run: pnpm install --frozen-lockfile
       # Frozen installation above resolves the lockfile's exact Playwright
       # version, which selects its browser revisions. Do not fall back to a
-      # cache for a different version. This adds about 927 MB per version to
-      # the shared cache budget; saving from main only follows #1743's policy.
+      # cache for a different version. The directory is about 927 MB unpacked;
+      # main-only saves follow #1743's policy and limit shared-cache pressure.
       - name: Read locked Playwright version
         id: playwright-version
         run: node -p '"version=" + require("@playwright/test/package.json").version' >> "$GITHUB_OUTPUT"
