@@ -1944,3 +1944,36 @@ fn a_prerelease_rwx_pin_fails() {
         "the failure must name the pin:\n{text}"
     );
 }
+
+/// An RWX config that dropped a pin is drift too: the RWX sites ride the
+/// workflow side, so a `.rwx/` with no go-task (or no nextest, ...) pin would
+/// otherwise leave the class passing on the workflows alone (PR #1802 review).
+#[test]
+fn an_rwx_config_missing_a_pin_fails() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let full = rwx_config("1.97.1", "0.9.143", PNPM, "3.53.1");
+    for (class, marker) in [
+        ("gotask", "go-task/task/releases"),
+        ("nextest", "get.nexte.st"),
+        ("pnpm", "pnpm@"),
+    ] {
+        let rwx: String = full
+            .lines()
+            .filter(|l| !l.contains(marker))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let out = rwx_fixture(&rwx).run();
+        let text = combined(&out);
+        assert!(
+            !out.status.success(),
+            "an .rwx/ with no {class} pin must fail:\n{text}"
+        );
+        assert!(
+            text.contains(class),
+            "the failure must name the class:\n{text}"
+        );
+    }
+}

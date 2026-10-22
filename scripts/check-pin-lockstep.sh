@@ -747,11 +747,19 @@ compare "pnpm" \
   "$(scan_devbox pnpm)" \
   "$(scan_workflow_pnpm; scan_rwx_pnpm)"
 
-# go-task runs the repository's Taskfile-based tests (`DAD_REQUIRE_GO_TASK`).
-# Compared only where RWX pins it, since nothing else in CI does.
-gotask_rwx="$(scan_rwx_gotask)"
-if [ -n "$gotask_rwx" ]; then
-  compare "go-task" "$(scan_devbox go-task)" "$gotask_rwx"
+# When the repository has RWX configs, each class must be pinned there too. The
+# RWX sites ride the workflow side of `compare`, so without this a `.rwx/` that
+# lost its pin (an unpinned installer, a reworded URL) would leave the class
+# agreeing on the workflows alone and nothing would say RWX now floats.
+if [ -n "$(rwx_files)" ]; then
+  for class in toolchain nextest pnpm gotask; do
+    if [ -z "$(sites_only "$(scan_rwx_$class)")" ]; then
+      err "$class: .rwx/ pins nothing for this class. The RWX configs install it, so they must pin the same exact version devbox.json does; an absent pin means RWX floats."
+    fi
+  done
+  # go-task runs the repository's Taskfile-based tests (`DAD_REQUIRE_GO_TASK`),
+  # and .rwx/ is the only CI side that pins it.
+  compare "go-task" "$(scan_devbox go-task)" "$(scan_rwx_gotask)"
 fi
 
 if [ "$fail" -ne 0 ]; then
