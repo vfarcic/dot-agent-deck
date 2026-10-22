@@ -1,6 +1,6 @@
 ---
 name: code-cleanup
-description: Dispatch small, recurring cleanup units, one per mode (code, tests, instructions), each owning a disjoint set of files. The code unit starts from what pinned static tools report (cargo-shear, knip); the others, and a code unit whose findings are all filtered out, draw a random, size-weighted area. Either way a unit skips anything an open PR, a running unit or the runner's off-limits list covers, proves its tests-mode removals with cargo-mutants where it can, changes code only where it can state a concrete benefit, and opens at most one bounded PR with no behaviour change, or reports that nothing was worth changing. Use at the end of every dispatch run (/issue-queue, /prd-queue, /pr-review-queue or ad-hoc dispatches all end with its shared end-of-run step), or on its own as /code-cleanup, optionally naming one mode. Never before a release. It does no cleanup itself; the units do.
+description: Dispatch small, recurring cleanup units, one per mode (code, tests, instructions), each owning a disjoint set of files. The code unit starts from what pinned static tools report (cargo-shear, knip); the others, and a code unit whose findings are all filtered out, draw a random, size-weighted area. Either way a unit skips anything an open PR, a running unit or the runner's off-limits list covers, proves its tests-mode removals with cargo-mutants where it can, changes code only where it can state a concrete benefit, and opens at most one bounded PR with no behaviour change, or reports that nothing was worth changing. Use at the end of every dispatch run (/issue-queue, /prd-queue, /pr-review-queue or ad-hoc dispatches all end with its shared end-of-run step), or on its own as /code-cleanup, optionally naming one mode, so that cleanup happens regularly. It does no cleanup itself; the units do.
 user-invocable: true
 ---
 
@@ -17,7 +17,6 @@ Not this skill:
 
 - **A cleanup you already know you want** (a named duplicate, a named stale paragraph) → just do it, or file an issue for `/issue-queue`. This skill exists to find work nobody filed, from tool findings or a random draw.
 - **Anything that changes behaviour** → that is a bug fix or a feature, with its own issue.
-- **Right before a release.** `/tag-release` does not run this skill, and a run that is about to cut a release skips the end-of-run step: a refactor merged just before a release ships having been used by nobody.
 
 ## At the end of a dispatch run
 
@@ -25,7 +24,7 @@ This is the one description of the end-of-run step. The queue skills and `dispat
 
 **When: after the run's last unit, never before and never between them.** Start once **every unit dispatched in the run** has finished: its PR is merged, closed, or stopped waiting for a person, or the unit stopped without opening one. Where the units report back to the pane, that report is the signal; elsewhere, read the PR states. A PR held for a human does **not** hold this step back: the draw skips every file an open PR touches, so cleanup stays off that PR's files without waiting for it. What must not happen is a cleanup unit running alongside, or ahead of, units from the same run.
 
-**Skip it** when the runner says so, at any point in the run, and when the runner is about to cut a release (above). Say in the run's report that no cleanup units went out, and why.
+**The point is that cleanup happens regularly, not that every run ends with it.** Skip it when the runner says so, at any point in the run; a run that is about to be followed by a release can skip it too, so a refactor does not land in the release untried. One skipped run costs nothing, since the next run picks the due modes up. Say in the run's report that no cleanup units went out, and why.
 
 **Otherwise, in order:**
 

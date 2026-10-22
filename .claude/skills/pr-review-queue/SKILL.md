@@ -577,7 +577,7 @@ Also report, plainly: every PR skipped and why — closed since listing, become 
 
 ## Step 9 — End of run: dispatch the cleanup units
 
-**A review queue run ends with the end-of-run step defined once in [`code-cleanup`](../code-cleanup/SKILL.md), section "At the end of a dispatch run"**, exactly as `/issue-queue` runs end. Follow it from this pane rather than composing cleanup tasks here; it holds when the step starts, the second pass of [`dispatch-base`](../dispatch-base/SKILL.md), the off-limits list, the frequency guard and why it is skipped before a release.
+**A review queue run ends with the end-of-run step defined once in [`code-cleanup`](../code-cleanup/SKILL.md), section "At the end of a dispatch run"**, exactly as `/issue-queue` runs end. Follow it from this pane rather than composing cleanup tasks here; it holds when the step starts, the second pass of [`dispatch-base`](../dispatch-base/SKILL.md), the off-limits list and the frequency guard.
 
 What this queue adds to it:
 

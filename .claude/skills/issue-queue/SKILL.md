@@ -427,7 +427,7 @@ Give the runner, per unit: issue number, worktree path as `dispatch` reported it
 
 ## Step 10 — End of run: dispatch the cleanup units
 
-**Every queue run ends with the end-of-run step defined once in [`code-cleanup`](../code-cleanup/SKILL.md), section "At the end of a dispatch run".** Follow it from this pane rather than composing cleanup tasks here. It holds when the step starts (after every issue unit dispatched in this run has reported back and its PR is merged, closed, or stopped waiting for a person, never before or between them), the second pass of [`dispatch-base`](../dispatch-base/SKILL.md), the off-limits list the units carry, the frequency guard that decides which modes go out, and why it is skipped before a release.
+**Every queue run ends with the end-of-run step defined once in [`code-cleanup`](../code-cleanup/SKILL.md), section "At the end of a dispatch run".** Follow it from this pane rather than composing cleanup tasks here. It holds when the step starts (after every issue unit dispatched in this run has reported back and its PR is merged, closed, or stopped waiting for a person, never before or between them), the second pass of [`dispatch-base`](../dispatch-base/SKILL.md), the off-limits list the units carry, and the frequency guard that decides which modes go out.
 
 What this queue adds to it:
 

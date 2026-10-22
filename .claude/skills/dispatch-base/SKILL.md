@@ -24,7 +24,7 @@ This is where the base step for **every** dispatch in this repo is defined: an a
 
 A dispatching skill may say otherwise for its own flow. `/issue-queue` re-runs it before every dispatch when its bug-fix units merge their own PRs, because there the loop itself moves `main` between dispatches; that exception, and why, is in its step 0.
 
-**An ad-hoc run of dispatches ends the way the queue runs do.** Once every unit of the request has finished (its PR merged, closed or waiting for a person, or the unit stopped without one), follow [`code-cleanup`](../code-cleanup/SKILL.md)'s "At the end of a dispatch run": it dispatches the cleanup modes that are due, starting with a second pass of this skill, since the run's merges have moved `origin/main`. The runner can skip it, and it is skipped before a release; that section says how.
+**An ad-hoc run of dispatches ends the way the queue runs do.** Once every unit of the request has finished (its PR merged, closed or waiting for a person, or the unit stopped without one), follow [`code-cleanup`](../code-cleanup/SKILL.md)'s "At the end of a dispatch run": it dispatches the cleanup modes that are due, starting with a second pass of this skill, since the run's merges have moved `origin/main`. The runner can skip it; that section says when.
 
 ## Step 1 — Fetch, then read the state
 
