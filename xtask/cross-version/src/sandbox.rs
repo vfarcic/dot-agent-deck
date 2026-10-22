@@ -927,8 +927,8 @@ pub fn stage_binary(src: &Path, dst: &Path) -> Result<String, String> {
 ///   running `inbox fetch` inside its own pane (tell 3, issue #1755). It was
 ///   `cat` while delivery was typed, which echoed the delegate onto the screen.
 /// * `reviewer` is a shell, because `work-done` and `agent-event` have to be
-///   issued from a WORKER pane, and the feedback the daemon writes back lands in
-///   the orchestrator's pane where it is a separate, daemon-authored observable.
+///   issued from a WORKER pane. The orchestrator then fetches and lists the
+///   report in its own inbox; the status change is read from daemon status.
 ///
 /// Each role prints a unique sentinel first: `PaneLayout::Stacked` draws only
 /// the focused role's pane, so the sentinel on screen names which role is

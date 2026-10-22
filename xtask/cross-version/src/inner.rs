@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Output};
 use std::time::{Duration, Instant};
 
+use crate::capture::{Session as CaptureSession, shell_word};
 use crate::isolation::{self, Plan};
 use crate::outer::epoch_secs;
 use crate::proc::{self, Identity, Mismatch, SandboxProcess, Terminated};
@@ -524,7 +525,8 @@ impl Guard<'_> {
         let counts = self.counts.borrow();
         let total: usize = counts.values().sum();
         format!(
-            "the pre-connect assertion held {total} time(s), once before every client: {}",
+            "the pre-connect assertion held {total} time(s) before harness-driven client \
+             commands (pane retypings counted separately): {}",
             counts
                 .iter()
                 .map(|(k, v)| format!("{k} ×{v}"))
@@ -1451,6 +1453,17 @@ fn with_attached_tui(
     focus_role(tui, plan, ROLE_ORCHESTRATOR)?;
     let nonce = epoch_secs();
     let delegate_sentinel = format!("XVER-DELEGATE-{nonce}");
+    let expected_pane = |role: &str| -> Result<&str, Abort> {
+        let rows: Vec<_> = rows_for(roles_before_attach, role);
+        match rows.as_slice() {
+            [row] if !row.pane_id.is_empty() => Ok(row.pane_id.as_str()),
+            _ => Err(Abort::Scenario(format!(
+                "expected exactly one recorded pane for `{role}`"
+            ))),
+        }
+    };
+    let coder_pane = expected_pane(ROLE_CODER)?;
+    let orchestrator_pane = expected_pane(ROLE_ORCHESTRATOR)?;
     // The pane's shell is about to start the client CLI, which is a client.
     g.preconnect_logged(
         &format!("pane: {} delegate", cast.pane_cli_label),
@@ -1461,7 +1474,7 @@ fn with_attached_tui(
         tui,
         &format!(
             "{} delegate --to {ROLE_CODER} --to {ROLE_REVIEWER} --task \"{delegate_sentinel} list the files in this directory\"",
-            cast.pane_cli
+            shell_word(&cast.pane_cli)
         ),
     );
 
@@ -1493,16 +1506,8 @@ fn with_attached_tui(
     // takes its inbox the way an agent's component does, and the deck's own
     // listing, read from a different pane, must then show that very message
     // acknowledged. The sentinel is checked in what the deck HANDED the worker;
-    // the command typed into the worker's shell does not carry it.
-    let coder_fetch = capture_in_pane(
-        g,
-        tui,
-        cast,
-        ev,
-        ROLE_CODER,
-        "fetch",
-        &fetch_until(&cast.pane_cli, &delegate_sentinel),
-    )?;
+    // judgement reads parsed fetch JSON, rather than terminal echo.
+    let coder_fetch = fetch_in_pane(g, tui, cast, ev, ROLE_CODER, &delegate_sentinel)?;
     let listing = capture_in_pane(
         g,
         tui,
@@ -1512,13 +1517,15 @@ fn with_attached_tui(
         "list-all",
         &format!(
             "{} inbox list --all --json; echo \"exit=$?\"",
-            cast.pane_cli
+            shell_word(&cast.pane_cli)
         ),
     )?;
     let (delivered, delivery_note) = judge_inbox_delivery(
         coder_fetch.out.as_deref(),
         listing.out.as_deref(),
         &delegate_sentinel,
+        coder_pane,
+        orchestrator_pane,
     );
     ev.tell(
         "tell-3",
@@ -1551,17 +1558,9 @@ fn with_attached_tui(
     //
     // The reviewer takes its own copy of the delegate first, as a worker does
     // before it reports. That is recorded, not judged: tell 3 is the delegate's
-    // tell. Taking it also leaves the reviewer nothing waiting, so no doorbell
-    // can be typed into its shell once `agent-event` below reports it started.
-    let reviewer_fetch = capture_in_pane(
-        g,
-        tui,
-        cast,
-        ev,
-        ROLE_REVIEWER,
-        "fetch",
-        &fetch_until(&cast.pane_cli, &delegate_sentinel),
-    )?;
+    // tell. A successful fetch drains this delegate before `agent-event` below;
+    // a timeout does not establish that the reviewer's inbox is empty.
+    let reviewer_fetch = fetch_in_pane(g, tui, cast, ev, ROLE_REVIEWER, &delegate_sentinel)?;
     ev.step(
         match reviewer_fetch
             .out
@@ -1589,22 +1588,15 @@ fn with_attached_tui(
         tui,
         &format!(
             "{} work-done --task \"{work_done_sentinel}\"",
-            cast.pane_cli
+            shell_word(&cast.pane_cli)
         ),
     );
     let mut refused = reviewer_fetch.refused || refused_by_lock(tui);
     // The report goes to the orchestrator's inbox; the orchestrator takes it
     // and its own listing must show it acknowledged — tell 3's evidence, for
     // the report travelling the other way.
-    let orchestrator_fetch = capture_in_pane(
-        g,
-        tui,
-        cast,
-        ev,
-        ROLE_ORCHESTRATOR,
-        "fetch",
-        &fetch_until(&cast.pane_cli, &work_done_sentinel),
-    )?;
+    let orchestrator_fetch =
+        fetch_in_pane(g, tui, cast, ev, ROLE_ORCHESTRATOR, &work_done_sentinel)?;
     let orchestrator_listing = capture_in_pane(
         g,
         tui,
@@ -1612,12 +1604,17 @@ fn with_attached_tui(
         ev,
         ROLE_ORCHESTRATOR,
         "list",
-        &format!("{} inbox list --json; echo \"exit=$?\"", cast.pane_cli),
+        &format!(
+            "{} inbox list --json; echo \"exit=$?\"",
+            shell_word(&cast.pane_cli)
+        ),
     )?;
     let (work_done_arrived, work_done_note) = judge_inbox_delivery(
         orchestrator_fetch.out.as_deref(),
         orchestrator_listing.out.as_deref(),
         &work_done_sentinel,
+        orchestrator_pane,
+        orchestrator_pane,
     );
 
     focus_role(tui, plan, ROLE_REVIEWER)?;
@@ -1628,7 +1625,7 @@ fn with_attached_tui(
     )?;
     type_into_pane(
         tui,
-        &format!("{} agent-event --type running", cast.pane_cli),
+        &format!("{} agent-event --type running", shell_word(&cast.pane_cli)),
     );
     refused |= refused_by_lock(tui);
     let client_cli = format!("{} CLI: daemon status", cast.client_side);
@@ -3255,20 +3252,20 @@ pub(crate) fn type_into_pane(deck: &pty::PtyDeck, text: &str) {
     std::thread::sleep(SETTLE);
 }
 
-/// How many times [`fetch_until`] asks for the inbox, a second apart. A
+/// How many times [`fetch_in_pane`] asks for the inbox, a second apart. A
 /// delegate's message is posted when the CLI returns, so the first ask usually
 /// finds it; the margin is for a loaded box.
 const FETCH_ATTEMPTS: usize = 60;
 
-/// How long [`capture_in_pane`] gives a pane's shell to start a typed command
-/// before typing it again, and how many times it types it.
+/// How long a capture command may run, and the earliest retry after a typing.
+/// A retry also needs the execution lease; CAPTURE_TYPINGS bounds the typings.
 const CAPTURE_START_WAIT: Duration = Duration::from_secs(10);
 const CAPTURE_TYPINGS: usize = 3;
 
 /// What [`capture_in_pane`] got back.
 pub(crate) struct Captured {
     /// Everything the command printed, once the pane's shell had finished it;
-    /// `None` when it had not within [`UI_TIMEOUT`].
+    /// `None` when the bounded attempts produced no published capture.
     pub out: Option<String>,
     /// The deck refused the typed command ([`refused_by_lock`]).
     pub refused: bool,
@@ -3279,8 +3276,8 @@ pub(crate) struct Captured {
 /// The shell writes the output to a file under the project directory, which
 /// the harness reads, rather than to the screen: a JSON answer is longer than a
 /// pane is wide, and reading it back off a wrapped grid would split values. The
-/// file is renamed into place only after `body` has finished, so a partial one
-/// is never read. Its first line is the `DOT_AGENT_DECK_PANE_ID` of the pane
+/// file is renamed into place after `body` has finished; the harness reads the
+/// published file. Its first line is the `DOT_AGENT_DECK_PANE_ID` of the pane
 /// that ran it, from that pane's own environment.
 pub(crate) fn capture_in_pane(
     g: &Guard<'_>,
@@ -3291,83 +3288,123 @@ pub(crate) fn capture_in_pane(
     what: &str,
     body: &str,
 ) -> Result<Captured, Abort> {
-    let name = format!("xver-{role}-{what}");
-    let tmp = g.sb.project.join(format!("{name}.tmp"));
-    let out = g.sb.project.join(format!("{name}.out"));
-    focus_role(tui, g.plan, role)?;
-    g.preconnect_logged(
-        &format!("pane: {} inbox {what}", cast.pane_cli_label),
-        &g.plan.env,
-        ev,
-    )?;
-    let command = format!(
-        "{{ echo \"pane=$DOT_AGENT_DECK_PANE_ID\"; {body}; }} > '{}' 2>&1; mv '{}' '{}'",
-        tmp.display(),
-        tmp.display(),
-        out.display()
-    );
-    // A delegate restarts its worker for the new task, so a command typed into
-    // the worker's pane right after it can reach the shell that is being
-    // replaced and be lost with it (measured against v0.47.0: the `coder`
-    // pane's first fetch never ran). The shell creates the `.tmp` file as it
-    // starts the command, so a pane with neither file after
-    // [`CAPTURE_START_WAIT`] never started it, and the command is typed again.
-    let started = |tmp: &Path, out: &Path| tmp.exists() || out.exists();
+    let session = CaptureSession::new(&g.sb.project, &format!("xver-{role}-{what}"));
     let mut refused = false;
-    for attempt in 1..=CAPTURE_TYPINGS {
-        if attempt > 1 {
-            ev.step(format!(
-                "the `{role}` pane had not started `inbox {what}` {}s after it was typed; typed \
-                 it again (attempt {attempt} of {CAPTURE_TYPINGS})",
-                CAPTURE_START_WAIT.as_secs()
-            ));
-            focus_role(tui, g.plan, role)?;
-        }
+    let mut text = None;
+    let mut attempt = session
+        .prepare(1)?
+        .ok_or("fresh capture lease was already held")?;
+    'typings: for number in 1..=CAPTURE_TYPINGS {
+        focus_role(tui, g.plan, role)?;
+        // Each typing contains one deck client, including retries. Do not put
+        // a client loop in the shell: it would bypass these checks.
+        g.preconnect_logged(
+            &format!("pane: {} inbox {what}", cast.pane_cli_label),
+            &g.plan.env,
+            ev,
+        )?;
+        let command = session.command(&attempt, body, CAPTURE_START_WAIT.as_secs());
         type_into_pane(tui, &command);
-        // The orchestrator's pane is never gated by the command-entry lock.
         refused |= role != ROLE_ORCHESTRATOR && refused_by_lock(tui);
-        let deadline = Instant::now() + CAPTURE_START_WAIT;
-        while !started(&tmp, &out) && Instant::now() < deadline {
+        let retry_at = Instant::now() + CAPTURE_START_WAIT;
+        let deadline = Instant::now() + UI_TIMEOUT;
+        loop {
+            if let Ok(out) = std::fs::read_to_string(&attempt.out) {
+                text = Some(out);
+                break 'typings;
+            }
+            if Instant::now() >= deadline {
+                ev.step(format!(
+                    "`{role}` inbox {what} did not publish within {}s; no duplicate was typed \
+                     while its execution lease was held",
+                    UI_TIMEOUT.as_secs()
+                ));
+                break 'typings;
+            }
+            if Instant::now() >= retry_at {
+                // prepare holds the execution lease while removing stale .tmp
+                // and advancing the token. It refuses a still-running writer.
+                let interrupted = attempt.tmp.exists();
+                if let Some(next) = session.prepare(number + 1)? {
+                    // Publication can win the race just before prepare acquired
+                    // the lease. Prefer that result over another inbox fetch.
+                    if let Ok(out) = std::fs::read_to_string(&attempt.out) {
+                        text = Some(out);
+                        break 'typings;
+                    }
+                    if number == CAPTURE_TYPINGS {
+                        break 'typings;
+                    }
+                    ev.step(format!(
+                        "`{role}` inbox {what} {} without publishing; advanced the capture \
+                         token and retyped (attempt {} of {CAPTURE_TYPINGS})",
+                        if interrupted {
+                            "left a temporary capture"
+                        } else {
+                            "never started or timed out"
+                        },
+                        number + 1
+                    ));
+                    attempt = next;
+                    break;
+                }
+            }
             std::thread::sleep(Duration::from_millis(250));
         }
-        if started(&tmp, &out) {
-            break;
-        }
     }
-    let deadline = Instant::now() + UI_TIMEOUT;
-    let text = loop {
-        if let Ok(text) = std::fs::read_to_string(&out) {
-            break Some(text);
-        }
-        if Instant::now() >= deadline {
-            break None;
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    };
     match &text {
         Some(text) => ev.excerpt(format!("`{role}` pane: `inbox {what}`"), text.clone()),
         None => ev.excerpt(
-            format!(
-                "`{role}` pane when its `inbox {what}` had written nothing within {}s",
-                UI_TIMEOUT.as_secs()
-            ),
+            format!("`{role}` pane when `inbox {what}` failed to publish a completed capture"),
             tui.grid(),
         ),
     }
     Ok(Captured { out: text, refused })
 }
 
-/// A shell loop that takes the pane's inbox with `cli inbox fetch --json`,
-/// once a second, until a hand-over carries `sentinel` or
-/// [`FETCH_ATTEMPTS`] asks have been made. Each answer is printed with the
-/// fetch's exit status, so every message it took is in the capture.
-pub(crate) fn fetch_until(cli: &str, sentinel: &str) -> String {
-    let attempts: Vec<String> = (1..=FETCH_ATTEMPTS).map(|i| i.to_string()).collect();
-    format!(
-        "for i in {}; do r=$({cli} inbox fetch --json 2>&1); echo \"exit=$?\"; \
-         printf '%s\\n' \"$r\"; case \"$r\" in *{sentinel}*) break;; esac; sleep 1; done",
-        attempts.join(" ")
-    )
+/// Drive bounded inbox asks from the harness, so each client is separately
+/// preceded by preconnect_logged (including every respawn retry).
+fn fetch_in_pane(
+    g: &Guard<'_>,
+    tui: &pty::PtyDeck,
+    cast: &Cast,
+    ev: &mut Evidence,
+    role: &str,
+    sentinel: &str,
+) -> Result<Captured, Abort> {
+    let mut captured = Captured {
+        out: None,
+        refused: false,
+    };
+    for ask in 1..=FETCH_ATTEMPTS {
+        let reply = capture_in_pane(
+            g,
+            tui,
+            cast,
+            ev,
+            role,
+            &format!("fetch-{ask}"),
+            &fetch_command(&cast.pane_cli),
+        )?;
+        captured.refused |= reply.refused;
+        let found = reply
+            .out
+            .as_deref()
+            .and_then(|s| fetched_id(s, sentinel))
+            .is_some();
+        captured.out = reply.out;
+        if found || captured.out.is_none() || captured.refused {
+            break;
+        }
+        if ask < FETCH_ATTEMPTS {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+    Ok(captured)
+}
+
+fn fetch_command(cli: &str) -> String {
+    format!("{} inbox fetch --json; echo \"exit=$?\"", shell_word(cli))
 }
 
 /// The pane id a [`capture_in_pane`] capture recorded from its pane's own
@@ -3422,22 +3459,20 @@ pub(crate) fn listed_state(out: &str, id: &str, pane: &str) -> Option<(String, O
     })
 }
 
-/// Tells 3 and 4's inbox judgement: a message carrying `sentinel` was handed
-/// to the pane that ran `fetch`, and `list` names that message, in that
-/// pane's inbox, as `acknowledged`. Returns the verdict and the sentence the
-/// evidence prints.
+/// Tells 3 and 4's inbox judgement: captures ran in the expected role panes,
+/// a message carrying `sentinel` was handed to the expected recipient, and
+/// `list` names that message in that pane's inbox as `acknowledged`.
 pub(crate) fn judge_inbox_delivery(
     fetch: Option<&str>,
     list: Option<&str>,
     sentinel: &str,
+    expected_recipient: &str,
+    expected_listing_pane: &str,
 ) -> (bool, String) {
     let Some(fetch) = fetch else {
         return (
             false,
-            format!(
-                "the `inbox fetch` loop wrote nothing within {}s",
-                UI_TIMEOUT.as_secs()
-            ),
+            "the bounded `inbox fetch` attempts published no completed capture".to_string(),
         );
     };
     let Some(pane) = captured_pane(fetch) else {
@@ -3446,6 +3481,12 @@ pub(crate) fn judge_inbox_delivery(
             "the fetching pane recorded no `DOT_AGENT_DECK_PANE_ID`".to_string(),
         );
     };
+    if pane != expected_recipient {
+        return (
+            false,
+            format!("fetch ran in pane {pane}, expected role pane {expected_recipient}"),
+        );
+    }
     let Some(id) = fetched_id(fetch, sentinel) else {
         return (
             false,
@@ -3457,11 +3498,19 @@ pub(crate) fn judge_inbox_delivery(
             false,
             format!(
                 "message {id} was handed to pane {pane} with `{sentinel}` in it, but the \
-                 `inbox list` wrote nothing within {}s",
-                UI_TIMEOUT.as_secs()
+                 bounded `inbox list` attempts published no completed capture"
             ),
         );
     };
+    if captured_pane(list) != Some(expected_listing_pane) {
+        return (
+            false,
+            format!(
+                "listing ran in pane {:?}, expected orchestrator pane {expected_listing_pane}",
+                captured_pane(list)
+            ),
+        );
+    }
     match listed_state(list, &id, pane) {
         Some((state, how)) if state == "acknowledged" => (
             true,
@@ -4829,17 +4878,21 @@ mod inbox_delivery_tests {
         format!("pane=1\n{reply}\nexit=0\n")
     }
 
+    /// Scenario: The coder fetches its delegate and the orchestrator lists that exact message acknowledged in coder's inbox.
     #[test]
     fn a_handed_over_message_listed_as_acknowledged_in_its_pane_passes() {
         let (ok, note) = judge_inbox_delivery(
             Some(&fetch_capture("2", &format!("{SENTINEL} list the files"))),
             Some(&list_capture("2", "acknowledged")),
             SENTINEL,
+            "2",
+            "1",
         );
         assert!(ok, "{note}");
         assert!(note.contains(ID) && note.contains("`explicit`"), "{note}");
     }
 
+    /// Scenario: The coder fetches an empty inbox while a listing names an acknowledged message; the tell must fail.
     #[test]
     fn an_empty_inbox_fails_whatever_the_listing_says() {
         let empty = format!("pane=2\nexit=0\n{}\n", serde_json::json!({"messages": []}));
@@ -4847,21 +4900,27 @@ mod inbox_delivery_tests {
             Some(&empty),
             Some(&list_capture("2", "acknowledged")),
             SENTINEL,
+            "2",
+            "1",
         );
         assert!(!ok);
         assert!(note.contains("no message"), "{note}");
     }
 
+    /// Scenario: The worker fetches an unrelated task; an acknowledged listing must not satisfy this delegate.
     #[test]
     fn a_hand_over_without_the_sentinel_fails() {
         let (ok, _) = judge_inbox_delivery(
             Some(&fetch_capture("2", "some other task")),
             Some(&list_capture("2", "acknowledged")),
             SENTINEL,
+            "2",
+            "1",
         );
         assert!(!ok);
     }
 
+    /// Scenario: The worker fetches its task but the listing is queued, fetched or undeliverable; each must fail.
     #[test]
     fn a_message_not_yet_acknowledged_fails() {
         for state in ["queued", "fetched", "undeliverable"] {
@@ -4869,51 +4928,111 @@ mod inbox_delivery_tests {
                 Some(&fetch_capture("2", SENTINEL)),
                 Some(&list_capture("2", state)),
                 SENTINEL,
+                "2",
+                "1",
             );
             assert!(!ok, "{state}");
             assert!(note.contains(&format!("`{state}`")), "{note}");
         }
     }
 
+    /// Scenario: The coder fetches its delegate but the listing names another recipient; the tell must fail.
     #[test]
     fn the_listing_must_name_the_pane_that_fetched() {
         let (ok, note) = judge_inbox_delivery(
             Some(&fetch_capture("2", SENTINEL)),
             Some(&list_capture("3", "acknowledged")),
             SENTINEL,
+            "2",
+            "1",
         );
         assert!(!ok);
         assert!(note.contains("no entry"), "{note}");
     }
 
+    /// Scenario: The reviewer receives the delegate and both captures consistently
+    /// name that reviewer. Tell 3 must fail because the intended recipient is coder.
+    #[test]
+    fn a_consistently_wrong_recipient_fails() {
+        let (ok, note) = judge_inbox_delivery(
+            Some(&fetch_capture("3", SENTINEL)),
+            Some(&list_capture("3", "acknowledged")),
+            SENTINEL,
+            "2",
+            "1",
+        );
+        assert!(!ok, "coder pane 2 was required, but: {note}");
+    }
+
+    /// Scenario: A missing capture or empty fetching pane identity must fail the tell.
     #[test]
     fn a_missing_capture_or_pane_id_fails() {
-        assert!(!judge_inbox_delivery(None, Some(&list_capture("2", "acknowledged")), SENTINEL).0);
-        assert!(!judge_inbox_delivery(Some(&fetch_capture("2", SENTINEL)), None, SENTINEL).0);
+        assert!(
+            !judge_inbox_delivery(
+                None,
+                Some(&list_capture("2", "acknowledged")),
+                SENTINEL,
+                "2",
+                "1"
+            )
+            .0
+        );
+        assert!(
+            !judge_inbox_delivery(
+                Some(&fetch_capture("2", SENTINEL)),
+                None,
+                SENTINEL,
+                "2",
+                "1"
+            )
+            .0
+        );
         let no_pane = fetch_capture("", SENTINEL);
         let (ok, note) = judge_inbox_delivery(
             Some(&no_pane),
             Some(&list_capture("", "acknowledged")),
             SENTINEL,
+            "2",
+            "1",
         );
         assert!(!ok);
         assert!(note.contains("DOT_AGENT_DECK_PANE_ID"), "{note}");
     }
 
+    /// Scenario: Each pane command must start one inbox client, with its executable
+    /// quoted literally, so the harness can check isolation before the next ask.
     #[test]
-    fn the_fetch_loop_stops_on_the_sentinel_and_is_bounded() {
-        let script = fetch_until("/s/bin/dot-agent-deck", SENTINEL);
-        assert!(
-            script.contains("/s/bin/dot-agent-deck inbox fetch --json"),
-            "{script}"
+    fn a_fetch_command_starts_one_client_without_a_shell_retry_loop() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("xver-fetch-command-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let cli = root.join("it's a cli $(false)");
+        std::fs::write(&cli, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let script = fetch_command(cli.to_str().unwrap());
+        let reply = Command::new("sh").args(["-c", &script]).output().unwrap();
+        assert!(reply.status.success(), "{reply:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&reply.stdout),
+            "inbox\nfetch\n--json\nexit=0\n"
         );
-        assert!(
-            script.contains(&format!("*{SENTINEL}*) break;;")),
-            "{script}"
+        assert!(!script.contains("for ") && !script.contains("while "));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Scenario: The right worker fetches the delegate but the listing was
+    /// captured in the reviewer pane. The tell must reject the wrong observer.
+    #[test]
+    fn the_listing_must_run_in_the_expected_orchestrator_pane() {
+        let wrong = list_capture("2", "acknowledged").replacen("pane=1", "pane=3", 1);
+        let (ok, note) = judge_inbox_delivery(
+            Some(&fetch_capture("2", SENTINEL)),
+            Some(&wrong),
+            SENTINEL,
+            "2",
+            "1",
         );
-        assert!(
-            script.contains(&format!(" {FETCH_ATTEMPTS}; do")),
-            "{script}"
-        );
+        assert!(!ok, "{note}");
+        assert!(note.contains("expected orchestrator pane 1"), "{note}");
     }
 }
