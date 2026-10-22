@@ -35,11 +35,13 @@ What you can do by voice, by screen:
 
 | Where | You can |
 | --- | --- |
-| Anywhere, including an agent's pane | Close what is open over the screen (a pane, Settings, a dialog, a daemon's Host figures); list the commands; turn [reading](#reading) on and off; silence the app's speech ("quiet"); turn voice off; [show the whole, unfiltered dashboard](#filtering-the-dashboard) |
+| Anywhere, including an agent's pane | Close what is open over the screen (a pane, Settings, a dialog, a confirmation, an upgrade dialog, a daemon's Host figures); list the commands; turn [reading](#reading) on and off; silence the app's speech ("quiet"); turn voice off; [show the whole, unfiltered dashboard](#filtering-the-dashboard) |
 | Dashboard | Open Settings; switch which daemon the app shows, such as "switch daemon to build", or show them all with "select all daemons"; [open a daemon's Host figures](#checking-a-daemons-machine); open an agent's pane; open New agent; [scroll the dashboard](#scrolling-the-dashboard); [filter the dashboard](#filtering-the-dashboard); [open an agent's pull request](#pull-requests); stop an agent or close an orchestration (the app shows the same confirmation as the buttons, and nothing stops until you confirm by hand) |
 | New agent dialog | Choose the daemon; open a directory, go up, use the directory shown; [filter the directories](#filtering-directories) or clear the filter; choose a Mode chip or the agent to run; set the Name; [set the Command](#setting-the-command); start; discard |
 | An agent's pane | Type into the agent's prompt; submit it; turn [typing mode](#typing-mode) on and off; in typing mode, [interrupt the agent, clear its prompt, or scratch what you last dictated](#interrupt-clear-and-scratch-that); [answer the question the agent is waiting on](#answering-an-agents-question); [open its pull request, or another agent's](#pull-requests) |
 | A pull request page | [Scroll it, open it in your system browser, or close it](#pull-requests) |
+
+"Close" closes only what is in front. With a confirmation or an upgrade dialog open, it closes that dialog the way **Cancel** or `Esc` does and leaves everything behind it as it was. While an upgrade is running, the dialog stays open and the app says why; when the dialog is asking whether to restart and stop running agents, "close" answers **Keep current daemon**, so nothing is stopped.
 
 Say a daemon's name the way you would say it. The app picks the daemon you meant from the ones the **Daemon** selector lists, even when the transcription spells it differently: "Select mini PC, demon" reaches a daemon named `minipc`, and "Switch to InMotionDeck" one named `inmotion`. The same goes for directories, Mode chips and orchestrations. With **Send on-screen names** set to **Off**, the app cannot pick a daemon, directory, mode, agent or orchestration from what you say: a command that needs one is refused, and the app says why; say its number (see [Choosing by number](#choosing-by-number)) or click it instead.
 
@@ -234,7 +236,7 @@ On the dashboard, say **"show host"**, **"open host info"** or **"show resource 
 - With several, name the one you mean, for example "show host for build box". If you do not, nothing opens and the app asks which one.
 - A daemon that is not connected has no figures, and the app says so instead.
 
-To close the figures, say **"close"**, **"close it"**, **"close host"** (the name of the figures' **X** button), **"close resource usage"** or **"hide resource usage"**. If something else is open over the dashboard, such as Settings, an agent's pane or the list of commands, "close" closes that first, and the figures on the next "close". While a confirmation is open, such as the one for stopping an agent, "close" leaves the figures open behind it. Their **X**, `Esc` or a click elsewhere also closes them. The app does not read the figures aloud.
+To close the figures, say **"close"**, **"close it"**, **"close host"** (the name of the figures' **X** button), **"close resource usage"** or **"hide resource usage"**. If something else is open over the dashboard, such as Settings, an agent's pane or the list of commands, "close" closes that first, and the figures on the next "close". While a confirmation is open, such as the one for stopping an agent, "close" closes the confirmation, as **Cancel** does, and leaves the figures open behind it. Their **X**, `Esc` or a click elsewhere also closes them. The app does not read the figures aloud.
 
 ## Long lists are shown in pages
 

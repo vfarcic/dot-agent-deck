@@ -562,6 +562,19 @@ fn ready_to_strand(listener: &UnixListener, pid: libc::pid_t) -> Result<(), Stri
     let armed = loop {
         match listener.accept() {
             Ok((mut stream, _)) => {
+                // On macOS the accepted stream inherits the listener's
+                // O_NONBLOCK (Linux's does not), so a read that beats the
+                // wrapper's write would fail with WouldBlock (issue #1700).
+                if let Err(error) = stream.set_nonblocking(false) {
+                    return Err(format!(
+                        "make the probe wrapper event stream blocking: {error}"
+                    ));
+                }
+                // Best-effort bound, so a wrapper that connects and stalls is an
+                // `Err` the caller cleans up after rather than a hung test. XNU
+                // refuses it with EINVAL once the peer has closed, and a read
+                // from a closed peer cannot hang anyway, so a refusal is ignored.
+                let _ = stream.set_read_timeout(Some(probe_start_budget()));
                 let mut json = String::new();
                 if let Err(error) = stream.read_to_string(&mut json) {
                     return Err(format!("read probe wrapper event: {error}"));

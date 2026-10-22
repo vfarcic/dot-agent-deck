@@ -11,7 +11,8 @@
 
 import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { connect, createServer, type Socket } from "node:net";
+import { readFile } from "node:fs/promises";
+import { connect, createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -103,15 +104,47 @@ export async function waitFor<T>(
   }
 }
 
-function freePort(): Promise<number> {
-  return new Promise((settle, fail) => {
-    const server = createServer();
-    server.once("error", fail);
-    server.listen(0, "127.0.0.1", () => {
+/**
+ * Issue #1795 — `count` free ports, all different. Every listener stays bound
+ * until the last port is chosen: a port is free again the moment its listener
+ * closes, and Linux handed the same one to two back-to-back requests 3 times
+ * in 20,000 (measured). tauri-driver given its own port as `--native-port`
+ * forwards every request to itself, recursing until the ephemeral ports run
+ * out, and the native driver cannot bind at all — the readiness wait then
+ * spends its whole bound on a server that will never answer.
+ */
+export async function freePorts(count: number): Promise<number[]> {
+  const servers: Server[] = [];
+  try {
+    for (let i = 0; i < count; i++) {
+      const server = createServer();
+      servers.push(server);
+      await new Promise<void>((settle, fail) => {
+        server.once("error", fail);
+        server.listen(0, "127.0.0.1", settle);
+      });
+    }
+    return servers.map((server) => {
       const address = server.address();
-      server.close(() => (typeof address === "object" && address ? settle(address.port) : fail(new Error("no port"))));
+      if (typeof address !== "object" || !address) throw new Error("no port");
+      return address.port;
     });
-  });
+  } finally {
+    await Promise.all(servers.map((server) => new Promise((settle) => server.close(settle))));
+  }
+}
+
+/**
+ * Issue #1795 — the line in `log` where the native driver said it could not
+ * bind its port, if it did. tauri-driver stays up with nothing behind it, so
+ * `assertRunning` sees no exit, and the line is in `driver.log` and nowhere
+ * else. Read asynchronously because it runs on every readiness poll.
+ */
+async function nativeDriverBindFailure(log: string): Promise<string | undefined> {
+  return (await readFile(log, "utf8"))
+    .split("\n")
+    .find((line) => line.includes("Unable to listen for HTTP server"))
+    ?.trim();
 }
 
 function run(file: string, args: string[], env: NodeJS.ProcessEnv): Promise<{ code: number; stdout: string }> {
@@ -328,21 +361,26 @@ export class Deck {
   }
 
   private async startWindow(): Promise<void> {
-    const port = await freePort();
-    const nativePort = await freePort();
+    const [port, nativePort] = await freePorts(2);
+    const driverLog = join(this.sandbox, "driver.log");
     // The app is launched by the native driver, which tauri-driver launches,
     // so this environment is the one the window runs under.
     this.driver = launch(
       paths.tauriDriver,
       ["--port", String(port), "--native-port", String(nativePort), "--native-driver", paths.nativeDriver],
       this.env,
-      join(this.sandbox, "driver.log"),
+      driverLog,
     );
     const base = `http://127.0.0.1:${port}`;
-    await waitFor("tauri-driver to accept sessions", async () => {
+    // A bind failure is an answer, not a retry: `waitFor` retries a probe that
+    // throws until its deadline, so the probe returns it and it is thrown here.
+    const { bindFailure } = await waitFor("tauri-driver to accept sessions", async () => {
       assertRunning(this.driver, "tauri-driver");
-      return serverReady(base);
+      const failure = await nativeDriverBindFailure(driverLog);
+      if (failure) return { bindFailure: failure };
+      return (await serverReady(base)) && { bindFailure: undefined };
     });
+    if (bindFailure) throw new Error(`the native driver could not bind its port: ${bindFailure}`);
     this.session = await Session.open(base, paths.app);
     // Past `about:blank` first: the webview's initial empty document is
     // complete, and already carries the Tauri internals, before the app's own
