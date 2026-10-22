@@ -265,8 +265,11 @@ tasks:
   # rustup-managed copy of the same toolchain.
   - key: rustup
     run: |
+      # `rust-src` up front: `cross` adds it otherwise, into the toolchain, and
+      # a warm tool cache then restores that copy over this layer's and
+      # rustup refuses the conflict (measured 2026-10-22).
       curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal \
-        --default-toolchain 1.98.1 \
+        --default-toolchain 1.98.1 --component rust-src \
         --target x86_64-pc-windows-msvc --target aarch64-unknown-linux-gnu
       echo "$HOME/.cargo/bin" >> "$RWX_ENV/PATH"
 
@@ -380,7 +383,7 @@ tasks:
     if: ${{ tasks.backend.values.aarch64 == 'true' }}
     use: [code, rustup]
     docker: true
-    tool-cache: ci-aarch64-v1
+    tool-cache: ci-aarch64-v2
     run: |
       set -euo pipefail
       sudo apt-get update
