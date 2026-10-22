@@ -35,7 +35,7 @@ gh pr merge <n> --squash --match-head-commit <sha>   # the sha on the overlap ch
 gh pr view <n> --json state,mergeCommit --jq '"\(.state) \(.mergeCommit.oid)"'   # MERGED <merge sha>
 ```
 
-Decide on the read-back, not on the exit code. **Not `--auto`:** CLAUDE.md rule 8 records that `--auto` on an already-approved PR with only a non-required check pending merges on the spot and exits 0. **No `--admin`, no bypass.**
+Decide on the read-back, not on the exit code. **Not `--auto`:** CLAUDE.md rule 8 records that `--auto` on an already-approved PR with only a non-required check pending merges on the spot and exits 0. **No `--admin`, no bypass**, with one sanctioned exception: `/land-prs` Step 6's admin merge of a PR held by a stale `CHANGES_REQUESTED`, on the user's explicit instruction. That merge still runs everything else here, the overlap check before it and the watch of `main`'s run after it; only the approval check is waived, and only by that instruction.
 
 ## The overlap check before a merge
 

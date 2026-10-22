@@ -638,10 +638,31 @@ pub(crate) fn sandbox_listed_active(listing: &str, config: &str) -> bool {
         .any(|line| line.split_whitespace().nth(1) == Some("active") && line.contains(config))
 }
 
+/// What `rwx sandbox list` says about this checkout's sandbox after a stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SandboxState {
+    Stopped,
+    Active,
+    /// The listing could not be read (the CLI failed to start or exited
+    /// non-zero), so nothing says the sandbox stopped. Treated like `Active`:
+    /// it may still be billing.
+    Unknown,
+}
+
+/// Reads one `rwx sandbox list` result: `None` when the command could not be
+/// run, else its exit status and stdout. Pure, so the failure paths are tested.
+pub(crate) fn sandbox_state(listing: Option<(bool, &str)>, config: &str) -> SandboxState {
+    match listing {
+        Some((true, stdout)) if sandbox_listed_active(stdout, config) => SandboxState::Active,
+        Some((true, _)) => SandboxState::Stopped,
+        _ => SandboxState::Unknown,
+    }
+}
+
 /// Stops this checkout's sandbox. `rwx sandbox stop` has been seen to time out
 /// and leave the sandbox running (2026-10-19), so the listing is checked and
-/// the stop repeated once; a sandbox that is still active after that is named,
-/// because it keeps billing.
+/// the stop repeated once; a sandbox that is still active after that, or whose
+/// state could not be read, is named, because it may keep billing.
 fn stop_sandbox(root: &Path) {
     let config = root
         .canonicalize()
@@ -655,20 +676,33 @@ fn stop_sandbox(root: &Path) {
             .args(["sandbox", "stop"])
             .current_dir(root)
             .status();
-        let still_active = Command::new("rwx")
+        let listing = Command::new("rwx")
             .args(["sandbox", "list"])
             .current_dir(root)
             .output()
-            .map(|out| sandbox_listed_active(&String::from_utf8_lossy(&out.stdout), &config))
-            .unwrap_or(false);
-        if !still_active {
-            return;
-        }
-        if attempt == 2 {
-            eprintln!(
+            .ok()
+            .map(|out| {
+                (
+                    out.status.success(),
+                    String::from_utf8_lossy(&out.stdout).into_owned(),
+                )
+            });
+        let state = sandbox_state(
+            listing.as_ref().map(|(ok, text)| (*ok, text.as_str())),
+            &config,
+        );
+        match (state, attempt) {
+            (SandboxState::Stopped, _) => return,
+            (SandboxState::Active, 2) => eprintln!(
                 "affected-checks: the RWX sandbox for {config} is still active; \
                  stop it with `rwx sandbox stop` (it is billed while active)"
-            );
+            ),
+            (SandboxState::Unknown, 2) => eprintln!(
+                "affected-checks: could not read `rwx sandbox list`, so nothing confirms the \
+                 RWX sandbox for {config} stopped; check `rwx sandbox list` and stop it with \
+                 `rwx sandbox stop` if it is listed (it is billed while active)"
+            ),
+            _ => {}
         }
     }
 }
@@ -1586,6 +1620,29 @@ mod tests {
                 argv(&["cargo", "nextest"])[..]
             );
         }
+    }
+
+    #[test]
+    fn a_listing_that_cannot_be_read_is_not_a_stopped_sandbox() {
+        let config = "/w/.rwx/sandbox.yml";
+        let active = "RUN  STATUS  CONFIG  BRANCH\nabc  active  /w/.rwx/sandbox.yml  rwx\n";
+        assert_eq!(
+            sandbox_state(Some((true, active)), config),
+            SandboxState::Active
+        );
+        assert_eq!(
+            sandbox_state(Some((true, "No sandbox sessions found.\n")), config),
+            SandboxState::Stopped
+        );
+        assert_eq!(
+            sandbox_state(Some((false, "")), config),
+            SandboxState::Unknown
+        );
+        assert_eq!(
+            sandbox_state(Some((false, active)), config),
+            SandboxState::Unknown
+        );
+        assert_eq!(sandbox_state(None, config), SandboxState::Unknown);
     }
 
     #[test]

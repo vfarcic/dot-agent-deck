@@ -62,6 +62,7 @@ defaults:
 
 tasks:
   - key: system-packages
+    if: ${{ tasks.backend.values.active == 'true' }}
     run: |
       sudo apt-get update
       sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
@@ -70,6 +71,7 @@ tasks:
       sudo apt-get clean
 
   - key: code
+    if: ${{ tasks.backend.values.active == 'true' }}
     call: git/clone 2.2.0
     with:
       repository: https://github.com/vfarcic/dot-agent-deck.git
@@ -114,7 +116,9 @@ tasks:
         # Fail safe: if the base cannot be fetched the list stays empty, which
         # the script reads as "unknown" and answers with everything.
         if git fetch -q origin "$BASE_SHA" && mb=$(git merge-base "$BASE_SHA" HEAD); then
-          files=$(git diff --name-only "$mb" HEAD)
+          # `--no-renames`: a moved file counts by its old path and its new
+          # one, as ci.yml's list (`filename` plus `previous_filename`) does.
+          files=$(git diff --no-renames --name-only "$mb" HEAD)
         fi
       fi
       printf '%s' "$files" | scripts/ci-changes.sh "$TRIGGER" "$AUTHOR" > changes.env
@@ -129,11 +133,13 @@ tasks:
       put aarch64 "$(on "$cargo")"
 
   - key: rust
+    if: ${{ tasks.backend.values.active == 'true' }}
     call: rust-lang/install 1.1.1
     with:
       rust-version: 1.99.0
 
   - key: nextest
+    if: ${{ tasks.backend.values.active == 'true' }}
     use: rust
     run: |
       mkdir -p "$HOME/.cargo/bin"
@@ -144,11 +150,13 @@ tasks:
   # ubuntu-latest image and the devbox shell both ship Node 24, the RWX base
   # image does not. Exact X.Y.Z is required by the package.
   - key: node
+    if: ${{ tasks.backend.values.active == 'true' }}
     call: nodejs/install 1.2.0
     with:
       node-version: "24.22.0"
 
   - key: go-task
+    if: ${{ tasks.backend.values.active == 'true' }}
     run: |
       curl -LsSf https://github.com/go-task/task/releases/download/v3.53.1/task_linux_amd64.tar.gz \
         | sudo tar zxf - -C /usr/local/bin task
@@ -266,16 +274,27 @@ tasks:
   # `rust-lang/install` ships no `rustup` to add them, so these get a
   # rustup-managed copy of the same toolchain.
   - key: rustup
+    if: ${{ tasks.backend.values.active == 'true' }}
+    env:
+      RUSTUP_VERSION: 1.29.2
     run: |
       # `rust-src` up front: `cross` adds it otherwise, into the toolchain, and
       # a warm tool cache then restores that copy over this layer's and
       # rustup refuses the conflict (measured 2026-10-22).
-      curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal \
+      # A pinned rustup-init, checked against its published SHA-256 before it
+      # runs; nothing downloaded is piped into a shell. A version bump needs
+      # the new checksum (`rustup-init.sha256` beside the binary).
+      curl -fsSLo /tmp/rustup-init \
+        "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-unknown-linux-gnu/rustup-init"
+      echo "5be191e8c70a5007074254cb74d78dbfdd25cd5a61c27de7b8e5410122ec24f4  /tmp/rustup-init" | sha256sum -c -
+      chmod +x /tmp/rustup-init
+      /tmp/rustup-init -y --profile minimal \
         --default-toolchain 1.99.0 --component rust-src \
         --target x86_64-pc-windows-msvc --target aarch64-unknown-linux-gnu
       echo "$HOME/.cargo/bin" >> "$RWX_ENV/PATH"
 
   - key: pnpm
+    if: ${{ tasks.backend.values.active == 'true' }}
     use: node
     run: |
       npm install -g pnpm@12.9.0
@@ -299,6 +318,9 @@ tasks:
     timeout: 20m
     run: |
       cd desktop
+      # The reports GHA's job uploads on failure; RWX keeps what lands in
+      # $RWX_ARTIFACTS, whatever the exit status.
+      trap 'for d in playwright-report test-results; do [ -e "$d" ] && cp -r "$d" "$RWX_ARTIFACTS/"; done; true' EXIT
       pnpm install --frozen-lockfile
       pnpm exec playwright install --with-deps chromium webkit
       pnpm test:browser:types
@@ -322,6 +344,7 @@ tasks:
       export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
       cargo build --locked --bin dot-agent-deck
       cd desktop
+      trap '[ -e driver-results ] && cp -r driver-results "$RWX_ARTIFACTS/"; true' EXIT
       pnpm install --frozen-lockfile
       pnpm test:driver:types
       VITE_DAD_DRIVER_SEAM=1 pnpm tauri build --debug --no-bundle
@@ -350,12 +373,21 @@ tasks:
 
   # Nix, single-user: a task has no init system for the daemon.
   - key: nix-install
+    if: ${{ tasks.backend.values.active == 'true' }}
     run: |
       sudo install -d -o "$(id -u)" -g "$(id -g)" /nix
-      curl -fsSL https://releases.nixos.org/nix/nix-2.35.3/install | sh -s -- --no-daemon
+      # The release tarball, checked against its published SHA-256, and its own
+      # installer run from the unpacked copy; a version bump needs the new
+      # checksum (`<tarball>.sha256` beside it).
+      curl -fsSLo /tmp/nix.tar.xz \
+        "https://releases.nixos.org/nix/nix-${NIX_VERSION}/nix-${NIX_VERSION}-x86_64-linux.tar.xz"
+      echo "6ce3ce3703fdc241b560cba401c5d338042122fe5b1a81e07bf1a623f259eba0  /tmp/nix.tar.xz" | sha256sum -c -
+      tar -xJf /tmp/nix.tar.xz -C /tmp
+      "/tmp/nix-${NIX_VERSION}-x86_64-linux/install" --no-daemon
       echo "$HOME/.nix-profile/bin" >> "$RWX_ENV/PATH"
     env:
       NIX_CONFIG: experimental-features = nix-command flakes
+      NIX_VERSION: 2.35.3
 
   # `nix flake check` (`nix`).
   - key: nix
@@ -376,7 +408,12 @@ tasks:
       DEVBOX_USE_VERSION: 0.18.4
     run: |
       scripts/check-pin-lockstep.sh
-      curl -fsSL https://get.jetify.com/devbox | bash -s -- -f
+      # The release binary, checked against its published SHA-256 (the
+      # release's checksums.txt), rather than the get.jetify.com script.
+      curl -fsSLo /tmp/devbox.tar.gz \
+        "https://github.com/jetify-com/devbox/releases/download/${DEVBOX_USE_VERSION}/devbox_${DEVBOX_USE_VERSION}_linux_amd64.tar.gz"
+      echo "4a466a8788186da73f3c692697917c79452b758f40b454b4761e6d1fcd2acad9  /tmp/devbox.tar.gz" | sha256sum -c -
+      sudo tar -xzf /tmp/devbox.tar.gz -C /usr/local/bin devbox
       devbox run -- bash scripts/devbox-smoke.sh
 
   # The aarch64 release build through `cross` (aarch64-crossbuild-check.yml),

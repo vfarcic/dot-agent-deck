@@ -183,6 +183,7 @@ jobs:
       # flaky job (a rerun that passes turns the run green) or fix it, then
       # dispatch again.
       - name: Refuse to release a main that CI has not passed
+        id: green
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -207,6 +208,7 @@ jobs:
             exit 1
           fi
           echo "CI for main at ${HEAD_SHA} passed: ${url}"
+          echo "sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
 
       - name: Validate the requested version
         id: input
@@ -434,8 +436,29 @@ jobs:
         env:
           VERSION: ${{ steps.input.outputs.version }}
           TAG_MESSAGE: ${{ inputs.tag_message }}
+          GREEN_SHA: ${{ steps.green.outputs.sha }}
         run: |
           set -euo pipefail
+          # The commit tagged here is NOT the one whose CI the gate above read:
+          # this workflow has since committed the flake version pin (and maybe
+          # an empty commit). Its own CI run starts only now, so instead of
+          # waiting for it, prove it differs from the green commit by nothing
+          # but that pin: `flake.nix` alone, one line, the version line. Any
+          # other difference means something this gate never saw would ship.
+          changed=$(git diff --name-only "${GREEN_SHA}" HEAD)
+          if [ -n "${changed}" ] && [ "${changed}" != flake.nix ]; then
+            echo "::error::Refusing to tag: the release commit differs from ${GREEN_SHA}, whose CI passed, in more than flake.nix: ${changed//$'\n'/, }. Nothing has been tagged."
+            exit 1
+          fi
+          if [ "${changed}" = flake.nix ]; then
+            lines=$(git diff --numstat "${GREEN_SHA}" HEAD -- flake.nix | awk '{print $1"/"$2}')
+            pin=$(git diff -U0 "${GREEN_SHA}" HEAD -- flake.nix | grep -cE '^\+[[:space:]]*version = "'"${VERSION}"'";[[:space:]]*$' || true)
+            if [ "${lines}" != "1/1" ] || [ "${pin}" != 1 ]; then
+              echo "::error::Refusing to tag: flake.nix differs from ${GREEN_SHA} by more than the version pin (${lines}). Nothing has been tagged."
+              exit 1
+            fi
+          fi
+          echo "The release commit is ${GREEN_SHA}, whose CI passed, plus the version pin only."
           MESSAGE="${TAG_MESSAGE}"
           if [ -z "${MESSAGE}" ]; then
             MESSAGE="Release v${VERSION}"

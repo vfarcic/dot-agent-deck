@@ -63,7 +63,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          SHA: ${{ github.sha }}
+          # The PR's HEAD, not `github.sha` (the merge commit): RWX reads the
+          # file at the head, and both sides must make the same choice. Read
+          # at the merge commit, a PR cut before `main` switched to `rwx`
+          # would make GHA skip its Linux jobs while RWX, reading `gha` at
+          # the head, skipped its own, and nothing would run.
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           EVENT: ${{ github.event_name }}
         run: |
           backend=gha

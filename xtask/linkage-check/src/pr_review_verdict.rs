@@ -317,7 +317,8 @@ fn the_attention_body_follows_the_verdict_not_the_approval_case() {
 fn the_deny_list_covers_the_reviewer_and_governance_paths() {
     assert_py_ok(
         "required = ['.github/', 'CLAUDE.md', 'MAINTAINERS.md',\n\
-        \x20           'scripts/apply-branch-protection.sh', 'src/daemon_protocol.rs']\n\
+        \x20           'scripts/apply-branch-protection.sh', 'src/daemon_protocol.rs',\n\
+        \x20           '.rwx/', 'scripts/ci-changes.sh']\n\
          for p in required:\n\
         \x20   assert p in DENY_PATHS, p + ' fell out of DENY_PATHS'\n\
          assert any('.github/workflows/pr-review.md'.startswith(d) for d in DENY_PATHS)",

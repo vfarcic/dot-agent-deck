@@ -59,6 +59,12 @@ DENY_PATHS = (
     "MAINTAINERS.md",
     "CLAUDE.md",
     "src/daemon_protocol.rs",
+    # The required Linux verdict lives outside `.github/` too: `.rwx/` defines
+    # what `RWX: linux` runs, and `scripts/ci-changes.sh` decides which Linux
+    # jobs either CI system skips (docs/develop/rwx.md). A PR editing either
+    # could make every required Linux check pass having tested nothing.
+    ".rwx/",
+    "scripts/ci-changes.sh",
 )
 
 # The order in which those paths' explanations take precedence, most specific
@@ -82,6 +88,8 @@ DENY_PRECEDENCE = (
     "MAINTAINERS.md",
     "greptile.json",
     ".pr_agent.toml",
+    ".rwx/",
+    "scripts/ci-changes.sh",
     ".github/",
 )
 

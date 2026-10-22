@@ -193,7 +193,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          SHA: ${{ github.sha }}
+          # The PR's HEAD, not `github.sha` (the merge commit): RWX reads the
+          # file at the head, and both sides must make the same choice. Read
+          # at the merge commit, a PR cut before `main` switched to `rwx`
+          # would make GHA skip its Linux jobs while RWX, reading `gha` at
+          # the head, skipped its own, and nothing would run.
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           EVENT: ${{ github.event_name }}
         run: |
           backend=gha
@@ -227,7 +232,9 @@ jobs:
             # empty list, which it reads as "unknown" and answers with the
             # full matrix, rather than failing this job and with it every job
             # that `needs` it.
-            files=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename' || true)
+            # A renamed file counts by its old path too (`previous_filename`),
+            # as `.rwx/ci.yml`'s `git diff --no-renames` list does.
+            files=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[] | .filename, (.previous_filename // empty)' || true)
           fi
           printf '%s' "$files" | scripts/ci-changes.sh "$EVENT" "${PR_AUTHOR:-}" | tee -a "$GITHUB_OUTPUT"
 

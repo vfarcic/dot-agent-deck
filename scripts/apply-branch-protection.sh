@@ -86,7 +86,8 @@ RENOVATE_BYPASS="${RENOVATE_BYPASS:-true}"
 RENOVATE_APP_ID="${RENOVATE_APP_ID:-2740}"
 
 # The status checks that must pass before a pull request may merge, as a
-# space-separated list of check-run names. Added to the live ruleset on
+# comma-separated list of check names (see the default below for why
+# commas). Added to the live ruleset on
 # 2026-08-11; see docs/develop/governance.md step 6.
 #
 # These four are the jobs in ci.yml that establish *objective* correctness, two
@@ -228,6 +229,19 @@ required_status_checks_rule_json() {
     [ -n "$ctx" ] && trimmed+=("$ctx")
   done
   set -- ${trimmed[@]+"${trimmed[@]}"}
+  # The list was space-separated until `RWX: linux` (a name with a space) made
+  # it comma-separated. An old-style value, such as `build security`, would now
+  # be ONE required context that no job reports, which leaves every PR waiting
+  # forever. A context with a space in it carries a `:` here (`RWX: linux`), so
+  # one entry made of several colon-free words is that old style: refuse it.
+  if [ "$#" -eq 1 ] && [[ "$1" == *[[:space:]]* ]] && [[ "$1" != *:* ]]; then
+    echo >&2
+    echo "error: REQUIRED_CHECKS='$1' reads as ONE context named '$1'." >&2
+    echo "The list is comma-separated (a context name can contain a space, e.g. 'RWX: linux')," >&2
+    echo "so a space-separated list must be rewritten with commas, e.g.:" >&2
+    echo "  REQUIRED_CHECKS='$(printf '%s' "$1" | tr -s '[:space:]' ',')' $0 apply" >&2
+    return 1
+  fi
   # Tested on the word count after splitting rather than with
   # `[ -z "$REQUIRED_CHECKS" ]`, so a whitespace-only value reaches the same
   # decision instead of slipping through as "omit the rule".
@@ -244,7 +258,8 @@ required_status_checks_rule_json() {
       echo "  REQUIRED_CHECKS= ALLOW_NO_REQUIRED_CHECKS=true $0 apply" >&2
       echo >&2
       echo "Otherwise leave REQUIRED_CHECKS unset for this repository's defaults, or set" >&2
-      echo "it to your own job names. See docs/develop/governance.md." >&2
+      echo "it to your own job names, comma-separated (REQUIRED_CHECKS='build,security')." >&2
+      echo "See docs/develop/governance.md." >&2
       return 1
     fi
     return 0

@@ -25,11 +25,11 @@ The exceptions, and why:
 - **`docs.yml` stays.** `docs-preview.yml` deploys the preview from its uploaded artifact through `workflow_run`, which only a GitHub Actions run can feed.
 - **`build-macos` runs on `main`, not on pull requests.** RWX has no macOS runners, and on a pull request it was the slowest required check (5 to 18 minutes) for a 3% rate of macOS-only failures (545 runs, 2026-10-06 to 10-21). A macOS-only defect now surfaces on `main`: whoever merged watches that run and owns a red (the `merge-pr` skill), `notify-main-red` opens an issue, and `tag-release.yml` refuses to release a `main` whose run is not green.
 
-**How the switch works.** Both systems trigger on every pull request and both read the file at the commit they test:
+**How the switch works.** Both systems trigger on every pull request and both read the file at the **PR's head commit**, so they always make the same choice (GitHub Actions tests the merge commit, but reading the switch there would let a PR cut before `main` switched leave both sides skipping):
 
 - **GitHub Actions** (`.github/workflows/ci.yml`): the `changes` job reads the file through the API and exposes `linux_backend`. When it says `rwx`, each Linux job's `if:` is false, so the job is skipped, and a job skipped by its own `if:` satisfies a required check. `aarch64-crossbuild-check.yml` has its own copy of that read.
 - **RWX** (`.rwx/ci.yml`): the `backend` task reads the file. Unless it says `rwx`, every check task is skipped and the run passes in seconds, so RWX's check, `RWX: linux`, can be required whichever side is active.
-- **Both skip the same jobs for the same change**: `scripts/ci-changes.sh` holds the path classification (a Renovate PR touching only the devbox or flake files, whether the change feeds the binary, whether the manifests changed), and both call it. GitHub Actions takes the PR's files from the API; RWX computes them against the merge-base with the PR's base, which is the same list.
+- **Both skip the same jobs for the same change**: `scripts/ci-changes.sh` holds the path classification (a Renovate PR touching only the devbox or flake files, whether the change feeds the binary, whether the manifests changed), and both call it. GitHub Actions takes the PR's files from the API (a renamed file by both its paths); RWX computes them against the merge-base with the PR's base with `git diff --no-renames`, which is the same list.
 
 Flipping the switch is a one-line pull request, and it takes effect on that pull request itself.
 

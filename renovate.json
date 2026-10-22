@@ -110,15 +110,15 @@
     },
     {
       "customType": "regex",
-      "description": "The RWX configs (`.rwx/ci.yml`, `.rwx/sandbox.yml`, docs/develop/rwx.md) are a third place the toolchain is pinned, in their own syntax, so the workflow managers above do not match them. This one reads the Nix installer the `nix-install` task runs (`releases.nixos.org/nix/nix-<X.Y.Z>/install`). Nothing else in the repository pins Nix.",
+      "description": "The RWX configs (`.rwx/ci.yml`, `.rwx/sandbox.yml`, docs/develop/rwx.md) are a third place the toolchain is pinned, in their own syntax, so the workflow managers above do not match them. This one reads the Nix release the `nix-install` task installs (`NIX_VERSION: <X.Y.Z>`). Nothing else in the repository pins Nix. The task checks the tarball against a pinned SHA-256, so a bump PR also needs that checksum updated (the `.sha256` beside the tarball on releases.nixos.org); it fails until then, which is the point.",
       "managerFilePatterns": ["/^\\.rwx/[^/]+\\.ya?ml$/"],
-      "matchStrings": ["releases\\.nixos\\.org/nix/nix-(?<currentValue>\\d+\\.\\d+\\.\\d+)/"],
+      "matchStrings": ["NIX_VERSION:\\s*(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
       "datasourceTemplate": "github-tags",
       "depNameTemplate": "NixOS/nix"
     },
     {
       "customType": "regex",
-      "description": "The RWX configs (`.rwx/ci.yml`, `.rwx/sandbox.yml`, docs/develop/rwx.md) are a third place the toolchain is pinned, in their own syntax, so the workflow managers above do not match them. This one reads the devbox CLI version the `devbox` task installs (`DEVBOX_USE_VERSION: <X.Y.Z>`).",
+      "description": "The RWX configs (`.rwx/ci.yml`, `.rwx/sandbox.yml`, docs/develop/rwx.md) are a third place the toolchain is pinned, in their own syntax, so the workflow managers above do not match them. This one reads the devbox CLI version the `devbox` task installs (`DEVBOX_USE_VERSION: <X.Y.Z>`). The task checks the release tarball against a pinned SHA-256, so a bump PR also needs that checksum updated (the release's checksums.txt).",
       "managerFilePatterns": ["/^\\.rwx/[^/]+\\.ya?ml$/"],
       "matchStrings": ["DEVBOX_USE_VERSION:\\s*(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
       "datasourceTemplate": "github-releases",
@@ -126,8 +126,16 @@
     },
     {
       "customType": "regex",
-      "description": "The `cross` version the aarch64 cross-build installs, in aarch64-crossbuild-check.yml and in `.rwx/ci.yml`'s `aarch64-crossbuild` task (docs/develop/rwx.md). One manager over both files, so one PR moves both.",
-      "managerFilePatterns": ["/^\\.github/workflows/aarch64-crossbuild-check\\.yml$/", "/^\\.rwx/ci\\.yml$/"],
+      "description": "The RWX configs (`.rwx/ci.yml`, docs/develop/rwx.md) install rustup-init for the cross-compiling tasks at `RUSTUP_VERSION: <X.Y.Z>`, checked against a pinned SHA-256, so a bump PR also needs that checksum updated (`rustup-init.sha256` beside the binary on static.rust-lang.org).",
+      "managerFilePatterns": ["/^\\.rwx/[^/]+\\.ya?ml$/"],
+      "matchStrings": ["RUSTUP_VERSION:\\s*(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
+      "datasourceTemplate": "github-tags",
+      "depNameTemplate": "rust-lang/rustup"
+    },
+    {
+      "customType": "regex",
+      "description": "The `cross` version the aarch64 builds install: release.yml's aarch64 leg, the aarch64-crossbuild-check.yml check that exists to predict it, and `.rwx/ci.yml`'s `aarch64-crossbuild` task (docs/develop/rwx.md). One manager over the three files, so one PR moves all of them and the check keeps predicting the release build.",
+      "managerFilePatterns": ["/^\\.github/workflows/aarch64-crossbuild-check\\.yml$/", "/^\\.github/workflows/release\\.yml$/", "/^\\.rwx/ci\\.yml$/"],
       "matchStrings": ["cargo install cross --locked --version (?<currentValue>\\d+\\.\\d+\\.\\d+)"],
       "datasourceTemplate": "crate",
       "depNameTemplate": "cross"
