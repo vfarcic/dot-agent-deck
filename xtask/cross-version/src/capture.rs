@@ -123,9 +123,9 @@ mod tests {
             .unwrap()
     }
 
-    /// Scenario: A shell creates a partial capture and exits before publication.
-    /// Its replacement clears the abandoned file and publishes its own output;
-    /// a late command from the old attempt must not run again.
+    /// Scenario: A shell exits before publishing either partial output or a complete
+    /// hand-over from a destructive inbox fetch. A retry must discard the partial
+    /// output but keep the hand-over even though the inbox is now empty.
     #[test]
     fn replacement_after_temporary_creation_publishes_only_the_new_attempt() {
         let root = scratch("replacement");
@@ -147,6 +147,49 @@ mod tests {
         assert!(run(&old).status.success());
         assert!(!first.tmp.exists(), "a superseded command ran again");
         assert!(!first.out.exists());
+        std::fs::remove_dir_all(root).unwrap();
+
+        let root = scratch("consumed-inbox");
+        let session = Session::new(&root, "fetch");
+        let inbox = root.join("inbox.json");
+        let message = r#"{"messages":[{"id":"m-consumed","text":"XVER-DELEGATE-consumed"}]}"#;
+        std::fs::write(&inbox, message).unwrap();
+        let first = session.prepare(1).unwrap().unwrap();
+        // Stand in for fetch's write/flush/ack sequence, then interrupt the
+        // capture shell before its rename. Acknowledgement empties the inbox.
+        let fetch = format!("cat {}; : > {}", path_word(&inbox), path_word(&inbox));
+        let interrupted = session.command(&first, &format!("{fetch}; exit 17"), 10);
+        assert!(!run(&interrupted).status.success());
+        assert_eq!(std::fs::read_to_string(&inbox).unwrap(), "");
+        assert!(first.tmp.exists());
+        assert!(!first.out.exists());
+        let second = session.prepare(2).unwrap().unwrap();
+        let captured = if first.out.exists() {
+            std::fs::read_to_string(&first.out).unwrap()
+        } else {
+            let retry = format!(
+                "if [ -s {} ]; then {fetch}; else echo '{{\"messages\":[]}}'; fi",
+                path_word(&inbox)
+            );
+            assert!(run(&session.command(&second, &retry, 10)).status.success());
+            std::fs::read_to_string(&second.out).unwrap()
+        };
+        let listing = "pane=1\n{\"messages\":[{\"id\":\"m-consumed\",\"recipient\":{\"pane_id\":\"2\"},\"state\":\"acknowledged\",\"ack_how\":\"explicit\"}]}";
+        let (delivered, detail) = crate::inner::judge_inbox_delivery(
+            Some(&captured),
+            Some(listing),
+            "XVER-DELEGATE-consumed",
+            "2",
+            "1",
+        );
+        assert!(
+            delivered,
+            "acknowledged hand-over lost after interruption: {detail}; capture={captured:?}"
+        );
+        assert!(!first.tmp.exists());
+        assert!(!second.out.exists(), "recovery started another fetch");
+        assert!(run(&interrupted).status.success());
+        assert!(!first.tmp.exists(), "a superseded fetch ran again");
         std::fs::remove_dir_all(root).unwrap();
     }
 
