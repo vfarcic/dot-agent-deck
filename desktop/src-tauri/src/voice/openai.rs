@@ -56,11 +56,11 @@
 //!   exactly as [`super::remote::request_body`] orders them.
 //! - **Every property is `required`.** OpenAI's strict structured outputs refuse
 //!   a schema where a declared property is optional, so `params` cannot simply
-//!   be left out of `required` the way the tool-use schema leaves it. Each param
-//!   is a `["string", "null"]` union instead — the documented way to express an
-//!   optional field under strict mode — and [`super::IntentAnswer`]'s own
-//!   deserializer drops the nulls, so a param the chosen action does not take
-//!   arrives downstream as absent and becomes
+//!   be an object whose params may be left out, the way the tool-use schema
+//!   leaves them. It is a list of `{"name", "value"}` pairs instead, one per
+//!   param the user referred to ([`response_schema`]), which
+//!   [`super::IntentAnswer`]'s own deserializer reads into the same map — so a
+//!   param the user did not refer to arrives downstream as absent and becomes
 //!   [`super::VoiceOutcome::ParamMissing`] exactly as before.
 //! - **The answer is text.** A `tool_use` block is a JSON value; a chat
 //!   completion's `content` is a string that has to be parsed. It is read
@@ -77,19 +77,37 @@ use super::remote::truncated_at;
 use super::resolver::{IntentAnswer, IntentError, IntentRequest};
 use super::schema::{AnnotatedCommand, TOOL_INSTRUCTIONS, TOOL_NAME};
 
-/// The `json_schema` the reply is constrained to.
+/// What `params` is described as to the model.
+const PARAMS_DESCRIPTION: &str = "The params the chosen action declares, as the user referred to \
+    them — or the agent's `label`, for a reference the user made by state. List only a param the \
+    user's own words refer to; leave out every other, including one the chosen action takes but \
+    the user did not mention — never fill one in from the screen. The app resolves each one \
+    against live state.";
+
+/// The `json_schema` the reply is constrained to: `{"action": …, "params":
+/// [{"name": …, "value": …}, …]}`, the action one of the annotated command list
+/// the backend was handed or `none`, and `params` the params the user referred
+/// to, each named from every param the table declares
+/// ([`super::IntentAnswer`] reads the list into the same map as an object).
 ///
-/// See the module docs for why every property is `required` and why each param
-/// is nullable. The shape is otherwise [`super::remote::tool_definition`]'s
-/// `input_schema`: the action enum comes from the annotated command list the
-/// backend was handed, and the params are enumerated from the table, so a row
-/// that adds a param adds a property without anyone editing this file.
+/// **A list of named values, not an object of every param** (PRD #1733). Strict
+/// structured outputs require every declared property, so an object had to
+/// list every param the table declares and the model wrote all of them, `null`
+/// but for one or two, on every answer — 75 output tokens a reply, measured on
+/// `gpt-5-mini` (2026-10-20), where a list writes about 33, and a reply's
+/// length is most of its latency: over the same 213 captured requests, sent
+/// three times each, interleaved, the median call went from 1.36 s to 0.90 s
+/// and its p95 from 1.68 s to 1.28 s. Two shorter shapes were measured and
+/// refused. One `anyOf` branch per action, carrying that action's own params,
+/// let the params steer the pick: "switch to the Codex agent" answered as the
+/// dashboard filter, whose `agent_type` fits "Codex", 9 times in 20, and a bare
+/// "stop" over an agent's pane as an action with no params to fill, 7 in 20
+/// (this shape: 0 in 15 for both). One action enum with an `anyOf` of the
+/// param sets paired the dashboard filter with the empty set for "show me all
+/// orchestration agents" 11 times in 15, which is a filter with no facet. A
+/// list's names are the table's, so a row that adds a param adds a name
+/// without anyone editing this file.
 pub fn response_schema(commands: &[AnnotatedCommand]) -> Value {
-    let names = param_names(commands);
-    let properties: serde_json::Map<String, Value> = names
-        .iter()
-        .map(|name| (name.clone(), json!({ "type": ["string", "null"] })))
-        .collect();
     json!({
         "type": "object",
         "properties": {
@@ -99,14 +117,17 @@ pub fn response_schema(commands: &[AnnotatedCommand]) -> Value {
                 "enum": action_enum(commands),
             },
             "params": {
-                "type": "object",
-                "description": "The params the chosen action declares, as the user referred to them \
-    — or the agent's `label`, for a reference the user made by state. Every param is listed; send \
-    `null` for the ones the chosen action does not take. The app resolves each one against live \
-    state.",
-                "properties": properties,
-                "required": names,
-                "additionalProperties": false,
+                "type": "array",
+                "description": PARAMS_DESCRIPTION,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "enum": param_names(commands) },
+                        "value": { "type": "string" },
+                    },
+                    "required": ["name", "value"],
+                    "additionalProperties": false,
+                },
             },
         },
         "required": ["action", "params"],
@@ -385,55 +406,62 @@ mod tests {
                     walk(child, &format!("{path}.{key}"));
                 }
             }
+            for (at, child) in value.as_array().into_iter().flatten().enumerate() {
+                walk(child, &format!("{path}[{at}]"));
+            }
         }
         walk(&schema, "schema");
     }
 
+    /// Scenario: `params` is a list of `{name, value}` pairs, both required,
+    /// the value a string and the name one of every param the table declares,
+    /// in table order; and `action` is written before `params`.
     #[test]
-    fn voice_openai_request_makes_every_param_nullable() {
-        // The consequence of requiring every property: a paramless action has
-        // to be able to say so, and `null` is how strict mode spells optional.
+    fn voice_openai_request_lists_the_params_by_name() {
         let schema = &body("show me the tester")["response_format"]["json_schema"]["schema"];
+        let params = &schema["properties"]["params"];
+        assert_eq!(params["type"], "array");
+        let item = &params["items"];
+        assert_eq!(item["required"], json!(["name", "value"]));
+        assert_eq!(item["properties"]["value"]["type"], "string");
+        let names: Vec<&str> = item["properties"]["name"]["enum"]
+            .as_array()
+            .expect("a name enum")
+            .iter()
+            .map(|name| name.as_str().expect("a string"))
+            .collect();
+        let mut declared: Vec<&str> = Vec::new();
+        for row in table().rows() {
+            for param in &row.params {
+                if !declared.contains(&param.name.as_str()) {
+                    declared.push(&param.name);
+                }
+            }
+        }
+        assert_eq!(names, declared);
+        let wire = schema.to_string();
+        assert!(wire.find("\"action\"") < wire.find("\"params\""), "{wire}");
+    }
+
+    /// Scenario: a reply in the shape the schema asks for parses into the
+    /// action and the named params.
+    #[test]
+    fn voice_openai_reply_with_listed_params_parses() {
+        let payload = json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "content": r#"{"action":"filter_dashboard","params":[{"name":"kind","value":"orchestration"}]}"#,
+                },
+            }],
+        });
+        let answer = parse_response(&payload, TokenCeiling::default()).expect("an answer");
+        assert_eq!(answer.action, "filter_dashboard");
         assert_eq!(
-            schema["properties"]["params"]["properties"]["agent"]["type"],
-            json!(["string", "null"])
+            answer.params.get("kind").map(String::as_str),
+            Some("orchestration")
         );
-        assert_eq!(
-            schema["properties"]["params"]["properties"]["prefix"]["type"],
-            json!(["string", "null"])
-        );
-        assert_eq!(
-            schema["properties"]["params"]["properties"]["deck"]["type"],
-            json!(["string", "null"])
-        );
-        assert_eq!(
-            schema["properties"]["params"]["properties"]["dir"]["type"],
-            json!(["string", "null"])
-        );
-        assert_eq!(
-            schema["properties"]["params"]["properties"]["text"]["type"],
-            json!(["string", "null"])
-        );
-        assert_eq!(
-            schema["properties"]["params"]["required"],
-            // `deck` ahead of `prefix` since PRD #1195's `switch_deck` row,
-            // which sits above the dictation pair in the table.
-            // The dashboard filter's facets (issue #1496) after `agent`.
-            json!([
-                "agent",
-                "kind",
-                "status",
-                "agent_type",
-                "daemon",
-                "text",
-                "deck",
-                "prefix",
-                "dir",
-                "mode",
-                "command",
-                "orchestration"
-            ])
-        );
+        assert_eq!(answer.params.len(), 1);
     }
 
     #[test]

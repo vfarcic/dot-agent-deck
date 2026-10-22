@@ -964,24 +964,35 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         let attach_reuse = reuse_registry.clone();
         let attach_worktrees = worktree_registry.clone();
         let attach_restart = restart_control.clone();
-        Some(tokio::spawn(async move {
-            if let Err(e) = crate::daemon_protocol::serve_attach_with_restart(
-                listener,
-                registry,
-                attach_event_tx,
-                attach_counter,
-                attach_state,
-                Some(attach_shutdown),
-                attach_scheduler,
-                attach_reuse,
-                attach_worktrees,
-                attach_restart,
-            )
-            .await
-            {
-                error!("attach protocol server error: {e}");
-            }
-        }))
+        // Issue #1794: a daemon whose attach server ended must not stay up
+        // serving hooks only, since then no client can reach it and no
+        // replacement can start. Put the listener back; stop when that fails.
+        let lost = crate::attach_recovery::stop_after_attach_lost(
+            shutdown.clone(),
+            pty_registry.clone(),
+            state.clone(),
+            restart_control.clone(),
+        );
+        Some(tokio::spawn(crate::attach_recovery::supervise(
+            path,
+            crate::config::state_dir(),
+            listener,
+            move |listener| {
+                crate::daemon_protocol::serve_attach_with_restart(
+                    listener,
+                    registry.clone(),
+                    attach_event_tx.clone(),
+                    attach_counter.clone(),
+                    attach_state.clone(),
+                    Some(attach_shutdown.clone()),
+                    attach_scheduler.clone(),
+                    attach_reuse.clone(),
+                    attach_worktrees.clone(),
+                    attach_restart.clone(),
+                )
+            },
+            move || lost,
+        )))
     } else {
         None
     };

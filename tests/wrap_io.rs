@@ -203,6 +203,9 @@ fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
+/// How long a read from an accepted wrapper event stream may wait for bytes.
+const WRAPPER_EVENT_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn collect_wrapper_events(listener: &UnixListener, expected: usize) -> Vec<AgentEvent> {
     listener
         .set_nonblocking(true)
@@ -212,6 +215,17 @@ fn collect_wrapper_events(listener: &UnixListener, expected: usize) -> Vec<Agent
     while events.len() < expected && Instant::now() < deadline {
         match listener.accept() {
             Ok((mut stream, _)) => {
+                // On macOS the accepted stream inherits the listener's
+                // O_NONBLOCK (Linux's does not), so a read that beats the
+                // wrapper's write would fail with WouldBlock (issue #1700).
+                stream
+                    .set_nonblocking(false)
+                    .expect("make the accepted wrapper event stream blocking");
+                // Best-effort bound, so a wrapper that connects and stalls fails
+                // the read instead of hanging the test. XNU refuses it with
+                // EINVAL once the peer has closed, and a read from a closed peer
+                // cannot hang anyway, so a refusal is ignored.
+                let _ = stream.set_read_timeout(Some(WRAPPER_EVENT_READ_TIMEOUT));
                 let mut json = String::new();
                 stream
                     .read_to_string(&mut json)
@@ -421,6 +435,11 @@ fn collect_wrapper_events_until(
     while Instant::now() < deadline {
         match listener.accept() {
             Ok((mut stream, _)) => {
+                // Blocking and bounded for the same reasons as in [`collect_wrapper_events`].
+                stream
+                    .set_nonblocking(false)
+                    .expect("make the accepted wrapper event stream blocking");
+                let _ = stream.set_read_timeout(Some(WRAPPER_EVENT_READ_TIMEOUT));
                 let mut json = String::new();
                 stream
                     .read_to_string(&mut json)

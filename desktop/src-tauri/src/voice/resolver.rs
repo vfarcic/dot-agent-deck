@@ -20,6 +20,7 @@ use std::pin::Pin;
 
 use serde::{Deserialize, Serialize};
 
+use super::meaning::{MeaningRequest, MeaningVerdict, Strictness};
 use super::schema::AnnotatedCommand;
 use super::{Transcript, VoiceDeck, VoiceDirectories, VoiceNewAgent};
 use crate::dto::DesktopAgent;
@@ -63,19 +64,22 @@ pub struct IntentRequest<'a> {
 ///
 /// # A `null` param is an ABSENT param, and that is forced rather than lenient
 ///
-/// OpenAI's strict structured outputs refuse a schema where a declared property
-/// is not in `required`, so [`super::openai::response_schema`] cannot leave a
-/// param optional the way a tool-use schema can: it enumerates every param the
-/// table declares, requires all of them, and types each as `["string", "null"]`
-/// — the documented way to spell *optional* under strict mode. The model is
-/// therefore obliged to name a param the chosen action does not take, and the
-/// only thing it can honestly say about it is `null`.
+/// A params object may carry a `null` for a param the user did not refer to —
+/// how a strict schema that lists every param spells *optional*, and what a
+/// server that enforces nothing may still send. Dropping those here is what
+/// keeps that a detail of one envelope. A `null` arriving as an empty string
+/// would resolve against nothing and render `no agent here matches ""`;
+/// arriving as absent, it is [`super::VoiceOutcome::ParamMissing`], which is
+/// the same sentence the other protocol produces for the same situation.
 ///
-/// Dropping those here is what keeps that a detail of one envelope. A `null`
-/// arriving as an empty string would resolve against nothing and render
-/// `no agent here matches ""`; arriving as absent, it is
-/// [`super::VoiceOutcome::ParamMissing`], which is the same sentence the other
-/// protocol produces for the same situation.
+/// # The params may also arrive as a list
+///
+/// [`super::openai::response_schema`] asks for `params` as a list of `{"name",
+/// "value"}` pairs, one per param the user referred to, which is the shortest
+/// reply strict mode can express (see its doc comment). The list is read into
+/// the same map, and a params object or list that names one param twice is
+/// refused — with a value or a `null` either time: two answers for one param,
+/// reduced to one by position, would be an answer nobody gave.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct IntentAnswer {
     pub action: String,
@@ -83,7 +87,8 @@ pub struct IntentAnswer {
     pub params: BTreeMap<String, String>,
 }
 
-/// [`IntentAnswer::params`], with the `null`s a strict schema forces removed.
+/// [`IntentAnswer::params`] as either shape arrives — an object, with its
+/// `null`s removed, or a list of named values — each name once.
 ///
 /// A non-string, non-null value is still an error — `{"agent": 7}` is a backend
 /// that did not honour the schema, and reading it as absent would turn a
@@ -91,12 +96,69 @@ pub struct IntentAnswer {
 fn params_without_nulls<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<BTreeMap<String, String>, D::Error> {
-    Ok(
-        BTreeMap::<String, Option<String>>::deserialize(deserializer)?
+    match AnsweredParams::deserialize(deserializer)? {
+        AnsweredParams::Named(NamedParams(params)) => Ok(params
             .into_iter()
             .filter_map(|(name, value)| value.map(|value| (name, value)))
-            .collect(),
-    )
+            .collect()),
+        AnsweredParams::Listed(params) => {
+            let mut named = BTreeMap::new();
+            for ListedParam { name, value } in params {
+                if named.insert(name, value).is_some() {
+                    return Err(serde::de::Error::custom("a param named twice"));
+                }
+            }
+            Ok(named)
+        }
+    }
+}
+
+/// The two shapes [`params_without_nulls`] reads.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AnsweredParams {
+    Named(NamedParams),
+    Listed(Vec<ListedParam>),
+}
+
+/// A params object, read entry by entry so that a name written twice is
+/// refused before a map keeps one of its values: `{"agent": "tester",
+/// "agent": "coder"}` read into a map is whichever came last, and a `null`
+/// after a value would erase it.
+struct NamedParams(BTreeMap<String, Option<String>>);
+
+impl<'de> Deserialize<'de> for NamedParams {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_map(NamedParamsVisitor)
+    }
+}
+
+struct NamedParamsVisitor;
+
+impl<'de> serde::de::Visitor<'de> for NamedParamsVisitor {
+    type Value = NamedParams;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an object naming each param once")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<NamedParams, A::Error> {
+        let mut named = BTreeMap::new();
+        while let Some((name, value)) = map.next_entry::<String, Option<String>>()? {
+            if named.insert(name, value).is_some() {
+                return Err(serde::de::Error::custom("a param named twice"));
+            }
+        }
+        Ok(NamedParams(named))
+    }
+}
+
+/// One entry of a listed `params`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListedParam {
+    name: String,
+    value: String,
 }
 
 impl IntentAnswer {
@@ -171,6 +233,10 @@ pub type ResolveFuture<'a> =
 pub type QuestionFuture<'a> =
     Pin<Box<dyn Future<Output = Result<super::question::ModelAnswer, IntentError>> + Send + 'a>>;
 
+/// The future [`IntentResolver::judge_meaning`] returns (PRD #1733).
+pub type MeaningFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<MeaningVerdict, IntentError>> + Send + 'a>>;
+
 /// A backend that turns an utterance into a structured answer.
 pub trait IntentResolver: Send + Sync {
     fn resolve<'a>(&'a self, request: IntentRequest<'a>) -> ResolveFuture<'a>;
@@ -186,6 +252,26 @@ pub trait IntentResolver: Send + Sync {
         Box::pin(async {
             Err(IntentError::NotConfigured(
                 "this command backend cannot answer an agent's questions".into(),
+            ))
+        })
+    }
+
+    /// PRD #1733: one vote of the meaning check — which of the table's
+    /// actions the transcript asks for ([`super::meaning`]). Its request
+    /// holds the transcript, the app's own text about each action and the
+    /// closed-enum screen kind and dialog state — never an observed name,
+    /// screen contents or the pick and its params. The pipeline sends two of these beside the command
+    /// call ([`super::meaning::Ballot`]).
+    ///
+    /// **The default refuses**: a backend that cannot ask the question answers
+    /// [`IntentError::NotConfigured`], and the caller acts on nothing it did
+    /// not get a `yes` for. So a backend added later without this method
+    /// cannot be a way around the check — it is a backend on which every
+    /// model pick is refused, which its first use makes obvious.
+    fn judge_meaning<'a>(&'a self, _request: MeaningRequest<'a>) -> MeaningFuture<'a> {
+        Box::pin(async {
+            Err(IntentError::NotConfigured(
+                "this command backend cannot check what was asked".into(),
             ))
         })
     }
@@ -265,6 +351,48 @@ pub struct StubResolver {
     /// spent none.
     question_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     failure: Option<IntentError>,
+    /// PRD #1733: scripted meaning verdicts, keyed by utterance, action and —
+    /// when only one reading is scripted — strictness. An unscripted action
+    /// is answered `yes` under every strictness for the action this stub's
+    /// `answers` picked for the utterance and `no` for every other: the stub
+    /// models a classifier that agrees with the command model and with
+    /// nothing else. Both votes of an utterance are answered alike.
+    meaning: BTreeMap<(String, String, Option<Strictness>), bool>,
+    /// PRD #1733: what an unscripted action is answered when set, in place
+    /// of agreeing with the pick alone.
+    meaning_default: Option<bool>,
+    /// PRD #1733: each vote's `names_target` for an utterance, in the order
+    /// the votes are asked — `Some(true)` a `yes`, `Some(false)` a `no` and
+    /// `None` a reply without the field. An utterance with none scripted is
+    /// answered without it, which names a target as far as the app reads it
+    /// ([`MeaningVerdict::names_no_target`]).
+    target_votes: BTreeMap<String, [Option<bool>; 2]>,
+    /// How many votes each utterance has been asked, to pick its
+    /// `target_votes` entry.
+    target_asked: std::sync::Arc<std::sync::Mutex<BTreeMap<String, usize>>>,
+    /// PRD #1733: a raw reply for an utterance, read by the production reader
+    /// ([`MeaningVerdict::read`]) — so a test can drive a malformed one.
+    meaning_replies: BTreeMap<String, serde_json::Value>,
+    /// PRD #1733: a backend's whole reply for an utterance, as the bytes it
+    /// sent, read by the remote resolver's own reader
+    /// ([`super::meaning::parse_reply`]) — so a test can drive a reply that
+    /// answers twice through the pipeline.
+    meaning_wire_replies: BTreeMap<String, (super::meaning::Dialect, String)>,
+    meaning_failure: Option<IntentError>,
+    /// PRD #1733: the meaning call never answers, for the timeout's test.
+    meaning_hangs: bool,
+    /// PRD #1733: every meaning request this stub was handed — one per vote —
+    /// as the wire bodies both dialects would send, which the boundary test
+    /// reads.
+    meaning_log: std::sync::Arc<std::sync::Mutex<Vec<RecordedMeaning>>>,
+}
+
+/// One meaning request a [`StubResolver`] was handed (PRD #1733): the
+/// request body each dialect would have sent for it, serialized — the exact
+/// bytes that would leave the machine.
+#[derive(Debug, Clone)]
+pub struct RecordedMeaning {
+    pub bodies: Vec<String>,
 }
 
 impl StubResolver {
@@ -301,6 +429,85 @@ impl StubResolver {
             ..Self::default()
         }
     }
+
+    /// PRD #1733: judge whether `utterance` asks for `action`, under every
+    /// strictness.
+    pub fn judging(mut self, utterance: &str, action: &str, asks: bool) -> Self {
+        self.meaning
+            .insert((normalize(utterance), action.to_string(), None), asks);
+        self
+    }
+
+    /// PRD #1733: answer every action no script answers with `asks` —
+    /// `true` models a sentence that asks for every row the pipeline may
+    /// consult on the pick's behalf (its redirects and readings included).
+    pub fn judging_everything(mut self, asks: bool) -> Self {
+        self.meaning_default = Some(asks);
+        self
+    }
+
+    /// PRD #1733: judge `utterance` for `action` under one strictness only.
+    pub fn judging_as(
+        mut self,
+        utterance: &str,
+        action: &str,
+        strictness: Strictness,
+        asks: bool,
+    ) -> Self {
+        self.meaning.insert(
+            (normalize(utterance), action.to_string(), Some(strictness)),
+            asks,
+        );
+        self
+    }
+
+    /// PRD #1733: answer `names_target` for `utterance` with `votes`, the
+    /// first meaning call with the first and every later one with the
+    /// second.
+    pub fn naming_target(mut self, utterance: &str, votes: [Option<bool>; 2]) -> Self {
+        self.target_votes.insert(normalize(utterance), votes);
+        self
+    }
+
+    /// PRD #1733: answer each meaning call for `utterance` with `reply`, read
+    /// as a backend's reply would be.
+    pub fn meaning_reply(mut self, utterance: &str, reply: serde_json::Value) -> Self {
+        self.meaning_replies.insert(normalize(utterance), reply);
+        self
+    }
+
+    /// PRD #1733: answer each meaning call for `utterance` with `reply`, the
+    /// bytes of a whole `dialect` reply, read as the remote resolver reads one.
+    pub fn meaning_wire_reply(
+        mut self,
+        utterance: &str,
+        dialect: super::meaning::Dialect,
+        reply: &str,
+    ) -> Self {
+        self.meaning_wire_replies
+            .insert(normalize(utterance), (dialect, reply.to_string()));
+        self
+    }
+
+    /// PRD #1733: fail every meaning call with `error`.
+    pub fn failing_meaning(mut self, error: IntentError) -> Self {
+        self.meaning_failure = Some(error);
+        self
+    }
+
+    /// PRD #1733: never answer a meaning call.
+    pub fn hanging_meaning(mut self) -> Self {
+        self.meaning_hangs = true;
+        self
+    }
+
+    /// PRD #1733: the meaning requests made so far, one per vote.
+    pub fn meaning_requests(&self) -> Vec<RecordedMeaning> {
+        self.meaning_log
+            .lock()
+            .map(|log| log.clone())
+            .unwrap_or_default()
+    }
 }
 
 impl IntentResolver for StubResolver {
@@ -329,6 +536,61 @@ impl IntentResolver for StubResolver {
                 .get(&normalize(request.transcript.text()))
                 .cloned()
                 .unwrap_or_else(super::question::ModelAnswer::not_answer)),
+        };
+        Box::pin(async move { outcome })
+    }
+
+    fn judge_meaning<'a>(&'a self, request: MeaningRequest<'a>) -> MeaningFuture<'a> {
+        let ceiling = crate::model_service::TokenCeiling::default();
+        let recorded = RecordedMeaning {
+            bodies: vec![
+                super::meaning::anthropic_body(&request, "stub", ceiling).to_string(),
+                super::meaning::openai_body(&request, "stub", ceiling, Some("minimal")).to_string(),
+            ],
+        };
+        if let Ok(mut log) = self.meaning_log.lock() {
+            log.push(recorded);
+        }
+        if self.meaning_hangs {
+            return Box::pin(std::future::pending());
+        }
+        let said = normalize(request.transcript().text());
+        let outcome = if let Some(error) = &self.meaning_failure {
+            Err(error.clone())
+        } else if let Some(reply) = self.meaning_replies.get(&said) {
+            MeaningVerdict::read(&request, reply)
+        } else if let Some((dialect, reply)) = self.meaning_wire_replies.get(&said) {
+            super::meaning::parse_reply(&request, *dialect, reply.as_bytes(), ceiling)
+        } else {
+            let picked = self.answers.get(&said).map(|answer| answer.action.as_str());
+            let names_target = self.target_votes.get(&said).and_then(|votes| {
+                let mut asked = self.target_asked.lock().expect("target votes");
+                let vote = asked.entry(said.clone()).or_default();
+                let names = votes[(*vote).min(1)];
+                *vote += 1;
+                names
+            });
+            let verdict = MeaningVerdict::yes_to(
+                request
+                    .action_ids()
+                    .flat_map(|action| {
+                        [Strictness::Asks, Strictness::Whole, Strictness::Write]
+                            .map(|strictness| (action, strictness))
+                    })
+                    .filter(|(action, strictness)| {
+                        self.meaning
+                            .get(&(said.clone(), action.to_string(), Some(*strictness)))
+                            .or_else(|| self.meaning.get(&(said.clone(), action.to_string(), None)))
+                            .copied()
+                            .or(self.meaning_default)
+                            .unwrap_or(picked == Some(*action))
+                    }),
+            );
+            Ok(if names_target == Some(false) {
+                verdict.naming_no_target()
+            } else {
+                verdict
+            })
         };
         Box::pin(async move { outcome })
     }
@@ -560,8 +822,8 @@ mod tests {
 
     #[test]
     fn voice_resolver_answer_reads_a_null_param_as_absent() {
-        // Forced by `openai`'s strict schema, which has to declare and require
-        // every param name. See `IntentAnswer`'s own docs.
+        // How a strict schema that lists every param spells one the user did
+        // not refer to. See `IntentAnswer`'s own docs.
         let answer: IntentAnswer =
             serde_json::from_str(r#"{"action":"open_deck","params":{"agent":null}}"#)
                 .expect("parses");
@@ -581,6 +843,60 @@ mod tests {
             serde_json::from_str::<IntentAnswer>(r#"{"action":"open_agent","params":{"agent":7}}"#)
                 .is_err()
         );
+    }
+
+    /// Scenario: a params object writes one name twice — two values, or a
+    /// value and a `null` in either order, or two `null`s. Each is malformed,
+    /// as a list naming one param twice is, rather than read as whichever
+    /// came last.
+    #[test]
+    fn voice_resolver_answer_refuses_an_object_naming_a_param_twice() {
+        for twice in [
+            r#"{"agent":"tester","agent":"coder"}"#,
+            r#"{"agent":"tester","agent":null}"#,
+            r#"{"agent":null,"agent":"coder"}"#,
+            r#"{"agent":null,"agent":null}"#,
+        ] {
+            let reply = format!(r#"{{"action":"open_agent","params":{twice}}}"#);
+            assert!(
+                serde_json::from_str::<IntentAnswer>(&reply).is_err(),
+                "{reply}"
+            );
+        }
+    }
+
+    /// Scenario: params answered as a list of named values — the shape
+    /// `openai`'s schema asks for — read into the same map as an object, an
+    /// empty list is no params, and a list that names one param twice, or an
+    /// entry with anything but a name and a string value, is malformed.
+    #[test]
+    fn voice_resolver_answer_reads_listed_params_each_name_once() {
+        let answer: IntentAnswer = serde_json::from_str(
+            r#"{"action":"filter_dashboard","params":[{"name":"kind","value":"orchestration"},{"name":"status","value":"working"}]}"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            answer.params.get("kind"),
+            Some(&"orchestration".to_string())
+        );
+        assert_eq!(answer.params.get("status"), Some(&"working".to_string()));
+        assert_eq!(answer.params.len(), 2);
+
+        let answer: IntentAnswer =
+            serde_json::from_str(r#"{"action":"open_settings","params":[]}"#).expect("parses");
+        assert!(answer.params.is_empty());
+
+        for malformed in [
+            r#"{"action":"open_agent","params":[{"name":"agent","value":"tester"},{"name":"agent","value":"coder"}]}"#,
+            r#"{"action":"open_agent","params":[{"name":"agent","value":7}]}"#,
+            r#"{"action":"open_agent","params":[{"name":"agent","value":"tester","also":"x"}]}"#,
+            r#"{"action":"open_agent","params":[{"name":"agent"}]}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<IntentAnswer>(malformed).is_err(),
+                "{malformed}"
+            );
+        }
     }
 
     #[test]

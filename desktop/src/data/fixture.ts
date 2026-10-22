@@ -1560,9 +1560,9 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     // length: a trailing rule would submit "the meeting is at the" when
     // somebody said "type the meeting is at the end".
     //
-    // `voice::dictation::SUBMIT_PHRASES` together with `submit_prompt`'s
-    // `heard_as_whole` entries in `commands.toml`, which is the set the mode
-    // answers ("go ahead" is one); `fixture.test.ts` compares this row with both.
+    // `voice::dictation::SUBMIT_PHRASES` together with
+    // `SUBMIT_WHERE_CALLABLE_PHRASES`, which is the set the mode answers ("go
+    // ahead" is one); `fixture.test.ts` compares this row with both.
     phrases: [
       "end", "send", "send it", "submit", "enter", "press enter",
       "submit it", "go ahead", "that is the end", "finished", "the prompt is finished",
@@ -1637,7 +1637,9 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
   },
   {
     // PR #1451 round 3, change 5 — the New agent browser's Filter box.
-    // Matched by OPENER, `commands.toml`'s `heard_as` for the row; the text
+    // Matched by OPENER — the words `commands.toml` listed as the row's
+    // `heard_as` until PRD #1733 replaced that column with a meaning check
+    // this preview has no model for; the text
     // is then picked out of the utterance by {@link fixtureFilterText} and
     // kept only if `voice::filter::grounded_filter_text` would keep it. The
     // picking is the one part a model does in a live build, so the preview's

@@ -346,14 +346,16 @@ export type VoiceActionContext = {
   closeSettings: () => void;
   /**
    * PR #1680 review — close the topmost of the app's overlays when it is one
-   * with no member of its own: the deck's command menu, its shortcut sheet, or
-   * a configuration sheet.
+   * with no member of its own: the deck's command menu, its shortcut sheet, a
+   * configuration sheet, or a confirmation or upgrade dialog (issue #1709).
+   * Answers the sentence saying why when it cannot close yet — an upgrade
+   * still running — and `undefined` (or nothing) when it closed.
    *
    * **Served by the SHELL, and only while such an overlay is on top**, read
    * from the fence's stack (`useInertBackground`) at dispatch time, for
    * {@link dismissVoiceOverlay}'s reason.
    */
-  closeOverlay: () => void;
+  closeOverlay: () => string | void;
   /**
    * Open the New agent dialog (PRD #1223), with `deckId` preselected when the
    * control that opened it belongs to one deck — a deck group's header.
@@ -764,7 +766,11 @@ export const VOICE_ACTIONS = {
         return;
       }
       if (context.closeSettings) return context.closeSettings();
-      if (context.closeOverlay) return context.closeOverlay();
+      if (context.closeOverlay) {
+        const refused = context.closeOverlay();
+        if (typeof refused === "string") context.reportRefused(refused);
+        return;
+      }
       if (target.agentViewOpen) return context.closeAgentView();
       if (context.closeHostMetrics) return context.closeHostMetrics();
       context.reportNothingToClose();

@@ -14,10 +14,13 @@
  * implementations would then disagree about what "modal" means on a screen that
  * can show both.
  *
- * **The other dialogs here are NOT fenced, and saying so is the honest version
- * of "a repo-wide convention".** `ConfirmDialog` and `OutputReader` each
- * declare `aria-modal="true"` over the same mounted background and each call
- * nothing here, so the claim is as untrue for them as it was for the pane.
+ * **Not every dialog here is fenced, and saying so is the honest version of
+ * "a repo-wide convention".** `OutputReader` declares `aria-modal="true"` over
+ * the same mounted background and calls nothing here, so the claim is as untrue
+ * for it as it was for the pane. `ConfirmDialog`, `UpgradeDialog` and
+ * `SelfUpgradeDialog` are on the stack (issue #1709), with their own way out
+ * as `close`, so voice's "close" dismisses them and no longer reaches past one
+ * to the overlay beneath it.
  * `SettingsSheet` and `ConfigurationPanels`'s four sheets are on the stack
  * through {@link useOverlaySheet} (PR #1680 review), and fence only while
  * raised over the agent pane or the pull request browser; otherwise they fence
@@ -149,6 +152,17 @@ export const VOICE_PEER_PROPS = { "data-modal-peer": "voice" } as const;
 const VOICE_PEER_SELECTOR = `[data-modal-peer="${VOICE_PEER_PROPS["data-modal-peer"]}"]`;
 
 /**
+ * Whether `element` is inside the voice surface ({@link VOICE_PEER_PROPS}).
+ * For a dialog the voice surface can host as well as a screen — `ConfirmDialog`
+ * (issue #1709) — which stays off the stack there: the voice row is raised over
+ * the stack's layers while it holds a dialog, and that dialog answers its own
+ * "confirm" and "cancel", so ordering and fencing it here would contradict both.
+ */
+export function insideVoicePeer(element: Element): boolean {
+  return element.closest(VOICE_PEER_SELECTOR) !== null;
+}
+
+/**
  * PR #1680 review (Qodo) — the layer each overlay on the stack paints in: the
  * `z-index` of its backdrop in `styles.css`, which `overlayLayers.test.ts`
  * reads back so the two cannot drift. The stack is ordered as the browser
@@ -174,7 +188,7 @@ export const OVERLAY_LAYER = {
   pullRequest: 92,
   /** `.sheet-backdrop.is-raised`: a sheet opened over the pane or the pull request browser, which the user just asked for. */
   raisedSheet: 93,
-  /** `.dialog-backdrop`: the New agent dialog, the command menu and the shortcut sheet. */
+  /** `.dialog-backdrop`: the New agent dialog, the command menu, the shortcut sheet, and the confirmation and upgrade dialogs. */
   dialog: 100,
 } as const;
 
@@ -185,8 +199,11 @@ export const OVERLAY_LAYER = {
  * element was replaced is found by its new one. `close` is how voice's "close"
  * dismisses it when it has no member of its own; `fences` is false for a sheet
  * that is not raised, which fences nothing (see {@link useOverlaySheet}).
+ * A `close` that cannot close right now returns the sentence saying why, which
+ * voice reports instead of "Closed." (issue #1709).
  */
-type Fenced = { node: HTMLElement | null; layer: number; opened: number; fences: boolean; close?: () => void };
+type OverlayClose = () => string | void;
+type Fenced = { node: HTMLElement | null; layer: number; opened: number; fences: boolean; close?: OverlayClose };
 
 /**
  * PRD #1401 — every open overlay. The topmost FENCING one is the only one that
@@ -263,7 +280,7 @@ export function overlayAbove(element: Element | null): boolean {
 }
 
 /** How to close the topmost open overlay, when it registered one (see `Fenced`). */
-export function topmostOverlayClose(): (() => void) | undefined {
+export function topmostOverlayClose(): OverlayClose | undefined {
   return ordered().at(-1)?.close;
 }
 
@@ -303,7 +320,7 @@ function fence() {
  * dismisses this overlay while it is the topmost one: for the overlays that
  * have no voice member of their own.
  */
-export function useInertBackground<T extends HTMLElement>(open: boolean, layer: number, close?: () => void) {
+export function useInertBackground<T extends HTMLElement>(open: boolean, layer: number, close?: OverlayClose) {
   return useOverlay<T>(open, layer, true, close).ref;
 }
 
@@ -351,7 +368,7 @@ function opensOverPaneOrPage(sheet: Fenced | null): boolean {
     && (opened === 0 || entry.opened < opened));
 }
 
-function useOverlay<T extends HTMLElement>(open: boolean, layer: number, fences: boolean, close?: () => void) {
+function useOverlay<T extends HTMLElement>(open: boolean, layer: number, fences: boolean, close?: OverlayClose) {
   const ref = useRef<T>(null);
   /** What had focus when this opened, so that closing can give it back. */
   const opener = useRef<Element | null>(null);

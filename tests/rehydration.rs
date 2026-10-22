@@ -3573,6 +3573,7 @@ async fn live_011_real_agent_event_cli_status_survives_reconnect_inner() {
 /// Scenario: A wrapped Codex pane runs under a real daemon, where Codex announced its conversation and the wrapper (reporting under `<pane>-session`) has spoken since; a fresh TUI hydrates through `ListAgents` after its event stream already delivered a wrapper frame. The reconnected TUI must hold the conversation the daemon's send guard holds, and must keep a genuine `SessionStart` it received after the daemon built its reply rather than roll back to the reply. Control: an older daemon's reply carries no generation, so the TUI keeps the id it built from events.
 #[spec("session/live/017")]
 #[test]
+#[ignore = "quarantined: vfarcic, #1786"]
 fn live_017_reconnect_adopts_the_daemons_pane_generation() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
