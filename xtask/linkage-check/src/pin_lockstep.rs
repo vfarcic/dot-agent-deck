@@ -250,6 +250,9 @@ fn renovate_devbox_managers(dep_name: &str, expected: usize) -> Vec<RenovateMana
         .expect("renovate.json has a customManagers array")
         .iter()
         .filter(|m| m["depNameTemplate"] == dep_name && m["datasourceTemplate"] == "devbox")
+        // The RWX configs' managers have their own comparison,
+        // `renovate_reads_exactly_the_rwx_sites_the_guard_finds`.
+        .filter(|m| !reads_rwx(m))
         .collect();
     assert_eq!(
         managers.len(),
@@ -291,12 +294,23 @@ fn renovate_devbox_managers(dep_name: &str, expected: usize) -> Vec<RenovateMana
         .collect()
 }
 
+/// The `managerFilePatterns` entry of renovate.json's RWX customManagers: the
+/// top level of `.rwx/`, matching what the guard's `rwx_files` reads.
+const RWX_FILE_PATTERN: &str = "/^\\.rwx/[^/]+\\.ya?ml$/";
+
+/// Whether a customManager reads ONLY the RWX configs.
+fn reads_rwx(manager: &serde_json::Value) -> bool {
+    manager["managerFilePatterns"]
+        .as_array()
+        .is_some_and(|p| p.len() == 1 && p[0] == RWX_FILE_PATTERN)
+}
+
 /// What `managers` extract under `root`, as `<file>:<line> <version>` — the
 /// same shape the guard's `--*-sites` modes print, with the line being the one
 /// the captured `currentValue` sits on.
 ///
-/// The candidate files are the repository root's own files and
-/// `.github/workflows/`'s, which is every place a manager here points at; each
+/// The candidate files are the repository root's own files, `.github/workflows/`'s
+/// and `.rwx/`'s, which is every place a manager here points at; each
 /// manager's file pattern then picks among them, as Renovate's does among the
 /// repository's files.
 fn renovate_sites(managers: &[RenovateManager], root: &Path) -> Vec<String> {
@@ -304,6 +318,7 @@ fn renovate_sites(managers: &[RenovateManager], root: &Path) -> Vec<String> {
     for (dir, prefix) in [
         (root.to_path_buf(), ""),
         (root.join(".github/workflows"), ".github/workflows/"),
+        (root.join(".rwx"), ".rwx/"),
     ] {
         let Ok(entries) = fs::read_dir(&dir) else {
             continue;
@@ -1720,4 +1735,245 @@ fn the_declared_msrv_matches_the_pinned_toolchain() {
             .collect::<Vec<_>>()
             .join(", "),
     );
+}
+
+/// The pins the guard compares in the RWX configs (`--rwx-sites`), and the
+/// renovate.json customManagers that bump them: one per spelling, each reading
+/// only `.rwx/`. Five: the Rust toolchain twice (`rust-version:` and rustup's
+/// `--default-toolchain`), cargo-nextest, pnpm and go-task.
+fn renovate_rwx_lockstep_managers() -> Vec<RenovateManager> {
+    let text = fs::read_to_string(repo_root().join("renovate.json")).expect("read renovate.json");
+    let config: serde_json::Value =
+        serde_json::from_str(&text).expect("renovate.json is not valid JSON");
+    let lockstep = ["rustc", "cargo-nextest", "pnpm", "go-task"];
+    let managers: Vec<RenovateManager> = config["customManagers"]
+        .as_array()
+        .expect("renovate.json has a customManagers array")
+        .iter()
+        .filter(|m| reads_rwx(m))
+        .filter(|m| lockstep.iter().any(|d| m["depNameTemplate"] == *d))
+        .map(|m| {
+            let strings = m["matchStrings"].as_array().expect("matchStrings array");
+            assert_eq!(
+                strings.len(),
+                1,
+                "each RWX customManager has exactly one matchString"
+            );
+            RenovateManager {
+                files: Regex::new(
+                    RWX_FILE_PATTERN
+                        .strip_prefix('/')
+                        .and_then(|p| p.strip_suffix('/'))
+                        .expect("a /regex/"),
+                )
+                .expect("the RWX file pattern compiles"),
+                matcher: Regex::new(strings[0].as_str().expect("a string matchString"))
+                    .expect("an RWX matchString compiles"),
+            }
+        })
+        .collect();
+    assert_eq!(
+        managers.len(),
+        5,
+        "renovate.json must carry exactly five RWX customManagers for the lockstep \
+         classes (rustc twice, cargo-nextest, pnpm, go-task); a new spelling needs \
+         a manager AND a scanner in scripts/check-pin-lockstep.sh"
+    );
+    managers
+}
+
+/// The RWX configs' copy of the pnpm and toolchain tests above. `.rwx/` pins the
+/// CI toolchain in its own syntax (docs/develop/rwx.md), so renovate.json reads
+/// it with its own regexes, and a site the guard compares that those regexes
+/// miss is one a grouped Renovate PR would leave behind, failing the lockstep
+/// check on the PR meant to satisfy it.
+#[test]
+fn renovate_reads_exactly_the_rwx_sites_the_guard_finds() {
+    if !bash_present() {
+        eprintln!("SKIP: the pin-lockstep guard needs `bash` on PATH");
+        return;
+    }
+    let root = repo_root();
+    let (guard, errors) = guard_sites("--rwx-sites", &root);
+    assert!(
+        errors.is_empty(),
+        "scripts/check-pin-lockstep.sh rejects a site in .rwx/:\n{}",
+        errors.join("\n")
+    );
+    assert!(
+        !guard.is_empty(),
+        "the guard found no pin in .rwx/ at all, so this comparison would pass vacuously"
+    );
+    assert_eq!(
+        renovate_sites(&renovate_rwx_lockstep_managers(), &root),
+        guard,
+        "renovate.json's RWX customManagers and scripts/check-pin-lockstep.sh disagree \
+         about which pins exist in .rwx/ (left: what Renovate extracts, right: what \
+         the guard reads)"
+    );
+}
+
+/// An RWX config carrying the four lockstep pins in the spelling `.rwx/ci.yml`
+/// uses.
+fn rwx_config(rust: &str, nextest: &str, pnpm: &str, gotask: &str) -> String {
+    format!(
+        "tasks:\n  \
+         - key: rust\n    \
+         call: rust-lang/install 1.1.1\n    \
+         with:\n      \
+         rust-version: {rust}\n  \
+         - key: rustup\n    \
+         run: curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain {rust}\n  \
+         - key: nextest\n    \
+         run: curl -LsSf https://get.nexte.st/{nextest}/linux | tar zxf -\n  \
+         - key: pnpm\n    \
+         run: npm install -g pnpm@{pnpm}\n  \
+         - key: go-task\n    \
+         run: curl -LsSf https://github.com/go-task/task/releases/download/v{gotask}/task_linux_amd64.tar.gz\n"
+    )
+}
+
+/// [`Fixture`] with a `.rwx/ci.yml`, and devbox.json carrying go-task too.
+fn rwx_fixture(rwx: &str) -> Fixture {
+    let mut packages = good_packages();
+    packages.push("go-task@3.53.1");
+    let fixture = Fixture::new(&packages, &good_workflows());
+    let dir = fixture.dir.path().join(".rwx");
+    fs::create_dir_all(&dir).expect("create the fixture .rwx dir");
+    fs::write(dir.join("ci.yml"), rwx).expect("write the fixture RWX config");
+    fixture
+}
+
+#[test]
+fn agreeing_rwx_pins_pass() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let out = rwx_fixture(&rwx_config("1.97.1", "0.9.143", PNPM, "3.53.1")).run();
+    assert!(
+        out.status.success(),
+        "an RWX config agreeing with devbox.json and the workflows must pass, or \
+         the drift tests below prove nothing:\n{}",
+        combined(&out)
+    );
+}
+
+#[test]
+fn a_drifted_rwx_pin_fails() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    for (class, rwx, version) in [
+        (
+            "Rust toolchain",
+            rwx_config("1.98.0", "0.9.143", PNPM, "3.53.1"),
+            "1.98.0",
+        ),
+        (
+            "cargo-nextest",
+            rwx_config("1.97.1", "0.9.140", PNPM, "3.53.1"),
+            "0.9.140",
+        ),
+        (
+            "pnpm",
+            rwx_config("1.97.1", "0.9.143", "11.21.0", "3.53.1"),
+            "11.21.0",
+        ),
+        (
+            "go-task",
+            rwx_config("1.97.1", "0.9.143", PNPM, "3.54.0"),
+            "3.54.0",
+        ),
+    ] {
+        let out = rwx_fixture(&rwx).run();
+        let text = combined(&out);
+        assert!(
+            !out.status.success(),
+            "a drifted RWX {class} pin must fail:\n{text}"
+        );
+        assert!(
+            text.contains(class) && text.contains(version),
+            "the failure must name the class and the RWX version:\n{text}"
+        );
+    }
+}
+
+/// Only rustup's `--default-toolchain` drifting: one spelling of the Rust
+/// toolchain in RWX agreeing does not cover the other.
+#[test]
+fn a_drifted_rustup_toolchain_in_rwx_fails() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let rwx = rwx_config("1.97.1", "0.9.143", PNPM, "3.53.1")
+        .replace("--default-toolchain 1.97.1", "--default-toolchain 1.98.0");
+    let out = rwx_fixture(&rwx).run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "a drifted --default-toolchain must fail:\n{text}"
+    );
+    assert!(
+        text.contains("1.98.0"),
+        "the failure must name the version:\n{text}"
+    );
+}
+
+/// A pre-release suffix is a different version, not the same one written
+/// longer: `1.97.1-beta.1` in `.rwx/` against devbox's `1.97.1` must fail, not
+/// read as `1.97.1` and pass (PR #1802 review).
+#[test]
+fn a_prerelease_rwx_pin_fails() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let rwx = rwx_config("1.97.1", "0.9.143", PNPM, "3.53.1")
+        .replace("rust-version: 1.97.1", "rust-version: 1.97.1-beta.1");
+    let out = rwx_fixture(&rwx).run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "a pre-release RWX pin must fail:\n{text}"
+    );
+    assert!(
+        text.contains("1.97.1-beta.1"),
+        "the failure must name the pin:\n{text}"
+    );
+}
+
+/// An RWX config that dropped a pin is drift too: the RWX sites ride the
+/// workflow side, so a `.rwx/` with no go-task (or no nextest, ...) pin would
+/// otherwise leave the class passing on the workflows alone (PR #1802 review).
+#[test]
+fn an_rwx_config_missing_a_pin_fails() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let full = rwx_config("1.97.1", "0.9.143", PNPM, "3.53.1");
+    for (class, marker) in [
+        ("gotask", "go-task/task/releases"),
+        ("nextest", "get.nexte.st"),
+        ("pnpm", "pnpm@"),
+    ] {
+        let rwx: String = full
+            .lines()
+            .filter(|l| !l.contains(marker))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let out = rwx_fixture(&rwx).run();
+        let text = combined(&out);
+        assert!(
+            !out.status.success(),
+            "an .rwx/ with no {class} pin must fail:\n{text}"
+        );
+        assert!(
+            text.contains(class),
+            "the failure must name the class:\n{text}"
+        );
+    }
 }
