@@ -4414,10 +4414,10 @@ pub fn compose_undelivered_notice(
 /// the task reached the worker, and that is [`compose_cancelled_notice`]'s
 /// not-handed notice. For every other reason the deck may have handed the task
 /// over first (a fetch it never saw acknowledged, an attempt in flight), so the
-/// notice says the worker may have it and to check before re-delegating. Only a
-/// task that ran out of hand-overs promises a correction: its late ack is
-/// remembered for [`LATE_ACK_MEMORY`] ([`settle_late_ack`]); an exited worker's
-/// ack is refused.
+/// notice says the worker may have it and to check before re-delegating. It
+/// promises no later correction: a late ack for a task that ran out of
+/// hand-overs can still produce one ([`settle_late_ack`]), but only while its
+/// record survives [`LATE_ACK_MAX_RECORDS`] and [`LATE_ACK_MEMORY`].
 pub fn compose_undeliverable_notice(
     message_id: &str,
     role: &str,
@@ -4425,9 +4425,7 @@ pub fn compose_undeliverable_notice(
 ) -> String {
     const CHECK: &str = "Check the worker's pane before you re-delegate or reassign it, or notify \
                          the user.";
-    // The MaxDeliver notice says "within the next hour".
-    const _: () = assert!(LATE_ACK_MEMORY.as_secs() == 60 * 60);
-    let (why, may_have_it, told) = match reason {
+    let (why, may_have_it) = match reason {
         UndeliverableReason::Cancelled => {
             return compose_cancelled_notice(message_id, role, false);
         }
@@ -4435,29 +4433,24 @@ pub fn compose_undeliverable_notice(
             "it was handed to the worker the most times the deck allows and was never acknowledged",
             "The deck will not deliver it again, but it may already have reached the worker, \
              which may be working on it; its work-done can still arrive.",
-            " If the deck learns within the next hour that the worker received it, you will be \
-             told.",
         ),
         UndeliverableReason::AgentExited => (
             "the worker it was addressed to exited before acknowledging it",
             "It may have reached the worker before it exited, so some of the work may already \
              be done.",
-            "",
         ),
         UndeliverableReason::InboxShut => (
             "the deck is shutting down",
             "It may already have reached the worker.",
-            "",
         ),
         UndeliverableReason::Superseded => (
             "a newer task replaced it",
             "It may already have reached the worker.",
-            "",
         ),
     };
     format!(
         "Task {message_id} to the worker in role {} is undeliverable: {why}. {may_have_it} \
-         {CHECK}{told}",
+         {CHECK}",
         crate::state::quote_untrusted_role(role),
     )
 }
@@ -7536,8 +7529,9 @@ mod tests {
 
     /// PRD #1666 part 2: a task that ran out of hand-overs was handed to the
     /// worker each time, so its notice says the worker may have it and its
-    /// work-done can still arrive, tells the orchestrator to check the pane
-    /// first, and promises the correction its late ack gets.
+    /// work-done can still arrive, and tells the orchestrator to check the pane
+    /// first. It promises no later correction: the record a late ack would
+    /// need can be evicted before the ack arrives.
     #[tokio::test]
     async fn a_task_out_of_hand_overs_may_still_be_with_the_worker() {
         let limits = InboxLimits {
@@ -7559,22 +7553,21 @@ mod tests {
         assert!(
             body.contains("may already have reached the worker")
                 && body.contains("its work-done can still arrive")
-                && body.contains(CHECK_FIRST)
-                && body.contains(
-                    "If the deck learns within the next hour that the worker received it, you \
-                     will be told."
-                ),
+                && body.contains(CHECK_FIRST),
             "{body}"
         );
         assert!(
-            !body.contains("did not receive") && !body.contains("no work-done can arrive"),
+            !body.contains("did not receive")
+                && !body.contains("no work-done can arrive")
+                && !body.contains("next hour")
+                && !body.contains("you will be told"),
             "{body}"
         );
     }
 
     /// PRD #1666 part 2: a worker that exited may have taken its task before
     /// it went, so the notice says so and tells the orchestrator to check the
-    /// pane first. Its ack would be refused, so no correction is promised.
+    /// pane first, and promises no correction.
     #[tokio::test]
     async fn a_task_whose_worker_exited_may_have_reached_it() {
         let hub = hub();
@@ -7604,7 +7597,9 @@ mod tests {
 
     /// PRD #1666 part 2: only a cancel the deck saw positively not handed rules
     /// out that the worker received the task; every other reason's notice says
-    /// it may have reached the worker and to check first.
+    /// it may have reached the worker and to check first, and none promises a
+    /// later correction. Composer coverage only: `boundary_022` reads the
+    /// not-handed cancel notice from the orchestrator's inbox.
     #[test]
     fn an_undeliverable_notice_says_the_worker_did_not_receive_it_only_when_ruled_out() {
         use UndeliverableReason::*;
@@ -7623,11 +7618,7 @@ mod tests {
                 !ruled_out,
                 "{reason:?}: {body}"
             );
-            assert_eq!(
-                body.contains("you will be told"),
-                reason == MaxDeliver,
-                "{reason:?}: {body}"
-            );
+            assert!(!body.contains("you will be told"), "{reason:?}: {body}");
         }
         assert_eq!(
             compose_undeliverable_notice("m-1", "coder", Cancelled),
