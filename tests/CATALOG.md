@@ -6907,7 +6907,7 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 
 ##### scheduler/dispatch/001 — Firing an `issue_dispatch` task clones the repo, creates a per-issue worktree on `agent/issue-<n>`, and spawns an agent into it with the substituted prompt (PRD #120 M2.1–M2.3).
 
-- **Claim coverage (PRD #421 Phase 2):** dispatches two issues in each of two cases: no repo labels, and a triage token denied provisioning an existing label. Both issues receive the label and their prompts; each run attempts forced provisioning exactly once before its first issue edit, even when provisioning fails. The offline stub rejects adding an unprovisioned label.
+- **Claim coverage (PRD #421 Phase 2):** dispatches two issues in each of three cases: no repo labels, a triage token denied provisioning an existing label, and a missing label whose first provisioning attempt fails with HTTP 502. Both issues receive the label and their prompts; forced provisioning happens before the first issue edit, once for the healthy and denied cases and exactly twice when recovering the missing label. The offline stub rejects adding an unprovisioned label.
 - **Layer:** L2 (headless `dot-agent-deck daemon serve` driven via the `RunNow` control message — no PTY/grid, same shape as `scheduler/spawn/*`). All GitHub access is isolated offline behind a stub `gh` on PATH (`issue list`/`pr list` → canned JSON; `repo clone` → `git clone` of a local one-commit fixture remote that carries a committed `.dot-agent-deck.toml`).
 - **Agent:** none (run-now; the fixture orchestration role runs `cat`, which echoes the delivered prompt).
 - **Asserts:** (PRD #1666 S5: the deck posts the prompt, task, remit or notice to the target pane's inbox instead of typing it, and the test reads that inbox over the attach socket; where this entry says it is delivered to, reaches or lands in a pane, read posted to that pane's inbox.) the repo is cloned to `<working_dir>/<name>`, the worktree appears at `<clone>/.worktrees/issue-7` with branch `agent/issue-7` (via `git`), and an `orchestrator`-role agent rooted at that worktree (`orchestration_cwd`) receives the substituted per-issue prompt (`ISSUEDISPATCH-7`, echoed by `cat`).
@@ -7035,11 +7035,11 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** Other agent implementations or keyboard-submitted human prompts.
 - **Platform coverage:** mac+linux.
 
-##### scheduler/dispatch/029 — A read-only repository still dispatches an agent and raises exactly one claim-failure notification with both write outcomes.
+##### scheduler/dispatch/029 — Claim failures preserve dispatch, and a transient authenticated-account lookup failure is retried for the next issue.
 
-- **Layer:** L2 synthetic, lane 1 (`tests/e2e_issue_dispatch.rs`), real daemon with an offline stateful gh stub rejecting writes with HTTP 403.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_issue_dispatch.rs`), real daemon with an offline stateful gh stub rejecting writes with HTTP 403 or failing the first `gh api user` call with HTTP 502.
 - **Agent:** none (orchestration role runs cat).
-- **Asserts:** agent spawn and prompt delivery succeed; one scheduler claim-failure message identifies issue, repo, task, label and record outcomes separately from dispatch success/failure; record creation is attempted despite provisioning failure, and GitHub state remains unchanged.
+- **Asserts:** agent spawn and prompt delivery succeed; one scheduler claim-failure message identifies issue, repo, task, label and record outcomes separately from dispatch success/failure; record creation is attempted despite provisioning failure, and denied writes leave GitHub state unchanged. In the transient-lookup case, the first issue's notice names the record failure, the second issue gets a POSTed claimant record owned by the authenticated numeric account id, and the failed lookup is attempted again rather than cached.
 - **Does not assert:** real GitHub permissions, live agents, claim gating, TTL or a kill switch.
 - **Platform coverage:** mac+linux.
 
@@ -7051,12 +7051,12 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** failures before spawn (covered by scheduler/dispatch/007); a real agent or real GitHub.
 - **Platform coverage:** mac+linux.
 
-##### scheduler/dispatch/031 — A hanging claim call times out without holding the next issue in the dispatch queue.
+##### scheduler/dispatch/031 — Hanging claim calls respect both the per-call timeout and a shared run budget without holding the dispatch queue.
 
-- **Layer:** L2 synthetic, lane 1 (`tests/e2e_issue_dispatch.rs`), real daemon and offline gh stub hanging only issue 7's label write.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_issue_dispatch.rs`), real daemon and offline gh stub hanging either issue 7's label write or every claim-path call while leaving enumeration, PR checks and cloning healthy.
 - **Agent:** none (orchestration roles run `cat`).
-- **Asserts:** with `DOT_AGENT_DECK_ISSUE_CLAIM_TIMEOUT_MS=1500`, issues 7 and 8 both spawn agents; issue 8 spawns within 20 seconds of observing the hanging call and receives its prompt and GitHub claim; exactly one claim-failure notification names issue 7's timed-out label step and both claim outcomes, separately from dispatch failure.
-- **Does not assert:** real GitHub latency, live agents, other timed-out claim steps, output budgets or notification sanitisation.
+- **Asserts:** with `DOT_AGENT_DECK_ISSUE_CLAIM_TIMEOUT_MS=1500`, issues 7 and 8 both spawn agents; issue 8 spawns within 20 seconds of observing the hanging call and receives its prompt and GitHub claim; exactly one claim-failure notification names issue 7's timed-out label step and both claim outcomes, separately from dispatch failure. With a 5000 ms per-call timeout and `DOT_AGENT_DECK_ISSUE_CLAIM_BUDGET_MS=3000`, a three-issue run finishes dispatch within 15 seconds, delivers each prompt and raises one claim-failure notice per issue; later notices name the exhausted budget, and no further claim calls occur after the first hanging call exhausts it.
+- **Does not assert:** real GitHub latency, live agents, output byte budgets or notification sanitisation.
 - **Platform coverage:** mac+linux.
 
 #### scheduler/pi

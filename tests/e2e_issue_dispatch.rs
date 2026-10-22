@@ -85,8 +85,17 @@ def hang_if_enabled(paths):
     while any(path.exists() for path in paths) and time.monotonic() < deadline:
         time.sleep(0.05)
 
+def fail_first(directory, kind):
+    remaining_file = directory / ('fail-first-' + kind)
+    if remaining_file.exists():
+        remaining = int(remaining_file.read_text())
+        if remaining > 0:
+            remaining_file.write_text(str(remaining - 1))
+            fail('HTTP 502: transient GitHub failure (' + kind + ')')
+
 if args == ['api', 'user']:
-    hang_if_enabled([root / 'hang-user'])
+    hang_if_enabled([root / 'hang-claim', root / 'hang-user'])
+    fail_first(root, 'user')
     emit(json.loads((root / 'authenticated-user.json').read_text()))
 
 if args[:2] == ['repo', 'clone'] and len(args) == 4:
@@ -135,10 +144,11 @@ if kind is None:
     fail('gh stub: unhandled invocation: ' + repr(args))
 
 rd = root / repo.replace('/', '_')
-hang_paths = [rd / 'hang', rd / ('hang-' + kind)]
+hang_paths = [root / 'hang-claim', rd / 'hang', rd / ('hang-' + kind)]
 if kind in ('issue', 'list', 'POST'):
     hang_paths += [rd / ('hang-issue-' + issue), rd / ('hang-issue-' + issue + '-' + kind)]
 hang_if_enabled(hang_paths)
+fail_first(rd, kind)
 state_file = rd / 'state.json'
 state = json.loads(state_file.read_text())
 if kind == 'list':
@@ -301,6 +311,23 @@ impl GhStub {
             "",
         )
         .expect("hang only this issue's label write");
+    }
+
+    fn hang_claim_calls(&self) {
+        std::fs::write(self.dir.join("hang-claim"), "").expect("hang every claim-path gh call");
+    }
+
+    fn fail_first_calls(&self, repo: &str, kind: &str, count: usize) {
+        let directory = if kind == "user" {
+            self.dir.clone()
+        } else {
+            self.repo_dir(repo)
+        };
+        std::fs::write(
+            directory.join(format!("fail-first-{kind}")),
+            count.to_string(),
+        )
+        .expect("fail the first N calls of this gh kind");
     }
 
     fn state(&self, repo: &str) -> serde_json::Value {
@@ -566,11 +593,17 @@ fn scheduler_messages(daemon: &common::DaemonProc) -> Vec<String> {
 }
 
 fn claim_failure_messages(daemon: &common::DaemonProc) -> Vec<String> {
+    claim_failure_messages_for(daemon, 7)
+}
+
+fn claim_failure_messages_for(daemon: &common::DaemonProc, issue: u64) -> Vec<String> {
     scheduler_messages(daemon)
         .into_iter()
         .filter(|line| {
             let lower = line.to_lowercase();
-            lower.contains("claim") && lower.contains("fail") && lower.contains("#7")
+            lower.contains("claim")
+                && lower.contains("fail")
+                && lower.contains(&format!("#{issue}"))
         })
         .collect()
 }
@@ -579,20 +612,22 @@ fn claim_failure_messages(daemon: &common::DaemonProc) -> Vec<String> {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Scenario: Fire a two-issue dispatch against both an unlabelled repo and a repo whose triage token can use an existing label but cannot provision it.
+/// Scenario: Fire a two-issue dispatch against an unlabelled repo, a repo whose token cannot provision an existing label, and a missing label whose first provisioning attempt fails transiently.
 /// Both issue worktrees and agents appear with their prompts, and both issues receive the claimed label.
-/// Each run attempts label provisioning once, before its first issue-label write, including when provisioning fails.
+/// Provisioning happens once unless the label is missing after a transient failure, when one retry recovers it.
 #[spec("scheduler/dispatch/001")]
 #[test]
 fn dispatch_001_clone_worktree_spawn() {
     let mut provision_counts = Vec::new();
-    for deny_provision in [false, true] {
+    for (case, expected_provisions) in [("missing", 1), ("denied", 1), ("transient", 2)] {
         let stub = GhStub::new();
         let repo = "acme/widgets";
         stub.add_repo(repo, true);
         stub.set_issues(repo, &[7, 8]);
-        if deny_provision {
+        if case == "denied" {
             stub.deny_provision_existing_label(repo);
+        } else if case == "transient" {
+            stub.fail_first_calls(repo, "label", 1);
         }
 
         let work_td = common::harness_tempdir().expect("workspace tempdir");
@@ -653,13 +688,6 @@ fn dispatch_001_clone_worktree_spawn() {
             ),
             "the substituted per-issue prompt must be delivered to the dispatched orchestrator"
         );
-        assert!(
-            common::wait_until(w(), || {
-                stub.state(repo)["issue_labels"]["7"] == serde_json::json!(["agent-deck/claimed"])
-            }),
-            "successful dispatch must persist agent-deck/claimed on issue #7; gh calls: {:?}",
-            stub.calls()
-        );
         let sibling_paths = derive_issue_paths(Path::new(&work_str), "dispatch-task", 8);
         let sibling = daemon
             .wait_for_agent_where(|r| orchestrator_in(r, &sibling_paths.worktree_dir), w())
@@ -670,12 +698,18 @@ fn dispatch_001_clone_worktree_spawn() {
             "ISSUEDISPATCH-8",
             w(),
         ));
+        assert!(daemon.wait_for_stderr_contains("dispatched issue #8", w()));
+        assert_eq!(
+            stub.state(repo)["issue_labels"]["7"],
+            serde_json::json!(["agent-deck/claimed"]),
+            "successful dispatch must persist agent-deck/claimed on issue #7; case={case}; notifications={:?}; gh calls: {:?}",
+            scheduler_messages(&daemon),
+            stub.calls()
+        );
         assert!(
-            common::wait_until(w(), || {
-                stub.state(repo)["issue_labels"]["8"] == serde_json::json!(["agent-deck/claimed"])
-                    && !stub.marker_comments(repo, 8).is_empty()
-            }),
-            "both issues must be labelled even when provisioning is denied; denied={deny_provision}; calls: {:?}",
+            stub.state(repo)["issue_labels"]["8"] == serde_json::json!(["agent-deck/claimed"])
+                && !stub.marker_comments(repo, 8).is_empty(),
+            "both issues must be labelled after provisioning failure; case={case}; calls: {:?}",
             stub.calls()
         );
         let calls = stub.calls();
@@ -684,7 +718,12 @@ fn dispatch_001_clone_worktree_spawn() {
             .enumerate()
             .filter(|(_, call)| call.starts_with(&["label".into(), "create".into()]))
             .collect();
-        provision_counts.push((deny_provision, provisions.len()));
+        provision_counts.push((case, provisions.len()));
+        assert_eq!(
+            provisions.len(),
+            expected_provisions,
+            "retry provisioning only while the label is missing; case={case}; calls: {calls:?}"
+        );
         assert!(!provisions.is_empty(), "attempt just-in-time provisioning");
         assert!(provisions[0].1.iter().any(|arg| arg == "--force"));
         let claim = calls
@@ -696,8 +735,8 @@ fn dispatch_001_clone_worktree_spawn() {
     }
     assert_eq!(
         provision_counts,
-        vec![(false, 1), (true, 1)],
-        "provision the label once per two-issue run, including failed provisioning (denied, calls)"
+        vec![("missing", 1), ("denied", 1), ("transient", 2)],
+        "provision once per run, retrying only to recover a missing label"
     );
 }
 
@@ -1612,8 +1651,9 @@ fn dispatch_012_worktree_present_skips_without_pr_check() {
     stub.assert_no_unhandled_calls();
 }
 
-/// Scenario: Fire issue dispatch against a repo whose token rejects every GitHub write.
-/// The agent still spawns and receives its prompt, and exactly one claim-failure notification identifies both the label and record outcomes separately from dispatch success or failure.
+/// Scenario: Fire issue dispatch against a repo whose token rejects every GitHub write, then a two-issue run whose first authenticated-account lookup fails transiently.
+/// Agents still receive their prompts, and each failed claim produces one notification naming both outcomes separately from dispatch success or failure.
+/// After the transient lookup failure, the next issue receives a claimant record owned by the authenticated account.
 #[spec("scheduler/dispatch/029")]
 #[test]
 fn dispatch_029_read_only_claim_failure_keeps_agent_running() {
@@ -1690,6 +1730,77 @@ fn dispatch_029_read_only_claim_failure_keeps_agent_running() {
         "record creation is attempted even if label provisioning fails"
     );
     stub.assert_no_unhandled_calls();
+    drop(daemon);
+
+    let stub = GhStub::new();
+    stub.add_repo(repo, true);
+    stub.set_issues(repo, &[7, 8]);
+    stub.set_authenticated_user(54321, "recovered-claim-owner");
+    stub.fail_first_calls(repo, "user", 1);
+    let work = common::harness_tempdir().expect("lookup-recovery workspace");
+    let task = dispatch_task(
+        "dispatch-task",
+        &work.path().to_string_lossy(),
+        "LOOKUPRECOVERY-{{issue_number}}",
+        repo,
+        5,
+    );
+    let path = stub.path_env();
+    let ghdir = stub.ghstub_dir();
+    let daemon = common::spawn_daemon_serve_with_env(
+        Some(&task),
+        "0",
+        &[("PATH", &path), ("GHSTUB_DIR", &ghdir)],
+    );
+    daemon
+        .run_now("dispatch-task")
+        .expect("fire lookup recovery");
+    assert!(daemon.wait_for_stderr_contains("dispatched issue #8", w()));
+    for issue in [7, 8] {
+        let paths = derive_issue_paths(work.path(), "dispatch-task", issue);
+        let agent = daemon
+            .wait_for_agent_where(|r| orchestrator_in(r, &paths.worktree_dir), w())
+            .expect("lookup failure must not prevent either agent from spawning");
+        assert!(view::wait_for(
+            &daemon.attach_socket,
+            agent.pane_id_env.as_deref().unwrap(),
+            &format!("LOOKUPRECOVERY-{issue}"),
+            w(),
+        ));
+    }
+    let messages = claim_failure_messages(&daemon);
+    assert_eq!(messages.len(), 1, "first lookup failure: {messages:?}");
+    assert!(
+        messages[0].to_lowercase().contains("record") && messages[0].contains("502"),
+        "the first issue's claim-failure notification names its failed record outcome: {messages:?}"
+    );
+    assert!(stub.marker_comments(repo, 7).is_empty());
+    let records = stub.marker_comments(repo, 8);
+    assert_eq!(
+        records.len(),
+        1,
+        "a failed account lookup must not be replayed for issue 8: it needs a claimant record; notifications={:?}; gh calls={:?}",
+        scheduler_messages(&daemon),
+        stub.calls()
+    );
+    assert_eq!(records[0]["user"]["id"], 54321);
+    assert!(
+        records[0]["body"]
+            .as_str()
+            .unwrap()
+            .contains("dispatch-task")
+    );
+    assert_eq!(comment_writes(&stub, "POST"), 1);
+    assert!(claim_failure_messages_for(&daemon, 8).is_empty());
+    assert_eq!(
+        stub.calls()
+            .iter()
+            .filter(|call| call.as_slice() == ["api", "user"])
+            .count(),
+        2,
+        "the second issue retries the failed authenticated-account lookup"
+    );
+    stub.assert_no_unhandled_calls();
 }
 
 /// Scenario: Fire issue dispatch against an orchestration whose start role names a missing executable.
@@ -1756,9 +1867,9 @@ fn dispatch_030_spawn_failure_writes_no_claim() {
     stub.assert_no_unhandled_calls();
 }
 
-/// Scenario: Dispatch two issues while the first issue's GitHub label write hangs and the daemon has a 1500 ms claim-call timeout.
-/// Both agents must spawn, with the second dispatched within 20 seconds of the hanging call, and the healthy issue gets its GitHub claim.
-/// Exactly one claim-failure notice names the first issue's timed-out label step, separately from successful dispatch.
+/// Scenario: Dispatch two issues with a hanging first label write and a 1500 ms call timeout, then three issues with every claim call hanging, a 5000 ms call timeout and a 3000 ms shared claim budget.
+/// The healthy sibling in the first run gets its prompt and claim, while the second run finishes dispatching three agents within 15 seconds.
+/// Each failed claim raises one notification naming both outcomes, and later issues in the second run say their claims were skipped for the run's time budget.
 #[spec("scheduler/dispatch/031")]
 #[test]
 fn dispatch_031_hanging_claim_does_not_hold_queue() {
@@ -1848,6 +1959,89 @@ fn dispatch_031_hanging_claim_does_not_hold_queue() {
     assert!(
         !daemon.stderr_contains("issue #7 of acme/widgets failed:"),
         "claim timeout must not become a dispatch failure"
+    );
+    stub.assert_no_unhandled_calls();
+    drop(daemon);
+
+    let stub = GhStub::new();
+    stub.add_repo(repo, true);
+    stub.set_issues(repo, &[7, 8, 9]);
+    stub.hang_claim_calls();
+    let work = common::harness_tempdir().expect("budget workspace");
+    let task = dispatch_task(
+        "dispatch-task",
+        &work.path().to_string_lossy(),
+        "CLAIMBUDGET-{{issue_number}}",
+        repo,
+        5,
+    );
+    let path = stub.path_env();
+    let ghdir = stub.ghstub_dir();
+    let daemon = common::spawn_daemon_serve_with_env(
+        Some(&task),
+        "0",
+        &[
+            ("PATH", &path),
+            ("GHSTUB_DIR", &ghdir),
+            ("DOT_AGENT_DECK_ISSUE_CLAIM_TIMEOUT_MS", "5000"),
+            ("DOT_AGENT_DECK_ISSUE_CLAIM_BUDGET_MS", "3000"),
+        ],
+    );
+    let started = std::time::Instant::now();
+    daemon.run_now("dispatch-task").expect("fire budget run");
+    // Fixed responsiveness bound: the old call-by-call waits need at least
+    // 25 s for this run, while a shared 3 s budget leaves room for git/spawn.
+    let ceiling = Duration::from_secs(15);
+    assert!(
+        daemon.wait_for_stderr_contains("dispatched issue #9", ceiling),
+        "three hanging claims must share the run's 3000 ms budget and finish dispatch within 15 s; elapsed={:?}; notifications={:?}; gh calls={:?}",
+        started.elapsed(),
+        scheduler_messages(&daemon),
+        stub.calls()
+    );
+    assert!(started.elapsed() < ceiling);
+    assert_eq!(count_orchestrators(&daemon), 3);
+    for issue in [7, 8, 9] {
+        let paths = derive_issue_paths(work.path(), "dispatch-task", issue);
+        let agent = daemon
+            .wait_for_agent_where(|r| orchestrator_in(r, &paths.worktree_dir), w())
+            .expect("exhausting the claim budget must not skip dispatch");
+        assert!(view::wait_for(
+            &daemon.attach_socket,
+            agent.pane_id_env.as_deref().unwrap(),
+            &format!("CLAIMBUDGET-{issue}"),
+            w(),
+        ));
+        let messages = claim_failure_messages_for(&daemon, issue);
+        assert_eq!(
+            messages.len(),
+            1,
+            "each issue gets exactly one claim-failure notice: issue={issue}; notifications={:?}",
+            scheduler_messages(&daemon)
+        );
+        let message = messages[0].to_lowercase();
+        assert!(message.contains("label") && message.contains("record"));
+        if issue != 7 {
+            assert!(
+                message.contains("budget"),
+                "later issues report a claim skipped for the shared time budget: {messages:?}"
+            );
+        }
+        assert!(!daemon.stderr_contains(&format!("issue #{issue} of {repo} failed:")));
+    }
+    let claim_calls: Vec<_> = stub
+        .calls()
+        .into_iter()
+        .filter(|call| {
+            is_claim_write(call)
+                || call.starts_with(&["api".into(), "--paginate".into()])
+                || call.as_slice() == ["api", "user"]
+        })
+        .collect();
+    assert_eq!(
+        claim_calls.len(),
+        1,
+        "after the first hanging call exhausts the budget, no further claim-path call is made: {claim_calls:?}"
     );
     stub.assert_no_unhandled_calls();
 }
