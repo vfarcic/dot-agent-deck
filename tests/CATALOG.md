@@ -6328,6 +6328,22 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** the delivery path itself, or the snapshot write (`pane/drift/001`); a config that makes the inserted role itself the `start` role — the tab keeps the start role it opened with.
 - **Platform coverage:** mac+linux (unix-only).
 
+#### pane/real-agent
+
+##### pane/real-agent/001 — `pane restart` of a Claude worker the user quit brings back a working Claude in the same pane (issue #1094). [reel]
+- **Layer:** L2 PTY-attached real agent, lane 2 (`tests/e2e_pane_verbs_real_agent.rs`); real `pane restart` and `delegate` CLIs run with the orchestrator's pane id.
+- **Agent:** Claude Code, interactive Haiku (`--allowedTools Bash Read Write`), `clear = false`; the orchestrator is `cat`.
+- **Asserts:** with coder focused, two Ctrl+C quit the first Claude generation; `pane restart coder` without `--force` is accepted once the daemon has seen it exit; a new generation is listed on the same pane, recognized as Claude Code, and shows its composer in its own scrollback; a delegated task makes it write the uniquely named sentinel with exact contents, the attached TUI paints Thinking, Working and then Idle after the delegate, and the one inbox message carrying the task is bound to the new generation.
+- **Does not assert:** `--force` against a live Claude, the refusal paths (`pane/restart/002`-`008`), or a late hook from the replaced generation (`pane/restart/014`).
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/real-agent/002 — `pane spawn` of a Claude role added mid-session puts a working Claude in the already-open tab (issue #1094). [reel]
+- **Layer:** L2 PTY-attached real agent, lane 2 (`tests/e2e_pane_verbs_real_agent.rs`); real `pane spawn` and `delegate` CLIs run with the orchestrator's pane id.
+- **Agent:** Claude Code, interactive Haiku (`--allowedTools Bash Read Write`), `clear = false`, as the spawned `reviewer`; the orchestrator and coder are `cat`.
+- **Asserts:** after `reviewer` is appended to the running orchestration's config, `pane spawn reviewer` succeeds; reviewer is listed and recognized as Claude Code, its card joins the open tab, and focusing it draws Claude's composer in the attached TUI; a delegated task makes it write the uniquely named sentinel with exact contents, the TUI paints Thinking, Working and then Idle after the delegate, and the one inbox message carrying the task is bound to reviewer's generation.
+- **Does not assert:** that no duplicate tab is created or where an inserted role lands (`pane/spawn/005`, `/014`-`/016`), or the session snapshot (`pane/drift/001`).
+- **Platform coverage:** mac+linux (unix-only).
+
 #### pi/live
 
 ##### pi/live/001 — A REAL `pi` agent runs LIVE in a PTY-attached pane and its card renders the experimental-gated Pi identity plus a real, extension-driven status TRANSITION on the vt100 grid, with NO hook (PRD #201, CLAUDE.md rule 4 + PRD #180 reel-eligibility).
