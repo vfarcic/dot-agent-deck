@@ -2544,6 +2544,8 @@ impl GroupKill {
         let Some(pid) = self.0 else {
             return;
         };
+        #[cfg(all(test, unix))]
+        group_kill_probe::record(pid);
         #[cfg(unix)]
         // SAFETY: kill(2) with a negative pid signals the process group
         // `process_group(0)` created, whose id is the child's pid. SIGKILL has
@@ -2566,6 +2568,49 @@ impl GroupKill {
 impl Drop for GroupKill {
     fn drop(&mut self) {
         self.kill();
+    }
+}
+
+/// Test-only record, per thread, of whether each [`GroupKill::kill`] found the
+/// leader still unreaped. A killed descendant cannot show that: a group
+/// outlives its reaped leader while any member is left, so a signal sent after
+/// the reap still reaches the descendant.
+#[cfg(all(test, unix))]
+mod group_kill_probe {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static SIGNALS: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn record(pid: u32) {
+        let unreaped = loop {
+            // SAFETY: an all-zero `siginfo_t` is a valid out-parameter, and
+            // `WNOWAIT` leaves the child waitable, so this reaps nothing. It
+            // returns 0 for a child that is running or a zombie, and fails
+            // with ECHILD once the child has been reaped.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let rc = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    libc::id_t::from(pid),
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if rc == 0 {
+                break true;
+            }
+            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                break false;
+            }
+        };
+        SIGNALS.with(|signals| signals.borrow_mut().push(unreaped));
+    }
+
+    /// The signals recorded on this thread since the last call.
+    pub(super) fn take() -> Vec<bool> {
+        SIGNALS.with(|signals| std::mem::take(&mut *signals.borrow_mut()))
     }
 }
 
@@ -2896,10 +2941,8 @@ mod tests {
     /// Scenario: PRD #421 review round 2 — the command's leader exits at once,
     /// leaving a backgrounded descendant that holds the pipes open and would
     /// touch a marker a second later; the bound expires first. The descendant
-    /// is killed. The group signal takes its target from the unreaped leader's
-    /// id (`Child::id`, which is `None` once the leader is reaped), so a dead
-    /// descendant also shows the leader was still unreaped when the group was
-    /// signalled — the id was this command's, not a stale one.
+    /// is killed, and the group is signalled while the leader is still
+    /// unreaped — the id was this command's, not a stale one.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_timed_out_subprocess_whose_leader_exited_first_takes_its_descendant_with_it() {
@@ -2916,6 +2959,7 @@ mod tests {
         .await
         .expect_err("the descendant holds the pipes past the bound");
         assert!(is_subprocess_timeout(&err), "{err}");
+        assert_eq!(group_kill_probe::take(), [true]);
         assert!(
             started.elapsed() < Duration::from_millis(900),
             "the bound must end the wait, took {:?}",
@@ -2952,10 +2996,60 @@ mod tests {
         .await
         .expect_err("5000 bytes must not pass a 1000-byte cap");
         assert!(is_subprocess_overflow(&err), "{err}");
+        assert_eq!(group_kill_probe::take(), [true]);
         tokio::time::sleep(Duration::from_millis(2000)).await;
         assert!(
             !marker.exists(),
             "the overflowing descendant of an exited leader was left running"
+        );
+    }
+
+    /// Scenario: PRD #421 review round 3 — the leader exits at once, leaving a
+    /// backgrounded descendant that holds the pipes open, touches a readiness
+    /// file and would touch a marker a second later. The caller drops the
+    /// unbounded call long before its bound, and the descendant is killed with
+    /// it rather than left running behind a run nobody is waiting on. The group
+    /// is signalled while the leader is still unreaped, so its id cannot have
+    /// been reissued to anybody else.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dropped_call_whose_leader_exited_first_takes_its_descendant_with_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ready = dir.path().join("descendant-ready");
+        let marker = dir.path().join("descendant-survived");
+        let script = format!(
+            "(sleep 0.2; touch '{}'; sleep 1; touch '{}') & exit 0",
+            ready.display(),
+            marker.display()
+        );
+        let args = ["-c", script.as_str()];
+        let mut call = Box::pin(output_within(
+            tokio::process::Command::new("sh"),
+            "sh",
+            &args,
+            Duration::from_secs(60),
+        ));
+        let started = std::time::Instant::now();
+        while !ready.exists() {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the descendant never signalled readiness"
+            );
+            if let Ok(result) = tokio::time::timeout(Duration::from_millis(20), &mut call).await {
+                panic!("the call ended while the descendant held its pipes: {result:?}");
+            }
+        }
+        group_kill_probe::take();
+        drop(call);
+        assert_eq!(
+            group_kill_probe::take(),
+            [true],
+            "dropping the call must signal the group once, before the leader is reaped"
+        );
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        assert!(
+            !marker.exists(),
+            "the descendant of an exited leader outlived the dropped call"
         );
     }
 
