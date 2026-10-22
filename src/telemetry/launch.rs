@@ -19,11 +19,12 @@
 //!   run's resource attributes, and prompt and tool logging off — to a file
 //!   only its owner can read, in a directory only its owner can enter, under
 //!   the daemon's state directory; passes it with `--config`; and removes it
-//!   when the run ends. The deck adds no credentials to it, but it is a copy
-//!   of the user's configuration and holds whatever that holds. A user's own
-//!   `otel` block is kept as it is, gaining only the resource attributes it
-//!   lacks; one that switches export off, or a command that already passes
-//!   `--config`, gets nothing.
+//!   when the run ends. The deck does not copy the user's OTLP header
+//!   variables into it, but it is a copy of the user's configuration and holds
+//!   whatever that holds. A user's own `otel` block is kept as it is, gaining
+//!   only the resource attributes it lacks; one that switches export off, a
+//!   command that already passes `--config`, or an endpoint that carries
+//!   credentials (as for Codex), gets nothing.
 //! - **Pi** exports through the deck's own Pi extension, which stays inert
 //!   unless the deck sets [`PI_TELEMETRY_ENV`] — which it does not when the
 //!   user set that variable themselves, so `0` keeps Pi's export off.
@@ -309,8 +310,9 @@ fn codex_home(env: &EnvMap) -> Option<PathBuf> {
     }
 }
 
-/// Whether an endpoint URL may carry a credential the command line would
-/// show: a `user:password@` before its host, or a query string.
+/// Whether an endpoint URL may carry a credential that a command line or a
+/// file the deck writes would show: a `user:password@` before its host, or a
+/// query string.
 fn may_carry_credentials(endpoint: &str) -> bool {
     let after_scheme = endpoint
         .split_once("://")
@@ -461,7 +463,11 @@ fn devin_config(
                     }
                 }
             }
-            if otel.is_empty() {
+            if otel.is_empty()
+                || otel
+                    .values()
+                    .any(|endpoint| endpoint.as_str().is_some_and(may_carry_credentials))
+            {
                 return None;
             }
             otel.insert("resource_attributes".into(), Value::Object(attributes));
@@ -583,22 +589,151 @@ pub fn remove_config_file(path: &Path) {
     }
 }
 
+/// Whether `name` is one [`devin_launch`] gives a per-run configuration file:
+/// [`DEVIN_CONFIG_PREFIX`], a run id as [`super::span::new_run_id`] makes them
+/// (32 lowercase hex digits), and `.json`.
+fn is_config_file_name(name: &[u8]) -> bool {
+    name.strip_prefix(DEVIN_CONFIG_PREFIX.as_bytes())
+        .and_then(|rest| rest.strip_suffix(b".json"))
+        .is_some_and(|id| {
+            id.len() == 32 && id.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        })
+}
+
 /// Remove every per-run configuration file in `dir`, the deck's own
 /// directory for them: called before any run exists, so each one there was
-/// left by a daemon that ended without removing it. Anything else in `dir` is
+/// left by a daemon that ended without removing it. Only regular files named
+/// as the deck names them ([`is_config_file_name`]) are removed, and only when
+/// `dir` is a directory of the current user's, not a symlink; anything else is
 /// left alone, and a missing `dir` has nothing to remove.
+///
+/// On Unix the directory is opened once, without following a symlink, and
+/// read and unlinked from through that descriptor, so a name swapped in after
+/// the check cannot redirect it.
+#[cfg(unix)]
 pub fn remove_leftover_config_files(dir: &Path) {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let handle = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(dir)
+    {
+        Ok(handle) => handle,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            tracing::warn!(
+                "telemetry: leftover agent configurations not swept: their directory could not be opened as a directory of its own ({e})"
+            );
+            return;
+        }
+    };
+    match handle.metadata() {
+        Ok(meta) if meta.is_dir() && meta.uid() == crate::platform::paths::current_uid() => {}
+        _ => {
+            tracing::warn!(
+                "telemetry: leftover agent configurations not swept: their directory is not the current user's"
+            );
+            return;
+        }
+    }
+    for name in dir_entry_names(&handle) {
+        if is_config_file_name(name.to_bytes()) && is_regular_file_at(&handle, &name) {
+            unlink_at(&handle, &name);
+        }
+    }
+}
+
+/// [`remove_leftover_config_files`] where there is no descriptor-relative
+/// unlink: the root is checked to be a real directory and then read through
+/// its path, which a directory swapped in between the check and the read
+/// would redirect.
+#[cfg(not(unix))]
+pub fn remove_leftover_config_files(dir: &Path) {
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) if meta.is_dir() => {}
+        _ => return,
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with(DEVIN_CONFIG_PREFIX)
-            && name.ends_with(".json")
+        if is_config_file_name(entry.file_name().as_encoded_bytes())
             && entry.file_type().is_ok_and(|t| t.is_file())
         {
             remove_config_file(&entry.path());
+        }
+    }
+}
+
+/// The names of the entries of the directory open at `dir`, `.` and `..`
+/// left out. Empty when it cannot be read.
+#[cfg(unix)]
+fn dir_entry_names(dir: &std::fs::File) -> Vec<std::ffi::CString> {
+    use std::os::fd::AsRawFd;
+    // `fdopendir` takes ownership of the descriptor it is given, so it gets
+    // its own copy.
+    // SAFETY: `dup` of a descriptor `dir` owns; the result is checked.
+    let fd = unsafe { libc::dup(dir.as_raw_fd()) };
+    if fd < 0 {
+        return Vec::new();
+    }
+    // SAFETY: `fd` is a fresh descriptor of a directory, owned by nothing else.
+    let stream = unsafe { libc::fdopendir(fd) };
+    if stream.is_null() {
+        // SAFETY: `fdopendir` failed, so `fd` is still ours to close.
+        unsafe { libc::close(fd) };
+        return Vec::new();
+    }
+    let mut names = Vec::new();
+    loop {
+        // SAFETY: `stream` is an open directory stream, read by this thread
+        // only.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break;
+        }
+        // SAFETY: `readdir` returned an entry whose `d_name` is a
+        // NUL-terminated name, valid until the next `readdir`.
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            names.push(name.to_owned());
+        }
+    }
+    // SAFETY: closes the stream and the descriptor `fdopendir` took.
+    unsafe { libc::closedir(stream) };
+    names
+}
+
+/// Whether the entry `name` of the directory open at `dir` is a regular file,
+/// a symlink not followed.
+#[cfg(unix)]
+fn is_regular_file_at(dir: &std::fs::File, name: &std::ffi::CStr) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `name` is NUL-terminated and `st` is written by a successful
+    // call, read only then.
+    let rc = unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            st.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    // SAFETY: `fstatat` returned 0, so it filled `st`.
+    rc == 0 && unsafe { st.assume_init() }.st_mode & libc::S_IFMT == libc::S_IFREG
+}
+
+/// Unlink the entry `name` of the directory open at `dir`. `unlinkat` removes
+/// a name, never what a symlink points at.
+#[cfg(unix)]
+fn unlink_at(dir: &std::fs::File, name: &std::ffi::CStr) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: `name` is NUL-terminated; a failure is read from `errno`.
+    if unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!("telemetry: a per-run agent configuration could not be removed ({e})");
         }
     }
 }
@@ -1395,6 +1530,106 @@ mod tests {
                 .unwrap(),
             format!("env devin {}", launch.args.join(" "))
         );
+    }
+
+    /// The leftover sweep reads only a directory of the user's own, not one a
+    /// symlink leads to, and removes only names the deck gives its files.
+    #[test]
+    fn the_leftover_sweep_stays_in_its_own_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let ours = format!("devin-{}.json", super::super::span::new_run_id());
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join(&ours), "{}").unwrap();
+        let linked = root.path().join("linked");
+        std::os::unix::fs::symlink(&elsewhere, &linked).unwrap();
+        remove_leftover_config_files(&linked);
+        assert!(
+            elsewhere.join(&ours).exists(),
+            "a file behind a symlinked directory survives"
+        );
+
+        let real = root.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join(&ours), "{}").unwrap();
+        std::fs::write(real.join("devin-not-owned.json"), "{}").unwrap();
+        let target = real.join("target.json");
+        std::fs::write(&target, "{}").unwrap();
+        let link = format!("devin-{}.json", super::super::span::new_run_id());
+        std::os::unix::fs::symlink(&target, real.join(&link)).unwrap();
+        remove_leftover_config_files(&real);
+        assert!(
+            !real.join(&ours).exists(),
+            "the deck's own leftover is removed"
+        );
+        assert!(real.join("devin-not-owned.json").exists());
+        assert!(target.exists(), "a symlink's target is never removed");
+        assert!(
+            std::fs::symlink_metadata(real.join(&link)).is_ok(),
+            "only regular files are removed"
+        );
+
+        remove_leftover_config_files(&root.path().join("absent"));
+        let file = root.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        remove_leftover_config_files(&file);
+        assert!(file.exists());
+    }
+
+    #[test]
+    fn config_file_names_are_the_ones_the_deck_gives() {
+        assert!(is_config_file_name(
+            format!("devin-{}.json", super::super::span::new_run_id()).as_bytes()
+        ));
+        for name in [
+            "devin-.json",
+            "devin-run-1.json",
+            "devin-0123456789abcdef0123456789abcdeg.json",
+            "devin-0123456789ABCDEF0123456789abcdef.json",
+            "devin-0123456789abcdef0123456789abcdef0.json",
+            "devin-0123456789abcdef0123456789abcdef.json.bak",
+            "xdevin-0123456789abcdef0123456789abcdef.json",
+        ] {
+            assert!(!is_config_file_name(name.as_bytes()), "{name}");
+        }
+    }
+
+    /// An endpoint that may carry a credential is not written into Devin's
+    /// file either.
+    #[test]
+    fn devin_gets_nothing_for_an_endpoint_with_credentials() {
+        let home = tempfile::tempdir().unwrap();
+        let state = home.path().join("state");
+        let h = home.path().to_str().unwrap();
+        let res = resource();
+        let launch = |pairs: &[(&str, &str)]| {
+            let mut all = vec![("HOME", h)];
+            all.extend_from_slice(pairs);
+            let env = env(&all);
+            prepare(&inputs(&AgentType::Devin, "devin", &env, &res, &state))
+        };
+        for pairs in [
+            &[(
+                "OTEL_EXPORTER_OTLP_ENDPOINT",
+                "https://user:synthetic-password-1741@collector.example",
+            )][..],
+            &[(
+                "OTEL_EXPORTER_OTLP_ENDPOINT",
+                "https://collector.example/?api_key=synthetic-token-1741",
+            )][..],
+            &[
+                ("OTEL_EXPORTER_OTLP_ENDPOINT", "https://collector.example"),
+                (
+                    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+                    "https://synthetic-token-1741@l.example/v1/logs",
+                ),
+            ][..],
+        ] {
+            assert_eq!(launch(pairs), Launch::default(), "{pairs:?}");
+        }
+        assert!(!state.exists(), "nothing was written");
+        let plain = launch(&[("OTEL_EXPORTER_OTLP_ENDPOINT", "https://collector.example")]);
+        assert!(plain.config_file.is_some(), "the control gets its file");
     }
 
     #[test]

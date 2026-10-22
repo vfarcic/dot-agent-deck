@@ -12,14 +12,16 @@
 //! whose arguments are usually data — text, patterns, files, hosts, request
 //! bodies and credentials ([`WORDLESS_PROGRAMS`]) — is never kept, and a
 //! wrapper whose options cannot be told apart from the command it runs gives
-//! neither a program nor a word. The text itself is not stored, logged or
-//! returned.
+//! neither a program nor a word, nor does a program that is not kept. The text
+//! itself is not stored, logged or returned.
 //!
-//! Only the first line counts, as the deck's cards show it. It is split on
+//! Only the first line counts, as the deck's cards show it, and only up to a
+//! shell comment: an unquoted `#` starting a word ends it. It is split on
 //! `&&`, `||`, `;` and `|` outside quotes into words, and those words keep the
 //! boundaries the shell gives them: a quoted argument stays one word wherever
 //! it is unwrapped from (`rwx sandbox exec … --`), and a shell's `-c` script is
-//! read as a script, its later arguments not. The first segment that runs
+//! read as a script, its later arguments not. A shell reading its script from
+//! standard input (`bash -s …`) gives its name only. The first segment that runs
 //! something other than a shell builtin that only sets up the next one
 //! ([`SETUP_PROGRAMS`]) is the one classified — after its leading `VAR=value`
 //! assignments and an `env`, `sudo`, `command`, `time` or `nice` in front,
@@ -324,9 +326,10 @@ fn classify_words(segment: &[String], depth: usize) -> Option<Operation> {
     if SHELLS.contains(&program) {
         return Some(match shell_operand(rest) {
             None => Operation::bare(Runner::Local),
-            Some((false, at)) => named(program, &rest[at..]),
-            Some((true, _)) if depth >= MAX_NESTING => named(program, &[]),
-            Some((true, at)) => match rest.get(at) {
+            Some(ShellInput::File(at)) => named(program, &rest[at..]),
+            Some(ShellInput::Stdin) => named(program, &[]),
+            Some(ShellInput::Command(_)) if depth >= MAX_NESTING => named(program, &[]),
+            Some(ShellInput::Command(at)) => match rest.get(at) {
                 Some(script) => classify_line(script, depth + 1),
                 None => Operation::bare(Runner::Local),
             },
@@ -357,19 +360,21 @@ fn classify_words(segment: &[String], depth: usize) -> Option<Operation> {
     Some(named(program, rest))
 }
 
-/// A local operation running `program` with `args`, its words filtered.
+/// A local operation running `program` with `args`, its words filtered. No
+/// word is kept for a program that is not kept: what it is cannot be told.
 fn named(program: &str, args: &[String]) -> Operation {
-    let word = if WORDLESS_PROGRAMS.contains(&program) {
-        None
-    } else {
-        args.iter()
+    let program = Some(program.to_string()).filter(|p| is_command_word(p));
+    let word = match &program {
+        Some(program) if !WORDLESS_PROGRAMS.contains(&program.as_str()) => args
+            .iter()
             .find(|a| !a.starts_with('-') && !a.starts_with('+'))
             .filter(|w| is_command_word(w))
-            .cloned()
+            .cloned(),
+        _ => None,
     };
     Operation {
         runner: Runner::Local,
-        program: Some(program.to_string()).filter(|p| is_command_word(p)),
+        program,
         word,
     }
 }
@@ -463,11 +468,23 @@ pub(super) fn options_len(words: &[String], options: &Options) -> Option<usize> 
     (i <= words.len()).then_some(i)
 }
 
-/// A shell's words after its name, read as its options: whether `-c` makes
-/// its first operand a script, and where that operand is. `None` when an
-/// option is not one a shell has, or its value is missing.
-fn shell_operand(args: &[String]) -> Option<(bool, usize)> {
+/// Where a shell reads the commands it runs.
+enum ShellInput {
+    /// `-c`: from its operand at this index, a script.
+    Command(usize),
+    /// From the file its operand at this index names.
+    File(usize),
+    /// From its standard input — `-s`, or no operand — its operands being the
+    /// script's arguments.
+    Stdin,
+}
+
+/// A shell's words after its name, read as its options: where it reads the
+/// commands it runs. `None` when an option is not one a shell has, or its
+/// value is missing.
+fn shell_operand(args: &[String]) -> Option<ShellInput> {
     let mut command = false;
+    let mut stdin = false;
     let mut i = 0;
     while let Some(word) = args.get(i) {
         if word == "--" || word == "-" {
@@ -493,6 +510,7 @@ fn shell_operand(args: &[String]) -> Option<(bool, usize)> {
         for c in cluster.chars() {
             match c {
                 'c' if minus => command = true,
+                's' => stdin = true,
                 'o' | 'O' => values += 1,
                 c if SHELL_FLAGS.contains(c) => {}
                 _ => return None,
@@ -500,16 +518,31 @@ fn shell_operand(args: &[String]) -> Option<(bool, usize)> {
         }
         i += 1 + values;
     }
-    (i <= args.len()).then_some((command, i))
+    if i > args.len() {
+        return None;
+    }
+    Some(if command {
+        ShellInput::Command(i)
+    } else if stdin || i == args.len() {
+        ShellInput::Stdin
+    } else {
+        ShellInput::File(i)
+    })
 }
 
 /// `line` split into segments on `&&`, `||`, `;` and `|` outside quotes, each
-/// a list of words with the shell's quotes and backslashes removed.
+/// a list of words with the shell's quotes and backslashes removed. A comment
+/// ends the line: an unquoted `#` that starts a word, or follows one of the
+/// shell's operator characters (`&`, `<`, `>`, `(`, `)`), and everything after
+/// it is dropped before any separator in it is read.
 fn segments(line: &str) -> Vec<Vec<String>> {
     let mut out = Vec::new();
     let mut words = Vec::new();
     let mut word = String::new();
     let mut in_word = false;
+    // Whether the last character read was an unquoted operator character
+    // kept in the word.
+    let mut after_operator = false;
     let mut chars = line.chars().peekable();
     let end_word = |word: &mut String, in_word: &mut bool, words: &mut Vec<String>| {
         if *in_word {
@@ -518,7 +551,9 @@ fn segments(line: &str) -> Vec<Vec<String>> {
         }
     };
     while let Some(c) = chars.next() {
+        let operator_before = std::mem::take(&mut after_operator);
         match c {
+            '#' if !in_word || operator_before => break,
             '\'' => {
                 in_word = true;
                 for q in chars.by_ref() {
@@ -554,6 +589,7 @@ fn segments(line: &str) -> Vec<Vec<String>> {
                     // A lone `&` (a redirection's or a background job's)
                     // is kept in the segment.
                     in_word = true;
+                    after_operator = true;
                     word.push(c);
                     continue;
                 }
@@ -566,6 +602,7 @@ fn segments(line: &str) -> Vec<Vec<String>> {
             c if c.is_whitespace() => end_word(&mut word, &mut in_word, &mut words),
             other => {
                 in_word = true;
+                after_operator = matches!(other, '<' | '>' | '(' | ')');
                 word.push(other);
             }
         }
@@ -923,11 +960,78 @@ mod tests {
     fn quoted_operators_do_not_split() {
         assert_eq!(
             classify(Some("cd x; 'my tool' run")),
-            op(Runner::Local, None, Some("run"))
+            op(Runner::Local, None, None),
+            "no word for a program that is not kept"
         );
         assert_eq!(
             classify(Some(r#"git log --format="%H;%s" | head"#)),
             local("git", Some("log"))
+        );
+    }
+
+    /// A shell comment is not a command: nothing in it is a program or a
+    /// word, and its separators split nothing.
+    #[test]
+    fn comments_are_not_commands() {
+        let bare = op(Runner::Local, None, None);
+        for (command, expected) in [
+            ("# hunter2", bare.clone()),
+            ("   # hunter2 run", bare.clone()),
+            ("cd /repo # note; hunter2", bare.clone()),
+            ("cd /repo # note && hunter2 run", bare.clone()),
+            ("cd /repo # note | hunter2 run", bare.clone()),
+            ("cd /repo;# note; hunter2", bare.clone()),
+            ("cd /repo &# note; hunter2", bare.clone()),
+            ("cd /repo >#note; hunter2", bare.clone()),
+            ("cargo test # hunter2", local("cargo", Some("test"))),
+            ("cargo # hunter2", local("cargo", None)),
+            ("cd x && make # ci; hunter2", local("make", None)),
+            ("bash -c 'cd x # y; hunter2'", bare.clone()),
+            // Quoted or inside a word, `#` is not a comment.
+            ("cd x; make '#'; hunter2", local("make", None)),
+            ("cd x; make ci#1", local("make", None)),
+            (
+                r#"git log --format="%H #%s" | head"#,
+                local("git", Some("log")),
+            ),
+            (r"cd x; make \#; hunter2", local("make", None)),
+            ("cd x; make issue#1; hunter2 run", local("make", None)),
+        ] {
+            assert_eq!(classify(Some(command)), expected, "{command}");
+        }
+        assert_eq!(
+            segments("cd x; make issue#1; hunter2 run"),
+            [
+                vec!["cd", "x"],
+                vec!["make", "issue#1"],
+                vec!["hunter2", "run"]
+            ]
+        );
+        assert_eq!(segments("make '#' # x; y"), [vec!["make", "#"]]);
+    }
+
+    /// A shell reading its script from standard input: its operands are the
+    /// script's arguments, not a script or a subcommand.
+    #[test]
+    fn a_shell_reading_stdin_gives_its_name_only() {
+        for (command, shell) in [
+            ("bash -s -- hunter2 < script.sh", "bash"),
+            ("sh -s hunter2", "sh"),
+            ("bash -es hunter2", "bash"),
+            ("zsh -s -- hunter2", "zsh"),
+            ("bash -s", "bash"),
+            ("bash", "bash"),
+            ("bash < script.sh", "bash"),
+        ] {
+            assert_eq!(classify(Some(command)), local(shell, None), "{command}");
+        }
+        assert_eq!(
+            classify(Some("bash ci.sh hunter2")),
+            local("bash", Some("ci.sh"))
+        );
+        assert_eq!(
+            classify(Some("bash -s -c 'make ci'")),
+            local("make", Some("ci"))
         );
     }
 

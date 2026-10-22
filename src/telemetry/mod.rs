@@ -453,8 +453,20 @@ mod tests {
     async fn starting_for_the_daemon_removes_leftover_devin_configs() {
         for env in [config::EnvMap::new(), exporting_env()] {
             let dir = tempfile::tempdir().unwrap();
-            let leftovers = ["devin-run-1.json", "devin-run-2.json"].map(|n| dir.path().join(n));
-            let kept = ["devin-notes.txt", "other.json", "devin.json"].map(|n| dir.path().join(n));
+            let leftovers = [
+                format!("devin-{}.json", "0123456789abcdef".repeat(2)),
+                format!("devin-{}.json", span::new_run_id()),
+            ]
+            .map(|n| dir.path().join(n));
+            let kept = [
+                "devin-notes.txt",
+                "other.json",
+                "devin.json",
+                "devin-run-1.json",
+                "devin-0123456789ABCDEF0123456789abcdef.json",
+                "devin-0123456789abcdef0123456789abcde.json",
+            ]
+            .map(|n| dir.path().join(n));
             for path in leftovers.iter().chain(&kept) {
                 std::fs::write(path, "{}").unwrap();
             }
