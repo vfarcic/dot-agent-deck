@@ -15580,8 +15580,8 @@ fn pane_stack_rects(
 }
 
 /// PRD #84 M4 (invariant 2) — derive each local pane's PTY size from its layout
-/// rect and commit only the deltas. Runs once per frame, after
-/// `compute_frame_layout` and before `terminal.draw`, so every layout-changing
+/// rect and commit only the deltas. Runs once per frame inside [`draw_frame`],
+/// after `compute_frame_layout` and before `render_frame`, so every layout-changing
 /// path (resize, tab open/close, mode switch, orchestration role
 /// transition) converges here instead of pushing its own
 /// `resize_pane_pty` from a private dimension calculation.
@@ -15973,40 +15973,49 @@ struct FrameSources<'a> {
 /// One frame of the run loop: reserve the footer rows, lay the frame out,
 /// size the panes from that layout, draw it, and record the open
 /// confirmation from the flushed buffer.
+///
+/// PRD #84 M4 (invariants 1, 2 & 4): ONE layout pass per frame, fed to both
+/// `resize_panes_to_layout` and `render_frame`, so PTY sizes and rendered
+/// rects are identical this frame. Every step reads the size from
+/// `frame.area()`, the buffer this draw renders into: `terminal.draw`
+/// autoresizes before calling the closure, and a layout taken from an earlier
+/// read of the size is stale when the terminal shrinks between the two —
+/// the bottom bar then wrote at its old row, outside the smaller buffer, and
+/// the TUI panicked (`resize/layout/004`).
 fn draw_frame<B: ratatui::backend::Backend>(
     terminal: &mut ratatui::Terminal<B>,
     ui: &mut UiState,
     sources: &FrameSources,
 ) -> Result<(), B::Error> {
-    let _ = terminal.autoresize();
-    let full_frame_area = terminal.get_frame().area();
     let protocol_refusal = sources.snapshot.protocol_refusal;
-    let (frame_area, footer_rows) = FooterRows::reserve(
-        full_frame_area,
-        sources.features.experimental,
-        sources.show_hook_notice,
-        protocol_refusal.is_some(),
-    );
     let embedded_panes = sources
         .pane
         .as_any()
         .downcast_ref::<EmbeddedPaneController>();
     let all_pane_ids = embedded_panes.map(|e| e.pane_ids()).unwrap_or_default();
     let focused_pane_id = embedded_panes.and_then(|e| e.focused_pane_id());
-    let bar_rows = bottom_bar_rows(ui, frame_area.width, frame_area.height);
-    let frame_layout = compute_frame_layout(
-        frame_area,
-        sources.tab_view,
-        sources.tab_bar,
-        &all_pane_ids,
-        ui.pane_layout,
-        focused_pane_id.as_deref(),
-        bar_rows,
-    );
-    if let Some(embedded) = embedded_panes {
-        resize_panes_to_layout(&frame_layout, embedded);
-    }
     let completed = terminal.draw(|frame| {
+        let (frame_area, footer_rows) = FooterRows::reserve(
+            frame.area(),
+            sources.features.experimental,
+            sources.show_hook_notice,
+            protocol_refusal.is_some(),
+        );
+        // PRD #144: the bottom bar wraps to more rows when its buttons do not
+        // fit one, so its actual height is reserved before the layout pass.
+        let bar_rows = bottom_bar_rows(ui, frame_area.width, frame_area.height);
+        let frame_layout = compute_frame_layout(
+            frame_area,
+            sources.tab_view,
+            sources.tab_bar,
+            &all_pane_ids,
+            ui.pane_layout,
+            focused_pane_id.as_deref(),
+            bar_rows,
+        );
+        if let Some(embedded) = embedded_panes {
+            resize_panes_to_layout(&frame_layout, embedded);
+        }
         render_frame(
             frame,
             sources.snapshot,
@@ -16051,10 +16060,10 @@ fn render_frame(
 ) {
     // PRD #84 + #139: `render_frame` reads the precomputed `FrameLayout` (one
     // layout pass per frame). The PRD #139 experimental-footer row is reserved
-    // in the main loop BEFORE `compute_frame_layout` (so the whole layout, and
+    // in [`draw_frame`] BEFORE `compute_frame_layout` (so the whole layout, and
     // the PTY sizing it drives, sits above the footer) and the footer itself is
-    // drawn there in the same `terminal.draw` — see the gating block around the
-    // `compute_frame_layout` call. So there is nothing footer-related to do here.
+    // drawn there in the same `terminal.draw`. So there is nothing
+    // footer-related to do here.
     // PRD #80 M4: rebuilt below only for the dashboard card grid; clearing here
     // means non-dashboard views (and the zero-card dashboard) leave no stale
     // card rects for the mouse hit-test.
