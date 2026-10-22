@@ -287,14 +287,15 @@ filter = 'binary(e2e_inbox_opencode_live)'
 slow-timeout = { period = "60s", terminate-after = 6 }
 
 # Issue #1094: the real-Claude `pane restart` / `pane spawn` tests boot up to
-# two interactive Claude generations and run one delegated turn, each phase with
-# its own bound of up to 120s. Passing runs took 17-33s, but the first run that
-# stalled in a phase was killed at the default 180s with no message and no grid.
-# Five minutes matches the harness daemon's default 300s lifetime, past which
-# the scenario has no daemon left to report on.
+# two interactive Claude generations and run one delegated turn in sequential
+# waits whose own bounds, the harness's fixed 30s ones included, sum to about
+# 730s for the restart test on a quiet box (585s for the spawn test). Passing
+# runs took 17-41s, but the first run that stalled in a wait was killed at the
+# default 180s with no message and no grid. 13 x 60s sits above that sum, and
+# the tests raise their daemon's lifetime to 900s so it outlives this window.
 [[profile.default.overrides]]
 filter = 'binary(e2e_pane_verbs_real_agent)'
-slow-timeout = { period = "60s", terminate-after = 5 }
+slow-timeout = { period = "60s", terminate-after = 13 }
 
 # PRD #220: `prompt/new-pane/016` drives a REAL interactive agent through a
 # dispatch turn, then waits for the daemon's `git worktree add` to land on disk.

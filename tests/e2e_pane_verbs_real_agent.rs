@@ -115,7 +115,7 @@ fn wait_for_claude_composer(deck: &TuiDeck, what: &str) {
     assert!(
         deck.wait_for_grid_string_within(
             CLAUDE_READY,
-            common::load_scaled(Duration::from_secs(120))
+            common::load_scaled(Duration::from_secs(90))
         ),
         "{what}: the attached TUI never drew an interactive Claude Code composer \
          ({CLAUDE_READY:?}). No Claude UI on the grid below means it never booted \
@@ -145,7 +145,7 @@ fn delegate_cli(deck: &TuiDeck, caller_pane: &str, to: &str, task: &str) {
 /// choice of directory to make.
 fn sentinel_task(sentinel: &Path) -> String {
     format!(
-        "Use the Bash tool to run exactly this command: printf '{SENTINEL_CONTENT}' > {path}. \
+        "Use the Bash tool to run exactly this command: printf '{SENTINEL_CONTENT}' > '{path}'. \
          Do not modify any other file. That is the entire task.",
         path = sentinel.display(),
     )
@@ -211,6 +211,11 @@ fn launch_deck() -> TuiDeck {
         .with_env("PATH", common::path_with_binary_dir())
         .with_imported_claude_credentials()
         .with_claude_trust_workdir()
+        // The waits' own bounds, the harness's fixed 30s ones included, sum
+        // to about 730s on a quiet box, past the harness daemon's default 300s
+        // lifetime; 900s keeps the daemon up until a stalled phase has
+        // reported (`.config/nextest.toml`).
+        .with_env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "900")
         .launch_with_fixture("minimal")
 }
 
