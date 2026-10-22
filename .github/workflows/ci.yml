@@ -318,18 +318,11 @@ jobs:
     needs: changes
     if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
     runs-on: ubuntu-latest
-    # NOT a measured runner wall clock — this job's own first run is the first
-    # measurement, so this is derived rather than observed. Measured on a warm
-    # 16-core dev box after #836's second phase took the suite from 20 tests to
-    # 54 across two engines, including the `vite build` the Playwright
-    # `webServer` runs first: 24.6s at 8 workers, 1m06s at `--workers=1`, which
-    # is the shape CI runs in. On top of that CI pays for `pnpm install`, the
-    # ~400 MiB browser download and the apt install for WebKit's runtime deps,
-    # and those three dominate. 20 minutes leaves room for all of it while still
-    # capping a wedged browser at a fraction of the 6-hour runner default.
-    # Re-tune downward once honest runs exist; do not raise it to paper over a
-    # hang.
-    timeout-minutes: 20
+    # On 2026-10-22 browser/apt downloads took 14–20 minutes, leaving no test
+    # budget under the former 20-minute job cap. Allow 25 minutes for install,
+    # 15 for the suite (observed 8–12), and 5 for setup/cache/report overhead.
+    # Separate step limits keep a hung suite bounded even after a fast install.
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: desktop
@@ -347,43 +340,38 @@ jobs:
           cache: pnpm
           cache-dependency-path: desktop/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
-      # The browser binaries are PINNED rather than cached, and the pin is the
-      # lockfile: `pnpm install --frozen-lockfile` resolves one exact
-      # `@playwright/test` version, and that version downloads one exact browser
-      # revision each, so nothing here floats. Measured on a dev box: 399 MiB
-      # downloaded (Chromium 187, its headless shell 114, WebKit 95, ffmpeg 2),
-      # unpacking to 927 MB, in ~50s.
-      #
-      # Deliberately NOT wrapped in `actions/cache`, for two reasons, and the
-      # second is the one a future "let's just cache this to speed CI up" PR
-      # has to argue against. Cost is the weaker one: the repository's cache
-      # budget is shared, and `Swatinem/rust-cache` in four other jobs is what
-      # actually keeps CI fast; adding a several-hundred-megabyte entry here to
-      # save part of a one-minute download risks evicting those.
-      #
-      # The security property is the stronger one. A GitHub Actions cache entry
-      # is writable by a workflow run on ANY branch, so a cached browser
-      # payload keyed by Playwright version would be a cross-branch poisoning
-      # target: a malicious or compromised branch could populate or overwrite
-      # that entry, and a later trusted run would restore those binaries and
-      # then EXECUTE them. Re-downloading from the pinned CDN on every run
-      # removes that write surface entirely. Note what it does NOT do: it does
-      # not make the download independently verified. The pin is a browser
-      # revision number resolved from the lockfile, not a hash of the archive
-      # bytes, so what arrives is trusted on TLS and CDN trust alone. Losing a
-      # cross-branch write path is the whole of what a cache would cost here,
-      # and a speed argument alone does not settle it.
-      #
-      # `--with-deps` is for WebKit, not for Chromium: WebKit needs a GTK4 and
-      # GStreamer runtime that the runner image does not carry in full. It runs
-      # apt, so it is the slowest step here.
+      # Frozen installation above resolves the lockfile's exact Playwright
+      # version, which selects its browser revisions. Do not fall back to a
+      # cache for a different version. This adds about 927 MB per version to
+      # the shared cache budget; saving from main only follows #1743's policy.
+      - name: Read locked Playwright version
+        id: playwright-version
+        run: node -p '"version=" + require("@playwright/test/package.json").version' >> "$GITHUB_OUTPUT"
+      - name: Restore Playwright browsers
+        id: playwright-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ runner.arch }}-${{ steps.playwright-version.outputs.version }}-chromium-webkit
+      # Run even on a cache hit: browser files are cached, WebKit's GTK4 and
+      # GStreamer system dependencies are not. Playwright skips present files.
       - run: pnpm exec playwright install --with-deps chromium webkit
+        timeout-minutes: 25
+      # Branches restore main's cache without saving their own payloads. The
+      # main-only save also avoids per-PR copies evicting the Rust caches.
+      - name: Save Playwright browsers from main
+        if: github.ref == 'refs/heads/main' && steps.playwright-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ steps.playwright-cache.outputs.cache-primary-key }}
       # Playwright transpiles specs without type-checking them, so a type error
       # under `desktop/e2e` would run happily and could pass. This is the gate
       # that makes it an error, and it is fast enough to run before the browsers
       # are launched.
       - run: pnpm test:browser:types
       - run: pnpm test:browser
+        timeout-minutes: 15
       # `retries` is 0 in `playwright.config.ts` — a retry turns a flake into a
       # green tick and deletes the evidence — so the trace and the HTML report
       # are the whole record of a failure. Both are written only on failure
@@ -433,13 +421,11 @@ jobs:
     needs: changes
     if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
     runs-on: ubuntu-latest
-    # Measured once, on run 36231844544 (a workflow_dispatch of this job's own
-    # branch, cold rust-cache): 6m55s end to end — the app's `tauri build`
-    # 2m52s, the daemon's build 1m17s, `cargo install tauri-driver` 17s, the
-    # suite 86s. 30 minutes is four times that, and still caps a wedged window
-    # at a fraction of the 6-hour default. Re-tune from more runs; do not raise
-    # it to paper over a hang.
-    timeout-minutes: 30
+    # This uses system WebKitWebDriver, not Playwright's browsers. Apt can
+    # still be slow: reserve 25 minutes for it, 10 for the suite, and 15 for
+    # builds/setup/reporting (run 39821435797 used about 6 minutes outside the
+    # suite). The test step's own limit bounds a wedged window separately.
+    timeout-minutes: 50
     env:
       # The ONE place tauri-driver's version is written. renovate.json's
       # tauri-driver customManager bumps this line, and
@@ -472,7 +458,9 @@ jobs:
       # reads that display's clipboard from outside the app for `terminal_002`
       # (issue #1403), and `xdotool` moves the display's focus to and from the
       # app's window for `terminal_003` (issue #1457).
-      - run: |
+      - name: Install driver system dependencies
+        timeout-minutes: 25
+        run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
             libayatana-appindicator3-dev librsvg2-dev libxdo-dev libasound2-dev \
@@ -504,6 +492,7 @@ jobs:
       - working-directory: desktop
         env:
           DAD_DRIVER_NATIVE_DRIVER: /usr/bin/WebKitWebDriver
+        timeout-minutes: 10
         run: xvfb-run -a -s "-screen 0 1920x1080x24 -dpi 96" pnpm test:driver
       # The harness writes a failing scenario's screenshot, page text,
       # terminal text and every sandbox log under `desktop/driver-results/`.
