@@ -113,7 +113,7 @@ export async function waitFor<T>(
  * out, and the native driver cannot bind at all — the readiness wait then
  * spends its whole bound on a server that will never answer.
  */
-async function freePorts(count: number): Promise<number[]> {
+export async function freePorts(count: number): Promise<number[]> {
   const servers: Server[] = [];
   try {
     for (let i = 0; i < count; i++) {
