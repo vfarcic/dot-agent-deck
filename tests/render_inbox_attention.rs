@@ -599,3 +599,47 @@ fn status_028_deck_messages_shows_a_refused_connection_whole() {
         "the row keeps Retry beside the notice"
     );
 }
+
+/// Scenario: The deck refused the agent's own request for its waiting messages, and the terminal is both narrow and short. Pressing `i` opens Deck messages with the notice from its headline, and where the rest does not fit the picker says to make the window taller, rather than silently dropping the remedy; in a window tall enough the whole notice shows and no such line does.
+#[spec("inbox/status/029")]
+#[test]
+fn status_029_a_refused_connection_too_long_for_the_window_says_to_make_it_taller() {
+    const TALLER: &str = "make the window taller to read the whole notice";
+    let words = words();
+    let state = state_refused(&[], "inbox_peer_unidentified");
+    let run = |size| {
+        inbox_attention_run(
+            &KeybindingConfig::default(),
+            &state,
+            "gen-q",
+            key(KeyCode::Char('i')),
+            &[],
+            size,
+        )
+    };
+    let short = run((30, 12));
+    assert!(short.open, "`i` opens on a refusal alone");
+    let rendered = text(short.screen.as_ref().unwrap());
+    let shown = flat(&rendered);
+    assert!(
+        shown.contains(words["admissionRefused"].as_str().unwrap()),
+        "the headline leads:\n{rendered}"
+    );
+    assert!(
+        !shown.contains(words["admissionRefusedRemedy"].as_str().unwrap()),
+        "the remedy does not fit at 30×12, which this pin is for:\n{rendered}"
+    );
+    assert!(
+        shown.contains(TALLER),
+        "says how to read the rest:\n{rendered}"
+    );
+    insta::assert_snapshot!("status_029_short_and_narrow", rendered);
+
+    let tall = run((30, 40));
+    let rendered = text(tall.screen.as_ref().unwrap());
+    assert!(
+        flat(&rendered).contains(words["admissionRefusedRemedy"].as_str().unwrap()),
+        "{rendered}"
+    );
+    assert!(!flat(&rendered).contains(TALLER), "{rendered}");
+}

@@ -9356,6 +9356,13 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** which requests the daemon reports (`inbox/protocol/023`), or the client rendering (`inbox/status/027`, `/028`).
 - **Platform coverage:** all.
 
+##### inbox/boundary/066 — A refusal already open tells each orchestrator that delegates into it, once.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub's `admission_refused` / `admission_admitted` and `post_delegate`.
+- **Agent:** none.
+- **Asserts:** a refusal before anything is delegated tells nobody; a task delegated into the open episode posts one `worker cannot take its messages` notice to its orchestrator, naming the task and the cause; repeated refusals and a second delegation by the same orchestrator post nothing more; a second orchestrator delegating into the episode is told once; after an admission, a new refusal tells the orchestrator whose task waits, once (PRD #1666 part 3, round 1).
+- **Does not assert:** the card notice (`inbox/boundary/065`), or which requests the daemon reports (`inbox/protocol/023`).
+- **Platform coverage:** all.
+
 ##### inbox/status/001 — Human daemon status shows each agent's pending inbox counts and wake path.
 - **Layer:** Unit (`tests/inbox_status.rs`), pure status projection and table rendering.
 - **Agent:** none.
@@ -9553,6 +9560,13 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Agent:** none.
 - **Asserts:** with only a refusal, `i` opens Deck messages and its body holds the whole notice — headline, cause, remedy — at 100 and at 30 columns, the footer offers only `Esc to close`, and `r` sends nothing; beside an uncertain delivery the notice heads the picker and the row still sends Retry.
 - **Does not assert:** the desktop tile (`desktop/src/lib/inboxWords.test.ts`, `AgentTile.test.tsx`).
+- **Platform coverage:** all.
+
+##### inbox/status/029 — A refused connection too long for a short, narrow window says to make it taller.
+- **Layer:** L1 (`tests/render_inbox_attention.rs`), the real key handler and picker over a TestBackend.
+- **Agent:** none.
+- **Asserts:** at 30×12, `i` opens Deck messages with the refusal's headline and, where the remedy does not fit, a closing `make the window taller to read the whole notice`; at 30×40 the whole notice shows and that line does not (PRD #1666 part 3, round 1).
+- **Does not assert:** scrolling the notice, or the desktop tile, whose list scrolls.
 - **Platform coverage:** all.
 
 ##### inbox/claude/001 — Supported Claude installs one status handler and one day-long native waiter per managed event.

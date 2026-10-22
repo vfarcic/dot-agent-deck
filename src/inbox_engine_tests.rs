@@ -5050,3 +5050,83 @@ fn boundary_065_a_refused_request_marks_its_own_card_while_mail_waits() {
         "a generation no longer in its pane records nothing"
     );
 }
+
+/// The refusal notices posted to orchestrator pane `pane` so far.
+fn refusal_notices(hub: &InboxHub, pane: &str) -> Vec<String> {
+    hub.post_owed_notices();
+    hub.list_with_bodies(Some(pane))
+        .into_iter()
+        .filter(|m| m.subject == ADMISSION_REFUSED_SUBJECT)
+        .map(|m| m.text.clone().unwrap_or_default())
+        .collect()
+}
+
+/// Scenario: The deck refuses a worker's own request for its messages before anything is delegated to it. An orchestrator then delegates a task to it: that orchestrator is told once, naming the task and the cause, and is not told again however often the refusal repeats or it delegates again. A second orchestrator delegating into the same refusal is told once too. Once a request is admitted, a new refusal tells the orchestrator whose task waits then, once.
+#[spec("inbox/boundary/066")]
+#[test]
+fn boundary_066_an_open_refusal_tells_each_orchestrator_that_delegates_into_it_once() {
+    let hub = hub_with(Duration::from_secs(30), Duration::from_secs(60));
+    hub.admission_refused("p", "a", "inbox_peer_unidentified");
+    assert!(
+        refusal_notices(&hub, "o").is_empty(),
+        "nothing delegated yet"
+    );
+
+    let first = delegate_to(&hub, "p", "first task");
+    let told = refusal_notices(&hub, "o");
+    assert_eq!(
+        told.len(),
+        1,
+        "the orchestrator is told when its task starts waiting: {told:?}"
+    );
+    assert!(told[0].contains(first.as_str()), "names the task: {told:?}");
+    assert!(
+        told[0].contains(crate::inbox_display::ADMISSION_CAUSE_UNIDENTIFIED),
+        "names the cause: {told:?}"
+    );
+    for _ in 0..3 {
+        hub.admission_refused("p", "a", "inbox_peer_unidentified");
+    }
+    delegate_to(&hub, "p", "second task");
+    hub.admission_refused("p", "a", "inbox_peer_unidentified");
+    assert_eq!(
+        refusal_notices(&hub, "o").len(),
+        1,
+        "once in the episode, however often it repeats or the orchestrator delegates again"
+    );
+
+    let third = hub
+        .post_delegate(
+            Recipient::bound("p", "a"),
+            "reviewer",
+            Some(Recipient::bound("o2", "ob")),
+            DelegateLedger::default(),
+            content("third task"),
+            &|| true,
+        )
+        .unwrap()
+        .0;
+    hub.admission_refused("p", "a", "inbox_peer_unidentified");
+    let other = refusal_notices(&hub, "o2");
+    assert_eq!(
+        other.len(),
+        1,
+        "the second orchestrator is told once: {other:?}"
+    );
+    assert!(other[0].contains(third.as_str()), "{other:?}");
+    assert_eq!(refusal_notices(&hub, "o").len(), 1);
+
+    hub.admission_admitted("p", "a");
+    hub.admission_refused("p", "a", "inbox_other_user");
+    hub.admission_refused("p", "a", "inbox_other_user");
+    assert_eq!(
+        refusal_notices(&hub, "o2").len(),
+        2,
+        "a new episode tells the orchestrator whose task waits, once"
+    );
+    assert_eq!(
+        refusal_notices(&hub, "o").len(),
+        1,
+        "its own task was superseded"
+    );
+}

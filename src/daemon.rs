@@ -12665,6 +12665,104 @@ mod hook_ingestion_tests {
         );
     }
 
+    /// PRD #1666 part 3, round 1 (reviewer R1, auditor U2): a capability
+    /// holder outside the agent's tree names a shell it shares a branch with
+    /// — a sibling of the agent under the terminal's shell, or a shell the
+    /// deck itself started — and the walk through shells would climb to the
+    /// terminal or the deck, above the agent. The resolved receiver is held to
+    /// what a named one is, so it is refused as above the agent; Claude Code's
+    /// background host, outside the tree and under init or the deck, still
+    /// resolves to itself.
+    #[test]
+    fn a_shell_outside_the_tree_cannot_resolve_to_a_process_above_the_agent() {
+        // 1 ── 5 terminal ── 6 bash ──┬── 10 agent
+        //                             └── 30 sh ── 31 CLI (another pane's tool)
+        //   └── 2 deck ──┬── 11 agent (a second deck pane)
+        //                ├── 20 sh ── 21 CLI
+        //                └── 40 claude (re-parented to the deck) ── 41 sh ── 42 CLI
+        //   └── 50 claude (re-parented to init) ── 51 sh ── 52 CLI
+        let parents = |pid: u32| match pid {
+            2 | 5 | 50 => Some(1),
+            6 => Some(5),
+            10 | 30 => Some(6),
+            31 => Some(30),
+            11 | 20 | 40 => Some(2),
+            21 => Some(20),
+            41 => Some(40),
+            42 => Some(41),
+            51 => Some(50),
+            52 => Some(51),
+            _ => None,
+        };
+        let executables = |pid: u32| {
+            Some(std::path::PathBuf::from(match pid {
+                5 => "/usr/bin/kitty",
+                6 => "/bin/bash",
+                10 | 11 | 40 | 50 => "/opt/claude",
+                2 | 31 | 21 | 42 | 52 => "/opt/dot-agent-deck",
+                20 | 30 | 41 | 51 => "/bin/sh",
+                _ => return None,
+            }))
+        };
+        let descends = |pid, root| crate::platform::proc::descends_from_with(pid, root, parents);
+        let admit = |peer_pid, claimed, root, evidence| {
+            admit_component(
+                peer(peer_pid, Some(true)),
+                claimed,
+                Some(root),
+                ComponentUse::Receiver,
+                evidence,
+                descends,
+                parents,
+                executables,
+            )
+        };
+        let above = |result: Result<Option<u32>, ComponentRefusal>| {
+            result.is_err_and(|refusal| refusal.code() == "inbox_receiver_above_agent")
+        };
+        for evidence in [Evidence::Required, Evidence::BestEffort] {
+            // The sibling shell climbs bash 6 to the terminal 5, above agent 10.
+            let sibling = admit(31, Some(30), 10, evidence);
+            assert!(above(sibling), "{evidence:?}: {sibling:?}");
+            // A shell the deck started climbs to the deck, above agent 11.
+            let deck = admit(21, Some(20), 11, evidence);
+            assert!(above(deck), "{evidence:?}: {deck:?}");
+            // Named directly, the processes above the agent are refused the same.
+            for claimed in [6, 5, 1] {
+                let direct = admit(31, Some(claimed), 10, evidence);
+                assert!(above(direct), "{evidence:?} {claimed}: {direct:?}");
+            }
+            // Claude Code outside the tree resolves to itself, whether it was
+            // re-parented to the deck that is above the agent or to init.
+            assert_eq!(admit(42, Some(41), 11, evidence), Ok(Some(40)));
+            assert_eq!(admit(52, Some(51), 10, evidence), Ok(Some(50)));
+            // In the tree the walk still stops at the agent.
+            assert_eq!(admit(42, Some(41), 40, evidence), Ok(Some(40)));
+        }
+        // Where the agent's own ancestry cannot be read, a walk that moved
+        // cannot show it stayed below the agent: refused on positive evidence.
+        let unreadable = |pid: u32| if pid == 10 { None } else { parents(pid) };
+        let without_10 =
+            |pid, root| crate::platform::proc::descends_from_with(pid, root, unreadable);
+        let resolve = |evidence| {
+            admit_component(
+                peer(52, Some(true)),
+                Some(51),
+                Some(10),
+                ComponentUse::Receiver,
+                evidence,
+                without_10,
+                unreadable,
+                executables,
+            )
+        };
+        assert_eq!(
+            resolve(Evidence::Required),
+            Err(ComponentRefusal::Unidentified)
+        );
+        assert_eq!(resolve(Evidence::BestEffort), Ok(Some(50)));
+    }
+
     /// Every refusal names its own cause, and a fixed message that says what
     /// to do about it and echoes nothing the request carried.
     #[test]
