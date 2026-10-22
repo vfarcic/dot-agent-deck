@@ -296,7 +296,7 @@ impl ActiveRun {
         }
     }
 
-    /// See [`RunTracker::observe_human_input`].
+    /// See [`RunTracker::observe_run_input`].
     fn human_input(&mut self, now: u64) {
         let new_burst = self
             .last_human_input
@@ -607,18 +607,19 @@ impl RunTracker {
         });
     }
 
-    /// Input from a person at an attached client reached `pane_id`. Input the
-    /// deck injects itself (a delegated task, an inbox delivery) must not be
-    /// reported here. Keystrokes less than [`INTERVENTION_COALESCE_NANOS`] apart
-    /// count as one intervention.
+    /// [`Self::observe_run_input`] for whichever run is open on `pane_id`.
+    #[cfg(test)]
     pub fn observe_human_input(&mut self, pane_id: &str, now: u64) {
         if let Some(run) = self.runs.get_mut(pane_id) {
             run.human_input(now);
         }
     }
 
-    /// [`Self::observe_human_input`], only while the run open on `pane_id` is
-    /// `run_id`.
+    /// Input from a person at an attached client reached `pane_id`, while the
+    /// run open on it, or replaced and waiting for its end, is `run_id`. Input
+    /// the deck injects itself (a delegated task, an inbox delivery) must not
+    /// be reported here. Keystrokes less than [`INTERVENTION_COALESCE_NANOS`]
+    /// apart count as one intervention.
     pub fn observe_run_input(&mut self, pane_id: &str, run_id: &str, now: u64) {
         let open = self
             .runs
@@ -750,6 +751,7 @@ impl RunTracker {
 
     /// Runs open (replaced ones still waiting for their end included) and
     /// prepared: what the tracker holds between spans.
+    #[cfg(test)]
     pub fn held(&self) -> (usize, usize) {
         (self.runs.len() + self.replaced.len(), self.pending.len())
     }

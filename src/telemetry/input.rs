@@ -74,6 +74,7 @@ impl InputFilter {
     }
 
     /// Whether a sequence is being held.
+    #[cfg(test)]
     pub fn is_holding(&self) -> bool {
         self.state != State::Ground
     }
@@ -180,6 +181,7 @@ fn is_csi_report(params: &[u8], fin: u8) -> bool {
 /// Whether `bytes`, one complete frame of client input, contains anything a
 /// person did. Stateless; a frame that ends inside a sequence counts that
 /// sequence as a person's.
+#[cfg(test)]
 pub fn is_human_input(bytes: &[u8]) -> bool {
     let mut filter = InputFilter::new();
     filter.feed(bytes) || filter.is_holding()

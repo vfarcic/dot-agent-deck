@@ -201,6 +201,7 @@ impl Probes {
     }
 
     /// Probes queued or running.
+    #[cfg(test)]
     pub fn outstanding(&self) -> usize {
         let mut tasks = self.tasks.lock().unwrap_or_else(|p| p.into_inner());
         while tasks.try_join_next().is_some() {}
@@ -240,6 +241,7 @@ pub async fn resolve_with(
 }
 
 /// [`resolve_with`] with the default settings and a permit of its own.
+#[cfg(test)]
 pub async fn resolve(cwd: &Path) -> RunContext {
     let settings = ProbeSettings::default();
     let permits = Semaphore::new(1);

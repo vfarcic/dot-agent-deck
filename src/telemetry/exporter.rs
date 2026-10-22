@@ -2,7 +2,7 @@
 //! feeds it in order, and a background task that batches finished spans and
 //! posts them over OTLP/HTTP.
 //!
-//! With telemetry off, [`Telemetry::start`] returns a handle that does nothing:
+//! With telemetry off, [`Telemetry::start_in`] returns a handle that does nothing:
 //! no task, no client, no environment for agents. With a `grpc` (or unknown)
 //! protocol it warns once and only propagates. Export is asynchronous and
 //! batched; a failure is logged at most once a minute, by status code or error
@@ -127,6 +127,7 @@ enum Command {
     },
     /// Acknowledged once everything sent before it, broadcast included, is
     /// applied.
+    #[cfg(test)]
     Barrier(oneshot::Sender<()>),
     /// End every run, stamped like [`Command::End`], and hand the spans that
     /// finishes back to [`Telemetry::shutdown`] to queue.
@@ -240,7 +241,8 @@ pub struct Telemetry {
     /// The daemon's `OTEL_*` variables (and Claude Code's switch), the base an
     /// agent's environment is computed from.
     otel_env: EnvMap,
-    /// The daemon's [`LAUNCH_ENV_KEYS`]: where agents' own configurations live.
+    /// The daemon's [`LAUNCH_ENV_KEYS`]: its `PATH`, which the shim directory
+    /// goes in front of, and the user's own say on Pi's export.
     launch_env: EnvMap,
     host: Option<String>,
     exporting: Option<Exporting>,
@@ -312,8 +314,9 @@ pub fn default_config_dir() -> PathBuf {
 struct Settings {
     probes: ProbeSettings,
     retry: RetryPolicy,
-    /// Where per-run agent configuration files go; the daemon's state
-    /// directory when unset.
+    /// Test seam: where [`Telemetry::start_with`] writes per-run agent
+    /// configuration files; the daemon's state directory when unset.
+    #[cfg(test)]
     config_dir: Option<PathBuf>,
     /// Test seam: hand finished spans here instead of to an HTTP exporter.
     #[cfg(test)]
@@ -345,21 +348,26 @@ impl Telemetry {
         Self::start_with(env, Settings::default())
     }
 
+    /// [`Self::start_in`] with test `settings`, into their `config_dir`, else
+    /// the daemon's [`default_config_dir`].
+    #[cfg(test)]
+    fn start_with(env: &EnvMap, mut settings: Settings) -> Self {
+        let config_dir = settings
+            .config_dir
+            .take()
+            .unwrap_or_else(default_config_dir);
+        Self::start_with_dir(env, config_dir, settings)
+    }
+
     /// Read the configuration from `env` (the daemon's environment at start)
     /// and, when it asks for an export the deck can do, spawn the exporter on
     /// the current tokio runtime, with per-run agent configuration files
     /// written into `config_dir`.
     pub fn start_in(env: &EnvMap, config_dir: PathBuf) -> Self {
-        Self::start_with(
-            env,
-            Settings {
-                config_dir: Some(config_dir),
-                ..Settings::default()
-            },
-        )
+        Self::start_with_dir(env, config_dir, Settings::default())
     }
 
-    fn start_with(env: &EnvMap, settings: Settings) -> Self {
+    fn start_with_dir(env: &EnvMap, config_dir: PathBuf, settings: Settings) -> Self {
         let Some(config) = TelemetryConfig::from_env(env) else {
             return Self::disabled();
         };
@@ -373,10 +381,6 @@ impl Telemetry {
             .filter(|(k, _)| LAUNCH_ENV_KEYS.contains(&k.as_str()))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        let config_dir = settings
-            .config_dir
-            .clone()
-            .unwrap_or_else(default_config_dir);
         let host = host_name();
         let exporting = if !config.protocol.deck_can_export() {
             tracing::warn!(
@@ -434,6 +438,7 @@ impl Telemetry {
     }
 
     /// Whether the deck exports its own spans.
+    #[cfg(test)]
     pub fn is_exporting(&self) -> bool {
         self.exporting.is_some()
     }
@@ -656,6 +661,7 @@ impl Telemetry {
 
     /// Resolves once everything sent to the tracker before it — broadcast
     /// events included — has been applied. Immediately when not exporting.
+    #[cfg(test)]
     pub async fn settled(&self) {
         let Some(exporting) = &self.exporting else {
             return;
@@ -789,6 +795,7 @@ impl Telemetry {
     }
 
     /// Run-context probes queued or running.
+    #[cfg(test)]
     pub fn outstanding_probes(&self) -> usize {
         self.exporting
             .as_ref()
@@ -1094,6 +1101,7 @@ fn apply(shared: &Shared, command: Command) -> bool {
             }
         }
         Command::HumanInput { pane_id, run_id } => shared.take_input(&pane_id, &run_id),
+        #[cfg(test)]
         Command::Barrier(ack) => {
             let _ = ack.send(());
         }

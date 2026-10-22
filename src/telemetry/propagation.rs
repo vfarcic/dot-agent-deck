@@ -53,6 +53,7 @@ pub const CLAUDE_CODE_DEFAULT_PROTOCOL: &str = "http/protobuf";
 
 /// Variables that make an agent's telemetry carry content. Listed so a test can
 /// assert none of them is ever produced here.
+#[cfg(test)]
 pub const CONTENT_SWITCHES: [&str; 2] = ["OTEL_LOG_USER_PROMPTS", "OTEL_LOG_TOOL_DETAILS"];
 
 /// Who a run is, as an agent's resource attributes describe it.

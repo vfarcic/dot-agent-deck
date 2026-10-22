@@ -104,22 +104,22 @@ const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash"];
 const SHELL_FLAGS: &str = "abefhiklmnprstuvxBCDEHPT";
 
 /// The options of a program that runs the rest of its words as a command.
-pub(super) struct Options {
+struct Options {
     /// Short options that take a value: `-u root`, or attached, `-uroot`.
-    pub short_values: &'static str,
+    short_values: &'static str,
     /// Short options that take none.
-    pub short_flags: &'static str,
+    short_flags: &'static str,
     /// Long options that take a value: `--chdir dir` or `--chdir=dir`.
-    pub long_values: &'static [&'static str],
+    long_values: &'static [&'static str],
     /// Long options that take none, or only an attached `=value`.
-    pub long_flags: &'static [&'static str],
+    long_flags: &'static [&'static str],
     /// Whether a number is an option: `nice -10`.
-    pub numbers: bool,
+    numbers: bool,
 }
 
 /// `env`. `-S` / `--split-string`, which carries the command inside its
 /// value, is deliberately unknown.
-pub(super) const ENV: Options = Options {
+const ENV: Options = Options {
     short_values: "uCPa",
     short_flags: "i0v",
     long_values: &["unset", "chdir", "argv0"],
@@ -360,7 +360,7 @@ fn command_words(segment: &[String]) -> Option<&[String]> {
 /// How many of `words` are `options` with their values, up to the command
 /// they run (past a `--`). `None` when one is not an option `options` knows,
 /// or its value is missing.
-pub(super) fn options_len(words: &[String], options: &Options) -> Option<usize> {
+fn options_len(words: &[String], options: &Options) -> Option<usize> {
     let mut i = 0;
     while let Some(word) = words.get(i) {
         if word == "--" {
@@ -559,20 +559,23 @@ mod tests {
         }
     }
 
-    fn local(program: &str, word: Option<&str>) -> Operation {
+    fn expected(program: &str, word: Option<&str>) -> Operation {
         op(Some(program), word)
     }
 
     #[test]
     fn the_program_and_its_first_word() {
         for (command, expected) in [
-            ("cargo test --workspace", local("cargo", Some("test"))),
-            ("git -C repo status", local("git", Some("repo"))),
-            ("cargo +nightly fmt", local("cargo", Some("fmt"))),
-            ("/usr/bin/make", local("make", None)),
-            ("./scripts/release.sh --dry-run", local("release.sh", None)),
-            ("npm run build:prod", local("npm", Some("run"))),
-            ("ls", local("ls", None)),
+            ("cargo test --workspace", expected("cargo", Some("test"))),
+            ("git -C repo status", expected("git", Some("repo"))),
+            ("cargo +nightly fmt", expected("cargo", Some("fmt"))),
+            ("/usr/bin/make", expected("make", None)),
+            (
+                "./scripts/release.sh --dry-run",
+                expected("release.sh", None),
+            ),
+            ("npm run build:prod", expected("npm", Some("run"))),
+            ("ls", expected("ls", None)),
         ] {
             assert_eq!(classify(Some(command)), expected, "{command}");
         }
@@ -581,25 +584,31 @@ mod tests {
     #[test]
     fn setup_segments_assignments_and_prefixes_are_skipped() {
         for (command, expected) in [
-            ("cd repo && cargo build", local("cargo", Some("build"))),
+            ("cd repo && cargo build", expected("cargo", Some("build"))),
             (
                 "export X=1; source env.sh; make test",
-                local("make", Some("test")),
+                expected("make", Some("test")),
             ),
             (
                 "RUST_LOG=debug CI=1 cargo nextest run",
-                local("cargo", Some("nextest")),
+                expected("cargo", Some("nextest")),
             ),
-            ("env -i FOO=1 cargo check", local("cargo", Some("check"))),
+            ("env -i FOO=1 cargo check", expected("cargo", Some("check"))),
             (
                 "sudo -u root systemctl restart x",
-                local("systemctl", Some("restart")),
+                expected("systemctl", Some("restart")),
             ),
-            ("time nice -n 10 cargo bench", local("cargo", Some("bench"))),
-            ("true || gh pr checks 1", local("gh", Some("pr"))),
-            ("cargo test 2>&1 | tail -n 5", local("cargo", Some("test"))),
-            ("command -v rg", local("command", Some("rg"))),
-            ("command -p make test", local("make", Some("test"))),
+            (
+                "time nice -n 10 cargo bench",
+                expected("cargo", Some("bench")),
+            ),
+            ("true || gh pr checks 1", expected("gh", Some("pr"))),
+            (
+                "cargo test 2>&1 | tail -n 5",
+                expected("cargo", Some("test")),
+            ),
+            ("command -v rg", expected("command", Some("rg"))),
+            ("command -p make test", expected("make", Some("test"))),
         ] {
             assert_eq!(classify(Some(command)), expected, "{command}");
         }
@@ -609,12 +618,12 @@ mod tests {
     fn a_shell_dash_c_is_classified_by_what_it_runs() {
         assert_eq!(
             classify(Some("/bin/bash -lc 'cd x && cargo test'")),
-            local("cargo", Some("test"))
+            expected("cargo", Some("test"))
         );
         // Unquoted, the script is `touch`; `out.txt` is the script's `$0`.
         assert_eq!(
             classify(Some("/bin/sh -lc touch out.txt")),
-            local("touch", None)
+            expected("touch", None)
         );
     }
 
@@ -623,25 +632,25 @@ mod tests {
     #[test]
     fn word_boundaries_survive_unwrapping() {
         for (command, expected) in [
-            ("cargo 'private payload'", local("cargo", None)),
-            ("env cargo 'abc;node secret'", local("cargo", None)),
-            ("sudo -u root cargo \"a && b\"", local("cargo", None)),
+            ("cargo 'private payload'", expected("cargo", None)),
+            ("env cargo 'abc;node secret'", expected("cargo", None)),
+            ("sudo -u root cargo \"a && b\"", expected("cargo", None)),
             (
                 r#"env bash -c 'node "private payload"'"#,
-                local("node", None),
+                expected("node", None),
             ),
             (
                 "FOO=1 env -u X sudo cargo test",
-                local("cargo", Some("test")),
+                expected("cargo", Some("test")),
             ),
             (
                 "bash -c 'cargo test' private payload",
-                local("cargo", Some("test")),
+                expected("cargo", Some("test")),
             ),
-            ("bash -c cargo private", local("cargo", None)),
-            ("sh -c 'node \"private payload\"' x", local("node", None)),
-            (r#"sh -c 'sh -c "make ci"'"#, local("make", Some("ci"))),
-            (r#"sh -c 'sh -c "sh -c make"'"#, local("sh", None)),
+            ("bash -c cargo private", expected("cargo", None)),
+            ("sh -c 'node \"private payload\"' x", expected("node", None)),
+            (r#"sh -c 'sh -c "make ci"'"#, expected("make", Some("ci"))),
+            (r#"sh -c 'sh -c "sh -c make"'"#, expected("sh", None)),
         ] {
             assert_eq!(classify(Some(command)), expected, "{command}");
         }
@@ -653,70 +662,88 @@ mod tests {
     fn prefix_and_shell_options_take_their_values() {
         let unresolved = Operation::default();
         for (command, expected) in [
-            ("time -f hunter2 cargo test", local("cargo", Some("test"))),
+            (
+                "time -f hunter2 cargo test",
+                expected("cargo", Some("test")),
+            ),
             (
                 "time -o out.txt -a cargo test",
-                local("cargo", Some("test")),
+                expected("cargo", Some("test")),
             ),
-            ("time --format=%e cargo test", local("cargo", Some("test"))),
+            (
+                "time --format=%e cargo test",
+                expected("cargo", Some("test")),
+            ),
             (
                 "time --output out -p cargo test",
-                local("cargo", Some("test")),
+                expected("cargo", Some("test")),
             ),
             (
                 "env --chdir /home/private cargo test",
-                local("cargo", Some("test")),
+                expected("cargo", Some("test")),
             ),
             (
                 "env -C /home/private cargo test",
-                local("cargo", Some("test")),
+                expected("cargo", Some("test")),
             ),
-            ("env -u hunter2 cargo test", local("cargo", Some("test"))),
-            ("env -iu x Y=1 cargo test", local("cargo", Some("test"))),
-            ("env --unset=x -- cargo test", local("cargo", Some("test"))),
+            ("env -u hunter2 cargo test", expected("cargo", Some("test"))),
+            ("env -iu x Y=1 cargo test", expected("cargo", Some("test"))),
+            (
+                "env --unset=x -- cargo test",
+                expected("cargo", Some("test")),
+            ),
             ("env -S 'cargo test'", unresolved.clone()),
             ("env --split-string='cargo test'", unresolved.clone()),
             ("env --bogus x cargo test", unresolved.clone()),
             (
                 "nice --adjustment 10 cargo test",
-                local("cargo", Some("test")),
+                expected("cargo", Some("test")),
             ),
             (
                 "nice --adjustment=10 cargo test",
-                local("cargo", Some("test")),
+                expected("cargo", Some("test")),
             ),
-            ("nice -n 10 cargo test", local("cargo", Some("test"))),
-            ("nice -n10 cargo test", local("cargo", Some("test"))),
-            ("nice -10 cargo test", local("cargo", Some("test"))),
+            ("nice -n 10 cargo test", expected("cargo", Some("test"))),
+            ("nice -n10 cargo test", expected("cargo", Some("test"))),
+            ("nice -10 cargo test", expected("cargo", Some("test"))),
             (
                 "sudo -u root -g wheel -C 5 systemctl restart x",
-                local("systemctl", Some("restart")),
+                expected("systemctl", Some("restart")),
             ),
             (
                 "sudo --user=root -H make install",
-                local("make", Some("install")),
+                expected("make", Some("install")),
             ),
-            ("sudo -uroot make install", local("make", Some("install"))),
+            (
+                "sudo -uroot make install",
+                expected("make", Some("install")),
+            ),
             ("sudo -e /etc/hosts", unresolved.clone()),
             ("sudo -u", unresolved.clone()),
             (
                 "bash --rcfile /home/private -c 'cargo test'",
-                local("cargo", Some("test")),
+                expected("cargo", Some("test")),
             ),
             (
                 "bash --init-file private -lc 'cargo test'",
-                local("cargo", Some("test")),
+                expected("cargo", Some("test")),
             ),
-            ("bash -o pipefail -c 'make ci'", local("make", Some("ci"))),
-            ("bash -eo pipefail -c 'make ci'", local("make", Some("ci"))),
-            ("bash +O extglob -c 'make ci'", local("make", Some("ci"))),
-            ("bash --login -c 'make ci'", local("make", Some("ci"))),
+            (
+                "bash -o pipefail -c 'make ci'",
+                expected("make", Some("ci")),
+            ),
+            (
+                "bash -eo pipefail -c 'make ci'",
+                expected("make", Some("ci")),
+            ),
+            ("bash +O extglob -c 'make ci'", expected("make", Some("ci"))),
+            ("bash --login -c 'make ci'", expected("make", Some("ci"))),
             ("bash --bogus -c 'make ci'", unresolved.clone()),
             ("bash -c", unresolved.clone()),
             ("bash --rcfile", unresolved.clone()),
-            ("bash ci.sh -c x", local("bash", Some("ci.sh"))),
-            ("bash --rcfile private", local("bash", None)),
-            ("sh", local("sh", None)),
+            ("bash ci.sh -c x", expected("bash", Some("ci.sh"))),
+            ("bash --rcfile private", expected("bash", None)),
+            ("sh", expected("sh", None)),
         ] {
             assert_eq!(classify(Some(command)), expected, "{command}");
         }
@@ -728,11 +755,14 @@ mod tests {
     fn a_joined_argv_gives_its_program_at_most() {
         let bare = Operation::default();
         for (command, expected) in [
-            ("/bin/sh -lc touch out.txt", local("touch", None)),
-            ("/bin/bash -lc cargo test --workspace", local("cargo", None)),
+            ("/bin/sh -lc touch out.txt", expected("touch", None)),
+            (
+                "/bin/bash -lc cargo test --workspace",
+                expected("cargo", None),
+            ),
             // `["/bin/sh", "-c", "cargo", "private payload"]`: the script is
             // `cargo`, the rest its `$0` and `$1`.
-            ("/bin/sh -c cargo private payload", local("cargo", None)),
+            ("/bin/sh -c cargo private payload", expected("cargo", None)),
             // `["/bin/sh", "-c", "true", "x && hunter2 run"]`.
             ("/bin/sh -c true x && hunter2 run", bare.clone()),
             ("/bin/bash -lc cd x && cargo test", bare.clone()),
@@ -745,12 +775,12 @@ mod tests {
             ("bash -o pipefail -c make ci", bare.clone()),
             ("bash ci.sh", bare.clone()),
             ("bash -c", bare.clone()),
-            ("cargo private payload", local("cargo", None)),
+            ("cargo private payload", expected("cargo", None)),
             ("env hunter2 cargo", bare.clone()),
-            ("rwx sandbox exec -- cargo private", local("rwx", None)),
+            ("rwx sandbox exec -- cargo private", expected("rwx", None)),
             (
                 "/bin/sh -lc rwx sandbox exec -- cargo test",
-                local("rwx", None),
+                expected("rwx", None),
             ),
             ("", bare.clone()),
         ] {
@@ -758,15 +788,15 @@ mod tests {
         }
         assert_eq!(
             classify_tool(Some("shell"), Some("/bin/sh -lc make ci")),
-            local("make", None)
+            expected("make", None)
         );
         assert_eq!(
             classify_tool(Some("Bash"), Some("/bin/sh -lc make ci")),
-            local("make", None)
+            expected("make", None)
         );
         assert_eq!(
             classify_tool(Some("Bash"), Some("/bin/sh -lc 'make ci'")),
-            local("make", Some("ci"))
+            expected("make", Some("ci"))
         );
     }
 
@@ -774,7 +804,7 @@ mod tests {
     fn only_the_first_line_counts() {
         assert_eq!(
             classify(Some("cargo build\nrm -rf secret-dir")),
-            local("cargo", Some("build"))
+            expected("cargo", Some("build"))
         );
     }
 
@@ -782,22 +812,25 @@ mod tests {
     #[test]
     fn anything_not_shaped_like_a_command_word_is_absent() {
         for (command, expected) in [
-            ("curl https://user:pw@host/x", local("curl", None)),
+            ("curl https://user:pw@host/x", expected("curl", None)),
             (
                 "git commit -m 'Fix the SECRET thing'",
-                local("git", Some("commit")),
+                expected("git", Some("commit")),
             ),
-            ("python3 /home/me/private/script.py", local("python3", None)),
+            (
+                "python3 /home/me/private/script.py",
+                expected("python3", None),
+            ),
             ("Rscript analysis.R", Operation::default()),
             (
                 "kubectl get secret/db-PASSWORD",
-                local("kubectl", Some("get")),
+                expected("kubectl", Some("get")),
             ),
-            ("node -e 'console.log(1)'", local("node", None)),
-            ("tool TOKEN=abc", local("tool", None)),
+            ("node -e 'console.log(1)'", expected("node", None)),
+            ("tool TOKEN=abc", expected("tool", None)),
             (
                 "make aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                local("make", None),
+                expected("make", None),
             ),
         ] {
             assert_eq!(classify(Some(command)), expected, "{command}");
@@ -814,13 +847,13 @@ mod tests {
         for program in WORDLESS_PROGRAMS {
             assert_eq!(
                 classify(Some(&format!("{program} hunter2 file"))),
-                local(program, None),
+                expected(program, None),
                 "{program}"
             );
         }
         assert_eq!(
             classify(Some("FOO=1 /bin/grep -r password .")),
-            local("grep", None)
+            expected("grep", None)
         );
         for (command, program) in [
             ("curl -d hunter2 https://example.invalid", "curl"),
@@ -841,12 +874,16 @@ mod tests {
             ("xargs hunter2", "xargs"),
             ("sh -c 'curl -d hunter2 x'", "curl"),
         ] {
-            assert_eq!(classify(Some(command)), local(program, None), "{command}");
+            assert_eq!(
+                classify(Some(command)),
+                expected(program, None),
+                "{command}"
+            );
         }
     }
 
     #[test]
-    fn no_command_or_only_setup_is_a_bare_local_operation() {
+    fn no_command_or_only_setup_names_no_program() {
         let bare = Operation::default();
         assert_eq!(classify(None), bare);
         assert_eq!(classify(Some("")), bare);
@@ -863,7 +900,7 @@ mod tests {
         );
         assert_eq!(
             classify(Some(r#"git log --format="%H;%s" | head"#)),
-            local("git", Some("log"))
+            expected("git", Some("log"))
         );
     }
 
@@ -881,19 +918,19 @@ mod tests {
             ("cd /repo;# note; hunter2", bare.clone()),
             ("cd /repo &# note; hunter2", bare.clone()),
             ("cd /repo >#note; hunter2", bare.clone()),
-            ("cargo test # hunter2", local("cargo", Some("test"))),
-            ("cargo # hunter2", local("cargo", None)),
-            ("cd x && make # ci; hunter2", local("make", None)),
+            ("cargo test # hunter2", expected("cargo", Some("test"))),
+            ("cargo # hunter2", expected("cargo", None)),
+            ("cd x && make # ci; hunter2", expected("make", None)),
             ("bash -c 'cd x # y; hunter2'", bare.clone()),
             // Quoted or inside a word, `#` is not a comment.
-            ("cd x; make '#'; hunter2", local("make", None)),
-            ("cd x; make ci#1", local("make", None)),
+            ("cd x; make '#'; hunter2", expected("make", None)),
+            ("cd x; make ci#1", expected("make", None)),
             (
                 r#"git log --format="%H #%s" | head"#,
-                local("git", Some("log")),
+                expected("git", Some("log")),
             ),
-            (r"cd x; make \#; hunter2", local("make", None)),
-            ("cd x; make issue#1; hunter2 run", local("make", None)),
+            (r"cd x; make \#; hunter2", expected("make", None)),
+            ("cd x; make issue#1; hunter2 run", expected("make", None)),
         ] {
             assert_eq!(classify(Some(command)), expected, "{command}");
         }
@@ -921,15 +958,15 @@ mod tests {
             ("bash", "bash"),
             ("bash < script.sh", "bash"),
         ] {
-            assert_eq!(classify(Some(command)), local(shell, None), "{command}");
+            assert_eq!(classify(Some(command)), expected(shell, None), "{command}");
         }
         assert_eq!(
             classify(Some("bash ci.sh hunter2")),
-            local("bash", Some("ci.sh"))
+            expected("bash", Some("ci.sh"))
         );
         assert_eq!(
             classify(Some("bash -s -c 'make ci'")),
-            local("make", Some("ci"))
+            expected("make", Some("ci"))
         );
     }
 
