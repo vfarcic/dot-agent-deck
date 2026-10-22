@@ -1,5 +1,5 @@
 //! The run tracker: turns what the daemon sees — agents starting and ending,
-//! the events on its broadcast, human input, delegations — into finished
+//! the events on its broadcast, human input — into finished
 //! `agent.run` and `agent.status` spans.
 //!
 //! Pure and synchronous. Every method takes the current time, so tests drive
@@ -33,10 +33,7 @@ use super::run_context::RunContext;
 use super::span::{
     Attribute, SpanEventRecord, SpanId, SpanRecord, TraceId, new_span_id, new_trace_id,
 };
-use super::{
-    AttrKey, EVENT_DELEGATION, EVENT_INTERVENTION, EVENT_STATUS_CHANGE, SPAN_AGENT_RUN,
-    SPAN_AGENT_STATUS,
-};
+use super::{AttrKey, EVENT_INTERVENTION, EVENT_STATUS_CHANGE, SPAN_AGENT_RUN, SPAN_AGENT_STATUS};
 
 /// Human input closer together than this is one intervention: a burst of
 /// keystrokes, not one per key.
@@ -108,8 +105,11 @@ pub struct RunStart {
 impl RunStart {
     /// What the spawn path knows about the agent it is starting on `pane_id`
     /// as generation `agent_id`: the declared agent kind, else the one the
-    /// command's basename names, and the orchestration the pane is a role of.
-    /// The run id is left for [`super::Telemetry::prepare_run`] to mint.
+    /// command names — read as the spawn path reads it, through leading
+    /// `VAR=VALUE` assignments and `env`, `sudo` and shell launchers
+    /// ([`AgentType::from_command`]) — and the orchestration the pane is a
+    /// role of. The run id is left for [`super::Telemetry::prepare_run`] to
+    /// mint.
     pub fn for_spawn(
         pane_id: &str,
         agent_id: &str,
@@ -117,11 +117,7 @@ impl RunStart {
         command: Option<&str>,
         membership: Option<&crate::agent_pty::TabMembership>,
     ) -> Self {
-        let detected = command
-            .and_then(|c| c.split_whitespace().next())
-            .and_then(|program| std::path::Path::new(program).file_name())
-            .and_then(|name| name.to_str())
-            .and_then(crate::agent_registry::detect_from_basename);
+        let detected = AgentType::from_command(command);
         let orchestration = match membership {
             Some(crate::agent_pty::TabMembership::Orchestration {
                 name,
@@ -162,6 +158,9 @@ struct PendingRun {
     prepared_at: u64,
     context: RunContext,
     events: Vec<(AgentEvent, u64)>,
+    /// Its agent already ended, before the run was committed: how and when,
+    /// applied by [`RunTracker::commit_run`] once the run opens.
+    ended: Option<(EndReason, Option<i32>, u64)>,
 }
 
 /// A run's own card state, dropped with the run. Tests count the live ones
@@ -296,6 +295,7 @@ impl RunTracker {
                 prepared_at: now,
                 context: RunContext::default(),
                 events: Vec::new(),
+                ended: None,
             });
     }
 
@@ -305,7 +305,9 @@ impl RunTracker {
     }
 
     /// The agent of the prepared run `run_id` started: open its run, from the
-    /// time it was prepared, and apply the events held for it.
+    /// time it was prepared, and apply the events held for it. A run whose
+    /// agent already ended ([`Self::end_agent_run`]) is ended straight after,
+    /// as of when it did.
     pub fn commit_run(&mut self, run_id: &str) {
         let Some(pending) = self.pending.remove(run_id) else {
             return;
@@ -317,6 +319,9 @@ impl RunTracker {
         }
         for (event, at) in pending.events {
             self.observe_event(&event, at);
+        }
+        if let Some((reason, exit_code, at)) = pending.ended {
+            self.end_run(&pane_id, reason, exit_code, at);
         }
     }
 
@@ -513,25 +518,6 @@ impl RunTracker {
         }
     }
 
-    /// `from_pane` delegated work to `to_pane`. Each side's run records the
-    /// other pane's id and nothing about the task.
-    pub fn observe_delegation(&mut self, from_pane: &str, to_pane: &str, now: u64) {
-        if let Some(run) = self.runs.get_mut(from_pane) {
-            run.push_event(SpanEventRecord {
-                name: EVENT_DELEGATION,
-                time_unix_nanos: now,
-                attributes: vec![Attribute::str(AttrKey::DelegationToPane, to_pane)],
-            });
-        }
-        if let Some(run) = self.runs.get_mut(to_pane) {
-            run.push_event(SpanEventRecord {
-                name: EVENT_DELEGATION,
-                time_unix_nanos: now,
-                attributes: vec![Attribute::str(AttrKey::DelegationFromPane, from_pane)],
-            });
-        }
-    }
-
     /// End the run on `pane_id`, if one is open.
     pub fn end_run(&mut self, pane_id: &str, reason: EndReason, exit_code: Option<i32>, now: u64) {
         let Some(mut run) = self.runs.remove(pane_id) else {
@@ -552,6 +538,12 @@ impl RunTracker {
     /// `agent_id` (or either side does not know its agent). An exit observed
     /// late for a generation a respawn already replaced must not end the new
     /// generation's run.
+    ///
+    /// An agent that exits before its run is committed — a fast exit can reach
+    /// its PTY's end before the spawn path publishes it — ends its prepared
+    /// run instead, which [`Self::commit_run`] then opens and ends. Its agent
+    /// was never registered, so nothing could have closed it: a `closed`
+    /// reason, read from it no longer being registered, is `exited`.
     pub fn end_agent_run(
         &mut self,
         pane_id: &str,
@@ -563,8 +555,23 @@ impl RunTracker {
         let other_generation = self.runs.get(pane_id).is_some_and(|run| {
             matches!((run.start_info.agent_id.as_deref(), agent_id), (Some(a), Some(b)) if a != b)
         });
-        if !other_generation {
+        if self.runs.contains_key(pane_id) && !other_generation {
             self.end_run(pane_id, reason, exit_code, now);
+            return;
+        }
+        let Some(agent_id) = agent_id else {
+            return;
+        };
+        if let Some(pending) = self
+            .pending
+            .values_mut()
+            .find(|p| p.start.pane_id == pane_id && p.start.agent_id.as_deref() == Some(agent_id))
+        {
+            let reason = match reason {
+                EndReason::Closed => EndReason::Exited,
+                other => other,
+            };
+            pending.ended.get_or_insert((reason, exit_code, now));
         }
     }
 
@@ -874,34 +881,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn delegation_records_only_the_other_pane() {
-        let mut tracker = RunTracker::new();
-        tracker.begin_run(start("orch"), 0);
-        tracker.begin_run(start("worker"), 0);
-        tracker.observe_delegation("orch", "worker", 5);
-        tracker.end_all(EndReason::DaemonShutdown, 9);
-        let spans = tracker.take_finished();
-        for span in spans.iter().filter(|s| s.name == SPAN_AGENT_RUN) {
-            assert_eq!(
-                attr(span, AttrKey::EndReason),
-                Some(&AttrValue::Str("daemon_shutdown".into()))
-            );
-            let delegation = span
-                .events
-                .iter()
-                .find(|e| e.name == EVENT_DELEGATION)
-                .expect("a delegation event");
-            let pane = attr(span, AttrKey::PaneId).unwrap();
-            let expected = if *pane == AttrValue::Str("orch".into()) {
-                Attribute::str(AttrKey::DelegationToPane, "worker")
-            } else {
-                Attribute::str(AttrKey::DelegationFromPane, "orch")
-            };
-            assert_eq!(delegation.attributes, vec![expected]);
-        }
-    }
-
-    #[test]
     fn orchestration_context_and_pr_attributes() {
         let mut tracker = RunTracker::new();
         let mut s = start("p1");
@@ -1035,6 +1014,61 @@ pub(crate) mod tests {
             "the run starts when it was prepared"
         );
         assert_eq!(tracker.held(), (0, 0));
+    }
+
+    /// A fast agent can reach the end of its PTY before the spawn path
+    /// commits its run. The end is kept for the prepared run, which the commit
+    /// then opens and ends: one run, ended `exited`, nothing left open.
+    #[test]
+    fn an_end_before_the_commit_ends_the_run_when_it_opens() {
+        for (reported, expected) in [
+            // Not yet registered reads as closed; nothing could have closed it.
+            (EndReason::Closed, "exited"),
+            (EndReason::Exited, "exited"),
+            (EndReason::DaemonShutdown, "daemon_shutdown"),
+        ] {
+            let mut tracker = RunTracker::new();
+            let mut s = start("p1");
+            s.agent_id = Some("agent-1".into());
+            tracker.prepare_run(s, 100);
+            let mut early = event("p1", EventType::SessionStart);
+            early.agent_id = Some("agent-1".into());
+            tracker.observe_event(&early, 105);
+            tracker.end_agent_run("p1", Some("agent-1"), reported, Some(3), 110);
+            assert!(tracker.take_finished().is_empty(), "not committed yet");
+            tracker.commit_run("run-p1");
+            let spans = tracker.take_finished();
+            let runs: Vec<_> = spans.iter().filter(|s| s.name == SPAN_AGENT_RUN).collect();
+            assert_eq!(runs.len(), 1, "{reported:?}");
+            assert_eq!(
+                attr(runs[0], AttrKey::EndReason),
+                Some(&AttrValue::Str(expected.into())),
+                "{reported:?}"
+            );
+            assert_eq!(attr(runs[0], AttrKey::ExitCode), Some(&AttrValue::Int(3)));
+            assert_eq!(runs[0].end_unix_nanos, 110, "ended when the agent did");
+            assert_eq!(
+                statuses(&spans).last(),
+                Some(&AttrValue::Str("idle".into()))
+            );
+            assert_eq!(tracker.held(), (0, 0), "{reported:?}");
+        }
+    }
+
+    /// The early end is for its own generation only: an end naming another
+    /// agent, or none, leaves a prepared run to open as usual.
+    #[test]
+    fn an_early_end_for_another_generation_leaves_the_prepared_run_open() {
+        for other in [Some("agent-0"), None] {
+            let mut tracker = RunTracker::new();
+            let mut s = start("p1");
+            s.agent_id = Some("agent-1".into());
+            tracker.prepare_run(s, 100);
+            tracker.end_agent_run("p1", other, EndReason::Exited, None, 110);
+            tracker.commit_run("run-p1");
+            assert!(tracker.take_finished().is_empty(), "{other:?}");
+            assert_eq!(tracker.run_id("p1"), Some("run-p1"), "{other:?}");
+        }
     }
 
     #[test]

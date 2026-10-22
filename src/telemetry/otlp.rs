@@ -648,9 +648,8 @@ pub(crate) mod tests {
             t += 1;
         }
         tracker.observe_human_input("pane-1", t);
-        tracker.observe_delegation("pane-1", "pane-2", t + 1);
-        tracker.end_run("pane-1", EndReason::Exited, Some(1), t + 2);
-        tracker.end_all(EndReason::DaemonShutdown, t + 3);
+        tracker.end_run("pane-1", EndReason::Exited, Some(1), t + 1);
+        tracker.end_all(EndReason::DaemonShutdown, t + 2);
         let spans = tracker.take_finished();
         let run = spans
             .iter()

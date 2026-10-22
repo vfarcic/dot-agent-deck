@@ -1300,7 +1300,11 @@ impl Sender {
                     break SendOutcome::Failed;
                 }
             };
-            let wait = wait.unwrap_or_else(|| jittered(backoff));
+            // A `Retry-After` can lengthen the wait, never shorten it below
+            // the backoff: `Retry-After: 0` from an overloaded backend must
+            // not turn into back-to-back retries.
+            let backoff_wait = jittered(backoff);
+            let wait = wait.map_or(backoff_wait, |asked| asked.max(backoff_wait));
             // Compared as durations: `now + wait` overflows `Instant` for a
             // `Retry-After` as large as `u64::MAX` seconds.
             if wait >= deadline.saturating_duration_since(Instant::now()) {
@@ -1389,7 +1393,13 @@ async fn run_exporter(mut sender: Sender, mut rx: mpsc::Receiver<ExportMsg>) {
                         sender.export(&mut batch, Some(deadline)).await;
                         batch = rest;
                     }
-                    batch.clear();
+                    if !batch.is_empty() {
+                        tracing::warn!(
+                            spans = batch.len(),
+                            "telemetry: the final flush ran out of time; spans dropped"
+                        );
+                        batch.clear();
+                    }
                     let _ = ack.send(());
                 }
                 None => {
@@ -1572,6 +1582,35 @@ mod tests {
         assert_eq!(get(&run.env, "OTEL_LOGS_EXPORTER"), Some("otlp"));
     }
 
+    /// A Claude Code launch behind leading assignments or an `env` prefix,
+    /// with no declared agent kind, is still Claude Code: its run says so and
+    /// it gets the switches.
+    #[test]
+    fn a_wrapped_claude_launch_is_claude_and_gets_the_switches() {
+        let telemetry = Arc::new(Telemetry::start(&env(&[
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:9"),
+            ("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc"),
+        ])));
+        for command in [
+            "FOO=1 claude --model haiku",
+            "env FOO=1 claude --model haiku",
+        ] {
+            let start = RunStart::for_spawn("p1", "a1", None, Some(command), None);
+            assert_eq!(start.agent, AgentType::ClaudeCode, "{command}");
+            let run = telemetry.prepare_run(start, &[], None).unwrap();
+            assert_eq!(
+                get(&run.env, "CLAUDE_CODE_ENABLE_TELEMETRY"),
+                Some("1"),
+                "{command}"
+            );
+            assert!(
+                get(&run.env, "OTEL_RESOURCE_ATTRIBUTES")
+                    .is_some_and(|attrs| attrs.contains("deck.agent=claude")),
+                "{command}"
+            );
+        }
+    }
+
     #[test]
     fn rate_limited_log_reports_the_first_then_one_per_interval() {
         let mut log = RateLimitedLog::new(Duration::from_secs(60));
@@ -1699,6 +1738,35 @@ mod tests {
             attr(run, AttrKey::EndReason),
             Some(&AttrValue::Str("daemon_shutdown".into()))
         );
+    }
+
+    /// A fast agent's PTY can end before the spawn path commits its run. The
+    /// end is kept for the run, which opens and ends at once: one run, ended
+    /// `exited`, and nothing of it left in the handle.
+    #[tokio::test]
+    async fn an_agent_that_exits_before_its_commit_leaves_no_run_open() {
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        let (tx, events) = broadcast::channel(16);
+        telemetry.subscribe(events);
+        let prepared = telemetry
+            .prepare_run(generation("p1", "a1"), &[], None)
+            .unwrap();
+        tx.send(of("p1", "a1", EventType::SessionStart)).unwrap();
+        // Not yet registered when its PTY ended, so the seam reads `closed`.
+        telemetry.end_run("p1", Some("a1"), EndReason::Closed, None);
+        telemetry.settled().await;
+        prepared.commit();
+        telemetry.settled().await;
+        let spans = captured(&mut rx);
+        let runs: Vec<_> = spans.iter().filter(|s| s.name == SPAN_AGENT_RUN).collect();
+        assert_eq!(runs.len(), 1, "{spans:?}");
+        assert_eq!(
+            attr(runs[0], AttrKey::EndReason),
+            Some(&AttrValue::Str("exited".into()))
+        );
+        let shared = &telemetry.exporting.as_ref().unwrap().shared;
+        assert_eq!(shared.tracker.lock().unwrap().held(), (0, 0));
+        assert!(shared.lock_filters().is_empty());
     }
 
     /// A spawn refused after `prepare_run` drops its `PreparedRun`: the run is
@@ -2646,7 +2714,7 @@ mod tests {
     /// N1: a `Retry-After` of any value ends in bounded time without a panic:
     /// one too large to add to a clock (`u64::MAX` seconds) or merely past the
     /// deadline gives up at once; one that is not a number of seconds falls
-    /// back to the backoff; zero retries at once.
+    /// back to the backoff; zero still waits for the backoff.
     #[tokio::test]
     async fn any_retry_after_ends_in_bounded_time() {
         let cases: [(&str, SendOutcome); 6] = [
@@ -2682,7 +2750,90 @@ mod tests {
                 "retry-after: {value}: {:?}",
                 started.elapsed()
             );
+            if value == "0" {
+                // The jittered first backoff is at least half of 20 ms.
+                assert!(
+                    started.elapsed() >= Duration::from_millis(10),
+                    "retry-after: 0 retried without the backoff: {:?}",
+                    started.elapsed()
+                );
+            }
         }
+    }
+
+    /// A backend that answers every send with `Retry-After: 0` is not hit
+    /// back to back: the backoff still sets the pauses, so the attempts within
+    /// the export timeout stay as few as the backoff allows.
+    #[tokio::test]
+    async fn a_zero_retry_after_does_not_shorten_the_backoff() {
+        let (addr, mut requests) = receiver(vec![format!("{UNAVAILABLE}\r\nretry-after: 0")]).await;
+        let mut sender = sender_for(
+            format!("http://{addr}/v1/traces"),
+            "",
+            Duration::from_millis(400),
+        );
+        let outcome = sender.send(&mut one_span(), None).await;
+        let Some(SendOutcome::GaveUp { attempts }) = outcome else {
+            panic!("{outcome:?}");
+        };
+        // Pauses of at least 10, 20, then 40 ms each fit at most 12 attempts
+        // in 400 ms; back-to-back retries over loopback make far more.
+        assert!((2..=12).contains(&attempts), "{attempts} attempts");
+        let taken = std::iter::from_fn(|| requests.try_recv().ok()).count();
+        assert!(taken <= 12, "{taken} requests");
+    }
+
+    /// A final flush whose deadline passes with spans still unsent drops them
+    /// and says how many in the log, rather than acknowledging in silence.
+    #[tokio::test]
+    async fn spans_left_at_the_flush_deadline_are_counted_in_a_warning() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let logs = Captured::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new(
+                "dot_agent_deck::telemetry=trace",
+            ))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(move || writer.clone()),
+            );
+        let _guard = crate::test_isolation::capture_tracing_on_this_thread(subscriber);
+
+        let sender = sender_for(
+            "http://127.0.0.1:9/v1/traces".into(),
+            "",
+            Duration::from_secs(1),
+        );
+        let (queue, rx) = mpsc::channel(QUEUE_CAPACITY);
+        let exporter = tokio::spawn(run_exporter(sender, rx));
+        for _ in 0..3 {
+            for span in one_span() {
+                queue.send(ExportMsg::Span(Box::new(span))).await.unwrap();
+            }
+        }
+        let (ack, done) = oneshot::channel();
+        queue
+            .send(ExportMsg::Flush {
+                ack,
+                // Already passed: nothing can be sent.
+                deadline: Instant::now(),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(60), done)
+            .await
+            .expect("the flush finished")
+            .expect("the exporter task is alive to acknowledge it");
+        drop(queue);
+        exporter.await.unwrap();
+        let logged = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        let warning = logged
+            .lines()
+            .find(|l| l.contains("the final flush ran out of time; spans dropped"))
+            .unwrap_or_else(|| panic!("no drop warning: {logged}"));
+        assert!(warning.contains("spans=3"), "{warning}");
     }
 
     /// N1: after a `Retry-After` of `u64::MAX` seconds, the exporter task is

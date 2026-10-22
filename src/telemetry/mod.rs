@@ -164,7 +164,6 @@ pub const SPAN_AGENT_STATUS: &str = "agent.status";
 /// The span event names the deck emits on `agent.run`.
 pub const EVENT_STATUS_CHANGE: &str = "deck.status_change";
 pub const EVENT_INTERVENTION: &str = "deck.intervention";
-pub const EVENT_DELEGATION: &str = "deck.delegation";
 
 /// Every attribute key the deck can put on a span, a span event, or the
 /// resource it builds itself. The closed set IS the allow-list: an attribute
@@ -200,8 +199,6 @@ pub enum AttrKey {
     StatusFrom,
     StatusTo,
     InterventionKind,
-    DelegationToPane,
-    DelegationFromPane,
 }
 
 impl AttrKey {
@@ -232,8 +229,6 @@ impl AttrKey {
         AttrKey::StatusFrom,
         AttrKey::StatusTo,
         AttrKey::InterventionKind,
-        AttrKey::DelegationToPane,
-        AttrKey::DelegationFromPane,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -263,8 +258,6 @@ impl AttrKey {
             AttrKey::StatusFrom => "deck.status.from",
             AttrKey::StatusTo => "deck.status.to",
             AttrKey::InterventionKind => "deck.intervention.kind",
-            AttrKey::DelegationToPane => "deck.delegation.to_pane.id",
-            AttrKey::DelegationFromPane => "deck.delegation.from_pane.id",
         }
     }
 

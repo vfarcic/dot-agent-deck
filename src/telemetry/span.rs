@@ -52,7 +52,7 @@ impl Attribute {
 pub type TraceId = [u8; 16];
 pub type SpanId = [u8; 8];
 
-/// A span event (`deck.status_change`, `deck.intervention`, `deck.delegation`).
+/// A span event (`deck.status_change`, `deck.intervention`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpanEventRecord {
     pub name: &'static str,
