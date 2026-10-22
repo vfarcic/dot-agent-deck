@@ -240,7 +240,7 @@ When applying updates:
 
 ## Step 7.5: Code Example Validation
 
-**For an issue PRD, skip this step**: its body carries no code examples to validate ([`../prd-start/issue-prd.md`](../prd-start/issue-prd.md), "The body"), and what was built and where goes in Step 7's progress comment, not in the body.
+**For an issue PRD, skip this step except for the two exceptions** in [`../prd-start/issue-prd.md`](../prd-start/issue-prd.md) ("The body"): names the user sees (a CLI command or flag, a config key, a keybinding) and constraints the PRD exists to enforce. Check each one the body carries against the implementation and, where progress shows it changed, update it in the body the way Step 7 edits the body. That page keeps speculative implementation examples out of the body, so they are not validated here; what was built and where goes in Step 7's progress comment, not in the body.
 
 When updating a file PRD based on implementation progress:
 
