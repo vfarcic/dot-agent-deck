@@ -9702,7 +9702,7 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/claude/045 — A phase out of time says so rather than calling the deck older.
 - **Layer:** Fast (`src/inbox_prompt.rs`), `fetch_with_receipts` against stand-in sockets and the commit's reporting (`report_committed`), with the process's said-notices cleared between steps (`inbox_oneshot::forget_reports`; nextest runs the test in a process of its own).
 - **Agent:** none.
-- **Asserts:** the doorbell fetch at a deck silent within the budget, and with the shared budget already spent (connecting to nothing), says `RECEIPTS_TIMED_OUT` alone; at a deck answering without the capability `RECEIPTS_UNSUPPORTED` alone; at a deck that hangs up unanswered `RECEIPTS_CONNECTION_LOST` alone; a `TimedOut` commit says `RECEIPTS_COMMIT_TIMED_OUT` (not the fetch's queued notice), a `Withheld` one the unsupported notice and a `Lost` one the connection-lost notice.
+- **Asserts:** the doorbell fetch at a deck silent within the budget, and with the shared budget already spent (connecting to nothing), says `RECEIPTS_TIMED_OUT` alone; at a deck answering without the capability `RECEIPTS_UNSUPPORTED` alone; at a deck that hangs up unanswered `RECEIPTS_CONNECTION_LOST` alone; a `TimedOut` commit says `RECEIPTS_COMMIT_TIMED_OUT` (not the fetch's queued notice), a `Withheld` one `RECEIPTS_COMMIT_UNSUPPORTED` and a `Lost` one `RECEIPTS_COMMIT_CONNECTION_LOST`, never the fetch's notices, which say no message was taken.
 - **Does not assert:** the stderr and exit status of the real hook (inbox/claude/028, /037, /043).
 - **Platform coverage:** mac+linux.
 

@@ -2046,20 +2046,23 @@ impl InboxHub {
             }
             if committed == Some(engine::ExplicitCommit::Committed) {
                 drain_events(&mut st);
-                return match st.inbox.get(id, pane_id).map(|m| &m.state) {
-                    Some(MessageState::Acknowledged { .. }) => AckOutcome::Acknowledged,
+                match st.inbox.get(id, pane_id).map(|m| &m.state) {
                     Some(MessageState::Claimed { expires, .. }) => AckOutcome::Claimed {
                         expires_in_ms: expires.saturating_duration_since(now).as_millis() as u64,
                     },
                     _ => AckOutcome::Acknowledged,
-                };
+                }
+            } else {
+                let outcome = st.inbox.ack(now, id, pane_id, agent_id, how);
+                drain_events(&mut st);
+                outcome
             }
-            let outcome = st.inbox.ack(now, id, pane_id, agent_id, how);
-            drain_events(&mut st);
-            outcome
         };
         // PRD #1666 S11: an ack claims an offered job, which its offerer is
-        // told of now rather than at the next deadline.
+        // told of now rather than at the next deadline. A commit's
+        // corrections (PR #1817 review 4347326623) are posted the same way,
+        // and the ticker is woken for the deadlines the commit moved.
+        self.changed.notify_one();
         self.post_owed_notices();
         outcome
     }

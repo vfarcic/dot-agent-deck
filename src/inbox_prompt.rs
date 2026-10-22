@@ -623,20 +623,33 @@ pub fn commit_delivered(prompt: &str, receipts_by: std::time::Instant) {
 }
 
 /// Say on stderr what `committed` leaves the user to act on, if anything:
-/// [`crate::inbox_oneshot::RECEIPTS_UNSUPPORTED`],
+/// [`crate::inbox_oneshot::RECEIPTS_COMMIT_UNSUPPORTED`],
 /// [`crate::inbox_oneshot::RECEIPTS_COMMIT_TIMED_OUT`],
-/// [`crate::inbox_oneshot::RECEIPTS_CONNECTION_LOST`] or
-/// [`crate::inbox_oneshot::RECEIPTS_FOREIGN_SOCKET`]. A commit's timeout says
-/// its own notice, not the fetch's: the waiter already took the message the
-/// prompt carries, so it is not promised to be queued.
+/// [`crate::inbox_oneshot::RECEIPTS_COMMIT_CONNECTION_LOST`] or
+/// [`crate::inbox_oneshot::RECEIPTS_FOREIGN_SOCKET`]. A commit's withheld
+/// answer, timeout and lost connection each say their own notice, not the
+/// fetch's: the waiter already took the message the prompt carries, so none
+/// says no message was taken or promises it is queued.
 #[cfg(unix)]
 fn report_committed(committed: Committed) {
     match committed {
-        Committed::Withheld => crate::inbox_oneshot::report_unsupported(),
-        Committed::Lost => crate::inbox_oneshot::report_connection_lost(),
+        Committed::Withheld => crate::inbox_oneshot::report_commit_unsupported(),
+        Committed::Lost => crate::inbox_oneshot::report_commit_connection_lost(),
         Committed::TimedOut => crate::inbox_oneshot::report_commit_timed_out(),
         Committed::Foreign => crate::inbox_oneshot::report_foreign_socket(),
         Committed::Nothing | Committed::Refused | Committed::Sent => {}
+    }
+}
+
+/// The notice [`report_committed`] says for `committed`, if any.
+#[cfg(all(test, unix))]
+fn committed_notice(committed: Committed) -> Option<&'static str> {
+    match committed {
+        Committed::Withheld => Some(crate::inbox_oneshot::RECEIPTS_COMMIT_UNSUPPORTED),
+        Committed::Lost => Some(crate::inbox_oneshot::RECEIPTS_COMMIT_CONNECTION_LOST),
+        Committed::TimedOut => Some(crate::inbox_oneshot::RECEIPTS_COMMIT_TIMED_OUT),
+        Committed::Foreign => Some(crate::inbox_oneshot::RECEIPTS_FOREIGN_SOCKET),
+        Committed::Nothing | Committed::Refused | Committed::Sent => None,
     }
 }
 
@@ -1701,15 +1714,41 @@ mod tests {
             (false, false, false, true),
             "a commit out of time promises nothing queued"
         );
+        // A withheld commit and a commit's lost connection say their own
+        // notices, not the fetch's (PR #1817 review 4347326613).
         forget_reports();
         report_committed(Committed::Withheld);
-        assert_eq!(said(), (false, true, false, false), "a withheld commit");
+        assert_eq!(said(), (false, false, false, false), "a withheld commit");
+        assert!(crate::inbox_oneshot::reported_commit_unsupported());
         forget_reports();
         report_committed(Committed::Lost);
         assert_eq!(
             said(),
-            (false, false, true, false),
+            (false, false, false, false),
             "a commit's lost connection"
         );
+        assert!(crate::inbox_oneshot::reported_commit_connection_lost());
+    }
+
+    /// PR #1817 review 4347326613: a commit's notice never says that no
+    /// message was taken, because the waiter already took the one the prompt
+    /// carries. Each says this hook did not confirm it and took no further
+    /// message.
+    #[cfg(unix)]
+    #[test]
+    fn a_commit_notice_never_says_no_message_was_taken() {
+        for committed in [
+            Committed::Withheld,
+            Committed::Lost,
+            Committed::TimedOut,
+        ] {
+            let notice = committed_notice(committed).unwrap();
+            for not in ["no message was taken", "took no message"] {
+                assert!(!notice.contains(not), "{committed:?} says {not:?}: {notice}");
+            }
+            for says in ["did not confirm", "took no further message"] {
+                assert!(notice.contains(says), "{committed:?} lacks {says:?}: {notice}");
+            }
+        }
     }
 }

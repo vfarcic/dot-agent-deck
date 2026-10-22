@@ -898,6 +898,52 @@ pub fn reported_connection_lost() -> bool {
     REPORTED_CONNECTION_LOST.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// What the prompt hook says when the deck answered its commit's question
+/// without confirming that it serves receipts ([`Opened::Unsupported`] on the
+/// commit's connection). [`RECEIPTS_UNSUPPORTED`]'s "no message was taken" is
+/// false here: the waiter already took the message the prompt carries. So
+/// this says only what this exchange did not do, and how to make the two
+/// builds agree.
+pub const RECEIPTS_COMMIT_UNSUPPORTED: &str = "dot-agent-deck: the deck daemon did not confirm that it serves message receipts, so this hook did not confirm to it that the message in this prompt was received, and took no further message. The deck daemon is most likely older than the dot-agent-deck this agent's hooks run. Restart the deck daemon on that newer build, or run `dot-agent-deck hooks install --agent claude-code` with the build the daemon runs, which rewrites the waiter and the prompt hook together; then restart the agent.";
+
+static REPORTED_COMMIT_UNSUPPORTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Say [`RECEIPTS_COMMIT_UNSUPPORTED`] on stderr, once per process, and
+/// remember it ([`reported_refusal`]).
+pub fn report_commit_unsupported() {
+    if !REPORTED_COMMIT_UNSUPPORTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        eprintln!("{RECEIPTS_COMMIT_UNSUPPORTED}");
+    }
+}
+
+/// Whether this process said [`RECEIPTS_COMMIT_UNSUPPORTED`].
+pub fn reported_commit_unsupported() -> bool {
+    REPORTED_COMMIT_UNSUPPORTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// What the prompt hook says when its commit's connection was lost before the
+/// deck answered whether it serves receipts ([`Opened::Lost`] on the commit's
+/// connection). Like [`RECEIPTS_COMMIT_TIMED_OUT`], it does not say no message
+/// was taken: the prompt carries one the waiter took.
+pub const RECEIPTS_COMMIT_CONNECTION_LOST: &str = "dot-agent-deck: the connection to the deck daemon was lost before it answered whether it serves message receipts, so this hook did not confirm to it that the message in this prompt was received, and took no further message. The deck daemon may have stopped or restarted: check that it is running with `dot-agent-deck daemon status`, and if this keeps happening while it runs, restart the agent.";
+
+static REPORTED_COMMIT_CONNECTION_LOST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Say [`RECEIPTS_COMMIT_CONNECTION_LOST`] on stderr, once per process, and
+/// remember it ([`reported_refusal`]).
+pub fn report_commit_connection_lost() {
+    if !REPORTED_COMMIT_CONNECTION_LOST.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        eprintln!("{RECEIPTS_COMMIT_CONNECTION_LOST}");
+    }
+}
+
+/// Whether this process said [`RECEIPTS_COMMIT_CONNECTION_LOST`].
+pub fn reported_commit_connection_lost() -> bool {
+    REPORTED_COMMIT_CONNECTION_LOST.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Forget what this process said, so a test can tell which notice a later
 /// step says.
 #[cfg(all(test, unix))]
@@ -907,6 +953,8 @@ pub(crate) fn forget_reports() {
         &REPORTED_TIMED_OUT,
         &REPORTED_COMMIT_TIMED_OUT,
         &REPORTED_CONNECTION_LOST,
+        &REPORTED_COMMIT_UNSUPPORTED,
+        &REPORTED_COMMIT_CONNECTION_LOST,
         &REPORTED_FOREIGN,
     ] {
         said.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -933,7 +981,8 @@ pub fn report_foreign_socket() {
 }
 
 /// Whether this process said [`RECEIPTS_UNSUPPORTED`], [`RECEIPTS_TIMED_OUT`],
-/// [`RECEIPTS_COMMIT_TIMED_OUT`], [`RECEIPTS_CONNECTION_LOST`] or
+/// [`RECEIPTS_COMMIT_TIMED_OUT`], [`RECEIPTS_CONNECTION_LOST`],
+/// [`RECEIPTS_COMMIT_UNSUPPORTED`], [`RECEIPTS_COMMIT_CONNECTION_LOST`] or
 /// [`RECEIPTS_FOREIGN_SOCKET`]: a one-shot that did any of them took
 /// nothing, and a later phase of the same hook asks nothing more.
 pub fn reported_refusal() -> bool {
@@ -941,6 +990,8 @@ pub fn reported_refusal() -> bool {
         || reported_timed_out()
         || reported_commit_timed_out()
         || reported_connection_lost()
+        || reported_commit_unsupported()
+        || reported_commit_connection_lost()
         || REPORTED_FOREIGN.load(std::sync::atomic::Ordering::SeqCst)
 }
 
@@ -2788,6 +2839,8 @@ pub(crate) mod tests {
             RECEIPTS_TIMED_OUT,
             RECEIPTS_COMMIT_TIMED_OUT,
             RECEIPTS_CONNECTION_LOST,
+            RECEIPTS_COMMIT_UNSUPPORTED,
+            RECEIPTS_COMMIT_CONNECTION_LOST,
         ];
         for (i, a) in notices.iter().enumerate() {
             for b in &notices[i + 1..] {
@@ -2798,6 +2851,7 @@ pub(crate) mod tests {
             RECEIPTS_TIMED_OUT,
             RECEIPTS_COMMIT_TIMED_OUT,
             RECEIPTS_CONNECTION_LOST,
+            RECEIPTS_COMMIT_CONNECTION_LOST,
         ] {
             assert!(
                 !notice.contains("most likely"),

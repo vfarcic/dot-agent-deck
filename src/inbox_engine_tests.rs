@@ -2247,6 +2247,45 @@ async fn a_commit_after_running_out_of_attempts_corrects_the_sender_and_the_card
     peer.close().await;
 }
 
+/// PR #1817 review 4347326623: a delegated task whose hand-outs lapse
+/// unpossessed becomes uncertain, and its orchestrator is told so. The
+/// worker then runs `ack <id>`, which commits the attempt. The orchestrator's
+/// correction is posted by the ack itself, not left for the ticker's next
+/// tick.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_explicit_ack_of_an_uncertain_task_posts_its_correction_at_once() {
+    let hub = hub_with(Duration::from_secs(30), Duration::from_secs(60));
+    let mut peer = Peer::open(&hub, "p", "a", InboxComponent::OpenCodePlugin, INTEGRATION).await;
+    peer.next().await;
+    let task = delegate_to(&hub, "p", "uncertain, then acked");
+    let mut seq = 0;
+    lapse_until_uncertain(&hub, &mut peer, task.as_str(), &mut seq).await;
+    until("the orchestrator to be told it is uncertain", || {
+        hub.tick();
+        orchestrator_notices(&hub)
+            .iter()
+            .any(|(subject, _)| subject == UNCERTAIN_SUBJECT)
+    })
+    .await;
+
+    assert_eq!(
+        hub.ack(task.as_str(), "p", "a", AckHow::Explicit),
+        AckOutcome::Acknowledged
+    );
+    // Read without posting what is owed: the ack must have posted it.
+    let subjects = hub
+        .list_with_bodies(Some("o"))
+        .into_iter()
+        .map(|m| m.subject.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        subjects,
+        vec![UNCERTAIN_SUBJECT, LATE_ACK_SUBJECT],
+        "the ack posts the correction itself"
+    );
+    peer.close().await;
+}
+
 /// Read out every line the daemon has written to `peer` so far, keepalives
 /// included, until none arrives for a moment.
 async fn drain_lines(peer: &mut Peer) {
