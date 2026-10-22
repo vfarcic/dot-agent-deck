@@ -32,7 +32,7 @@ Work through the PRD template focusing on project management, milestone tracking
 
 **Key Principle**: Focus on 5-10 major milestones rather than exhaustive task lists. Each milestone should represent meaningful progress that can be clearly validated.
 
-**What, not where**: the body says what changes for the user and why, not where in the code. Write no file paths, type or function names, code snippets or line numbers, except names the user sees (a CLI flag, a config key, a command) and constraints the PRD exists to enforce (e.g. "no `PROTOCOL_VERSION` bump"). Decisions keep their rationale. Code-level detail written now goes stale before anyone implements it, and the agent that starts the PRD reads the code anyway; notes on what was built and where belong later, in `### PRD progress` comments ([`issue-prd.md`](../prd-start/issue-prd.md), "The body").
+**What, not where**: the body says what changes for the user and why, not where in the code. Write no file paths, type or function names, code snippets or line numbers, except names the user sees (a CLI flag, a config key, a command) and constraints the PRD exists to enforce (e.g. "no `PROTOCOL_VERSION` bump"). Decisions keep their rationale. Code-level detail written now can go stale before anyone implements it, and the agent that starts the PRD reads the code anyway; notes on what was built and where belong later, in `### PRD progress` comments ([`issue-prd.md`](../prd-start/issue-prd.md), "The body").
 
 **Consider Including** (when applicable to the project/feature):
 - **Tests** - If the project has tests, include a milestone for test coverage of new functionality
