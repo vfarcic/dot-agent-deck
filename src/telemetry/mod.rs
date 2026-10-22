@@ -39,7 +39,7 @@
 //!
 //! The module is self-contained: the daemon and the agent spawn path each reach
 //! it through one call per lifecycle point — [`start_for_daemon`] and
-//! [`note_stop_signals`], [`prepare_spawn`] and [`commit_spawn`], [`agent_exited`] and
+//! [`teardown_began`], [`prepare_spawn`] and [`commit_spawn`], [`agent_exited`] and
 //! [`observe_pane_input`] — so what telemetry does at each of them is decided
 //! here, not at the call site.
 
@@ -62,26 +62,38 @@ pub use tracker::{EndReason, OrchestrationInfo, RunStart, RunTracker};
 
 use std::sync::Arc;
 
-/// Daemon start: read the configuration from this process's environment,
-/// subscribe the tracker to `event_tx`, and hand `registry` the handle so the
-/// agents it spawns get runs. With telemetry off the returned handle does
-/// nothing, nothing is subscribed, and `registry` is left alone.
+/// Daemon start: clear the per-run agent configuration files a daemon that
+/// ended without its teardown (a crash, a SIGKILL) left behind, read the
+/// configuration from this process's environment, subscribe the tracker to
+/// `event_tx`, and hand `registry` the handle so the agents it spawns get runs.
+/// With telemetry off the returned handle does nothing, nothing is subscribed,
+/// and `registry` is left alone.
 ///
-/// Installs no signal handler: that waits for [`note_stop_signals`], which
-/// the daemon calls once its own termination watch exists.
+/// Installs no signal handler: when the daemon's teardown begins is told by
+/// the daemon itself ([`teardown_began`]).
 pub fn start_for_daemon(
     event_tx: &tokio::sync::broadcast::Sender<crate::event::BroadcastMsg>,
     registry: &crate::agent_pty::AgentPtyRegistry,
 ) -> Arc<Telemetry> {
-    start_from(&config::process_env(), event_tx, registry)
+    start_from(
+        &config::process_env(),
+        exporter::default_config_dir(),
+        event_tx,
+        registry,
+    )
 }
 
+/// `config_dir` holds this daemon's per-run agent configuration files. The
+/// leftovers are removed whether or not telemetry is on now: no run of this
+/// daemon exists yet to own one, and the daemon before it may have exported.
 fn start_from(
     env: &config::EnvMap,
+    config_dir: std::path::PathBuf,
     event_tx: &tokio::sync::broadcast::Sender<crate::event::BroadcastMsg>,
     registry: &crate::agent_pty::AgentPtyRegistry,
 ) -> Arc<Telemetry> {
-    let telemetry = Arc::new(Telemetry::start(env));
+    launch::remove_leftover_config_files(&config_dir);
+    let telemetry = Arc::new(Telemetry::start_in(env, config_dir));
     telemetry.subscribe(event_tx.subscribe());
     if telemetry.is_enabled() {
         registry.set_telemetry(Arc::clone(&telemetry));
@@ -89,50 +101,28 @@ fn start_from(
     telemetry
 }
 
-/// The daemon's termination watch is up (`daemon_watch` is its task): from
-/// here, tell `telemetry` when a termination signal reaches the daemon.
-/// `daemon stop` and the build-mismatch prompt stop it with one and wait a
-/// fixed window for it to exit, which the final flush must fit in.
-///
-/// Only listens, and only alongside that watch. Registering a listener
-/// replaces the signal's default disposition for the life of the process, so
-/// one registered before the watch, or with no watch at all, would swallow a
-/// stop the daemon never sees. Hence the handle: without it — telemetry not
-/// exporting, or the watch could not be installed — nothing is registered.
-pub fn note_stop_signals<T>(
-    telemetry: &Arc<Telemetry>,
-    daemon_watch: Option<&tokio::task::JoinHandle<T>>,
-) {
-    if daemon_watch.is_some() && telemetry.is_exporting() {
-        note_termination_signal(telemetry);
+/// The teardowns no stop client is timing, by the cause the daemon names them
+/// with: a restart, whose client waits for the old daemon's endpoint and the
+/// successor's answer for far longer than the final flush's own budget, and a
+/// lost attach socket, which leaves no client able to wait at all.
+const UNTIMED_TEARDOWNS: [&str; 2] = ["restart-daemon", "attach-lost"];
+
+/// The daemon began a teardown it accepted, for `cause`: called where it names
+/// what that teardown stops ([`crate::daemon_stop::log_teardown_inventory`]),
+/// ahead of the agents' drain, on each path that drains them — a termination
+/// signal, `StopDaemon`, `KIND_SHUTDOWN`, a restart, a lost attach socket. A
+/// stop the daemon does not act on, such as a signal after it committed to a
+/// restart, does not reach it. Where a stop client is timing the daemon's exit
+/// its window opened about now, and the final flush is sized to what is left
+/// of it ([`Telemetry::teardown_began`]); after one of the
+/// [`UNTIMED_TEARDOWNS`] the flush keeps its own budget.
+pub fn teardown_began(telemetry: Option<Arc<Telemetry>>, cause: &str) {
+    if let Some(telemetry) = telemetry
+        && !UNTIMED_TEARDOWNS.contains(&cause)
+    {
+        telemetry.teardown_began(std::time::Instant::now());
     }
 }
-
-#[cfg(unix)]
-fn note_termination_signal(telemetry: &Arc<Telemetry>) {
-    use tokio::signal::unix::{SignalKind, signal};
-    let (Ok(mut sigterm), Ok(mut sigint)) = (
-        signal(SignalKind::terminate()),
-        signal(SignalKind::interrupt()),
-    ) else {
-        return;
-    };
-    let telemetry = Arc::downgrade(telemetry);
-    tokio::spawn(async move {
-        tokio::select! {
-            _ = sigterm.recv() => {}
-            _ = sigint.recv() => {}
-        }
-        if let Some(telemetry) = telemetry.upgrade() {
-            telemetry.teardown_began(std::time::Instant::now());
-        }
-    });
-}
-
-/// Here a stop arrives as a `KIND_SHUTDOWN` frame, which telemetry does not
-/// see, so the flush is sized from when it starts.
-#[cfg(not(unix))]
-fn note_termination_signal(_telemetry: &Arc<Telemetry>) {}
 
 /// The spawn path, before the agent process exists: prepare this generation's
 /// run and add its identity to the agent's environment. `None` when telemetry
@@ -426,7 +416,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     fn exporting_env() -> config::EnvMap {
         config::EnvMap::from([(
             "OTEL_EXPORTER_OTLP_ENDPOINT".to_string(),
@@ -435,15 +424,21 @@ mod tests {
     }
 
     /// Starting telemetry, exporting, leaves both stop signals' disposition
-    /// as it found it: a stop arriving before the daemon's own watch exists
-    /// still terminates the daemon instead of reaching only telemetry.
+    /// as it found it: only the daemon's own watch decides what a stop signal
+    /// does.
     #[cfg(unix)]
     #[tokio::test]
     async fn starting_for_the_daemon_installs_no_signal_handler() {
         let before = (disposition(libc::SIGTERM), disposition(libc::SIGINT));
         let (event_tx, _) = tokio::sync::broadcast::channel(8);
         let registry = crate::agent_pty::AgentPtyRegistry::new();
-        let telemetry = start_from(&exporting_env(), &event_tx, &registry);
+        let dir = tempfile::tempdir().unwrap();
+        let telemetry = start_from(
+            &exporting_env(),
+            dir.path().to_path_buf(),
+            &event_tx,
+            &registry,
+        );
         assert!(telemetry.is_exporting());
         assert_eq!(
             (disposition(libc::SIGTERM), disposition(libc::SIGINT)),
@@ -451,48 +446,99 @@ mod tests {
         );
     }
 
-    /// Without the daemon's watch there is nothing to act on a signal, so
-    /// telemetry does not take one either.
-    #[cfg(unix)]
+    /// A Devin configuration a crashed or SIGKILLed daemon left behind is
+    /// removed when the next one starts, exporting or not; nothing else in the
+    /// directory is touched.
     #[tokio::test]
-    async fn no_daemon_watch_no_stop_listener() {
-        let before = (disposition(libc::SIGTERM), disposition(libc::SIGINT));
-        let telemetry = Arc::new(Telemetry::start(&exporting_env()));
-        note_stop_signals::<()>(&telemetry, None);
-        assert_eq!(
-            (disposition(libc::SIGTERM), disposition(libc::SIGINT)),
-            before
-        );
+    async fn starting_for_the_daemon_removes_leftover_devin_configs() {
+        for env in [config::EnvMap::new(), exporting_env()] {
+            let dir = tempfile::tempdir().unwrap();
+            let leftovers = ["devin-run-1.json", "devin-run-2.json"].map(|n| dir.path().join(n));
+            let kept = ["devin-notes.txt", "other.json", "devin.json"].map(|n| dir.path().join(n));
+            for path in leftovers.iter().chain(&kept) {
+                std::fs::write(path, "{}").unwrap();
+            }
+            std::fs::create_dir(dir.path().join("devin-dir.json")).unwrap();
+            let (event_tx, _) = tokio::sync::broadcast::channel(8);
+            let registry = crate::agent_pty::AgentPtyRegistry::new();
+            let telemetry = start_from(&env, dir.path().to_path_buf(), &event_tx, &registry);
+            for path in &leftovers {
+                assert!(!path.exists(), "left over: {}", path.display());
+            }
+            for path in &kept {
+                assert!(path.exists(), "removed: {}", path.display());
+            }
+            assert!(dir.path().join("devin-dir.json").is_dir());
+            telemetry
+                .shutdown(std::time::Duration::from_millis(100))
+                .await;
+        }
+        let (event_tx, _) = tokio::sync::broadcast::channel(8);
+        let registry = crate::agent_pty::AgentPtyRegistry::new();
+        let missing = tempfile::tempdir().unwrap().path().join("absent");
+        start_from(&exporting_env(), missing, &event_tx, &registry);
     }
 
-    /// Alongside the daemon's watch, a SIGTERM still marks when teardown
-    /// began, which is what sizes the final flush to the stop window.
-    #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn alongside_the_daemon_watch_a_sigterm_marks_the_teardown() {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut watch_signal = signal(SignalKind::terminate()).expect("the daemon's watch");
-        let watch = tokio::spawn(async move {
-            watch_signal.recv().await;
-        });
-        let telemetry = Arc::new(Telemetry::start(&exporting_env()));
-        note_stop_signals(&telemetry, Some(&watch));
-        assert!(telemetry.teardown_began_at().is_none());
+    fn exporting_registry() -> (Arc<Telemetry>, Arc<crate::agent_pty::AgentPtyRegistry>) {
+        let (event_tx, _) = tokio::sync::broadcast::channel(8);
+        let registry = Arc::new(crate::agent_pty::AgentPtyRegistry::new());
+        let dir = tempfile::tempdir().unwrap();
+        let telemetry = start_from(
+            &exporting_env(),
+            dir.path().to_path_buf(),
+            &event_tx,
+            &registry,
+        );
+        (telemetry, registry)
+    }
 
-        // SAFETY: a handler for SIGTERM is registered above, so this only
-        // wakes the two listeners.
-        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            while telemetry.teardown_began_at().is_none() {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the stop listener marked the teardown");
-        tokio::time::timeout(std::time::Duration::from_secs(10), watch)
-            .await
-            .expect("the daemon's watch saw the same signal")
-            .unwrap();
+    /// A teardown a stop client is timing — a signal, `StopDaemon`,
+    /// `KIND_SHUTDOWN` — marks when it began, through the inventory every
+    /// draining path logs first, so the final flush fits that client's
+    /// window. A restart and a lost attach socket leave the flush its own
+    /// budget: Qodo's case, where a restart's flush was cut short.
+    #[tokio::test]
+    async fn a_timed_teardown_marks_when_it_began_and_a_restart_does_not() {
+        for cause in ["signal", "stop-daemon", "shutdown-frame"] {
+            let (telemetry, registry) = exporting_registry();
+            let state: crate::state::SharedState = Default::default();
+            let before = std::time::Instant::now();
+            crate::daemon_stop::log_teardown_inventory(&state, &registry, cause).await;
+            let began = telemetry.teardown_began_at().expect(cause);
+            assert!(
+                began >= before && began <= std::time::Instant::now(),
+                "{cause}"
+            );
+        }
+        for cause in UNTIMED_TEARDOWNS {
+            let (telemetry, registry) = exporting_registry();
+            let state: crate::state::SharedState = Default::default();
+            crate::daemon_stop::log_teardown_inventory(&state, &registry, cause).await;
+            assert_eq!(telemetry.teardown_began_at(), None, "{cause}");
+        }
+        teardown_began(None, "signal");
+    }
+
+    /// The untimed causes are spelled as the daemon spells them, so a
+    /// renamed cause cannot quietly turn a restart back into a timed stop.
+    #[test]
+    fn the_untimed_teardowns_are_causes_the_daemon_names() {
+        let sources = [
+            include_str!("../daemon.rs"),
+            include_str!("../daemon_protocol.rs"),
+            include_str!("../attach_recovery.rs"),
+        ];
+        let named: Vec<&str> = sources
+            .iter()
+            .flat_map(|src| src.split("log_teardown_inventory(").skip(1))
+            .filter_map(|call| call.split(')').next()?.split('"').nth(1))
+            .collect();
+        for cause in UNTIMED_TEARDOWNS {
+            assert!(named.contains(&cause), "{cause} not among {named:?}");
+        }
+        for cause in ["signal", "stop-daemon", "shutdown-frame"] {
+            assert!(named.contains(&cause), "{cause} not among {named:?}");
+        }
     }
 
     #[test]

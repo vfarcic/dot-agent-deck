@@ -480,6 +480,26 @@ pub fn remove_config_file(path: &Path) {
     }
 }
 
+/// Remove every per-run configuration file in `dir`, the deck's own
+/// directory for them: called before any run exists, so each one there was
+/// left by a daemon that ended without removing it. Anything else in `dir` is
+/// left alone, and a missing `dir` has nothing to remove.
+pub fn remove_leftover_config_files(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(DEVIN_CONFIG_PREFIX)
+            && name.ends_with(".json")
+            && entry.file_type().is_ok_and(|t| t.is_file())
+        {
+            remove_config_file(&entry.path());
+        }
+    }
+}
+
 // ---- Pi ----
 
 /// Whether the deck's Pi extension has somewhere to send logs: a logs

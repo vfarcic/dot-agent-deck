@@ -230,7 +230,7 @@ struct Exporting {
     commands: mpsc::UnboundedSender<Command>,
     probes: Probes,
     ingest: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// When the daemon was first asked to stop, if it was by a signal — see
+    /// When the daemon began a teardown a stop client is timing — see
     /// [`Telemetry::teardown_began`].
     teardown_began: OnceLock<std::time::Instant>,
 }
@@ -312,6 +312,12 @@ impl Drop for PreparedRun {
     }
 }
 
+/// Where the daemon writes per-run agent configuration files: under its state
+/// directory.
+pub fn default_config_dir() -> PathBuf {
+    crate::config::state_dir().join("telemetry")
+}
+
 /// How [`Telemetry`] runs, apart from the environment. Tests change it.
 #[derive(Default)]
 struct Settings {
@@ -350,6 +356,18 @@ impl Telemetry {
         Self::start_with(env, Settings::default())
     }
 
+    /// [`Self::start`], with per-run agent configuration files written into
+    /// `config_dir` rather than [`default_config_dir`].
+    pub fn start_in(env: &EnvMap, config_dir: PathBuf) -> Self {
+        Self::start_with(
+            env,
+            Settings {
+                config_dir: Some(config_dir),
+                ..Settings::default()
+            },
+        )
+    }
+
     fn start_with(env: &EnvMap, settings: Settings) -> Self {
         let Some(config) = TelemetryConfig::from_env(env) else {
             return Self::disabled();
@@ -367,7 +385,7 @@ impl Telemetry {
         let config_dir = settings
             .config_dir
             .clone()
-            .unwrap_or_else(|| crate::config::state_dir().join("telemetry"));
+            .unwrap_or_else(default_config_dir);
         let host = host_name();
         let exporting = if !config.protocol.deck_can_export() {
             tracing::warn!(
