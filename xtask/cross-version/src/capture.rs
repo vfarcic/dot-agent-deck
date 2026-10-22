@@ -266,16 +266,22 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// Scenario: Interrupted captures contain complete, partial or unrelated JSON.
-    /// Recovery publishes a nonempty hand-over only when its pane and attempt
-    /// match the expected role and current token, preserving any existing publication.
+    /// Scenario: Interrupted captures contain complete, partial or unrelated JSON,
+    /// sometimes followed by acknowledgement diagnostics on stderr. Recovery keeps
+    /// an unambiguous hand-over for the current pane and attempt, preserving existing publications.
     #[test]
     fn only_complete_current_pane_hand_overs_are_recovered() {
         let json = r#"{"messages":[{"id":"m-consumed","text":"XVER-DELEGATE-consumed"}]}"#;
         let complete = format!("pane=2\nattempt=1\n{json}\n");
+        let diagnostic = "dot-agent-deck: the deck did not confirm message m-consumed as delivered; it may hand it over again\n";
+        let refused = "dot-agent-deck: the deck could not record message m-consumed as delivered (wrong_agent)\n";
         for (tag, text, token, recover) in [
             ("complete", complete.clone(), "1", true),
             ("exit-zero", format!("{complete}exit=0\n"), "1", true),
+            ("ack-diagnostic", format!("{complete}{diagnostic}exit=0\n"), "1", true),
+            ("interrupted-ack-diagnostic", format!("{complete}{diagnostic}"), "1", true),
+            ("ack-refused-diagnostic", format!("{complete}{refused}exit=0\n"), "1", true),
+            ("multiple-diagnostics", format!("{complete}{diagnostic}{refused}exit=0\n"), "1", true),
             ("wrong-pane", complete.replace("pane=2", "pane=3"), "1", false),
             ("wrong-attempt", complete.replace("attempt=1", "attempt=7"), "1", false),
             ("superseded", complete.clone(), "2", false),
@@ -285,6 +291,13 @@ mod tests {
             ("listing", "pane=2\nattempt=1\n{\"messages\":[{\"id\":\"m-consumed\",\"state\":\"acknowledged\"}]}".to_string(), "1", false),
             ("empty-id", complete.replace("m-consumed", ""), "1", false),
             ("exit-failure", format!("{complete}exit=17\n"), "1", false),
+            ("diagnostic-exit-failure", format!("{complete}{diagnostic}exit=17\n"), "1", false),
+            ("second-json", format!("{complete}{json}\nexit=0\n"), "1", false),
+            ("diagnostic-second-json", format!("{complete}{diagnostic}{json}\nexit=0\n"), "1", false),
+            ("partial-second-json", format!("{complete}{diagnostic}  {{\"messages\":["), "1", false),
+            ("second-json-array", format!("{complete}{diagnostic} []\nexit=0\n"), "1", false),
+            ("same-line-json", format!("pane=2\nattempt=1\n{json}{json}\n"), "1", false),
+            ("partial-json-diagnostic", format!("pane=2\nattempt=1\n{{\"messages\":[\n{diagnostic}exit=0\n"), "1", false),
             ("trailing-junk", format!("{complete}exit=0\nerror\n"), "1", false),
         ] {
             let root = scratch(tag);
