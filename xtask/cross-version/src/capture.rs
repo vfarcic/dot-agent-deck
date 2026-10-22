@@ -181,6 +181,30 @@ mod tests {
             .unwrap()
     }
 
+    fn wait_for_released_lease<T>(
+        session: &Session,
+        mut acquire: impl FnMut() -> Result<Option<T>, String>,
+    ) -> T {
+        // A concurrently spawning test can fork with the lease descriptor open;
+        // that child's reference can outlive our File until close-on-exec.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if let Some(value) = acquire().unwrap() {
+                return value;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "capture lease remained locked after release: {}",
+                session.lock.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    fn prepare_when_released(session: &Session, number: usize) -> Attempt {
+        wait_for_released_lease(session, || session.prepare(number))
+    }
+
     /// Scenario: A shell exits before publishing either partial output or a complete
     /// hand-over from a destructive inbox fetch. A retry must discard the partial
     /// output but keep the hand-over even though the inbox is now empty.
@@ -193,7 +217,7 @@ mod tests {
         assert!(!run(&old).status.success());
         assert!(first.tmp.exists());
         assert!(!first.out.exists());
-        let second = session.prepare(2).unwrap().unwrap();
+        let second = prepare_when_released(&session, 2);
         assert!(!first.tmp.exists(), "abandoned temporary capture remains");
         let command = session.command(&second, "printf '%s\\n' replacement", 10);
         assert!(run(&command).status.success());
@@ -221,7 +245,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&inbox).unwrap(), "");
         assert!(first.tmp.exists());
         assert!(!first.out.exists());
-        let second = session.prepare(2).unwrap().unwrap();
+        let second = prepare_when_released(&session, 2);
         let captured = if first.out.exists() {
             std::fs::read_to_string(&first.out).unwrap()
         } else {
@@ -252,14 +276,15 @@ mod tests {
     }
 
     /// Scenario: A capture still holds the execution lease when the harness
-    /// reaches its retry bound. It must keep its temporary output and token.
+    /// reaches its retry bound, so a retry must keep its temporary output and token.
+    /// After release, the retry waits for inherited subprocess descriptors to close.
     #[test]
     fn a_running_capture_cannot_be_duplicated_or_have_its_output_removed() {
         let root = scratch("running");
         let session = Session::new(&root, "fetch", "2");
         let first = session.prepare(1).unwrap().unwrap();
         std::fs::write(&first.tmp, "partial").unwrap();
-        let lease = session.lease().unwrap().unwrap();
+        let lease = wait_for_released_lease(&session, || session.lease());
         assert!(session.prepare(2).unwrap().is_none());
         assert_eq!(std::fs::read_to_string(&first.tmp).unwrap(), "partial");
         assert_eq!(std::fs::read_to_string(&session.token).unwrap(), "1");
@@ -271,7 +296,7 @@ mod tests {
         );
         assert!(!first.out.exists());
         drop(lease);
-        assert!(session.prepare(2).unwrap().is_some());
+        prepare_when_released(&session, 2);
         assert!(!first.tmp.exists());
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -317,7 +342,7 @@ mod tests {
             let first = session.prepare(1).unwrap().unwrap();
             std::fs::write(&first.tmp, &text).unwrap();
             std::fs::write(&session.token, token).unwrap();
-            session.prepare(2).unwrap().unwrap();
+            prepare_when_released(&session, 2);
             assert_eq!(first.out.exists(), recover, "{tag}: {text}");
             if recover {
                 assert_eq!(std::fs::read_to_string(&first.out).unwrap(), text, "{tag}");
@@ -330,7 +355,7 @@ mod tests {
         let first = session.prepare(1).unwrap().unwrap();
         std::fs::write(&first.out, "already published").unwrap();
         std::fs::write(&first.tmp, complete).unwrap();
-        session.prepare(2).unwrap().unwrap();
+        prepare_when_released(&session, 2);
         assert_eq!(
             std::fs::read_to_string(&first.out).unwrap(),
             "already published"
