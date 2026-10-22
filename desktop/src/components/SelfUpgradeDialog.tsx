@@ -21,6 +21,9 @@ export interface SelfUpgradeClosed {
   installed: boolean;
 }
 
+/** Why voice's "close" leaves the dialog up while a copy is upgrading (issue #1709). */
+export const SELF_UPGRADE_RUNNING_CLOSE_BLOCKED = "An upgrade is still running. The dialog can be closed once it has finished.";
+
 /**
  * Issue #1635 — upgrading this machine's copies of Agent Deck: the app, and the
  * `dot-agent-deck` CLI when one is installed beside it. Since issue #1753 each
@@ -75,10 +78,6 @@ export function SelfUpgradeDialog({ check, api, copies, then, onClose, copyText 
      also over a plan that offers only Close (Qodo, PR #1769). */
   const finished = (): SelfUpgradeClosed => ({ installed: shownResults.some((result) => result.installed) });
   const close = () => onClose(finished());
-  /* Fence the rest of the window while it is open (Greptile, PR #1769): a
-     rail button reached with Tab would otherwise switch screens and unmount
-     this dialog mid-upgrade, losing its result and any command to run. */
-  const ref = useInertBackground<HTMLElement>(true, OVERLAY_LAYER.dialog);
 
   const upgrade = (plan: SelfUpgradePlan) => {
     setRunning(plan.copy);
@@ -94,9 +93,17 @@ export function SelfUpgradeDialog({ check, api, copies, then, onClose, copyText 
   /* Cancel before anything ran closes the dialog having done nothing; after an
      upgrade it passes on this copy and moves to the next, or to the end. */
   const cancel = (plan: SelfUpgradePlan) => (anyRun ? setDone((current) => [...current, plan.copy]) : onClose());
-  const dismiss = () => {
-    if (!running) onClose(anyRun ? finished() : undefined);
+  /* Answers why it stays up, for voice's "close" to say (issue #1709). */
+  const dismiss = (): string | undefined => {
+    if (running) return SELF_UPGRADE_RUNNING_CLOSE_BLOCKED;
+    onClose(anyRun ? finished() : undefined);
+    return undefined;
   };
+  /* Fence the rest of the window while it is open (Greptile, PR #1769): a
+     rail button reached with Tab would otherwise switch screens and unmount
+     this dialog mid-upgrade, losing its result and any command to run. Voice's
+     "close" is `dismiss`, as Escape is (issue #1709). */
+  const ref = useInertBackground<HTMLElement>(true, OVERLAY_LAYER.dialog, dismiss);
   const doRelaunch = () => {
     setRelaunchError(undefined);
     api.relaunch().catch((cause: unknown) => setRelaunchError(String(cause instanceof Error ? cause.message : cause)));

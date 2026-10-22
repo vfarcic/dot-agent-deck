@@ -32,6 +32,7 @@ FALLBACK_REQUIRED_CONTEXTS = (
     "build-windows",
     "security",
     "e2e-deterministic",
+    "RWX: linux",
 )
 
 # Changes touching these need a human to READ them before they merge.
@@ -58,6 +59,12 @@ DENY_PATHS = (
     "MAINTAINERS.md",
     "CLAUDE.md",
     "src/daemon_protocol.rs",
+    # The required Linux verdict lives outside `.github/` too: `.rwx/` defines
+    # what `RWX: linux` runs, and `scripts/ci-changes.sh` decides which Linux
+    # jobs either CI system skips (docs/develop/rwx.md). A PR editing either
+    # could make every required Linux check pass having tested nothing.
+    ".rwx/",
+    "scripts/ci-changes.sh",
 )
 
 # The order in which those paths' explanations take precedence, most specific
@@ -81,6 +88,8 @@ DENY_PRECEDENCE = (
     "MAINTAINERS.md",
     "greptile.json",
     ".pr_agent.toml",
+    ".rwx/",
+    "scripts/ci-changes.sh",
     ".github/",
 )
 
@@ -365,6 +374,36 @@ def classify_check_runs(runs, required):
     return True, why, advisory
 
 
+# A commit status's `state`, as the check-run conclusion `classify_check_runs`
+# reads. `pending` is a run still going, so it maps to no conclusion.
+_STATUS_CONCLUSION = {"success": "success", "failure": "failure", "error": "failure"}
+
+
+def statuses_as_runs(statuses):
+    """Commit statuses in the shape of check runs, so one gate reads both. Pure.
+
+    Not every CI reports as a check run: RWX (docs/develop/rwx.md) posts a
+    commit STATUS, which `GET /commits/{sha}/check-runs` never returns. Read
+    from check runs alone, a required RWX context would look as if it never
+    reported and the reviewer would select nothing. `gh pr checks` lists both
+    kinds; this is the same merge for the reviewer. A status's context is its
+    name, and `updated_at` orders repeats of one context the way `started_at`
+    orders re-runs.
+    """
+    runs = []
+    for st in statuses or ():
+        state = (st.get("state") or "").lower()
+        conclusion = _STATUS_CONCLUSION.get(state)
+        runs.append({
+            "name": st.get("context"),
+            "status": "in_progress" if conclusion is None else "completed",
+            "conclusion": conclusion,
+            "started_at": st.get("updated_at") or st.get("created_at"),
+            "id": st.get("id"),
+        })
+    return runs
+
+
 def check_status(repo, sha):
     """`checks_green` plus the advisory failures the gate ignored."""
     runs = gh_json_paginated(
@@ -374,7 +413,11 @@ def check_status(repo, sha):
         # ours to rely on.
         "--jq", "[.check_runs[] | {name, status, conclusion, started_at, id}]",
     )
-    return classify_check_runs(runs, required_contexts(repo))
+    statuses = gh_json_paginated(
+        "api", f"repos/{repo}/commits/{sha}/statuses", "--paginate",
+        "--jq", "[.[] | {context, state, created_at, updated_at, id}]",
+    )
+    return classify_check_runs((runs or []) + statuses_as_runs(statuses), required_contexts(repo))
 
 
 def checks_green(repo, sha):
