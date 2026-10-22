@@ -8607,6 +8607,20 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 - **Does not assert:** the real daemon (inbox/boundary/011).
 - **Platform coverage:** mac+linux.
 
+##### inbox/protocol/021 — A pane-capability holder outside the agent's process tree takes its mail.
+- **Layer:** Fast tier (`tests/inbox_process_identity.rs`), the real binary as `daemon serve` with its production admission on; the pane's agent starts an `xargs` helper in a subshell that exits at once, so the helper is re-parented outside the agent's tree with the pane's environment, as Claude Code's background session host is.
+- **Agent:** none (`/bin/sh` agent stand-in, `xargs` helper running `/bin/sh -c` hook shells).
+- **Asserts:** `ps` shows the helper outside the agent's ancestry; the helper's real `inbox fetch` prints and acknowledges a queued task; the real `hook --agent claude-code`, for a prompt carrying a doorbell, prints the task it names; `inbox announce --agent pi` is accepted (`wake: native`), and a later hook shell's `inbox wait --agent pi --stream` takes the next task.
+- **Does not assert:** a real Claude Code background host (lane 2), Windows, or the refusals (`inbox/protocol/022`).
+- **Platform coverage:** mac+linux; in the fast tier so CI's `build-macos` runs it.
+
+##### inbox/protocol/022 — A wrong, missing or earlier capability takes nothing.
+- **Layer:** Fast tier (`tests/inbox_process_identity.rs`), the real binary as `daemon serve` with its production admission on, hook-socket requests from the test process, outside every pane.
+- **Agent:** none (`cat` stand-ins).
+- **Asserts:** a fetch and an ack for one pane's task carrying another pane's capability are refused `token_names_another_pane`, with no capability `missing_token`, and with the capability of a generation replaced in its pane `unknown_token`, whether they name the earlier or the current agent; every task stays queued; the same outside process with the pane's current capability is handed the task, and it is acknowledged.
+- **Does not assert:** a peer running as another user (the `daemon.rs` unit test `a_capability_holder_outside_the_tree_must_be_the_decks_user` pins it, since a test cannot run as two users), or the card notice (`inbox/protocol/023`).
+- **Platform coverage:** mac+linux.
+
 #### Agent CLI
 
 ##### inbox/cli/001 — In-pane fetch frames the task, acknowledges it and updates list.
