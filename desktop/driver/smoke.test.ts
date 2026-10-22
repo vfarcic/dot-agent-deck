@@ -9,7 +9,8 @@
 // cover and, at the same length, what they do not.
 
 import assert from "node:assert/strict";
-import { basename } from "node:path";
+import { readFile } from "node:fs/promises";
+import { basename, join } from "node:path";
 import { test } from "node:test";
 import { type Deck, waitFor, withDeck } from "./harness.ts";
 import { CONTROL, ENTER, type Element, META, SHIFT } from "./webdriver.ts";
@@ -193,13 +194,7 @@ test("terminal_003 a drag that starts with the press focusing the window keeps i
     // (that size has landed 1.9-2.0s after the attach, per PR #1505's CI runs).
     // Read the daemon through a non-sizing observer and require xterm to agree
     // after settling; return that same checked grid as the baseline.
-    const own = await waitFor("the daemon and settled pane to agree on the pane's own size", async () => {
-      await deck.gridSettled();
-      const applied = await deck.appliedGrid(agent.agent_id);
-      const [grid] = await deck.grids();
-      return grid !== undefined && !(applied[0] === 80 && applied[1] === 24)
-        && grid[0] === applied[0] && grid[1] === applied[1] ? grid : false;
-    });
+    const own = await agreedGrid(deck, agent.agent_id, "the pane's own size", ([cols, rows]) => !(cols === 80 && rows === 24));
 
     // The control: the same gesture when coming to the front resizes nothing,
     // because the window is the only client and already the one sized for.
@@ -249,13 +244,17 @@ test("terminal_004 an agent that owns the mouse copies to the clipboard with OSC
     // the release (SGR ends a release with `m`), then copy with OSC 52 and give
     // the mouse back. The copied text is computed by the shell, so it can only
     // reach the clipboard through the agent's request, never from the screen.
+    // Echo is off for the whole loop, not only inside each `read -s`: `read`
+    // restores it on return, so a report arriving between two reads was echoed
+    // onto the screen, and `released-2` then shared its row with it (measured
+    // once in ten local runs while #1355's scenario was added).
     const copied = "dad-osc52-42-ok";
     await deck.session.type(
       input,
-      "printf '\\e[?1000h\\e[?1002h\\e[?1006h'; echo armed-$((1+1)); "
+      "stty -echo; printf '\\e[?1000h\\e[?1002h\\e[?1006h'; echo armed-$((1+1)); "
         + "while IFS= read -rsn1 c; do [ \"$c\" = m ] && break; done; "
         + "printf '\\e]52;c;%s\\a' \"$(printf 'dad-osc52-%s-ok' $((6*7)) | base64 | tr -d '\\r\\n')\"; "
-        + "printf '\\e[?1006l\\e[?1002l\\e[?1000l'; echo released-$((1+1))"
+        + "printf '\\e[?1006l\\e[?1002l\\e[?1000l'; stty echo; echo released-$((1+1))"
         + ENTER,
     );
     await waitFor("the stand-in to turn on mouse reporting", async () =>
@@ -282,6 +281,123 @@ test("terminal_004 an agent that owns the mouse copies to the clipboard with OSC
     await waitFor(`the clipboard to hold ${row}`, async () => (await deck.clipboardText()) === row);
   });
 });
+
+/// Scenario: in a shell agent's pane, ask the shell for its terminal size with
+/// `stty size` and find it matches the pane; then make the real window smaller
+/// and find a second `stty size` reports the new, smaller size; then press
+/// Ctrl+= to zoom in and Ctrl+0 to reset, and find the shell's size shrink and
+/// come back with them, and the level saved in `desktop.toml` each time.
+test("terminal_005 resizing and zooming the window resizes the agent's PTY", async () => {
+  const command = "bash --noprofile --norc";
+  await withDeck("terminal_005", { daemonFirst: true, defaultCommand: command }, async (deck) => {
+    await deck.element(connected, "the deck group to report connected");
+    const input = await openShellPane(deck);
+    const [agent] = await deck.daemonAgents();
+
+    // The size the shell sees, read from inside the PTY, against the grid the
+    // pane fitted — not the client's proposal, which is all the tiers below
+    // this one can observe. See terminal_003 for why 80x24 is excluded.
+    const own = await agreedGrid(deck, agent.agent_id, "the pane's own size", ([cols, rows]) => !(cols === 80 && rows === 24));
+    assert.deepEqual(await sttySize(deck, input, "own"), own, "the shell's size is the pane's grid");
+
+    // Smaller on both axes, and still above `tauri.conf.json`'s 1024x680 floor.
+    const before = await deck.session.windowRect();
+    const target = { width: before.width - 300, height: before.height - 160 };
+    await deck.session.setWindowRect(target);
+    await waitFor(`the window to take ${target.width}x${target.height}`, async () => {
+      const rect = await deck.session.windowRect();
+      return rect.width === target.width && rect.height === target.height;
+    });
+    const resized = await agreedGrid(
+      deck,
+      agent.agent_id,
+      `a grid smaller than ${own.join("x")} after the window shrank`,
+      ([cols, rows]) => cols < own[0] && rows < own[1],
+    );
+    assert.deepEqual(await sttySize(deck, input, "resized"), resized, "the shell's size followed the window");
+
+    // Zoom by keyboard only from here: a webview zoom rescales the page, and
+    // WebKitWebDriver places pointer events without that scale (the
+    // devicePixelRatio check in `harness.ts`), so a click after it could land
+    // anywhere. Focus is still in xterm's textarea, which is the case the zoom
+    // keys' capture-phase listener exists for: had xterm seen Ctrl+=, it would
+    // have written `=` into the shell's line, and the `stty` command typed next
+    // would fail as `=echo: command not found` rather than answer.
+    await deck.session.chord([CONTROL, "="]);
+    const zoomed = await agreedGrid(
+      deck,
+      agent.agent_id,
+      `fewer columns than ${resized.join("x")} after zooming in`,
+      ([cols, rows]) => cols < resized[0] && rows <= resized[1],
+    );
+    // Measured, because the harness's click-placement check rests on it: a
+    // webview zoom moves `devicePixelRatio` the way a scaled display does.
+    const ratio = await deck.session.execute<number>("return window.devicePixelRatio");
+    assert.deepEqual(await sttySize(deck, input, "zoomed"), zoomed, "the shell's size followed the zoom");
+    await waitFor("desktop.toml to store zoom level 1.1", async () => (await storedZoom(deck)) === 1.1);
+
+    await deck.session.chord([CONTROL, "0"]);
+    await agreedGrid(deck, agent.agent_id, `the grid back at ${resized.join("x")} after resetting the zoom`, ([cols, rows]) =>
+      cols === resized[0] && rows === resized[1]);
+    assert.deepEqual(await sttySize(deck, input, "reset"), resized, "the shell's size came back with the zoom");
+    await waitFor("desktop.toml to store zoom level 1", async () => (await storedZoom(deck)) === 1);
+    console.log(
+      `terminal_005: cols x rows from stty size: pane ${own.join("x")}, window ${target.width}x${target.height} ${resized.join("x")}, ` +
+        `110% ${zoomed.join("x")} (devicePixelRatio ${ratio}), reset ${resized.join("x")}`,
+    );
+  });
+});
+
+/**
+ * Issue #1355 — the terminal's grid as `[cols, rows]`, once it has settled, the
+ * daemon reports the same size applied to the agent, and `accept` holds for it.
+ * The daemon is read through a non-sizing observer, so asking does not move it.
+ */
+async function agreedGrid(
+  deck: Deck,
+  agentId: string,
+  description: string,
+  accept: (grid: [number, number]) => boolean,
+): Promise<[number, number]> {
+  return waitFor(`the daemon and the settled pane to agree on ${description}`, async () => {
+    await deck.gridSettled();
+    const applied = await deck.appliedGrid(agentId);
+    const [grid] = await deck.grids();
+    return grid !== undefined && grid[0] === applied[0] && grid[1] === applied[1] && accept(grid) ? grid : false;
+  });
+}
+
+/**
+ * Issue #1355 — the PTY's size as `[cols, rows]`, as the shell inside it reads
+ * it with `stty size`. The answer is printed on a line marked with `tag`, which
+ * the typed command line cannot match, since it carries `$(stty size …)`
+ * rather than the numbers.
+ */
+async function sttySize(deck: Deck, input: Element, tag: string): Promise<[number, number]> {
+  await deck.session.type(input, `echo dad-stty-${tag}-$(stty size | tr ' ' x)${ENTER}`);
+  const answer = new RegExp(`^dad-stty-${tag}-(\\d+)x(\\d+)$`);
+  return waitFor(`the shell to print its size for ${tag}`, async () => {
+    for (const { text } of await deck.terminalTexts()) {
+      for (const line of text.split("\n")) {
+        const match = answer.exec(line.trim());
+        if (match) return [Number(match[2]), Number(match[1])] as [number, number];
+      }
+    }
+    return undefined;
+  });
+}
+
+/** Issue #1355 — `level` under `[zoom]` in the sandbox's `desktop.toml`, or `undefined` while there is none. */
+async function storedZoom(deck: Deck): Promise<number | undefined> {
+  let section = "";
+  for (const line of (await readFile(join(deck.sandbox, "desktop.toml"), "utf8")).split("\n")) {
+    const header = /^\s*\[([^\]]+)\]\s*$/.exec(line);
+    if (header) section = header[1].trim();
+    const level = /^\s*level\s*=\s*([0-9.]+)\s*$/.exec(line);
+    if (section === "zoom" && level) return Number(level[1]);
+  }
+  return undefined;
+}
 
 /**
  * Issue #1457 — press on the row whose text is exactly `text`, bring the window
