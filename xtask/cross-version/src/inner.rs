@@ -1450,7 +1450,7 @@ fn with_attached_tui(
     ));
 
     println!("xver (inner): step 5 — delegate first, hooks last");
-    focus_role(tui, plan, ROLE_ORCHESTRATOR)?;
+    focus_role(tui, plan, ROLE_ORCHESTRATOR, ev)?;
     let nonce = epoch_secs();
     let delegate_sentinel = format!("XVER-DELEGATE-{nonce}");
     let expected_pane = |role: &str| -> Result<&str, Abort> {
@@ -1484,7 +1484,7 @@ fn with_attached_tui(
     // way, once, before the first command typed into a worker: the lock is
     // deck-global for the life of this TUI.
     if plan.experimental {
-        match unlock_worker_entry(tui, plan, ROLE_CODER) {
+        match unlock_worker_entry(tui, plan, ROLE_CODER, ev) {
             Ok(note) => ev.step(note),
             Err(e) => {
                 ev.step(format!(
@@ -1593,7 +1593,7 @@ fn with_attached_tui(
         },
     );
     let work_done_sentinel = format!("XVER-WORKDONE-{nonce}");
-    focus_role(tui, plan, ROLE_REVIEWER)?;
+    focus_role(tui, plan, ROLE_REVIEWER, ev)?;
     g.preconnect_logged(
         &format!("pane: {} work-done", cast.pane_cli_label),
         &plan.env,
@@ -1638,7 +1638,7 @@ fn with_attached_tui(
         orchestrator_pane,
     );
 
-    focus_role(tui, plan, ROLE_REVIEWER)?;
+    focus_role(tui, plan, ROLE_REVIEWER, ev)?;
     g.preconnect_logged(
         &format!("pane: {} agent-event", cast.pane_cli_label),
         &plan.env,
@@ -3128,8 +3128,9 @@ pub(crate) fn unlock_worker_entry(
     deck: &pty::PtyDeck,
     plan: &Plan,
     role: &str,
+    ev: &mut Evidence,
 ) -> Result<String, String> {
-    focus_role(deck, plan, role)?;
+    focus_role(deck, plan, role, ev)?;
     if !ensure_command_mode(deck) {
         let grid = deck.grid();
         return Err(format!(
@@ -3164,7 +3165,7 @@ pub(crate) fn unlock_worker_entry(
             footer_row(&grid).map(str::trim)
         ));
     }
-    focus_role(deck, plan, role)?;
+    focus_role(deck, plan, role, ev)?;
     Ok(format!(
         "unlocked command entry into worker panes (PRD #393's lock, on under \
          `--experimental`) with the TUI's own `Ctrl+D` then `Ctrl+E`: the footer read \
@@ -3175,15 +3176,19 @@ pub(crate) fn unlock_worker_entry(
 /// Put the deck in command mode and prove it by the footer, sending `Ctrl+D`
 /// only when the footer says it is needed.
 ///
-/// Returns whether command mode was confirmed. Each `Ctrl+D` is followed by a
-/// wait for a `COMMAND` footer, and the mode is re-read before any further
-/// press, so a slow redraw never earns a second toggle that would undo the
-/// first.
+/// An unreadable footer can be a partially painted frame, not typing mode.
+/// Wait for a readable chip before deciding whether to toggle. Send at most
+/// one toggle, and stop if its COMMAND frame is not confirmed.
 pub(crate) fn ensure_command_mode(deck: &pty::PtyDeck) -> bool {
+    ensure_command_mode_recorded(deck, |note| println!("  · {note}"))
+}
+
+fn ensure_command_mode_recorded(deck: &pty::PtyDeck, record: impl FnMut(String)) -> bool {
     confirm_command_mode(
         || deck.grid(),
         |pred| deck.wait_for_grid(STEP_TIMEOUT, pred),
         || deck.send(b"\x04"),
+        record,
     )
 }
 
@@ -3191,17 +3196,39 @@ fn confirm_command_mode(
     mut grid: impl FnMut() -> String,
     mut wait: impl FnMut(&dyn Fn(&str) -> bool) -> bool,
     mut toggle: impl FnMut(),
+    mut record: impl FnMut(String),
 ) -> bool {
-    for _ in 0..3 {
-        if footer_mode(&grid()) == Some(FooterMode::Command) {
-            return true;
+    let mut mode = footer_mode(&grid());
+    if mode.is_none() {
+        record(format!(
+            "waiting up to {STEP_TIMEOUT:?} for a readable mode footer before any focus key"
+        ));
+        let observed = std::cell::Cell::new(None);
+        if !wait(&|g| {
+            let mode = footer_mode(g);
+            observed.set(mode);
+            mode.is_some()
+        }) {
+            record("mode footer was not confirmed; no focus key was sent".into());
+            return false;
         }
-        toggle();
-        if wait(&|g| footer_mode(g) == Some(FooterMode::Command)) {
-            return true;
-        }
+        mode = observed.get();
     }
-    false
+    if mode == Some(FooterMode::Command) {
+        record("confirmed COMMAND before selecting a role".into());
+        return true;
+    }
+    record(format!(
+        "observed TYPING; sending one Ctrl+D and waiting up to {STEP_TIMEOUT:?} for COMMAND"
+    ));
+    toggle();
+    let confirmed = wait(&|g| footer_mode(g) == Some(FooterMode::Command));
+    record(if confirmed {
+        "confirmed COMMAND after Ctrl+D".into()
+    } else {
+        "COMMAND was not confirmed after Ctrl+D; no second toggle or focus digit was sent".into()
+    });
+    confirmed
 }
 
 /// Give keyboard focus to `role`'s pane and leave the deck in `PaneInput` mode
@@ -3223,14 +3250,22 @@ fn confirm_command_mode(
 /// ran `1dot-agent-deck delegate …` and failed tells 3 and 4, deterministically
 /// on a quiet box. Measured with a footer trace on `main`: ` COMMAND ` before
 /// the press, ` TYPING ` 45 ms after it. So [`ensure_command_mode`] presses
-/// `Ctrl+D` only when the footer is not already `COMMAND`, and every wait below
+/// `Ctrl+D` only after a readable `TYPING` footer, and every wait below
 /// is for a state the keystroke CHANGES — the footer flipping — never for one
 /// that might predate it.
+/// A missing chip during a partial reattach frame must first become readable:
+/// toggling before then can accept the old COMMAND paint while the queued key
+/// enters the shell (issue #1755). Each bounded wait is recorded in evidence.
 ///
 /// Cycles tabs when the deck is not on the orchestration tab: after a reattach
 /// the deck lands wherever the previous session left it, and a digit on the
 /// Dashboard tab means something else.
-pub(crate) fn focus_role(deck: &pty::PtyDeck, plan: &Plan, role: &str) -> Result<(), String> {
+pub(crate) fn focus_role(
+    deck: &pty::PtyDeck,
+    plan: &Plan,
+    role: &str,
+    ev: &mut Evidence,
+) -> Result<(), String> {
     let index = roles(plan)
         .iter()
         .position(|r| r == role)
@@ -3242,26 +3277,41 @@ pub(crate) fn focus_role(deck: &pty::PtyDeck, plan: &Plan, role: &str) -> Result
         .ok_or_else(|| format!("role {role} is card {} — past the digit keys", index + 1))?;
     let expanded = format!("┌{role}");
     for _attempt in 0..6 {
-        if !ensure_command_mode(deck) {
+        if !ensure_command_mode_recorded(deck, |note| ev.step(note)) {
             // Sending the digit now could type it into a pane. Stop instead:
             // the error names the footer the deck was actually showing.
             break;
         }
         deck.send(&[digit]);
+        ev.step(format!(
+            "selected `{role}` with digit {}; waiting up to {STEP_TIMEOUT:?} for its expanded pane and TYPING footer before typing a command",
+            char::from(digit)
+        ));
         if deck.wait_for_grid(STEP_TIMEOUT, |g| {
             footer_mode(g) == Some(FooterMode::Typing) && g.contains(&expanded)
         }) {
+            ev.step(format!(
+                "confirmed `{role}` expanded with TYPING before command entry"
+            ));
             return Ok(());
         }
         // Not on the orchestration tab (or not yet rebuilt): step right one tab
         // and try again. The arrow is a deck shortcut only in command mode, so
         // that is established first — the digit may have focused some other
         // pane on the way.
-        if !ensure_command_mode(deck) {
+        if !ensure_command_mode_recorded(deck, |note| ev.step(note)) {
             break;
         }
+        let before = deck.grid();
         deck.send(b"\x1b[C");
-        std::thread::sleep(SETTLE);
+        ev.step(format!(
+            "stepped right one tab; waiting up to {STEP_TIMEOUT:?} for a changed COMMAND frame"
+        ));
+        if !deck.wait_for_grid(STEP_TIMEOUT, |g| {
+            g != before && footer_mode(g) == Some(FooterMode::Command)
+        }) {
+            break;
+        }
     }
     let grid = deck.grid();
     Err(format!(
@@ -3327,7 +3377,7 @@ pub(crate) fn capture_in_pane(
         .prepare(1)?
         .ok_or("fresh capture lease was already held")?;
     'typings: for number in 1..=CAPTURE_TYPINGS {
-        focus_role(tui, g.plan, role)?;
+        focus_role(tui, g.plan, role, ev)?;
         // Each typing contains one deck client, including retries. Do not put
         // a client loop in the shell: it would bypass these checks.
         g.preconnect_logged(
@@ -3737,6 +3787,7 @@ mod tests {
                 };
                 *actual_mode.borrow_mut() = next;
             },
+            |_| {},
         ));
         let mut shell_input = String::new();
         if *actual_mode.borrow() == FooterMode::Typing {
@@ -3747,6 +3798,40 @@ mod tests {
             shell_input, "dot-agent-deck delegate",
             "the focus digit leaked into the shell before the command"
         );
+
+        // The ordinary typing-mode control needs exactly one toggle, followed
+        // by a COMMAND observation. A dropped key must never earn a second
+        // toggle: that could undo the first one when only its paint was late.
+        for (initial, responsive, expected, expected_presses) in [
+            (Some(FooterMode::Command), true, true, 0),
+            (Some(FooterMode::Typing), true, true, 1),
+            (Some(FooterMode::Typing), false, false, 1),
+            (None, false, false, 0),
+        ] {
+            let presses = std::cell::Cell::new(0);
+            let mode = std::cell::Cell::new(initial);
+            let frame = || match mode.get() {
+                Some(FooterMode::Command) => command_frame.clone(),
+                Some(FooterMode::Typing) => grid_with_footer(" TYPING "),
+                None => String::from("┌orchestrator"),
+            };
+            assert_eq!(
+                confirm_command_mode(
+                    frame,
+                    |pred| pred(&frame()),
+                    || {
+                        presses.set(presses.get() + 1);
+                        if responsive {
+                            mode.set(Some(FooterMode::Command));
+                        }
+                    },
+                    |_| {},
+                ),
+                expected,
+                "initial={initial:?}, responsive={responsive}"
+            );
+            assert_eq!(presses.get(), expected_presses);
+        }
     }
 
     #[test]
