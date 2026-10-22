@@ -17,8 +17,13 @@
  *
  * Bounded and harmless to Pi: at most {@link MAX_PENDING} records wait, a
  * batch goes every {@link BATCH_INTERVAL_MS} and at the end of each agent
- * loop, each request gives up after {@link EXPORT_TIMEOUT_MS}, the last batch
- * is sent when the session shuts down, and a failure is dropped silently.
+ * loop, one request is out at a time and gives up after
+ * {@link EXPORT_TIMEOUT_MS}, and a failure is dropped silently. The session's
+ * shutdown waits at most {@link SHUTDOWN_TIMEOUT_MS} in all — for a request
+ * already out and for the last batch — and cancels whatever is still out then.
+ *
+ * A redirect is an error, not followed: the headers carry the backend's
+ * credentials, and they go to the configured endpoint only.
  *
  * Import-free apart from Node's globals, so it is testable without Pi.
  */
@@ -35,7 +40,7 @@ export const BATCH_INTERVAL_MS = 5000;
 /** How long one export may take. */
 export const EXPORT_TIMEOUT_MS = 5000;
 
-/** How long the last export may take as the session shuts down. */
+/** How long the session's shutdown may wait for exports, in all. */
 export const SHUTDOWN_TIMEOUT_MS = 2000;
 
 /** The longest string attribute sent (a model or tool name). */
@@ -230,13 +235,21 @@ export function encodeLogs(config: TelemetryConfig, records: Array<UsageRecord &
 	});
 }
 
-export type FetchLike = (url: string, init: { method: string; headers: Record<string, string>; body: string; signal: AbortSignal }) => Promise<unknown>;
+export type FetchLike = (
+	url: string,
+	init: { method: string; headers: Record<string, string>; body: string; signal: AbortSignal; redirect: "error" },
+) => Promise<unknown>;
 
 /** The exporter for one extension instance. */
 export class PiTelemetry {
 	private pending: Array<UsageRecord & { timeMs: number }> = [];
 	private timer: ReturnType<typeof setInterval> | undefined;
-	private inFlight: Promise<void> = Promise.resolve();
+	/** The one flush worker, while it runs: it sends batches until none waits. */
+	private worker: Promise<void> | undefined;
+	/** Cancels the request that is out, if one is. */
+	private active: AbortController | undefined;
+	/** Aborts when the shutdown's time is up; set by {@link shutdown}. */
+	private deadline: AbortSignal | undefined;
 	/** Records dropped because {@link MAX_PENDING} were waiting. */
 	dropped = 0;
 
@@ -273,36 +286,70 @@ export class PiTelemetry {
 		}
 	}
 
-	/** Send what is waiting, after any export already in flight. Never rejects. */
-	flush(timeoutMs: number = EXPORT_TIMEOUT_MS): Promise<void> {
-		this.inFlight = this.inFlight.then(() => this.send(timeoutMs));
-		return this.inFlight;
+	/**
+	 * Send what is waiting. A flush while one runs joins it, and that one sends
+	 * what arrived meanwhile once its request is done. Never rejects.
+	 */
+	flush(): Promise<void> {
+		if (this.worker === undefined) {
+			this.worker = this.drain().finally(() => {
+				this.worker = undefined;
+			});
+		}
+		return this.worker;
 	}
 
-	/** The session is ending: stop the timer and send the last batch. */
+	/**
+	 * The session is ending: stop the timer and send the last batch, waiting
+	 * at most {@link SHUTDOWN_TIMEOUT_MS} for it and any request already out.
+	 */
 	async shutdown(): Promise<void> {
 		if (this.timer !== undefined) {
 			clearInterval(this.timer);
 			this.timer = undefined;
 		}
-		await this.flush(SHUTDOWN_TIMEOUT_MS);
+		if (this.deadline === undefined) {
+			this.deadline = AbortSignal.timeout(SHUTDOWN_TIMEOUT_MS);
+			this.deadline.addEventListener("abort", () => this.active?.abort(), { once: true });
+		}
+		const deadline = this.deadline;
+		const timeUp = new Promise<void>((resolve) => {
+			if (deadline.aborted) {
+				resolve();
+			} else {
+				deadline.addEventListener("abort", () => resolve(), { once: true });
+			}
+		});
+		await Promise.race([this.flush(), timeUp]);
 	}
 
-	private async send(timeoutMs: number): Promise<void> {
-		if (this.pending.length === 0) {
-			return;
+	private async drain(): Promise<void> {
+		while (this.pending.length > 0 && this.deadline?.aborted !== true) {
+			await this.send();
 		}
+	}
+
+	private async send(): Promise<void> {
 		const batch = this.pending;
 		this.pending = [];
+		const active = new AbortController();
+		this.active = active;
 		try {
+			const signals = [active.signal, AbortSignal.timeout(EXPORT_TIMEOUT_MS)];
+			if (this.deadline !== undefined) {
+				signals.push(this.deadline);
+			}
 			await this.fetchImpl(this.config.endpoint, {
 				method: "POST",
 				headers: this.config.headers,
 				body: encodeLogs(this.config, batch),
-				signal: AbortSignal.timeout(timeoutMs),
+				signal: AbortSignal.any(signals),
+				redirect: "error",
 			});
 		} catch {
-			// Dropped: a backend that is down never affects Pi.
+			// Dropped: a backend that is down, slow or redirecting never affects Pi.
+		} finally {
+			this.active = undefined;
 		}
 	}
 }

@@ -5,6 +5,8 @@
  */
 
 import assert from "node:assert/strict";
+import { createServer, type IncomingHttpHeaders, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import { describe, test } from "node:test";
 import {
 	createPiTelemetry,
@@ -12,6 +14,7 @@ import {
 	MAX_PENDING,
 	parsePairs,
 	PiTelemetry,
+	SHUTDOWN_TIMEOUT_MS,
 	TELEMETRY_ENV,
 	type FetchLike,
 	telemetryConfig,
@@ -63,6 +66,44 @@ function capture(): { fetch: FetchLike; bodies: string[]; calls: Array<{ url: st
 			calls.push({ url, headers: init.headers });
 			bodies.push(init.body);
 			return {};
+		},
+	};
+}
+
+/** A loopback HTTP server that records each request and answers with `respond`. */
+async function listen(
+	respond: (res: import("node:http").ServerResponse) => void,
+): Promise<{ server: Server; url: string; requests: IncomingHttpHeaders[] }> {
+	const requests: IncomingHttpHeaders[] = [];
+	const server = createServer((req, res) => {
+		requests.push(req.headers);
+		req.resume();
+		req.on("end", () => respond(res));
+	});
+	await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+	const { port } = server.address() as AddressInfo;
+	return { server, url: `http://127.0.0.1:${port}`, requests };
+}
+
+/** A fetch whose requests stay out until released, or until their signal aborts when `honourAbort`. */
+function gated(honourAbort: boolean): { fetch: FetchLike; signals: AbortSignal[]; release: () => void } {
+	const signals: AbortSignal[] = [];
+	const waiting: Array<() => void> = [];
+	return {
+		signals,
+		release: () => {
+			for (const done of waiting.splice(0)) {
+				done();
+			}
+		},
+		fetch: (_url, init) => {
+			signals.push(init.signal);
+			return new Promise((resolve, reject) => {
+				waiting.push(() => resolve({}));
+				if (honourAbort) {
+					init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+				}
+			});
 		},
 	};
 }
@@ -162,4 +203,76 @@ describe("pi telemetry", () => {
 		});
 		assert.match(encodeLogs({ endpoint: "x", headers: {}, resource: [] }, []), /"logRecords":\[\]/);
 	});
+
+	test("a redirect is not followed, so the headers reach no other origin", async () => {
+		const other = await listen((res) => res.end());
+		const first = await listen((res) => {
+			res.writeHead(307, { location: `${other.url}/v1/logs` });
+			res.end();
+		});
+		try {
+			const telemetry = createPiTelemetry({
+				[TELEMETRY_ENV]: "1",
+				OTEL_EXPORTER_OTLP_ENDPOINT: first.url,
+				OTEL_EXPORTER_OTLP_HEADERS: "x-honeycomb-team=synthetic-credential-1741",
+			});
+			assert.ok(telemetry);
+			telemetry.observe("agent_end", {});
+			await telemetry.flush();
+			await telemetry.shutdown();
+			assert.equal(first.requests.length, 1, "the configured endpoint was asked");
+			assert.equal(first.requests[0]["x-honeycomb-team"], "synthetic-credential-1741");
+			assert.deepEqual(other.requests, [], "the redirect target received nothing");
+		} finally {
+			first.server.close();
+			other.server.close();
+		}
+		const sink = capture();
+		let redirect: string | undefined;
+		const telemetry = new PiTelemetry(telemetryConfig(ON)!, async (url, init) => {
+			redirect = init.redirect;
+			return sink.fetch(url, init);
+		}, Date.now, 0);
+		telemetry.observe("agent_end", {});
+		await telemetry.flush();
+		assert.equal(redirect, "error");
+	});
+
+	test("flushes while a request is out join it and send the rest after it", async () => {
+		const config = telemetryConfig(ON);
+		assert.ok(config);
+		const gate = gated(false);
+		const telemetry = new PiTelemetry(config, gate.fetch, Date.now, 0);
+		telemetry.observe("agent_start", {});
+		const first = telemetry.flush();
+		telemetry.observe("agent_end", {});
+		const joined = Array.from({ length: 100 }, () => telemetry.flush());
+		assert.ok(joined.every((p) => p === first), "one worker, not a chain of 100");
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(gate.signals.length, 1, "one request out at a time");
+		gate.release();
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(gate.signals.length, 2, "what arrived meanwhile goes next");
+		gate.release();
+		await first;
+	});
+
+	for (const honourAbort of [true, false]) {
+		test(`shutdown waits at most its deadline for a request already out (fetch ${honourAbort ? "honours" : "ignores"} abort)`, { timeout: 10_000 }, async () => {
+			const config = telemetryConfig(ON);
+			assert.ok(config);
+			const gate = gated(honourAbort);
+			const telemetry = new PiTelemetry(config, gate.fetch, Date.now, 0);
+			telemetry.observe("agent_start", {});
+			void telemetry.flush();
+			telemetry.observe("session_shutdown", {});
+			const started = Date.now();
+			await telemetry.shutdown();
+			const waited = Date.now() - started;
+			assert.ok(waited >= SHUTDOWN_TIMEOUT_MS - 50, `returned early: ${waited} ms`);
+			assert.ok(waited < SHUTDOWN_TIMEOUT_MS + 500, `waited past the deadline: ${waited} ms`);
+			assert.ok(gate.signals[0].aborted, "the outstanding request was cancelled");
+			gate.release();
+		});
+	}
 });

@@ -13,15 +13,18 @@
 //! The run's pull request is read back from the same card, so a newer report, an
 //! older one and an explicit "no pull request" are folded as the card folds
 //! them, and so are its checks, which make the run's `agent.ci` stretches
-//! ([`super::ci`]). That state holds the events' content in memory, as every
-//! client's does; nothing from it but the status enum and the pull request's
-//! number and check counts reaches a span, and it is dropped with the run, so
-//! the tracker holds nothing per pane once a pane's runs have ended.
+//! ([`super::ci`]). That state holds the events in memory, as every client's
+//! does, minus what a tool call reports of its arguments ([`KeptEvent`]);
+//! nothing from it but the status enum and the pull request's number and check
+//! counts reaches a span, and it is dropped with the run, so the tracker holds
+//! nothing per pane once a pane's runs have ended.
 //!
 //! **A shell command is an `agent.operation`**, from the shell tool's start to
 //! its end as the agent's hooks report them. Its command text is classified
-//! the moment the start arrives ([`super::operation::classify`]) and only the
-//! classification is kept with the operation.
+//! as the event arrives ([`super::operation::classify_tool`]) and only the
+//! classification is kept: the copy of the event the tracker holds — in a
+//! run's cards, or waiting for its run to open — has the tool's detail and the
+//! command taken out.
 //!
 //! **A run is prepared before its agent starts.** [`RunTracker::prepare_run`]
 //! is called before the agent process exists, so no event the agent causes can
@@ -44,7 +47,7 @@ use crate::event::{AgentEvent, AgentType, DAEMON_PANE_CLOSED_METADATA_KEY, Event
 use crate::state::{AppState, SessionStatus};
 
 use super::ci::{CiEffect, RunCi};
-use super::operation::{Operation, classify, is_shell_tool};
+use super::operation::{Operation, classify_tool, is_shell_tool};
 use super::run_context::RunContext;
 use super::span::{
     Attribute, SpanEventRecord, SpanId, SpanRecord, TraceId, new_span_id, new_trace_id,
@@ -83,6 +86,10 @@ pub const MAX_OPEN_OPERATIONS: usize = 64;
 /// The event metadata key carrying the agent's id for one tool call, which
 /// pairs a call's end with its start when several run at once.
 const TOOL_CALL_ID_METADATA_KEY: &str = "tool_use_id";
+
+/// Where a hook puts a shell command whole (`tool_detail` holds its first
+/// line, cut short).
+const BASH_COMMAND_METADATA_KEY: &str = "bash_command";
 
 /// How a run ended, as far as the deck can tell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,7 +209,7 @@ struct PendingRun {
     start: RunStart,
     prepared_at: u64,
     context: RunContext,
-    events: Vec<(AgentEvent, u64)>,
+    events: Vec<(KeptEvent, u64)>,
     /// Its agent already ended, before the run was committed: how and when,
     /// applied by [`RunTracker::commit_run`] once the run opens.
     ended: Option<(EndReason, Option<i32>, u64)>,
@@ -376,7 +383,7 @@ impl RunTracker {
             run.context = pending.context;
         }
         for (event, at) in pending.events {
-            self.observe_event(&event, at);
+            self.observe_kept(event, at);
         }
         if let Some((reason, exit_code, at)) = pending.ended {
             self.end_run(&pane_id, reason, exit_code, at);
@@ -464,30 +471,34 @@ impl RunTracker {
     /// session on the run's pane, when exactly one does. The run's copy names
     /// the pane, which a card state with panes of its own needs to admit it.
     pub fn observe_event(&mut self, event: &AgentEvent, now: u64) {
-        let Some(pane_id) = event.pane_id.as_deref() else {
-            if let Some(pane_id) = self.pane_holding_session(&event.session_id) {
-                let mut event = event.clone();
-                event.pane_id = Some(pane_id.clone());
-                self.apply_to_run(&pane_id, &event, now);
+        self.observe_kept(KeptEvent::of(event), now);
+    }
+
+    /// [`Self::observe_event`], for the copy of the event the tracker keeps.
+    fn observe_kept(&mut self, mut kept: KeptEvent, now: u64) {
+        let Some(pane_id) = kept.event.pane_id.clone() else {
+            if let Some(pane_id) = self.pane_holding_session(&kept.event.session_id) {
+                kept.event.pane_id = Some(pane_id.clone());
+                self.apply_to_run(&pane_id, kept, now);
             }
             return;
         };
         // A prepared run takes the events of its own generation, and, while
         // the pane has no open run, the events that name no generation.
-        let pane_has_run = self.runs.contains_key(pane_id);
+        let pane_has_run = self.runs.contains_key(&pane_id);
         if let Some(pending) = self.pending.values_mut().find(|p| {
             p.start.pane_id == pane_id
-                && match (p.start.agent_id.as_deref(), event.agent_id.as_deref()) {
+                && match (p.start.agent_id.as_deref(), kept.event.agent_id.as_deref()) {
                     (Some(ours), Some(theirs)) => ours == theirs,
                     _ => !pane_has_run,
                 }
         }) {
             if pending.events.len() < MAX_PENDING_EVENTS {
-                pending.events.push((event.clone(), now));
+                pending.events.push((kept, now));
             }
             return;
         }
-        self.apply_to_run(pane_id, event, now);
+        self.apply_to_run(&pane_id, kept, now);
     }
 
     /// The pane of the one open run whose cards hold `session_id` on that
@@ -506,7 +517,8 @@ impl RunTracker {
     /// Apply `event` to the run open on `pane_id`, unless it names another
     /// generation of the pane. The pane's close broadcast naming a replaced
     /// generation ends that generation's run.
-    fn apply_to_run(&mut self, pane_id: &str, event: &AgentEvent, now: u64) {
+    fn apply_to_run(&mut self, pane_id: &str, kept: KeptEvent, now: u64) {
+        let event = &kept.event;
         let closed = event.event_type == EventType::SessionEnd
             && event.metadata.contains_key(DAEMON_PANE_CLOSED_METADATA_KEY);
         let Some(run) = self.runs.get_mut(pane_id) else {
@@ -543,7 +555,7 @@ impl RunTracker {
             }
         }
         if is_shell_tool(event.tool_name.as_deref()) {
-            observe_operation(run, event, now, &mut self.finished);
+            observe_operation(run, &kept, now, &mut self.finished);
         }
         let status = run
             .cards
@@ -741,14 +753,18 @@ impl RunTracker {
 }
 
 /// A shell tool's start or end reached `run`: open an operation, or end the
-/// one it belongs to — the open one with the same call id, else the oldest.
-/// A failed call ends as an `Error` event, which ends it the same way.
+/// one it belongs to. An end naming a call ends that call's operation only —
+/// or, when none has that id, the oldest that has no id, since an agent may
+/// name the call on its end only — and so a repeated end, or one whose start
+/// was dropped, ends nothing. An end naming no call ends the oldest. A failed
+/// call ends as an `Error` event, which ends it the same way.
 fn observe_operation(
     run: &mut ActiveRun,
-    event: &AgentEvent,
+    kept: &KeptEvent,
     now: u64,
     finished: &mut Vec<SpanRecord>,
 ) {
+    let event = &kept.event;
     let call_id = event.metadata.get(TOOL_CALL_ID_METADATA_KEY);
     match event.event_type {
         EventType::ToolStart => {
@@ -760,24 +776,68 @@ fn observe_operation(
             run.operations.push(OpenOperation {
                 span_id: new_span_id(),
                 start: now,
-                operation: classify(event.tool_detail.as_deref()),
+                operation: kept
+                    .operation
+                    .clone()
+                    .unwrap_or_else(|| classify_tool(event.tool_name.as_deref(), None)),
                 call_id: call_id.cloned(),
             });
         }
         EventType::ToolEnd | EventType::Error => {
-            let i = call_id
-                .and_then(|id| {
-                    run.operations
-                        .iter()
-                        .position(|op| op.call_id.as_ref() == Some(id))
-                })
-                .or_else(|| (!run.operations.is_empty()).then_some(0));
+            let i = match call_id {
+                Some(id) => run
+                    .operations
+                    .iter()
+                    .position(|op| op.call_id.as_ref() == Some(id))
+                    .or_else(|| run.operations.iter().position(|op| op.call_id.is_none())),
+                None => (!run.operations.is_empty()).then_some(0),
+            };
             if let Some(i) = i {
                 let open = run.operations.remove(i);
                 finished.push(operation_span(run, open, now));
             }
         }
         _ => {}
+    }
+}
+
+/// An event as the tracker keeps it: without what a tool call reports of its
+/// arguments — the tool's detail, the whole shell command, and the detail of
+/// the tool a question asks about — and with the classification of a shell
+/// command it starts, made before those were taken out.
+struct KeptEvent {
+    event: AgentEvent,
+    operation: Option<Operation>,
+}
+
+impl KeptEvent {
+    fn of(event: &AgentEvent) -> Self {
+        let operation = (event.event_type == EventType::ToolStart
+            && is_shell_tool(event.tool_name.as_deref()))
+        .then(|| classify_tool(event.tool_name.as_deref(), event.tool_detail.as_deref()));
+        let mut event = AgentEvent {
+            tool_detail: None,
+            ..event.clone()
+        };
+        event.metadata.remove(BASH_COMMAND_METADATA_KEY);
+        if event
+            .metadata
+            .contains_key(crate::event::QUESTION_METADATA_KEY)
+        {
+            match event.question() {
+                Some(mut question) => {
+                    if let Some(tool) = question.tool.as_mut() {
+                        tool.detail = None;
+                    }
+                    event.set_question(&question);
+                }
+                // The cards read a question that does not decode as none.
+                None => {
+                    event.metadata.remove(crate::event::QUESTION_METADATA_KEY);
+                }
+            }
+        }
+        KeptEvent { event, operation }
     }
 }
 
@@ -1853,6 +1913,132 @@ pub(crate) mod tests {
         assert_eq!(
             attr(run, AttrKey::OperationsCount),
             Some(&AttrValue::Int(4))
+        );
+    }
+
+    /// An end naming a call ends that call's operation and no other: a
+    /// repeated end, or the end of a call evicted by the cap, ends nothing.
+    #[test]
+    fn an_end_with_a_call_id_ends_only_that_call() {
+        let bash = |t: EventType, call: &str| shell("p1", t, "Bash", Some("make"), Some(call));
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        tracker.observe_event(&bash(EventType::ToolStart, "a"), 1);
+        tracker.observe_event(&bash(EventType::ToolStart, "b"), 2);
+        tracker.observe_event(&bash(EventType::ToolEnd, "a"), 3);
+        tracker.observe_event(&bash(EventType::ToolEnd, "a"), 4);
+        assert_eq!(
+            operations(&tracker.take_finished())
+                .iter()
+                .map(|(_, start, end)| (*start, *end))
+                .collect::<Vec<_>>(),
+            vec![(1, 3)],
+            "the duplicate end left b open"
+        );
+        tracker.observe_event(&bash(EventType::ToolEnd, "b"), 5);
+        assert_eq!(operations(&tracker.take_finished())[0].1..=5, 2..=5);
+
+        // The cap evicts the oldest; its late end must not end the next one.
+        for i in 0..=MAX_OPEN_OPERATIONS as u64 {
+            tracker.observe_event(&bash(EventType::ToolStart, &format!("c{i}")), 10 + i);
+        }
+        assert_eq!(operations(&tracker.take_finished()).len(), 1, "c0 evicted");
+        tracker.observe_event(&bash(EventType::ToolEnd, "c0"), 200);
+        assert!(
+            operations(&tracker.take_finished()).is_empty(),
+            "c0's late end ended c1"
+        );
+        tracker.observe_event(&bash(EventType::ToolEnd, "c1"), 201);
+        assert_eq!(operations(&tracker.take_finished())[0].1, 11);
+
+        // An agent that names the call on its end only: the oldest unnamed.
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        tracker.observe_event(&bash(EventType::ToolStart, "x"), 1);
+        tracker.observe_event(
+            &shell("p1", EventType::ToolStart, "Bash", Some("make"), None),
+            2,
+        );
+        tracker.observe_event(&bash(EventType::ToolEnd, "y"), 3);
+        assert_eq!(operations(&tracker.take_finished())[0].1, 2);
+    }
+
+    /// What the tracker keeps of an event — in a run's cards, and held for a
+    /// run that has not opened yet — has no shell command in it, while the
+    /// operation is still classified from it.
+    #[test]
+    fn no_command_text_is_retained() {
+        const SECRET: &str = "retainedsecret1741";
+        let command = format!("cargo test {SECRET}");
+        let tool = |pane: &str, t: EventType| {
+            let mut e = shell(pane, t, "Bash", Some(&command), Some("call-1"));
+            e.metadata
+                .insert(BASH_COMMAND_METADATA_KEY.into(), format!("{command}\nmore"));
+            e
+        };
+        let mut asking = event("p1", EventType::PermissionRequest);
+        asking.tool_name = Some("Bash".into());
+        asking.tool_detail = Some(command.clone());
+        asking.set_question(
+            &serde_json::from_value(serde_json::json!({
+                "id": "q1",
+                "kind": "permission",
+                "questions": [{"prompt": "Allow?", "options": [
+                    {"index": 1, "label": "Yes", "role": "allow_once"},
+                    {"index": 2, "label": "No", "role": "deny"},
+                ]}],
+                "raised_at_ms": 1,
+                "tool": {"name": "Bash", "detail": command, "use_id": "call-1"},
+                "channel": "keys",
+            }))
+            .unwrap(),
+        );
+        assert!(asking.question().is_some(), "the fixture is a question");
+
+        let mut tracker = RunTracker::new();
+        tracker.prepare_run(start("p1"), 0);
+        for (t, e) in [
+            event("p1", EventType::SessionStart),
+            tool("p1", EventType::ToolStart),
+            asking,
+        ]
+        .iter()
+        .enumerate()
+        {
+            tracker.observe_event(e, 1 + t as u64);
+        }
+        let held = format!(
+            "{:?}",
+            tracker.pending["run-p1"]
+                .events
+                .iter()
+                .map(|(k, _)| &k.event)
+                .collect::<Vec<_>>()
+        );
+        assert!(held.contains("PermissionRequest"), "{held}");
+        assert!(!held.contains(SECRET), "held for the run: {held}");
+
+        tracker.commit_run("run-p1");
+        let cards = format!("{:?}", tracker.runs["p1"].cards.state);
+        assert!(cards.contains("Bash"), "the cards saw the call: {cards}");
+        assert!(!cards.contains(SECRET), "in the run's cards: {cards}");
+        assert_eq!(
+            tracker.runs["p1"]
+                .cards
+                .sessions
+                .values()
+                .map(|s| status_name(&s.status))
+                .collect::<Vec<_>>(),
+            vec!["waiting"],
+            "the question still counts"
+        );
+
+        tracker.observe_event(&tool("p1", EventType::ToolEnd), 10);
+        assert!(!format!("{:?}", tracker.runs["p1"].cards.state).contains(SECRET));
+        tracker.end_run("p1", EndReason::Exited, None, 20);
+        assert_eq!(
+            operations(&tracker.take_finished()),
+            vec![(op_attrs("local", Some("cargo"), Some("test")), 2, 10)]
         );
     }
 

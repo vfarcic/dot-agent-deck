@@ -9,15 +9,27 @@
 //!   header goes on the command line — Codex reads the `OTEL_EXPORTER_OTLP_*`
 //!   header variables from its environment once an exporter is on. Nothing is
 //!   added when the user's Codex configuration names an exporter itself, or
-//!   the command already passes an `otel.` override.
+//!   the command already passes an `otel.` override; when which configuration
+//!   Codex will read cannot be told without running the command (a
+//!   `CODEX_HOME` built from `$HOME` or `~`, or set by anything but a plain
+//!   assignment in front of it); or when an endpoint carries credentials (a
+//!   `user:password@` or a query string), which the command line would show.
 //! - **Devin** needs an endpoint in its user configuration and does not read
 //!   `OTEL_RESOURCE_ATTRIBUTES`. The deck writes a copy of the user's Devin
-//!   configuration with an `otel` block added — the endpoint, the run's
-//!   resource attributes, and prompt and tool logging off — to a private file
-//!   under the daemon's state directory, passes it with `--config`, and
-//!   removes it when the run ends. A user's own `otel` block is kept as it is,
-//!   gaining only the resource attributes it lacks; one that switches export
-//!   off, or a command that already passes `--config`, gets nothing.
+//!   configuration with an `otel` block added — the endpoint of each signal
+//!   the user's `OTEL_LOGS_EXPORTER` / `OTEL_METRICS_EXPORTER` leave on, the
+//!   run's resource attributes, and prompt and tool logging off — to a file
+//!   only its owner can read, in a directory only its owner can enter, under
+//!   the daemon's state directory; passes it with `--config`; and removes it
+//!   when the run ends. The deck adds no credentials to it, but it is a copy
+//!   of the user's configuration and holds whatever that holds. A user's own
+//!   `otel` block is kept as it is, gaining only the resource attributes it
+//!   lacks; one that switches export off, or a command that already passes
+//!   `--config`, gets nothing.
+//!
+//! The agent's program is found where a shell would run it: at the start of a
+//! command, after `VAR=value` assignments, after `env` (with its options) or
+//! `devbox run` (with its options), or after a wrapper's `--`.
 //! - **Pi** exports through the deck's own Pi extension, which stays inert
 //!   unless the deck sets [`PI_TELEMETRY_ENV`] — which it does not when the
 //!   user set that variable themselves, so `0` keeps Pi's export off.
@@ -30,6 +42,7 @@ use std::path::{Path, PathBuf};
 use crate::event::AgentType;
 
 use super::config::{EnvMap, OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_PROTOCOL, non_empty};
+use super::operation::{ENV, Options, options_len};
 
 /// Set in a Pi agent's environment when the deck's Pi extension should export.
 pub const PI_TELEMETRY_ENV: &str = "DOT_AGENT_DECK_PI_TELEMETRY";
@@ -60,7 +73,7 @@ impl Launch {
             return None;
         }
         let command = command?;
-        let at = program_end(command, agent_basename(agent)?)?;
+        let at = locate(command, agent_basename(agent)?)?.end;
         Some(format!(
             "{} {}{}",
             &command[..at],
@@ -187,16 +200,13 @@ fn codex_args(command: Option<&str>, env: &EnvMap) -> Vec<String> {
     let Some(command) = command else {
         return Vec::new();
     };
-    if program_end(command, "codex").is_none() || command.contains("otel.") {
+    let Some(codex) = locate(command, "codex") else {
+        return Vec::new();
+    };
+    if command.contains("otel.") {
         return Vec::new();
     }
-    let assigned = leading_assignment(command, "CODEX_HOME");
-    let home = assigned
-        .as_deref()
-        .or_else(|| non_empty(env, "CODEX_HOME"))
-        .map(PathBuf::from)
-        .or_else(|| non_empty(env, "HOME").map(|h| Path::new(h).join(".codex")));
-    let Some(home) = home else {
+    let Some(home) = codex_home(command, &codex, env) else {
         return Vec::new();
     };
     if codex_config_names_an_exporter(&home.join("config.toml")) != Some(false) {
@@ -211,6 +221,9 @@ fn codex_args(command: Option<&str>, env: &EnvMap) -> Vec<String> {
         else {
             continue;
         };
+        if may_carry_credentials(&endpoint) {
+            return Vec::new();
+        }
         let protocol = match protocol {
             HttpProtocol::Protobuf => "binary",
             HttpProtocol::Json => "json",
@@ -223,6 +236,61 @@ fn codex_args(command: Option<&str>, env: &EnvMap) -> Vec<String> {
         args.push(shell_quote(&value));
     }
     args
+}
+
+/// The Codex home `command` runs Codex with, at `codex`: a `CODEX_HOME`
+/// assigned in front of it, else the environment's, else `.codex` in the home
+/// directory. `None` when that cannot be told without running the command —
+/// a value built from `$`, `` ` `` or `~`, or not absolute; a `CODEX_HOME` or
+/// `HOME` set anywhere but in front of it (an `export`, another command); an
+/// `env` that clears or unsets variables; a file sourced before it.
+fn codex_home(command: &str, codex: &Located, env: &EnvMap) -> Option<PathBuf> {
+    if codex.environment_unknown {
+        return None;
+    }
+    let assigned = |name: &str| {
+        codex
+            .assignments
+            .iter()
+            .rev()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    };
+    let count = |name: &str| codex.assignments.iter().filter(|(n, _)| n == name).count();
+    let home_mentions = command.matches("HOME=").count() - command.matches("CODEX_HOME=").count();
+    if command.matches("CODEX_HOME").count() != count("CODEX_HOME")
+        || home_mentions != count("HOME")
+    {
+        return None;
+    }
+    let literal = |value: &str| {
+        (Path::new(value).is_absolute() && !value.contains(['$', '`', '~']))
+            .then(|| PathBuf::from(value))
+    };
+    if let Some(value) = assigned("CODEX_HOME") {
+        return literal(value);
+    }
+    if let Some(value) = non_empty(env, "CODEX_HOME") {
+        return Some(PathBuf::from(value));
+    }
+    let home = match assigned("HOME") {
+        Some(value) => literal(value)?,
+        None => PathBuf::from(non_empty(env, "HOME")?),
+    };
+    Some(home.join(".codex"))
+}
+
+/// Whether an endpoint URL may carry a credential the command line would
+/// show: a `user:password@` before its host, or a query string.
+fn may_carry_credentials(endpoint: &str) -> bool {
+    let after_scheme = endpoint
+        .split_once("://")
+        .map_or(endpoint, |(_, rest)| rest);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    authority.contains('@') || endpoint.contains('?')
 }
 
 /// Whether the Codex configuration at `path` sets one of Codex's OTel
@@ -269,7 +337,7 @@ fn toml_string(value: &str) -> String {
 /// `--config`. `None` when the run gets nothing — see the module docs.
 fn devin_launch(inputs: &LaunchInputs<'_>) -> Option<Launch> {
     let command = inputs.command?;
-    if program_end(command, "devin").is_none() || command.contains("--config") {
+    if locate(command, "devin").is_none() || command.contains("--config") {
         return None;
     }
     let env = inputs.env;
@@ -345,13 +413,23 @@ fn devin_config(
         }
         Some(_) => return None,
         None => {
+            // Devin reads no `OTEL_*_EXPORTER` selector itself, so a signal the
+            // user switched off there gets no endpoint here.
             let mut otel = Map::new();
-            if let Some(general) = non_empty(env, OTEL_EXPORTER_OTLP_ENDPOINT) {
-                otel.insert("endpoint".into(), Value::String(general.to_string()));
-            } else {
-                for (key, signal) in [("logs_endpoint", &LOGS), ("metrics_endpoint", &METRICS)] {
-                    if let Some(endpoint) = non_empty(env, signal.endpoint) {
-                        otel.insert(key.into(), Value::String(endpoint.to_string()));
+            let general = non_empty(env, OTEL_EXPORTER_OTLP_ENDPOINT);
+            let shared = [&LOGS, &METRICS]
+                .iter()
+                .all(|signal| !signal.declined(env) && non_empty(env, signal.endpoint).is_none());
+            match general {
+                Some(general) if shared => {
+                    otel.insert("endpoint".into(), Value::String(general.to_string()));
+                }
+                _ => {
+                    for (key, signal) in [("logs_endpoint", &LOGS), ("metrics_endpoint", &METRICS)]
+                    {
+                        if let Some(endpoint) = signal.endpoint(env) {
+                            otel.insert(key.into(), Value::String(endpoint));
+                        }
                     }
                 }
             }
@@ -452,15 +530,12 @@ fn strip_jsonc_lookahead(rest: &str) -> Option<char> {
 }
 
 /// Write `bytes` to a new file at `path` readable by its owner only, in a
-/// directory only its owner can enter.
+/// directory only its owner can enter: created so, or an existing one made
+/// so — refused when it is a symlink or another user owns it.
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     if let Some(dir) = path.parent() {
-        let mut builder = std::fs::DirBuilder::new();
-        builder.recursive(true);
-        #[cfg(unix)]
-        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-        builder.create(dir)?;
+        crate::platform::fsperm::ensure_owner_only_dir(dir)?;
     }
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -587,47 +662,102 @@ fn tokens(command: &str) -> Vec<Token> {
     out
 }
 
-/// The byte offset just past the first word of `command` that runs
-/// `program` — a word whose basename is `program`, at the start of the line or
-/// of a command after a control operator or a `--`, past any `VAR=value`
-/// assignments. `None` when no such word is found.
-fn program_end(command: &str, program: &str) -> Option<usize> {
-    let mut at_command = true;
-    for token in tokens(command) {
-        match token {
-            Token::Operator => at_command = true,
-            Token::Word { end, text } => {
-                if text == "--" {
-                    at_command = true;
-                    continue;
-                }
-                if !at_command || crate::event::is_env_assignment(&text) {
-                    continue;
-                }
-                if text.rsplit('/').next() == Some(program) {
-                    return Some(end);
-                }
-                at_command = false;
+/// Where `command` runs a program — see [`locate`].
+#[derive(Debug)]
+struct Located {
+    /// The byte offset just past the program's word.
+    end: usize,
+    /// The `VAR=value` assignments in front of it in its command, `env`'s
+    /// included, in order, with the shell's quoting removed.
+    assignments: Vec<(String, String)>,
+    /// Whether something in front of it changes its environment in a way not
+    /// read here: an `env` that clears or unsets variables, or an earlier
+    /// command that `source`s, `.`s or `eval`s.
+    environment_unknown: bool,
+}
+
+/// The first place `command` runs `program` — a word whose basename is
+/// `program`, at the start of a command (after a control operator), past
+/// `VAR=value` assignments, an `env` with its options, a `devbox run` with its
+/// options, or a wrapper's arguments up to its `--`. `None` when there is no
+/// such word, or a forwarding prefix has an option not known here.
+fn locate(command: &str, program: &str) -> Option<Located> {
+    let mut sourced = false;
+    let mut segment: Vec<(usize, String)> = Vec::new();
+    let mut tokens = tokens(command).into_iter();
+    loop {
+        let token = tokens.next();
+        if let Some(Token::Word { end, text }) = token {
+            segment.push((end, text));
+            continue;
+        }
+        if let Some(mut found) = locate_in(&segment, program) {
+            found.environment_unknown |= sourced;
+            return Some(found);
+        }
+        sourced |= segment
+            .first()
+            .is_some_and(|(_, w)| matches!(basename(w), "source" | "." | "eval"));
+        segment.clear();
+        token.as_ref()?;
+    }
+}
+
+/// [`locate`] within one command's words.
+fn locate_in(words: &[(usize, String)], program: &str) -> Option<Located> {
+    let mut found = Located {
+        end: 0,
+        assignments: Vec::new(),
+        environment_unknown: false,
+    };
+    let mut i = 0;
+    while let Some((end, word)) = words.get(i) {
+        if crate::event::is_env_assignment(word) {
+            if let Some((name, value)) = word.split_once('=') {
+                found
+                    .assignments
+                    .push((name.to_string(), value.to_string()));
             }
+            i += 1;
+            continue;
+        }
+        let base = basename(word);
+        if base == program {
+            found.end = *end;
+            return Some(found);
+        }
+        let rest: Vec<String> = words[i + 1..].iter().map(|(_, w)| w.clone()).collect();
+        if base == "env" {
+            let len = options_len(&rest, &ENV)?;
+            found.environment_unknown |= rest[..len].iter().any(|w| {
+                w.starts_with("--unset") || w == "--ignore-environment" || {
+                    !w.starts_with("--") && w.starts_with('-') && w.contains(['i', 'u'])
+                }
+            });
+            i += 1 + len;
+        } else if base == "devbox" && rest.first().map(String::as_str) == Some("run") {
+            i += 2 + options_len(&rest[1..], &DEVBOX_RUN)?;
+        } else {
+            // A wrapper's own arguments, up to the command after its `--`.
+            i += 2 + rest.iter().position(|w| w == "--")?;
         }
     }
     None
 }
 
-/// The value `command` assigns to `name` before its program, if it does.
-fn leading_assignment(command: &str, name: &str) -> Option<String> {
-    tokens(command)
-        .into_iter()
-        .map_while(|token| match token {
-            Token::Word { text, .. } if crate::event::is_env_assignment(&text) => Some(text),
-            _ => None,
-        })
-        .find_map(|text| {
-            text.split_once('=')
-                .filter(|(n, _)| *n == name)
-                .map(|(_, v)| v.to_string())
-        })
-        .filter(|v| !v.is_empty())
+/// `devbox run`'s options. It stops reading options at the command it runs,
+/// so the agent's own options after it reach the agent.
+const DEVBOX_RUN: Options = Options {
+    short_values: "ce",
+    short_flags: "q",
+    long_values: &["config", "env", "env-file", "environment"],
+    long_flags: &["pure", "all-projects", "quiet", "debug"],
+    numbers: false,
+};
+
+/// The last `/`-separated part of `word`.
+fn basename(word: &str) -> &str {
+    word.rsplit('/').next().unwrap_or(word)
 }
 
 /// `value` as one POSIX shell word.
@@ -790,6 +920,133 @@ mod tests {
         );
     }
 
+    /// The overrides reach Codex through `env` and `devbox run`, as `sh`
+    /// builds its argv and as `devbox run` passes it on.
+    #[test]
+    fn codex_through_a_forwarding_prefix_gets_its_overrides_as_its_own_args() {
+        let home = tempfile::tempdir().unwrap();
+        let env = env(&[
+            ("HOME", home.path().to_str().unwrap()),
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://c:4318"),
+        ]);
+        for (command, program_at) in [
+            ("env codex --model m", 1),
+            ("env -C /w FOO=1 codex --model m", 4),
+            ("devbox run codex --model m", 2),
+            ("devbox run --pure -- codex --model m", 4),
+        ] {
+            let launch = prepare(&inputs(
+                &AgentType::Codex,
+                command,
+                &env,
+                &resource(),
+                home.path(),
+            ));
+            let argv = argv(&launch.command(&AgentType::Codex, Some(command)).unwrap());
+            assert_eq!(argv[program_at], "codex", "{command}: {argv:?}");
+            assert_eq!(argv[program_at + 1], "-c", "{command}: {argv:?}");
+            assert!(argv[program_at + 2].starts_with("otel.trace_exporter="));
+            assert_eq!(argv[argv.len() - 2..], ["--model", "m"], "{command}");
+        }
+    }
+
+    /// The configuration checked is the one the launched Codex reads; when
+    /// that cannot be told without running the command, nothing is added.
+    #[test]
+    fn codex_home_is_the_launched_codexs_or_nothing_is_added() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path().to_str().unwrap();
+        let alt = home.path().join("alt");
+        std::fs::create_dir_all(&alt).unwrap();
+        std::fs::write(
+            alt.join("config.toml"),
+            "[otel]\ntrace_exporter = \"none\"\n",
+        )
+        .unwrap();
+        let empty = home.path().join("empty");
+        let alt = alt.to_str().unwrap();
+        let empty = empty.to_str().unwrap();
+        let base = env(&[
+            ("HOME", h),
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://c:4318"),
+        ]);
+        let added = |command: &str| !codex_args(Some(command), &base).is_empty();
+        for command in [
+            "CODEX_HOME=\"$HOME/alt\" codex".to_string(),
+            "CODEX_HOME=$HOME/alt codex".to_string(),
+            "CODEX_HOME=~/alt codex".to_string(),
+            format!("CODEX_HOME=$(echo {alt}) codex"),
+            format!("CODEX_HOME=`echo {alt}` codex"),
+            "CODEX_HOME=relative codex".to_string(),
+            format!("cd /w && CODEX_HOME={alt} codex"),
+            format!("CODEX_HOME={alt} env codex"),
+            format!("env CODEX_HOME={alt} codex"),
+            format!("devbox run -e CODEX_HOME={alt} codex"),
+            format!("CODEX_HOME={alt} /bin/deck wrap --agent codex -- codex"),
+            format!("/bin/deck wrap --agent codex -- CODEX_HOME={alt} codex"),
+            format!("export CODEX_HOME={empty} && codex"),
+            format!("export HOME={empty}; codex"),
+            "HOME=~ codex".to_string(),
+            format!("env -i HOME={empty} codex"),
+            "env -u CODEX_HOME codex".to_string(),
+            "env --unset=CODEX_HOME codex".to_string(),
+            "source ~/.envrc && codex".to_string(),
+            ". ./env.sh; codex".to_string(),
+        ] {
+            assert!(!added(&command), "{command}");
+        }
+        for command in [
+            format!("CODEX_HOME={empty} codex"),
+            format!("cd /w && CODEX_HOME={empty} codex"),
+            format!("env CODEX_HOME={empty} codex"),
+            format!("HOME={empty} codex"),
+            format!("CODEX_HOME={alt} CODEX_HOME={empty} codex"),
+        ] {
+            assert!(added(&command), "{command}");
+        }
+    }
+
+    /// An endpoint that may carry a credential is not put on a command line.
+    #[test]
+    fn codex_gets_nothing_for_an_endpoint_with_credentials() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path().to_str().unwrap();
+        let args = |pairs: &[(&str, &str)]| {
+            let mut all = vec![("HOME", h)];
+            all.extend_from_slice(pairs);
+            codex_args(Some("codex"), &env(&all))
+        };
+        for endpoint in [
+            "https://user:synthetic-password-1741@collector.example",
+            "https://synthetic-token-1741@collector.example:4318/",
+            "https://collector.example/v1?api_key=synthetic-token-1741",
+        ] {
+            assert!(
+                args(&[("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint)]).is_empty(),
+                "{endpoint}"
+            );
+        }
+        assert!(
+            args(&[
+                ("OTEL_EXPORTER_OTLP_ENDPOINT", "https://collector.example"),
+                (
+                    "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+                    "https://u:p@m.example/v1/metrics"
+                ),
+            ])
+            .is_empty(),
+            "one credential-bearing signal declines both"
+        );
+        assert!(
+            !args(&[(
+                "OTEL_EXPORTER_OTLP_ENDPOINT",
+                "https://collector.example/a@b"
+            )])
+            .is_empty()
+        );
+        assert!(!args(&[("OTEL_EXPORTER_OTLP_ENDPOINT", "https://collector.example")]).is_empty());
+    }
+
     #[test]
     fn the_args_go_after_the_program_wherever_it_starts() {
         let launch = Launch {
@@ -812,6 +1069,28 @@ mod tests {
                 "/bin/deck wrap --agent codex -- codex",
                 "/bin/deck wrap --agent codex -- codex -c 'a b'",
             ),
+            ("env codex --yolo", "env codex -c 'a b' --yolo"),
+            (
+                "env -u X -C /w FOO=1 /bin/codex",
+                "env -u X -C /w FOO=1 /bin/codex -c 'a b'",
+            ),
+            (
+                "devbox run codex --model m",
+                "devbox run codex -c 'a b' --model m",
+            ),
+            (
+                "devbox run --pure -e K=V -c /w codex",
+                "devbox run --pure -e K=V -c /w codex -c 'a b'",
+            ),
+            ("devbox run -- codex", "devbox run -- codex -c 'a b'"),
+            (
+                "/bin/deck wrap --agent codex -- env codex",
+                "/bin/deck wrap --agent codex -- env codex -c 'a b'",
+            ),
+            (
+                "/bin/deck wrap --agent codex -- devbox run codex",
+                "/bin/deck wrap --agent codex -- devbox run codex -c 'a b'",
+            ),
         ] {
             assert_eq!(
                 launch.command(&codex, Some(command)).as_deref(),
@@ -819,7 +1098,14 @@ mod tests {
                 "{command}"
             );
         }
-        for command in ["echo codex", "devbox run codex-big", "mycodex"] {
+        for command in [
+            "echo codex",
+            "devbox run codex-big",
+            "mycodex",
+            "env -S 'codex'",
+            "devbox run --bogus codex",
+            "devbox shell codex",
+        ] {
             assert_eq!(launch.command(&codex, Some(command)), None, "{command}");
         }
         assert_eq!(Launch::default().command(&codex, Some("codex")), None);
@@ -919,6 +1205,102 @@ mod tests {
             )
             .is_none(),
             "Devin exports no traces"
+        );
+    }
+
+    /// Devin reads no exporter selector, so the deck's block configures only
+    /// the signals the user left on.
+    #[test]
+    fn devin_signals_follow_the_users_exporter_selectors() {
+        let config = |pairs: &[(&str, &str)]| {
+            let mut all = vec![("OTEL_EXPORTER_OTLP_ENDPOINT", "http://c:4318")];
+            all.extend_from_slice(pairs);
+            devin_config(serde_json::json!({}), &env(&all), &resource()).map(|c| c["otel"].clone())
+        };
+        let endpoints = |otel: serde_json::Value| {
+            ["endpoint", "logs_endpoint", "metrics_endpoint"]
+                .iter()
+                .filter_map(|k| otel.get(*k).map(|v| format!("{k}={}", v.as_str().unwrap())))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            config(&[
+                ("OTEL_LOGS_EXPORTER", "none"),
+                ("OTEL_METRICS_EXPORTER", "none")
+            ]),
+            None
+        );
+        assert_eq!(
+            endpoints(config(&[("OTEL_LOGS_EXPORTER", "none")]).unwrap()),
+            ["metrics_endpoint=http://c:4318/v1/metrics"]
+        );
+        assert_eq!(
+            endpoints(config(&[("OTEL_METRICS_EXPORTER", "console")]).unwrap()),
+            ["logs_endpoint=http://c:4318/v1/logs"]
+        );
+        assert_eq!(
+            endpoints(config(&[("OTEL_METRICS_EXPORTER", "otlp")]).unwrap()),
+            ["endpoint=http://c:4318"]
+        );
+        assert_eq!(
+            endpoints(config(&[("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "http://l/v1/logs")]).unwrap()),
+            [
+                "logs_endpoint=http://l/v1/logs",
+                "metrics_endpoint=http://c:4318/v1/metrics"
+            ]
+        );
+        let own = devin_config(
+            serde_json::json!({"otel": {"endpoint": "https://mine"}}),
+            &env(&[
+                ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://c:4318"),
+                ("OTEL_LOGS_EXPORTER", "none"),
+                ("OTEL_METRICS_EXPORTER", "none"),
+            ]),
+            &resource(),
+        )
+        .unwrap();
+        assert_eq!(
+            own["otel"]["endpoint"], "https://mine",
+            "the user's own block stands"
+        );
+        assert_eq!(own["otel"]["resource_attributes"]["deck.run.id"], "run-1");
+    }
+
+    /// The per-run file goes only in a directory the deck can vouch for.
+    #[test]
+    fn devin_config_directory_is_owner_only_or_refused() {
+        let home = tempfile::tempdir().unwrap();
+        let env = env(&[
+            ("HOME", home.path().to_str().unwrap()),
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://c:4318"),
+        ]);
+        let res = resource();
+        let elsewhere = home.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let linked = home.path().join("linked");
+        std::os::unix::fs::symlink(&elsewhere, &linked).unwrap();
+        assert_eq!(
+            prepare(&inputs(&AgentType::Devin, "devin", &env, &res, &linked)),
+            Launch::default()
+        );
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+
+        let open = home.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let launch = prepare(&inputs(&AgentType::Devin, "env devin", &env, &res, &open));
+        assert!(launch.config_file.is_some());
+        assert_eq!(
+            mode(&open),
+            0o700,
+            "an existing directory is made owner-only"
+        );
+        assert_eq!(
+            launch
+                .command(&AgentType::Devin, Some("env devin"))
+                .unwrap(),
+            format!("env devin {}", launch.args.join(" "))
         );
     }
 

@@ -1,21 +1,29 @@
 //! What kind of shell command an agent ran, read from the command text its
 //! hook reported — for `agent.operation` spans.
 //!
-//! **The command line is never sent.** [`classify`] reads the text once and
-//! returns three words at most: the runner (an enum), the program's basename
+//! **The command line is not sent.** [`classify`] reads the text once and
+//! returns three values at most: the runner (an enum), the program's basename
 //! and its first non-option argument. Each word is kept only when it has the
 //! shape of a command word ([`is_command_word`]: lowercase letters, digits,
-//! `.`, `_` and `-`, at most 32 characters), so a path, a URL, a quoted
-//! string, a token or anything with an uppercase letter or a `=` in it never
-//! leaves this function; and the first argument of a program that prints or
-//! searches text ([`WORDLESS_PROGRAMS`]) is never kept at all. The text itself
-//! is not stored, logged or returned.
+//! `.`, `_` and `-`, at most 32 characters), which leaves out a path, a URL, a
+//! quoted string with a space in it, and anything with an uppercase letter or
+//! a `=` in it. **That shape is not a secret filter**: a short lowercase
+//! password, file name or host name has it. So the first argument of a program
+//! whose arguments are usually data — text, patterns, files, hosts, request
+//! bodies and credentials ([`WORDLESS_PROGRAMS`]) — is never kept, and a
+//! wrapper whose options cannot be told apart from the command it runs gives
+//! neither a program nor a word. The text itself is not stored, logged or
+//! returned.
 //!
 //! Only the first line counts, as the deck's cards show it. It is split on
-//! `&&`, `||`, `;` and `|` outside quotes, and the first segment that runs
+//! `&&`, `||`, `;` and `|` outside quotes into words, and those words keep the
+//! boundaries the shell gives them: a quoted argument stays one word wherever
+//! it is unwrapped from (`rwx sandbox exec … --`), and a shell's `-c` script is
+//! read as a script, its later arguments not. The first segment that runs
 //! something other than a shell builtin that only sets up the next one
 //! ([`SETUP_PROGRAMS`]) is the one classified — after its leading `VAR=value`
-//! assignments and an `env`, `sudo`, `command`, `time` or `nice` in front.
+//! assignments and an `env`, `sudo`, `command`, `time` or `nice` in front,
+//! with their options and the options' values.
 
 /// Where a command ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +57,17 @@ pub struct Operation {
     pub word: Option<String>,
 }
 
+impl Operation {
+    /// An operation of which nothing but its runner is known.
+    fn bare(runner: Runner) -> Self {
+        Operation {
+            runner,
+            program: None,
+            word: None,
+        }
+    }
+}
+
 /// The tool names agents give their shell tool: Claude Code's `Bash`,
 /// OpenCode's and Pi's `bash`, Codex's `shell` (and the names its newer
 /// releases use), and Devin's `exec`.
@@ -62,24 +81,157 @@ pub const SHELL_TOOLS: &[&str] = &[
     "local_shell",
 ];
 
+/// The shell tool whose command the hooks report as an argv joined with
+/// spaces (Codex's `shell`): see [`classify_joined_argv`].
+pub const JOINED_ARGV_TOOL: &str = "shell";
+
 /// Whether `tool_name` is an agent's shell tool.
 pub fn is_shell_tool(tool_name: Option<&str>) -> bool {
     tool_name.is_some_and(|name| SHELL_TOOLS.contains(&name))
+}
+
+/// Classify the command a shell tool call reported, read as its tool reports
+/// it: [`classify_joined_argv`] for [`JOINED_ARGV_TOOL`], else [`classify`].
+pub fn classify_tool(tool_name: Option<&str>, command: Option<&str>) -> Operation {
+    if tool_name == Some(JOINED_ARGV_TOOL) {
+        classify_joined_argv(command)
+    } else {
+        classify(command)
+    }
 }
 
 /// Builtins that only prepare the next command; a segment running one is
 /// skipped.
 pub const SETUP_PROGRAMS: &[&str] = &["cd", "export", "source", ".", "set", "true"];
 
-/// Programs whose first argument is the text they print or search for: only
-/// the program is kept.
-pub const WORDLESS_PROGRAMS: &[&str] = &["echo", "printf", "cat", "grep", "rg", "sed", "awk"];
-
-/// Words that run the rest of the segment as a command.
-const PREFIX_PROGRAMS: &[&str] = &["env", "sudo", "command", "time", "nice"];
+/// Programs whose arguments are usually data — text they print, a pattern, a
+/// file, a host, a request body or a credential: only the program is kept.
+pub const WORDLESS_PROGRAMS: &[&str] = &[
+    "echo",
+    "printf",
+    "cat",
+    "grep",
+    "rg",
+    "sed",
+    "awk",
+    "curl",
+    "wget",
+    "redis-cli",
+    "base64",
+    "head",
+    "tail",
+    "xargs",
+    "ssh",
+    "scp",
+    "sftp",
+    "rsync",
+];
 
 /// Shells whose `-c` argument is the command they run.
 const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash"];
+
+/// The single-letter options a shell takes without a value. `-c` is read
+/// separately, and `-o` / `-O` take one.
+const SHELL_FLAGS: &str = "abefhiklmnprstuvxBCDEHPT";
+
+/// The options of a program that runs the rest of its words as a command.
+pub(super) struct Options {
+    /// Short options that take a value: `-u root`, or attached, `-uroot`.
+    pub short_values: &'static str,
+    /// Short options that take none.
+    pub short_flags: &'static str,
+    /// Long options that take a value: `--chdir dir` or `--chdir=dir`.
+    pub long_values: &'static [&'static str],
+    /// Long options that take none, or only an attached `=value`.
+    pub long_flags: &'static [&'static str],
+    /// Whether a number is an option: `nice -10`.
+    pub numbers: bool,
+}
+
+/// `env`. `-S` / `--split-string`, which carries the command inside its
+/// value, is deliberately unknown.
+pub(super) const ENV: Options = Options {
+    short_values: "uCPa",
+    short_flags: "i0v",
+    long_values: &["unset", "chdir", "argv0"],
+    long_flags: &[
+        "ignore-environment",
+        "null",
+        "debug",
+        "block-signal",
+        "default-signal",
+        "ignore-signal",
+        "list-signal-handling",
+    ],
+    numbers: false,
+};
+
+/// `sudo`. `-e` / `--edit`, which takes files rather than a command, is
+/// deliberately unknown.
+const SUDO: Options = Options {
+    short_values: "ugChprtUTDR",
+    short_flags: "AbBEHiKklnNPSsvV",
+    long_values: &[
+        "user",
+        "group",
+        "close-from",
+        "host",
+        "prompt",
+        "role",
+        "type",
+        "other-user",
+        "command-timeout",
+        "chdir",
+        "chroot",
+    ],
+    long_flags: &[
+        "askpass",
+        "background",
+        "bell",
+        "preserve-env",
+        "set-home",
+        "login",
+        "remove-timestamp",
+        "reset-timestamp",
+        "list",
+        "non-interactive",
+        "no-update",
+        "preserve-groups",
+        "stdin",
+        "shell",
+        "validate",
+        "version",
+    ],
+    numbers: false,
+};
+
+/// `command`. Its `-v` / `-V` look a name up rather than run it: see
+/// [`command_words`].
+const COMMAND: Options = Options {
+    short_values: "",
+    short_flags: "pvV",
+    long_values: &[],
+    long_flags: &[],
+    numbers: false,
+};
+
+/// GNU `time`, and the shell keyword's `-p`.
+const TIME: Options = Options {
+    short_values: "fo",
+    short_flags: "apqv",
+    long_values: &["format", "output"],
+    long_flags: &["append", "portability", "quiet", "verbose"],
+    numbers: false,
+};
+
+/// `nice`.
+const NICE: Options = Options {
+    short_values: "n",
+    short_flags: "",
+    long_values: &["adjustment"],
+    long_flags: &[],
+    numbers: true,
+};
 
 /// The longest command word kept.
 pub const MAX_WORD_CHARS: usize = 32;
@@ -101,64 +253,105 @@ pub fn classify(command: Option<&str>) -> Operation {
     classify_line(line, 0)
 }
 
-/// How deep `sh -c '…'` nesting is followed.
+/// [`classify`] for a command reported as an argv joined with single spaces,
+/// as Codex's `shell` tool's is: which of its spaces were inside an argument
+/// is lost. A shell running a `-c` script is classified by the script, which
+/// is the rest of the line — Codex runs its commands as
+/// `["/bin/sh", "-lc", "<script>"]`. Anything else gives its program only,
+/// and its runner.
+pub fn classify_joined_argv(command: Option<&str>) -> Operation {
+    let line = command.and_then(|c| c.lines().next()).unwrap_or("");
+    let words: Vec<(usize, &str)> = line
+        .split(' ')
+        .scan(0, |at, word| {
+            let start = *at;
+            *at += word.len() + 1;
+            Some((start, word))
+        })
+        .filter(|(_, word)| !word.is_empty())
+        .collect();
+    let Some(&(_, first)) = words.first() else {
+        return Operation::bare(Runner::Local);
+    };
+    let program = basename(first);
+    let rest: Vec<String> = words[1..].iter().map(|(_, w)| w.to_string()).collect();
+    if SHELLS.contains(&program)
+        && let Some((true, at)) = shell_operand(&rest)
+        && let Some(&(start, _)) = words.get(at + 1)
+    {
+        return classify_line(&line[start..], 1);
+    }
+    match (
+        program,
+        rest.first().map(String::as_str),
+        rest.get(1).map(String::as_str),
+    ) {
+        ("rwx", Some("sandbox"), Some("exec")) => Operation::bare(Runner::RwxSandbox),
+        ("rwx", Some("run"), _) => Operation {
+            runner: Runner::RwxRun,
+            program: Some("rwx".to_string()),
+            word: Some("run".to_string()),
+        },
+        _ => named(program, &[]),
+    }
+}
+
+/// How deep `sh -c '…'` and `rwx sandbox exec -- …` nesting is followed.
 const MAX_NESTING: usize = 2;
 
 fn classify_line(line: &str, depth: usize) -> Operation {
-    for segment in segments(line) {
-        let words = command_words(&segment);
-        let Some(first) = words.first() else {
-            continue;
-        };
-        let program = basename(first);
-        if SETUP_PROGRAMS.contains(&program) {
-            continue;
-        }
-        let rest = &words[1..];
-        if depth < MAX_NESTING
-            && SHELLS.contains(&program)
-            && let Some(flag) = rest.first()
-            && flag.starts_with('-')
-            && flag.contains('c')
-        {
-            let inner = rest[1..].join(" ");
-            return classify_line(&inner, depth + 1);
-        }
-        if program == "rwx" {
-            match rest.first().map(String::as_str) {
-                Some("sandbox") if rest.get(1).map(String::as_str) == Some("exec") => {
-                    let inner = rest
-                        .iter()
-                        .position(|w| w == "--")
-                        .map(|i| rest[i + 1..].join(" "))
-                        .unwrap_or_default();
-                    let mut op = if depth < MAX_NESTING {
-                        classify_line(&inner, depth + 1)
-                    } else {
-                        named(program, rest)
-                    };
-                    op.runner = Runner::RwxSandbox;
-                    if inner.is_empty() {
-                        op.program = None;
-                        op.word = None;
-                    }
-                    return op;
-                }
-                Some("run") => {
-                    let mut op = named(program, rest);
-                    op.runner = Runner::RwxRun;
-                    return op;
-                }
-                _ => {}
+    segments(line)
+        .iter()
+        .find_map(|segment| classify_words(segment, depth))
+        .unwrap_or(Operation::bare(Runner::Local))
+}
+
+/// Classify one segment's words. `None` when the segment only sets up the
+/// next one.
+fn classify_words(segment: &[String], depth: usize) -> Option<Operation> {
+    let Some(words) = command_words(segment) else {
+        return Some(Operation::bare(Runner::Local));
+    };
+    let first = words.first()?;
+    let program = basename(first);
+    if SETUP_PROGRAMS.contains(&program) {
+        return None;
+    }
+    let rest = &words[1..];
+    if SHELLS.contains(&program) {
+        return Some(match shell_operand(rest) {
+            None => Operation::bare(Runner::Local),
+            Some((false, at)) => named(program, &rest[at..]),
+            Some((true, _)) if depth >= MAX_NESTING => named(program, &[]),
+            Some((true, at)) => match rest.get(at) {
+                Some(script) => classify_line(script, depth + 1),
+                None => Operation::bare(Runner::Local),
+            },
+        });
+    }
+    if program == "rwx" {
+        match rest.first().map(String::as_str) {
+            Some("sandbox") if rest.get(1).map(String::as_str) == Some("exec") => {
+                let inner = rest
+                    .iter()
+                    .position(|w| w == "--")
+                    .map(|i| &rest[i + 1..])
+                    .filter(|inner| !inner.is_empty() && depth < MAX_NESTING);
+                let mut op = inner
+                    .and_then(|inner| classify_words(inner, depth + 1))
+                    .unwrap_or(Operation::bare(Runner::Local));
+                op.runner = Runner::RwxSandbox;
+                return Some(op);
             }
+            Some("run") => {
+                let mut op = named(program, rest);
+                op.runner = Runner::RwxRun;
+                return Some(op);
+            }
+            _ => {}
         }
-        return named(program, rest);
     }
-    Operation {
-        runner: Runner::Local,
-        program: None,
-        word: None,
-    }
+    Some(named(program, rest))
 }
 
 /// A local operation running `program` with `args`, its words filtered.
@@ -184,34 +377,127 @@ fn basename(word: &str) -> &str {
 }
 
 /// A segment's words from its program on: leading assignments and the prefix
-/// programs in front of it, with their options and assignments, dropped.
-fn command_words(segment: &[String]) -> Vec<String> {
-    let mut words = segment.iter().peekable();
-    while words
-        .peek()
-        .is_some_and(|w| crate::event::is_env_assignment(w))
-    {
-        words.next();
+/// programs in front of it, with their options, the options' values and
+/// assignments, dropped. `None` when a prefix's options cannot be told apart
+/// from the command it runs.
+fn command_words(segment: &[String]) -> Option<&[String]> {
+    let mut words = segment;
+    loop {
+        let assignments = words
+            .iter()
+            .take_while(|w| crate::event::is_env_assignment(w))
+            .count();
+        words = &words[assignments..];
+        let Some(first) = words.first() else {
+            return Some(words);
+        };
+        let prefix = basename(first);
+        let options = match prefix {
+            "env" => &ENV,
+            "sudo" => &SUDO,
+            "command" => &COMMAND,
+            "time" => &TIME,
+            "nice" => &NICE,
+            _ => return Some(words),
+        };
+        let len = options_len(&words[1..], options)?;
+        // `command -v cargo` looks `cargo` up and runs nothing: the program
+        // is `command`.
+        if prefix == "command"
+            && words[1..=len]
+                .iter()
+                .any(|w| !w.starts_with("--") && w.starts_with('-') && w.contains(['v', 'V']))
+        {
+            return Some(words);
+        }
+        words = &words[1 + len..];
     }
-    while let Some(prefix) = words.peek().map(|w| basename(w))
-        && PREFIX_PROGRAMS.contains(&prefix)
-    {
-        words.next();
-        while let Some(w) = words.peek() {
-            if w.starts_with('-') || crate::event::is_env_assignment(w) {
-                let option = words.next();
-                // `nice -n 10`, `sudo -u root`: the option's own value.
-                if matches!(option.map(String::as_str), Some("-n" | "-u" | "-g"))
-                    && words.peek().is_some()
-                {
-                    words.next();
-                }
+}
+
+/// How many of `words` are `options` with their values, up to the command
+/// they run (past a `--`). `None` when one is not an option `options` knows,
+/// or its value is missing.
+pub(super) fn options_len(words: &[String], options: &Options) -> Option<usize> {
+    let mut i = 0;
+    while let Some(word) = words.get(i) {
+        if word == "--" {
+            return Some(i + 1);
+        }
+        if let Some(long) = word.strip_prefix("--") {
+            let (name, attached) = match long.split_once('=') {
+                Some((name, _)) => (name, true),
+                None => (long, false),
+            };
+            if options.long_values.contains(&name) {
+                i += if attached { 1 } else { 2 };
+            } else if options.long_flags.contains(&name) {
+                i += 1;
             } else {
+                return None;
+            }
+            continue;
+        }
+        let Some(cluster) = word.strip_prefix('-').filter(|c| !c.is_empty()) else {
+            break;
+        };
+        if options.numbers && cluster.bytes().all(|b| b.is_ascii_digit()) {
+            i += 1;
+            continue;
+        }
+        let mut takes_next = false;
+        for (at, c) in cluster.char_indices() {
+            if options.short_values.contains(c) {
+                // A value attached to the option is the rest of this word.
+                takes_next = at + c.len_utf8() == cluster.len();
                 break;
             }
+            if !options.short_flags.contains(c) {
+                return None;
+            }
         }
+        i += if takes_next { 2 } else { 1 };
     }
-    words.cloned().collect()
+    (i <= words.len()).then_some(i)
+}
+
+/// A shell's words after its name, read as its options: whether `-c` makes
+/// its first operand a script, and where that operand is. `None` when an
+/// option is not one a shell has, or its value is missing.
+fn shell_operand(args: &[String]) -> Option<(bool, usize)> {
+    let mut command = false;
+    let mut i = 0;
+    while let Some(word) = args.get(i) {
+        if word == "--" || word == "-" {
+            i += 1;
+            break;
+        }
+        if let Some(long) = word.strip_prefix("--") {
+            i += match long {
+                "rcfile" | "init-file" => 2,
+                "login" | "norc" | "noprofile" | "noediting" | "posix" | "restricted"
+                | "verbose" | "debugger" | "dump-strings" | "dump-po-strings" | "help"
+                | "version" | "pretty-print" => 1,
+                _ => return None,
+            };
+            continue;
+        }
+        let (minus, cluster) = match (word.strip_prefix('-'), word.strip_prefix('+')) {
+            (Some(cluster), _) => (true, cluster),
+            (None, Some(cluster)) => (false, cluster),
+            (None, None) => break,
+        };
+        let mut values = 0;
+        for c in cluster.chars() {
+            match c {
+                'c' if minus => command = true,
+                'o' | 'O' => values += 1,
+                c if SHELL_FLAGS.contains(c) => {}
+                _ => return None,
+            }
+        }
+        i += 1 + values;
+    }
+    (i <= args.len()).then_some((command, i))
 }
 
 /// `line` split into segments on `&&`, `||`, `;` and `|` outside quotes, each
@@ -338,7 +624,8 @@ mod tests {
             ("time nice -n 10 cargo bench", local("cargo", Some("bench"))),
             ("true || gh pr checks 1", local("gh", Some("pr"))),
             ("cargo test 2>&1 | tail -n 5", local("cargo", Some("test"))),
-            ("command -v rg", local("rg", None)),
+            ("command -v rg", local("command", Some("rg"))),
+            ("command -p make test", local("make", Some("test"))),
         ] {
             assert_eq!(classify(Some(command)), expected, "{command}");
         }
@@ -350,10 +637,159 @@ mod tests {
             classify(Some("/bin/bash -lc 'cd x && cargo test'")),
             local("cargo", Some("test"))
         );
-        // Codex's argv, joined: its quotes are already gone.
+        // Unquoted, the script is `touch`; `out.txt` is the script's `$0`.
         assert_eq!(
             classify(Some("/bin/sh -lc touch out.txt")),
-            local("touch", Some("out.txt"))
+            local("touch", None)
+        );
+    }
+
+    /// A quoted argument stays one word however it is unwrapped, and a
+    /// shell's later arguments are not its script.
+    #[test]
+    fn word_boundaries_survive_unwrapping() {
+        let sandbox =
+            |program: Option<&str>, word: Option<&str>| op(Runner::RwxSandbox, program, word);
+        for (command, expected) in [
+            (
+                "rwx sandbox exec -- cargo 'private payload'",
+                sandbox(Some("cargo"), None),
+            ),
+            (
+                "rwx sandbox exec -- cargo 'abc;node secret'",
+                sandbox(Some("cargo"), None),
+            ),
+            (
+                "rwx sandbox exec -- cargo \"a && b\"",
+                sandbox(Some("cargo"), None),
+            ),
+            (
+                r#"rwx sandbox exec -- bash -c 'node "private payload"'"#,
+                sandbox(Some("node"), None),
+            ),
+            (
+                "rwx sandbox exec -- FOO=1 env -u X cargo test",
+                sandbox(Some("cargo"), Some("test")),
+            ),
+            (
+                "bash -c 'cargo test' private payload",
+                local("cargo", Some("test")),
+            ),
+            ("bash -c cargo private", local("cargo", None)),
+            ("sh -c 'node \"private payload\"' x", local("node", None)),
+            (r#"sh -c 'sh -c "make ci"'"#, local("make", Some("ci"))),
+            (r#"sh -c 'sh -c "sh -c make"'"#, local("sh", None)),
+        ] {
+            assert_eq!(classify(Some(command)), expected, "{command}");
+        }
+    }
+
+    /// A prefix's options and their values are skipped, not read as the
+    /// program; a form whose options are not known gives nothing.
+    #[test]
+    fn prefix_and_shell_options_take_their_values() {
+        let unresolved = op(Runner::Local, None, None);
+        for (command, expected) in [
+            ("time -f hunter2 cargo test", local("cargo", Some("test"))),
+            (
+                "time -o out.txt -a cargo test",
+                local("cargo", Some("test")),
+            ),
+            ("time --format=%e cargo test", local("cargo", Some("test"))),
+            (
+                "time --output out -p cargo test",
+                local("cargo", Some("test")),
+            ),
+            (
+                "env --chdir /home/private cargo test",
+                local("cargo", Some("test")),
+            ),
+            (
+                "env -C /home/private cargo test",
+                local("cargo", Some("test")),
+            ),
+            ("env -u hunter2 cargo test", local("cargo", Some("test"))),
+            ("env -iu x Y=1 cargo test", local("cargo", Some("test"))),
+            ("env --unset=x -- cargo test", local("cargo", Some("test"))),
+            ("env -S 'cargo test'", unresolved.clone()),
+            ("env --split-string='cargo test'", unresolved.clone()),
+            ("env --bogus x cargo test", unresolved.clone()),
+            (
+                "nice --adjustment 10 cargo test",
+                local("cargo", Some("test")),
+            ),
+            (
+                "nice --adjustment=10 cargo test",
+                local("cargo", Some("test")),
+            ),
+            ("nice -n 10 cargo test", local("cargo", Some("test"))),
+            ("nice -n10 cargo test", local("cargo", Some("test"))),
+            ("nice -10 cargo test", local("cargo", Some("test"))),
+            (
+                "sudo -u root -g wheel -C 5 systemctl restart x",
+                local("systemctl", Some("restart")),
+            ),
+            (
+                "sudo --user=root -H make install",
+                local("make", Some("install")),
+            ),
+            ("sudo -uroot make install", local("make", Some("install"))),
+            ("sudo -e /etc/hosts", unresolved.clone()),
+            ("sudo -u", unresolved.clone()),
+            (
+                "bash --rcfile /home/private -c 'cargo test'",
+                local("cargo", Some("test")),
+            ),
+            (
+                "bash --init-file private -lc 'cargo test'",
+                local("cargo", Some("test")),
+            ),
+            ("bash -o pipefail -c 'make ci'", local("make", Some("ci"))),
+            ("bash -eo pipefail -c 'make ci'", local("make", Some("ci"))),
+            ("bash +O extglob -c 'make ci'", local("make", Some("ci"))),
+            ("bash --login -c 'make ci'", local("make", Some("ci"))),
+            ("bash --bogus -c 'make ci'", unresolved.clone()),
+            ("bash -c", unresolved.clone()),
+            ("bash --rcfile", unresolved.clone()),
+            ("bash ci.sh -c x", local("bash", Some("ci.sh"))),
+            ("bash --rcfile private", local("bash", None)),
+            ("sh", local("sh", None)),
+        ] {
+            assert_eq!(classify(Some(command)), expected, "{command}");
+        }
+    }
+
+    /// Codex's `shell` tool reports its argv joined with spaces.
+    #[test]
+    fn a_joined_argv_is_read_by_its_script_or_not_at_all() {
+        for (command, expected) in [
+            ("/bin/sh -lc touch out.txt", local("touch", Some("out.txt"))),
+            (
+                "/bin/bash -lc cd x && cargo test",
+                local("cargo", Some("test")),
+            ),
+            (
+                "bash --rcfile private -c make ci",
+                local("make", Some("ci")),
+            ),
+            ("cargo private payload", local("cargo", None)),
+            ("env hunter2 cargo", local("env", None)),
+            (
+                "rwx sandbox exec -- cargo private",
+                op(Runner::RwxSandbox, None, None),
+            ),
+            ("rwx run ci", op(Runner::RwxRun, Some("rwx"), Some("run"))),
+            ("", op(Runner::Local, None, None)),
+        ] {
+            assert_eq!(classify_joined_argv(Some(command)), expected, "{command}");
+        }
+        assert_eq!(
+            classify_tool(Some("shell"), Some("/bin/sh -lc make ci")),
+            local("make", Some("ci"))
+        );
+        assert_eq!(
+            classify_tool(Some("Bash"), Some("/bin/sh -lc make ci")),
+            local("make", None)
         );
     }
 
@@ -430,6 +866,27 @@ mod tests {
             classify(Some("FOO=1 /bin/grep -r password .")),
             local("grep", None)
         );
+        for (command, program) in [
+            ("curl -d hunter2 https://example.invalid", "curl"),
+            (
+                "curl --oauth2-bearer hunter2 https://example.invalid",
+                "curl",
+            ),
+            ("curl -u 'hunter2' https://example.invalid", "curl"),
+            ("wget hunter2.example", "wget"),
+            ("redis-cli -a hunter2 ping", "redis-cli"),
+            ("ssh internal-prod", "ssh"),
+            ("scp internal-prod:x .", "scp"),
+            ("sftp internal-prod", "sftp"),
+            ("rsync -a internal-prod:x .", "rsync"),
+            ("base64 private.txt", "base64"),
+            ("head private.txt", "head"),
+            ("tail -f private.log", "tail"),
+            ("xargs hunter2", "xargs"),
+            ("sh -c 'curl -d hunter2 x'", "curl"),
+        ] {
+            assert_eq!(classify(Some(command)), local(program, None), "{command}");
+        }
     }
 
     #[test]
