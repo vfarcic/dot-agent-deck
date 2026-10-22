@@ -14,7 +14,6 @@
 //! `cargo test` they share a process, and only under nextest does each get its
 //! own.
 
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -77,23 +76,22 @@ async fn spawn_daemon(hook_path: &Path, attach_path: &Path) -> DaemonHandle {
 }
 
 /// Whether a client reaches the daemon at `attach_path` — what `dot-agent-deck`
-/// does first — within `budget`.
+/// does first — within `budget`, a connection that never answers included.
 async fn attach_answers_within(attach_path: &Path, budget: Duration) -> bool {
-    let deadline = tokio::time::Instant::now() + budget;
-    loop {
-        if UnixStream::connect(attach_path).await.is_ok()
-            && DaemonClient::new(attach_path.to_path_buf())
-                .list_agents()
-                .await
-                .is_ok()
-        {
-            return true;
+    let probe = async {
+        loop {
+            if UnixStream::connect(attach_path).await.is_ok()
+                && DaemonClient::new(attach_path.to_path_buf())
+                    .list_agents()
+                    .await
+                    .is_ok()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        if tokio::time::Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    };
+    tokio::time::timeout(budget, probe).await.is_ok()
 }
 
 /// Two sibling directories, so a test can make the attach endpoint's directory
@@ -195,11 +193,11 @@ impl Drop for FdExhaustion {
 /// file descriptor in the process is taken and a client connects with the last
 /// one, so the daemon's next `accept` fails with "Too many open files"; then
 /// the descriptors are released. A client connecting afterwards must reach the
-/// daemon, as `dot-agent-deck` would, and the one that connected during the
-/// shortage must still be connected.
+/// daemon, as `dot-agent-deck` would, and on Linux the one that connected
+/// during the shortage must still be connected.
 #[spec("daemon/attach-accept/001")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_transient_emfile_on_accept_does_not_end_the_attach_server() {
+async fn attach_accept_001_a_transient_emfile_does_not_end_the_attach_server() {
     let _serial = SERIAL.lock().await;
     let (_root, hook, attach) = endpoint_dirs();
     let daemon = spawn_daemon(&hook, &attach).await;
@@ -231,14 +229,25 @@ async fn a_transient_emfile_on_accept_does_not_end_the_attach_server() {
         daemon.attach_path.display()
     );
     assert!(!daemon.handle.is_finished(), "the daemon must keep running");
-    // The client that connected during the shortage is still connected: the
-    // daemon accepted it once descriptors were free, rather than closing the
-    // listener under it. Nothing was sent, so a read waits.
+    // Linux only: on macOS the kernel itself drops a queued connection whose
+    // `accept` fails with EMFILE, whatever the daemon does next.
+    #[cfg(target_os = "linux")]
+    assert_still_connected(&pending);
+    drop(pending);
+}
+
+/// The client that connected during the shortage is still connected: the
+/// daemon accepted it once descriptors were free, rather than closing the
+/// listener under it. Nothing was sent, so a read waits.
+#[cfg(target_os = "linux")]
+fn assert_still_connected(pending: &std::os::unix::net::UnixStream) {
+    use std::io::{ErrorKind, Read};
     pending
         .set_read_timeout(Some(Duration::from_millis(300)))
         .expect("set read timeout");
     let mut byte = [0u8; 1];
-    match std::io::Read::read(&mut &pending, &mut byte) {
+    let mut reader = pending;
+    match reader.read(&mut byte) {
         Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
         other => panic!(
             "the client that connected while descriptors ran out was dropped ({other:?}); \
@@ -286,8 +295,15 @@ fn spawn_supervisor(
     let runs = Arc::new(AtomicUsize::new(0));
     let lost = Arc::new(AtomicBool::new(false));
     let lost_flag = lost.clone();
+    // Beside the endpoint dirs, so a rebind's spawn lock is this test's own.
+    let state_dir = attach
+        .parent()
+        .and_then(Path::parent)
+        .expect("endpoint root")
+        .join("state");
     let handle = tokio::spawn(attach_recovery::supervise(
         attach.to_path_buf(),
+        state_dir,
         listener,
         stand_in_server(fail_first, runs.clone()),
         move || async move { lost_flag.store(true, Ordering::SeqCst) },
@@ -309,10 +325,10 @@ async fn connects_within(path: &Path, budget: Duration) -> bool {
 /// Scenario: the attach server ends with an error about its listener rather
 /// than a passing one. A client connecting to the same attach path shortly
 /// after must get through, because the daemon listens again instead of
-/// stopping, and the daemon is not shut down.
+/// stopping; aborting supervision, as an exiting daemon does, then stops it.
 #[spec("daemon/attach-accept/002")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_attach_server_that_ends_is_replaced_on_the_same_path() {
+async fn attach_accept_002_an_attach_server_that_ends_is_replaced_on_the_same_path() {
     let _serial = SERIAL.lock().await;
     let (_root, _hook, attach) = endpoint_dirs();
     let (handle, runs, lost) = spawn_supervisor(&attach, bind_attach(&attach), 1);
@@ -339,7 +355,18 @@ async fn an_attach_server_that_ends_is_replaced_on_the_same_path() {
         "a listener that could be put back must not stop the daemon"
     );
     assert!(!handle.is_finished(), "supervision must go on");
+
+    // Aborting supervision, as the daemon does when it exits, stops the server
+    // it runs: nothing listens there once it is gone.
     handle.abort();
+    let deadline = tokio::time::Instant::now() + budget;
+    while UnixStream::connect(&attach).await.is_ok() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the attach server kept listening after its supervision was aborted"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// Scenario: the attach server ends and the attach socket's directory is
@@ -348,7 +375,7 @@ async fn an_attach_server_that_ends_is_replaced_on_the_same_path() {
 /// client able to reach it.
 #[spec("daemon/attach-accept/003")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_attach_server_that_cannot_listen_again_stops_the_daemon() {
+async fn attach_accept_003_an_attach_server_that_cannot_listen_again_stops_the_daemon() {
     let _serial = SERIAL.lock().await;
     // SAFETY: `geteuid` has no preconditions.
     if unsafe { libc::geteuid() } == 0 {
@@ -385,7 +412,7 @@ async fn an_attach_server_that_cannot_listen_again_stops_the_daemon() {
 /// stop action, rather than loop for ever.
 #[spec("daemon/attach-accept/004")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_attach_server_that_keeps_ending_is_not_restarted_for_ever() {
+async fn attach_accept_004_an_attach_server_that_keeps_ending_is_not_restarted_for_ever() {
     let _serial = SERIAL.lock().await;
     let (_root, _hook, attach) = endpoint_dirs();
     let (handle, runs, lost) = spawn_supervisor(&attach, bind_attach(&attach), usize::MAX);

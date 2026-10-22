@@ -15,10 +15,15 @@
 //!   the listener cannot be put back does it call its `lost` action, which in
 //!   the daemon is [`stop_after_attach_lost`]: an unreachable daemon is worse
 //!   than none, because the next client can start a fresh one.
+//!
+//! On Windows a rebind creates the pipe's first instance, which fails while a
+//! connection the previous server accepted is still open, so there a daemon
+//! whose attach server ended stops unless its clients have disconnected by the
+//! last rebind. Windows builds do not ship yet.
 
 use std::future::Future;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -129,9 +134,18 @@ pub const RESTART_WINDOW: Duration = Duration::from_secs(60);
 /// ended more than [`MAX_RESTARTS_IN_WINDOW`] times within [`RESTART_WINDOW`].
 ///
 /// Each run of `serve` is its own task, so a panic in the accept loop ends that
-/// run like an error does rather than ending supervision.
-pub async fn supervise<S, F, L, LF>(path: PathBuf, listener: IpcListener, mut serve: S, lost: L)
-where
+/// run like an error does rather than ending supervision. That task is aborted
+/// when this future is dropped, so aborting supervision stops the listener too.
+///
+/// `state_dir` holds `spawn.lock`, which a rebind takes (see
+/// [`bind_under_spawn_lock`]).
+pub async fn supervise<S, F, L, LF>(
+    path: PathBuf,
+    state_dir: PathBuf,
+    listener: IpcListener,
+    mut serve: S,
+    lost: L,
+) where
     S: FnMut(IpcListener) -> F,
     F: Future<Output = io::Result<()>> + Send + 'static,
     L: FnOnce() -> LF,
@@ -140,7 +154,8 @@ where
     let mut listener = listener;
     let mut restarts: Vec<Instant> = Vec::new();
     loop {
-        match tokio::spawn(serve(listener)).await {
+        let mut server = AbortOnDrop(tokio::spawn(serve(listener)));
+        match (&mut server.0).await {
             Ok(Ok(())) => error!("attach protocol server stopped"),
             Ok(Err(e)) => error!("attach protocol server error: {e}"),
             Err(e) => error!("attach protocol server failed: {e}"),
@@ -157,7 +172,7 @@ where
             return;
         }
         restarts.push(now);
-        match rebind(&path).await {
+        match rebind(&path, &state_dir).await {
             Some(fresh) => listener = fresh,
             None => {
                 lost().await;
@@ -167,10 +182,18 @@ where
     }
 }
 
-async fn rebind(path: &std::path::Path) -> Option<IpcListener> {
+struct AbortOnDrop(tokio::task::JoinHandle<io::Result<()>>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn rebind(path: &Path, state_dir: &Path) -> Option<IpcListener> {
     for delay in REBIND_DELAYS {
         tokio::time::sleep(delay).await;
-        match crate::daemon_protocol::bind_attach_listener(path) {
+        match bind_under_spawn_lock(path, state_dir).await {
             Ok(listener) => {
                 // Not the startup line `Attach protocol listening on`, which the
                 // cross-version harness counts to tell one daemon from two.
@@ -187,6 +210,41 @@ async fn rebind(path: &std::path::Path) -> Option<IpcListener> {
     );
     None
 }
+
+/// Bind a fresh attach listener at `path` while holding `spawn.lock` in
+/// `state_dir`. A client that finds the endpoint dead removes it and starts a
+/// daemon under that lock (`daemon_attach::ensure_daemon_running`), so binding
+/// outside it could land between that client's probe and its unlink, and the
+/// client would unlink the listener just bound. The wait for the lock is
+/// bounded past a client's own wait for a daemon to start; if it runs out, or
+/// the lock cannot be taken, the bind goes ahead without it.
+async fn bind_under_spawn_lock(path: &Path, state_dir: &Path) -> io::Result<IpcListener> {
+    let wait = crate::daemon_attach::daemon_start_poll_timeout() + SPAWN_LOCK_EXTRA_WAIT;
+    let lock = match crate::platform::fsperm::ensure_owner_only_dir(state_dir) {
+        Ok(()) => tokio::time::timeout(
+            wait,
+            crate::platform::lock::acquire_spawn_lock(&state_dir.join("spawn.lock")),
+        )
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "waited too long"))
+        .and_then(|taken| taken),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = &lock {
+        warn!("binding the attach listener without the spawn lock: {e}");
+    }
+    let path = path.to_path_buf();
+    let bound =
+        tokio::task::spawn_blocking(move || crate::daemon_protocol::bind_attach_listener(&path))
+            .await
+            .map_err(io::Error::other)?;
+    drop(lock);
+    bound
+}
+
+/// How much longer than a client's own wait for a daemon to start a rebind
+/// waits for the spawn lock.
+const SPAWN_LOCK_EXTRA_WAIT: Duration = Duration::from_secs(5);
 
 /// The daemon's `lost` action for [`supervise`]: stop the way a termination
 /// signal does, so the hook endpoint is released and the next client can start

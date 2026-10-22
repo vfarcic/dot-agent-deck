@@ -953,6 +953,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         );
         Some(tokio::spawn(crate::attach_recovery::supervise(
             path,
+            crate::config::state_dir(),
             listener,
             move |listener| {
                 crate::daemon_protocol::serve_attach_with_restart(
