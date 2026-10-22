@@ -503,7 +503,7 @@ Long turns affect delivery the same way in the TUI and the desktop app:
 - In a Pi pane, pressing Escape while a deck message waits in Pi's queue, or moving Pi's queued messages back to its input box, can put that message's text in Pi's input box. The deck then sends the message again by itself, marked as a possible repeat. If you also submit the restored text, the agent gets the task twice, so clear it from the input box unless you want that.
 - If the deck reported a task as not delivered and the agent takes it after all, the orchestrator is told that the task arrived, and the agent's TUI card or desktop tile leaves its delivery error state once no other delivery error remains.
 - If the orchestrator was told a task has not reached its worker and the worker then picks it up, the orchestrator is told the task arrived after all.
-- OpenCode and Pi keep a message queued this way for as long as the busy turn lasts, with no time limit. After an hour without the agent starting on it, the card shows the one-time reminder described above. An offered job waits the same way; see [Announcements and pooled jobs](#announcements-and-pooled-jobs).
+- OpenCode, Pi and Claude Code with hooks from the deck's release keep a message queued this way for as long as the busy turn lasts, with no time limit. After an hour without the agent starting on it, the card shows the one-time reminder described above. An offered job waits the same way; see [Announcements and pooled jobs](#announcements-and-pooled-jobs).
 
 **TUI:**
 

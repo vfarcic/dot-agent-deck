@@ -9,7 +9,7 @@ import { desktopScenario } from "./support";
  */
 
 /** Load a fixture state and open the agent dashboard through its rail control. */
-async function overview(page: Page, state: "docs" | "docs-fleet" | "docs-pr" | "empty"): Promise<void> {
+async function overview(page: Page, state: "docs" | "docs-fleet" | "docs-pr" | "docs-restart" | "empty"): Promise<void> {
   await page.goto(`/?fixture=1&state=${state}`);
   await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
   await page.getByTestId("open-overview").click();
@@ -75,6 +75,14 @@ desktopScenario("host-metrics", async (page) => {
   await expect(page.getByTestId("host-metrics")).toContainText("6 GiB free of 64 GiB total (warning)");
   await expect(page.getByTestId("host-metrics")).toContainText("Memory available43.5 GiB");
   await expect(page.getByTestId("host-metrics-popover").getByRole("button", { name: "Close host" })).toBeVisible();
+});
+
+// The two agents the TUI `restart-notice` image names, stopped by a restart of
+// the fixture's `docs-restart` deck after its first listing was shown.
+desktopScenario("restart-notice", async (page) => {
+  await overview(page, "docs-restart");
+  await expect(page.getByTestId("restart-toast")).toHaveText("The deck restarted; these agents were stopped: api-fix, docs-review.");
+  await expect(page.locator(".overview-row")).toHaveCount(0);
 });
 
 /** Select the fixture project's directory in the shared New agent form. */

@@ -1,4 +1,4 @@
-import { createFixtureFleet, createFixtureStartedAgent, DEFAULT_PROFILES, FIXTURE_APP_VERSION, FIXTURE_DAEMON_VERSION, FIXTURE_UPGRADE_STEP_MS, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureQuestion, resolveFixtureVoice, type FixtureState } from "../data/fixture";
+import { createFixtureFleet, createFixtureStartedAgent, FIXTURE_RESTART_AFTER_MS, restartedFixtureSnapshot, DEFAULT_PROFILES, FIXTURE_APP_VERSION, FIXTURE_DAEMON_VERSION, FIXTURE_UPGRADE_STEP_MS, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureQuestion, resolveFixtureVoice, type FixtureState } from "../data/fixture";
 import { voicePagesDirectory, voicePagesOrchestrations } from "../data/fixtureCrowded";
 import { actionErrorFrom, LaunchCleanupError, startDaemonErrorFrom } from "./actionError";
 import { PartialSettingsSaveError, partialSettingsSave } from "./settingsError";
@@ -2843,7 +2843,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
  * reachable from the URL — the previous inline `||` chain had to be edited in
  * lockstep with the fixture and was not.
  */
-const FIXTURE_STATES: readonly FixtureState[] = ["connected", "crowded", "disconnected", "error", "empty", "fleet", "docs", "docs-pr", "docs-fleet", "voice-pages", "upgrade", "upgrade-error", "hook-notice", "docs-question"];
+const FIXTURE_STATES: readonly FixtureState[] = ["connected", "crowded", "disconnected", "error", "empty", "fleet", "docs", "docs-pr", "docs-fleet", "voice-pages", "upgrade", "upgrade-error", "hook-notice", "docs-question", "docs-restart"];
 
 class FixtureDeckBridge implements DeckBridge {
   readonly mode = "fixture" as const;
@@ -2889,6 +2889,7 @@ class FixtureDeckBridge implements DeckBridge {
   private upgradeQuestions = new Map<string, { questionId: number; answer: (choice: UpgradeChoice) => void }>();
   private upgradeCount = 0;
   private upgradeQuestionCount = 0;
+  private restartScheduled = false;
 
   /**
    * The selected deck, which is the only one every mutating fixture action
@@ -2965,6 +2966,16 @@ class FixtureDeckBridge implements DeckBridge {
   async subscribe(onFleet: FleetListener, onTerminal: TerminalListener): Promise<Unsubscribe> {
     this.fleetListeners.add(onFleet);
     this.terminalListeners.add(onTerminal);
+    // PRD #1666 part 2: the `docs-restart` deck's daemon restarts once, after
+    // the app has shown its first listing, so the restart notice has agents to name.
+    if (this.fixtureState === "docs-restart" && !this.restartScheduled) {
+      this.restartScheduled = true;
+      setTimeout(() => {
+        this.snapshot = restartedFixtureSnapshot();
+        this.markOlderDeck(this.snapshot);
+        this.emitSnapshot();
+      }, FIXTURE_RESTART_AFTER_MS);
+    }
     return () => {
       this.fleetListeners.delete(onFleet);
       this.terminalListeners.delete(onTerminal);

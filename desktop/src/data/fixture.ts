@@ -47,7 +47,7 @@ export const FIXTURE_UNREACHABLE_DAEMON_ID = "ci@runner-7";
 export const FIXTURE_PENDING_DAEMON_ID = "ops@edge-3";
 
 /** Which scenario `createFixtureFleet` builds; selected by `?state=`. */
-export type FixtureState = "connected" | "disconnected" | "error" | "empty" | "crowded" | "fleet" | "docs" | "docs-pr" | "docs-fleet" | "voice-pages" | "upgrade" | "upgrade-error" | "hook-notice" | "docs-question";
+export type FixtureState = "connected" | "disconnected" | "error" | "empty" | "crowded" | "fleet" | "docs" | "docs-pr" | "docs-fleet" | "voice-pages" | "upgrade" | "upgrade-error" | "hook-notice" | "docs-question" | "docs-restart";
 
 /**
  * PRD #1487 M5 — the versions the `upgrade` scenarios play: this app's, and the
@@ -768,6 +768,30 @@ const docsAgents: AgentSession[] = [
 ];
 
 /**
+ * PRD #1666 part 2: the two agents the `restart-notice` scenario's deck runs
+ * before it restarts, the names the TUI capture gives its two agents. Both are
+ * listed by the process `docs-before`; {@link restartedFixtureSnapshot} is the
+ * same deck after the restart, running none.
+ */
+const docsRestartAgents: AgentSession[] = [
+  { ...crowdedAgent({ id: "1", displayName: "api-fix", role: "Claude code", cli: "claude", status: "running", cwd: "/home/dev/demo-project", toolCount: 0, upForMinutes: 12, quietForMinutes: 0, activeTool: "Edit", activeToolDetail: "src/api/retry.rs", lastUserPrompt: "Fix the retry handling in the API client.", tab: { kind: "dashboard" } }), incarnation: "docs-before" },
+  { ...crowdedAgent({ id: "2", displayName: "docs-review", role: "Claude code", cli: "claude", status: "idle", cwd: "/home/dev/demo-project", toolCount: 0, upForMinutes: 9, quietForMinutes: 2, lastUserPrompt: "Review the retry section of the docs.", tab: { kind: "dashboard" } }), incarnation: "docs-before" },
+];
+
+/** How long after the app subscribes the `docs-restart` deck restarts: after the first listing has been shown. */
+export const FIXTURE_RESTART_AFTER_MS = 1000;
+
+/**
+ * PRD #1666 part 2: the `docs-restart` deck after its daemon restarted — the
+ * same deck, listed by another process (`docs-after`) that runs no agents, so
+ * the app removes the two rows and names them in its restart notice.
+ */
+export function restartedFixtureSnapshot(): DeckSnapshot {
+  const before = createFixtureSnapshot("docs-restart");
+  return { ...before, connection: { ...before.connection, incarnation: "docs-after", message: "Daemon responding · no agents running" }, agents: [] };
+}
+
+/**
  * PRD #1666: a Pi agent whose first prompt may not have reached it, matching
  * the TUI's inbox-attention capture.
  */
@@ -1260,19 +1284,19 @@ export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSn
   // asking for one gets the deck the single-deck screens are on — never the
   // disconnected fall-through an unlisted state would otherwise land in.
   if (state === "fleet" || state === "docs-fleet" || state === "voice-pages" || state === "upgrade" || state === "upgrade-error" || state === "hook-notice") return createFixtureFleet(state)[0];
-  const connected = state === "connected" || state === "crowded" || state === "empty" || state === "docs" || state === "docs-question";
+  const connected = state === "connected" || state === "crowded" || state === "empty" || state === "docs" || state === "docs-question" || state === "docs-restart";
   const connection = connected
-    ? { status: "connected" as const, deckId: FIXTURE_DAEMON_ID, socketPath: FIXTURE_DAEMON_ID, message: state === "empty" ? "Daemon responding · no agents running" : "Daemon responding" }
+    ? { status: "connected" as const, deckId: FIXTURE_DAEMON_ID, socketPath: FIXTURE_DAEMON_ID, message: state === "empty" ? "Daemon responding · no agents running" : "Daemon responding", ...(state === "docs-restart" ? { incarnation: "docs-before" } : {}) }
     : state === "error"
       ? { status: "error" as const, deckId: FIXTURE_DAEMON_ID, socketPath: FIXTURE_DAEMON_ID, daemonDetected: true, message: "This daemon is older than this app, and the two cannot work together. Update the daemon to this app's version.", detail: "The app speaks protocol 6; the daemon reports protocol 5." }
       : { status: "disconnected" as const, message: "No daemon is listening on the configured socket." };
 
   const messagingParam = state === "docs" && typeof window !== "undefined" ? new URLSearchParams(window.location.search).get("messaging") : null;
   const messaging = messagingParam === "1" || messagingParam === "attention";
-  const fleet = messagingParam === "attention" ? docsAttentionAgents : messaging ? docsMessagingAgents : state === "empty" ? [] : state === "crowded" ? crowdedAgents : state === "docs" ? docsAgents : state === "docs-question" ? docsQuestionAgents : agents;
+  const fleet = messagingParam === "attention" ? docsAttentionAgents : messaging ? docsMessagingAgents : state === "empty" ? [] : state === "crowded" ? crowdedAgents : state === "docs" ? docsAgents : state === "docs-question" ? docsQuestionAgents : state === "docs-restart" ? docsRestartAgents : agents;
   // The docs scenario carries only what its screenshots show, so nothing from
   // the demo run (its worktree, stages, handoffs, evidence) leaks into one.
-  const docs = state === "docs" || state === "docs-question";
+  const docs = state === "docs" || state === "docs-question" || state === "docs-restart";
 
   return {
     runId: "run_7f24a",
