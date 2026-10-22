@@ -4966,7 +4966,7 @@ fn refusal_of(hub: &InboxHub, pane: &str) -> Option<String> {
     hub.summary(pane, "a").notices.admission_refused
 }
 
-/// Scenario: The deck refuses a worker's own request for its messages before any wait: its card says nothing. Once a task delegated to it waits, the card names the refusal, and a client is told so; an admitted request clears it. A refusal in a new episode tells the task's orchestrator once, naming the task and the cause, however often it repeats; an orchestrator in the worker's own pane is never told. The worker's exit clears the notice, and a refusal for a generation that no longer holds its pane is ignored.
+/// Scenario: The deck refuses a worker's own request for its messages before any wait: its card says nothing. Once a task delegated to it waits, the card names the refusal, a client is told so and the task's orchestrator is told; an admitted request clears it. A refusal in a new episode tells the task's orchestrator once more, naming the task and the cause, however often it repeats; an orchestrator in the worker's own pane is never told. The worker's exit clears the notice, and a refusal for a generation that no longer holds its pane is ignored.
 #[spec("inbox/boundary/065")]
 #[test]
 fn boundary_065_a_refused_request_marks_its_own_card_while_mail_waits() {
@@ -4992,9 +4992,10 @@ fn boundary_065_a_refused_request_marks_its_own_card_while_mail_waits() {
         }
     }
     assert!(told, "clients are told the card's notice");
-    assert!(
-        orchestrator_notices(&hub).is_empty(),
-        "the episode began before the task was delegated"
+    assert_eq!(
+        orchestrator_notices(&hub).len(),
+        1,
+        "a task delegated into the open episode tells its orchestrator (inbox/boundary/066)"
     );
 
     hub.admission_admitted("p", "a");
@@ -5005,8 +5006,8 @@ fn boundary_065_a_refused_request_marks_its_own_card_while_mail_waits() {
     }
     assert_eq!(refusal_of(&hub, "p").as_deref(), Some("inbox_nested_agent"));
     let notices = orchestrator_notices(&hub);
-    assert_eq!(notices.len(), 1, "one notice per episode: {notices:?}");
-    let (subject, text) = &notices[0];
+    assert_eq!(notices.len(), 2, "one notice per episode: {notices:?}");
+    let (subject, text) = &notices[1];
     assert_eq!(subject, ADMISSION_REFUSED_SUBJECT);
     assert!(text.contains(first.as_str()), "names the task: {text}");
     assert!(

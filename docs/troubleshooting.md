@@ -273,11 +273,12 @@ The doorbell waits while the agent is busy, a permission or dialog answer is nee
 
 An agent's hooks, plugin, extension and tool shell take its deck messages by running `dot-agent-deck` with the deck environment of the agent's pane. On Linux and macOS the deck accepts such a request from any process that carries that pane's current deck environment and runs as the same user as the deck, including a process the agent started outside its pane, such as Claude Code's background session.
 
-When the deck refuses one of the agent's own requests while messages wait for the agent, the TUI card and the desktop tile both say `Messages can't reach this agent`, the cause, and `Restart it from the deck; messages addressed to it are not handed to the restarted agent, so have them sent again.` In the TUI, press `i` on the card to read the whole notice if the card cuts it off. The command that was refused prints the cause and what to do, with a code:
+When the deck refuses one of the agent's own requests while messages wait for the agent, the TUI card and the desktop tile both say `Messages can't reach this agent`, the cause, and `Restart it from the deck; messages addressed to it are not handed to the restarted agent, so have them sent again.` In the TUI, press `i` on the card to read the whole notice if the card cuts it off; if the window is too short for all of it, the notice says to make the window taller. The command that was refused prints the cause and what to do, with a code:
 
-- `inbox_other_user`: the request came from a process running as another user. Run it as the user that runs the deck.
+- `inbox_other_user`: the request came from a process outside the agent, running as another user. Run it as the user that runs the deck.
 - `inbox_peer_unidentified`: the deck could not identify the process that made the request, for example because it exited before the deck answered. Run the command again from the agent's pane and let it finish.
 - `inbox_component_not_caller`: the agent's integration named a process other than its own as the one that receives messages. Run the inbox command from the agent's own integration.
+- `inbox_receiver_above_agent`: the request named, directly or through a shell, a process the agent itself runs under, such as its terminal or the deck, as the one that receives its messages. This happens when a command carrying the agent's deck environment runs from a shell outside the agent, such as another tab of the same terminal. Run the inbox command from the agent's own integration.
 - `inbox_nested_agent`: an agent of the same kind running inside the agent asked for its messages. Run the inbox command from the pane's own agent, not from an agent it started.
 - `inbox_not_agent_process`: the request came from a process outside the agent, on a system where the deck cannot check which user runs it. Run it from the agent's own pane.
 

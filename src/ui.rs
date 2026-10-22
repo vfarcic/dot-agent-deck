@@ -19580,6 +19580,16 @@ fn inbox_attention_lines(
     // PRD #1666 part 3 (R-2): the refusal notice in full, wrapped, ahead of
     // the rows, with a blank row between when there are rows.
     let notice = inbox_attention_notice_rows(dialog, width);
+    // PRD #1666 part 3, round 1: a notice taller than the body ends with a
+    // line saying to make the window taller, rather than losing its remedy
+    // unannounced. The desktop tile has no such state: its list scrolls.
+    let notice = if notice.len() > rows {
+        let taller = crate::upgrade_dialog::wrap(NOTICE_NEEDS_HEIGHT, width.saturating_sub(2));
+        let keep = rows.saturating_sub(taller.len());
+        notice.into_iter().take(keep).chain(taller).collect()
+    } else {
+        notice
+    };
     let notice_rows = notice.len().min(rows);
     for text in notice.iter().take(notice_rows) {
         lines.push(Line::styled(
@@ -19803,6 +19813,10 @@ const RETRY_NEEDS_HEIGHT: &str = "make the window taller to see what Retry does"
 
 /// PRD #1666 G3 (F-A01): the answer to `r` in a picker too narrow for it.
 const RETRY_NEEDS_WIDTH: &str = "make the window wider to see what Retry does";
+
+/// PRD #1666 part 3, round 1: the line closing a refusal notice the picker is
+/// too short to show whole.
+const NOTICE_NEEDS_HEIGHT: &str = "… make the window taller to read the whole notice";
 
 /// Which way the picker drawn in `area` is too small to show what Retry does
 /// on the cursor's row: width when the explanation's words do not fit across

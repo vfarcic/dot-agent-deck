@@ -1905,7 +1905,7 @@ pub(super) fn notices(st: &HubState, key: &AgentKey, now: Instant) -> InboxCardN
             .admission_refused
             .get(key)
             .filter(|_| super::has_waiting_mail(&st.inbox, &key.0, &key.1))
-            .cloned(),
+            .map(|episode| episode.code.clone()),
         ..InboxCardNotices::default()
     };
     let Some(generation) = st.receipts.gens.get(key) else {

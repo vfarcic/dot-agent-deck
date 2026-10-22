@@ -9352,7 +9352,7 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/boundary/065 — A refused request marks its own card while mail waits, and tells its orchestrator once.
 - **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub's `admission_refused` / `admission_admitted` (the daemon's admission outcome), delegates through `post_delegate`, a broadcast receiver.
 - **Agent:** none.
-- **Asserts:** a refusal with nothing waiting shows nothing; once a delegated task waits the summary carries `admission_refused` and an attention update broadcasts it; an admitted request clears it; a refusal starting a new episode posts one `worker cannot take its messages` notice to the task's orchestrator, naming the task and the cause, however often it repeats; an orchestrator in the worker's own pane is not told; exit clears the state; a generation no longer in its pane records nothing.
+- **Asserts:** a refusal with nothing waiting shows nothing; once a delegated task waits the summary carries `admission_refused`, an attention update broadcasts it and its orchestrator is told; an admitted request clears it; a refusal starting a new episode posts one more `worker cannot take its messages` notice to the task's orchestrator, naming the task and the cause, however often it repeats; an orchestrator in the worker's own pane is not told; exit clears the state; a generation no longer in its pane records nothing.
 - **Does not assert:** which requests the daemon reports (`inbox/protocol/023`), or the client rendering (`inbox/status/027`, `/028`).
 - **Platform coverage:** all.
 

@@ -544,7 +544,17 @@ struct HubState {
     /// one of theirs is admitted or they exit. One entry per live generation
     /// at most: only a request the generation's current capability attests
     /// sets one ([`InboxHub::admission_refused`]).
-    admission_refused: HashMap<AgentKey, String>,
+    admission_refused: HashMap<AgentKey, AdmissionEpisode>,
+}
+
+/// PRD #1666 part 3 (R-2): one refusal episode of an agent generation's own
+/// requests for its messages ([`HubState::admission_refused`]).
+struct AdmissionEpisode {
+    /// The code the latest refused request got.
+    code: String,
+    /// The orchestrators told in this episode, each once
+    /// ([`owe_admission_notices`]), whenever their task started waiting.
+    told: Vec<Recipient>,
 }
 
 /// PRD #1666 long-turn delivery: who was told that a message ran out of
@@ -1153,6 +1163,7 @@ impl InboxHub {
     ) -> Result<(MessageId, oneshot::Receiver<DelegateEnd>), PostRefusal> {
         let (tx, rx) = oneshot::channel();
         let mut saved = false;
+        let mut owed = false;
         let (id, superseded) = {
             let mut st = self.lock();
             let now = Instant::now();
@@ -1206,10 +1217,18 @@ impl InboxHub {
                 st.spills.own_task(path, id.as_str(), bytes, &worker);
                 saved = true;
             }
+            // PRD #1666 part 3, round 1: a task delegated to a worker whose
+            // refusal episode is open tells its orchestrator, once per episode.
+            if let Some(agent) = worker.agent_id.as_ref() {
+                owed = owe_admission_notices(&mut st, &(worker.pane_id.clone(), agent.clone()));
+            }
             (id, superseded)
         };
         if saved {
             self.record_spills(self.lock());
+        }
+        if owed {
+            self.post_owed_notices();
         }
         if superseded > 0 {
             debug!(pane_id = %worker.pane_id, superseded, "inbox: older delegated tasks superseded");
@@ -3208,8 +3227,9 @@ impl InboxHub {
     /// PRD #1666 part 3 (R-2): the deck refused `agent_id`'s own request for
     /// its messages in `pane_id`, with the refusal `code`. Its card says so
     /// while messages wait for it ([`InboxCardNotices::admission_refused`]),
-    /// and, the first time in an episode, each orchestrator with a task
-    /// delegated to it is told once. The caller has checked that the
+    /// and each orchestrator with a task delegated to it is told once in the
+    /// episode — one whose task starts waiting later in it too
+    /// ([`Self::post_delegate`]). The caller has checked that the
     /// request's capability attests `agent_id` and that `agent_id` holds the
     /// pane, so a request naming another agent's pane never reaches this.
     pub fn admission_refused(&self, pane_id: &str, agent_id: &str, code: &str) {
@@ -3223,13 +3243,14 @@ impl InboxHub {
                 return;
             }
             let key = (pane_id.to_string(), agent_id.to_string());
-            if st
-                .admission_refused
-                .insert(key.clone(), code.to_string())
-                .is_none()
-            {
-                owe_admission_notices(&mut st, &key, code);
-            }
+            st.admission_refused
+                .entry(key.clone())
+                .and_modify(|episode| episode.code = code.to_string())
+                .or_insert_with(|| AdmissionEpisode {
+                    code: code.to_string(),
+                    told: Vec::new(),
+                });
+            owe_admission_notices(&mut st, &key);
             engine::broadcast_notices(&mut st, &key, Instant::now());
         }
         self.post_owed_notices();
@@ -4140,10 +4161,18 @@ fn has_waiting_mail(inbox: &Inbox, pane_id: &str, agent_id: &str) -> bool {
 }
 
 /// PRD #1666 part 3 (R-2): owe each orchestrator with a task delegated to
-/// `key`'s generation one notice that the deck refused that worker's request
-/// for its messages with `code`. An orchestrator in the worker's own pane is
-/// never told: that is the refused agent itself.
-fn owe_admission_notices(st: &mut HubState, key: &AgentKey, code: &str) {
+/// `key`'s generation, while its refusal episode is open, one notice that the
+/// deck refused that worker's request for its messages, with the episode's
+/// latest code. Called on each refusal and each task delegated into the
+/// episode, so an orchestrator whose task starts waiting after the episode
+/// began is told too; one already told in the episode is not told again. An
+/// orchestrator in the worker's own pane is never told: that is the refused
+/// agent itself. Answers whether it owed any.
+fn owe_admission_notices(st: &mut HubState, key: &AgentKey) -> bool {
+    let Some(episode) = st.admission_refused.get(key) else {
+        return false;
+    };
+    let code = episode.code.clone();
     let mut told: Vec<(Recipient, String, Vec<String>)> = Vec::new();
     let mut watched: Vec<(&String, &DelegateWatch)> = st
         .delegates
@@ -4157,7 +4186,7 @@ fn owe_admission_notices(st: &mut HubState, key: &AgentKey, code: &str) {
         let Some(orchestrator) = watch.orchestrator.as_ref() else {
             continue;
         };
-        if orchestrator.pane_id == key.0 {
+        if orchestrator.pane_id == key.0 || episode.told.contains(orchestrator) {
             continue;
         }
         match told.iter_mut().find(|(to, _, _)| to == orchestrator) {
@@ -4165,10 +4194,20 @@ fn owe_admission_notices(st: &mut HubState, key: &AgentKey, code: &str) {
             None => told.push((orchestrator.clone(), watch.role.clone(), vec![id.clone()])),
         }
     }
-    for (to, role, ids) in told {
-        let body = compose_admission_refused_notice(&role, &ids, code);
+    let notices: Vec<_> = told
+        .into_iter()
+        .map(|(to, role, ids)| (to, compose_admission_refused_notice(&role, &ids, &code)))
+        .collect();
+    if let Some(episode) = st.admission_refused.get_mut(key) {
+        episode
+            .told
+            .extend(notices.iter().map(|(to, _)| to.clone()));
+    }
+    let owed = !notices.is_empty();
+    for (to, body) in notices {
         st.owed_notices.push((to, ADMISSION_REFUSED_SUBJECT, body));
     }
+    owed
 }
 
 /// PRD #1666 part 3 (R-2): the subject of the notice an orchestrator gets

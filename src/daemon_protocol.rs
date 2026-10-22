@@ -1572,7 +1572,8 @@ pub const CONTRACT_BREAKS: &[&str] = &[
     // capability's token -> spawn -> pane binding are unchanged. Same requests,
     // same replies; what moved is who is admitted, and the refusal codes
     // (`inbox_other_user`, `inbox_peer_unidentified`,
-    // `inbox_component_not_caller`, `inbox_nested_agent`) that name the cause.
+    // `inbox_component_not_caller`, `inbox_receiver_above_agent`,
+    // `inbox_nested_agent`) that name the cause.
     // `changelog.d/1666-pane-capability.breaking.md` is its fragment.
     "1666-pane-capability-inbox-admission",
 ];

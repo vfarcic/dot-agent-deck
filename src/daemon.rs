@@ -4866,6 +4866,9 @@ enum ComponentRefusal {
     /// An agent of the same kind as the receiver the request names sits
     /// between it and the caller (audit F3).
     NestedAgent,
+    /// The receiver the request names is, or resolves through shells to, a
+    /// process the agent itself runs under: the deck, a terminal, init.
+    AboveAgent,
 }
 
 impl ComponentRefusal {
@@ -4876,6 +4879,7 @@ impl ComponentRefusal {
             ComponentRefusal::Unidentified => "inbox_peer_unidentified",
             ComponentRefusal::NotCaller => "inbox_component_not_caller",
             ComponentRefusal::NestedAgent => "inbox_nested_agent",
+            ComponentRefusal::AboveAgent => "inbox_receiver_above_agent",
         }
     }
 
@@ -4906,6 +4910,12 @@ impl ComponentRefusal {
                 "an agent of the same kind sits between this process and the agent it names, so a \
                  nested agent cannot act as that agent's receiver; run the receiver from the \
                  pane's own agent, not from an agent it started"
+            }
+            ComponentRefusal::AboveAgent => {
+                "the receiver this request names is, or runs under shells that lead to, a process \
+                 the agent itself runs under, such as the deck or a terminal, so the deck will not \
+                 register it; run the inbox command from the agent's own integration, not from a \
+                 shell outside the agent"
             }
         }
     }
@@ -5144,8 +5154,9 @@ fn note_admission(
 /// deck's own OS user: a peer outside the tree is admitted when the kernel
 /// recorded it as the deck's user ([`AcceptedPeer::same_user`]), since the
 /// gate ahead of this admitted its token as the pane's current capability.
-/// Another user is refused under either [`Evidence`]
-/// ([`ComponentRefusal::OtherUser`]). Where the user cannot be read (no peer,
+/// Another user outside the tree is refused under either [`Evidence`]
+/// ([`ComponentRefusal::OtherUser`]); inside it, the tree admits whatever the
+/// user reads. Where the user cannot be read (no peer,
 /// or a platform that does not read it), the process tree alone decides, as
 /// it did before: a positive "outside" refuses, and so, under
 /// [`Evidence::Required`], does a walk that cannot say, a pane with no agent
@@ -5153,9 +5164,11 @@ fn note_admission(
 ///
 /// **The receiver** ([`ComponentUse::Receiver`]). The instance a request
 /// names must be the caller or one of its parents, and not a process above
-/// the agent's own, so a member cannot register an arbitrary process as the
-/// agent's receiver; it is pinned through
-/// hook shells to the process that runs them ([`receiver_instance`]); and a
+/// the agent's own ([`ComponentRefusal::AboveAgent`]), so a member cannot
+/// register an arbitrary process as the agent's receiver; it is pinned through
+/// hook shells to the process that runs them ([`receiver_instance`]), and what
+/// that resolves to must not be above the agent's either, read on positive
+/// evidence under [`Evidence::Required`]; and a
 /// process between the caller and that instance running the instance's own
 /// executable — an agent of the same kind, started inside the one whose
 /// receiver it names — is refused ([`nested_between`], audit F3).
@@ -5195,7 +5208,7 @@ fn admit_component(
     if claimed <= 1
         || root.is_some_and(|root| claimed != root && descends(root, claimed) == Some(true))
     {
-        return Err(ComponentRefusal::NotCaller);
+        return Err(ComponentRefusal::AboveAgent);
     }
     match descends(peer.pid, claimed) {
         Some(true) => {}
@@ -5204,6 +5217,18 @@ fn admit_component(
         None => {}
     }
     let instance = receiver_instance(claimed, root, parent_of, executable_of);
+    // PRD #1666 part 3, round 1: the resolved instance is held to what a
+    // named one is. In the tree the walk stops at the agent; a caller outside
+    // it can name a shell on a branch it shares with the agent, which would
+    // climb to the terminal or the deck above it.
+    if let Some(root) = root.filter(|&root| instance != claimed && instance != root) {
+        match descends(root, instance) {
+            Some(false) => {}
+            Some(true) => return Err(ComponentRefusal::AboveAgent),
+            None if required => return Err(ComponentRefusal::Unidentified),
+            None => {}
+        }
+    }
     if nested_between(peer.pid, instance, parent_of, executable_of) == Some(true) {
         return Err(ComponentRefusal::NestedAgent);
     }
@@ -5212,7 +5237,9 @@ fn admit_component(
 
 /// Audit F3: the process an agent's receiver is pinned by — `claimed`, or,
 /// when `claimed` is a shell the agent runs a hook through, the nearest
-/// ancestor that is not a shell, never above the agent's own process `root`.
+/// ancestor that is not a shell. Inside the agent's tree the walk stops at its
+/// own process `root`; from a shell outside it nothing here bounds the walk,
+/// so [`admit_component`] refuses a result above `root`.
 ///
 /// Claude Code runs every hook through a new `sh` that does not `exec` it
 /// (measured on 2.1.299: `claude ── sh ── hook`), so its announcement and each
@@ -12505,7 +12532,7 @@ mod hook_ingestion_tests {
         );
         assert_eq!(
             admit(12, Some(1), Some(10), Receiver, BestEffort),
-            Err(ComponentRefusal::NotCaller)
+            Err(ComponentRefusal::AboveAgent)
         );
         assert_eq!(
             admit(12, Some(10), Some(10), Receiver, BestEffort),
@@ -12577,8 +12604,8 @@ mod hook_ingestion_tests {
     /// capability — Claude Code's background session host, whose tool shell
     /// and hooks the deck's recorded agent did not start, is one. It takes
     /// and settles mail on positive evidence, and registers a receiver under
-    /// an instance that is its own ancestry; another user is refused under
-    /// either evidence, even with the token.
+    /// an instance that is its own ancestry; another user outside the tree is
+    /// refused under either evidence, even with the token.
     #[test]
     fn a_capability_holder_outside_the_tree_must_be_the_decks_user() {
         // 1 ── 10 (agent, the deck's front end)
@@ -12644,7 +12671,7 @@ mod hook_ingestion_tests {
             );
             assert_eq!(
                 admit(peer(32, Some(true)), Some(1), Receiver, evidence),
-                Err(ComponentRefusal::NotCaller)
+                Err(ComponentRefusal::AboveAgent)
             );
         }
         // The agent's own tree stays a member whatever the user reads.
@@ -12773,6 +12800,7 @@ mod hook_ingestion_tests {
             ComponentRefusal::Unidentified,
             ComponentRefusal::NotCaller,
             ComponentRefusal::NestedAgent,
+            ComponentRefusal::AboveAgent,
         ];
         let codes: std::collections::HashSet<_> = all.iter().map(|r| r.code()).collect();
         assert_eq!(codes.len(), all.len(), "one code per cause");

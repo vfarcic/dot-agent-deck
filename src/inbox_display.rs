@@ -151,6 +151,8 @@ pub const ADMISSION_CAUSE_NOT_CALLER: &str = "its integration named a process ot
 pub const ADMISSION_CAUSE_NESTED: &str =
     "an agent of the same kind running inside it asked for them";
 pub const ADMISSION_CAUSE_NOT_MEMBER: &str = "a process outside the agent asked for them";
+pub const ADMISSION_CAUSE_ABOVE_AGENT: &str =
+    "its integration named a process the agent itself runs under";
 
 /// The cause [`ADMISSION_REFUSED`] names for the refusal `code`.
 pub fn admission_cause(code: &str) -> Option<&'static str> {
@@ -160,6 +162,7 @@ pub fn admission_cause(code: &str) -> Option<&'static str> {
         "inbox_component_not_caller" => Some(ADMISSION_CAUSE_NOT_CALLER),
         "inbox_nested_agent" => Some(ADMISSION_CAUSE_NESTED),
         "inbox_not_agent_process" => Some(ADMISSION_CAUSE_NOT_MEMBER),
+        "inbox_receiver_above_agent" => Some(ADMISSION_CAUSE_ABOVE_AGENT),
         _ => None,
     }
 }
@@ -526,6 +529,7 @@ mod tests {
             ("inbox_component_not_caller", ADMISSION_CAUSE_NOT_CALLER),
             ("inbox_nested_agent", ADMISSION_CAUSE_NESTED),
             ("inbox_not_agent_process", ADMISSION_CAUSE_NOT_MEMBER),
+            ("inbox_receiver_above_agent", ADMISSION_CAUSE_ABOVE_AGENT),
         ] {
             assert_eq!(words["admissionCauses"][code], cause, "{code}");
             assert_eq!(admission_cause(code), Some(cause));
@@ -534,7 +538,7 @@ mod tests {
             words["admissionCauses"]
                 .as_object()
                 .map(|causes| causes.len()),
-            Some(5),
+            Some(6),
             "the fixture lists every cause the deck names"
         );
         assert_eq!(

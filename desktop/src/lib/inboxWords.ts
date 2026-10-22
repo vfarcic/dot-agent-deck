@@ -60,6 +60,7 @@ export const INBOX_WORDS = {
     inbox_component_not_caller: "its integration named a process other than its own",
     inbox_nested_agent: "an agent of the same kind running inside it asked for them",
     inbox_not_agent_process: "a process outside the agent asked for them",
+    inbox_receiver_above_agent: "its integration named a process the agent itself runs under",
   },
 } as const;
 
