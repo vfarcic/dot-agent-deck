@@ -1,6 +1,6 @@
 # Host metrics
 
-PRD #1258 (complete; the PRD is `prds/done/1258-resource-aware-decks.md`). The daemon reports the machine it runs on (disk per watched role, load per core, memory) through one capability-gated attach verb, and judges each reading with a health level. The TUI's **Host of this deck** overlay (`m`) and the desktop Dashboard's per-daemon **Host** button and popover both read it. The user-facing page is [`docs/session-management.md`](../session-management.md#check-the-machine-a-deck-runs-on); this page covers the mechanism.
+PRD #1258 (complete; the PRD is `prds/done/1258-resource-aware-decks.md`). The daemon reports the machine it runs on (disk per watched role, load per core, memory) through one capability-gated attach verb, and judges each reading with a health level. The TUI's **Host of this deck** overlay (`m`) and the desktop Dashboard's per-daemon **Host** button and popover both read it. The user-facing page is [`docs/session-management.md`](../session-management.md#check-the-machine-a-deck-runs-on); this page covers the mechanism. The figures are the host's, never an agent's: why the deck does not attribute them to agents, with the measurements, is [per-agent resource attribution](per-agent-resources.md) (PRD #1692).
 
 ## The sampler
 
