@@ -25018,7 +25018,7 @@ pub fn render_host_metrics_key_sequence_to_buffers(
             bar_rows,
         );
         let filtered = filter_sessions(&state, ui);
-        terminal
+        let completed = terminal
             .draw(|frame| {
                 render_frame(
                     frame, &state, ui, &filtered, 0, true, &*ctrl, &tab_view, &tab_bar, &layout,
@@ -25026,6 +25026,9 @@ pub fn render_host_metrics_key_sequence_to_buffers(
                 );
             })
             .expect("TestBackend draw should succeed");
+        // As the run loop does: an open confirmation's record and click
+        // targets come from the flushed frame before the next key is handled.
+        record_flushed_confirmation(ui, completed.buffer);
         terminal.backend().buffer().clone()
     };
 
@@ -25144,7 +25147,7 @@ pub fn render_restart_notice_agents_key_sequence_to_buffers(
             bar_rows,
         );
         let filtered = filter_sessions(&state, ui);
-        terminal
+        let completed = terminal
             .draw(|frame| {
                 render_frame(
                     frame, &state, ui, &filtered, 0, true, &*ctrl, &tab_view, &tab_bar, &layout,
@@ -25152,6 +25155,9 @@ pub fn render_restart_notice_agents_key_sequence_to_buffers(
                 );
             })
             .expect("TestBackend draw should succeed");
+        // As the run loop does: an open confirmation's record and click
+        // targets come from the flushed frame before the next key is handled.
+        record_flushed_confirmation(ui, completed.buffer);
         terminal.backend().buffer().clone()
     };
 
