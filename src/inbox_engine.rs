@@ -1590,6 +1590,7 @@ pub(super) fn exit(
     now: Instant,
 ) -> Option<Arc<GenerationSpool>> {
     st.receipts.floors.remove(key);
+    st.admission_refused.remove(key);
     forget_turns(st, key);
     let told = st.receipts.told.remove(key);
     let generation = st.receipts.gens.remove(key);
@@ -1899,6 +1900,12 @@ pub(super) fn notices(st: &HubState, key: &AgentKey, now: Instant) -> InboxCardN
         integration_command: (integration == Some(IntegrationNotice::HooksTooOld))
             .then(|| st.hooks_remedy.clone())
             .flatten(),
+        // PRD #1666 part 3 (R-2): while messages wait for the agent.
+        admission_refused: st
+            .admission_refused
+            .get(key)
+            .filter(|_| super::has_waiting_mail(&st.inbox, &key.0, &key.1))
+            .cloned(),
         ..InboxCardNotices::default()
     };
     let Some(generation) = st.receipts.gens.get(key) else {

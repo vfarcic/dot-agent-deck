@@ -8621,6 +8621,13 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 - **Does not assert:** a peer running as another user (the `daemon.rs` unit test `a_capability_holder_outside_the_tree_must_be_the_decks_user` pins it, since a test cannot run as two users), or the card notice (`inbox/protocol/023`).
 - **Platform coverage:** mac+linux.
 
+##### inbox/protocol/023 — A refused request of the agent's own shows on its card; another pane's does not.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), daemon with its production admission on; refused requests go over a connection whose creator exited, the rest from the test process; the card state is read from `list-agents`, the snapshot both clients hydrate from.
+- **Agent:** none (`cat` stand-ins).
+- **Asserts:** with a task queued, a fetch carrying the pane's own token over an exited creator's connection is refused `inbox_peer_unidentified` with a remedy in its error, and the agent's record carries `inbox.admission_refused: "inbox_peer_unidentified"`; a request naming a second pane with the first pane's token is refused `token_names_another_pane` and the second pane's record carries no refusal; an admitted fetch with the pane's token clears the first pane's.
+- **Does not assert:** the orchestrator notice (`inbox/boundary/065`) or the rendering (`inbox/status/027`, `/028`, desktop `inboxWords.test.ts`).
+- **Platform coverage:** mac+linux.
+
 #### Agent CLI
 
 ##### inbox/cli/001 — In-pane fetch frames the task, acknowledges it and updates list.
@@ -9342,6 +9349,13 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** the warning's text, or the removal of the generation's spool at exit.
 - **Platform coverage:** mac+linux.
 
+##### inbox/boundary/065 — A refused request marks its own card while mail waits, and tells its orchestrator once.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub's `admission_refused` / `admission_admitted` (the daemon's admission outcome), delegates through `post_delegate`, a broadcast receiver.
+- **Agent:** none.
+- **Asserts:** a refusal with nothing waiting shows nothing; once a delegated task waits the summary carries `admission_refused` and an attention update broadcasts it; an admitted request clears it; a refusal starting a new episode posts one `worker cannot take its messages` notice to the task's orchestrator, naming the task and the cause, however often it repeats; an orchestrator in the worker's own pane is not told; exit clears the state; a generation no longer in its pane records nothing.
+- **Does not assert:** which requests the daemon reports (`inbox/protocol/023`), or the client rendering (`inbox/status/027`, `/028`).
+- **Platform coverage:** all.
+
 ##### inbox/status/001 — Human daemon status shows each agent's pending inbox counts and wake path.
 - **Layer:** Unit (`tests/inbox_status.rs`), pure status projection and table rendering.
 - **Agent:** none.
@@ -9526,6 +9540,20 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Platform coverage:** all.
 
 #### inbox/claude
+
+##### inbox/status/027 — The card says messages can't reach the agent, why and what to do.
+- **Layer:** L1 (`tests/render_dashboard.rs`), TestBackend card render from the daemon's record/resync seam.
+- **Agent:** none.
+- **Asserts:** a snapshot carrying `admission_refused` renders `Messages can't reach this agent: its connection to the deck…` in the shared words, ahead of an out-of-date hooks notice on the same card.
+- **Does not assert:** what raises or clears it (`inbox/protocol/023`), or the whole sentence at a narrow width (`inbox/status/028`).
+- **Platform coverage:** all.
+
+##### inbox/status/028 — Deck messages shows a refused connection whole.
+- **Layer:** L1 (`tests/render_inbox_attention.rs`), the real key handler and picker over a TestBackend.
+- **Agent:** none.
+- **Asserts:** with only a refusal, `i` opens Deck messages and its body holds the whole notice — headline, cause, remedy — at 100 and at 30 columns, the footer offers only `Esc to close`, and `r` sends nothing; beside an uncertain delivery the notice heads the picker and the row still sends Retry.
+- **Does not assert:** the desktop tile (`desktop/src/lib/inboxWords.test.ts`, `AgentTile.test.tsx`).
+- **Platform coverage:** all.
 
 ##### inbox/claude/001 — Supported Claude installs one status handler and one day-long native waiter per managed event.
 - **Layer:** Fast CLI (`tests/inbox_claude.rs`), isolated HOME and version stub, no daemon or credential.

@@ -930,6 +930,78 @@ fn inbox_protocol_017_a_connection_of_unknown_ancestry_cannot_take_mail() {
     );
 }
 
+/// The `list-agents` record of `pane`'s agent.
+fn record(daemon: &DaemonProc, pane: &Pane) -> Value {
+    attach(daemon, json!({"op":"list-agents"}))["agent_records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["id"] == pane.agent)
+        .cloned()
+        .unwrap_or_else(|| panic!("no record for {}", pane.agent))
+}
+
+/// Scenario: With the daemon's production admission on and a task queued for a pane's agent, a connection whose creator exited asks for the agent's messages with the pane's own token and is refused. The agent's record then says its messages can't reach it, with that cause, as both clients read it. A request naming a second pane with the first pane's token raises nothing on the second pane's record, though a task waits there too. An admitted fetch with the pane's token clears the first pane's notice.
+#[spec("inbox/protocol/023")]
+#[test]
+fn inbox_protocol_023_a_refused_request_of_the_agents_own_shows_on_its_card() {
+    let daemon = common::spawn_daemon_serve(None, "0");
+    let own = pane(&daemon, "refused-own", "exec /bin/cat");
+    let victim = pane(&daemon, "refused-victim", "exec /bin/cat");
+    let id = enqueue(&daemon, &own);
+    enqueue(&daemon, &victim);
+    let refused = |request: &Value| {
+        let (mut socket, _) = connect_from_an_exited_process(&daemon.hook_socket);
+        writeln!(socket.get_mut(), "{request}").unwrap();
+        line(&mut socket)
+    };
+    let mut fetch = request(&own, "inbox_fetch");
+    fetch["consumer"] = json!("cli");
+    let reply = refused(&fetch);
+    assert_eq!(reply["refused"], "inbox_peer_unidentified", "{reply}");
+    assert!(
+        reply["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("; run ")),
+        "the refusal names a remedy: {reply}"
+    );
+    let latest = RefCell::new(Value::Null);
+    assert!(
+        common::wait_until(WAIT, || {
+            *latest.borrow_mut() = record(&daemon, &own);
+            latest.borrow()["inbox"]["admission_refused"] == "inbox_peer_unidentified"
+        }),
+        "the agent's record names the refusal: {}",
+        latest.borrow()
+    );
+
+    let mut forged = request(&victim, "inbox_fetch");
+    forged["token"] = json!(own.token);
+    forged["agent_id"] = json!(own.agent);
+    forged["consumer"] = json!("cli");
+    let reply = refused(&forged);
+    assert_eq!(reply["refused"], "token_names_another_pane", "{reply}");
+    assert!(
+        record(&daemon, &victim)["inbox"]
+            .get("admission_refused")
+            .is_none_or(Value::is_null),
+        "another own's request marks nothing on this card: {}",
+        record(&daemon, &victim)
+    );
+
+    let mut fetch = request(&own, "inbox_fetch");
+    fetch["consumer"] = json!("cli");
+    fetch["ack"] = json!(true);
+    blocks(&hook(&daemon, fetch), &id);
+    assert!(
+        common::wait_until(WAIT, || record(&daemon, &own)["inbox"]
+            .get("admission_refused")
+            .is_none_or(Value::is_null)),
+        "an admitted request clears it: {}",
+        record(&daemon, &own)
+    );
+}
+
 /// Scenario: Fill a deck that may hold one message, then have an agent pane ask it to dispatch a unit. The deck has no room for the dispatch's result, so it refuses the dispatch with deck_full instead of accepting it, and no unit is started.
 #[spec("inbox/protocol/018")]
 #[test]

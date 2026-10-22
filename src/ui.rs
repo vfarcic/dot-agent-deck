@@ -2239,8 +2239,38 @@ struct InboxAttentionDialog {
     /// opened on was learned from — what every press it makes is bound to.
     incarnation: crate::daemon_client::Incarnation,
     items: Vec<crate::inbox_hub::InboxAttentionItem>,
+    /// PRD #1666 part 3 (R-2): the card's refusal notice in full
+    /// ([`crate::inbox_display::admission_refused_text`]), which a card cuts
+    /// at its width, above the rows.
+    notice: Option<String>,
     selected: usize,
     answer: Option<String>,
+}
+
+/// PRD #1666 §6.4 and part 3 (R-2): what the Deck messages picker shows for
+/// `pane_id`: the agent generation, the rows waiting on Retry or Cancel and
+/// the card's refusal notice. `None` when there is neither, or the two belong
+/// to different generations.
+fn inbox_deck_messages(
+    snapshot: &AppState,
+    pane_id: &str,
+) -> Option<(
+    Option<String>,
+    Vec<crate::inbox_hub::InboxAttentionItem>,
+    Option<String>,
+)> {
+    let attention = snapshot.inbox_attention(pane_id);
+    let refused = snapshot.inbox_admission_refused(pane_id);
+    let agent = attention
+        .map(|(agent, _)| agent)
+        .or(refused.map(|(agent, _)| agent))?;
+    let items = attention
+        .map(|(_, items)| items.to_vec())
+        .unwrap_or_default();
+    let notice = refused
+        .filter(|(owner, _)| *owner == agent)
+        .map(|(_, code)| crate::inbox_display::admission_refused_text(code));
+    (!items.is_empty() || notice.is_some()).then(|| (agent.map(str::to_string), items, notice))
 }
 
 /// PRD #1666 part 2 (G-fix7d) — the one notice naming the agents deck restarts
@@ -8294,11 +8324,12 @@ fn poll_inbox_attention(ui: &mut UiState, snapshot: &AppState) {
             Err(why) => why,
         });
     }
-    dialog.items = snapshot
-        .inbox_attention(&dialog.pane_id)
-        .filter(|(agent, _)| *agent == Some(dialog.agent_id.as_str()))
-        .map(|(_, items)| items.to_vec())
+    let (items, notice) = inbox_deck_messages(snapshot, &dialog.pane_id)
+        .filter(|(agent, _, _)| agent.as_deref() == Some(dialog.agent_id.as_str()))
+        .map(|(_, items, notice)| (items, notice))
         .unwrap_or_default();
+    dialog.items = items;
+    dialog.notice = notice;
     dialog.selected = dialog.selected.min(dialog.items.len().saturating_sub(1));
 }
 
@@ -11379,16 +11410,17 @@ fn dispatch_action(
                 .and_then(|sid| snapshot.sessions.get(sid))
                 .and_then(SessionState::bound_pane);
             let found = card.and_then(|card| {
-                let (agent, items) = snapshot.inbox_attention(&card.pane_id)?;
-                Some((card, agent?.to_string(), items.to_vec()))
+                let (agent, items, notice) = inbox_deck_messages(snapshot, &card.pane_id)?;
+                Some((card, agent?, items, notice))
             });
             match found {
-                Some((card, agent_id, items)) => {
+                Some((card, agent_id, items, notice)) => {
                     ui.inbox_attention = Some(InboxAttentionDialog {
                         pane_id: card.pane_id,
                         agent_id,
                         incarnation: card.incarnation,
                         items,
+                        notice,
                         selected: 0,
                         answer: None,
                     });
@@ -11396,7 +11428,9 @@ fn dispatch_action(
                 }
                 None => {
                     ui.status_message = Some((
-                        "This agent has no deck messages waiting on Retry or Cancel.".to_string(),
+                        "This agent has no deck messages waiting on Retry or Cancel, and none \
+                         the deck refused."
+                            .to_string(),
                         std::time::Instant::now(),
                     ));
                 }
@@ -19543,7 +19577,24 @@ fn inbox_attention_lines(
 ) -> (Vec<Line<'static>>, Option<(usize, usize)>, bool) {
     let width = usize::from(width);
     let mut lines = Vec::new();
-    if dialog.items.is_empty() {
+    // PRD #1666 part 3 (R-2): the refusal notice in full, wrapped, ahead of
+    // the rows, with a blank row between when there are rows.
+    let notice = inbox_attention_notice_rows(dialog, width);
+    let notice_rows = notice.len().min(rows);
+    for text in notice.iter().take(notice_rows) {
+        lines.push(Line::styled(
+            truncate_with_ellipsis(&format!("  {text}"), width),
+            Style::default().fg(palette::status_color(&SessionStatus::Blocked)),
+        ));
+    }
+    let rows = rows - notice_rows;
+    let rows = if notice_rows > 0 && !dialog.items.is_empty() && rows > 0 {
+        lines.push(Line::from(""));
+        rows - 1
+    } else {
+        rows
+    };
+    if dialog.items.is_empty() && dialog.notice.is_none() {
         lines.push(Line::from(format!(
             "  {}",
             crate::inbox_display::ACTION_GONE
@@ -19634,6 +19685,16 @@ fn inbox_attention_lines(
 /// The columns the picker indents an explanation by.
 const INBOX_REASON_INDENT: usize = 4;
 
+/// PRD #1666 part 3 (R-2): the picker's refusal notice wrapped to its
+/// `width`, after a two-column indent; empty with none.
+fn inbox_attention_notice_rows(dialog: &InboxAttentionDialog, width: usize) -> Vec<String> {
+    dialog
+        .notice
+        .as_deref()
+        .map(|notice| crate::upgrade_dialog::wrap(notice, width.saturating_sub(2)))
+        .unwrap_or_default()
+}
+
 /// The cursor row's explanation wrapped to the picker's `width`, after its
 /// indent.
 fn inbox_attention_reason_rows(
@@ -19674,9 +19735,16 @@ fn inbox_attention_geometry(dialog: &InboxAttentionDialog, area: Rect) -> (Rect,
     let explained = dialog.items.get(dialog.selected).map_or(0, |item| {
         inbox_attention_reason_rows(item, usize::from(popup_width.saturating_sub(2))).len() - 1
     });
-    let wanted = (dialog.items.len() * 2)
-        .max(1)
+    let notice = inbox_attention_notice_rows(dialog, usize::from(popup_width.saturating_sub(2)));
+    let items = if dialog.items.is_empty() && !notice.is_empty() {
+        0
+    } else {
+        (dialog.items.len() * 2).max(1)
+    };
+    let wanted = items
         .saturating_add(explained)
+        .saturating_add(notice.len())
+        .saturating_add(usize::from(!notice.is_empty() && items > 0))
         .saturating_add(if dialog.answer.is_some() { 2 } else { 0 });
     let popup_height = wanted
         .saturating_add(3 + 2)
@@ -19791,35 +19859,41 @@ fn render_inbox_attention_overlay(
     if footer_area.height == 0 {
         return Vec::new();
     }
+    let hint = if dialog.items.is_empty() {
+        "  Esc to close".to_string()
+    } else {
+        format!(
+            "  r {} · c {} · Esc to close",
+            crate::inbox_display::RETRY,
+            crate::inbox_display::CANCEL
+        )
+    };
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(""),
-            Line::styled(
-                format!(
-                    "  r {} · c {} · Esc to close",
-                    crate::inbox_display::RETRY,
-                    crate::inbox_display::CANCEL
-                ),
-                text_primary(),
-            ),
-        ]),
+        Paragraph::new(vec![Line::from(""), Line::styled(hint, text_primary())]),
         footer_area,
     );
-    let buttons = [
-        Button::new(
-            crate::inbox_display::RETRY,
-            "r",
-            Action::InboxAttentionAct(true),
-            inbox_attention_retry_readable(dialog, area),
-        ),
-        Button::new(
-            crate::inbox_display::CANCEL,
-            "c",
-            Action::InboxAttentionAct(false),
-            !dialog.items.is_empty(),
-        ),
-        Button::new("Close", "", Action::CloseInboxAttention, true),
-    ];
+    let close = Button::new("Close", "", Action::CloseInboxAttention, true);
+    // PRD #1666 part 3 (R-2): a refusal alone offers nothing to Retry or
+    // Cancel, so only Close is drawn.
+    let buttons = if dialog.items.is_empty() {
+        vec![close]
+    } else {
+        vec![
+            Button::new(
+                crate::inbox_display::RETRY,
+                "r",
+                Action::InboxAttentionAct(true),
+                inbox_attention_retry_readable(dialog, area),
+            ),
+            Button::new(
+                crate::inbox_display::CANCEL,
+                "c",
+                Action::InboxAttentionAct(false),
+                true,
+            ),
+            close,
+        ]
+    };
     let btn_row = Rect {
         x: footer_area.x,
         y: footer_area.y,
@@ -24779,6 +24853,19 @@ pub fn render_inbox_attention_overlay_to_buffer(
     width: u16,
     height: u16,
 ) -> ratatui::buffer::Buffer {
+    render_inbox_deck_messages_to_buffer(items, None, selected, answer, width, height)
+}
+
+/// PRD #1666 part 3 (R-2) L1 seam: [`render_inbox_attention_overlay_to_buffer`]
+/// with the card's refusal notice, by its refusal code, above the rows.
+pub fn render_inbox_deck_messages_to_buffer(
+    items: &[crate::inbox_hub::InboxAttentionItem],
+    refusal: Option<&str>,
+    selected: usize,
+    answer: Option<&str>,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     let dialog = InboxAttentionDialog {
@@ -24786,6 +24873,7 @@ pub fn render_inbox_attention_overlay_to_buffer(
         agent_id: "agent".into(),
         incarnation: Default::default(),
         items: items.to_vec(),
+        notice: refusal.map(crate::inbox_display::admission_refused_text),
         selected,
         answer: answer.map(str::to_string),
     };
@@ -25521,6 +25609,7 @@ mod tests {
             agent_id: "a".to_string(),
             incarnation: Default::default(),
             items: Vec::new(),
+            notice: None,
             selected: 0,
             answer: None,
         });
@@ -42314,6 +42403,7 @@ mod tests {
                     subject: "a's message".into(),
                     task_id: None,
                 }],
+                notice: None,
                 selected: 0,
                 answer: None,
             });

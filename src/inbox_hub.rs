@@ -285,6 +285,12 @@ pub struct InboxCardNotices {
     /// Delivered messages whose evidence pauses hand-outs (§7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence_paused: Option<usize>,
+    /// PRD #1666 part 3 (R-2): the refusal code the deck gave the agent's own
+    /// request for its messages, while messages wait for it
+    /// ([`InboxHub::admission_refused`]). Additive: a reader that predates it
+    /// skips it, and its absence means no refusal is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_refused: Option<String>,
 }
 
 /// The wire spelling of `component`, for [`InboxSummary::component`].
@@ -533,6 +539,12 @@ struct HubState {
     /// ([`crate::hook_binary::remedy_for`]), `None` when the deck can offer
     /// none.
     hooks_remedy: Option<String>,
+    /// PRD #1666 part 3 (R-2): agent generations whose own request for their
+    /// messages the deck refused at admission, with the refusal's code, until
+    /// one of theirs is admitted or they exit. One entry per live generation
+    /// at most: only a request the generation's current capability attests
+    /// sets one ([`InboxHub::admission_refused`]).
+    admission_refused: HashMap<AgentKey, String>,
 }
 
 /// PRD #1666 long-turn delivery: who was told that a message ran out of
@@ -727,6 +739,7 @@ impl InboxHub {
                 spool_error: None,
                 action_presses: HashMap::new(),
                 hooks_remedy: None,
+                admission_refused: HashMap::new(),
             }),
             spill_manifest: Mutex::new(None),
             changed: Arc::new(Notify::new()),
@@ -3192,6 +3205,47 @@ impl InboxHub {
         })
     }
 
+    /// PRD #1666 part 3 (R-2): the deck refused `agent_id`'s own request for
+    /// its messages in `pane_id`, with the refusal `code`. Its card says so
+    /// while messages wait for it ([`InboxCardNotices::admission_refused`]),
+    /// and, the first time in an episode, each orchestrator with a task
+    /// delegated to it is told once. The caller has checked that the
+    /// request's capability attests `agent_id` and that `agent_id` holds the
+    /// pane, so a request naming another agent's pane never reaches this.
+    pub fn admission_refused(&self, pane_id: &str, agent_id: &str, code: &str) {
+        {
+            let mut st = self.lock();
+            if st
+                .live_agent
+                .as_ref()
+                .is_some_and(|live| !live(pane_id, agent_id))
+            {
+                return;
+            }
+            let key = (pane_id.to_string(), agent_id.to_string());
+            if st
+                .admission_refused
+                .insert(key.clone(), code.to_string())
+                .is_none()
+            {
+                owe_admission_notices(&mut st, &key, code);
+            }
+            engine::broadcast_notices(&mut st, &key, Instant::now());
+        }
+        self.post_owed_notices();
+    }
+
+    /// PRD #1666 part 3 (R-2): the deck admitted `agent_id`'s own request for
+    /// its messages in `pane_id`, which ends a refusal episode
+    /// ([`Self::admission_refused`]).
+    pub fn admission_admitted(&self, pane_id: &str, agent_id: &str) {
+        let mut st = self.lock();
+        let key = (pane_id.to_string(), agent_id.to_string());
+        if st.admission_refused.remove(&key).is_some() {
+            engine::broadcast_notices(&mut st, &key, Instant::now());
+        }
+    }
+
     /// PRD #1666 §11: a fetch or stream from a component the receipt policy
     /// covers declared an integration below the floor.
     pub fn refuse_old_adapter(&self, pane_id: &str, agent_id: &str) {
@@ -4013,6 +4067,14 @@ fn drain_events(st: &mut HubState) {
         let Some(recipient) = event.recipient else {
             continue;
         };
+        // PRD #1666 part 3 (R-2): a refused generation's card names the
+        // refusal only while messages wait for it, so each message arriving
+        // or leaving retells its notices.
+        let refused = recipient
+            .agent_id
+            .as_ref()
+            .map(|agent| (recipient.pane_id.clone(), agent.clone()))
+            .filter(|key| st.admission_refused.contains_key(key));
         // A send with no subscriber is not an error worth reporting.
         let _ = tx.send(BroadcastMsg::Inbox(InboxNotice {
             pane_id: recipient.pane_id,
@@ -4029,6 +4091,9 @@ fn drain_events(st: &mut HubState) {
             requeued: event.requeued,
             notices: InboxCardNotices::default(),
         }));
+        if let Some(key) = refused {
+            engine::broadcast_notices(st, &key, Instant::now());
+        }
     }
     // Each was for the retirement drained just now.
     st.cancelled_handed.clear();
@@ -4061,6 +4126,86 @@ fn broadcast_wake_stall(st: &HubState, pane_id: &str, agent_id: &str, id: &str, 
         requeued: false,
         notices: InboxCardNotices::default(),
     }));
+}
+
+/// PRD #1666 part 3 (R-2): whether a message waits for `agent_id` in
+/// `pane_id` — one not yet acknowledged nor undeliverable that it may take.
+fn has_waiting_mail(inbox: &Inbox, pane_id: &str, agent_id: &str) -> bool {
+    inbox.list(pane_id).into_iter().any(|m| {
+        !m.state.is_terminal()
+            && m.recipient
+                .as_ref()
+                .is_some_and(|r| r.admits(pane_id, agent_id))
+    })
+}
+
+/// PRD #1666 part 3 (R-2): owe each orchestrator with a task delegated to
+/// `key`'s generation one notice that the deck refused that worker's request
+/// for its messages with `code`. An orchestrator in the worker's own pane is
+/// never told: that is the refused agent itself.
+fn owe_admission_notices(st: &mut HubState, key: &AgentKey, code: &str) {
+    let mut told: Vec<(Recipient, String, Vec<String>)> = Vec::new();
+    let mut watched: Vec<(&String, &DelegateWatch)> = st
+        .delegates
+        .iter()
+        .filter(|(_, watch)| {
+            watch.worker.pane_id == key.0 && watch.worker.agent_id.as_deref() == Some(&key.1)
+        })
+        .collect();
+    watched.sort_by(|a, b| a.0.cmp(b.0));
+    for (id, watch) in watched {
+        let Some(orchestrator) = watch.orchestrator.as_ref() else {
+            continue;
+        };
+        if orchestrator.pane_id == key.0 {
+            continue;
+        }
+        match told.iter_mut().find(|(to, _, _)| to == orchestrator) {
+            Some((_, _, ids)) => ids.push(id.clone()),
+            None => told.push((orchestrator.clone(), watch.role.clone(), vec![id.clone()])),
+        }
+    }
+    for (to, role, ids) in told {
+        let body = compose_admission_refused_notice(&role, &ids, code);
+        st.owed_notices.push((to, ADMISSION_REFUSED_SUBJECT, body));
+    }
+}
+
+/// PRD #1666 part 3 (R-2): the subject of the notice an orchestrator gets
+/// when the deck refuses a worker's request for its messages.
+pub const ADMISSION_REFUSED_SUBJECT: &str = "worker cannot take its messages";
+
+/// How many task ids [`compose_admission_refused_notice`] names before
+/// counting the rest.
+const ADMISSION_NOTICE_MAX_IDS: usize = 5;
+
+/// PRD #1666 part 3 (R-2): the notice an orchestrator gets when the deck
+/// refused, with `code`, a request of its worker in `role` for its messages,
+/// naming the tasks `ids` it delegated to that worker. Composed by the deck
+/// from fixed words; the role is quoted as untrusted.
+pub fn compose_admission_refused_notice(role: &str, ids: &[String], code: &str) -> String {
+    let named = ids
+        .iter()
+        .take(ADMISSION_NOTICE_MAX_IDS)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = ids.len().saturating_sub(ADMISSION_NOTICE_MAX_IDS);
+    let tasks = if more > 0 {
+        format!("{named} and {more} more")
+    } else {
+        named
+    };
+    let cause = crate::inbox_display::admission_cause(code)
+        .map(|cause| format!(" ({cause})"))
+        .unwrap_or_default();
+    format!(
+        "The worker in role {} cannot take its deck messages: its connection to the deck was \
+         refused{cause}. Your task(s) {tasks} wait in its inbox. Its card tells the user to \
+         restart it from the deck; a restart ends those tasks as not delivered, and you are told \
+         when it does. Decide whether to wait, re-delegate with --supersede, or notify the user.",
+        crate::state::quote_untrusted_role(role),
+    )
 }
 
 /// The subject of a notice that a delegated task did not reach its worker.

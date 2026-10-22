@@ -5091,24 +5091,47 @@ fn mail_taker_admitted(
     verb: &str,
     pane_id: &str,
 ) -> Result<(), ComponentRefusal> {
-    match admit_inbox_component(
+    let admitted = admit_inbox_component(
         peer,
         None,
         registry.child_pid(agent_id),
         ComponentUse::Cli,
         Evidence::Required,
-    ) {
-        Ok(_) => Ok(()),
-        Err(refusal) => {
-            warn!(
-                verb,
-                pane_id = %escape_id_for_log(pane_id),
-                reason = refusal.code(),
-                "hook socket: refused an inbox verb from a process the deck cannot admit for \
-                 the pane"
-            );
-            Err(refusal)
-        }
+    )
+    .map(|_| ());
+    if let Err(refusal) = admitted {
+        warn!(
+            verb,
+            pane_id = %escape_id_for_log(pane_id),
+            reason = refusal.code(),
+            "hook socket: refused an inbox verb from a process the deck cannot admit for the \
+             pane"
+        );
+    }
+    note_admission(registry, pane_id, agent_id, admitted);
+    admitted
+}
+
+/// PRD #1666 part 3 (R-2): tell the inbox how the deck answered `agent_id`'s
+/// own request to take its messages or register its receiver in `pane_id`: a
+/// refusal raises that card's notice, an admission ends it. Only while
+/// `agent_id` holds the pane, and the request's capability attested
+/// `agent_id` before admission ran, so a request naming another agent's pane
+/// never marks that agent's card.
+fn note_admission(
+    registry: &AgentPtyRegistry,
+    pane_id: &str,
+    agent_id: &str,
+    admitted: Result<(), ComponentRefusal>,
+) {
+    if registry.pane_current_agent_id(pane_id).as_deref() != Some(agent_id) {
+        return;
+    }
+    match admitted {
+        Ok(()) => registry.inbox().admission_admitted(pane_id, agent_id),
+        Err(refusal) => registry
+            .inbox()
+            .admission_refused(pane_id, agent_id, refusal.code()),
     }
 }
 
@@ -6322,14 +6345,21 @@ async fn run_hook_loop_with_limits(
                                         }
                                         continue;
                                     }
-                                    let instance = match admit_inbox_component(
+                                    let admitted = admit_inbox_component(
                                         peer_pid,
                                         req.pid,
                                         pty_registry.child_pid(&agent_id),
                                         ComponentUse::Receiver,
                                         // A waiter is handed the agent's mail.
                                         Evidence::Required,
-                                    ) {
+                                    );
+                                    note_admission(
+                                        &pty_registry,
+                                        &req.pane_id,
+                                        &agent_id,
+                                        admitted.map(|_| ()),
+                                    );
+                                    let instance = match admitted {
                                         Ok(instance) => instance,
                                         Err(refusal) => {
                                             warn!(
@@ -6394,13 +6424,20 @@ async fn run_hook_loop_with_limits(
                                     // positive evidence as arming a waiter: an
                                     // unproven one could pin a dead process and
                                     // lock the real integration out.
-                                    let instance = match admit_inbox_component(
+                                    let admitted = admit_inbox_component(
                                         peer_pid,
                                         req.pid,
                                         pty_registry.child_pid(&agent_id),
                                         ComponentUse::Receiver,
                                         Evidence::Required,
-                                    ) {
+                                    );
+                                    note_admission(
+                                        &pty_registry,
+                                        &req.pane_id,
+                                        &agent_id,
+                                        admitted.map(|_| ()),
+                                    );
+                                    let instance = match admitted {
                                         Ok(instance) => instance,
                                         Err(refusal) => {
                                         warn!(

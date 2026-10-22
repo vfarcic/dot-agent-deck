@@ -4960,3 +4960,93 @@ async fn boundary_064_a_failed_removal_is_tried_again_on_the_next_tick() {
     ));
     waiter.close().await;
 }
+
+/// The refusal code `pane`/`a`'s card names now.
+fn refusal_of(hub: &InboxHub, pane: &str) -> Option<String> {
+    hub.summary(pane, "a").notices.admission_refused
+}
+
+/// Scenario: The deck refuses a worker's own request for its messages before any wait: its card says nothing. Once a task delegated to it waits, the card names the refusal, and a client is told so; an admitted request clears it. A refusal in a new episode tells the task's orchestrator once, naming the task and the cause, however often it repeats; an orchestrator in the worker's own pane is never told. The worker's exit clears the notice, and a refusal for a generation that no longer holds its pane is ignored.
+#[spec("inbox/boundary/065")]
+#[test]
+fn boundary_065_a_refused_request_marks_its_own_card_while_mail_waits() {
+    let hub = hub_with(Duration::from_secs(30), Duration::from_secs(60));
+    let (tx, mut rx) = broadcast::channel(256);
+    hub.set_broadcast(tx);
+    hub.admission_refused("p", "a", "inbox_peer_unidentified");
+    assert_eq!(refusal_of(&hub, "p"), None, "nothing waits for it");
+
+    let first = delegate_to(&hub, "p", "first task");
+    assert_eq!(
+        refusal_of(&hub, "p").as_deref(),
+        Some("inbox_peer_unidentified"),
+        "a task now waits"
+    );
+    let mut told = false;
+    while let Ok(message) = rx.try_recv() {
+        if let BroadcastMsg::Inbox(notice) = message
+            && notice.attention_update
+            && notice.notices.admission_refused.as_deref() == Some("inbox_peer_unidentified")
+        {
+            told = true;
+        }
+    }
+    assert!(told, "clients are told the card's notice");
+    assert!(
+        orchestrator_notices(&hub).is_empty(),
+        "the episode began before the task was delegated"
+    );
+
+    hub.admission_admitted("p", "a");
+    assert_eq!(refusal_of(&hub, "p"), None, "an admitted request clears it");
+
+    for _ in 0..3 {
+        hub.admission_refused("p", "a", "inbox_nested_agent");
+    }
+    assert_eq!(refusal_of(&hub, "p").as_deref(), Some("inbox_nested_agent"));
+    let notices = orchestrator_notices(&hub);
+    assert_eq!(notices.len(), 1, "one notice per episode: {notices:?}");
+    let (subject, text) = &notices[0];
+    assert_eq!(subject, ADMISSION_REFUSED_SUBJECT);
+    assert!(text.contains(first.as_str()), "names the task: {text}");
+    assert!(
+        text.contains(crate::inbox_display::ADMISSION_CAUSE_NESTED),
+        "names the cause: {text}"
+    );
+
+    // An orchestrator in the refused worker's own pane is that agent itself.
+    hub.post_delegate(
+        Recipient::bound("q", "a"),
+        "self",
+        Some(Recipient::bound("q", "a")),
+        DelegateLedger::default(),
+        content("to itself"),
+        &|| true,
+    )
+    .unwrap();
+    hub.admission_refused("q", "a", "inbox_other_user");
+    assert_eq!(refusal_of(&hub, "q").as_deref(), Some("inbox_other_user"));
+    hub.post_owed_notices();
+    assert!(
+        hub.list_with_bodies(Some("q"))
+            .iter()
+            .all(|m| m.subject != ADMISSION_REFUSED_SUBJECT),
+        "no notice to the refused agent itself"
+    );
+
+    hub.agent_exited("p", "a");
+    assert!(
+        !hub.lock()
+            .admission_refused
+            .contains_key(&("p".into(), "a".into()))
+    );
+
+    hub.set_live_agent_check(Arc::new(|pane: &str, _: &str| pane != "gone"));
+    hub.admission_refused("gone", "a", "inbox_other_user");
+    assert!(
+        !hub.lock()
+            .admission_refused
+            .contains_key(&("gone".into(), "a".into())),
+        "a generation no longer in its pane records nothing"
+    );
+}

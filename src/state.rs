@@ -6578,6 +6578,10 @@ fn card_inbox_of(event: &AgentEvent) -> Option<crate::inbox_display::CardInbox> 
         .metadata
         .get(crate::inbox_display::CARD_INBOX_COMMAND_METADATA_KEY)
         .cloned();
+    inbox.admission_refused = event
+        .metadata
+        .get(crate::inbox_display::CARD_INBOX_ADMISSION_METADATA_KEY)
+        .cloned();
     Some(inbox)
 }
 
@@ -6620,6 +6624,12 @@ fn set_card_inbox(session: &mut SessionState, inbox: crate::inbox_display::CardI
         metadata.insert(
             crate::inbox_display::CARD_INBOX_COMMAND_METADATA_KEY.to_string(),
             command.clone(),
+        );
+    }
+    if let Some(code) = &inbox.admission_refused {
+        metadata.insert(
+            crate::inbox_display::CARD_INBOX_ADMISSION_METADATA_KEY.to_string(),
+            code.clone(),
         );
     }
     session.recent_events.push_back(AgentEvent {
@@ -6854,6 +6864,7 @@ impl PaneInbox {
             integration_command: self.notices.integration_command.clone(),
             evidence_paused: self.notices.evidence_paused,
             receipts_degraded: self.notices.receipts_degraded.clone(),
+            admission_refused: self.notices.admission_refused.clone(),
         }
     }
 
@@ -9265,6 +9276,19 @@ impl AppState {
         };
         inbox.fold(notice);
         self.refresh_card_inbox(&notice.pane_id);
+    }
+
+    /// PRD #1666 part 3 (R-2): the refusal code of the request `pane_id`'s
+    /// agent made for its own messages, while messages wait for it, with the
+    /// agent generation it belongs to.
+    pub fn inbox_admission_refused(&self, pane_id: &str) -> Option<(Option<&str>, &str)> {
+        self.pane_inboxes.get(pane_id).and_then(|inbox| {
+            inbox
+                .notices
+                .admission_refused
+                .as_deref()
+                .map(|code| (inbox.agent_id.as_deref(), code))
+        })
     }
 
     /// PRD #1666 §6.4: the items `pane_id`'s card lists for the user to
