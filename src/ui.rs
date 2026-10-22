@@ -3517,6 +3517,20 @@ pub struct HydrationPartition {
     pub rejections: Vec<HydrationRejection>,
 }
 
+/// Seed startup hydration's card for `h`, learned from the daemon process
+/// that accepted its attach
+/// ([`crate::state::AppState::seed_hydrated_session_learned`]).
+fn seed_hydrated_card(st: &mut crate::state::AppState, h: &HydratedPane) {
+    st.seed_hydrated_session_learned(
+        h.pane_id.clone(),
+        h.cwd.clone(),
+        h.agent_type.clone(),
+        Some(h.agent_id.clone()),
+        h.live.as_ref(),
+        h.incarnation.clone(),
+    );
+}
+
 /// PRD #76 M2.12: partition hydrated daemon panes into dashboard /
 /// orchestration buckets based on each agent's recorded
 /// `tab_membership`. Pure function for testability.
@@ -12661,13 +12675,7 @@ pub fn run_tui(
             // the seeded card. Without this, it would carry `agent_id=None`
             // and a `SessionStart` with `Some(daemon-id)` would not match → a
             // second card would appear beside the hydrated one.
-            st.seed_hydrated_session(
-                h.pane_id.clone(),
-                h.cwd.clone(),
-                h.agent_type.clone(),
-                Some(h.agent_id.clone()),
-                h.live.as_ref(),
-            );
+            seed_hydrated_card(&mut st, h);
             drop(st);
             let display_name = h.display_name.clone().unwrap_or_else(|| h.agent_id.clone());
             ui.pane_display_names
@@ -28368,6 +28376,57 @@ mod tests {
             agent_type: None,
             live: None,
             orchestrator_context_path: None,
+            incarnation: crate::daemon_client::Incarnation::UNNAMED,
+        }
+    }
+
+    /// PR #1817 review 4347247784: startup hydration seeds a card for pane
+    /// `1`, attached on deck process `a`, before the event stream has opened.
+    /// The stream then opens on `a`, and after a later gap the resync's
+    /// snapshot says the agent waits for input: the card shows it. A card
+    /// attached on `b` while the stream opens on `a` is dropped for the
+    /// restart notice instead (control).
+    #[test]
+    fn a_card_hydrated_before_the_stream_opens_is_resynced_after_a_gap() {
+        use crate::daemon_client::Incarnation;
+        use crate::state::{AppState, SessionStatus};
+        let named = |process: &str| Incarnation::from(Some(process.to_string()));
+        let listed = |status: &str| -> Vec<crate::agent_pty::AgentRecord> {
+            serde_json::from_value(serde_json::json!([{
+                "id": "a-1",
+                "pane_id_env": "1",
+                "live": { "status": status, "tool_count": 0 },
+            }]))
+            .unwrap()
+        };
+        let card = |st: &AppState| {
+            st.sessions
+                .values()
+                .filter(|card| card.pane_id.as_deref() == Some("1"))
+                .map(|card| card.status.clone())
+                .collect::<Vec<_>>()
+        };
+        for attached_on in ["a", "b"] {
+            let mut st = AppState::default();
+            st.register_pane("1".to_string());
+            let mut h = hydrated("1", "a-1", None, None);
+            h.live = listed("Idle")[0].live.clone();
+            h.incarnation = named(attached_on);
+            seed_hydrated_card(&mut st, &h);
+            assert_eq!(card(&st), vec![SessionStatus::Idle], "{attached_on}: drawn at once");
+
+            st.learn_stream_incarnation(named("a"));
+            if attached_on == "b" {
+                assert!(card(&st).is_empty(), "control: b's card was kept");
+                assert_eq!(st.take_restart_drops().len(), 1, "control");
+                continue;
+            }
+            st.resync_after_event_gap(&listed("WaitingForInput"));
+            assert_eq!(
+                card(&st),
+                vec![SessionStatus::WaitingForInput],
+                "the resync skipped the hydrated card"
+            );
         }
     }
 

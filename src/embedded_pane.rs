@@ -77,6 +77,11 @@ pub struct HydratedPane {
     /// older daemon), or a path that fails that check, keeps the fixed-path
     /// mirror fallback.
     pub orchestrator_context_path: Option<std::path::PathBuf>,
+    /// PRD #1666 part 2 (G-fix6/7): the daemon process that accepted this
+    /// pane's attach, which its card is learned from — unnamed from an
+    /// ungated controller. Not the event stream's, which may not be open yet
+    /// when hydration seeds the card (PR #1817 review 4347247784).
+    pub incarnation: Incarnation,
 }
 
 /// Commands the per-pane I/O task drains from `input_rx`. `Input` carries
@@ -2447,6 +2452,7 @@ impl EmbeddedPaneController {
             // bounds — vt100 has subtle edge cases at zero / huge
             // sizes, and a debug log keeps the fall-back observable.
             let (parser_rows, parser_cols) = parser_init_dims(record.rows, record.cols);
+            let attached_on = conn.incarnation().cloned().unwrap_or_default();
             self.wire_stream_pane(
                 pane_id.clone(),
                 agent_id.clone(),
@@ -2469,6 +2475,7 @@ impl EmbeddedPaneController {
                     .orchestrator_context_path
                     .as_deref()
                     .map(std::path::PathBuf::from),
+                incarnation: attached_on,
             });
         }
         hydrated

@@ -8856,6 +8856,29 @@ impl AppState {
         agent_id: Option<String>,
         live: Option<&SessionSnapshot>,
     ) {
+        let learned_from = self.stream_incarnation.clone();
+        self.seed_hydrated_session_learned(pane_id, cwd, agent_type, agent_id, live, learned_from);
+    }
+
+    /// [`Self::seed_hydrated_session`] for a card learned from the daemon
+    /// process `learned_from` — the attach that produced it, at startup
+    /// hydration — rather than the stream open now (PR #1817 review
+    /// 4347247784). Startup hydration runs beside the first subscription, so
+    /// the stream may not have opened yet: the card is then drawn at once,
+    /// bound to its attach's process, and the stream's opening drops it if it
+    /// opens on another one ([`Self::learn_stream_incarnation`]). Bound to no
+    /// process, a later resync on the named stream would skip it. With a named
+    /// stream open it is [`Self::insert_placeholder_session_learned`]'s to
+    /// draw, hold or queue as stale.
+    pub fn seed_hydrated_session_learned(
+        &mut self,
+        pane_id: String,
+        cwd: Option<String>,
+        agent_type: Option<AgentType>,
+        agent_id: Option<String>,
+        live: Option<&SessionSnapshot>,
+        learned_from: Incarnation,
+    ) {
         // The snapshot's event-derived agent_type wins; fall back to the
         // spawn-time value only when the snapshot has none (or is absent).
         let effective_agent_type = match live {
@@ -8870,8 +8893,26 @@ impl AppState {
         // Mint the placeholder exactly as today (PRD #110 agent_id,
         // started_at reuse, session_id), then overlay the live snapshot
         // fields when one is present.
-        let session_id =
-            self.insert_placeholder_session(pane_id.clone(), cwd, effective_agent_type, agent_id);
+        let session_id = if self.stream_incarnation.is_unnamed()
+            && !learned_from.is_unnamed()
+            && !self.process_replaced(&learned_from)
+        {
+            self.draw_placeholder(
+                pane_id.clone(),
+                cwd,
+                effective_agent_type,
+                agent_id,
+                learned_from,
+            )
+        } else {
+            self.insert_placeholder_session_learned(
+                pane_id.clone(),
+                cwd,
+                effective_agent_type,
+                agent_id,
+                learned_from,
+            )
+        };
         let Some(snap) = live else { return };
         // The overlay below can push a live-target carrier onto the card's
         // journal outside the accounted path; recount it at the next pass.
