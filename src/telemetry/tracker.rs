@@ -1935,6 +1935,36 @@ pub(crate) mod tests {
         );
     }
 
+    /// A failed call's `Error` moves the card to Error exactly as before: one
+    /// status change, whether or not a shell operation was open for it.
+    #[test]
+    fn a_failed_call_is_one_status_change() {
+        let changes = |with_start: bool| {
+            let mut tracker = RunTracker::new();
+            tracker.begin_run(start("p1"), 0);
+            tracker.observe_event(&event("p1", EventType::SessionStart), 1);
+            if with_start {
+                tracker.observe_event(
+                    &shell("p1", EventType::ToolStart, "Bash", Some("make"), Some("c")),
+                    2,
+                );
+            } else {
+                tracker.observe_event(
+                    &shell("p1", EventType::ToolStart, "Read", Some("f"), Some("c")),
+                    2,
+                );
+            }
+            tracker.observe_event(&shell("p1", EventType::Error, "Bash", None, Some("c")), 3);
+            tracker.end_run("p1", EndReason::Exited, None, 4);
+            let spans = tracker.take_finished();
+            (
+                attr(run_span_of(&spans), AttrKey::StatusChangesCount).cloned(),
+                statuses(&spans),
+            )
+        };
+        assert_eq!(changes(true), changes(false));
+    }
+
     /// An end naming a call ends that call's operation and no other: a
     /// repeated end, or the end of a call evicted by the cap, ends nothing.
     #[test]
