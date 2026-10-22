@@ -18,7 +18,7 @@
 //! does hold content; what it reads back is typed: the card's status, mapped to
 //! one of a fixed set of names, and the number and CI result of the card's pull
 //! request. One value is read from an event's text, and only through a filter:
-//! a shell command's runner, program and first word ([`operation::classify`]),
+//! a shell command's program and first word ([`operation::classify`]),
 //! each kept only when it has the shape of a command word, and never the first
 //! word of a program that prints or searches text. No other value on a span is
 //! read from an event: the rest come from the
@@ -286,7 +286,6 @@ pub enum AttrKey {
     StatusFrom,
     StatusTo,
     InterventionKind,
-    OperationRunner,
     OperationProgram,
     OperationWord,
     OperationsCount,
@@ -328,7 +327,6 @@ impl AttrKey {
         AttrKey::StatusFrom,
         AttrKey::StatusTo,
         AttrKey::InterventionKind,
-        AttrKey::OperationRunner,
         AttrKey::OperationProgram,
         AttrKey::OperationWord,
         AttrKey::OperationsCount,
@@ -369,7 +367,6 @@ impl AttrKey {
             AttrKey::StatusFrom => "deck.status.from",
             AttrKey::StatusTo => "deck.status.to",
             AttrKey::InterventionKind => "deck.intervention.kind",
-            AttrKey::OperationRunner => "deck.operation.runner",
             AttrKey::OperationProgram => "deck.operation.program",
             AttrKey::OperationWord => "deck.operation.word",
             AttrKey::OperationsCount => "deck.operations.count",

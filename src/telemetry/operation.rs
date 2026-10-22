@@ -2,8 +2,8 @@
 //! hook reported — for `agent.operation` spans.
 //!
 //! **The command line is not sent.** [`classify`] reads the text once and
-//! returns three values at most: the runner (an enum), the program's basename
-//! and its first non-option argument. Each word is kept only when it has the
+//! returns two values at most: the program's basename and its first
+//! non-option argument. Each word is kept only when it has the
 //! shape of a command word ([`is_command_word`]: lowercase letters, digits,
 //! `.`, `_` and `-`, at most 32 characters), which leaves out a path, a URL, a
 //! quoted string with a space in it, and anything with an uppercase letter or
@@ -19,55 +19,22 @@
 //! shell comment: an unquoted `#` starting a word ends it. It is split on
 //! `&&`, `||`, `;` and `|` outside quotes into words, and those words keep the
 //! boundaries the shell gives them: a quoted argument stays one word wherever
-//! it is unwrapped from (`rwx sandbox exec … --`), and a shell's `-c` script is
-//! read as a script, its later arguments not. A shell reading its script from
+//! it is unwrapped from, and a shell's `-c` script is read as a script, its
+//! later arguments not. A shell reading its script from
 //! standard input (`bash -s …`) gives its name only. The first segment that runs
 //! something other than a shell builtin that only sets up the next one
 //! ([`SETUP_PROGRAMS`]) is the one classified — after its leading `VAR=value`
 //! assignments and an `env`, `sudo`, `command`, `time` or `nice` in front,
 //! with their options and the options' values.
 
-/// Where a command ran.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Runner {
-    /// On the agent's own machine.
-    Local,
-    /// Inside an RWX sandbox: `rwx sandbox exec … -- <command>`.
-    RwxSandbox,
-    /// An RWX run: `rwx run …`.
-    RwxRun,
-}
-
-impl Runner {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Runner::Local => "local",
-            Runner::RwxSandbox => "rwx_sandbox",
-            Runner::RwxRun => "rwx_run",
-        }
-    }
-}
-
 /// What [`classify`] keeps of a command.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Operation {
-    pub runner: Runner,
     /// The program's basename, when it passes [`is_command_word`].
     pub program: Option<String>,
     /// Its first non-option argument, when it passes [`is_command_word`] and
     /// the program is not one of [`WORDLESS_PROGRAMS`].
     pub word: Option<String>,
-}
-
-impl Operation {
-    /// An operation of which nothing but its runner is known.
-    fn bare(runner: Runner) -> Self {
-        Operation {
-            runner,
-            program: None,
-            word: None,
-        }
-    }
 }
 
 /// The tool names agents give their shell tool: Claude Code's `Bash`,
@@ -263,59 +230,53 @@ pub fn classify(command: Option<&str>) -> Operation {
 /// `["/bin/sh", "-lc", "<script>"]`), the first word of the script. A program
 /// that only sets up, prefixes or wraps the next one gives nothing, since that
 /// one's words may belong to a later argument; so does a line with an empty
-/// argument in it, or a shell with any other options. `rwx` still gives its
-/// runner.
+/// argument in it, or a shell with any other options.
 pub fn classify_joined_argv(command: Option<&str>) -> Operation {
     let line = command.and_then(|c| c.lines().next()).unwrap_or("");
     let words: Vec<&str> = line.split(' ').collect();
     // An empty argument, or one starting or ending with a space, leaves an
     // empty word: nothing can be placed.
     if words.iter().any(|w| w.is_empty()) {
-        return Operation::bare(Runner::Local);
+        return Operation::default();
     }
-    let (program, rest) = match words.as_slice() {
+    let program = match words.as_slice() {
         [shell, flags, script @ ..] if SHELLS.contains(&basename(shell)) => {
             let dash_c = flags.strip_prefix('-').is_some_and(|cluster| {
                 cluster.contains('c')
                     && cluster.chars().all(|c| c == 'c' || SHELL_FLAGS.contains(c))
             });
             match script {
-                [program, rest @ ..] if dash_c => (basename(program), rest),
-                _ => return Operation::bare(Runner::Local),
+                [program, ..] if dash_c => basename(program),
+                _ => return Operation::default(),
             }
         }
-        [program, rest @ ..] => (basename(program), rest),
-        [] => return Operation::bare(Runner::Local),
+        [program, ..] => basename(program),
+        [] => return Operation::default(),
     };
     let unsure = SETUP_PROGRAMS.contains(&program)
         || SHELLS.contains(&program)
         || ["env", "sudo", "command", "time", "nice", "exec", "eval"].contains(&program);
-    match (program, rest) {
-        _ if unsure => Operation::bare(Runner::Local),
-        ("rwx", ["sandbox", "exec", ..]) => Operation::bare(Runner::RwxSandbox),
-        ("rwx", ["run", ..]) => Operation {
-            runner: Runner::RwxRun,
-            ..named(program, &[])
-        },
-        _ => named(program, &[]),
+    if unsure {
+        return Operation::default();
     }
+    named(program, &[])
 }
 
-/// How deep `sh -c '…'` and `rwx sandbox exec -- …` nesting is followed.
+/// How deep `sh -c '…'` nesting is followed.
 const MAX_NESTING: usize = 2;
 
 fn classify_line(line: &str, depth: usize) -> Operation {
     segments(line)
         .iter()
         .find_map(|segment| classify_words(segment, depth))
-        .unwrap_or(Operation::bare(Runner::Local))
+        .unwrap_or(Operation::default())
 }
 
 /// Classify one segment's words. `None` when the segment only sets up the
 /// next one.
 fn classify_words(segment: &[String], depth: usize) -> Option<Operation> {
     let Some(words) = command_words(segment) else {
-        return Some(Operation::bare(Runner::Local));
+        return Some(Operation::default());
     };
     let first = words.first()?;
     let program = basename(first);
@@ -325,42 +286,20 @@ fn classify_words(segment: &[String], depth: usize) -> Option<Operation> {
     let rest = &words[1..];
     if SHELLS.contains(&program) {
         return Some(match shell_operand(rest) {
-            None => Operation::bare(Runner::Local),
+            None => Operation::default(),
             Some(ShellInput::File(at)) => named(program, &rest[at..]),
             Some(ShellInput::Stdin) => named(program, &[]),
             Some(ShellInput::Command(_)) if depth >= MAX_NESTING => named(program, &[]),
             Some(ShellInput::Command(at)) => match rest.get(at) {
                 Some(script) => classify_line(script, depth + 1),
-                None => Operation::bare(Runner::Local),
+                None => Operation::default(),
             },
         });
-    }
-    if program == "rwx" {
-        match rest.first().map(String::as_str) {
-            Some("sandbox") if rest.get(1).map(String::as_str) == Some("exec") => {
-                let inner = rest
-                    .iter()
-                    .position(|w| w == "--")
-                    .map(|i| &rest[i + 1..])
-                    .filter(|inner| !inner.is_empty() && depth < MAX_NESTING);
-                let mut op = inner
-                    .and_then(|inner| classify_words(inner, depth + 1))
-                    .unwrap_or(Operation::bare(Runner::Local));
-                op.runner = Runner::RwxSandbox;
-                return Some(op);
-            }
-            Some("run") => {
-                let mut op = named(program, rest);
-                op.runner = Runner::RwxRun;
-                return Some(op);
-            }
-            _ => {}
-        }
     }
     Some(named(program, rest))
 }
 
-/// A local operation running `program` with `args`, its words filtered. No
+/// An operation running `program` with `args`, its words filtered. No
 /// word is kept for a program that is not kept: what it is cannot be told.
 fn named(program: &str, args: &[String]) -> Operation {
     let program = Some(program.to_string()).filter(|p| is_command_word(p));
@@ -372,11 +311,7 @@ fn named(program: &str, args: &[String]) -> Operation {
             .cloned(),
         _ => None,
     };
-    Operation {
-        runner: Runner::Local,
-        program,
-        word,
-    }
+    Operation { program, word }
 }
 
 /// The last `/`-separated part of `word`.
@@ -617,16 +552,15 @@ fn segments(line: &str) -> Vec<Vec<String>> {
 mod tests {
     use super::*;
 
-    fn op(runner: Runner, program: Option<&str>, word: Option<&str>) -> Operation {
+    fn op(program: Option<&str>, word: Option<&str>) -> Operation {
         Operation {
-            runner,
             program: program.map(str::to_string),
             word: word.map(str::to_string),
         }
     }
 
     fn local(program: &str, word: Option<&str>) -> Operation {
-        op(Runner::Local, Some(program), word)
+        op(Some(program), word)
     }
 
     #[test]
@@ -688,28 +622,17 @@ mod tests {
     /// shell's later arguments are not its script.
     #[test]
     fn word_boundaries_survive_unwrapping() {
-        let sandbox =
-            |program: Option<&str>, word: Option<&str>| op(Runner::RwxSandbox, program, word);
         for (command, expected) in [
+            ("cargo 'private payload'", local("cargo", None)),
+            ("env cargo 'abc;node secret'", local("cargo", None)),
+            ("sudo -u root cargo \"a && b\"", local("cargo", None)),
             (
-                "rwx sandbox exec -- cargo 'private payload'",
-                sandbox(Some("cargo"), None),
+                r#"env bash -c 'node "private payload"'"#,
+                local("node", None),
             ),
             (
-                "rwx sandbox exec -- cargo 'abc;node secret'",
-                sandbox(Some("cargo"), None),
-            ),
-            (
-                "rwx sandbox exec -- cargo \"a && b\"",
-                sandbox(Some("cargo"), None),
-            ),
-            (
-                r#"rwx sandbox exec -- bash -c 'node "private payload"'"#,
-                sandbox(Some("node"), None),
-            ),
-            (
-                "rwx sandbox exec -- FOO=1 env -u X cargo test",
-                sandbox(Some("cargo"), Some("test")),
+                "FOO=1 env -u X sudo cargo test",
+                local("cargo", Some("test")),
             ),
             (
                 "bash -c 'cargo test' private payload",
@@ -728,7 +651,7 @@ mod tests {
     /// program; a form whose options are not known gives nothing.
     #[test]
     fn prefix_and_shell_options_take_their_values() {
-        let unresolved = op(Runner::Local, None, None);
+        let unresolved = Operation::default();
         for (command, expected) in [
             ("time -f hunter2 cargo test", local("cargo", Some("test"))),
             (
@@ -803,7 +726,7 @@ mod tests {
     /// where each argument ends: its program only, and only where certain.
     #[test]
     fn a_joined_argv_gives_its_program_at_most() {
-        let bare = op(Runner::Local, None, None);
+        let bare = Operation::default();
         for (command, expected) in [
             ("/bin/sh -lc touch out.txt", local("touch", None)),
             ("/bin/bash -lc cargo test --workspace", local("cargo", None)),
@@ -824,15 +747,11 @@ mod tests {
             ("bash -c", bare.clone()),
             ("cargo private payload", local("cargo", None)),
             ("env hunter2 cargo", bare.clone()),
-            (
-                "rwx sandbox exec -- cargo private",
-                op(Runner::RwxSandbox, None, None),
-            ),
+            ("rwx sandbox exec -- cargo private", local("rwx", None)),
             (
                 "/bin/sh -lc rwx sandbox exec -- cargo test",
-                op(Runner::RwxSandbox, None, None),
+                local("rwx", None),
             ),
-            ("rwx run ci", op(Runner::RwxRun, Some("rwx"), None)),
             ("", bare.clone()),
         ] {
             assert_eq!(classify_joined_argv(Some(command)), expected, "{command}");
@@ -851,25 +770,23 @@ mod tests {
         );
     }
 
+    /// `rwx sandbox exec -- <command>` is classified like any other command:
+    /// program `rwx`, word `sandbox`, and the command it runs is not read.
     #[test]
-    fn rwx_runners() {
-        assert_eq!(
-            classify(Some("rwx sandbox exec --image x -- cargo test --workspace")),
-            op(Runner::RwxSandbox, Some("cargo"), Some("test"))
-        );
-        assert_eq!(
-            classify(Some("cd repo && rwx sandbox exec -- bash -c 'make ci'")),
-            op(Runner::RwxSandbox, Some("make"), Some("ci"))
-        );
-        assert_eq!(
-            classify(Some("rwx sandbox exec --image x")),
-            op(Runner::RwxSandbox, None, None)
-        );
-        assert_eq!(
-            classify(Some("rwx run .rwx/ci.yml --wait")),
-            op(Runner::RwxRun, Some("rwx"), Some("run"))
-        );
-        assert_eq!(classify(Some("rwx login")), local("rwx", Some("login")));
+    fn rwx_is_an_ordinary_program() {
+        for (command, expected) in [
+            (
+                "rwx sandbox exec --image x -- cargo test --workspace",
+                local("rwx", Some("sandbox")),
+            ),
+            (
+                "cd repo && rwx sandbox exec -- bash -c 'make ci'",
+                local("rwx", Some("sandbox")),
+            ),
+            ("rwx run .rwx/ci.yml --wait", local("rwx", Some("run"))),
+        ] {
+            assert_eq!(classify(Some(command)), expected, "{command}");
+        }
     }
 
     #[test]
@@ -890,7 +807,7 @@ mod tests {
                 local("git", Some("commit")),
             ),
             ("python3 /home/me/private/script.py", local("python3", None)),
-            ("Rscript analysis.R", op(Runner::Local, None, None)),
+            ("Rscript analysis.R", Operation::default()),
             (
                 "kubectl get secret/db-PASSWORD",
                 local("kubectl", Some("get")),
@@ -949,7 +866,7 @@ mod tests {
 
     #[test]
     fn no_command_or_only_setup_is_a_bare_local_operation() {
-        let bare = op(Runner::Local, None, None);
+        let bare = Operation::default();
         assert_eq!(classify(None), bare);
         assert_eq!(classify(Some("")), bare);
         assert_eq!(classify(Some("cd /tmp && export A=b")), bare);
@@ -960,7 +877,7 @@ mod tests {
     fn quoted_operators_do_not_split() {
         assert_eq!(
             classify(Some("cd x; 'my tool' run")),
-            op(Runner::Local, None, None),
+            Operation::default(),
             "no word for a program that is not kept"
         );
         assert_eq!(
@@ -973,7 +890,7 @@ mod tests {
     /// word, and its separators split nothing.
     #[test]
     fn comments_are_not_commands() {
-        let bare = op(Runner::Local, None, None);
+        let bare = Operation::default();
         for (command, expected) in [
             ("# hunter2", bare.clone()),
             ("   # hunter2 run", bare.clone()),

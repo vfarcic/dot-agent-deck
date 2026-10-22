@@ -1019,7 +1019,7 @@ fn telemetry_otlp_012_daemon_shutdown_flushes_open_run() {
     );
 }
 
-/// Scenario: Send shell-tool start/end hooks for sandboxed, CI, local and private commands to a stand-in pane, plus a non-shell tool. Close the pane and inspect completed operation spans for safe runner/program/word metadata, parent identity, duration and count, rejecting private or raw command text from every request body.
+/// Scenario: Send shell-tool start/end hooks for ordinary, wrapped, sandboxed and private commands to a stand-in pane, plus a non-shell tool. Close the pane and inspect completed operation spans for safe program/word metadata (an `rwx sandbox exec` command is program `rwx`, word `sandbox`, and no span says where a command ran), parent identity, duration and count, rejecting private or raw command text from every request body.
 #[spec("telemetry/otlp/014")]
 #[test]
 fn telemetry_otlp_014_shell_operations_classify_without_content() {
@@ -1031,50 +1031,33 @@ fn telemetry_otlp_014_shell_operations_classify_without_content() {
     let pane = agent.pane_id_env.as_deref().unwrap();
     let events = deck.subscribe_events();
     let cases = [
-        (
-            "rwx sandbox exec -- cargo test-fast",
-            "rwx_sandbox",
-            "cargo",
-            "test-fast",
-        ),
-        ("rwx run ci", "rwx_run", "rwx", "run"),
-        ("FOO=1 /usr/bin/make build", "local", "make", "build"),
-        ("cd /tmp/x && npm run lint", "local", "npm", "run"),
-        ("echo PRIVATE_WORD_1741_17ad", "local", "echo", ""),
-        ("cat PRIVATE_FILE_1741_91bd", "local", "cat", ""),
-        ("kubectl apply -f /secret/path", "local", "kubectl", "apply"),
-        ("npm run \"Weird Name\"", "local", "npm", "run"),
-        ("npm \"Weird Name\"", "local", "npm", ""),
+        ("rwx sandbox exec -- cargo test-fast", "rwx", "sandbox"),
+        ("rwx run ci", "rwx", "run"),
+        ("FOO=1 /usr/bin/make build", "make", "build"),
+        ("cd /tmp/x && npm run lint", "npm", "run"),
+        ("echo PRIVATE_WORD_1741_17ad", "echo", ""),
+        ("cat PRIVATE_FILE_1741_91bd", "cat", ""),
+        ("kubectl apply -f /secret/path", "kubectl", "apply"),
+        ("npm run \"Weird Name\"", "npm", "run"),
+        ("npm \"Weird Name\"", "npm", ""),
         (
             "env FOO=1 sudo command time nice /usr/bin/cargo --locked check",
-            "local",
             "cargo",
             "check",
         ),
         (
             "export TOKEN=PRIVATE_ASSIGNMENT_1741; true || make check",
-            "local",
             "make",
             "check",
         ),
-        ("rg privateword1741", "local", "rg", ""),
-        ("printf privateword1741", "local", "printf", ""),
-        ("grep privateword1741", "local", "grep", ""),
-        ("sed privateword1741", "local", "sed", ""),
-        ("awk privateword1741", "local", "awk", ""),
-        ("PRIVATE_PROGRAM_1741 PRIVATE_WORD_1741", "local", "", ""),
-        (
-            "make a234567890123456789012345678901234",
-            "local",
-            "make",
-            "",
-        ),
-        (
-            "make check\necho PRIVATE_SECOND_LINE_1741",
-            "local",
-            "make",
-            "check",
-        ),
+        ("rg privateword1741", "rg", ""),
+        ("printf privateword1741", "printf", ""),
+        ("grep privateword1741", "grep", ""),
+        ("sed privateword1741", "sed", ""),
+        ("awk privateword1741", "awk", ""),
+        ("PRIVATE_PROGRAM_1741 PRIVATE_WORD_1741", "", ""),
+        ("make a234567890123456789012345678901234", "make", ""),
+        ("make check\necho PRIVATE_SECOND_LINE_1741", "make", "check"),
     ];
     for (tool, command) in std::iter::once(("Read", "PRIVATE_NON_SHELL_1741"))
         .chain(cases.iter().map(|(command, ..)| ("Bash", *command)))
@@ -1114,7 +1097,6 @@ fn telemetry_otlp_014_shell_operations_classify_without_content() {
         .iter()
         .map(|span| {
             (
-                attribute(span, "deck.operation.runner"),
                 attribute(span, "deck.operation.program"),
                 attribute(span, "deck.operation.word"),
             )
@@ -1122,9 +1104,7 @@ fn telemetry_otlp_014_shell_operations_classify_without_content() {
         .collect();
     let mut expected: Vec<_> = cases
         .iter()
-        .map(|(_, runner, program, word)| {
-            (runner.to_string(), program.to_string(), word.to_string())
-        })
+        .map(|(_, program, word)| (program.to_string(), word.to_string()))
         .collect();
     actual.sort();
     expected.sort();
@@ -1142,6 +1122,14 @@ fn telemetry_otlp_014_shell_operations_classify_without_content() {
                 );
             }
         }
+        assert!(
+            !operation["attributes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|attr| attr["key"] == "deck.operation.runner"),
+            "no attribute says where a command ran: {operation}"
+        );
         assert_eq!(operation["parentSpanId"], run["spanId"]);
         assert_eq!(operation["traceId"], run["traceId"]);
         assert_eq!(
@@ -1172,6 +1160,10 @@ fn telemetry_otlp_014_shell_operations_classify_without_content() {
         for (command, ..) in cases {
             assert!(!body.contains(command), "raw command leaked: {command}");
         }
+        assert!(
+            !body.contains("deck.operation.runner"),
+            "no request carries a runner attribute"
+        );
     }
 }
 

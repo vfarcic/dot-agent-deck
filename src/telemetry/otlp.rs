@@ -657,7 +657,7 @@ pub(crate) mod tests {
             "grep -r sentinel-input .",
             "cd /home/u/SENTINEL-CWD && ./SENTINEL-TITLE.sh",
             "TOKEN=SENTINEL-ENV-VALUE curl https://SENTINEL-PR-URL.example",
-            "rwx sandbox exec -- echo SENTINEL-BRANCH",
+            "sudo -u root echo SENTINEL-BRANCH",
         ] {
             for event_type in [EventType::ToolStart, EventType::ToolEnd] {
                 let mut e = loaded_event("pane-1", event_type);

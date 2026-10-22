@@ -988,10 +988,6 @@ fn status_span(run: &ActiveRun, open: OpenStatus, now: u64) -> SpanRecord {
 
 fn operation_span(run: &ActiveRun, open: OpenOperation, now: u64) -> SpanRecord {
     let mut attributes = identity_attributes(&run.start_info);
-    attributes.push(Attribute::str(
-        AttrKey::OperationRunner,
-        open.operation.runner.as_str(),
-    ));
     attributes.extend(Attribute::opt_str(
         AttrKey::OperationProgram,
         open.operation.program.as_deref(),
@@ -1844,16 +1840,19 @@ pub(crate) mod tests {
             .collect()
     }
 
-    fn op_attrs(runner: &str, program: Option<&str>, word: Option<&str>) -> Vec<Attribute> {
-        let mut out = vec![Attribute::str(AttrKey::OperationRunner, runner)];
-        out.extend(Attribute::opt_str(AttrKey::OperationProgram, program));
+    fn op_attrs(program: Option<&str>, word: Option<&str>) -> Vec<Attribute> {
+        let mut out = Attribute::opt_str(AttrKey::OperationProgram, program)
+            .into_iter()
+            .collect::<Vec<_>>();
         out.extend(Attribute::opt_str(AttrKey::OperationWord, word));
         out
     }
 
     /// One `agent.operation` per shell command, from its start to its end,
     /// paired by call id when several overlap and by age otherwise; other
-    /// tools make none, and the run counts them.
+    /// tools make none, and the run counts them. A command run through
+    /// `rwx sandbox exec` carries `rwx sandbox` and nothing else: no attribute
+    /// says where it ran.
     #[test]
     fn shell_commands_become_operations() {
         let mut tracker = RunTracker::new();
@@ -1915,10 +1914,10 @@ pub(crate) mod tests {
         assert_eq!(
             operations(&spans),
             vec![
-                (op_attrs("rwx_sandbox", Some("make"), Some("ci")), 11, 13),
-                (op_attrs("local", Some("cargo"), Some("test")), 10, 15),
-                (op_attrs("local", Some("echo"), None), 16, 17),
-                (op_attrs("local", Some("cargo"), None), 18, 100),
+                (op_attrs(Some("rwx"), Some("sandbox")), 11, 13),
+                (op_attrs(Some("cargo"), Some("test")), 10, 15),
+                (op_attrs(Some("echo"), None), 16, 17),
+                (op_attrs(Some("cargo"), None), 18, 100),
             ]
         );
         let run = run_span_of(&spans);
@@ -2093,7 +2092,7 @@ pub(crate) mod tests {
         tracker.end_run("p1", EndReason::Exited, None, 20);
         assert_eq!(
             operations(&tracker.take_finished()),
-            vec![(op_attrs("local", Some("cargo"), Some("test")), 2, 10)]
+            vec![(op_attrs(Some("cargo"), Some("test")), 2, 10)]
         );
     }
 
