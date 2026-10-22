@@ -212,6 +212,12 @@ fn collect_wrapper_events(listener: &UnixListener, expected: usize) -> Vec<Agent
     while events.len() < expected && Instant::now() < deadline {
         match listener.accept() {
             Ok((mut stream, _)) => {
+                // On macOS the accepted stream inherits the listener's
+                // O_NONBLOCK (Linux's does not), so a read that beats the
+                // wrapper's write would fail with WouldBlock (issue #1700).
+                stream
+                    .set_nonblocking(false)
+                    .expect("make the accepted wrapper event stream blocking");
                 let mut json = String::new();
                 stream
                     .read_to_string(&mut json)
@@ -421,6 +427,10 @@ fn collect_wrapper_events_until(
     while Instant::now() < deadline {
         match listener.accept() {
             Ok((mut stream, _)) => {
+                // Blocking for the same reason as in [`collect_wrapper_events`].
+                stream
+                    .set_nonblocking(false)
+                    .expect("make the accepted wrapper event stream blocking");
                 let mut json = String::new();
                 stream
                     .read_to_string(&mut json)
