@@ -1831,7 +1831,7 @@ fn delivered_after_all(st: &mut HubState, key: &AgentKey, id: &str, despite_canc
         .get_mut(key)
         .is_some_and(|generation| generation.uncertain_told.remove(id));
     let Some(watch) = st.delegates.get(id) else {
-        if let Some((to, role)) = st.cancelled_tasks.remove(id) {
+        if let Some((to, role, _)) = st.cancelled_tasks.remove(id) {
             st.owed_notices.push((
                 to,
                 LATE_ACK_SUBJECT,
@@ -1987,8 +1987,8 @@ pub(super) fn action(
         && let Some(watch) = st.delegates.get(id)
         && let Some(to) = watch.orchestrator.clone()
     {
-        st.cancelled_tasks
-            .insert(id.to_string(), (to, watch.role.clone()));
+        let role = watch.role.clone();
+        super::remember_cancelled_task(st, id, to, &role);
     }
     apply(st, key, now, out);
     dispatch(st, key, now, out);

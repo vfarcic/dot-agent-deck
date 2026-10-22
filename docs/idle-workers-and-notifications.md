@@ -25,7 +25,7 @@ Each report waits in the orchestrator's inbox and reaches its conversation throu
 What each report means for the orchestrator's next step:
 
 - **A task not yet acknowledged** produces a delivery notice for the orchestrator. Check the worker's inbox badge and pane before asking it to repeat the task.
-- **Uncertain, or cancelled after it was handed over:** the worker may or may not have the task. The report asks the orchestrator to check the worker's pane before delegating it again, and a correction follows if the deck learns the worker has it.
+- **Uncertain, or cancelled after it was handed over:** the worker may or may not have the task. The report asks the orchestrator to check the worker's pane before delegating it again. A correction may follow if the deck later learns the worker has it; go by the pane, not by the absence of a correction.
 - **Undeliverable:** the deck will not deliver the task again. Before delegating it again, giving it to another role or telling you, the report asks the orchestrator to check the worker's pane, because a task the deck handed over before giving up can still have reached it; a `work-done` for it is to be trusted over this report. Otherwise the task can be done twice. [Delivery in the TUI and desktop app](orchestration.md#delivery-in-the-tui-and-desktop-app) explains **Retry** and **Cancel**.
 - **Waiting for input** includes the last lines of the worker's pane, so the orchestrator can see what needs an answer.
 - **Waiting for input** depends on the agent. For Claude Code it means a permission prompt; a Claude Code worker that asks a question in plain text simply ends its turn, so only the timeout report covers it. [Session Management](session-management.md) lists what each status means per agent.

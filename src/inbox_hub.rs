@@ -506,9 +506,12 @@ struct HubState {
     /// pending spool work ([`engine`]).
     receipts: engine::Receipts,
     /// PRD #1666 §2: delegated tasks the user cancelled, with the
-    /// orchestrator and role to correct when one commits after all. Oldest
-    /// dropped past [`MAX_CANCELLED_TASKS`].
-    cancelled_tasks: HashMap<String, (Recipient, String)>,
+    /// orchestrator and role to correct when one commits after all, and the
+    /// order they were cancelled in. Oldest dropped past
+    /// [`MAX_CANCELLED_TASKS`] ([`remember_cancelled_task`]).
+    cancelled_tasks: HashMap<String, (Recipient, String, u64)>,
+    /// The order number the next entry of `cancelled_tasks` gets.
+    cancelled_seq: u64,
     /// PRD #1666 §6.4: cancelled messages that may already have reached their
     /// agent (an attempt was not positively not handed), so the notice their
     /// retirement owes says so. Set as the cancel retires the message and
@@ -716,6 +719,7 @@ impl InboxHub {
                     arm_deadline_from_env(),
                 ),
                 cancelled_tasks: HashMap::new(),
+                cancelled_seq: 0,
                 cancelled_handed: HashSet::new(),
                 spool: None,
                 spool_error: None,
@@ -4238,13 +4242,17 @@ fn settle_delegate(st: &mut HubState, event: &InboxEvent) {
 }
 
 /// PRD #1666 §6.6: the notice an orchestrator gets once when a delegated
-/// task's delivery became uncertain.
+/// task's delivery became uncertain. It says a correction may follow, never
+/// that one will: a late receipt is not seen once its verifier is gone, and
+/// none is reported once the worker's generation exits, the task's watch is
+/// superseded or the deck restarts.
 pub fn compose_uncertain_notice(message_id: &str, role: &str) -> String {
     format!(
         "Task {message_id} to the worker in role {} may or may not have reached the worker: the \
          deck handed it over, lost track of it, and its repeats did not settle it. The worker's \
-         card offers Retry, which sends it again marked as a possible repeat, and Cancel. If it \
-         reached the worker after all, you will be told.",
+         card offers Retry, which sends it again marked as a possible repeat, and Cancel. The \
+         worker may already be working on it. Check the worker's pane before you re-delegate or \
+         reassign it, or notify the user. A later receipt may produce a correction.",
         crate::state::quote_untrusted_role(role),
     )
 }
@@ -4323,6 +4331,26 @@ fn remember_late_ack(
             break;
         };
         st.late_acks.remove(&oldest);
+    }
+}
+
+/// PRD #1666 §2: remember a cancelled task's orchestrator and role, so a
+/// commit after the Cancel can still correct them, dropping the oldest past
+/// [`MAX_CANCELLED_TASKS`].
+fn remember_cancelled_task(st: &mut HubState, id: &str, to: Recipient, role: &str) {
+    st.cancelled_seq += 1;
+    st.cancelled_tasks
+        .insert(id.to_string(), (to, role.to_string(), st.cancelled_seq));
+    while st.cancelled_tasks.len() > MAX_CANCELLED_TASKS {
+        let Some(oldest) = st
+            .cancelled_tasks
+            .iter()
+            .min_by_key(|(_, (_, _, seq))| *seq)
+            .map(|(id, _)| id.clone())
+        else {
+            break;
+        };
+        st.cancelled_tasks.remove(&oldest);
     }
 }
 
@@ -4458,7 +4486,8 @@ pub fn compose_undeliverable_notice(
 /// PRD #1666 §6.4: the notice an orchestrator gets when the user cancelled a
 /// task it delegated. `possibly_handed` when the deck cannot rule out that the
 /// task reached the worker before the cancel: then the worker may be working
-/// on it, and re-delegating it may run it twice.
+/// on it, and re-delegating it may run it twice. A correction may follow, as
+/// for [`compose_uncertain_notice`]; none is promised.
 pub fn compose_cancelled_notice(message_id: &str, role: &str, possibly_handed: bool) -> String {
     let role = crate::state::quote_untrusted_role(role);
     if possibly_handed {
@@ -4467,7 +4496,7 @@ pub fn compose_cancelled_notice(message_id: &str, role: &str, possibly_handed: b
              deck had handed it over, so it may already have reached the worker, which may be \
              working on it; its work-done can still arrive. The deck will not deliver it \
              again. Check the worker's pane before you re-delegate or reassign it, or notify \
-             the user. If the deck learns the worker received it, you will be told."
+             the user. A later receipt may produce a correction."
         )
     } else {
         format!(
@@ -7623,6 +7652,53 @@ mod tests {
         assert_eq!(
             compose_undeliverable_notice("m-1", "coder", Cancelled),
             compose_cancelled_notice("m-1", "coder", false)
+        );
+    }
+
+    /// PRD #1666 part 2: the uncertain notice and the possibly-handed cancel
+    /// notice say a correction may follow, after telling the orchestrator to
+    /// check the worker's pane, and promise none: a correction is lost with
+    /// the verifier, the worker's generation, a superseded watch or a deck
+    /// restart.
+    #[test]
+    fn a_correction_is_never_promised() {
+        const MAY: &str = "A later receipt may produce a correction.";
+        const CHECK: &str = "Check the worker's pane before you re-delegate or reassign it";
+        for body in [
+            compose_uncertain_notice("m-1", "coder"),
+            compose_cancelled_notice("m-1", "coder", true),
+        ] {
+            let check = body.find(CHECK).unwrap_or_else(|| panic!("{body}"));
+            let may = body.find(MAY).unwrap_or_else(|| panic!("{body}"));
+            assert!(check < may, "the action leads: {body}");
+            assert!(
+                !body.contains("you will be told") && !body.contains("will be told"),
+                "{body}"
+            );
+        }
+    }
+
+    /// PRD #1666 part 2: the deck remembers at most [`MAX_CANCELLED_TASKS`]
+    /// cancelled tasks to correct; past that the oldest is dropped and the
+    /// newest kept.
+    #[test]
+    fn cancelled_tasks_are_bounded_oldest_first() {
+        let hub = hub();
+        let mut st = hub.lock();
+        for i in 0..=MAX_CANCELLED_TASKS {
+            remember_cancelled_task(
+                &mut st,
+                &format!("m-{i}"),
+                Recipient::bound("o", "oa"),
+                "coder",
+            );
+        }
+        assert_eq!(st.cancelled_tasks.len(), MAX_CANCELLED_TASKS);
+        assert!(!st.cancelled_tasks.contains_key("m-0"));
+        assert!(st.cancelled_tasks.contains_key("m-1"));
+        assert!(
+            st.cancelled_tasks
+                .contains_key(&format!("m-{MAX_CANCELLED_TASKS}"))
         );
     }
 
