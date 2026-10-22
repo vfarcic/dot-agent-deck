@@ -10036,16 +10036,6 @@ impl AgentPtyRegistry {
             .map(str::trim)
             .filter(|c| !c.is_empty())
             .map(str::to_string);
-        // PRD #1741: the words the agent's own telemetry needs on its command
-        // line (Codex's exporters, Devin's per-run config), on the command
-        // exec'd only — after the configured one is captured above.
-        let telemetry_command = telemetry_run
-            .as_ref()
-            .and_then(|run| run.launch_command(opts.command));
-        let mut opts = opts;
-        if let Some(command) = telemetry_command.as_deref() {
-            opts.command = Some(command);
-        }
         let captured_rows = opts.rows.clamp(1, PTY_RESIZE_DIM_MAX);
         let captured_cols = opts.cols.clamp(1, PTY_RESIZE_DIM_MAX);
 

@@ -41,7 +41,9 @@
 //! it through one call per lifecycle point — [`start_for_daemon`] and
 //! [`teardown_began`], [`prepare_spawn`] and [`commit_spawn`], [`agent_exited`] and
 //! [`observe_pane_input`] — so what telemetry does at each of them is decided
-//! here, not at the call site.
+//! here, not at the call site. The deck's entrypoint has one more: the `PATH`
+//! shim that switches on Codex's and Devin's own telemetry runs there
+//! ([`shim::run_if_invoked`]).
 
 pub mod ci;
 pub mod config;
@@ -53,6 +55,7 @@ pub mod otlp;
 pub mod propagation;
 pub mod resource;
 pub mod run_context;
+pub mod shim;
 pub mod span;
 pub mod tracker;
 
@@ -64,10 +67,11 @@ use std::sync::Arc;
 
 /// Daemon start: clear the per-run agent configuration files a daemon that
 /// ended without its teardown (a crash, a SIGKILL) left behind, read the
-/// configuration from this process's environment, subscribe the tracker to
-/// `event_tx`, and hand `registry` the handle so the agents it spawns get runs.
-/// With telemetry off the returned handle does nothing, nothing is subscribed,
-/// and `registry` is left alone.
+/// configuration from this process's environment, (re)write the `PATH` shim
+/// ([`shim`]) running this binary, subscribe the tracker to `event_tx`, and
+/// hand `registry` the handle so the agents it spawns get runs. With telemetry
+/// off the returned handle does nothing, nothing is subscribed, no shim is
+/// written, and `registry` is left alone.
 ///
 /// Installs no signal handler: when the daemon's teardown begins is told by
 /// the daemon itself ([`teardown_began`]).
@@ -78,22 +82,41 @@ pub fn start_for_daemon(
     start_from(
         &config::process_env(),
         exporter::default_config_dir(),
+        crate::platform::paths::executable_path().as_deref(),
         event_tx,
         registry,
     )
 }
 
-/// `config_dir` holds this daemon's per-run agent configuration files. The
-/// leftovers are removed whether or not telemetry is on now: no run of this
-/// daemon exists yet to own one, and the daemon before it may have exported.
+/// `config_dir` holds this daemon's per-run agent configuration files and its
+/// shim directory; `deck` is the binary the shim runs, and no shim is written
+/// without one. The leftovers are removed whether or not telemetry is on now:
+/// no run of this daemon exists yet to own one, and the daemon before it may
+/// have exported.
 fn start_from(
     env: &config::EnvMap,
     config_dir: std::path::PathBuf,
+    deck: Option<&str>,
     event_tx: &tokio::sync::broadcast::Sender<crate::event::BroadcastMsg>,
     registry: &crate::agent_pty::AgentPtyRegistry,
 ) -> Arc<Telemetry> {
     launch::remove_leftover_config_files(&config_dir);
-    let telemetry = Arc::new(Telemetry::start_in(env, config_dir));
+    let mut telemetry = Telemetry::start_in(env, config_dir.clone());
+    #[cfg(unix)]
+    if telemetry.is_enabled()
+        && let Some(deck) = deck
+    {
+        match shim::install(&config_dir, deck) {
+            Ok(dir) => telemetry.set_shim_dir(dir),
+            Err(e) => tracing::warn!(
+                "telemetry: the PATH shim could not be written ({e}); Codex and Devin will not \
+                 switch on their own telemetry"
+            ),
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = deck;
+    let telemetry = Arc::new(telemetry);
     telemetry.subscribe(event_tx.subscribe());
     if telemetry.is_enabled() {
         registry.set_telemetry(Arc::clone(&telemetry));
@@ -143,12 +166,7 @@ pub fn prepare_spawn(
         opts.command,
         membership,
     );
-    let run = telemetry.prepare_run(
-        start,
-        &opts.env,
-        opts.cwd.map(std::path::PathBuf::from),
-        opts.command,
-    )?;
+    let run = telemetry.prepare_run(start, &opts.env, opts.cwd.map(std::path::PathBuf::from))?;
     opts.env.extend(run.env.iter().cloned());
     Some(run)
 }
@@ -436,6 +454,7 @@ mod tests {
         let telemetry = start_from(
             &exporting_env(),
             dir.path().to_path_buf(),
+            None,
             &event_tx,
             &registry,
         );
@@ -473,7 +492,7 @@ mod tests {
             std::fs::create_dir(dir.path().join("devin-dir.json")).unwrap();
             let (event_tx, _) = tokio::sync::broadcast::channel(8);
             let registry = crate::agent_pty::AgentPtyRegistry::new();
-            let telemetry = start_from(&env, dir.path().to_path_buf(), &event_tx, &registry);
+            let telemetry = start_from(&env, dir.path().to_path_buf(), None, &event_tx, &registry);
             for path in &leftovers {
                 assert!(!path.exists(), "left over: {}", path.display());
             }
@@ -488,7 +507,53 @@ mod tests {
         let (event_tx, _) = tokio::sync::broadcast::channel(8);
         let registry = crate::agent_pty::AgentPtyRegistry::new();
         let missing = tempfile::tempdir().unwrap().path().join("absent");
-        start_from(&exporting_env(), missing, &event_tx, &registry);
+        start_from(&exporting_env(), missing, None, &event_tx, &registry);
+    }
+
+    /// The daemon writes the `PATH` shim only when telemetry is on, and an
+    /// agent's `PATH` gains it only then: with telemetry off there is no shim
+    /// directory and nothing is added to any agent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_shim_is_written_and_used_only_when_telemetry_is_on() {
+        let mut on = exporting_env();
+        on.insert("PATH".into(), "/usr/bin".into());
+        let off: config::EnvMap = [("PATH".to_string(), "/usr/bin".to_string())].into();
+        for (env, enabled) in [(off, false), (on, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let (event_tx, _) = tokio::sync::broadcast::channel(8);
+            let registry = crate::agent_pty::AgentPtyRegistry::new();
+            let telemetry = start_from(
+                &env,
+                dir.path().to_path_buf(),
+                Some("/opt/deck"),
+                &event_tx,
+                &registry,
+            );
+            let shim = dir.path().join(shim::DIR_NAME);
+            assert_eq!(shim.join("codex").is_file(), enabled);
+            assert_eq!(shim.join("devin").is_file(), enabled);
+            assert_eq!(shim.exists(), enabled, "no shim directory when off");
+            let mut opts = crate::agent_pty::SpawnOptions {
+                command: Some("codex"),
+                env: crate::test_isolation::pin_unreachable_endpoints(Vec::new()),
+                ..Default::default()
+            };
+            let run = prepare_spawn(registry.telemetry(), Some("p1"), "a1", &mut opts, None);
+            assert_eq!(run.is_some(), enabled);
+            let path = opts
+                .env
+                .iter()
+                .find(|(k, _)| k == "PATH")
+                .map(|(_, v)| v.clone());
+            assert_eq!(
+                path,
+                enabled.then(|| format!("{}:/usr/bin", shim.display())),
+            );
+            telemetry
+                .shutdown(std::time::Duration::from_millis(100))
+                .await;
+        }
     }
 
     fn exporting_registry() -> (Arc<Telemetry>, Arc<crate::agent_pty::AgentPtyRegistry>) {
@@ -498,6 +563,7 @@ mod tests {
         let telemetry = start_from(
             &exporting_env(),
             dir.path().to_path_buf(),
+            None,
             &event_tx,
             &registry,
         );
