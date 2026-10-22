@@ -42967,16 +42967,21 @@ mod tests {
         }
     }
 
-    /// Scenario: a Close confirmation is drawn at 80×24, then something painted later in the same draw covers part of its [Close] button inside the dialog. A click on that button closes nothing, while [Cancel], still whole, works; with nothing painted over it, [Close] confirms (control).
+    /// Scenario: a Close confirmation is drawn at 80×24, then something painted later in the same draw covers part of its [Close] button inside the dialog, both on its first frame and after an earlier unobscured frame. A click on that button closes nothing, while [Cancel], still whole, works; with nothing painted over it, [Close] confirms (control).
     #[spec("lifecycle/handshake/013")]
     #[test]
     fn handshake_013_a_button_painted_over_later_in_the_draw_takes_no_click() {
-        for covered in [true, false] {
-            let mut ui = default_ui();
-            ui.mode = UiMode::CloseConfirm;
-            let rows = draw_sized(&mut ui, 80, 24);
+        for (covered, warmed) in [(true, false), (true, true), (false, false), (false, true)] {
+            let mut probe = default_ui();
+            probe.mode = UiMode::CloseConfirm;
+            let rows = draw_sized(&mut probe, 80, 24);
             let close = find_in_rows(&rows, "[Close]").expect("[Close] is drawn");
             let cancel = find_in_rows(&rows, "[Cancel]").expect("[Cancel] is drawn");
+            let mut ui = default_ui();
+            ui.mode = UiMode::CloseConfirm;
+            if warmed {
+                draw_sized(&mut ui, 80, 24);
+            }
             let rows = draw_then_paint(&mut ui, 80, 24, false, &[], |frame| {
                 if covered {
                     frame.render_widget(

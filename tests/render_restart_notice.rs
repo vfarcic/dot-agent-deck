@@ -47,7 +47,7 @@ fn handshake_013_the_restart_notice_has_a_footer_row_of_its_own() {
     );
 }
 
-/// Scenario: A deck restart stopped five agents while the user types a filter; the field and the notice share the footer without stealing typed `ac`. Help and confirmation dialogs retain keyboard ownership and leave the notice visible when both fit. At forty rows Help instead draws completely over the notice, which returns when Help closes.
+/// Scenario: A deck restart stopped five agents while the user types a filter; the field and the notice share the footer without stealing typed `ac`. Help and confirmation dialogs retain keyboard ownership and leave the notice visible when both fit; Down in a drawn Quit dialog selects Stop. At forty rows Help instead draws completely over the notice, which returns when Help closes.
 #[spec("lifecycle/handshake/013")]
 #[test]
 fn handshake_013_the_restart_notice_shows_beside_a_text_field() {
@@ -113,6 +113,28 @@ fn handshake_013_the_restart_notice_shows_beside_a_text_field() {
             assert!(!shown.contains("│ Restart notice"), "{mode:?}: {shown}");
         }
     }
+    let quit = render_restart_notice_key_sequence_to_buffers(
+        &["coder", "reviewer"],
+        UiMode::QuitConfirm,
+        None,
+        &[key(KeyCode::Down)],
+        120,
+        40,
+    );
+    let before = text(&quit[0]);
+    let after = text(&quit[1]);
+    assert!(
+        before.contains("> Detach"),
+        "Quit did not start on Detach:\n{before}"
+    );
+    assert!(
+        after.contains("> Stop"),
+        "Down in the drawn Quit dialog did not select Stop:\n{after}"
+    );
+    assert!(
+        after.contains("these agents were stopped: coder, reviewer."),
+        "Quit navigation lost the restart notice:\n{after}"
+    );
     let help = render_restart_notice_key_sequence_to_buffers(
         &["coder", "reviewer"],
         UiMode::Help,
