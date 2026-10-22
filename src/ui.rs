@@ -28434,6 +28434,80 @@ mod tests {
         }
     }
 
+    /// PR #1817 review 4347247784 (U2): the stream opens on deck process `a`,
+    /// then reconnects to its successor `b`, which cards its own agent on pane
+    /// `1` waiting for input. A hydration of pane `1` attached on `a` (or on a
+    /// process no stream has named) arrives after that: `b`'s card keeps its
+    /// status, agent and process, and the pane keeps `b`'s hook generation.
+    /// The `a` card is queued for the restart notice; the other is held.
+    #[test]
+    fn a_delayed_hydration_leaves_a_successors_card_alone() {
+        use crate::daemon_client::Incarnation;
+        use crate::state::{AppState, SessionStatus};
+        let named = |process: &str| Incarnation::from(Some(process.to_string()));
+        let listed = |id: &str, status: &str, generation: &str| {
+            serde_json::from_value::<Vec<crate::agent_pty::AgentRecord>>(serde_json::json!([{
+                "id": id,
+                "pane_id_env": "1",
+                "live": {
+                    "status": status,
+                    "tool_count": 0,
+                    "hook_generation": {
+                        "session_id": generation,
+                        "established_ms": 1_700_000_000_000i64,
+                    },
+                },
+            }]))
+            .unwrap()
+        };
+        for attached_on in ["a", "c"] {
+            let mut st = AppState::default();
+            st.register_pane("1".to_string());
+            st.learn_stream_incarnation(named("a"));
+            st.learn_stream_incarnation(named("b"));
+            st.card_unseen_agents(&listed("b-1", "WaitingForInput", "gen-b"));
+
+            let mut h = hydrated("1", "a-1", None, None);
+            h.live = listed("a-1", "Working", "gen-a")[0].live.clone();
+            h.incarnation = named(attached_on);
+            seed_hydrated_card(&mut st, &h);
+
+            let cards = st
+                .sessions
+                .values()
+                .filter(|card| card.pane_id.as_deref() == Some("1"))
+                .map(|card| {
+                    (
+                        card.status.clone(),
+                        card.agent_id.clone(),
+                        card.incarnation.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                cards,
+                vec![(
+                    SessionStatus::WaitingForInput,
+                    Some("b-1".to_string()),
+                    named("b"),
+                )],
+                "{attached_on}: the delayed hydration changed b's card"
+            );
+            assert_eq!(
+                st.pane_hook_session_id("1").as_deref(),
+                Some("gen-b"),
+                "{attached_on}: the delayed hydration took the pane's generation"
+            );
+            let drops = st.take_restart_drops();
+            if attached_on == "a" {
+                assert_eq!(drops.len(), 1, "a's card was not queued");
+                assert_eq!(drops[0].agent_id.as_deref(), Some("a-1"));
+            } else {
+                assert!(drops.is_empty(), "a held card was queued as stale");
+            }
+        }
+    }
+
     #[test]
     fn partition_routes_dashboard_panes_unchanged() {
         let panes = vec![

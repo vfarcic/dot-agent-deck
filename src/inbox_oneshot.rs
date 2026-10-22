@@ -983,8 +983,9 @@ pub fn report_foreign_socket() {
 /// Whether this process said [`RECEIPTS_UNSUPPORTED`], [`RECEIPTS_TIMED_OUT`],
 /// [`RECEIPTS_COMMIT_TIMED_OUT`], [`RECEIPTS_CONNECTION_LOST`],
 /// [`RECEIPTS_COMMIT_UNSUPPORTED`], [`RECEIPTS_COMMIT_CONNECTION_LOST`] or
-/// [`RECEIPTS_FOREIGN_SOCKET`]: a one-shot that did any of them took
-/// nothing, and a later phase of the same hook asks nothing more.
+/// [`RECEIPTS_FOREIGN_SOCKET`]: the phase that said one took no further
+/// mail (a commit's prompt already carries the message the waiter took), and
+/// a later phase of the same hook asks nothing more.
 pub fn reported_refusal() -> bool {
     reported_unsupported()
         || reported_timed_out()

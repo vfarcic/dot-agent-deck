@@ -8869,7 +8869,9 @@ impl AppState {
     /// opens on another one ([`Self::learn_stream_incarnation`]). Bound to no
     /// process, a later resync on the named stream would skip it. With a named
     /// stream open it is [`Self::insert_placeholder_session_learned`]'s to
-    /// draw, hold or queue as stale.
+    /// draw, hold or queue as stale; the snapshot and its hook generation then
+    /// reach only a card of this agent learned from `learned_from`, never a
+    /// successor's card that holds the key by now.
     pub fn seed_hydrated_session_learned(
         &mut self,
         pane_id: String,
@@ -8901,19 +8903,28 @@ impl AppState {
                 pane_id.clone(),
                 cwd,
                 effective_agent_type,
-                agent_id,
-                learned_from,
+                agent_id.clone(),
+                learned_from.clone(),
             )
         } else {
             self.insert_placeholder_session_learned(
                 pane_id.clone(),
                 cwd,
                 effective_agent_type,
-                agent_id,
-                learned_from,
+                agent_id.clone(),
+                learned_from.clone(),
             )
         };
         let Some(snap) = live else { return };
+        // PR #1817 review 4347247784: a stale or held placeholder's key is
+        // answered all the same, and may hold a successor's card by now. The
+        // snapshot, and the generation it carries, describe this attach's
+        // agent, so they reach only a card of that agent and process.
+        if !self.sessions.get(&session_id).is_some_and(|session| {
+            session.agent_id == agent_id && session.incarnation == learned_from
+        }) {
+            return;
+        }
         // The overlay below can push a live-target carrier onto the card's
         // journal outside the accounted path; recount it at the next pass.
         self.forget_unproven_journal_count(&session_id);
