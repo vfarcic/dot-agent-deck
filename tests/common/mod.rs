@@ -11947,15 +11947,42 @@ pub fn claude_session_start_line(bin: &str, session_id: &str) -> String {
     )
 }
 
+/// The command that draws [`CLAUDE_PROMPT_FRAME`]'s box, once.
+macro_rules! claude_prompt_draw {
+    () => {
+        "printf '%s\\n❯\\n%s\\n' '────────────────────' '────────────────────'"
+    };
+}
+
 /// PRD #1666 part 2: a shell line that draws Claude Code's empty prompt box
 /// the way 2.1.300 does (a rule, the `❯` marker, a rule), for a stand-in that
 /// plays Claude Code. Claude Code posts its `SessionStart` before that box is
 /// up, so the doorbell rings a generation that has only started once
 /// `dot_agent_deck::agent_registry::claude_prompt_on_screen` finds it; a
 /// stand-in that reports only `SessionStart` draws it after, as the agent does.
+///
+/// It also repaints the box in place on `SIGWINCH`, as Claude Code does: a
+/// resize clears the daemon's copy of the pane's output (the attach that sizes
+/// a new pane is one), so a box drawn before it is no longer there for the
+/// doorbell to find. Drawn once only, the box was lost whenever the attach's
+/// resize landed after it, and the first prompt was never rung
+/// (`scheduler/form/007`, red on PR #1817).
+///
+/// The repaint runs in a background subshell parked in `wait`, because `sh`
+/// runs a trap only once its current command returns, and the stand-ins spend
+/// their life blocked in `read`; `wait` is interrupted by a trapped signal. As
+/// an asynchronous list of a shell without job control, the subshell shares the
+/// terminal's foreground process group, so it is sent both the `SIGWINCH` and
+/// the hangup that ends it when the pane closes. It also ends within a second
+/// of the stand-in's own exit (`$$` is the stand-in's shell), so a stand-in that
+/// exits by itself does not leave it holding the pane open.
 #[allow(dead_code)]
-pub const CLAUDE_PROMPT_FRAME: &str =
-    "printf '%s\\n❯\\n%s\\n' '────────────────────' '────────────────────'\n";
+pub const CLAUDE_PROMPT_FRAME: &str = concat!(
+    claude_prompt_draw!(),
+    "\n( trap \"printf '\\033[H\\033[2J'; ",
+    claude_prompt_draw!(),
+    "\" WINCH; while kill -0 $$ 2>/dev/null; do sleep 1 & wait $!; done ) &\n"
+);
 
 /// The [`write_late_announcing_agent`] log line meaning "my PTY input queue was
 /// EMPTY at the instant I announced myself" — i.e. nothing was written before an
