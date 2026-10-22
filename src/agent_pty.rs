@@ -10767,7 +10767,8 @@ impl AgentPtyRegistry {
         // by its own hooks gets no byte unless the screen shows it is: its
         // agent's prompt for one that only started, its composer gate below
         // for one with no report at all, and nothing for an agent with
-        // neither. Read once, under the writer, before the first step.
+        // neither. Read under the writer before the first step; the prompt is
+        // read again before each step (below).
         match ready {
             DoorbellReady::Ready => {}
             DoorbellReady::Screen(prompt) => match self.screen_rows(expected_agent_id).await {
@@ -10836,14 +10837,29 @@ impl AgentPtyRegistry {
             // pre-ring CR, the line, its submit and a cleanup CR — and after
             // the wait between steps, so a dialog or a turn that started, or
             // (part 2, `inbox/doorbell/031`) the ring's own message leaving the
-            // queue, stops what is left. A human frame that arrived while this
-            // write holds the writer is queued behind it: the keystroke is not
-            // in the draft tracker yet, so it is asked for separately, and the
-            // remaining steps are left to the user.
-            if self.human_frame_in_flight(pane_id)
-                || self.draft_pending(pane_id)
-                || !still_admitted().await
+            // queue, stops what is left.
+            if !still_admitted().await {
+                return withdrawn(n);
+            }
+            // PR #1817 review 4348580010: a generation admitted on its screen
+            // is admitted on it again before every step. Its agent can replace
+            // the prompt with a dialog and report nothing, which the admission
+            // above does not see.
+            if let DoorbellReady::Screen(prompt) = ready
+                && !self
+                    .screen_rows(expected_agent_id)
+                    .await
+                    .is_some_and(|(rows, _)| prompt(&rows))
             {
+                return withdrawn(n);
+            }
+            // A human frame that arrived while this write holds the writer is
+            // queued behind it: the keystroke is not in the draft tracker yet,
+            // so it is asked for separately, and the remaining steps are left
+            // to the user. Asked last, with nothing awaited between it and the
+            // write (review 4348580021), so a frame that arrived during the
+            // awaits above is seen.
+            if self.human_frame_in_flight(pane_id) || self.draft_pending(pane_id) {
                 return withdrawn(n);
             }
             match sink.write_tracked(bytes).await {
@@ -20195,6 +20211,106 @@ mod spawn_tests {
             String::from_utf8_lossy(bytes),
             snap.len()
         );
+    }
+
+    /// Scenario: a `cat` pane shows Claude Code's empty prompt box, and a doorbell for a generation that has only started (so it waits for that box on screen) types its line; before its Enter, the pane's screen is replaced by a start dialog with no hook event. The Enter is withheld and the write reports its line typed but not submitted; with the box left in place, the same write submits (control).
+    #[spec("inbox/doorbell/033")]
+    #[tokio::test]
+    async fn doorbell_033_a_dialog_replacing_the_prompt_between_steps_withholds_the_rest() {
+        const FRAME: &str = "────────\r\n❯\r\n────────\r\n";
+        const DIALOG: &[u8] =
+            b"\x1b[2J\x1b[HDo you trust the files in this folder?\r\n> 1. Yes\r\n";
+        for replaced in [true, false] {
+            let pane = format!("pane-doorbell-screen-{replaced}");
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let id = registry
+                .spawn_agent(SpawnOptions {
+                    command: Some("/bin/cat"),
+                    env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                        DOT_AGENT_DECK_PANE_ID.to_string(),
+                        pane.clone(),
+                    )]),
+                    ..SpawnOptions::default()
+                })
+                .expect("spawn the doorbell's pane");
+            let bus = Arc::clone(&registry.inner.lock().unwrap().agents[&id].bus);
+            bus.push(FRAME.as_bytes().to_vec());
+            let checks = AtomicUsize::new(0);
+            let outcome = registry
+                .write_doorbell_when_ready(
+                    &pane,
+                    &id,
+                    DoorbellReady::Screen(crate::agent_registry::claude_prompt_on_screen),
+                    false,
+                    None,
+                    Some("RING"),
+                    || async {
+                        // The second step's re-check: the line is in, its
+                        // Enter is next.
+                        if replaced && checks.fetch_add(1, Ordering::SeqCst) == 1 {
+                            bus.push(DIALOG.to_vec());
+                        }
+                        true
+                    },
+                )
+                .await;
+            let expected = if replaced {
+                DoorbellWrite::Cancelled {
+                    steps_written: 1,
+                    line_typed: true,
+                }
+            } else {
+                DoorbellWrite::Written
+            };
+            assert_eq!(outcome, expected, "replaced={replaced}");
+            registry.shutdown_all();
+        }
+    }
+
+    /// Scenario: a doorbell writes its line into a `cat` pane, and a human input frame for that pane arrives while the doorbell awaits its admission re-check for the first step. The doorbell writes nothing and reports itself not admitted; once the frame is gone, the next doorbell is written (control).
+    #[spec("inbox/doorbell/032")]
+    #[tokio::test]
+    async fn doorbell_032_a_human_frame_during_the_admission_recheck_withholds_the_step() {
+        const PANE: &str = "pane-doorbell-human";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    PANE.to_string(),
+                )]),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the doorbell's pane");
+        let arrived = std::sync::Mutex::new(None);
+        let outcome = registry
+            .write_doorbell(PANE, &id, false, None, Some("TYPEDAHEAD"), || async {
+                let mut arrived = arrived.lock().unwrap();
+                if arrived.is_none() {
+                    *arrived = Some(registry.human_frame_arriving(PANE));
+                }
+                true
+            })
+            .await;
+        assert_eq!(
+            outcome,
+            DoorbellWrite::NotAdmitted,
+            "a human frame that arrived during the re-check must stop the step"
+        );
+        drop(arrived);
+        let control = registry
+            .write_doorbell(PANE, &id, false, None, Some("CONTROL"), || async { true })
+            .await;
+        assert_eq!(control, DoorbellWrite::Written, "control");
+        crate::test_pty_wait::wait_for_echo_bytes(&registry, &id, b"CONTROL").await;
+        let snapshot = registry.snapshot(&id).expect("pane snapshot");
+        assert!(
+            !String::from_utf8_lossy(&snapshot).contains("TYPEDAHEAD"),
+            "the doorbell typed ahead of the human frame: {:?}",
+            String::from_utf8_lossy(&snapshot)
+        );
+        registry.shutdown_all();
     }
 
     /// PRD #882 — the policy itself: two viewers of different sizes leave the

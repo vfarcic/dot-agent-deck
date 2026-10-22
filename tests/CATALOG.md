@@ -8811,6 +8811,22 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** a real editor's startup buffering, or settlement atomic with an already-enqueued PTY-thread write. E2E barriers use a configured single directory whose canonical target is checked under HOME; the harness supplies the isolated HOME and trusted filesystem, including marker leaves. These checks do not enforce no-symlink-escape confinement. Armed waits time out after eight seconds, and a test-only unwind guard clears busy slots; ordinary interleave fixtures share a six-second operation budget and release barriers on unwind. Between-step barriers retain the pane writer; completion barriers do not. Processes with fixture access can manipulate its files; these are not process-local barriers.
 - **Platform coverage:** mac+linux.
 
+##### inbox/doorbell/032 — A human frame arriving during the admission re-check stops the step.
+- **Layer:** Fast (`src/agent_pty.rs`, `spawn_tests`), the registry's doorbell write against a real `cat` PTY.
+- **Agent:** none (`cat`).
+- **Asserts:** a human input frame that starts arriving while the doorbell awaits its admission re-check for a step is seen before that step's bytes are written: the write reports `NotAdmitted` and the line never reaches the pane; with the frame gone, the next doorbell is written (control).
+- **Does not assert:** a frame that arrives after the last check, which waits behind the write for the pane's writer (inbox/doorbell/031 covers the frames between steps).
+- **Platform coverage:** mac+linux.
+- **Cost:** none.
+
+##### inbox/doorbell/033 — A prompt replaced between steps stops what is left of the ring.
+- **Layer:** Fast (`src/agent_pty.rs`, `spawn_tests`), the registry's doorbell write against a real `cat` PTY, with the pane's output fed directly.
+- **Agent:** none (`cat`), read with Claude Code's prompt recogniser.
+- **Asserts:** for a generation that waits for its prompt on screen, a screen that stops showing the prompt between the line and its Enter, with no hook event, withholds the Enter and reports the line typed but not submitted; with the prompt left in place, the same write submits (control).
+- **Does not assert:** a real agent's dialog, or a screen that changes after the last step's check.
+- **Platform coverage:** mac+linux.
+- **Cost:** none.
+
 #### inbox/boundary
 
 ##### inbox/boundary/001 — The legacy ack-wait touches only legacy-owned assignments.
