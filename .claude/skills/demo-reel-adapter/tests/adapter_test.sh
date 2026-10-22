@@ -34,6 +34,11 @@
 #         test still says "no e2e tests changed"; a reel built from the other
 #         changed tests warns that the unrecorded one is missing; and a skip
 #         after assembly still counts the unrecorded one;
+#   (vii) `build.sh title` on a `prd-<n>` branch with no prds/<n>-*.md takes the
+#         description from the PRD issue's title through a stub `gh` (issue
+#         #1821), strips its prefix and control characters without evaluating
+#         it, falls back to "demo reel" when gh fails, and still prefers a
+#         prds/ file when one exists;
 #   (v)   the CAST PROVENANCE gate (issue #808) refuses a clip whose sidecar is
 #         absent, corrupt, of an unknown schema, missing a required field,
 #         recorded at a different commit, or recorded from a non-passing run —
@@ -609,5 +614,58 @@ says "further e2e test(s) have no recording at all" "$out10" \
   || fail "(vi) the skip must still count the unrecorded test; got: '$out10'"
 says "epsilon" "$out10" || fail "(vi) the skip must name the unrecorded test; got: '$out10'"
 echo "PASS (vi): changed e2e tests with no recording are counted, named and given the DOT_AGENT_DECK_RECORD=1 remedy"
+
+# --- (vii) the title's <short desc> when there is no prds/ file (issue #1821) ---
+# Since issue #1591 a PRD lives in its issue and has no prds/<n>-*.md, so the
+# description falls back to the issue title. A stub `gh` on PATH stands in for
+# GitHub (no network); `build.sh title` prints the composed title and nothing
+# else. The branch name is what supplies the PRD number.
+GH_BIN="$TMP/gh-bin"
+GH_LOG="$TMP/gh.log"
+mkdir -p "$GH_BIN"
+cat > "$GH_BIN/gh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$GH_LOG"
+if [[ "$1 $2" == "issue view" && -z "${GH_STUB_FAIL:-}" ]]; then
+  printf '%s\n' "$GH_STUB_TITLE"
+  exit 0
+fi
+exit 1
+STUB
+chmod +x "$GH_BIN/gh"
+export GH_LOG
+title_on() { (cd "$REPO" && PATH="$GH_BIN:$PATH" "$BUILD" title); }
+
+git -C "$REPO" checkout -q -b prd-4242-title mainline
+
+# (vii-a) no file: the issue title, minus its 'PRD: ' prefix.
+rm -f "$GH_LOG"
+t="$(GH_STUB_TITLE='PRD: Stubbed issue title' title_on)"
+[[ "$t" == "repo · PRD #4242 — Stubbed issue title" ]] \
+  || fail "(vii-a) with no prds/ file the description must come from the issue title; got: '$t'"
+says "issue view 4242" "$(cat "$GH_LOG")" || fail "(vii-a) the issue looked up must be the branch's PRD; gh calls: $(cat "$GH_LOG")"
+
+# (vii-b) a 'PRD #<n>:' prefix is stripped too, and a title is text, never code:
+# control characters go, and shell syntax is printed rather than run.
+t="$(GH_STUB_TITLE=$'PRD #4242: Run $(touch '"$TMP"$'/pwned) `id`\tnow\r' title_on)"
+[[ "$t" == "repo · PRD #4242 — Run \$(touch $TMP/pwned) \`id\`now" ]] \
+  || fail "(vii-b) the title must be stripped of its prefix and control characters and kept verbatim otherwise; got: '$t'"
+[[ ! -e "$TMP/pwned" ]] || fail "(vii-b) the issue title was evaluated as shell"
+
+# (vii-c) gh failing (offline, no auth, no such issue) still yields a title.
+t="$(GH_STUB_FAIL=1 title_on)"
+[[ "$t" == "repo · PRD #4242 — demo reel" ]] || fail "(vii-c) a failed lookup must fall back to 'demo reel'; got: '$t'"
+
+# (vii-d) a prds/ file still wins, and GitHub is not asked.
+mkdir -p "$REPO/prds"
+printf '# PRD #4242: From the file\n\nbody\n' > "$REPO/prds/4242-title.md"
+rm -f "$GH_LOG"
+t="$(GH_STUB_TITLE='PRD: From the issue' title_on)"
+rm -rf "$REPO/prds"
+[[ "$t" == "repo · PRD #4242 — From the file" ]] || fail "(vii-d) a prds/ file must still win over the issue title; got: '$t'"
+if says "issue view" "$(cat "$GH_LOG" 2>/dev/null)"; then
+  fail "(vii-d) with a prds/ file the issue must not be looked up; gh calls: $(cat "$GH_LOG")"
+fi
+echo "PASS (vii): the reel description falls back to the PRD issue title (prefix and control characters stripped, never evaluated), then to 'demo reel'; a prds/ file still wins"
 
 echo "ADAPTER TEST PASS"
