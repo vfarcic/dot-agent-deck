@@ -681,7 +681,7 @@ reason = "Confirmation dialog Cancel: a dismissal, not a capability."
 [[site]]
 file = "desktop/src/components/ConfirmDialog.tsx"
 handler = "onClick"
-code = "() => { setBusy(true); void state.action().finally(onClose); }"
+code = "confirm"
 reason = "Confirmation dialog Confirm button: runs the destructive action the opener staged. Kept manual by design: voice raises the same confirmation (`stop_agent`, `close_orchestration`) and the user confirms it by hand."
 
 # --- desktop/src/components/DeckSelector.tsx ---

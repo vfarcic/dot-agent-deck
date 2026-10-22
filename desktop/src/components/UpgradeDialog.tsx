@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Check, CircleArrowUp, CircleStop, LoaderCircle, RefreshCw, ShieldAlert } from "lucide-react";
 
+import { OVERLAY_LAYER, useInertBackground } from "../hooks/useInertBackground";
 import type { DeckRuntimeState } from "../types";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import {
@@ -26,6 +27,11 @@ export interface UpgradeTarget {
   /** The crate's offer, for the versions the confirmation names. Absent for Replace daemon. */
   offer?: UpgradeOffer;
 }
+
+/** Why voice's "close" leaves the dialog up while the upgrade runs (issue #1709). */
+export const UPGRADE_RUNNING_CLOSE_BLOCKED = "The upgrade is still running. The dialog can be closed once it has finished.";
+/** Why it leaves the dialog up while an answer to its question is on its way. */
+export const UPGRADE_ANSWERING_CLOSE_BLOCKED = "Your answer is on its way. The dialog can be closed once it has arrived.";
 
 /** Which question an answer is for: the run, and the question within it. */
 type QuestionRef = Pick<UpgradeDecisionEvent, "upgradeId" | "questionId">;
@@ -148,10 +154,16 @@ export function UpgradeDialog({ target, runtime, onClose, autoStart = false }: {
     );
   };
 
+  /* On the overlay stack (issue #1709): the rest of the window is fenced, and
+     voice's "close" is `dismiss` below — a Keep while a question is open, and
+     nothing while the upgrade is running — rather than closing whatever this
+     is drawn over. Declared before `dismiss`, so it reads the one declared
+     below through a call. */
+  const section = useInertBackground<HTMLElement>(true, OVERLAY_LAYER.dialog, () => dismiss());
+
   /* Focus inside the dialog from the start, so Escape and Tab reach it: an
      autoStart dialog opens in its running phase, with no button to take it,
      over whatever had focus (Qodo, PR #1640). A button that autofocused keeps it. */
-  const section = useRef<HTMLElement>(null);
   useEffect(() => {
     const element = section.current;
     if (element && !element.contains(document.activeElement)) element.focus();
@@ -198,14 +210,18 @@ export function UpgradeDialog({ target, runtime, onClose, autoStart = false }: {
     );
   };
 
-  /** Escape, a click outside, or the dialog's own close. Never a restart. */
-  const dismiss = () => {
-    if (state.phase === "running") return; // nothing to answer, and it is still working
+  /**
+   * Escape, a click outside, voice's "close", or the dialog's own close. Never
+   * a restart. Answers why when it stays up, for voice to say.
+   */
+  const dismiss = (): string | undefined => {
+    if (state.phase === "running") return UPGRADE_RUNNING_CLOSE_BLOCKED; // nothing to answer, and it is still working
     if (state.phase === "deciding") {
-      if (state.answering) return; // an answer is on its way; let it land
+      if (state.answering) return UPGRADE_ANSWERING_CLOSE_BLOCKED; // an answer is on its way; let it land
       answer(state.question, "keep-current");
     }
     onClose();
+    return undefined;
   };
 
   const title = state.phase === "confirm"

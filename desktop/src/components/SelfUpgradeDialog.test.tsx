@@ -2,7 +2,8 @@ import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { SelfCopy, SelfUpgradeApi, SelfUpgradeCheck, SelfUpgradePlan, SelfUpgradeResult } from "../lib/selfUpgrade";
-import { SelfUpgradeDialog } from "./SelfUpgradeDialog";
+import { topmostOverlayClose } from "../hooks/useInertBackground";
+import { SELF_UPGRADE_RUNNING_CLOSE_BLOCKED, SelfUpgradeDialog } from "./SelfUpgradeDialog";
 
 /* Plans in the crate's own words (`src/self_upgrade/plan.rs`), as
    `desktop_self_upgrade_check` serializes them. */
@@ -462,5 +463,21 @@ describe("SelfUpgradeDialog", () => {
     expect(screen.getByTestId("self-upgrade-dialog")).not.toHaveAttribute("inert");
     rerender(<><button data-testid="rail">Daemons</button></>);
     expect(screen.getByTestId("rail")).not.toHaveAttribute("inert");
+  });
+
+  /** Scenario: issue #1709 — voice's "close" is refused with a sentence while a copy is upgrading, and once it has finished closes the dialog as Escape does, reporting the result. */
+  it("self_upgrade_dialog_018 answers voice's close as Escape does", async () => {
+    const { api, finish } = controlledApi();
+    const onClose = vi.fn();
+    render(<SelfUpgradeDialog copies={["cli"]} check={checkOf(APP_SWAP, CLI_BREW)} api={api} onClose={onClose} />);
+    fireEvent.click(screen.getByTestId("self-upgrade-start"));
+    let refused: string | void = undefined;
+    act(() => { refused = topmostOverlayClose()?.(); });
+    expect(refused).toBe(SELF_UPGRADE_RUNNING_CLOSE_BLOCKED);
+    expect(onClose).not.toHaveBeenCalled();
+
+    await finish({ ...BREWED, ok: false, installed: false });
+    act(() => { topmostOverlayClose()?.(); });
+    expect(onClose).toHaveBeenLastCalledWith({ installed: false });
   });
 });

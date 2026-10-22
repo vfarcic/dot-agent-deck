@@ -2,8 +2,9 @@ import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { StrictMode } from "react";
 import { describe, expect, it, vi } from "vitest";
 
+import { topmostOverlayClose } from "../hooks/useInertBackground";
 import type { UpgradeEvent, UpgradeOutcome, UpgradeStopSet } from "../lib/upgrade";
-import { UpgradeDialog, type UpgradeTarget } from "./UpgradeDialog";
+import { UPGRADE_RUNNING_CLOSE_BLOCKED, UpgradeDialog, type UpgradeTarget } from "./UpgradeDialog";
 
 const TARGET: UpgradeTarget = { deckId: "deck-remote", deckName: "build-box", kind: "upgrade", offer: { kind: "offered", from: "0.44.0", to: "0.45.0" } };
 const LOCAL_TARGET: UpgradeTarget = { deckId: "deck-local", deckName: "Local daemon", kind: "local-upgrade", offer: { kind: "offered", from: "0.44.0", to: "0.45.0" } };
@@ -373,6 +374,38 @@ describe("UpgradeDialog", () => {
     fireEvent.click(screen.getByTestId("upgrade-cancel"));
     expect(onClose).toHaveBeenCalledTimes(1);
     expect(runtime.upgradeDaemon).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Scenario: issue #1709 — the dialog is on the overlay stack: the window
+   * behind it is inert, and voice's "close" is Cancel on the confirmation,
+   * refused with a sentence while the upgrade runs, and Keep current daemon on
+   * the question.
+   */
+  it("fences the window and answers voice's close as Escape does", () => {
+    const { runtime, emit } = controlledRuntime();
+    const onClose = vi.fn();
+    const { unmount } = render(<><button data-testid="rail">Daemons</button><UpgradeDialog target={TARGET} runtime={runtime} onClose={onClose} /></>);
+    expect(screen.getByTestId("rail")).toHaveAttribute("inert");
+    expect(screen.getByTestId("upgrade-dialog")).not.toHaveAttribute("inert");
+    act(() => { topmostOverlayClose()?.(); });
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(runtime.upgradeDaemon).not.toHaveBeenCalled();
+    unmount();
+
+    const closed = vi.fn();
+    render(<UpgradeDialog target={TARGET} runtime={runtime} onClose={closed} />);
+    fireEvent.click(screen.getByTestId("upgrade-start"));
+    emit(progress("installing"));
+    let refused: string | void = undefined;
+    act(() => { refused = topmostOverlayClose()?.(); });
+    expect(refused).toBe(UPGRADE_RUNNING_CLOSE_BLOCKED);
+    expect(closed).not.toHaveBeenCalled();
+
+    emit(decision);
+    act(() => { topmostOverlayClose()?.(); });
+    expect(runtime.decideUpgrade).toHaveBeenCalledWith("upgrade-1", 1, "keep-current");
+    expect(closed).toHaveBeenCalledTimes(1);
   });
 
   /** Scenario: Replace daemon on the local deck is worded as a replacement, not an install. */
