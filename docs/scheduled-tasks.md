@@ -184,7 +184,7 @@ A failure on one issue (a `gh` error, a worktree error) is reported and the run 
 
 ### Claims on GitHub
 
-Each dispatched issue is marked on GitHub, so anyone reading the repository's issue list can see an agent is working on it before a pull request exists:
+The deck tries to mark each dispatched issue on GitHub, so anyone reading the repository's issue list can see an agent is working on it before a pull request exists:
 
 - **The `agent-deck/claimed` label** is added to the issue. If the repository does not have that label yet, the run creates it first; if it already exists, its colour and description are reset to the deck's.
 - **One claim comment** on the issue, posted by the account `gh` is signed in with, names the schedule and a machine id for the machine that dispatched it. When the same schedule on the same machine, signed in as the same account, dispatches that issue again later, it updates its comment instead of posting another one. A copy of that comment posted by anyone else is left alone.

@@ -432,8 +432,12 @@ pub fn find_own_claim_record(
     Ok(own)
 }
 
-/// The longest claim diagnostic, in characters, that reaches a notification or
-/// the log; the rest is cut with a note of the full length.
+/// The character budget of a claim diagnostic BEFORE escaping: longer text is
+/// cut to this many characters, with a note of the full length. Escaping comes
+/// after the cut, and each control or bidi character it escapes grows into a
+/// sequence of up to eight characters, so the text that reaches a notification
+/// or the log can be longer than this — still bounded, and never split inside
+/// an escape sequence.
 const MAX_CLAIM_ERROR_CHARS: usize = 500;
 
 /// Make a claim diagnostic safe to put in a notification or the log (PRD #421
@@ -442,13 +446,16 @@ const MAX_CLAIM_ERROR_CHARS: usize = 500;
 ///
 /// - token-shaped strings (`ghp_…`, `gho_…`, `ghu_…`, `ghs_…`, `ghr_…`,
 ///   `github_pat_…`) are replaced with `<redacted>` — first, so that cutting
-///   the text short cannot leave half a token behind;
-/// - the text is capped at [`MAX_CLAIM_ERROR_CHARS`];
+///   the text short cannot leave half a token behind. A prefix is matched
+///   wherever it appears, including glued to the word before it
+///   (`token_ghp_…`), so an ordinary word that happens to contain one is
+///   redacted too: over-redacting a diagnostic costs less than leaking a token;
+/// - the text is cut to [`MAX_CLAIM_ERROR_CHARS`] characters;
 /// - control characters (C0 including ESC, BEL and CR, DEL, C1) and bidi
 ///   overrides are escaped, so the text cannot forge or rewrite a log line.
 pub fn sanitize_claim_error(text: &str) -> String {
     static TOKEN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+")
+        regex::Regex::new(r"(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+")
             .expect("the token pattern is valid")
     });
     let redacted = TOKEN.replace_all(text, "<redacted>");
@@ -1074,12 +1081,24 @@ mod tests {
             "capped: {} chars",
             clean.chars().count()
         );
-        // Every gh token prefix is redacted; a word merely containing one is not.
+        // Every gh token prefix is redacted.
         for prefix in ["ghp_", "gho_", "ghu_", "ghs_", "ghr_"] {
             let text = format!("x {prefix}abc123 y");
             assert_eq!(sanitize_claim_error(&text), "x <redacted> y");
         }
-        assert_eq!(sanitize_claim_error("xghp_abc"), "xghp_abc");
+        // A token glued to the word before it — by an underscore, a letter, a
+        // digit or a non-ASCII letter — is redacted all the same; only the
+        // prefix word survives.
+        for (text, expected) in [
+            ("xghp_abc", "x<redacted>"),
+            ("token_ghp_abc123 y", "token_<redacted> y"),
+            ("prefixgithub_pat_11AB_cd y", "prefix<redacted> y"),
+            ("id7gho_abc y", "id7<redacted> y"),
+            ("cléghs_abc y", "clé<redacted> y"),
+            ("令牌ghr_abc y", "令牌<redacted> y"),
+        ] {
+            assert_eq!(sanitize_claim_error(text), expected, "{text}");
+        }
         assert_eq!(sanitize_claim_error("plain error"), "plain error");
     }
 

@@ -1387,6 +1387,17 @@ const CLAIM_CALL_TIMEOUT_ENV: &str = "DOT_AGENT_DECK_ISSUE_CLAIM_TIMEOUT_MS";
 /// stays bounded in the daemon's memory.
 const CLAIM_COMMENTS_MAX_BYTES: usize = 8 * 1024 * 1024;
 
+/// The most any other claim call may print on stdout before it is killed. What
+/// those calls print is one small JSON object (the account, the written
+/// comment), a line, or nothing, so this is far above any real answer.
+const CLAIM_CALL_MAX_BYTES: usize = 256 * 1024;
+
+/// How much of a claim call's stderr is kept for its diagnostic; the rest is
+/// read and discarded (see [`OutputCaps::stderr`]). The diagnostic built from it
+/// is cut much shorter still ([`crate::issue_dispatch::sanitize_claim_error`]),
+/// so this only bounds what the daemon holds while the call runs.
+const CLAIM_STDERR_MAX_BYTES: usize = 64 * 1024;
+
 /// [`CLAIM_CALL_TIMEOUT`], or the [`CLAIM_CALL_TIMEOUT_ENV`] override when it
 /// holds a positive number of milliseconds.
 fn claim_call_timeout_from(value: Option<&str>) -> Duration {
@@ -1450,7 +1461,7 @@ async fn claim_issue(
             &crate::issue_dispatch::claim_label_provision_argv(repo),
             "creating the label",
             run.bound,
-            None,
+            CLAIM_CALL_MAX_BYTES,
         )
         .await
         .map(drop);
@@ -1469,7 +1480,7 @@ async fn claim_issue(
         &crate::issue_dispatch::claim_issue_argv(repo, issue),
         "adding the label",
         run.bound,
-        None,
+        CLAIM_CALL_MAX_BYTES,
     )
     .await
     .err()
@@ -1520,7 +1531,7 @@ async fn write_claim_record(
             &authenticated_user_argv(),
             "looking up the signed-in GitHub account",
             run.bound,
-            None,
+            CLAIM_CALL_MAX_BYTES,
         )
         .await
         .and_then(|json| parse_authenticated_user_id(&json).map_err(|e| sanitize_claim_error(&e)));
@@ -1531,7 +1542,7 @@ async fn write_claim_record(
         &issue_comments_argv(repo, issue),
         "reading the issue's comments",
         run.bound,
-        Some(CLAIM_COMMENTS_MAX_BYTES),
+        CLAIM_COMMENTS_MAX_BYTES,
     )
     .await?;
     let own = find_own_claim_record(&comments, task_name, &run.host_id, user_id)
@@ -1542,7 +1553,7 @@ async fn write_claim_record(
             &edit_claim_record_argv(repo, id, &body),
             "editing the claim comment",
             run.bound,
-            None,
+            CLAIM_CALL_MAX_BYTES,
         )
         .await
         .map(drop),
@@ -1550,7 +1561,7 @@ async fn write_claim_record(
             &create_claim_record_argv(repo, issue, &body),
             "posting the claim comment",
             run.bound,
-            None,
+            CLAIM_CALL_MAX_BYTES,
         )
         .await
         .map(drop),
@@ -1558,7 +1569,8 @@ async fn write_claim_record(
 }
 
 /// Run one `gh` call of the claim within `bound` and return its stdout, killing
-/// the call if it prints more than `max_stdout` bytes. Its error names the
+/// the call if it prints more than `max_stdout` bytes; at most
+/// [`CLAIM_STDERR_MAX_BYTES`] of its stderr are kept. Its error names the
 /// step (`what`) instead of echoing the argv, which for a comment write carries
 /// the whole multi-line body, is folded onto one line so the notification
 /// built from it stays a single line, and is sanitised
@@ -1568,7 +1580,7 @@ async fn gh_claim_call(
     argv: &[String],
     what: &str,
     bound: Duration,
-    max_stdout: Option<usize>,
+    max_stdout: usize,
 ) -> Result<String, String> {
     use crate::issue_dispatch::sanitize_claim_error;
     let args: Vec<&str> = argv.iter().map(String::as_str).collect();
@@ -1578,7 +1590,10 @@ async fn gh_claim_call(
         "gh",
         &args,
         bound,
-        max_stdout,
+        OutputCaps {
+            stdout: Some(max_stdout),
+            stderr: Some(CLAIM_STDERR_MAX_BYTES),
+        },
     )
     .await
     {
@@ -1595,8 +1610,7 @@ async fn gh_claim_call(
             bound.as_secs_f64()
         )),
         Err(error) if is_subprocess_overflow(&error) => Err(format!(
-            "{what} failed: its output passed {} bytes and the call was killed",
-            max_stdout.unwrap_or_default()
+            "{what} failed: its output passed {max_stdout} bytes and the call was killed"
         )),
         Err(error) => Err(sanitize_claim_error(&format!(
             "{what} failed: {}",
@@ -2461,10 +2475,21 @@ fn is_subprocess_timeout(err: &str) -> bool {
 /// has no process-group kill in this code, so there the direct child alone is
 /// killed.
 ///
+/// **The direct child is not reaped until both pipes have been drained.** The
+/// run reads stdout and stderr to end-of-file first, and only then waits for
+/// the child. So whenever the group is signalled — on a timeout, on an
+/// overflow, or because the caller dropped the run part-way — the child is
+/// still unreaped, a zombie at worst, and its pid, which is the group's id,
+/// cannot have been reissued: the signal reaches this command's group and no
+/// other, including when the child exited early and a backgrounded descendant
+/// still holds a pipe open. Waiting alongside the drains instead would let the
+/// child be reaped first, leaving either a stale id to signal or no id at all
+/// and the descendant running.
+///
 /// The `.output()`-equivalent defaults are set explicitly because `spawn` does
 /// not imply them: stdin is `/dev/null`, so nothing can block reading it, and
-/// both output streams are captured. The whole run — the exit AND the two
-/// pipes draining — sits under the bound, so a descendant that keeps a pipe
+/// both output streams are captured. The whole run — the two pipes draining
+/// and then the exit — sits under the bound, so a descendant that keeps a pipe
 /// open after the child exits cannot stretch the wait past it either.
 async fn output_within(
     cmd: tokio::process::Command,
@@ -2472,7 +2497,7 @@ async fn output_within(
     args: &[&str],
     bound: Duration,
 ) -> Result<std::process::Output, String> {
-    output_within_capped(cmd, program, args, bound, None).await
+    output_within_capped(cmd, program, args, bound, OutputCaps::UNBOUNDED).await
 }
 
 /// The prefix of the error [`output_within_capped`] returns when it killed a
@@ -2486,16 +2511,73 @@ fn is_subprocess_overflow(err: &str) -> bool {
     err.starts_with(SUBPROCESS_OVERFLOW_MARKER)
 }
 
-/// [`output_within`] with an optional cap on the bytes captured from stdout.
-/// A command that prints more than `max_stdout` is killed and reaped the way a
-/// timed-out one is, and reported with [`SUBPROCESS_OVERFLOW_MARKER`] — so a
-/// caller can never mistake a truncated capture for the whole output.
+/// How much of each output stream [`output_within_capped`] keeps. `None` keeps
+/// all of it.
+#[derive(Clone, Copy)]
+struct OutputCaps {
+    /// Past this many bytes of stdout the command is killed and reported with
+    /// [`SUBPROCESS_OVERFLOW_MARKER`]: stdout is the result, so a truncated
+    /// capture must never pass for the whole of it.
+    stdout: Option<usize>,
+    /// Past this many bytes of stderr the rest is read and discarded, and the
+    /// capture ends with a note of how many bytes were dropped. Stderr is only
+    /// ever a diagnostic, and a command that is merely chatty there (`gh` with
+    /// `GH_DEBUG` set) still succeeds.
+    stderr: Option<usize>,
+}
+
+impl OutputCaps {
+    /// Keep everything — what [`output_within`]'s callers get.
+    const UNBOUNDED: Self = Self {
+        stdout: None,
+        stderr: None,
+    };
+}
+
+/// The process group of a spawned command, `SIGKILL`ed when this is dropped
+/// unless [`GroupKill::disarm`] ran first — see [`output_within`] for why the
+/// id stays the command's own while this is armed. A no-op off Unix.
+struct GroupKill(Option<u32>);
+
+impl GroupKill {
+    fn kill(&self) {
+        let Some(pid) = self.0 else {
+            return;
+        };
+        #[cfg(unix)]
+        // SAFETY: kill(2) with a negative pid signals the process group
+        // `process_group(0)` created, whose id is the child's pid. SIGKILL has
+        // no failure mode beyond ESRCH/EPERM, both ignored: ESRCH means
+        // everything in it has already exited. Every holder of an armed guard
+        // keeps the child unreaped, so the id cannot name anybody else's group.
+        unsafe {
+            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+        }
+        #[cfg(not(unix))]
+        let _ = pid;
+    }
+
+    /// The child has been reaped, so its id is no longer this command's.
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for GroupKill {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// [`output_within`] with caps on the bytes captured from each stream (see
+/// [`OutputCaps`]). A command that prints more stdout than its cap is killed
+/// and reaped the way a timed-out one is.
 async fn output_within_capped(
     mut cmd: tokio::process::Command,
     program: &str,
     args: &[&str],
     bound: Duration,
-    max_stdout: Option<usize>,
+    caps: OutputCaps,
 ) -> Result<std::process::Output, String> {
     use std::process::Stdio;
     use tokio::io::AsyncReadExt;
@@ -2510,9 +2592,11 @@ async fn output_within_capped(
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to run `{program}`: {e}"))?;
-    let pid = child.id();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
+    // Declared after `child`, so it is dropped first: a run dropped part-way
+    // signals the group before dropping `child` can reap the leader.
+    let mut group = GroupKill(child.id());
 
     async fn drain(pipe: Option<impl tokio::io::AsyncRead + Unpin>) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -2545,62 +2629,71 @@ async fn output_within_capped(
         Ok(buf)
     }
 
+    /// [`drain`], keeping the first `cap` bytes and reading the rest to
+    /// end-of-file into nothing, so the command never blocks on a full pipe.
+    async fn drain_prefix(
+        pipe: Option<impl tokio::io::AsyncRead + Unpin>,
+        cap: Option<usize>,
+    ) -> Vec<u8> {
+        let Some(cap) = cap else {
+            return drain(pipe).await;
+        };
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let limit = u64::try_from(cap).unwrap_or(u64::MAX);
+            let _ = (&mut pipe).take(limit).read_to_end(&mut buf).await;
+            let discarded = tokio::io::copy(&mut pipe, &mut tokio::io::sink())
+                .await
+                .unwrap_or(0);
+            if discarded > 0 {
+                buf.extend_from_slice(format!(" [{discarded} more bytes discarded]").as_bytes());
+            }
+        }
+        buf
+    }
+
     let outcome = tokio::time::timeout(bound, async {
-        tokio::try_join!(
-            async { Ok::<_, Overflow>(child.wait().await) },
-            drain_capped(stdout, max_stdout),
-            async { Ok(drain(stderr).await) },
-        )
+        let stderr = async { Ok(drain_prefix(stderr, caps.stderr).await) };
+        let (stdout, stderr) = tokio::try_join!(drain_capped(stdout, caps.stdout), stderr)?;
+        // Only now that both pipes are at end-of-file — see `output_within`.
+        Ok::<_, Overflow>((child.wait().await, stdout, stderr))
     })
     .await;
-    // The group to kill. On an overflow the child may already have been reaped
-    // — its `wait` ran alongside the drain that overflowed — and then its pid
-    // is no longer ours to signal, so the group is taken from `child.id()`,
-    // which is `None` once the child is reaped.
-    let (reason, group) = match outcome {
+    let reason = match outcome {
         Ok(Ok((status, stdout, stderr))) => {
+            // `id()` turns `None` once `wait` has reaped the child. A `wait`
+            // that failed may not have, and then the guard still kills the
+            // group as this returns.
+            if child.id().is_none() {
+                group.disarm();
+            }
             return Ok(std::process::Output {
                 status: status.map_err(|e| format!("failed to run `{program}`: {e}"))?,
                 stdout,
                 stderr,
             });
         }
-        Ok(Err(Overflow)) => (
-            format!(
-                "{SUBPROCESS_OVERFLOW_MARKER}`{program} {}` printed more than {} bytes and was \
-                 killed",
-                args.join(" "),
-                max_stdout.unwrap_or_default()
-            ),
-            child.id(),
+        Ok(Err(Overflow)) => format!(
+            "{SUBPROCESS_OVERFLOW_MARKER}`{program} {}` printed more than {} bytes and was killed",
+            args.join(" "),
+            caps.stdout.unwrap_or_default()
         ),
-        Err(_) => (
-            format!(
-                "{SUBPROCESS_TIMEOUT_MARKER}`{program} {}` did not finish within {}s and was \
-                 killed; it is treated as failed so the task's later fires are not blocked \
-                 behind it",
-                args.join(" "),
-                bound.as_secs_f64()
-            ),
-            pid,
+        Err(_) => format!(
+            "{SUBPROCESS_TIMEOUT_MARKER}`{program} {}` did not finish within {}s and was \
+             killed; it is treated as failed so the task's later fires are not blocked \
+             behind it",
+            args.join(" "),
+            bound.as_secs_f64()
         ),
     };
-    #[cfg(unix)]
-    if let Some(pid) = group {
-        // SAFETY: kill(2) with a negative pid signals the process group
-        // `process_group(0)` created above, whose id is the child's pid.
-        // SIGKILL has no failure mode beyond ESRCH/EPERM, both ignored:
-        // ESRCH means everything in it has already exited. The id cannot
-        // name somebody else's group, because the child is not yet reaped
-        // — `wait` below does that — so the pid is still ours.
-        unsafe {
-            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = group;
+    // Unreaped on both arms: an overflow is found before `wait` starts, and a
+    // timeout cancels a `wait` that had not returned.
+    group.kill();
     let _ = child.start_kill();
     let _ = child.wait().await;
+    if child.id().is_none() {
+        group.disarm();
+    }
     Err(reason)
 }
 
@@ -2769,7 +2862,7 @@ mod tests {
             "sh",
             &["-c", "head -c 5000 /dev/zero; sleep 30"],
             Duration::from_secs(20),
-            Some(1000),
+            stdout_cap(1000),
         )
         .await
         .expect_err("5000 bytes must not pass a 1000-byte cap");
@@ -2786,11 +2879,126 @@ mod tests {
             "sh",
             &["-c", "head -c 1000 /dev/zero"],
             Duration::from_secs(20),
-            Some(1000),
+            stdout_cap(1000),
         )
         .await
         .expect("output at the cap is accepted");
         assert_eq!(out.stdout.len(), 1000);
+    }
+
+    fn stdout_cap(bytes: usize) -> OutputCaps {
+        OutputCaps {
+            stdout: Some(bytes),
+            stderr: None,
+        }
+    }
+
+    /// Scenario: PRD #421 review round 2 — the command's leader exits at once,
+    /// leaving a backgrounded descendant that holds the pipes open and would
+    /// touch a marker a second later; the bound expires first. The descendant
+    /// is killed. The group signal takes its target from the unreaped leader's
+    /// id (`Child::id`, which is `None` once the leader is reaped), so a dead
+    /// descendant also shows the leader was still unreaped when the group was
+    /// signalled — the id was this command's, not a stale one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timed_out_subprocess_whose_leader_exited_first_takes_its_descendant_with_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("descendant-survived");
+        let script = format!("(sleep 1; touch '{}') & exit 0", marker.display());
+        let started = std::time::Instant::now();
+        let err = output_within(
+            tokio::process::Command::new("sh"),
+            "sh",
+            &["-c", &script],
+            Duration::from_millis(200),
+        )
+        .await
+        .expect_err("the descendant holds the pipes past the bound");
+        assert!(is_subprocess_timeout(&err), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "the bound must end the wait, took {:?}",
+            started.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            !marker.exists(),
+            "the descendant of a leader that had already exited survived the timeout"
+        );
+    }
+
+    /// Scenario: PRD #421 review round 2 — the leader exits at once; its
+    /// backgrounded descendant then prints past a 1000-byte stdout cap and
+    /// would touch a marker a second later. The call is reported as an
+    /// overflow, and the descendant is killed with it rather than left running
+    /// behind an error that says the call was killed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_subprocess_overflowing_after_its_leader_exited_takes_its_descendant_with_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("descendant-survived");
+        let script = format!(
+            "(sleep 0.3; head -c 5000 /dev/zero; sleep 1; touch '{}') & exit 0",
+            marker.display()
+        );
+        let err = output_within_capped(
+            tokio::process::Command::new("sh"),
+            "sh",
+            &["-c", &script],
+            Duration::from_secs(20),
+            stdout_cap(1000),
+        )
+        .await
+        .expect_err("5000 bytes must not pass a 1000-byte cap");
+        assert!(is_subprocess_overflow(&err), "{err}");
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        assert!(
+            !marker.exists(),
+            "the overflowing descendant of an exited leader was left running"
+        );
+    }
+
+    /// Scenario: PRD #421 review round 2 — a command floods stderr with 10 MB
+    /// and then succeeds. With a 4 KiB stderr cap it is still a success: its
+    /// stdout comes back whole, and its stderr is the first 4 KiB plus a note
+    /// of how many bytes were discarded, not the whole flood.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stderr_flood_keeps_a_bounded_prefix_and_the_call_succeeds() {
+        let out = output_within_capped(
+            tokio::process::Command::new("sh"),
+            "sh",
+            &[
+                "-c",
+                "head -c 10000000 /dev/zero | tr '\\0' e >&2; echo done",
+            ],
+            Duration::from_secs(20),
+            OutputCaps {
+                stdout: Some(1000),
+                stderr: Some(4096),
+            },
+        )
+        .await
+        .expect("a stderr flood is not a failure");
+        assert!(out.status.success(), "{:?}", out.status);
+        assert_eq!(out.stdout, b"done\n");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.starts_with(&"e".repeat(4096)),
+            "the prefix is kept: {:?}",
+            &stderr[..64.min(stderr.len())]
+        );
+        assert!(
+            stderr.ends_with(" [9995904 more bytes discarded]"),
+            "{:?}",
+            &stderr[4096..]
+        );
+        assert!(
+            out.stderr.len() < 4096 + 64,
+            "{} bytes kept",
+            out.stderr.len()
+        );
     }
 
     /// Scenario: PRD #421 amendment item 9 — the claim-call bound is 30 s
