@@ -1801,17 +1801,18 @@ struct UiState {
     /// rows, if it drew them ([`render_bottom_bar`]), so a modal overlay is
     /// laid out above them rather than over them ([`overlay_area`]).
     restart_notice_area: Option<Rect>,
-    /// PRD #1666 part 2 (G-fix7f): how many of the open confirmation's
-    /// choices the last frame drew, with the mode it drew them for
-    /// ([`confirm_choices_drawn`]); [`refuse_undrawn_choice`] refuses the keys
-    /// that would move to or confirm one it did not draw.
+    /// PRD #1666 part 2 (G-fix7f): which of the open confirmation's choices
+    /// the last frame showed, with the mode it drew them for; G-fix7h: read
+    /// back from that frame once it is finished ([`ConfirmChoices::shown`]).
+    /// [`refuse_undrawn_choice`] refuses the keys that would move to or confirm
+    /// one it did not show.
     ///
     /// G-fix7g: also the confirmations' render-before-input gate, which was
     /// the close confirmation's alone (PRD #241 review F5). Cleared when a
     /// confirmation opens and whenever an event changes the mode, so `None`, or
     /// a record for another mode, means this opening of the open confirmation
     /// has not been drawn yet ([`confirmation_awaits_frame`]).
-    confirm_choices_drawn: Option<(UiMode, usize)>,
+    confirm_choices_drawn: Option<(UiMode, ChoicesShown)>,
     /// PRD #341 M6: which pane the user was typing into as of the previous
     /// [`reconcile_pane_input_scrollback`] frame — `Some(pane_id)` while `mode ==
     /// PaneInput` with a focused pane, `None` otherwise. A change in this value is
@@ -4980,6 +4981,10 @@ pub enum Action {
     /// applied any local-state mutation (e.g. a typed character).
     Continue,
     Quit,
+    /// PRD #1666 part 2 (G-fix7h): the footer's `[Quit Ctrl+C]` button. Opens
+    /// the Quit confirmation, as Ctrl+C on the dashboard does, rather than
+    /// exiting at once as [`Action::Quit`] does.
+    RequestQuit,
     /// PRD #76, M2.5: detach every stream-backed pane (sending an explicit
     /// `KIND_DETACH` frame so the daemon distinguishes voluntary detach
     /// from abrupt disconnect) and then exit. Local-PTY panes are torn
@@ -10422,6 +10427,10 @@ fn dispatch_action(
             // the pre-draw `resize_panes_to_layout` re-sizes it next frame.
         }
         Action::Quit => return Flow::Break,
+        Action::RequestQuit => {
+            ui.quit_confirm_selected = 0;
+            ui.mode = UiMode::QuitConfirm;
+        }
         Action::DetachAndQuit => {
             // M2.5: emit explicit `KIND_DETACH` frames for every
             // stream-backed pane so the daemon distinguishes
@@ -16412,10 +16421,12 @@ fn render_overlays(frame: &mut Frame, ui: &mut UiState) {
         let full = frame.area();
         ui.modal_button_rects = render_restart_notice_overlay(frame, full, notice, &ui.keybindings);
     }
-    // PRD #241 review F5, G-fix7g: records what this frame drew of an open
-    // confirmation, so input arriving from here on is an answer to it. Until
-    // then the run loop feeds it nothing (see the drain at the top of the event
-    // loop).
+    // PRD #241 review F5, G-fix7g: records which of an open confirmation's
+    // choices this frame shows. The record is the render gate: until a frame
+    // has recorded the open confirmation, the run loop drains its input rather
+    // than feed it (see the drain at the top of the event loop). It is written
+    // inside the draw, before the frame reaches the terminal, and says nothing
+    // about when any later input arrived.
     draw_modal(frame, area, ui);
 }
 
@@ -16466,14 +16477,22 @@ fn draw_modal(frame: &mut Frame, area: Rect, ui: &mut UiState) {
     if ui.mode == UiMode::StarPrompt {
         ui.modal_button_rects = render_star_prompt(frame, area);
     }
+    let mut confirm_choices = None;
+    let confirmation = |ui: &mut UiState, drawn: ConfirmDrawing| {
+        ui.modal_button_rects = drawn.buttons;
+        Some(drawn.choices)
+    };
     if ui.mode == UiMode::ConfigGenPrompt {
-        ui.modal_button_rects = render_config_gen_prompt(frame, area, ui.config_gen_selected);
+        let drawn = render_config_gen_prompt(frame, area, ui.config_gen_selected);
+        confirm_choices = confirmation(ui, drawn);
     }
     if ui.mode == UiMode::QuitConfirm {
-        ui.modal_button_rects = render_quit_confirm(frame, area, ui.quit_confirm_selected);
+        let drawn = render_quit_confirm(frame, area, ui.quit_confirm_selected);
+        confirm_choices = confirmation(ui, drawn);
     }
     if ui.mode == UiMode::CloseConfirm {
-        ui.modal_button_rects = render_close_confirm(frame, area, &ui.close_confirm);
+        let drawn = render_close_confirm(frame, area, &ui.close_confirm);
+        confirm_choices = confirmation(ui, drawn);
     }
     if ui.mode == UiMode::Upgrade
         && let Some(dialog) = ui.upgrade_dialog.as_mut()
@@ -16486,15 +16505,18 @@ fn draw_modal(frame: &mut Frame, area: Rect, ui: &mut UiState) {
     if ui.mode == UiMode::StopConfirm {
         // M5 adds no buttons to the secondary Stop-confirm dialog (not in the
         // contract); its keystrokes (y/n/Enter/Esc) remain the only path.
-        render_stop_confirm(
+        confirm_choices = Some(render_stop_confirm(
             frame,
             area,
             ui.stop_confirm_selected,
             ui.stop_confirm_agent_count,
-        );
+        ));
     }
-    // G-fix7f: after drawing, so the record is this frame's.
-    ui.confirm_choices_drawn = confirm_choices_drawn(ui, area).map(|drawn| (ui.mode, drawn));
+    // G-fix7f, G-fix7h: read back from the buffer once everything this frame
+    // draws is in it (the modal is drawn last), so the record is of the choices
+    // the finished frame shows, after the button row.
+    ui.confirm_choices_drawn =
+        confirm_choices.map(|choices| (ui.mode, choices.shown(frame.buffer_mut())));
 }
 
 // ---------------------------------------------------------------------------
@@ -17609,8 +17631,9 @@ fn global_bar_buttons(
             true,
         ),
         // Quit is the non-overridable Ctrl+C modal trigger — not a remappable
-        // KbAction, so its label stays fixed.
-        Button::new("Quit", "Ctrl+C", Action::Quit, true),
+        // KbAction, so its label stays fixed. G-fix7h: a click opens the same
+        // confirmation the key does.
+        Button::new("Quit", "Ctrl+C", Action::RequestQuit, true),
     ]
 }
 
@@ -18233,19 +18256,13 @@ fn modal_rect(desired_w: u16, desired_h: u16, terminal: Rect, min_w: u16, min_h:
 }
 
 /// PRD #1666 part 2 (G-fix7f): the rows of a confirmation dialog that lists its
-/// choices one per row. Its renderer takes its height from here, and
-/// [`confirm_choices_drawn`] counts from the same numbers.
+/// choices one per row. Its renderer takes its height and its choices' places
+/// from here.
 struct ConfirmLayout {
     /// The popup's height when the frame has room, borders included.
     rows: u16,
     /// The text line, inside the border, of the first choice.
-    first_choice: usize,
-    choices: usize,
-    /// G-fix7g: the columns inside the border a choice's line needs to show
-    /// its selection marker and its whole label: the two-space indent, the
-    /// marker, a space and the longest label. Each of these popups wants more
-    /// columns than that, so only a narrow terminal leaves fewer.
-    label_cols: u16,
+    first_choice: u16,
 }
 
 impl ConfirmLayout {
@@ -18255,66 +18272,108 @@ impl ConfirmLayout {
         (self.rows + extra).min(area.height.saturating_sub(4))
     }
 
-    /// How many choices a popup laid out in `area` draws inside its border,
-    /// each with its marker and whole label. G-fix7g: none when the popup,
-    /// `area.width - 4` wide at most, is too narrow to show a label.
-    fn choices_drawn(&self, extra: u16, area: Rect) -> usize {
-        if area.width.saturating_sub(4).saturating_sub(2) < self.label_cols {
-            return 0;
-        }
-        let inner = usize::from(self.popup_height(extra, area).saturating_sub(2));
-        inner
-            .saturating_sub(self.first_choice + usize::from(extra))
-            .min(self.choices)
+    /// Where a popup at `popup` puts each of `labels`' selection marker and
+    /// label, for [`ConfirmChoices::shown`] to read back once the frame is
+    /// drawn. Each choice's line is `"  {marker} {label}…"` inside the border.
+    fn choices<'a>(
+        &self,
+        popup: Rect,
+        extra: u16,
+        labels: impl IntoIterator<Item = &'a str>,
+        selected: usize,
+    ) -> ConfirmChoices {
+        let inner = popup.inner(ratatui::layout::Margin::new(1, 1));
+        let first = self.first_choice + extra;
+        let cells = labels
+            .into_iter()
+            .enumerate()
+            .map(|(i, label)| {
+                let marker = if i == selected { '>' } else { ' ' };
+                let row = u16::try_from(i)
+                    .ok()
+                    .and_then(|i| inner.y.checked_add(first)?.checked_add(i));
+                (inner.x.saturating_add(2), row, format!("{marker} {label}"))
+            })
+            .collect();
+        ConfirmChoices { inner, cells }
     }
 }
 
 const QUIT_CONFIRM: ConfirmLayout = ConfirmLayout {
     rows: 10,
     first_choice: 3,
-    choices: 3,
-    // "Detach" / "Cancel".
-    label_cols: 4 + 6,
 };
 const CLOSE_CONFIRM: ConfirmLayout = ConfirmLayout {
     rows: 9,
     first_choice: 3,
-    choices: CLOSE_CONFIRM_OPTION_COUNT,
-    // "Cancel".
-    label_cols: 4 + 6,
 };
 const STOP_CONFIRM: ConfirmLayout = ConfirmLayout {
     rows: 10,
     first_choice: 4,
-    choices: 2,
-    // "Yes".
-    label_cols: 4 + 3,
 };
 const CONFIG_GEN_CONFIRM: ConfirmLayout = ConfirmLayout {
     rows: 14,
     first_choice: 5,
-    choices: 3,
-    // "Never".
-    label_cols: 4 + 5,
 };
 
-/// PRD #1666 part 2 (G-fix7f): how many of the open confirmation's choices a
-/// frame drawing it in `area` shows; `None` for any other mode.
-fn confirm_choices_drawn(ui: &UiState, area: Rect) -> Option<usize> {
-    match ui.mode {
-        UiMode::QuitConfirm => Some(QUIT_CONFIRM.choices_drawn(0, area)),
-        UiMode::CloseConfirm => {
-            let kept = if ui.close_confirm.kept_worktree.is_some() {
-                3
-            } else {
-                0
-            };
-            Some(CLOSE_CONFIRM.choices_drawn(kept, area))
+/// PRD #1666 part 2 (G-fix7h): where a confirmation's renderer put each of its
+/// choices, so the finished frame can be read back for which of them it shows.
+struct ConfirmChoices {
+    /// The popup inside its border; a choice outside it is not the dialog's.
+    inner: Rect,
+    /// Each choice's column, row (`None` past the last representable row) and
+    /// marker-and-label text, in choice order.
+    cells: Vec<(u16, Option<u16>, String)>,
+}
+
+impl ConfirmChoices {
+    /// Which choices `buf` shows: a choice counts only when its marker and its
+    /// whole label are inside the popup and every one of their cells still
+    /// reads as the renderer wrote it — so one a narrow popup clips, a short
+    /// one leaves out, or the button row paints over does not.
+    fn shown(&self, buf: &ratatui::buffer::Buffer) -> ChoicesShown {
+        let mut shown = ChoicesShown::default();
+        for (i, (x, row, text)) in self.cells.iter().enumerate() {
+            let Some(y) = *row else { continue };
+            let width = text.chars().count();
+            let fits = y >= self.inner.top()
+                && y < self.inner.bottom()
+                && usize::from(*x) + width <= usize::from(self.inner.right());
+            let intact = fits
+                && text.chars().zip(*x..).all(|(ch, x)| {
+                    buf.cell((x, y))
+                        .is_some_and(|cell| cell.symbol().chars().eq([ch]))
+                });
+            if intact {
+                shown.insert(i);
+            }
         }
-        UiMode::StopConfirm => Some(STOP_CONFIRM.choices_drawn(0, area)),
-        UiMode::ConfigGenPrompt => Some(CONFIG_GEN_CONFIRM.choices_drawn(0, area)),
-        _ => None,
+        shown
     }
+}
+
+/// PRD #1666 part 2 (G-fix7h): the choices of a confirmation a frame showed,
+/// by index.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ChoicesShown(u8);
+
+impl ChoicesShown {
+    fn insert(&mut self, choice: usize) {
+        if choice < 8 {
+            self.0 |= 1 << choice;
+        }
+    }
+
+    fn contains(self, choice: usize) -> bool {
+        choice < 8 && self.0 & (1 << choice) != 0
+    }
+}
+
+/// PRD #1666 part 2 (G-fix7h): what a confirmation's renderer drew: its
+/// buttons' click targets and where it put its choices.
+struct ConfirmDrawing {
+    buttons: Vec<(Action, Rect)>,
+    choices: ConfirmChoices,
 }
 
 /// PRD #1666 part 2 (G-fix7g): whether the open confirmation has not been
@@ -18330,17 +18389,18 @@ fn confirmation_awaits_frame(ui: &UiState) -> bool {
 }
 
 /// PRD #1666 part 2 (G-fix7f): refuse a key that would move to, or confirm, a
-/// choice the open confirmation's last frame did not draw — a terminal too
-/// small for its popup clips the lower choices, or too narrow shows no label
-/// at all — and Stop's `y` while its Yes is not drawn. Escape and the dialogs'
-/// own way back are not refused. G-fix7g: before this opening's first frame
-/// none of its choices counts as drawn.
+/// choice the open confirmation's last frame did not show — a terminal too
+/// small for its popup clips the lower choices or shows no label at all, and
+/// G-fix7h: a short popup's button row paints over a choice — and Stop's `y`
+/// while its Yes is not shown. Escape and the dialogs' own way back are not
+/// refused. G-fix7g: before this opening's first frame none of its choices
+/// counts as shown.
 fn refuse_undrawn_choice(key: &KeyEvent, ui: &UiState) -> Option<Action> {
     let mode = ui.mode;
-    let drawn = ui
+    let shown = ui
         .confirm_choices_drawn
         .filter(|(drawn_for, _)| *drawn_for == mode)
-        .map_or(0, |(_, drawn)| drawn);
+        .map_or(ChoicesShown::default(), |(_, shown)| shown);
     let selected = match mode {
         UiMode::QuitConfirm => ui.quit_confirm_selected,
         UiMode::CloseConfirm => ui.close_confirm.selected,
@@ -18349,15 +18409,17 @@ fn refuse_undrawn_choice(key: &KeyEvent, ui: &UiState) -> Option<Action> {
         _ => return None,
     };
     let refused = match key.code {
-        KeyCode::Down | KeyCode::Char('j') => selected + 1 >= drawn,
-        KeyCode::Enter => selected >= drawn,
-        KeyCode::Char('y') | KeyCode::Char('Y') => mode == UiMode::StopConfirm && drawn < 2,
+        KeyCode::Down | KeyCode::Char('j') => !shown.contains(selected + 1),
+        KeyCode::Enter => !shown.contains(selected),
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            mode == UiMode::StopConfirm && !shown.contains(1)
+        }
         _ => false,
     };
     refused.then_some(Action::Continue)
 }
 
-fn render_quit_confirm(frame: &mut Frame, area: Rect, selected: usize) -> Vec<(Action, Rect)> {
+fn render_quit_confirm(frame: &mut Frame, area: Rect, selected: usize) -> ConfirmDrawing {
     let popup_width = 64u16.min(area.width.saturating_sub(4));
     let popup_height = QUIT_CONFIRM.popup_height(0, area);
     let x = (area.width.saturating_sub(popup_width)) / 2;
@@ -18435,7 +18497,10 @@ fn render_quit_confirm(frame: &mut Frame, area: Rect, selected: usize) -> Vec<(A
         width: popup_area.width.saturating_sub(2),
         height: 1,
     };
-    render_modal_button_row(frame, &buttons, btn_row, 1)
+    ConfirmDrawing {
+        buttons: render_modal_button_row(frame, &buttons, btn_row, 1),
+        choices: QUIT_CONFIRM.choices(popup_area, 0, options.map(|(label, _)| label), selected),
+    }
 }
 
 /// PRD #241 M3: the close confirmation dialog. Same shape as
@@ -18446,7 +18511,7 @@ fn render_close_confirm(
     frame: &mut Frame,
     area: Rect,
     state: &CloseConfirmState,
-) -> Vec<(Action, Rect)> {
+) -> ConfirmDrawing {
     let selected = state.selected;
     // Issue #717: the kept-worktree warning adds a headline and a path line.
     // The path is the actionable half — the user has to `cd` to it — so the
@@ -18544,14 +18609,27 @@ fn render_close_confirm(
         width: popup_area.width.saturating_sub(2),
         height: 1,
     };
-    render_modal_button_row(frame, &buttons, btn_row, 1)
+    ConfirmDrawing {
+        buttons: render_modal_button_row(frame, &buttons, btn_row, 1),
+        choices: CLOSE_CONFIRM.choices(
+            popup_area,
+            kept_lines,
+            close_confirm_options(state.scope).map(|(label, _)| label),
+            selected,
+        ),
+    }
 }
 
 /// PRD #92 F1: secondary y/n confirmation dialog when the user picked
 /// Stop with at least one managed agent alive. Renders the count
 /// explicitly so the user sees exactly how many agents are about to be
 /// terminated. Default selection is No (index 0).
-fn render_stop_confirm(frame: &mut Frame, area: Rect, selected: usize, agent_count: usize) {
+fn render_stop_confirm(
+    frame: &mut Frame,
+    area: Rect,
+    selected: usize,
+    agent_count: usize,
+) -> ConfirmChoices {
     let popup_width = 68u16.min(area.width.saturating_sub(4));
     let popup_height = STOP_CONFIRM.popup_height(0, area);
     let x = (area.width.saturating_sub(popup_width)) / 2;
@@ -18608,6 +18686,7 @@ fn render_stop_confirm(frame: &mut Frame, area: Rect, selected: usize, agent_cou
         .border_style(Style::default().fg(Color::Red));
     let paragraph = Paragraph::new(text).block(block);
     frame.render_widget(paragraph, popup_area);
+    STOP_CONFIRM.choices(popup_area, 0, options.map(|(label, _)| label), selected)
 }
 
 /// Width of the star prompt popup.
@@ -18689,7 +18768,7 @@ fn render_star_prompt(frame: &mut Frame, area: Rect) -> Vec<(Action, Rect)> {
     render_modal_button_row(frame, &buttons, btn_row, 1)
 }
 
-fn render_config_gen_prompt(frame: &mut Frame, area: Rect, selected: usize) -> Vec<(Action, Rect)> {
+fn render_config_gen_prompt(frame: &mut Frame, area: Rect, selected: usize) -> ConfirmDrawing {
     let popup_width = 60u16.min(area.width.saturating_sub(4));
     let popup_height = CONFIG_GEN_CONFIRM.popup_height(0, area);
     let x = (area.width.saturating_sub(popup_width)) / 2;
@@ -18763,7 +18842,15 @@ fn render_config_gen_prompt(frame: &mut Frame, area: Rect, selected: usize) -> V
         width: popup_area.width.saturating_sub(2),
         height: 1,
     };
-    render_modal_button_row(frame, &buttons, btn_row, 1)
+    ConfirmDrawing {
+        buttons: render_modal_button_row(frame, &buttons, btn_row, 1),
+        choices: CONFIG_GEN_CONFIRM.choices(
+            popup_area,
+            0,
+            options.map(|(label, _)| label),
+            selected,
+        ),
+    }
 }
 
 /// Format one help row: a key column (left-padded to a fixed width so the
@@ -42407,6 +42494,193 @@ mod tests {
                 ui.mode,
                 UiMode::Normal,
                 "{mode:?}: Escape no longer cancels"
+            );
+        }
+    }
+
+    /// Scenario: Quit, Close and ConfigGen are drawn in terminals short enough that their button row lands on one of their choices, and Stop in one that clips its Yes. Each final frame hides that choice, and Down, Enter or `y` cannot pick it, while a choice the frame still shows can be confirmed. At 80×24 every choice is shown and each dialog navigates and confirms normally (control).
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_a_confirmation_counts_only_the_choices_its_final_frame_shows() {
+        use tokio::sync::RwLock;
+        let pc = Arc::new(OpenTabPC::new());
+        let mut tab_manager = TabManager::new(pc.clone());
+        let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+        let mut press = |ui: &mut UiState, code: KeyCode, (width, height): (u16, u16)| {
+            handle_key_event(
+                KeyEvent::new(code, KeyModifiers::NONE),
+                ui,
+                &*pc,
+                &state,
+                &mut tab_manager,
+                &snapshot,
+                &[],
+                Rect::new(0, 0, width, height),
+            )
+        };
+        let selected = |ui: &UiState| match ui.mode {
+            UiMode::QuitConfirm => ui.quit_confirm_selected,
+            UiMode::CloseConfirm => ui.close_confirm.selected,
+            UiMode::StopConfirm => ui.stop_confirm_selected,
+            _ => ui.config_gen_selected,
+        };
+        let select = |ui: &mut UiState, choice: usize| match ui.mode {
+            UiMode::QuitConfirm => ui.quit_confirm_selected = choice,
+            UiMode::CloseConfirm => ui.close_confirm.selected = choice,
+            UiMode::StopConfirm => ui.stop_confirm_selected = choice,
+            _ => ui.config_gen_selected = choice,
+        };
+        let open = |mode: UiMode| {
+            let mut ui = default_ui();
+            ui.mode = mode;
+            ui.stop_confirm_agent_count = 2;
+            ui
+        };
+        // The choice line as the renderer writes it, from its marker through its
+        // label: `"  > Close"` or `"    Close"`.
+        let line =
+            |label: &str, chosen: bool| format!("  {} {label}", if chosen { '>' } else { ' ' });
+        let shows = |rows: &[String], text: &str| rows.iter().any(|row| row.contains(text));
+
+        struct Case {
+            mode: UiMode,
+            small: (u16, u16),
+            labels: &'static [&'static str],
+            /// The choice the small frame hides.
+            hidden: usize,
+            /// A later choice it still shows, which confirms.
+            later: Option<usize>,
+        }
+        let cases = [
+            // [Detach] paints over Stop; Cancel, below it, is still shown.
+            Case {
+                mode: UiMode::QuitConfirm,
+                small: (16, 12),
+                labels: &["Detach", "Stop", "Cancel"],
+                hidden: 1,
+                later: Some(2),
+            },
+            // [Cancel] paints over Close: GF7G-R01.
+            Case {
+                mode: UiMode::CloseConfirm,
+                small: (16, 12),
+                labels: &["Cancel", "Close"],
+                hidden: 1,
+                later: None,
+            },
+            // Too short for Yes's row; Stop has no button row.
+            Case {
+                mode: UiMode::StopConfirm,
+                small: (80, 11),
+                labels: &["No", "Yes"],
+                hidden: 1,
+                later: None,
+            },
+            // [Yes] [No] [Never] paints over No; Never is still shown.
+            Case {
+                mode: UiMode::ConfigGenPrompt,
+                small: (80, 14),
+                labels: &["Yes", "No", "Never"],
+                hidden: 1,
+                later: Some(2),
+            },
+        ];
+        for Case {
+            mode,
+            small,
+            labels,
+            hidden,
+            later,
+        } in cases
+        {
+            // The hidden choice selected (as a larger frame could have left
+            // it), then the small frame drawn.
+            let mut ui = open(mode);
+            select(&mut ui, hidden);
+            let rows = draw_sized(&mut ui, small.0, small.1);
+            let shown = rows.join("\n");
+            assert!(
+                !shows(&rows, &line(labels[hidden], true)),
+                "precondition {mode:?}: the final frame shows {:?}:\n{shown}",
+                labels[hidden]
+            );
+            assert!(
+                shows(&rows, &line(labels[0], false)),
+                "precondition {mode:?}: the first choice is hidden too:\n{shown}"
+            );
+            let record = ui
+                .confirm_choices_drawn
+                .expect("the frame drew a confirmation");
+            assert_eq!(record.0, mode);
+            assert!(
+                record.1.contains(0),
+                "{mode:?}: the shown first choice is not counted"
+            );
+            assert!(
+                !record.1.contains(hidden),
+                "{mode:?}: counted a choice its final frame hides:\n{shown}"
+            );
+            for code in [KeyCode::Enter, KeyCode::Char('y')] {
+                assert_eq!(
+                    press(&mut ui, code, small),
+                    Flow::Continue,
+                    "{mode:?}: {code:?} acted"
+                );
+                assert_eq!(ui.mode, mode, "{mode:?}: {code:?} took the hidden choice");
+                assert_eq!(selected(&ui), hidden);
+            }
+
+            // From the first choice, Down cannot move onto the hidden one.
+            select(&mut ui, 0);
+            draw_sized(&mut ui, small.0, small.1);
+            press(&mut ui, KeyCode::Down, small);
+            assert_eq!(selected(&ui), 0, "{mode:?}: Down moved to a hidden choice");
+            assert_eq!(ui.mode, mode);
+
+            // A choice the frame still shows is confirmed as usual.
+            if let Some(later) = later {
+                select(&mut ui, later);
+                let rows = draw_sized(&mut ui, small.0, small.1);
+                assert!(
+                    shows(&rows, &line(labels[later], true)),
+                    "precondition {mode:?}: {:?} is hidden:\n{}",
+                    labels[later],
+                    rows.join("\n")
+                );
+                assert!(
+                    ui.confirm_choices_drawn
+                        .is_some_and(|(_, s)| s.contains(later))
+                );
+                press(&mut ui, KeyCode::Enter, small);
+                assert_ne!(
+                    ui.mode, mode,
+                    "{mode:?}: Enter on a shown choice was refused"
+                );
+            }
+
+            // Control: 80×24 shows every choice, and Down then Enter takes the
+            // one the small frame hid.
+            let normal = (80u16, 24u16);
+            let mut ui = open(mode);
+            let rows = draw_sized(&mut ui, normal.0, normal.1);
+            for (i, label) in labels.iter().enumerate() {
+                assert!(
+                    shows(&rows, &line(label, i == 0)),
+                    "control {mode:?}: {label:?} is not shown:\n{}",
+                    rows.join("\n")
+                );
+                assert!(ui.confirm_choices_drawn.is_some_and(|(_, s)| s.contains(i)));
+            }
+            press(&mut ui, KeyCode::Down, normal);
+            assert_eq!(selected(&ui), hidden, "control {mode:?}: Down was refused");
+            draw_sized(&mut ui, normal.0, normal.1);
+            let flow = press(&mut ui, KeyCode::Enter, normal);
+            // Quit's Stop with no agents, and Stop's Yes, end the deck.
+            let took = flow == Flow::Break || ui.mode != mode;
+            assert!(
+                took,
+                "control {mode:?}: Enter on the shown choice was refused"
             );
         }
     }
