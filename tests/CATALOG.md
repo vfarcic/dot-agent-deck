@@ -129,21 +129,21 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 
 ##### telemetry/otlp/016 — Codex launch activates traces and metrics while preserving user choices.
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
-- **Agent:** PATH stand-in named codex, launched through the production wrapper.
-- **Asserts:** explicit trace/metric signal URLs and JSON protocol reach per-run -c overrides, no logs exporter or secret in argv, header and run identity in env, original CODEX_HOME retained, no overrides with export off or user-owned exporter configuration.
+- **Agent:** PATH stand-in named codex, launched directly, through a shell script calling codex by name, and by absolute path.
+- **Asserts:** scripted and plain launches activate safe trace/metric overrides with signal URLs and JSON protocol, preserve original arguments and header/run identity in env, and add no logs exporter or secret in argv. In-script CODEX_HOME and trace opt-outs take effect; absolute-path launches bypass activation; export off preserves PATH and argv with no shim directory on PATH.
 - **Does not assert:** real Codex export (018) or all TOML exporter forms.
 - **Platform coverage:** mac+linux.
 
 ##### telemetry/otlp/017 — Devin launch uses a private temporary metadata-only overlay.
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
-- **Agent:** PATH stand-in named devin recording argv, env and config content/mode.
-- **Asserts:** export off adds no config; enabled overlay is 0600, preserves JSONC settings, contains endpoint/resource identity, excludes header values, disables content logging by default, respects user OTel endpoints/flags/resources and is removed at pane close.
+- **Agent:** PATH stand-in named devin recording argv, env and config content/mode through direct, scripted and absolute-path launches.
+- **Asserts:** scripted and plain launches receive a 0600 overlay preserving JSONC settings, endpoint/resource identity and user OTel choices, excluding header values and disabling content logging by default; the overlay exists while running and is removed at pane close. In-script config-home, enabled:false, metric opt-outs and explicit --config are respected; absolute paths bypass activation; export off preserves PATH and argv without a shim directory.
 - **Does not assert:** authenticated Devin delivery (020) or crash-recovery cleanup.
 - **Platform coverage:** mac+linux.
 
 ##### telemetry/otlp/018 — Real interactive Codex safely joins its own telemetry to the deck run. [reel]
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_telemetry_export_live.rs`).
-- **Agent:** real wrapped Codex on the auth-compatible cheap model (ChatGPT default gpt-5.6-luna).
+- **Agent:** real Codex called by name inside a wrapper shell script on the auth-compatible cheap model (ChatGPT default gpt-5.6-luna).
 - **Asserts:** real shell copies a unique fixture, the pane completes and card settles, native traces/metrics carry the deck resource run id, no logs are captured and prompt/file/output sentinels are absent from every captured body.
 - **Does not assert:** Codex sandbox enforcement or native metric values.
 - **Platform coverage:** mac+linux when authenticated.

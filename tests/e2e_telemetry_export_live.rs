@@ -613,12 +613,16 @@ fn finish_native_join(
     }
 }
 
-/// Scenario: Start real wrapped interactive Codex on cheap Luna, type a directive to copy a unique fixture through its shell, and observe the proof and completed response in its pane. Closing the pane must deliver Codex's own traces or metrics with the deck's resource run id, no Codex logs and no prompt/file/output sentinel in any captured request.
+/// Scenario: Start real interactive Codex on cheap Luna through a shell script that exports a variable and calls codex by name, then ask it to copy a unique fixture through its shell and observe the proof and completed response. Closing the pane must deliver Codex's own traces or metrics with the deck's resource run id, no Codex logs and no prompt/file/output sentinel in any captured request.
 #[spec("telemetry/otlp/018")]
 #[test]
 fn telemetry_otlp_018_real_codex_safe_telemetry_joins_deck_run() {
     skip_unless!(common::check_codex_available());
     let receiver = Receiver::start();
+    let scratch = common::harness_tempdir().unwrap();
+    let wrapper = scratch.path().join("run-codex.sh");
+    std::fs::write(&wrapper, "#!/bin/sh\nexport FOO=1\ncodex \"$@\"\n").unwrap();
+    let wrapper = wrapper.to_str().unwrap().replace('\'', "'\\''");
     let deck = TuiDeck::builder()
         .with_pty_size(180, 50)
         .with_imported_codex_credentials()
@@ -626,7 +630,7 @@ fn telemetry_otlp_018_real_codex_safe_telemetry_joins_deck_run() {
         .with_env("OTEL_EXPORTER_OTLP_ENDPOINT", &receiver.endpoint)
         .with_env("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json")
         .with_env("OTEL_METRIC_EXPORT_INTERVAL", "1000")
-        .with_continue_session("telemetry-codex-luna", format!("codex --model {} --dangerously-bypass-approvals-and-sandbox -c 'model_reasoning_effort=\"low\"' -c 'analytics.enabled=false'", common::codex_test_model()))
+        .with_continue_session("telemetry-codex-luna", format!("/bin/sh '{wrapper}' --model {} --dangerously-bypass-approvals-and-sandbox -c 'model_reasoning_effort=\"low\"' -c 'analytics.enabled=false'", common::codex_test_model()))
         .launch_with_fixture("minimal");
     const SENTINEL: &str = "telemetry_codex_private_fixture_1741.txt";
     const PROOF: &str = "telemetry_codex_proof_1741.txt";

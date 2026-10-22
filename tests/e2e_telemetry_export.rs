@@ -1374,17 +1374,67 @@ fn launch_record(deck: &TuiDeck) -> Value {
     serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
 }
 
-/// Scenario: Restore a wrapped Codex stand-in that records argv and environment with export off, on, and explicitly configured by the user. Only the default-enabled case may receive trace/metric exporter overrides with the signal URLs; headers stay in environment, no logs exporter is added, and the user's CODEX_HOME and exporter choice survive.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn assert_launch_path(record: &Value, deck: &TuiDeck, original_path: &str, enabled: bool) {
+    let path = record["env"]["PATH"].as_str().expect("agent PATH");
+    let shim = deck.workdir().join("state/telemetry/bin");
+    if enabled {
+        assert_eq!(
+            std::env::split_paths(path).next().as_deref(),
+            Some(shim.as_path()),
+            "export ON must prepend the shim even for a scripted/unknown agent"
+        );
+    } else {
+        assert_eq!(path, original_path, "export OFF must preserve agent PATH");
+        assert!(
+            !std::env::split_paths(path).any(|entry| entry == shim),
+            "export OFF must not put the telemetry shim on PATH"
+        );
+    }
+}
+
+// Preserve the fixture PATH through the daemon's login-shell capture, without
+// depending on host /etc/profile additions. All real launch commands still run.
+fn launch_test_shell(root: &Path) -> std::path::PathBuf {
+    let shell = root.join("fixture-shell");
+    write_executable(
+        &shell,
+        "#!/bin/sh\nif [ \"$1\" = -ilc ]; then shift; exec /bin/sh -c \"$@\"; fi\nexec /bin/sh \"$@\"\n",
+    );
+    shell
+}
+
+/// Scenario: Start a Codex recorder directly and through scripts that call codex by name, change CODEX_HOME or opt out of trace export, and through an absolute executable path. Inspect the real argv and environment for safe signal activation, preserved arguments and user choices, no header secret or logs exporter, and unchanged PATH/argv when export is off.
 #[spec("telemetry/otlp/016")]
 #[test]
 fn telemetry_otlp_016_codex_launch_enables_only_safe_signals() {
     let receiver = Receiver::start();
-    for (enabled, user_config) in [(false, false), (true, false), (true, true)] {
+    for case in [
+        "script",
+        "plain",
+        "user-config",
+        "script-home",
+        "script-traces-none",
+        "absolute",
+        "off",
+    ] {
+        let enabled = case != "off";
+        let user_config = case == "user-config";
         let scratch = common::harness_tempdir().unwrap();
         let bin = scratch.path().join("bin");
         let codex_home = scratch.path().join("codex-home");
+        let alt_home = scratch.path().join("alternate-codex-home");
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::create_dir_all(&codex_home).unwrap();
+        std::fs::create_dir_all(&alt_home).unwrap();
+        std::fs::write(
+            alt_home.join("config.toml"),
+            "[otel]\nmetrics_exporter = \"none\"\n",
+        )
+        .unwrap();
         write_executable(&bin.join("codex"), AGENT_LAUNCH_RECORDER);
         if user_config {
             std::fs::write(
@@ -1393,14 +1443,31 @@ fn telemetry_otlp_016_codex_launch_enables_only_safe_signals() {
             )
             .unwrap();
         }
+        let wrapper = scratch.path().join("run-codex.sh");
+        let setup = match case {
+            "script-home" => format!(
+                "export CODEX_HOME={}\n",
+                shell_quote(alt_home.to_str().unwrap())
+            ),
+            "script-traces-none" => "export OTEL_TRACES_EXPORTER=none\n".to_string(),
+            _ => "export FOO=1\n".to_string(),
+        };
+        write_executable(&wrapper, &format!("#!/bin/sh\n{setup}codex \"$@\"\n"));
+        let program = match case {
+            "plain" | "user-config" => "codex".to_string(),
+            "absolute" => shell_quote(bin.join("codex").to_str().unwrap()),
+            _ => shell_quote(wrapper.to_str().unwrap()),
+        };
+        let original_path = format!("{}:{}", bin.display(), common::path_with_binary_dir());
         let mut builder = TuiDeck::builder()
             .without_agent_credentials()
-            .with_env(
-                "PATH",
-                format!("{}:{}", bin.display(), common::path_with_binary_dir()),
-            )
+            .with_env("SHELL", launch_test_shell(scratch.path()).to_string_lossy())
+            .with_env("PATH", &original_path)
             .with_env("CODEX_HOME", codex_home.to_string_lossy())
-            .with_continue_session("telemetry-codex-recorder", "codex");
+            .with_continue_session(
+                "telemetry-codex-recorder",
+                format!("{program} 'argument with spaces' --fixture-flag"),
+            );
         if enabled {
             builder = builder
                 .with_env("OTEL_EXPORTER_OTLP_ENDPOINT", &receiver.endpoint)
@@ -1426,7 +1493,27 @@ fn telemetry_otlp_016_codex_launch_enables_only_safe_signals() {
             .iter()
             .map(|arg| arg.as_str().unwrap())
             .collect();
-        assert_eq!(record["env"]["CODEX_HOME"], codex_home.to_str().unwrap());
+        assert_launch_path(&record, &deck, &original_path, enabled);
+        assert_eq!(
+            record["env"]["CODEX_HOME"],
+            if case == "script-home" {
+                alt_home.to_str().unwrap()
+            } else {
+                codex_home.to_str().unwrap()
+            },
+            "{case}: effective CODEX_HOME"
+        );
+        if !matches!(case, "plain" | "user-config" | "absolute") {
+            assert_eq!(
+                record["env"]["FOO"],
+                if case == "script-home" || case == "script-traces-none" {
+                    Value::Null
+                } else {
+                    json!("1")
+                },
+                "{case}: script must really execute"
+            );
+        }
         assert!(
             !argv.join(" ").contains(HEADER_SECRET),
             "secret in Codex argv"
@@ -1440,14 +1527,44 @@ fn telemetry_otlp_016_codex_launch_enables_only_safe_signals() {
             .filter(|pair| pair[0] == "-c" && pair[1].starts_with("otel."))
             .map(|pair| pair[1])
             .collect();
+        let original_args: Vec<_> = argv
+            .iter()
+            .enumerate()
+            .filter_map(|(index, arg)| {
+                if (*arg == "-c"
+                    && argv
+                        .get(index + 1)
+                        .is_some_and(|next| next.starts_with("otel.")))
+                    || (index > 0 && argv[index - 1] == "-c" && arg.starts_with("otel."))
+                {
+                    None
+                } else {
+                    Some(*arg)
+                }
+            })
+            .collect();
+        assert_eq!(
+            original_args,
+            ["argument with spaces", "--fixture-flag"],
+            "{case}: preserve original argv"
+        );
         close(&deck, &agent(&deck));
-        if enabled && !user_config {
+        if enabled && !matches!(case, "user-config" | "script-home" | "absolute") {
             assert_eq!(
                 overrides.len(),
-                2,
-                "Codex needs exactly trace and metric activation: {argv:?}"
+                if case == "script-traces-none" { 1 } else { 2 },
+                "{case}: Codex needs only the enabled trace/metric activation: {argv:?}"
             );
             for (signal, endpoint) in [("trace", "codex-traces"), ("metrics", "codex-metrics")] {
+                if case == "script-traces-none" && signal == "trace" {
+                    assert!(
+                        !overrides
+                            .iter()
+                            .any(|value| value.starts_with("otel.trace_exporter=")),
+                        "in-script trace opt-out: {argv:?}"
+                    );
+                    continue;
+                }
                 let value = overrides
                     .iter()
                     .find(|value| value.starts_with(&format!("otel.{signal}_exporter=")))
@@ -1471,7 +1588,7 @@ fn telemetry_otlp_016_codex_launch_enables_only_safe_signals() {
         } else {
             assert!(
                 overrides.is_empty(),
-                "off/user-owned configuration must not receive overrides: {argv:?}"
+                "{case}: off/user-owned/absolute launch must not receive overrides: {argv:?}"
             );
             if !enabled {
                 assert!(record["env"].get("OTEL_RESOURCE_ATTRIBUTES").is_none());
@@ -1480,17 +1597,36 @@ fn telemetry_otlp_016_codex_launch_enables_only_safe_signals() {
     }
 }
 
-/// Scenario: Restore a Devin stand-in with export off and on, recording argv and any per-run config while the pane is alive. Enabled export must supply a private metadata-only config with run identity and preserved JSONC user settings, respect a user's own OTel endpoints and logging flags, then delete the overlay when the pane closes.
+/// Scenario: Start a Devin recorder directly and through scripts that call devin by name, select another config home, disable OTel or metrics, or supply their own config, plus an absolute-path launch and export off. Inspect argv, PATH and the private overlay for preserved user settings, identity, permissions and absent header secrets, then close the pane and require overlay removal.
 #[spec("telemetry/otlp/017")]
 #[test]
 fn telemetry_otlp_017_devin_launch_config_is_private_and_temporary() {
-    for (enabled, user_otel) in [(false, false), (true, false), (true, true)] {
+    for case in [
+        "script",
+        "plain",
+        "user-otel",
+        "script-home",
+        "script-disabled",
+        "script-metrics-none",
+        "script-config",
+        "absolute",
+        "off",
+    ] {
+        let enabled = case != "off";
+        let user_otel = case == "user-otel";
         let receiver = Receiver::start();
         let scratch = common::harness_tempdir().unwrap();
         let bin = scratch.path().join("bin");
         let config_home = scratch.path().join("config");
+        let alt_config_home = scratch.path().join("alternate-config");
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::create_dir_all(config_home.join("devin")).unwrap();
+        std::fs::create_dir_all(alt_config_home.join("devin")).unwrap();
+        std::fs::write(
+            alt_config_home.join("devin/config.json"),
+            r#"{"theme_mode":"light"}"#,
+        )
+        .unwrap();
         write_executable(&bin.join("devin"), AGENT_LAUNCH_RECORDER);
         let source = if user_otel {
             "{ // user choices\n\"theme_mode\": \"dark\", \"otel\": {\"endpoint\": \"http://127.0.0.1:9/user-owned\", \"disable_user_prompt_logging\": false, \"disable_tool_logging\": false, \"resource_attributes\": {\"user.marker\": \"preserved\"}}}"
@@ -1498,14 +1634,59 @@ fn telemetry_otlp_017_devin_launch_config_is_private_and_temporary() {
             "{ // user config must survive\n\"theme_mode\": \"dark\"}"
         };
         std::fs::write(config_home.join("devin/config.json"), source).unwrap();
+        let explicit_config = scratch.path().join("explicit-devin.json");
+        std::fs::write(
+            &explicit_config,
+            r#"{"theme_mode":"light","otel":{"enabled":false}}"#,
+        )
+        .unwrap();
+        let disabled_home = scratch.path().join("disabled-config");
+        std::fs::create_dir_all(disabled_home.join("devin")).unwrap();
+        std::fs::write(
+            disabled_home.join("devin/config.json"),
+            r#"{"otel":{"enabled":false}}"#,
+        )
+        .unwrap();
+        let wrapper = scratch.path().join("run-devin.sh");
+        let setup = match case {
+            "script-home" => format!(
+                "export XDG_CONFIG_HOME={}\n",
+                shell_quote(alt_config_home.to_str().unwrap())
+            ),
+            "script-disabled" => format!(
+                "export XDG_CONFIG_HOME={}\n",
+                shell_quote(disabled_home.to_str().unwrap())
+            ),
+            "script-metrics-none" => "export OTEL_METRICS_EXPORTER=none\n".to_string(),
+            _ => "export FOO=1\n".to_string(),
+        };
+        let config_arg = if case == "script-config" {
+            format!(
+                "--config {} ",
+                shell_quote(explicit_config.to_str().unwrap())
+            )
+        } else {
+            String::new()
+        };
+        write_executable(
+            &wrapper,
+            &format!("#!/bin/sh\n{setup}devin {config_arg}\"$@\"\n"),
+        );
+        let program = match case {
+            "plain" | "user-otel" => "devin".to_string(),
+            "absolute" => shell_quote(bin.join("devin").to_str().unwrap()),
+            _ => shell_quote(wrapper.to_str().unwrap()),
+        };
+        let original_path = format!("{}:{}", bin.display(), common::path_with_binary_dir());
         let mut builder = TuiDeck::builder()
             .without_agent_credentials()
-            .with_env(
-                "PATH",
-                format!("{}:{}", bin.display(), common::path_with_binary_dir()),
-            )
+            .with_env("SHELL", launch_test_shell(scratch.path()).to_string_lossy())
+            .with_env("PATH", &original_path)
             .with_env("XDG_CONFIG_HOME", config_home.to_string_lossy())
-            .with_continue_session("telemetry-devin-recorder", "devin");
+            .with_continue_session(
+                "telemetry-devin-recorder",
+                format!("{program} 'argument with spaces' --fixture-flag"),
+            );
         if enabled {
             builder = builder
                 .with_env("OTEL_EXPORTER_OTLP_ENDPOINT", &receiver.endpoint)
@@ -1518,20 +1699,63 @@ fn telemetry_otlp_017_devin_launch_config_is_private_and_temporary() {
         }
         let deck = builder.launch_with_fixture("minimal");
         let record = launch_record(&deck);
+        assert_launch_path(&record, &deck, &original_path, enabled);
         assert!(!record["argv"].to_string().contains(HEADER_SECRET));
+        let argv = record["argv"].as_array().unwrap();
+        let original_args: Vec<_> = argv
+            .iter()
+            .enumerate()
+            .filter_map(|(index, arg)| {
+                if arg == "--config" || (index > 0 && argv[index - 1] == "--config") {
+                    None
+                } else {
+                    Some(arg.as_str().unwrap())
+                }
+            })
+            .collect();
+        assert_eq!(
+            original_args,
+            ["argument with spaces", "--fixture-flag"],
+            "{case}: preserve original argv"
+        );
         let launched = agent(&deck);
+        let generated_path = record.get("config_path").and_then(Value::as_str);
+        if let Some(path) = generated_path {
+            assert!(
+                Path::new(path).exists(),
+                "{case}: config must exist while agent is alive"
+            );
+        }
         close(&deck, &launched);
-        if !enabled {
+        if matches!(
+            case,
+            "off" | "absolute" | "script-disabled" | "script-config"
+        ) {
+            if case == "script-config" {
+                assert_eq!(
+                    generated_path,
+                    explicit_config.to_str(),
+                    "explicit --config must be unchanged"
+                );
+                assert!(
+                    explicit_config.exists(),
+                    "user config must not be deleted at run end"
+                );
+                continue;
+            }
             assert!(
                 record.get("config_path").is_none(),
-                "disabled export must not add --config: {record}"
+                "{case}: disabled/user-owned/absolute launch must not add --config; argv: {}",
+                record["argv"]
             );
-            assert!(record["env"].get("OTEL_RESOURCE_ATTRIBUTES").is_none());
+            if !enabled {
+                assert!(record["env"].get("OTEL_RESOURCE_ATTRIBUTES").is_none());
+            }
             continue;
         }
         let path = record["config_path"].as_str().unwrap_or_else(|| {
             panic!(
-                "enabled Devin launch must pass --config; argv: {}",
+                "{case}: enabled Devin launch must pass --config; argv: {}",
                 record["argv"]
             )
         });
@@ -1547,7 +1771,12 @@ fn telemetry_otlp_017_devin_launch_config_is_private_and_temporary() {
         );
         let config: Value = serde_json::from_str(raw).expect("generated Devin overlay JSON");
         assert_eq!(
-            config["theme_mode"], "dark",
+            config["theme_mode"],
+            if case == "script-home" {
+                "light"
+            } else {
+                "dark"
+            },
             "JSONC user settings must survive"
         );
         let otel = &config["otel"];
@@ -1562,6 +1791,16 @@ fn telemetry_otlp_017_devin_launch_config_is_private_and_temporary() {
         assert_eq!(resources["user.region"], "test");
         assert_eq!(otel["disable_user_prompt_logging"], !user_otel);
         assert_eq!(otel["disable_tool_logging"], !user_otel);
+        if case == "script-metrics-none" {
+            assert!(
+                otel.get("metrics_endpoint").is_none() && otel.get("endpoint").is_none(),
+                "in-script metric opt-out: {config}"
+            );
+            assert_eq!(
+                otel["logs_endpoint"],
+                format!("{}/v1/logs", receiver.endpoint)
+            );
+        }
         if user_otel {
             assert_eq!(otel["endpoint"], "http://127.0.0.1:9/user-owned");
             assert_eq!(resources["user.marker"], "preserved");
