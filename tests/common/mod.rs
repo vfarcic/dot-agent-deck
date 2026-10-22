@@ -11973,15 +11973,26 @@ macro_rules! claude_prompt_draw {
 /// their life blocked in `read`; `wait` is interrupted by a trapped signal. As
 /// an asynchronous list of a shell without job control, the subshell shares the
 /// terminal's foreground process group, so it is sent both the `SIGWINCH` and
-/// the hangup that ends it when the pane closes. It also ends within a second
-/// of the stand-in's own exit (`$$` is the stand-in's shell), so a stand-in that
-/// exits by itself does not leave it holding the pane open.
+/// the hangup that ends it when the pane closes.
+///
+/// The subshell draws the first box too, after installing its trap, so no
+/// resize falls between a box and the trap that would repaint it: one before
+/// the trap is cleared before the box is drawn. The stand-in still waits for
+/// that box before its next line: the subshell holds the pipe to `cat` until
+/// the box is out, and then writes to the terminal through fd 9.
+///
+/// Its loop checks once a second whether the stand-in's shell (`$$`) is still
+/// there, and ends after it is gone. A stand-in shell that has exited but is
+/// not yet reaped, or whose PID is reused, keeps it running until the pane's
+/// hangup, and each resize can leave one `sleep 1` running out its second.
 #[allow(dead_code)]
 pub const CLAUDE_PROMPT_FRAME: &str = concat!(
+    "exec 9>&1\n{ ( trap \"printf '\\033[H\\033[2J' >&9; ",
     claude_prompt_draw!(),
-    "\n( trap \"printf '\\033[H\\033[2J'; ",
+    " >&9\" WINCH; ",
     claude_prompt_draw!(),
-    "\" WINCH; while kill -0 $$ 2>/dev/null; do sleep 1 & wait $!; done ) &\n"
+    " >&9; exec >&9; while kill -0 $$ 2>/dev/null; do sleep 1 & wait $!; done ) & } \
+     | cat >/dev/null\n"
 );
 
 /// The [`write_late_announcing_agent`] log line meaning "my PTY input queue was

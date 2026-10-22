@@ -8827,6 +8827,14 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Platform coverage:** mac+linux.
 - **Cost:** none.
 
+##### inbox/doorbell/034 — A repaint racing a resize's ring clear is kept for the first ring.
+- **Layer:** Fast (`src/agent_pty.rs`, `spawn_tests`), a real resize of a `cat` PTY, with a test hook between the resize's ioctl and its ring clear and the pane's output fed directly.
+- **Agent:** none (`cat`), read with Claude Code's prompt recogniser.
+- **Asserts:** a prompt box pushed from another thread, as the PTY reader pushes the agent's SIGWINCH repaint, between the ioctl and the clear survives the clear, and the doorbell for a generation that waits for its prompt on screen is written and submitted. Red when the clear can run after such a push.
+- **Does not assert:** a real agent's repaint timing, or bytes written at the old size that the reader pushes after the clear (the best-effort part of a resize's single-epoch replay).
+- **Platform coverage:** mac+linux.
+- **Cost:** half a second, the time the hook gives the push to land before the clear.
+
 #### inbox/boundary
 
 ##### inbox/boundary/001 — The legacy ack-wait touches only legacy-owned assignments.

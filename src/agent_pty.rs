@@ -2004,6 +2004,10 @@ const GEOMETRY_BROADCAST_CAPACITY: usize = 16;
 pub struct AgentBus {
     tx: broadcast::Sender<Arc<Vec<u8>>>,
     state: Mutex<AgentBusState>,
+    /// Test hook run once by the next resize between its ioctl and its ring
+    /// clear (`inbox/doorbell/034`).
+    #[cfg(test)]
+    between_resize_and_clear: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 struct AgentBusState {
@@ -2031,6 +2035,13 @@ impl AgentBusState {
         snapshot.extend(self.scrollback.iter().copied());
         snapshot
     }
+
+    fn clear_ring(&mut self) {
+        self.scrollback.clear();
+        // Issue #1537: the ring now starts where the stream is, so it starts in
+        // whatever modes the stream is in.
+        self.ring_start_modes = self.live_modes.clone();
+    }
 }
 
 impl Default for AgentBus {
@@ -2049,6 +2060,16 @@ impl AgentBus {
                 live_modes: ReplayModes::default(),
                 ring_start_modes: ReplayModes::default(),
             }),
+            #[cfg(test)]
+            between_resize_and_clear: Mutex::new(None),
+        }
+    }
+
+    #[cfg(test)]
+    fn run_between_resize_and_clear(&self) {
+        let hook = self.between_resize_and_clear.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
         }
     }
 
@@ -2092,25 +2113,41 @@ impl AgentBus {
         self.state.lock().unwrap().snapshot()
     }
 
-    /// Drop the scrollback ring on the floor, leaving live subscribers
-    /// untouched (PRD #104 M3). Called from
-    /// [`AgentPtyRegistry::resize`] after the master ioctl succeeds so
-    /// the next attach-replay snapshot only covers bytes written at
-    /// the new (rows, cols) — without this, a single snapshot could
-    /// span multiple dimension epochs and the early bytes would be
-    /// parsed at the wrong width.
+    /// Run `resize`, the master ioctl that SIGWINCHes the child, and when it
+    /// succeeds drop the scrollback ring on the floor, leaving live
+    /// subscribers untouched (PRD #104 M3). Called from
+    /// [`AgentPtyRegistry::resize`] so the next attach-replay snapshot only
+    /// covers bytes written at the new (rows, cols) — without this, a single
+    /// snapshot could span multiple dimension epochs and the early bytes
+    /// would be parsed at the wrong width.
     ///
-    /// Takes the same `state` mutex `push`/`subscribe`/`snapshot` use,
-    /// so a concurrent `subscribe` either sees the full pre-resize
-    /// snapshot (and the live receiver picks up post-resize bytes) or
-    /// sees an empty snapshot and the receiver picks up everything —
-    /// no torn read.
-    fn clear_scrollback(&self) {
+    /// Both run under the `state` mutex `push` takes, so no byte the child
+    /// writes in answer to the SIGWINCH can be pushed before the clear: the
+    /// repaint it draws for the new size always survives it. Before PRD #1666
+    /// part 2 the ioctl ran first, and a repaint pushed in between was
+    /// cleared; since then the doorbell waits for a just-started agent's
+    /// prompt on screen (`inbox/doorbell/008`), so losing that repaint held
+    /// its first message until it drew again (`inbox/doorbell/034`). Bytes
+    /// the child wrote at the OLD size that the reader had not pushed yet
+    /// still land after the clear, as they always did: the ring is one epoch
+    /// from the ioctl on, best-effort for what was already in flight.
+    ///
+    /// A concurrent `subscribe` either sees the full pre-resize snapshot (and
+    /// the live receiver picks up post-resize bytes) or sees an empty
+    /// snapshot and the receiver picks up everything — no torn read.
+    fn resize_and_clear<E>(&self, resize: impl FnOnce() -> Result<(), E>) -> Result<(), E> {
         let mut state = self.state.lock().unwrap();
-        state.scrollback.clear();
-        // Issue #1537: the ring now starts where the stream is, so it starts in
-        // whatever modes the stream is in.
-        state.ring_start_modes = state.live_modes.clone();
+        resize()?;
+        #[cfg(test)]
+        self.run_between_resize_and_clear();
+        state.clear_ring();
+        Ok(())
+    }
+
+    /// The ring clear [`Self::resize_and_clear`] makes, without a resize.
+    #[cfg(test)]
+    fn clear_scrollback(&self) {
+        self.state.lock().unwrap().clear_ring();
     }
 
     /// Current number of live broadcast subscribers. Lets diagnostics and
@@ -12356,23 +12393,25 @@ impl AgentPtyRegistry {
         if agent.pty_rows == rows && agent.pty_cols == cols {
             return Ok(());
         }
+        // PRD #104 M3: drop the scrollback ring so a snapshot returned to a
+        // fresh subscriber covers a single dimension epoch, in one step with
+        // the ioctl so the agent's repaint for the new size is kept. See
+        // `AgentBus::resize_and_clear` for the residual best-effort gap.
+        let master = &agent.master;
         agent
-            .master
-            .resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
+            .bus
+            .resize_and_clear(|| {
+                master.resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
             })
             .map_err(|e| AgentPtyError::Resize(e.to_string()))?;
         agent.pty_rows = rows;
         agent.pty_cols = cols;
         agent.geometry_changes += 1;
-        // PRD #104 M3: drop the scrollback ring so a snapshot returned to a
-        // fresh subscriber covers a single dimension epoch. See the long note
-        // in `resize` for the residual best-effort gap and why it is
-        // acceptable.
-        agent.bus.clear_scrollback();
         // PRD #882: tell every participating viewer what the size is now. The
         // requester learns the same number from its own response, so this is
         // for the OTHER viewers — the ones whose parser would otherwise stay at
@@ -20265,6 +20304,70 @@ mod spawn_tests {
             assert_eq!(outcome, expected, "replaced={replaced}");
             registry.shutdown_all();
         }
+    }
+
+    /// Scenario: a `cat` pane plays a Claude Code generation that has only started, and a resize moves its PTY; the prompt box the agent repaints on that SIGWINCH reaches the pane's output between the resize's ioctl and the clearing of the old-size output. The doorbell's first line, which waits for that box on screen, is written and submitted.
+    #[spec("inbox/doorbell/034")]
+    #[tokio::test]
+    async fn doorbell_034_a_repaint_racing_the_resize_clear_survives_for_the_first_ring() {
+        const PANE: &str = "pane-doorbell-resize-repaint";
+        const FRAME: &str = "────────\r\n❯\r\n────────\r\n";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                rows: 24,
+                cols: 80,
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    PANE.to_string(),
+                )]),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the doorbell's pane");
+        let bus = Arc::clone(&registry.inner.lock().unwrap().agents[&id].bus);
+        // The repaint is pushed from another thread, as the reader pushes it.
+        // The resize gives that push half a second to land before it clears:
+        // it lands at once unless the resize holds the ring meanwhile.
+        let repaint = Arc::new(std::sync::Mutex::new(None));
+        {
+            let pusher = Arc::clone(&bus);
+            let repaint = Arc::clone(&repaint);
+            *bus.between_resize_and_clear.lock().unwrap() = Some(Box::new(move || {
+                let (pushed_tx, pushed_rx) = std::sync::mpsc::channel();
+                let push = std::thread::spawn(move || {
+                    pusher.push(FRAME.as_bytes().to_vec());
+                    let _ = pushed_tx.send(());
+                });
+                let _ = pushed_rx.recv_timeout(Duration::from_millis(500));
+                *repaint.lock().unwrap() = Some(push);
+            }));
+        }
+        registry.resize(&id, 30, 100).expect("resize the pane");
+        repaint
+            .lock()
+            .unwrap()
+            .take()
+            .expect("test prerequisite: the repaint ran between the ioctl and the clear")
+            .join()
+            .expect("the repaint's push");
+        let outcome = registry
+            .write_doorbell_when_ready(
+                PANE,
+                &id,
+                DoorbellReady::Screen(crate::agent_registry::claude_prompt_on_screen),
+                false,
+                None,
+                Some("RING"),
+                || async { true },
+            )
+            .await;
+        assert_eq!(
+            outcome,
+            DoorbellWrite::Written,
+            "the prompt the agent repainted for the resize must still be on screen for the doorbell"
+        );
+        registry.shutdown_all();
     }
 
     /// Scenario: a doorbell writes its line into a `cat` pane, and a human input frame for that pane arrives while the doorbell awaits its admission re-check for the first step. The doorbell writes nothing and reports itself not admitted; once the frame is gone, the next doorbell is written (control).
