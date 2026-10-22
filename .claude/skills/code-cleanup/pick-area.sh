@@ -19,8 +19,8 @@
 #
 # or `ERROR=<reason>` and a non-zero exit.
 #
-# With `--findings <file>` (the output of find-targets.sh code: `TARGET=` lines,
-# anything else ignored) it first filters the tools' findings instead: a finding
+# With `--findings <file>` (the output of find-targets.sh code: `TARGET=` lines
+# and the `FINDINGS=` total; `TOOL=` lines are ignored) it first filters the tools' findings instead: a finding
 # survives when the mode's --check set owns its file, no open PR or running unit
 # touches that file, and no off-limits pattern matches it. The recent-cleanup
 # filter does not apply: a finding the tools still report was not fixed by the
@@ -39,7 +39,9 @@
 #
 # and when none survive it prints `FINDINGS=` and `FINDINGS_KEPT=0` and falls
 # back to the random draw above, so a unit whose findings were all filtered
-# out still gets an area.
+# out still gets an area. A findings file holding an `ERROR=` line, or with no
+# `FINDINGS=` total matching its `TARGET=` lines, is a tool run that failed or
+# was cut short: that is an `ERROR=` here, never a draw.
 #
 # `--off-limits <file>` names paths no unit may draw or change, one per line
 # (blank lines and `#` comments ignored), as the runner passed them. A line is a
@@ -251,7 +253,15 @@ seed=$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')
 # The tools' findings first, when the unit passed them. Each filter's drop is
 # counted on its own so the unit can report why a finding was not handed out.
 if [ -n "$findings" ]; then
+  # A failed or cut-short tool run is refused here, never turned into a draw:
+  # find-targets.sh prints FINDINGS= last, and only when every tool succeeded.
+  tool_error=$(grep -m1 '^ERROR=' "$findings")
+  [ -z "$tool_error" ] || die "$findings records a failed tool run (${tool_error#ERROR=}); fix that, do not draw without the findings"
+  declared=$(sed -n 's/^FINDINGS=\([0-9][0-9]*\)$/\1/p' "$findings" | tail -n 1)
+  [ -n "$declared" ] || die "$findings has no FINDINGS= total, so find-targets.sh did not finish; rerun it"
   grep '^TARGET=' "$findings" | sed 's/^TARGET=//' >"$tmp/targets" || true
+  [ "$(wc -l <"$tmp/targets")" -eq "$declared" ] \
+    || die "$findings declares FINDINGS=$declared but holds $(wc -l <"$tmp/targets") TARGET= lines"
   awk -F'\t' 'NF >= 4 && $3 ~ /^[0-9]+$/' "$tmp/targets" >"$tmp/targets.ok"
   [ "$(wc -l <"$tmp/targets.ok")" -eq "$(wc -l <"$tmp/targets")" ] \
     || die "$findings has a TARGET= line that is not <tool><TAB><path><TAB><line><TAB><what>"

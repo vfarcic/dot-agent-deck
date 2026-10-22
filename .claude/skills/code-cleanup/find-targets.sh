@@ -36,7 +36,8 @@
 # cargo-mutants restores it after each mutant; the script refuses a file with
 # uncommitted changes and checks it is unchanged afterwards.
 #
-# versions: checks every pinned tool, printing only the TOOL= lines.
+# versions: checks every pinned tool, starting knip through pnpm dlx to confirm
+# the pinned package runs, and prints only the TOOL= lines.
 #
 # A tool that is missing or at a version other than its pin stops the run with
 # ERROR= and the command that installs the pin, and a non-zero exit: a run that
@@ -74,10 +75,14 @@ require_cargo_tool() { # <crate> <subcommand> <pin>
   echo "TOOL=$1 $have"
 }
 
-require_knip() {
+require_knip() { # [start]: also start the pinned knip, for `versions`
   command -v pnpm >/dev/null || die "pnpm not found; knip runs through pnpm dlx (devbox provides pnpm)"
   [ -d desktop/node_modules ] \
     || die "desktop/node_modules is missing, and knip needs it to resolve imports; run: pnpm --dir desktop install --frozen-lockfile"
+  if [ "${1:-}" = start ]; then
+    (cd desktop && pnpm dlx "knip@$KNIP_VERSION" --version 2>&1) | grep -qxF "$KNIP_VERSION" \
+      || die "knip@$KNIP_VERSION does not start through pnpm dlx; run: pnpm --dir desktop dlx knip@$KNIP_VERSION --version"
+  fi
   echo "TOOL=knip $KNIP_VERSION"
 }
 
@@ -89,7 +94,7 @@ case "$cmd" in
   versions)
     require_cargo_tool cargo-shear shear "$CARGO_SHEAR_VERSION"
     require_cargo_tool cargo-mutants mutants "$CARGO_MUTANTS_VERSION"
-    require_knip
+    require_knip start
     ;;
 
   code)
@@ -103,11 +108,13 @@ case "$cmd" in
     # A finding carries a byte offset into its manifest; the unit needs a line.
     jq -r '.findings[] | [.file, (.location.offset // 0), ((.message + "; " + (.help // "")) | gsub("[\t\r\n]"; " "))] | @tsv' \
       "$tmp/shear.json" >"$tmp/shear.tsv"
+    # Only the printf goes to the targets file, so a die in here reaches stdout.
+    : >"$tmp/targets"
     while IFS=$'\t' read -r file offset what; do
       [ -f "$file" ] || die "cargo shear names $file, which is not a file in this checkout"
       line=$(( $(head -c "$offset" "$file" | wc -l) + 1 ))
-      printf 'TARGET=cargo-shear\t%s\t%s\t%s\n' "$file" "$line" "$what"
-    done <"$tmp/shear.tsv" >"$tmp/targets"
+      printf 'TARGET=cargo-shear\t%s\t%s\t%s\n' "$file" "$line" "$what" >>"$tmp/targets"
+    done <"$tmp/shear.tsv"
 
     # knip exits 1 when it finds something too, so again the JSON decides.
     (cd desktop && pnpm dlx "knip@$KNIP_VERSION" --reporter json) >"$tmp/knip.json" 2>"$tmp/knip.err"

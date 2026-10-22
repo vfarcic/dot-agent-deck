@@ -14,10 +14,9 @@
 # within the window (default 24 hours, the default SKILL.md states). A PR is
 # attributed to a mode by its head branch, `agent/dispatch-cleanup-<mode>-...`,
 # the name SKILL.md step 3 gives every unit; a `cleanup` PR on any other branch
-# names no mode and is ignored. Only the 50 most recently created merged
-# cleanup PRs are read, so a mode whose last merge is older than all of them
-# reads as due, which is the answer the window would give it anyway unless the
-# window is long and cleanup PRs very frequent.
+# names no mode and is ignored. GitHub is asked only for the cleanup PRs merged
+# within the window, up to 200 of them, so the answer does not depend on the
+# order in which older PRs were created.
 #
 # A failed GitHub lookup stops with ERROR= and a non-zero exit rather than
 # reporting every mode as due.
@@ -50,7 +49,8 @@ tmp=$(mktemp) || die "mktemp failed"
 trap 'rm -f "$tmp"' EXIT
 
 repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner) || die "gh repo view failed"
-gh pr list --repo "$repo" --label cleanup --state merged --limit 50 \
+since=$(jq -nr --argjson h "$window" '(now - $h * 3600) | floor | todate') || die "cannot compute the window start"
+gh pr list --repo "$repo" --label cleanup --state merged --search "merged:>=$since" --limit 200 \
   --json number,headRefName,mergedAt >"$tmp" || die "cannot list merged cleanup PRs"
 jq -e 'type == "array"' "$tmp" >/dev/null 2>&1 || die "gh pr list returned something other than a list"
 
