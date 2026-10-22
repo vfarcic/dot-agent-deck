@@ -2117,6 +2117,50 @@ async fn a_full_stream_queue_is_issued_nothing() {
     peer.close().await;
 }
 
+/// PRD #1666 part 2: a delegation that supersedes a task whose orchestrator
+/// was told it is uncertain retires the task's watch and, with it, the
+/// generation's record that the orchestrator was told, which no later commit
+/// could use any more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_superseded_uncertain_task_leaves_no_told_marker() {
+    let hub = hub_with(Duration::from_secs(30), Duration::from_secs(60));
+    let mut peer = Peer::open(&hub, "p", "a", InboxComponent::OpenCodePlugin, INTEGRATION).await;
+    peer.next().await;
+    let delegate = |body: &str| {
+        hub.post_delegate(
+            Recipient::bound("p", "a"),
+            "coder",
+            Some(Recipient::bound("o", "oa")),
+            DelegateLedger::default(),
+            content(body),
+            &|| true,
+        )
+        .unwrap()
+        .0
+    };
+    let id = delegate("uncertain task");
+    let mut seq = 0;
+    lapse_until_uncertain(&hub, &mut peer, id.as_str(), &mut seq).await;
+    let key = ("p".to_string(), "a".to_string());
+    let marked = || {
+        hub.lock().receipts.gens[&key]
+            .uncertain_told
+            .contains(id.as_str())
+    };
+    until("the orchestrator to be told it is uncertain", || {
+        hub.tick();
+        marked()
+    })
+    .await;
+    delegate("newer task");
+    assert!(
+        !hub.lock().delegates.contains_key(id.as_str()),
+        "the newer delegation retired the watch"
+    );
+    assert!(!marked(), "and the marker with it");
+    peer.close().await;
+}
+
 /// Reviewer R9T-03 (PR #1735 review 4298669219): a task delegated to a Pi
 /// receiver is reported not handed on every attempt, so it runs out of
 /// attempts: the orchestrator is told it is undeliverable and the worker's

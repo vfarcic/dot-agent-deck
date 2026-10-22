@@ -507,10 +507,11 @@ struct HubState {
     receipts: engine::Receipts,
     /// PRD #1666 §2: delegated tasks the user cancelled, with the
     /// orchestrator and role to correct when one commits after all, and the
-    /// order they were cancelled in. Oldest dropped past
+    /// order of each task's first Cancel. Oldest dropped past
     /// [`MAX_CANCELLED_TASKS`] ([`remember_cancelled_task`]).
     cancelled_tasks: HashMap<String, (Recipient, String, u64)>,
-    /// The order number the next entry of `cancelled_tasks` gets.
+    /// The order number the next task added to `cancelled_tasks` gets. A
+    /// plain `u64` count: nothing handles its overflow.
     cancelled_seq: u64,
     /// PRD #1666 §6.4: cancelled messages that may already have reached their
     /// agent (an attempt was not positively not handed), so the notice their
@@ -3920,7 +3921,7 @@ fn retire_delegates_locked(
             .retire(now, &id, pane_id, UndeliverableReason::Superseded)
         {
             retired += 1;
-        } else if let Some(mut watch) = st.delegates.remove(&id) {
+        } else if let Some(mut watch) = remove_watch(st, &id) {
             // Already terminal without an event reaching the watch.
             if let Some(end) = watch.end.take() {
                 let _ = end.send(DelegateEnd::Ended);
@@ -3938,6 +3939,15 @@ fn retire_delegates_locked(
             .is_none_or(|message| message.state.is_terminal())
     });
     retired
+}
+
+/// End the watch on delegated task `id`, and the record that its orchestrator
+/// was told it is uncertain: a commit corrects through the watch, so without it
+/// that record is never read.
+fn remove_watch(st: &mut HubState, id: &str) -> Option<DelegateWatch> {
+    let watch = st.delegates.remove(id)?;
+    engine::forget_uncertain(st, id);
+    Some(watch)
 }
 
 /// Log the inbox's state changes and broadcast each one to attached clients.
@@ -4185,7 +4195,7 @@ fn settle_delegate(st: &mut HubState, event: &InboxEvent) {
         StateName::Undeliverable => DelegateEnd::Ended,
         _ => return,
     };
-    let Some(mut watch) = st.delegates.remove(id) else {
+    let Some(mut watch) = remove_watch(st, id) else {
         return;
     };
     if let Some(tx) = watch.end.take() {
@@ -4243,9 +4253,10 @@ fn settle_delegate(st: &mut HubState, event: &InboxEvent) {
 
 /// PRD #1666 §6.6: the notice an orchestrator gets once when a delegated
 /// task's delivery became uncertain. It says a correction may follow, never
-/// that one will: a late receipt is not seen once its verifier is gone, and
-/// none is reported once the worker's generation exits, the task's watch is
-/// superseded or the deck restarts.
+/// that one will: a receipt the deck has not yet observed is not seen once its
+/// verifier is gone, and has no route to the orchestrator once the worker's
+/// generation exits, the task's watch is superseded or the deck restarts. A
+/// correction already queued in `owed_notices` before then can still post.
 pub fn compose_uncertain_notice(message_id: &str, role: &str) -> String {
     format!(
         "Task {message_id} to the worker in role {} may or may not have reached the worker: the \
@@ -4336,8 +4347,14 @@ fn remember_late_ack(
 
 /// PRD #1666 §2: remember a cancelled task's orchestrator and role, so a
 /// commit after the Cancel can still correct them, dropping the oldest past
-/// [`MAX_CANCELLED_TASKS`].
+/// [`MAX_CANCELLED_TASKS`]. A task already remembered (a retransmitted
+/// Cancel) keeps the place its first Cancel gave it.
 fn remember_cancelled_task(st: &mut HubState, id: &str, to: Recipient, role: &str) {
+    if let Some(held) = st.cancelled_tasks.get_mut(id) {
+        held.0 = to;
+        held.1 = role.to_string();
+        return;
+    }
     st.cancelled_seq += 1;
     st.cancelled_tasks
         .insert(id.to_string(), (to, role.to_string(), st.cancelled_seq));
@@ -7700,6 +7717,31 @@ mod tests {
             st.cancelled_tasks
                 .contains_key(&format!("m-{MAX_CANCELLED_TASKS}"))
         );
+    }
+
+    /// PRD #1666 part 2: a Cancel remembered again for a task already held (a
+    /// retransmitted Cancel) keeps the task's first place, so past the cap the
+    /// task cancelled first is still the one dropped.
+    #[test]
+    fn a_cancel_remembered_again_keeps_its_first_place() {
+        fn remember(st: &mut HubState, id: &str) {
+            remember_cancelled_task(st, id, Recipient::bound("o", "oa"), "coder");
+        }
+        let hub = hub();
+        let mut st = hub.lock();
+        for i in 0..MAX_CANCELLED_TASKS {
+            remember(&mut st, &format!("m-{i}"));
+        }
+        remember(&mut st, "m-0");
+        assert_eq!(st.cancelled_tasks.len(), MAX_CANCELLED_TASKS);
+        remember(&mut st, "m-new");
+        assert_eq!(st.cancelled_tasks.len(), MAX_CANCELLED_TASKS);
+        assert!(
+            !st.cancelled_tasks.contains_key("m-0"),
+            "the task cancelled first is dropped first"
+        );
+        assert!(st.cancelled_tasks.contains_key("m-1"));
+        assert!(st.cancelled_tasks.contains_key("m-new"));
     }
 
     /// Reviewer nit: a delegation refused because the worker's agent no longer

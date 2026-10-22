@@ -286,7 +286,10 @@ pub(super) struct Gen {
     /// §7: hand-outs are paused for room in the evidence store.
     pub(super) paused: bool,
     /// Delegated tasks whose orchestrator was told their delivery is
-    /// uncertain (§6.6), so a later commit corrects it once.
+    /// uncertain (§6.6), so a later commit corrects it once while the task's
+    /// delegate watch remains. An id goes when the watch does
+    /// ([`forget_uncertain`]): a delegation with `--supersede` that retires it
+    /// leaves a later commit nothing to correct through.
     pub(super) uncertain_told: HashSet<String>,
 }
 
@@ -1822,8 +1825,18 @@ fn uncertain_notice(st: &mut HubState, key: &AgentKey, id: &str) {
     ));
 }
 
+/// The delegate watch on `id` has ended, so no commit can correct its
+/// orchestrator through it: drop the record that it was told `id` is uncertain.
+pub(super) fn forget_uncertain(st: &mut HubState, id: &str) {
+    for generation in st.receipts.gens.values_mut() {
+        generation.uncertain_told.remove(id);
+    }
+}
+
 /// Rule 1's correction (§2): a sender told otherwise hears the message
-/// reached its agent after all.
+/// reached its agent after all, while the task's delegate watch or its
+/// cancelled-task record remains. A task whose watch a newer delegation
+/// retired (superseded) has neither, and gets no correction.
 fn delivered_after_all(st: &mut HubState, key: &AgentKey, id: &str, despite_cancel: bool) {
     let told = st
         .receipts
