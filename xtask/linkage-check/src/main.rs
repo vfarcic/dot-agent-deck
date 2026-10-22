@@ -139,6 +139,11 @@ mod dispatch_base;
 /// only — the remedy is `gh aw compile`, not a hand-edit.
 #[cfg(test)]
 mod gh_aw_lock_consistency;
+/// Issue #1774: no gh-aw prompt body quotes the API proxy's credit-exceeded
+/// error, which gh-aw's conclusion job reads back from the agent's output as a
+/// credit failure. Tests only — the source is the workflow `.md` files.
+#[cfg(test)]
+mod gh_aw_prompt_body;
 /// Issue #1181: no `git` program literal in the root crate's production
 /// sources. Like `desktop_project_boundary` this carries a live rule — rule 13
 /// in [`RULES`] — as well as its own tests.

@@ -1,7 +1,7 @@
 // Issue #953 — the driver tier's WebDriver client.
 //
-// A W3C WebDriver session is plain JSON over HTTP, and this suite needs twelve
-// of its endpoints, so it speaks the protocol directly with Node's own `fetch`
+// A W3C WebDriver session is plain JSON over HTTP, and this suite needs
+// fourteen of its endpoints, so it speaks the protocol directly with Node's own `fetch`
 // rather than pulling in WebdriverIO: no new dependency to pin, audit or bump,
 // and nothing between a failing assertion and the wire it came from.
 //
@@ -96,6 +96,8 @@ export async function serverReady(base: string): Promise<boolean> {
 }
 
 export type Element = { readonly id: string };
+
+export type WindowRect = { x: number; y: number; width: number; height: number };
 
 export class Session {
   readonly base: string;
@@ -276,6 +278,20 @@ export class Session {
 
   async execute<T>(script: string, args: unknown[] = []): Promise<T> {
     return (await this.request("POST", "/execute/sync", { script, args })) as T;
+  }
+
+  /** Issue #1355 — the app window's position and outer size, in CSS pixels. */
+  async windowRect(): Promise<WindowRect> {
+    return (await this.request("GET", "/window/rect")) as WindowRect;
+  }
+
+  /**
+   * Issue #1355 — resize the app window as a window manager would, with
+   * WebDriver's Set Window Rect, and return the rect the driver reports after
+   * it. Only the size is sent: xvfb runs no window manager to place a window.
+   */
+  async setWindowRect(size: { width: number; height: number }): Promise<WindowRect> {
+    return (await this.request("POST", "/window/rect", size)) as WindowRect;
   }
 
   /** Base64 PNG of the window, for the failure record. */
