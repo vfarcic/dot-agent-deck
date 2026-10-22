@@ -2525,6 +2525,17 @@ impl EmbeddedPaneController {
                 self.notice_identity_refusal(&e);
                 return Ok(());
             }
+            // Every card was learned on this binary's protocol, so a daemon on
+            // another one is not the card's, and was sent nothing past its
+            // `Hello`: the close is done here, as above, and says so.
+            Ok(Err(ClientError::ProtocolMismatch { daemon, local })) => {
+                self.forget_card(pane_id);
+                push_notice(
+                    &self.close_warnings,
+                    other_protocol_close_notice(daemon, local),
+                );
+                return Ok(());
+            }
             Ok(Err(e)) => {
                 return Err(PaneError::CommandFailed(format!(
                     "Pane {pane_id} is not attached here and the daemon could not be \
@@ -2579,6 +2590,15 @@ impl EmbeddedPaneController {
             Ok(Err(e)) if is_identity_refusal(&e) => {
                 self.forget_card(pane_id);
                 self.notice_identity_refusal(&e);
+                Ok(())
+            }
+            // Or one replaced between the two by a daemon on another protocol.
+            Ok(Err(ClientError::ProtocolMismatch { daemon, local })) => {
+                self.forget_card(pane_id);
+                push_notice(
+                    &self.close_warnings,
+                    other_protocol_close_notice(daemon, local),
+                );
                 Ok(())
             }
             Ok(Err(e)) => Err(PaneError::CommandFailed(format!(
@@ -3073,6 +3093,11 @@ enum StopClass {
     /// reachable through this deck — which is not proof its process stopped —
     /// and the successor's agent with the same id is somebody else's.
     Restarted,
+    /// PRD #1666 part 2 (PR #1817 review): the daemon answering speaks another
+    /// attach protocol, so nothing past its `Hello` was sent. The pane's agent
+    /// was attached on this binary's protocol, so this daemon replaced the one
+    /// it ran under, and the close cannot be checked or retried against it.
+    OtherProtocol { daemon: Option<u32>, local: u32 },
 }
 
 impl StopClass {
@@ -3098,6 +3123,11 @@ impl StopClass {
             StopClass::Restarted => Some(StopOutcome::DoneUnverified(
                 crate::daemon_client::AGENT_GONE_AFTER_RESTART.to_string(),
             )),
+            // Completes too, rather than `Failed`: retaining the pane would
+            // only fail the same way on every retry, leaving it unclosable.
+            StopClass::OtherProtocol { daemon, local } => Some(StopOutcome::DoneUnverified(
+                other_protocol_close_notice(daemon, local),
+            )),
         }
     }
 }
@@ -3113,6 +3143,9 @@ fn classify_stop(
         Ok(Ok(())) => StopClass::Stopped,
         Ok(Err(e)) if is_agent_not_found(&e, agent_id) => StopClass::NotFound,
         Ok(Err(ClientError::DaemonRestarted)) => StopClass::Restarted,
+        Ok(Err(ClientError::ProtocolMismatch { daemon, local })) => {
+            StopClass::OtherProtocol { daemon, local }
+        }
         Ok(Err(e)) => StopClass::Failed(e.to_string()),
         Err(_) => StopClass::TimedOut,
     }
@@ -3135,6 +3168,23 @@ fn unverified_close_warning(pane_id_env: &str, reason: &str) -> String {
     format!(
         "Closed agent {pane_id_env} but {reason} — an agent may still be running unattended; \
          restart the deck to reattach it, or stop the daemon"
+    )
+}
+
+/// PRD #1666 part 2 (PR #1817 review): the user-visible text for a close whose
+/// daemon was replaced by one on another attach protocol (`daemon`, `None` when
+/// its `Hello` named none; `local` is this binary's). The pane's agent ran
+/// under a daemon on this binary's protocol, so the one answering now is not
+/// it, and nothing but the `Hello` reached it: the pane closes here, and the
+/// user is told the agent was neither checked nor stopped.
+fn other_protocol_close_notice(daemon: Option<u32>, local: u32) -> String {
+    let speaks = match daemon {
+        Some(daemon) => format!("attach protocol v{daemon}, not this deck's v{local}"),
+        None => format!("another attach protocol than this deck's v{local}"),
+    };
+    format!(
+        "Closed this pane here only: the daemon now speaks {speaks}, so the agent it showed \
+         could not be checked or stopped and may still be running"
     )
 }
 
@@ -7233,6 +7283,64 @@ mod incarnation_binding_tests {
                     daemon.received_by("a").contains(&"stop-agent".to_string()),
                     "control: current detached card stops its agent"
                 );
+            }
+        }
+    }
+
+    /// Scenario: the TUI holds a pane attached on its daemon, or a card whose terminal it detached, and the daemon is replaced at its socket by one on the next attach protocol before the user presses Ctrl+W. The pane or card closes here, the status line says the agent could not be checked or stopped, and the replacement is sent nothing past its Hello; without the replacement the close stops the agent (control).
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_a_pane_whose_daemon_changed_protocol_closes_here() {
+        let runtime = runtime();
+        let local = crate::daemon_protocol::PROTOCOL_VERSION;
+        for detached in [false, true] {
+            for replaced in [false, true] {
+                let case = format!("detached={detached} replaced={replaced}");
+                let daemon = runtime.block_on(async { RestartingDaemon::spawn("a") });
+                let controller =
+                    EmbeddedPaneController::new(daemon.path.clone(), runtime.handle().clone())
+                        .with_protocol_gate();
+                assert_eq!(controller.hydrate_from_daemon().len(), 1, "{case}");
+                if detached {
+                    controller.detach_pane("pane-1").unwrap();
+                }
+                if replaced {
+                    daemon.restart_as("other-protocol-b");
+                    if !detached {
+                        // Where the pane's reattach leaves it on meeting the
+                        // replacement.
+                        controller
+                            .mark_pane_lost_for_test("pane-1", PaneLostReason::ProtocolMismatch);
+                    }
+                }
+                let result = controller.close_pane("pane-1");
+                assert!(result.is_ok(), "{case}: Ctrl+W must close: {result:?}");
+                assert!(
+                    controller.pane_ids().is_empty(),
+                    "{case}: the pane was kept"
+                );
+                if replaced {
+                    assert_eq!(
+                        daemon.received_by("other-protocol-b"),
+                        Vec::<String>::new(),
+                        "{case}: the replacement was sent a request about the old agent"
+                    );
+                    assert_eq!(
+                        controller.take_close_warnings(),
+                        vec![other_protocol_close_notice(Some(local + 1), local)],
+                        "{case}"
+                    );
+                } else {
+                    assert!(
+                        daemon.received_by("a").contains(&"stop-agent".to_string()),
+                        "{case}: control: the close stops the agent"
+                    );
+                    assert_eq!(
+                        controller.take_close_warnings(),
+                        Vec::<String>::new(),
+                        "{case}"
+                    );
+                }
             }
         }
     }

@@ -8983,8 +8983,15 @@ pub(crate) mod restart_fixture {
                                 let op = request["op"].as_str().unwrap_or("?").to_string();
                                 if op == "hello" {
                                     *script.lock().unwrap().hellos.entry(process).or_default() += 1;
+                                    // A process named `other-protocol-…` is a
+                                    // replacement on the next attach protocol.
+                                    let version = if process.starts_with("other-protocol-") {
+                                        PROTOCOL_VERSION + 1
+                                    } else {
+                                        PROTOCOL_VERSION
+                                    };
                                     let mut reply =
-                                        AttachResponse::hello(PROTOCOL_VERSION).with_capabilities();
+                                        AttachResponse::hello(version).with_capabilities();
                                     let withheld = script.lock().unwrap().withheld.clone();
                                     if let Some(capabilities) = reply.capabilities.as_mut() {
                                         capabilities
