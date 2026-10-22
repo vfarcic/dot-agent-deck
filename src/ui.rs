@@ -41857,64 +41857,85 @@ mod tests {
         }
     }
 
-    /// Scenario: a TUI has eight panes on deck process `a`, each with a card drawn before any stream named a process. The deck restarts, and every pane's reattach finds `b` answering before the event stream has noticed. The one notice names the eight agents in pane order, not in the order the pane controller happens to hold them.
+    /// Scenario: a TUI has eight panes on deck process `a`, each with a card drawn before any stream named a process. The deck restarts, and their reattachments find `b` before the event stream notices, either together or with one pane delayed until the next frame. Each batch is named in pane order and the later batch appends without losing or repeating earlier names.
     #[spec("lifecycle/handshake/013")]
     #[test]
     fn handshake_013_lost_panes_are_named_in_pane_order() {
         use crate::daemon_client::restart_fixture::RestartingDaemon;
         use crate::embedded_pane::{EmbeddedPaneController, PaneLostReason};
         use tokio::sync::RwLock;
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let daemon = runtime.block_on(async { RestartingDaemon::spawn("a") });
-        let controller = Arc::new(
-            EmbeddedPaneController::new(daemon.path.clone(), runtime.handle().clone())
-                .with_protocol_gate(),
-        );
-        let pc: Arc<dyn PaneController> = controller.clone();
-        let mut tab_manager = TabManager::new(pc.clone());
-        let state: SharedState = Arc::new(RwLock::new(AppState::default()));
-        let mut panes: Vec<String> = (0..8)
-            .map(|_| {
-                controller
-                    .create_pane(Some("cat"), None)
-                    .expect("a pane on a")
-            })
-            .collect();
-        {
-            let mut st = state.blocking_write();
-            for pane in &panes {
-                st.register_pane(pane.clone());
-                let mut card = make_session(SessionStatus::Idle);
-                card.session_id = format!("s-{pane}");
-                card.pane_id = Some(pane.clone());
-                card.display_name = Some(format!("agent-on-{pane}"));
-                st.sessions.insert(card.session_id.clone(), card);
+        for delayed in [false, true] {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            let daemon = runtime.block_on(async { RestartingDaemon::spawn("a") });
+            let controller = Arc::new(
+                EmbeddedPaneController::new(daemon.path.clone(), runtime.handle().clone())
+                    .with_protocol_gate(),
+            );
+            let pc: Arc<dyn PaneController> = controller.clone();
+            let mut tab_manager = TabManager::new(pc.clone());
+            let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+            let mut panes: Vec<String> = (0..8)
+                .map(|_| {
+                    controller
+                        .create_pane(Some("cat"), None)
+                        .expect("a pane on a")
+                })
+                .collect();
+            {
+                let mut st = state.blocking_write();
+                for pane in &panes {
+                    st.register_pane(pane.clone());
+                    let mut card = make_session(SessionStatus::Idle);
+                    card.session_id = format!("s-{pane}");
+                    card.pane_id = Some(pane.clone());
+                    card.display_name = Some(format!("agent-on-{pane}"));
+                    st.sessions.insert(card.session_id.clone(), card);
+                }
             }
-        }
-        daemon.restart_as("b");
-        for pane in &panes {
-            controller.mark_pane_lost_for_test(pane, PaneLostReason::DeckRestarted);
-        }
-        let mut ui = default_ui();
-        process_restart_drops(&state, &*pc, &mut tab_manager, &mut ui);
+            daemon.restart_as("b");
+            panes.sort();
+            for pane in &panes {
+                if delayed && pane == &panes[2] {
+                    continue;
+                }
+                controller.mark_pane_lost_for_test(pane, PaneLostReason::DeckRestarted);
+            }
+            let mut ui = default_ui();
+            process_restart_drops(&state, &*pc, &mut tab_manager, &mut ui);
 
-        panes.sort();
-        let names: Vec<String> = panes
-            .iter()
-            .map(|pane| format!("agent-on-{pane}"))
-            .collect();
-        assert_eq!(
-            restart_notice_text(&ui),
-            Some(format!(
-                "The deck restarted; these agents were stopped: {}.",
-                names.join(", ")
-            )),
-            "the notice's order follows the controller's map"
-        );
+            if delayed {
+                let late = panes.remove(2);
+                let first_batch = restart_notice_text(&ui).unwrap();
+                assert!(
+                    !first_batch.contains(&format!("agent-on-{late}")),
+                    "delayed pane was already named: {first_batch}"
+                );
+                controller.mark_pane_lost_for_test(&late, PaneLostReason::DeckRestarted);
+                process_restart_drops(&state, &*pc, &mut tab_manager, &mut ui);
+                panes.push(late);
+            }
+            let names: Vec<String> = panes
+                .iter()
+                .map(|pane| format!("agent-on-{pane}"))
+                .collect();
+            assert_eq!(
+                restart_notice_text(&ui),
+                Some(format!(
+                    "The deck restarted; these agents were stopped: {}.",
+                    names.join(", ")
+                )),
+                "the notice's order follows the controller's map"
+            );
+            let rows = restart_frame_rows(&state.blocking_read(), &mut ui).join("\n");
+            assert!(
+                rows.contains("The deck restarted") && rows.contains("and 5 more."),
+                "footer did not keep the first batch's names: {rows}"
+            );
+        }
     }
 
     /// Scenario: the deck-messages picker is open on a card learned from deck process `a` when the event stream moves to `b`, a restarted deck reusing the card's pane and agent ids. The picker closes rather than show `b`'s rows; while the stream is between two processes it keeps the rows it has; while the stream is still `a` it stays open and refreshes (control).
@@ -42152,7 +42173,7 @@ mod tests {
         }
     }
 
-    /// Scenario: with one managed agent, a burst of Ctrl+C, Down, Enter and `y` reaches the dashboard with no frame drawn between the keys. The Quit dialog opens and nothing else happens. Once Quit is drawn, Down and Enter open the Stop confirmation, and `y`, Down and Enter do nothing until Stop has been drawn; after that frame `y` stops (control). Opening Stop with Quit's [Stop] button behaves the same. In an 8×14 terminal, where Stop's popup is too narrow to show No or Yes, `y`, Down and Enter are refused even after a frame, and Escape still returns to Quit; at 80×24 Down and Enter stop (control).
+    /// Scenario: With one managed agent, keys queued before Quit, Stop or ConfigGen's first frame choose nothing, including after a mouse opening or closing and reopening the same dialog without a frame. In an 8×14 terminal each dialog refuses choices whose labels are clipped. At 80×24 the drawn dialogs navigate and confirm normally, with Stop terminating only after a visible choice.
     #[spec("lifecycle/handshake/013")]
     #[test]
     fn handshake_013_a_confirmation_takes_no_choice_its_frame_has_not_shown() {
@@ -42165,7 +42186,15 @@ mod tests {
         let mut tab_manager = TabManager::new(pc.clone());
         let state: SharedState = Arc::new(RwLock::new(AppState::default()));
         let mut snapshot = AppState::default();
-        snapshot.seed_hydrated_session("p".into(), None, None, Some("1".into()), None);
+        snapshot.seed_hydrated_session(
+            "p".into(),
+            Some("/synthetic-config-target".into()),
+            None,
+            Some("1".into()),
+            None,
+        );
+        let selected = snapshot.sessions.keys().next().unwrap().clone();
+        let filtered: Vec<_> = snapshot.sessions.iter().collect();
         let mut send = |ui: &mut UiState, input: Input, (width, height): (u16, u16)| {
             let area = Rect::new(0, 0, width, height);
             match input {
@@ -42176,7 +42205,7 @@ mod tests {
                     &state,
                     &mut tab_manager,
                     &snapshot,
-                    &[],
+                    &filtered,
                     area,
                 ),
                 Input::Click(action) => dispatch_action(
@@ -42186,8 +42215,8 @@ mod tests {
                     &state,
                     &mut tab_manager,
                     &snapshot,
-                    &[],
-                    None,
+                    &filtered,
+                    Some(&selected),
                     area,
                 ),
             }
@@ -42305,6 +42334,81 @@ mod tests {
             Flow::Break,
             "control: Down and Enter on the drawn Yes did not stop"
         );
+
+        // ConfigGen's keyboard and mouse openings, including leaving and
+        // reopening the same mode before the next frame (a stale-record trap).
+        for mouse in [false, true] {
+            let mut ui = default_ui();
+            ui.selected_index = Some(0);
+            let open = || {
+                if mouse {
+                    Input::Click(Action::RequestConfigGen)
+                } else {
+                    key(KeyCode::Char('g'))
+                }
+            };
+            send(&mut ui, open(), normal);
+            assert_eq!(ui.mode, UiMode::ConfigGenPrompt, "ConfigGen did not open");
+            for code in [KeyCode::Down, KeyCode::Enter, KeyCode::Char('y')] {
+                send(&mut ui, key(code), normal);
+            }
+            let rows = draw_sized(&mut ui, normal.0, normal.1).join("\n");
+            assert!(
+                rows.contains("Generate .dot-agent-deck.toml") && rows.contains("> Yes"),
+                "undrawn ConfigGen took queued input (mouse={mouse}): {rows}"
+            );
+            send(&mut ui, key(KeyCode::Esc), normal);
+            send(&mut ui, open(), normal);
+            send(&mut ui, key(KeyCode::Down), normal);
+            send(&mut ui, key(KeyCode::Enter), normal);
+            let rows = draw_sized(&mut ui, normal.0, normal.1).join("\n");
+            assert!(
+                rows.contains("Generate .dot-agent-deck.toml") && rows.contains("> Yes"),
+                "reopened ConfigGen reused its previous frame (mouse={mouse}): {rows}"
+            );
+            send(&mut ui, key(KeyCode::Down), normal);
+            let rows = draw_sized(&mut ui, normal.0, normal.1).join("\n");
+            assert!(
+                rows.contains("> No"),
+                "control: ConfigGen refused drawn Down: {rows}"
+            );
+            send(&mut ui, key(KeyCode::Enter), normal);
+            assert_eq!(
+                ui.mode,
+                UiMode::Normal,
+                "control: ConfigGen's No did not close"
+            );
+        }
+
+        for mode in [UiMode::QuitConfirm, UiMode::ConfigGenPrompt] {
+            let mut ui = default_ui();
+            ui.mode = mode;
+            draw_sized(&mut ui, tiny.0, tiny.1);
+            for code in [KeyCode::Down, KeyCode::Enter, KeyCode::Char('y')] {
+                let flow = send(&mut ui, key(code), tiny);
+                assert_eq!(flow, Flow::Continue, "8×14 {mode:?}: {code:?} acted");
+                assert_eq!(
+                    ui.mode, mode,
+                    "8×14 {mode:?}: {code:?} chose a clipped label"
+                );
+            }
+            let rows = draw_sized(&mut ui, normal.0, normal.1).join("\n");
+            let expected = if mode == UiMode::QuitConfirm {
+                "> Detach"
+            } else {
+                "> Yes"
+            };
+            assert!(
+                rows.contains(expected),
+                "8×14 {mode:?} moved its selection: {rows}"
+            );
+            send(&mut ui, key(KeyCode::Esc), normal);
+            assert_eq!(
+                ui.mode,
+                UiMode::Normal,
+                "{mode:?}: Escape no longer cancels"
+            );
+        }
     }
 
     /// Scenario: with a restart notice held in its footer rows, the user opens the upgrade dialog in a 60×24 terminal, narrower than the dialog needs. The dialog asks for a larger terminal above the notice, which stays in view: no draw clears it.

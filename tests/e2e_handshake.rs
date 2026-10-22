@@ -803,7 +803,7 @@ fn handshake_013_ctrl_w_after_a_same_build_restart_preserves_the_successor() {
     );
 }
 
-/// Scenario: Restart the private deck while typing a filter with twelve agents listed. The notice stays in a footer row beside the field, independent of the expiring status slot, and remains after Escape; `a` opens a scrollable list containing every name, Escape keeps the notice, a second restart joins it, and `c` dismisses it. While the notice is held, typing `ac` into the successor's pane still reaches that pane.
+/// Scenario: Restart the private deck while typing a filter with twelve agents listed. The notice stays in a footer row beside the field, independent of the expiring status slot, and remains after Escape; `a` opens a scrollable list containing every name regardless of drop order, Escape keeps the notice, and a second restart keeps every earlier name alongside its new one before `c` dismisses it. While the notice is held, typing `ac` into the successor's pane still reaches that pane.
 #[spec("lifecycle/handshake/013")]
 #[test]
 fn handshake_013_the_held_notice_survives_filter_and_joins_later_restarts() {
@@ -853,41 +853,75 @@ fn handshake_013_the_held_notice_survives_filter_and_joins_later_restarts() {
             ),
         ],
     );
-    let summary =
-        "The deck restarted; these agents were stopped: held-00, held-01, held-02 and 9 more.";
+    let prefix = "The deck restarted; these agents were stopped: ";
     deck.wait_until_grid("held notice has its own row while Filter owns input", |g| {
         g.contains("/ ac")
-            && g.lines()
-                .any(|line| line.contains(summary) && !line.contains("/ ac"))
+            && g.lines().any(|line| {
+                line.contains(prefix) && line.contains("and 9 more.") && !line.contains("/ ac")
+            })
     });
+    // Reattachments can discover the restart in different frames. Each batch
+    // is sorted, then appended to the held notice; the combined list need not
+    // be alphabetical. Pin the three distinct names and total, then keep this
+    // exact summary through edits and the full-list round trip.
+    let grid = deck.snapshot_grid();
+    let summary = grid
+        .lines()
+        .find_map(|line| {
+            let (_, rest) = line.split_once(prefix)?;
+            let (shown, _) = rest.split_once(" and 9 more.")?;
+            let shown: Vec<_> = shown.split(", ").collect();
+            assert_eq!(shown.len(), 3, "footer did not name three agents: {line}");
+            assert_eq!(
+                shown.iter().collect::<std::collections::HashSet<_>>().len(),
+                3,
+                "footer repeated an agent: {line}"
+            );
+            assert!(
+                shown.iter().all(|name| names.iter().any(|n| n == name)),
+                "footer named an agent the restart did not stop: {line}"
+            );
+            Some(format!("{prefix}{} and 9 more.", shown.join(", ")))
+        })
+        .expect("the held summary disappeared");
+    // Read each rendered page, waiting for its visible range to advance. This
+    // checks every name without assuming which one appears on which page.
+    let read_list = |expected: &[String]| {
+        let mut seen = std::collections::HashSet::new();
+        for first in 1..=expected.len() {
+            let title = format!("Restart notice · {first}–");
+            deck.wait_until_grid("scrollable restart list advances", |g| g.contains(&title));
+            let grid = deck.snapshot_grid();
+            for line in grid.lines() {
+                let name = line.trim().trim_matches('│').trim();
+                if expected.iter().any(|expected| expected == name) {
+                    seen.insert(name.to_string());
+                }
+            }
+            if seen.len() == expected.len() {
+                break;
+            }
+            deck.send_keys(b"\x1b[B");
+        }
+        for name in expected {
+            assert!(seen.contains(name), "full list omitted {name}: {seen:?}");
+        }
+    };
     // This pins the held footer rather than waiting out the old 15-second
     // status timer: that status slot is not rendered in Filter mode.
     deck.send_keys(b"ac");
     deck.wait_until_grid("notice keys remain field input", |g| {
-        g.contains("/ acac") && g.contains(summary)
+        g.contains("/ acac") && g.contains(&summary)
     });
     deck.send_keys(b"\x1b");
     deck.wait_until_grid("leaving Filter keeps the notice", |g| {
-        !g.contains("/ acac") && g.contains(summary)
+        !g.contains("/ acac") && g.contains(&summary)
     });
     deck.send_keys(b"a");
-    deck.wait_until_grid("restart list opens on its first page", |g| {
-        g.contains("Restart notice") && g.contains("held-00") && !g.contains("held-11")
-    });
-    let mut seen = String::new();
-    for name in &names {
-        if !seen.contains(name) {
-            deck.wait_until_grid("scrollable restart list", |g| g.contains(name));
-            seen.push_str(&deck.snapshot_grid());
-        }
-        deck.send_keys(b"\x1b[B");
-    }
-    for name in &names {
-        assert!(seen.contains(name), "full list omitted {name}: {seen}");
-    }
+    read_list(&names);
     deck.send_keys(b"\x1b");
     deck.wait_until_grid("closing the list keeps the footer", |g| {
-        g.contains(summary) && !g.contains("Restart notice")
+        g.contains(&summary) && !g.contains("Restart notice")
     });
     // A fresh successor card is a control for pane input with the notice held.
     let new = pane(&successor, "held-successor");
@@ -926,12 +960,9 @@ fn handshake_013_the_held_notice_survives_filter_and_joins_later_restarts() {
         g.contains("and 10 more.")
     });
     deck.send_keys(b"a");
-    for _ in 0..names.len() {
-        deck.send_keys(b"\x1b[B");
-    }
-    deck.wait_until_grid("joined list still names old and new agents", |g| {
-        g.contains("held-successor")
-    });
+    let mut joined = names.clone();
+    joined.push("held-successor".into());
+    read_list(&joined);
     deck.send_keys(b"\x1b");
     deck.wait_until_grid("second Escape keeps accumulated footer", |g| {
         g.contains("and 10 more.")

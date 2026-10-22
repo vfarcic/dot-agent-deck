@@ -76,11 +76,12 @@ fn pane_003_empty_dashboard_never_opens_close_confirmation() {
     );
 }
 
-/// Scenario: Launch one live dashboard card and drive Ctrl+W through the real binary twice. Enter on the Cancel-default modal must preserve the card and daemon agent, while a fresh Ctrl+W followed by Down+Enter must remove both.
+/// Scenario: Launch one live dashboard card and drive Ctrl+W through the real binary twice. Enter on the Cancel-default modal preserves the card and daemon agent, while a fresh Ctrl+W followed by Down+Enter removes both at 80×24. Repeat with another card at 16×12: after Down, Enter may close it only if the final frame actually shows the Close choice, rather than covering it with Cancel.
 #[spec("prompt/close-confirm/002")]
 #[test]
 fn close_confirm_002_real_cancel_preserves_and_confirm_closes() {
     let deck = TuiDeck::builder()
+        .with_pty_size(80, 24)
         .with_continue_session("confirm-target", "cat")
         .launch_with_fixture("minimal");
     deck.wait_for_string("[Command Mode Ctrl+D]");
@@ -115,6 +116,55 @@ fn close_confirm_002_real_cancel_preserves_and_confirm_closes() {
         ),
         "Down+Enter on Close must remove the daemon agent"
     );
+
+    let mut tiny = TuiDeck::builder()
+        .with_pty_size(80, 24)
+        .with_continue_session("tiny-close-target", "cat")
+        .launch_with_fixture("minimal");
+    tiny.wait_for_string("[Command Mode Ctrl+D]");
+    tiny.send_keys(b"\x04");
+    tiny.wait_for_string("tiny-close-target");
+    tiny.send_keys(b"\x17");
+    tiny.wait_for_string("Close selected agent?");
+    tiny.resize(16, 12);
+    tiny.wait_until_grid("16×12 Close confirmation is drawn", |grid| {
+        grid.contains("┌ Close") && grid.contains("Cancel") && !grid.contains("tiny-close-target")
+    });
+    let before = tiny.snapshot_grid();
+    tiny.send_keys(b"\x1b[B");
+    tiny.wait_until_grid_then_hold(
+        "16×12 Close stays open after Down",
+        Duration::from_secs(1),
+        |grid| grid.contains("┌ Close") && grid.contains("Cancel"),
+    );
+    let selected = tiny.snapshot_grid();
+    let close_shown = selected.contains("> Close") || selected.contains("[Close]");
+    // Escape after Enter leaves an undrawn-choice refusal or Cancel without
+    // closing the agent. It cannot undo an accepted destructive Close.
+    tiny.send_keys(b"\r\x1b");
+    tiny.resize(80, 24);
+    tiny.wait_until_grid("close answer has settled back on the dashboard", |grid| {
+        !grid.contains("Close selected agent?")
+            && (grid.contains("tiny-close-target") || grid.contains("No active agents"))
+    });
+    if !close_shown {
+        assert!(
+            common::wait_for_agent_display_name(
+                tiny.attach_socket_path(),
+                "tiny-close-target",
+                true,
+                Duration::from_secs(5),
+            ),
+            "Enter closed an agent whose Close choice was covered by Cancel.\n\
+             Before Down:\n{before}\nAfter Down:\n{selected}\nAfter Enter:\n{}",
+            tiny.snapshot_grid()
+        );
+        let settled = tiny.snapshot_grid();
+        assert!(
+            settled.contains("tiny-close-target"),
+            "the refused close lost its card: {settled}"
+        );
+    }
 }
 
 /// Scenario: Launch one live card at a roomy width, click the real persistent `[Close w/Ctrl+W]` button, cancel, then press Ctrl+W. Both production input paths must display the same Cancel-default close modal while leaving the agent alive until explicit confirmation.
