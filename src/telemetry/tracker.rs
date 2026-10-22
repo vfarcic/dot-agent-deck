@@ -41,7 +41,7 @@
 //! [`MAX_REPLACED_RUNS`] aside, or that is still aside at daemon shutdown, ends
 //! as [`EndReason::Unknown`] at the time it was replaced.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use crate::event::{AgentEvent, AgentType, DAEMON_PANE_CLOSED_METADATA_KEY, EventType};
 use crate::state::{AppState, SessionStatus};
@@ -82,6 +82,10 @@ pub const MAX_REPLACED_RUNS: usize = 64;
 /// Shell commands open at once in one run. Past it the oldest is ended where
 /// it stands, so starts whose end never arrives cannot pile up.
 pub const MAX_OPEN_OPERATIONS: usize = 64;
+
+/// The tool call ids one run remembers having seen, newest kept: an end
+/// naming one of them ends nothing unless that call is still open.
+pub const MAX_SEEN_CALL_IDS: usize = 256;
 
 /// The event metadata key carrying the agent's id for one tool call, which
 /// pairs a call's end with its start when several run at once.
@@ -271,6 +275,9 @@ struct ActiveRun {
     last_human_input: Option<u64>,
     operations: Vec<OpenOperation>,
     operations_count: u64,
+    /// The call ids this run's shell starts and ends named, at most
+    /// [`MAX_SEEN_CALL_IDS`], oldest first.
+    seen_call_ids: VecDeque<String>,
     ci: RunCi,
 }
 
@@ -430,6 +437,7 @@ impl RunTracker {
                 last_human_input: None,
                 operations: Vec::new(),
                 operations_count: 0,
+                seen_call_ids: VecDeque::new(),
                 ci: RunCi::default(),
             },
         );
@@ -754,10 +762,11 @@ impl RunTracker {
 
 /// A shell tool's start or end reached `run`: open an operation, or end the
 /// one it belongs to. An end naming a call ends that call's operation only —
-/// or, when none has that id, the oldest that has no id, since an agent may
-/// name the call on its end only — and so a repeated end, or one whose start
-/// was dropped, ends nothing. An end naming no call ends the oldest. A failed
-/// call ends as an `Error` event, which ends it the same way.
+/// or, when the run has never seen that id, the oldest that has no id, since
+/// an agent may name the call on its end only. An id seen before (a repeated
+/// end, the end of a call the cap ended, a start's id whose operation is gone)
+/// ends nothing. An end naming no call ends the oldest. A failed call ends as
+/// an `Error` event, which ends it the same way.
 fn observe_operation(
     run: &mut ActiveRun,
     kept: &KeptEvent,
@@ -766,6 +775,13 @@ fn observe_operation(
 ) {
     let event = &kept.event;
     let call_id = event.metadata.get(TOOL_CALL_ID_METADATA_KEY);
+    let seen_before = call_id.is_some_and(|id| run.seen_call_ids.contains(id));
+    if let Some(id) = call_id.filter(|_| !seen_before) {
+        if run.seen_call_ids.len() >= MAX_SEEN_CALL_IDS {
+            run.seen_call_ids.pop_front();
+        }
+        run.seen_call_ids.push_back(id.clone());
+    }
     match event.event_type {
         EventType::ToolStart => {
             if run.operations.len() >= MAX_OPEN_OPERATIONS {
@@ -789,7 +805,11 @@ fn observe_operation(
                     .operations
                     .iter()
                     .position(|op| op.call_id.as_ref() == Some(id))
-                    .or_else(|| run.operations.iter().position(|op| op.call_id.is_none())),
+                    .or_else(|| {
+                        (!seen_before)
+                            .then(|| run.operations.iter().position(|op| op.call_id.is_none()))
+                            .flatten()
+                    }),
                 None => (!run.operations.is_empty()).then_some(0),
             };
             if let Some(i) = i {
@@ -1898,7 +1918,7 @@ pub(crate) mod tests {
                 (op_attrs("rwx_sandbox", Some("make"), Some("ci")), 11, 13),
                 (op_attrs("local", Some("cargo"), Some("test")), 10, 15),
                 (op_attrs("local", Some("echo"), None), 16, 17),
-                (op_attrs("local", Some("cargo"), Some("fmt")), 18, 100),
+                (op_attrs("local", Some("cargo"), None), 18, 100),
             ]
         );
         let run = run_span_of(&spans);
@@ -1961,6 +1981,41 @@ pub(crate) mod tests {
         );
         tracker.observe_event(&bash(EventType::ToolEnd, "y"), 3);
         assert_eq!(operations(&tracker.take_finished())[0].1, 2);
+    }
+
+    /// An id that already ended an unnamed call does not end the next one
+    /// when it is repeated; an id the run has never seen still does.
+    #[test]
+    fn a_repeated_end_only_id_ends_nothing() {
+        let unnamed = || shell("p1", EventType::ToolStart, "Bash", Some("make"), None);
+        let end = |call: &str| shell("p1", EventType::ToolEnd, "Bash", None, Some(call));
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        tracker.observe_event(&unnamed(), 1);
+        tracker.observe_event(&end("a"), 2);
+        assert_eq!(operations(&tracker.take_finished()).len(), 1);
+        tracker.observe_event(&unnamed(), 3);
+        tracker.observe_event(&end("a"), 4);
+        assert!(
+            operations(&tracker.take_finished()).is_empty(),
+            "the repeated end of a ended the next unnamed call"
+        );
+        tracker.observe_event(&end("b"), 5);
+        assert_eq!(
+            operations(&tracker.take_finished())
+                .iter()
+                .map(|(_, start, end)| (*start, *end))
+                .collect::<Vec<_>>(),
+            vec![(3, 5)]
+        );
+
+        // The memory is bounded: an id pushed out of it is new again.
+        for i in 0..MAX_SEEN_CALL_IDS {
+            tracker.observe_event(&end(&format!("filler{i}")), 10);
+        }
+        tracker.observe_event(&unnamed(), 20);
+        tracker.observe_event(&end("a"), 21);
+        assert_eq!(operations(&tracker.take_finished()).len(), 1);
     }
 
     /// What the tracker keeps of an event — in a run's cards, and held for a

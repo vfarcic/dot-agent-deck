@@ -254,43 +254,46 @@ pub fn classify(command: Option<&str>) -> Operation {
 }
 
 /// [`classify`] for a command reported as an argv joined with single spaces,
-/// as Codex's `shell` tool's is: which of its spaces were inside an argument
-/// is lost. A shell running a `-c` script is classified by the script, which
-/// is the rest of the line — Codex runs its commands as
-/// `["/bin/sh", "-lc", "<script>"]`. Anything else gives its program only,
-/// and its runner.
+/// as Codex's `shell` tool's is. Which of its spaces were inside an argument
+/// is lost, so no word is read from it at all: only the program, and only
+/// where it is certain. That is the first word of the line, or, for a shell
+/// run as `<shell> -c <script>` (Codex runs its commands as
+/// `["/bin/sh", "-lc", "<script>"]`), the first word of the script. A program
+/// that only sets up, prefixes or wraps the next one gives nothing, since that
+/// one's words may belong to a later argument; so does a line with an empty
+/// argument in it, or a shell with any other options. `rwx` still gives its
+/// runner.
 pub fn classify_joined_argv(command: Option<&str>) -> Operation {
     let line = command.and_then(|c| c.lines().next()).unwrap_or("");
-    let words: Vec<(usize, &str)> = line
-        .split(' ')
-        .scan(0, |at, word| {
-            let start = *at;
-            *at += word.len() + 1;
-            Some((start, word))
-        })
-        .filter(|(_, word)| !word.is_empty())
-        .collect();
-    let Some(&(_, first)) = words.first() else {
+    let words: Vec<&str> = line.split(' ').collect();
+    // An empty argument, or one starting or ending with a space, leaves an
+    // empty word: nothing can be placed.
+    if words.iter().any(|w| w.is_empty()) {
         return Operation::bare(Runner::Local);
-    };
-    let program = basename(first);
-    let rest: Vec<String> = words[1..].iter().map(|(_, w)| w.to_string()).collect();
-    if SHELLS.contains(&program)
-        && let Some((true, at)) = shell_operand(&rest)
-        && let Some(&(start, _)) = words.get(at + 1)
-    {
-        return classify_line(&line[start..], 1);
     }
-    match (
-        program,
-        rest.first().map(String::as_str),
-        rest.get(1).map(String::as_str),
-    ) {
-        ("rwx", Some("sandbox"), Some("exec")) => Operation::bare(Runner::RwxSandbox),
-        ("rwx", Some("run"), _) => Operation {
+    let (program, rest) = match words.as_slice() {
+        [shell, flags, script @ ..] if SHELLS.contains(&basename(shell)) => {
+            let dash_c = flags.strip_prefix('-').is_some_and(|cluster| {
+                cluster.contains('c')
+                    && cluster.chars().all(|c| c == 'c' || SHELL_FLAGS.contains(c))
+            });
+            match script {
+                [program, rest @ ..] if dash_c => (basename(program), rest),
+                _ => return Operation::bare(Runner::Local),
+            }
+        }
+        [program, rest @ ..] => (basename(program), rest),
+        [] => return Operation::bare(Runner::Local),
+    };
+    let unsure = SETUP_PROGRAMS.contains(&program)
+        || SHELLS.contains(&program)
+        || ["env", "sudo", "command", "time", "nice", "exec", "eval"].contains(&program);
+    match (program, rest) {
+        _ if unsure => Operation::bare(Runner::Local),
+        ("rwx", ["sandbox", "exec", ..]) => Operation::bare(Runner::RwxSandbox),
+        ("rwx", ["run", ..]) => Operation {
             runner: Runner::RwxRun,
-            program: Some("rwx".to_string()),
-            word: Some("run".to_string()),
+            ..named(program, &[])
         },
         _ => named(program, &[]),
     }
@@ -759,37 +762,55 @@ mod tests {
         }
     }
 
-    /// Codex's `shell` tool reports its argv joined with spaces.
+    /// Codex's `shell` tool reports its argv joined with spaces, which loses
+    /// where each argument ends: its program only, and only where certain.
     #[test]
-    fn a_joined_argv_is_read_by_its_script_or_not_at_all() {
+    fn a_joined_argv_gives_its_program_at_most() {
+        let bare = op(Runner::Local, None, None);
         for (command, expected) in [
-            ("/bin/sh -lc touch out.txt", local("touch", Some("out.txt"))),
-            (
-                "/bin/bash -lc cd x && cargo test",
-                local("cargo", Some("test")),
-            ),
-            (
-                "bash --rcfile private -c make ci",
-                local("make", Some("ci")),
-            ),
+            ("/bin/sh -lc touch out.txt", local("touch", None)),
+            ("/bin/bash -lc cargo test --workspace", local("cargo", None)),
+            // `["/bin/sh", "-c", "cargo", "private payload"]`: the script is
+            // `cargo`, the rest its `$0` and `$1`.
+            ("/bin/sh -c cargo private payload", local("cargo", None)),
+            // `["/bin/sh", "-c", "true", "x && hunter2 run"]`.
+            ("/bin/sh -c true x && hunter2 run", bare.clone()),
+            ("/bin/bash -lc cd x && cargo test", bare.clone()),
+            ("/bin/sh -c FOO=1 cargo test", bare.clone()),
+            ("/bin/sh -c env cargo test", bare.clone()),
+            ("/bin/sh -c sh -c make ci", bare.clone()),
+            ("/bin/sh -c 'cargo test'", bare.clone()),
+            ("/bin/sh -c  cargo", bare.clone()),
+            ("bash --rcfile private -c make ci", bare.clone()),
+            ("bash -o pipefail -c make ci", bare.clone()),
+            ("bash ci.sh", bare.clone()),
+            ("bash -c", bare.clone()),
             ("cargo private payload", local("cargo", None)),
-            ("env hunter2 cargo", local("env", None)),
+            ("env hunter2 cargo", bare.clone()),
             (
                 "rwx sandbox exec -- cargo private",
                 op(Runner::RwxSandbox, None, None),
             ),
-            ("rwx run ci", op(Runner::RwxRun, Some("rwx"), Some("run"))),
-            ("", op(Runner::Local, None, None)),
+            (
+                "/bin/sh -lc rwx sandbox exec -- cargo test",
+                op(Runner::RwxSandbox, None, None),
+            ),
+            ("rwx run ci", op(Runner::RwxRun, Some("rwx"), None)),
+            ("", bare.clone()),
         ] {
             assert_eq!(classify_joined_argv(Some(command)), expected, "{command}");
         }
         assert_eq!(
             classify_tool(Some("shell"), Some("/bin/sh -lc make ci")),
-            local("make", Some("ci"))
+            local("make", None)
         );
         assert_eq!(
             classify_tool(Some("Bash"), Some("/bin/sh -lc make ci")),
             local("make", None)
+        );
+        assert_eq!(
+            classify_tool(Some("Bash"), Some("/bin/sh -lc 'make ci'")),
+            local("make", Some("ci"))
         );
     }
 
