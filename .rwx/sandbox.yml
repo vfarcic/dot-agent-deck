@@ -1,0 +1,75 @@
+# An RWX sandbox for running this repository's heavy local operations — the
+# commit gates, e2e runs, `cargo xver` — on a cloud Linux machine instead of
+# the developer's box. `rwx sandbox exec -- <command>` syncs the worktree's
+# local changes up, runs the command, and syncs changes back. Each worktree
+# gets its own sandbox (keyed by branch and config path).
+#
+# The setup tasks mirror `.rwx/ci.yml`, so the sandbox has the same toolchain
+# CI's RWX port used. No tool cache: a cached sandbox task would upload its
+# whole filesystem (tens of GB with a `target/`) when it stops.
+
+on:
+  cli:
+    init:
+      commit-sha: ${{ event.git.sha }}
+
+base:
+  image: ubuntu:24.04
+  config: rwx/base 1.2.0
+
+tasks:
+  - key: system-packages
+    run: |
+      sudo apt-get update
+      sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+        libayatana-appindicator3-dev librsvg2-dev libxdo-dev libasound2-dev \
+        build-essential pkg-config jq bubblewrap
+      sudo apt-get clean
+
+  - key: code
+    call: git/clone 2.2.0
+    with:
+      preserve-git-dir: true
+      repository: https://github.com/vfarcic/dot-agent-deck.git
+      ref: ${{ init.commit-sha }}
+
+  - key: rust
+    call: rust-lang/install 1.1.1
+    with:
+      rust-version: 1.99.0
+
+  - key: nextest
+    use: rust
+    run: |
+      mkdir -p "$HOME/.cargo/bin"
+      curl -LsSf https://get.nexte.st/0.9.146/linux | tar zxf - -C "$HOME/.cargo/bin"
+      cargo nextest --version
+
+  # Some fast-tier tests run `node` (e.g. tests/pi_native_observer.rs); GitHub's
+  # ubuntu-latest image and the devbox shell both ship Node 24, the RWX base
+  # image does not. Exact X.Y.Z is required by the package.
+  - key: node
+    call: nodejs/install 1.2.0
+    with:
+      node-version: "24.22.0"
+
+  - key: go-task
+    run: |
+      curl -LsSf https://github.com/go-task/task/releases/download/v3.53.1/task_linux_amd64.tar.gz \
+        | sudo tar zxf - -C /usr/local/bin task
+      task --version
+
+  - key: sandbox
+    use: [system-packages, code, rust, nextest, go-task, node]
+    runner:
+      cpus: 16
+      memory: 64gb
+      disk: 150gb
+    env:
+      DAD_REQUIRE_GO_TASK: "1"
+    # Billed per second while alive, idle included. `affected-checks --run`
+    # stops it when it finishes; this is the backstop for everything else (an
+    # interrupted run, an ad-hoc `rwx sandbox exec`). A running command counts
+    # as activity (measured 2026-10-22: a 3-minute command survived a 1-minute
+    # timeout), so a short timeout cannot cut a long test run off.
+    run: rwx-sandbox --inactivity-timeout 5m

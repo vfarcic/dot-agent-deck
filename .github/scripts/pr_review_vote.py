@@ -106,6 +106,15 @@ DENY_REASONS = {
     "MAINTAINERS.md": "This edits the **record of who the maintainers are**.",
     "greptile.json": "This edits the **other reviewer's configuration**.",
     ".pr_agent.toml": "This edits the **other reviewer's configuration**.",
+    ".rwx/": (
+        "This edits the **RWX CI definition**, which runs a pull request's required Linux "
+        "checks (`RWX: linux`) when `.github/ci-backend` says `rwx`; a change here can make "
+        "them pass having tested nothing."
+    ),
+    "scripts/ci-changes.sh": (
+        "This edits the **path classification both CI systems use** to decide which Linux "
+        "jobs to skip; a change here can skip the required checks' work."
+    ),
     ".github/": (
         "This edits **CI or repository automation**, which is how permissions and gates get "
         "widened."
