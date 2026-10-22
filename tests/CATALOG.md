@@ -113,6 +113,55 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** a full protobuf schema decode or privacy of external agents' own telemetry.
 - **Platform coverage:** mac+linux.
 
+##### telemetry/otlp/014 — Shell operation metadata classifies safe command shapes without exporting content.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
+- **Agent:** shell/cat stand-in with synthetic shell-tool and Read hooks.
+- **Asserts:** rwx sandbox/run and local command classification, assignments/prefixes/segments, independent program/word shape filtering, the seven-program word deny-list, first-line handling, child identity/duration/count and absence of private/raw commands from captured bodies.
+- **Does not assert:** native hook availability for each agent or nested shell grammar.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/015 — Polled PR check rollups export CI intervals, results and counters.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
+- **Agent:** cat stand-in; offline gh stub and local fixture git repository.
+- **Asserts:** pending → failing → pending → passing is served before each next update and exports four change events, two child CI spans with final counts, two rounds and one failure.
+- **Does not assert:** sub-poll timing precision, real GitHub or CI provider identification.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/016 — Codex launch activates traces and metrics while preserving user choices.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
+- **Agent:** PATH stand-in named codex, launched through the production wrapper.
+- **Asserts:** explicit trace/metric signal URLs and JSON protocol reach per-run -c overrides, no logs exporter or secret in argv, header and run identity in env, original CODEX_HOME retained, no overrides with export off or user-owned exporter configuration.
+- **Does not assert:** real Codex export (018) or all TOML exporter forms.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/017 — Devin launch uses a private temporary metadata-only overlay.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
+- **Agent:** PATH stand-in named devin recording argv, env and config content/mode.
+- **Asserts:** export off adds no config; enabled overlay is 0600, preserves JSONC settings, contains endpoint/resource identity, excludes header values, disables content logging by default, respects user OTel endpoints/flags/resources and is removed at pane close.
+- **Does not assert:** authenticated Devin delivery (020) or crash-recovery cleanup.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/018 — Real interactive Codex safely joins its own telemetry to the deck run. [reel]
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_telemetry_export_live.rs`).
+- **Agent:** real wrapped Codex on the auth-compatible cheap model (ChatGPT default gpt-5.6-luna).
+- **Asserts:** real shell copies a unique fixture, the pane completes and card settles, native traces/metrics carry the deck resource run id, no logs are captured and prompt/file/output sentinels are absent from every captured body.
+- **Does not assert:** Codex sandbox enforcement or native metric values.
+- **Platform coverage:** mac+linux when authenticated.
+
+##### telemetry/otlp/019 — Real interactive Pi Haiku exports metadata with the deck identity. [reel]
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_telemetry_export_live.rs`).
+- **Agent:** real Pi on Anthropic claude-haiku-4-5, using the automatically bundled extension.
+- **Asserts:** an inbox directive makes real bash copy a unique fixture, the pane completes and card settles, Pi's own resource run id joins the deck run and prompt/file/output sentinels are absent from every captured body.
+- **Does not assert:** provider fallback or exact token/cost values.
+- **Platform coverage:** mac+linux with Anthropic credentials.
+
+##### telemetry/otlp/020 — Authenticated real Devin exports metadata joined to the deck run. [reel]
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_telemetry_export_live.rs`); authentication preflight becomes failure with DOT_AGENT_DECK_REQUIRE_REAL_E2E=1.
+- **Agent:** real Devin on its account-default model.
+- **Asserts:** a real exec writes a proof file, the pane visibly completes and native telemetry resources carry the deck run id without prompt/output sentinels.
+- **Does not assert:** delivery on a logged-out host; that outcome is unverified, not a successful delivery check.
+- **Platform coverage:** mac+linux when authenticated.
+
 ### Session pull requests
 
 #### session/pr

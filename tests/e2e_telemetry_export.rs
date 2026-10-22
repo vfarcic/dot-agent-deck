@@ -12,6 +12,8 @@ use serde_json::{Value, json};
 use spec::spec;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -30,6 +32,23 @@ const BRANCH_SECRET: &str = "PRIVATE_BRANCH_1741_901a";
 const COMMAND_SECRET: &str = "PRIVATE_COMMAND_1741_faec";
 const CWD_SECRET: &str = "PRIVATE_CWD_1741_5cfe";
 const ENV_SECRET: &str = "PRIVATE_ENV_1741_89de";
+
+fn write_executable(path: &Path, source: &str) {
+    std::fs::write(path, source).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn integer_attribute(value: &Value, key: &str) -> u64 {
+    let attr = value["attributes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|attr| attr["key"] == key)
+        .unwrap_or_else(|| panic!("missing integer attribute {key}: {value}"));
+    attr["value"]["intValue"]
+        .as_u64()
+        .unwrap_or_else(|| attr["value"]["intValue"].as_str().unwrap().parse().unwrap())
+}
 
 #[derive(Clone, Debug)]
 struct Request {
@@ -998,4 +1017,565 @@ fn telemetry_otlp_012_daemon_shutdown_flushes_open_run() {
         "daemon_shutdown",
         "shutdown must flush an open run before stopping agents"
     );
+}
+
+/// Scenario: Send shell-tool start/end hooks for sandboxed, CI, local and private commands to a stand-in pane, plus a non-shell tool. Close the pane and inspect completed operation spans for safe runner/program/word metadata, parent identity, duration and count, rejecting private or raw command text from every request body.
+#[spec("telemetry/otlp/014")]
+#[test]
+fn telemetry_otlp_014_shell_operations_classify_without_content() {
+    use dot_agent_deck::event::EventType;
+
+    let receiver = Receiver::start();
+    let deck = launch(Some(&receiver), true);
+    let agent = agent(&deck);
+    let pane = agent.pane_id_env.as_deref().unwrap();
+    let events = deck.subscribe_events();
+    let cases = [
+        (
+            "rwx sandbox exec -- cargo test-fast",
+            "rwx_sandbox",
+            "cargo",
+            "test-fast",
+        ),
+        ("rwx run ci", "rwx_run", "rwx", "run"),
+        ("FOO=1 /usr/bin/make build", "local", "make", "build"),
+        ("cd /tmp/x && npm run lint", "local", "npm", "run"),
+        ("echo PRIVATE_WORD_1741_17ad", "local", "echo", ""),
+        ("cat PRIVATE_FILE_1741_91bd", "local", "cat", ""),
+        ("kubectl apply -f /secret/path", "local", "kubectl", "apply"),
+        ("npm run \"Weird Name\"", "local", "npm", "run"),
+        ("npm \"Weird Name\"", "local", "npm", ""),
+        (
+            "env FOO=1 sudo command time nice /usr/bin/cargo --locked check",
+            "local",
+            "cargo",
+            "check",
+        ),
+        (
+            "export TOKEN=PRIVATE_ASSIGNMENT_1741; true || make check",
+            "local",
+            "make",
+            "check",
+        ),
+        ("rg privateword1741", "local", "rg", ""),
+        ("printf privateword1741", "local", "printf", ""),
+        ("grep privateword1741", "local", "grep", ""),
+        ("sed privateword1741", "local", "sed", ""),
+        ("awk privateword1741", "local", "awk", ""),
+        ("PRIVATE_PROGRAM_1741 PRIVATE_WORD_1741", "local", "", ""),
+        (
+            "make a234567890123456789012345678901234",
+            "local",
+            "make",
+            "",
+        ),
+        (
+            "make check\necho PRIVATE_SECOND_LINE_1741",
+            "local",
+            "make",
+            "check",
+        ),
+    ];
+    for (tool, command) in std::iter::once(("Read", "PRIVATE_NON_SHELL_1741"))
+        .chain(cases.iter().map(|(command, ..)| ("Bash", *command)))
+    {
+        for (kind, expected) in [
+            ("tool_start", EventType::ToolStart),
+            ("tool_end", EventType::ToolEnd),
+        ] {
+            let payload = json!({
+                "session_id": "telemetry-operations", "pane_id": pane,
+                "agent_id": agent.id, "agent_type": "claude_code", "event_type": kind,
+                "timestamp": chrono::Utc::now().to_rfc3339(), "cwd": deck.workdir(),
+                "tool_name": tool, "tool_detail": command
+            });
+            common::write_hook_line(deck.hook_socket_path(), &payload.to_string()).unwrap();
+            events.wait_for(
+                |event| {
+                    event.event_type == expected && event.tool_detail.as_deref() == Some(command)
+                },
+                Duration::from_secs(10),
+            );
+        }
+    }
+    close(&deck, &agent);
+    let run = receiver.run(pane);
+    let spans = receiver.spans();
+    let operations: Vec<_> = spans
+        .iter()
+        .filter(|span| span["name"] == "agent.operation" && attribute(span, "deck.pane.id") == pane)
+        .collect();
+    assert_eq!(
+        operations.len(),
+        cases.len(),
+        "one operation per shell start/end pair, excluding Read; exported spans: {spans:?}"
+    );
+    let mut actual: Vec<_> = operations
+        .iter()
+        .map(|span| {
+            (
+                attribute(span, "deck.operation.runner"),
+                attribute(span, "deck.operation.program"),
+                attribute(span, "deck.operation.word"),
+            )
+        })
+        .collect();
+    let mut expected: Vec<_> = cases
+        .iter()
+        .map(|(_, runner, program, word)| {
+            (runner.to_string(), program.to_string(), word.to_string())
+        })
+        .collect();
+    actual.sort();
+    expected.sort();
+    assert_eq!(actual, expected, "operation classification");
+    for operation in &operations {
+        for key in ["deck.operation.program", "deck.operation.word"] {
+            if attribute(operation, key).is_empty() {
+                assert!(
+                    !operation["attributes"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|attr| attr["key"] == key),
+                    "unsafe attribute must be absent, not empty: {operation}"
+                );
+            }
+        }
+        assert_eq!(operation["parentSpanId"], run["spanId"]);
+        assert_eq!(operation["traceId"], run["traceId"]);
+        assert_eq!(
+            attribute(operation, "deck.run.id"),
+            attribute(&run, "deck.run.id")
+        );
+        let nanos = |key: &str| operation[key].as_str().unwrap().parse::<u64>().unwrap();
+        assert!(
+            nanos("endTimeUnixNano") >= nanos("startTimeUnixNano"),
+            "operation duration: {operation}"
+        );
+    }
+    assert_eq!(
+        integer_attribute(&run, "deck.operations.count"),
+        cases.len() as u64
+    );
+    for request in receiver.requests() {
+        let body = String::from_utf8_lossy(&request.body);
+        for secret in [
+            "PRIVATE_",
+            "privateword1741",
+            "/secret/path",
+            "/tmp/x",
+            "Weird Name",
+        ] {
+            assert!(!body.contains(secret), "operation content leaked: {secret}");
+        }
+        for (command, ..) in cases {
+            assert!(!body.contains(command), "raw command leaked: {command}");
+        }
+    }
+}
+
+/// Scenario: Link a stand-in pane to an offline fixture PR whose fake gh rollup changes pending, failing, pending, passing, observing each served check state before advancing. Closing the pane must export four CI-change events, two completed CI intervals with final check counts, two rounds and one failure.
+#[spec("telemetry/otlp/015")]
+#[test]
+fn telemetry_otlp_015_ci_rounds_follow_polled_check_rollups() {
+    let receiver = Receiver::start();
+    let scratch = common::harness_tempdir().unwrap();
+    let repo = scratch.path().join("repo");
+    let bin = scratch.path().join("bin");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    for args in [
+        vec!["init", "-b", "telemetry-ci"],
+        vec!["commit", "--allow-empty", "-m", "fixture"],
+        vec![
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/test-org/test-repo.git",
+        ],
+    ] {
+        let output = common::fixture_git(&repo, scratch.path())
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "fixture git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let reply = scratch.path().join("rollup.json");
+    write_executable(
+        &bin.join("gh"),
+        "#!/bin/sh\n[ \"$1\" = pr ] && [ \"$2\" = list ] || exit 91\ncat \"$TELEMETRY_GH_REPLY\"\n",
+    );
+    let set_checks = |conclusion: Option<&str>| {
+        let checks = match conclusion {
+            Some(conclusion) => {
+                json!([{"__typename": "CheckRun", "name": "build", "workflowName": "CI", "status": "COMPLETED", "conclusion": conclusion}, {"__typename": "CheckRun", "name": "optional", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SKIPPED"}])
+            }
+            None => {
+                json!([{"__typename": "CheckRun", "name": "build", "workflowName": "CI", "status": "IN_PROGRESS", "conclusion": null}])
+            }
+        };
+        let value = json!([{"number": 1741, "state": "OPEN", "isDraft": false, "reviewDecision": "REVIEW_REQUIRED", "headRefName": "telemetry-ci", "url": "https://github.com/test-org/test-repo/pull/1741", "statusCheckRollup": checks}]);
+        let pending = scratch.path().join("rollup.pending");
+        std::fs::write(&pending, value.to_string()).unwrap();
+        std::fs::rename(&pending, &reply).unwrap();
+    };
+    set_checks(None);
+    let deck = TuiDeck::builder()
+        .without_agent_credentials()
+        .impersonating_pane_signals()
+        .with_pty_size(180, 45)
+        .with_env(
+            "PATH",
+            format!("{}:{}", bin.display(), common::path_with_binary_dir()),
+        )
+        .with_env("TELEMETRY_GH_REPLY", reply.to_string_lossy())
+        .with_env("DOT_AGENT_DECK_PR_REFRESH_SECS", "1")
+        .with_env("OTEL_EXPORTER_OTLP_ENDPOINT", &receiver.endpoint)
+        .with_env("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json")
+        .with_continue_session("telemetry-ci-bootstrap", "cat")
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("[Command Mode Ctrl+D]");
+    let previous = agent(&deck);
+    close(&deck, &previous);
+    let current = start_on_pane(&deck, &previous, &repo, "cat".into());
+    let pane = current.pane_id_env.as_deref().unwrap();
+    let hook = json!({"session_id": "telemetry-ci", "pane_id": pane, "agent_id": current.id,
+        "agent_type": "claude_code", "event_type": "session_start", "cwd": repo,
+        "timestamp": chrono::Utc::now().to_rfc3339()});
+    common::write_hook_line(deck.hook_socket_path(), &hook.to_string()).unwrap();
+    for (conclusion, expected) in [
+        (None, "pending"),
+        (Some("FAILURE"), "failing"),
+        (None, "pending"),
+        (Some("SUCCESS"), "passing"),
+    ] {
+        set_checks(conclusion);
+        assert!(
+            common::wait_until(Duration::from_secs(15), || {
+                common::agent_records_on(deck.attach_socket_path())
+                    .iter()
+                    .find(|record| record.id == current.id)
+                    .and_then(|record| record.live.as_ref())
+                    .and_then(|live| live.pull_request.as_ref())
+                    .and_then(|pr| pr.checks.as_ref())
+                    .is_some_and(|checks| {
+                        serde_json::to_value(checks).unwrap()["state"] == expected
+                    })
+            }),
+            "fixture PR never served check state {expected}"
+        );
+    }
+    close(&deck, &current);
+    assert!(
+        common::wait_until(EXPORT_WAIT, || receiver
+            .spans()
+            .iter()
+            .filter(|span| span["name"] == "agent.run" && attribute(span, "deck.pane.id") == pane)
+            .count()
+            == 2),
+        "bootstrap and linked PR runs must both finish"
+    );
+    let runs: Vec<_> = receiver
+        .spans()
+        .into_iter()
+        .filter(|span| span["name"] == "agent.run" && attribute(span, "deck.pane.id") == pane)
+        .collect();
+    let run = runs
+        .iter()
+        .max_by_key(|run| {
+            run["startTimeUnixNano"]
+                .as_str()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+        })
+        .unwrap();
+    let changes: Vec<_> = run["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["name"] == "deck.ci.change")
+        .collect();
+    assert_eq!(changes.len(), 4, "CI changes: {run}");
+    assert!(
+        !changes[0]["attributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|attr| attr["key"] == "deck.ci.from"),
+        "first CI event must omit the unknown prior state: {}",
+        changes[0]
+    );
+    for (i, expected) in ["pending", "failing", "pending", "passing"]
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(attribute(changes[i], "deck.ci.to"), *expected);
+        assert_eq!(integer_attribute(changes[i], "deck.pr.number"), 1741);
+        assert_eq!(
+            attribute(changes[i], "deck.ci.from"),
+            if i == 0 {
+                ""
+            } else {
+                ["pending", "failing", "pending"][i - 1]
+            }
+        );
+    }
+    assert_eq!(integer_attribute(run, "deck.ci.rounds.count"), 2);
+    assert_eq!(integer_attribute(run, "deck.ci.failures.count"), 1);
+    let intervals: Vec<_> = receiver
+        .spans()
+        .into_iter()
+        .filter(|span| {
+            span["name"] == "agent.ci"
+                && attribute(span, "deck.run.id") == attribute(run, "deck.run.id")
+        })
+        .collect();
+    assert_eq!(intervals.len(), 2, "CI intervals: {intervals:?}");
+    for (result, passing, failing) in [("failing", 0, 1), ("passing", 1, 0)] {
+        let span = intervals
+            .iter()
+            .find(|span| attribute(span, "deck.ci.result") == result)
+            .unwrap_or_else(|| panic!("missing CI result {result}: {intervals:?}"));
+        assert_eq!(span["parentSpanId"], run["spanId"]);
+        assert_eq!(span["traceId"], run["traceId"]);
+        assert_eq!(integer_attribute(span, "deck.pr.number"), 1741);
+        assert_eq!(integer_attribute(span, "deck.ci.checks.passing"), passing);
+        assert_eq!(integer_attribute(span, "deck.ci.checks.failing"), failing);
+        assert_eq!(integer_attribute(span, "deck.ci.checks.skipped"), 1);
+    }
+}
+
+const AGENT_LAUNCH_RECORDER: &str = r#"#!/usr/bin/env python3
+import json, os, stat, sys
+if 'app-server' in sys.argv:
+    sys.exit(0)
+record = {'argv': sys.argv[1:], 'env': dict(os.environ)}
+if '--config' in sys.argv:
+    path = sys.argv[sys.argv.index('--config') + 1]
+    record['config_path'] = path
+    record['config_mode'] = stat.S_IMODE(os.stat(path).st_mode)
+    record['config'] = open(path).read()
+with open('telemetry-launch.json.tmp', 'w') as output:
+    json.dump(record, output)
+os.rename('telemetry-launch.json.tmp', 'telemetry-launch.json')
+print('TELEMETRY_LAUNCH_READY', flush=True)
+os.execvp('cat', ['cat'])
+"#;
+
+fn launch_record(deck: &TuiDeck) -> Value {
+    let path = deck.workdir().join("telemetry-launch.json");
+    common::wait_for_file_contains(&path, "argv");
+    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+}
+
+/// Scenario: Restore a wrapped Codex stand-in that records argv and environment with export off, on, and explicitly configured by the user. Only the default-enabled case may receive trace/metric exporter overrides with the signal URLs; headers stay in environment, no logs exporter is added, and the user's CODEX_HOME and exporter choice survive.
+#[spec("telemetry/otlp/016")]
+#[test]
+fn telemetry_otlp_016_codex_launch_enables_only_safe_signals() {
+    let receiver = Receiver::start();
+    for (enabled, user_config) in [(false, false), (true, false), (true, true)] {
+        let scratch = common::harness_tempdir().unwrap();
+        let bin = scratch.path().join("bin");
+        let codex_home = scratch.path().join("codex-home");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&codex_home).unwrap();
+        write_executable(&bin.join("codex"), AGENT_LAUNCH_RECORDER);
+        if user_config {
+            std::fs::write(
+                codex_home.join("config.toml"),
+                "[otel]\ntrace_exporter = \"none\"\n",
+            )
+            .unwrap();
+        }
+        let mut builder = TuiDeck::builder()
+            .without_agent_credentials()
+            .with_env(
+                "PATH",
+                format!("{}:{}", bin.display(), common::path_with_binary_dir()),
+            )
+            .with_env("CODEX_HOME", codex_home.to_string_lossy())
+            .with_continue_session("telemetry-codex-recorder", "codex");
+        if enabled {
+            builder = builder
+                .with_env("OTEL_EXPORTER_OTLP_ENDPOINT", &receiver.endpoint)
+                .with_env(
+                    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                    format!("{}/codex-traces", receiver.endpoint),
+                )
+                .with_env(
+                    "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+                    format!("{}/codex-metrics", receiver.endpoint),
+                )
+                .with_env("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json")
+                .with_env(
+                    "OTEL_EXPORTER_OTLP_HEADERS",
+                    format!("x-secret={HEADER_SECRET}"),
+                );
+        }
+        let deck = builder.launch_with_fixture("minimal");
+        let record = launch_record(&deck);
+        let argv: Vec<_> = record["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|arg| arg.as_str().unwrap())
+            .collect();
+        assert_eq!(record["env"]["CODEX_HOME"], codex_home.to_str().unwrap());
+        assert!(
+            !argv.join(" ").contains(HEADER_SECRET),
+            "secret in Codex argv"
+        );
+        assert!(
+            !argv.iter().any(|arg| arg.starts_with("otel.exporter")),
+            "deck must leave content-bearing log export off: {argv:?}"
+        );
+        let overrides: Vec<_> = argv
+            .windows(2)
+            .filter(|pair| pair[0] == "-c" && pair[1].starts_with("otel."))
+            .map(|pair| pair[1])
+            .collect();
+        close(&deck, &agent(&deck));
+        if enabled && !user_config {
+            assert_eq!(
+                overrides.len(),
+                2,
+                "Codex needs exactly trace and metric activation: {argv:?}"
+            );
+            for (signal, endpoint) in [("trace", "codex-traces"), ("metrics", "codex-metrics")] {
+                let value = overrides
+                    .iter()
+                    .find(|value| value.starts_with(&format!("otel.{signal}_exporter=")))
+                    .unwrap_or_else(|| panic!("missing Codex {signal} exporter: {argv:?}"));
+                assert!(
+                    value.contains(&format!("{}/{endpoint}", receiver.endpoint)),
+                    "signal endpoint: {value}"
+                );
+                assert!(value.contains("json"), "signal protocol: {value}");
+            }
+            assert_eq!(
+                record["env"]["OTEL_EXPORTER_OTLP_HEADERS"],
+                format!("x-secret={HEADER_SECRET}")
+            );
+            assert!(
+                record["env"]["OTEL_RESOURCE_ATTRIBUTES"]
+                    .as_str()
+                    .unwrap()
+                    .contains("deck.run.id=")
+            );
+        } else {
+            assert!(
+                overrides.is_empty(),
+                "off/user-owned configuration must not receive overrides: {argv:?}"
+            );
+            if !enabled {
+                assert!(record["env"].get("OTEL_RESOURCE_ATTRIBUTES").is_none());
+            }
+        }
+    }
+}
+
+/// Scenario: Restore a Devin stand-in with export off and on, recording argv and any per-run config while the pane is alive. Enabled export must supply a private metadata-only config with run identity and preserved JSONC user settings, respect a user's own OTel endpoints and logging flags, then delete the overlay when the pane closes.
+#[spec("telemetry/otlp/017")]
+#[test]
+fn telemetry_otlp_017_devin_launch_config_is_private_and_temporary() {
+    for (enabled, user_otel) in [(false, false), (true, false), (true, true)] {
+        let receiver = Receiver::start();
+        let scratch = common::harness_tempdir().unwrap();
+        let bin = scratch.path().join("bin");
+        let config_home = scratch.path().join("config");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(config_home.join("devin")).unwrap();
+        write_executable(&bin.join("devin"), AGENT_LAUNCH_RECORDER);
+        let source = if user_otel {
+            "{ // user choices\n\"theme_mode\": \"dark\", \"otel\": {\"endpoint\": \"http://127.0.0.1:9/user-owned\", \"disable_user_prompt_logging\": false, \"disable_tool_logging\": false, \"resource_attributes\": {\"user.marker\": \"preserved\"}}}"
+        } else {
+            "{ // user config must survive\n\"theme_mode\": \"dark\"}"
+        };
+        std::fs::write(config_home.join("devin/config.json"), source).unwrap();
+        let mut builder = TuiDeck::builder()
+            .without_agent_credentials()
+            .with_env(
+                "PATH",
+                format!("{}:{}", bin.display(), common::path_with_binary_dir()),
+            )
+            .with_env("XDG_CONFIG_HOME", config_home.to_string_lossy())
+            .with_continue_session("telemetry-devin-recorder", "devin");
+        if enabled {
+            builder = builder
+                .with_env("OTEL_EXPORTER_OTLP_ENDPOINT", &receiver.endpoint)
+                .with_env("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json")
+                .with_env("OTEL_RESOURCE_ATTRIBUTES", "user.region=test")
+                .with_env(
+                    "OTEL_EXPORTER_OTLP_HEADERS",
+                    format!("x-secret={HEADER_SECRET}"),
+                );
+        }
+        let deck = builder.launch_with_fixture("minimal");
+        let record = launch_record(&deck);
+        assert!(!record["argv"].to_string().contains(HEADER_SECRET));
+        let launched = agent(&deck);
+        close(&deck, &launched);
+        if !enabled {
+            assert!(
+                record.get("config_path").is_none(),
+                "disabled export must not add --config: {record}"
+            );
+            assert!(record["env"].get("OTEL_RESOURCE_ATTRIBUTES").is_none());
+            continue;
+        }
+        let path = record["config_path"].as_str().unwrap_or_else(|| {
+            panic!(
+                "enabled Devin launch must pass --config; argv: {}",
+                record["argv"]
+            )
+        });
+        assert!(
+            Path::new(path).starts_with(deck.workdir().join("state")),
+            "Devin overlay must live under the isolated daemon state dir: {path}"
+        );
+        assert_eq!(record["config_mode"], 0o600, "Devin overlay permissions");
+        let raw = record["config"].as_str().unwrap();
+        assert!(
+            !raw.contains(HEADER_SECRET),
+            "header secret in Devin config"
+        );
+        let config: Value = serde_json::from_str(raw).expect("generated Devin overlay JSON");
+        assert_eq!(
+            config["theme_mode"], "dark",
+            "JSONC user settings must survive"
+        );
+        let otel = &config["otel"];
+        let resources = &otel["resource_attributes"];
+        assert!(
+            !resources["deck.run.id"]
+                .as_str()
+                .unwrap_or_default()
+                .is_empty(),
+            "Devin resource run id: {config}"
+        );
+        assert_eq!(resources["user.region"], "test");
+        assert_eq!(otel["disable_user_prompt_logging"], !user_otel);
+        assert_eq!(otel["disable_tool_logging"], !user_otel);
+        if user_otel {
+            assert_eq!(otel["endpoint"], "http://127.0.0.1:9/user-owned");
+            assert_eq!(resources["user.marker"], "preserved");
+        } else {
+            assert!(
+                otel.to_string().contains(&receiver.endpoint),
+                "Devin endpoint missing: {config}"
+            );
+        }
+        assert!(
+            common::wait_until(Duration::from_secs(10), || !Path::new(path).exists()),
+            "Devin overlay remains after pane close: {path}"
+        );
+        let run = receiver.run(launched.pane_id_env.as_deref().unwrap());
+        assert_eq!(resources["deck.run.id"], attribute(&run, "deck.run.id"));
+    }
 }

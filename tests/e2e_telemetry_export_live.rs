@@ -50,7 +50,12 @@ impl Receiver {
                     break;
                 }
                 let stream = stream.expect("accept OTLP request");
-                let request = read_request(&stream);
+                // Native SDKs can open a connection and cancel it at shutdown
+                // before sending an HTTP request. Keep accepting the deck's
+                // final batch after that empty connection.
+                let Some(request) = read_request(&stream) else {
+                    continue;
+                };
                 let protobuf = request
                     .headers
                     .iter()
@@ -62,7 +67,7 @@ impl Receiver {
                 } else {
                     b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
                 };
-                stream.write_all(response).unwrap();
+                let _ = stream.write_all(response);
             }
         });
         Self {
@@ -125,26 +130,26 @@ impl Drop for Receiver {
     }
 }
 
-fn read_request(stream: &TcpStream) -> Request {
+fn read_request(stream: &TcpStream) -> Option<Request> {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    reader.read_line(&mut line).unwrap();
-    let path = line
-        .split_whitespace()
-        .nth(1)
-        .expect("HTTP path")
-        .to_string();
+    if reader.read_line(&mut line).ok()? == 0 {
+        return None;
+    }
+    let path = line.split_whitespace().nth(1)?.to_string();
     let mut headers = Vec::new();
     loop {
         line.clear();
-        reader.read_line(&mut line).unwrap();
+        if reader.read_line(&mut line).ok()? == 0 {
+            return None;
+        }
         if line == "\r\n" {
             break;
         }
-        let (key, value) = line.trim_end().split_once(':').expect("HTTP header");
+        let (key, value) = line.trim_end().split_once(':')?;
         headers.push((key.to_ascii_lowercase(), value.trim().to_string()));
     }
     let mut body = Vec::new();
@@ -154,16 +159,18 @@ fn read_request(stream: &TcpStream) -> Request {
     {
         loop {
             line.clear();
-            reader.read_line(&mut line).unwrap();
-            let size = usize::from_str_radix(line.trim().split(';').next().unwrap(), 16).unwrap();
+            if reader.read_line(&mut line).ok()? == 0 {
+                return None;
+            }
+            let size = usize::from_str_radix(line.trim().split(';').next()?, 16).ok()?;
             if size == 0 {
                 break;
             }
             let start = body.len();
             body.resize(start + size, 0);
-            reader.read_exact(&mut body[start..]).unwrap();
+            reader.read_exact(&mut body[start..]).ok()?;
             let mut crlf = [0; 2];
-            reader.read_exact(&mut crlf).unwrap();
+            reader.read_exact(&mut crlf).ok()?;
         }
     } else {
         let size = headers
@@ -172,13 +179,13 @@ fn read_request(stream: &TcpStream) -> Request {
             .map(|(_, value)| value.parse::<usize>().expect("Content-Length"))
             .unwrap_or(0);
         body.resize(size, 0);
-        reader.read_exact(&mut body).unwrap();
+        reader.read_exact(&mut body).ok()?;
     }
-    Request {
+    Some(Request {
         path,
         headers,
         body,
-    }
+    })
 }
 
 fn attribute(value: &Value, key: &str) -> String {
@@ -347,7 +354,7 @@ fn protobuf_messages(bytes: &[u8], wanted: u64) -> Vec<&[u8]> {
 
 fn request_resources(request: &Request) -> Vec<Value> {
     if let Ok(body) = serde_json::from_slice::<Value>(&request.body) {
-        return ["resourceLogs", "resourceSpans"]
+        return ["resourceLogs", "resourceSpans", "resourceMetrics"]
             .iter()
             .flat_map(|key| body[key].as_array().into_iter().flatten())
             .map(|entry| entry["resource"].clone())
@@ -531,4 +538,271 @@ fn telemetry_otlp_007_real_opencode_telemetry_joins_deck_run() {
             &deck.workdir().to_string_lossy(),
         ],
     );
+}
+
+fn finish_native_join(
+    receiver: &Receiver,
+    deck: &TuiDeck,
+    native_name: &str,
+    private_strings: &[&str],
+    forbid_logs: bool,
+) {
+    let agent = common::agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .next()
+        .unwrap();
+    let pane = agent.pane_id_env.as_deref().unwrap();
+    assert!(
+        common::wait_until(EXPORT_WAIT, || receiver.requests().iter().any(|request| {
+            request_resources(request).iter().any(|resource| {
+                attribute(resource, "service.name") != "dot-agent-deck"
+                    && !attribute(resource, "deck.run.id").is_empty()
+            })
+        })),
+        "{native_name} never exported its own telemetry before pane close; request paths: {:?}",
+        receiver
+            .requests()
+            .iter()
+            .map(|request| &request.path)
+            .collect::<Vec<_>>()
+    );
+    let response = common::attach_request_on(
+        deck.attach_socket_path(),
+        &AttachRequest::StopAgent {
+            id: agent.id.clone(),
+        },
+    )
+    .unwrap();
+    assert!(response.ok, "close {native_name} pane: {response:?}");
+    let run = receiver.run(pane);
+    let run_id = attribute(&run, "deck.run.id");
+    assert!(!run_id.is_empty());
+    assert!(
+        common::wait_until(EXPORT_WAIT, || receiver.requests().iter().any(|request| {
+            (!forbid_logs || matches!(request.path.as_str(), "/v1/traces" | "/v1/metrics"))
+                && request_resources(request).iter().any(|resource| {
+                    attribute(resource, "service.name") != "dot-agent-deck"
+                        && attribute(resource, "deck.run.id") == run_id
+                })
+        })),
+        "{native_name} never exported its own telemetry with resource deck.run.id={run_id}; paths/resources: {:?}",
+        receiver
+            .requests()
+            .iter()
+            .map(|request| (&request.path, request_resources(request)))
+            .collect::<Vec<_>>()
+    );
+    let requests = receiver.requests();
+    if forbid_logs {
+        assert!(
+            !requests.iter().any(|request| request.path == "/v1/logs"),
+            "Codex logs carry tool content and must stay off"
+        );
+    }
+    for request in &requests {
+        for private in private_strings {
+            assert!(!private.is_empty());
+            assert!(
+                !request
+                    .body
+                    .windows(private.len())
+                    .any(|bytes| bytes == private.as_bytes()),
+                "private sentinel {private:?} in {native_name} or deck OTLP payload"
+            );
+        }
+    }
+}
+
+/// Scenario: Start real wrapped interactive Codex on cheap Luna, type a directive to copy a unique fixture through its shell, and observe the proof and completed response in its pane. Closing the pane must deliver Codex's own traces or metrics with the deck's resource run id, no Codex logs and no prompt/file/output sentinel in any captured request.
+#[spec("telemetry/otlp/018")]
+#[test]
+fn telemetry_otlp_018_real_codex_safe_telemetry_joins_deck_run() {
+    skip_unless!(common::check_codex_available());
+    let receiver = Receiver::start();
+    let deck = TuiDeck::builder()
+        .with_pty_size(180, 50)
+        .with_imported_codex_credentials()
+        .with_env("PATH", common::path_with_binary_dir())
+        .with_env("OTEL_EXPORTER_OTLP_ENDPOINT", &receiver.endpoint)
+        .with_env("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json")
+        .with_env("OTEL_METRIC_EXPORT_INTERVAL", "1000")
+        .with_continue_session("telemetry-codex-luna", format!("codex --model {} --dangerously-bypass-approvals-and-sandbox -c 'model_reasoning_effort=\"low\"' -c 'analytics.enabled=false'", common::codex_test_model()))
+        .launch_with_fixture("minimal");
+    const SENTINEL: &str = "telemetry_codex_private_fixture_1741.txt";
+    const PROOF: &str = "telemetry_codex_proof_1741.txt";
+    const CONTENT: &str = "PRIVATE_CODEX_FILE_1741_e6da";
+    const PROMPT: &str = "PRIVATE_CODEX_PROMPT_1741_ae51";
+    const OUTPUT: &str = "PRIVATE_CODEX_OUTPUT_1741_d9a7";
+    std::fs::write(deck.workdir().join(SENTINEL), CONTENT).unwrap();
+    assert!(
+        deck.wait_for_grid_string_within("Ask Codex to do anything", Duration::from_secs(60)),
+        "Codex composer did not become ready:\n{}",
+        deck.snapshot_grid()
+    );
+    let directive = format!(
+        "{PROMPT}: Use the shell exactly once to copy {SENTINEL} to {PROOF} in the current directory. Do not change any other file. Then reply exactly {OUTPUT} and end the turn."
+    );
+    deck.send_keys(directive.as_bytes());
+    deck.wait_for_string(PROMPT);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        deck.send_keys(b"\r");
+        if deck.wait_for_grid_string_within("Ask Codex to do anything", Duration::from_secs(2)) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Codex did not submit prompt:\n{}",
+            deck.snapshot_grid()
+        );
+    }
+    common::wait_for_file_trimmed_eq(
+        &deck.workdir().join(PROOF),
+        CONTENT,
+        Duration::from_secs(100),
+    )
+    .unwrap_or_else(|state| {
+        panic!(
+            "real Codex did not do the sentinel work: {state}\n{}",
+            deck.snapshot_grid()
+        )
+    });
+    assert!(
+        deck.wait_for_grid_string_within(OUTPUT, Duration::from_secs(30)),
+        "Codex did not visibly finish:\n{}",
+        deck.snapshot_grid()
+    );
+    deck.send_bytes(b"\x04");
+    assert!(
+        deck.wait_for_grid_string_within("Idle", Duration::from_secs(20)),
+        "Codex card did not settle:\n{}",
+        deck.snapshot_grid()
+    );
+    finish_native_join(
+        &receiver,
+        &deck,
+        "Codex",
+        &[PROMPT, CONTENT, SENTINEL, OUTPUT],
+        true,
+    );
+}
+
+/// Scenario: Start real interactive Pi Haiku through the deck's bundled extension and post an inbox directive to copy a uniquely named fixture and reply with a private output marker. Observe the real work and settled card, then require Pi's own metadata export to share the deck's resource run id while prompt, file and output markers stay out of every captured request.
+#[spec("telemetry/otlp/019")]
+#[test]
+fn telemetry_otlp_019_real_pi_metadata_joins_deck_run() {
+    skip_unless!(common::anthropic_api_key().map(|_| ()).ok_or_else(|| {
+        "Pi Haiku requires an Anthropic API key; no provider fallback".to_string()
+    }));
+    let receiver = Receiver::start();
+    let deck = TuiDeck::builder()
+        .with_pty_size(180, 50)
+        .with_env("PATH", common::path_with_binary_dir())
+        .with_env("ANTHROPIC_API_KEY", common::anthropic_api_key().unwrap())
+        .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
+        .with_env("PI_TELEMETRY", "0")
+        .with_env("OTEL_EXPORTER_OTLP_ENDPOINT", &receiver.endpoint)
+        .with_env("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json")
+        .with_continue_session(
+            "telemetry-pi-haiku",
+            "pi --provider anthropic --model claude-haiku-4-5 --approve",
+        )
+        .launch_with_fixture("minimal");
+    const SENTINEL: &str = "telemetry_pi_private_fixture_1741.txt";
+    const PROOF: &str = "telemetry_pi_proof_1741.txt";
+    const CONTENT: &str = "PRIVATE_PI_FILE_1741_79a1";
+    const PROMPT: &str = "PRIVATE_PI_PROMPT_1741_f7ab";
+    const OUTPUT: &str = "PRIVATE_PI_OUTPUT_1741_a9d3";
+    std::fs::write(deck.workdir().join(SENTINEL), CONTENT).unwrap();
+    assert!(
+        deck.wait_for_grid_string_within("claude-haiku", Duration::from_secs(60)),
+        "Pi Haiku did not become ready:\n{}",
+        deck.snapshot_grid()
+    );
+    let directive = format!(
+        "{PROMPT}: Use bash exactly once to copy {SENTINEL} to {PROOF} in the current directory. Do not change any other file. Then reply exactly {OUTPUT} and end the turn."
+    );
+    let agent = common::agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .next()
+        .unwrap();
+    common::post_message_on(
+        deck.attach_socket_path(),
+        agent.pane_id_env.as_deref().unwrap(),
+        &agent.id,
+        &directive,
+    )
+    .expect("post sentinel directive to Pi's native inbox");
+    common::wait_for_file_trimmed_eq(
+        &deck.workdir().join(PROOF),
+        CONTENT,
+        Duration::from_secs(100),
+    )
+    .unwrap_or_else(|state| {
+        panic!(
+            "real Pi Haiku did not do the sentinel work: {state}\n{}",
+            deck.snapshot_grid()
+        )
+    });
+    assert!(
+        deck.wait_for_grid_string_within(OUTPUT, Duration::from_secs(30)),
+        "Pi did not visibly finish:\n{}",
+        deck.snapshot_grid()
+    );
+    deck.send_bytes(b"\x04");
+    assert!(
+        deck.wait_for_grid_string_within("Idle", Duration::from_secs(20)),
+        "Pi card did not settle:\n{}",
+        deck.snapshot_grid()
+    );
+    finish_native_join(
+        &receiver,
+        &deck,
+        "Pi",
+        &[PROMPT, CONTENT, SENTINEL, OUTPUT],
+        false,
+    );
+}
+
+/// Scenario: When Devin is authenticated, start its real interactive pane, ask it to write a unique proof file and visibly complete, then close it. Its own metadata export must carry the deck's resource run id and omit the directive and output markers; missing authentication is reported as unverified by the required-real gate.
+#[spec("telemetry/otlp/020")]
+#[test]
+fn telemetry_otlp_020_real_devin_telemetry_join_when_authenticated() {
+    skip_unless!(common::check_devin_available());
+    let receiver = Receiver::start();
+    let deck = TuiDeck::builder()
+        .with_pty_size(180, 50)
+        .with_imported_devin_credentials()
+        .with_env("OTEL_EXPORTER_OTLP_ENDPOINT", &receiver.endpoint)
+        .with_env("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json")
+        .with_continue_session(
+            "telemetry-devin-live",
+            "devin --respect-workspace-trust false --permission-mode auto",
+        )
+        .launch_with_fixture("minimal");
+    assert!(
+        deck.wait_for_grid_string_within("Ask Devin", Duration::from_secs(60)),
+        "Devin did not become ready:\n{}",
+        deck.snapshot_grid()
+    );
+    const PROMPT: &str = "PRIVATE_DEVIN_PROMPT_1741_e8ac";
+    const OUTPUT: &str = "PRIVATE_DEVIN_OUTPUT_1741_a18b";
+    let directive = format!(
+        "{PROMPT}: Use exec once to write exactly TELEMETRY_DEVIN_OK to telemetry_devin_proof_1741.txt. Then reply exactly {OUTPUT} and end the turn."
+    );
+    deck.send_keys(directive.as_bytes());
+    deck.wait_for_string(PROMPT);
+    deck.send_keys(b"\r");
+    common::wait_for_file_trimmed_eq(
+        &deck.workdir().join("telemetry_devin_proof_1741.txt"),
+        "TELEMETRY_DEVIN_OK",
+        Duration::from_secs(100),
+    )
+    .expect("real Devin sentinel work");
+    assert!(
+        deck.wait_for_grid_string_within(OUTPUT, Duration::from_secs(30)),
+        "Devin did not visibly finish:\n{}",
+        deck.snapshot_grid()
+    );
+    finish_native_join(&receiver, &deck, "Devin", &[PROMPT, OUTPUT], false);
 }
