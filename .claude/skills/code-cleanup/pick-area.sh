@@ -185,7 +185,7 @@ if [ "$check" = --check ]; then
   [ "$mode" = tests ] && grep -E '\.snap$' "$tmp/changed" | sed 's/^/SNAPSHOT=/'
   sort -u "$tmp/out" | sed 's/^/OUTSIDE=/' | tee "$tmp/report"
   off_limits_hits "$tmp/changed" | sed 's/^/OFF_LIMITS=/' | tee -a "$tmp/report"
-  echo "CHANGED=$(wc -l <"$tmp/changed")"
+  echo "CHANGED=$(wc -l <"$tmp/changed" | tr -d '[:space:]')"
   [ -s "$tmp/report" ] && exit 1
   exit 0
 fi
@@ -217,7 +217,7 @@ files_jq='.[] | .filename, (.previous_filename // empty)'
 repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner) || die "gh repo view failed"
 gh pr list --repo "$repo" --state open --limit 300 --json number --jq '.[].number' >"$tmp/open" \
   || die "gh pr list failed"
-[ "$(wc -l <"$tmp/open")" -lt 300 ] || die "300 or more open PRs; raise the limit before trusting the busy filter"
+[ "$(wc -l <"$tmp/open" | tr -d '[:space:]')" -lt 300 ] || die "300 or more open PRs; raise the limit before trusting the busy filter"
 : >"$tmp/busy"
 while read -r n; do
   [ -n "$n" ] || continue
@@ -260,10 +260,10 @@ if [ -n "$findings" ]; then
   declared=$(sed -n 's/^FINDINGS=\([0-9][0-9]*\)$/\1/p' "$findings" | tail -n 1)
   [ -n "$declared" ] || die "$findings has no FINDINGS= total, so find-targets.sh did not finish; rerun it"
   grep '^TARGET=' "$findings" | sed 's/^TARGET=//' >"$tmp/targets" || true
-  [ "$(wc -l <"$tmp/targets")" -eq "$declared" ] \
-    || die "$findings declares FINDINGS=$declared but holds $(wc -l <"$tmp/targets") TARGET= lines"
+  [ "$(wc -l <"$tmp/targets" | tr -d '[:space:]')" -eq "$declared" ] \
+    || die "$findings declares FINDINGS=$declared but holds $(wc -l <"$tmp/targets" | tr -d '[:space:]') TARGET= lines"
   awk -F'\t' 'NF >= 4 && $3 ~ /^[0-9]+$/' "$tmp/targets" >"$tmp/targets.ok"
-  [ "$(wc -l <"$tmp/targets.ok")" -eq "$(wc -l <"$tmp/targets")" ] \
+  [ "$(wc -l <"$tmp/targets.ok" | tr -d '[:space:]')" -eq "$(wc -l <"$tmp/targets" | tr -d '[:space:]')" ] \
     || die "$findings has a TARGET= line that is not <tool><TAB><path><TAB><line><TAB><what>"
   cut -f2 "$tmp/targets" | sort -u >"$tmp/target-files"
   not_owned "$mode" "$tmp/target-files" | sort -u >"$tmp/t-not-owned"
@@ -284,7 +284,7 @@ if [ -n "$findings" ]; then
       printf "%d\t%d\t%d\t%d\n", n_no, n_busy, n_off, n_kept > counts
     }' "$tmp/targets"
   IFS=$'\t' read -r t_no t_busy t_off t_kept <"$tmp/t-counts"
-  t_total=$(wc -l <"$tmp/targets")
+  t_total=$(wc -l <"$tmp/targets" | tr -d '[:space:]')
   if [ "$t_kept" -gt 0 ]; then
     drawn=$(awk -v seed="$seed" 'BEGIN { srand(seed) } { l[NR] = $0 } END { print l[int(rand() * NR) + 1] }' "$tmp/kept")
     IFS=$'\t' read -r d_tool d_file d_line d_what <<<"$drawn"
@@ -311,14 +311,14 @@ grep -vxFf "$tmp/busy" "$tmp/owned" >"$tmp/free1" || true
 grep -vxFf "$tmp/recent" "$tmp/free1" >"$tmp/free2" || true
 grep -vxFf "$tmp/off" "$tmp/free2" >"$tmp/free" || true
 
-skipped_busy=$(( $(wc -l <"$tmp/owned") - $(wc -l <"$tmp/free1") ))
-skipped_recent=$(( $(wc -l <"$tmp/free1") - $(wc -l <"$tmp/free2") ))
-skipped_off=$(( $(wc -l <"$tmp/free2") - $(wc -l <"$tmp/free") ))
+skipped_busy=$(( $(wc -l <"$tmp/owned" | tr -d '[:space:]') - $(wc -l <"$tmp/free1" | tr -d '[:space:]') ))
+skipped_recent=$(( $(wc -l <"$tmp/free1" | tr -d '[:space:]') - $(wc -l <"$tmp/free2" | tr -d '[:space:]') ))
+skipped_off=$(( $(wc -l <"$tmp/free2" | tr -d '[:space:]') - $(wc -l <"$tmp/free" | tr -d '[:space:]') ))
 [ -s "$tmp/free" ] || die "every owned file is busy, recently cleaned or off limits (busy $skipped_busy, recent $skipped_recent, off limits $skipped_off)"
 
 # Weighted draw: sizes in bytes, one random offset across their sum.
 while IFS= read -r f; do
-  printf '%s\t%s\n' "$(wc -c <"$f")" "$f"
+  printf '%s\t%s\n' "$(wc -c <"$f" | tr -d '[:space:]')" "$f"
 done <"$tmp/free" >"$tmp/sized"
 
 pick=$(awk -F'\t' -v seed="$seed" '
@@ -335,11 +335,11 @@ pick=$(awk -F'\t' -v seed="$seed" '
 
 offset=${pick%%$'\t'*}
 file=${pick#*$'\t'}
-line=$(( $(head -c "$offset" "$file" | wc -l) + 1 ))
+line=$(( $(head -c "$offset" "$file" | wc -l | tr -d '[:space:]') + 1 ))
 
 echo "MODE=$mode"
 echo "SOURCE=draw"
-echo "CANDIDATES=$(wc -l <"$tmp/free")"
+echo "CANDIDATES=$(wc -l <"$tmp/free" | tr -d '[:space:]')"
 echo "SKIPPED_BUSY=$skipped_busy"
 echo "SKIPPED_RECENT=$skipped_recent"
 echo "SKIPPED_OFF_LIMITS=$skipped_off"

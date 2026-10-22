@@ -112,7 +112,7 @@ case "$cmd" in
     : >"$tmp/targets"
     while IFS=$'\t' read -r file offset what; do
       [ -f "$file" ] || die "cargo shear names $file, which is not a file in this checkout"
-      line=$(( $(head -c "$offset" "$file" | wc -l) + 1 ))
+      line=$(( $(head -c "$offset" "$file" | wc -l | tr -d '[:space:]') + 1 ))
       printf 'TARGET=cargo-shear\t%s\t%s\t%s\n' "$file" "$line" "$what" >>"$tmp/targets"
     done <"$tmp/shear.tsv"
 
@@ -137,7 +137,7 @@ case "$cmd" in
       "$tmp/knip.json" >>"$tmp/targets" || die "cannot read knip's JSON report"
 
     cat "$tmp/targets"
-    echo "FINDINGS=$(wc -l <"$tmp/targets")"
+    echo "FINDINGS=$(wc -l <"$tmp/targets" | tr -d '[:space:]')"
     ;;
 
   tests)

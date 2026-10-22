@@ -85,6 +85,17 @@ case "$*" in
 esac
 "#;
 
+/// BSD `wc` pads stdin counts; exercise that format on Linux too. The real
+/// utility still counts bytes/newlines, including a final unterminated line.
+const WC_STUB: &str = r#"#!/usr/bin/env bash
+count=$(/usr/bin/wc "$@") || exit
+if [ "${STUB_PAD_WC:-1}" = 0 ]; then
+  printf '%s\n' "$count"
+else
+  printf '%8d\n' "$count"
+fi
+"#;
+
 /// A throwaway checkout: `tracked` files exist on disk with some content and
 /// are what `git ls-files` lists, `changed` is what `git diff` lists, and `bin`
 /// holds the stand-ins, ahead of the real tools on `PATH`.
@@ -107,6 +118,7 @@ impl Sandbox {
         }
         sb.stub("git", GIT_STUB);
         sb.stub("gh", GH_STUB);
+        sb.stub("wc", WC_STUB);
         sb.file("tracked", &lines(tracked));
         sb.file("changed", &lines(changed));
         sb.env("STUB_TRACKED", "tracked");
@@ -182,6 +194,8 @@ fn stdout(out: &Output) -> String {
 
 const DOT_AI_SKILL: &str = ".claude/skills/dot-ai-changelog-fragment/SKILL.md";
 
+/// Scenario: Check a changed dot-ai skill in instructions mode with padded wc
+/// output. The script must accept it and report an unpadded changed-file count.
 #[test]
 fn code_cleanup_001_the_instructions_check_accepts_a_dot_ai_skill() {
     if !tools_present() {
@@ -190,12 +204,16 @@ fn code_cleanup_001_the_instructions_check_accepts_a_dot_ai_skill() {
     let out = Sandbox::new(&[DOT_AI_SKILL], &[DOT_AI_SKILL])
         .run("pick-area.sh", &["instructions", "--check"]);
     assert!(
-        out.status.success() && !stdout(&out).contains("OUTSIDE="),
+        out.status.success()
+            && !stdout(&out).contains("OUTSIDE=")
+            && stdout(&out).contains("CHANGED=1\n"),
         "a change to a dot-ai-* skill must be inside the instructions mode\n{}",
         report(&out)
     );
 }
 
+/// Scenario: Draw from a checkout containing one dot-ai skill with padded wc
+/// output. Instructions mode must select that skill and print one candidate.
 #[test]
 fn code_cleanup_002_the_instructions_draw_can_pick_a_dot_ai_skill() {
     if !tools_present() {
@@ -203,7 +221,9 @@ fn code_cleanup_002_the_instructions_draw_can_pick_a_dot_ai_skill() {
     }
     let out = Sandbox::new(&[DOT_AI_SKILL], &[DOT_AI_SKILL]).run("pick-area.sh", &["instructions"]);
     assert!(
-        out.status.success() && stdout(&out).contains(&format!("FILE={DOT_AI_SKILL}\n")),
+        out.status.success()
+            && stdout(&out).contains(&format!("FILE={DOT_AI_SKILL}\n"))
+            && stdout(&out).contains("CANDIDATES=1\n"),
         "a dot-ai-* skill must be in the instructions mode's owned set\n{}",
         report(&out)
     );
@@ -542,27 +562,33 @@ fn find_targets_sandbox(shear_version: Option<&str>) -> Sandbox {
     sb
 }
 
+/// Scenario: Run finding discovery against offline tool reports with native
+/// and BSD-padded wc output. Both must print the same findings, line numbers
+/// and unpadded total so the area picker can consume the report.
 #[test]
 fn code_cleanup_010_find_targets_prints_each_finding_with_its_line() {
     if !tools_present() {
         return;
     }
-    let out =
-        find_targets_sandbox(Some(&pin("CARGO_SHEAR_VERSION"))).run("find-targets.sh", &["code"]);
-    let text = stdout(&out);
-    for want in [
-        "TARGET=cargo-shear\tCargo.toml\t3\tunused dependency `tokio-test`; remove this dependency\n",
-        "TARGET=knip\tdesktop/src/App.tsx\t40\texports: PULL_REQUEST_AGENT_GONE\n",
-        "TARGET=knip\tdesktop/src/App.tsx\t7\ttypes: Row\n",
-        "TARGET=knip\tdesktop/src/old.ts\t1\tfiles: unused file\n",
-        "FINDINGS=4\n",
-    ] {
-        assert!(
-            out.status.success() && text.contains(want),
-            "find-targets.sh code must print `{}`\n{}",
-            want.trim_end(),
-            report(&out)
-        );
+    for padded in ["0", "1"] {
+        let mut sb = find_targets_sandbox(Some(&pin("CARGO_SHEAR_VERSION")));
+        sb.set("STUB_PAD_WC", padded);
+        let out = sb.run("find-targets.sh", &["code"]);
+        let text = stdout(&out);
+        for want in [
+            "TARGET=cargo-shear\tCargo.toml\t3\tunused dependency `tokio-test`; remove this dependency\n",
+            "TARGET=knip\tdesktop/src/App.tsx\t40\texports: PULL_REQUEST_AGENT_GONE\n",
+            "TARGET=knip\tdesktop/src/App.tsx\t7\ttypes: Row\n",
+            "TARGET=knip\tdesktop/src/old.ts\t1\tfiles: unused file\n",
+            "FINDINGS=4\n",
+        ] {
+            assert!(
+                out.status.success() && text.contains(want),
+                "find-targets.sh code must print `{}`\n{}",
+                want.trim_end(),
+                report(&out)
+            );
+        }
     }
 }
 
