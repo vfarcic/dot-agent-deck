@@ -178,6 +178,353 @@ pub fn pr_list_for_issue_argv(repo: &str, issue_number: u64) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
+// PRD #421 Phase 2 — the visible dispatch claim
+// ---------------------------------------------------------------------------
+//
+// A dispatched issue is labelled [`CLAIM_LABEL`] and carries one claimant
+// record: a comment naming the task and the machine id that dispatched it,
+// written by the account `gh` is signed in with, and edited rather than
+// appended on a re-claim. There is deliberately no builder that removes a label
+// or deletes a comment (PRD #421 M2.1/M2.2): the deck never releases a claim.
+// `tests/dispatch_claim_never_released.rs` scans `src/` for the spellings of a
+// label removal and of a REST `DELETE`.
+
+/// The deck-owned label a dispatched issue carries (PRD #421 M2.0). Namespaced
+/// so that no repository's own workflow vocabulary can collide with it, which
+/// is what makes provisioning it with `--force` safe.
+pub const CLAIM_LABEL: &str = "agent-deck/claimed";
+
+/// The colour [`claim_label_provision_argv`] converges the label onto.
+pub const CLAIM_LABEL_COLOR: &str = "1D76DB";
+
+/// The description [`claim_label_provision_argv`] converges the label onto.
+pub const CLAIM_LABEL_DESCRIPTION: &str = "An agent was dispatched to this issue by dot-agent-deck";
+
+/// The fixed marker opening every claimant record, which any deck can find.
+/// Task and machine id are fields inside the body, not part of the marker.
+pub const CLAIM_RECORD_MARKER: &str = "<!-- dot-agent-deck:claim -->";
+
+const CLAIM_RECORD_TASK_FIELD: &str = "- Task: ";
+const CLAIM_RECORD_HOST_FIELD: &str = "- Machine: ";
+const CLAIM_RECORD_CLAIMED_AT_FIELD: &str = "- Claimed at: ";
+
+/// The domain separator [`claim_host_id`] hashes in front of the host name, so
+/// the digest differs from a plain SHA-256 of the bare name computed for some
+/// other purpose. The `v1` is the scheme's version: a different derivation gets
+/// a new separator and a new id prefix rather than silently changing ids.
+const CLAIM_HOST_DOMAIN: &[u8] = b"dot-agent-deck/claim-host/v1\0";
+
+/// The machine id a claimant record names instead of the raw host name
+/// (PRD #421 amendment item 8): `h1-` and the first 16 hex digits of SHA-256
+/// over [`CLAIM_HOST_DOMAIN`] followed by `hostname`. Stable for a machine
+/// whose host name does not change, which is what lets a re-claim find its own
+/// record.
+///
+/// It keeps the raw name out of the public comment, but it is NOT
+/// anonymisation: the digest is unsalted and host names are low-entropy, so
+/// anyone who can guess a name can confirm it by hashing it the same way.
+pub fn claim_host_id(hostname: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(CLAIM_HOST_DOMAIN);
+    hasher.update(hostname.as_bytes());
+    let digest = hasher.finalize();
+    let hex: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+    format!("h1-{hex}")
+}
+
+/// Build the `gh api` argv (arguments after `gh`) that reads the account `gh`
+/// is signed in with — whose numeric `id` decides which claimant records are
+/// this deck's own (PRD #421 amendment item 6).
+pub fn authenticated_user_argv() -> Vec<String> {
+    vec!["api".to_string(), "user".to_string()]
+}
+
+/// Read the numeric account id out of the output of
+/// [`authenticated_user_argv`]. Anything without one is an error: without the
+/// id no record can be proven to be this deck's.
+pub fn parse_authenticated_user_id(json: &str) -> Result<u64, String> {
+    #[derive(serde::Deserialize)]
+    struct User {
+        id: u64,
+    }
+    serde_json::from_str::<User>(json)
+        .map(|user| user.id)
+        .map_err(|e| format!("failed to read the signed-in GitHub account: {e}"))
+}
+
+/// Build the `gh label create` argv (arguments after `gh`) that provisions
+/// [`CLAIM_LABEL`] in `repo`, creating it or, with `--force`, converging an
+/// existing one onto the deck's colour and description. Every value after
+/// `create` is a constant or the validated `repo` slug, so no element can be
+/// read as an unexpected flag.
+pub fn claim_label_provision_argv(repo: &str) -> Vec<String> {
+    vec![
+        "label".to_string(),
+        "create".to_string(),
+        CLAIM_LABEL.to_string(),
+        "--repo".to_string(),
+        repo.to_string(),
+        "--force".to_string(),
+        "--color".to_string(),
+        CLAIM_LABEL_COLOR.to_string(),
+        "--description".to_string(),
+        CLAIM_LABEL_DESCRIPTION.to_string(),
+    ]
+}
+
+/// Build the `gh issue edit` argv (arguments after `gh`) that adds
+/// [`CLAIM_LABEL`] to `issue_number`, with the issue number after the `--`
+/// end-of-options marker (see `issue_list_argv`).
+pub fn claim_issue_argv(repo: &str, issue_number: u64) -> Vec<String> {
+    vec![
+        "issue".to_string(),
+        "edit".to_string(),
+        "--repo".to_string(),
+        repo.to_string(),
+        "--add-label".to_string(),
+        CLAIM_LABEL.to_string(),
+        "--".to_string(),
+        issue_number.to_string(),
+    ]
+}
+
+/// Build the `gh api` argv (arguments after `gh`) listing every comment on
+/// `issue_number`, which is where an existing claimant record is found. The
+/// endpoint starts with `repos/`, so it cannot be read as a flag.
+pub fn issue_comments_argv(repo: &str, issue_number: u64) -> Vec<String> {
+    vec![
+        "api".to_string(),
+        "--paginate".to_string(),
+        format!("repos/{repo}/issues/{issue_number}/comments"),
+    ]
+}
+
+/// Build the `gh api` argv (arguments after `gh`) that posts `body` as a new
+/// comment on `issue_number` — used when the issue carries no claimant record
+/// of this deck's yet. `-f` sends the body as a raw string, never a file read.
+pub fn create_claim_record_argv(repo: &str, issue_number: u64, body: &str) -> Vec<String> {
+    vec![
+        "api".to_string(),
+        "--method".to_string(),
+        "POST".to_string(),
+        format!("repos/{repo}/issues/{issue_number}/comments"),
+        "-f".to_string(),
+        format!("body={body}"),
+    ]
+}
+
+/// Build the `gh api` argv (arguments after `gh`) that replaces the body of
+/// the existing claimant record `comment_id` — a re-claim edits the record
+/// rather than appending another one.
+pub fn edit_claim_record_argv(repo: &str, comment_id: u64, body: &str) -> Vec<String> {
+    vec![
+        "api".to_string(),
+        "--method".to_string(),
+        "PATCH".to_string(),
+        format!("repos/{repo}/issues/comments/{comment_id}"),
+        "-f".to_string(),
+        format!("body={body}"),
+    ]
+}
+
+/// What a claimant record's body says about who wrote it: the scheduled task
+/// and the machine id ([`claim_host_id`]) it ran on, and when it was last
+/// claimed. Who actually authored the comment is not part of the body —
+/// [`find_own_claim_record`] takes that from the comment's `user.id`, which
+/// GitHub sets and a body cannot forge.
+///
+/// `claimed_at` is `None` for a record written before the field existed; such
+/// a record is still a record, and gains the field on its next edit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimRecord {
+    pub task: String,
+    pub host: String,
+    pub claimed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Render the body of a claimant record for `task` on the machine `host_id`
+/// (a [`claim_host_id`]), claimed at `claimed_at`: the marker on the first
+/// line, a sentence for a human reading the issue, then the fields. Each field
+/// value is a JSON string, so a task name carrying quotes or a newline still
+/// renders on one line and parses back exactly. Only the machine id is
+/// repeated in the sentence: it is hex by construction, while the task name is
+/// the user's free text.
+///
+/// The claim time is what makes a re-claim's body differ from the record it
+/// edits: GitHub leaves a comment's `updated_at` alone when an edit repeats the
+/// same body, and `updated_at` is the claim's clock. It carries milliseconds,
+/// and a re-claim takes its time from [`next_claim_time`], which is at least a
+/// millisecond past the time the edited record carries, so the two bodies
+/// differ even when the wall clock repeats or steps back.
+pub fn render_claim_record(
+    task: &str,
+    host_id: &str,
+    claimed_at: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let quote = |value: &str| serde_json::Value::from(value).to_string();
+    let claimed_at = claimed_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    format!(
+        "{CLAIM_RECORD_MARKER}\nAn agent was dispatched to work on this issue by dot-agent-deck \
+         on machine `{host_id}`, last claimed at {claimed_at}.\n\n\
+         {CLAIM_RECORD_TASK_FIELD}{}\n{CLAIM_RECORD_HOST_FIELD}{}\n{CLAIM_RECORD_CLAIMED_AT_FIELD}{}\n",
+        quote(task),
+        quote(host_id),
+        quote(&claimed_at)
+    )
+}
+
+/// The claim time to write when `previous` is the claim time of the record
+/// being edited (`None` for a new record, or one with no readable time):
+/// `max(now, previous + 1 ms)` when there is a `previous`, and `now` when
+/// there is not. So `now` is used only when it is at least one millisecond
+/// past `previous` — a `now` that is past `previous` by less than that still
+/// yields `previous + 1 ms`. The record renders its time to the millisecond,
+/// so the result always renders differently from the time the edited record
+/// holds — a wall clock that repeats a millisecond, or is corrected
+/// backwards, cannot re-render the same body. A record whose time is in the future therefore
+/// carries each re-claim one millisecond further until the clock catches up.
+pub fn next_claim_time(
+    now: chrono::DateTime<chrono::Utc>,
+    previous: Option<chrono::DateTime<chrono::Utc>>,
+) -> chrono::DateTime<chrono::Utc> {
+    previous
+        .and_then(|previous| previous.checked_add_signed(chrono::Duration::milliseconds(1)))
+        .map_or(now, |floor| now.max(floor))
+}
+
+/// Parse a comment body as a claimant record. Only a body whose first line is
+/// [`CLAIM_RECORD_MARKER`] counts, so a reply quoting a record (`> <!-- …`) is
+/// not mistaken for one; the task and machine fields must be present. The
+/// claim time is optional — records written before it existed have none — and
+/// one that does not parse as an RFC 3339 time reads as absent.
+pub fn parse_claim_record(body: &str) -> Option<ClaimRecord> {
+    let mut lines = body.trim_start().lines();
+    if lines.next()?.trim_end() != CLAIM_RECORD_MARKER {
+        return None;
+    }
+    let mut task = None;
+    let mut host = None;
+    let mut claimed_at = None;
+    for line in lines {
+        let line = line.trim_end();
+        if let Some(value) = line.strip_prefix(CLAIM_RECORD_TASK_FIELD) {
+            task = task.or_else(|| serde_json::from_str::<String>(value).ok());
+        } else if let Some(value) = line.strip_prefix(CLAIM_RECORD_HOST_FIELD) {
+            host = host.or_else(|| serde_json::from_str::<String>(value).ok());
+        } else if let Some(value) = line.strip_prefix(CLAIM_RECORD_CLAIMED_AT_FIELD) {
+            claimed_at = claimed_at.or_else(|| {
+                serde_json::from_str::<String>(value)
+                    .ok()
+                    .and_then(|time| chrono::DateTime::parse_from_rfc3339(&time).ok())
+                    .map(|time| time.with_timezone(&chrono::Utc))
+            });
+        }
+    }
+    Some(ClaimRecord {
+        task: task?,
+        host: host?,
+        claimed_at,
+    })
+}
+
+/// This deck's own claimant record, as [`find_own_claim_record`] found it: the
+/// comment's id, its body as GitHub returned it, and the claim time that body
+/// carries, if any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnClaimRecord {
+    pub id: u64,
+    pub body: String,
+    pub claimed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Find this deck's own claimant record in the output of
+/// [`issue_comments_argv`], returning its comment id, body and claim time. A
+/// record is this deck's only when its body names the same `task` AND the
+/// same `host_id` AND the comment was written by the account `user_id` (PRD
+/// #421 amendment item 7), whatever claim time it carries, or none. A body is
+/// anyone's to copy, so a matching body by someone else is skipped and the
+/// search goes on.
+///
+/// `gh api --paginate` prints one JSON array per page back to back, and every
+/// page is parsed even after an own record turns up, so a stream that goes bad
+/// on a later page is still an error. Malformed output — and output with no
+/// page at all, which is what a listing cut short looks like — is an error,
+/// never "no record", which would append a duplicate.
+pub fn find_own_claim_record(
+    comments_json: &str,
+    task: &str,
+    host_id: &str,
+    user_id: u64,
+) -> Result<Option<OwnClaimRecord>, String> {
+    #[derive(serde::Deserialize)]
+    struct Author {
+        id: u64,
+    }
+    #[derive(serde::Deserialize)]
+    struct Comment {
+        id: u64,
+        #[serde(default)]
+        body: Option<String>,
+        #[serde(default)]
+        user: Option<Author>,
+    }
+    if comments_json.trim().is_empty() {
+        return Err("the issue's comments came back empty".to_string());
+    }
+    let mut own = None;
+    for page in serde_json::Deserializer::from_str(comments_json).into_iter::<Vec<Comment>>() {
+        let page = page.map_err(|e| format!("failed to parse the issue's comments: {e}"))?;
+        if own.is_some() {
+            continue;
+        }
+        own = page.into_iter().find_map(|comment| {
+            if !comment.user.as_ref().is_some_and(|user| user.id == user_id) {
+                return None;
+            }
+            let body = comment.body?;
+            let record = parse_claim_record(&body)?;
+            (record.task == task && record.host == host_id).then_some(OwnClaimRecord {
+                id: comment.id,
+                body,
+                claimed_at: record.claimed_at,
+            })
+        });
+    }
+    Ok(own)
+}
+
+/// The character budget of a claim diagnostic BEFORE escaping: longer text is
+/// cut to this many characters, with a note of the full length. Escaping comes
+/// after the cut, and each control or bidi character it escapes grows into a
+/// sequence of up to eight characters, so the text that reaches a notification
+/// or the log can be longer than this — still bounded, and never split inside
+/// an escape sequence.
+const MAX_CLAIM_ERROR_CHARS: usize = 500;
+
+/// Make a claim diagnostic safe to put in a notification or the log (PRD #421
+/// amendment item 11). Its text comes partly from `gh`'s stderr, which echoes
+/// server responses, so before it goes anywhere:
+///
+/// - token-shaped strings (`ghp_…`, `gho_…`, `ghu_…`, `ghs_…`, `ghr_…`,
+///   `github_pat_…`) are replaced with `<redacted>` — first, so that cutting
+///   the text short cannot leave half a token behind. A prefix is matched
+///   wherever it appears, including glued to the word before it
+///   (`token_ghp_…`), so an ordinary word that happens to contain one is
+///   redacted too: over-redacting a diagnostic costs less than leaking a token;
+/// - the text is cut to [`MAX_CLAIM_ERROR_CHARS`] characters;
+/// - control characters (C0 including ESC, BEL and CR, DEL, C1) and bidi
+///   overrides are escaped, so the text cannot forge or rewrite a log line.
+pub fn sanitize_claim_error(text: &str) -> String {
+    static TOKEN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+")
+            .expect("the token pattern is valid")
+    });
+    let redacted = TOKEN.replace_all(text, "<redacted>");
+    crate::config_validation::escape_field_for_log(&redacted, MAX_CLAIM_ERROR_CHARS)
+}
+
+// ---------------------------------------------------------------------------
 // M1 — validate the user-config GitHub knobs that flow into `gh`/`git` argv
 // ---------------------------------------------------------------------------
 
@@ -519,6 +866,462 @@ mod tests {
                 "--",
             ]
         );
+    }
+
+    // --- PRD #421 Phase 2: the dispatch claim ---
+
+    #[test]
+    fn claim_label_provision_argv_forces_the_deck_owned_label() {
+        assert_eq!(
+            claim_label_provision_argv("vfarcic/dot-ai"),
+            vec![
+                "label",
+                "create",
+                "agent-deck/claimed",
+                "--repo",
+                "vfarcic/dot-ai",
+                "--force",
+                "--color",
+                CLAIM_LABEL_COLOR,
+                "--description",
+                CLAIM_LABEL_DESCRIPTION,
+            ]
+        );
+        assert_eq!(CLAIM_LABEL_COLOR.len(), 6);
+        assert!(CLAIM_LABEL_COLOR.chars().all(|c| c.is_ascii_hexdigit()));
+        // GitHub caps a label description at 100 characters.
+        assert!(CLAIM_LABEL_DESCRIPTION.chars().count() <= 100);
+    }
+
+    #[test]
+    fn claim_issue_argv_puts_the_issue_after_end_of_options() {
+        assert_eq!(
+            claim_issue_argv("vfarcic/dot-ai", 17),
+            vec![
+                "issue",
+                "edit",
+                "--repo",
+                "vfarcic/dot-ai",
+                "--add-label",
+                "agent-deck/claimed",
+                "--",
+                "17",
+            ]
+        );
+    }
+
+    #[test]
+    fn claim_record_argvs_address_the_issue_and_comment_endpoints() {
+        assert_eq!(
+            issue_comments_argv("o/r", 7),
+            vec!["api", "--paginate", "repos/o/r/issues/7/comments"]
+        );
+        assert_eq!(
+            create_claim_record_argv("o/r", 7, "hello\nworld"),
+            vec![
+                "api",
+                "--method",
+                "POST",
+                "repos/o/r/issues/7/comments",
+                "-f",
+                "body=hello\nworld",
+            ]
+        );
+        assert_eq!(
+            edit_claim_record_argv("o/r", 4242, "hello"),
+            vec![
+                "api",
+                "--method",
+                "PATCH",
+                "repos/o/r/issues/comments/4242",
+                "-f",
+                "body=hello",
+            ]
+        );
+    }
+
+    fn at(rfc3339: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(rfc3339)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    fn t0() -> chrono::DateTime<chrono::Utc> {
+        at("2026-10-22T05:00:13.000Z")
+    }
+
+    #[test]
+    fn claim_record_round_trips_task_host_and_claim_time() {
+        let when = at("2026-10-22T05:00:13.250Z");
+        let body = render_claim_record("dispatch-task", "build-box", when);
+        assert!(body.starts_with(CLAIM_RECORD_MARKER));
+        assert!(body.contains("dispatch-task") && body.contains("build-box"));
+        assert!(
+            body.contains("- Claimed at: \"2026-10-22T05:00:13.250Z\"\n"),
+            "{body}"
+        );
+        assert!(
+            body.lines()
+                .nth(1)
+                .unwrap()
+                .contains("2026-10-22T05:00:13.250Z"),
+            "the sentence says when it was last claimed: {body}"
+        );
+        assert_eq!(
+            parse_claim_record(&body),
+            Some(ClaimRecord {
+                task: "dispatch-task".into(),
+                host: "build-box".into(),
+                claimed_at: Some(when),
+            })
+        );
+        // Awkward task names survive the round trip on a single field line.
+        let tricky = "Issues vfarcic/dot-ai \"quoted\"\nsecond line";
+        assert_eq!(
+            parse_claim_record(&render_claim_record(tricky, "h", when)),
+            Some(ClaimRecord {
+                task: tricky.into(),
+                host: "h".into(),
+                claimed_at: Some(when),
+            })
+        );
+    }
+
+    #[test]
+    fn a_re_claim_renders_a_body_that_differs_from_the_record_it_edits() {
+        // GitHub moves `updated_at` only when an edit changes the body. A
+        // later millisecond renders a different body; `next_claim_time` is
+        // what makes the re-claim's time a later one.
+        assert_ne!(
+            render_claim_record("t", "h", at("2026-10-22T05:00:13.000Z")),
+            render_claim_record("t", "h", at("2026-10-22T05:00:13.001Z")),
+        );
+    }
+
+    #[test]
+    fn parse_claim_record_accepts_a_record_without_a_claim_time() {
+        // The shape earlier builds wrote, with no `- Claimed at:` line.
+        let legacy = format!(
+            "{CLAIM_RECORD_MARKER}\nAn agent was dispatched to work on this issue by \
+             dot-agent-deck on machine `h1-0123456789abcdef`.\n\n\
+             - Task: \"t\"\n- Machine: \"h1-0123456789abcdef\"\n"
+        );
+        assert_eq!(
+            parse_claim_record(&legacy),
+            Some(ClaimRecord {
+                task: "t".into(),
+                host: "h1-0123456789abcdef".into(),
+                claimed_at: None,
+            })
+        );
+        // A claim time that is not a time reads as absent, not as no record.
+        let garbled = format!("{legacy}- Claimed at: \"yesterday\"\n");
+        assert_eq!(parse_claim_record(&garbled).unwrap().claimed_at, None);
+    }
+
+    #[test]
+    fn parse_claim_record_rejects_non_records() {
+        // No marker.
+        assert_eq!(parse_claim_record("- Task: \"t\"\n- Host: \"h\""), None);
+        // A reply quoting a record is not a record.
+        let quoted = render_claim_record("t", "h", t0())
+            .lines()
+            .map(|l| format!("> {l}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(parse_claim_record(&quoted), None);
+        // The marker alone, or a missing field, is not a record.
+        assert_eq!(parse_claim_record(CLAIM_RECORD_MARKER), None);
+        assert_eq!(
+            parse_claim_record(&format!("{CLAIM_RECORD_MARKER}\n- Task: \"t\"")),
+            None
+        );
+    }
+
+    const ME: u64 = 12345;
+
+    #[test]
+    fn claim_host_id_is_a_stable_versioned_digest_of_the_host_name() {
+        let id = claim_host_id("build-box");
+        assert_eq!(id, claim_host_id("build-box"), "stable across calls");
+        assert!(id.starts_with("h1-"), "{id}");
+        let hex = &id["h1-".len()..];
+        assert_eq!(hex.len(), 16, "{id}");
+        assert!(
+            hex.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+        assert!(
+            !id.contains("build-box"),
+            "the raw name stays out of the id"
+        );
+        assert_ne!(id, claim_host_id("build-box2"));
+        // Domain-separated: not a prefix of the plain SHA-256 of the name.
+        use sha2::{Digest, Sha256};
+        let plain: String = Sha256::digest(b"build-box")
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert!(!plain.starts_with(hex));
+    }
+
+    #[test]
+    fn authenticated_user_id_is_read_from_gh_api_user() {
+        assert_eq!(authenticated_user_argv(), vec!["api", "user"]);
+        assert_eq!(
+            parse_authenticated_user_id(r#"{"id":12345,"login":"deck-bot"}"#),
+            Ok(12345)
+        );
+        assert!(parse_authenticated_user_id(r#"{"login":"deck-bot"}"#).is_err());
+        assert!(parse_authenticated_user_id("").is_err());
+        assert!(parse_authenticated_user_id("not json").is_err());
+    }
+
+    #[test]
+    fn claim_record_names_the_machine_id_not_the_host_name() {
+        let host_id = claim_host_id("secret-laptop");
+        let body = render_claim_record("dispatch-task", &host_id, t0());
+        assert!(!body.contains("secret-laptop"), "{body}");
+        let sentence = body.lines().nth(1).unwrap();
+        assert!(sentence.contains(&host_id), "{sentence}");
+        assert!(!sentence.contains("dispatch-task"), "{sentence}");
+    }
+
+    fn comment(id: u64, user: u64, body: &str) -> serde_json::Value {
+        serde_json::json!({"id": id, "user": {"id": user, "login": "x"}, "body": body})
+    }
+
+    /// The comment id [`find_own_claim_record`] picks, for the tests that are
+    /// about which comment matches rather than what it carries.
+    fn own_id(json: &str, task: &str, host: &str, user: u64) -> Result<Option<u64>, String> {
+        find_own_claim_record(json, task, host, user).map(|own| own.map(|record| record.id))
+    }
+
+    #[test]
+    fn find_own_claim_record_requires_same_task_host_and_author() {
+        let own = render_claim_record("task", "host", t0());
+        let other_host = render_claim_record("task", "elsewhere", t0());
+        let other_task = render_claim_record("another", "host", t0());
+        let json = serde_json::json!([
+            comment(1, ME, "plain comment"),
+            comment(2, ME, &other_host),
+            comment(3, ME, &other_task),
+            comment(4, ME, &own),
+            {"id": 5, "body": null, "user": null},
+        ])
+        .to_string();
+        assert_eq!(own_id(&json, "task", "host", ME), Ok(Some(4)));
+        assert_eq!(own_id(&json, "task", "nowhere", ME), Ok(None));
+        assert_eq!(own_id(&json, "task", "host", 999), Ok(None));
+        assert_eq!(own_id("[]", "task", "host", ME), Ok(None));
+    }
+
+    #[test]
+    fn find_own_claim_record_ignores_the_claim_time() {
+        // A record claimed at another time, or written before the field
+        // existed, is still this deck's own: the time is not part of the match.
+        let earlier = render_claim_record("task", "host", at("2025-01-01T00:00:00.000Z"));
+        let json = serde_json::json!([comment(4, ME, &earlier)]).to_string();
+        assert_eq!(own_id(&json, "task", "host", ME), Ok(Some(4)));
+        let legacy = format!(
+            "{CLAIM_RECORD_MARKER}\nAn agent was dispatched.\n\n- Task: \"task\"\n- Machine: \"host\"\n"
+        );
+        let json = serde_json::json!([comment(6, ME, &legacy)]).to_string();
+        assert_eq!(own_id(&json, "task", "host", ME), Ok(Some(6)));
+    }
+
+    #[test]
+    fn find_own_claim_record_returns_the_record_body_and_claim_time() {
+        let when = at("2026-10-22T05:00:13.250Z");
+        let own = render_claim_record("task", "host", when);
+        let json = serde_json::json!([comment(4, ME, &own)]).to_string();
+        assert_eq!(
+            find_own_claim_record(&json, "task", "host", ME),
+            Ok(Some(OwnClaimRecord {
+                id: 4,
+                body: own,
+                claimed_at: Some(when),
+            }))
+        );
+    }
+
+    #[test]
+    fn next_claim_time_is_now_when_the_clock_moved_forward() {
+        let previous = at("2026-10-22T05:00:13.000Z");
+        let now = at("2026-10-22T05:00:14.500Z");
+        assert_eq!(next_claim_time(now, Some(previous)), now);
+        // Exactly one millisecond on is already strictly later.
+        let now = at("2026-10-22T05:00:13.001Z");
+        assert_eq!(next_claim_time(now, Some(previous)), now);
+    }
+
+    #[test]
+    fn next_claim_time_is_strictly_later_when_the_clock_repeats() {
+        let previous = at("2026-10-22T05:00:13.250Z");
+        let next = next_claim_time(previous, Some(previous));
+        assert_eq!(next, at("2026-10-22T05:00:13.251Z"));
+        // Within the same millisecond the clock has not moved either.
+        let next = next_claim_time(at("2026-10-22T05:00:13.250900Z"), Some(previous));
+        assert!(next > previous, "{next}");
+        assert_ne!(
+            render_claim_record("t", "h", next),
+            render_claim_record("t", "h", previous),
+            "the same millisecond twice must still change the body"
+        );
+    }
+
+    #[test]
+    fn next_claim_time_is_previous_plus_one_ms_when_the_clock_stepped_back() {
+        let previous = at("2026-10-22T05:00:13.250Z");
+        let now = at("2026-10-22T04:59:00.000Z");
+        assert_eq!(
+            next_claim_time(now, Some(previous)),
+            at("2026-10-22T05:00:13.251Z")
+        );
+        assert_ne!(
+            render_claim_record("t", "h", next_claim_time(now, Some(previous))),
+            render_claim_record("t", "h", previous),
+        );
+    }
+
+    #[test]
+    fn next_claim_time_is_now_for_a_record_without_a_claim_time() {
+        let now = t0();
+        assert_eq!(next_claim_time(now, None), now);
+        // A legacy record, and one whose time does not parse, carry no time
+        // to step past: the re-claim's body differs because it gains the field.
+        let legacy = format!(
+            "{CLAIM_RECORD_MARKER}\nAn agent was dispatched to work on this issue by \
+             dot-agent-deck on machine `h`.\n\n- Task: \"t\"\n- Machine: \"h\"\n"
+        );
+        let garbled = format!("{legacy}- Claimed at: \"yesterday\"\n");
+        for old in [legacy, garbled] {
+            let json = serde_json::json!([comment(7, ME, &old)]).to_string();
+            let own = find_own_claim_record(&json, "t", "h", ME).unwrap().unwrap();
+            assert_eq!(own.claimed_at, None);
+            let body = render_claim_record("t", "h", next_claim_time(now, own.claimed_at));
+            assert_ne!(body, own.body);
+        }
+    }
+
+    #[test]
+    fn a_re_claim_through_the_lookup_never_repeats_the_body() {
+        // The path `write_claim_record` takes: find the own record, step past
+        // its time, render. A clock frozen on the record's own millisecond, or
+        // set behind it, still yields a different body.
+        let previous = at("2026-10-22T05:00:13.250Z");
+        let old = render_claim_record("t", "h", previous);
+        let json = serde_json::json!([comment(7, ME, &old)]).to_string();
+        let own = find_own_claim_record(&json, "t", "h", ME).unwrap().unwrap();
+        for now in [
+            previous,
+            at("2026-10-22T05:00:13.250999Z"),
+            at("2020-01-01T00:00:00Z"),
+        ] {
+            let body = render_claim_record("t", "h", next_claim_time(now, own.claimed_at));
+            assert_ne!(body, own.body, "clock at {now}");
+        }
+    }
+
+    #[test]
+    fn find_own_claim_record_skips_a_forged_record_and_keeps_searching() {
+        let body = render_claim_record("task", "host", t0());
+        let forged_first = serde_json::json!([
+            comment(1, 99999, &body),
+            {"id": 2, "body": body},
+            comment(3, ME, &body),
+        ])
+        .to_string();
+        assert_eq!(
+            own_id(&forged_first, "task", "host", ME),
+            Ok(Some(3)),
+            "the forged and the authorless copies are skipped; the genuine one is found"
+        );
+        let forged_only = serde_json::json!([comment(1, 99999, &body)]).to_string();
+        assert_eq!(own_id(&forged_only, "task", "host", ME), Ok(None));
+    }
+
+    #[test]
+    fn find_own_claim_record_reads_every_paginated_page() {
+        let page1 = serde_json::json!([comment(1, ME, "first page")]);
+        let page2 = serde_json::json!([comment(9, ME, &render_claim_record("t", "h", t0()))]);
+        let stream = format!("{page1}\n{page2}\n");
+        assert_eq!(own_id(&stream, "t", "h", ME), Ok(Some(9)));
+    }
+
+    #[test]
+    fn find_own_claim_record_fails_on_malformed_output() {
+        assert!(find_own_claim_record("not json", "t", "h", ME).is_err());
+        assert!(find_own_claim_record("{\"id\": 1}", "t", "h", ME).is_err());
+    }
+
+    #[test]
+    fn find_own_claim_record_fails_on_empty_output() {
+        assert!(find_own_claim_record("", "t", "h", ME).is_err());
+        assert!(find_own_claim_record(" \n\t\r\n", "t", "h", ME).is_err());
+    }
+
+    #[test]
+    fn find_own_claim_record_validates_pages_after_the_own_record() {
+        let page1 = serde_json::json!([comment(9, ME, &render_claim_record("t", "h", t0()))]);
+        let stream = format!("{page1}\n[{{\"id\": 10, \"body\": ");
+        assert!(
+            find_own_claim_record(&stream, "t", "h", ME).is_err(),
+            "a later page that does not parse fails the lookup even after a match"
+        );
+        let stream = format!("{page1}\n{{\"message\": \"Server Error\"}}");
+        assert!(find_own_claim_record(&stream, "t", "h", ME).is_err());
+    }
+
+    #[test]
+    fn sanitize_claim_error_escapes_caps_and_redacts() {
+        let token = format!("ghp_{}", "A1b2C3d4".repeat(5));
+        let pat = format!("github_pat_{}", "x9".repeat(30));
+        let raw = format!(
+            "HTTP 401\u{1b}[2J\u{7}\rforged line token={token} and {pat}; {}",
+            "y".repeat(2000)
+        );
+        let clean = sanitize_claim_error(&raw);
+        for raw_char in ['\u{1b}', '\u{7}', '\r', '\n'] {
+            assert!(
+                !clean.contains(raw_char),
+                "{raw_char:?} survived: {clean:?}"
+            );
+        }
+        assert!(
+            clean.contains("\\u{1b}") && clean.contains("\\r"),
+            "{clean}"
+        );
+        assert!(
+            !clean.contains(&token) && !clean.contains("ghp_A1b2"),
+            "{clean}"
+        );
+        assert!(!clean.contains("github_pat_x9"), "{clean}");
+        assert_eq!(clean.matches("<redacted>").count(), 2, "{clean}");
+        assert!(
+            clean.chars().count() < 600,
+            "capped: {} chars",
+            clean.chars().count()
+        );
+        // Every gh token prefix is redacted.
+        for prefix in ["ghp_", "gho_", "ghu_", "ghs_", "ghr_"] {
+            let text = format!("x {prefix}abc123 y");
+            assert_eq!(sanitize_claim_error(&text), "x <redacted> y");
+        }
+        // A token glued to the word before it — by an underscore, a letter, a
+        // digit or a non-ASCII letter — is redacted all the same; only the
+        // prefix word survives.
+        for (text, expected) in [
+            ("xghp_abc", "x<redacted>"),
+            ("token_ghp_abc123 y", "token_<redacted> y"),
+            ("prefixgithub_pat_11AB_cd y", "prefix<redacted> y"),
+            ("id7gho_abc y", "id7<redacted> y"),
+            ("cléghs_abc y", "clé<redacted> y"),
+            ("令牌ghr_abc y", "令牌<redacted> y"),
+        ] {
+            assert_eq!(sanitize_claim_error(text), expected, "{text}");
+        }
+        assert_eq!(sanitize_claim_error("plain error"), "plain error");
     }
 
     // --- M1: user-config validation ---

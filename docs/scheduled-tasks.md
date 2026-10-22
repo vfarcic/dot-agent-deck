@@ -19,7 +19,7 @@ The Schedules manager exists only in the TUI. In the desktop app, a schedule's r
 
 - **A running daemon.** Starting the TUI (`dot-agent-deck`) starts one if none is running. The `schedule` subcommands do not start one. Check with `dot-agent-deck daemon status`, which reports a missing daemon rather than starting it.
 - **An agent command.** A plain schedule needs the command that launches your agent, for example `claude`, `opencode`, `pi`, `codex` or `devin`, or a wrapper that ends up running one of them (`devbox run agent`). Any other command runs, but the deck cannot show its status.
-- **For issue dispatch only:** the GitHub CLI `gh`, installed and signed in (`gh auth status` succeeds), and `git`, both on the daemon's `PATH`.
+- **For issue dispatch only:** the GitHub CLI `gh`, installed and signed in (`gh auth status` succeeds), and `git`, both on the daemon's `PATH`. Read access to the repository is enough to dispatch. To [claim](#claims-on-github) the issues it dispatches, the account `gh` is signed in with also needs to add labels and comments to the repository's issues: write access to the repository covers the whole claim, including creating its label, and an account that can apply labels and comment but not create labels can claim once the `agent-deck/claimed` label exists.
 
 ## Schedule a prompt with the CLI
 
@@ -178,8 +178,24 @@ Check it: `dot-agent-deck schedule list` shows the schedule, and `dot-agent-deck
 3. **Skips claimed issues.** An issue is skipped when its worktree `<clone>/.worktrees/issue-<n>` already exists, or when an open pull request has the head branch `agent/issue-<n>`. Skipped issues still count toward `max_per_run`: if every listed issue is claimed, the run starts nothing, even when later issues are free.
 4. **Creates the worktree** at `<clone>/.worktrees/issue-<n>` on the branch `agent/issue-<n>`. If that branch already exists in the clone (from an earlier run whose tab you closed without opening a pull request), the worktree checks it out, so its commits carry over.
 5. **Starts the agent** in the worktree and sends it the prompt. If the worktree's `.dot-agent-deck.toml` defines an orchestration with roles, the issue gets an orchestration tab, using the roles' own commands. Otherwise it gets one agent running the schedule's `command`, else your [`default_command`](configuration.md#set-the-command-new-agents-start-with); if neither is set, the agent pane starts the daemon's shell (`$SHELL`), which cannot act on the prompt, so set one of them.
+6. **Claims the issue on GitHub** once the agent has started, as described in [Claims on GitHub](#claims-on-github). An issue whose agent did not start gets no claim.
 
 A failure on one issue (a `gh` error, a worktree error) is reported and the run carries on with the other issues. A failure to get the repository or list issues stops that run.
+
+### Claims on GitHub
+
+The deck tries to mark each dispatched issue on GitHub, so anyone reading the repository's issue list can see an agent is working on it before a pull request exists:
+
+- **The `agent-deck/claimed` label** is added to the issue. If the repository does not have that label yet, the run creates it first; if it already exists, its colour and description are reset to the deck's. When the account cannot create or edit labels, the run logs that in the [daemon log](#where-schedule-errors-are-reported) and still adds the label if the repository already has it.
+- **One claim comment** on the issue, posted by the account `gh` is signed in with, names the schedule, a machine id for the machine that dispatched it, and when it last claimed the issue. When the same schedule on the same machine, signed in as the same account, dispatches that issue again later, it updates its comment, including that time, instead of posting another one. A copy of that comment posted by anyone else is left alone.
+
+The claim comment is as visible as the issue: on a public repository, anyone can read it. It shows the schedule's `name`, so give an issue-dispatch schedule a name you are happy to publish. The machine id (`h1-` followed by 16 hex digits) is computed from the machine's host name, so the comment does not show the host name itself, but anyone who guesses the host name can compute the same id and confirm the guess. If the machine's host name changes, its next claim posts a new comment.
+
+With write access to the repository, the account `gh` is signed in with can do all of this. An account that can apply labels and comment on issues but not create labels, such as one with GitHub's triage role, claims issues too once the `agent-deck/claimed` label exists in the repository: if it is missing, ask someone with write access to create it once, for example with `gh label create agent-deck/claimed --repo <owner/name>`. If the label or the comment cannot be written, the run reports it with one `claim failed for issue #<n>` line in the [daemon log](#where-schedule-errors-are-reported) saying what happened to the label and to the claim record (the comment), and why. The agent keeps working either way: a failed claim never stops a dispatch. The claims of one run share a two-minute time limit on GitHub calls, so claims can delay later dispatches by up to two minutes in total per run. Once that limit is used up, the run's remaining issues are dispatched without a claim attempt, and each gets a `claim failed` line saying its claim was skipped because the run's claim time budget was used up.
+
+The claim is for people reading the issue: the deck does not yet skip issues that carry it. Another machine, or another schedule dispatching the same repository, can still dispatch an issue that is already claimed.
+
+The deck never removes the label or the comment, not even when you close the issue's tab. Remove them yourself when you no longer want them, for example with `gh issue edit <n> --repo <owner/name> --remove-label agent-deck/claimed`.
 
 ### Clean up
 
@@ -187,7 +203,7 @@ Dispatched tabs stay open until you close them. **Closing an issue's tab removes
 
 After the daemon restarts, closing such a tab no longer removes the worktree. Remove it yourself with `git -C <clone> worktree remove .worktrees/issue-<n>`, or that issue stays skipped.
 
-An issue that is still open after its pull request merged or closed has no open pull request any more, so once its worktree is gone a later run dispatches it again on the existing branch. Close the issue (or remove the label) to stop that.
+An issue that is still open after its pull request merged or closed has no open pull request any more, so once its worktree is gone a later run dispatches it again on the existing branch. Close the issue (or remove the label your schedule's `label` filter selects) to stop that.
 
 ## Keep schedules running
 
@@ -228,6 +244,7 @@ For more detail, see [Troubleshooting](troubleshooting.md#enabling-debug-logs).
 | Nothing opened, and the log has `[scheduler] task "<name>": spawn failed: shape …` | The `shape` could not be resolved in that directory. | The line names the orchestrations that exist; fix the `shape` or the directory's config. |
 | The log has `could not create working_dir` | The working directory cannot be created. | Fix the path or its permissions. |
 | A changed `working_dir` or `command` is ignored | The run reused the tab the previous run opened. | Close that tab; see [Manage schedules](#manage-schedules). |
+| The log has `claim failed for issue #<n>` | One step of the claim did not work. The agent was still dispatched. Possible causes: the account `gh` is signed in with cannot write to the repository's issues or labels, a GitHub call timed out (each claim call is given 30 seconds, and all the claims of one run two minutes together), or a network or GitHub server error. | Read what the line says after `label agent-deck/claimed:` and after `claim record:` before changing anything: an `HTTP 403` or `not accessible` points at permissions. The account (`gh auth status` shows which) needs to be able to add labels and comments to the repository's issues; if the line also says creating the label failed, have someone with write access create `agent-deck/claimed` once, or sign `gh` in with an account that has write access. `timed out`, `claim time budget` or a server error is usually temporary, but the deck does not come back to claim the issue later, so add the label yourself if you want it. Or leave it: the dispatch works without the claim. See [Claims on GitHub](#claims-on-github). |
 | An issue-dispatch run started nothing | The listed issues were all claimed, `gh` failed, or the clone's `origin` does not match `repo`. | Read the `[scheduler] task "<name>": …` lines: `skipping already-claimed issue`, `repo … dispatch error`, `issue #<n> … failed`. |
 
 ## Worked examples

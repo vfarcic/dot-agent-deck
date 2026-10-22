@@ -55,6 +55,15 @@ Ask the user to confirm the version or give you a different one. Ask for a one- 
 
 ## Step 3 — Dispatch the release
 
+**`main` must be green first.** The workflow refuses unless `ci.yml`'s push run for the SHA from Step 1 has finished with every job passing, and there is no override. That run is the only one that tests macOS, since pull requests no longer run `build-macos`. Check it before dispatching, and when it is red or still running, fix or wait rather than dispatch into the refusal:
+
+```bash
+gh api "repos/vfarcic/dot-agent-deck/actions/workflows/ci.yml/runs?head_sha=<the SHA from Step 1>&event=push&branch=main&per_page=1" \
+  --jq '.workflow_runs[0] // empty | "\(.status) \(.conclusion) \(.html_url)"'   # completed success <url>
+```
+
+A red is fixed through `/merge-pr` like any other (CLAUDE.md rule 6), and the fix's own merge commit is then the SHA to release; go back to Step 1 for it.
+
 ```bash
 gh workflow run tag-release.yml --ref main \
   -f version=<X.Y.Z> \

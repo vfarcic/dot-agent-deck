@@ -78,7 +78,7 @@ Applies when the diff touches the daemon, the TUI↔daemon protocol, orchestrati
 
 State these explicitly in the report rather than letting them read as verified:
 
-- **macOS and Windows** — `checks.sh`'s `windows-cross` step is a type-check only (and fails outright without an MSVC cross-toolchain), and there is no local macOS proxy. Both are CI-only signal, which is why Phase 1b exists: `build-macos` and `build-windows` each run a real build + clippy + `cargo nextest run` on the real OS. If those runs were never released, this is unverified, not merely partial. A macOS-only break is not hypothetical: the `libc` `openpty`/`ioctl` pointer-type differences in `src/wrap.rs` broke the v0.34.0 release build.
+- **macOS and Windows** — `checks.sh`'s `windows-cross` step is a type-check only (and fails outright without an MSVC cross-toolchain), and there is no local macOS proxy. Neither has a PR-time signal now: `build-macos` runs a real build + clippy + `cargo nextest run` on macOS on pushes to `main`, not on pull requests, and `build-windows` is `if: false`. So both are unverified on the PR; macOS is checked by `main`'s run after the merge, which the merger watches (`/merge-pr`) and `tag-release.yml` requires to be green. A macOS-only break is not hypothetical: the `libc` `openpty`/`ioctl` pointer-type differences in `src/wrap.rs` broke the v0.34.0 release build.
 - **Real-agent coverage that skipped** — see `e2e-skips.txt`. Skipped real-agent tests count as PASSED.
 - **The rule 12 manual cross-version test**, unless you actually ran it.
 - **Flake vs defect** — a single e2e failure is not a verdict until it has been rerun in isolation (rule 6).
