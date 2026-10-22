@@ -141,6 +141,8 @@ pub mod submitted_prompt;
 pub mod system_browser;
 pub mod tab;
 pub mod tab_layout;
+// PRD #1741: agent-run telemetry over OTLP, off unless an endpoint is set.
+pub mod telemetry;
 pub mod terminal_hangup;
 // Issue #1537: the DEC private-mode parser shared by the TUI's mouse-mode scan
 // and the daemon's output ring, which restores those modes on replay.
