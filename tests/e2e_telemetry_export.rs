@@ -11,7 +11,7 @@ use dot_agent_deck::daemon_protocol::AttachRequest;
 use serde_json::{Value, json};
 use spec::spec;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -40,6 +40,7 @@ struct Request {
 }
 
 struct Receiver {
+    addr: SocketAddr,
     endpoint: String,
     requests: Arc<Mutex<Vec<Request>>>,
     stop: Arc<AtomicBool>,
@@ -54,35 +55,31 @@ impl Receiver {
     // Repeat the final response after the scripted responses are exhausted.
     fn responding(responses: Vec<String>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind isolated OTLP receiver");
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let endpoint = format!("http://{addr}");
         let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let captured = Arc::clone(&requests);
         let stopped = Arc::clone(&stop);
         let worker = std::thread::spawn(move || {
-            let mut count = 0;
-            while !stopped.load(Ordering::Relaxed) {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        let response = responses.get(count).or_else(|| responses.last());
-                        let response = response.map(String::as_str).unwrap_or("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
-                        let mut request = read_request(&stream);
-                        request.accepted = response.starts_with("HTTP/1.1 200");
-                        captured.lock().unwrap().push(request);
-                        count += 1;
-                        let mut stream = stream;
-                        // A bounded exporter may close a retry/shutdown request.
-                        let _ = stream.write_all(response.as_bytes());
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(error) => panic!("accept OTLP request: {error}"),
+            // Blocking accept: Drop wakes it with a connection of its own.
+            for (count, stream) in listener.incoming().enumerate() {
+                if stopped.load(Ordering::Relaxed) {
+                    break;
                 }
+                let stream = stream.expect("accept OTLP request");
+                let response = responses.get(count).or_else(|| responses.last());
+                let response = response.map(String::as_str).unwrap_or("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+                let mut request = read_request(&stream);
+                request.accepted = response.starts_with("HTTP/1.1 200");
+                captured.lock().unwrap().push(request);
+                let mut stream = stream;
+                // A bounded exporter may close a retry/shutdown request.
+                let _ = stream.write_all(response.as_bytes());
             }
         });
         Self {
+            addr,
             endpoint,
             requests,
             stop,
@@ -130,6 +127,8 @@ impl Receiver {
 impl Drop for Receiver {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        // Unblock the worker's accept so it can observe `stop`.
+        let _ = TcpStream::connect(self.addr);
         if let Some(worker) = self.worker.take() {
             worker.join().expect("OTLP receiver thread");
         }
@@ -634,7 +633,7 @@ fn telemetry_otlp_006_claude_switches_preserve_user_opt_out() {
     use std::os::unix::fs::PermissionsExt;
 
     let receiver = Receiver::start();
-    let shim_dir = tempfile::tempdir().expect("isolated Claude stand-in directory");
+    let shim_dir = common::harness_tempdir().expect("isolated Claude stand-in directory");
     let shim = shim_dir.path().join("claude");
     std::fs::write(
         &shim,

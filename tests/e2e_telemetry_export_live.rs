@@ -9,7 +9,7 @@ use dot_agent_deck::daemon_protocol::AttachRequest;
 use serde_json::Value;
 use spec::spec;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -27,6 +27,7 @@ struct Request {
 }
 
 struct Receiver {
+    addr: SocketAddr,
     endpoint: String,
     requests: Arc<Mutex<Vec<Request>>>,
     stop: Arc<AtomicBool>,
@@ -36,37 +37,36 @@ struct Receiver {
 impl Receiver {
     fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind isolated OTLP receiver");
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let endpoint = format!("http://{addr}");
         let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let captured = Arc::clone(&requests);
         let stopped = Arc::clone(&stop);
         let worker = std::thread::spawn(move || {
-            while !stopped.load(Ordering::Relaxed) {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        let request = read_request(&stream);
-                        let protobuf = request.headers.iter().any(|(key, value)| {
-                            key == "content-type" && value.contains("protobuf")
-                        });
-                        captured.lock().unwrap().push(request);
-                        let mut stream = stream;
-                        let response: &[u8] = if protobuf {
-                            b"HTTP/1.1 200 OK\r\nContent-Type: application/x-protobuf\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        } else {
-                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
-                        };
-                        stream.write_all(response).unwrap();
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(error) => panic!("accept OTLP request: {error}"),
+            // Blocking accept: Drop wakes it with a connection of its own.
+            for stream in listener.incoming() {
+                if stopped.load(Ordering::Relaxed) {
+                    break;
                 }
+                let stream = stream.expect("accept OTLP request");
+                let request = read_request(&stream);
+                let protobuf = request
+                    .headers
+                    .iter()
+                    .any(|(key, value)| key == "content-type" && value.contains("protobuf"));
+                captured.lock().unwrap().push(request);
+                let mut stream = stream;
+                let response: &[u8] = if protobuf {
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/x-protobuf\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else {
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                };
+                stream.write_all(response).unwrap();
             }
         });
         Self {
+            addr,
             endpoint,
             requests,
             stop,
@@ -117,6 +117,8 @@ impl Receiver {
 impl Drop for Receiver {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        // Unblock the worker's accept so it can observe `stop`.
+        let _ = TcpStream::connect(self.addr);
         if let Some(worker) = self.worker.take() {
             worker.join().expect("OTLP receiver thread");
         }
