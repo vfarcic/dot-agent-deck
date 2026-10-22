@@ -1561,6 +1561,38 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Does not assert:** the shell snippet's own rung ordering or its fall-through (`remote_tunnel::tunnel_tests::the_probe_*`, which execute `REMOTE_SOCKET_PROBE` under every `sh` on the machine); anything about a remote host or a real `ssh` hop.
 - **Platform coverage:** mac+linux.
 
+#### daemon/attach-accept
+
+Issue #1794: a daemon must not be left half-alive — hook endpoint up, no attach listener — after its attach listener fails to accept. All four live in `tests/attach_accept_resilience.rs` and hold one lock, because `/001` lowers the process's descriptor limit.
+
+##### daemon/attach-accept/001 — A transient "Too many open files" on accept does not end the attach server.
+- **Layer:** fast in-process integration (a real daemon through `run_daemon_with` on its own hook and attach sockets; no PTY, no LLM, no `e2e` feature gate).
+- **Agent:** none.
+- **Asserts:** with the process's soft `RLIMIT_NOFILE` lowered and every free descriptor held, a client connects with the last one so the daemon's accept fails with `EMFILE`; once the descriptors are released, a fresh `DaemonClient::list_agents` reaches the daemon at the same attach path, the daemon task is still running, and the client that connected during the shortage is still connected (a read waits rather than seeing a reset). Before the fix the server ended and the reachability assertion failed; with only the accept backoff removed, reachability recovers through the supervisor's rebind and the still-connected assertion fails with `ECONNRESET`, which is what makes the backoff load-bearing here.
+- **Does not assert:** which accept errors count as transient (`attach_recovery::tests`); the rebind and stop paths (`/002`–`/004`); that the accept actually ran inside the 500 ms shortage window, which a starved box could stretch — that would make the test pass vacuously against broken code, never fail against working code.
+- **Platform coverage:** mac+linux.
+
+##### daemon/attach-accept/002 — An attach server that ends is replaced by a fresh listener on the same path.
+- **Layer:** fast in-process integration (`attach_recovery::supervise` driven directly with a stand-in server; no daemon, no PTY, no LLM).
+- **Agent:** none (synthetic — the stand-in's first run ends at once with an error about its listener, later runs accept and drop connections; no daemon-level fault reaches this branch on demand once transient errors are retried).
+- **Asserts:** a client connects at the same path after the first run ended, the server was run exactly twice, the stop action did not run, and supervision is still going.
+- **Does not assert:** the daemon's own wiring of `supervise` in `run_daemon_with` (exercised by `/001` only when the accept backoff is removed, by hand); that agents survive, which follows from the daemon not stopping rather than being observed here.
+- **Platform coverage:** mac+linux.
+
+##### daemon/attach-accept/003 — An attach server that cannot listen again runs the daemon's stop action.
+- **Layer:** fast in-process integration (as `/002`).
+- **Agent:** none (synthetic — the stand-in always ends at once, and the attach socket's directory is made read-only after the first bind, so every rebind fails with `EACCES`).
+- **Asserts:** supervision ends within the sum of `REBIND_DELAYS` plus the load-scaled start budget, the stop action ran, and the server was run once. Skipped as root, which the read-only directory does not stop.
+- **Does not assert:** what the daemon's stop action does (`stop_after_attach_lost`: the `attach-lost` disclosure, the graceful drain and the hook loop's release, the same calls as the signal path, and not covered by a test of its own); that a replacement daemon then starts.
+- **Platform coverage:** mac+linux.
+
+##### daemon/attach-accept/004 — An attach server that keeps ending is not restarted for ever.
+- **Layer:** fast in-process integration (as `/002`).
+- **Agent:** none (synthetic — the stand-in always ends at once and every rebind succeeds).
+- **Asserts:** supervision ends with the stop action run after exactly `MAX_RESTARTS_IN_WINDOW + 1` runs.
+- **Does not assert:** that restarts older than `RESTART_WINDOW` stop counting.
+- **Platform coverage:** mac+linux.
+
 #### worktree/reclaim
 
 ##### worktree/reclaim/001 — `dot-agent-deck worktree list` succeeds in a git repo and names the worktree it examined.
