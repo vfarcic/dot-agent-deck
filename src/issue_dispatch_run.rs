@@ -559,8 +559,7 @@ pub async fn run_issue_dispatch(
     // PRD #421 M2.6(a) — the claim label is provisioned just in time: at most
     // once per run, and only in a run that is about to write a claim, so a fire
     // that dispatches nothing makes no GitHub write at all (#483).
-    let mut provisioned: Option<Result<(), String>> = None;
-    let host = local_hostname();
+    let mut claim_run = ClaimRun::new(&local_hostname());
 
     for issue in issues.into_iter().take(cfg.max_per_run) {
         loop {
@@ -586,15 +585,7 @@ pub async fn run_issue_dispatch(
                 // "dispatched" is the issue's last word in this run: nothing
                 // writes to GitHub for it after that line.
                 Ok(IssueOutcome::Dispatched) => {
-                    claim_issue(
-                        task_name,
-                        &cfg.repo,
-                        issue,
-                        &host,
-                        &mut provisioned,
-                        notifier,
-                    )
-                    .await;
+                    claim_issue(task_name, &cfg.repo, issue, &mut claim_run, notifier).await;
                     // M1.3 — surface the per-issue dispatch success.
                     notifier.notify(NotifyEvent::IssueDispatched {
                         task: task_name.to_string(),
@@ -1377,6 +1368,59 @@ fn parse_open_pr_present(json: &str) -> Result<bool, String> {
     Ok(!arr.is_empty())
 }
 
+/// The default bound on ONE `gh` call of the claim (PRD #421 amendment item 9),
+/// independent of [`SUBPROCESS_TIMEOUT`]. A claim call is an API request, small
+/// next to a clone, and the claim runs between one issue's dispatch and
+/// the next issue's, so a hung call here holds up every issue after it: the
+/// bound is what keeps a stuck claim from delaying the rest of the run by
+/// more than a few of these.
+const CLAIM_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Overrides [`CLAIM_CALL_TIMEOUT`], in milliseconds — what lets a test drive
+/// the timeout without a 30-second wait. A value that is not a positive
+/// integer is ignored.
+const CLAIM_CALL_TIMEOUT_ENV: &str = "DOT_AGENT_DECK_ISSUE_CLAIM_TIMEOUT_MS";
+
+/// The most `gh api --paginate` may print for one issue's comments before the
+/// call is killed (PRD #421 amendment item 10). Far above what a typical issue's
+/// comments print, and low enough that a runaway listing's captured output
+/// stays bounded in the daemon's memory.
+const CLAIM_COMMENTS_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// [`CLAIM_CALL_TIMEOUT`], or the [`CLAIM_CALL_TIMEOUT_ENV`] override when it
+/// holds a positive number of milliseconds.
+fn claim_call_timeout_from(value: Option<&str>) -> Duration {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(CLAIM_CALL_TIMEOUT)
+}
+
+/// What the claims of one run share: the machine id the records name, the
+/// per-call bound, and the two lookups made at most once per run — the label
+/// provisioning (PRD #421 M2.6(a)) and the signed-in account (amendment item
+/// 6). Each lookup is made lazily, on the first claim that needs it, so a run
+/// that dispatches nothing makes no claim call at all, and its outcome —
+/// failure included — stands for the rest of the run.
+struct ClaimRun {
+    host_id: String,
+    bound: Duration,
+    provisioned: Option<Result<(), String>>,
+    account: Option<Result<u64, String>>,
+}
+
+impl ClaimRun {
+    fn new(hostname: &str) -> Self {
+        Self {
+            host_id: crate::issue_dispatch::claim_host_id(hostname),
+            bound: claim_call_timeout_from(std::env::var(CLAIM_CALL_TIMEOUT_ENV).ok().as_deref()),
+            provisioned: None,
+            account: None,
+        }
+    }
+}
+
 /// PRD #421 M2.2 — claim a just-dispatched issue on GitHub: provision the
 /// label (once per run, before the first claim write), add it to the issue,
 /// then write this deck's claimant record — editing its existing one if the
@@ -1388,24 +1432,25 @@ fn parse_open_pr_present(json: &str) -> Result<bool, String> {
 /// that helper, a failure is not left to a WARN alone: a claim that did not
 /// fully succeed raises exactly one [`NotifyEvent::IssueClaimFailed`] naming
 /// both outcomes (M2.6(b)), so a read-only token does not pass as a run of
-/// clean claims.
+/// clean claims. Every call is bounded by `run.bound`, so a call that hangs is
+/// reported as its step's failure and the run moves on to the next issue.
 ///
-/// `provisioned` carries the run's provisioning outcome between issues. A
-/// failed provisioning does not stop the label write: a token that may apply
+/// A failed provisioning does not stop the label write: a token that may apply
 /// labels without managing them (GitHub's triage role) still succeeds at the
 /// add when the label already exists.
 async fn claim_issue(
     task_name: &str,
     repo: &str,
     issue: u64,
-    host: &str,
-    provisioned: &mut Option<Result<(), String>>,
+    run: &mut ClaimRun,
     notifier: &dyn Notifier,
 ) {
-    if provisioned.is_none() {
+    if run.provisioned.is_none() {
         let outcome = gh_claim_call(
             &crate::issue_dispatch::claim_label_provision_argv(repo),
             "creating the label",
+            run.bound,
+            None,
         )
         .await
         .map(drop);
@@ -1417,21 +1462,23 @@ async fn claim_issue(
                 "issue-dispatch: could not provision the claim label"
             );
         }
-        *provisioned = Some(outcome);
+        run.provisioned = Some(outcome);
     }
 
     let label_error = gh_claim_call(
         &crate::issue_dispatch::claim_issue_argv(repo, issue),
         "adding the label",
+        run.bound,
+        None,
     )
     .await
     .err()
-    .map(|error| match provisioned {
+    .map(|error| match &run.provisioned {
         Some(Err(provision)) => format!("{error}; earlier, {provision}"),
         _ => error,
     });
 
-    let record_error = write_claim_record(task_name, repo, issue, host).await.err();
+    let record_error = write_claim_record(task_name, repo, issue, run).await.err();
 
     if label_error.is_some() || record_error.is_some() {
         tracing::warn!(
@@ -1453,69 +1500,108 @@ async fn claim_issue(
 }
 
 /// Write this deck's claimant record on `issue`: read the comments to find a
-/// record naming this task and host, and edit it if there is one, so a
-/// re-claim never appends a second record. If the comments cannot be read,
-/// nothing is posted — a blind post is how a duplicate record would appear.
+/// record this deck wrote — same task, same machine id, authored by the account
+/// `gh` is signed in with — and edit it if there is one, so a re-claim never
+/// appends a second record. If the account or the comments cannot be read,
+/// nothing is posted: a blind post is how a duplicate record would appear.
 async fn write_claim_record(
     task_name: &str,
     repo: &str,
     issue: u64,
-    host: &str,
+    run: &mut ClaimRun,
 ) -> Result<(), String> {
     use crate::issue_dispatch::{
-        create_claim_record_argv, edit_claim_record_argv, find_own_claim_record,
-        issue_comments_argv, render_claim_record,
+        authenticated_user_argv, create_claim_record_argv, edit_claim_record_argv,
+        find_own_claim_record, issue_comments_argv, parse_authenticated_user_id,
+        render_claim_record, sanitize_claim_error,
     };
+    if run.account.is_none() {
+        let account = gh_claim_call(
+            &authenticated_user_argv(),
+            "looking up the signed-in GitHub account",
+            run.bound,
+            None,
+        )
+        .await
+        .and_then(|json| parse_authenticated_user_id(&json).map_err(|e| sanitize_claim_error(&e)));
+        run.account = Some(account);
+    }
+    let user_id = run.account.clone().expect("resolved above")?;
     let comments = gh_claim_call(
         &issue_comments_argv(repo, issue),
         "reading the issue's comments",
+        run.bound,
+        Some(CLAIM_COMMENTS_MAX_BYTES),
     )
     .await?;
-    let body = render_claim_record(task_name, host);
-    match find_own_claim_record(&comments, task_name, host)? {
+    let own = find_own_claim_record(&comments, task_name, &run.host_id, user_id)
+        .map_err(|e| sanitize_claim_error(&e))?;
+    let body = render_claim_record(task_name, &run.host_id);
+    match own {
         Some(id) => gh_claim_call(
             &edit_claim_record_argv(repo, id, &body),
             "editing the claim comment",
+            run.bound,
+            None,
         )
         .await
         .map(drop),
         None => gh_claim_call(
             &create_claim_record_argv(repo, issue, &body),
             "posting the claim comment",
+            run.bound,
+            None,
         )
         .await
         .map(drop),
     }
 }
 
-/// Run one `gh` call of the claim and return its stdout. Its error names the
+/// Run one `gh` call of the claim within `bound` and return its stdout, killing
+/// the call if it prints more than `max_stdout` bytes. Its error names the
 /// step (`what`) instead of echoing the argv, which for a comment write carries
-/// the whole multi-line body, and is folded onto one line so the notification
-/// built from it stays a single line.
-async fn gh_claim_call(argv: &[String], what: &str) -> Result<String, String> {
+/// the whole multi-line body, is folded onto one line so the notification
+/// built from it stays a single line, and is sanitised
+/// ([`crate::issue_dispatch::sanitize_claim_error`]) because it quotes `gh`'s
+/// stderr.
+async fn gh_claim_call(
+    argv: &[String],
+    what: &str,
+    bound: Duration,
+    max_stdout: Option<usize>,
+) -> Result<String, String> {
+    use crate::issue_dispatch::sanitize_claim_error;
     let args: Vec<&str> = argv.iter().map(String::as_str).collect();
     let one_line = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
-    match output_within(
+    match output_within_capped(
         tokio::process::Command::new("gh"),
         "gh",
         &args,
-        SUBPROCESS_TIMEOUT,
+        bound,
+        max_stdout,
     )
     .await
     {
         Ok(output) if output.status.success() => {
             Ok(String::from_utf8_lossy(&output.stdout).into_owned())
         }
-        Ok(output) => Err(format!(
+        Ok(output) => Err(sanitize_claim_error(&format!(
             "{what} failed ({}): {}",
             output.status,
             one_line(&String::from_utf8_lossy(&output.stderr))
-        )),
+        ))),
         Err(error) if is_subprocess_timeout(&error) => Err(format!(
-            "{what} did not finish within {}s and was killed",
-            SUBPROCESS_TIMEOUT.as_secs()
+            "{what} timed out after {}s and was killed",
+            bound.as_secs_f64()
         )),
-        Err(error) => Err(format!("{what} failed: {}", one_line(&error))),
+        Err(error) if is_subprocess_overflow(&error) => Err(format!(
+            "{what} failed: its output passed {} bytes and the call was killed",
+            max_stdout.unwrap_or_default()
+        )),
+        Err(error) => Err(sanitize_claim_error(&format!(
+            "{what} failed: {}",
+            one_line(&error)
+        ))),
     }
 }
 
@@ -2381,10 +2467,35 @@ fn is_subprocess_timeout(err: &str) -> bool {
 /// pipes draining — sits under the bound, so a descendant that keeps a pipe
 /// open after the child exits cannot stretch the wait past it either.
 async fn output_within(
+    cmd: tokio::process::Command,
+    program: &str,
+    args: &[&str],
+    bound: Duration,
+) -> Result<std::process::Output, String> {
+    output_within_capped(cmd, program, args, bound, None).await
+}
+
+/// The prefix of the error [`output_within_capped`] returns when it killed a
+/// command for printing more than its stdout cap — see
+/// [`is_subprocess_overflow`].
+const SUBPROCESS_OVERFLOW_MARKER: &str = "output too large: ";
+
+/// Whether `err` is the error [`output_within_capped`] returns when it killed
+/// a command for printing more than its stdout cap.
+fn is_subprocess_overflow(err: &str) -> bool {
+    err.starts_with(SUBPROCESS_OVERFLOW_MARKER)
+}
+
+/// [`output_within`] with an optional cap on the bytes captured from stdout.
+/// A command that prints more than `max_stdout` is killed and reaped the way a
+/// timed-out one is, and reported with [`SUBPROCESS_OVERFLOW_MARKER`] — so a
+/// caller can never mistake a truncated capture for the whole output.
+async fn output_within_capped(
     mut cmd: tokio::process::Command,
     program: &str,
     args: &[&str],
     bound: Duration,
+    max_stdout: Option<usize>,
 ) -> Result<std::process::Output, String> {
     use std::process::Stdio;
     use tokio::io::AsyncReadExt;
@@ -2411,42 +2522,86 @@ async fn output_within(
         buf
     }
 
+    /// The stdout cap was exceeded.
+    struct Overflow;
+
+    /// [`drain`], reading at most one byte past `cap` so an overflow is
+    /// detected without buffering the rest of the stream.
+    async fn drain_capped(
+        pipe: Option<impl tokio::io::AsyncRead + Unpin>,
+        cap: Option<usize>,
+    ) -> Result<Vec<u8>, Overflow> {
+        let Some(cap) = cap else {
+            return Ok(drain(pipe).await);
+        };
+        let mut buf = Vec::new();
+        if let Some(pipe) = pipe {
+            let limit = u64::try_from(cap).unwrap_or(u64::MAX).saturating_add(1);
+            let _ = pipe.take(limit).read_to_end(&mut buf).await;
+        }
+        if buf.len() > cap {
+            return Err(Overflow);
+        }
+        Ok(buf)
+    }
+
     let outcome = tokio::time::timeout(bound, async {
-        tokio::join!(child.wait(), drain(stdout), drain(stderr))
+        tokio::try_join!(
+            async { Ok::<_, Overflow>(child.wait().await) },
+            drain_capped(stdout, max_stdout),
+            async { Ok(drain(stderr).await) },
+        )
     })
     .await;
-    match outcome {
-        Ok((status, stdout, stderr)) => Ok(std::process::Output {
-            status: status.map_err(|e| format!("failed to run `{program}`: {e}"))?,
-            stdout,
-            stderr,
-        }),
-        Err(_) => {
-            #[cfg(unix)]
-            if let Some(pid) = pid {
-                // SAFETY: kill(2) with a negative pid signals the process group
-                // `process_group(0)` created above, whose id is the child's pid.
-                // SIGKILL has no failure mode beyond ESRCH/EPERM, both ignored:
-                // ESRCH means everything in it has already exited. The id cannot
-                // name somebody else's group, because the child is not yet reaped
-                // — `wait` below does that — so the pid is still ours.
-                unsafe {
-                    libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-                }
-            }
-            #[cfg(not(unix))]
-            let _ = pid;
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            Err(format!(
+    // The group to kill. On an overflow the child may already have been reaped
+    // — its `wait` ran alongside the drain that overflowed — and then its pid
+    // is no longer ours to signal, so the group is taken from `child.id()`,
+    // which is `None` once the child is reaped.
+    let (reason, group) = match outcome {
+        Ok(Ok((status, stdout, stderr))) => {
+            return Ok(std::process::Output {
+                status: status.map_err(|e| format!("failed to run `{program}`: {e}"))?,
+                stdout,
+                stderr,
+            });
+        }
+        Ok(Err(Overflow)) => (
+            format!(
+                "{SUBPROCESS_OVERFLOW_MARKER}`{program} {}` printed more than {} bytes and was \
+                 killed",
+                args.join(" "),
+                max_stdout.unwrap_or_default()
+            ),
+            child.id(),
+        ),
+        Err(_) => (
+            format!(
                 "{SUBPROCESS_TIMEOUT_MARKER}`{program} {}` did not finish within {}s and was \
                  killed; it is treated as failed so the task's later fires are not blocked \
                  behind it",
                 args.join(" "),
                 bound.as_secs_f64()
-            ))
+            ),
+            pid,
+        ),
+    };
+    #[cfg(unix)]
+    if let Some(pid) = group {
+        // SAFETY: kill(2) with a negative pid signals the process group
+        // `process_group(0)` created above, whose id is the child's pid.
+        // SIGKILL has no failure mode beyond ESRCH/EPERM, both ignored:
+        // ESRCH means everything in it has already exited. The id cannot
+        // name somebody else's group, because the child is not yet reaped
+        // — `wait` below does that — so the pid is still ours.
+        unsafe {
+            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
         }
     }
+    #[cfg(not(unix))]
+    let _ = group;
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    Err(reason)
 }
 
 /// Run a subprocess that must exit zero and return its captured stdout. Accepts
@@ -2599,6 +2754,61 @@ mod tests {
         .await
         .expect_err("the capturing variant must be bounded too");
         assert!(err.contains("did not finish within"), "{err}");
+    }
+
+    /// Scenario: PRD #421 amendment item 10 — a command capped at 1000 bytes of
+    /// stdout prints far more and keeps running; it is killed promptly and
+    /// reported as an overflow, never returned as a truncated capture. Output
+    /// at the cap itself is returned whole.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_subprocess_past_its_stdout_cap_is_killed_and_reported() {
+        let started = std::time::Instant::now();
+        let err = output_within_capped(
+            tokio::process::Command::new("sh"),
+            "sh",
+            &["-c", "head -c 5000 /dev/zero; sleep 30"],
+            Duration::from_secs(20),
+            Some(1000),
+        )
+        .await
+        .expect_err("5000 bytes must not pass a 1000-byte cap");
+        assert!(is_subprocess_overflow(&err), "{err}");
+        assert!(!is_subprocess_timeout(&err), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "an overflow must end the call, took {:?}",
+            started.elapsed()
+        );
+
+        let out = output_within_capped(
+            tokio::process::Command::new("sh"),
+            "sh",
+            &["-c", "head -c 1000 /dev/zero"],
+            Duration::from_secs(20),
+            Some(1000),
+        )
+        .await
+        .expect("output at the cap is accepted");
+        assert_eq!(out.stdout.len(), 1000);
+    }
+
+    /// Scenario: PRD #421 amendment item 9 — the claim-call bound is 30 s
+    /// unless the override holds a positive millisecond count.
+    #[test]
+    fn the_claim_call_timeout_defaults_to_30s_and_takes_an_override() {
+        assert_eq!(claim_call_timeout_from(None), Duration::from_secs(30));
+        assert_eq!(
+            claim_call_timeout_from(Some("1500")),
+            Duration::from_millis(1500)
+        );
+        for ignored in ["", "0", "-5", "abc", "1.5"] {
+            assert_eq!(
+                claim_call_timeout_from(Some(ignored)),
+                Duration::from_secs(30),
+                "{ignored:?}"
+            );
+        }
     }
 
     /// Issue #692: the timed-out child is killed, not left running to race the
