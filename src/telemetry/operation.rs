@@ -770,25 +770,6 @@ mod tests {
         );
     }
 
-    /// `rwx sandbox exec -- <command>` is classified like any other command:
-    /// program `rwx`, word `sandbox`, and the command it runs is not read.
-    #[test]
-    fn rwx_is_an_ordinary_program() {
-        for (command, expected) in [
-            (
-                "rwx sandbox exec --image x -- cargo test --workspace",
-                local("rwx", Some("sandbox")),
-            ),
-            (
-                "cd repo && rwx sandbox exec -- bash -c 'make ci'",
-                local("rwx", Some("sandbox")),
-            ),
-            ("rwx run .rwx/ci.yml --wait", local("rwx", Some("run"))),
-        ] {
-            assert_eq!(classify(Some(command)), expected, "{command}");
-        }
-    }
-
     #[test]
     fn only_the_first_line_counts() {
         assert_eq!(

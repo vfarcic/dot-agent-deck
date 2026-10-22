@@ -510,19 +510,16 @@ fn config_file_name(run_id: &str, pid: u32) -> String {
 }
 
 /// The run whose configuration file `name` is, when it is named as the deck
-/// names them ([`config_file_name`]), or as a deck before the shim named them
-/// (`devin-<run id>.json`).
+/// names them ([`config_file_name`]).
 fn config_file_run(name: &[u8]) -> Option<&[u8]> {
     let rest = name
         .strip_prefix(DEVIN_CONFIG_PREFIX.as_bytes())?
         .strip_suffix(b".json")?;
-    let (id, pid) = match rest.get(32..) {
-        Some([b'-', pid @ ..]) => (&rest[..32], Some(pid)),
-        Some([]) => (rest, None),
-        _ => return None,
+    let Some([b'-', pid @ ..]) = rest.get(32..) else {
+        return None;
     };
-    let pid_ok =
-        pid.is_none_or(|pid| (1..=10).contains(&pid.len()) && pid.iter().all(u8::is_ascii_digit));
+    let id = &rest[..32];
+    let pid_ok = (1..=10).contains(&pid.len()) && pid.iter().all(u8::is_ascii_digit);
     (pid_ok && std::str::from_utf8(id).is_ok_and(is_run_id)).then_some(id)
 }
 
@@ -1111,8 +1108,6 @@ mod tests {
         let real = root.path().join("real");
         std::fs::create_dir(&real).unwrap();
         std::fs::write(real.join(&ours), "{}").unwrap();
-        let older = format!("devin-{}.json", super::super::span::new_run_id());
-        std::fs::write(real.join(&older), "{}").unwrap();
         std::fs::write(real.join("devin-not-owned.json"), "{}").unwrap();
         std::fs::create_dir(real.join("bin")).unwrap();
         std::fs::write(real.join("bin").join(&ours), "{}").unwrap();
@@ -1125,7 +1120,6 @@ mod tests {
             !real.join(&ours).exists(),
             "the deck's own leftover is removed"
         );
-        assert!(!real.join(&older).exists(), "an older deck's name too");
         assert!(real.join("devin-not-owned.json").exists());
         assert!(
             real.join("bin").join(&ours).exists(),
@@ -1175,9 +1169,9 @@ mod tests {
         assert!(is_config_file_name(
             config_file_name(&id, u32::MAX).as_bytes()
         ));
-        assert!(is_config_file_name(format!("devin-{id}.json").as_bytes()));
         for name in [
             "devin-.json",
+            "devin-0123456789abcdef0123456789abcdef.json",
             "devin-run-1.json",
             "devin-0123456789abcdef0123456789abcdeg.json",
             "devin-0123456789ABCDEF0123456789abcdef.json",

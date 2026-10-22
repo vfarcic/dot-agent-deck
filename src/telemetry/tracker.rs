@@ -1850,9 +1850,7 @@ pub(crate) mod tests {
 
     /// One `agent.operation` per shell command, from its start to its end,
     /// paired by call id when several overlap and by age otherwise; other
-    /// tools make none, and the run counts them. A command run through
-    /// `rwx sandbox exec` carries `rwx sandbox` and nothing else: no attribute
-    /// says where it ran.
+    /// tools make none, and the run counts them.
     #[test]
     fn shell_commands_become_operations() {
         let mut tracker = RunTracker::new();

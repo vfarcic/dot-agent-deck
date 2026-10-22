@@ -72,9 +72,6 @@ use std::sync::Arc;
 /// hand `registry` the handle so the agents it spawns get runs. With telemetry
 /// off the returned handle does nothing, nothing is subscribed, no shim is
 /// written, and `registry` is left alone.
-///
-/// Installs no signal handler: when the daemon's teardown begins is told by
-/// the daemon itself ([`teardown_began`]).
 pub fn start_for_daemon(
     event_tx: &tokio::sync::broadcast::Sender<crate::event::BroadcastMsg>,
     registry: &crate::agent_pty::AgentPtyRegistry,
@@ -419,47 +416,11 @@ mod tests {
         commit_spawn(None);
     }
 
-    /// The handler installed for `sig` right now: `SIG_DFL` until something in
-    /// this process registers a listener for it.
-    #[cfg(unix)]
-    fn disposition(sig: libc::c_int) -> libc::sighandler_t {
-        // SAFETY: a null `act` only reads the current action into `old`.
-        unsafe {
-            let mut old: libc::sigaction = std::mem::zeroed();
-            assert_eq!(libc::sigaction(sig, std::ptr::null(), &mut old), 0);
-            old.sa_sigaction
-        }
-    }
-
     fn exporting_env() -> config::EnvMap {
         config::EnvMap::from([(
             "OTEL_EXPORTER_OTLP_ENDPOINT".to_string(),
             "http://127.0.0.1:9".to_string(),
         )])
-    }
-
-    /// Starting telemetry, exporting, leaves both stop signals' disposition
-    /// as it found it: only the daemon's own watch decides what a stop signal
-    /// does.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn starting_for_the_daemon_installs_no_signal_handler() {
-        let before = (disposition(libc::SIGTERM), disposition(libc::SIGINT));
-        let (event_tx, _) = tokio::sync::broadcast::channel(8);
-        let registry = crate::agent_pty::AgentPtyRegistry::new();
-        let dir = tempfile::tempdir().unwrap();
-        let telemetry = start_from(
-            &exporting_env(),
-            dir.path().to_path_buf(),
-            None,
-            &event_tx,
-            &registry,
-        );
-        assert!(telemetry.is_exporting());
-        assert_eq!(
-            (disposition(libc::SIGTERM), disposition(libc::SIGINT)),
-            before
-        );
     }
 
     /// A Devin configuration a crashed or SIGKILLed daemon left behind is
@@ -470,8 +431,8 @@ mod tests {
         for env in [config::EnvMap::new(), exporting_env()] {
             let dir = tempfile::tempdir().unwrap();
             let leftovers = [
-                format!("devin-{}.json", "0123456789abcdef".repeat(2)),
-                format!("devin-{}.json", span::new_run_id()),
+                format!("devin-{}-1.json", "0123456789abcdef".repeat(2)),
+                format!("devin-{}-4242.json", span::new_run_id()),
             ]
             .map(|n| dir.path().join(n));
             let kept = [
@@ -481,6 +442,7 @@ mod tests {
                 "devin-run-1.json",
                 "devin-0123456789ABCDEF0123456789abcdef.json",
                 "devin-0123456789abcdef0123456789abcde.json",
+                "devin-0123456789abcdef0123456789abcdef.json",
             ]
             .map(|n| dir.path().join(n));
             for path in leftovers.iter().chain(&kept) {

@@ -325,7 +325,7 @@ struct Settings {
 }
 
 impl Telemetry {
-    /// A handle that does nothing — what [`Self::start`] returns when off.
+    /// A handle that does nothing — what [`Self::start_in`] returns when off.
     pub fn disabled() -> Self {
         Telemetry {
             config: None,
@@ -339,15 +339,16 @@ impl Telemetry {
         }
     }
 
-    /// Read the configuration from `env` (the daemon's environment at start)
-    /// and, when it asks for an export the deck can do, spawn the exporter on
-    /// the current tokio runtime.
+    /// [`Self::start_in`] with the daemon's [`default_config_dir`].
+    #[cfg(test)]
     pub fn start(env: &EnvMap) -> Self {
         Self::start_with(env, Settings::default())
     }
 
-    /// [`Self::start`], with per-run agent configuration files written into
-    /// `config_dir` rather than [`default_config_dir`].
+    /// Read the configuration from `env` (the daemon's environment at start)
+    /// and, when it asks for an export the deck can do, spawn the exporter on
+    /// the current tokio runtime, with per-run agent configuration files
+    /// written into `config_dir`.
     pub fn start_in(env: &EnvMap, config_dir: PathBuf) -> Self {
         Self::start_with(
             env,
@@ -442,7 +443,7 @@ impl Telemetry {
     /// agent process exists and [`PreparedRun::commit`] once it does; a spawn
     /// refused in between drops the [`PreparedRun`], which forgets the run.
     /// `spawn_env` is the spawn's own overlay and is applied over the daemon's
-    /// environment captured by [`Self::start`]: a value set in either counts as
+    /// environment captured by [`Self::start_in`]: a value set in either counts as
     /// the user's. `cwd` is used only to resolve the run's git context, off
     /// this thread. With the shim installed, its directory
     /// goes first on the agent's `PATH` — the spawn's own, else the daemon's —

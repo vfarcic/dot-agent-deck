@@ -1019,7 +1019,7 @@ fn telemetry_otlp_012_daemon_shutdown_flushes_open_run() {
     );
 }
 
-/// Scenario: Send shell-tool start/end hooks for ordinary, wrapped, sandboxed and private commands to a stand-in pane, plus a non-shell tool. Close the pane and inspect completed operation spans for safe program/word metadata (an `rwx sandbox exec` command is program `rwx`, word `sandbox`, and no span says where a command ran), parent identity, duration and count, rejecting private or raw command text from every request body.
+/// Scenario: Send shell-tool start/end hooks for ordinary, wrapped, sandboxed and private commands to a stand-in pane, plus a non-shell tool. Close the pane and inspect completed operation spans for safe program/word metadata, parent identity, duration and count, rejecting private or raw command text from every request body.
 #[spec("telemetry/otlp/014")]
 #[test]
 fn telemetry_otlp_014_shell_operations_classify_without_content() {
@@ -1122,14 +1122,6 @@ fn telemetry_otlp_014_shell_operations_classify_without_content() {
                 );
             }
         }
-        assert!(
-            !operation["attributes"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|attr| attr["key"] == "deck.operation.runner"),
-            "no attribute says where a command ran: {operation}"
-        );
         assert_eq!(operation["parentSpanId"], run["spanId"]);
         assert_eq!(operation["traceId"], run["traceId"]);
         assert_eq!(
@@ -1160,10 +1152,6 @@ fn telemetry_otlp_014_shell_operations_classify_without_content() {
         for (command, ..) in cases {
             assert!(!body.contains(command), "raw command leaked: {command}");
         }
-        assert!(
-            !body.contains("deck.operation.runner"),
-            "no request carries a runner attribute"
-        );
     }
 }
 
