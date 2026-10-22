@@ -33,6 +33,11 @@
 //!      with the remaining issues. One issue never aborts the rest.
 //!   7. **M1.3** — per-issue success / skip / failure events are surfaced through
 //!      #127's existing [`Notifier`] seam (no parallel notification system).
+//!   8. **PRD #421 Phase 2** — after a successful spawn, claim the issue on
+//!      GitHub: provision the `agent-deck/claimed` label just in time, add it,
+//!      and write or edit this deck's claimant comment. Best-effort and never
+//!      fatal, with one notification per issue whose claim fell short. Nothing
+//!      ever removes the label or the comment.
 //!
 //! All GitHub/git access goes through the `gh` / `git` binaries resolved from
 //! `PATH`, inheriting the daemon's environment — that is exactly what lets the
@@ -551,6 +556,12 @@ pub async fn run_issue_dispatch(
     // dispatched): already-claimed issues inside the cap are skipped, yielding a
     // clean "≤ max_per_run concurrent in-flight" ceiling (PRD concurrency model —
     // today's run only picks up slots yesterday's run vacated).
+    // PRD #421 M2.6(a) — the claim label is provisioned just in time: at most
+    // once per run, and only in a run that is about to write a claim, so a fire
+    // that dispatches nothing makes no GitHub write at all (#483).
+    let mut provisioned: Option<Result<(), String>> = None;
+    let host = local_hostname();
+
     for issue in issues.into_iter().take(cfg.max_per_run) {
         loop {
             // M3.2 — per-issue error boundary: one failure never aborts the rest.
@@ -571,6 +582,27 @@ pub async fn run_issue_dispatch(
             .await
             {
                 Ok(IssueOutcome::Handled) => break,
+                // The claim is written before the success is surfaced, so
+                // "dispatched" is the issue's last word in this run: nothing
+                // writes to GitHub for it after that line.
+                Ok(IssueOutcome::Dispatched) => {
+                    claim_issue(
+                        task_name,
+                        &cfg.repo,
+                        issue,
+                        &host,
+                        &mut provisioned,
+                        notifier,
+                    )
+                    .await;
+                    // M1.3 — surface the per-issue dispatch success.
+                    notifier.notify(NotifyEvent::IssueDispatched {
+                        task: task_name.to_string(),
+                        repo: cfg.repo.clone(),
+                        issue,
+                    });
+                    break;
+                }
                 Err(message) => {
                     notifier.notify(NotifyEvent::IssueDispatchFailed {
                         task: task_name.to_string(),
@@ -844,8 +876,12 @@ async fn abandoned_generation_if_unused(
 /// What [`dispatch_one_issue`] did with an issue it did not fail on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IssueOutcome {
-    /// Dispatched, or skipped as already claimed (the skip is surfaced there).
+    /// Skipped as already claimed (the skip is surfaced there).
     Handled,
+    /// An agent was spawned for the issue, so the caller claims it on GitHub
+    /// (PRD #421 M2.2) — never on any other outcome — and surfaces the
+    /// dispatch.
+    Dispatched,
     /// PRD #1487 re-check, reviewer R3: refused because the daemon is
     /// restarting. The issue's worktree was removed again, so the slot stays
     /// open for the next attempt — this daemon's, if the restart is called
@@ -853,8 +889,9 @@ enum IssueOutcome {
     DeferredForRestart,
 }
 
-/// Process one candidate issue. `Ok(Handled)` means it was dispatched OR
-/// skipped (a skip is surfaced here, not treated as an error), and
+/// Process one candidate issue. `Ok(Dispatched)` means an agent was spawned,
+/// `Ok(Handled)` that it was skipped (a skip is surfaced here, not treated as
+/// an error), and
 /// `Ok(DeferredForRestart)` that the daemon refused the agent for now; `Err` is
 /// a per-issue failure for the caller to surface through the notifier (M3.2).
 #[allow(clippy::too_many_arguments)]
@@ -1019,13 +1056,8 @@ async fn dispatch_one_issue(
         .await;
     }
 
-    // M1.3 — surface the per-issue dispatch success.
-    notifier.notify(NotifyEvent::IssueDispatched {
-        task: task_name.to_string(),
-        repo: cfg.repo.clone(),
-        issue,
-    });
-    Ok(IssueOutcome::Handled)
+    // M1.3 — the caller claims the issue and then surfaces the success.
+    Ok(IssueOutcome::Dispatched)
 }
 
 /// S5: resolve the task's `working_dir` to an ABSOLUTE workspace root. The
@@ -1343,6 +1375,177 @@ fn parse_open_pr_present(json: &str) -> Result<bool, String> {
         .as_array()
         .ok_or_else(|| "`gh pr list` did not return a JSON array".to_string())?;
     Ok(!arr.is_empty())
+}
+
+/// PRD #421 M2.2 — claim a just-dispatched issue on GitHub: provision the
+/// label (once per run, before the first claim write), add it to the issue,
+/// then write this deck's claimant record — editing its existing one if the
+/// issue already carries it, posting a new one otherwise.
+///
+/// Called only after `spawn` returned `Ok`, so a failed dispatch never leaves
+/// a claim. Every step is best-effort in the way [`ensure_worktrees_excluded`]
+/// is: a failure never fails the dispatch, which genuinely succeeded. Unlike
+/// that helper, a failure is not left to a WARN alone: a claim that did not
+/// fully succeed raises exactly one [`NotifyEvent::IssueClaimFailed`] naming
+/// both outcomes (M2.6(b)), so a read-only token does not pass as a run of
+/// clean claims.
+///
+/// `provisioned` carries the run's provisioning outcome between issues. A
+/// failed provisioning does not stop the label write: a token that may apply
+/// labels without managing them (GitHub's triage role) still succeeds at the
+/// add when the label already exists.
+async fn claim_issue(
+    task_name: &str,
+    repo: &str,
+    issue: u64,
+    host: &str,
+    provisioned: &mut Option<Result<(), String>>,
+    notifier: &dyn Notifier,
+) {
+    if provisioned.is_none() {
+        let outcome = gh_claim_call(
+            &crate::issue_dispatch::claim_label_provision_argv(repo),
+            "creating the label",
+        )
+        .await
+        .map(drop);
+        if let Err(error) = &outcome {
+            tracing::warn!(
+                task = task_name,
+                repo,
+                error = %error,
+                "issue-dispatch: could not provision the claim label"
+            );
+        }
+        *provisioned = Some(outcome);
+    }
+
+    let label_error = gh_claim_call(
+        &crate::issue_dispatch::claim_issue_argv(repo, issue),
+        "adding the label",
+    )
+    .await
+    .err()
+    .map(|error| match provisioned {
+        Some(Err(provision)) => format!("{error}; earlier, {provision}"),
+        _ => error,
+    });
+
+    let record_error = write_claim_record(task_name, repo, issue, host).await.err();
+
+    if label_error.is_some() || record_error.is_some() {
+        tracing::warn!(
+            task = task_name,
+            repo,
+            issue,
+            label_error = ?label_error,
+            record_error = ?record_error,
+            "issue-dispatch: the issue was dispatched but its claim did not fully succeed"
+        );
+        notifier.notify(NotifyEvent::IssueClaimFailed {
+            task: task_name.to_string(),
+            repo: repo.to_string(),
+            issue,
+            label_error,
+            record_error,
+        });
+    }
+}
+
+/// Write this deck's claimant record on `issue`: read the comments to find a
+/// record naming this task and host, and edit it if there is one, so a
+/// re-claim never appends a second record. If the comments cannot be read,
+/// nothing is posted — a blind post is how a duplicate record would appear.
+async fn write_claim_record(
+    task_name: &str,
+    repo: &str,
+    issue: u64,
+    host: &str,
+) -> Result<(), String> {
+    use crate::issue_dispatch::{
+        create_claim_record_argv, edit_claim_record_argv, find_own_claim_record,
+        issue_comments_argv, render_claim_record,
+    };
+    let comments = gh_claim_call(
+        &issue_comments_argv(repo, issue),
+        "reading the issue's comments",
+    )
+    .await?;
+    let body = render_claim_record(task_name, host);
+    match find_own_claim_record(&comments, task_name, host)? {
+        Some(id) => gh_claim_call(
+            &edit_claim_record_argv(repo, id, &body),
+            "editing the claim comment",
+        )
+        .await
+        .map(drop),
+        None => gh_claim_call(
+            &create_claim_record_argv(repo, issue, &body),
+            "posting the claim comment",
+        )
+        .await
+        .map(drop),
+    }
+}
+
+/// Run one `gh` call of the claim and return its stdout. Its error names the
+/// step (`what`) instead of echoing the argv, which for a comment write carries
+/// the whole multi-line body, and is folded onto one line so the notification
+/// built from it stays a single line.
+async fn gh_claim_call(argv: &[String], what: &str) -> Result<String, String> {
+    let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let one_line = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    match output_within(
+        tokio::process::Command::new("gh"),
+        "gh",
+        &args,
+        SUBPROCESS_TIMEOUT,
+    )
+    .await
+    {
+        Ok(output) if output.status.success() => {
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        }
+        Ok(output) => Err(format!(
+            "{what} failed ({}): {}",
+            output.status,
+            one_line(&String::from_utf8_lossy(&output.stderr))
+        )),
+        Err(error) if is_subprocess_timeout(&error) => Err(format!(
+            "{what} did not finish within {}s and was killed",
+            SUBPROCESS_TIMEOUT.as_secs()
+        )),
+        Err(error) => Err(format!("{what} failed: {}", one_line(&error))),
+    }
+}
+
+/// The host name a claimant record names, read in-process — no `hostname`
+/// binary resolved from `PATH` on this unattended path. Falls back to
+/// `unknown-host`, which still keeps one record per task on that machine.
+fn local_hostname() -> String {
+    #[cfg(unix)]
+    {
+        let mut buf = [0u8; 256];
+        // SAFETY: `buf` is valid for `buf.len()` bytes for the whole call, and
+        // `gethostname` writes at most that many.
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+        if rc == 0 {
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            let name = String::from_utf8_lossy(&buf[..end]).trim().to_string();
+            if !name.is_empty() {
+                return name;
+            }
+        }
+    }
+    #[cfg(windows)]
+    if let Some(name) = std::env::var("COMPUTERNAME")
+        .ok()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+    {
+        return name;
+    }
+    "unknown-host".to_string()
 }
 
 /// Outcome of [`create_worktree`].

@@ -19,7 +19,7 @@ The Schedules manager exists only in the TUI. In the desktop app, a schedule's r
 
 - **A running daemon.** Starting the TUI (`dot-agent-deck`) starts one if none is running. The `schedule` subcommands do not start one. Check with `dot-agent-deck daemon status`, which reports a missing daemon rather than starting it.
 - **An agent command.** A plain schedule needs the command that launches your agent, for example `claude`, `opencode`, `pi`, `codex` or `devin`, or a wrapper that ends up running one of them (`devbox run agent`). Any other command runs, but the deck cannot show its status.
-- **For issue dispatch only:** the GitHub CLI `gh`, installed and signed in (`gh auth status` succeeds), and `git`, both on the daemon's `PATH`.
+- **For issue dispatch only:** the GitHub CLI `gh`, installed and signed in (`gh auth status` succeeds), and `git`, both on the daemon's `PATH`. Read access to the repository is enough to dispatch; to [claim](#claims-on-github) the issues it dispatches, the account `gh` is signed in with also needs write access to the repository.
 
 ## Schedule a prompt with the CLI
 
@@ -178,8 +178,22 @@ Check it: `dot-agent-deck schedule list` shows the schedule, and `dot-agent-deck
 3. **Skips claimed issues.** An issue is skipped when its worktree `<clone>/.worktrees/issue-<n>` already exists, or when an open pull request has the head branch `agent/issue-<n>`. Skipped issues still count toward `max_per_run`: if every listed issue is claimed, the run starts nothing, even when later issues are free.
 4. **Creates the worktree** at `<clone>/.worktrees/issue-<n>` on the branch `agent/issue-<n>`. If that branch already exists in the clone (from an earlier run whose tab you closed without opening a pull request), the worktree checks it out, so its commits carry over.
 5. **Starts the agent** in the worktree and sends it the prompt. If the worktree's `.dot-agent-deck.toml` defines an orchestration with roles, the issue gets an orchestration tab, using the roles' own commands. Otherwise it gets one agent running the schedule's `command`, else your [`default_command`](configuration.md#set-the-command-new-agents-start-with); if neither is set, the agent pane starts the daemon's shell (`$SHELL`), which cannot act on the prompt, so set one of them.
+6. **Claims the issue on GitHub** once the agent has started, as described in [Claims on GitHub](#claims-on-github). An issue whose agent did not start gets no claim.
 
 A failure on one issue (a `gh` error, a worktree error) is reported and the run carries on with the other issues. A failure to get the repository or list issues stops that run.
+
+### Claims on GitHub
+
+Each dispatched issue is marked on GitHub, so anyone reading the repository's issue list can see an agent is working on it before a pull request exists:
+
+- **The `agent-deck/claimed` label** is added to the issue. If the repository does not have that label yet, the run creates it first; if it already exists, its colour and description are reset to the deck's.
+- **One claim comment** on the issue names the schedule and the machine that dispatched it. When the same schedule on the same machine dispatches that issue again later, it updates its comment instead of posting another one.
+
+Both need the account `gh` is signed in with to have write access to the repository. If either cannot be written (a read-only token, say), the run reports it with one `claim failed for issue #<n>` line in the [daemon log](#where-schedule-errors-are-reported) saying what happened to the label and to the claim record (the comment). The agent keeps working either way: a failed claim never stops a dispatch.
+
+The claim is for people reading the issue: the deck does not yet skip issues that carry it. Another machine, or another schedule dispatching the same repository, can still dispatch an issue that is already claimed.
+
+The deck never removes the label or the comment, not even when you close the issue's tab. Remove them yourself when you no longer want them, for example with `gh issue edit <n> --repo <owner/name> --remove-label agent-deck/claimed`.
 
 ### Clean up
 
@@ -187,7 +201,7 @@ Dispatched tabs stay open until you close them. **Closing an issue's tab removes
 
 After the daemon restarts, closing such a tab no longer removes the worktree. Remove it yourself with `git -C <clone> worktree remove .worktrees/issue-<n>`, or that issue stays skipped.
 
-An issue that is still open after its pull request merged or closed has no open pull request any more, so once its worktree is gone a later run dispatches it again on the existing branch. Close the issue (or remove the label) to stop that.
+An issue that is still open after its pull request merged or closed has no open pull request any more, so once its worktree is gone a later run dispatches it again on the existing branch. Close the issue (or remove the label your schedule's `label` filter selects) to stop that.
 
 ## Keep schedules running
 
@@ -228,6 +242,7 @@ For more detail, see [Troubleshooting](troubleshooting.md#enabling-debug-logs).
 | Nothing opened, and the log has `[scheduler] task "<name>": spawn failed: shape …` | The `shape` could not be resolved in that directory. | The line names the orchestrations that exist; fix the `shape` or the directory's config. |
 | The log has `could not create working_dir` | The working directory cannot be created. | Fix the path or its permissions. |
 | A changed `working_dir` or `command` is ignored | The run reused the tab the previous run opened. | Close that tab; see [Manage schedules](#manage-schedules). |
+| The log has `claim failed for issue #<n>` | The account `gh` is signed in with cannot write to the repository's issues or labels. The agent was still dispatched. | Sign `gh` in with an account that has write access to the repository (check with `gh auth status`), or leave it: the dispatch works without the claim. See [Claims on GitHub](#claims-on-github). |
 | An issue-dispatch run started nothing | The listed issues were all claimed, `gh` failed, or the clone's `origin` does not match `repo`. | Read the `[scheduler] task "<name>": …` lines: `skipping already-claimed issue`, `repo … dispatch error`, `issue #<n> … failed`. |
 
 ## Worked examples

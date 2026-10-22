@@ -95,6 +95,18 @@ pub enum NotifyEvent {
         repo: String,
         message: String,
     },
+    /// PRD #421 M2.6: an issue WAS dispatched, but its claim on GitHub did not
+    /// fully succeed. Raised once per issue, naming both outcomes: `label_error`
+    /// is why the `agent-deck/claimed` label was not added and `record_error`
+    /// why the claimant comment was not written, `None` for the half that
+    /// succeeded. The dispatch itself stands either way.
+    IssueClaimFailed {
+        task: String,
+        repo: String,
+        issue: u64,
+        label_error: Option<String>,
+        record_error: Option<String>,
+    },
 }
 
 /// Default [`Notifier`] that logs to stderr. Stand-in until the PRD #126
@@ -156,6 +168,25 @@ impl Notifier for StderrNotifier {
                 message,
             } => {
                 eprintln!("[scheduler] task {task:?}: repo {repo} dispatch error: {message}");
+            }
+            NotifyEvent::IssueClaimFailed {
+                task,
+                repo,
+                issue,
+                label_error,
+                record_error,
+            } => {
+                let outcome = |error: Option<String>, done: &str| match error {
+                    Some(error) => format!("not {done} ({error})"),
+                    None => done.to_string(),
+                };
+                eprintln!(
+                    "[scheduler] task {task:?}: claim failed for issue #{issue} of {repo} \
+                     (the agent was still dispatched) — label {}: {}; claim record: {}",
+                    crate::issue_dispatch::CLAIM_LABEL,
+                    outcome(label_error, "added"),
+                    outcome(record_error, "written"),
+                );
             }
         }
     }

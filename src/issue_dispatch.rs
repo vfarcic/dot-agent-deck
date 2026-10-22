@@ -178,6 +178,187 @@ pub fn pr_list_for_issue_argv(repo: &str, issue_number: u64) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
+// PRD #421 Phase 2 — the visible dispatch claim
+// ---------------------------------------------------------------------------
+//
+// A dispatched issue is labelled [`CLAIM_LABEL`] and carries one claimant
+// record: a comment naming the task and host that dispatched it, edited rather
+// than appended on a re-claim. There is deliberately no builder that removes a
+// label or deletes a comment (PRD #421 M2.1/M2.2): the deck never releases a
+// claim, and `tests/dispatch_claim_never_released.rs` holds that absence for all of
+// `src/`.
+
+/// The deck-owned label a dispatched issue carries (PRD #421 M2.0). Namespaced
+/// so that no repository's own workflow vocabulary can collide with it, which
+/// is what makes provisioning it with `--force` safe.
+pub const CLAIM_LABEL: &str = "agent-deck/claimed";
+
+/// The colour [`claim_label_provision_argv`] converges the label onto.
+pub const CLAIM_LABEL_COLOR: &str = "1D76DB";
+
+/// The description [`claim_label_provision_argv`] converges the label onto.
+pub const CLAIM_LABEL_DESCRIPTION: &str = "An agent was dispatched to this issue by dot-agent-deck";
+
+/// The fixed marker opening every claimant record, which any deck can find.
+/// Task and host are fields inside the body, not part of the marker.
+pub const CLAIM_RECORD_MARKER: &str = "<!-- dot-agent-deck:claim -->";
+
+const CLAIM_RECORD_TASK_FIELD: &str = "- Task: ";
+const CLAIM_RECORD_HOST_FIELD: &str = "- Host: ";
+
+/// Build the `gh label create` argv (arguments after `gh`) that provisions
+/// [`CLAIM_LABEL`] in `repo`, creating it or, with `--force`, converging an
+/// existing one onto the deck's colour and description. Every value after
+/// `create` is a constant or the validated `repo` slug, so no element can be
+/// read as an unexpected flag.
+pub fn claim_label_provision_argv(repo: &str) -> Vec<String> {
+    vec![
+        "label".to_string(),
+        "create".to_string(),
+        CLAIM_LABEL.to_string(),
+        "--repo".to_string(),
+        repo.to_string(),
+        "--force".to_string(),
+        "--color".to_string(),
+        CLAIM_LABEL_COLOR.to_string(),
+        "--description".to_string(),
+        CLAIM_LABEL_DESCRIPTION.to_string(),
+    ]
+}
+
+/// Build the `gh issue edit` argv (arguments after `gh`) that adds
+/// [`CLAIM_LABEL`] to `issue_number`, with the issue number after the `--`
+/// end-of-options marker (see `issue_list_argv`).
+pub fn claim_issue_argv(repo: &str, issue_number: u64) -> Vec<String> {
+    vec![
+        "issue".to_string(),
+        "edit".to_string(),
+        "--repo".to_string(),
+        repo.to_string(),
+        "--add-label".to_string(),
+        CLAIM_LABEL.to_string(),
+        "--".to_string(),
+        issue_number.to_string(),
+    ]
+}
+
+/// Build the `gh api` argv (arguments after `gh`) listing every comment on
+/// `issue_number`, which is where an existing claimant record is found. The
+/// endpoint starts with `repos/`, so it cannot be read as a flag.
+pub fn issue_comments_argv(repo: &str, issue_number: u64) -> Vec<String> {
+    vec![
+        "api".to_string(),
+        "--paginate".to_string(),
+        format!("repos/{repo}/issues/{issue_number}/comments"),
+    ]
+}
+
+/// Build the `gh api` argv (arguments after `gh`) that posts `body` as a new
+/// comment on `issue_number` — used when the issue carries no claimant record
+/// of this deck's yet. `-f` sends the body as a raw string, never a file read.
+pub fn create_claim_record_argv(repo: &str, issue_number: u64, body: &str) -> Vec<String> {
+    vec![
+        "api".to_string(),
+        "--method".to_string(),
+        "POST".to_string(),
+        format!("repos/{repo}/issues/{issue_number}/comments"),
+        "-f".to_string(),
+        format!("body={body}"),
+    ]
+}
+
+/// Build the `gh api` argv (arguments after `gh`) that replaces the body of
+/// the existing claimant record `comment_id` — a re-claim edits the record
+/// rather than appending another one.
+pub fn edit_claim_record_argv(repo: &str, comment_id: u64, body: &str) -> Vec<String> {
+    vec![
+        "api".to_string(),
+        "--method".to_string(),
+        "PATCH".to_string(),
+        format!("repos/{repo}/issues/comments/{comment_id}"),
+        "-f".to_string(),
+        format!("body={body}"),
+    ]
+}
+
+/// Who wrote a claimant record: the scheduled task and the host it ran on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimRecord {
+    pub task: String,
+    pub host: String,
+}
+
+/// Render the body of a claimant record for `task` on `host`: the marker on
+/// the first line, a sentence for a human reading the issue, then the two
+/// fields. Each field value is a JSON string, so a task name carrying quotes
+/// or a newline still renders on one line and parses back exactly.
+pub fn render_claim_record(task: &str, host: &str) -> String {
+    let quote = |value: &str| serde_json::Value::from(value).to_string();
+    format!(
+        "{CLAIM_RECORD_MARKER}\nAn agent was dispatched to work on this issue by dot-agent-deck.\n\n\
+         {CLAIM_RECORD_TASK_FIELD}{}\n{CLAIM_RECORD_HOST_FIELD}{}\n",
+        quote(task),
+        quote(host)
+    )
+}
+
+/// Parse a comment body as a claimant record. Only a body whose first line is
+/// [`CLAIM_RECORD_MARKER`] counts, so a reply quoting a record (`> <!-- …`) is
+/// not mistaken for one; both fields must be present.
+pub fn parse_claim_record(body: &str) -> Option<ClaimRecord> {
+    let mut lines = body.trim_start().lines();
+    if lines.next()?.trim_end() != CLAIM_RECORD_MARKER {
+        return None;
+    }
+    let mut task = None;
+    let mut host = None;
+    for line in lines {
+        let line = line.trim_end();
+        if let Some(value) = line.strip_prefix(CLAIM_RECORD_TASK_FIELD) {
+            task = task.or_else(|| serde_json::from_str::<String>(value).ok());
+        } else if let Some(value) = line.strip_prefix(CLAIM_RECORD_HOST_FIELD) {
+            host = host.or_else(|| serde_json::from_str::<String>(value).ok());
+        }
+    }
+    Some(ClaimRecord {
+        task: task?,
+        host: host?,
+    })
+}
+
+/// Find this deck's own claimant record — a record naming the same `task` AND
+/// the same `host` — in the output of [`issue_comments_argv`], returning its
+/// comment id. `gh api --paginate` prints one JSON array per page back to
+/// back, so every array in the stream is read. Malformed output is an error,
+/// never "no record", which would append a duplicate.
+pub fn find_own_claim_record(
+    comments_json: &str,
+    task: &str,
+    host: &str,
+) -> Result<Option<u64>, String> {
+    #[derive(serde::Deserialize)]
+    struct Comment {
+        id: u64,
+        #[serde(default)]
+        body: Option<String>,
+    }
+    for page in serde_json::Deserializer::from_str(comments_json).into_iter::<Vec<Comment>>() {
+        let page = page.map_err(|e| format!("failed to parse the issue's comments: {e}"))?;
+        let own = page.into_iter().find(|comment| {
+            comment
+                .body
+                .as_deref()
+                .and_then(parse_claim_record)
+                .is_some_and(|record| record.task == task && record.host == host)
+        });
+        if let Some(comment) = own {
+            return Ok(Some(comment.id));
+        }
+    }
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------------
 // M1 — validate the user-config GitHub knobs that flow into `gh`/`git` argv
 // ---------------------------------------------------------------------------
 
@@ -519,6 +700,152 @@ mod tests {
                 "--",
             ]
         );
+    }
+
+    // --- PRD #421 Phase 2: the dispatch claim ---
+
+    #[test]
+    fn claim_label_provision_argv_forces_the_deck_owned_label() {
+        assert_eq!(
+            claim_label_provision_argv("vfarcic/dot-ai"),
+            vec![
+                "label",
+                "create",
+                "agent-deck/claimed",
+                "--repo",
+                "vfarcic/dot-ai",
+                "--force",
+                "--color",
+                CLAIM_LABEL_COLOR,
+                "--description",
+                CLAIM_LABEL_DESCRIPTION,
+            ]
+        );
+        assert_eq!(CLAIM_LABEL_COLOR.len(), 6);
+        assert!(CLAIM_LABEL_COLOR.chars().all(|c| c.is_ascii_hexdigit()));
+        // GitHub caps a label description at 100 characters.
+        assert!(CLAIM_LABEL_DESCRIPTION.chars().count() <= 100);
+    }
+
+    #[test]
+    fn claim_issue_argv_puts_the_issue_after_end_of_options() {
+        assert_eq!(
+            claim_issue_argv("vfarcic/dot-ai", 17),
+            vec![
+                "issue",
+                "edit",
+                "--repo",
+                "vfarcic/dot-ai",
+                "--add-label",
+                "agent-deck/claimed",
+                "--",
+                "17",
+            ]
+        );
+    }
+
+    #[test]
+    fn claim_record_argvs_address_the_issue_and_comment_endpoints() {
+        assert_eq!(
+            issue_comments_argv("o/r", 7),
+            vec!["api", "--paginate", "repos/o/r/issues/7/comments"]
+        );
+        assert_eq!(
+            create_claim_record_argv("o/r", 7, "hello\nworld"),
+            vec![
+                "api",
+                "--method",
+                "POST",
+                "repos/o/r/issues/7/comments",
+                "-f",
+                "body=hello\nworld",
+            ]
+        );
+        assert_eq!(
+            edit_claim_record_argv("o/r", 4242, "hello"),
+            vec![
+                "api",
+                "--method",
+                "PATCH",
+                "repos/o/r/issues/comments/4242",
+                "-f",
+                "body=hello",
+            ]
+        );
+    }
+
+    #[test]
+    fn claim_record_round_trips_task_and_host() {
+        let body = render_claim_record("dispatch-task", "build-box");
+        assert!(body.starts_with(CLAIM_RECORD_MARKER));
+        assert!(body.contains("dispatch-task") && body.contains("build-box"));
+        assert_eq!(
+            parse_claim_record(&body),
+            Some(ClaimRecord {
+                task: "dispatch-task".into(),
+                host: "build-box".into(),
+            })
+        );
+        // Awkward task names survive the round trip on a single field line.
+        let tricky = "Issues vfarcic/dot-ai \"quoted\"\nsecond line";
+        assert_eq!(
+            parse_claim_record(&render_claim_record(tricky, "h")),
+            Some(ClaimRecord {
+                task: tricky.into(),
+                host: "h".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_claim_record_rejects_non_records() {
+        // No marker.
+        assert_eq!(parse_claim_record("- Task: \"t\"\n- Host: \"h\""), None);
+        // A reply quoting a record is not a record.
+        let quoted = render_claim_record("t", "h")
+            .lines()
+            .map(|l| format!("> {l}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(parse_claim_record(&quoted), None);
+        // The marker alone, or a missing field, is not a record.
+        assert_eq!(parse_claim_record(CLAIM_RECORD_MARKER), None);
+        assert_eq!(
+            parse_claim_record(&format!("{CLAIM_RECORD_MARKER}\n- Task: \"t\"")),
+            None
+        );
+    }
+
+    #[test]
+    fn find_own_claim_record_requires_same_task_and_host() {
+        let own = render_claim_record("task", "host");
+        let other_host = render_claim_record("task", "elsewhere");
+        let other_task = render_claim_record("another", "host");
+        let json = serde_json::json!([
+            {"id": 1, "body": "plain comment"},
+            {"id": 2, "body": other_host},
+            {"id": 3, "body": other_task},
+            {"id": 4, "body": own},
+            {"id": 5, "body": null},
+        ])
+        .to_string();
+        assert_eq!(find_own_claim_record(&json, "task", "host"), Ok(Some(4)));
+        assert_eq!(find_own_claim_record(&json, "task", "nowhere"), Ok(None));
+        assert_eq!(find_own_claim_record("[]", "task", "host"), Ok(None));
+    }
+
+    #[test]
+    fn find_own_claim_record_reads_every_paginated_page() {
+        let page1 = serde_json::json!([{"id": 1, "body": "first page"}]);
+        let page2 = serde_json::json!([{"id": 9, "body": render_claim_record("t", "h")}]);
+        let stream = format!("{page1}\n{page2}\n");
+        assert_eq!(find_own_claim_record(&stream, "t", "h"), Ok(Some(9)));
+    }
+
+    #[test]
+    fn find_own_claim_record_fails_on_malformed_output() {
+        assert!(find_own_claim_record("not json", "t", "h").is_err());
+        assert!(find_own_claim_record("{\"id\": 1}", "t", "h").is_err());
     }
 
     // --- M1: user-config validation ---
