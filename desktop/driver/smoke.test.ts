@@ -300,9 +300,16 @@ test("terminal_005 resizing and zooming the window resizes the agent's PTY", asy
     const own = await agreedGrid(deck, agent.agent_id, "the pane's own size", ([cols, rows]) => !(cols === 80 && rows === 24));
     assert.deepEqual(await sttySize(deck, input, "own"), own, "the shell's size is the pane's grid");
 
-    // Smaller on both axes, and still above `tauri.conf.json`'s 1024x680 floor.
+    // Smaller on both axes, and still above `tauri.conf.json`'s 1024x680 floor:
+    // the window would stop at the floor and the wait below would never end.
     const before = await deck.session.windowRect();
     const target = { width: before.width - 300, height: before.height - 160 };
+    if (target.width < 1024 || target.height < 680) {
+      throw new Error(
+        `the window opened at ${before.width}x${before.height}, too small to shrink by 300x160 above its 1024x680 ` +
+          "minimum: run on a display of at least 1440x920 (driver-test.sh's xvfb is 1920x1080)",
+      );
+    }
     await deck.session.setWindowRect(target);
     await waitFor(`the window to take ${target.width}x${target.height}`, async () => {
       const rect = await deck.session.windowRect();
