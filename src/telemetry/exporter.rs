@@ -52,10 +52,12 @@ use tokio::time::Instant;
 
 use crate::event::BroadcastMsg;
 
+use super::config::OTEL_RESOURCE_ATTRIBUTES;
 use super::config::{EnvMap, TelemetryConfig, redacted_endpoint};
 use super::input::{InputFilter, LONE_ESCAPE_WINDOW};
+use super::launch::{LAUNCH_ENV_KEYS, Launch, LaunchInputs};
 use super::propagation::{RunIdentity, agent_env};
-use super::resource::{ResourceAttribute, deck_resource, host_name};
+use super::resource::{ResourceAttribute, deck_resource, host_name, parse_resource_attributes};
 use super::run_context::{ProbeSettings, Probes};
 use super::span::{SpanRecord, new_run_id};
 use super::tracker::{EndReason, RunStart, RunTracker};
@@ -239,8 +241,22 @@ pub struct Telemetry {
     /// The daemon's `OTEL_*` variables (and Claude Code's switch), the base an
     /// agent's environment is computed from.
     otel_env: EnvMap,
+    /// The daemon's [`LAUNCH_ENV_KEYS`]: where agents' own configurations live.
+    launch_env: EnvMap,
     host: Option<String>,
     exporting: Option<Exporting>,
+    /// Where per-run agent configuration files are written.
+    config_dir: Option<PathBuf>,
+    /// The per-run agent configuration files of committed runs, removed as
+    /// each run's agent ends ([`super::launch`]).
+    config_files: Mutex<Vec<ConfigFile>>,
+}
+
+/// A per-run agent configuration file, and the run it belongs to.
+struct ConfigFile {
+    pane_id: String,
+    agent_id: Option<String>,
+    path: PathBuf,
 }
 
 /// A run minted for a spawn that has not started its agent yet — see
@@ -249,6 +265,9 @@ pub struct Telemetry {
 pub struct PreparedRun {
     /// The variables to add to the agent's environment.
     pub env: Vec<(String, String)>,
+    /// What the agent's launch needs for its own telemetry.
+    launch: Launch,
+    agent: crate::event::AgentType,
     telemetry: Arc<Telemetry>,
     run_id: String,
     pane_id: String,
@@ -258,18 +277,36 @@ pub struct PreparedRun {
 }
 
 impl PreparedRun {
+    /// The command to run in place of `command`, when the agent's own
+    /// telemetry needs words added to it ([`super::launch`]); `None` to run
+    /// `command` as it is.
+    pub fn launch_command(&self, command: Option<&str>) -> Option<String> {
+        self.launch.command(&self.agent, command)
+    }
+
     /// The agent started: open its run.
     pub fn commit(mut self) {
         self.committed = true;
+        if let Some(path) = self.launch.config_file.take() {
+            self.telemetry.lock_config_files().push(ConfigFile {
+                pane_id: self.pane_id.clone(),
+                agent_id: self.agent_id.clone(),
+                path,
+            });
+        }
         self.telemetry.commit(&self);
     }
 }
 
 impl Drop for PreparedRun {
     fn drop(&mut self) {
-        if !self.committed
-            && let Some(exporting) = &self.telemetry.exporting
-        {
+        if self.committed {
+            return;
+        }
+        if let Some(path) = self.launch.config_file.take() {
+            super::launch::remove_config_file(&path);
+        }
+        if let Some(exporting) = &self.telemetry.exporting {
             exporting.shared.with_tracker(|t| t.abort_run(&self.run_id));
         }
     }
@@ -280,6 +317,9 @@ impl Drop for PreparedRun {
 struct Settings {
     probes: ProbeSettings,
     retry: RetryPolicy,
+    /// Where per-run agent configuration files go; the daemon's state
+    /// directory when unset.
+    config_dir: Option<PathBuf>,
     /// Test seam: hand finished spans here instead of to an HTTP exporter.
     #[cfg(test)]
     sink: Option<mpsc::Sender<ExportMsg>>,
@@ -295,8 +335,11 @@ impl Telemetry {
         Telemetry {
             config: None,
             otel_env: EnvMap::new(),
+            launch_env: EnvMap::new(),
             host: None,
             exporting: None,
+            config_dir: None,
+            config_files: Mutex::new(Vec::new()),
         }
     }
 
@@ -316,6 +359,15 @@ impl Telemetry {
             .filter(|(k, _)| k.starts_with("OTEL_") || k.starts_with("CLAUDE_CODE_"))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+        let launch_env: EnvMap = env
+            .iter()
+            .filter(|(k, _)| LAUNCH_ENV_KEYS.contains(&k.as_str()))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let config_dir = settings
+            .config_dir
+            .clone()
+            .unwrap_or_else(|| crate::config::state_dir().join("telemetry"));
         let host = host_name();
         let exporting = if !config.protocol.deck_can_export() {
             tracing::warn!(
@@ -352,8 +404,11 @@ impl Telemetry {
         Telemetry {
             config: Some(config),
             otel_env,
+            launch_env,
             host,
             exporting,
+            config_dir: Some(config_dir),
+            config_files: Mutex::new(Vec::new()),
         }
     }
 
@@ -374,20 +429,24 @@ impl Telemetry {
     /// `spawn_env` is the spawn's own overlay and is applied over the daemon's
     /// environment captured by [`Self::start`]: a value set in either counts as
     /// the user's. `cwd` is used only to resolve the run's git context, off
-    /// this thread. `None` when telemetry is off.
+    /// this thread. `command` is the spawn's command as configured, which
+    /// the agent's launch may need words added to
+    /// ([`PreparedRun::launch_command`]). `None` when telemetry is off.
     pub fn prepare_run(
         self: &Arc<Self>,
         mut start: RunStart,
         spawn_env: &[(String, String)],
         cwd: Option<PathBuf>,
+        command: Option<&str>,
     ) -> Option<PreparedRun> {
         let config = self.config.as_ref()?;
         if start.run_id.is_empty() {
             start.run_id = new_run_id();
         }
         let mut base = self.otel_env.clone();
+        base.extend(self.launch_env.iter().map(|(k, v)| (k.clone(), v.clone())));
         base.extend(spawn_env.iter().cloned());
-        let env = agent_env(
+        let mut env = agent_env(
             Some(config),
             &base,
             &RunIdentity {
@@ -398,8 +457,24 @@ impl Telemetry {
             },
             self.host.as_deref(),
         );
+        let resource = env
+            .iter()
+            .find(|(k, _)| k == OTEL_RESOURCE_ATTRIBUTES)
+            .map(|(_, v)| parse_resource_attributes(v))
+            .unwrap_or_default();
+        let mut launch = super::launch::prepare(&LaunchInputs {
+            agent: &start.agent,
+            command,
+            env: &base,
+            resource: &resource,
+            run_id: &start.run_id,
+            config_dir: self.config_dir.as_deref(),
+        });
+        env.append(&mut launch.env);
         let prepared = PreparedRun {
             env,
+            launch,
+            agent: start.agent.clone(),
             telemetry: Arc::clone(self),
             run_id: start.run_id.clone(),
             pane_id: start.pane_id.clone(),
@@ -534,6 +609,9 @@ impl Telemetry {
         reason: EndReason,
         exit_code: Option<i32>,
     ) {
+        self.remove_config_files(|file| {
+            file.pane_id == pane_id && (agent_id.is_none() || file.agent_id.as_deref() == agent_id)
+        });
         let Some(exporting) = &self.exporting else {
             return;
         };
@@ -607,6 +685,7 @@ impl Telemetry {
     /// holds, retrying only while the budget lasts. Returns as soon as that is
     /// done, at once when nothing is pending.
     pub async fn shutdown(&self, budget: Duration) {
+        self.remove_config_files(|_| true);
         let Some(exporting) = &self.exporting else {
             return;
         };
@@ -669,6 +748,35 @@ impl Telemetry {
         {
             ingest.abort();
         }
+    }
+
+    fn lock_config_files(&self) -> std::sync::MutexGuard<'_, Vec<ConfigFile>> {
+        self.config_files.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Remove the per-run configuration files `which` selects.
+    fn remove_config_files(&self, which: impl Fn(&ConfigFile) -> bool) {
+        let removed: Vec<PathBuf> = {
+            let mut files = self.lock_config_files();
+            let (removed, kept) = std::mem::take(&mut *files).into_iter().partition(&which);
+            *files = kept;
+            removed
+                .into_iter()
+                .map(|file: ConfigFile| file.path)
+                .collect()
+        };
+        for path in removed {
+            super::launch::remove_config_file(&path);
+        }
+    }
+
+    /// The per-run configuration files in use.
+    #[cfg(test)]
+    pub(crate) fn config_file_paths(&self) -> Vec<PathBuf> {
+        self.lock_config_files()
+            .iter()
+            .map(|file| file.path.clone())
+            .collect()
     }
 
     /// Run-context probes queued or running.
@@ -1500,7 +1608,7 @@ mod tests {
         start: RunStart,
         spawn_env: &[(String, String)],
     ) -> Vec<(String, String)> {
-        let run = telemetry.prepare_run(start, spawn_env, None).unwrap();
+        let run = telemetry.prepare_run(start, spawn_env, None, None).unwrap();
         let added = run.env.clone();
         run.commit();
         added
@@ -1608,7 +1716,7 @@ mod tests {
         ])));
         let overlay = vec![("OTEL_LOGS_EXPORTER".to_string(), "console".to_string())];
         let run = telemetry
-            .prepare_run(run_start("p1"), &overlay, None)
+            .prepare_run(run_start("p1"), &overlay, None, None)
             .unwrap();
         assert_eq!(get(&run.env, "CLAUDE_CODE_ENABLE_TELEMETRY"), None);
         assert_eq!(get(&run.env, "OTEL_METRICS_EXPORTER"), None);
@@ -1620,7 +1728,7 @@ mod tests {
             ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:9"),
             ("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc"),
         ])));
-        let run = unset.prepare_run(run_start("p1"), &[], None).unwrap();
+        let run = unset.prepare_run(run_start("p1"), &[], None, None).unwrap();
         assert_eq!(get(&run.env, "CLAUDE_CODE_ENABLE_TELEMETRY"), Some("1"));
         assert_eq!(get(&run.env, "OTEL_METRICS_EXPORTER"), Some("otlp"));
         assert_eq!(get(&run.env, "OTEL_LOGS_EXPORTER"), Some("otlp"));
@@ -1641,7 +1749,7 @@ mod tests {
         ] {
             let start = RunStart::for_spawn("p1", "a1", None, Some(command), None);
             assert_eq!(start.agent, AgentType::ClaudeCode, "{command}");
-            let run = telemetry.prepare_run(start, &[], None).unwrap();
+            let run = telemetry.prepare_run(start, &[], None, None).unwrap();
             assert_eq!(
                 get(&run.env, "CLAUDE_CODE_ENABLE_TELEMETRY"),
                 Some("1"),
@@ -1673,8 +1781,89 @@ mod tests {
         assert!(!telemetry.is_exporting());
         assert!(
             telemetry
-                .prepare_run(run_start("p1"), &[], Some(PathBuf::from("/")))
+                .prepare_run(run_start("p1"), &[], Some(PathBuf::from("/")), None)
                 .is_none()
+        );
+    }
+
+    /// A Devin run's per-run configuration exists from its preparation to its
+    /// agent's end — or to the spawn being refused — and only that run's goes;
+    /// Codex's launch gains its exporters on the command it runs; and a
+    /// stopping daemon removes whatever is left.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_agents_launch_additions_live_as_long_as_its_run() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("state");
+        let mut pairs = ON.to_vec();
+        let h = home.path().to_str().unwrap().to_string();
+        pairs.push(("HOME", &h));
+        let telemetry = Arc::new(Telemetry::start_with(
+            &env(&pairs),
+            Settings {
+                config_dir: Some(dir.clone()),
+                ..Settings::default()
+            },
+        ));
+        let devin = |pane: &str, agent: &str| RunStart {
+            agent: AgentType::Devin,
+            ..generation(pane, agent)
+        };
+        let prepare = |start| {
+            telemetry
+                .prepare_run(start, &[], None, Some("devin"))
+                .unwrap()
+        };
+
+        let refused = prepare(devin("p0", "a0"));
+        assert_eq!(dir.read_dir().unwrap().count(), 1);
+        drop(refused);
+        assert_eq!(
+            dir.read_dir().unwrap().count(),
+            0,
+            "a refused spawn's file goes"
+        );
+
+        let first = prepare(devin("p1", "a1"));
+        let command = first.launch_command(Some("devin")).unwrap();
+        assert!(command.starts_with("devin --config '"), "{command}");
+        first.commit();
+        let second = prepare(devin("p2", "a2"));
+        second.commit();
+        assert_eq!(telemetry.config_file_paths().len(), 2);
+        telemetry.end_run("p1", Some("a-other"), EndReason::Exited, None);
+        assert_eq!(
+            telemetry.config_file_paths().len(),
+            2,
+            "another generation's end"
+        );
+        telemetry.end_run("p1", Some("a1"), EndReason::Exited, None);
+        assert_eq!(dir.read_dir().unwrap().count(), 1, "only p1's went");
+
+        let codex = telemetry
+            .prepare_run(
+                RunStart {
+                    agent: AgentType::Codex,
+                    ..run_start("p3")
+                },
+                &[],
+                None,
+                Some("codex --yolo"),
+            )
+            .unwrap();
+        let command = codex.launch_command(Some("codex --yolo")).unwrap();
+        assert!(
+            command.starts_with("codex -c 'otel.trace_exporter="),
+            "{command}"
+        );
+        assert!(command.ends_with(" --yolo"), "{command}");
+        drop(codex);
+
+        telemetry.shutdown(Duration::from_secs(1)).await;
+        assert_eq!(
+            dir.read_dir().unwrap().count(),
+            0,
+            "shutdown removes the rest"
         );
     }
 
@@ -1703,7 +1892,7 @@ mod tests {
         let (tx, events) = broadcast::channel(16);
         telemetry.subscribe(events);
         let prepared = telemetry
-            .prepare_run(generation("p1", "a1"), &[], None)
+            .prepare_run(generation("p1", "a1"), &[], None, None)
             .unwrap();
         tx.send(of("p1", "a1", EventType::SessionStart)).unwrap();
         tx.send(of("p1", "a1", EventType::ToolStart)).unwrap();
@@ -1793,7 +1982,7 @@ mod tests {
         let (tx, events) = broadcast::channel(16);
         telemetry.subscribe(events);
         let prepared = telemetry
-            .prepare_run(generation("p1", "a1"), &[], None)
+            .prepare_run(generation("p1", "a1"), &[], None, None)
             .unwrap();
         tx.send(of("p1", "a1", EventType::SessionStart)).unwrap();
         // Not yet registered when its PTY ended, so the seam reads `closed`.
@@ -1821,7 +2010,7 @@ mod tests {
         let (tx, events) = broadcast::channel(16);
         telemetry.subscribe(events);
         let prepared = telemetry
-            .prepare_run(generation("p1", "a1"), &[], None)
+            .prepare_run(generation("p1", "a1"), &[], None, None)
             .unwrap();
         tx.send(of("p1", "a1", EventType::SessionStart)).unwrap();
         telemetry.settled().await;
@@ -2372,7 +2561,7 @@ mod tests {
             .map(|i| {
                 let id = format!("s{i}");
                 telemetry
-                    .prepare_run(generation(&id, &id), &[], None)
+                    .prepare_run(generation(&id, &id), &[], None, None)
                     .unwrap()
             })
             .collect();
@@ -2494,6 +2683,7 @@ mod tests {
                 generation("p1", "a1"),
                 &[],
                 Some(scratch.path().to_path_buf()),
+                None,
             )
             .unwrap();
         run.commit();
@@ -3488,7 +3678,7 @@ mod tests {
 
         // Run 1: its export is rejected, so the failure is logged.
         let run = telemetry
-            .prepare_run(start("pane-1"), &spawn_env, Some(cwd.clone()))
+            .prepare_run(start("pane-1"), &spawn_env, Some(cwd.clone()), None)
             .unwrap();
         for (k, v) in &run.env {
             for sentinel in SENTINELS {
@@ -3525,7 +3715,7 @@ mod tests {
 
         // Run 2: delivered at shutdown.
         let run = telemetry
-            .prepare_run(start("pane-2"), &spawn_env, Some(cwd.clone()))
+            .prepare_run(start("pane-2"), &spawn_env, Some(cwd.clone()), None)
             .unwrap();
         run.commit();
         let events: Vec<AgentEvent> = [

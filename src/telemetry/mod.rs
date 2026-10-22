@@ -16,8 +16,12 @@
 //! tracker matches an event to its run by pane and agent id and applies it to
 //! that run's own copy of the card state ([`crate::state::AppState`]), which
 //! does hold content; what it reads back is typed: the card's status, mapped to
-//! one of a fixed set of names, and the number of the card's pull request.
-//! No other value on a span is read from an event: the rest come from the
+//! one of a fixed set of names, and the number and CI result of the card's pull
+//! request. One value is read from an event's text, and only through a filter:
+//! a shell command's runner, program and first word ([`operation::classify`]),
+//! each kept only when it has the shape of a command word, and never the first
+//! word of a program that prints or searches text. No other value on a span is
+//! read from an event: the rest come from the
 //! spawn (its ids, role and orchestration), the deck's own counts and enum
 //! names, the configuration and host, and the git probes (a commit hash and the
 //! repository's name). A test feeds
@@ -31,7 +35,7 @@
 //! ([`otlp::encode_json`]) and posted with the `reqwest` client the crate
 //! already depends on. The `opentelemetry` SDK crates would add `prost`,
 //! `opentelemetry-proto` and the SDK runtime to a build that has none of them,
-//! for a producer that emits two span names.
+//! for a producer that emits four span names.
 //!
 //! The module is self-contained: the daemon and the agent spawn path each reach
 //! it through one call per lifecycle point — [`start_for_daemon`] and
@@ -39,9 +43,12 @@
 //! [`observe_pane_input`] — so what telemetry does at each of them is decided
 //! here, not at the call site.
 
+pub mod ci;
 pub mod config;
 pub mod exporter;
 pub mod input;
+pub mod launch;
+pub mod operation;
 pub mod otlp;
 pub mod propagation;
 pub mod resource;
@@ -146,7 +153,12 @@ pub fn prepare_spawn(
         opts.command,
         membership,
     );
-    let run = telemetry.prepare_run(start, &opts.env, opts.cwd.map(std::path::PathBuf::from))?;
+    let run = telemetry.prepare_run(
+        start,
+        &opts.env,
+        opts.cwd.map(std::path::PathBuf::from),
+        opts.command,
+    )?;
     opts.env.extend(run.env.iter().cloned());
     Some(run)
 }
@@ -213,13 +225,24 @@ pub const SCHEMA_VERSION: &str = "1";
 /// The service name a span batch carries when `OTEL_SERVICE_NAME` is unset.
 pub const DEFAULT_SERVICE_NAME: &str = "dot-agent-deck";
 
-/// The two span names the deck emits.
+/// The span names the deck emits.
 pub const SPAN_AGENT_RUN: &str = "agent.run";
 pub const SPAN_AGENT_STATUS: &str = "agent.status";
+pub const SPAN_AGENT_OPERATION: &str = "agent.operation";
+pub const SPAN_AGENT_CI: &str = "agent.ci";
+
+/// Every span name, for the tests that check what reaches a payload.
+pub const SPAN_NAMES: [&str; 4] = [
+    SPAN_AGENT_RUN,
+    SPAN_AGENT_STATUS,
+    SPAN_AGENT_OPERATION,
+    SPAN_AGENT_CI,
+];
 
 /// The span event names the deck emits on `agent.run`.
 pub const EVENT_STATUS_CHANGE: &str = "deck.status_change";
 pub const EVENT_INTERVENTION: &str = "deck.intervention";
+pub const EVENT_CI_CHANGE: &str = "deck.ci.change";
 
 /// Every attribute key the deck can put on a span, a span event, or the
 /// resource it builds itself. The closed set IS the allow-list: an attribute
@@ -255,6 +278,18 @@ pub enum AttrKey {
     StatusFrom,
     StatusTo,
     InterventionKind,
+    OperationRunner,
+    OperationProgram,
+    OperationWord,
+    OperationsCount,
+    CiFrom,
+    CiTo,
+    CiResult,
+    CiChecksPassing,
+    CiChecksFailing,
+    CiChecksSkipped,
+    CiRoundsCount,
+    CiFailuresCount,
 }
 
 impl AttrKey {
@@ -285,6 +320,18 @@ impl AttrKey {
         AttrKey::StatusFrom,
         AttrKey::StatusTo,
         AttrKey::InterventionKind,
+        AttrKey::OperationRunner,
+        AttrKey::OperationProgram,
+        AttrKey::OperationWord,
+        AttrKey::OperationsCount,
+        AttrKey::CiFrom,
+        AttrKey::CiTo,
+        AttrKey::CiResult,
+        AttrKey::CiChecksPassing,
+        AttrKey::CiChecksFailing,
+        AttrKey::CiChecksSkipped,
+        AttrKey::CiRoundsCount,
+        AttrKey::CiFailuresCount,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -314,6 +361,18 @@ impl AttrKey {
             AttrKey::StatusFrom => "deck.status.from",
             AttrKey::StatusTo => "deck.status.to",
             AttrKey::InterventionKind => "deck.intervention.kind",
+            AttrKey::OperationRunner => "deck.operation.runner",
+            AttrKey::OperationProgram => "deck.operation.program",
+            AttrKey::OperationWord => "deck.operation.word",
+            AttrKey::OperationsCount => "deck.operations.count",
+            AttrKey::CiFrom => "deck.ci.from",
+            AttrKey::CiTo => "deck.ci.to",
+            AttrKey::CiResult => "deck.ci.result",
+            AttrKey::CiChecksPassing => "deck.ci.checks.passing",
+            AttrKey::CiChecksFailing => "deck.ci.checks.failing",
+            AttrKey::CiChecksSkipped => "deck.ci.checks.skipped",
+            AttrKey::CiRoundsCount => "deck.ci.rounds.count",
+            AttrKey::CiFailuresCount => "deck.ci.failures.count",
         }
     }
 

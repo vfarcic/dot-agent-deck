@@ -647,6 +647,26 @@ pub(crate) mod tests {
             tracker.observe_event(&loaded_event("pane-1", event_type), t);
             t += 1;
         }
+        // Shell commands, whose classification is the one thing a span reads
+        // from an event's text: every sentinel is in a place the filter or
+        // the deny-list keeps out.
+        for command in [
+            "SENTINEL-COMMAND --flag",
+            "git commit -m 'SENTINEL-PROMPT'",
+            "cat SENTINEL-TOOL-ARGS",
+            "grep -r sentinel-input .",
+            "cd /home/u/SENTINEL-CWD && ./SENTINEL-TITLE.sh",
+            "TOKEN=SENTINEL-ENV-VALUE curl https://SENTINEL-PR-URL.example",
+            "rwx sandbox exec -- echo SENTINEL-BRANCH",
+        ] {
+            for event_type in [EventType::ToolStart, EventType::ToolEnd] {
+                let mut e = loaded_event("pane-1", event_type);
+                e.tool_name = Some("Bash".into());
+                e.tool_detail = Some(command.into());
+                tracker.observe_event(&e, t);
+                t += 1;
+            }
+        }
         tracker.observe_human_input("pane-1", t);
         tracker.end_run("pane-1", EndReason::Exited, Some(1), t + 1);
         tracker.end_all(EndReason::DaemonShutdown, t + 2);
@@ -663,6 +683,11 @@ pub(crate) mod tests {
             run.attributes
                 .contains(&Attribute::int(AttrKey::PrNumber, 4242)),
             "the sentinel events were applied, the valid report included"
+        );
+        assert!(
+            run.attributes
+                .contains(&Attribute::int(AttrKey::OperationsCount, 7)),
+            "the shell commands were classified"
         );
         spans
     }
@@ -745,7 +770,10 @@ pub(crate) mod tests {
                 );
             }
             for name in names {
-                assert!(name == "agent.run" || name == "agent.status", "{name}");
+                assert!(
+                    crate::telemetry::SPAN_NAMES.contains(&name.as_str()),
+                    "{name}"
+                );
             }
         }
         // Each span carries each key at most once.

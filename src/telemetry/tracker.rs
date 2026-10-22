@@ -1,6 +1,6 @@
 //! The run tracker: turns what the daemon sees — agents starting and ending,
 //! the events on its broadcast, human input — into finished
-//! `agent.run` and `agent.status` spans.
+//! `agent.run`, `agent.status`, `agent.operation` and `agent.ci` spans.
 //!
 //! Pure and synchronous. Every method takes the current time, so tests drive
 //! it deterministically; [`super::exporter::Telemetry`] owns one behind a
@@ -12,10 +12,16 @@
 //! dashboard card showed — not a second derivation that could drift from it.
 //! The run's pull request is read back from the same card, so a newer report, an
 //! older one and an explicit "no pull request" are folded as the card folds
-//! them. That state holds the events' content in memory, as every client's
-//! does; nothing from it but the status enum and the pull request's number
-//! reaches a span, and it is dropped with the run, so the tracker holds nothing
-//! per pane once a pane's runs have ended.
+//! them, and so are its checks, which make the run's `agent.ci` stretches
+//! ([`super::ci`]). That state holds the events' content in memory, as every
+//! client's does; nothing from it but the status enum and the pull request's
+//! number and check counts reaches a span, and it is dropped with the run, so
+//! the tracker holds nothing per pane once a pane's runs have ended.
+//!
+//! **A shell command is an `agent.operation`**, from the shell tool's start to
+//! its end as the agent's hooks report them. Its command text is classified
+//! the moment the start arrives ([`super::operation::classify`]) and only the
+//! classification is kept with the operation.
 //!
 //! **A run is prepared before its agent starts.** [`RunTracker::prepare_run`]
 //! is called before the agent process exists, so no event the agent causes can
@@ -37,11 +43,16 @@ use std::collections::HashMap;
 use crate::event::{AgentEvent, AgentType, DAEMON_PANE_CLOSED_METADATA_KEY, EventType};
 use crate::state::{AppState, SessionStatus};
 
+use super::ci::{CiEffect, RunCi};
+use super::operation::{Operation, classify, is_shell_tool};
 use super::run_context::RunContext;
 use super::span::{
     Attribute, SpanEventRecord, SpanId, SpanRecord, TraceId, new_span_id, new_trace_id,
 };
-use super::{AttrKey, EVENT_INTERVENTION, EVENT_STATUS_CHANGE, SPAN_AGENT_RUN, SPAN_AGENT_STATUS};
+use super::{
+    AttrKey, EVENT_CI_CHANGE, EVENT_INTERVENTION, EVENT_STATUS_CHANGE, SPAN_AGENT_CI,
+    SPAN_AGENT_OPERATION, SPAN_AGENT_RUN, SPAN_AGENT_STATUS,
+};
 
 /// Human input closer together than this is one intervention: a burst of
 /// keystrokes, not one per key.
@@ -64,6 +75,14 @@ pub const REPLACED_RUN_GRACE_NANOS: u64 = 60_000_000_000;
 /// Replaced runs waiting for their own end at once, across every pane. Past
 /// it the longest-waiting one is ended as [`EndReason::Unknown`].
 pub const MAX_REPLACED_RUNS: usize = 64;
+
+/// Shell commands open at once in one run. Past it the oldest is ended where
+/// it stands, so starts whose end never arrives cannot pile up.
+pub const MAX_OPEN_OPERATIONS: usize = 64;
+
+/// The event metadata key carrying the agent's id for one tool call, which
+/// pairs a call's end with its start when several run at once.
+const TOOL_CALL_ID_METADATA_KEY: &str = "tool_use_id";
 
 /// How a run ended, as far as the deck can tell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +188,15 @@ struct OpenStatus {
     start: u64,
 }
 
+/// A shell command still running: its classification only, never its text.
+struct OpenOperation {
+    span_id: SpanId,
+    start: u64,
+    operation: Operation,
+    /// The agent's id for the call, when it reports one.
+    call_id: Option<String>,
+}
+
 /// A run whose agent is starting: see [`RunTracker::prepare_run`].
 struct PendingRun {
     start: RunStart,
@@ -234,6 +262,9 @@ struct ActiveRun {
     interventions: u64,
     status_changes: u64,
     last_human_input: Option<u64>,
+    operations: Vec<OpenOperation>,
+    operations_count: u64,
+    ci: RunCi,
 }
 
 /// A run a newer generation of its pane replaced before its own end was seen:
@@ -390,6 +421,9 @@ impl RunTracker {
                 interventions: 0,
                 status_changes: 0,
                 last_human_input: None,
+                operations: Vec::new(),
+                operations_count: 0,
+                ci: RunCi::default(),
             },
         );
     }
@@ -502,7 +536,14 @@ impl RunTracker {
         if event.event_type == EventType::PullRequest
             && let Some(pr) = card_pull_request(&run.cards, event)
         {
-            run.pr_number = pr;
+            run.pr_number = pr.as_ref().map(|pr| pr.number);
+            let checks = pr.and_then(|pr| pr.checks);
+            for effect in run.ci.observe(run.pr_number, checks, now, new_span_id) {
+                record_ci(run, effect, now, &mut self.finished);
+            }
+        }
+        if is_shell_tool(event.tool_name.as_deref()) {
+            observe_operation(run, event, now, &mut self.finished);
         }
         let status = run
             .cards
@@ -625,6 +666,12 @@ impl RunTracker {
         if let Some(open) = run.status.take() {
             self.finished.push(status_span(&run, open, now));
         }
+        for open in std::mem::take(&mut run.operations) {
+            self.finished.push(operation_span(&run, open, now));
+        }
+        if let Some(effect) = run.ci.end_run() {
+            record_ci(&mut run, effect, now, &mut self.finished);
+        }
         self.finished.push(run_span(run, reason, exit_code, now));
     }
 
@@ -693,12 +740,113 @@ impl RunTracker {
     }
 }
 
+/// A shell tool's start or end reached `run`: open an operation, or end the
+/// one it belongs to — the open one with the same call id, else the oldest.
+/// A failed call ends as an `Error` event, which ends it the same way.
+fn observe_operation(
+    run: &mut ActiveRun,
+    event: &AgentEvent,
+    now: u64,
+    finished: &mut Vec<SpanRecord>,
+) {
+    let call_id = event.metadata.get(TOOL_CALL_ID_METADATA_KEY);
+    match event.event_type {
+        EventType::ToolStart => {
+            if run.operations.len() >= MAX_OPEN_OPERATIONS {
+                let oldest = run.operations.remove(0);
+                finished.push(operation_span(run, oldest, now));
+            }
+            run.operations_count += 1;
+            run.operations.push(OpenOperation {
+                span_id: new_span_id(),
+                start: now,
+                operation: classify(event.tool_detail.as_deref()),
+                call_id: call_id.cloned(),
+            });
+        }
+        EventType::ToolEnd | EventType::Error => {
+            let i = call_id
+                .and_then(|id| {
+                    run.operations
+                        .iter()
+                        .position(|op| op.call_id.as_ref() == Some(id))
+                })
+                .or_else(|| (!run.operations.is_empty()).then_some(0));
+            if let Some(i) = i {
+                let open = run.operations.remove(i);
+                finished.push(operation_span(run, open, now));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Record what one observation of the run's checks changed.
+fn record_ci(run: &mut ActiveRun, effect: CiEffect, now: u64, finished: &mut Vec<SpanRecord>) {
+    match effect {
+        CiEffect::Change { from, to, pr } => {
+            let mut attributes = Vec::with_capacity(3);
+            if let Some(from) = from {
+                attributes.push(Attribute::str(AttrKey::CiFrom, from.as_str()));
+            }
+            attributes.push(Attribute::str(AttrKey::CiTo, to.as_str()));
+            attributes.push(Attribute::int(AttrKey::PrNumber, saturating_i64(pr)));
+            run.push_event(SpanEventRecord {
+                name: EVENT_CI_CHANGE,
+                time_unix_nanos: now,
+                attributes,
+            });
+        }
+        CiEffect::Ended {
+            stretch,
+            result,
+            checks,
+        } => {
+            let mut attributes = identity_attributes(&run.start_info);
+            attributes.push(Attribute::int(
+                AttrKey::PrNumber,
+                saturating_i64(stretch.pr),
+            ));
+            if let Some(result) = result {
+                attributes.push(Attribute::str(AttrKey::CiResult, result.as_str()));
+            }
+            if let Some(checks) = checks {
+                attributes.push(Attribute::int(
+                    AttrKey::CiChecksPassing,
+                    i64::from(checks.passing),
+                ));
+                attributes.push(Attribute::int(
+                    AttrKey::CiChecksFailing,
+                    i64::from(checks.failing),
+                ));
+                attributes.push(Attribute::int(
+                    AttrKey::CiChecksSkipped,
+                    i64::from(checks.skipped),
+                ));
+            }
+            finished.push(SpanRecord {
+                trace_id: run.trace_id,
+                span_id: stretch.span_id,
+                parent_span_id: Some(run.span_id),
+                name: SPAN_AGENT_CI,
+                start_unix_nanos: stretch.start,
+                end_unix_nanos: now.max(stretch.start),
+                attributes,
+                events: Vec::new(),
+            });
+        }
+    }
+}
+
 /// The pull request the card `event` reported on now holds — `Some(None)` when
 /// it holds none — or `None` when the run holds no such card, so the report had
 /// nothing to land on. Read after the card applied the report, so the card's own
 /// rules decide: a report older than the one it holds is ignored, and a report
 /// of no pull request clears it.
-fn card_pull_request(cards: &AppState, event: &AgentEvent) -> Option<Option<u64>> {
+fn card_pull_request(
+    cards: &AppState,
+    event: &AgentEvent,
+) -> Option<Option<crate::pull_request_info::PullRequestInfo>> {
     cards
         .sessions
         .iter()
@@ -709,7 +857,7 @@ fn card_pull_request(cards: &AppState, event: &AgentEvent) -> Option<Option<u64>
                     && s.agent_id == event.agent_id)
         })
         .max_by_key(|(_, s)| s.last_activity)
-        .map(|(_, s)| s.pull_request.as_ref().map(|pr| pr.number))
+        .map(|(_, s)| s.pull_request.clone())
 }
 
 /// The `deck.status` value for a card status.
@@ -751,6 +899,32 @@ fn status_span(run: &ActiveRun, open: OpenStatus, now: u64) -> SpanRecord {
         span_id: open.span_id,
         parent_span_id: Some(run.span_id),
         name: SPAN_AGENT_STATUS,
+        start_unix_nanos: open.start,
+        end_unix_nanos: now.max(open.start),
+        attributes,
+        events: Vec::new(),
+    }
+}
+
+fn operation_span(run: &ActiveRun, open: OpenOperation, now: u64) -> SpanRecord {
+    let mut attributes = identity_attributes(&run.start_info);
+    attributes.push(Attribute::str(
+        AttrKey::OperationRunner,
+        open.operation.runner.as_str(),
+    ));
+    attributes.extend(Attribute::opt_str(
+        AttrKey::OperationProgram,
+        open.operation.program.as_deref(),
+    ));
+    attributes.extend(Attribute::opt_str(
+        AttrKey::OperationWord,
+        open.operation.word.as_deref(),
+    ));
+    SpanRecord {
+        trace_id: run.trace_id,
+        span_id: open.span_id,
+        parent_span_id: Some(run.span_id),
+        name: SPAN_AGENT_OPERATION,
         start_unix_nanos: open.start,
         end_unix_nanos: now.max(open.start),
         attributes,
@@ -804,6 +978,18 @@ fn run_span(run: ActiveRun, reason: EndReason, exit_code: Option<i32>, now: u64)
     attributes.push(Attribute::int(
         AttrKey::StatusChangesCount,
         saturating_i64(run.status_changes),
+    ));
+    attributes.push(Attribute::int(
+        AttrKey::OperationsCount,
+        saturating_i64(run.operations_count),
+    ));
+    attributes.push(Attribute::int(
+        AttrKey::CiRoundsCount,
+        saturating_i64(run.ci.rounds),
+    ));
+    attributes.push(Attribute::int(
+        AttrKey::CiFailuresCount,
+        saturating_i64(run.ci.failures),
     ));
     SpanRecord {
         trace_id: run.trace_id,
@@ -1542,6 +1728,266 @@ pub(crate) mod tests {
             !statuses(&p2).contains(&AttrValue::Str("working".into())),
             "{:?}",
             statuses(&p2)
+        );
+    }
+
+    /// A shell tool event for `pane`: `tool` with `command` as its detail and
+    /// `call` as the agent's id for the call.
+    fn shell(
+        pane: &str,
+        event_type: EventType,
+        tool: &str,
+        command: Option<&str>,
+        call: Option<&str>,
+    ) -> AgentEvent {
+        let mut e = event(pane, event_type);
+        e.tool_name = Some(tool.into());
+        e.tool_detail = command.map(str::to_string);
+        if let Some(call) = call {
+            e.metadata
+                .insert(TOOL_CALL_ID_METADATA_KEY.into(), call.to_string());
+        }
+        e
+    }
+
+    fn operations(spans: &[SpanRecord]) -> Vec<(Vec<Attribute>, u64, u64)> {
+        spans
+            .iter()
+            .filter(|s| s.name == SPAN_AGENT_OPERATION)
+            .map(|s| {
+                (
+                    s.attributes[2..].to_vec(),
+                    s.start_unix_nanos,
+                    s.end_unix_nanos,
+                )
+            })
+            .collect()
+    }
+
+    fn op_attrs(runner: &str, program: Option<&str>, word: Option<&str>) -> Vec<Attribute> {
+        let mut out = vec![Attribute::str(AttrKey::OperationRunner, runner)];
+        out.extend(Attribute::opt_str(AttrKey::OperationProgram, program));
+        out.extend(Attribute::opt_str(AttrKey::OperationWord, word));
+        out
+    }
+
+    /// One `agent.operation` per shell command, from its start to its end,
+    /// paired by call id when several overlap and by age otherwise; other
+    /// tools make none, and the run counts them.
+    #[test]
+    fn shell_commands_become_operations() {
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        tracker.observe_event(&event("p1", EventType::SessionStart), 1);
+        let seq = [
+            shell(
+                "p1",
+                EventType::ToolStart,
+                "Bash",
+                Some("cargo test --workspace"),
+                Some("a"),
+            ),
+            shell(
+                "p1",
+                EventType::ToolStart,
+                "Bash",
+                Some("rwx sandbox exec -- make ci"),
+                Some("b"),
+            ),
+            shell(
+                "p1",
+                EventType::ToolStart,
+                "Read",
+                Some("/secret/path"),
+                Some("c"),
+            ),
+            shell(
+                "p1",
+                EventType::ToolEnd,
+                "Bash",
+                Some("rwx sandbox exec -- make ci"),
+                Some("b"),
+            ),
+            shell("p1", EventType::ToolEnd, "Read", None, Some("c")),
+            // Pi's end names the tool and nothing else.
+            shell("p1", EventType::ToolEnd, "bash", None, None),
+            shell(
+                "p1",
+                EventType::ToolStart,
+                "exec",
+                Some("echo hunter2"),
+                None,
+            ),
+            shell("p1", EventType::Error, "exec", Some("echo hunter2"), None),
+            shell(
+                "p1",
+                EventType::ToolStart,
+                "shell",
+                Some("/bin/sh -lc cargo fmt"),
+                None,
+            ),
+        ];
+        for (t, e) in seq.iter().enumerate() {
+            tracker.observe_event(e, 10 + t as u64);
+        }
+        tracker.end_run("p1", EndReason::Exited, None, 100);
+        let spans = tracker.take_finished();
+        assert_eq!(
+            operations(&spans),
+            vec![
+                (op_attrs("rwx_sandbox", Some("make"), Some("ci")), 11, 13),
+                (op_attrs("local", Some("cargo"), Some("test")), 10, 15),
+                (op_attrs("local", Some("echo"), None), 16, 17),
+                (op_attrs("local", Some("cargo"), Some("fmt")), 18, 100),
+            ]
+        );
+        let run = run_span_of(&spans);
+        for op in spans.iter().filter(|s| s.name == SPAN_AGENT_OPERATION) {
+            assert_eq!(op.parent_span_id, Some(run.span_id));
+            assert_eq!(op.trace_id, run.trace_id);
+            assert_eq!(
+                attr(op, AttrKey::RunId),
+                Some(&AttrValue::Str("run-p1".into()))
+            );
+        }
+        assert_eq!(
+            attr(run, AttrKey::OperationsCount),
+            Some(&AttrValue::Int(4))
+        );
+    }
+
+    /// Starts whose end never arrives are bounded per run.
+    #[test]
+    fn open_operations_are_bounded() {
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        for t in 0..(MAX_OPEN_OPERATIONS as u64 + 3) {
+            tracker.observe_event(
+                &shell("p1", EventType::ToolStart, "Bash", Some("make"), None),
+                t,
+            );
+        }
+        assert_eq!(operations(&tracker.take_finished()).len(), 3);
+        tracker.end_run("p1", EndReason::Exited, None, 1000);
+        assert_eq!(
+            operations(&tracker.take_finished()).len(),
+            MAX_OPEN_OPERATIONS
+        );
+    }
+
+    fn checks_report(
+        pane: &str,
+        number: u64,
+        revision: u64,
+        state: &str,
+        counts: (u32, u32, u32),
+    ) -> AgentEvent {
+        let mut pr = pr_report(pane, Some(number), Some(revision));
+        pr.metadata.insert(
+            crate::event::PULL_REQUEST_METADATA_KEY.into(),
+            format!(
+                r#"{{"number":{number},"url":"https://github.com/o/r/pull/{number}","state":"open","checks":{{"state":"{state}","passing":{},"failing":{},"pending":0,"skipped":{}}}}}"#,
+                counts.0, counts.1, counts.2
+            ),
+        );
+        pr
+    }
+
+    /// The run's pull request's checks, as the card folds the deck's reports:
+    /// a change event per new result, an `agent.ci` span per pending stretch
+    /// with its result and counts, and the run's round and failure counts. A
+    /// report older than the card's is ignored.
+    #[test]
+    fn ci_time_follows_the_cards_checks() {
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        tracker.observe_event(&event("p1", EventType::SessionStart), 1);
+        for (t, report) in [
+            checks_report("p1", 9, 1, "pending", (0, 0, 0)),
+            checks_report("p1", 9, 2, "failing", (5, 1, 2)),
+            // Older than the card's: ignored.
+            checks_report("p1", 9, 1, "pending", (0, 0, 0)),
+            checks_report("p1", 9, 3, "pending", (5, 0, 2)),
+            checks_report("p1", 9, 4, "passing", (8, 0, 2)),
+            checks_report("p1", 9, 5, "pending", (0, 0, 0)),
+        ]
+        .iter()
+        .enumerate()
+        {
+            tracker.observe_event(report, 10 * (t as u64 + 1));
+        }
+        tracker.end_run("p1", EndReason::Exited, None, 100);
+        let spans = tracker.take_finished();
+        let ci: Vec<_> = spans
+            .iter()
+            .filter(|s| s.name == SPAN_AGENT_CI)
+            .map(|s| {
+                (
+                    attr(s, AttrKey::CiResult).cloned(),
+                    attr(s, AttrKey::CiChecksPassing).cloned(),
+                    attr(s, AttrKey::CiChecksFailing).cloned(),
+                    attr(s, AttrKey::CiChecksSkipped).cloned(),
+                    s.start_unix_nanos,
+                    s.end_unix_nanos,
+                )
+            })
+            .collect();
+        let int = |v: i64| Some(AttrValue::Int(v));
+        let s = |v: &str| Some(AttrValue::Str(v.into()));
+        assert_eq!(
+            ci,
+            vec![
+                (s("failing"), int(5), int(1), int(2), 10, 20),
+                (s("passing"), int(8), int(0), int(2), 40, 50),
+                (None, int(0), int(0), int(0), 60, 100),
+            ]
+        );
+        let run = run_span_of(&spans);
+        for span in spans.iter().filter(|s| s.name == SPAN_AGENT_CI) {
+            assert_eq!(span.parent_span_id, Some(run.span_id));
+            assert_eq!(attr(span, AttrKey::PrNumber), int(9).as_ref());
+        }
+        let changes: Vec<_> = run
+            .events
+            .iter()
+            .filter(|e| e.name == EVENT_CI_CHANGE)
+            .map(|e| e.attributes.clone())
+            .collect();
+        assert_eq!(changes.len(), 5);
+        assert_eq!(
+            changes[0],
+            vec![
+                Attribute::str(AttrKey::CiTo, "pending"),
+                Attribute::int(AttrKey::PrNumber, 9)
+            ],
+            "no from on the first"
+        );
+        assert_eq!(
+            changes[1][..2],
+            [
+                Attribute::str(AttrKey::CiFrom, "pending"),
+                Attribute::str(AttrKey::CiTo, "failing"),
+            ]
+        );
+        assert_eq!(attr(run, AttrKey::CiRoundsCount), int(2).as_ref());
+        assert_eq!(attr(run, AttrKey::CiFailuresCount), int(1).as_ref());
+    }
+
+    /// A run with no pull request reports no CI, with zero counts.
+    #[test]
+    fn a_run_without_ci_counts_zero() {
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        tracker.end_run("p1", EndReason::Exited, None, 1);
+        let spans = tracker.take_finished();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            attr(&spans[0], AttrKey::CiRoundsCount),
+            Some(&AttrValue::Int(0))
+        );
+        assert_eq!(
+            attr(&spans[0], AttrKey::OperationsCount),
+            Some(&AttrValue::Int(0))
         );
     }
 

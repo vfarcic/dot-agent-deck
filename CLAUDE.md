@@ -20,7 +20,7 @@
 
     | tier | what | when |
     | --- | --- | --- |
-    | always | `cargo test-fast` (alias for `cargo nextest run --workspace`) — protocol/state tests plus L1 widget/render tests | per task, unchanged |
+    | always | `cargo test-fast` (alias for `cargo nextest run --workspace`, with `OTEL_SDK_DISABLED=true` set for the tests) — protocol/state tests plus L1 widget/render tests | per task, unchanged |
     | **scoped to the change** | **the tests covering what you touched — any tier, credentialed included** | per task |
     | CI | lane 1 in full — the `e2e-deterministic` check, which runs `cargo test-e2e`'s selection from one nextest archive in five shards | per PR; **monitor and analyse that run, do not reproduce it locally** |
 

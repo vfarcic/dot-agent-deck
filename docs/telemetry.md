@@ -1,10 +1,10 @@
 # Telemetry
 
-The deck can send a record of every agent run to an OpenTelemetry backend of your choice: which agent ran in which pane, its role and orchestration, how long it worked, when its status changed, when you stepped in, and how it ended. Collected over weeks and across machines, that record answers questions such as which agent or model finishes a kind of task with the least help from you, or whether a change to your `CLAUDE.md` or skills made agents stumble less.
+The deck can send a record of every agent run to an OpenTelemetry backend of your choice: which agent ran in which pane, its role and orchestration, how long it worked, when its status changed, when you stepped in, what kinds of shell commands it ran and how long they took, how long its pull request's CI took, and how it ended. Collected over weeks and across machines, that record answers questions such as which agent or model finishes a kind of task with the least help from you, whether a change to your `CLAUDE.md` or skills made agents stumble less, or how much of a run's time went to tests and CI.
 
 **It is off unless you configure it.** With no OpenTelemetry endpoint set, the deck sends nothing and behaves exactly as it does without this feature. You turn it on with the standard OpenTelemetry environment variables, so a backend that accepts OTLP over HTTP with its credentials in a header works, hosted or your own; [Connections](#connections) has what the deck's connection does and does not support.
 
-The deck sends metadata only. Prompts, file contents, agent output and your API key are never part of it; [What is never sent](#what-is-never-sent) has the full list, and the two values it sends exactly as you wrote them: your own service name and resource attributes.
+The deck sends metadata only. Prompts, file contents, agent output and your API key are never part of it; [What is never sent](#what-is-never-sent) has the full list, the two values it sends exactly as you wrote them (your own service name and resource attributes), and the one thing it reads from a command line: a shell command's program and first word, filtered.
 
 Telemetry behaves the same in the TUI and in the desktop app, because the daemon that runs the agents is what sends it. The only difference between the two clients is where you set the variables.
 
@@ -81,12 +81,14 @@ The deck's runs appear in a dataset named `dot-agent-deck` (or your `OTEL_SERVIC
 - `WHERE name = agent.run`, `GROUP BY deck.agent`, `VISUALIZE HEATMAP(duration_ms)` — how long runs take, per agent.
 - `WHERE name = agent.run`, `GROUP BY deck.role`, `VISUALIZE AVG(deck.interventions.count)` — which roles need you most.
 - `WHERE name = agent.status AND deck.status = blocked`, `GROUP BY host.name`, `VISUALIZE SUM(duration_ms)` — time spent waiting on a permission prompt, per machine.
+- `WHERE name = agent.operation`, `GROUP BY deck.operation.program, deck.operation.word, deck.operation.runner`, `VISUALIZE SUM(duration_ms)` — where agents' shell time goes, for example `cargo test` run locally against the same command in an RWX sandbox.
+- `WHERE name = agent.ci AND deck.ci.result exists`, `GROUP BY deck.ci.result`, `VISUALIZE HEATMAP(duration_ms)` — how long CI takes on the pull requests agents open; compare two periods to see what a change to your CI setup did.
 
 To see everything one run did, take its `deck.run.id` from an `agent.run` span and query all datasets in the environment with `WHERE deck.run.id = <that id>`: the deck's spans and the agent's own events come back together.
 
 ## What the deck sends
 
-The deck sends traces with two kinds of spans: `agent.run`, one per agent run, and `agent.status`, one per stretch of time the agent spent in one status, as a child of its run.
+The deck sends traces with four kinds of spans: `agent.run`, one per agent run, and, as children of their run, `agent.status`, one per stretch of time the agent spent in one status, `agent.operation`, one per shell command the agent ran, and `agent.ci`, one per stretch of time the run's pull request had CI checks running.
 
 A run starts when the deck starts an agent in a pane and ends when the agent exits, its pane is closed, or the daemon shuts down. Restarting an agent in the same pane starts a new run with a new id. **A value the deck cannot determine is left out, never guessed and never sent empty.** The deck does not send a span for a run that is still open when the daemon crashes or is killed by force.
 
@@ -117,6 +119,9 @@ A run starts when the deck starts an agent in a pane and ends when the agent exi
 | `deck.run.end_reason` | `exited` (the agent exited by itself), `closed` (its pane was closed, or the deck stopped the agent, for example to restart it in its pane), `daemon_shutdown`, or `unknown` when the deck could not tell how the run ended. |
 | `deck.status_changes.count` | How many status changes the run had. |
 | `deck.interventions.count` | How many times you stepped in (see `deck.intervention` below). |
+| `deck.operations.count` | How many shell commands the agent ran (see [`agent.operation`](#agentoperation)). |
+| `deck.ci.rounds.count` | How many times the pull request's checks went from running to a result (see [`agent.ci`](#agentci)). |
+| `deck.ci.failures.count` | How many of those ended failing. |
 
 Events on the `agent.run` span:
 
@@ -124,14 +129,53 @@ Events on the `agent.run` span:
 | --- | --- | --- |
 | `deck.status_change` | `deck.status.from`, `deck.status.to` | The agent's status changed. The first status of a run has only `deck.status.to`. |
 | `deck.intervention` | `deck.intervention.kind` (`input`) | You typed into the agent's pane from either client, or answered its question by voice in the desktop app. Keystrokes less than about five seconds apart count as one intervention. Input the deck sends on its own, such as a delegated task, a message or a scheduled prompt, is not counted, and neither are the replies your terminal sends without you, such as answers to the agent's questions about the cursor position or colours. |
+| `deck.ci.change` | `deck.ci.from`, `deck.ci.to`, `deck.pr.number` | The overall result of the pull request's checks changed: `pending`, `passing` or `failing`. The first one for a pull request has only `deck.ci.to`. |
 
 A run with many changes keeps its first 1024 events; the two counts keep counting after that.
 
-**Not sent yet.** A run does not say which model the agent used, the agent's exit code, which issue it worked on, or which skill or command started it. For the model, cost and tokens, use the agent's own telemetry (next section). Nor is there an event when an orchestrator hands work to a role; `deck.orchestration.id`, `deck.orchestrator` and `deck.role` tie an orchestration's runs together instead.
+**Not sent yet.** A run does not say which model the agent used, the agent's exit code, which issue it worked on, or which skill or command started it. For the model, cost and tokens, use the agent's own telemetry ([Agents' own telemetry](#agents-own-telemetry)). Nor is there an event when an orchestrator hands work to a role; `deck.orchestration.id`, `deck.orchestrator` and `deck.role` tie an orchestration's runs together instead.
 
 ### `agent.status`
 
 One span per stretch of time in one status, ending at the next change or with the run. Attributes: `deck.status`, plus `deck.run.id` and `deck.pane.id` so you can query status time without the parent. The statuses are the ones the dashboard shows ([Session Management](session-management.md)): `thinking`, `working`, `compacting`, `waiting`, `idle`, `error`, `blocked` and `unknown`.
+
+### `agent.operation`
+
+One span per shell command the agent ran, from when the agent started it to when it finished, as the agent reports its shell tool calls to the deck. Other tools, such as reading or editing a file, produce no span. A command still running when the run ends ends with the run.
+
+| Attribute | Value |
+| --- | --- |
+| `deck.operation.runner` | `rwx_sandbox` for a command run with `rwx sandbox exec … -- <command>`, `rwx_run` for `rwx run …`, and `local` otherwise. |
+| `deck.operation.program` | The program the command runs, without its directory: `cargo`, `npm`, `gh`. For an RWX sandbox command, the program run inside the sandbox. |
+| `deck.operation.word` | The first argument after the program that is not an option: `test` in `cargo test --workspace`, `pr` in `gh pr checks`. |
+| `deck.run.id`, `deck.pane.id` | The run, as on `agent.status`. |
+
+The deck reads the first line of the command. When it chains several commands, the first one that does more than set up the next is the one described: `cd`, `export`, `source`, `.`, `set` and `true` are skipped, and so are `VAR=value` assignments and an `env`, `sudo`, `command`, `time` or `nice` in front of the program. A command run through `sh -c` or `bash -c` is described by what it runs.
+
+The program and the word are each sent **only when they look like a command word**: lowercase letters, digits, `.`, `_` and `-`, starting with a letter or digit, and at most 32 characters. A path, a URL, a quoted message, anything with an uppercase letter, an `=` or a space, or anything longer is left out. For `echo`, `printf`, `cat`, `grep`, `rg`, `sed` and `awk`, whose first argument is text or a search pattern, the word is never sent, only the program.
+
+Which agents report their shell commands:
+
+| Agent | Shell commands become `agent.operation` spans |
+| --- | --- |
+| Claude Code | Yes, its `Bash` tool. |
+| OpenCode | Yes, its `bash` tool. |
+| Codex | Yes, its shell tool, through the hooks the deck installs for Codex. |
+| Devin | Yes, its `exec` tool. |
+| Pi | Yes, its `bash` tool, through the deck's Pi extension. |
+
+### `agent.ci`
+
+One span per stretch of time the run's pull request had CI checks running, from when the deck first saw them `pending` to when it saw them `passing` or `failing`. It comes from the same check of the pull request that puts the CI badge on the agent's card, so it covers the pull request of the agent's branch once the deck has found it.
+
+| Attribute | Value |
+| --- | --- |
+| `deck.pr.number` | The pull request. |
+| `deck.ci.result` | `passing` or `failing`. Absent when the stretch ended for another reason: the run ended first, or the agent's branch moved to another pull request. |
+| `deck.ci.checks.passing`, `deck.ci.checks.failing`, `deck.ci.checks.skipped` | How many checks were in each state when the stretch ended. |
+| `deck.run.id`, `deck.pane.id` | The run, as on `agent.status`. |
+
+The deck checks the pull request about once a minute (`DOT_AGENT_DECK_PR_REFRESH_SECS` in the daemon's environment changes that), so a stretch's start and end are each up to one check late: compare CI times over many runs rather than reading one to the second. The deck reads the checks as GitHub rolls them up for the pull request, which does not say which CI system ran each one, so to compare two CI setups, compare the periods before and after you switched.
 
 ## What is never sent
 
@@ -143,21 +187,25 @@ The deck builds what it sends from the attributes on this page. The values of `O
 - secrets: API keys, the values of environment variables, and the values of your OTLP headers (those go to the endpoint you configured as headers, and to nothing else, and the deck does not write them to its log);
 - pane titles, status details, branch names, working-directory paths, remote URLs, or command lines.
 
+**The one exception for command lines** is what [`agent.operation`](#agentoperation) describes: for each shell command, where it ran (`local`, `rwx_sandbox` or `rwx_run`), the name of the program and its first argument. The program and the argument are sent only when they have the shape of a command word (lowercase letters, digits, `.`, `_` and `-`, at most 32 characters), and the first argument of `echo`, `printf`, `cat`, `grep`, `rg`, `sed` and `awk` is never sent. Nothing else from the command is sent, and the deck's telemetry does not log it. To drop even these, delete the `agent.operation` spans in a Collector ([Trim what is sent](#trim-what-is-sent)).
+
 This covers what the **deck** sends to your backend. The deck's own log on your machine, when you turn it on, is separate from telemetry: it can record details of agents' tool calls, such as the first line of a command an agent ran ([Enabling Debug Logs](troubleshooting.md#enabling-debug-logs)). What an agent sends with its own telemetry is decided by that agent and its settings; see the next section.
 
 ## Agents' own telemetry
 
-Some agents send their own telemetry: token use, cost, model, tool decisions. With telemetry on, the deck gives every agent it starts the `OTEL_*` variables the daemon has, unchanged, except `OTEL_RESOURCE_ATTRIBUTES`. That one becomes your own value (if any) plus `deck.run.id`, `deck.pane.id`, `deck.agent`, the orchestration attributes where the run has them, `host.name` and `deck.telemetry.schema_version`. An agent that puts `OTEL_RESOURCE_ATTRIBUTES` on its data therefore sends it tagged with the run's `deck.run.id`, and you can join the two in the backend with no manual matching.
+Agents send their own telemetry too: token use, cost, model, tool decisions. With telemetry on, the deck gives every agent it starts the `OTEL_*` variables the daemon has, unchanged, except `OTEL_RESOURCE_ATTRIBUTES`. That one becomes your own value (if any) plus `deck.run.id`, `deck.pane.id`, `deck.agent`, the orchestration attributes where the run has them, `host.name` and `deck.telemetry.schema_version`. An agent that puts those attributes on its data sends it tagged with the run's `deck.run.id`, and you can join the two in the backend with no manual matching.
 
-Because the agents get the same endpoint and headers, an agent that reads them sends its telemetry to the same backend whether or not you meant it to. The table says which ones do.
+For each supported agent the deck also does what that agent needs to send to the same backend, with no setup from you. It never turns on an agent's recording of prompts, responses, tool arguments or tool output, and it leaves alone a setting you made yourself, in the environment or in the agent's own configuration.
 
-| Agent | Sends its own telemetry | Joins the deck's run | What is missing |
+| Agent | Sends its own telemetry | Joins the deck's run | How to keep it off |
 | --- | --- | --- | --- |
-| Claude Code | Yes, with `OTEL_EXPORTER_OTLP_ENDPOINT` set: the deck turns on its metrics and events (see below). | Yes: Claude Code puts `OTEL_RESOURCE_ATTRIBUTES` on every metric and event. | Its traces are a beta you turn on yourself. |
-| OpenCode | Yes, whenever `OTEL_EXPORTER_OTLP_ENDPOINT` is set: its logs and traces. | Yes: OpenCode puts `OTEL_RESOURCE_ATTRIBUTES` on what it sends. | No token or cost metrics; see below. |
-| Codex | Only when you configure it in Codex's own `~/.codex/config.toml`. | Expected, not yet confirmed. | Takes its endpoint from its own configuration, not from the deck's variables. |
-| Devin | Yes, when the `OTEL_EXPORTER_OTLP_*` variables are set (Devin for Terminal 3000.11.1 and later): agent events and metrics. | Unknown: Devin does not document whether it uses `OTEL_RESOURCE_ATTRIBUTES`. | The join is not confirmed. |
-| Pi | No, not built in. | Not applicable. | Needs a third-party extension, which the deck does not install. |
+| Claude Code | Yes: the deck turns on its metrics and events (see below). | Yes: Claude Code puts `OTEL_RESOURCE_ATTRIBUTES` on every metric and event. | `CLAUDE_CODE_ENABLE_TELEMETRY=0` |
+| OpenCode | Yes, whenever `OTEL_EXPORTER_OTLP_ENDPOINT` is set: its logs and traces. | Yes: OpenCode puts `OTEL_RESOURCE_ATTRIBUTES` on what it sends. | Use `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` instead of the general endpoint. |
+| Codex | Yes: the deck turns on its traces and metrics; its logs stay off. | Yes. | Name an exporter in Codex's own configuration. |
+| Devin | Yes: the deck gives each Devin run a configuration that turns on its events and metrics. | Yes, by the configuration the deck writes; not yet confirmed against a signed-in Devin. | `"enabled": false` in the `otel` block of Devin's configuration. |
+| Pi | Yes: the deck's Pi extension sends Pi's usage. | Yes. | `DOT_AGENT_DECK_PI_TELEMETRY=0` |
+
+Each agent's data appears under its own service name, for example `claude-code` or `pi`. The sections below say how to keep each one off in full; each "keep it off" setting goes in the daemon's environment, or in the agent's own configuration where it says so, and leaves the deck's own spans on.
 
 ### Claude Code
 
@@ -177,15 +225,29 @@ What OpenCode sends does not include token or cost metrics. OpenCode's `experime
 
 ### Codex
 
-Codex sends telemetry only when you configure an exporter in the `[otel]` table of `~/.codex/config.toml`, with its own endpoint and headers there ([Codex configuration](https://developers.openai.com/codex/config-advanced)); it does not pick up the deck's `OTEL_EXPORTER_OTLP_*` variables. Codex's documentation does not say whether it uses `OTEL_RESOURCE_ATTRIBUTES`. It is built on the OpenTelemetry SDK, whose default resource includes that variable, so its data is expected to carry `deck.run.id`; check one run in your backend before relying on it. Codex records prompts only when you set `log_user_prompt = true`.
+Codex sends telemetry only when its configuration names an exporter, so the deck names two when it starts Codex: it adds `-c otel.trace_exporter=…` and `-c otel.metrics_exporter=…` to the Codex command it runs, each pointing at your endpoint for that signal (`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` or `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, else `OTEL_EXPORTER_OTLP_ENDPOINT` with `/v1/traces` or `/v1/metrics` added) over `http/protobuf`, or `http/json` if that is your protocol. Codex then reads your headers from `OTEL_EXPORTER_OTLP_HEADERS` and tags what it sends with `OTEL_RESOURCE_ATTRIBUTES`, so its traces and metrics join the deck's run. Your headers are never put on the command line. The command your pane shows and saves is the one you configured; the additions are made only to the process the deck starts.
+
+The deck leaves Codex's **logs** off, because Codex's log events include the arguments and part of the output of each tool call. Turn them on yourself with `otel.exporter` in Codex's configuration if your backend may hold that.
+
+The deck adds nothing when your Codex configuration (`config.toml` in `CODEX_HOME`, by default `~/.codex`) already names an exporter in its `[otel]` table, when your Codex command already passes an `otel.` setting, when a signal's exporter variable is set to something other than `otlp` (for example `OTEL_METRICS_EXPORTER=none`, which keeps Codex's metrics off), or when your protocol is `grpc`. To keep Codex's telemetry off entirely, put `trace_exporter = "none"` and `metrics_exporter = "none"` in the `[otel]` table of Codex's configuration. A Codex started through a launcher of your own, such as a script with another name, gets no additions; name the exporters in Codex's configuration for it.
 
 ### Devin
 
-Devin for Terminal sends agent events and metrics when the standard `OTEL_EXPORTER_OTLP_*` variables are set or its configuration has an `otel` block ([Devin changelog](https://docs.devin.ai/cli/changelog/stable), 3000.11.1), so with the deck's telemetry on it sends to the same backend. Devin does not document whether it adds `OTEL_RESOURCE_ATTRIBUTES` to that data or what the events contain, so the join with the deck's run is not confirmed. If its data in your backend has no `deck.run.id`, the deck's `agent.run` span (agent `devin`, pane, start and end time) is what you have for those runs.
+Devin sends telemetry only when its user configuration names an endpoint, and it does not read `OTEL_RESOURCE_ATTRIBUTES`. So for each Devin run the deck writes a copy of your Devin configuration (`config.json` under `$XDG_CONFIG_HOME/devin` or `~/.config/devin`) with an `otel` block added, and starts Devin with `--config` pointing at it. The block holds your endpoint, the run's resource attributes (the deck's and your own), and `disable_user_prompt_logging` and `disable_tool_logging` set to `true`, because Devin otherwise records prompts, responses and tool arguments. Devin then sends its events and metrics over `http/protobuf`, with your headers from `OTEL_EXPORTER_OTLP_HEADERS`; it sends no traces, so a traces-only endpoint gives Devin nothing to send. The copy holds no header values, only you can read it, it lives in the deck's state directory, and the deck removes it when the run ends.
+
+If your Devin configuration already has an `otel` block, the deck keeps it exactly as you wrote it and adds only the resource attributes it lacks. To keep Devin's telemetry off, put `"enabled": false` in that block, and the deck starts Devin as usual. Nothing is added either when your Devin command already passes `--config`, or when your protocol is `grpc`.
+
+That Devin's data carries the run's `deck.run.id` this way follows from Devin's own documentation of its configuration; it has not yet been checked against a signed-in Devin. If its data in your backend has no `deck.run.id`, the deck's `agent.run` span (agent `devin`, pane, start and end time) is what you have for those runs.
 
 ### Pi
 
-Pi has no built-in OpenTelemetry export. Third-party Pi extensions add it; the deck does not install one, and whether an extension tags its data with `OTEL_RESOURCE_ATTRIBUTES` depends on the extension. Without one, the deck's own spans are the record of Pi runs.
+Pi has no OpenTelemetry export of its own, so the deck's Pi extension, which the deck already installs for Pi, sends it. With telemetry on and a logs endpoint (`OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`, or `OTEL_EXPORTER_OTLP_ENDPOINT` with `/v1/logs` added), it sends one log record per event under the service name `pi`, as OTLP/JSON with your headers, tagged with the run's resource attributes:
+
+- `pi.model_usage` for each reply from the model: the model, the provider, the input, output and cache token counts, and the cost Pi estimates;
+- `pi.tool_result` for each tool call: the tool's name, whether it succeeded, and how long it took;
+- `pi.session_start`, `pi.agent_start`, `pi.agent_end` and `pi.session_end`.
+
+It never sends a prompt, a reply, a tool's arguments or a tool's output. It sends in batches every few seconds and when Pi finishes a turn or exits, and a backend that is slow or down does not affect Pi. To keep it off, set `DOT_AGENT_DECK_PI_TELEMETRY=0` in the daemon's environment, or `OTEL_LOGS_EXPORTER=none`, which also keeps Claude Code's events off.
 
 ## Trim what is sent
 
@@ -208,12 +270,13 @@ processors:
         action: delete
       - key: deck.orchestration.name
         action: delete
-  # Drop whole spans: here, the per-status spans.
+  # Drop whole spans: here, the per-status and per-command spans.
   filter/trim:
     error_mode: ignore
     traces:
       span:
         - 'name == "agent.status"'
+        - 'name == "agent.operation"'
 
 exporters:
   otlphttp/honeycomb:
@@ -239,4 +302,4 @@ Any one of these turns the deck's telemetry off, from the daemon's next start:
 - set `OTEL_SDK_DISABLED=true`;
 - set `OTEL_TRACES_EXPORTER=none`.
 
-With it off, the deck sends nothing and no longer adds anything to the agents' environment, so Claude Code's telemetry goes back to whatever you set yourself. Agents that read the endpoint on their own, such as OpenCode and Devin, keep sending while the endpoint is still set, so unsetting the endpoint is the way to stop everything. Then stop the daemon (`dot-agent-deck daemon stop`) so the next one starts without it.
+With it off, the deck sends nothing and adds nothing to how it starts agents: no variables, no Codex or Devin additions, and the Pi extension stays quiet, so each agent's telemetry goes back to whatever you set yourself. An agent that reads the endpoint on its own, such as OpenCode, keeps sending while the endpoint is still set, so unsetting the endpoint is the way to stop everything. Then stop the daemon (`dot-agent-deck daemon stop`) so the next one starts without it.
