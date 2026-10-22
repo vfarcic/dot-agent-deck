@@ -114,7 +114,7 @@ A run starts when the deck starts an agent in a pane and ends when the agent exi
 | `deck.instructions.commit` | The commit that last changed `CLAUDE.md`, `AGENTS.md` or `.claude/skills` at the root of the agent's repository, whichever directory in it the agent runs from, so you can compare runs before and after an instructions change. Absent outside a git repository or when none of those has any history. |
 | `vcs.repository.name` | The repository's name, taken from the last part of its `origin` remote (`dot-agent-deck` for `git@github.com:vfarcic/dot-agent-deck.git`). The remote's URL itself is never sent. |
 | `deck.pr.number` | The pull request the agent's branch has, once the deck has found it (the same pull request the card's badge shows). |
-| `deck.run.end_reason` | `exited` (the agent exited by itself), `closed` (its pane was closed), `daemon_shutdown`, or `unknown`, for example when the agent was restarted in its pane. |
+| `deck.run.end_reason` | `exited` (the agent exited by itself), `closed` (its pane was closed, or the deck stopped the agent, for example to restart it in its pane), `daemon_shutdown`, or `unknown` when the deck could not tell how the run ended. |
 | `deck.status_changes.count` | How many status changes the run had. |
 | `deck.interventions.count` | How many times you stepped in (see `deck.intervention` below). |
 

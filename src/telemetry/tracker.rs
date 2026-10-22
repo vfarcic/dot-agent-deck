@@ -23,6 +23,14 @@
 //! (up to [`MAX_PENDING_EVENTS`]) and applied when [`RunTracker::commit_run`]
 //! opens it, and [`RunTracker::abort_run`] forgets a run whose agent never
 //! started.
+//!
+//! **A replaced run waits for its own end.** A respawn can open the new
+//! generation's run before the old generation's end is seen; the old run is
+//! then set aside, still open, and ended by its own generation's end, with that
+//! end's reason and time. One whose end does not come within
+//! [`REPLACED_RUN_GRACE_NANOS`], or that would hold more than
+//! [`MAX_REPLACED_RUNS`] aside, or that is still aside at daemon shutdown, ends
+//! as [`EndReason::Unknown`] at the time it was replaced.
 
 use std::collections::HashMap;
 
@@ -47,6 +55,15 @@ pub const MAX_EVENTS_PER_RUN: usize = 1024;
 /// Events held for a prepared run until it is committed. Its agent has only
 /// just started, so this is far more than the window ever sees.
 pub const MAX_PENDING_EVENTS: usize = 256;
+
+/// How long a replaced run waits for its own generation's end before it is
+/// ended as [`EndReason::Unknown`]. A respawn stops the old agent, so its end
+/// follows within moments; this only bounds an end that never comes.
+pub const REPLACED_RUN_GRACE_NANOS: u64 = 60_000_000_000;
+
+/// Replaced runs waiting for their own end at once, across every pane. Past
+/// it the longest-waiting one is ended as [`EndReason::Unknown`].
+pub const MAX_REPLACED_RUNS: usize = 64;
 
 /// How a run ended, as far as the deck can tell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,6 +236,14 @@ struct ActiveRun {
     last_human_input: Option<u64>,
 }
 
+/// A run a newer generation of its pane replaced before its own end was seen:
+/// see [`RunTracker::begin_run`].
+struct ReplacedRun {
+    run: ActiveRun,
+    /// When the newer generation's run opened.
+    at: u64,
+}
+
 impl ActiveRun {
     fn push_event(&mut self, event: SpanEventRecord) {
         if self.events.len() < MAX_EVENTS_PER_RUN {
@@ -256,6 +281,8 @@ pub struct RunTracker {
     runs: HashMap<String, ActiveRun>,
     /// Prepared runs, by run id.
     pending: HashMap<String, PendingRun>,
+    /// Runs replaced before their own end was seen, the longest-waiting first.
+    replaced: Vec<ReplacedRun>,
     finished: Vec<SpanRecord>,
     held_input: Option<HeldInput>,
     /// Test witness: the [`ShadowCards`] alive.
@@ -325,11 +352,27 @@ impl RunTracker {
         }
     }
 
-    /// Open a run. A run still open on the same pane is ended first with
-    /// [`EndReason::Unknown`]: the deck replaced it without reporting how.
+    /// Open a run. A run still open on the same pane is replaced: when both
+    /// know their generation and the two differ, it is set aside to be ended
+    /// by its own generation's end ([`Self::end_agent_run`], or the pane's
+    /// close broadcast naming it); otherwise it is ended now with
+    /// [`EndReason::Unknown`], since no end could be told apart as its own.
     pub fn begin_run(&mut self, start: RunStart, now: u64) {
-        if self.runs.contains_key(&start.pane_id) {
-            self.end_run(&start.pane_id, EndReason::Unknown, None, now);
+        self.expire_replaced(now);
+        if let Some(old) = self.runs.remove(&start.pane_id) {
+            let own_end_can_come = matches!(
+                (old.start_info.agent_id.as_deref(), start.agent_id.as_deref()),
+                (Some(a), Some(b)) if a != b
+            );
+            if own_end_can_come {
+                self.replaced.push(ReplacedRun { run: old, at: now });
+                if self.replaced.len() > MAX_REPLACED_RUNS {
+                    let oldest = self.replaced.remove(0);
+                    self.finish(oldest.run, EndReason::Unknown, None, oldest.at);
+                }
+            } else {
+                self.finish(old, EndReason::Unknown, None, now);
+            }
         }
         let pane_id = start.pane_id.clone();
         self.runs.insert(
@@ -373,6 +416,7 @@ impl RunTracker {
         } else if let Some(run) = self
             .runs
             .values_mut()
+            .chain(self.replaced.iter_mut().map(|r| &mut r.run))
             .find(|run| run.start_info.run_id == run_id)
         {
             run.context = context;
@@ -426,8 +470,11 @@ impl RunTracker {
     }
 
     /// Apply `event` to the run open on `pane_id`, unless it names another
-    /// generation of the pane.
+    /// generation of the pane. The pane's close broadcast naming a replaced
+    /// generation ends that generation's run.
     fn apply_to_run(&mut self, pane_id: &str, event: &AgentEvent, now: u64) {
+        let closed = event.event_type == EventType::SessionEnd
+            && event.metadata.contains_key(DAEMON_PANE_CLOSED_METADATA_KEY);
         let Some(run) = self.runs.get_mut(pane_id) else {
             return;
         };
@@ -436,11 +483,12 @@ impl RunTracker {
             event.agent_id.as_deref(),
         ) && ours != theirs
         {
+            if closed {
+                self.end_replaced(pane_id, theirs, EndReason::Closed, None, now);
+            }
             return;
         }
-        if event.event_type == EventType::SessionEnd
-            && event.metadata.contains_key(DAEMON_PANE_CLOSED_METADATA_KEY)
-        {
+        if closed {
             let pane_id = pane_id.to_string();
             self.end_run(&pane_id, EndReason::Closed, None, now);
             return;
@@ -511,20 +559,66 @@ impl RunTracker {
     /// [`Self::observe_human_input`], only while the run open on `pane_id` is
     /// `run_id`.
     pub fn observe_run_input(&mut self, pane_id: &str, run_id: &str, now: u64) {
-        if let Some(run) = self.runs.get_mut(pane_id)
-            && run.start_info.run_id == run_id
-        {
+        let open = self
+            .runs
+            .get_mut(pane_id)
+            .filter(|run| run.start_info.run_id == run_id);
+        if let Some(run) = open.or_else(|| {
+            self.replaced
+                .iter_mut()
+                .map(|r| &mut r.run)
+                .find(|run| run.start_info.pane_id == pane_id && run.start_info.run_id == run_id)
+        }) {
             run.human_input(now);
         }
     }
 
     /// End the run on `pane_id`, if one is open.
     pub fn end_run(&mut self, pane_id: &str, reason: EndReason, exit_code: Option<i32>, now: u64) {
-        let Some(mut run) = self.runs.remove(pane_id) else {
-            return;
+        if let Some(run) = self.runs.remove(pane_id) {
+            self.finish(run, reason, exit_code, now);
+        }
+    }
+
+    /// End the replaced run of generation `agent_id` on `pane_id`, if one is
+    /// waiting. Whether one was.
+    fn end_replaced(
+        &mut self,
+        pane_id: &str,
+        agent_id: &str,
+        reason: EndReason,
+        exit_code: Option<i32>,
+        now: u64,
+    ) -> bool {
+        let Some(i) = self.replaced.iter().position(|r| {
+            r.run.start_info.pane_id == pane_id
+                && r.run.start_info.agent_id.as_deref() == Some(agent_id)
+        }) else {
+            return false;
         };
+        let replaced = self.replaced.remove(i);
+        self.finish(replaced.run, reason, exit_code, now);
+        true
+    }
+
+    /// End every replaced run whose own end has not come within
+    /// [`REPLACED_RUN_GRACE_NANOS`] as [`EndReason::Unknown`], at the time it
+    /// was replaced.
+    fn expire_replaced(&mut self, now: u64) {
+        let (expired, waiting) = std::mem::take(&mut self.replaced)
+            .into_iter()
+            .partition(|r| now.saturating_sub(r.at) >= REPLACED_RUN_GRACE_NANOS);
+        self.replaced = waiting;
+        for r in expired {
+            self.finish(r.run, EndReason::Unknown, None, r.at);
+        }
+    }
+
+    /// Finish `run`'s spans: its held-back input counted, its open status
+    /// interval and the run itself ended at `now`.
+    fn finish(&mut self, mut run: ActiveRun, reason: EndReason, exit_code: Option<i32>, now: u64) {
         if let Some(held) = self.held_input.as_mut() {
-            for written in held(pane_id, &run.start_info.run_id) {
+            for written in held(&run.start_info.pane_id, &run.start_info.run_id) {
                 run.human_input(written);
             }
         }
@@ -537,7 +631,8 @@ impl RunTracker {
     /// [`Self::end_run`], but only when the run open on `pane_id` belongs to
     /// `agent_id` (or either side does not know its agent). An exit observed
     /// late for a generation a respawn already replaced must not end the new
-    /// generation's run.
+    /// generation's run: it ends the replaced run instead, with this reason
+    /// and time.
     ///
     /// An agent that exits before its run is committed — a fast exit can reach
     /// its PTY's end before the spawn path publishes it — ends its prepared
@@ -557,15 +652,11 @@ impl RunTracker {
         });
         if self.runs.contains_key(pane_id) && !other_generation {
             self.end_run(pane_id, reason, exit_code, now);
-            return;
-        }
-        let Some(agent_id) = agent_id else {
-            return;
-        };
-        if let Some(pending) = self
-            .pending
-            .values_mut()
-            .find(|p| p.start.pane_id == pane_id && p.start.agent_id.as_deref() == Some(agent_id))
+        } else if let Some(agent_id) = agent_id
+            && !self.end_replaced(pane_id, agent_id, reason, exit_code, now)
+            && let Some(pending) = self.pending.values_mut().find(|p| {
+                p.start.pane_id == pane_id && p.start.agent_id.as_deref() == Some(agent_id)
+            })
         {
             let reason = match reason {
                 EndReason::Closed => EndReason::Exited,
@@ -573,21 +664,27 @@ impl RunTracker {
             };
             pending.ended.get_or_insert((reason, exit_code, now));
         }
+        self.expire_replaced(now);
     }
 
     /// End every open run and forget every prepared one, for daemon
-    /// shutdown.
+    /// shutdown. A replaced run still waiting for its own end ends as
+    /// [`EndReason::Unknown`], at the time it was replaced.
     pub fn end_all(&mut self, reason: EndReason, now: u64) {
         self.pending.clear();
+        for r in std::mem::take(&mut self.replaced) {
+            self.finish(r.run, EndReason::Unknown, None, r.at);
+        }
         let panes: Vec<String> = self.runs.keys().cloned().collect();
         for pane in panes {
             self.end_run(&pane, reason, None, now);
         }
     }
 
-    /// Runs open and prepared: what the tracker holds between spans.
+    /// Runs open (replaced ones still waiting for their end included) and
+    /// prepared: what the tracker holds between spans.
     pub fn held(&self) -> (usize, usize) {
-        (self.runs.len(), self.pending.len())
+        (self.runs.len() + self.replaced.len(), self.pending.len())
     }
 
     /// The spans finished since the last call.
@@ -975,6 +1072,135 @@ pub(crate) mod tests {
         assert_eq!(tracker.run_id("p1"), Some("run-p1"));
         tracker.end_agent_run("p1", Some("agent-2"), EndReason::Exited, None, 2);
         assert!(tracker.run_id("p1").is_none());
+    }
+
+    fn generation(pane: &str, agent_id: &str) -> RunStart {
+        let mut s = start(pane);
+        s.run_id = format!("run-{pane}-{agent_id}");
+        s.agent_id = Some(agent_id.into());
+        s
+    }
+
+    fn end_of(spans: &[SpanRecord], run_id: &str) -> (AttrValue, u64) {
+        let run = spans
+            .iter()
+            .find(|s| {
+                s.name == SPAN_AGENT_RUN
+                    && attr(s, AttrKey::RunId) == Some(&AttrValue::Str(run_id.into()))
+            })
+            .unwrap_or_else(|| panic!("an agent.run span for {run_id}"));
+        (
+            attr(run, AttrKey::EndReason).unwrap().clone(),
+            run.end_unix_nanos,
+        )
+    }
+
+    /// Qodo item 18: a respawn's run can open before the old generation's end
+    /// is seen. The old run ends when its own end arrives, with that end's
+    /// reason and time — by its agent's end or by the pane's close naming it —
+    /// and the new run stays open.
+    #[test]
+    fn a_replaced_run_ends_with_its_own_late_end() {
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(generation("p1", "a1"), 0);
+        tracker.observe_event(&event("p1", EventType::SessionStart), 1);
+        tracker.observe_event(&event("p1", EventType::ToolStart), 2);
+        tracker.begin_run(generation("p1", "a2"), 10);
+        assert!(
+            !tracker
+                .take_finished()
+                .iter()
+                .any(|s| s.name == SPAN_AGENT_RUN),
+            "no run ended yet"
+        );
+        assert_eq!(tracker.held(), (2, 0));
+        tracker.end_agent_run("p1", Some("a1"), EndReason::Closed, Some(0), 15);
+        let spans = tracker.take_finished();
+        assert_eq!(
+            end_of(&spans, "run-p1-a1"),
+            (AttrValue::Str("closed".into()), 15)
+        );
+        let status = spans
+            .iter()
+            .find(|s| s.name == SPAN_AGENT_STATUS)
+            .expect("the old run's last status interval");
+        assert_eq!(
+            (attr(status, AttrKey::Status), status.end_unix_nanos),
+            (Some(&AttrValue::Str("working".into())), 15)
+        );
+        assert_eq!(tracker.run_id("p1"), Some("run-p1-a2"));
+
+        tracker.begin_run(generation("p1", "a3"), 20);
+        let mut closed = event("p1", EventType::SessionEnd);
+        closed.agent_id = Some("a2".into());
+        closed
+            .metadata
+            .insert(DAEMON_PANE_CLOSED_METADATA_KEY.into(), "1".into());
+        tracker.observe_event(&closed, 25);
+        let spans = tracker.take_finished();
+        assert_eq!(
+            end_of(&spans, "run-p1-a2"),
+            (AttrValue::Str("closed".into()), 25)
+        );
+        assert_eq!(tracker.run_id("p1"), Some("run-p1-a3"));
+        tracker.end_agent_run("p1", Some("a2"), EndReason::Exited, None, 26);
+        assert!(tracker.take_finished().is_empty(), "the old run ended once");
+        tracker.end_agent_run("p1", Some("a3"), EndReason::Exited, Some(0), 30);
+        assert_eq!(
+            end_of(&tracker.take_finished(), "run-p1-a3"),
+            (AttrValue::Str("exited".into()), 30)
+        );
+        assert_eq!(tracker.held(), (0, 0));
+    }
+
+    /// Qodo item 18: a replaced run whose own end never arrives is still
+    /// finished, as `unknown` at the time it was replaced — at shutdown, once
+    /// its grace passes, or when too many are waiting.
+    #[test]
+    fn a_replaced_run_whose_end_never_comes_ends_as_unknown() {
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(generation("p1", "a1"), 0);
+        tracker.begin_run(generation("p1", "a2"), 10);
+        tracker.end_all(EndReason::DaemonShutdown, 50);
+        let spans = tracker.take_finished();
+        assert_eq!(
+            end_of(&spans, "run-p1-a1"),
+            (AttrValue::Str("unknown".into()), 10)
+        );
+        assert_eq!(
+            end_of(&spans, "run-p1-a2"),
+            (AttrValue::Str("daemon_shutdown".into()), 50)
+        );
+        assert_eq!(tracker.held(), (0, 0));
+
+        tracker.begin_run(generation("p1", "b1"), 100);
+        tracker.begin_run(generation("p1", "b2"), 200);
+        tracker.end_agent_run(
+            "p2",
+            Some("x"),
+            EndReason::Exited,
+            None,
+            200 + REPLACED_RUN_GRACE_NANOS,
+        );
+        assert_eq!(
+            end_of(&tracker.take_finished(), "run-p1-b1"),
+            (AttrValue::Str("unknown".into()), 200)
+        );
+        assert_eq!(tracker.held(), (1, 0));
+
+        let t = 300 + REPLACED_RUN_GRACE_NANOS;
+        for i in 0..=MAX_REPLACED_RUNS {
+            tracker.begin_run(generation("p3", &format!("c{i}")), t + i as u64);
+        }
+        tracker.begin_run(generation("p3", "last"), t + 1000);
+        let spans = tracker.take_finished();
+        let runs: Vec<_> = spans.iter().filter(|s| s.name == SPAN_AGENT_RUN).collect();
+        assert_eq!(runs.len(), 1, "the longest-waiting one, past the cap");
+        assert_eq!(
+            end_of(&spans, "run-p3-c0"),
+            (AttrValue::Str("unknown".into()), t + 1)
+        );
+        assert_eq!(tracker.held(), (MAX_REPLACED_RUNS + 2, 0));
     }
 
     fn statuses(spans: &[SpanRecord]) -> Vec<AttrValue> {

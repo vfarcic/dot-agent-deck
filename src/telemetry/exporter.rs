@@ -1914,22 +1914,29 @@ mod tests {
         assert_eq!(count, Some(AttrValue::Int(1)));
         assert_eq!(times, vec![written]);
 
-        // A new generation replaces the run with no end_run for it.
+        // A new generation replaces the run before its end is seen: the run
+        // waits for its own end.
         begin(&telemetry, generation("p1", "a3"), &[]);
         telemetry.settled().await;
         telemetry.observe_client_input_at("p1", b"\x1b", now_unix_nanos(), window_held_open());
         begin(&telemetry, generation("p1", "a4"), &[]);
         telemetry.settled().await;
-        let (count, _) = run_of(&captured(&mut rx), "unknown");
-        assert_eq!(count, Some(AttrValue::Int(1)));
+        assert!(
+            captured(&mut rx).is_empty(),
+            "the replaced run is still open"
+        );
 
-        // A late close for an older generation leaves the newer one's Escape
-        // where it is.
+        // Its close, read late, ends it with its Escape, and leaves the newer
+        // run's Escape where it is.
         telemetry.observe_client_input_at("p1", b"\x1b", now_unix_nanos(), window_held_open());
         tx.send(pane_closed("p1", "a3")).unwrap();
         telemetry.settled().await;
-        assert!(captured(&mut rx).is_empty());
+        let (count, _) = run_of(&captured(&mut rx), "closed");
+        assert_eq!(count, Some(AttrValue::Int(1)));
         assert!(shared.lock_filters()["p1"][0].escape.is_some());
+        telemetry.end_run("p1", Some("a3"), EndReason::Exited, None);
+        telemetry.settled().await;
+        assert!(captured(&mut rx).is_empty(), "the replaced run ended once");
         telemetry.end_run("p1", Some("a4"), EndReason::Exited, None);
         telemetry.settled().await;
         let (count, _) = run_of(&captured(&mut rx), "exited");
