@@ -2236,7 +2236,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     const held = questionFormRef.current;
     if (!held) return undefined;
     return questionLost(
-      { deckId: held.target.deckId, agentId: held.target.agentId, questionId: held.target.questionId, revision: held.target.revision, spawnedAtMs: held.spawnedAtMs, inputBlocked: held.inputBlocked, deck: held.deck },
+      { deckId: held.target.deckId, agentId: held.target.agentId, questionId: held.target.questionId, revision: held.target.revision, spawnedAtMs: held.spawnedAtMs, inputBlocked: held.inputBlocked, deck: held.deck, incarnation: held.target.incarnation },
       { pane: paneRef.current, confirmation: confirmationRef.current, deck: selectedDeckRef.current },
     );
   }, []);
@@ -2321,7 +2321,8 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   /*
     PRD #1631 — the staleness rule: the answer, its confirmation and its
     countdown are dropped, with nothing sent, the moment the question waiting
-    is no longer the one answered, the pane changes or its agent is replaced,
+    is no longer the one answered, the pane changes, the deck restarts under
+    it or its agent is replaced,
     the pane stops taking input — its deck stopped answering, say (issue
     #1726) — a confirmation opens, or the selected deck changes. Each is
     something the host already hands down, so this subscribes rather than
@@ -2333,6 +2334,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   const paneQuestionDeck = pane?.deckId;
   const paneQuestionAgent = pane?.agentId;
   const paneQuestionSpawned = pane?.spawnedAtMs;
+  const paneQuestionIncarnation = pane?.incarnation;
   const paneQuestionBlocked = pane?.inputBlocked;
   const paneQuestionHidden = pane?.terminalHidden;
   useEffect(() => {
@@ -2347,7 +2349,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
        cancel it. */
     if (!lost || (lost.code === "question" && questionFormRef.current?.sending)) return;
     dropQuestion(questionLostSentence(lost));
-  }, [answerLost, confirmationOpen, dropQuestion, paneQuestionAgent, paneQuestionBlocked, paneQuestionDeck, paneQuestionHidden, paneQuestionId, paneQuestionRevision, paneQuestionSpawned, selectedDeckId]);
+  }, [answerLost, confirmationOpen, dropQuestion, paneQuestionAgent, paneQuestionBlocked, paneQuestionDeck, paneQuestionHidden, paneQuestionId, paneQuestionIncarnation, paneQuestionRevision, paneQuestionSpawned, selectedDeckId]);
 
   /**
    * PRD #1631 — an utterance said while the agent on screen waits on a
@@ -2427,7 +2429,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
        confirmation opened or the deck changed while the answer was worked
        out opens no countdown or confirmation over it (PR #1698 review). */
     const lost = questionLost(
-      { deckId: target.deckId, agentId: target.agentId, questionId: target.questionId, revision: target.revision, spawnedAtMs, inputBlocked, deck },
+      { deckId: target.deckId, agentId: target.agentId, questionId: target.questionId, revision: target.revision, spawnedAtMs, inputBlocked, deck, incarnation: target.incarnation },
       { pane: paneRef.current, confirmation: confirmationRef.current, deck: selectedDeckRef.current },
     );
     if (lost) {

@@ -220,6 +220,33 @@ describe("answering an agent's question by voice", () => {
   });
 
   /**
+   * Scenario (question/desktop/006, PR #1817 review 4347326620): the user
+   * says "yes" and the countdown starts. Before it runs out the deck
+   * restarts, and the pane shows its new process's agent under the same agent
+   * and question ids, with no spawn time to tell them apart. The countdown is
+   * called off at once and the panel says the agent is gone, with nothing
+   * sent.
+   */
+  it("question/desktop/006: the countdown is called off when the deck restarts under the same ids", async () => {
+    const voice = microphone();
+    const { rt, sendVoiceAnswer } = runtime(voice, () => SENT);
+    const before: VoicePane = { ...pane(), spawnedAtMs: undefined, incarnation: "p1" };
+    const view = render(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={before} selectedDeckId="local" />);
+    await turnOnVoice();
+
+    await speak(voice, "yes");
+    expect(screen.getByTestId("voice-question")).toHaveTextContent("sending in 5 s.");
+    await waitOut(2_000);
+    view.rerender(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={{ ...before, incarnation: "p2" }} selectedDeckId="local" />);
+    await flush();
+    expect(screen.queryByTestId("voice-question")).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Nothing was sent — that agent is gone (the deck restarted).");
+    await waitOut(VOICE_DICTATION_SEND_MS);
+    expect(sendVoiceAnswer).not.toHaveBeenCalled();
+    view.unmount();
+  });
+
+  /**
    * Scenario (question/desktop/006, audit R5): the question keeps its id but
    * the deck registers it again — a new revision — while nothing else about
    * the pane changes. A countdown is called off at once with nothing sent. An
@@ -299,6 +326,12 @@ describe("answering an agent's question by voice", () => {
     expect(questionLost(aim, { ...now, pane: { ...pane(), agentId: "a2" } })?.code).toBe("pane");
     expect(questionLost(aim, { ...now, pane: undefined })?.code).toBe("pane");
     expect(questionLost(aim, { ...now, pane: { ...pane(), spawnedAtMs: 2 } })?.code).toBe("replaced");
+    /* PR #1817 review 4347326620: the deck restarted under the same agent
+       and question ids, with no spawn time to tell them apart. */
+    const bound = { ...aim, spawnedAtMs: undefined, incarnation: "p1" };
+    const unspawned = { ...pane(), spawnedAtMs: undefined };
+    expect(questionLost(bound, { ...now, pane: { ...unspawned, incarnation: "p1" } })).toBeUndefined();
+    expect(questionLost(bound, { ...now, pane: { ...unspawned, incarnation: "p2" } })?.code).toBe("restarted");
     expect(questionLost(aim, { ...now, confirmation: true })?.code).toBe("confirmation");
     expect(questionLost(aim, { ...now, deck: "remote" })?.code).toBe("deck");
     /* Issue #1726: the pane stopping taking input calls it off; one that
