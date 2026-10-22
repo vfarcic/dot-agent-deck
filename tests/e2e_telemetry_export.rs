@@ -1019,7 +1019,7 @@ fn telemetry_otlp_012_daemon_shutdown_flushes_open_run() {
     );
 }
 
-/// Scenario: Send shell-tool start/end hooks for ordinary, wrapped, sandboxed and private commands to a stand-in pane, plus a non-shell tool. Close the pane and inspect completed operation spans for safe program/word metadata (an `rwx sandbox exec` command is program `rwx`, word `sandbox`, and no span says where a command ran), parent identity, duration and count, rejecting private or raw command text from every request body.
+/// Scenario: Send shell-tool start/end hooks for ordinary, wrapped, sandboxed and private commands to a stand-in pane, plus a non-shell tool, then run the real Codex hook command for one failed and one successful shell call. Close the pane and inspect completed operation spans for safe program/word metadata (an `rwx sandbox exec` command is program `rwx`, word `sandbox`, and no span says where a command ran), outcome `failure` on the failed call and no outcome on any plain end, parent identity, duration and count, rejecting private or raw command text and the commands' output from every request body.
 #[spec("telemetry/otlp/014")]
 #[test]
 fn telemetry_otlp_014_shell_operations_classify_without_content() {
@@ -1081,6 +1081,74 @@ fn telemetry_otlp_014_shell_operations_classify_without_content() {
             );
         }
     }
+    // Codex shell calls through the real hook command, which turns a
+    // `PostToolUse` whose response reports a non-zero exit into an `Error`:
+    // that call's operation is a failure. A plain end is no success, since a
+    // Codex command can fail without its end saying so.
+    let hook_cases = [
+        (
+            "make fail1741",
+            "fail1741",
+            "Exit code: 7\nWall time: 0 seconds\nOutput:\nPRIVATE_STDERR_1741",
+            EventType::Error,
+            "failure",
+        ),
+        (
+            "make pass1741",
+            "pass1741",
+            "Exit code: 0\nWall time: 0 seconds\nOutput:\nPRIVATE_STDOUT_1741",
+            EventType::ToolEnd,
+            "",
+        ),
+    ];
+    for (i, (command, _, response, end, _)) in hook_cases.iter().enumerate() {
+        let call = format!("telemetry-codex-call-{i}");
+        for (hook, expected, response) in [
+            ("PreToolUse", EventType::ToolStart, None),
+            ("PostToolUse", end.clone(), Some(*response)),
+        ] {
+            let mut payload = json!({
+                "session_id": "telemetry-operations", "turn_id": "telemetry-turn",
+                "hook_event_name": hook, "cwd": deck.workdir(),
+                "tool_name": "Bash", "tool_use_id": call,
+                "tool_input": {"command": command}
+            });
+            if let Some(response) = response {
+                payload["tool_response"] = json!(response);
+            }
+            let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+                .args(["hook", "--agent", "codex"])
+                .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
+                .env("DOT_AGENT_DECK_PANE_ID", pane)
+                .env("DOT_AGENT_DECK_AGENT_ID", &agent.id)
+                .env("HOME", deck.home_dir())
+                .env_remove("DOT_AGENT_DECK_PANE_CAPABILITY")
+                .current_dir(deck.workdir())
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn the Codex hook command");
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(payload.to_string().as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "hook --agent codex refused {hook}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            events.wait_for(
+                |event| {
+                    event.event_type == expected && event.metadata.get("tool_use_id") == Some(&call)
+                },
+                Duration::from_secs(10),
+            );
+        }
+    }
     close(&deck, &agent);
     let run = receiver.run(pane);
     let spans = receiver.spans();
@@ -1090,7 +1158,7 @@ fn telemetry_otlp_014_shell_operations_classify_without_content() {
         .collect();
     assert_eq!(
         operations.len(),
-        cases.len(),
+        cases.len() + hook_cases.len(),
         "one operation per shell start/end pair, excluding Read; exported spans: {spans:?}"
     );
     let mut actual: Vec<_> = operations
@@ -1099,18 +1167,27 @@ fn telemetry_otlp_014_shell_operations_classify_without_content() {
             (
                 attribute(span, "deck.operation.program"),
                 attribute(span, "deck.operation.word"),
+                attribute(span, "deck.operation.outcome"),
             )
         })
         .collect();
-    let mut expected: Vec<_> = cases
-        .iter()
-        .map(|(_, program, word)| (program.to_string(), word.to_string()))
-        .collect();
+    let mut expected: Vec<_> =
+        cases
+            .iter()
+            .map(|(_, program, word)| (program.to_string(), word.to_string(), String::new()))
+            .chain(hook_cases.iter().map(|(_, word, _, _, outcome)| {
+                ("make".into(), word.to_string(), outcome.to_string())
+            }))
+            .collect();
     actual.sort();
     expected.sort();
-    assert_eq!(actual, expected, "operation classification");
+    assert_eq!(actual, expected, "operation classification and outcome");
     for operation in &operations {
-        for key in ["deck.operation.program", "deck.operation.word"] {
+        for key in [
+            "deck.operation.program",
+            "deck.operation.word",
+            "deck.operation.outcome",
+        ] {
             if attribute(operation, key).is_empty() {
                 assert!(
                     !operation["attributes"]
@@ -1144,7 +1221,7 @@ fn telemetry_otlp_014_shell_operations_classify_without_content() {
     }
     assert_eq!(
         integer_attribute(&run, "deck.operations.count"),
-        cases.len() as u64
+        (cases.len() + hook_cases.len()) as u64
     );
     for request in receiver.requests() {
         let body = String::from_utf8_lossy(&request.body);
@@ -1154,6 +1231,7 @@ fn telemetry_otlp_014_shell_operations_classify_without_content() {
             "/secret/path",
             "/tmp/x",
             "Weird Name",
+            "Exit code",
         ] {
             assert!(!body.contains(secret), "operation content leaked: {secret}");
         }
