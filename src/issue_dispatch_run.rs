@@ -556,8 +556,9 @@ pub async fn run_issue_dispatch(
     // dispatched): already-claimed issues inside the cap are skipped, yielding a
     // clean "≤ max_per_run concurrent in-flight" ceiling (PRD concurrency model —
     // today's run only picks up slots yesterday's run vacated).
-    // PRD #421 M2.6(a) — the claim label is provisioned just in time: at most
-    // once per run, and only in a run that is about to write a claim, so a fire
+    // PRD #421 M2.6(a) — the claim label is provisioned just in time: once per
+    // run, plus at most one re-attempt when a later label add fails while it has
+    // not succeeded, and only in a run that is about to write a claim, so a fire
     // that dispatches nothing makes no GitHub write at all (#483).
     let mut claim_run = ClaimRun::new(&local_hostname());
 
@@ -1459,14 +1460,15 @@ impl ClaimBudget {
 }
 
 /// What the claims of one run share: the machine id the records name, the
-/// time budget every claim call draws from, and the two lookups made at most
-/// once per run — the label provisioning (PRD #421 M2.6(a)) and the signed-in
-/// account (amendment item 6). Each lookup is made lazily, on the first claim
-/// that needs it, so a run that dispatches nothing makes no claim call at all.
-/// A provisioning outcome, failure included, stands for the rest of the run,
-/// apart from the one retry [`ClaimRun::should_reprovision`] allows; only a
-/// successful account lookup is kept, so a failed one is tried again by the
-/// next claim that needs it (amendment item 13).
+/// time budget every claim call draws from, and two lookups — the label
+/// provisioning (PRD #421 M2.6(a)) and the signed-in account (amendment item
+/// 6). Each is made lazily, on the first claim that needs it, so a run that
+/// dispatches nothing makes no claim call at all. Provisioning is attempted
+/// once per run, plus at most one re-attempt when a later label add fails while
+/// provisioning has not succeeded ([`ClaimRun::should_reprovision`], amendment
+/// item 14); its outcome otherwise stands for the rest of the run. Only a
+/// successful account lookup is cached, so a failed one is retried by the next
+/// claim that needs a record (amendment item 13).
 struct ClaimRun {
     host_id: String,
     budget: ClaimBudget,
@@ -1572,7 +1574,8 @@ impl ClaimRun {
 }
 
 /// PRD #421 M2.2 — claim a just-dispatched issue on GitHub: provision the
-/// label (once per run, before the first claim write), add it to the issue,
+/// label (before the first claim write of the run, and at most once more if a
+/// label add fails while provisioning has not succeeded), add it to the issue,
 /// then write this deck's claimant record — editing its existing one if the
 /// issue already carries it, posting a new one otherwise.
 ///
