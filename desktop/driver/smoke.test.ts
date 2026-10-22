@@ -327,8 +327,11 @@ test("terminal_005 resizing and zooming the window resizes the agent's PTY", asy
     const zoomed = await agreedGrid(
       deck,
       agent.agent_id,
-      `fewer columns than ${resized.join("x")} after zooming in`,
-      ([cols, rows]) => cols < resized[0] && rows <= resized[1],
+      `a grid smaller than ${resized.join("x")} after zooming in`,
+      // Smaller, not fewer columns: which axis gives way depends on the layout
+      // at the zoomed width — measured, 77x24 to 71x20 on a dev box but 135x23
+      // to 134x19 on a GitHub runner.
+      ([cols, rows]) => cols <= resized[0] && rows <= resized[1] && (cols < resized[0] || rows < resized[1]),
     );
     // Measured, because the harness's click-placement check rests on it: a
     // webview zoom moves `devicePixelRatio` the way a scaled display does.
