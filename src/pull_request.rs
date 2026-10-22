@@ -110,26 +110,27 @@ pub(crate) const GH_PR_FIELDS: &str = "number,state,isDraft,reviewDecision,url,h
      isCrossRepository,headRepository,headRepositoryOwner,statusCheckRollup";
 
 /// Whether a fork's pull request is the branch's own: its head repository,
-/// `head_owner`/`head_name` as `gh` names them, is `push_repo`, the `owner/name`
-/// the branch is pushed to (issue #1779). A contributor whose `origin` is the
-/// upstream repository pushes the branch to their fork and opens the pull
-/// request from there; a stranger's fork is a different repository. GitHub
-/// compares names case-insensitively, and so does this. Anything missing — no
-/// push remote, or a head repository `gh` does not name, as for a deleted
-/// fork — is no match, so that pull request stays someone else's.
+/// `head_owner`/`head_name` as `gh` names them, is one of `push_repos`, the
+/// `owner/name`s the branch is pushed to (issue #1779). A contributor whose
+/// `origin` is the upstream repository pushes the branch to their fork and
+/// opens the pull request from there; a stranger's fork is a different
+/// repository. GitHub compares names case-insensitively, and so does this.
+/// Anything missing — no push remote, or a head repository `gh` does not
+/// name, as for a deleted fork — is no match, so that pull request stays
+/// someone else's.
 pub(crate) fn is_push_repo(
     head_owner: Option<&str>,
     head_name: Option<&str>,
-    push_repo: Option<&str>,
+    push_repos: &[String],
 ) -> bool {
-    let (Some(owner), Some(name), Some((push_owner, push_name))) = (
-        head_owner,
-        head_name,
-        push_repo.and_then(|p| p.split_once('/')),
-    ) else {
+    let (Some(owner), Some(name)) = (head_owner, head_name) else {
         return false;
     };
-    owner.eq_ignore_ascii_case(push_owner) && name.eq_ignore_ascii_case(push_name)
+    push_repos.iter().any(|repo| {
+        repo.split_once('/').is_some_and(|(push_owner, push_name)| {
+            owner.eq_ignore_ascii_case(push_owner) && name.eq_ignore_ascii_case(push_name)
+        })
+    })
 }
 
 /// The arguments of `gh pr list` for `branch` of `repo_slug`, asking for
@@ -198,9 +199,37 @@ pub(crate) struct PrKey {
     pub slug: String,
     /// The checked-out branch.
     pub branch: String,
-    /// `owner/name` of the GitHub repository the branch is pushed to, when
-    /// its push remote is one: the fork whose pull request is the branch's.
-    pub push: Option<String>,
+    /// `owner/name` of each GitHub repository the branch is pushed to: the
+    /// forks whose pull request is the branch's. Empty without a push remote.
+    pub push: Vec<String>,
+}
+
+/// What reading a directory's branch found: its key, and whether the push
+/// remote could be read at all. A `git` that could not run or outlived
+/// [`GIT_TIMEOUT`] leaves `push_known` false, and the monitor then keeps the
+/// push repositories it last read for the same branch ([`BranchProbe::resolve`])
+/// rather than let a slow `git` change the key, which would drop the badge and
+/// look the pull request up again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BranchProbe {
+    pub key: PrKey,
+    pub push_known: bool,
+}
+
+impl BranchProbe {
+    /// The key a directory has after this probe, given the one it had.
+    pub(crate) fn resolve(probe: Option<Self>, previous: Option<PrKey>) -> Option<PrKey> {
+        match (probe?, previous) {
+            (
+                Self {
+                    key,
+                    push_known: false,
+                },
+                Some(previous),
+            ) if previous.slug == key.slug && previous.branch == key.branch => Some(previous),
+            (probe, _) => Some(probe.key),
+        }
+    }
 }
 
 /// Whether `branch` is the remote's default. `default` is what
@@ -219,6 +248,13 @@ pub(crate) fn is_default_branch(branch: &str, default: Option<&str>) -> bool {
 /// dropped — so a timed-out probe, or one whose job is aborted, leaves no git
 /// behind.
 async fn git_line(cwd: &Path, args: &[&str]) -> Option<String> {
+    git_run(cwd, args).await.ok().flatten()
+}
+
+/// [`git_line`], telling a `git` that could not run or outlived
+/// [`GIT_TIMEOUT`] (`Err`) apart from one that failed or printed nothing
+/// (`Ok(None)`).
+async fn git_run(cwd: &Path, args: &[&str]) -> Result<Option<String>, ()> {
     let mut cmd = tokio::process::Command::from(git_at(cwd));
     cmd.args(args)
         .stdin(std::process::Stdio::null())
@@ -226,13 +262,13 @@ async fn git_line(cwd: &Path, args: &[&str]) -> Option<String> {
         .kill_on_drop(true);
     let out = tokio::time::timeout(GIT_TIMEOUT, cmd.output())
         .await
-        .ok()?
-        .ok()?;
+        .map_err(drop)?
+        .map_err(drop)?;
     if !out.status.success() {
-        return None;
+        return Ok(None);
     }
     let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!line.is_empty()).then_some(line)
+    Ok((!line.is_empty()).then_some(line))
 }
 
 /// The key `cwd`'s PR is looked up by, or `None` when it gets no badge: not a
@@ -241,7 +277,7 @@ async fn git_line(cwd: &Path, args: &[&str]) -> Option<String> {
 /// as `worktree reclaim` reads it ([`crate::worktree_reclaim::push_remote_args`]),
 /// only adds to a key. Each `git` it runs is bounded by [`GIT_TIMEOUT`] and
 /// killed when the future is dropped.
-pub(crate) async fn branch_key(cwd: &Path) -> Option<PrKey> {
+pub(crate) async fn branch_key(cwd: &Path) -> Option<BranchProbe> {
     // `symbolic-ref` fails on a detached HEAD and outside a repository alike.
     let branch = git_line(cwd, &["symbolic-ref", "--quiet", "--short", "HEAD"]).await?;
     let default = git_line(
@@ -262,17 +298,32 @@ pub(crate) async fn branch_key(cwd: &Path) -> Option<PrKey> {
     }
     let origin = git_line(cwd, &["remote", "get-url", "origin"]).await?;
     let slug = crate::worktree_reclaim::parse_github_owner_repo(&origin)?;
-    let push = push_repo(cwd, &branch).await;
-    Some(PrKey { slug, branch, push })
+    let push = push_repos(cwd, &branch).await;
+    Some(BranchProbe {
+        push_known: push.is_ok(),
+        key: PrKey {
+            slug,
+            branch,
+            push: push.unwrap_or_default(),
+        },
+    })
 }
 
-/// `owner/name` of the GitHub repository `branch` is pushed to, or `None`.
-async fn push_repo(cwd: &Path, branch: &str) -> Option<String> {
+/// `owner/name` of each GitHub repository `branch` is pushed to, or `Err`
+/// when a `git` could not run or outlived [`GIT_TIMEOUT`].
+async fn push_repos(cwd: &Path, branch: &str) -> Result<Vec<String>, ()> {
+    use crate::worktree_reclaim::{parse_push_remote, push_remote_args, push_repos_from_urls};
     let branch_ref = format!("refs/heads/{branch}");
-    let refs = git_line(cwd, &crate::worktree_reclaim::push_remote_args(&branch_ref)).await?;
-    let remote = crate::worktree_reclaim::parse_push_remote(&refs, &branch_ref)?;
-    let url = git_line(cwd, &["remote", "get-url", "--push", &remote]).await?;
-    crate::worktree_reclaim::parse_github_owner_repo(&url)
+    let Some(remote) = git_run(cwd, &push_remote_args(&branch_ref))
+        .await?
+        .and_then(|refs| parse_push_remote(&refs, &branch_ref))
+    else {
+        return Ok(Vec::new());
+    };
+    let urls = git_run(cwd, &["remote", "get-url", "--push", "--all", &remote]).await?;
+    Ok(urls
+        .map(|urls| push_repos_from_urls(&urls))
+        .unwrap_or_default())
 }
 
 #[derive(serde::Deserialize)]
@@ -470,15 +521,15 @@ impl GhPr {
 
 /// The PR `gh pr list --json` output reports for exactly `branch`, or `None`
 /// when it reports none. Only an exact `headRefName` match counts, from a
-/// branch of the repository itself or of `push_repo`, the fork the branch is
-/// pushed to ([`is_push_repo`]): any other fork's pull request from a branch
+/// branch of the repository itself or of one of `push_repos`, the forks the
+/// branch is pushed to ([`is_push_repo`]): any other fork's pull request from a branch
 /// with the same name is someone else's. Of several,
 /// an open (or draft) one wins, then the highest number. An entry with a state
 /// this build does not know, or a URL off `https://github.com/`, is skipped.
 pub fn parse_pr_list(
     json: &str,
     branch: &str,
-    push_repo: Option<&str>,
+    push_repos: &[String],
 ) -> Result<Option<PullRequestInfo>, String> {
     let entries: Vec<GhPr> =
         serde_json::from_str(json).map_err(|e| format!("could not parse gh output: {e}"))?;
@@ -492,7 +543,7 @@ pub fn parse_pr_list(
                             .as_ref()
                             .and_then(|o| o.login.as_deref()),
                         pr.head_repository.as_ref().and_then(|r| r.name.as_deref()),
-                        push_repo,
+                        push_repos,
                     ))
         })
         .filter_map(GhPr::into_info)
@@ -520,7 +571,7 @@ async fn query_gh(cwd: PathBuf, key: PrKey) -> Result<Option<PullRequestInfo>, S
     parse_pr_list(
         &String::from_utf8_lossy(&out.stdout),
         &key.branch,
-        key.push.as_deref(),
+        &key.push,
     )
 }
 
@@ -821,7 +872,7 @@ pub async fn run_pull_request_monitor(
 ) {
     let mut events = event_tx.subscribe();
     let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_JOBS));
-    let mut probes: JobPool<PathBuf, Option<PrKey>> = JobPool::new(permits.clone());
+    let mut probes: JobPool<PathBuf, Option<BranchProbe>> = JobPool::new(permits.clone());
     let mut lookups: JobPool<PrKey, Result<Option<PullRequestInfo>, String>> =
         JobPool::new(permits);
     // One timer for the monitor's life: a sleep rebuilt on every pass would
@@ -852,11 +903,11 @@ pub async fn run_pull_request_monitor(
                 Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => return,
             },
-            Some((cwd, key)) = probes.next() => {
+            Some((cwd, probe)) = probes.next() => {
                 // A directory dropped meanwhile had its job cancelled, so a
                 // result always has its entry.
                 if let Some(entry) = cwds.get_mut(&cwd) {
-                    entry.key = key;
+                    entry.key = BranchProbe::resolve(probe, entry.key.take());
                     entry.resolved_at = Some(Instant::now());
                 }
             }
@@ -1078,7 +1129,7 @@ mod tests {
             let pr = parse_pr_list(
                 &gh(json!([gh_pr(7, "feat/x", state, draft, review)])),
                 "feat/x",
-                None,
+                &[],
             )
             .unwrap()
             .unwrap();
@@ -1099,7 +1150,7 @@ mod tests {
             gh_pr(1000, "feat/x", "CLOSED", false, serde_json::Value::Null),
         ]));
         assert_eq!(
-            parse_pr_list(&out, "feat/x", None).unwrap().unwrap().number,
+            parse_pr_list(&out, "feat/x", &[]).unwrap().unwrap().number,
             1234
         );
         // A draft is open too.
@@ -1108,7 +1159,7 @@ mod tests {
             gh_pr(1234, "feat/x", "OPEN", true, serde_json::Value::Null),
         ]));
         assert_eq!(
-            parse_pr_list(&out, "feat/x", None).unwrap().unwrap().number,
+            parse_pr_list(&out, "feat/x", &[]).unwrap().unwrap().number,
             1234
         );
     }
@@ -1121,19 +1172,19 @@ mod tests {
             gh_pr(1234, "feat/x", "MERGED", false, json!("APPROVED")),
             gh_pr(1100, "feat/x", "CLOSED", false, serde_json::Value::Null),
         ]));
-        let pr = parse_pr_list(&out, "feat/x", None).unwrap().unwrap();
+        let pr = parse_pr_list(&out, "feat/x", &[]).unwrap().unwrap();
         assert_eq!((pr.number, pr.state), (1234, PullRequestState::Merged));
     }
 
     #[test]
     fn no_match_unknown_states_and_foreign_urls_read_as_no_pr() {
         use serde_json::json;
-        assert_eq!(parse_pr_list("[]", "feat/x", None).unwrap(), None);
+        assert_eq!(parse_pr_list("[]", "feat/x", &[]).unwrap(), None);
         assert_eq!(
             parse_pr_list(
                 &gh(json!([gh_pr(1, "other", "OPEN", false, json!(""))])),
                 "feat/x",
-                None
+                &[]
             )
             .unwrap(),
             None
@@ -1142,7 +1193,7 @@ mod tests {
             parse_pr_list(
                 &gh(json!([gh_pr(1, "feat/x", "QUEUED", false, json!(""))])),
                 "feat/x",
-                None
+                &[]
             )
             .unwrap(),
             None
@@ -1150,7 +1201,7 @@ mod tests {
         let mut foreign = gh_pr(1, "feat/x", "OPEN", false, json!(""));
         foreign["url"] = json!("https://evil.example/pull/1");
         assert_eq!(
-            parse_pr_list(&gh(json!([foreign])), "feat/x", None).unwrap(),
+            parse_pr_list(&gh(json!([foreign])), "feat/x", &[]).unwrap(),
             None
         );
     }
@@ -1173,13 +1224,13 @@ mod tests {
         let mut own = gh_pr(1234, "feat/x", "OPEN", false, json!(""));
         own["isCrossRepository"] = json!(false);
         assert_eq!(
-            parse_pr_list(&gh(json!([own, fork.clone()])), "feat/x", None)
+            parse_pr_list(&gh(json!([own, fork.clone()])), "feat/x", &[])
                 .unwrap()
                 .map(|pr| pr.number),
             Some(1234)
         );
         assert_eq!(
-            parse_pr_list(&gh(json!([fork])), "feat/x", None).unwrap(),
+            parse_pr_list(&gh(json!([fork])), "feat/x", &[]).unwrap(),
             None
         );
     }
@@ -1205,36 +1256,82 @@ mod tests {
             pr["headRepositoryOwner"] = json!({"id": "U_1", "login": owner});
             pr
         };
-        let number = |json: &str, push: Option<&str>| {
-            parse_pr_list(json, "feat/x", push)
+        let number = |json: &str, push: &[&str]| {
+            let push: Vec<String> = push.iter().map(|p| p.to_string()).collect();
+            parse_pr_list(json, "feat/x", &push)
                 .unwrap()
                 .map(|pr| pr.number)
         };
         let both = gh(json!([from(1234, "me"), from(9000, "stranger")]));
-        assert_eq!(number(&both, Some("me/r")), Some(1234));
-        assert_eq!(number(&both, Some("ME/R")), Some(1234), "case-insensitive");
+        assert_eq!(number(&both, &["me/r"]), Some(1234));
+        assert_eq!(number(&both, &["ME/R"]), Some(1234), "case-insensitive");
         let stranger = gh(json!([from(9000, "stranger")]));
-        assert_eq!(number(&stranger, Some("me/r")), None);
-        assert_eq!(number(&both, None), None, "no push remote, no match");
+        assert_eq!(number(&stranger, &["me/r"]), None);
+        assert_eq!(number(&both, &[]), None, "no push remote, no match");
+        assert_eq!(
+            number(&both, &["other/r", "me/r"]),
+            Some(1234),
+            "any of the push URLs"
+        );
         let mut deleted = from(1234, "me");
         deleted["headRepository"] = serde_json::Value::Null;
-        assert_eq!(number(&gh(json!([deleted])), Some("me/r")), None);
+        assert_eq!(number(&gh(json!([deleted])), &["me/r"]), None);
+    }
+
+    /// A probe whose push remote could not be read keeps the push
+    /// repositories the last probe read for the same branch, so a slow `git`
+    /// neither drops the badge nor costs another lookup (Qodo on PR #1805).
+    #[test]
+    fn an_unread_push_remote_keeps_the_previous_key_of_the_same_branch() {
+        let key = |branch: &str, push: &[&str]| PrKey {
+            slug: "o/r".into(),
+            branch: branch.into(),
+            push: push.iter().map(|p| p.to_string()).collect(),
+        };
+        let probe = |key, push_known| Some(BranchProbe { key, push_known });
+        let previous = Some(key("feat/x", &["me/r"]));
+        assert_eq!(
+            BranchProbe::resolve(probe(key("feat/x", &[]), false), previous.clone()),
+            previous,
+            "unread: the same branch keeps its push repositories"
+        );
+        assert_eq!(
+            BranchProbe::resolve(probe(key("feat/x", &[]), true), previous.clone()),
+            Some(key("feat/x", &[])),
+            "read and gone: the key changes"
+        );
+        assert_eq!(
+            BranchProbe::resolve(probe(key("feat/y", &[]), false), previous.clone()),
+            Some(key("feat/y", &[])),
+            "another branch is another key"
+        );
+        assert_eq!(
+            BranchProbe::resolve(probe(key("feat/x", &[]), false), None),
+            Some(key("feat/x", &[]))
+        );
+        assert_eq!(BranchProbe::resolve(None, previous), None);
     }
 
     #[test]
     fn is_push_repo_needs_every_part_to_match() {
-        assert!(is_push_repo(Some("me"), Some("r"), Some("me/r")));
-        assert!(!is_push_repo(Some("me"), Some("other"), Some("me/r")));
-        assert!(!is_push_repo(Some("you"), Some("r"), Some("me/r")));
-        assert!(!is_push_repo(None, Some("r"), Some("me/r")));
-        assert!(!is_push_repo(Some("me"), None, Some("me/r")));
-        assert!(!is_push_repo(Some("me"), Some("r"), None));
-        assert!(!is_push_repo(Some("me"), Some("r"), Some("me")));
+        let me = ["me/r".to_string()];
+        assert!(is_push_repo(Some("me"), Some("r"), &me));
+        assert!(is_push_repo(
+            Some("me"),
+            Some("r"),
+            &["up/r".to_string(), "me/r".to_string()]
+        ));
+        assert!(!is_push_repo(Some("me"), Some("other"), &me));
+        assert!(!is_push_repo(Some("you"), Some("r"), &me));
+        assert!(!is_push_repo(None, Some("r"), &me));
+        assert!(!is_push_repo(Some("me"), None, &me));
+        assert!(!is_push_repo(Some("me"), Some("r"), &[]));
+        assert!(!is_push_repo(Some("me"), Some("r"), &["me".to_string()]));
     }
 
     #[test]
     fn unparsable_gh_output_is_an_error_not_no_pr() {
-        assert!(parse_pr_list("not json", "feat/x", None).is_err());
+        assert!(parse_pr_list("not json", "feat/x", &[]).is_err());
     }
 
     #[test]
@@ -1501,7 +1598,7 @@ mod tests {
     fn checks_of(rollup: serde_json::Value) -> Option<PullRequestChecks> {
         let mut pr = gh_pr(7, "feat/x", "OPEN", false, serde_json::json!(""));
         pr["statusCheckRollup"] = rollup;
-        parse_pr_list(&gh(serde_json::json!([pr])), "feat/x", None)
+        parse_pr_list(&gh(serde_json::json!([pr])), "feat/x", &[])
             .unwrap()
             .unwrap()
             .checks
@@ -1643,7 +1740,7 @@ mod tests {
         let pr = parse_pr_list(
             &gh(json!([gh_pr(7, "feat/x", "OPEN", false, json!(""))])),
             "feat/x",
-            None,
+            &[],
         )
         .unwrap()
         .unwrap();
@@ -1931,19 +2028,44 @@ mod tests {
         git(&["checkout", "-q", "-b", "feat/x"]);
         assert_eq!(
             branch_key(&repo).await,
-            Some(PrKey {
-                slug: "o/r".into(),
-                branch: "feat/x".into(),
-                push: None,
+            Some(BranchProbe {
+                key: PrKey {
+                    slug: "o/r".into(),
+                    branch: "feat/x".into(),
+                    push: Vec::new(),
+                },
+                push_known: true,
             }),
             "a branch with no push remote"
         );
         git(&["remote", "add", "fork", "https://github.com/me/r.git"]);
         git(&["config", "branch.feat/x.pushRemote", "fork"]);
         assert_eq!(
-            branch_key(&repo).await.and_then(|key| key.push),
-            Some("me/r".into()),
+            branch_key(&repo).await.map(|probe| probe.key.push),
+            Some(vec!["me/r".to_string()]),
             "the fork the branch is pushed to"
+        );
+        // A remote with two push URLs pushes to both (Qodo on PR #1805).
+        git(&[
+            "remote",
+            "set-url",
+            "--add",
+            "--push",
+            "fork",
+            "git@github.com:me/r.git",
+        ]);
+        git(&[
+            "remote",
+            "set-url",
+            "--add",
+            "--push",
+            "fork",
+            "git@github.com:me/r-mirror.git",
+        ]);
+        assert_eq!(
+            branch_key(&repo).await.map(|probe| probe.key.push),
+            Some(vec!["me/r".to_string(), "me/r-mirror".to_string()]),
+            "every push URL of the push remote"
         );
         git(&["config", "--unset", "branch.feat/x.pushRemote"]);
         git(&["remote", "set-url", "origin", "https://gitlab.com/o/r.git"]);
