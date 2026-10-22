@@ -854,6 +854,9 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         state.clone(),
         restart_control.clone(),
     );
+    // PRD #1741: only now may telemetry listen for the stop, so it never
+    // takes a signal the watch above is not there to act on.
+    crate::telemetry::note_stop_signals(&telemetry, signal_handle.as_ref());
 
     // Test-only orphan watchdog: when `DOT_AGENT_DECK_EXIT_WHEN_ORPHANED` is
     // truthy, gracefully shut down (via the SAME `shutdown` signal the idle

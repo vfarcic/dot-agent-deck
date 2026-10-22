@@ -34,8 +34,8 @@
 //! for a producer that emits two span names.
 //!
 //! The module is self-contained: the daemon and the agent spawn path each reach
-//! it through one call per lifecycle point — [`start_for_daemon`],
-//! [`prepare_spawn`] and [`commit_spawn`], [`agent_exited`] and
+//! it through one call per lifecycle point — [`start_for_daemon`] and
+//! [`note_stop_signals`], [`prepare_spawn`] and [`commit_spawn`], [`agent_exited`] and
 //! [`observe_pane_input`] — so what telemetry does at each of them is decided
 //! here, not at the call site.
 
@@ -59,26 +59,48 @@ use std::sync::Arc;
 /// subscribe the tracker to `event_tx`, and hand `registry` the handle so the
 /// agents it spawns get runs. With telemetry off the returned handle does
 /// nothing, nothing is subscribed, and `registry` is left alone.
+///
+/// Installs no signal handler: that waits for [`note_stop_signals`], which
+/// the daemon calls once its own termination watch exists.
 pub fn start_for_daemon(
     event_tx: &tokio::sync::broadcast::Sender<crate::event::BroadcastMsg>,
     registry: &crate::agent_pty::AgentPtyRegistry,
 ) -> Arc<Telemetry> {
-    let telemetry = Arc::new(Telemetry::start(&config::process_env()));
+    start_from(&config::process_env(), event_tx, registry)
+}
+
+fn start_from(
+    env: &config::EnvMap,
+    event_tx: &tokio::sync::broadcast::Sender<crate::event::BroadcastMsg>,
+    registry: &crate::agent_pty::AgentPtyRegistry,
+) -> Arc<Telemetry> {
+    let telemetry = Arc::new(Telemetry::start(env));
     telemetry.subscribe(event_tx.subscribe());
     if telemetry.is_enabled() {
         registry.set_telemetry(Arc::clone(&telemetry));
     }
-    if telemetry.is_exporting() {
-        note_termination_signal(&telemetry);
-    }
     telemetry
 }
 
-/// Tell `telemetry` when a termination signal reaches the daemon: `daemon
-/// stop` and the build-mismatch prompt stop it with one and wait a fixed
-/// window for it to exit, which the final flush must fit in. Only listens:
-/// the daemon's own signal watch, which installs handlers for both signals
-/// whether or not telemetry is on, does the stopping.
+/// The daemon's termination watch is up (`daemon_watch` is its task): from
+/// here, tell `telemetry` when a termination signal reaches the daemon.
+/// `daemon stop` and the build-mismatch prompt stop it with one and wait a
+/// fixed window for it to exit, which the final flush must fit in.
+///
+/// Only listens, and only alongside that watch. Registering a listener
+/// replaces the signal's default disposition for the life of the process, so
+/// one registered before the watch, or with no watch at all, would swallow a
+/// stop the daemon never sees. Hence the handle: without it — telemetry not
+/// exporting, or the watch could not be installed — nothing is registered.
+pub fn note_stop_signals<T>(
+    telemetry: &Arc<Telemetry>,
+    daemon_watch: Option<&tokio::task::JoinHandle<T>>,
+) {
+    if daemon_watch.is_some() && telemetry.is_exporting() {
+        note_termination_signal(telemetry);
+    }
+}
+
 #[cfg(unix)]
 fn note_termination_signal(telemetry: &Arc<Telemetry>) {
     use tokio::signal::unix::{SignalKind, signal};
@@ -331,6 +353,87 @@ mod tests {
         });
         observe_pane_input(None, true, "p1", b"x");
         commit_spawn(None);
+    }
+
+    /// The handler installed for `sig` right now: `SIG_DFL` until something in
+    /// this process registers a listener for it.
+    #[cfg(unix)]
+    fn disposition(sig: libc::c_int) -> libc::sighandler_t {
+        // SAFETY: a null `act` only reads the current action into `old`.
+        unsafe {
+            let mut old: libc::sigaction = std::mem::zeroed();
+            assert_eq!(libc::sigaction(sig, std::ptr::null(), &mut old), 0);
+            old.sa_sigaction
+        }
+    }
+
+    #[cfg(unix)]
+    fn exporting_env() -> config::EnvMap {
+        config::EnvMap::from([(
+            "OTEL_EXPORTER_OTLP_ENDPOINT".to_string(),
+            "http://127.0.0.1:9".to_string(),
+        )])
+    }
+
+    /// Starting telemetry, exporting, leaves both stop signals' disposition
+    /// as it found it: a stop arriving before the daemon's own watch exists
+    /// still terminates the daemon instead of reaching only telemetry.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn starting_for_the_daemon_installs_no_signal_handler() {
+        let before = (disposition(libc::SIGTERM), disposition(libc::SIGINT));
+        let (event_tx, _) = tokio::sync::broadcast::channel(8);
+        let registry = crate::agent_pty::AgentPtyRegistry::new();
+        let telemetry = start_from(&exporting_env(), &event_tx, &registry);
+        assert!(telemetry.is_exporting());
+        assert_eq!(
+            (disposition(libc::SIGTERM), disposition(libc::SIGINT)),
+            before
+        );
+    }
+
+    /// Without the daemon's watch there is nothing to act on a signal, so
+    /// telemetry does not take one either.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn no_daemon_watch_no_stop_listener() {
+        let before = (disposition(libc::SIGTERM), disposition(libc::SIGINT));
+        let telemetry = Arc::new(Telemetry::start(&exporting_env()));
+        note_stop_signals::<()>(&telemetry, None);
+        assert_eq!(
+            (disposition(libc::SIGTERM), disposition(libc::SIGINT)),
+            before
+        );
+    }
+
+    /// Alongside the daemon's watch, a SIGTERM still marks when teardown
+    /// began, which is what sizes the final flush to the stop window.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn alongside_the_daemon_watch_a_sigterm_marks_the_teardown() {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut watch_signal = signal(SignalKind::terminate()).expect("the daemon's watch");
+        let watch = tokio::spawn(async move {
+            watch_signal.recv().await;
+        });
+        let telemetry = Arc::new(Telemetry::start(&exporting_env()));
+        note_stop_signals(&telemetry, Some(&watch));
+        assert!(telemetry.teardown_began_at().is_none());
+
+        // SAFETY: a handler for SIGTERM is registered above, so this only
+        // wakes the two listeners.
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while telemetry.teardown_began_at().is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the stop listener marked the teardown");
+        tokio::time::timeout(std::time::Duration::from_secs(10), watch)
+            .await
+            .expect("the daemon's watch saw the same signal")
+            .unwrap();
     }
 
     #[test]

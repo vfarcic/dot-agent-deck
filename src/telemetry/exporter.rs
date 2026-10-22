@@ -588,6 +588,13 @@ impl Telemetry {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn teardown_began_at(&self) -> Option<std::time::Instant> {
+        self.exporting
+            .as_ref()
+            .and_then(|e| e.teardown_began.get().copied())
+    }
+
     /// Daemon shutdown, bounded in all by `budget`, or by what is left of the
     /// stop client's window when that is less — the window since
     /// [`Self::teardown_began`] (since now when it was not called), less
