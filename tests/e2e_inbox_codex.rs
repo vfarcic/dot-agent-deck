@@ -49,7 +49,7 @@ if 'app-server' in sys.argv:
     sys.exit(0)
 tty.setraw(0, termios.TCSANOW)
 base = os.environ['INBOX_CODEX_BASE']
-with open(base + '.env','w') as f: json.dump(dict(os.environ), f)
+with open(base + '.env','w') as f: json.dump({k: os.environ[k] for k in ['DOT_AGENT_DECK_INBOX_SPOOL'] if k in os.environ}, f)
 with open(base + '.pid','w') as f: f.write(str(os.getpid()))
 capture = open(base + '.bytes','ab',buffering=0)
 previous = None

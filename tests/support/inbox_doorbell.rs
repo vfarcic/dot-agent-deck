@@ -251,7 +251,7 @@ pub fn pane_with(daemon: &impl Endpoint, name: &str, extra: Value) -> Pane {
     std::fs::write(&script, r#"import os, sys, tty, termios, time, json, select
 tty.setraw(0, termios.TCSANOW)
 base = sys.argv[1]
-with open(base + '.env', 'w') as f: json.dump(dict(os.environ), f)
+with open(base + '.env', 'w') as f: json.dump({k: os.environ[k] for k in ['DOT_AGENT_DECK_INBOX_SPOOL'] if k in os.environ}, f)
 with open(base + '.pid', 'w') as f: f.write(str(os.getpid()))
 capture = open(base + '.bytes', 'ab', buffering=0)
 turns = open(base + '.turns', 'a', buffering=1)
@@ -329,7 +329,9 @@ while True:
 }
 
 /// The value of `name` in the environment the deck gave the stand-in's
-/// process (it writes it beside its pid as it starts).
+/// process, of the keys it writes beside its pid as it starts: only
+/// `DOT_AGENT_DECK_INBOX_SPOOL`, so the file never holds the pane's capability
+/// or anything else the stand-in inherited.
 pub fn pane_env(pane: &Pane, name: &str) -> Option<String> {
     let env: Value = serde_json::from_str(
         &std::fs::read_to_string(pane.capture.with_extension("env")).expect("the pane's env"),
