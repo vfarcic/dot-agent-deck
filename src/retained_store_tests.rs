@@ -552,6 +552,19 @@ fn recovery_015_a_crash_mid_transfer_then_two_starters() {
         }
         a.flush_inventory().unwrap();
         let a_run = a.run_id().to_string();
+        // Each file's inode, so a takeover that copied instead of renaming
+        // shows even where the crash point falls between files.
+        #[cfg(unix)]
+        let inodes: std::collections::HashMap<String, u64> = names_in(a.dir())
+            .iter()
+            .map(|n| {
+                use std::os::unix::fs::MetadataExt;
+                (
+                    report_of(n),
+                    std::fs::metadata(a.dir().join(n)).unwrap().ino(),
+                )
+            })
+            .collect();
         drop(a);
         let b = open_armed(root.path(), StoreConfig::default(), on(start, 1), |store| {
             store.seams.stop_after.store(k, Ordering::SeqCst);
@@ -604,6 +617,18 @@ fn recovery_015_a_crash_mid_transfer_then_two_starters() {
         assert!(!runs_root(root.path()).join(lock_name(&a_run)).exists());
         assert!(!runs_root(root.path()).join(inventory_name(&a_run)).exists());
         assert!(!files_root(root.path()).join(&a_run).exists());
+        #[cfg(unix)]
+        for (run, name) in &files {
+            use std::os::unix::fs::MetadataExt;
+            let ino = std::fs::metadata(files_root(root.path()).join(run).join(name))
+                .unwrap()
+                .ino();
+            assert_eq!(
+                ino,
+                inodes[&report_of(name)],
+                "k={k}: {name} must be A's file renamed, not a copy"
+            );
+        }
     }
 }
 
@@ -1198,7 +1223,14 @@ fn recovery_022_the_adopted_sum_follows_the_directory_conservatively() {
     let mut lines = BoundedLines::new(long.as_bytes(), INVENTORY_LINE_MAX);
     lines.next_line().unwrap();
     assert!(matches!(lines.next_line(), Err(LineError::TooLong)));
-    assert!(lines.peak <= INVENTORY_LINE_MAX + 1);
+    assert!(lines.peak <= INVENTORY_LINE_MAX);
+    // A line of exactly the bound is read; one byte more is refused, and the
+    // buffer never grows past the bound.
+    let at_bound = format!("{}\n{}\n", "a".repeat(16), "b".repeat(17));
+    let mut lines = BoundedLines::new(at_bound.as_bytes(), 16);
+    assert_eq!(lines.next_line().unwrap().unwrap().len(), 16);
+    assert!(matches!(lines.next_line(), Err(LineError::TooLong)));
+    assert!(lines.peak <= 16);
     let header = "{\"v\":1,\"run\":\"r\",\"max_files\":4,\"count\":1}\n";
     for bad in [
         format!("{header}{{\"n\":\"r-a.md\",\"c\":1,\"s\":\"pinned\"}}\ntrailing"),
