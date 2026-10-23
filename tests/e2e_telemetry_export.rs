@@ -1019,7 +1019,7 @@ fn telemetry_otlp_012_daemon_shutdown_flushes_open_run() {
     );
 }
 
-/// Scenario: Send shell-tool start/end hooks for ordinary, wrapped, sandboxed and private commands to a stand-in pane, plus a non-shell tool. Close the pane and inspect completed operation spans for safe program/word metadata, parent identity, duration and count, rejecting private or raw command text from every request body.
+/// Scenario: Send shell-tool start/end hooks for ordinary, wrapped, sandboxed and private commands to a stand-in pane, including assignments whose values hold a path in both the shell-split and Codex's joined-argv form, plus a non-shell tool. Close the pane and inspect completed operation spans for safe program/word metadata, parent identity, duration and count, rejecting private or raw command text from every request body.
 #[spec("telemetry/otlp/014")]
 #[test]
 fn telemetry_otlp_014_shell_operations_classify_without_content() {
@@ -1058,10 +1058,33 @@ fn telemetry_otlp_014_shell_operations_classify_without_content() {
         ("PRIVATE_PROGRAM_1741 PRIVATE_WORD_1741", "", ""),
         ("make a234567890123456789012345678901234", "make", ""),
         ("make check\necho PRIVATE_SECOND_LINE_1741", "make", "check"),
+        (
+            "WORKDIR=/private/sentinelvalue1741 cargo test",
+            "cargo",
+            "test",
+        ),
+        ("1WORKDIR=/private/sentinelvalue1741 cargo test", "", ""),
     ];
-    for (tool, command) in std::iter::once(("Read", "PRIVATE_NON_SHELL_1741"))
-        .chain(cases.iter().map(|(command, ..)| ("Bash", *command)))
-    {
+    // Codex's `shell` tool reports a joined argv: its program at most.
+    let joined_cases = [
+        ("WORKDIR=/private/sentinelvalue1741 cargo test", "", ""),
+        (
+            "/bin/sh -lc WORKDIR=/private/sentinelvalue1741 cargo test",
+            "",
+            "",
+        ),
+        ("/bin/sh -lc /usr/bin/cargo test", "cargo", ""),
+    ];
+    let all_cases: Vec<_> = cases
+        .iter()
+        .map(|case| ("Bash", case))
+        .chain(joined_cases.iter().map(|case| ("shell", case)))
+        .collect();
+    for (tool, command) in std::iter::once(("Read", "PRIVATE_NON_SHELL_1741")).chain(
+        all_cases
+            .iter()
+            .map(|(tool, (command, ..))| (*tool, *command)),
+    ) {
         for (kind, expected) in [
             ("tool_start", EventType::ToolStart),
             ("tool_end", EventType::ToolEnd),
@@ -1075,7 +1098,9 @@ fn telemetry_otlp_014_shell_operations_classify_without_content() {
             common::write_hook_line(deck.hook_socket_path(), &payload.to_string()).unwrap();
             events.wait_for(
                 |event| {
-                    event.event_type == expected && event.tool_detail.as_deref() == Some(command)
+                    event.event_type == expected
+                        && event.tool_name.as_deref() == Some(tool)
+                        && event.tool_detail.as_deref() == Some(command)
                 },
                 Duration::from_secs(10),
             );
@@ -1090,7 +1115,7 @@ fn telemetry_otlp_014_shell_operations_classify_without_content() {
         .collect();
     assert_eq!(
         operations.len(),
-        cases.len(),
+        all_cases.len(),
         "one operation per shell start/end pair, excluding Read; exported spans: {spans:?}"
     );
     let mut actual: Vec<_> = operations
@@ -1102,9 +1127,9 @@ fn telemetry_otlp_014_shell_operations_classify_without_content() {
             )
         })
         .collect();
-    let mut expected: Vec<_> = cases
+    let mut expected: Vec<_> = all_cases
         .iter()
-        .map(|(_, program, word)| (program.to_string(), word.to_string()))
+        .map(|(_, (_, program, word))| (program.to_string(), word.to_string()))
         .collect();
     actual.sort();
     expected.sort();
@@ -1136,7 +1161,7 @@ fn telemetry_otlp_014_shell_operations_classify_without_content() {
     }
     assert_eq!(
         integer_attribute(&run, "deck.operations.count"),
-        cases.len() as u64
+        all_cases.len() as u64
     );
     for request in receiver.requests() {
         let body = String::from_utf8_lossy(&request.body);
@@ -1146,10 +1171,11 @@ fn telemetry_otlp_014_shell_operations_classify_without_content() {
             "/secret/path",
             "/tmp/x",
             "Weird Name",
+            "sentinelvalue",
         ] {
             assert!(!body.contains(secret), "operation content leaked: {secret}");
         }
-        for (command, ..) in cases {
+        for (_, (command, ..)) in &all_cases {
             assert!(!body.contains(command), "raw command leaked: {command}");
         }
     }

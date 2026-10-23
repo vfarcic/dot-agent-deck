@@ -25,8 +25,9 @@
 //!   variables into it, but it is a copy of the user's configuration and holds
 //!   whatever that holds. A user's own `otel` block is kept as it is, gaining
 //!   only the resource attributes it lacks; one that switches export off,
-//!   arguments that already pass `--config`, or an endpoint that carries
-//!   credentials (as for Codex), gets nothing.
+//!   or arguments that already pass `--config`, get nothing, and no new
+//!   `otel` block is created for an endpoint that carries credentials (as
+//!   for Codex).
 //! - **Pi** exports through the deck's own Pi extension, which stays inert
 //!   unless the deck sets [`PI_TELEMETRY_ENV`] — which it does not when the
 //!   user set that variable themselves, so `0` keeps Pi's export off.
@@ -54,7 +55,7 @@ pub const PI_TELEMETRY_ENV: &str = "DOT_AGENT_DECK_PI_TELEMETRY";
 pub const LAUNCH_ENV_KEYS: [&str; 2] = [PI_TELEMETRY_ENV, "PATH"];
 
 /// The variables naming where Codex's and Devin's configurations live, read
-/// as paths: exactly as set ([`path_value`]).
+/// as paths: exactly as set (`path_value`).
 pub const CONFIG_HOME_ENV_KEYS: [&str; 3] = ["CODEX_HOME", "HOME", "XDG_CONFIG_HOME"];
 
 /// The value of `key`, one of [`CONFIG_HOME_ENV_KEYS`], in `env`, exactly as
@@ -526,7 +527,7 @@ fn config_file_run(name: &[u8]) -> Option<&[u8]> {
 /// Remove every per-run configuration file in `dir`, the deck's own
 /// directory for them: called before any run exists, so each one there was
 /// left by a daemon that ended without removing it — and at a daemon's
-/// shutdown. See [`remove_config_files_where`].
+/// shutdown. See `remove_config_files_where`.
 pub fn remove_leftover_config_files(dir: &Path) {
     remove_config_files_where(dir, |_| true);
 }

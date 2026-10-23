@@ -11,7 +11,7 @@
 //!
 //! 1. finds the real program: the first executable file of that name on
 //!    `PATH` that is not a deck shim script, in the shim directory or any
-//!    other ([`resolve`]) — none is the shell's `command not found` and
+//!    other (`resolve`) — none is the shell's `command not found` and
 //!    status 127;
 //! 2. decides from its own environment — the agent's real one, after any
 //!    script or launcher — what the agent needs ([`super::launch`]), unless
@@ -19,7 +19,7 @@
 //!    ([`GUARD_ENV`]), or the real program is not one of the forms the shim
 //!    recognises as the agent itself — a native program, npm's Codex
 //!    launcher, a Nix store script — and may be a wrapper that changes that
-//!    environment before the agent reads it ([`launcher_is_certain`]), or the
+//!    environment before the agent reads it (`launcher_is_certain`), or the
 //!    environment holds a value the decision cannot read exactly;
 //! 3. replaces itself with the real program, those arguments in front of the
 //!    user's own, so signals, the exit status and the terminal are the
@@ -405,8 +405,9 @@ fn is_nix_store_path(canonical: &Path) -> bool {
 
 /// Whether `text`, a script, names neither `HOME` (which `CODEX_HOME` and
 /// `XDG_CONFIG_HOME` contain) nor an `OTEL_` variable, the configuration the
-/// decision reads. A check of the text, not of what the script does: a script
-/// that runs another one that sets them is not caught.
+/// decision reads. A check of the text, not of what the script does: a name
+/// the script computes or splits, and a script that runs another one that
+/// sets them, are not caught.
 fn names_no_decision_variable(text: &[u8]) -> bool {
     !["HOME", "OTEL_"]
         .iter()

@@ -138,7 +138,7 @@ const UNTIMED_TEARDOWNS: [&str; 2] = ["restart-daemon", "attach-lost"];
 /// restart, does not reach it. Where a stop client is timing the daemon's exit
 /// its window opened about now, and the final flush is sized to what is left
 /// of it ([`Telemetry::teardown_began`]); after one of the
-/// [`UNTIMED_TEARDOWNS`] the flush keeps its own budget.
+/// `UNTIMED_TEARDOWNS` the flush keeps its own budget.
 pub fn teardown_began(telemetry: Option<Arc<Telemetry>>, cause: &str) {
     if let Some(telemetry) = telemetry
         && !UNTIMED_TEARDOWNS.contains(&cause)

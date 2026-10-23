@@ -85,7 +85,7 @@ const PROBE_SHUTDOWN_BUDGET: Duration = Duration::from_millis(500);
 /// build-mismatch prompt's, whichever is tighter. Past it plain `daemon stop`
 /// reports a timeout and `daemon stop --force` kills the daemon mid-teardown.
 const STOP_CLIENT_WINDOW: Duration = crate::agent_pty::DAEMON_STOP_POLL_BUDGET;
-/// What the final flush leaves of [`STOP_CLIENT_WINDOW`] for the rest of the
+/// What the final flush leaves of `STOP_CLIENT_WINDOW` for the rest of the
 /// daemon's teardown after it: closing its sockets, stopping what is left and
 /// exiting, while the client samples only every 100 ms.
 pub const SHUTDOWN_HEADROOM: Duration = Duration::from_millis(500);

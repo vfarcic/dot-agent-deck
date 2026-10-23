@@ -14,7 +14,7 @@
 //! older one and an explicit "no pull request" are folded as the card folds
 //! them, and so are its checks, which make the run's `agent.ci` stretches
 //! ([`super::ci`]). That state holds the events in memory, as every client's
-//! does, minus what a tool call reports of its arguments ([`KeptEvent`]);
+//! does, minus what a tool call reports of its arguments (`KeptEvent`);
 //! nothing from it but the status enum and the pull request's number and check
 //! counts reaches a span, and it is dropped with the run, so the tracker holds
 //! nothing per pane once a pane's runs have ended.

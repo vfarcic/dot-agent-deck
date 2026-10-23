@@ -107,7 +107,7 @@ pub const HARDENING_ENV_REMOVED: [&str; 13] = [
     "GIT_PROXY_COMMAND",
 ];
 
-/// What [`Probes::resolve`] found for a run.
+/// What [`resolve_with`] found for a run.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunContext {
     pub instructions_commit: Option<String>,
@@ -118,8 +118,9 @@ pub struct RunContext {
 #[derive(Debug, Clone)]
 pub struct ProbeSettings {
     /// `None`: git, as [`crate::git_env::git_async`] builds it. `Some`: this
-    /// program with these leading arguments, then git's arguments — a test
-    /// seam for a stand-in that hangs.
+    /// program with these leading arguments, then git's arguments — a
+    /// stand-in that hangs.
+    #[cfg(test)]
     pub program: Option<(PathBuf, Vec<String>)>,
     pub deadline: Duration,
     pub max_concurrent: usize,
@@ -129,6 +130,7 @@ pub struct ProbeSettings {
 impl Default for ProbeSettings {
     fn default() -> Self {
         ProbeSettings {
+            #[cfg(test)]
             program: None,
             deadline: PROBE_DEADLINE,
             max_concurrent: MAX_CONCURRENT_PROBES,
@@ -260,17 +262,7 @@ pub fn probe_command(
     cwd: &Path,
     args: &[&str],
 ) -> tokio::process::Command {
-    let mut cmd = match &settings.program {
-        None => crate::git_env::git_async(),
-        Some((program, leading)) => {
-            let mut cmd = tokio::process::Command::new(program);
-            for var in crate::git_env::AMBIENT_LOCATION_VARS {
-                cmd.env_remove(var);
-            }
-            cmd.args(leading);
-            cmd
-        }
-    };
+    let mut cmd = settings.program_command();
     cmd.arg("-C").arg(cwd);
     harden(&mut cmd);
     cmd.args(args)
@@ -279,6 +271,31 @@ pub fn probe_command(
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
     cmd
+}
+
+impl ProbeSettings {
+    /// git, as [`crate::git_env::git_async`] builds it.
+    #[cfg(not(test))]
+    fn program_command(&self) -> tokio::process::Command {
+        crate::git_env::git_async()
+    }
+
+    /// git, or the stand-in [`Self::program`] names, with the ambient
+    /// location environment cleared as git's is.
+    #[cfg(test)]
+    fn program_command(&self) -> tokio::process::Command {
+        match &self.program {
+            None => crate::git_env::git_async(),
+            Some((program, leading)) => {
+                let mut cmd = tokio::process::Command::new(program);
+                for var in crate::git_env::AMBIENT_LOCATION_VARS {
+                    cmd.env_remove(var);
+                }
+                cmd.args(leading);
+                cmd
+            }
+        }
+    }
 }
 
 /// Switch off the settings and variables known to make a read-only git

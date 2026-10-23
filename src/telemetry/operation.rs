@@ -25,7 +25,9 @@
 //! something other than a shell builtin that only sets up the next one
 //! ([`SETUP_PROGRAMS`]) is the one classified — after its leading `VAR=value`
 //! assignments and an `env`, `sudo`, `command`, `time` or `nice` in front,
-//! with their options and the options' values.
+//! with their options and the options' values. A program word that still has
+//! a `=` in it names no program: what follows its last `/` may be part of a
+//! value.
 
 /// What [`classify`] keeps of a command.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -216,7 +218,7 @@ pub fn is_command_word(word: &str) -> bool {
 }
 
 /// Classify the command a shell tool call reported. `None` for no text gives
-/// a local operation with nothing else known.
+/// an operation with neither program nor word.
 pub fn classify(command: Option<&str>) -> Operation {
     let line = command.and_then(|c| c.lines().next()).unwrap_or("");
     classify_line(line, 0)
@@ -229,7 +231,8 @@ pub fn classify(command: Option<&str>) -> Operation {
 /// run as `<shell> -c <script>` (Codex runs its commands as
 /// `["/bin/sh", "-lc", "<script>"]`), the first word of the script. A program
 /// that only sets up, prefixes or wraps the next one gives nothing, since that
-/// one's words may belong to a later argument; so does a line with an empty
+/// one's words may belong to a later argument; so does a program word with a
+/// `=` in it (a `VAR=value` assignment among them), a line with an empty
 /// argument in it, or a shell with any other options.
 pub fn classify_joined_argv(command: Option<&str>) -> Operation {
     let line = command.and_then(|c| c.lines().next()).unwrap_or("");
@@ -240,18 +243,23 @@ pub fn classify_joined_argv(command: Option<&str>) -> Operation {
         return Operation::default();
     }
     let program = match words.as_slice() {
-        [shell, flags, script @ ..] if SHELLS.contains(&basename(shell)) => {
+        [shell, flags, script @ ..]
+            if program_name(shell).is_some_and(|shell| SHELLS.contains(&shell)) =>
+        {
             let dash_c = flags.strip_prefix('-').is_some_and(|cluster| {
                 cluster.contains('c')
                     && cluster.chars().all(|c| c == 'c' || SHELL_FLAGS.contains(c))
             });
             match script {
-                [program, ..] if dash_c => basename(program),
+                [program, ..] if dash_c => program_name(program),
                 _ => return Operation::default(),
             }
         }
-        [program, ..] => basename(program),
+        [program, ..] => program_name(program),
         [] => return Operation::default(),
+    };
+    let Some(program) = program else {
+        return Operation::default();
     };
     let unsure = SETUP_PROGRAMS.contains(&program)
         || SHELLS.contains(&program)
@@ -279,7 +287,9 @@ fn classify_words(segment: &[String], depth: usize) -> Option<Operation> {
         return Some(Operation::default());
     };
     let first = words.first()?;
-    let program = basename(first);
+    let Some(program) = program_name(first) else {
+        return Some(Operation::default());
+    };
     if SETUP_PROGRAMS.contains(&program) {
         return None;
     }
@@ -314,9 +324,11 @@ fn named(program: &str, args: &[String]) -> Operation {
     Operation { program, word }
 }
 
-/// The last `/`-separated part of `word`.
-fn basename(word: &str) -> &str {
-    word.rsplit('/').next().unwrap_or(word)
+/// The basename of the program `word` runs. `None` for a word with a `=` in
+/// it: an assignment, or a path through one, whose last part is a value's,
+/// not a program's.
+fn program_name(word: &str) -> Option<&str> {
+    (!word.contains('=')).then(|| word.rsplit('/').next().unwrap_or(word))
 }
 
 /// A segment's words from its program on: leading assignments and the prefix
@@ -334,19 +346,19 @@ fn command_words(segment: &[String]) -> Option<&[String]> {
         let Some(first) = words.first() else {
             return Some(words);
         };
-        let prefix = basename(first);
+        let prefix = program_name(first);
         let options = match prefix {
-            "env" => &ENV,
-            "sudo" => &SUDO,
-            "command" => &COMMAND,
-            "time" => &TIME,
-            "nice" => &NICE,
+            Some("env") => &ENV,
+            Some("sudo") => &SUDO,
+            Some("command") => &COMMAND,
+            Some("time") => &TIME,
+            Some("nice") => &NICE,
             _ => return Some(words),
         };
         let len = options_len(&words[1..], options)?;
         // `command -v cargo` looks `cargo` up and runs nothing: the program
         // is `command`.
-        if prefix == "command"
+        if prefix == Some("command")
             && words[1..=len]
                 .iter()
                 .any(|w| !w.starts_with("--") && w.starts_with('-') && w.contains(['v', 'V']))
@@ -798,6 +810,53 @@ mod tests {
             classify_tool(Some("Bash"), Some("/bin/sh -lc 'make ci'")),
             expected("make", Some("ci"))
         );
+    }
+
+    /// An assignment's value can hold a `/`: the part after it is the value's,
+    /// not a program's, so a word with a `=` in it names no program however it
+    /// is read. A program's own path still gives its basename.
+    #[test]
+    fn an_assignment_value_is_never_the_program() {
+        let bare = Operation::default();
+        for (command, expected) in [
+            ("WORKDIR=/private/sentinelvalue cargo test", bare.clone()),
+            (
+                "/bin/sh -lc WORKDIR=/private/sentinelvalue cargo test",
+                bare.clone(),
+            ),
+            ("/bin/sh -lc WORKDIR=/private/sh -c cargo", bare.clone()),
+            ("1WORKDIR=/private/sentinelvalue cargo test", bare.clone()),
+            ("X=/private/sh -lc cargo test", bare.clone()),
+            ("/usr/bin/cargo test", expected("cargo", None)),
+            ("/bin/sh -lc /usr/bin/cargo test", expected("cargo", None)),
+        ] {
+            assert_eq!(classify_joined_argv(Some(command)), expected, "{command}");
+            assert_eq!(
+                classify_tool(Some("shell"), Some(command)),
+                expected,
+                "{command}"
+            );
+        }
+        for (command, expected) in [
+            (
+                "WORKDIR=/private/sentinelvalue cargo test",
+                expected("cargo", Some("test")),
+            ),
+            (
+                "/bin/sh -lc 'WORKDIR=/private/sentinelvalue cargo test'",
+                expected("cargo", Some("test")),
+            ),
+            ("1WORKDIR=/private/sentinelvalue cargo test", bare.clone()),
+            (
+                "/bin/sh -lc '1WORKDIR=/private/sentinelvalue cargo test'",
+                bare.clone(),
+            ),
+            ("env 1X=/private/sentinelvalue cargo test", bare.clone()),
+            ("1X=/private/env cargo test", bare.clone()),
+            ("/usr/bin/cargo test", expected("cargo", Some("test"))),
+        ] {
+            assert_eq!(classify(Some(command)), expected, "{command}");
+        }
     }
 
     #[test]
