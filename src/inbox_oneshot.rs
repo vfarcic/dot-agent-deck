@@ -685,6 +685,12 @@ impl Ran {
             .iter()
             .any(|output| *output != Output::NotHanded)
     }
+
+    /// Whether a hand-over that asks the agent to go on with its turn
+    /// (Codex's `Stop`) did ask it: every block was written and flushed.
+    pub fn continues_turn(&self) -> bool {
+        self.error.is_none() && self.outputs.iter().all(|output| *output == Output::Written)
+    }
 }
 
 #[cfg(unix)]

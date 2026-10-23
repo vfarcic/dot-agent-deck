@@ -8531,6 +8531,13 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 - **Does not assert:** the callers' handling (`inbox/codex/023`, `inbox/cli/006`).
 - **Platform coverage:** mac+linux.
 
+##### inbox/receipt/032 — Codex's `Stop` goes on with the turn only with blocks it wrote.
+- **Layer:** Fast (`src/inbox_prompt.rs`), `OneShotInjection::print_to` with `Envelope::Block` over a connection pair whose deck refuses or grants each `may` (PRD #1666 part 3, H4).
+- **Agent:** none.
+- **Asserts:** with both grants refused nothing is printed and `continues_turn` is false (the hook reports the turn's Idle); with the first refused one `{"decision":"block"}` line carries the framing and only the second block, `continues_turn` is true and only the second commits; with both granted both are carried and commit.
+- **Does not assert:** the real hook binary reporting or withholding Idle (`inbox/codex/019`), or a write that fails partway (`inbox/receipt/030`).
+- **Platform coverage:** mac+linux.
+
 #### Protocol and waiter lifecycle
 
 ##### inbox/protocol/001 — Inbox verbs require an attested caller.
@@ -8709,6 +8716,13 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 - **Agent:** none.
 - **Asserts:** against a serving deck, plain and `--json` output print two messages and commit both exact attempts; the JSON carries exactly `id`, `subject`, `from` and `text`; neither known cap string is in stdout, stderr or any line sent to the deck; zero bytes reports both `not_handed` and says nothing was printed; a prefix or a failed flush reports `handed`, not committed, and says the output was cut short; a revoke arriving between the grant and the output prints nothing and reports `not_handed`; a silent deck is `CLI_RECEIPTS_TIMED_OUT`, part 2's deck (receipts 1, no CLI named) `CLI_RECEIPTS_UNSUPPORTED`, each sent only the question; a deck that answers the question and never the fetch is `CLI_FETCH_TIMED_OUT`, whose words differ and do not say nothing was taken.
 - **Does not assert:** the real binary against the real daemon (`inbox/codex/020`, `inbox/boundary/054`), or a real spool's records (`inbox/codex/020`).
+- **Platform coverage:** mac+linux.
+
+##### inbox/cli/007 — A fenced-out message leaves `inbox fetch --json` valid JSON.
+- **Layer:** Fast (`src/inbox_cli.rs`), `fetch_one_shot` with `--json` against a stand-in deck handing three messages and refusing chosen grants (PRD #1666 part 3, H4).
+- **Agent:** none.
+- **Asserts:** with the first, the middle or the last grant refused, stdout parses as JSON listing exactly the other two with only `id`, `subject`, `from` and `text`, and the deck is told those two committed and the refused one not handed; with every grant refused, stdout is an empty list and nothing commits.
+- **Does not assert:** a write that fails partway (`inbox/cli/006`), or the real binary against the real daemon (`inbox/codex/020`).
 - **Platform coverage:** mac+linux.
 
 ##### inbox/codex/023 — Codex's hooks and `inbox fetch` take nothing from an older daemon.
@@ -9453,6 +9467,20 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Asserts:** with a Claude Code and a Codex `hooks install` command set and a task waiting, a stamped line raises no notice; an unstamped line of either agent's makes the integration notice `hooks_too_old` with that agent's command, the doorbell is not blocked, and a stamped line from the same generation clears it (PRD #1666 part 3, R-3).
 - **Does not assert:** the daemon reading the stamp off a real hook line (`inbox/claude/047`), or the TUI and desktop rendering the notice (`inbox/claude/020`'s notice, part 2's renderers).
 - **Platform coverage:** all.
+
+##### inbox/boundary/068 — Codex's whole hook line stays within 6000 bytes at the edge.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), `serve_hook` for Codex's prompt hook and `Stop` within the room `one_shot_request` asks for, printed through each envelope (PRD #1666 part 3, H4).
+- **Agent:** none.
+- **Asserts:** for each hook, a task whose block with its attempt opener measures exactly that room, and tasks four bytes either side of it, print a JSON line, separator and newline included, of at most Codex's 6000 bytes.
+- **Does not assert:** several blocks in one hand-over (`inbox/codex/018`, `inbox/codex/019`), or Codex reading the line (`inbox/codex/009`, `inbox/codex/011`).
+- **Platform coverage:** mac+linux.
+
+##### inbox/boundary/069 — A body Codex's JSON would cut is saved, and its cut block names the file.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), `body_needs_saving` and `retain_full_body`, then `serve_hook` for Codex's prompt hook and `Stop` within the room each asks for (PRD #1666 part 3, H4).
+- **Agent:** none.
+- **Asserts:** bodies heavy in quotes, backslashes, control characters or a mix of them, within Codex's plain byte budget but not once JSON-escaped, are saved; each hook's block of them is whole or names the saved file and never says only how much did not fit; the longest quote-heavy body that is not saved renders whole in both hooks' room as a marked repeat with the longest attempt opener.
+- **Does not assert:** the daemon's post path refusing a body it cannot save (`an_oversized_body_that_cannot_be_saved_is_refused`).
+- **Platform coverage:** mac+linux.
 
 ##### inbox/status/001 — Human daemon status shows each agent's pending inbox counts and wake path.
 - **Layer:** Unit (`tests/inbox_status.rs`), pure status projection and table rendering.

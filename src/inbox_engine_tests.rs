@@ -3805,6 +3805,20 @@ fn open_hook_as(
     named: Option<&str>,
     declared: Option<u32>,
 ) -> Peer {
+    let budget =
+        (consumer != crate::event::InboxFetchConsumer::Cli).then(|| component.inline_budget());
+    open_hook_within(hub, component, consumer, named, declared, budget)
+}
+
+/// [`open_hook_as`] asking for `budget`, as the hook's own fetch names it.
+fn open_hook_within(
+    hub: &Arc<InboxHub>,
+    component: InboxComponent,
+    consumer: crate::event::InboxFetchConsumer,
+    named: Option<&str>,
+    declared: Option<u32>,
+    budget: Option<InboxBudget>,
+) -> Peer {
     let (client, server) = tokio::io::duplex(1 << 16);
     let (read, write) = tokio::io::split(server);
     let serve = tokio::spawn(serve_hook(
@@ -3814,8 +3828,7 @@ fn open_hook_as(
         component,
         HookFetch {
             named: named.map(str::to_string),
-            budget: (consumer != crate::event::InboxFetchConsumer::Cli)
-                .then(|| component.inline_budget()),
+            budget,
             hook_integration: declared,
             consumer,
         },
@@ -5406,4 +5419,172 @@ fn boundary_066_an_open_refusal_tells_each_orchestrator_that_delegates_into_it_o
         1,
         "its own task was superseded"
     );
+}
+
+/// PRD #1666 part 3 (H4): a task headed `edge` whose body is `body`.
+fn edge_content(body: &str) -> Content {
+    Content {
+        subject: "edge".to_string(),
+        body: body.to_string(),
+        ..content("")
+    }
+}
+
+/// Codex's prompt hook's and its `Stop`'s hand-overs: each envelope, the
+/// consumer it fetches as, and the room it asks the deck for, as the hook
+/// itself computes it.
+fn codex_hand_overs() -> Vec<(
+    crate::inbox_prompt::Envelope,
+    crate::event::InboxFetchConsumer,
+    usize,
+)> {
+    use crate::event::InboxFetchConsumer::{DoorbellHook, TurnEndHook};
+    use crate::inbox_prompt::{Envelope, HookHandOver, one_shot_request};
+    let prompt = Envelope::Context {
+        hook_event_name: "UserPromptSubmit".to_string(),
+    };
+    [(prompt, DoorbellHook), (Envelope::Block, TurnEndHook)]
+        .into_iter()
+        .map(|(envelope, consumer)| {
+            let request = one_shot_request(
+                &HookHandOver {
+                    component: InboxComponent::CodexHooks,
+                    consumer,
+                    rung: None,
+                    envelope: &envelope,
+                    framing: AGENT_FRAMING,
+                },
+                "p".to_string(),
+                Some("a".to_string()),
+                "t".to_string(),
+            );
+            let room = request.max_json_bytes.expect("Codex's hooks count JSON");
+            (envelope, consumer, room)
+        })
+        .collect()
+}
+
+/// What a Codex hook fetching as `consumer` within `room` JSON bytes is handed
+/// of `c`, posted alone to `p`/`a`.
+async fn codex_fetch(
+    consumer: crate::event::InboxFetchConsumer,
+    room: usize,
+    c: Content,
+) -> Vec<crate::event::InboxDelivery> {
+    let (hub, _state) = hub_with_spool(Duration::from_secs(30), Duration::from_secs(60));
+    hub.post_direct(Recipient::bound("p", "a"), c).unwrap();
+    let mut hook = open_hook_within(
+        &hub,
+        InboxComponent::CodexHooks,
+        consumer,
+        None,
+        Some(HOOK_INTEGRATION),
+        Some(InboxBudget::JsonBytes(room)),
+    );
+    let batch = hook.next().await.messages.expect("a batch");
+    hook.close().await;
+    batch
+}
+
+/// The line a Codex hook prints for `batch` in `envelope`, every block
+/// written.
+#[cfg(unix)]
+fn codex_line(
+    envelope: &crate::inbox_prompt::Envelope,
+    batch: Vec<crate::event::InboxDelivery>,
+) -> String {
+    let batch = crate::inbox_oneshot::OneShotBatch::new(batch);
+    let texts: Vec<&str> = (0..batch.len())
+        .map(|i| batch.text(i).unwrap_or_default())
+        .collect();
+    let parts = envelope.parts(AGENT_FRAMING, &texts);
+    let mut out = Vec::new();
+    let hand = batch.hand_over(&mut out, &parts.pieces(), |_| Ok(()));
+    assert!(hand.error.is_none());
+    String::from_utf8(out).unwrap()
+}
+
+/// Scenario: For Codex's prompt hook and its `Stop`, a task is posted whose block, with its attempt opener, measures exactly the room the hook asks the deck for, and tasks a few bytes either side of it. Each is fetched within that room and printed in the hook's JSON with its framing: every line, the separator before the block and the newline included, is at most Codex's 6000 bytes.
+#[cfg(unix)]
+#[spec("inbox/boundary/068")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boundary_068_codexs_whole_line_stays_within_its_bytes_at_the_edge() {
+    let limit = InboxComponent::CodexHooks.inline_budget().limit();
+    for (envelope, consumer, room) in codex_hand_overs() {
+        let probe = codex_fetch(consumer, room, edge_content("x")).await;
+        let structure = crate::event::json_escaped_len(&probe[0].text) - 1;
+        let exact = room - structure;
+        for n in exact - 4..=exact + 4 {
+            let batch = codex_fetch(consumer, room, edge_content(&"x".repeat(n))).await;
+            let line = codex_line(&envelope, batch);
+            assert!(
+                line.len() <= limit,
+                "{consumer:?}, a body of {n} (exactly the room at {exact}): {} bytes",
+                line.len()
+            );
+        }
+    }
+}
+
+/// Scenario: Tasks whose bodies are heavy in quotes, backslashes or control characters, short enough in plain bytes to fit Codex's byte budget but not once JSON-escaped, go through the deck's full-body check. Each is saved to a file, and fetched by Codex's prompt hook or its `Stop` within the room each asks for, its block is either whole or names that file, never only how much did not fit. The longest quote-heavy body the check does not save renders whole in both hooks' room, even as a marked repeat with the longest attempt opener.
+#[cfg(unix)]
+#[spec("inbox/boundary/069")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boundary_069_a_body_codexs_json_would_cut_is_saved_and_named() {
+    let dir = tempfile::tempdir().unwrap();
+    let raw_room = InboxComponent::CodexHooks.inline_budget().limit() - AGENT_FRAMING.len();
+    for (what, unit, n) in [
+        ("quotes", "\"", 3_000),
+        ("backslashes", "\\", 3_000),
+        ("control characters", "\u{1}", 1_000),
+        ("a mix", "\"\\\u{1}\t", 600),
+    ] {
+        let body = format!("{}\nFINAL STEP: write the sentinel", unit.repeat(n));
+        assert!(body.len() < raw_room, "{what} fits in plain bytes");
+        let mut c = edge_content(&body);
+        assert!(body_needs_saving(&deck(), "p", &c), "{what}");
+        retain_full_body(&deck(), "p", &mut c, &[dir.path().to_path_buf()]).unwrap();
+        let path = c.spill_path.clone().expect("saved to a file");
+        for (_, consumer, room) in codex_hand_overs() {
+            let batch = codex_fetch(consumer, room, c.clone()).await;
+            let text = &batch[0].text;
+            assert!(
+                !text.contains("did not fit"),
+                "{what}, {consumer:?}: {text}"
+            );
+            assert!(
+                text.contains(&body) || text.contains(&path.display().to_string()),
+                "{what}, {consumer:?}: neither whole nor naming its file"
+            );
+        }
+    }
+
+    let saved = |n: usize| body_needs_saving(&deck(), "p", &edge_content(&"\"".repeat(n)));
+    let (mut kept, mut cut) = (0, 6_000);
+    assert!(!saved(kept) && saved(cut));
+    while cut - kept > 1 {
+        let mid = (kept + cut) / 2;
+        if saved(mid) {
+            cut = mid;
+        } else {
+            kept = mid;
+        }
+    }
+    let (hub, _state) = hub_with_spool(Duration::from_secs(30), Duration::from_secs(60));
+    let id = hub
+        .post_direct(Recipient::bound("p", "a"), edge_content(&"\"".repeat(kept)))
+        .unwrap();
+    let message = hub.lock().inbox.get(id.as_str(), "p").cloned().unwrap();
+    for (_, consumer, room) in codex_hand_overs() {
+        let block = render_marked(
+            &message,
+            Some(InboxBudget::JsonBytes(room).less(BLOCK_SEPARATOR)),
+            true,
+            Some((u32::MAX, u32::MAX)),
+        );
+        assert!(
+            block.text.contains(message.body.as_ref()),
+            "{consumer:?}: the longest unsaved body ({kept}) was cut"
+        );
+    }
 }

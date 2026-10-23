@@ -1524,6 +1524,95 @@ mod tests {
         assert!(lines[1].contains("inbox_receipt_fetch"), "{lines:?}");
     }
 
+    /// Scenario: Run `inbox fetch --json` against a stand-in deck that hands it three messages and refuses the grant of the first, the middle or the last. Each time stdout parses as JSON listing exactly the other two, each with only its public keys, and the deck is told those two committed and the refused one not handed. With every grant refused, stdout is an empty list and nothing commits.
+    #[cfg(unix)]
+    #[spec("inbox/cli/007")]
+    #[test]
+    fn inbox_cli_007_a_fenced_out_message_leaves_the_json_whole() {
+        use crate::event::InboxStreamControl;
+        let ids = [
+            "m-k3xzq2ab-0f3c9a71d2e4b850",
+            "m-k3xzq2ab-1a2b3c4d5e6f7081",
+            "m-k3xzq2ab-2b3c4d5e6f708192",
+        ];
+        let at = |id: &str| crate::event::InboxAttemptRef {
+            id: id.to_string(),
+            a: 1,
+            e: 1,
+        };
+        let mut refusals: Vec<Vec<usize>> = (0..ids.len()).map(|i| vec![i]).collect();
+        refusals.push((0..ids.len()).collect());
+        for refused in refusals {
+            let mut answers = serving(&ids, &[]);
+            for &i in &refused {
+                answers[2 + i] = format!(r#"{{"grant":{{"q":{},"ok":false}}}}"#, i + 1);
+            }
+            let dir = crate::test_temp::tempdir().unwrap();
+            let (path, deck) =
+                crate::inbox_oneshot::tests::stand_in_deck(dir.path(), vec![Some(answers)]);
+            let mut out = Out {
+                took: Vec::new(),
+                room: None,
+                flush_fails: false,
+            };
+            let mut err = Vec::new();
+            fetch_one_shot(
+                true,
+                Identity {
+                    pane_id: "p".to_string(),
+                    agent_id: Some("a".to_string()),
+                    token: Some("t".to_string()),
+                },
+                &path,
+                Duration::from_millis(400),
+                Ok(&mut out),
+                &|| crate::inbox_oneshot::Pinned::Unpinned,
+                &mut err,
+            );
+            let lines: Vec<String> = deck.join().unwrap().into_iter().flatten().collect();
+            let stdout = String::from_utf8(out.took).unwrap();
+            let printed: serde_json::Value = serde_json::from_str(&stdout)
+                .unwrap_or_else(|error| panic!("refused {refused:?}: {error}: {stdout}"));
+            let kept: Vec<&str> = (0..ids.len())
+                .filter(|i| !refused.contains(i))
+                .map(|i| ids[i])
+                .collect();
+            let listed: Vec<&str> = printed["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|message| {
+                    let mut keys: Vec<&str> = message
+                        .as_object()
+                        .unwrap()
+                        .keys()
+                        .map(String::as_str)
+                        .collect();
+                    keys.sort();
+                    assert_eq!(keys, ["from", "id", "subject", "text"], "{message}");
+                    message["id"].as_str().unwrap()
+                })
+                .collect();
+            assert_eq!(listed, kept, "refused {refused:?}");
+            let reported: Vec<InboxStreamControl> = lines
+                .iter()
+                .filter(|line| !line.contains("message_type") && !line.contains("\"may\""))
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect();
+            assert_eq!(reported.len(), 1, "{lines:?}");
+            assert_eq!(
+                reported[0].committed,
+                kept.iter().map(|id| at(id)).collect::<Vec<_>>(),
+                "refused {refused:?}"
+            );
+            assert_eq!(
+                reported[0].not_handed,
+                refused.iter().map(|&i| at(ids[i])).collect::<Vec<_>>(),
+                "refused {refused:?}"
+            );
+        }
+    }
+
     /// PRD #1666 S8: `inbox wait --agent opencode-mini` speaks for OpenCode's
     /// `--mini` server plugin, on the wire as `opencode_mini`; the full TUI's
     /// plugin keeps `opencode_plugin`.

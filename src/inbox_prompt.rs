@@ -512,13 +512,17 @@ impl OneShotInjection {
     /// possibly handed, one refused at its fence or never started is not
     /// handed (part 2 §1.2). Answers what became of each block.
     pub fn print(self) -> crate::inbox_oneshot::Ran {
-        self.print_to(raw_stdout())
+        self.print_to(raw_stdout(), &pinned_spool())
     }
 
     /// [`Self::print`] to `stdout`, this process's stdout if it could be
-    /// opened; if it could not, nothing is written and the deck is told the
-    /// batch was not handed.
-    fn print_to(mut self, stdout: std::io::Result<std::fs::File>) -> crate::inbox_oneshot::Ran {
+    /// opened, publishing into `pinned`; if it could not be opened, nothing
+    /// is written and the deck is told the batch was not handed.
+    fn print_to(
+        mut self,
+        stdout: std::io::Result<std::fs::File>,
+        pinned: &crate::inbox_oneshot::Pinned,
+    ) -> crate::inbox_oneshot::Ran {
         let Ok(mut stdout) = stdout else {
             return self
                 .batch
@@ -529,10 +533,9 @@ impl OneShotInjection {
             .collect();
         let parts = self.envelope.parts(&self.framing, &texts);
         let pieces = parts.pieces();
-        let pinned = pinned_spool();
         self.batch.run(
             &mut self.connection,
-            &pinned,
+            pinned,
             self.grant_ttl,
             &mut stdout,
             &pieces,
@@ -1043,10 +1046,88 @@ mod tests {
                 hook_event_name: "UserPromptSubmit".to_string(),
             },
         };
-        injection.print_to(Err(std::io::Error::other("no descriptor left")));
+        injection.print_to(
+            Err(std::io::Error::other("no descriptor left")),
+            &crate::inbox_oneshot::Pinned::Unpinned,
+        );
         let controls = crate::inbox_oneshot::tests::controls_read(deck);
         assert_eq!(controls.len(), 1, "{controls:?}");
         assert_eq!(controls[0].not_handed, attempts);
+    }
+
+    /// Scenario: Codex's `Stop` hands a two-message batch over against a deck that refuses both grants, refuses the first, or grants both. With both refused it prints nothing and does not go on with the turn, so its Idle is reported as the turn ends; with the first refused it prints one `{"decision":"block"}` line carrying only the second block and goes on with the turn; with both granted it carries both and goes on. The deck is told exactly the blocks it printed committed.
+    #[cfg(unix)]
+    #[spec("inbox/receipt/032")]
+    #[test]
+    fn receipt_032_stop_blocks_the_turn_only_with_what_it_wrote() {
+        use crate::event::{InboxDelivery, InboxDeliveryAttempt};
+        use std::io::{Read, Seek, Write};
+        let block = |id: &str| InboxDelivery {
+            id: id.to_string(),
+            subject: "s".to_string(),
+            from: "the orchestrator".to_string(),
+            text: format!(
+                "[dot-agent-deck message {id} delivery 1.1 from the orchestrator]\nbody of {id}\n[end of dot-agent-deck message {id}]"
+            ),
+            attempt: Some(InboxDeliveryAttempt {
+                a: 1,
+                e: 1,
+                d: 1,
+                repeat: false,
+                caps: None,
+            }),
+        };
+        for (granted, printed) in [
+            ([false, false], vec![]),
+            ([false, true], vec![OTHER]),
+            ([true, true], vec![ID, OTHER]),
+        ] {
+            let (connection, mut deck) = crate::inbox_oneshot::tests::connection_pair();
+            for (q, ok) in granted.iter().enumerate() {
+                writeln!(deck, r#"{{"grant":{{"q":{},"ok":{ok}}}}}"#, q + 1).unwrap();
+            }
+            let batch = crate::inbox_oneshot::OneShotBatch::new(vec![block(ID), block(OTHER)]);
+            let injection = OneShotInjection {
+                connection,
+                batch,
+                grant_ttl: std::time::Duration::from_secs(60),
+                framing: "framing".to_string(),
+                envelope: Envelope::Block,
+            };
+            let mut file = tempfile::tempfile().unwrap();
+            let ran = injection.print_to(file.try_clone(), &crate::inbox_oneshot::Pinned::Unpinned);
+            let mut stdout = String::new();
+            file.rewind().unwrap();
+            file.read_to_string(&mut stdout).unwrap();
+            let committed: Vec<String> = crate::inbox_oneshot::tests::controls_read(deck)
+                .into_iter()
+                .filter(|control| control.may.is_none())
+                .flat_map(|control| control.committed)
+                .map(|at| at.id)
+                .collect();
+            assert_eq!(committed, printed, "granted {granted:?}");
+            assert_eq!(
+                ran.continues_turn(),
+                !printed.is_empty(),
+                "granted {granted:?}"
+            );
+            if printed.is_empty() {
+                assert!(stdout.is_empty(), "granted {granted:?}: {stdout}");
+                continue;
+            }
+            assert_eq!(stdout.lines().count(), 1, "{stdout}");
+            let decision: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+            assert_eq!(decision["decision"], "block", "{stdout}");
+            let reason = decision["reason"].as_str().unwrap();
+            assert!(reason.starts_with("framing"), "{reason}");
+            for id in [ID, OTHER] {
+                assert_eq!(
+                    reason.contains(&format!("body of {id}")),
+                    printed.contains(&id),
+                    "granted {granted:?}: {reason}"
+                );
+            }
+        }
     }
 
     /// Scenario: Claude's prompt hook hands a two-message batch over as additionalContext, one block's body full of characters JSON escapes. Its pieces, joined, are exactly the JSON the hook prints for the framing and both blocks, then a newline, each block a piece of its own; none of the batch's caps is in them or in the batch's debug output. Written to an output that fails partway through the second block, the first block is possibly handed (the hook's JSON never closed) and the second possibly handed too.

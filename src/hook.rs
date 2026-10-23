@@ -209,13 +209,7 @@ pub fn handle_hook(agent: &str) -> ExitCode {
             // Codex no block to act on, so the turn ends as usual.
             #[cfg(unix)]
             CodexInbox::TurnEnd(injection) => {
-                let ran = injection.print();
-                if ran.error.is_none()
-                    && ran
-                        .outputs
-                        .iter()
-                        .all(|output| *output == crate::inbox_oneshot::Output::Written)
-                {
+                if injection.print().continues_turn() {
                     return ExitCode::SUCCESS;
                 }
             }
