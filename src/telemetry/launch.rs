@@ -48,7 +48,9 @@ use std::path::{Path, PathBuf};
 
 use crate::event::AgentType;
 
-use super::config::{EnvMap, OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_PROTOCOL, non_empty};
+use super::config::{
+    EnvMap, OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_PROTOCOL, non_empty, sdk_disabled,
+};
 
 /// Set in a Pi agent's environment when the deck's Pi extension should export.
 pub const PI_TELEMETRY_ENV: &str = "DOT_AGENT_DECK_PI_TELEMETRY";
@@ -151,11 +153,6 @@ impl Signal {
 enum HttpProtocol {
     Protobuf,
     Json,
-}
-
-/// Whether `env` switches the OTel SDK off.
-fn sdk_disabled(env: &EnvMap) -> bool {
-    non_empty(env, "OTEL_SDK_DISABLED").is_some_and(|v| v.eq_ignore_ascii_case("true"))
 }
 
 /// Whether one of `args` starts with or contains `needle`, read lossily.
@@ -517,7 +514,14 @@ fn config_file_name(run_id: &str, pid: u32) -> String {
 
 /// The run whose configuration file `name` is, when it is named as the deck
 /// names them ([`config_file_name`]).
+#[cfg(test)]
 fn config_file_run(name: &[u8]) -> Option<&[u8]> {
+    config_file_parts(name).map(|(run, _)| run)
+}
+
+/// The run and the Devin's process id, as digits, of configuration file
+/// `name`, when it is named as the deck names them ([`config_file_name`]).
+fn config_file_parts(name: &[u8]) -> Option<(&[u8], &[u8])> {
     let rest = name
         .strip_prefix(DEVIN_CONFIG_PREFIX.as_bytes())?
         .strip_suffix(b".json")?;
@@ -526,23 +530,50 @@ fn config_file_run(name: &[u8]) -> Option<&[u8]> {
     };
     let id = &rest[..32];
     let pid_ok = (1..=10).contains(&pid.len()) && pid.iter().all(u8::is_ascii_digit);
-    (pid_ok && std::str::from_utf8(id).is_ok_and(is_run_id)).then_some(id)
+    (pid_ok && std::str::from_utf8(id).is_ok_and(is_run_id)).then_some((id, pid))
 }
 
-/// Remove every per-run configuration file in `dir`, the deck's own
-/// directory for them: called before any run exists, so each one there was
-/// left by a daemon that ended without removing it — and at a daemon's
-/// shutdown. See `remove_config_files_where`.
+/// Remove the per-run configuration files in `dir`, the deck's own directory
+/// for them, left by a daemon that ended without removing them: called
+/// before any run of this daemon exists. Another daemon on the same state
+/// directory shares `dir`, so on Unix a file is removed only when the Devin
+/// it was written for has exited ([`process_is_live`]); elsewhere every one
+/// is. See `remove_config_files_where`.
 pub fn remove_leftover_config_files(dir: &Path) {
-    remove_config_files_where(dir, |_| true);
+    #[cfg(unix)]
+    remove_config_files_where(dir, |_, pid| !process_is_live(pid));
+    #[cfg(not(unix))]
+    remove_config_files_where(dir, |_, _| true);
 }
 
 /// Remove run `run_id`'s per-run configuration files in `dir`: its run ended.
 pub fn remove_run_config_files(dir: &Path, run_id: &str) {
-    remove_config_files_where(dir, |run| run == run_id.as_bytes());
+    remove_config_files_where(dir, |run, _| run == run_id.as_bytes());
 }
 
-/// Remove the per-run configuration files in `dir` whose run `which` selects.
+/// Whether the process `pid`, written in digits, may be alive: `kill(pid, 0)`
+/// finds it, or fails for any reason other than `ESRCH` (no such process),
+/// `EPERM` (another user's) included. A number that is no process id — `0`,
+/// or past `pid_t` — is no process. The system can reuse an exited Devin's
+/// id, which keeps its file until a later daemon's start.
+#[cfg(unix)]
+fn process_is_live(pid: &[u8]) -> bool {
+    let Some(pid) = std::str::from_utf8(pid)
+        .ok()
+        .and_then(|p| p.parse::<libc::pid_t>().ok())
+        .filter(|p| *p > 0)
+    else {
+        return false;
+    };
+    // SAFETY: signal 0 is not sent; `kill` only checks the process exists.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// Remove the per-run configuration files in `dir` whose run and Devin
+/// process id `which` selects.
 /// Only regular files named as the deck names them ([`config_file_run`]) are
 /// removed, and only when `dir` is a directory of the current user's, not a
 /// symlink; anything else — the shim directory beside them included — is
@@ -552,7 +583,7 @@ pub fn remove_run_config_files(dir: &Path, run_id: &str) {
 /// read and unlinked from through that descriptor, so a name swapped in after
 /// the check cannot redirect it.
 #[cfg(unix)]
-fn remove_config_files_where(dir: &Path, which: impl Fn(&[u8]) -> bool) {
+fn remove_config_files_where(dir: &Path, which: impl Fn(&[u8], &[u8]) -> bool) {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let handle = match std::fs::OpenOptions::new()
         .read(true)
@@ -578,7 +609,7 @@ fn remove_config_files_where(dir: &Path, which: impl Fn(&[u8]) -> bool) {
         }
     }
     for name in dir_entry_names(&handle) {
-        if config_file_run(name.to_bytes()).is_some_and(&which)
+        if config_file_parts(name.to_bytes()).is_some_and(|(run, pid)| which(run, pid))
             && is_regular_file_at(&handle, &name)
         {
             unlink_at(&handle, &name);
@@ -591,7 +622,7 @@ fn remove_config_files_where(dir: &Path, which: impl Fn(&[u8]) -> bool) {
 /// its path, which a directory swapped in between the check and the read
 /// would redirect.
 #[cfg(not(unix))]
-fn remove_config_files_where(dir: &Path, which: impl Fn(&[u8]) -> bool) {
+fn remove_config_files_where(dir: &Path, which: impl Fn(&[u8], &[u8]) -> bool) {
     match std::fs::symlink_metadata(dir) {
         Ok(meta) if meta.is_dir() => {}
         _ => return,
@@ -600,7 +631,8 @@ fn remove_config_files_where(dir: &Path, which: impl Fn(&[u8]) -> bool) {
         return;
     };
     for entry in entries.flatten() {
-        if config_file_run(entry.file_name().as_encoded_bytes()).is_some_and(&which)
+        if config_file_parts(entry.file_name().as_encoded_bytes())
+            .is_some_and(|(run, pid)| which(run, pid))
             && entry.file_type().is_ok_and(|t| t.is_file())
         {
             remove_config_file(&entry.path());
@@ -1101,7 +1133,7 @@ mod tests {
     #[test]
     fn the_leftover_sweep_stays_in_its_own_directory() {
         let root = tempfile::tempdir().unwrap();
-        let ours = config_file_name(&super::super::span::new_run_id(), 7);
+        let ours = config_file_name(&super::super::span::new_run_id(), dead_pid());
         let elsewhere = root.path().join("elsewhere");
         std::fs::create_dir(&elsewhere).unwrap();
         std::fs::write(elsewhere.join(&ours), "{}").unwrap();
@@ -1144,6 +1176,35 @@ mod tests {
         std::fs::write(&file, "").unwrap();
         remove_leftover_config_files(&file);
         assert!(file.exists());
+    }
+
+    /// The process id of a process that has exited. The system may give it
+    /// to a new process before the caller uses it, which would make a test
+    /// that needs it dead fail, never pass wrongly.
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    /// Another daemon on the same state directory has live Devins whose
+    /// files are in the same directory: the sweep at a daemon's start removes
+    /// a file only when the Devin it was written for has exited.
+    #[test]
+    fn the_leftover_sweep_keeps_a_live_devins_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = config_file_name(&super::super::span::new_run_id(), std::process::id());
+        let dead = config_file_name(&super::super::span::new_run_id(), dead_pid());
+        for name in [&live, &dead] {
+            std::fs::write(dir.path().join(name), "{}").unwrap();
+        }
+        remove_leftover_config_files(dir.path());
+        assert!(dir.path().join(&live).exists(), "a live Devin's file stays");
+        assert!(
+            !dir.path().join(&dead).exists(),
+            "an exited Devin's file goes"
+        );
     }
 
     /// A run's end removes its own files, every Devin of it, and no other run's.

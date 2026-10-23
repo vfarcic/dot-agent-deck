@@ -1786,6 +1786,63 @@ mod tests {
         assert_eq!(flag(&logs_off, &[]), None, "the daemon's own selector");
     }
 
+    /// A switch the deck sets only when the user has not, set in the
+    /// daemon's environment to a value that is not UTF-8, is the user's all
+    /// the same: the deck adds none of it, for Claude Code or for Pi.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_switch_counts_as_set() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let start = |unreadable: &str| {
+            Arc::new(Telemetry::start(&super::super::config::env_from([
+                (
+                    OsString::from("OTEL_EXPORTER_OTLP_ENDPOINT"),
+                    OsString::from("http://127.0.0.1:9"),
+                ),
+                (
+                    OsString::from(unreadable),
+                    OsString::from_vec(vec![b'0', 0xff]),
+                ),
+            ])))
+        };
+        let pi = || RunStart {
+            agent: AgentType::Pi,
+            ..run_start("p1")
+        };
+        let pi_flag = super::super::launch::PI_TELEMETRY_ENV;
+        // With the SDK switch unreadable the deck's own export is off too,
+        // and there is no run to prepare.
+        for switch in [
+            pi_flag,
+            "OTEL_SDK_DISABLED",
+            "OTEL_LOGS_EXPORTER",
+            "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
+        ] {
+            let run = start(switch)
+                .prepare_run(pi(), &[], None)
+                .map(|run| run.env.clone())
+                .unwrap_or_default();
+            assert_eq!(get(&run, pi_flag), None, "{switch}");
+        }
+        for switch in [
+            "CLAUDE_CODE_ENABLE_TELEMETRY",
+            "OTEL_METRICS_EXPORTER",
+            "OTEL_LOGS_EXPORTER",
+            "OTEL_EXPORTER_OTLP_PROTOCOL",
+        ] {
+            let run = start(switch)
+                .prepare_run(run_start("p1"), &[], None)
+                .map(|run| run.env.clone())
+                .unwrap_or_default();
+            assert_eq!(get(&run, switch), None, "{switch}");
+        }
+        // Unreadable values the deck has no use for are still left out.
+        let other = start("OTEL_SERVICE_NAME");
+        let run = other.prepare_run(run_start("p1"), &[], None).unwrap();
+        assert_eq!(get(&run.env, "CLAUDE_CODE_ENABLE_TELEMETRY"), Some("1"));
+    }
+
     /// A Claude Code launch behind leading assignments or an `env` prefix,
     /// with no declared agent kind, is still Claude Code: its run says so and
     /// it gets the switches.

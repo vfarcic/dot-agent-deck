@@ -7,6 +7,7 @@
 //! specification says it must.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::time::Duration;
 
 use super::resource;
@@ -30,13 +31,57 @@ pub const DEFAULT_EXPORT_TIMEOUT: Duration = Duration::from_secs(10);
 /// A snapshot of an environment, keyed by variable name.
 pub type EnvMap = HashMap<String, String>;
 
+/// What [`process_env`] holds for one of [`SET_WHEN_UNREADABLE`] whose value
+/// is not UTF-8: a value no reader takes for an `otlp` selector, an HTTP
+/// protocol or `0`/`1`, so the variable is set, to something the deck cannot
+/// read.
+pub const UNREADABLE: &str = "\u{FFFD}";
+
+/// The switches whose presence alone is the user's say: the ones the deck
+/// sets for an agent only when the user has not, and the opt-outs and
+/// selectors that turn an export off. One whose value is not UTF-8 is kept as
+/// [`UNREADABLE`] rather than dropped, which would read as unset and have the
+/// deck set it over the user's value.
+pub const SET_WHEN_UNREADABLE: [&str; 10] = [
+    OTEL_SDK_DISABLED,
+    OTEL_TRACES_EXPORTER,
+    "OTEL_METRICS_EXPORTER",
+    "OTEL_LOGS_EXPORTER",
+    OTEL_EXPORTER_OTLP_PROTOCOL,
+    OTEL_EXPORTER_OTLP_TRACES_PROTOCOL,
+    "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
+    super::propagation::CLAUDE_CODE_ENABLE_TELEMETRY.0,
+    super::launch::PI_TELEMETRY_ENV,
+];
+
 /// The daemon process's environment, for [`TelemetryConfig::from_env`].
-/// Variables whose name or value is not UTF-8 are skipped: none of the ones
-/// read here can be meaningful in that form.
+/// A variable whose name is not UTF-8 is skipped, and so is one whose value
+/// is not, but for [`SET_WHEN_UNREADABLE`].
 pub fn process_env() -> EnvMap {
-    std::env::vars_os()
-        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+    env_from(std::env::vars_os())
+}
+
+/// [`process_env`] over `vars`.
+pub(crate) fn env_from(vars: impl IntoIterator<Item = (OsString, OsString)>) -> EnvMap {
+    vars.into_iter()
+        .filter_map(|(k, v)| {
+            let k = k.into_string().ok()?;
+            let v = match v.into_string() {
+                Ok(v) => v,
+                Err(_) if SET_WHEN_UNREADABLE.contains(&k.as_str()) => UNREADABLE.to_string(),
+                Err(_) => return None,
+            };
+            Some((k, v))
+        })
         .collect()
+}
+
+/// Whether `env` switches the OTel SDK off: `OTEL_SDK_DISABLED` is `true`, in
+/// any case, or set to a value the deck cannot read.
+pub fn sdk_disabled(env: &EnvMap) -> bool {
+    non_empty(env, OTEL_SDK_DISABLED)
+        .is_some_and(|v| v.eq_ignore_ascii_case("true") || v == UNREADABLE)
 }
 
 /// The value of `key` in `env`, or `None` when it is absent or empty after
@@ -126,7 +171,7 @@ impl TelemetryConfig {
     /// and names no `otlp` exporter (`none`, `console`, …), or no endpoint is
     /// configured.
     pub fn from_env(env: &EnvMap) -> Option<Self> {
-        if non_empty(env, OTEL_SDK_DISABLED).is_some_and(|v| v.eq_ignore_ascii_case("true")) {
+        if sdk_disabled(env) {
             return None;
         }
         if let Some(exporters) = non_empty(env, OTEL_TRACES_EXPORTER)

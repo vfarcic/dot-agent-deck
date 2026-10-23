@@ -3,7 +3,7 @@
 //!
 //! **The command line is not sent.** [`classify`] reads the text once and
 //! returns two values at most: the program's basename and its first
-//! non-option argument. Each word is kept only when it has the
+//! argument, when no option comes before it. Each word is kept only when it has the
 //! shape of a command word ([`is_command_word`]: lowercase letters, digits,
 //! `.`, `_` and `-`, at most 32 characters), which leaves out a path, a URL, a
 //! quoted string with a space in it, and anything with an uppercase letter or
@@ -40,8 +40,9 @@
 pub struct Operation {
     /// The program's basename, when it passes [`is_command_word`].
     pub program: Option<String>,
-    /// Its first non-option argument, when it passes [`is_command_word`] and
-    /// the program is not one of [`WORDLESS_PROGRAMS`].
+    /// Its first argument, when no option comes before it, it passes
+    /// [`is_command_word`] and the program is not one of
+    /// [`WORDLESS_PROGRAMS`].
     pub word: Option<String>,
 }
 
@@ -412,19 +413,21 @@ fn classify_words(segment: &[&str]) -> Option<Operation> {
 /// word is kept for a program that is not kept: what it is cannot be told.
 /// The arguments are read up to the first that is not an option, each a
 /// simple word, or the command declines — for one of [`WORDLESS_PROGRAMS`]
-/// too, though its word is then dropped.
+/// too, though its word is then dropped. The word is kept only when it is
+/// the first argument: an option before it may take it as its value
+/// (`sshpass -p <password>`), and which options do is not known.
 fn named(program: &str, args: &[&str]) -> Operation {
     if !is_command_word(program) {
         return Operation::default();
     }
     let mut word = None;
-    for arg in args {
+    for (at, arg) in args.iter().enumerate() {
         if !is_simple_word(arg) {
             return Operation::default();
         }
         if !arg.starts_with('-') && !arg.starts_with('+') {
             word = Some(arg.to_string())
-                .filter(|w| is_command_word(w) && !WORDLESS_PROGRAMS.contains(&program));
+                .filter(|w| at == 0 && is_command_word(w) && !WORDLESS_PROGRAMS.contains(&program));
             break;
         }
     }
@@ -669,8 +672,8 @@ mod tests {
     fn the_program_and_its_first_word() {
         for (command, expected) in [
             ("cargo test --workspace", expected("cargo", Some("test"))),
-            ("git -C repo status", expected("git", Some("repo"))),
-            ("cargo +nightly fmt", expected("cargo", Some("fmt"))),
+            ("git -C repo status", expected("git", None)),
+            ("cargo +nightly fmt", expected("cargo", None)),
             ("/usr/bin/make", expected("make", None)),
             (
                 "./scripts/release.sh --dry-run",
@@ -678,6 +681,29 @@ mod tests {
             ),
             ("npm run build:prod", expected("npm", Some("run"))),
             ("ls", expected("ls", None)),
+        ] {
+            assert_eq!(classify(Some(command)), expected, "{command}");
+        }
+    }
+
+    /// An option before the first argument can take that argument as its
+    /// value — a password, a user name, a directory — and which options do
+    /// is not known for most programs: a word is sent only when it comes
+    /// straight after the program.
+    #[test]
+    fn no_word_after_an_option() {
+        for (command, expected) in [
+            ("sshpass -p x ssh host", expected("sshpass", None)),
+            ("mysql -u admin db", expected("mysql", None)),
+            ("psql -U admin", expected("psql", None)),
+            ("git -C dir status", expected("git", None)),
+            ("kubectl -n ns get pods", expected("kubectl", None)),
+            ("cargo +nightly fmt", expected("cargo", None)),
+            ("bash -c 'sshpass -p x ssh host'", expected("sshpass", None)),
+            ("sudo -u root mysql -u admin db", expected("mysql", None)),
+            ("cargo test --workspace", expected("cargo", Some("test"))),
+            ("npm run build", expected("npm", Some("run"))),
+            ("gh pr checks 1814", expected("gh", Some("pr"))),
         ] {
             assert_eq!(classify(Some(command)), expected, "{command}");
         }
@@ -709,7 +735,7 @@ mod tests {
                 "cargo test 2>&1 | tail -n 5",
                 expected("cargo", Some("test")),
             ),
-            ("command -v rg", expected("command", Some("rg"))),
+            ("command -v rg", expected("command", None)),
             ("command -p make test", expected("make", Some("test"))),
         ] {
             assert_eq!(classify(Some(command)), expected, "{command}");
@@ -1081,11 +1107,9 @@ mod tests {
             classify(Some("time cargo build")),
             expected("cargo", Some("build"))
         );
-        // Looked up, not run: the keyword is the word of `command -v`.
-        assert_eq!(
-            classify(Some("command -v case")),
-            expected("command", Some("case"))
-        );
+        // Looked up, not run: the program is `command`, with no word after
+        // its option.
+        assert_eq!(classify(Some("command -v case")), expected("command", None));
     }
 
     /// Every reserved word and declaration or precommand word of the shells
@@ -1163,10 +1187,7 @@ mod tests {
             classify(Some("time cargo build")),
             expected("cargo", Some("build"))
         );
-        assert_eq!(
-            classify(Some("command -v case")),
-            expected("command", Some("case"))
-        );
+        assert_eq!(classify(Some("command -v case")), expected("command", None));
     }
 
     #[test]

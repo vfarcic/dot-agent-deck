@@ -467,16 +467,25 @@ mod tests {
 
     /// A Devin configuration a crashed or SIGKILLed daemon left behind is
     /// removed when the next one starts, exporting or not; nothing else in the
-    /// directory is touched.
+    /// directory is touched, nor, on Unix, a file whose Devin still runs.
     #[tokio::test]
     async fn starting_for_the_daemon_removes_leftover_devin_configs() {
+        // A process that has exited; its id may be reused before the sweep,
+        // which fails the test rather than passing it wrongly.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
         for env in [config::EnvMap::new(), exporting_env()] {
             let dir = tempfile::tempdir().unwrap();
             let leftovers = [
-                format!("devin-{}-1.json", "0123456789abcdef".repeat(2)),
-                format!("devin-{}-4242.json", span::new_run_id()),
+                format!("devin-{}-{dead}.json", "0123456789abcdef".repeat(2)),
+                format!("devin-{}-{dead}.json", span::new_run_id()),
             ]
             .map(|n| dir.path().join(n));
+            #[cfg(unix)]
+            let live = [format!("devin-{}-1.json", span::new_run_id())];
+            #[cfg(not(unix))]
+            let live: [String; 0] = [];
             let kept = [
                 "devin-notes.txt",
                 "other.json",
@@ -487,6 +496,10 @@ mod tests {
                 "devin-0123456789abcdef0123456789abcdef.json",
             ]
             .map(|n| dir.path().join(n));
+            let kept: Vec<_> = kept
+                .into_iter()
+                .chain(live.iter().map(|n| dir.path().join(n)))
+                .collect();
             for path in leftovers.iter().chain(&kept) {
                 std::fs::write(path, "{}").unwrap();
             }

@@ -1041,10 +1041,13 @@ fn telemetry_otlp_014_shell_operations_classify_without_content() {
         ("npm run \"Weird Name\"", "npm", "run"),
         ("npm \"Weird Name\"", "", ""),
         (
-            "env FOO=1 sudo command time nice /usr/bin/cargo --locked check",
+            "env FOO=1 sudo command time nice /usr/bin/cargo check --locked",
             "cargo",
             "check",
         ),
+        // An option before the first argument can take it as its value.
+        ("sshpass -p sentinelvalue1741 ssh host", "sshpass", ""),
+        ("/usr/bin/cargo --locked check", "cargo", ""),
         (
             "export TOKEN=PRIVATE_ASSIGNMENT_1741; true || make check",
             "make",
