@@ -439,7 +439,7 @@ pub fn classify(command: Option<&str>) -> Operation {
 /// command a wrapper runs: see [`Description`].
 pub fn describe(command: Option<&str>) -> Description {
     let line = command.and_then(|c| c.lines().next()).unwrap_or("");
-    describe_line(line)
+    describe_line(line, true)
 }
 
 /// [`classify`] for a command reported as an argv joined with single spaces,
@@ -486,10 +486,13 @@ pub fn classify_joined_argv(command: Option<&str>) -> Operation {
     named(program, &[])
 }
 
-fn describe_line(line: &str) -> Description {
+/// `wrappers`: whether a wrapper's command is read. It is not for a command a
+/// wrapper runs, whose own wrapped command is not kept, so a line of nested
+/// wrappers is read one level deep, however many it holds.
+fn describe_line(line: &str, wrappers: bool) -> Description {
     let mut out = Description::default();
     for segment in segments(line) {
-        let Some(read) = read_segment(&segment) else {
+        let Some(read) = read_segment(&segment, wrappers) else {
             continue;
         };
         if out.commands.is_empty() {
@@ -511,8 +514,9 @@ fn describe_line(line: &str) -> Description {
 }
 
 /// Read one segment's words. `None` when the segment only sets up the next
-/// one; a description with no command when it declines.
-fn read_segment(segment: &[&str]) -> Option<Description> {
+/// one; a description with no command when it declines. `wrappers` as for
+/// [`describe_line`].
+fn read_segment(segment: &[&str], wrappers: bool) -> Option<Description> {
     let Some(words) = command_words(segment) else {
         return Some(Description::default());
     };
@@ -541,15 +545,15 @@ fn read_segment(segment: &[&str]) -> Option<Description> {
                     .filter(|s| is_simple_word(s))
                     .or_else(|| unquote(script))
             }) {
-                Some(script) => describe_line(script),
+                Some(script) => describe_line(script, wrappers),
                 None => Description::default(),
             },
         });
     }
     let mut description = Description::of(named(program, rest));
-    if !description.commands.is_empty() {
+    if wrappers && !description.commands.is_empty() {
         description.wrapped = wrapped_start(program, rest)
-            .and_then(|at| read_segment(&rest[at..]))
+            .and_then(|at| read_segment(&rest[at..], false))
             .map(|wrapped| wrapped.operation)
             .unwrap_or_default();
     }
@@ -634,9 +638,13 @@ const WRAPPERS: &[Wrapper] = &[
     },
 ];
 
+/// Options that print help or a version and run nothing.
+const INFO_OPTIONS: &[&str] = &["-h", "--help", "--version"];
+
 /// Where in `args` the command `program` wraps starts. `None` when `program`
-/// is not on [`WRAPPERS`], a word before that command is not simple or not
-/// one the wrapper is known to take, or there is no command.
+/// is not on [`WRAPPERS`], a word before that command is not simple, is one of
+/// [`INFO_OPTIONS`] or is not one the wrapper is known to take, or there is no
+/// command.
 fn wrapped_start(program: &str, args: &[&str]) -> Option<usize> {
     let wrapper = WRAPPERS.iter().find(|w| {
         w.program == program
@@ -659,10 +667,9 @@ fn wrapped_start(program: &str, args: &[&str]) -> Option<usize> {
         }
         WrappedAt::After { markers, operands } => {
             let at = args_after.iter().position(|w| markers.contains(w))?;
-            if !args_after[..at]
-                .iter()
-                .all(|w| is_simple_word(w) && (*operands || w.starts_with('-')))
-            {
+            if !args_after[..at].iter().all(|w| {
+                is_simple_word(w) && !INFO_OPTIONS.contains(w) && (*operands || w.starts_with('-'))
+            }) {
                 return None;
             }
             at + 1
@@ -1780,6 +1787,26 @@ mod tests {
         }
     }
 
+    /// A wrapper's command is read one level deep: the wrapped command's own
+    /// wrapper is not followed, so a long run of wrappers costs no more.
+    #[test]
+    fn nested_wrappers_are_read_one_level_deep() {
+        assert_eq!(
+            wrapped("timeout 5 nohup cargo test"),
+            expected("nohup", Some("cargo"))
+        );
+        assert_eq!(
+            wrapped("bash -c 'timeout 5 cargo test'"),
+            expected("cargo", Some("test"))
+        );
+        let deep = format!("{}cargo test", "nohup ".repeat(100_000));
+        assert_eq!(wrapped(&deep), expected("nohup", Some("nohup")));
+        assert_eq!(
+            describe(Some(&deep)).operation,
+            expected("nohup", Some("nohup"))
+        );
+    }
+
     #[test]
     fn a_chain_keeps_at_most_max_commands() {
         let line = (0..MAX_COMMANDS + 3)
@@ -1890,6 +1917,11 @@ mod tests {
             "timeout 5 eval sentinelvalue",
             "timeout 5 cd x",
             "timeout 5 X=$(cat /x/sentinelvalue) cargo",
+            // Help runs nothing.
+            "devbox run --help -- cargo test",
+            "kubectl exec pod -h -- cargo test",
+            "nix develop --version -c cargo test",
+            "timeout --help 5 cargo test",
             // Only the first command's wrapper is read.
             "cargo fmt && timeout 5 cargo test",
         ] {

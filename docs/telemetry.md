@@ -168,9 +168,9 @@ The span does not say whether the command succeeded. Some agents send that with 
 | `nix develop`, `nix shell` | After `-c` or `--command`: `nix develop -c cargo test`. |
 | `devbox run` | After a `--` that has only options before it: `devbox run -- cargo test`. |
 
-For any other wrapper, such as `uv run pytest` or `poetry run pytest`, the span describes the wrapper alone, as it did before. A wrapper whose options the deck does not know, or with quotes or other shell syntax before the command it runs, sends no wrapped command. Prefixes such as `env`, `sudo` and `time`, which the deck already looks past, are not wrappers: `sudo cargo test` is still `cargo test` in `deck.operation.program`.
+For any other wrapper, such as `uv run pytest` or `poetry run pytest`, the span describes the wrapper alone, as it did before. A wrapper whose options the deck does not know, one given `-h`, `--help` or `--version`, or one with quotes or other shell syntax before the command it runs, sends no wrapped command. Prefixes such as `env`, `sudo` and `time`, which the deck already looks past, are not wrappers: `sudo cargo test` is still `cargo test` in `deck.operation.program`.
 
-The program and the word are each sent **only when they look like a command word**: lowercase letters, digits, `.`, `_` and `-`, starting with a letter or digit, and at most 32 characters. A path, a URL, a quoted message, anything with an uppercase letter, an `=` or a space, or anything longer is left out. That shape does not make a word safe: a short lowercase password, file name or host name has it too. So for programs whose arguments are usually text, patterns, files, hosts or credentials — `echo`, `printf`, `cat`, `grep`, `rg`, `sed`, `awk`, `curl`, `wget`, `redis-cli`, `base64`, `head`, `tail`, `xargs`, `ssh`, `scp`, `sftp` and `rsync` — the word is never sent, only the program. For any other program the word is its first argument, and only when no option comes before it, since an option can take the next argument as its value: `sshpass -p <password> ssh host` and `mysql -u admin db` send the program and no word. These rules apply to every command in `deck.operation.commands` and to the wrapped command, so a later command's first word, or a wrapped command's, is sent when the first command's would be. If your agents run programs whose first argument can be private, drop `deck.operation.word`, `deck.operation.commands` and `deck.operation.wrapped.word` in a Collector ([Trim what is sent](#trim-what-is-sent)).
+The program and the word are each sent **only when they look like a command word**: lowercase letters, digits, `.`, `_` and `-`, starting with a letter or digit, and at most 32 characters. A path, a URL, a quoted message, anything with an uppercase letter, an `=` or a space, or anything longer is left out. That shape does not make a word safe: a short lowercase password, file name or host name has it too. So for programs whose arguments are usually text, patterns, files, hosts or credentials — `echo`, `printf`, `cat`, `grep`, `rg`, `sed`, `awk`, `curl`, `wget`, `redis-cli`, `base64`, `head`, `tail`, `xargs`, `ssh`, `scp`, `sftp` and `rsync` — the word is never sent, only the program. For any other program the word is its first argument, and only when no option comes before it, since an option can take the next argument as its value: `sshpass -p <password> ssh host` and `mysql -u admin db` send the program and no word. These rules apply to every command in `deck.operation.commands` and to the wrapped command, so a later command's first word, or a wrapped command's, is sent when the first command's would be. If your agents run programs whose first argument can be private, drop `deck.operation.word`, `deck.operation.commands` and `deck.operation.wrapped.word` in a Collector ([Trim what is sent](#trim-what-is-sent)); dropping `deck.operation.word` alone no longer covers it, since `deck.operation.commands` holds the same word.
 
 Which agents report their shell commands:
 
@@ -300,7 +300,12 @@ processors:
         action: delete
       - key: deck.orchestration.name
         action: delete
+      # A command's first argument: all three carry one.
+      - key: deck.operation.word
+        action: delete
       - key: deck.operation.commands
+        action: delete
+      - key: deck.operation.wrapped.word
         action: delete
   # Drop whole spans: here, the per-status and per-command spans.
   filter/trim:

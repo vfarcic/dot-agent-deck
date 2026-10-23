@@ -834,9 +834,16 @@ struct KeptEvent {
 
 impl KeptEvent {
     fn of(event: &AgentEvent) -> Self {
+        // Claude Code's hook cuts `tool_detail` at 120 bytes and keeps the
+        // whole command beside it, which the later commands of a long line
+        // need.
+        let command = event
+            .metadata
+            .get(BASH_COMMAND_METADATA_KEY)
+            .or(event.tool_detail.as_ref());
         let operation = (event.event_type == EventType::ToolStart
             && is_shell_tool(event.tool_name.as_deref()))
-        .then(|| describe_tool(event.tool_name.as_deref(), event.tool_detail.as_deref()));
+        .then(|| describe_tool(event.tool_name.as_deref(), command.map(String::as_str)));
         let mut event = AgentEvent {
             tool_detail: None,
             ..event.clone()
@@ -1921,6 +1928,33 @@ pub(crate) mod tests {
                     13
                 ),
             ]
+        );
+    }
+
+    /// A line longer than the hook's cut `tool_detail` is described from the
+    /// whole command the hook keeps beside it.
+    #[test]
+    fn a_long_line_is_described_from_the_whole_command() {
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        let line = format!("git commit -m '{}' && cargo test", "x".repeat(150));
+        let mut begin = shell("p1", EventType::ToolStart, "Bash", Some(&line[..120]), None);
+        begin.tool_detail = Some(format!("{}…", &line[..120]));
+        begin
+            .metadata
+            .insert(BASH_COMMAND_METADATA_KEY.into(), line.clone());
+        tracker.observe_event(&begin, 10);
+        tracker.observe_event(&shell("p1", EventType::ToolEnd, "Bash", None, None), 11);
+        tracker.end_run("p1", EndReason::Exited, None, 100);
+        let ops = operations(&tracker.take_finished());
+        assert_eq!(ops.len(), 1);
+        assert!(
+            ops[0].0.contains(&Attribute::str(
+                AttrKey::OperationCommands,
+                "git commit,cargo test"
+            )),
+            "{:?}",
+            ops[0].0
         );
     }
 
