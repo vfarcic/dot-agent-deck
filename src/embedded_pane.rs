@@ -7980,3 +7980,42 @@ mod incarnation_binding_tests {
         }
     }
 }
+
+#[cfg(all(test, unix))]
+mod resize_worker_tests {
+    use super::*;
+    use crate::daemon_client::restart_fixture::RestartingDaemon;
+
+    /// A resize asked for before the pane's resize worker first runs, as the
+    /// first layout pass after a pane is created can be, still reaches the
+    /// daemon. The pane records the request and draws at the new size either
+    /// way, so a lost one leaves the agent's PTY at the old size until the
+    /// layout changes again.
+    #[tokio::test]
+    async fn a_resize_asked_before_the_worker_first_runs_reaches_the_daemon() {
+        let daemon = RestartingDaemon::spawn("a");
+        let (resize_tx, resize_rx) = tokio::sync::watch::channel(None);
+        resize_tx.send_replace(Some((30, 100)));
+        let attached = Arc::new(Mutex::new(PaneAttachment {
+            agent_id: "1".into(),
+            viewer: None,
+            incarnation: None,
+        }));
+        let worker = tokio::spawn(resize_worker(
+            resize_rx,
+            DaemonClient::new(daemon.path.clone()),
+            attached,
+            Arc::new(Mutex::new(new_pane_parser(24, 80))),
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !daemon.received_by("a").contains(&"resize".to_string()) {
+            assert!(
+                Instant::now() < deadline,
+                "the resize never reached the daemon"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        worker.abort();
+        drop(resize_tx);
+    }
+}
