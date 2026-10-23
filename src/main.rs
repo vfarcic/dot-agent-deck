@@ -4062,6 +4062,7 @@ async fn run_schedule_cli(action: ScheduleAction) -> ExitCode {
                 max_per_run: max_per_run.unwrap_or_else(default_max_per_run),
                 label,
                 query,
+                claim: Default::default(),
             });
             schedule_cli::add(
                 &mut tasks,

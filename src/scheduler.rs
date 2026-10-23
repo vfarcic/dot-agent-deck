@@ -43,12 +43,14 @@ pub trait Notifier: Send + Sync {
 /// variants (spawn errors, mkdir failures) without touching existing arms.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NotifyEvent {
-    /// A `[[scheduled_tasks]]` entry (or the whole file) failed to load/parse.
-    /// `entry` is the array index when the failure is attributable to a single
-    /// entry, `None` for a file-level error.
+    /// A `[[scheduled_tasks]]` entry (or the whole file) failed to load/parse,
+    /// or, with [`ConfigSeverity::Warning`], loaded with part of it not in
+    /// effect. `entry` is the array index when the problem is attributable to
+    /// a single entry, `None` for a file-level one.
     ConfigError {
         entry: Option<usize>,
         message: String,
+        severity: ConfigSeverity,
     },
     /// A scheduled fire (cron tick or run-now) was skipped because the prior
     /// run for the same task name has not returned yet.
@@ -64,20 +66,25 @@ pub enum NotifyEvent {
     /// spawn itself failed. The fire is abandoned; other tasks keep running.
     SpawnFailed { task: String, message: String },
     /// PRD #120 M1.3: an `issue_dispatch` task successfully dispatched one issue
-    /// (per-issue worktree created + agent spawned).
+    /// (per-issue worktree created + agent spawned). `claims_unchecked` is why
+    /// the claims on the issue could not be read when claim gating is on (PRD
+    /// #421 M3.2: the issue is then dispatched without them), `None` otherwise.
     IssueDispatched {
         task: String,
         repo: String,
         issue: u64,
+        claims_unchecked: Option<String>,
     },
     /// PRD #120 M1.3/M2.2: an issue was skipped because it is already claimed —
-    /// its per-issue worktree exists, or an open PR already targets `branch`
-    /// (`agent/issue-<n>`).
+    /// its per-issue worktree exists, an open PR already targets `branch`
+    /// (`agent/issue-<n>`), another deck's claim on GitHub is live, or another
+    /// run created the worktree first. `cause` says which (PRD #421 M3.2).
     IssueDispatchSkipped {
         task: String,
         repo: String,
         issue: u64,
         branch: String,
+        cause: crate::issue_dispatch::SkipCause,
     },
     /// PRD #120 M3.2: dispatching ONE issue failed (clone/worktree/`gh` error).
     /// The failing issue is abandoned; the rest of the run continues.
@@ -109,6 +116,29 @@ pub enum NotifyEvent {
     },
 }
 
+/// How serious a [`NotifyEvent::ConfigError`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigSeverity {
+    /// The entry, or the file, did not load.
+    Error,
+    /// The entry loaded and runs, but part of its configuration is not in
+    /// effect, such as claim gating whose TTL the cron cannot keep current
+    /// (PRD #421 M3.1).
+    Warning,
+}
+
+/// The stderr line [`StderrNotifier`] prints for a [`NotifyEvent::ConfigError`].
+fn config_error_line(entry: Option<usize>, message: &str, severity: ConfigSeverity) -> String {
+    let label = match severity {
+        ConfigSeverity::Error => "config error",
+        ConfigSeverity::Warning => "warning",
+    };
+    match entry {
+        Some(i) => format!("[scheduler] {label} in scheduled_tasks[{i}]: {message}"),
+        None => format!("[scheduler] {label}: {message}"),
+    }
+}
+
 /// Default [`Notifier`] that logs to stderr. Stand-in until the PRD #126
 /// notification channel exists; swapped out by passing a different `Notifier`
 /// to [`Scheduler::new`].
@@ -118,12 +148,11 @@ pub struct StderrNotifier;
 impl Notifier for StderrNotifier {
     fn notify(&self, event: NotifyEvent) {
         match event {
-            NotifyEvent::ConfigError { entry, message } => match entry {
-                Some(i) => {
-                    eprintln!("[scheduler] config error in scheduled_tasks[{i}]: {message}")
-                }
-                None => eprintln!("[scheduler] config error: {message}"),
-            },
+            NotifyEvent::ConfigError {
+                entry,
+                message,
+                severity,
+            } => eprintln!("{}", config_error_line(entry, &message, severity)),
             NotifyEvent::SkippedStillRunning { task } => {
                 eprintln!("[scheduler] skipped fire of {task:?}: previous run still active");
             }
@@ -139,19 +168,29 @@ impl Notifier for StderrNotifier {
             NotifyEvent::SpawnFailed { task, message } => {
                 eprintln!("[scheduler] task {task:?}: spawn failed: {message}");
             }
-            NotifyEvent::IssueDispatched { task, repo, issue } => {
-                eprintln!(
+            NotifyEvent::IssueDispatched {
+                task,
+                repo,
+                issue,
+                claims_unchecked,
+            } => match claims_unchecked {
+                None => eprintln!(
                     "[scheduler] task {task:?}: dispatched issue #{issue} of {repo} (agent/issue-{issue})"
-                );
-            }
+                ),
+                Some(reason) => eprintln!(
+                    "[scheduler] task {task:?}: dispatched issue #{issue} of {repo} (agent/issue-{issue}) \
+                     without checking its claims, which could not be read: {reason}"
+                ),
+            },
             NotifyEvent::IssueDispatchSkipped {
                 task,
                 repo,
                 issue,
                 branch,
+                cause,
             } => {
                 eprintln!(
-                    "[scheduler] task {task:?}: skipping already-claimed issue #{issue} of {repo} ({branch})"
+                    "[scheduler] task {task:?}: skipping already-claimed issue #{issue} of {repo} ({branch}): {cause}"
                 );
             }
             NotifyEvent::IssueDispatchFailed {
@@ -250,6 +289,37 @@ pub fn validate_cron(expr: &str) -> Result<(), String> {
 /// [`Scheduler::tick_at`].
 pub fn fires_at<Z: TimeZone>(schedule: &CronSchedule, instant: DateTime<Z>) -> bool {
     schedule.includes(instant)
+}
+
+/// The longest interval between two consecutive fires of `schedule` after
+/// `from` (PRD #421 M3.1: a claim's TTL must be at least twice this). The walk
+/// takes every fire up to `from + horizon` and the first fire past it, so the
+/// gap straddling the horizon's end counts too, and a schedule sparser than
+/// the horizon still yields one gap. `None` when no gap can be computed: the
+/// schedule stops firing before the walk passes the horizon, or the walk would
+/// take more than `max_fires` fires.
+pub fn longest_fire_gap<Z: TimeZone>(
+    schedule: &CronSchedule,
+    from: &DateTime<Z>,
+    horizon: chrono::Duration,
+    max_fires: usize,
+) -> Option<chrono::Duration> {
+    let end = from.clone().checked_add_signed(horizon)?;
+    let mut fires = schedule.after(from);
+    let mut previous = fires.next()?;
+    let mut longest: Option<chrono::Duration> = None;
+    for (walked, fire) in (2..).zip(fires) {
+        if walked > max_fires {
+            return None;
+        }
+        let gap = fire.clone().signed_duration_since(previous);
+        longest = Some(longest.map_or(gap, |longest| longest.max(gap)));
+        if fire > end {
+            return longest;
+        }
+        previous = fire;
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -542,6 +612,7 @@ impl Scheduler {
             self.notifier.notify(NotifyEvent::ConfigError {
                 entry: e.entry,
                 message: e.message.clone(),
+                severity: ConfigSeverity::Error,
             });
         }
     }
@@ -619,7 +690,10 @@ impl Scheduler {
     /// entries are treated as absent (removed). Returns a [`ReloadDiff`]
     /// describing the delta. Invalid cron expressions in `desired` are surfaced
     /// through the notifier and skipped — a single bad entry never aborts the
-    /// reload.
+    /// reload. So is every enabled issue-dispatch task whose `claim_gating`
+    /// the load turned off because its TTL cannot keep up with its cron (PRD
+    /// #421 M3.1): the task still registers, and the notice repeats on each
+    /// reload for as long as the config stays that way.
     ///
     /// This is the pure reload-apply logic only. The daemon's socket
     /// `ReloadSchedules` handler (a later task) will load the config and call
@@ -628,6 +702,24 @@ impl Scheduler {
     where
         F: FnMut(&ScheduledTask) -> Callback,
     {
+        for task in desired.iter().filter(|t| t.enabled) {
+            if let Some(reason) = task
+                .issue_dispatch
+                .as_ref()
+                .and_then(|disp| disp.claim.gating_off.as_deref())
+            {
+                self.notifier.notify(NotifyEvent::ConfigError {
+                    entry: None,
+                    message: format!(
+                        "schedule {:?}: claim_gating is OFF for this task \
+                         (claims are still written): {reason}",
+                        task.name
+                    ),
+                    severity: ConfigSeverity::Warning,
+                });
+            }
+        }
+
         let mut diff = ReloadDiff::default();
         let mut tasks = self.tasks.lock().expect("scheduler task map poisoned");
 
@@ -682,6 +774,7 @@ impl Scheduler {
                             self.notifier.notify(NotifyEvent::ConfigError {
                                 entry: None,
                                 message: e.to_string(),
+                                severity: ConfigSeverity::Error,
                             });
                         }
                     }
@@ -1260,5 +1353,146 @@ mod tests {
         assert_eq!(capped.len(), 5);
         assert_eq!(*capped.last().unwrap(), now);
         assert_eq!(capped[0], local_at(2026, 6, 8, 9, 0, 6));
+    }
+
+    fn utc_at(y: i32, mo: u32, d: u32, h: u32) -> DateTime<chrono::Utc> {
+        chrono::Utc.with_ymd_and_hms(y, mo, d, h, 0, 0).unwrap()
+    }
+
+    // PRD #421 M3.1 — the longest gap between consecutive fires, which a
+    // claim TTL must be at least twice. Evaluated in UTC so no DST hour moves it.
+    #[test]
+    fn longest_fire_gap_finds_the_weekday_cron_weekend_gap() {
+        let schedule = parse_cron("0 9 * * MON-FRI").unwrap();
+        let two_weeks = chrono::Duration::days(14);
+        // 2026-10-21 is a Wednesday; 2026-10-24 a Saturday.
+        for from in [utc_at(2026, 10, 21, 0), utc_at(2026, 10, 24, 12)] {
+            assert_eq!(
+                longest_fire_gap(&schedule, &from, two_weeks, 1_000),
+                Some(chrono::Duration::hours(72)),
+                "from {from}"
+            );
+        }
+        // A 2-day horizon from Monday 00:00 ends Wednesday 00:00; the walk
+        // still takes the first fire past it, Wednesday 09:00, and sees no
+        // weekend.
+        let monday = utc_at(2026, 10, 19, 0);
+        assert_eq!(
+            longest_fire_gap(&schedule, &monday, chrono::Duration::days(2), 1_000),
+            Some(chrono::Duration::hours(24))
+        );
+    }
+
+    #[test]
+    fn longest_fire_gap_walks_past_the_horizon_for_a_sparse_cron() {
+        // Fires once a year: the horizon ends long before the second fire.
+        let schedule = parse_cron("0 9 1 1 *").unwrap();
+        let from = utc_at(2026, 10, 21, 0);
+        assert_eq!(
+            longest_fire_gap(&schedule, &from, chrono::Duration::days(14), 1_000),
+            Some(utc_at(2028, 1, 1, 9) - utc_at(2027, 1, 1, 9))
+        );
+    }
+
+    #[test]
+    fn longest_fire_gap_is_none_when_it_cannot_be_computed() {
+        let from = utc_at(2026, 10, 21, 0);
+        let year = chrono::Duration::days(366);
+        // Stops firing at the end of 2026, before the walk passes the horizon.
+        let ending = parse_cron("0 0 9 * * * 2026").unwrap();
+        assert_eq!(longest_fire_gap(&ending, &from, year, 1_000), None);
+        // A single fire left: no gap at all.
+        let once = parse_cron("0 0 9 1 1 * 2027").unwrap();
+        assert_eq!(longest_fire_gap(&once, &from, year, 1_000), None);
+        // More fires than the walk may take.
+        let hourly = parse_cron("0 * * * *").unwrap();
+        assert_eq!(longest_fire_gap(&hourly, &from, year, 100), None);
+        assert_eq!(
+            longest_fire_gap(&hourly, &from, chrono::Duration::days(1), 100),
+            Some(chrono::Duration::hours(1))
+        );
+    }
+
+    // PRD #421 M3.1 — a task whose `claim_gating` the load turned off is still
+    // registered, and every reload says why through the notifier.
+    #[test]
+    fn reload_apply_reports_an_issue_dispatch_task_whose_gating_was_turned_off() {
+        #[derive(Default)]
+        struct RecordingNotifier {
+            events: Mutex<Vec<NotifyEvent>>,
+        }
+        impl Notifier for RecordingNotifier {
+            fn notify(&self, event: NotifyEvent) {
+                self.events.lock().unwrap().push(event);
+            }
+        }
+        let notifier = Arc::new(RecordingNotifier::default());
+        let scheduler = Scheduler::new(notifier.clone());
+        let counter = Arc::new(AtomicUsize::new(0));
+        let make = |_t: &ScheduledTask| counting_callback(counter.clone());
+
+        let task = |name: &str, gating_off: Option<&str>, enabled: bool| ScheduledTask {
+            name: name.to_string(),
+            cron: "0 9 * * MON-FRI".to_string(),
+            working_dir: "/tmp".to_string(),
+            command: None,
+            prompt: "p".to_string(),
+            new_tab_per_fire: false,
+            enabled,
+            shape: None,
+            issue_dispatch: Some(crate::config::IssueDispatchConfig {
+                repo: "acme/widgets".to_string(),
+                max_per_run: 1,
+                label: None,
+                query: None,
+                claim: crate::config::ClaimGatingConfig {
+                    gating: true,
+                    ttl_hours: 100,
+                    gating_off: gating_off.map(str::to_string),
+                },
+            }),
+        };
+
+        let diff = scheduler.reload_apply(
+            &[
+                task("off", Some("the TTL is too short"), true),
+                task("on", None, true),
+                task("disabled", Some("the TTL is too short"), false),
+            ],
+            make,
+        );
+        assert_eq!(diff.added, vec!["off".to_string(), "on".to_string()]);
+        assert_eq!(
+            *notifier.events.lock().unwrap(),
+            vec![NotifyEvent::ConfigError {
+                entry: None,
+                message: "schedule \"off\": claim_gating is OFF for this task \
+                          (claims are still written): the TTL is too short"
+                    .to_string(),
+                severity: ConfigSeverity::Warning,
+            }]
+        );
+    }
+
+    // PRD #421 M3.1 — a task that loads with gating off is reported as a
+    // warning, not as a config error; a load failure still reads as an error.
+    #[test]
+    fn a_config_warning_reads_as_a_warning_and_an_error_as_an_error() {
+        assert_eq!(
+            config_error_line(
+                None,
+                "schedule \"off\": claim_gating is OFF for this task",
+                ConfigSeverity::Warning
+            ),
+            "[scheduler] warning: schedule \"off\": claim_gating is OFF for this task"
+        );
+        assert_eq!(
+            config_error_line(Some(2), "bad cron", ConfigSeverity::Error),
+            "[scheduler] config error in scheduled_tasks[2]: bad cron"
+        );
+        assert_eq!(
+            config_error_line(None, "unreadable file", ConfigSeverity::Error),
+            "[scheduler] config error: unreadable file"
+        );
     }
 }
