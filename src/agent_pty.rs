@@ -2279,6 +2279,16 @@ fn pump_reader(
     if let Some(registry) = registry.upgrade() {
         registry.signal_agent_exit(&agent_id);
     }
+    // PRD #1741: this generation's telemetry run ends with its PTY.
+    if let Some(registry) = registry.upgrade() {
+        crate::telemetry::agent_exited(
+            registry.telemetry(),
+            pane_id_env.as_deref(),
+            &agent_id,
+            registry.is_shutting_down(),
+            || registry.is_agent_still_registered(&agent_id),
+        );
+    }
     // PRD #1666 S3: whatever the exit, messages bound to this agent can no
     // longer reach it. Deliberate closes included: the entry is gone by now, but
     // its messages are not.
@@ -3643,6 +3653,9 @@ struct PaneInputState {
     /// newline inside a paste nor a newline KEY is read as a submission. See
     /// [`PaneInputStream`].
     input: HashMap<String, PaneInputStream>,
+    /// PRD #1741: the daemon's telemetry, `None` when it is off. Kept here so
+    /// [`InputRecorder`] reaches it — see [`AgentPtyRegistry::set_telemetry`].
+    telemetry: Option<Arc<crate::telemetry::Telemetry>>,
     /// Test seam: see [`InputRecorder::pause_at`].
     #[cfg(test)]
     write_pause: Option<PtyWritePauseArm>,
@@ -4042,6 +4055,12 @@ impl InputRecorder {
             ByteSource::Answer => state.note_user_bytes_as(pane_id, accepted, false),
         }
         state.settle_written_bytes(pane_id, turns_after_write);
+        // PRD #1741: a person's keys, typed or a voice answer, can be an
+        // intervention; the deck's own never are.
+        let telemetry = state.telemetry.clone();
+        drop(state);
+        let human = !matches!(source, ByteSource::Deck);
+        crate::telemetry::observe_pane_input(telemetry, human, pane_id, accepted);
     }
 
     /// Test seam: park this writer's thread at `at` when a test asked for it
@@ -7657,6 +7676,18 @@ impl AgentPtyRegistry {
         *self.hook_socket.lock().unwrap() = Some(path);
     }
 
+    /// PRD #1741: hand the registry the daemon's telemetry, so every agent it
+    /// spawns opens a run and receives the run's identity. Called from
+    /// [`crate::telemetry::start_for_daemon`] only when telemetry is configured.
+    pub fn set_telemetry(&self, telemetry: Arc<crate::telemetry::Telemetry>) {
+        self.pane_input.lock().unwrap().telemetry = Some(telemetry);
+    }
+
+    /// PRD #1741: the telemetry [`Self::set_telemetry`] installed, if any.
+    pub fn telemetry(&self) -> Option<Arc<crate::telemetry::Telemetry>> {
+        self.pane_input.lock().unwrap().telemetry.clone()
+    }
+
     /// PRD #1589 D8: record the attach endpoint this registry's daemon serves —
     /// `Some(path)` when it bound one, `None` when it serves no attach protocol
     /// — so [`Self::spawn_agent`] pins it into every child as
@@ -10130,6 +10161,16 @@ impl AgentPtyRegistry {
         // capture site keeps the on-wire value consistent with the
         // kernel's actual TIOCGWINSZ).
         let captured_env = opts.env.clone();
+        // PRD #1741: prepare this generation's telemetry run — after the
+        // capture, so a respawn mints a fresh one — and hand the agent its
+        // identity. Dropped uncommitted by a refused spawn.
+        let telemetry_run = crate::telemetry::prepare_spawn(
+            self.telemetry(),
+            pane_id_env.as_deref(),
+            &preallocated_id,
+            &mut opts,
+            tab_membership.as_ref(),
+        );
         // Issue #1602: the configured command, before `spawn` wraps it.
         let spawn_command = opts
             .command
@@ -10468,6 +10509,9 @@ impl AgentPtyRegistry {
             agent.spawn_env.clone(),
         );
         inner.agents.insert(id.clone(), agent);
+        // PRD #1741: under the lock that published the agent, so its reader's
+        // EOF, which checks registration under it, is ordered after this.
+        crate::telemetry::commit_spawn(telemetry_run);
         // Signal *after* releasing the lock would be cleaner, but we still
         // hold `inner` here. Notify is cheap and a spurious wake-up is
         // harmless — the monitor will re-check counters anyway.

@@ -300,7 +300,7 @@ fn dispatch_unit(
 ) -> Result<(PathBuf, Result<StatusRow, String>), Abort> {
     let plan = ctx.g.plan;
     let sb = ctx.g.sb;
-    focus_role(ctx.tui, plan, ROLE_ORCHESTRATOR)?;
+    focus_role(ctx.tui, plan, ROLE_ORCHESTRATOR, ctx.ev)?;
     ctx.g.preconnect_logged(
         &format!("pane: {} dispatch", ctx.cast.pane_cli_label),
         &plan.env,
@@ -526,7 +526,7 @@ fn late_session_start(ctx: &mut Ctx<'_, '_>) -> Result<(), Abort> {
     let sb = ctx.g.sb;
     let pointer = format!("Read .dot-agent-deck/worker-task-{ROLE_LATEBOOT}.md for your task.");
     println!("xver (inner): probe late-session-start — delegate to the lateboot stub (≥30 s)");
-    focus_role(ctx.tui, plan, ROLE_ORCHESTRATOR)?;
+    focus_role(ctx.tui, plan, ROLE_ORCHESTRATOR, ctx.ev)?;
     ctx.g.preconnect_logged(
         &format!("pane: {} delegate", ctx.cast.pane_cli_label),
         &plan.env,
@@ -541,7 +541,7 @@ fn late_session_start(ctx: &mut Ctx<'_, '_>) -> Result<(), Abort> {
     );
     // Watch the worker pane. Focusing it writes nothing to its PTY — the keys
     // are the deck's own — so the recovery's "operator typed" gate stays shut.
-    focus_role(ctx.tui, plan, ROLE_LATEBOOT)?;
+    focus_role(ctx.tui, plan, ROLE_LATEBOOT, ctx.ev)?;
     let stub_log = stub::log_path(sb, stub::Mode::LateBoot);
     let swallowed = format!("{}{pointer}", stub::SWALLOWED);
     let submitted_prefix = stub::SUBMITTED;
@@ -696,7 +696,7 @@ fn log_escaping(ctx: &mut Ctx<'_, '_>) -> Result<(), Abort> {
     let plan = ctx.g.plan;
     let sb = ctx.g.sb;
     println!("xver (inner): probe log-escaping — a newline-bearing session id");
-    focus_role(ctx.tui, plan, ROLE_REVIEWER)?;
+    focus_role(ctx.tui, plan, ROLE_REVIEWER, ctx.ev)?;
     type_hook(
         ctx,
         r#"{"hook_event_name":"UserPromptSubmit","session_id":"xver-1082\nFORGED-LINE","prompt":"ordinary"}"#,
@@ -813,7 +813,7 @@ fn log_escaping(ctx: &mut Ctx<'_, '_>) -> Result<(), Abort> {
 fn cross_pane_session_key(ctx: &mut Ctx<'_, '_>) -> Result<(), Abort> {
     let plan = ctx.g.plan;
     println!("xver (inner): probe cross-pane-session-key — one session id from two panes");
-    focus_role(ctx.tui, plan, ROLE_ALPHA)?;
+    focus_role(ctx.tui, plan, ROLE_ALPHA, ctx.ev)?;
     type_hook(
         ctx,
         r#"{"hook_event_name":"SessionStart","session_id":"xver-shared","source":"startup"}"#,
@@ -822,7 +822,7 @@ fn cross_pane_session_key(ctx: &mut Ctx<'_, '_>) -> Result<(), Abort> {
         ctx,
         r#"{"hook_event_name":"PreToolUse","session_id":"xver-shared","tool_name":"Bash","tool_input":{"command":"printf alpha"}}"#,
     )?;
-    focus_role(ctx.tui, plan, ROLE_BETA)?;
+    focus_role(ctx.tui, plan, ROLE_BETA, ctx.ev)?;
     type_hook(
         ctx,
         r#"{"hook_event_name":"SessionStart","session_id":"xver-shared","source":"startup"}"#,
@@ -1014,7 +1014,7 @@ fn signal_ack(ctx: &mut Ctx<'_, '_>) -> Result<(), Abort> {
     ctx.ev
         .excerpt("the orchestrator pane after the dispatch", ctx.tui.grid());
 
-    focus_role(ctx.tui, plan, ROLE_REVIEWER)?;
+    focus_role(ctx.tui, plan, ROLE_REVIEWER, ctx.ev)?;
     // The landing is asserted as the reviewer's card REACHING `WaitingForInput`
     // (tell 4 left it `running`), which is evidence only if it did not read that
     // already.
