@@ -59,11 +59,13 @@ impl Drop for RestorePairedDoc {
 /// Scenario: Start the deck and a sleeping stand-in agent on a named thread,
 /// capture their sandbox daemon and agent pids, then panic as a failing test does.
 /// Teardown must stop both before deleting their working directory, still write
-/// the failed recording, and skip regeneration of the paired test document.
+/// the failed recording (including relative logs from a launch subdirectory and Claude metadata from an overridden sandbox HOME), and skip regeneration of the paired test document.
 #[test]
 #[spec("harness/teardown/001")]
 fn teardown_001_a_panicking_test_skips_the_paired_doc_regeneration() {
     let recordings = common::current_test_recordings_dir();
+    let effective_home = common::harness_tempdir().unwrap();
+    let home_path = effective_home.path().to_path_buf();
     let paired_doc = recordings.join("test.md");
     // A previous `DOT_AGENT_DECK_RECORD=1` run or `cargo xtask docs --tests`
     // may have left one, and the launch-time discard keeps it on purpose so a
@@ -85,13 +87,28 @@ fn teardown_001_a_panicking_test_skips_the_paired_doc_regeneration() {
     let joined = std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
-            let builder = TuiDeck::builder();
+            let builder = TuiDeck::builder()
+                .with_launch_subdir("nested-launch")
+                .with_env("DOT_AGENT_DECK_LOG", "relative-deck.log")
+                .with_env("HOME", home_path.to_str().unwrap());
             #[cfg(unix)]
             let builder = builder.with_continue_session(
                 "teardown-standin",
                 "sh -c 'echo $$ > teardown-agent.pid; exec sleep 180'",
             );
             let deck = builder.launch_with_fixture("minimal");
+            let projects = home_path.join(".claude/projects/fixture");
+            std::fs::create_dir_all(&projects).unwrap();
+            std::fs::write(
+                projects.join("observed.jsonl"),
+                "{\"sessionId\":\"overridden-home-session\",\"permissionMode\":\"acceptEdits\"}\n",
+            )
+            .unwrap();
+            std::fs::write(
+                deck.workdir().join("nested-launch/relative-deck.log"),
+                "relative launch log sentinel\n",
+            )
+            .unwrap();
             #[cfg(unix)]
             {
                 deck.wait_for_string("teardown-standin");
@@ -179,6 +196,19 @@ fn teardown_001_a_panicking_test_skips_the_paired_doc_regeneration() {
     assert!(
         recordings.join("final-grid.txt").is_file(),
         "a panicking drop still writes the final grid"
+    );
+    assert!(
+        std::fs::read_to_string(recordings.join("deck.log"))
+            .is_ok_and(|log| log.contains("relative launch log sentinel")),
+        "teardown lost the relative deck log from its actual launch directory"
+    );
+    assert!(
+        parsed["claude_sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|session| session["session_id"] == "overridden-home-session"),
+        "teardown lost Claude metadata from the effective child HOME: {provenance}"
     );
 
     assert!(
