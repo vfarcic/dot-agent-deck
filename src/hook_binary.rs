@@ -1912,6 +1912,19 @@ fn remedy_for_shell(
     }
 }
 
+/// Whether `binary`, as an agent's hook config names it, is this deck's own
+/// file. An absolute path is resolved through the filesystem; a bare command
+/// never is.
+pub fn names_this_deck(deck: &DeckIdentity, binary: &str) -> bool {
+    TrustedPin::classify(deck, binary).is_self
+}
+
+/// `path` as the program word(s) of a command for this platform's default
+/// shell, quoted as [`remedy_for`]'s commands are.
+pub fn shell_program(path: &str) -> String {
+    Shell::CURRENT.program(path)
+}
+
 /// The shell a notice's command is written for: the one a user pastes it into
 /// by default on this platform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

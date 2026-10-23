@@ -195,14 +195,19 @@ pub async fn run_checker(state: SharedState) {
 pub async fn run(plan: UpgradePlan, this_tui: bool) -> RunResult {
     let handle = tokio::runtime::Handle::current();
     let result = tokio::task::spawn_blocking(move || {
+        let host = SystemHost::default();
         let outcome = handle.block_on(crate::self_upgrade::execute::execute(
-            &SystemHost::default(),
+            &host,
             &plan,
             &ReleaseSource::from_build(),
             &PlanOptions::default_staging_root(),
         ));
         match outcome {
-            Ok(outcome) => RunResult::from_outcome(&plan, &outcome, this_tui),
+            Ok(outcome) => {
+                // R-3: a CLI the upgrade installed refreshes the agents' hooks.
+                let hooks = crate::self_upgrade::agent_hooks::after_upgrade(&host, &plan, &outcome);
+                RunResult::from_outcome_and_hooks(&plan, &outcome, hooks, this_tui)
+            }
             Err(error) => RunResult::from_error(&error),
         }
     })
@@ -286,7 +291,20 @@ impl RunResult {
     /// A finished upgrade of `plan`. When the copy is the one this TUI runs
     /// from (`this_tui`), the core's restart line follows the outcome.
     pub fn from_outcome(plan: &UpgradePlan, outcome: &Outcome, this_tui: bool) -> Self {
+        Self::from_outcome_and_hooks(plan, outcome, Vec::new(), this_tui)
+    }
+
+    /// [`Self::from_outcome`] with what the core says about the agents' hooks
+    /// after it ([`crate::self_upgrade::agent_hooks::after_upgrade`]), ahead
+    /// of the restart line.
+    pub fn from_outcome_and_hooks(
+        plan: &UpgradePlan,
+        outcome: &Outcome,
+        hooks: Vec<PlanLine>,
+        this_tui: bool,
+    ) -> Self {
         let mut lines = outcome.items();
+        lines.extend(hooks);
         let restart = if this_tui {
             outcome.tui_restart_line(&plan.latest)
         } else {

@@ -38,7 +38,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use dot_agent_deck::self_upgrade::{
     CopyKind, Host, Installation, OtherCopy, Outcome, PlanAction, PlanLine, PlanOptions,
     ProvenanceCheck, ReleaseSource, Releases, SystemHost, UPDATE_RECHECK_INTERVAL, UpgradeError,
-    UpgradePlan, detect, discover, execute, plan,
+    UpgradePlan, agent_hooks, detect, discover, execute, plan,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State, Webview};
@@ -532,12 +532,16 @@ pub(crate) fn check_dto(
 /// What an upgrade of `copy` did, for the webview. Relaunch is offered when
 /// the app's own copy was installed: the `.dmg` swap, or the `.deb` installed
 /// behind the password prompt, which replaces the running app's files.
-pub(crate) fn outcome_dto(copy: SelfCopy, outcome: &Outcome) -> RunDto {
+/// `hooks` is what the core says about the agents' hooks after it
+/// ([`agent_hooks::after_upgrade`], PRD #1666 part 3 R-3), shown last.
+pub(crate) fn outcome_dto(copy: SelfCopy, outcome: &Outcome, hooks: Vec<PlanLine>) -> RunDto {
+    let mut lines = outcome.items();
+    lines.extend(hooks);
     RunDto {
         copy,
         ok: outcome.upgraded(),
         installed: outcome.installed(),
-        lines: line_dtos(outcome.items()),
+        lines: line_dtos(lines),
         relaunch: copy == SelfCopy::App && outcome.app_relaunch_notice().is_some(),
     }
 }
@@ -629,18 +633,24 @@ pub(crate) async fn desktop_self_upgrade_run(
         let host = SystemHost {
             path: run_state.login_path(),
         };
-        handle.block_on(execute::execute(
-            &host,
-            &run_plan,
-            &ReleaseSource::from_build(),
-            &PlanOptions::default_staging_root(),
-        ))
+        handle
+            .block_on(execute::execute(
+                &host,
+                &run_plan,
+                &ReleaseSource::from_build(),
+                &PlanOptions::default_staging_root(),
+            ))
+            .map(|outcome| {
+                // R-3: a CLI the upgrade installed refreshes the agents' hooks.
+                let hooks = agent_hooks::after_upgrade(&host, &run_plan, &outcome);
+                (outcome, hooks)
+            })
     })
     .await
     .map_err(|e| safe_message(e.to_string()))?;
     Ok(match result {
-        Ok(outcome) => {
-            let dto = outcome_dto(copy, &outcome);
+        Ok((outcome, hooks)) => {
+            let dto = outcome_dto(copy, &outcome, hooks);
             state.mark_installed(copy, &outcome, &dto);
             dto
         }
@@ -1215,6 +1225,7 @@ mod tests {
                 provenance: provenance(),
                 mount_left: None,
             },
+            Vec::new(),
         );
         assert!(replaced.ok);
         assert!(replaced.relaunch);
@@ -1229,8 +1240,8 @@ mod tests {
             version: LATEST.into(),
             provenance: provenance(),
         };
-        assert!(outcome_dto(SelfCopy::App, &deb).relaunch);
-        assert!(!outcome_dto(SelfCopy::Cli, &deb).relaunch);
+        assert!(outcome_dto(SelfCopy::App, &deb, Vec::new()).relaunch);
+        assert!(!outcome_dto(SelfCopy::Cli, &deb, Vec::new()).relaunch);
 
         let others = [
             Outcome::BrewNotUpgraded {
@@ -1256,11 +1267,11 @@ mod tests {
             },
         ];
         for outcome in &others {
-            let dto = outcome_dto(SelfCopy::App, outcome);
+            let dto = outcome_dto(SelfCopy::App, outcome, Vec::new());
             assert_eq!(dto.ok, outcome.upgraded());
             assert!(!dto.relaunch, "{outcome:?}");
         }
-        let staged = outcome_dto(SelfCopy::App, &others[3]);
+        let staged = outcome_dto(SelfCopy::App, &others[3], Vec::new());
         assert_eq!(
             commands(&staged.lines),
             vec!["sudo apt install /stage/x.deb"]
@@ -1280,14 +1291,14 @@ mod tests {
             version: LATEST.into(),
             provenance: provenance(),
         };
-        let dto = outcome_dto(SelfCopy::Cli, &staged);
+        let dto = outcome_dto(SelfCopy::Cli, &staged, Vec::new());
         assert!(dto.ok && !dto.installed);
         let not_brewed = Outcome::BrewNotUpgraded {
             formula: "dot-agent-deck",
             reported: Some(CURRENT.into()),
             offered: LATEST.into(),
         };
-        assert!(!outcome_dto(SelfCopy::Cli, &not_brewed).installed);
+        assert!(!outcome_dto(SelfCopy::Cli, &not_brewed, Vec::new()).installed);
         for installed in [
             Outcome::Replaced {
                 path: PathBuf::from("/home/u/.local/bin/dot-agent-deck"),
@@ -1305,7 +1316,7 @@ mod tests {
             },
         ] {
             assert!(
-                outcome_dto(SelfCopy::Cli, &installed).installed,
+                outcome_dto(SelfCopy::Cli, &installed, Vec::new()).installed,
                 "{installed:?}"
             );
         }
@@ -1324,6 +1335,7 @@ mod tests {
                 reported: Some(CURRENT.into()),
                 offered: LATEST.into(),
             },
+            Vec::new(),
         );
         assert!(!dto.ok);
         assert!(!dto.relaunch);
@@ -1432,13 +1444,13 @@ mod tests {
         state.mark_installed(
             SelfCopy::Cli,
             &replaced,
-            &outcome_dto(SelfCopy::Cli, &replaced),
+            &outcome_dto(SelfCopy::Cli, &replaced, Vec::new()),
         );
         assert!(!state.relaunch_ready());
         state.mark_installed(
             SelfCopy::App,
             &replaced,
-            &outcome_dto(SelfCopy::App, &replaced),
+            &outcome_dto(SelfCopy::App, &replaced, Vec::new()),
         );
         assert!(state.relaunch_ready());
     }
@@ -1499,7 +1511,7 @@ mod tests {
             version: LATEST.into(),
             provenance: provenance(),
         };
-        let result = outcome_dto(SelfCopy::App, &installed);
+        let result = outcome_dto(SelfCopy::App, &installed, Vec::new());
         assert!(result.ok && result.relaunch);
         state.mark_installed(SelfCopy::App, &installed, &result);
 
@@ -1540,7 +1552,7 @@ mod tests {
         assert_eq!(json["installed"]["relaunch"], true);
 
         // The CLI's own install is not the app's.
-        let cli_installed = outcome_dto(SelfCopy::Cli, &installed);
+        let cli_installed = outcome_dto(SelfCopy::Cli, &installed, Vec::new());
         assert!(cli_installed.ok && !cli_installed.relaunch);
     }
 
@@ -1585,6 +1597,7 @@ mod tests {
                 version: LATEST.into(),
                 provenance: provenance(),
             },
+            Vec::new(),
         );
         assert_eq!(commands(&dto.lines), vec![command.clone()]);
         assert!(command.ends_with(" /usr/local/bin/dot-agent-deck"));
@@ -1600,6 +1613,7 @@ mod tests {
                 version: LATEST.into(),
                 provenance: provenance(),
             },
+            Vec::new(),
         );
         assert!(commands(&dto.lines).is_empty());
         // And the core shows no command for such a path in the first place:
@@ -1621,6 +1635,7 @@ mod tests {
                 version: LATEST.into(),
                 provenance: provenance(),
             },
+            Vec::new(),
         );
         assert!(commands(&manual.lines).is_empty());
         assert!(
@@ -1765,7 +1780,7 @@ mod tests {
             completing.mark_installed(
                 SelfCopy::App,
                 &installed,
-                &outcome_dto(SelfCopy::App, &installed),
+                &outcome_dto(SelfCopy::App, &installed, Vec::new()),
             );
             drop(first);
         };
@@ -1840,5 +1855,33 @@ mod tests {
 
         state.mark_unfinished(SelfCopy::Cli, &unfinished(false));
         assert!(state.claim(SelfCopy::Cli, id).is_ok());
+    }
+
+    /// PRD #1666 part 3 (R-3): what the core says about the agents' hooks
+    /// after a CLI upgrade follows the upgrade's own lines, and its command
+    /// is copyable exactly as the core built it.
+    #[test]
+    fn self_upgrade_035_the_hooks_lines_follow_the_cli_result() {
+        let command = "/home/u/.local/bin/dot-agent-deck hooks install --agent claude-code";
+        let installed = Outcome::Installed {
+            version: LATEST.into(),
+            provenance: provenance(),
+        };
+        let dto = outcome_dto(
+            SelfCopy::Cli,
+            &installed,
+            vec![
+                PlanLine::Text("Claude Code's hooks still run another copy, /opt/x.".into()),
+                PlanLine::Command(command.into()),
+            ],
+        );
+        assert!(dto.ok && dto.installed);
+        let texts = texts(&dto.lines);
+        assert_eq!(texts[0], format!("Installed v{LATEST}."));
+        assert_eq!(
+            texts[texts.len() - 2],
+            "Claude Code's hooks still run another copy, /opt/x."
+        );
+        assert_eq!(commands(&dto.lines), vec![command.to_string()]);
     }
 }

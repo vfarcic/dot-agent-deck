@@ -76,6 +76,7 @@ pub mod hook;
 pub mod hook_binary;
 pub mod hook_provenance;
 pub mod hooks_manage;
+pub mod hooks_refresh;
 pub mod hyperlink;
 // PRD #1666: the per-agent inbox every deck message is posted to (pure data).
 pub mod inbox;

@@ -5575,6 +5575,13 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Does not assert:** a click on Upgrade in the restored frame (the same `choose` the keys reach), or a resize while an upgrade runs.
 - **Platform coverage:** mac+linux+windows.
 
+##### upgrade/upgrade-dialog/015 — A CLI upgrade's result names the agents' hooks remedy before the TUI restart.
+- **Layer:** L1 (dialog state machine + `TestBackend` at 100×30, insta snapshot `upgrade_dialog_015_hooks_remedy`).
+- **Agent:** none.
+- **Asserts:** after this TUI's CLI is replaced and `RunResult::from_outcome_and_hooks` is given a refresh that left Claude Code's hooks on another copy, the result shows the upgrade line, then the other copy, the `hooks install --agent claude-code` command whole on one row and `Then restart the affected agents.`, and only then the TUI restart line (PRD #1666 part 3, R-3).
+- **Does not assert:** running the refresh (`self_upgrade::agent_hooks` unit tests, `inbox/claude/048`), or the desktop dialog (`local_upgrade_008`–`010`).
+- **Platform coverage:** mac+linux+windows.
+
 #### upgrade/tui-upgrade
 
 ##### upgrade/tui-upgrade/001 — The badge's key opens the dialog, and confirming replaces the running copy's binary with the served release.

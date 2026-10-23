@@ -903,6 +903,14 @@ enum HooksAction {
         #[arg(long, value_enum, default_value_t = CliAgent::ClaudeCode)]
         agent: CliAgent,
     },
+    /// Update every installed agent's hooks to this copy, as the deck does
+    /// when it starts, and say what they run now. Another live install the
+    /// hooks run is left in place, and the command to replace it is shown.
+    Refresh {
+        /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1452,6 +1460,25 @@ fn main() -> ExitCode {
                             eprintln!("No hook installer for agent {}", spec.label);
                             return ExitCode::FAILURE;
                         }
+                    }
+                }
+                HooksAction::Refresh { json } => {
+                    let report = dot_agent_deck::hooks_refresh::refresh();
+                    if json {
+                        match serde_json::to_string(&report) {
+                            Ok(line) => println!("{line}"),
+                            Err(e) => {
+                                eprintln!("Failed to write the hooks report: {e}");
+                                return ExitCode::FAILURE;
+                            }
+                        }
+                    } else {
+                        for line in report.render() {
+                            println!("{line}");
+                        }
+                    }
+                    if !report.ok {
+                        return ExitCode::FAILURE;
                     }
                 }
                 HooksAction::Uninstall { agent } => {
