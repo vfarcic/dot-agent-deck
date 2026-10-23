@@ -2014,7 +2014,7 @@ async fn send_addendum_with_supersede(clear: bool) -> SupersededWorker {
     }
 }
 
-/// Scenario: Delegate a task to a `clear = true` `coder` and let its worker take it, then send an addendum with `--supersede`, since a plain delegate is refused as busy. A new agent takes the addendum alone, the one that was working is gone, and after one `work-done` the worker takes the next task. On a `clear = false` worker the agent that was working takes the addendum and keeps running, but owes a `work-done` for each task.
+/// Scenario: Delegate a task to a `clear = true` `coder` and let its worker take it, then send an addendum with `--supersede`, since a plain delegate is refused as busy. A new agent takes the addendum alone, the one that was working is gone, and after one `work-done` the worker takes the next task. On a `clear = false` worker the agent that was working takes the addendum and keeps running, and the addendum replaces the original task, so one `work-done` leaves it free too.
 ///
 /// Issue #1784 reproduced: what this pins is `--supersede`'s documented meaning,
 /// which the issue keeps and the orchestrator's instructions now warn about. An
@@ -2063,11 +2063,12 @@ async fn delegate_052_a_supersede_addendum_restarts_a_clear_true_worker() {
         "control — the clear = false worker must be handed the addendum; text = {:?}",
         kept.addendum_text
     );
-    // What the orchestrator is told: the addendum is a task of its own, so a
-    // worker that had taken the original task owes a work-done for each.
+    // PRD #1666 part 3, round 5 (plan D8): `--supersede` ends the task it
+    // replaces, its debt included, so the worker owes one work-done, for the
+    // addendum. Before round 5 it owed one for each task.
     assert!(
-        kept.busy_after_one_work_done,
-        "a clear = false worker that took the original task and then the addendum must still \
-         owe a work-done after reporting once"
+        !kept.busy_after_one_work_done,
+        "a --supersede addendum replaces the original task, so a clear = false worker that \
+         reported once must be free for the next task"
     );
 }

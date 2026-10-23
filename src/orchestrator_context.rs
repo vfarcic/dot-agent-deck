@@ -214,10 +214,9 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
          cannot wait, `{bin} delegate --supersede` with the whole task restated together with \
          the addition, knowing the worker starts over. A worker without that mark keeps its \
          agent, so `{bin} delegate --supersede` reaches the running agent with its work intact: \
-         say in the task that it adds to the task the worker is doing. The deck counts the \
-         addition as a task of its own, so a worker that had already taken the original task \
-         owes a work-done for each: tell it to report both, or your next delegate to it is \
-         refused as busy. The marks show `.dot-agent-deck.toml` as it was when this orchestration \
+         say in the task that it adds to the task the worker is doing. The addition replaces \
+         the original task, so the worker owes one work-done, for both together: tell it to \
+         report the whole of its work in that one. The marks show `.dot-agent-deck.toml` as it was when this orchestration \
          started, and every delegate reads it again, so if it may have changed, check the role's \
          `clear` there before relying on a worker keeping its agent. A follow-up after a work-done is a new task too, so restate everything a \
          worker that starts fresh for every task needs: the files, the branch, and what its \

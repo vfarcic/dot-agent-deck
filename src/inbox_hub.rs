@@ -398,10 +398,44 @@ pub enum DelegateEnd {
 /// commission and the idle-worker record its delegate armed — handed back when
 /// the task turns undeliverable because its worker exited, so the debt goes
 /// with the task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DelegateLedger {
     pub commission_arm_id: Option<u64>,
     pub delegation_seq: Option<u64>,
+    /// PRD #1666 part 3, round 5: the worker's orchestration instance, which
+    /// the task ledger binds the task to (plan D2, D12).
+    pub instance: Option<String>,
+}
+
+/// PRD #1666 part 3, round 5 (plan D12 rule 4): how a worker generation's
+/// process ended, as its reader saw it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitKind {
+    /// Nothing had removed its registry record: the agent ended on its own.
+    Natural,
+    /// A close or a respawn removed its record before ending it.
+    Removed,
+}
+
+/// What a worker generation's exit left owing: the debt of the tasks it
+/// held, for the caller to retire exactly, and whether the task ledger
+/// decided its notices.
+#[derive(Debug, Default)]
+pub struct ExitSettlement {
+    pub ledgers: Vec<DelegateLedger>,
+    /// The ledger walked the generation's tasks (the report state was not
+    /// torn), so a tracker record or commission arm left afterwards names no
+    /// ledger task.
+    pub walked: bool,
+}
+
+/// A delegated task the hub took: its id, the signal of its end, and the
+/// debt of the older tasks it superseded, for the caller to release exactly
+/// (plan D8).
+pub struct PostedDelegate {
+    pub id: MessageId,
+    pub ended: oneshot::Receiver<DelegateEnd>,
+    pub superseded: Vec<DelegateLedger>,
 }
 
 /// PRD #1666 S5: a delegated task the deck reports on if it does not reach
@@ -1256,6 +1290,7 @@ impl InboxHub {
             MintedSpill::default(),
             worker_holds,
         )
+        .map(|posted| (posted.id, posted.ended))
     }
 
     /// [`Self::post_delegate`] into the room `reservation` held for the task
@@ -1277,7 +1312,7 @@ impl InboxHub {
         content: Content,
         spill: MintedSpill,
         worker_holds: &dyn Fn() -> bool,
-    ) -> Result<(MessageId, oneshot::Receiver<DelegateEnd>), PostRefusal> {
+    ) -> Result<PostedDelegate, PostRefusal> {
         self.post_delegate_with(
             Some(reservation),
             worker,
@@ -1297,6 +1332,13 @@ impl InboxHub {
     /// held until the task is retired: its worker's `work-done`, a newer task
     /// superseding it, or the worker exiting, since the worker may still be
     /// working from it after acknowledging the excerpt.
+    ///
+    /// PRD #1666 part 3, round 5 (plan D8, D12): in the same section, the task
+    /// is bound in the task ledger to the worker generation and instance, and
+    /// every older open task of the pane that no report has claimed is
+    /// superseded by it; their debt comes back in [`PostedDelegate`] for the
+    /// caller to release exactly. With the report state torn, the task is
+    /// posted as before round 5, with no ledger entry.
     #[allow(clippy::too_many_arguments)]
     fn post_delegate_with(
         &self,
@@ -1308,10 +1350,11 @@ impl InboxHub {
         content: Content,
         spill: MintedSpill,
         worker_holds: &dyn Fn() -> bool,
-    ) -> Result<(MessageId, oneshot::Receiver<DelegateEnd>), PostRefusal> {
+    ) -> Result<PostedDelegate, PostRefusal> {
         let (tx, rx) = oneshot::channel();
         let mut saved = false;
         let mut owed = false;
+        let mut superseded_debt = Vec::new();
         let (id, superseded) = {
             let mut st = self.lock();
             let now = Instant::now();
@@ -1349,6 +1392,34 @@ impl InboxHub {
                 reservation.hub = None;
             }
             drain_events(&mut st);
+            if let Some(worker_agent) = worker.agent_id.clone() {
+                let binding = crate::report_recovery::TaskBinding {
+                    worker_pane: worker.pane_id.clone(),
+                    worker_agent,
+                    instance: ledger.instance.clone(),
+                    role: role.to_string(),
+                    orchestrator: orchestrator.clone(),
+                    arm_id: ledger.commission_arm_id,
+                    seq: ledger.delegation_seq,
+                };
+                let task_id = id.to_string();
+                match st.guarded_section(|_, reports| {
+                    // Superseded before the new task is bound, so it never
+                    // supersedes itself.
+                    let debt = supersede_tasks(reports, &binding.worker_pane, Some(&task_id));
+                    if reports.tasks.bind(&task_id, binding).is_err() {
+                        tracing::error!(
+                            message_id = %task_id,
+                            "inbox: a delegated task's id was already bound; it was not \
+                             recorded again"
+                        );
+                    }
+                    debt
+                }) {
+                    Ok(debt) => superseded_debt = debt,
+                    Err(_) => st.log_torn_once("post_delegate"),
+                }
+            }
             st.delegates.insert(
                 id.to_string(),
                 DelegateWatch {
@@ -1387,7 +1458,11 @@ impl InboxHub {
             Some(agent) => self.dispatch_agent(&worker.pane_id, agent),
             None => self.dispatch_pane(&worker.pane_id),
         }
-        Ok((id, rx))
+        Ok(PostedDelegate {
+            id,
+            ended: rx,
+            superseded: superseded_debt,
+        })
     }
 
     /// PRD #1666 S5: what a worker's `work-done` retires, as superseded, so no
@@ -1415,11 +1490,41 @@ impl InboxHub {
     /// both; it is not implemented.
     pub fn retire_answered_delegates_to(&self, pane_id: &str) -> usize {
         let received = self.lock().received_since_done.remove(pane_id);
-        if received {
+        let retired = if received {
             self.retire_delegates_to(pane_id, |message| message.deliveries > 0)
         } else {
             self.retire_delegates_to(pane_id, |_| true)
+        };
+        // PRD #1666 part 3, round 5: until task-scoped completion, a legacy
+        // `work-done` answers the pane's tasks it retired above and the ones
+        // already acknowledged, as before; the ledger records them reported,
+        // so the worker's exit owes nothing for them. A task still watched (a
+        // newer one never fetched) stays open.
+        let mut st = self.lock();
+        let answered = st.guarded_section(|st, reports| {
+            for id in reports.tasks.open_of_pane(pane_id) {
+                let claimed = matches!(
+                    reports.tasks.lookup(&id),
+                    crate::report_recovery::TaskLookup::Open(task)
+                        if matches!(task.state, crate::report_recovery::TaskState::Reporting { .. })
+                );
+                if claimed || st.delegates.contains_key(&id) {
+                    continue;
+                }
+                let _ = reports.tasks.settle(
+                    &id,
+                    crate::report_recovery::Tombstone::Reported {
+                        report_id: None,
+                        digest: None,
+                        destination: crate::report_recovery::Destination::Inbox,
+                    },
+                );
+            }
+        });
+        if answered.is_err() {
+            st.log_torn_once("work-done");
         }
+        retired
     }
 
     /// PRD #1666 S5: retire every delegated task to `pane_id` that is not yet
@@ -1427,7 +1532,50 @@ impl InboxHub {
     /// restarting, has made it moot. Superseded tasks are not reported. A
     /// worker's `work-done` retires less: [`Self::retire_answered_delegates_to`].
     pub fn supersede_delegates_to(&self, pane_id: &str) -> usize {
-        self.retire_delegates_to(pane_id, |_| true)
+        let retired = self.retire_delegates_to(pane_id, |_| true);
+        // PRD #1666 part 3, round 5 (plan D8): a restart supersedes the pane's
+        // open tasks in the ledger too, so its old generation's exit owes no
+        // notice for them.
+        let mut st = self.lock();
+        if st
+            .guarded_section(|_, reports| supersede_tasks(reports, pane_id, None))
+            .is_err()
+        {
+            st.log_torn_once("supersede");
+        }
+        retired
+    }
+
+    /// PRD #1666 part 3, round 5 (plan D12 rule 4): the fallback producer of
+    /// an exit notice, for a tracker record or commission arm that names no
+    /// ledger task (`task_ids` empty), or names tasks the ledger may already
+    /// have settled. Withheld when every named task is being reported, dropped
+    /// when every named task was reported (both answer `Ok(None)`), and posted
+    /// otherwise.
+    pub fn post_exit_notice(
+        &self,
+        to: Recipient,
+        subject: &'static str,
+        body: String,
+        task_ids: &[String],
+    ) -> Result<Option<MessageId>, PostError> {
+        use crate::report_recovery::{TaskLookup, TaskState, Tombstone};
+        if !task_ids.is_empty() {
+            let decided = self.lock().guarded_read(|reports| {
+                let looked: Vec<_> = task_ids.iter().map(|id| reports.tasks.lookup(id)).collect();
+                let reporting = looked.iter().all(|l| {
+                    matches!(l, TaskLookup::Open(task) if matches!(task.state, TaskState::Reporting { .. }))
+                });
+                let reported = looked
+                    .iter()
+                    .all(|l| matches!(l, TaskLookup::Settled(Tombstone::Reported { .. })));
+                reporting || reported
+            });
+            if decided == Ok(true) {
+                return Ok(None);
+            }
+        }
+        self.post_notice(to, subject, body).map(Some)
     }
 
     /// Retire, as superseded, each watched task to `pane_id` whose live message
@@ -1869,8 +2017,35 @@ impl InboxHub {
     /// is told — the notices this exit owes are held until the caller runs
     /// [`Self::post_owed_notices`].
     pub fn agent_exited(&self, pane_id: &str, agent_id: &str) -> Vec<DelegateLedger> {
+        self.agent_exited_as(pane_id, agent_id, ExitKind::Natural)
+            .ledgers
+    }
+
+    /// [`Self::agent_exited`], told how the generation ended.
+    ///
+    /// PRD #1666 part 3, round 5 (plan D12 rule 4): the hub decides every
+    /// notice the generation's delegated tasks owe from its task ledger,
+    /// FIRST, before the generation's messages turn undeliverable: a task
+    /// never acknowledged owes its "not delivered" notice; on a natural exit,
+    /// the tasks it acknowledged (or that ran out of hand-overs) owe one
+    /// "worker exited" notice naming them; a close or respawn owes none of
+    /// the latter. Each walked task is closed, and its debt answered.
+    pub fn agent_exited_as(&self, pane_id: &str, agent_id: &str, kind: ExitKind) -> ExitSettlement {
         let mut st = self.lock();
         let now = Instant::now();
+        let mut walked_debt = Vec::new();
+        let walked = match st
+            .guarded_section(|st, reports| walk_exited_tasks(st, reports, pane_id, agent_id, kind))
+        {
+            Ok(debt) => {
+                walked_debt = debt;
+                true
+            }
+            Err(_) => {
+                st.log_torn_once("agent_exited");
+                false
+            }
+        };
         st.inbox.agent_exited(now, pane_id, agent_id);
         let key = (pane_id.to_string(), agent_id.to_string());
         // PRD #1666 §2 T9: the generation's attempts are fenced and its
@@ -1906,10 +2081,11 @@ impl InboxHub {
             broadcast_wake_stall(&st, pane_id, agent_id, &id, false);
         }
         drain_events(&mut st);
-        let ledgers = std::mem::take(&mut st.exited_ledgers);
+        let mut ledgers = std::mem::take(&mut st.exited_ledgers);
+        ledgers.append(&mut walked_debt);
         drop(st);
         self.changed.notify_one();
-        ledgers
+        ExitSettlement { ledgers, walked }
     }
 
     /// PR #1735 fifth review (R5): the doorbell's verdict that nothing has
@@ -4141,6 +4317,156 @@ fn retire_delegates_locked(
 /// End the watch on delegated task `id`, and the record that its orchestrator
 /// was told it is uncertain: that record only affects a correction made through
 /// the watch, so without the watch it can affect no correction.
+/// PRD #1666 part 3, round 5 (plan D8): supersede every open task of
+/// `pane_id` that no report has claimed, by `by` (the newer task) or by a
+/// restart (`None`), and answer their debt for the caller to release exactly.
+/// A claimed task is not superseded: its report settles it (D12 rule 6).
+fn supersede_tasks(
+    reports: &mut crate::report_recovery::ReportState,
+    pane_id: &str,
+    by: Option<&str>,
+) -> Vec<DelegateLedger> {
+    use crate::report_recovery::{TaskLookup, TaskState, Tombstone};
+    let mut debt = Vec::new();
+    for id in reports.tasks.open_of_pane(pane_id) {
+        if matches!(
+            reports.tasks.lookup(&id),
+            TaskLookup::Open(task) if matches!(task.state, TaskState::Reporting { .. })
+        ) {
+            continue;
+        }
+        if let Some(task) = reports.tasks.settle(
+            &id,
+            Tombstone::Superseded {
+                by: by.map(str::to_string),
+            },
+        ) {
+            debt.push(task_debt(&task));
+        }
+    }
+    debt
+}
+
+/// PRD #1666 part 3, round 5 (plan D12 rule 4): decide the notices generation
+/// `(pane, agent)`'s open tasks owe at its exit, close them, and answer their
+/// debt. A task a report has claimed is left to its claim.
+fn walk_exited_tasks(
+    st: &mut HubState,
+    reports: &mut crate::report_recovery::ReportState,
+    pane_id: &str,
+    agent_id: &str,
+    kind: ExitKind,
+) -> Vec<DelegateLedger> {
+    use crate::report_recovery::{TaskDelivery, TaskState, Tombstone};
+    let mut debt = Vec::new();
+    // The "worker exited" notice, one per orchestrator, naming its tasks.
+    let mut exited: Vec<(Recipient, Vec<String>)> = Vec::new();
+    for id in reports.tasks.open_of_generation(pane_id, agent_id) {
+        let Some(task) = reports.tasks.open_task_mut(&id) else {
+            continue;
+        };
+        if matches!(task.state, TaskState::Reporting { .. }) {
+            continue;
+        }
+        task.exit_walked = true;
+        let Some(task) = reports.tasks.settle(&id, Tombstone::Closed) else {
+            continue;
+        };
+        reports.exit_walked.insert(id.clone());
+        debt.push(task_debt(&task));
+        let Some(orchestrator) = task.binding.orchestrator.clone() else {
+            continue;
+        };
+        match task.delivery {
+            TaskDelivery::Live => st.owed_notices.push((
+                orchestrator,
+                UNDELIVERED_SUBJECT,
+                compose_undeliverable_notice(
+                    &id,
+                    &task.binding.role,
+                    UndeliverableReason::AgentExited,
+                ),
+            )),
+            TaskDelivery::Acknowledged | TaskDelivery::Ended if kind == ExitKind::Natural => {
+                match exited.iter_mut().find(|(to, _)| *to == orchestrator) {
+                    Some((_, ids)) => ids.push(id),
+                    None => exited.push((orchestrator, vec![id])),
+                }
+            }
+            TaskDelivery::Acknowledged | TaskDelivery::Ended => {}
+        }
+    }
+    for (orchestrator, ids) in exited {
+        st.owed_notices.push((
+            orchestrator,
+            WORKER_EXITED_SUBJECT,
+            crate::state::compose_worker_exited_notice_for_tasks(pane_id, &ids),
+        ));
+    }
+    debt
+}
+
+/// The subject of the notice an orchestrator gets when its worker exits
+/// owing it a `work-done`.
+const WORKER_EXITED_SUBJECT: &str = "worker exited";
+
+/// The commission arm and idle-worker record a task's delegate armed.
+fn task_debt(task: &crate::report_recovery::Task) -> DelegateLedger {
+    DelegateLedger {
+        commission_arm_id: task.binding.arm_id,
+        delegation_seq: task.binding.seq,
+        instance: task.binding.instance.clone(),
+    }
+}
+
+/// PRD #1666 part 3, round 5: what the task ledger said about one event, for
+/// [`settle_delegate`], which runs outside the guarded section.
+#[derive(Default)]
+struct TaskVerdicts {
+    /// Tasks whose worker's exit walk decided their notices.
+    walked: HashSet<String>,
+    /// Whether the ledger could be read at all.
+    readable: bool,
+}
+
+/// PRD #1666 part 3, round 5 (plan D12): record a delegated task's delivery in
+/// the ledger, and note the tasks whose exit the walk already decided.
+fn settle_task(
+    reports: &mut crate::report_recovery::ReportState,
+    event: &InboxEvent,
+    verdicts: &mut TaskVerdicts,
+) {
+    use crate::report_recovery::TaskDelivery;
+    let id = event.message_id.as_str();
+    match event.state {
+        StateName::Acknowledged => {
+            if let Some(task) = reports.tasks.open_task_mut(id) {
+                task.delivery = TaskDelivery::Acknowledged;
+            }
+        }
+        StateName::Undeliverable => match event.undeliverable_reason {
+            Some(UndeliverableReason::AgentExited) => {
+                if reports.exit_walked.remove(id) {
+                    verdicts.walked.insert(id.to_string());
+                } else {
+                    // Its worker's exit did not walk it (bound to another
+                    // generation of the pane): it ended all the same.
+                    let _ = reports
+                        .tasks
+                        .settle(id, crate::report_recovery::Tombstone::Closed);
+                }
+            }
+            Some(UndeliverableReason::Superseded) | None => {}
+            Some(_) => {
+                if let Some(task) = reports.tasks.open_task_mut(id) {
+                    task.delivery = TaskDelivery::Ended;
+                }
+            }
+        },
+        _ => {}
+    }
+}
+
 fn remove_watch(st: &mut HubState, id: &str) -> Option<DelegateWatch> {
     let watch = st.delegates.remove(id)?;
     engine::forget_uncertain(st, id);
@@ -4253,6 +4579,7 @@ fn settle_accepted_report(
 
 fn drain_events(st: &mut HubState) {
     let events = st.inbox.drain_events();
+    let mut verdicts = TaskVerdicts::default();
     if !events.is_empty() {
         let store = st.retained.clone();
         let now = crate::retained_store::Now::current();
@@ -4260,13 +4587,15 @@ fn drain_events(st: &mut HubState) {
             let mut access = StoreAccess::Take(store.as_deref());
             for event in &events {
                 settle_accepted_report(reports, &mut access, event, now);
+                settle_task(reports, event, &mut verdicts);
             }
         });
-        if settled.is_err() {
-            st.log_torn_once("drain_events");
+        match settled {
+            Ok(()) => verdicts.readable = true,
+            Err(_) => st.log_torn_once("drain_events"),
         }
     }
-    consume_events(st, events);
+    consume_events(st, events, &verdicts);
 }
 
 /// [`drain_events`] for code already inside a guarded section, holding the
@@ -4279,13 +4608,18 @@ fn drain_events_in_section(
 ) {
     let events = st.inbox.drain_events();
     let now = crate::retained_store::Now::current();
+    let mut verdicts = TaskVerdicts {
+        readable: true,
+        ..TaskVerdicts::default()
+    };
     for event in &events {
         settle_accepted_report(reports, store, event, now);
+        settle_task(reports, event, &mut verdicts);
     }
-    consume_events(st, events);
+    consume_events(st, events, &verdicts);
 }
 
-fn consume_events(st: &mut HubState, events: Vec<InboxEvent>) {
+fn consume_events(st: &mut HubState, events: Vec<InboxEvent>, verdicts: &TaskVerdicts) {
     for event in events {
         // PR #1735 fifth review (R5): the message a stalled wake was recorded
         // against left the queue, so something took it, and clients are told
@@ -4307,7 +4641,7 @@ fn consume_events(st: &mut HubState, events: Vec<InboxEvent>) {
             }
         }
         settle_late_ack(st, &event);
-        settle_delegate(st, &event);
+        settle_delegate(st, &event, verdicts);
         remember_max_deliver(st, &event);
         settle_offer(st, &event);
         debug!(
@@ -4634,7 +4968,7 @@ fn owe_card_notice(st: &mut HubState, event: &InboxEvent) {
 /// PRD #1666 S5: end the watch on a delegated task once it is acknowledged or
 /// can no longer be, and owe its orchestrator a notice when it turned
 /// undeliverable for any reason but being superseded.
-fn settle_delegate(st: &mut HubState, event: &InboxEvent) {
+fn settle_delegate(st: &mut HubState, event: &InboxEvent, verdicts: &TaskVerdicts) {
     let id = event.message_id.as_str();
     let end = match event.state {
         StateName::Acknowledged => DelegateEnd::Acknowledged(Instant::now()),
@@ -4672,6 +5006,20 @@ fn settle_delegate(st: &mut HubState, event: &InboxEvent) {
         Some(reason) => reason,
     };
     if reason == UndeliverableReason::AgentExited {
+        // PRD #1666 part 3, round 5 (plan D12 rule 4): the worker's exit walk
+        // decided this task's notices and returned its debt, so this is the
+        // one producer that stays silent for it.
+        if verdicts.walked.contains(id) {
+            return;
+        }
+        if verdicts.readable {
+            warn!(
+                message_id = %id,
+                pane_id = %watch.worker.pane_id,
+                "inbox: a delegated task with no ledger entry ended with its worker; its notice \
+                 comes from the watch"
+            );
+        }
         st.exited_ledgers.push(watch.ledger);
     }
     let handed = st.cancelled_handed.remove(id);
@@ -6432,6 +6780,7 @@ mod tests {
         let ledger = || DelegateLedger {
             commission_arm_id: None,
             delegation_seq: None,
+            instance: None,
         };
         let (older, _end) = hub
             .post_delegate(
@@ -6486,6 +6835,7 @@ mod tests {
         let ledger = || DelegateLedger {
             commission_arm_id: None,
             delegation_seq: None,
+            instance: None,
         };
         let (older, mut older_end) = hub
             .post_delegate(
@@ -7170,6 +7520,7 @@ mod tests {
             spill,
             &|| true,
         )
+        .map(|posted| (posted.id, posted.ended))
         .unwrap()
     }
 
@@ -7354,7 +7705,7 @@ mod tests {
         hub.post_direct(worker.clone(), content("posted while the task saved"))
             .unwrap();
         let mut room = room;
-        let (task, _end) = hub
+        let task = hub
             .post_reserved_delegate(
                 &mut room,
                 worker.clone(),
@@ -7365,7 +7716,8 @@ mod tests {
                 MintedSpill::default(),
                 &|| true,
             )
-            .unwrap();
+            .unwrap()
+            .id;
         assert_eq!(state_in(&hub, "w", &task), StateName::Queued);
         assert_eq!(hub.list("w").len(), 3, "one over the limit of two");
         let refused = hub.post_direct(worker.clone(), content("one more"));

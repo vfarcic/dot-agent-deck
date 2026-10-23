@@ -940,11 +940,13 @@ mod tests {
         assert!(returns.is_empty());
     }
 
-    /// PRD #1666 part 3, round 5: a route is taken by its stable unit id, not
-    /// by the pane alone, so a recycled pane's newer unit is never taken for
-    /// an older one.
+    /// Scenario: A unit's route is registered on a pane. Taking the route for
+    /// another unit id on the same pane takes nothing; taking it for its own
+    /// unit id takes it, so a recycled pane's newer unit is never taken for an
+    /// older one.
+    #[spec::spec("orchestration/work-done/031")]
     #[test]
-    fn take_for_unit_matches_the_unit_id_not_the_pane_alone() {
+    fn work_done_031_take_for_unit_matches_the_unit_id_not_the_pane_alone() {
         let mut returns = DispatchReturns::default();
         returns.register("unit-pane", "unit-agent", "unit-2", caller("c", "1", "n"));
         assert!(returns.take_for_unit("unit-pane", "unit-1").is_none());

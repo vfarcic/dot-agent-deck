@@ -1628,8 +1628,10 @@ pub const CONTRACT_BREAKS: &[&str] = &[
     // and `deck_unavailable` once the daemon's report state was torn by an
     // internal panic); a failed respawn of a unit's terminal ends the unit; and
     // `InboxNotice` / `MessageSummary` carry report provenance, an additive
-    // optional field. The task-scoped `work-done` half of the same break lands
-    // with its gated verb. Nothing on the attach wire moved shape;
+    // optional field. `delegate --supersede` now ends the task it replaces,
+    // debt included, and a worker's exit releases its tasks' debt, so what a
+    // worker owes changed too. The task-scoped `work-done` half of the same
+    // break lands with its gated verb. Nothing on the attach wire moved shape;
     // `ListOutcomes` is a new request every sender withholds until the daemon
     // advertises `CAP_DECK_OUTCOMES`. What moved is which dispatches are
     // refused and what a unit's end tells its caller.

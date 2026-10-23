@@ -2306,6 +2306,7 @@ fn pump_reader(
     // PRD #1666 S3: whatever the exit, messages bound to this agent can no
     // longer reach it. Deliberate closes included: the entry is gone by now, but
     // its messages are not.
+    let mut exit_walked = false;
     if let Some(pane_id) = pane_id_env.as_deref()
         && let Some(registry) = registry.upgrade()
     {
@@ -2325,12 +2326,29 @@ fn pump_reader(
         // armed go with it — before the orchestrator is told, so a delegate sent
         // in answer to the notice is not refused as busy, and the sweep below
         // finds no record to report the same exit a second time.
-        for ledger in registry.inbox().agent_exited(pane_id, &agent_id) {
-            if ledger.commission_arm_id.is_some() {
-                registry.release_delegation_commission(pane_id, ledger.commission_arm_id);
-            }
-            if let Some(seq) = ledger.delegation_seq {
-                let _ = registry.take_outstanding_delegation_if(pane_id, seq);
+        //
+        // PRD #1666 part 3, round 5 (plan D12 rule 4): the hub's task ledger
+        // decides the notices this exit owes, from the tasks themselves, and
+        // answers each walked task's debt, which is retired here by its exact
+        // arm and record. A close or respawn removed the record first, so it
+        // owes no "worker exited" notice.
+        let kind = if registry.is_agent_still_registered(&agent_id) {
+            crate::inbox_hub::ExitKind::Natural
+        } else {
+            crate::inbox_hub::ExitKind::Removed
+        };
+        let settled = registry.inbox().agent_exited_as(pane_id, &agent_id, kind);
+        exit_walked = settled.walked;
+        if settled.walked {
+            registry.retire_task_debt_exact(pane_id, &settled.ledgers);
+        } else {
+            for ledger in settled.ledgers {
+                if ledger.commission_arm_id.is_some() {
+                    registry.release_delegation_commission(pane_id, ledger.commission_arm_id);
+                }
+                if let Some(seq) = ledger.delegation_seq {
+                    let _ = registry.take_outstanding_delegation_if(pane_id, seq);
+                }
             }
         }
         registry.inbox().post_owed_notices();
@@ -2365,6 +2383,17 @@ fn pump_reader(
             .into_iter()
             .filter(|delegation| delegation.orchestrator_pane_id != pane_id)
             .collect();
+        // PRD #1666 part 3, round 5 (plan D12 rule 4): the ledger's walk above
+        // retired every record and arm its tasks armed, so what is left here
+        // names no ledger task. Its notice is the fallback, and should not
+        // happen once every delegate is a ledger task.
+        if exit_walked && !worker_exits.is_empty() {
+            tracing::warn!(
+                pane_id = %pane_id,
+                records = worker_exits.len(),
+                "pane EOF: an idle-worker record named no ledger task; reporting it from the record"
+            );
+        }
         // PRD #1666 S5: with the idle-worker detector switched off no delegation
         // record exists, but the commission still says this agent owed a
         // work-done. Its orchestrator is told the same way.
@@ -6057,6 +6086,37 @@ struct DelegationTracker {
     waiting_notice_sent_at: HashMap<String, Instant>,
 }
 
+impl DelegationTracker {
+    /// PRD #1666 part 3, round 5 (plan D6): remove exactly commission arm
+    /// `arm_id` owed by `worker_pane_id`. Never another arm: unlike
+    /// [`AgentPtyRegistry::release_delegation_commission`], an absent arm
+    /// removes nothing, so a task's debt can never retire a sibling's.
+    fn remove_arm_exact(&mut self, worker_pane_id: &str, arm_id: u64) -> bool {
+        let Some(entry) = self.commissions.get_mut(worker_pane_id) else {
+            return false;
+        };
+        let removed = entry.remove_arm(arm_id);
+        if entry.outstanding() == 0 {
+            self.commissions.remove(worker_pane_id);
+        }
+        removed
+    }
+
+    /// PRD #1666 part 3, round 5 (plan D6): take `worker_pane_id`'s idle-worker
+    /// record only when it is generation `seq`.
+    fn take_record_if(&mut self, worker_pane_id: &str, seq: u64) -> Option<OutstandingDelegation> {
+        if self
+            .records
+            .get(worker_pane_id)
+            .is_some_and(|record| record.seq == seq)
+        {
+            self.records.remove(worker_pane_id)
+        } else {
+            None
+        }
+    }
+}
+
 /// Issue #447: one worker pane's pending "this delegated worker is waiting for
 /// input" notice — the debounce between a worker's hook reporting
 /// `WaitingForInput` and the daemon telling the orchestrator that delegated to
@@ -8871,15 +8931,36 @@ impl AgentPtyRegistry {
         worker_pane_id: &str,
         seq: u64,
     ) -> Option<OutstandingDelegation> {
-        let mut tracker = self.delegations.lock();
-        if tracker
-            .records
-            .get(worker_pane_id)
-            .is_some_and(|d| d.seq == seq)
-        {
-            tracker.records.remove(worker_pane_id)
-        } else {
-            None
+        self.delegations.lock().take_record_if(worker_pane_id, seq)
+    }
+
+    /// PRD #1666 part 3, round 5 (plan D8, D12 rule 4): retire the debt of
+    /// tasks the task ledger closed or superseded — each task's own commission
+    /// arm and idle-worker record, by their ids, and nothing else. Idempotent:
+    /// debt already retired is left as it is. A new path, so it takes the
+    /// tracker without panicking: when it is unavailable, nothing is retired.
+    pub fn retire_task_debt_exact(
+        &self,
+        worker_pane_id: &str,
+        debt: &[crate::inbox_hub::DelegateLedger],
+    ) {
+        if debt.is_empty() {
+            return;
+        }
+        let Ok(mut tracker) = self.delegations.try_lock() else {
+            tracing::error!(
+                pane_id = %worker_pane_id,
+                "delegation: the delegation tracker is unavailable; a task's debt was not retired"
+            );
+            return;
+        };
+        for task in debt {
+            if let Some(arm_id) = task.commission_arm_id {
+                tracker.remove_arm_exact(worker_pane_id, arm_id);
+            }
+            if let Some(seq) = task.delegation_seq {
+                let _ = tracker.take_record_if(worker_pane_id, seq);
+            }
         }
     }
 
@@ -23653,6 +23734,42 @@ mod spawn_tests {
             blocked_notice_waiter: None,
             _watch_cancel: oneshot::channel().0,
         }
+    }
+
+    /// Scenario: A worker owes one commission. Retiring a task's debt that
+    /// names an arm the worker does not owe removes nothing, where the legacy
+    /// release falls back to the oldest arm; retiring the debt that names the
+    /// owed arm removes exactly it.
+    #[spec("orchestration/work-done/031")]
+    #[test]
+    fn work_done_031_exact_debt_retirement_never_falls_back_to_a_sibling_arm() {
+        const WORKER: &str = "exact-debt-worker";
+        const ORCH: &str = "exact-debt-orchestrator";
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let arm = |reg: &Arc<AgentPtyRegistry>| match reg
+            .arm_delegation_commission(WORKER, ORCH, None, true)
+        {
+            CommissionArm::Armed { in_flight, .. } => in_flight.arm_id(),
+            other => panic!("expected an armed commission, got {other:?}"),
+        };
+        let debt = |arm_id: u64| crate::inbox_hub::DelegateLedger {
+            commission_arm_id: Some(arm_id),
+            ..Default::default()
+        };
+        let owed = arm(&reg);
+        reg.retire_task_debt_exact(WORKER, &[debt(owed + 1000)]);
+        assert!(
+            reg.owes_delegation_commission(WORKER),
+            "a task's debt naming another arm retires nothing"
+        );
+        reg.retire_task_debt_exact(WORKER, &[debt(owed)]);
+        assert!(!reg.owes_delegation_commission(WORKER), "its own arm goes");
+
+        // Control: the legacy release, given an arm the worker does not owe,
+        // takes the oldest one, which is what the exact path must never do.
+        let _sibling = arm(&reg);
+        reg.release_delegation_commission(WORKER, Some(u64::MAX));
+        assert!(!reg.owes_delegation_commission(WORKER));
     }
 
     /// Issue #708 (Greptile P1 and P2 on PR #1338); PRD #1666 S5: two

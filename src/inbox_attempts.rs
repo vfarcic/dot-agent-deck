@@ -2425,72 +2425,6 @@ fn possessed(
     }
 }
 
-/// How a work-done report resolved against the task index (§9).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReportOutcome {
-    Retired(String),
-    AlreadyReported,
-    UnknownTask,
-    /// No task id: posted visibly and uncorrelated, retiring nothing.
-    Uncorrelated,
-}
-
-#[derive(Debug, Clone)]
-struct TaskEntry {
-    worker_pane: String,
-    worker_generation: u64,
-    reported: bool,
-}
-
-/// `tasks: id → worker pane + generation` (§9): a no-inference prototype
-/// until §13 step 5, which adds the instance and orchestration binding, the
-/// commission/notice transaction, worker-exit cleanup and the bound on
-/// reported tombstones. It has none of those yet and evicts nothing.
-#[derive(Debug, Clone, Default)]
-pub struct TaskIndex {
-    tasks: BTreeMap<String, TaskEntry>,
-}
-
-impl TaskIndex {
-    pub fn bind(&mut self, task_id: &str, worker_pane: &str, worker_generation: u64) {
-        self.tasks.insert(
-            task_id.to_string(),
-            TaskEntry {
-                worker_pane: worker_pane.to_string(),
-                worker_generation,
-                reported: false,
-            },
-        );
-    }
-
-    /// A report names its task, or retires nothing (§9): no inference from
-    /// whichever task happens to be open.
-    pub fn report(&mut self, task_id: Option<&str>, pane: &str, generation: u64) -> ReportOutcome {
-        let Some(id) = task_id else {
-            return ReportOutcome::Uncorrelated;
-        };
-        match self.tasks.get_mut(id) {
-            Some(t) if t.worker_pane == pane && t.worker_generation == generation => {
-                if t.reported {
-                    ReportOutcome::AlreadyReported
-                } else {
-                    t.reported = true;
-                    ReportOutcome::Retired(id.to_string())
-                }
-            }
-            _ => ReportOutcome::UnknownTask,
-        }
-    }
-
-    pub fn open(&self) -> Vec<String> {
-        self.tasks
-            .iter()
-            .filter(|(_, t)| !t.reported)
-            .map(|(id, _)| id.clone())
-            .collect()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3522,34 +3456,6 @@ mod tests {
         m.stage(t1, "taken", 1, tk.e, Stage::Committed, None);
         assert_eq!(m.evidence_reserved(), 0);
         assert!(m.issue(t1, "waiting", rx).is_ok());
-    }
-
-    /// Scenario: An orchestrator delegates task t1, the worker reports it by
-    /// id, the orchestrator delegates t2, and the worker then sends two
-    /// reports with no task id, one naming t1 again, one naming an unknown
-    /// task and one from another generation of the pane. Reports without an
-    /// id retire nothing and t2 stays open.
-    #[spec("inbox/attempts/015")]
-    #[test]
-    fn attempts_015_a_report_without_a_task_id_retires_nothing() {
-        let mut tasks = TaskIndex::default();
-        tasks.bind("t1", "2", 1);
-        assert_eq!(
-            tasks.report(Some("t1"), "2", 1),
-            ReportOutcome::Retired("t1".into())
-        );
-        tasks.bind("t2", "2", 1);
-        assert_eq!(tasks.report(None, "2", 1), ReportOutcome::Uncorrelated);
-        assert_eq!(tasks.report(None, "2", 1), ReportOutcome::Uncorrelated);
-        assert_eq!(tasks.open(), vec!["t2".to_string()]);
-        assert_eq!(
-            tasks.report(Some("t1"), "2", 1),
-            ReportOutcome::AlreadyReported
-        );
-        assert_eq!(tasks.report(Some("t9"), "2", 1), ReportOutcome::UnknownTask);
-        assert_eq!(tasks.report(Some("t2"), "2", 2), ReportOutcome::UnknownTask);
-        assert_eq!(tasks.report(Some("t2"), "3", 1), ReportOutcome::UnknownTask);
-        assert_eq!(tasks.open(), vec!["t2".to_string()]);
     }
 
     /// Scenario: A generation exits holding a possessed direct message, a

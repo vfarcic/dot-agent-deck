@@ -442,11 +442,11 @@ A role "reaches no worker" when it is not in the file, when it is the orchestrat
 
 ### One task per worker at a time
 
-A worker that has been given a task is busy until it sends `work-done`, and until then `delegate` refuses to give it another. What counts is whether the worker has reported, not its status: a worker's card (TUI) or row (desktop) can read idle while the worker still owes a `work-done`. A worker whose agent exited without reporting is still busy, until a different agent takes over its pane: a task the exited agent had received does not make the new agent busy.
+A worker that has been given a task is busy until it sends `work-done`, and until then `delegate` refuses to give it another. What counts is whether the worker has reported, not its status: a worker's card (TUI) or row (desktop) can read idle while the worker still owes a `work-done`. When a worker's agent exits without reporting, the orchestrator is told which of its tasks were not reported, and the worker no longer counts as busy with them.
 
 When the earlier task is not coming back:
 
-- **`delegate --supersede`** queues the new task and retires an earlier task that has not been acknowledged. On a `clear = false` worker, work it already received can finish and a late `work-done` for that earlier task still counts. On a `clear = true` worker the agent is restarted, so its earlier work is lost.
+- **`delegate --supersede`** queues the new task and ends the earlier one, whether or not the worker had taken it, so the worker owes one `work-done`, for the new task. On a `clear = false` worker, work it already received can finish. On a `clear = true` worker the agent is restarted, so its earlier work is lost.
 - **`pane restart <role>`** replaces the worker's agent and drops the task it owed, together with its pending [idle-worker reports](idle-workers-and-notifications.md).
 - **Wait.** Seven days after a task was sent, the deck stops counting it.
 
@@ -456,7 +456,7 @@ If the orchestrator's own agent was replaced since it delegated, the new orchest
 
 When the orchestrator needs to give a worker more information about the task it is already doing (a correction, a missing detail, a forgotten constraint), whether the worker keeps its work depends on the role's `clear`:
 
-- **`clear = false`:** `delegate --supersede` reaches the running agent, which keeps its conversation and its work. The orchestrator says in the task that it adds to the current one. The deck counts the addition as a task of its own, so a worker that had already taken the original task owes a `work-done` for each, and until it sends both, a plain `delegate` to it is refused as busy.
+- **`clear = false`:** `delegate --supersede` reaches the running agent, which keeps its conversation and its work. The orchestrator says in the task that it adds to the current one. The addition replaces the original task, so the worker owes one `work-done`, for both together.
 - **`clear = true`:** every delegate restarts the worker's agent, `--supersede` included, so the worker loses its conversation and anything it had not saved. The orchestrator waits for the `work-done` and delegates a follow-up that restates what the worker needs, or supersedes with the whole task restated and lets the worker start over.
 
 The deck marks the `clear = true` workers in the orchestrator's instructions as starting fresh for every task, and tells it the above. This is the same whether you run the orchestration in the TUI or the desktop app: the orchestrator's agent runs the same commands in either. A follow-up delegated after a `work-done` is a new task too, so a `clear = true` worker starts it without the earlier conversation. If a role's work usually continues from one task to the next, for example a coder that addresses review findings on its own change, set `clear = false` on that role.

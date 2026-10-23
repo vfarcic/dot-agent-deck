@@ -15,12 +15,15 @@
 //!   attest before they are indexed (D7).
 //! - [`FallbackBodies`]: dispatch results the deck could not write to disk,
 //!   held in memory under their report id (§3.2).
+//! - [`TaskLedger`]: every delegated task, bound to the worker generation and
+//!   orchestration instance it was posted to, while it is open, and a bounded
+//!   tombstone once it is reported, closed or superseded (D2, D8, D12).
 //!
 //! The wire projection (`ReportProvenance`, `DeckOutcome`) is frozen here for
 //! round 6. Every enum a newer deck may extend decodes an unknown value as
 //! `Unknown`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -655,6 +658,232 @@ pub struct FallbackBody {
 pub type FallbackBodies = HashMap<String, FallbackBody>;
 
 // ---------------------------------------------------------------------------
+// The task ledger (D2, D8, D12)
+// ---------------------------------------------------------------------------
+
+/// What a delegated task is bound to when it is posted. Immutable: a report
+/// is checked against it, never against whoever holds the worker's pane now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskBinding {
+    pub worker_pane: String,
+    pub worker_agent: String,
+    /// The worker's orchestration instance, when it has one.
+    pub instance: Option<String>,
+    pub role: String,
+    /// The orchestrator generation the task's notices and report go to.
+    pub orchestrator: Option<Recipient>,
+    /// The commission arm and idle-worker record its delegate armed.
+    pub arm_id: Option<u64>,
+    pub seq: Option<u64>,
+}
+
+/// Where the task's message is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskDelivery {
+    /// Not yet acknowledged, and still deliverable.
+    Live,
+    /// The worker acknowledged it.
+    Acknowledged,
+    /// It became undeliverable for a reason other than the worker's exit
+    /// (out of hand-overs, cancelled), so its exit owes no undeliverable
+    /// notice for it.
+    Ended,
+}
+
+/// An open task's state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskState {
+    /// Waiting for its report.
+    Open { revision: u64 },
+    /// A report for it is being saved.
+    Reporting { claim_id: u64 },
+}
+
+/// A task that is not open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Tombstone {
+    /// It was reported. A report taken before task-scoped completion carries
+    /// no report id or digest.
+    Reported {
+        report_id: Option<String>,
+        digest: Option<[u8; 32]>,
+        destination: Destination,
+    },
+    /// Its worker generation ended before it was reported.
+    Closed,
+    /// A newer task to the same worker replaced it (`by`), or the worker was
+    /// restarted (`None`).
+    Superseded { by: Option<String> },
+}
+
+/// An open task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Task {
+    pub binding: TaskBinding,
+    pub delivery: TaskDelivery,
+    pub state: TaskState,
+    /// Its worker's exit decided which notices it owed (D12 rule 4).
+    pub exit_walked: bool,
+}
+
+/// What the ledger knows about a task id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskLookup<'a> {
+    Open(&'a Task),
+    Settled(&'a Tombstone),
+    Unknown,
+}
+
+/// A task id is already known to the ledger: ids are bound once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rebind;
+
+/// The tombstone key for a task with no orchestration instance.
+const NO_INSTANCE: &str = "";
+
+/// Every delegated task the deck still knows, by its message id. Open tasks
+/// are never evicted. Tombstones are kept up to `per_instance` for each
+/// orchestration instance and `global` across the daemon, oldest evicted
+/// first; a report naming an evicted task is unknown, and its id is never
+/// bound again (ids are minted once).
+#[derive(Debug)]
+pub struct TaskLedger {
+    open: HashMap<String, Task>,
+    settled: HashMap<String, (String, Tombstone)>,
+    by_instance: HashMap<String, VecDeque<String>>,
+    order: VecDeque<String>,
+    per_instance: usize,
+    global: usize,
+}
+
+impl TaskLedger {
+    pub fn new(per_instance: usize) -> Self {
+        let per_instance = per_instance.max(1);
+        TaskLedger {
+            open: HashMap::new(),
+            settled: HashMap::new(),
+            by_instance: HashMap::new(),
+            order: VecDeque::new(),
+            per_instance,
+            global: per_instance.saturating_mul(16),
+        }
+    }
+
+    /// Bind `task_id`, open and live. Refused for an id the ledger knows.
+    pub fn bind(&mut self, task_id: &str, binding: TaskBinding) -> Result<(), Rebind> {
+        if self.open.contains_key(task_id) || self.settled.contains_key(task_id) {
+            return Err(Rebind);
+        }
+        self.open.insert(
+            task_id.to_string(),
+            Task {
+                binding,
+                delivery: TaskDelivery::Live,
+                state: TaskState::Open { revision: 0 },
+                exit_walked: false,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn lookup(&self, task_id: &str) -> TaskLookup<'_> {
+        if let Some(task) = self.open.get(task_id) {
+            return TaskLookup::Open(task);
+        }
+        match self.settled.get(task_id) {
+            Some((_, tombstone)) => TaskLookup::Settled(tombstone),
+            None => TaskLookup::Unknown,
+        }
+    }
+
+    pub fn open_task_mut(&mut self, task_id: &str) -> Option<&mut Task> {
+        self.open.get_mut(task_id)
+    }
+
+    /// The open tasks bound to `(pane, agent)`, oldest id order not implied.
+    pub fn open_of_generation(&self, pane_id: &str, agent_id: &str) -> Vec<String> {
+        self.open_where(|b| b.worker_pane == pane_id && b.worker_agent == agent_id)
+    }
+
+    /// The open tasks bound to any generation of `pane_id`.
+    pub fn open_of_pane(&self, pane_id: &str) -> Vec<String> {
+        self.open_where(|b| b.worker_pane == pane_id)
+    }
+
+    fn open_where(&self, keep: impl Fn(&TaskBinding) -> bool) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .open
+            .iter()
+            .filter(|(_, task)| keep(&task.binding))
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// Settle open task `task_id` as `tombstone`, and evict the oldest
+    /// tombstones past the bounds. Answers the task, or `None` when it was
+    /// not open.
+    pub fn settle(&mut self, task_id: &str, tombstone: Tombstone) -> Option<Task> {
+        let task = self.open.remove(task_id)?;
+        let instance = task
+            .binding
+            .instance
+            .clone()
+            .unwrap_or_else(|| NO_INSTANCE.to_string());
+        self.settled
+            .insert(task_id.to_string(), (instance.clone(), tombstone));
+        self.by_instance
+            .entry(instance.clone())
+            .or_default()
+            .push_back(task_id.to_string());
+        self.order.push_back(task_id.to_string());
+        self.evict(&instance);
+        Some(task)
+    }
+
+    fn evict(&mut self, instance: &str) {
+        while self
+            .by_instance
+            .get(instance)
+            .is_some_and(|ids| ids.len() > self.per_instance)
+        {
+            let Some(oldest) = self
+                .by_instance
+                .get_mut(instance)
+                .and_then(VecDeque::pop_front)
+            else {
+                break;
+            };
+            self.forget(&oldest);
+        }
+        while self.order.len() > self.global {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some((instance, _)) = self.settled.remove(&oldest)
+                && let Some(ids) = self.by_instance.get_mut(&instance)
+            {
+                ids.retain(|id| *id != oldest);
+                if ids.is_empty() {
+                    self.by_instance.remove(&instance);
+                }
+            }
+        }
+    }
+
+    fn forget(&mut self, task_id: &str) {
+        self.settled.remove(task_id);
+        self.order.retain(|id| id != task_id);
+    }
+
+    /// How many tombstones the ledger holds.
+    pub fn settled_len(&self) -> usize {
+        self.settled.len()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The report state
 // ---------------------------------------------------------------------------
 
@@ -667,6 +896,11 @@ pub struct ReportState {
     pub units: UnitTable,
     pub publications: Publications,
     pub fallback: FallbackBodies,
+    pub tasks: TaskLedger,
+    /// Tasks a worker's exit walk decided (D12 rule 4), until the exit's
+    /// `AgentExited` event for each is settled: `settle_delegate` posts no
+    /// notice of its own for them.
+    pub exit_walked: HashSet<String>,
     /// This run of the daemon, as `DeckOutcomes` names it.
     pub incarnation: String,
 }
@@ -681,6 +915,8 @@ impl ReportState {
             units: UnitTable::new(tombstones_max_from_env().saturating_mul(16)),
             publications: HashMap::new(),
             fallback: HashMap::new(),
+            tasks: TaskLedger::new(tombstones_max_from_env()),
+            exit_walked: HashSet::new(),
             incarnation: bytes.iter().map(|b| format!("{b:02x}")).collect(),
         }
     }
@@ -702,6 +938,8 @@ pub fn party(recipient: &Recipient, role: Option<String>) -> OutcomeParty {
 
 #[cfg(test)]
 mod tests {
+    use spec::spec;
+
     use super::*;
 
     #[test]
@@ -748,6 +986,150 @@ mod tests {
         assert_eq!(store.overflow(), 1);
         assert!(!store.has_report("a"));
         assert!(store.has_report("b"));
+    }
+
+    fn binding(pane: &str, agent: &str, instance: Option<&str>) -> TaskBinding {
+        TaskBinding {
+            worker_pane: pane.to_string(),
+            worker_agent: agent.to_string(),
+            instance: instance.map(str::to_string),
+            role: "coder".to_string(),
+            orchestrator: None,
+            arm_id: None,
+            seq: None,
+        }
+    }
+
+    /// How a report from `(pane, agent)` naming `task_id` reads against the
+    /// ledger: a report names its task and is checked against the task's own
+    /// binding, never inferred from whichever task is open.
+    fn report(
+        ledger: &mut TaskLedger,
+        task_id: Option<&str>,
+        pane: &str,
+        agent: &str,
+    ) -> &'static str {
+        let Some(id) = task_id else {
+            return "uncorrelated";
+        };
+        match ledger.lookup(id) {
+            TaskLookup::Open(task)
+                if task.binding.worker_pane == pane && task.binding.worker_agent == agent =>
+            {
+                ledger.settle(
+                    id,
+                    Tombstone::Reported {
+                        report_id: Some(format!("r-{id}")),
+                        digest: None,
+                        destination: Destination::Inbox,
+                    },
+                );
+                "reported"
+            }
+            TaskLookup::Settled(Tombstone::Reported { .. }) => "already reported",
+            _ => "unknown",
+        }
+    }
+
+    /// Scenario: An orchestrator delegates task t1, the worker reports it by
+    /// id, the orchestrator delegates t2, and the worker then sends two
+    /// reports with no task id, one naming t1 again, one naming an unknown
+    /// task and one from another generation of the pane. Reports without an
+    /// id retire nothing and t2 stays open, in the deck's task ledger.
+    #[spec("inbox/attempts/015")]
+    #[test]
+    fn attempts_015_a_report_without_a_task_id_retires_nothing() {
+        let mut tasks = TaskLedger::new(256);
+        tasks.bind("t1", binding("2", "g1", None)).unwrap();
+        assert_eq!(report(&mut tasks, Some("t1"), "2", "g1"), "reported");
+        tasks.bind("t2", binding("2", "g1", None)).unwrap();
+        assert_eq!(report(&mut tasks, None, "2", "g1"), "uncorrelated");
+        assert_eq!(report(&mut tasks, None, "2", "g1"), "uncorrelated");
+        assert_eq!(tasks.open_of_pane("2"), vec!["t2".to_string()]);
+        assert_eq!(
+            report(&mut tasks, Some("t1"), "2", "g1"),
+            "already reported"
+        );
+        assert_eq!(report(&mut tasks, Some("t9"), "2", "g1"), "unknown");
+        assert_eq!(report(&mut tasks, Some("t2"), "2", "g2"), "unknown");
+        assert_eq!(report(&mut tasks, Some("t2"), "3", "g1"), "unknown");
+        assert_eq!(tasks.open_of_pane("2"), vec!["t2".to_string()]);
+    }
+
+    /// Scenario: Tasks are bound, acknowledged, claimed and settled as
+    /// reported, closed or superseded; an id the ledger knows is never bound
+    /// again; tombstones past the per-instance bound, and past the daemon-wide
+    /// bound across instances, are evicted oldest first, after which the id
+    /// is unknown; an open task is never evicted.
+    #[spec("orchestration/work-done/030")]
+    #[test]
+    fn work_done_030_the_task_ledger_and_its_tombstone_bounds() {
+        let mut tasks = TaskLedger::new(2);
+        tasks.bind("t1", binding("w", "a", Some("i1"))).unwrap();
+        assert_eq!(tasks.bind("t1", binding("w", "a", Some("i1"))), Err(Rebind));
+        let task = tasks.open_task_mut("t1").unwrap();
+        assert_eq!(task.delivery, TaskDelivery::Live);
+        assert_eq!(task.state, TaskState::Open { revision: 0 });
+        task.delivery = TaskDelivery::Acknowledged;
+        task.state = TaskState::Reporting { claim_id: 7 };
+        assert!(matches!(
+            tasks.lookup("t1"),
+            TaskLookup::Open(Task {
+                state: TaskState::Reporting { claim_id: 7 },
+                delivery: TaskDelivery::Acknowledged,
+                ..
+            })
+        ));
+        tasks.settle("t1", Tombstone::Closed).unwrap();
+        assert_eq!(tasks.lookup("t1"), TaskLookup::Settled(&Tombstone::Closed));
+        assert_eq!(
+            tasks.bind("t1", binding("w", "a", Some("i1"))),
+            Err(Rebind),
+            "a settled id is not bound again"
+        );
+        assert!(
+            tasks.settle("t1", Tombstone::Closed).is_none(),
+            "settled once"
+        );
+
+        // The per-instance bound: two tombstones of i1 are kept.
+        for id in ["t2", "t3"] {
+            tasks.bind(id, binding("w", "a", Some("i1"))).unwrap();
+            tasks
+                .settle(
+                    id,
+                    Tombstone::Superseded {
+                        by: Some("t9".into()),
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            tasks.lookup("t1"),
+            TaskLookup::Unknown,
+            "the oldest of i1 is gone"
+        );
+        assert!(matches!(tasks.lookup("t2"), TaskLookup::Settled(_)));
+        assert!(matches!(tasks.lookup("t3"), TaskLookup::Settled(_)));
+
+        // An open task outlives any number of tombstones.
+        tasks.bind("open", binding("w", "a", Some("i1"))).unwrap();
+        // The daemon-wide bound: 16 times the per-instance one, across
+        // instances, oldest first.
+        for n in 0..40 {
+            let id = format!("x{n}");
+            tasks
+                .bind(&id, binding("w", "a", Some(&format!("i{n}"))))
+                .unwrap();
+            tasks.settle(&id, Tombstone::Closed).unwrap();
+        }
+        assert_eq!(tasks.settled_len(), 32);
+        assert_eq!(tasks.lookup("t2"), TaskLookup::Unknown);
+        assert_eq!(tasks.lookup("x7"), TaskLookup::Unknown);
+        assert!(matches!(tasks.lookup("x8"), TaskLookup::Settled(_)));
+        assert!(matches!(tasks.lookup("open"), TaskLookup::Open(_)));
+        assert_eq!(tasks.open_of_generation("w", "a"), vec!["open".to_string()]);
+        assert!(tasks.open_of_generation("w", "b").is_empty());
     }
 
     #[test]

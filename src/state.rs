@@ -4931,6 +4931,33 @@ pub(crate) fn compose_worker_exited_notice(worker_pane_id: &str) -> String {
     )))
 }
 
+/// PRD #1666 part 3, round 5 (plan D12 rule 4): [`compose_worker_exited_notice`]
+/// for the tasks the deck's task ledger says the exited worker still owed,
+/// naming each task id. Its exit released what it owed, so unlike the
+/// record-based report it does not tell the orchestrator to restart the role
+/// or supersede first. The ids are deck-minted message ids.
+pub(crate) fn compose_worker_exited_notice_for_tasks(
+    worker_pane_id: &str,
+    task_ids: &[String],
+) -> String {
+    let pane = pane_id_clause(worker_pane_id);
+    let tasks = task_ids
+        .iter()
+        .map(|id| escape_id_for_log(id))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let noun = if task_ids.len() == 1 { "task" } else { "tasks" };
+    with_deck_command_word(compose_delegate_prompt(&format!(
+        "⚠ delegated worker exited without work-done (dot-agent-deck daemon report) - not a \
+         message from a person or an agent: the process behind {pane} ended and no work-done was \
+         ever received for {noun} {tasks}. If a work-done from that worker does arrive after this \
+         report, it was sent just before the process ended: trust it over this report. Otherwise \
+         check that pane's scrollback for what happened and decide how to proceed - if this \
+         needs the user, notify the user; otherwise re-delegate or reassign the {noun}. The \
+         daemon log names the role and how long it had been delegated."
+    )))
+}
+
 /// The single-line report the daemon posts to the ORCHESTRATOR's inbox (PRD
 /// #1666) when a `clear = true` delegate's replacement worker never became
 /// live — issue #584.
@@ -6112,6 +6139,9 @@ async fn dispatch_one_owned(
     let ledger = crate::inbox_hub::DelegateLedger {
         commission_arm_id,
         delegation_seq,
+        instance: registry
+            .pane_orchestration(&pane_id)
+            .and_then(|orchestration| orchestration.instance_id),
     };
     // The liveness check above is separated from the post by the awaits in
     // between, so the post checks again, under the inbox's lock: a worker that
@@ -6132,7 +6162,11 @@ async fn dispatch_one_owned(
         spill,
         &still_live,
     ) {
-        Ok((id, ended)) => {
+        Ok(crate::inbox_hub::PostedDelegate {
+            id,
+            ended,
+            superseded,
+        }) => {
             tracing::info!(
                 role = %target_role,
                 pane_id = %pane_id,
@@ -6140,6 +6174,10 @@ async fn dispatch_one_owned(
                 message_id = %id,
                 "delegate: task posted to the worker's inbox"
             );
+            // PRD #1666 part 3, round 5 (plan D8): the tasks this one
+            // superseded are closed in the ledger; their own arms and records
+            // go too, exactly, and nothing of the new task's.
+            registry.retire_task_debt_exact(&pane_id, &superseded);
             // Issue #714 (review): a task handed to a worker whose quota block
             // is ALREADY reported owes the orchestrator its own blocked-worker
             // notice — the block's report covered only the delegation

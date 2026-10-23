@@ -1,5 +1,7 @@
-## A dispatched unit that ends without reporting now tells its dispatcher, and a dispatch's result is kept
+## A dispatched unit that ends without reporting now tells its dispatcher, a dispatch's result is kept, and `delegate --supersede` ends the task it replaces
 
 A dispatched unit whose agent exits, is closed or cannot be restarted before it reports now sends its dispatcher a `dispatch ended` message saying so, instead of leaving it waiting for a report that will not come. The deck now saves every dispatch's start and failure message in its state directory, under `retained-reports/`, so one is not lost when the dispatcher that should read it has gone. A `dispatch` is refused, before anything starts, when the deck cannot be sure of keeping its result: its saved-results store is full, its directory cannot be used, too many dispatches are already starting, or earlier results it could not save fill the room it keeps in memory. A dispatch result the deck could not save to disk is kept in memory until the deck restarts, and says so.
 
-This changes which dispatches the daemon accepts and what a unit's end tells its dispatcher, so a desktop app from this release refuses an older daemon and says which versions they are. Upgrade the deck, the desktop app and the daemon together.
+`delegate --supersede` now ends the task it replaces, whether or not the worker had taken it, so the worker owes one `work-done`, for the new task, instead of one for each. When a worker's agent exits without reporting, the orchestrator's notice names the tasks it had not reported, and the worker no longer counts as busy with them.
+
+This changes which dispatches the daemon accepts, what a unit's end tells its dispatcher and what a worker owes, so a desktop app from this release refuses an older daemon and says which versions they are. Upgrade the deck, the desktop app and the daemon together.

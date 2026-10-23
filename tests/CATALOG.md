@@ -4221,10 +4221,10 @@ without depending on the config struct API.
 - **Does not assert:** what the orchestrator's pane shows for the refusal; the TUI opening the successor's pane itself (the test sends the `StartAgent` a TUI would send).
 - **Platform coverage:** mac+linux (unix-only PTY/UDS, `python3` stand-in roles).
 
-##### orchestration/delegate/052 — An addendum sent with `delegate --supersede` to a `clear = true` worker that is working on a task restarts the worker, and the new agent gets the addendum without the original task; a `clear = false` worker keeps its agent but owes a `work-done` for each task (issue #1784).
+##### orchestration/delegate/052 — An addendum sent with `delegate --supersede` to a `clear = true` worker that is working on a task restarts the worker, and the new agent gets the addendum without the original task; a `clear = false` worker keeps its agent, and the addendum replaces the original task (issue #1784; PRD #1666 part 3).
 - **Layer:** fast integration (`tests/delegate_respawn_recovery.rs`; the real `handle_delegate_with_state` against an in-process daemon whose roles were started through the real `StartAgent`, and the worker's tasks fetched and acknowledged from its inbox as an agent's component does).
 - **Agent:** none: `cat` stand-ins for both roles, because what is under test is which agent the daemon hands the addendum to, not what an agent does with it.
-- **Asserts:** for a `clear = true` `coder`: the original task is dispatched and taken, so the worker owes a `work-done`; a plain delegate of the addendum is refused with `coder` in `busy`; the `--supersede` delegate is dispatched; the addendum is taken by a different agent than the one that took the original task, that agent is no longer running, and both the delivered text and `worker-task-coder.md` carry the addendum without the original task; after one `work-done`, a plain delegate is not refused as busy. Control: the same steps on a `clear = false` `coder` hand the addendum to the agent that took the original task, which is still running, and after one `work-done` a plain delegate IS refused as busy, because the addendum is a task of its own (the orchestrator's instructions say so; PR #1785 review).
+- **Asserts:** for a `clear = true` `coder`: the original task is dispatched and taken, so the worker owes a `work-done`; a plain delegate of the addendum is refused with `coder` in `busy`; the `--supersede` delegate is dispatched; the addendum is taken by a different agent than the one that took the original task, that agent is no longer running, and both the delivered text and `worker-task-coder.md` carry the addendum without the original task; after one `work-done`, a plain delegate is not refused as busy. Control: the same steps on a `clear = false` `coder` hand the addendum to the agent that took the original task, which is still running, and after one `work-done` a plain delegate is not refused as busy, because `--supersede` ended the original task and its debt (PRD #1666 part 3, round 5, plan D8; before it, the worker owed a `work-done` for each task, PR #1785 review).
 - **Why it exists:** issue #1784. Confirmed red when written to assert what the user wanted (`left: "4"`, `right: "3"`: the agent that was working was replaced), and green with the same assertions on `clear = false`, so the restart comes from `clear = true` and not from `--supersede`. It pins `--supersede`'s meaning, which the issue keeps and the orchestrator's instructions warn about; an addendum that keeps a `clear = true` worker's agent needs its own path, which is scheduled after PRD #1666.
 - **Does not assert:** a real agent losing its conversation (a `cat` has none; the agent being replaced is what loses it); the orchestrator's instructions (`orchestrator_context` unit tests cover those); a `--supersede` before the worker took its task.
 - **Platform coverage:** mac+linux (unix-only PTYs).
@@ -4340,6 +4340,22 @@ without depending on the config struct API.
 - **Test:** `work_done_015_a_successor_in_an_exited_worker_s_pane_is_not_credited_with_its_task` in `tests/e2e_delegate_exited_worker.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/030 — The task ledger binds each delegated task once, and bounds its tombstones.
+- **Layer:** fast unit (`src/report_recovery.rs`, in-crate; no PTY, no daemon).
+- **Agent:** none.
+- **Asserts:** a bound task is open, live and unclaimed; an id the ledger knows, open or settled, is refused when bound again; a task is settled once; tombstones past the per-instance bound, and past the daemon-wide bound (16 times it) across instances, are evicted oldest first and their ids then read as unknown; an open task is never evicted; a generation's open tasks are found by its pane and agent.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D2, D12): a report names its task, and the ledger is what it is checked against, so a forgotten task must read as unknown rather than be rebound or reconstructed.
+- **Does not assert:** the hub paths that bind, supersede and close tasks (the delegate, exit and work-done tests cover them).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/work-done/031 — A task's debt is retired exactly, and a unit's route is taken by its unit id.
+- **Layer:** fast unit (`src/agent_pty.rs`, `src/dispatch_return.rs`, in-crate; no PTY).
+- **Agent:** none.
+- **Asserts:** retiring a task's debt that names a commission arm the worker does not owe removes nothing, and naming its own arm removes exactly it, where the legacy release falls back to the oldest arm; taking a route for another unit id on the same pane takes nothing, and for its own unit id takes it.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D6): the exit walk, supersede and the commit release a task's own debt; a fallback to the oldest arm would credit a sibling task.
+- **Does not assert:** the idle-worker record half, which the exit tests cover.
+- **Platform coverage:** mac+linux+windows.
 
 ##### orchestration/work-done/032 — The daemon's ranked locks are taken in rank order, and no acquisition form clears poison or panics where it must not.
 - **Layer:** fast unit (`src/lock_rank.rs`, in-crate; no PTY, no daemon).
@@ -8414,7 +8430,7 @@ The pure state model of a deck message's delivery attempts (`src/inbox_attempts.
 - **Platform coverage:** mac+linux+windows.
 
 ##### inbox/attempts/015 — A report without a task id retires nothing.
-- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Layer:** L1 unit (src/report_recovery.rs, the deck's task ledger).
 - **Agent:** none.
 - **Asserts:** a report naming its task retires it once and then answers already reported; reports with no task id are uncorrelated and leave a newer delegated task open; an unknown task id, or one from another pane or generation, is refused.
 - **Does not assert:** the `work-done --task-id` CLI or the rail.
