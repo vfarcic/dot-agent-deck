@@ -1556,18 +1556,10 @@ impl InboxHub {
                 .inbox
                 .get(&id, &worker.pane_id)
                 .map(|message| message.state.clone());
-            let receipt = st.inbox.get(&id, &worker.pane_id).and_then(|m| m.owner)
-                == Some(crate::inbox::AssignmentOwner::Receipt);
+            // PRD #1666 §6.6: a hand-out is possessed, or its delivery is
+            // uncertain and said so; it is not "not reached".
             let held = match state {
                 Some(MessageState::Queued) => "still queued: the worker has not taken it",
-                // PRD #1666 §6.6: a receipt-owned hand-out is possessed, or
-                // its delivery is uncertain and said so; it is not "not
-                // reached".
-                Some(MessageState::Fetched { .. }) if receipt => continue,
-                Some(MessageState::Fetched { .. }) => {
-                    "fetched by the worker but not acknowledged: it may not have reached the \
-                     agent's session"
-                }
                 _ => continue,
             };
             let key = (
@@ -1873,8 +1865,6 @@ impl InboxHub {
             let mut st = self.lock();
             let now = Instant::now();
             let key = (pane_id.to_string(), agent_id.to_string());
-            // PRD #1666 §13 step 4: a receipt-owned assignment is settled
-            // through its attempt model, never by the legacy ack alone.
             // A repeated ack is answered as one, the model left alone.
             if matches!(
                 st.inbox.state_for(id, pane_id, agent_id),
@@ -1882,38 +1872,41 @@ impl InboxHub {
             ) {
                 return AckOutcome::AlreadyAcknowledged;
             }
-            let receipt_owned = st.inbox.owner_of(id, pane_id, agent_id)
-                == Some(crate::inbox::AssignmentOwner::Receipt);
-            let committed = receipt_owned.then(|| engine::explicit_commit(&mut st, &key, id, now));
-            // C-5: an ack of a message no attempt of which reached the agent
-            // changes nothing, and does not fall through to the legacy ack,
-            // which would acknowledge the inbox copy the model still queues.
-            if committed == Some(engine::ExplicitCommit::Refused) {
-                return AckOutcome::Unknown;
-            }
-            // PRD #1666 part 3 (H5): nor does an ack of a message the deck
-            // never handed out, still waiting for its agent or assigned to it
-            // as an offer: no fetch is left that could have shown the agent
-            // its body. A settled, claimed or undeliverable copy still answers
-            // as the store does, so a late ack of a copy out of attempts still
-            // corrects its sender.
-            if committed != Some(engine::ExplicitCommit::Committed)
-                && st.inbox.state_for(id, pane_id, agent_id) == Some(&MessageState::Queued)
-            {
-                return AckOutcome::Unknown;
-            }
-            if committed == Some(engine::ExplicitCommit::Committed) {
-                drain_events(&mut st);
-                match st.inbox.get(id, pane_id).map(|m| &m.state) {
-                    Some(MessageState::Claimed { expires, .. }) => AckOutcome::Claimed {
-                        expires_in_ms: expires.saturating_duration_since(now).as_millis() as u64,
-                    },
-                    _ => AckOutcome::Acknowledged,
+            // PRD #1666 §13 step 4: a hand-out is settled through its attempt
+            // model, never by the store's ack alone.
+            match engine::explicit_commit(&mut st, &key, id, now) {
+                engine::ExplicitCommit::Committed => {
+                    drain_events(&mut st);
+                    match st.inbox.get(id, pane_id).map(|m| &m.state) {
+                        Some(MessageState::Claimed { expires, .. }) => AckOutcome::Claimed {
+                            expires_in_ms: expires.saturating_duration_since(now).as_millis()
+                                as u64,
+                        },
+                        _ => AckOutcome::Acknowledged,
+                    }
                 }
-            } else {
-                let outcome = st.inbox.ack(now, id, pane_id, agent_id, how);
-                drain_events(&mut st);
-                outcome
+                // C-5: an ack of a message no attempt of which reached the
+                // agent changes nothing, and does not fall through to the
+                // store's ack, which would acknowledge the inbox copy the
+                // model still queues.
+                engine::ExplicitCommit::Refused => return AckOutcome::Unknown,
+                // PRD #1666 part 3 (H5): nor does an ack of a message the
+                // deck never handed out, still waiting for its agent or
+                // assigned to it as an offer: no fetch is left that could have
+                // shown the agent its body. A settled, claimed or
+                // undeliverable copy still answers as the store does, so a
+                // late ack of a copy out of attempts still corrects its
+                // sender.
+                engine::ExplicitCommit::NoAttempt
+                    if st.inbox.state_for(id, pane_id, agent_id) == Some(&MessageState::Queued) =>
+                {
+                    return AckOutcome::Unknown;
+                }
+                engine::ExplicitCommit::NoAttempt => {
+                    let outcome = st.inbox.ack(now, id, pane_id, agent_id, how);
+                    drain_events(&mut st);
+                    outcome
+                }
             }
         };
         // PRD #1666 S11: an ack claims an offered job, which its offerer is
@@ -4733,7 +4726,6 @@ fn fits_every_hand_over(deck: &DeckId, pane_id: &str, content: &Content) -> bool
         history: Vec::new(),
         excluded: Vec::new(),
         assign_deadline: None,
-        owner: None,
     };
     // Counted as the tightest hand-over can print it: after the separator it
     // puts before each block, as a marked repeat whose opener names the

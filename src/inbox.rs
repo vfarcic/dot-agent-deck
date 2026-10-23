@@ -548,25 +548,6 @@ pub struct Message {
     /// Offers only: when an offer assigned to a holder that has not fetched
     /// it goes back to its pool ([`InboxLimits::offer_assign_wait`]).
     pub assign_deadline: Option<Instant>,
-    /// PRD #1666 §13 step 4: which policy owns this assignment, fixed at its
-    /// first issuance by the receiver that took it. A direct message has one
-    /// assignment for life; an offer has one per holder, so this is cleared
-    /// when it returns to its pool. The legacy ack-wait and requeue act only
-    /// on `Legacy`-owned messages, and only a receipt receiver
-    /// takes a `Receipt`-owned one, so the two policies never run for one
-    /// assignment.
-    pub owner: Option<AssignmentOwner>,
-}
-
-/// PRD #1666 §13 step 4: the policy that owns an assignment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum AssignmentOwner {
-    /// Ack-wait redelivery and `max_deliver`, for a consumer not on
-    /// receipts: a hook or a once-waiter.
-    Legacy,
-    /// The attempt model (`crate::inbox_attempts`) through the hub's receipt
-    /// engine.
-    Receipt,
 }
 
 impl Message {
@@ -1360,9 +1341,9 @@ impl Inbox {
     }
 
     /// PRD #1666 §13 step 4: hand message `id`, queued for `agent_id` in
-    /// `pane_id`, to a receipt receiver: it becomes fetched by `consumer` and
-    /// its assignment `Receipt`-owned. `None` unless it is queued, admits the
-    /// agent and is not `Legacy`-owned.
+    /// `pane_id`, to a receipt receiver: it becomes fetched by `consumer`, and
+    /// its attempt model decides what becomes of it from then on. `None`
+    /// unless it is queued and admits the agent.
     pub fn take_receipt(
         &mut self,
         now: Instant,
@@ -1373,13 +1354,12 @@ impl Inbox {
     ) -> Option<Message> {
         let index = self.find_for(id, pane_id, agent_id)?;
         let message = &mut self.messages[index];
-        if message.state != MessageState::Queued || message.owner == Some(AssignmentOwner::Legacy) {
+        if message.state != MessageState::Queued {
             return None;
         }
         if !message.is_offer() {
             message.deliveries += 1;
         }
-        message.owner = Some(AssignmentOwner::Receipt);
         self.transition(
             index,
             now,
@@ -1393,34 +1373,29 @@ impl Inbox {
 
     /// PRD #1666 §2: another hand-out of message `id`'s current assignment —
     /// an automatic repeat or a Retry — issued while a receipt receiver holds
-    /// it fetched. It counts one more delivery, as each fetch does for a
-    /// legacy consumer; an offer counts its assignments, so a repeat to the
-    /// same holder adds none. Returns whether it counted.
+    /// it fetched. It counts one more delivery, as its first hand-out did; an
+    /// offer counts its assignments, so a repeat to the same holder adds none.
+    /// Returns whether it counted.
     pub fn count_receipt_repeat(&mut self, id: &str, pane_id: &str, agent_id: &str) -> bool {
         let Some(index) = self.find_for(id, pane_id, agent_id) else {
             return false;
         };
         let message = &mut self.messages[index];
-        if message.owner != Some(AssignmentOwner::Receipt)
-            || !matches!(message.state, MessageState::Fetched { .. })
-            || message.is_offer()
-        {
+        if !matches!(message.state, MessageState::Fetched { .. }) || message.is_offer() {
             return false;
         }
         message.deliveries += 1;
         true
     }
 
-    /// PRD #1666 §2 rule 3: a `Receipt`-owned message every attempt of which
-    /// was positively not handed is queued again for its recipient, or for an
+    /// PRD #1666 §2 rule 3: a fetched message every attempt of which was
+    /// positively not handed is queued again for its recipient, or for an
     /// offer returned to its pool, excluding this holder. The attempt model
     /// counts and bounds these requeues, so `max_deliver` is not applied here.
     /// Returns whether it was fetched.
     pub fn requeue_receipt(&mut self, now: Instant, id: &str, pane_id: &str) -> bool {
         let Some(index) = self.messages.iter().position(|m| {
-            m.id.as_str() == id
-                && m.owner == Some(AssignmentOwner::Receipt)
-                && m.recipient.as_ref().is_some_and(|r| r.pane_id == pane_id)
+            m.id.as_str() == id && m.recipient.as_ref().is_some_and(|r| r.pane_id == pane_id)
         }) else {
             return false;
         };
@@ -1440,12 +1415,6 @@ impl Inbox {
     pub fn state_for(&self, id: &str, pane_id: &str, agent_id: &str) -> Option<&MessageState> {
         self.find_for(id, pane_id, agent_id)
             .map(|index| &self.messages[index].state)
-    }
-
-    /// The owner of the copy of `id` this agent may act on.
-    pub fn owner_of(&self, id: &str, pane_id: &str, agent_id: &str) -> Option<AssignmentOwner> {
-        self.find_for(id, pane_id, agent_id)
-            .and_then(|index| self.messages[index].owner)
     }
 
     /// The claimant of offer `id` finished the job.
@@ -1800,7 +1769,6 @@ impl Inbox {
             history: Vec::new(),
             excluded: Vec::new(),
             assign_deadline: None,
-            owner: None,
         };
         self.messages.push(message);
         let index = self.messages.len() - 1;
@@ -1862,7 +1830,6 @@ impl Inbox {
     fn return_offer(&mut self, index: usize, now: Instant, cause: ReturnCause) {
         let message = &mut self.messages[index];
         message.assign_deadline = None;
-        message.owner = None;
         let previous = message.recipient.take();
         if let Some(holder) = &previous {
             message.excluded.push(holder.clone());

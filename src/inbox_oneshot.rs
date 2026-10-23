@@ -644,8 +644,8 @@ pub enum Frame {
 /// Read one line from the daemon, at most `max` bytes before its newline. A
 /// line is handed back only once its newline has been read: the bytes before
 /// an end of connection inside a line are dropped, never parsed, even when
-/// they would parse (`BufRead::read_line`, which today's legacy waiter uses,
-/// hands them back). That is what [`classify_frame`] relies on.
+/// they would parse (`BufRead::read_line`, which an older dot-agent-deck's
+/// waiter used, hands them back). That is what [`classify_frame`] relies on.
 pub fn read_frame<R: io::BufRead>(reader: &mut R, max: usize) -> Frame {
     let mut line = Vec::new();
     loop {
@@ -681,9 +681,9 @@ pub fn read_frame<R: io::BufRead>(reader: &mut R, max: usize) -> Frame {
 /// newline, and a receiver reading through [`read_frame`] drops a line
 /// without one unparsed. That holds only for such a receiver, so the daemon
 /// may use this only on a connection whose receiver declared the one-shot
-/// integration (part 2 §2.7, H3's waiter); today's legacy waiter reads with
-/// `read_line`, which would parse such a line, and is never classified this
-/// way. `accepted` is `None` when a timeout left the progress unknown.
+/// integration (part 2 §2.7, H3's waiter); an older dot-agent-deck's waiter
+/// read with `read_line`, which would parse such a line, and the deck no
+/// longer serves it (part 3, H5). `accepted` is `None` when a timeout left the progress unknown.
 pub fn classify_frame(frame: &[u8], accepted: Option<usize>, flushed: bool) -> Output {
     match accepted {
         Some(n) if n < frame.len() && frame.last() == Some(&b'\n') => Output::NotHanded,

@@ -1,7 +1,7 @@
 //! PRD #1666 design v3.2 §13 step 4: the hub's receipt engine — one attempt
 //! model (`crate::inbox_attempts`) per agent generation, driving delivery for
-//! the receivers switched to the receipt policy, beside the legacy ack-wait
-//! the others keep.
+//! every receiver: since PRD #1666 part 3 (H5) the receipt policy is the only
+//! one.
 //!
 //! A child of [`super`] (the hub): every function here runs under the hub's
 //! lock on its [`HubState`], and none does file IO. Spool IO — the generation
@@ -9,13 +9,12 @@
 //! removal of reclaimed evidence — runs off the executor and outside the lock,
 //! in the hub methods that call in here.
 //!
-//! **One policy per assignment.** A message is handed to a receipt receiver
-//! only while its inbox copy is queued and not `Legacy`-owned; taking it makes
-//! the assignment `Receipt`-owned ([`crate::inbox::AssignmentOwner`]), which
-//! the legacy ack-wait and requeue then leave alone. The attempt model
-//! decides everything after that, and [`sync`] mirrors each of its decisions
-//! into the inbox: a settle acknowledges (or claims an offer), rule 3 queues
-//! the message again, an undeliverable verdict retires it.
+//! **One policy.** A message is handed to a receipt receiver only while its
+//! inbox copy is queued for the receiver's agent. The attempt model decides
+//! everything after that, and [`sync`] mirrors each of its decisions into the
+//! inbox: a settle acknowledges (or claims an offer), rule 3 queues the
+//! message again, an undeliverable verdict retires it. (PRD #1666 part 3, H5
+//! removed the legacy policy that once owned some assignments instead.)
 //!
 //! **The adapter floor (§11).** A generation's [`Floor`] holds what the deck
 //! knows of its integration: the capability probe's verdict, a registration
@@ -41,7 +40,7 @@ use crate::event::{
     InboxDelivery, InboxDeliveryAttempt, InboxGrant, InboxIssued, InboxNotice, InboxRebound,
     InboxRegistered, InboxStreamControl, InboxWaitReply,
 };
-use crate::inbox::{AckHow, AssignmentOwner, Consumer, MessageState, UndeliverableReason};
+use crate::inbox::{AckHow, Consumer, MessageState, UndeliverableReason};
 use crate::inbox_attempts::{
     AttemptModel, CommitTargetRefusal, Effect, HandOverRefusal, LapseCheck, Limits,
     MessageState as Delivery, ResumeAnswer, Rx, Slot, Stage, TurnView, UncertainReason,
@@ -292,7 +291,7 @@ impl Evidence {
     }
 }
 
-/// One agent generation's receipt-owned delivery.
+/// One agent generation's delivery on receipts.
 pub(super) struct Gen {
     pub(super) model: AttemptModel,
     pub(super) spool: Option<Arc<GenerationSpool>>,
@@ -713,12 +712,10 @@ pub(super) fn closed(st: &mut HubState, key: &AgentKey, rx: Rx, conn_id: u64, no
 }
 
 /// Whether `id`'s inbox copy for `key` is one this generation's receipt
-/// receiver may be handed now: queued, admitting the agent, not
-/// `Legacy`-owned.
+/// receiver may be handed now: queued and admitting the agent.
 fn takeable(st: &HubState, key: &AgentKey, id: &str) -> bool {
     st.inbox.get(id, &key.0).is_some_and(|m| {
         m.state == MessageState::Queued
-            && m.owner != Some(AssignmentOwner::Legacy)
             && m.recipient
                 .as_ref()
                 .is_some_and(|r| r.admits(&key.0, &key.1))
@@ -726,7 +723,7 @@ fn takeable(st: &HubState, key: &AgentKey, id: &str) -> bool {
 }
 
 /// The messages a hand-out to `key` may carry now, oldest first: scheduled
-/// repeats, then queued mail no legacy consumer owns.
+/// repeats, then queued mail.
 pub(super) fn candidates(st: &HubState, key: &AgentKey) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     if let Some(generation) = st.receipts.gens.get(key) {
@@ -737,7 +734,6 @@ pub(super) fn candidates(st: &HubState, key: &AgentKey) -> Vec<String> {
                 .is_some_and(|d| d.repeat_scheduled() && !d.state.is_terminal());
             let held = st.inbox.get(&id, &key.0).is_some_and(|m| {
                 !m.state.is_terminal()
-                    && m.owner == Some(AssignmentOwner::Receipt)
                     && m.recipient
                         .as_ref()
                         .is_some_and(|r| r.admits(&key.0, &key.1))
@@ -1434,7 +1430,7 @@ pub(super) enum ExplicitCommit {
     NoAttempt,
 }
 
-/// An explicit acknowledgement of a `Receipt`-owned message (`dot-agent-deck
+/// An explicit acknowledgement of a handed-out message (`dot-agent-deck
 /// ack <id>`): its agent says it has the message, which settles it — rule 1
 /// needs one committed attempt of the current assignment, the newest that
 /// may have reached the agent ([`AttemptModel::commit_target`]).
@@ -1812,8 +1808,7 @@ fn sync(st: &mut HubState, key: &AgentKey, now: Instant, returned: &HashSet<Stri
                 Delivery::Settled
             )
         );
-        if message.owner != Some(AssignmentOwner::Receipt) || (message.state.is_terminal() && !late)
-        {
+        if message.state.is_terminal() && !late {
             continue;
         }
         let fetched = matches!(message.state, MessageState::Fetched { .. });
