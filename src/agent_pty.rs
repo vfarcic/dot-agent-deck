@@ -9511,9 +9511,10 @@ impl AgentPtyRegistry {
     /// `agent_type` is upgradable in place by [`Self::set_agent_type`] from a
     /// hook event, so any same-user producer can claim a type there, while
     /// `spawn_agent_type` is what the deck itself exec'd and no hook path can
-    /// write it. PRD #1666 reads it to tell a Pi or a Claude Code generation
+    /// write it. PRD #1666 reads it to tell a Pi or an OpenCode generation
     /// apart for its inbox (`daemon.rs`'s `pi_generation` and
-    /// `claude_hook_fetch`).
+    /// `old_adapter_doorbell`), and an old hook's agent for its card's remedy
+    /// (`legacy_hook_component`).
     pub fn spawn_agent_type(&self, agent_id: &str) -> Option<AgentType> {
         self.inner
             .lock()
@@ -9529,11 +9530,11 @@ impl AgentPtyRegistry {
     /// attests, or, under the `warn` provenance policy, a token-less one when
     /// the generation is the pane's one speaker). Unlike
     /// [`Self::spawn_agent_type`], a same-user hook producer can choose it:
-    /// it is a routing hint, not authentication of the agent or its hooks.
-    /// `claude_hook_fetch` routes on it both ways: a claimed Claude type sends
-    /// a stale hook fetch to its visible refusal, and a non-Claude type
-    /// reported first keeps a real bare Claude on the legacy path, its mail
-    /// handed on legacy terms with no notice.
+    /// it is a hint, not authentication of the agent or its hooks. The inbox
+    /// reads it only to choose which agent's `hooks install` an old hook's
+    /// refusal names on the card (`daemon.rs`'s `legacy_hook_component`) and
+    /// a model-run `inbox fetch`'s budget: since PRD #1666 part 3 (H5) no
+    /// type can route a fetch to a legacy service, which no longer exists.
     pub fn reported_agent_type(&self, agent_id: &str) -> Option<AgentType> {
         self.inner
             .lock()

@@ -9860,32 +9860,11 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** a same-user process that reads the caps file and publishes the receipt itself (the accepted same-user trade).
 - **Platform coverage:** mac+linux.
 
-##### inbox/claude/024 — A stale hook waits for the SessionStart connected before it.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), real hook CLI child, the e2e-only `DOT_AGENT_DECK_INBOX_TEST_HOOK_INTEGRATION=none` knob, SessionStart's connection opened by a child process of the pane's scripted Claude (inside the agent's process tree, as Claude's own hooks are) before the hook runs, and its event written after.
+##### inbox/claude/024 — A stale hook is refused without waiting for an earlier SessionStart.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), real hook CLI child, the e2e-only `DOT_AGENT_DECK_INBOX_TEST_HOOK_INTEGRATION=none` knob, SessionStart's connection opened by a child process of the pane's scripted Claude (inside the agent's process tree, as Claude's own hooks are) before the hooks run, and its event written last.
 - **Agent:** none (synthetic Claude parent; no credential).
-- **Asserts:** in a pane with no agent type and nothing announced, a stale prompt hook's fetch that reaches the deck before the earlier SessionStart connection's event is held (the hook has not finished 400 ms later and the pane is still untyped); once that event reports Claude Code the fetch is refused: nothing of the task is printed, the task stays queued and the card's notice is `hooks_too_old` (R2F-R02).
-- **Does not assert:** the 2-second bound running out (an earlier connection that never sends a line), which serves the fetch the legacy way (inbox/claude/025).
-- **Platform coverage:** mac+linux.
-
-##### inbox/claude/025 — A silent earlier connection holds a stale fetch for two seconds, then legacy.
-- **Layer:** Fast (`src/daemon.rs`, `ingest_order_tests`), `route_hook_fetch` over a real registry with a `/bin/sh` agent and an `IngestOrder` whose earlier ticket never settles.
-- **Agent:** none.
-- **Asserts:** a doorbell-hook fetch with no integration from an untyped, unannounced generation is `Undecided`; with an earlier connection whose peer the deck cannot place, or one from the agent's own process tree, it is held for `HOOK_ROUTE_WAIT` (2 s, and less than 3 s more) and then served `Legacy`; with an earlier connection from a process outside the agent's tree it is routed at once; no ticket is left pending (R2-fix3 U2).
-- **Does not assert:** the hook socket's accept loop or a real stale hook binary (inbox/claude/024), or a SessionStart typing the generation within the hold.
-- **Platform coverage:** mac+linux.
-
-##### inbox/claude/027 — A silent peer the deck cannot place outside the tree holds a stale fetch.
-- **Layer:** Fast (`src/daemon.rs`, `ingest_order_tests`), `route_hook_fetch_with` over a real registry with a `/bin/sh` agent, an `IngestOrder` whose earlier ticket never settles, and the production placement (`may_type_generation_with`) over a stand-in parent and start-time lookup.
-- **Agent:** none.
-- **Asserts:** with a 400 ms wait, an earlier connection whose peer is readable and whose walk ends outside the agent's tree routes the fetch at once; one whose ancestry reaches the agent only past the walk's step limit, one whose start time was never read, one whose pid names another process once the walk has answered, and one whose start time cannot be read after the walk each hold the fetch for the whole wait, then it is served `Legacy`; no ticket is left pending (R2-fix4 U2).
-- **Does not assert:** a real process tree, the Windows parent lookup, or a parent that exits during the walk and reparents the peer out of the tree (best-effort placement).
-- **Platform coverage:** mac+linux.
-
-##### inbox/claude/026 — Silent connections wait no more than the pool serves.
-- **Layer:** Fast (`src/daemon.rs`, `question_hold_tests`), the real hook loop (`run_hook_loop_with_limits`) with a pool of two and a 200 ms idle window, its `IngestOrder` read by the test.
-- **Agent:** none.
-- **Asserts:** with ten connections that send nothing, no more than two are ever pending a first message, all ten are accepted in turn as the idle window reclaims each, and none is left pending (R2-fix3 U2).
-- **Does not assert:** a fetch held while the pool is full, or the production pool size.
+- **Asserts:** in a pane with no agent type and nothing announced, a stale prompt hook's fetch is refused while the earlier SessionStart connection has still sent nothing: nothing of the task is printed, the task stays queued and the card's notice is `hooks_too_old`; a current prompt hook in the same pane is then handed the task, also before that event (PRD #1666 part 3, H5 removed the route hold R2F-R02 added).
+- **Does not assert:** which agent's `hooks install` the notice names for an untyped pane (none: inbox/boundary/073 pins that for a bare pane).
 - **Platform coverage:** mac+linux.
 
 ##### inbox/claude/028 — Newer Claude hooks take nothing from an older daemon.

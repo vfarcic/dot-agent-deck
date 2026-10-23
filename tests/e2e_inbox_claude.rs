@@ -1242,10 +1242,10 @@ fn claude_023_a_raw_exact_commit_needs_the_attempts_receipt() {
     state(&daemon, &pane, &id, "acknowledged");
 }
 
-/// Scenario: In a pane started from its command alone, with no agent type and no deck waiter in Claude's settings, Claude's SessionStart hook — a process inside the pane's agent, as Claude's own hooks are — has connected to the deck but its event has not been read yet when a prompt hook too old for the deck's messages fetches a queued task's doorbell. The deck holds the fetch until the earlier connection's event is in: the hook prints nothing while it waits, and once the SessionStart event reports Claude Code the fetch is refused as hooks too old, the task stays queued and the card names the notice.
+/// Scenario: In a pane started from its command alone, with no agent type and no deck waiter in Claude's settings, Claude's SessionStart hook — a process inside the pane's agent, as Claude's own hooks are — has connected to the deck but its event has not been read yet when a prompt hook too old for the deck's messages fetches a queued task's doorbell. The deck does not wait for that connection: the stale hook is refused before the SessionStart event is sent, prints nothing, the task stays queued and the card says the hooks are too old. A current prompt hook in the same pane is then handed the task, also before SessionStart's event is in.
 #[spec("inbox/claude/024")]
 #[test]
-fn claude_024_a_stale_hook_waits_for_the_session_start_connected_before_it() {
+fn claude_024_a_stale_hook_is_refused_without_waiting_for_an_earlier_session_start() {
     let daemon = daemon(&[]);
     let pane = parent_as(&daemon, "claude-bare-early", None);
     let id = post(&daemon, &pane, NATIVE_BODY);
@@ -1294,24 +1294,11 @@ fn claude_024_a_stale_hook_waits_for_the_session_start_connected_before_it() {
     command_with(
         &pane,
         "stale",
-        json!({"kind":"hook","payload":hook,
+        json!({"kind":"hook","payload":hook.clone(),
                "env":{"DOT_AGENT_DECK_INBOX_TEST_HOOK_INTEGRATION":"none"}}),
     );
-    assert!(
-        !common::wait_until(Duration::from_millis(400), || sidecar(
-            &pane,
-            "result-stale"
-        )
-        .exists()),
-        "the fetch is held for the event connected before it: {:?}",
-        std::fs::read_to_string(sidecar(&pane, "result-stale"))
-    );
-    assert!(
-        record(&daemon, &pane)["agent_type"].is_null(),
-        "nothing typed the pane yet: {}",
-        record(&daemon, &pane)
-    );
-    std::fs::write(&go, b"").unwrap();
+    // PRD #1666 part 3 (H5): no legacy service is left for a wait to decide
+    // between, so the stale fetch is refused with SessionStart still unsent.
     let stale = result(&pane, "stale");
     assert!(
         !stale["stdout"].as_str().unwrap().contains(NATIVE_BODY),
@@ -1324,6 +1311,17 @@ fn claude_024_a_stale_hook_waits_for_the_session_start_connected_before_it() {
         notice()
     );
     state(&daemon, &pane, &id, "queued");
+    command_with(&pane, "current", json!({"kind":"hook","payload":hook}));
+    let current = result(&pane, "current");
+    let printed: Value =
+        serde_json::from_str(current["stdout"].as_str().unwrap().trim()).unwrap_or(Value::Null);
+    assert!(
+        printed["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .is_some_and(|context| context.contains(NATIVE_BODY)),
+        "a current hook is handed the task without waiting either: {current}"
+    );
+    std::fs::write(&go, b"").unwrap();
 }
 
 /// Scenario: A process in a Claude agent's own tree asks the deck directly whether it serves one-shot receipts, then sends the receipt verbs for what they do not serve: a once-wait from a Codex component, a Claude stream wait, a hook fetch naming a stream's or the waiter's component, and a fetch a stream bound. The deck answers the question with the receipt support and the senders it serves; it refuses each of the others as unsupported, and a task queued beforehand stays queued.
