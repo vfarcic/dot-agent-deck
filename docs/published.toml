@@ -58,6 +58,11 @@ title = "Run the Daemon as a Service"
 description = "Keep the daemon running across reboots, crashes and remote upgrades with dot-agent-deck daemon install: a systemd user unit on Linux, a LaunchAgent on macOS."
 
 [[page]]
+slug = "telemetry"
+title = "Telemetry"
+description = "Send a metadata-only record of every agent run to an OpenTelemetry backend (Honeycomb example): turning it on in either client, every span and attribute sent, what is never sent, joining each agent's own telemetry, and trimming."
+
+[[page]]
 slug = "configuration"
 title = "Configuration"
 description = "Every configuration file and environment variable: config.toml (default_command, default_dir, bell), the project .dot-agent-deck.toml, the experimental flag, and the desktop app's desktop.toml."
