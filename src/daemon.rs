@@ -6795,80 +6795,37 @@ async fn run_hook_loop_with_limits(
                                         done = signal.done,
                                         "Received work-done signal"
                                     );
-                                    // The report is posted AFTER the read guard is
-                                    // released: `prepare_work_done` runs under it
-                                    // and `deliver` after it. PRD #1666 S5:
-                                    // `deliver` is an inbox post and waits on
-                                    // nothing.
-                                    //
                                     // PRD #1631: the `work-done` CLI is acked
-                                    // HERE, once its report is posted, not at the
-                                    // provenance gate. Acked at the gate, a
-                                    // worker's second report could reach the
+                                    // HERE, from the result of the report's
+                                    // whole handling, not at the provenance
+                                    // gate. Acked at the gate, a worker's
+                                    // second report could reach the
                                     // orchestrator ahead of its first. Acked
-                                    // after the post, a sender that waits for its
-                                    // ack is ordered, and the wait is the state
-                                    // change and the post, never the agent
-                                    // reading it.
-                                    // PRD #1589 D5: the completion mark `close`
-                                    // reads, bound to the attested sender. Before
-                                    // the return route's own handling, which is
-                                    // unchanged.
-                                    //
-                                    // PR #1735 fifth review (N3): room for the
-                                    // report is held BEFORE anything is taken on —
-                                    // the completion mark, the delegation, a
-                                    // dispatched unit's return edge — so a report
-                                    // the worker is told was accepted cannot then
-                                    // be refused by its orchestrator's full inbox
-                                    // or a deck that filled meanwhile. With no room
-                                    // now the work-done is refused, visibly, and
-                                    // nothing it would have consumed is touched.
-                                    let room = match pty_registry.inbox().reserve_reply() {
-                                        Ok(room) => room,
-                                        Err(error) => {
-                                            warn!(
-                                                pane_id = %escape_id_for_log(&signal.pane_id),
-                                                %error,
-                                                "hook socket: refused a work-done; the deck has \
-                                                 no room for its report"
-                                            );
-                                            let refusal = crate::event::SignalAck::refused(
-                                                "deck_full",
-                                                &format!(
-                                                    "{error}, so it could not take this work-done \
-                                                     report; nothing was reported, so run \
-                                                     work-done again once the deck has room"
-                                                ),
-                                            );
-                                            if let Ok(json) = serde_json::to_string(&refusal) {
-                                                let line = format!("{json}\n");
-                                                let _ = write_half.write_all(line.as_bytes()).await;
-                                                let _ = write_half.flush().await;
-                                            }
-                                            continue;
-                                        }
-                                    };
-                                    mark_dispatched_unit_completion(
+                                    // after, a sender that waits for its ack is
+                                    // ordered, and the wait is the state change
+                                    // and the post, never the agent reading it.
+                                    // PRD #1666 part 3, round 5: that handling
+                                    // is `task_completion::complete`.
+                                    let disposition = crate::task_completion::complete(
+                                        &state,
                                         &pty_registry,
-                                        &signal,
+                                        signal,
                                         &provenance,
-                                    );
-                                    let delivery = state
-                                        .read()
-                                        .await
-                                        .prepare_work_done(signal, &pty_registry)
+                                    )
+                                    .await;
+                                    pty_registry
+                                        .pause_point(crate::task_completion::PAUSE_COMMITTED)
                                         .await;
-                                    // PRD #1666 S5: a post, not a write — nothing
-                                    // waits on the recipient.
-                                    delivery.deliver(&pty_registry, room).await;
-                                    if let Ok(json) = serde_json::to_string(
-                                        &crate::event::SignalAck::accepted(),
-                                    ) {
+                                    if let Ok(json) =
+                                        serde_json::to_string(&disposition.to_signal_ack())
+                                    {
                                         let line = format!("{json}\n");
                                         let _ = write_half.write_all(line.as_bytes()).await;
                                         let _ = write_half.flush().await;
                                     }
+                                    pty_registry
+                                        .pause_point(crate::task_completion::PAUSE_ACKED)
+                                        .await;
                                 }
                                 DaemonMessage::Ack(signal) => {
                                     // Issue #1383: the id is producer-supplied, so

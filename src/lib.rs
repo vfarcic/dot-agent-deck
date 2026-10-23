@@ -143,6 +143,7 @@ pub mod submitted_prompt;
 pub mod system_browser;
 pub mod tab;
 pub mod tab_layout;
+pub mod task_completion;
 // PRD #1741: agent-run telemetry over OTLP, off unless an endpoint is set.
 pub mod telemetry;
 pub mod terminal_hangup;

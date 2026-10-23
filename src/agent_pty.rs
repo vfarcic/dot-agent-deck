@@ -5698,11 +5698,38 @@ pub struct AgentPtyRegistry {
     /// PRD #1589 test seam: see [`Self::pause_at_for_test`].
     #[cfg(test)]
     named_pauses: NamedPauses,
+    /// PRD #1666 part 3, round 5: see [`Self::pause_at_sync_for_test`].
+    #[cfg(test)]
+    named_sync_pauses: Mutex<HashMap<String, StdPause>>,
+    /// PRD #1666 part 3, round 5: see [`Self::inject_fault_for_test`].
+    #[cfg(test)]
+    named_faults: Mutex<HashMap<String, TestFault>>,
 }
+
+/// PRD #1666 part 3, round 5: the synchronous pause in a respawn's
+/// replacement window, after the replacement's spawn returned and before the
+/// dispatched unit follows it ([`AgentPtyRegistry::pause_at_sync_for_test`]).
+pub(crate) const PAUSE_RESPAWN_BEFORE_PUBLISH: &str = "respawn-before-publish";
+
+/// PRD #1666 part 3, round 5: the fault point at the same place as
+/// [`PAUSE_RESPAWN_BEFORE_PUBLISH`], just after it
+/// ([`AgentPtyRegistry::inject_fault_for_test`]).
+pub(crate) const FAULT_RESPAWN_AFTER_SPAWN: &str = "respawn-after-spawn";
 
 /// See [`AgentPtyRegistry::pause_at_for_test`].
 #[cfg(test)]
 type NamedPauses = Mutex<HashMap<String, (oneshot::Sender<()>, oneshot::Receiver<()>)>>;
+
+/// PRD #1666 part 3, round 5: what a named fault point does the next time it
+/// is reached, armed by [`AgentPtyRegistry::inject_fault_for_test`].
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) enum TestFault {
+    /// The step fails as its own error path would.
+    Fail,
+    /// The step panics with this payload.
+    Panic(&'static str),
+}
 
 /// See [`AgentPtyRegistry::pause_next_publish_for_test`].
 #[cfg(test)]
@@ -7491,6 +7518,10 @@ impl AgentPtyRegistry {
             close_revalidation_pause: Mutex::new(None),
             #[cfg(test)]
             named_pauses: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            named_sync_pauses: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            named_faults: Mutex::new(HashMap::new()),
         }
     }
 
@@ -11604,6 +11635,11 @@ impl AgentPtyRegistry {
             agent.agent_type = Some(observed);
             agent.badge_command = previous_badge_command;
         }
+        // PRD #1666 part 3, round 5 test seams: the replacement window, after
+        // the replacement's spawn and before the dispatched unit follows it.
+        // The window has no `.await`, so its pause is the synchronous one.
+        self.pause_point_sync(PAUSE_RESPAWN_BEFORE_PUBLISH);
+        let _ = self.fault_point(FAULT_RESPAWN_AFTER_SPAWN);
         // PRD #1589 D5: a dispatched unit bound to the replaced generation — a
         // single unit's agent, or an orchestration's terminal generation —
         // follows it to the replacement, so the replacement's completion marks
@@ -14767,6 +14803,65 @@ impl AgentPtyRegistry {
                 let _ = release.await;
             }
         }
+    }
+
+    /// PRD #1666 part 3, round 5 test seam: the synchronous twin of
+    /// [`Self::pause_at_for_test`], for a window that has no `.await` (a
+    /// `tokio` oneshot's `blocking_recv` panics inside an async context). The
+    /// next time [`Self::pause_point_sync`] is reached with `name`, it reports
+    /// on the returned receiver and blocks its thread until the returned
+    /// sender sends or is dropped. A test that uses it runs on a multi-thread
+    /// runtime, since the pause blocks a worker thread.
+    #[cfg(test)]
+    pub(crate) fn pause_at_sync_for_test(
+        &self,
+        name: &str,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        self.named_sync_pauses
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), (reached_tx, release_rx));
+        (reached_rx, release_tx)
+    }
+
+    /// Where [`Self::pause_at_sync_for_test`] waits. A no-op outside tests.
+    pub(crate) fn pause_point_sync(&self, _name: &str) {
+        #[cfg(test)]
+        {
+            let pause = self.named_sync_pauses.lock().unwrap().remove(_name);
+            if let Some((reached, release)) = pause {
+                let _ = reached.send(());
+                let _ = release.recv();
+            }
+        }
+    }
+
+    /// PRD #1666 part 3, round 5 test seam: the next time
+    /// [`Self::fault_point`] is reached with `name`, it acts out `fault`.
+    #[cfg(test)]
+    pub(crate) fn inject_fault_for_test(&self, name: &str, fault: TestFault) {
+        self.named_faults
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), fault);
+    }
+
+    /// A named fault point: panics with an injected [`TestFault::Panic`]'s
+    /// payload, and answers whether an injected [`TestFault::Fail`] asks the
+    /// step to fail. Always `false` outside tests.
+    pub(crate) fn fault_point(&self, _name: &str) -> bool {
+        #[cfg(test)]
+        {
+            let fault = self.named_faults.lock().unwrap().remove(_name);
+            match fault {
+                Some(TestFault::Panic(payload)) => std::panic::panic_any(payload),
+                Some(TestFault::Fail) => return true,
+                None => {}
+            }
+        }
+        false
     }
 
     /// PRD #1589: the record of dispatched units. Held only for pure reads and
