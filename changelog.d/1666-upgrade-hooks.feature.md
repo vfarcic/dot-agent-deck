@@ -1,0 +1,9 @@
+## Upgrading the CLI also updates your agents' hooks, and a card says when an agent's hooks are too old to take its messages
+
+When the TUI, `dot-agent-deck upgrade` or the desktop app installs a new CLI, it now updates every installed agent's hooks to the new copy, as starting the deck does, and the upgrade's result says what they call: for example `Claude Code and Codex hooks now run this copy (v<new>). Restart agents that were already running so they use them.` Hooks that call another installed copy of the same or a newer release are left as they are. When the hooks still call an older copy, or the new copy could not be asked, the result names the command to run, which the desktop app can copy, and says to restart the affected agents. After a download you still have to install, the result says the hooks were not updated and gives the command to run once it is installed. The new `dot-agent-deck hooks refresh` command does the same by hand, for an upgrade made with Homebrew, Nix, a package manager or a build of your own.
+
+A Claude Code or Codex agent whose hooks come from a release before 0.47, which never ask for the agent's messages, showed nothing on its card. Its TUI card and desktop tile now say `this agent's deck hooks run a dot-agent-deck too old for its messages` with that agent's `hooks install` command, as soon as one of its hook events reaches the deck. Its messages still reach it the old way meanwhile, through the doorbell that asks it to run `dot-agent-deck inbox fetch`; the notice clears once the agent's hooks are updated and the agent is restarted.
+
+In the TUI's Deck messages picker, a window too small for the line saying to make it taller now shows a shorter version of that line whole, instead of cutting it off.
+
+See [Installation → Your agents' hooks after an upgrade](https://agent-deck.devopstoolkit.ai/docs/installation.md#your-agents-hooks-after-an-upgrade).
