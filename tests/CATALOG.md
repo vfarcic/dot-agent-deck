@@ -2601,7 +2601,7 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 ##### logging/containment/002 — A process armed only by nextest's environment never opens a deck.log outside every test scratch root.
 - **Layer:** fast tier (`tests/deck_log_containment.rs`): the same wrapper run, armed only by `NEXTEST` and `NEXTEST_RUN_ID`, the way a binary spawned without a cleared environment inherits them.
 - **Agent:** none (`/bin/true`).
-- **Asserts:** a log in cargo's target tmp dir (checked to be outside the private base and the temp dir) is never created; a log in a test scratch directory receives the refused install's line.
+- **Asserts:** a log in cargo's target tmp dir (checked to be outside the private base; the child is handed its own temp dir, so the system one is not among its roots) is never created; a log in the child's temp dir receives the refused install's line.
 - **Does not assert:** that the test runner itself scrubs `DOT_AGENT_DECK_LOG` before `main`; a deck started with a cleared environment and no containment variables, which is not a test process to the binary.
 - **Platform coverage:** mac+linux.
 

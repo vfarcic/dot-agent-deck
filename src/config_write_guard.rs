@@ -111,12 +111,28 @@ pub fn log_write_allowed(log: &Path) -> bool {
     }
 }
 
-/// Whether `log` resolves to the same file as the default debug log. A default
-/// that cannot be resolved is compared as spelled.
+/// Whether `log` names the same file as the default debug log.
 fn is_default_debug_log(log: &Path) -> bool {
-    let default = crate::platform::paths::default_debug_log_path();
-    let resolved = resolve_for_containment(&default).unwrap_or(default);
-    resolve_for_containment(log).is_ok_and(|log| log == resolved)
+    same_log(log, &crate::platform::paths::default_debug_log_path())
+}
+
+/// Whether `log` and `other` name one file: the same resolved path, or, where
+/// both exist, the same file identity — so a hard link to `other` inside an
+/// owned root counts as `other` (PR #1857 review). An `other` that cannot be
+/// resolved is compared as spelled.
+fn same_log(log: &Path, other: &Path) -> bool {
+    let resolved_other = resolve_for_containment(other).unwrap_or_else(|_| other.to_path_buf());
+    if resolve_for_containment(log).is_ok_and(|log| log == resolved_other) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(a), Ok(b)) = (std::fs::metadata(log), std::fs::metadata(other)) {
+            return (a.dev(), a.ino()) == (b.dev(), b.ino());
+        }
+    }
+    false
 }
 
 /// [`ensure_config_write_allowed`] without the log line.
@@ -324,6 +340,27 @@ fn resolve_for_containment(dest: &Path) -> io::Result<PathBuf> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// Scenario: a stand-in for the shared debug log exists in one directory;
+    /// a hard link to it in another directory is the same log, and so is a
+    /// symlink to it, while a separate file and a missing path are not.
+    #[test]
+    fn a_hard_link_to_the_shared_log_is_the_shared_log() {
+        let fixture = crate::test_temp::tempdir().unwrap();
+        let root = std::fs::canonicalize(fixture.path()).unwrap();
+        std::fs::create_dir_all(root.join("shared")).unwrap();
+        std::fs::create_dir_all(root.join("owned")).unwrap();
+        let shared = root.join("shared/dot-agent-deck.log");
+        std::fs::write(&shared, b"").unwrap();
+        std::fs::hard_link(&shared, root.join("owned/linked.log")).unwrap();
+        std::os::unix::fs::symlink(&shared, root.join("owned/symlinked.log")).unwrap();
+        std::fs::write(root.join("owned/own.log"), b"").unwrap();
+
+        assert!(same_log(&root.join("owned/linked.log"), &shared));
+        assert!(same_log(&root.join("owned/symlinked.log"), &shared));
+        assert!(!same_log(&root.join("owned/own.log"), &shared));
+        assert!(!same_log(&root.join("owned/missing.log"), &shared));
+    }
 
     /// The lib's unit tests are armed by `cfg(test)` alone, and resolve a path
     /// through a symlink and `..` the way the kernel does.

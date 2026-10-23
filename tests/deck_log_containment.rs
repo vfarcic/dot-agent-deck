@@ -47,11 +47,12 @@ fn wrap(fixture: &Path, codex_home: &Path, log: &Path, armed: Armed<'_>) {
     std::fs::create_dir_all(durable.parent().unwrap()).unwrap();
     std::fs::write(&durable, b"#!/bin/sh\nexit 0\n").unwrap();
     std::fs::set_permissions(&durable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::create_dir_all(child_tmp(fixture)).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
     command
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
-        .env("TMPDIR", std::env::temp_dir())
+        .env("TMPDIR", child_tmp(fixture))
         .env("HOME", &home)
         .env("CODEX_HOME", codex_home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
@@ -86,6 +87,13 @@ fn wrap(fixture: &Path, codex_home: &Path, log: &Path, armed: Armed<'_>) {
         }
     }
     command.status().expect("run the wrapper");
+}
+
+/// The temp dir the child is handed: its own, so the system temp dir — where
+/// cargo's target tmp dir can live — is not one of a nextest-armed child's
+/// default roots.
+fn child_tmp(fixture: &Path) -> PathBuf {
+    fixture.join("tmp")
 }
 
 /// The positive control both tests share: with the log inside the owned root,
@@ -170,18 +178,21 @@ fn logging_containment_002_nextest_armed_wrapper_never_opens_an_outside_log() {
         std::fs::read_to_string(&real_log).unwrap_or_default()
     );
 
-    let contained = fixture.path().join("deck.log");
+    let contained = child_tmp(fixture.path()).join("deck.log");
     wrap(fixture.path(), &outside_codex, &contained, Armed::ByNextest);
     assert_logged_inside(&contained);
 }
 
-/// The roots a nextest-armed child without an explicit root treats as its own,
-/// canonicalized. Read in this process, whose temp dir is the one the child is
-/// handed; a `DAD_E2E_TMPDIR` here only makes the precondition stricter, since
-/// the child's cleared environment drops it.
+/// The default roots a nextest-armed child shares with this process,
+/// canonicalized: the private base, and a `DAD_E2E_TMPDIR` set here (which the
+/// child's cleared environment drops, so it only makes the precondition
+/// stricter). Not this process's temp dir: the child is handed its own,
+/// [`child_tmp`].
 fn scratch_roots() -> Vec<PathBuf> {
+    let own_tmp = std::env::temp_dir();
     dot_agent_deck::config_write_guard::default_test_roots()
         .into_iter()
+        .filter(|root| *root != own_tmp)
         .filter_map(|root| std::fs::canonicalize(root).ok())
         .collect()
 }
