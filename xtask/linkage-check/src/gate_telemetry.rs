@@ -8,11 +8,12 @@
 //! `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, or with
 //! `OTEL_SDK_DISABLED=true`, [`config_from`] returns `None`, no exporter is
 //! built and nothing reaches the network. This module writes no output of its
-//! own, so the helper prints the same lines with telemetry on or off.
+//! own, so with telemetry off the helper prints exactly what it printed before.
 //!
 //! **It never fails or stalls the gates.** The send runs on its own thread and
-//! [`report`] waits for it at most [`EXPORT_BOUND`]; an error or a send still
-//! running after that is dropped, and the exit status is the gates' own.
+//! [`report`] waits for it at most [`EXPORT_BOUND`]; an error, a panic or a
+//! send still running after that is dropped, and the exit status is the gates'
+//! own. A panic still prints Rust's panic message, as any thread's does.
 //!
 //! The workspace has no OpenTelemetry crate to reuse: the deck's own export
 //! (PRD #1741, `src/telemetry/otlp.rs`) encodes OTLP by hand over `reqwest`,
@@ -117,10 +118,23 @@ pub(crate) fn config_from(env: &dyn Fn(&str) -> Option<String>) -> Option<Config
         Some("http/json") => Protocol::HttpJson,
         Some(_) => return None,
     };
-    let headers = get("OTEL_EXPORTER_OTLP_TRACES_HEADERS")
+    // Header names are case-insensitive, and a repeated one keeps its last
+    // value, as the deck's exporter resolves them: sending both would hand the
+    // backend a stale credential beside the current one.
+    let mut headers: Vec<(String, String)> = Vec::new();
+    for (key, value) in get("OTEL_EXPORTER_OTLP_TRACES_HEADERS")
         .or_else(|| get("OTEL_EXPORTER_OTLP_HEADERS"))
         .map(|raw| key_value_list(&raw))
-        .unwrap_or_default();
+        .unwrap_or_default()
+    {
+        match headers
+            .iter_mut()
+            .find(|(k, _)| k.eq_ignore_ascii_case(&key))
+        {
+            Some(existing) => existing.1 = value,
+            None => headers.push((key, value)),
+        }
+    }
     let timeout = get("OTEL_EXPORTER_OTLP_TRACES_TIMEOUT")
         .or_else(|| get("OTEL_EXPORTER_OTLP_TIMEOUT"))
         .and_then(|ms| ms.parse::<u64>().ok())
@@ -259,6 +273,7 @@ pub(crate) struct RunTrace {
     started: Instant,
     info: RunInfo,
     commands: Vec<Span>,
+    failed: bool,
     failed_command: Option<String>,
 }
 
@@ -312,6 +327,7 @@ impl RunTrace {
             started: began.at,
             info,
             commands: Vec::new(),
+            failed: false,
             failed_command: None,
         }
     }
@@ -351,8 +367,15 @@ impl RunTrace {
             error: !result.passed,
         });
         if !result.passed && self.failed_command.is_none() {
+            self.failed = true;
             self.failed_command = Some(command);
         }
+    }
+
+    /// Marks the run failed before any command ran, for example when the
+    /// change could not be computed.
+    pub(crate) fn fail(&mut self) {
+        self.failed = true;
     }
 
     /// Ends the run span now and returns every span, the run first.
@@ -370,9 +393,9 @@ impl RunTrace {
         attributes.push(("gates.commands.count", Value::Int(info.commands as i64)));
         attributes.push((
             "gates.outcome",
-            Value::Str(outcome(self.failed_command.is_none()).to_string()),
+            Value::Str(outcome(!self.failed).to_string()),
         ));
-        let error = self.failed_command.is_some();
+        let error = self.failed;
         if let Some(failed) = self.failed_command {
             attributes.push(("gates.failed_command", Value::Str(failed)));
         }
@@ -436,9 +459,10 @@ impl Exporter for Http {
 /// Sends `spans` through `exporter` and returns `status` unchanged.
 ///
 /// The send runs on its own thread, and this waits for it at most `bound`. Its
-/// error, its panic and a send still running after `bound` are all dropped
-/// without a word: a thread still sending when `main` returns ends with the
-/// process.
+/// error and a send still running after `bound` are dropped without output,
+/// and a panic in it does not reach the caller, though Rust's default hook
+/// still prints the panic message. A thread still sending when `main` returns
+/// ends with the process.
 pub(crate) fn report(
     status: ExitCode,
     exporter: Option<Box<dyn Exporter>>,
@@ -691,6 +715,23 @@ mod tests {
         assert_eq!(config.protocol, Protocol::HttpJson);
         assert_eq!(config.headers, [("b".to_string(), "2".to_string())]);
         assert_eq!(config.timeout, EXPORT_BOUND, "a long timeout is capped");
+
+        let config = config_from(&env(&[
+            BASE,
+            (
+                "OTEL_EXPORTER_OTLP_HEADERS",
+                "x-honeycomb-team=old,other=1,X-Honeycomb-Team=new",
+            ),
+        ]))
+        .unwrap();
+        assert_eq!(
+            config.headers,
+            [
+                ("x-honeycomb-team".to_string(), "new".to_string()),
+                ("other".to_string(), "1".to_string()),
+            ],
+            "a repeated header name, in any case, keeps one value: the last"
+        );
     }
 
     #[test]
@@ -824,6 +865,20 @@ mod tests {
             assert!(child.end_unix_nanos <= run.end_unix_nanos);
         }
         assert!(!fmt.error && tests.error);
+    }
+
+    #[test]
+    fn a_run_failed_before_any_command_is_failed_without_a_failed_command() {
+        let mut trace = RunTrace::start(Began::now(), info());
+        trace.fail();
+        let spans = trace.finish();
+        assert_eq!(spans.len(), 1);
+        assert!(spans[0].error);
+        assert_eq!(
+            spans[0].attr("gates.outcome"),
+            Some(&Value::Str("failed".into()))
+        );
+        assert_eq!(spans[0].attr("gates.failed_command"), None);
     }
 
     #[test]

@@ -10,7 +10,7 @@ It reads the standard OpenTelemetry variables, the same ones the deck's own expo
 
 - **On** when `OTEL_EXPORTER_OTLP_ENDPOINT` (sent to `<endpoint>/v1/traces`) or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` (used as written) is set.
 - **Off** when neither is set, when `OTEL_SDK_DISABLED=true`, when `OTEL_TRACES_EXPORTER` is set and names no `otlp`, or when the protocol is `grpc` or unrecognised. Off means no exporter is built and no connection is made.
-- `OTEL_EXPORTER_OTLP_HEADERS` (or `_TRACES_HEADERS`, which replaces it) carries the backend's credentials; `OTEL_EXPORTER_OTLP_PROTOCOL` (or `_TRACES_PROTOCOL`) picks `http/protobuf`, the default, or `http/json`.
+- `OTEL_EXPORTER_OTLP_HEADERS` (or `_TRACES_HEADERS`, which replaces it) carries the backend's credentials, a header named twice keeping its last value whatever the case; `OTEL_EXPORTER_OTLP_PROTOCOL` (or `_TRACES_PROTOCOL`) picks `http/protobuf`, the default, or `http/json`.
 - `OTEL_RESOURCE_ATTRIBUTES` becomes the resource, and `OTEL_SERVICE_NAME` (or a `service.name` pair in it) the service name, `dot-agent-deck` when neither is set so the spans land beside the deck's own.
 
 An agent's shell under a deck with telemetry on inherits the daemon's endpoint and headers, and the deck adds `deck.run.id`, `deck.pane.id` (and `deck.role` for an orchestration role) to its `OTEL_RESOURCE_ATTRIBUTES` (`src/telemetry/propagation.rs`), so a gate run an agent starts joins that agent's run with nothing else to set: query `affected_checks.run` by `deck.run.id`.
@@ -19,20 +19,20 @@ The test aliases set `OTEL_SDK_DISABLED=true` for the tests only (`.cargo/config
 
 ## It never fails or stalls the gates
 
-The spans are sent once, after the last command and after the sandbox is stopped, in one request on a separate thread. The helper waits for that request at most 3 seconds (less when `OTEL_EXPORTER_OTLP_TIMEOUT` is lower) and then exits with the gates' own status whatever happened: an unreachable collector, an HTTP error or a timeout is dropped without a word. The module writes no output of its own, so the helper prints the same lines with telemetry on or off. A run interrupted before it finishes (Ctrl+C, a kill) sends nothing.
+The spans are sent once, after the last command and after the sandbox is stopped, in one request on a separate thread. The helper waits for that request at most 3 seconds (less when `OTEL_EXPORTER_OTLP_TIMEOUT` is lower) and then exits with the gates' own status whatever happened: an unreachable collector, an HTTP error or a timeout is dropped without output, and a panic in the exporter changes nothing but the stderr line Rust prints for any panicking thread. The module writes no output of its own, so with telemetry off the helper prints exactly what it printed before. A run interrupted before it finishes (Ctrl+C, a kill) sends nothing.
 
 ## The spans
 
-`affected_checks.run`, one per `--run`, from the start of the invocation (so it includes computing the change and probing the runner) to the end of the sandbox stop:
+`affected_checks.run`, one per `--run`, from the start of the invocation (so it includes computing the change and probing the runner) to the end of the sandbox stop. A `--run` that cannot compute the change still sends one, `failed` with plan `unknown` and no command span, without probing the runner:
 
 | Attribute | Value |
 | --- | --- |
 | `gates.runner.requested` | What `DAD_REMOTE_EXEC` asked for, trimmed: `rwx`, or whatever else it says. `local` when it is unset or empty. |
 | `gates.runner.used` | `local`, or the runner's name (`rwx`). |
 | `gates.runner.fallback_reason` | Only when a requested runner was not used: `cli_missing`, `not_logged_in`, `config_missing` or `unknown_runner`, several joined by `,` (for example `cli_missing,config_missing`). |
-| `gates.plan` | `full` (any path needs the full gates), `text` (every path is mapped text) or `none` (no change, so no command). |
+| `gates.plan` | `full` (any path needs the full gates), `text` (every path is mapped text), `none` (no change, so no command) or `unknown` (the change could not be computed). |
 | `gates.commands.count` | How many commands the plan has. |
-| `gates.outcome` | `passed`, or `failed` when a command failed or could not start. |
+| `gates.outcome` | `passed`, or `failed` when a command failed or could not start, or the change could not be computed. |
 | `gates.failed_command` | The first command that failed, as planned. Only on a failed run. |
 
 `affected_checks.command`, a child of the run per command that ran (none after the first failure, because the helper stops there):

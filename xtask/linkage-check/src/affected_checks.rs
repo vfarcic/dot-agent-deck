@@ -874,7 +874,29 @@ pub(crate) fn run(root: &Path, args: &[String]) -> ExitCode {
                 for command in FULL_GATES {
                     println!("{}", shell_line(&argv(command)));
                 }
-                return ExitCode::FAILURE;
+                if !execute_plan {
+                    return ExitCode::FAILURE;
+                }
+                // A `--run` that never got to its commands is still a run:
+                // failed, with no command. The runner is not probed for it.
+                let opt_in = std::env::var(REMOTE_ENV).ok();
+                let mut trace = gate_telemetry::RunTrace::start(
+                    began,
+                    gate_telemetry::RunInfo {
+                        requested: opt_in
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|v| !v.is_empty())
+                            .unwrap_or("local")
+                            .to_string(),
+                        used: Runner::Local.name(),
+                        fallback_reason: None,
+                        plan: "unknown",
+                        commands: 0,
+                    },
+                );
+                trace.fail();
+                return send_trace(ExitCode::FAILURE, trace);
             }
         }
     } else {
@@ -905,24 +927,28 @@ pub(crate) fn run(root: &Path, args: &[String]) -> ExitCode {
         if used_sandbox && !keep {
             stop_sandbox(root);
         }
-        // Issue #1850: off unless the `OTEL_*` variables turn it on, and
-        // whatever happens to the send, the exit status is the gates' own.
-        let config = gate_telemetry::from_process_env();
-        let resource = config
-            .as_ref()
-            .map(|c| c.resource.clone())
-            .unwrap_or_default();
-        let exporter =
-            config.map(|c| Box::new(gate_telemetry::Http(c)) as Box<dyn gate_telemetry::Exporter>);
-        return gate_telemetry::report(
-            status,
-            exporter,
-            resource,
-            trace.finish(),
-            gate_telemetry::EXPORT_BOUND,
-        );
+        return send_trace(status, trace);
     }
     ExitCode::SUCCESS
+}
+
+/// Issue #1850: sends the run's spans when the `OTEL_*` variables turn export
+/// on, and returns `status` whatever happens to the send.
+fn send_trace(status: ExitCode, trace: gate_telemetry::RunTrace) -> ExitCode {
+    let config = gate_telemetry::from_process_env();
+    let resource = config
+        .as_ref()
+        .map(|c| c.resource.clone())
+        .unwrap_or_default();
+    let exporter =
+        config.map(|c| Box::new(gate_telemetry::Http(c)) as Box<dyn gate_telemetry::Exporter>);
+    gate_telemetry::report(
+        status,
+        exporter,
+        resource,
+        trace.finish(),
+        gate_telemetry::EXPORT_BOUND,
+    )
 }
 
 #[cfg(test)]
