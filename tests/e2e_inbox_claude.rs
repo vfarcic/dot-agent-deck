@@ -1326,7 +1326,7 @@ fn claude_024_a_stale_hook_waits_for_the_session_start_connected_before_it() {
     state(&daemon, &pane, &id, "queued");
 }
 
-/// Scenario: A process in a Claude agent's own tree asks the deck directly whether it serves one-shot receipts, then sends the receipt verbs for what they do not serve: a once-wait from a Codex component, a Claude stream wait, a CLI fetch and a fetch a stream bound. The deck answers the question with the receipt support it serves; it refuses each of the others as unsupported, and a task queued beforehand stays queued.
+/// Scenario: A process in a Claude agent's own tree asks the deck directly whether it serves one-shot receipts, then sends the receipt verbs for what they do not serve: a once-wait from a Codex component, a Claude stream wait, a hook fetch naming a stream's or the waiter's component, and a fetch a stream bound. The deck answers the question with the receipt support and the senders it serves; it refuses each of the others as unsupported, and a task queued beforehand stays queued.
 #[spec("inbox/claude/031")]
 #[test]
 fn claude_031_the_deck_answers_its_receipts_and_refuses_what_they_do_not_serve() {
@@ -1343,6 +1343,12 @@ fn claude_031_the_deck_answers_its_receipts_and_refuses_what_they_do_not_serve()
     };
     let answer = ask("question", "inbox_receipts", json!({}));
     assert_eq!(answer["one_shot_receipts"], 1, "{answer}");
+    // PRD #1666 part 3 (H4): and the senders it serves beyond Claude Code's.
+    assert_eq!(
+        answer["one_shot_senders"],
+        json!(["claude_waiter", "claude_hooks", "codex_hooks", "cli"]),
+        "{answer}"
+    );
     for (tag, verb, extra) in [
         (
             "codex-once",
@@ -1355,9 +1361,16 @@ fn claude_031_the_deck_answers_its_receipts_and_refuses_what_they_do_not_serve()
             json!({"component":"claude_waiter", "mode":"stream", "hook_integration":1}),
         ),
         (
-            "cli-fetch",
+            "stream-component-fetch",
             "inbox_receipt_fetch",
-            json!({"consumer":"cli", "max_chars":65536, "hook_integration":1}),
+            json!({"consumer":"doorbell_hook", "component":"opencode_plugin",
+                "max_chars":65536, "hook_integration":1}),
+        ),
+        (
+            "waiter-component-fetch",
+            "inbox_receipt_fetch",
+            json!({"consumer":"turn_end_hook", "component":"claude_waiter",
+                "max_chars":65536, "hook_integration":1}),
         ),
         (
             "bound-fetch",
