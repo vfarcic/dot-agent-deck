@@ -12898,6 +12898,57 @@ mod hook_ingestion_tests {
         }
     }
 
+    /// PRD #1666 part 3, round 3: a receiver named directly, not resolved
+    /// through a shell, whose place relative to the agent cannot be read
+    /// because a parent on the agent's walk is unreadable. Under required
+    /// evidence it is unidentified, where it used to be admitted; under best
+    /// effort it is still admitted. The terminal is named so the resolved
+    /// instance is the named process and only the direct check decides.
+    #[test]
+    fn a_directly_named_receiver_whose_walk_is_unreadable_is_unidentified() {
+        // 1 ── 5 terminal ── 6 bash ── 30 sh ── 31 CLI
+        //      ? ── 1000 ── 10 agent   (1000's parent cannot be read)
+        let parents = |pid: u32| match pid {
+            5 => Some(1),
+            6 => Some(5),
+            30 => Some(6),
+            31 => Some(30),
+            10 => Some(1000),
+            _ => None,
+        };
+        let executables = |pid: u32| {
+            Some(std::path::PathBuf::from(match pid {
+                5 => "/usr/bin/kitty",
+                6 => "/bin/bash",
+                10 => "/opt/claude",
+                30 => "/bin/sh",
+                31 => "/opt/dot-agent-deck",
+                _ => "/usr/bin/env",
+            }))
+        };
+        let admit = |evidence| {
+            admit_component(
+                peer(31, Some(true)),
+                Some(5),
+                Some(10),
+                ComponentUse::Receiver,
+                evidence,
+                |pid, root| crate::platform::proc::descends_from_with(pid, root, parents),
+                parents,
+                executables,
+            )
+        };
+        assert_eq!(
+            crate::platform::proc::ancestry_with(10, 5, parents),
+            crate::platform::proc::Ancestry::Unreadable
+        );
+        assert_eq!(
+            admit(Evidence::Required),
+            Err(ComponentRefusal::Unidentified)
+        );
+        assert_eq!(admit(Evidence::BestEffort), Ok(Some(5)));
+    }
+
     /// Every refusal names its own cause, and a fixed message that says what
     /// to do about it and echoes nothing the request carried.
     #[test]

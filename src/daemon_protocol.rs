@@ -1568,9 +1568,13 @@ pub const CONTRACT_BREAKS: &[&str] = &[
     // runs a conversation outside the tree the deck recorded, with the pane's
     // environment -- was refused `inbox_not_agent_process` and its mail
     // queued for good. Membership is now the pane's current capability plus
-    // the deck's own OS user; the receiver checks, generation identity and the
-    // capability's token -> spawn -> pane binding are unchanged. Same requests,
-    // same replies; what moved is who is admitted, and the refusal codes
+    // the deck's own OS user; generation identity and the capability's
+    // token -> spawn -> pane binding are unchanged, and so are the receiver
+    // checks but one: under required evidence a receiver whose place above or
+    // below the agent cannot be read (an unreadable parent, or a walk that
+    // runs out of steps) is now refused `inbox_peer_unidentified` rather than
+    // admitted (part 3, round 2). Same requests, same replies; what moved is
+    // who is admitted, and the refusal codes
     // (`inbox_other_user`, `inbox_peer_unidentified`,
     // `inbox_component_not_caller`, `inbox_receiver_above_agent`,
     // `inbox_nested_agent`) that name the cause.
