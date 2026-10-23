@@ -12367,11 +12367,13 @@ mod tests {
         ("offer_completed", crate::inbox::AckHow::OfferCompleted),
     ];
 
-    /// Scenario: Frozen `ListInbox` answers as older daemons wrote them — one acknowledged message for each of the seven `ack_how` spellings, the three legacy ones together in one list, every state and undeliverable reason, both sender kinds, both trust levels, a minimal and a maximal summary, a body whose text opens like a block — are decoded by this build as an attach response, as a hook `inbox list` answer and as bare summaries; and a frozen 0.47 reader decodes what this build writes for the vocabulary it still produces.
+    /// Scenario: Frozen `ListInbox` answers as older daemons wrote them — one acknowledged message for each of the seven `ack_how` spellings, the three legacy ones together in one list, every state and undeliverable reason, both sender kinds, both trust levels, a minimal and a maximal summary, a body whose text opens like a block — are decoded by this build as an attach response, as a hook `inbox list` answer and as bare summaries; and a frozen copy of 0.47's reader, its nested types and closed enums included, decodes what this build writes as an attach response and as a hook `inbox list` answer: every state, undeliverable reason and `ack_how` spelling, both senders, each recipient shape, every wake, and a summary with every optional field set and one with none.
     #[spec("inbox/boundary/070")]
     #[test]
     fn boundary_070_an_older_daemons_inbox_listing_still_decodes() {
-        use crate::inbox::{AckHow, BodyTrust, MessageSummary, Sender, StateName};
+        use crate::inbox::{
+            BodyTrust, MessageSummary, Recipient, Sender, StateName, UndeliverableReason,
+        };
         for (spelling, how) in EVERY_ACK_HOW {
             let element = frozen_summary(spelling, "");
             let attach: AttachResponse =
@@ -12456,70 +12458,237 @@ mod tests {
         ));
 
         // The reverse direction: a frozen 0.47 reader of what this build
-        // writes. Its enums are the closed sets 0.47 shipped.
-        #[derive(serde::Deserialize)]
-        #[serde(rename_all = "snake_case")]
+        // writes. Every type below is `v0.47.0`'s, field for field and with
+        // its own serde attributes, down to the nested ones: its enums are the
+        // closed sets 0.47 shipped and its message id checks what 0.47's did.
         #[allow(dead_code)]
-        enum OldAckHow {
-            PromptObserved,
-            PluginConfirmed,
-            ExtensionConfirmed,
-            HookHandover,
-            FetchedByCli,
-            Explicit,
-            OfferCompleted,
+        mod v047 {
+            use serde::Deserialize;
+
+            #[derive(Deserialize)]
+            #[serde(try_from = "String")]
+            pub struct MessageId(String);
+
+            impl TryFrom<String> for MessageId {
+                type Error = String;
+                fn try_from(text: String) -> Result<Self, Self::Error> {
+                    const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+                    let valid = text
+                        .strip_prefix("m-")
+                        .and_then(|rest| rest.split_once('-'))
+                        .is_some_and(|(deck, hex)| {
+                            deck.len() == 8
+                                && deck.bytes().all(|b| ALPHABET.contains(&b))
+                                && hex.len() == 16
+                                && hex
+                                    .bytes()
+                                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                        });
+                    if valid {
+                        Ok(Self(text))
+                    } else {
+                        Err(format!("not a message id: {text:?}"))
+                    }
+                }
+            }
+
+            #[derive(Deserialize)]
+            pub struct Recipient {
+                pub pane_id: String,
+                pub agent_id: Option<String>,
+            }
+
+            #[derive(Deserialize)]
+            #[serde(rename_all = "snake_case", tag = "type")]
+            pub enum Sender {
+                Deck {
+                    reason: String,
+                },
+                Agent {
+                    pane_id: String,
+                    agent_id: String,
+                    role: Option<String>,
+                    orchestration: Option<String>,
+                },
+            }
+
+            #[derive(Deserialize)]
+            #[serde(rename_all = "snake_case")]
+            pub enum BodyTrust {
+                Trusted,
+                Untrusted,
+            }
+
+            #[derive(Deserialize)]
+            #[serde(rename_all = "snake_case")]
+            pub enum StateName {
+                Queued,
+                Fetched,
+                Claimed,
+                Acknowledged,
+                Undeliverable,
+            }
+
+            #[derive(Deserialize)]
+            #[serde(rename_all = "snake_case")]
+            pub enum UndeliverableReason {
+                AgentExited,
+                MaxDeliver,
+                Superseded,
+                InboxShut,
+                Cancelled,
+            }
+
+            #[derive(Deserialize)]
+            #[serde(rename_all = "snake_case")]
+            pub enum AckHow {
+                PromptObserved,
+                PluginConfirmed,
+                ExtensionConfirmed,
+                HookHandover,
+                FetchedByCli,
+                Explicit,
+                OfferCompleted,
+            }
+
+            #[derive(Deserialize)]
+            pub struct MessageSummary {
+                pub id: MessageId,
+                pub kind: String,
+                #[serde(default)]
+                pub topic: Option<String>,
+                #[serde(default)]
+                pub pool: Option<String>,
+                pub to: String,
+                pub recipient: Option<Recipient>,
+                #[serde(default)]
+                pub bind_agent: Option<String>,
+                pub from: Sender,
+                pub subject: String,
+                pub body_trust: BodyTrust,
+                #[serde(default)]
+                pub spill_path: Option<std::path::PathBuf>,
+                pub state: StateName,
+                #[serde(default)]
+                pub undeliverable_reason: Option<UndeliverableReason>,
+                #[serde(default)]
+                pub ack_how: Option<AckHow>,
+                pub deliveries: u32,
+                pub age_ms: u64,
+                #[serde(default)]
+                pub text: Option<String>,
+            }
+
+            #[derive(Deserialize)]
+            #[serde(rename_all = "snake_case")]
+            pub enum InboxWake {
+                Native,
+                TurnEnd,
+                DoorbellOnly,
+            }
+
+            /// The two fields of 0.47's `AttachResponse` a listing reads.
+            #[derive(Deserialize)]
+            pub struct AttachResponse {
+                pub ok: bool,
+                #[serde(default)]
+                pub inbox_messages: Option<Vec<MessageSummary>>,
+            }
+
+            #[derive(Deserialize)]
+            pub struct InboxListReply {
+                pub messages: Vec<MessageSummary>,
+                pub armed: usize,
+                #[serde(default)]
+                pub wake: Option<InboxWake>,
+                #[serde(default)]
+                pub component: Option<String>,
+            }
         }
-        #[derive(serde::Deserialize)]
-        #[serde(rename_all = "snake_case")]
-        #[allow(dead_code)]
-        enum OldState {
-            Queued,
-            Fetched,
-            Claimed,
-            Acknowledged,
-            Undeliverable,
-        }
-        #[derive(serde::Deserialize)]
-        #[allow(dead_code)]
-        struct OldSummary {
-            id: String,
-            kind: String,
-            to: String,
-            recipient: Option<serde_json::Value>,
-            from: serde_json::Value,
-            subject: String,
-            body_trust: String,
-            state: OldState,
-            #[serde(default)]
-            ack_how: Option<OldAckHow>,
-            deliveries: u32,
-            age_ms: u64,
-        }
-        #[derive(serde::Deserialize)]
-        #[allow(dead_code)]
-        struct OldAttach {
-            inbox_messages: Option<Vec<OldSummary>>,
-        }
+        // What this build writes: every state, every undeliverable reason and
+        // every ack spelling its types hold, both senders, each recipient
+        // shape, and the optional fields both set and absent.
         let produced: MessageSummary = serde_json::from_str(&maximal).unwrap();
-        for how in [
-            AckHow::PluginConfirmed,
-            AckHow::ExtensionConfirmed,
-            AckHow::Explicit,
-            AckHow::OfferCompleted,
+        let bare = MessageSummary {
+            topic: None,
+            pool: None,
+            recipient: None,
+            bind_agent: None,
+            from: Sender::Deck {
+                reason: "seed".to_string(),
+            },
+            body_trust: BodyTrust::Untrusted,
+            spill_path: None,
+            undeliverable_reason: None,
+            ack_how: None,
+            text: None,
+            ..produced.clone()
+        };
+        let mut written = vec![produced.clone(), bare.clone()];
+        for state in [
+            StateName::Queued,
+            StateName::Fetched,
+            StateName::Claimed,
+            StateName::Acknowledged,
+            StateName::Undeliverable,
         ] {
-            let summary = MessageSummary {
+            written.push(MessageSummary {
+                state,
+                recipient: Some(Recipient::bound("p", "a")),
+                ..bare.clone()
+            });
+        }
+        for reason in [
+            UndeliverableReason::AgentExited,
+            UndeliverableReason::MaxDeliver,
+            UndeliverableReason::Superseded,
+            UndeliverableReason::InboxShut,
+            UndeliverableReason::Cancelled,
+        ] {
+            written.push(MessageSummary {
+                state: StateName::Undeliverable,
+                undeliverable_reason: Some(reason),
+                recipient: Some(Recipient {
+                    pane_id: "p".to_string(),
+                    agent_id: None,
+                }),
+                ..produced.clone()
+            });
+        }
+        for (_, how) in EVERY_ACK_HOW {
+            written.push(MessageSummary {
                 ack_how: Some(how),
                 state: StateName::Acknowledged,
                 ..produced.clone()
-            };
-            let response = AttachResponse {
-                inbox_messages: Some(vec![summary]),
+            });
+        }
+        for summary in &written {
+            let wire = serde_json::to_string(&AttachResponse {
+                inbox_messages: Some(vec![summary.clone()]),
                 ..AttachResponse::hello(PROTOCOL_VERSION)
-            };
-            let wire = serde_json::to_string(&response).unwrap();
-            let old: OldAttach = serde_json::from_str(&wire)
-                .unwrap_or_else(|e| panic!("a 0.47 reader of {how:?}: {e}"));
-            assert_eq!(old.inbox_messages.map(|m| m.len()), Some(1));
+            })
+            .unwrap();
+            let old: v047::AttachResponse = serde_json::from_str(&wire)
+                .unwrap_or_else(|e| panic!("a 0.47 reader of {wire}: {e}"));
+            assert!(old.ok);
+            assert_eq!(old.inbox_messages.map(|m| m.len()), Some(1), "{wire}");
+        }
+        for wake in [
+            None,
+            Some(crate::event::InboxWake::Native),
+            Some(crate::event::InboxWake::TurnEnd),
+            Some(crate::event::InboxWake::DoorbellOnly),
+        ] {
+            let wire = serde_json::to_string(&crate::event::InboxListReply {
+                messages: written.clone(),
+                armed: 2,
+                wake,
+                component: wake.map(|_| "claude_waiter".to_string()),
+            })
+            .unwrap();
+            let old: v047::InboxListReply = serde_json::from_str(&wire)
+                .unwrap_or_else(|e| panic!("a 0.47 hook listing reader of {wake:?}: {e}"));
+            assert_eq!((old.messages.len(), old.armed), (written.len(), 2));
         }
     }
 

@@ -9491,9 +9491,9 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Platform coverage:** mac+linux.
 
 ##### inbox/boundary/070 — An older daemon's inbox listing still decodes.
-- **Layer:** Fast (`src/daemon_protocol.rs`), literal frozen JSON decoded as `AttachResponse`, `InboxListReply` and bare `MessageSummary`, and a frozen 0.47 reader DTO (PRD #1666 part 3, H5's ListInbox wire audit).
+- **Layer:** Fast (`src/daemon_protocol.rs`), literal frozen JSON decoded as `AttachResponse`, `InboxListReply` and bare `MessageSummary`, and a frozen copy of 0.47's reader DTOs, nested types and closed enums included (PRD #1666 part 3, H5's ListInbox wire audit).
 - **Agent:** none.
-- **Asserts:** each of the seven `ack_how` spellings (the legacy `prompt_observed`, `hook_handover` and `fetched_by_cli` included) decodes in all three envelopes, and a list of the three legacy values together decodes whole; all five states, all five undeliverable reasons, both sender kinds, both trust levels, null and absent optional fields, and a maximal summary whose text opens like a delivery block decode; a frozen 0.47 reader decodes this build's attach answer for every `ack_how` it still produces.
+- **Asserts:** each of the seven `ack_how` spellings (the legacy `prompt_observed`, `hook_handover` and `fetched_by_cli` included) decodes in all three envelopes, and a list of the three legacy values together decodes whole; all five states, all five undeliverable reasons, both sender kinds, both trust levels, null and absent optional fields, and a maximal summary whose text opens like a delivery block decode; the frozen 0.47 reader decodes what this build writes, as an attach answer and as a hook `inbox list` answer, for every state, undeliverable reason and `ack_how` spelling, both senders, each recipient shape, every wake, and a summary with every optional field set and one with none.
 - **Does not assert:** an old binary against this daemon (the cross-version job), or that a handshake across a declared contract break connects.
 - **Platform coverage:** mac+linux.
 
