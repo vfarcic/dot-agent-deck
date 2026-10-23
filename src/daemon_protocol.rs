@@ -1580,6 +1580,21 @@ pub const CONTRACT_BREAKS: &[&str] = &[
     // `inbox_nested_agent`) that name the cause.
     // `changelog.d/1666-pane-capability.breaking.md` is its fragment.
     "1666-pane-capability-inbox-admission",
+    // PRD #1666 part 3 (H4), at 12 without moving it. Codex's prompt and Stop
+    // hooks and a model-run `dot-agent-deck inbox fetch` (Codex with its hooks
+    // off or untrusted, Devin, any other agent) become one-shot receipt
+    // receivers, as Claude Code's hooks did in part 2: each fetches on
+    // `inbox_receipt_fetch` (the CLI's refusal there is lifted), commits by
+    // writing its output whole, and no longer acknowledges by id, so a lost
+    // hand-over repeats marked or turns uncertain instead of being re-sent
+    // after the ack-wait. Each asks `inbox_receipts` first and goes on only
+    // when that answer names it in the additive `one_shot_senders`: a daemon
+    // answering `one_shot_receipts` 1 alone (part 2's) is handed nothing by
+    // them, with no legacy fallback. Additive request fields
+    // (`component`, `max_json_bytes`) and an unchanged attach wire; what moved
+    // is who takes mail on receipts and what settles it.
+    // `changelog.d/1666-remaining-inbox.breaking.md` is its fragment.
+    "1666-remaining-inbox-one-shot-receipts",
 ];
 
 /// What comparing this build's [`CONTRACT_BREAKS`] against a peer's found.

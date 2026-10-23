@@ -134,6 +134,18 @@ pub const HOOK_INTEGRATION: u32 = 1;
 /// answers at least this ([`crate::inbox_oneshot::Connection::open_receipts`]).
 pub const ONE_SHOT_RECEIPTS: u32 = 1;
 
+/// PRD #1666 part 3 (H4): the one-shot senders this daemon serves on the
+/// receipt verbs, answered beside [`ONE_SHOT_RECEIPTS`]. A sender other than
+/// Claude Code's goes on only on a daemon that names it
+/// ([`crate::inbox_oneshot::serves_receipts`]): part 2's answers
+/// `ONE_SHOT_RECEIPTS` and names none.
+pub const ONE_SHOT_SENDERS: &[crate::event::InboxOneShotSender] = &[
+    crate::event::InboxOneShotSender::ClaudeWaiter,
+    crate::event::InboxOneShotSender::ClaudeHooks,
+    crate::event::InboxOneShotSender::CodexHooks,
+    crate::event::InboxOneShotSender::Cli,
+];
+
 #[path = "inbox_engine.rs"]
 mod engine;
 #[cfg(test)]
@@ -3372,6 +3384,7 @@ async fn serve_receipt<R, W, P>(
                 &mut st,
                 &key,
                 component,
+                engine::Registrant::Integration,
                 arm.doorbell_only,
                 arm.resumed,
                 conn_id,
@@ -3534,6 +3547,7 @@ async fn serve_once<R, W>(
                     &mut st,
                     &key,
                     component,
+                    engine::Registrant::Integration,
                     false,
                     false,
                     conn_id,
@@ -3646,7 +3660,7 @@ async fn serve_once<R, W>(
 }
 
 /// What a hook receiver's own fetch asked for (part 2 §2.4).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct HookFetch {
     /// The message the doorbell named: nothing is issued unless it is still
     /// waiting.
@@ -3654,15 +3668,28 @@ pub struct HookFetch {
     pub budget: Option<InboxBudget>,
     /// The one-shot integration the hook declared ([`HOOK_INTEGRATION`]).
     pub hook_integration: Option<u32>,
+    /// Who fetches. PRD #1666 part 3 (H4): a model-run `inbox fetch`
+    /// ([`crate::event::InboxFetchConsumer::Cli`]) is served as a hook is,
+    /// but proves nothing about the agent's hooks: it leaves the card's
+    /// integration notices as they are, and one declaring no integration is
+    /// refused without one.
+    pub consumer: crate::event::InboxFetchConsumer,
 }
 
-/// Part 2 §2.4: serve one hook receiver (Claude's prompt hook) until it
-/// ends: register it beside every other receiver of the generation, issue it
-/// what its fetch asked for once, with the caps it publishes its receipts
-/// with, and apply its controls until it closes or its hold runs out. It is
-/// never pushed anything. Below the one-shot integration floor (§2.7)
-/// nothing is registered or issued, and the agent's card names the command
-/// that updates its hooks.
+impl HookFetch {
+    fn cli(&self) -> bool {
+        self.consumer == crate::event::InboxFetchConsumer::Cli
+    }
+}
+
+/// Part 2 §2.4: serve one hook receiver (Claude Code's or Codex's prompt
+/// hook, Codex's `Stop`, or since part 3's H4 a model-run `inbox fetch`)
+/// until it ends: register it beside every other receiver of the generation,
+/// issue it what its fetch asked for once, with the caps it publishes its
+/// receipts with, and apply its controls until it closes or its hold runs
+/// out. It is never pushed anything. Below the one-shot integration floor
+/// (§2.7) nothing is registered or issued, and for an agent's own hook the
+/// card names the command that updates its hooks.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_hook<R, W>(
     hub: Arc<InboxHub>,
@@ -3682,7 +3709,9 @@ pub async fn serve_hook<R, W>(
         .hook_integration
         .is_none_or(|declared| declared < HOOK_INTEGRATION)
     {
-        hub.refuse_old_hooks(&pane_id, &agent_id);
+        if !fetch.cli() {
+            hub.refuse_old_hooks(&pane_id, &agent_id);
+        }
         warn!(
             pane_id = %pane_id,
             ?component,
@@ -3725,6 +3754,11 @@ pub async fn serve_hook<R, W>(
                 &mut st,
                 &key,
                 component,
+                if fetch.cli() {
+                    engine::Registrant::Cli
+                } else {
+                    engine::Registrant::Integration
+                },
                 false,
                 false,
                 conn_id,
@@ -3742,6 +3776,11 @@ pub async fn serve_hook<R, W>(
                 &mut st,
                 &key,
                 rx,
+                match fetch.consumer {
+                    crate::event::InboxFetchConsumer::Cli => Consumer::FetchCli,
+                    crate::event::InboxFetchConsumer::TurnEndHook => Consumer::TurnEndHook,
+                    crate::event::InboxFetchConsumer::DoorbellHook => Consumer::DoorbellHook,
+                },
                 fetch.named.as_deref(),
                 fetch.budget,
                 now,
@@ -5389,11 +5428,22 @@ pub async fn serve_waiter<R, W, P>(
     P: Fn(&str),
 {
     let deadline = hub.write_deadline();
+    // PRD #1666 part 3 (H4): Codex's, Devin's and an unknown component's
+    // hooks are receivers of their own fetch, so none of them streams; a
+    // legacy once wait from one (`inbox_wait`, which only an older binary
+    // sends: this one's goes on the receipt verb, refused unless it is Claude
+    // Code's waiter) keeps the legacy waiter below until H5 deletes it. The
+    // hook mapping grants none of them a native wake.
+    let legacy_once = mode == InboxWaitMode::Once
+        && matches!(
+            component,
+            InboxComponent::CodexHooks | InboxComponent::DevinHooks | InboxComponent::Other
+        );
     // Part 2 §2.4, §2.7: Claude's once-waiter is served by the receipt
     // engine at the one-shot integration floor; below it nothing registers or
     // is issued, and its card names the command that updates the hooks. A
     // one-shot component never streams.
-    if engine::one_shot_component(component) {
+    if !legacy_once && engine::one_shot_component(component) {
         if mode == InboxWaitMode::Once && component == InboxComponent::ClaudeWaiter {
             if arm
                 .hook_integration
@@ -5429,7 +5479,7 @@ pub async fn serve_waiter<R, W, P>(
     // PRD #1666 §13 step 4, §11: a component the receipt policy covers is
     // served by the receipt engine, at the floor or above; below it nothing
     // registers and its card says the integration is out of date.
-    if receipt_component(component) {
+    if !legacy_once && receipt_component(component) {
         if mode == InboxWaitMode::Stream
             && arm
                 .adapter_integration

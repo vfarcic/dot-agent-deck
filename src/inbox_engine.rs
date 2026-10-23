@@ -112,15 +112,20 @@ pub(super) struct TurnClock {
 
 /// The receiver slot a component registers in (§4; part 2 §2.1): a stream
 /// for OpenCode and Pi, a once-waiter for Claude's `asyncRewake` waiter, a
-/// hook for Claude's prompt hook.
+/// hook for Claude's prompt hook and, since part 3's H4, for Codex's hooks and
+/// for a model-run `inbox fetch` in a Codex, Devin or other agent's pane. A
+/// hook is registered by its own fetch and is handed what that fetch asked
+/// for, once: no component's hook is a native wake.
 pub(super) fn slot_for(component: InboxComponent) -> Option<Slot> {
     match component {
         InboxComponent::OpenCodePlugin => Some(Slot::OpencodeTui),
         InboxComponent::OpenCodeMini => Some(Slot::OpencodeServer),
         InboxComponent::PiExtension => Some(Slot::Pi),
         InboxComponent::ClaudeWaiter => Some(Slot::OnceWaiter),
-        InboxComponent::ClaudeHooks => Some(Slot::Hook),
-        _ => None,
+        InboxComponent::ClaudeHooks
+        | InboxComponent::CodexHooks
+        | InboxComponent::DevinHooks
+        | InboxComponent::Other => Some(Slot::Hook),
     }
 }
 
@@ -523,6 +528,17 @@ pub(super) fn generation_mut<'a>(
     })
 }
 
+/// PRD #1666 part 3 (H4): who a receipt registration speaks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Registrant {
+    /// The agent's own integration — its stream, waiter or hook — which
+    /// proves that integration current, so it clears the floor's verdicts.
+    Integration,
+    /// A model-run `inbox fetch`: it proves nothing about the agent's hooks
+    /// or adapter, so the floor's verdicts and its readiness stand.
+    Cli,
+}
+
 /// T8: a receipt receiver registers for `key`. For a stream, the slot's
 /// previous incarnation is retired and its open attempts wait for this
 /// registration's resume answer; a once-waiter supersedes the previous one,
@@ -532,6 +548,7 @@ pub(super) fn register(
     st: &mut HubState,
     key: &AgentKey,
     component: InboxComponent,
+    registrant: Registrant,
     doorbell_only: bool,
     resumed: bool,
     conn_id: u64,
@@ -540,13 +557,15 @@ pub(super) fn register(
     now: Instant,
 ) -> Option<InboxWaitReply> {
     let slot = slot_for(component)?;
-    let floor = st.receipts.floors.entry(key.clone()).or_default();
-    floor.registered = true;
-    floor.adapter_too_old = false;
-    floor.hooks_too_old = false;
-    floor.hooks_unstamped = None;
-    floor.cli_too_old = false;
-    floor.refresh_failed = None;
+    if registrant == Registrant::Integration {
+        let floor = st.receipts.floors.entry(key.clone()).or_default();
+        floor.registered = true;
+        floor.adapter_too_old = false;
+        floor.hooks_too_old = false;
+        floor.hooks_unstamped = None;
+        floor.cli_too_old = false;
+        floor.refresh_failed = None;
+    }
     let grant_ttl = st.receipts.limits.grant_ttl();
     let generation = generation_mut(st, key, spool);
     let registration = generation.model.register(now, slot, resumed);
@@ -1096,10 +1115,12 @@ pub(super) fn deck_not_handed(
 /// `budget` is issued to it, each block naming its attempt, with the caps it
 /// publishes its receipts with. With `named`, nothing is issued unless that
 /// message is still waiting, decided under the same lock.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn hook_fetch(
     st: &mut HubState,
     key: &AgentKey,
     rx: Rx,
+    consumer: Consumer,
     named: Option<&str>,
     budget: Option<InboxBudget>,
     now: Instant,
@@ -1119,7 +1140,7 @@ pub(super) fn hook_fetch(
     {
         return Vec::new();
     }
-    let batch = issue_to(st, key, rx, &ids, budget, Consumer::DoorbellHook, true, now);
+    let batch = issue_to(st, key, rx, &ids, budget, consumer, true, now);
     apply(st, key, now, out);
     batch
 }

@@ -2886,6 +2886,7 @@ async fn attempts_022_only_a_turn_that_ended_moves_the_turn_clock() {
         &mut hub.lock(),
         &key,
         InboxComponent::OpenCodeMini,
+        engine::Registrant::Integration,
         false,
         false,
         1,
@@ -3785,17 +3786,38 @@ fn open_once(hub: &Arc<InboxHub>, declared: Option<u32>) -> Peer {
 /// Claude's prompt hook's end of one connection to `p`/`a`: its fetch, for
 /// the doorbell that named `named`, declaring `declared`.
 fn open_hook(hub: &Arc<InboxHub>, named: Option<&str>, declared: Option<u32>) -> Peer {
+    open_hook_as(
+        hub,
+        InboxComponent::ClaudeHooks,
+        crate::event::InboxFetchConsumer::DoorbellHook,
+        named,
+        declared,
+    )
+}
+
+/// PRD #1666 part 3 (H4): [`open_hook`] for a hook of `component` fetching
+/// as `consumer`: Codex's prompt hook or `Stop`, or a model-run `inbox
+/// fetch` (`Cli`) served as the hook of the agent's component.
+fn open_hook_as(
+    hub: &Arc<InboxHub>,
+    component: InboxComponent,
+    consumer: crate::event::InboxFetchConsumer,
+    named: Option<&str>,
+    declared: Option<u32>,
+) -> Peer {
     let (client, server) = tokio::io::duplex(1 << 16);
     let (read, write) = tokio::io::split(server);
     let serve = tokio::spawn(serve_hook(
         Arc::clone(hub),
         "p".to_string(),
         "a".to_string(),
-        InboxComponent::ClaudeHooks,
+        component,
         HookFetch {
             named: named.map(str::to_string),
-            budget: Some(InboxComponent::ClaudeHooks.inline_budget()),
+            budget: (consumer != crate::event::InboxFetchConsumer::Cli)
+                .then(|| component.inline_budget()),
             hook_integration: declared,
+            consumer,
         },
         BufReader::new(read),
         write,
@@ -4279,6 +4301,225 @@ async fn boundary_057_a_hook_receiver_takes_only_what_its_fetch_asked_for() {
     })
     .await;
     assert_eq!(state_of(&hub, "p", later.as_str()), StateName::Queued);
+}
+
+/// Scenario: Codex's prompt hook and `Stop`, and a model-run `inbox fetch` in a Devin or an unknown agent's pane, each fetch as a hook receiver declaring no one-shot integration, or a lower one. Each is refused `hooks_too_old` with no batch, nothing is issued and the task stays queued; an agent's own hook puts the out-of-date notice on the card, and the fetch, which proves nothing about the agent's hooks, leaves the card as it was.
+#[spec("inbox/boundary/049")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boundary_049_every_hook_receiver_below_the_floor_is_refused_before_issue() {
+    use crate::event::InboxFetchConsumer::{Cli, DoorbellHook, TurnEndHook};
+    for (component, consumer) in [
+        (InboxComponent::ClaudeHooks, DoorbellHook),
+        (InboxComponent::CodexHooks, DoorbellHook),
+        (InboxComponent::CodexHooks, TurnEndHook),
+        (InboxComponent::DevinHooks, Cli),
+        (InboxComponent::Other, Cli),
+    ] {
+        for declared in [None, Some(HOOK_INTEGRATION - 1)] {
+            let (hub, _state) = hub_with_spool(Duration::from_secs(30), Duration::from_secs(60));
+            let id = hub
+                .post_direct(Recipient::bound("p", "a"), content("behind the floor"))
+                .unwrap();
+            let what = format!("{component:?} {consumer:?} {declared:?}");
+            let mut peer = open_hook_as(&hub, component, consumer, None, declared);
+            let reply = peer.next().await;
+            assert_eq!(reply.refused.as_deref(), Some("hooks_too_old"), "{what}");
+            assert!(reply.messages.is_none(), "{what}");
+            peer.close().await;
+            assert!(
+                hub.lock()
+                    .receipts
+                    .gens
+                    .get(&("p".to_string(), "a".to_string()))
+                    .and_then(|generation| generation.model.delivery(id.as_str()))
+                    .is_none_or(|delivery| delivery.attempts.is_empty()),
+                "{what}: nothing issued"
+            );
+            assert_eq!(
+                state_of(&hub, "p", id.as_str()),
+                StateName::Queued,
+                "{what}"
+            );
+            assert_eq!(
+                integration_notice(&hub).0,
+                (consumer != Cli).then_some(IntegrationNotice::HooksTooOld),
+                "{what}"
+            );
+        }
+    }
+}
+
+/// Scenario: A model-run `inbox fetch` is issued a task, writes it, publishes its committed receipt and dies before it can tell the deck, its connection closing. The deck's clock finds the receipt and settles the task: a receipt published after its connection is gone still counts.
+#[spec("inbox/boundary/050")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boundary_050_a_fetch_that_dies_after_publishing_its_receipt_is_settled_late() {
+    let (hub, _state) = hub_with_spool(Duration::from_secs(30), Duration::from_secs(60));
+    let id = hub
+        .post_direct(Recipient::bound("p", "a"), content("late receipt"))
+        .unwrap();
+    let mut fetch = open_hook_as(
+        &hub,
+        InboxComponent::CodexHooks,
+        crate::event::InboxFetchConsumer::Cli,
+        None,
+        Some(HOOK_INTEGRATION),
+    );
+    let batch = fetch.next().await.messages.expect("a batch");
+    assert_eq!(batch.len(), 1);
+    assert!(batch[0].text.contains(" delivery 1.1 from "));
+    publish_receipt(
+        &hub,
+        "p",
+        "a",
+        &batch[0],
+        crate::inbox_receipt::RecordStage::Committed,
+    );
+    fetch.close().await;
+    until("the clock to settle it from its receipt", || {
+        hub.tick();
+        state_of(&hub, "p", id.as_str()) == StateName::Acknowledged
+    })
+    .await;
+}
+
+/// Scenario: Codex hooks and model-run fetches are hook receivers. Two Codex hooks racing for one task: one is issued it and the other nothing. A task posted while a hook holds its batch is not pushed to it. A Pi stream's task is never handed to a fetch beside it. Empty fetches leave no receiver record, and a holding hook and fetch live side by side, never counted as armed waiters.
+#[spec("inbox/boundary/053")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boundary_053_hook_receivers_are_request_bound_and_take_no_held_mail() {
+    use crate::event::InboxFetchConsumer::{Cli, DoorbellHook, TurnEndHook};
+    let key: AgentKey = ("p".into(), "a".into());
+    let receivers = |hub: &InboxHub| {
+        hub.lock()
+            .receipts
+            .gens
+            .get(&key)
+            .map_or(0, |generation| generation.model.receivers_held())
+    };
+    let (hub, _state) = hub_with_spool(Duration::from_secs(30), Duration::from_secs(60));
+    // Empty registrations leave nothing behind.
+    for consumer in [DoorbellHook, TurnEndHook, Cli] {
+        let mut peer = open_hook_as(
+            &hub,
+            InboxComponent::CodexHooks,
+            consumer,
+            None,
+            Some(HOOK_INTEGRATION),
+        );
+        assert_eq!(peer.next().await.messages.map(|m| m.len()), Some(0));
+        peer.close().await;
+    }
+    assert_eq!(
+        receivers(&hub),
+        0,
+        "no receiver record outlives an empty fetch"
+    );
+    // Two hooks race for one task.
+    let id = hub
+        .post_direct(Recipient::bound("p", "a"), content("one task"))
+        .unwrap();
+    let mut first = open_hook_as(
+        &hub,
+        InboxComponent::CodexHooks,
+        TurnEndHook,
+        None,
+        Some(HOOK_INTEGRATION),
+    );
+    let mut second = open_hook_as(
+        &hub,
+        InboxComponent::CodexHooks,
+        Cli,
+        None,
+        Some(HOOK_INTEGRATION),
+    );
+    let (a, b) = (first.next().await, second.next().await);
+    let counts = (
+        a.messages.as_ref().map_or(0, Vec::len),
+        b.messages.as_ref().map_or(0, Vec::len),
+    );
+    assert!(counts == (1, 0) || counts == (0, 1), "{counts:?}");
+    let (mut holder, held) = if counts.0 == 1 {
+        second.close().await;
+        (first, a.messages.unwrap().remove(0))
+    } else {
+        first.close().await;
+        (second, b.messages.unwrap().remove(0))
+    };
+    assert_eq!(held.id, id.as_str());
+    // A task posted while it holds its batch is not pushed to it; a fetch
+    // beside it takes that one, and the two live at once.
+    let later = hub
+        .post_direct(
+            Recipient::bound("p", "a"),
+            content("posted during the print"),
+        )
+        .unwrap();
+    for _ in 0..5 {
+        hub.tick();
+        if let Ok(reply) = tokio::time::timeout(Duration::from_millis(30), holder.next()).await {
+            assert!(
+                reply.messages.is_none(),
+                "nothing is pushed to a hook: {reply:?}"
+            );
+        }
+    }
+    let mut beside = open_hook_as(
+        &hub,
+        InboxComponent::CodexHooks,
+        Cli,
+        None,
+        Some(HOOK_INTEGRATION),
+    );
+    let taken = beside.next().await.messages.expect("a batch");
+    assert_eq!(
+        taken.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+        vec![later.as_str()],
+        "it takes only what no receiver holds"
+    );
+    assert_eq!(hub.armed("p", "a"), 0, "no hook is an armed waiter");
+    assert_eq!(hub.doorbell_facts("p", "a").armed, 0);
+    for (peer, delivery) in [(&mut holder, &held), (&mut beside, &taken[0])] {
+        publish_receipt(
+            &hub,
+            "p",
+            "a",
+            delivery,
+            crate::inbox_receipt::RecordStage::Committed,
+        );
+        peer.send(serde_json::json!({"committed": [at(delivery)]}))
+            .await;
+    }
+    holder.close().await;
+    beside.close().await;
+    until("both to settle", || {
+        state_of(&hub, "p", id.as_str()) == StateName::Acknowledged
+            && state_of(&hub, "p", later.as_str()) == StateName::Acknowledged
+    })
+    .await;
+    assert_eq!(receivers(&hub), 0, "closed hooks are pruned");
+
+    // Beside a Pi stream, a fetch never takes the stream's task.
+    let (hub, _state) = hub_with_spool(Duration::from_secs(30), Duration::from_secs(60));
+    let mut pi = Peer::open(&hub, "p", "a", InboxComponent::PiExtension, INTEGRATION).await;
+    pi.next().await;
+    let task = hub
+        .post_direct(Recipient::bound("p", "a"), content("the stream's"))
+        .unwrap();
+    let pushed = pi.handout().await;
+    assert_eq!(pushed[0].id, task.as_str());
+    let mut fetch = open_hook_as(
+        &hub,
+        InboxComponent::Other,
+        Cli,
+        None,
+        Some(HOOK_INTEGRATION),
+    );
+    assert_eq!(
+        fetch.next().await.messages.map(|m| m.len()),
+        Some(0),
+        "the stream's task is not diverted"
+    );
+    fetch.close().await;
+    pi.close().await;
 }
 
 /// Hold every caps-file write until the test lets it go: the returned

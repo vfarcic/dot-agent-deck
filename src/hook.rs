@@ -204,9 +204,20 @@ pub fn handle_hook(agent: &str) -> ExitCode {
         match codex_inbox_hooks(&input, &mut event, &mut announce) {
             CodexInbox::Nothing => {}
             CodexInbox::Print(output) => output.print(),
-            CodexInbox::ContinueTurn(output) => {
-                output.print();
-                return ExitCode::SUCCESS;
+            // PRD #1666 part 3 (H4): only a hand-over written and flushed whole
+            // goes on with the turn; one cut short or not written at all left
+            // Codex no block to act on, so the turn ends as usual.
+            #[cfg(unix)]
+            CodexInbox::TurnEnd(injection) => {
+                let ran = injection.print();
+                if ran.error.is_none()
+                    && ran
+                        .outputs
+                        .iter()
+                        .all(|output| *output == crate::inbox_oneshot::Output::Written)
+                {
+                    return ExitCode::SUCCESS;
+                }
             }
         }
     }
@@ -350,12 +361,10 @@ fn claude_inbox_hooks(
     }
 }
 
-/// What a hook prints for the inbox, and the messages that output hands over.
+/// What a hook prints for the inbox.
 pub struct HookOutput {
     stdout: String,
-    /// Fetched, not yet acknowledged: acknowledged once `stdout` is written.
-    fetched: Vec<String>,
-    /// Part 2 §1.2: Claude's doorbell hand-over on receipts, which prints and
+    /// Part 2 §1.2: a doorbell's hand-over on receipts, which prints and
     /// reports its own attempts instead.
     #[cfg(unix)]
     one_shot: Option<crate::inbox_prompt::OneShotInjection>,
@@ -365,16 +374,13 @@ impl HookOutput {
     fn text(stdout: String) -> Self {
         Self {
             stdout,
-            fetched: Vec::new(),
             #[cfg(unix)]
             one_shot: None,
         }
     }
 
-    /// Write the output, then acknowledge the messages it hands over. A write
-    /// that fails acknowledges nothing, so what it carried is handed over
-    /// again after the ack-wait (PR #1735 review). A one-shot hand-over
-    /// commits what it wrote in full instead, on each attempt's own cap.
+    /// Write the output. A one-shot hand-over commits what it wrote in full,
+    /// on each attempt's own cap.
     fn print(self) {
         #[cfg(unix)]
         if let Some(one_shot) = self.one_shot {
@@ -382,9 +388,7 @@ impl HookOutput {
             return;
         }
         let mut out = std::io::stdout();
-        if writeln!(out, "{}", self.stdout).is_ok() && out.flush().is_ok() {
-            acknowledge_handed_over(&self.fetched);
-        }
+        let _ = writeln!(out, "{}", self.stdout).and_then(|()| out.flush());
     }
 }
 
@@ -534,13 +538,15 @@ enum CodexInbox {
     Nothing,
     /// Print this, then report the event as usual.
     Print(HookOutput),
-    /// Print this and report nothing: the turn goes on.
-    ContinueTurn(HookOutput),
+    /// PRD #1666 part 3 (H4): hand this over as the `Stop` block; a hand-over
+    /// written and flushed whole goes on with the turn and reports nothing.
+    #[cfg(unix)]
+    TurnEnd(crate::inbox_prompt::OneShotInjection),
 }
 
 /// PRD #1666 S7: Codex's side of the inbox, for one hook payload in a deck
 /// pane. Codex is woken by the doorbell when idle; its hooks run outside its
-/// sandbox, so they, not the model, fetch and acknowledge.
+/// sandbox, so they, not the model, take the messages for it.
 ///
 /// - `SessionStart` queues an `inbox_announce` `TurnEnd` line, sent ahead of
 ///   the status event.
@@ -550,9 +556,15 @@ enum CodexInbox {
 ///   so Codex continues the turn with it. Nothing waiting, or no answer from
 ///   the daemon, and the turn ends as usual.
 ///
-/// Every hand-over is headed by [`crate::inbox_hub::AGENT_FRAMING`] and stays
-/// within [`crate::event::InboxComponent::CodexHooks`]'s byte budget; what does
-/// not fit stays queued for the next `Stop` or doorbell.
+/// PRD #1666 part 3 (H4): both hand-overs are one-shot receipt receivers, as
+/// Claude Code's prompt hook is (part 2 §1.4): each asks the deck whether it
+/// serves Codex's hooks, fetches on that connection, and commits what it wrote
+/// and flushed; nothing is acknowledged by id. Each is headed by
+/// [`crate::inbox_hub::AGENT_FRAMING`], and its whole JSON — envelope, framing
+/// and escaped blocks — stays within
+/// [`crate::event::InboxComponent::CodexHooks`]'s byte budget; what does not
+/// fit stays queued for the next `Stop` or doorbell. The one-shots are Unix
+/// only: elsewhere Codex's hooks hand nothing over, as Claude Code's do not.
 fn codex_inbox_hooks(
     input: &str,
     event: &mut AgentEvent,
@@ -561,7 +573,6 @@ fn codex_inbox_hooks(
     let Ok(payload) = serde_json::from_str::<Value>(input) else {
         return CodexInbox::Nothing;
     };
-    let budget = crate::event::InboxComponent::CodexHooks.inline_budget();
     let framing = crate::inbox_hub::AGENT_FRAMING;
     match payload.get("hook_event_name").and_then(Value::as_str) {
         Some("SessionStart") => {
@@ -583,36 +594,33 @@ fn codex_inbox_hooks(
                 )
             })
             .map_or(CodexInbox::Nothing, CodexInbox::Print),
-        Some("Stop") => crate::inbox_prompt::turn_end_hand_over(budget, framing).map_or(
-            CodexInbox::Nothing,
-            |hand_over| {
-                CodexInbox::ContinueTurn(HookOutput {
-                    stdout: serde_json::json!({"decision": "block", "reason": hand_over.context})
-                        .to_string(),
-                    fetched: hand_over.fetched,
-                    #[cfg(unix)]
-                    one_shot: None,
-                })
+        #[cfg(unix)]
+        Some("Stop") => crate::inbox_prompt::one_shot_injection(
+            crate::inbox_prompt::HookHandOver {
+                component: crate::event::InboxComponent::CodexHooks,
+                consumer: crate::event::InboxFetchConsumer::TurnEndHook,
+                rung: None,
+                envelope: &crate::inbox_prompt::Envelope::Block,
+                framing,
             },
-        ),
+            std::time::Instant::now() + crate::inbox_prompt::prompt_receipts_wait(),
+        )
+        .map_or(CodexInbox::Nothing, CodexInbox::TurnEnd),
         _ => CodexInbox::Nothing,
     }
 }
 
 /// PRD #1666 S6: the `UserPromptSubmit` side of the inbox, agent-neutral so
 /// every agent whose hook accepts `hookSpecificOutput.additionalContext`
-/// shares it (Claude Code now, Codex in S7), each with its `component`'s
+/// shares it (Claude Code, and Codex since S7), each with its `component`'s
 /// budget and the `framing` that heads an injection. An ordinary prompt costs
 /// a local scan and no daemon call. A doorbell line fetches only while the
 /// message it names is queued.
 ///
-/// Claude Code's hooks are on receipts (part 2 §1.2, §1.3): the blocks the
-/// prompt carries whole are committed by their exact attempts
+/// Both are on receipts (part 2 §1.2, §1.3; Codex's since part 3's H4): the
+/// blocks the prompt carries whole are committed by their exact attempts
 /// ([`crate::inbox_prompt::commit_delivered`]), never acknowledged by id, and
 /// a doorbell's hand-over is a one-shot receiver that commits what it wrote.
-/// Codex's still acknowledge: what a doorbell hands over once the hook has
-/// printed it ([`HookOutput::print`]), and a block the prompt itself opens
-/// before this returns.
 pub fn deck_prompt_submit(
     prompt: &str,
     component: crate::event::InboxComponent,
@@ -623,60 +631,50 @@ pub fn deck_prompt_submit(
     if ids.is_empty() {
         return None;
     }
-    let budget = component.inline_budget();
-    if component == crate::event::InboxComponent::ClaudeHooks {
-        // One socket-wait budget shared by the commit and the doorbell fetch
-        // (what it leaves out: `prompt_receipts_wait`): the hook blocks the
-        // user's prompt while it runs.
-        let receipts_by = std::time::Instant::now() + crate::inbox_prompt::prompt_receipts_wait();
-        crate::inbox_prompt::commit_delivered(prompt, receipts_by);
-        #[cfg(unix)]
-        {
-            let injection = ids.rung.first().and_then(|rung| {
-                crate::inbox_prompt::one_shot_injection(
-                    budget,
+    // One socket-wait budget shared by the commit and the doorbell fetch
+    // (what it leaves out: `prompt_receipts_wait`): the hook blocks the
+    // user's prompt while it runs.
+    let receipts_by = std::time::Instant::now() + crate::inbox_prompt::prompt_receipts_wait();
+    crate::inbox_prompt::commit_delivered(
+        prompt,
+        crate::inbox_prompt::sender_of(component),
+        receipts_by,
+    );
+    #[cfg(unix)]
+    {
+        let envelope = crate::inbox_prompt::Envelope::Context {
+            hook_event_name: "UserPromptSubmit".to_string(),
+        };
+        let injection = ids.rung.first().and_then(|rung| {
+            crate::inbox_prompt::one_shot_injection(
+                crate::inbox_prompt::HookHandOver {
+                    component,
+                    consumer: crate::event::InboxFetchConsumer::DoorbellHook,
+                    rung: Some(rung),
+                    envelope: &envelope,
                     framing,
-                    rung,
-                    "UserPromptSubmit",
-                    receipts_by,
-                )
-            });
-            let fetched = injection
-                .as_ref()
-                .map(crate::inbox_prompt::OneShotInjection::ids)
-                .unwrap_or_default();
-            let _ = crate::inbox_prompt::mark_event(event, &ids, &fetched);
-            return injection.map(|injection| HookOutput {
-                stdout: String::new(),
-                fetched: Vec::new(),
-                one_shot: Some(injection),
-            });
-        }
-        // The one-shot receivers are Unix only: no body is injected here,
-        // so a doorbell does not deliver to Claude on Windows yet.
-        #[cfg(not(unix))]
-        {
-            let _ = crate::inbox_prompt::mark_event(event, &ids, &[]);
-            return None;
-        }
+                },
+                receipts_by,
+            )
+        });
+        let fetched = injection
+            .as_ref()
+            .map(crate::inbox_prompt::OneShotInjection::ids)
+            .unwrap_or_default();
+        let _ = crate::inbox_prompt::mark_event(event, &ids, &fetched);
+        injection.map(|injection| HookOutput {
+            stdout: String::new(),
+            one_shot: Some(injection),
+        })
     }
-    let injection = ids.rung.first().and_then(|rung| {
-        crate::inbox_prompt::doorbell_injection(budget, framing, Some(rung.as_str()))
-    });
-    let fetched = injection
-        .as_ref()
-        .map(|injection| injection.fetched.clone())
-        .unwrap_or_default();
-    // PR #1735 second review: the content of the blocks the prompt opens is
-    // already in the model's context, so they are acknowledged here, with the
-    // `ack` verb the daemon admits only from the agent's own process tree.
-    acknowledge_handed_over(&crate::inbox_prompt::mark_event(event, &ids, &fetched));
-    injection.map(|injection| HookOutput {
-        stdout: crate::inbox_prompt::hook_output("UserPromptSubmit", &injection.context),
-        fetched: injection.fetched,
-        #[cfg(unix)]
-        one_shot: None,
-    })
+    // The one-shot receivers are Unix only: no body is injected here, so a
+    // doorbell does not deliver to Claude Code or Codex on Windows yet.
+    #[cfg(not(unix))]
+    {
+        let _ = (component, framing);
+        let _ = crate::inbox_prompt::mark_event(event, &ids, &[]);
+        None
+    }
 }
 
 /// PRD #1666 S8: send an `inbox_announce` on its own connection, for a

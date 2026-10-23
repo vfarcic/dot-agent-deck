@@ -3326,6 +3326,27 @@ pub enum InboxBudget {
     Chars(usize),
     /// UTF-8 bytes.
     Bytes(usize),
+    /// PRD #1666 part 3 (H4): UTF-8 bytes once escaped as a JSON string's
+    /// contents ([`json_escaped_len`]), for a hand-over printed inside a hook's
+    /// JSON (Codex's): the whole output, its escaping included, has to fit.
+    JsonBytes(usize),
+}
+
+/// The bytes `c` takes inside a JSON string as `serde_json` writes it: a
+/// quote, a backslash and the short control escapes take two, another
+/// control character six (`\u00XX`), anything else its UTF-8 length.
+fn json_escaped_char_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// The bytes `text` takes inside a JSON string as `serde_json` writes it,
+/// without the quotes around it.
+pub fn json_escaped_len(text: &str) -> usize {
+    text.chars().map(json_escaped_char_len).sum()
 }
 
 impl InboxBudget {
@@ -3334,12 +3355,13 @@ impl InboxBudget {
         match self {
             InboxBudget::Chars(_) => text.chars().count(),
             InboxBudget::Bytes(_) => text.len(),
+            InboxBudget::JsonBytes(_) => json_escaped_len(text),
         }
     }
 
     pub fn limit(self) -> usize {
         match self {
-            InboxBudget::Chars(n) | InboxBudget::Bytes(n) => n,
+            InboxBudget::Chars(n) | InboxBudget::Bytes(n) | InboxBudget::JsonBytes(n) => n,
         }
     }
 
@@ -3349,6 +3371,7 @@ impl InboxBudget {
         match self {
             InboxBudget::Chars(_) => InboxBudget::Chars(rest),
             InboxBudget::Bytes(_) => InboxBudget::Bytes(rest),
+            InboxBudget::JsonBytes(_) => InboxBudget::JsonBytes(rest),
         }
     }
 
@@ -3363,6 +3386,15 @@ impl InboxBudget {
                     end -= 1;
                 }
                 end
+            }
+            InboxBudget::JsonBytes(_) => {
+                let mut used = 0;
+                text.char_indices()
+                    .find(|(_, c)| {
+                        used += json_escaped_char_len(*c);
+                        used > max
+                    })
+                    .map_or(text.len(), |(i, _)| i)
             }
         };
         &text[..end]
@@ -3678,6 +3710,40 @@ pub struct InboxFetchRequest {
     /// for its `may` and stage controls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hook_integration: Option<u32>,
+    /// PRD #1666 part 3 (H4): the hook that fetches as a receiver of its own,
+    /// on [`DaemonMessage::InboxReceiptFetch`] (`codex_hooks` for Codex's).
+    /// Additive: a hook fetch without it is Claude Code's, as from part 2's
+    /// hooks. The CLI sends none; the deck knows its agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component: Option<InboxComponent>,
+    /// PRD #1666 part 3 (H4): the most UTF-8 bytes the hand-out's blocks may
+    /// take once escaped inside a JSON string, separators included
+    /// ([`InboxBudget::JsonBytes`]), for a hook that prints them inside its
+    /// JSON. Additive; when set it governs over `max_bytes` and `max_chars`.
+    /// Sent only to a deck that confirmed it serves the sender
+    /// ([`InboxWaitReply::one_shot_senders`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_json_bytes: Option<usize>,
+}
+
+/// PRD #1666 part 3 (H4): a one-shot that takes mail on the receipt verbs, as
+/// a deck's answer to [`DaemonMessage::InboxReceipts`] names the ones it
+/// serves ([`InboxWaitReply::one_shot_senders`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxOneShotSender {
+    /// Claude Code's `asyncRewake` waiter.
+    ClaudeWaiter,
+    /// Claude Code's prompt hook.
+    ClaudeHooks,
+    /// Codex's prompt and `Stop` hooks.
+    CodexHooks,
+    /// `dot-agent-deck inbox fetch`, run by the agent's model.
+    Cli,
+    /// A sender a later deck names. Read so a new one does not make the whole
+    /// answer unparseable.
+    #[serde(other)]
+    Unknown,
 }
 
 /// PRD #1666 part 2 §1.3: payload of [`DaemonMessage::InboxCommitted`].
@@ -3879,6 +3945,13 @@ pub struct InboxWaitReply {
     /// other lines (refusals, keepalives, batches) omit it from any daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub one_shot_receipts: Option<u32>,
+    /// PRD #1666 part 3 (H4): with [`Self::one_shot_receipts`], the one-shot
+    /// senders this daemon serves on the receipt verbs. Additive. A sender
+    /// other than Claude Code's goes on only when it is named here, in the
+    /// answer on its own connection: `one_shot_receipts` 1 alone is Claude
+    /// Code's support (part 2's daemon answers it and serves no other).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub one_shot_senders: Vec<InboxOneShotSender>,
 }
 
 impl InboxWaitReply {

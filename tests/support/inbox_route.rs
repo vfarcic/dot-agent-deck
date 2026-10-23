@@ -258,10 +258,17 @@ pub fn fetched(
         ),
         "session frame: {block}"
     );
+    // PRD #1666 part 3 (H4): the in-pane `inbox fetch` is a one-shot
+    // receiver, so its opener names the attempt it was handed
+    // (`delivery A.e`) between the id and the sender.
+    let opener = block
+        .lines()
+        .find(|line| line.starts_with(&format!("[dot-agent-deck message {id} ")))
+        .unwrap_or_default();
     assert!(
-        block.contains(&format!("[dot-agent-deck message {id} from "))
-            && (sender.is_empty()
-                || block.contains(&format!("[dot-agent-deck message {id} from {sender}]")))
+        opener.starts_with(&format!("[dot-agent-deck message {id} delivery "))
+            && opener.contains(" from ")
+            && (sender.is_empty() || opener.ends_with(&format!(" from {sender}]")))
             && block.contains(&format!("[end of dot-agent-deck message {id}]"))
             && block.contains(body),
         "complete framed block: {block}"

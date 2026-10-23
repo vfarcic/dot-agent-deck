@@ -407,3 +407,65 @@ fn boundary_025_a_start_refreshes_the_adapter_first_or_says_it_could_not() {
         record_inbox(&daemon, &pane)
     );
 }
+
+/// `dot-agent-deck inbox fetch` as a Devin stand-in pane's model runs it: the
+/// pane's identity, capability and receipt spool.
+fn devin_fetch(daemon: &common::DaemonProc, pane: &Pane) -> std::process::Command {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
+    command
+        .args(["inbox", "fetch"])
+        .env_clear()
+        .env("HOME", &daemon.home)
+        .env("DOT_AGENT_DECK_SOCKET", &daemon.hook_socket)
+        .env("DOT_AGENT_DECK_PANE_ID", &pane.id)
+        .env("DOT_AGENT_DECK_AGENT_ID", &pane.agent)
+        .env("DOT_AGENT_DECK_PANE_CAPABILITY", &pane.token)
+        .stdin(std::process::Stdio::null());
+    if let Some(spool) = pane_env(pane, "DOT_AGENT_DECK_INBOX_SPOOL") {
+        command.env("DOT_AGENT_DECK_INBOX_SPOOL", spool);
+    }
+    command
+}
+
+/// Scenario: Queue a task for an idle stand-in spawned as Devin, which has no inbox hooks: the deck types its doorbell, and the model's `dot-agent-deck inbox fetch` is a one-shot receiver. Run with its stdout already closed, it writes nothing, says so, and the task is back in the queue at once; run again, it prints the block naming its attempt and the task is settled by its receipt.
+#[spec("inbox/boundary/054")]
+#[test]
+fn boundary_054_a_devin_panes_model_run_fetch_is_a_one_shot_receiver() {
+    let daemon = daemon_unbound(&[]);
+    let pane = pane_with(&daemon, "devin-standin", json!({"agent_type":"devin"}));
+    // Devin's own status hook says it is idle; it has no inbox hooks.
+    status(&daemon, &pane, "idle", "devin");
+    let id = enqueue(&daemon, &pane, BODY);
+    ring(&daemon, &pane, &id);
+    let mut closed = devin_fetch(&daemon, &pane)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(closed.stdout.take());
+    let closed = closed.wait_with_output().unwrap();
+    assert!(!closed.status.success(), "{closed:?}");
+    assert!(
+        String::from_utf8_lossy(&closed.stderr)
+            .contains(dot_agent_deck::inbox_cli::CLI_NOTHING_PRINTED),
+        "{closed:?}"
+    );
+    state(&daemon, &pane, &id, "queued");
+    let fetched = devin_fetch(&daemon, &pane).output().unwrap();
+    assert!(fetched.status.success(), "{fetched:?}");
+    let stdout = String::from_utf8_lossy(&fetched.stdout);
+    assert!(
+        stdout.contains(BODY)
+            && stdout.contains(&format!("[dot-agent-deck message {id} delivery ")),
+        "{stdout}"
+    );
+    state(&daemon, &pane, &id, "acknowledged");
+    let summary = listing(&daemon, &pane)["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == id)
+        .cloned()
+        .unwrap();
+    assert_eq!(summary["ack_how"], "plugin_confirmed", "{summary}");
+}

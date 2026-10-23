@@ -19,13 +19,12 @@
 //! ([`stamp_deck_message_prompt`]), because only the daemon can attest the
 //! agent and knows the subject.
 //!
-//! How the hook settles what the prompt carries depends on the agent. Claude
-//! Code's (part 2's H3) commits the exact attempt each whole block names,
-//! through that attempt's caps file and the `inbox_committed` verb
-//! ([`delivered`], [`commit_delivered`]), and its doorbell is a receiver of
-//! its own that commits what it printed. Codex's, until H4, acknowledges the
-//! ids with the `ack` verb ([`crate::hook::acknowledge_handed_over`]). The
-//! daemon admits both verbs only from the agent's own process tree.
+//! The hook settles what the prompt carries by the exact attempt each whole
+//! block names, through that attempt's caps file and the `inbox_committed`
+//! verb ([`delivered`], [`commit_delivered`]), and its doorbell is a receiver
+//! of its own that commits what it printed: Claude Code's since part 2's H3,
+//! Codex's since part 3's H4. Neither acknowledges by id. The daemon admits
+//! these verbs only from a member of the agent's pane.
 //!
 //! Agent-neutral: Claude Code uses it in S6, and Codex, whose hooks take the
 //! same `additionalContext` shape, reuses it in S7 with its own budget.
@@ -174,48 +173,15 @@ pub fn delivered(prompt: &str) -> Vec<InboxAttemptRef> {
     found
 }
 
-/// What a doorbell-started prompt hands the model: the framing and the
-/// fetched blocks, and which ids the fetch took, for the hook to acknowledge
-/// once it has printed them.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Injection {
-    pub context: String,
-    pub fetched: Vec<String>,
-}
-
 /// Whether this process runs in a deck pane: the deck put a pane id in its
 /// environment.
 pub fn in_deck_pane() -> bool {
     std::env::var(DOT_AGENT_DECK_PANE_ID).is_ok_and(|pane| !pane.is_empty())
 }
 
-/// Fetch what is waiting for this pane's agent, for the doorbell that named
-/// message `rung`, within `budget` including `framing`, which heads it.
-/// Nothing is fetched once `rung` is no longer queued (a doorbell recalled
-/// from prompt history, or a message another consumer took). The fetch does
-/// not acknowledge: the hook acknowledges [`Injection::fetched`] once it has
-/// printed them ([`crate::hook::acknowledge_handed_over`]), and what it never
-/// prints is handed over again after the ack-wait. `None` outside a deck pane,
-/// without a token, when the daemon does not answer, or when nothing is
-/// waiting. Bounded by the hook socket's 5 s request timeout.
-pub fn doorbell_injection(
-    budget: InboxBudget,
-    framing: &str,
-    rung: Option<&str>,
-) -> Option<Injection> {
-    hand_over(InboxFetchConsumer::DoorbellHook, budget, framing, rung)
-}
-
-/// PRD #1666 S7: [`doorbell_injection`] for a hook that hands the messages over
-/// as its turn ends (Codex's `Stop`), with no doorbell to name one.
-pub fn turn_end_hand_over(budget: InboxBudget, framing: &str) -> Option<Injection> {
-    hand_over(InboxFetchConsumer::TurnEndHook, budget, framing, None)
-}
-
 /// The fetch a hook's hand-over sends for the agent `agent_id` in `pane_id`.
-/// PR #1735 review: it does not acknowledge, so a reply the hook never
-/// receives (its 5 s exchange timed out) or cannot parse leaves the messages
-/// fetched, for the ack-wait to hand over again, rather than delivered.
+/// It does not acknowledge: the hook is a one-shot receiver of its own and
+/// commits what it printed ([`one_shot_request`] completes it).
 fn hand_over_request(
     consumer: InboxFetchConsumer,
     budget: InboxBudget,
@@ -232,7 +198,7 @@ fn hand_over_request(
         InboxBudget::Chars(_) => (rest, None),
         // A daemon without `max_bytes` reads `max_chars`, which a byte count
         // bounds from above.
-        InboxBudget::Bytes(_) => (rest, Some(rest)),
+        InboxBudget::Bytes(_) | InboxBudget::JsonBytes(_) => (rest, Some(rest)),
     };
     InboxFetchRequest {
         pane_id,
@@ -246,53 +212,22 @@ fn hand_over_request(
         adapter_integration: None,
         rx: None,
         hook_integration: None,
+        component: None,
+        max_json_bytes: None,
     }
 }
 
-fn hand_over(
-    consumer: InboxFetchConsumer,
-    budget: InboxBudget,
-    framing: &str,
-    rung: Option<&str>,
-) -> Option<Injection> {
-    let pane_id = std::env::var(DOT_AGENT_DECK_PANE_ID)
-        .ok()
-        .filter(|pane| !pane.is_empty())?;
-    let token = crate::hook_provenance::token_from_env()?;
-    let agent_id = std::env::var(DOT_AGENT_DECK_AGENT_ID)
-        .ok()
-        .filter(|agent| !agent.is_empty());
-    let request = DaemonMessage::InboxFetch(hand_over_request(
-        consumer, budget, framing, rung, pane_id, agent_id, token,
-    ));
-    let json = serde_json::to_string(&request).ok()?;
-    let line = crate::hook::request_from_socket(&json)?;
-    let messages = serde_json::from_str::<InboxWaitReply>(&line)
-        .ok()?
-        .messages
-        .filter(|messages| !messages.is_empty())?;
-    let mut context = framing.to_string();
-    for message in &messages {
-        context.push_str(crate::inbox_hub::BLOCK_SEPARATOR);
-        context.push_str(&message.text);
-    }
-    Some(Injection {
-        context,
-        fetched: messages.into_iter().map(|message| message.id).collect(),
-    })
-}
-
-/// Part 2 §1.2: what Claude's prompt hook hands the model when a doorbell
-/// started the prompt, fetched on a connection of its own as a one-shot
-/// receiver ([`crate::inbox_hub::HOOK_INTEGRATION`]). Its caps never leave
-/// [`crate::inbox_oneshot::OneShotBatch`].
+/// Part 2 §1.2: what a hook hands the model when a doorbell started the
+/// prompt, or, for Codex's `Stop`, as the turn ends, fetched on a connection
+/// of its own as a one-shot receiver ([`crate::inbox_hub::HOOK_INTEGRATION`]).
+/// Its caps never leave [`crate::inbox_oneshot::OneShotBatch`].
 #[cfg(unix)]
 pub struct OneShotInjection {
     connection: crate::inbox_oneshot::Connection,
     batch: crate::inbox_oneshot::OneShotBatch,
     grant_ttl: std::time::Duration,
     framing: String,
-    hook_event_name: String,
+    envelope: Envelope,
 }
 
 #[cfg(unix)]
@@ -301,6 +236,49 @@ impl std::fmt::Debug for OneShotInjection {
         f.debug_struct("OneShotInjection")
             .field("batch", &self.batch)
             .finish_non_exhaustive()
+    }
+}
+
+/// PRD #1666 part 3 (H4): the JSON a one-shot hook prints its hand-over in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Envelope {
+    /// `{"hookSpecificOutput":{"additionalContext":…,"hookEventName":…}}`:
+    /// a prompt or session hook's context (Claude Code's, Codex's prompt
+    /// hook).
+    Context { hook_event_name: String },
+    /// `{"decision":"block","reason":…}`: Codex's `Stop`, which goes on with
+    /// the turn, the reason as its input.
+    Block,
+}
+
+/// PRD #1666 part 3 (H4): which hook's one-shot hand-over this is, and how it
+/// is printed.
+#[derive(Debug, Clone, Copy)]
+pub struct HookHandOver<'a> {
+    /// `ClaudeHooks` or `CodexHooks`: whose budget, and which sender the deck
+    /// must confirm it serves.
+    pub component: crate::event::InboxComponent,
+    pub consumer: InboxFetchConsumer,
+    /// The message the doorbell named; none for a turn-end hand-over.
+    pub rung: Option<&'a str>,
+    pub envelope: &'a Envelope,
+    /// What heads the hand-over, inside the envelope.
+    pub framing: &'a str,
+}
+
+impl HookHandOver<'_> {
+    /// The receipts sender this hook is ([`crate::inbox_oneshot::serves_receipts`]).
+    pub fn sender(&self) -> crate::event::InboxOneShotSender {
+        sender_of(self.component)
+    }
+}
+
+/// The receipts sender a hook of `component` is: Codex's hooks, or Claude
+/// Code's.
+pub fn sender_of(component: crate::event::InboxComponent) -> crate::event::InboxOneShotSender {
+    match component {
+        crate::event::InboxComponent::CodexHooks => crate::event::InboxOneShotSender::CodexHooks,
+        _ => crate::event::InboxOneShotSender::ClaudeHooks,
     }
 }
 
@@ -355,12 +333,14 @@ pub fn prompt_receipts_wait() -> std::time::Duration {
 /// the answer that keeps mail back is shared within the hook, the one that
 /// lets it through never is. A hook that declares no integration stands in
 /// for an older one and fetches unasked, on the legacy verb.
+///
+/// PRD #1666 part 3 (H4): the same for Codex's prompt hook and its `Stop`,
+/// with what `hand` says: the budget is the component's, and a hand-over
+/// printed inside JSON counted as the JSON carries it, the envelope and the
+/// framing taken off first ([`one_shot_request`]), so the whole output fits.
 #[cfg(unix)]
 pub fn one_shot_injection(
-    budget: InboxBudget,
-    framing: &str,
-    rung: &str,
-    hook_event_name: &str,
+    hand: HookHandOver<'_>,
     receipts_by: std::time::Instant,
 ) -> Option<OneShotInjection> {
     let pane_id = std::env::var(DOT_AGENT_DECK_PANE_ID)
@@ -370,22 +350,13 @@ pub fn one_shot_injection(
     let agent_id = std::env::var(DOT_AGENT_DECK_AGENT_ID)
         .ok()
         .filter(|agent| !agent.is_empty());
-    let mut request = hand_over_request(
-        InboxFetchConsumer::DoorbellHook,
-        budget,
-        framing,
-        Some(rung),
-        pane_id,
-        agent_id,
-        token,
-    );
-    request.hook_integration = crate::inbox_oneshot::declared_hook_integration();
+    let request = one_shot_request(&hand, pane_id, agent_id, token);
     let path = crate::endpoint_resolve::client_socket_path();
     let (connection, reply) = if request.hook_integration.is_some() {
         if crate::inbox_oneshot::reported_refusal() {
             return None;
         }
-        fetch_with_receipts(&path, request, receipts_by)?
+        fetch_with_receipts(&path, request, hand.sender(), receipts_by)?
     } else {
         let json = serde_json::to_string(&DaemonMessage::InboxFetch(request)).ok()?;
         let mut connection = crate::inbox_oneshot::Connection::open(&path, &json).ok()?;
@@ -408,9 +379,51 @@ pub fn one_shot_injection(
         connection,
         batch,
         grant_ttl,
-        framing: framing.to_string(),
-        hook_event_name: hook_event_name.to_string(),
+        framing: hand.framing.to_string(),
+        envelope: hand.envelope.clone(),
     })
+}
+
+/// The receipt fetch `hand` sends for the agent `agent_id` in `pane_id`.
+/// A budget in characters (Claude Code's) is the framing's and the blocks', as
+/// before; one in bytes (Codex's) is the whole JSON the hook prints, so the
+/// envelope and the escaped framing are taken off it and the deck counts each
+/// block as escaped ([`InboxBudget::JsonBytes`]).
+pub fn one_shot_request(
+    hand: &HookHandOver<'_>,
+    pane_id: String,
+    agent_id: Option<String>,
+    token: String,
+) -> InboxFetchRequest {
+    let budget = hand.component.inline_budget();
+    let mut request = hand_over_request(
+        hand.consumer,
+        budget,
+        hand.framing,
+        hand.rung,
+        pane_id,
+        agent_id,
+        token,
+    );
+    if let InboxBudget::Bytes(limit) = budget {
+        let rest = limit
+            .saturating_sub(envelope_bytes(hand.envelope, hand.framing))
+            .max(1);
+        request.max_chars = Some(rest);
+        request.max_bytes = Some(rest);
+        request.max_json_bytes = Some(rest);
+    }
+    request.hook_integration = crate::inbox_oneshot::declared_hook_integration();
+    request.component = Some(hand.component);
+    request
+}
+
+/// The bytes `envelope` takes around a hand-over headed by `framing`, its
+/// newline included: everything the hook prints but the blocks and the
+/// separators before them.
+fn envelope_bytes(envelope: &Envelope, framing: &str) -> usize {
+    let parts = envelope.parts(framing, &[]);
+    parts.head.len() + parts.tail.len()
 }
 
 /// The doorbell fetch `request` on the receipt verb at the deck at `path`:
@@ -433,11 +446,12 @@ pub fn one_shot_injection(
 pub fn fetch_with_receipts(
     path: &std::path::Path,
     request: InboxFetchRequest,
+    sender: crate::event::InboxOneShotSender,
     receipts_by: std::time::Instant,
 ) -> Option<(crate::inbox_oneshot::Connection, InboxWaitReply)> {
     use crate::inbox_oneshot::{Connection, Opened};
     if receipts_by <= std::time::Instant::now() {
-        crate::inbox_oneshot::report_timed_out();
+        crate::inbox_oneshot::report_timed_out(sender);
         return None;
     }
     let question = crate::inbox_oneshot::receipts_question(
@@ -446,10 +460,10 @@ pub fn fetch_with_receipts(
         request.token.as_deref().unwrap_or_default(),
     )?;
     let json = serde_json::to_string(&DaemonMessage::InboxReceiptFetch(request)).ok()?;
-    let mut connection = match Connection::open_receipts_by(path, &question, receipts_by) {
+    let mut connection = match Connection::open_receipts_by(path, &question, sender, receipts_by) {
         Opened::Ready(connection) => connection,
         Opened::Unsupported => {
-            crate::inbox_oneshot::report_unsupported();
+            crate::inbox_oneshot::report_unsupported(sender);
             return None;
         }
         Opened::Lost => {
@@ -457,7 +471,7 @@ pub fn fetch_with_receipts(
             return None;
         }
         Opened::TimedOut => {
-            crate::inbox_oneshot::report_timed_out();
+            crate::inbox_oneshot::report_timed_out(sender);
             return None;
         }
         Opened::Foreign => {
@@ -492,24 +506,28 @@ impl OneShotInjection {
         self.batch.ids()
     }
 
-    /// Hand the batch to the model as the hook's `additionalContext`, written
-    /// straight to stdout: a block whose bytes all went and were flushed is
-    /// committed, one partly written is possibly handed, one refused at its
-    /// fence or never started is not handed (part 2 §1.2).
-    pub fn print(self) {
-        self.print_to(raw_stdout());
+    /// Hand the batch to the model in the hook's envelope (`additionalContext`,
+    /// or Codex's `Stop` reason), written straight to stdout: a block whose
+    /// bytes all went and were flushed is committed, one partly written is
+    /// possibly handed, one refused at its fence or never started is not
+    /// handed (part 2 §1.2). Answers what became of each block.
+    pub fn print(self) -> crate::inbox_oneshot::Ran {
+        self.print_to(raw_stdout())
     }
 
     /// [`Self::print`] to `stdout`, this process's stdout if it could be
     /// opened; if it could not, nothing is written and the deck is told the
     /// batch was not handed.
-    fn print_to(mut self, stdout: std::io::Result<std::fs::File>) {
+    fn print_to(mut self, stdout: std::io::Result<std::fs::File>) -> crate::inbox_oneshot::Ran {
         let Ok(mut stdout) = stdout else {
-            self.batch
+            return self
+                .batch
                 .decline(&mut self.connection, crate::inbox_oneshot::Receiver::Hook);
-            return;
         };
-        let parts = hook_output_parts(&self.hook_event_name, &self.framing, &self.batch);
+        let texts: Vec<&str> = (0..self.batch.len())
+            .map(|i| self.batch.text(i).unwrap_or_default())
+            .collect();
+        let parts = self.envelope.parts(&self.framing, &texts);
         let pieces = parts.pieces();
         let pinned = pinned_spool();
         self.batch.run(
@@ -520,7 +538,7 @@ impl OneShotInjection {
             &pieces,
             crate::inbox_oneshot::Receiver::Hook,
             None,
-        );
+        )
     }
 }
 
@@ -542,9 +560,9 @@ fn pinned_spool() -> crate::inbox_oneshot::Pinned {
     crate::inbox_oneshot::Pinned::from_env(&pane, &agent)
 }
 
-/// [`hook_output`]'s bytes for `framing` and `batch`, each block's escaped
-/// text a piece of its own, so the hand-over judges each block by what of it
-/// was written.
+/// [`hook_output`]'s bytes, or the `Stop` block's, for a framing and the
+/// blocks, each block's escaped text a piece of its own, so the hand-over
+/// judges each block by what of it was written.
 pub struct HookOutputParts {
     head: String,
     separator: String,
@@ -565,30 +583,61 @@ impl HookOutputParts {
     }
 }
 
+/// `text` as the contents of a JSON string, without its quotes.
+fn json_escaped(text: &str) -> String {
+    let quoted = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
+    quoted[1..quoted.len() - 1].to_string()
+}
+
+impl Envelope {
+    /// The parts of the hook's stdout handing `framing` and `blocks` to the
+    /// model: the JSON a hook prints for them joined by
+    /// [`crate::inbox_hub::BLOCK_SEPARATOR`] ([`hook_output`] for a context),
+    /// then its newline.
+    pub fn parts(&self, framing: &str, blocks: &[&str]) -> HookOutputParts {
+        let (head, tail) = match self {
+            Envelope::Context { hook_event_name } => {
+                let event =
+                    serde_json::to_string(hook_event_name).unwrap_or_else(|_| "\"\"".to_string());
+                (
+                    format!(
+                        "{{\"hookSpecificOutput\":{{\"additionalContext\":\"{}",
+                        json_escaped(framing)
+                    ),
+                    format!("\",\"hookEventName\":{event}}}}}\n"),
+                )
+            }
+            Envelope::Block => (
+                format!(
+                    "{{\"decision\":\"block\",\"reason\":\"{}",
+                    json_escaped(framing)
+                ),
+                "\"}\n".to_string(),
+            ),
+        };
+        HookOutputParts {
+            head,
+            separator: json_escaped(crate::inbox_hub::BLOCK_SEPARATOR),
+            blocks: blocks.iter().map(|text| json_escaped(text)).collect(),
+            tail,
+        }
+    }
+}
+
 /// The parts of the hook's stdout handing `framing` and `batch`'s blocks to
-/// the model: the same JSON [`hook_output`] prints for the joined context,
-/// then its newline.
+/// the model as `hook_event_name`'s context ([`Envelope::Context`]).
 pub fn hook_output_parts(
     hook_event_name: &str,
     framing: &str,
     batch: &crate::inbox_oneshot::OneShotBatch,
 ) -> HookOutputParts {
-    let escaped = |text: &str| {
-        let quoted = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
-        quoted[1..quoted.len() - 1].to_string()
-    };
-    let event = serde_json::to_string(hook_event_name).unwrap_or_else(|_| "\"\"".to_string());
-    HookOutputParts {
-        head: format!(
-            "{{\"hookSpecificOutput\":{{\"additionalContext\":\"{}",
-            escaped(framing)
-        ),
-        separator: escaped(crate::inbox_hub::BLOCK_SEPARATOR),
-        blocks: (0..batch.len())
-            .map(|i| escaped(batch.text(i).unwrap_or_default()))
-            .collect(),
-        tail: format!("\",\"hookEventName\":{event}}}}}\n"),
+    let texts: Vec<&str> = (0..batch.len())
+        .map(|i| batch.text(i).unwrap_or_default())
+        .collect();
+    Envelope::Context {
+        hook_event_name: hook_event_name.to_string(),
     }
+    .parts(framing, &texts)
 }
 
 /// Part 2 §1.3: commit the exact attempts whose blocks `prompt` carries whole
@@ -596,7 +645,11 @@ pub fn hook_output_parts(
 /// notification — for this pane's agent ([`commit_attempts_by`]), within the
 /// prompt's shared receipts budget, `receipts_by` ([`prompt_receipts_wait`]).
 /// Outside a deck pane or without a token nothing is sent.
-pub fn commit_delivered(prompt: &str, receipts_by: std::time::Instant) {
+pub fn commit_delivered(
+    prompt: &str,
+    sender: crate::event::InboxOneShotSender,
+    receipts_by: std::time::Instant,
+) {
     let attempts = delivered(prompt);
     if attempts.is_empty() {
         return;
@@ -614,21 +667,25 @@ pub fn commit_delivered(prompt: &str, receipts_by: std::time::Instant) {
         .ok()
         .filter(|agent| !agent.is_empty());
     #[cfg(unix)]
-    report_committed(commit_attempts_by(
-        &crate::endpoint_resolve::client_socket_path(),
-        CommitFor {
-            pane_id: &pane_id,
-            agent_id: agent_id.as_deref(),
-            token: &token,
-        },
-        attempts,
-        &pinned_spool(),
-        receipts_by,
-    ));
+    report_committed(
+        commit_attempts_by(
+            &crate::endpoint_resolve::client_socket_path(),
+            CommitFor {
+                pane_id: &pane_id,
+                agent_id: agent_id.as_deref(),
+                token: &token,
+                sender,
+            },
+            attempts,
+            &pinned_spool(),
+            receipts_by,
+        ),
+        sender,
+    );
     // The one-shot receipt protocol is Unix only: no one-shot there wrote
     // a block for a prompt to carry.
     #[cfg(not(unix))]
-    let _ = (pane_id, agent_id, token, receipts_by);
+    let _ = (pane_id, agent_id, token, sender, receipts_by);
 }
 
 /// Say on stderr what `committed` leaves the user to act on, if anything:
@@ -640,11 +697,11 @@ pub fn commit_delivered(prompt: &str, receipts_by: std::time::Instant) {
 /// fetch's: the waiter already took the message the prompt carries, so none
 /// says no message was taken or promises it is queued.
 #[cfg(unix)]
-fn report_committed(committed: Committed) {
+fn report_committed(committed: Committed, sender: crate::event::InboxOneShotSender) {
     match committed {
-        Committed::Withheld => crate::inbox_oneshot::report_commit_unsupported(),
+        Committed::Withheld => crate::inbox_oneshot::report_commit_unsupported(sender),
         Committed::Lost => crate::inbox_oneshot::report_commit_connection_lost(),
-        Committed::TimedOut => crate::inbox_oneshot::report_commit_timed_out(),
+        Committed::TimedOut => crate::inbox_oneshot::report_commit_timed_out(sender),
         Committed::Foreign => crate::inbox_oneshot::report_foreign_socket(),
         Committed::Nothing | Committed::Refused | Committed::Sent => {}
     }
@@ -668,6 +725,8 @@ pub struct CommitFor<'a> {
     pub pane_id: &'a str,
     pub agent_id: Option<&'a str>,
     pub token: &'a str,
+    /// Whose hook commits: the deck has to confirm it serves that sender.
+    pub sender: crate::event::InboxOneShotSender,
 }
 
 /// What [`commit_attempts`] did.
@@ -758,7 +817,8 @@ pub fn commit_attempts_by(
     else {
         return Committed::Refused;
     };
-    let mut connection = match Connection::open_receipts_by(socket, &question, deadline) {
+    let mut connection = match Connection::open_receipts_by(socket, &question, who.sender, deadline)
+    {
         Opened::Ready(connection) => connection,
         Opened::Unsupported => return Committed::Withheld,
         Opened::Lost => return Committed::Lost,
@@ -920,6 +980,10 @@ pub fn stamp_deck_message_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Claude Code's prompt hook, the sender these tests stand in for.
+    #[cfg(unix)]
+    const CLAUDE: crate::event::InboxOneShotSender = crate::event::InboxOneShotSender::ClaudeHooks;
     use spec::spec;
 
     const ID: &str = "m-k3xzq2ab-0f3c9a71d2e4b850";
@@ -975,7 +1039,9 @@ mod tests {
             batch,
             grant_ttl: std::time::Duration::from_secs(60),
             framing: "framing".to_string(),
-            hook_event_name: "UserPromptSubmit".to_string(),
+            envelope: Envelope::Context {
+                hook_event_name: "UserPromptSubmit".to_string(),
+            },
         };
         injection.print_to(Err(std::io::Error::other("no descriptor left")));
         let controls = crate::inbox_oneshot::tests::controls_read(deck);
@@ -1377,6 +1443,7 @@ mod tests {
             pane_id: pane,
             agent_id: Some(agent),
             token: "token-1",
+            sender: CLAUDE,
         };
         let key = RecordKey {
             msg: ID.to_string(),
@@ -1466,6 +1533,7 @@ mod tests {
             pane_id: "2",
             agent_id: Some("agent-a"),
             token: "token-1",
+            sender: CLAUDE,
         };
         // A deck that answers the question, then reads `then` more lines and
         // holds the connection open, unread and unanswered, until joined.
@@ -1548,6 +1616,7 @@ mod tests {
             pane_id: "2",
             agent_id: Some("agent-a"),
             token: "token-1",
+            sender: CLAUDE,
         };
         let fetch = || {
             hand_over_request(
@@ -1623,7 +1692,7 @@ mod tests {
         let receipts_by = Instant::now() + wait;
         let committed =
             commit_attempts_by(&path, who, vec![attempt()], &Pinned::Unpinned, receipts_by);
-        let fetched = fetch_with_receipts(&path, fetch(), receipts_by);
+        let fetched = fetch_with_receipts(&path, fetch(), CLAUDE, receipts_by);
         assert_eq!(committed, Committed::Sent);
         assert!(fetched.is_some(), "the fetch was answered");
         drop(fetched);
@@ -1646,7 +1715,7 @@ mod tests {
             let receipts_by = Instant::now() + wait;
             let committed =
                 commit_attempts_by(&path, who, vec![attempt()], &Pinned::Unpinned, receipts_by);
-            let fetched = fetch_with_receipts(&path, fetch(), receipts_by).is_some();
+            let fetched = fetch_with_receipts(&path, fetch(), CLAUDE, receipts_by).is_some();
             (committed, fetched)
         })
         .expect("the prompt's receipt work is still waiting");
@@ -1712,7 +1781,7 @@ mod tests {
         );
 
         forget_reports();
-        assert!(fetch_with_receipts(&path, fetch(), Instant::now() + wait).is_none());
+        assert!(fetch_with_receipts(&path, fetch(), CLAUDE, Instant::now() + wait).is_none());
         assert_eq!(
             said(),
             (true, false, false, false),
@@ -1720,7 +1789,7 @@ mod tests {
         );
 
         forget_reports();
-        assert!(fetch_with_receipts(&path, fetch(), Instant::now() + wait).is_none());
+        assert!(fetch_with_receipts(&path, fetch(), CLAUDE, Instant::now() + wait).is_none());
         assert_eq!(
             said(),
             (false, true, false, false),
@@ -1728,7 +1797,7 @@ mod tests {
         );
 
         forget_reports();
-        assert!(fetch_with_receipts(&path, fetch(), Instant::now() + wait).is_none());
+        assert!(fetch_with_receipts(&path, fetch(), CLAUDE, Instant::now() + wait).is_none());
         assert_eq!(
             said(),
             (false, false, true, false),
@@ -1740,7 +1809,7 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&spent).unwrap();
         listener.set_nonblocking(true).unwrap();
         forget_reports();
-        assert!(fetch_with_receipts(&spent, fetch(), Instant::now()).is_none());
+        assert!(fetch_with_receipts(&spent, fetch(), CLAUDE, Instant::now()).is_none());
         assert_eq!(
             said(),
             (true, false, false, false),
@@ -1752,7 +1821,7 @@ mod tests {
         );
 
         forget_reports();
-        report_committed(Committed::TimedOut);
+        report_committed(Committed::TimedOut, CLAUDE);
         assert_eq!(
             said(),
             (false, false, false, true),
@@ -1761,11 +1830,11 @@ mod tests {
         // A withheld commit and a commit's lost connection say their own
         // notices, not the fetch's (PR #1817 review 4347326613).
         forget_reports();
-        report_committed(Committed::Withheld);
+        report_committed(Committed::Withheld, CLAUDE);
         assert_eq!(said(), (false, false, false, false), "a withheld commit");
         assert!(crate::inbox_oneshot::reported_commit_unsupported());
         forget_reports();
-        report_committed(Committed::Lost);
+        report_committed(Committed::Lost, CLAUDE);
         assert_eq!(
             said(),
             (false, false, false, false),

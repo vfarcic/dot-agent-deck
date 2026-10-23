@@ -8524,6 +8524,13 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 - **Does not assert:** the hook process's stdout (inbox/claude/019).
 - **Platform coverage:** mac+linux+windows.
 
+##### inbox/receipt/031 — The receipts gate serves each sender only as its answer names it.
+- **Layer:** Fast (`src/inbox_oneshot.rs`), `serves_receipts` on parsed answers and `Connection::open_receipts_within` against a stand-in deck (PRD #1666 part 3, H4).
+- **Agent:** none.
+- **Asserts:** part 2's answer (`one_shot_receipts` 1, no senders), this deck's (the four senders) and a later deck's naming an unknown sender all serve Claude Code's waiter and hook; Codex's hooks and the CLI are served only where the answer names them, so part 2's deck is `Unsupported` for them; an unknown sender name parses; Codex's notices name `hooks install --agent codex` and never `claude-code`, and Claude Code's are unchanged.
+- **Does not assert:** the callers' handling (`inbox/codex/023`, `inbox/cli/006`).
+- **Platform coverage:** mac+linux.
+
 #### Protocol and waiter lifecycle
 
 ##### inbox/protocol/001 — Inbox verbs require an attested caller.
@@ -8668,7 +8675,7 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 ##### inbox/cli/001 — In-pane fetch frames the task, acknowledges it and updates list.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), real CLI launched inside a daemon-owned scripted pane.
 - **Agent:** none (shell stand-in that waits for a fixture sentinel before fetching).
-- **Asserts:** list shows Queued before fetch; fetch prints the session framing and complete message block; wire list and CLI list show Acknowledged afterward.
+- **Asserts:** list shows Queued before fetch; fetch prints the session framing and complete message block, its opener naming the attempt it was handed (`delivery 1.1`, PRD #1666 part 3, H4); wire list and CLI list show Acknowledged afterward.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/cli/002 — Claude Once waiter wakes with exit two and stderr.
@@ -8696,6 +8703,20 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 - **Asserts:** the CLI sends exactly one `inbox_fetch`, naming the doorbell's message and not acknowledging; the hook asks `inbox_receipts`, then sends one `inbox_receipt_fetch` naming it with `hook_integration: 1`, no legacy `inbox_fetch` and no `inbox_list`, and prints the fetched block once its `may` is granted.
 - **Platform coverage:** mac+linux.
 #### Fixed doorbell
+
+##### inbox/cli/006 — A model-run fetch is a one-shot receiver that never shows a cap.
+- **Layer:** Fast (`src/inbox_cli.rs`), `fetch_one_shot` against stand-in decks (`inbox_oneshot::tests::stand_in_deck`) and writers that take nothing, a prefix, or everything with a failing flush (PRD #1666 part 3, H4).
+- **Agent:** none.
+- **Asserts:** against a serving deck, plain and `--json` output print two messages and commit both exact attempts; the JSON carries exactly `id`, `subject`, `from` and `text`; neither known cap string is in stdout, stderr or any line sent to the deck; zero bytes reports both `not_handed` and says nothing was printed; a prefix or a failed flush reports `handed`, not committed, and says the output was cut short; a revoke arriving between the grant and the output prints nothing and reports `not_handed`; a silent deck is `CLI_RECEIPTS_TIMED_OUT`, part 2's deck (receipts 1, no CLI named) `CLI_RECEIPTS_UNSUPPORTED`, each sent only the question; a deck that answers the question and never the fetch is `CLI_FETCH_TIMED_OUT`, whose words differ and do not say nothing was taken.
+- **Does not assert:** the real binary against the real daemon (`inbox/codex/020`, `inbox/boundary/054`), or a real spool's records (`inbox/codex/020`).
+- **Platform coverage:** mac+linux.
+
+##### inbox/codex/023 — Codex's hooks and `inbox fetch` take nothing from an older daemon.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), the real Codex hook CLI and `inbox fetch` (plain and `--json`) against a stand-in 0.47.0 hook endpoint (answers nothing it cannot decode) and a stand-in part-2 endpoint (`one_shot_receipts` 1 naming no sender, refusing the CLI on the receipt verb, serving any other hook fetch), the e2e-only `DOT_AGENT_DECK_INBOX_TEST_RECEIPTS_WAIT_MS` knob (PRD #1666 part 3, H4).
+- **Agent:** none (`cat` stand-in supplies the pane identity).
+- **Asserts:** Codex's doorbell, committing and Stop hooks and both fetches each ask `inbox_receipts`, send no mail verb, print no message and exit 1; the hooks say the `RECEIPTS_*` notice in Codex's words (`hooks install --agent codex`, never `claude-code`), the fetches the `CLI_*` notice, a timeout at 0.47.0 and not-supported at part 2's; an older binary's fetch (the `none` integration knob) still takes the message afterwards.
+- **Does not assert:** a real 0.47 or part-2 binary.
+- **Platform coverage:** mac+linux.
 
 The typed-delivery entries `orchestration/delegate/040–041` and `orchestration/work-done/010` are retired; their attached draft and arrival-order outcomes now live in `inbox/doorbell/009–012`. `scheduler/dispatch/023` is rewritten in the binary harness. Terminal-report filtering is retained as a control there.
 
@@ -9307,11 +9328,39 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** a real waiter binary or Claude's settings (inbox/claude/020).
 - **Platform coverage:** mac+linux.
 
+##### inbox/boundary/049 — Every hook receiver below the integration floor is refused before issue.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), `serve_hook` over in-memory duplexes, a real spool (PRD #1666 part 3, H4).
+- **Agent:** none.
+- **Asserts:** Claude Code's prompt hook, Codex's prompt hook and Stop, and a model-run fetch served as Devin's or an unknown agent's hook, each declaring no or a lower `HOOK_INTEGRATION`, are refused `hooks_too_old` with no batch; no attempt is issued and the task stays queued; an agent's own hook raises the `hooks_too_old` notice, a model-run fetch leaves the card without one.
+- **Does not assert:** the daemon's routing to `serve_hook` (`inbox/claude/031`, `inbox/codex/023`).
+- **Platform coverage:** all.
+
+##### inbox/boundary/050 — A fetch that dies after publishing its receipt is settled late.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), `serve_hook` over an in-memory duplex, a real spool (PRD #1666 part 3, H4).
+- **Agent:** none.
+- **Asserts:** a model-run fetch is issued a task, its committed receipt is published on the attempt's own cap, and its connection closes with no control; the clock finds the receipt and the task is acknowledged.
+- **Does not assert:** the sender correction a late commit of an already uncertain task makes.
+- **Platform coverage:** all.
+
 ##### inbox/boundary/051 — A batch line whose newline never went is not handed.
 - **Layer:** Fast (`src/inbox_engine_tests.rs`), `serve_waiter` writing to a scripted writer.
 - **Agent:** none.
 - **Asserts:** a once batch line of which the connection took no byte, or a prefix without its newline, makes its attempt `NotHanded` and the task queued again, handed to the next waiter unmarked; one taken whole whose flush failed leaves the attempt `Fenced` (possibly handed), the message attempting and its inbox copy not queued.
 - **Does not assert:** a real socket's partial writes.
+- **Platform coverage:** mac+linux.
+
+##### inbox/boundary/053 — Hook receivers are request-bound and take no held mail.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), `serve_hook` and a Pi `serve_waiter` stream over in-memory duplexes, a real spool (PRD #1666 part 3, H4).
+- **Agent:** none.
+- **Asserts:** empty Codex prompt, Stop and model-run fetches leave no receiver record; of a Codex Stop and a fetch racing one task exactly one is issued it; a task posted while a hook holds its batch is not pushed to it over five clock passes, and a fetch beside it takes only that task; neither is counted as an armed waiter (`armed`, the doorbell's facts); both commit and settle, and closed hooks are pruned; beside a Pi stream that holds its task, a fetch is issued nothing.
+- **Does not assert:** the `MAX_LIVE_HOOKS` bound itself (`inbox/attempts/031`), or a full stream queue on an interleaving.
+- **Platform coverage:** all.
+
+##### inbox/boundary/054 — A Devin pane's model-run fetch is a one-shot receiver.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_boundary.rs`), real daemon, the real `inbox fetch` CLI run with the pane's identity and receipt spool (PRD #1666 part 3, H4).
+- **Agent:** python stand-in spawned with agent type Devin, which reports Idle through Devin's status hook and has no inbox hooks.
+- **Asserts:** the doorbell is typed and submitted; a fetch whose stdout is closed before its first byte exits non-zero with `CLI_NOTHING_PRINTED` and the task is queued again at once; a second fetch prints the block naming its attempt, and the task is acknowledged by its receipt (`ack_how` `plugin_confirmed`).
+- **Does not assert:** a real Devin, whose live inbox delivery is unverified (#1348).
 - **Platform coverage:** mac+linux.
 
 ##### inbox/boundary/052 — A newer waiter supersedes, and a spent one takes nothing.
@@ -9788,7 +9837,7 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/claude/028 — Newer Claude hooks take nothing from an older daemon.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), the real waiter and prompt-hook CLI children against a stand-in 0.47.0 hook endpoint (hands its one message to the first legacy `inbox_wait`/`inbox_fetch`, answers nothing to a verb it cannot decode), the e2e-only `DOT_AGENT_DECK_INBOX_TEST_RECEIPTS_WAIT_MS` knob.
 - **Agent:** none (no credential).
-- **Asserts:** the once-waiter, the prompt hook answering a doorbell and the prompt hook submitting a waiter's whole block each send `inbox_receipts` and nothing that could take or commit mail (no `inbox_wait`, `inbox_fetch`, receipt verb, `inbox_committed` or `ack`), print nothing of the message, exit 1 and say on stderr that the deck did not answer in time (an older daemon does not answer, naming `hooks install --agent claude-code`): `RECEIPTS_TIMED_OUT` for the waiter and the doorbell hook, `RECEIPTS_COMMIT_TIMED_OUT` for the committing hook, which promises nothing queued; none says `RECEIPTS_UNSUPPORTED`'s "most likely older"; a legacy `inbox fetch` afterwards still takes and prints the message (wire audit W03–W06).
+- **Asserts:** the once-waiter, the prompt hook answering a doorbell and the prompt hook submitting a waiter's whole block each send `inbox_receipts` and nothing that could take or commit mail (no `inbox_wait`, `inbox_fetch`, receipt verb, `inbox_committed` or `ack`), print nothing of the message, exit 1 and say on stderr that the deck did not answer in time (an older daemon does not answer, naming `hooks install --agent claude-code`): `RECEIPTS_TIMED_OUT` for the waiter and the doorbell hook, `RECEIPTS_COMMIT_TIMED_OUT` for the committing hook, which promises nothing queued; none says `RECEIPTS_UNSUPPORTED`'s "most likely older"; an older binary's `inbox fetch` afterwards (the `none` integration knob; this build's asks first, `inbox/codex/023`) still takes and prints the message (wire audit W03–W06).
 - **Does not assert:** a real 0.47.0 binary, or the desktop's or TUI's attach refusal (inbox/claude/032).
 - **Platform coverage:** mac+linux.
 
@@ -9809,7 +9858,7 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/claude/031 — The deck answers its receipt support and refuses what the receipt verbs do not serve.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), raw requests from a process inside a scripted Claude parent's tree to the real daemon.
 - **Agent:** none (synthetic Claude parent; no credential).
-- **Asserts:** `inbox_receipts` is answered with `one_shot_receipts` 1; `inbox_receipt_wait` from a Codex component or for a stream, and `inbox_receipt_fetch` from the CLI or bound to a stream, are each refused `unsupported` with no messages, and a task queued beforehand stays queued.
+- **Asserts:** `inbox_receipts` is answered with `one_shot_receipts` 1 and `one_shot_senders` `claude_waiter`, `claude_hooks`, `codex_hooks`, `cli`; `inbox_receipt_wait` from a Codex component or for a stream, and `inbox_receipt_fetch` naming a stream's or the waiter's component or bound to a stream, are each refused `unsupported` with no messages, and a task queued beforehand stays queued. Since PRD #1666 part 3's H4 the CLI's receipt fetch is served (`inbox/codex/020`).
 - **Does not assert:** the served paths, which the real waiter and hook take in inbox/claude/016–/020.
 - **Platform coverage:** mac+linux.
 
@@ -10029,18 +10078,32 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** Cross-version compatibility.
 - **Platform coverage:** mac+linux.
 
-##### inbox/codex/007 — Stop blocks with framed inbox content within 6000 bytes and keeps overflow queued.
-- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`).
-- **Agent:** none (real Codex hook CLI).
-- **Asserts:** Busy Stop emits decision:block with a bounded framed reason, acknowledges handed-over ids, retains overflow and prints no block once empty; no PTY input is used.
-- **Does not assert:** Real Codex compliance with the reason.
+##### inbox/codex/018 — Codex's doorbell prompt hook hands over on receipts within its byte budget.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`), the real Codex hook CLI with the pane's identity and receipt spool (PRD #1666 part 3, H4; replaces inbox/codex/008).
+- **Agent:** none (real Codex hook CLI, wrapped stand-in Codex).
+- **Asserts:** with four token-dense tasks queued, some of them with quotes and backslashes, the doorbell's UserPromptSubmit prints one JSON line of at most 6000 UTF-8 bytes, escaping included, whose additionalContext carries a bounded subset, each block naming its attempt; those are acknowledged by their receipts (`ack_how` `plugin_confirmed`, one delivery) and the rest stay queued, never issued; the human prompt history and the ✉ card label are kept.
+- **Does not assert:** a real Codex reading it (`inbox/codex/009`).
 - **Platform coverage:** mac+linux.
 
-##### inbox/codex/008 — Codex doorbell submission injects and acknowledges content within its byte budget.
-- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`).
-- **Agent:** none (real Codex hook CLI).
-- **Asserts:** Doorbell UserPromptSubmit returns additionalContext within 6000 UTF-8 bytes, acknowledges handed-over ids, retains overflow and preserves human history while labelling the event with ✉.
-- **Does not assert:** A sandboxed model shell fetch; trusted hooks run outside the sandbox.
+##### inbox/codex/019 — Codex's Stop hands over on receipts and keeps overflow unissued.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`), the real Codex hook CLI with the pane's identity and receipt spool (PRD #1666 part 3, H4; replaces inbox/codex/007).
+- **Agent:** none (real Codex hook CLI, wrapped stand-in Codex).
+- **Asserts:** busy Stop prints a `decision: block` JSON line of at most 6000 bytes with a bounded subset, each block naming its attempt, settled by receipt with one delivery; the rest are never issued until later Stops take each once; an empty Stop prints nothing; nothing is typed into the pane.
+- **Does not assert:** real Codex compliance with the reason (`inbox/codex/011`).
+- **Platform coverage:** mac+linux.
+
+##### inbox/codex/020 — With untrusted hooks, a model-run fetch commits on receipts.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`), the real `inbox fetch` CLI with the pane's identity and receipt spool (PRD #1666 part 3, H4).
+- **Agent:** none (no deck hook runs; wrapped stand-in Codex).
+- **Asserts:** the doorbell is typed; a stand-in model's `inbox fetch` prints the framing and the block naming its attempt, exits 0, and the task is settled by its receipt with the card not degraded; with the generation's receipt records directory made read-only, a second fetch still prints and settles its task and the record's `receipts_degraded` names the receipt.
+- **Does not assert:** Codex's real sandbox (`inbox/codex/022`).
+- **Platform coverage:** mac+linux.
+
+##### inbox/codex/021 — Prompt hook off, Stop on: each task is handed over and settled once.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`), the real Codex Stop hook and `inbox fetch` CLI (PRD #1666 part 3, H4).
+- **Agent:** none (wrapped stand-in Codex; its prompt hook is never run).
+- **Asserts:** an idle task reaches the model through the doorbell and a model-run fetch; a busy task through Stop; a Stop and a fetch run at once over two queued tasks print each exactly once between them; every task is settled by its receipt with one delivery.
+- **Does not assert:** a real Codex (`inbox/codex/011`, `/022`).
 - **Platform coverage:** mac+linux.
 
 ### Test harness: Claude Code prompt submission
@@ -10795,6 +10858,14 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Asserts:** busy precondition, no doorbell, TurnEndHook hand-over, visible Blocked by hook text, exact sentinel and acknowledgement.
 - **Does not assert:** multiple-message byte budgets (synthetic /007 and /008).
 - **Cost:** two cheap model turns.
+
+##### inbox/codex/022 — Real Codex with its hooks off delivers through a model-run fetch on receipts.
+- **Layer:** L2 real agent, lane 2 (`tests/e2e_inbox_codex_live.rs`), attached interactive PTY (PRD #1666 part 3, H4).
+- **Agent:** Codex 0.160.0, cheap model from `codex_test_model()`, `--sandbox workspace-write` with network access, every deck hook switched off in Codex's trust records, the build under test first on the pane's `PATH`.
+- **Asserts:** the doorbell rings; Codex's model runs `dot-agent-deck inbox fetch` in its own sandbox and that fetch reaches the deck as a hook receiver (`consumer=Cli` in the deck log; a fetch that never arrives fails as UNVERIFIED, not a pass); the sentinel is written once; the task is settled by its receipt; no deck hook fetched.
+- **Does not assert:** a spool write the sandbox denies (`inbox/codex/020`), or Codex showing a failing hook's stderr.
+- **Cost:** one cheap model turn.
+- **Platform coverage:** mac+linux.
 
 ##### inbox/codex/012 — A draft retained after paste-burst Enter prevents all doorbell input.
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`).

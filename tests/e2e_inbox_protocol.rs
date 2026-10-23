@@ -1023,7 +1023,7 @@ fn inbox_protocol_018_a_dispatch_the_deck_has_no_room_to_answer_is_refused() {
     );
 }
 
-/// Scenario: Enqueue a task for a scripted agent pane and release it to run the real inbox fetch command using its injected identity. Its captured output must contain the session framing and complete message block; both the wire listing and inbox list CLI must show Acknowledged.
+/// Scenario: Enqueue a task for a scripted agent pane and release it to run the real inbox fetch command using its injected identity. Its captured output must contain the session framing and the complete message block, naming the attempt it was handed; both the wire listing and inbox list CLI must show Acknowledged.
 #[spec("inbox/cli/001")]
 #[test]
 fn inbox_cli_001_in_pane_fetch_frames_and_acknowledges() {
@@ -1064,7 +1064,7 @@ fn inbox_cli_001_in_pane_fetch_frames_and_acknowledges() {
     assert!(
         text.starts_with(FRAME)
             && text.contains(BODY)
-            && text.contains(&format!("[dot-agent-deck message {id} from "))
+            && text.contains(&format!("[dot-agent-deck message {id} delivery 1.1 from "))
             && text.contains(&format!("[end of dot-agent-deck message {id}]")),
         "framed CLI output: {text}"
     );
@@ -1456,8 +1456,11 @@ fn claude_028_newer_hooks_take_nothing_from_an_older_daemon() {
         &requests,
     );
 
+    // An older dot-agent-deck's `inbox fetch` (this one asks first since
+    // part 3's H4: inbox/codex/023).
     let (output, _) = record_requests(
-        &mut cli(&daemon, Some(&pane), &["inbox", "fetch"]),
+        cli(&daemon, Some(&pane), &["inbox", "fetch"])
+            .env("DOT_AGENT_DECK_INBOX_TEST_HOOK_INTEGRATION", "none"),
         b"",
         &daemon.home.join("older-fetch.sock"),
         older,
@@ -1468,6 +1471,155 @@ fn claude_028_newer_hooks_take_nothing_from_an_older_daemon() {
         String::from_utf8_lossy(&output.stdout).contains(body),
         "and prints it: {output:?}"
     );
+}
+
+/// Scenario: Point Codex's prompt hook answering a doorbell, its prompt hook submitting a whole block, its Stop hook, and the plain and `--json` `inbox fetch` at a stand-in 0.47.0 daemon, which answers nothing it cannot decode, and at a stand-in for part 2's daemon, which answers `one_shot_receipts` 1 naming no other sender and serves the receipt verbs to Claude Code alone. Each asks, sends nothing that could take or commit mail, prints no message, exits 1 and says why in its own words: Codex's name `hooks install --agent codex`, the fetch's tell the model to restart the daemon on this release; no answer is a timeout and part 2's answer is not support. The message is still there for an older binary's fetch.
+#[spec("inbox/codex/023")]
+#[test]
+fn codex_023_codex_hooks_and_the_fetch_take_nothing_from_an_older_daemon() {
+    use dot_agent_deck::inbox_cli::{CLI_RECEIPTS_TIMED_OUT, CLI_RECEIPTS_UNSUPPORTED};
+    use dot_agent_deck::inbox_oneshot::{
+        RECEIPTS_COMMIT_TIMED_OUT, RECEIPTS_COMMIT_UNSUPPORTED, RECEIPTS_TIMED_OUT,
+        RECEIPTS_UNSUPPORTED, notice_for,
+    };
+    let codex = dot_agent_deck::event::InboxOneShotSender::CodexHooks;
+    let daemon = daemon();
+    let pane = pane(&daemon, "older-daemon-codex", "exec /bin/cat");
+    let id = "m-k3xzq2ab-0f3c9a71d2e4b850";
+    let body = "older-daemon codex body 3a77";
+    let block = format!(
+        "[dot-agent-deck message {id} from the orchestrator]\n{body}\n[end of dot-agent-deck message {id}]"
+    );
+    let taken = Cell::new(false);
+    let hand = |taken: &Cell<bool>| {
+        if taken.replace(true) {
+            json!({"messages":[]})
+        } else {
+            json!({"messages":[{"id":id, "subject":"task", "from":"the orchestrator",
+                "text":block}]})
+        }
+    };
+    // 0.47.0: the legacy verbs only; nothing else is decoded or answered.
+    let v047 = |request: &Value| match request["message_type"].as_str() {
+        Some("inbox_wait" | "inbox_fetch") => Some(hand(&taken)),
+        _ => None,
+    };
+    // Part 2's daemon: receipts for Claude Code alone. It refuses the CLI on
+    // the receipt verb, and serves any other hook fetch as Claude Code's.
+    let part2 = |request: &Value| match request["message_type"].as_str() {
+        Some("inbox_receipts") => Some(json!({"one_shot_receipts":1})),
+        Some("inbox_receipt_fetch") if request["consumer"] == "cli" => {
+            Some(json!({"refused":"unsupported"}))
+        }
+        Some("inbox_receipt_fetch") => Some(hand(&taken)),
+        Some("inbox_wait" | "inbox_fetch") => Some(hand(&taken)),
+        _ => None,
+    };
+    let quick = [("DOT_AGENT_DECK_INBOX_TEST_RECEIPTS_WAIT_MS", "300")];
+    let doorbell = json!({"session_id":"older-codex", "hook_event_name":"UserPromptSubmit",
+        "prompt":format!("dot-agent-deck: message {id} waiting, run: dot-agent-deck inbox fetch"),
+        "cwd":daemon.home})
+    .to_string();
+    let whole = json!({"session_id":"older-codex", "hook_event_name":"UserPromptSubmit",
+        "prompt":format!("[dot-agent-deck message {id} delivery 1.1 from the orchestrator]\n{body}\n[end of dot-agent-deck message {id}]"),
+        "cwd":daemon.home})
+    .to_string();
+    let stop = json!({"session_id":"older-codex", "hook_event_name":"Stop", "cwd":daemon.home})
+        .to_string();
+    let run = |what: &str, args: &[&str], stdin: &str, deck: &dyn Fn(&Value) -> Option<Value>| {
+        record_requests(
+            cli(&daemon, Some(&pane), args).envs(quick),
+            stdin.as_bytes(),
+            &daemon.home.join(format!("{}.sock", what.replace(' ', "-"))),
+            deck,
+        )
+    };
+    for (deck, older, fetch_notice, notice, commit_notice) in [
+        (
+            "0.47.0",
+            &v047 as &dyn Fn(&Value) -> Option<Value>,
+            CLI_RECEIPTS_TIMED_OUT,
+            notice_for(RECEIPTS_TIMED_OUT, codex).into_owned(),
+            notice_for(RECEIPTS_COMMIT_TIMED_OUT, codex).into_owned(),
+        ),
+        (
+            "part 2",
+            &part2 as &dyn Fn(&Value) -> Option<Value>,
+            CLI_RECEIPTS_UNSUPPORTED,
+            notice_for(RECEIPTS_UNSUPPORTED, codex).into_owned(),
+            notice_for(RECEIPTS_COMMIT_UNSUPPORTED, codex).into_owned(),
+        ),
+    ] {
+        for (what, args, stdin, said) in [
+            (
+                "codex doorbell hook",
+                &["hook", "--agent", "codex"][..],
+                doorbell.as_str(),
+                notice.as_str(),
+            ),
+            (
+                "codex committing hook",
+                &["hook", "--agent", "codex"][..],
+                whole.as_str(),
+                commit_notice.as_str(),
+            ),
+            (
+                "codex stop hook",
+                &["hook", "--agent", "codex"][..],
+                stop.as_str(),
+                notice.as_str(),
+            ),
+            ("plain fetch", &["inbox", "fetch"][..], "", fetch_notice),
+            (
+                "json fetch",
+                &["inbox", "fetch", "--json"][..],
+                "",
+                fetch_notice,
+            ),
+        ] {
+            let what = format!("{what} at {deck}");
+            let (output, requests) = run(&what, args, stdin, older);
+            assert_eq!(output.status.code(), Some(1), "{what}: {output:?}");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains(said), "{what} says why: {stderr}");
+            assert!(
+                !stderr.contains("--agent claude-code"),
+                "{what} names no Claude Code remedy: {stderr}"
+            );
+            assert!(
+                requests
+                    .iter()
+                    .any(|r| r["message_type"] == "inbox_receipts"),
+                "{what} asks: {requests:?}"
+            );
+            for request in &requests {
+                let verb = request["message_type"].as_str().unwrap_or_default();
+                assert!(
+                    !MAIL_VERBS.contains(&verb),
+                    "{what} sent {verb}: {requests:?}"
+                );
+            }
+            assert!(!taken.get(), "{what} took the message");
+            assert!(
+                !String::from_utf8_lossy(&output.stdout).contains(body),
+                "{what} handed nothing over: {output:?}"
+            );
+        }
+        assert!(
+            notice.contains("hooks install --agent codex"),
+            "Codex's remedy: {notice}"
+        );
+    }
+    let (output, _) = record_requests(
+        cli(&daemon, Some(&pane), &["inbox", "fetch"])
+            .env("DOT_AGENT_DECK_INBOX_TEST_HOOK_INTEGRATION", "none"),
+        b"",
+        &daemon.home.join("older-codex-fetch.sock"),
+        v047,
+    );
+    success(&output);
+    assert!(taken.get(), "an older binary's fetch still takes it");
+    assert!(String::from_utf8_lossy(&output.stdout).contains(body));
 }
 
 /// Scenario: Submit one prompt to Claude Code's prompt hook that carries both a waiter's whole block and a doorbell for a second message, against a stand-in for a 0.47.0 daemon that answers nothing it cannot decode. The hook asks whether the deck serves receipts once, not once for the commit and again for the doorbell's fetch, sends nothing that could take or commit mail, and exits 1 saying, once, that the deck did not answer in time, in the commit's words, which promise nothing queued, and not the fetch's.

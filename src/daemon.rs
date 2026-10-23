@@ -5728,9 +5728,46 @@ impl Drop for IngestTicket {
 
 /// The budget a fetch asked for: `max_bytes` when set, else `max_chars`.
 fn fetch_budget(req: &crate::event::InboxFetchRequest) -> Option<crate::event::InboxBudget> {
-    req.max_bytes
-        .map(crate::event::InboxBudget::Bytes)
+    req.max_json_bytes
+        .map(crate::event::InboxBudget::JsonBytes)
+        .or(req.max_bytes.map(crate::event::InboxBudget::Bytes))
         .or(req.max_chars.map(crate::event::InboxBudget::Chars))
+}
+
+/// PRD #1666 part 3 (H4): the hook component an `inbox_receipt_fetch` is
+/// served as, or `None` when the receipt verb does not serve it (it is
+/// refused `unsupported`, nothing issued). A hook names its component, and one
+/// without it is Claude Code's prompt hook (part 2's); only Claude Code's and
+/// Codex's hooks fetch this way. A model-run `inbox fetch` names none: it is
+/// served as the hook of the generation's agent, `agent`, the spawn's type
+/// else the one its hooks reported (a routing hint for the budget and the
+/// log, not authority: the fetch is admitted like any other). A fetch a
+/// stream bound (`rx`) is that stream's doorbell substitution, on the legacy
+/// verb, never this one.
+fn receipt_fetch_component(
+    req: &crate::event::InboxFetchRequest,
+    agent: Option<crate::event::AgentType>,
+) -> Option<crate::event::InboxComponent> {
+    use crate::event::{AgentType, InboxComponent, InboxFetchConsumer};
+    if req.rx.is_some() {
+        return None;
+    }
+    match req.consumer {
+        InboxFetchConsumer::Cli => Some(match agent {
+            Some(AgentType::ClaudeCode) => InboxComponent::ClaudeHooks,
+            Some(AgentType::Codex) => InboxComponent::CodexHooks,
+            Some(AgentType::Devin) => InboxComponent::DevinHooks,
+            _ => InboxComponent::Other,
+        }),
+        InboxFetchConsumer::DoorbellHook | InboxFetchConsumer::TurnEndHook => {
+            match req.component.unwrap_or(InboxComponent::ClaudeHooks) {
+                component @ (InboxComponent::ClaudeHooks | InboxComponent::CodexHooks) => {
+                    Some(component)
+                }
+                _ => None,
+            }
+        }
+    }
 }
 
 fn handle_inbox_fetch(
@@ -6356,6 +6393,8 @@ async fn run_hook_loop_with_limits(
                                         one_shot_receipts: Some(
                                             crate::inbox_hub::ONE_SHOT_RECEIPTS,
                                         ),
+                                        one_shot_senders: crate::inbox_hub::ONE_SHOT_SENDERS
+                                            .to_vec(),
                                         ..crate::event::InboxWaitReply::default()
                                     };
                                     if let Ok(json) = serde_json::to_string(&reply) {
@@ -6548,20 +6587,27 @@ async fn run_hook_loop_with_limits(
                                     let Some(agent_id) = attested_agent else {
                                         continue;
                                     };
-                                    // Part 2 §2.4, §2.7: a Claude hook's fetch is
-                                    // a one-shot receiver of its own, held on
+                                    // Part 2 §2.4, §2.7: a hook's fetch is a
+                                    // one-shot receiver of its own, held on
                                     // this connection for its controls; below
                                     // the integration floor nothing is issued
                                     // ([`crate::inbox_hub::serve_hook`]). On the
                                     // receipt verb it says so itself; a legacy
-                                    // fetch is routed. Until H4, only a hook's
-                                    // fetch that no stream bound is served on
-                                    // receipts.
+                                    // fetch is routed. PRD #1666 part 3 (H4):
+                                    // Claude Code's and Codex's hooks and a
+                                    // model-run `inbox fetch` are served on
+                                    // receipts; a fetch a stream bound is not.
+                                    let mut component = crate::event::InboxComponent::ClaudeHooks;
                                     let route = if receipt_verb {
-                                        if req.rx.is_some()
-                                            || req.consumer
-                                                == crate::event::InboxFetchConsumer::Cli
-                                        {
+                                        let served = receipt_fetch_component(
+                                            &req,
+                                            pty_registry
+                                                .spawn_agent_type(&agent_id)
+                                                .or_else(|| {
+                                                    pty_registry.reported_agent_type(&agent_id)
+                                                }),
+                                        );
+                                        let Some(served) = served else {
                                             let reply = crate::event::InboxWaitReply::refused(
                                                 INBOX_RECEIPT_UNSUPPORTED,
                                                 INBOX_RECEIPT_UNSUPPORTED_MESSAGE,
@@ -6573,7 +6619,8 @@ async fn run_hook_loop_with_limits(
                                                 let _ = write_half.flush().await;
                                             }
                                             continue;
-                                        }
+                                        };
+                                        component = served;
                                         HookRoute::OneShot
                                     } else {
                                         route_hook_fetch(
@@ -6616,7 +6663,7 @@ async fn run_hook_loop_with_limits(
                                             hub,
                                             req.pane_id.clone(),
                                             agent_id,
-                                            crate::event::InboxComponent::ClaudeHooks,
+                                            component,
                                             crate::inbox_hub::HookFetch {
                                                 named: req
                                                     .doorbell
@@ -6624,6 +6671,7 @@ async fn run_hook_loop_with_limits(
                                                     .filter(|id| crate::inbox::is_valid_message_id(id)),
                                                 budget: fetch_budget(&req),
                                                 hook_integration: req.hook_integration,
+                                                consumer: req.consumer,
                                             },
                                             reader,
                                             write_half,
