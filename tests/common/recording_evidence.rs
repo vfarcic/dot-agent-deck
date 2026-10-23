@@ -297,7 +297,7 @@ fn empty_session(path: &Path) -> Value {
 }
 
 /// Bounded JSONL records; an oversized record is drained without retaining its
-/// bytes. I/O errors preserve earlier observations but explicitly mark a gap.
+/// bytes. I/O errors and partial EOF records explicitly mark a gap.
 pub(crate) fn collect_session_records(
     mut reader: impl BufRead,
     mut skip_first: bool,
@@ -307,7 +307,16 @@ pub(crate) fn collect_session_records(
     let mut oversized = false;
     loop {
         let chunk = match reader.fill_buf() {
-            Ok([]) => break,
+            Ok([]) => {
+                if !skip_first
+                    && !oversized
+                    && !line.is_empty()
+                    && !collect_session_record(&line, result)
+                {
+                    result["truncated"] = json!(true);
+                }
+                break;
+            }
             Ok(chunk) => chunk,
             Err(error) => {
                 result["read_error"] = json!(error.kind().to_string());
@@ -330,31 +339,39 @@ pub(crate) fn collect_session_records(
         if end.is_none() {
             continue;
         }
-        if !skip_first
-            && !oversized
-            && let Ok(record) = serde_json::from_slice::<Value>(&line)
-        {
-            for (source, target) in [
-                ("sessionId", "session_id"),
-                ("version", "version"),
-                ("permissionMode", "permissionMode"),
-            ] {
-                if let Some(value) = record[source].as_str() {
-                    result[target] = json!(value);
-                }
-            }
-            if let Some(mode) = record["permissionMode"].as_str() {
-                push_distinct(&mut result["permission_modes"], mode);
-            }
-            if let Some(model) = record["message"]["model"].as_str() {
-                result["model"] = json!(model);
-                push_distinct(&mut result["models"], model);
-            }
+        if !skip_first && !oversized {
+            collect_session_record(&line, result);
         }
         skip_first = false;
         oversized = false;
         line.clear();
     }
+}
+
+fn collect_session_record(line: &[u8], result: &mut Value) -> bool {
+    let Ok(record) = serde_json::from_slice::<Value>(line) else {
+        return false;
+    };
+    if !record.is_object() {
+        return false;
+    }
+    for (source, target) in [
+        ("sessionId", "session_id"),
+        ("version", "version"),
+        ("permissionMode", "permissionMode"),
+    ] {
+        if let Some(value) = record[source].as_str() {
+            result[target] = json!(value);
+        }
+    }
+    if let Some(mode) = record["permissionMode"].as_str() {
+        push_distinct(&mut result["permission_modes"], mode);
+    }
+    if let Some(model) = record["message"]["model"].as_str() {
+        result["model"] = json!(model);
+        push_distinct(&mut result["models"], model);
+    }
+    true
 }
 
 fn push_distinct(values: &mut Value, value: &str) {
