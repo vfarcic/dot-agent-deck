@@ -756,6 +756,8 @@ pub struct TuiDeck {
     child: Box<dyn Child + Send + Sync>,
     tempdir: tempfile::TempDir,
     home: PathBuf,
+    /// HOME after builder overrides, for session metadata from the actual child.
+    effective_home: PathBuf,
     hook_socket: PathBuf,
     attach_socket: PathBuf,
     /// The final attach override, exactly as the deck was launched with it.
@@ -1411,9 +1413,20 @@ impl TuiDeck {
                 if path.is_absolute() {
                     path
                 } else {
-                    work.join(path)
+                    launch_dir.join(path)
                 }
             });
+        let effective_home = final_env
+            .get("HOME")
+            .map(PathBuf::from)
+            .map(|path| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    launch_dir.join(path)
+                }
+            })
+            .unwrap_or_else(|| home.clone());
         for (k, v) in final_env {
             cmd.env(k, v);
         }
@@ -1517,6 +1530,7 @@ impl TuiDeck {
             child,
             tempdir,
             home,
+            effective_home,
             hook_socket,
             attach_socket,
             teardown_attach_socket,
@@ -2741,7 +2755,7 @@ impl Drop for TuiDeck {
             let _ = h.join();
         }
 
-        let has_claude_sessions = self.home.join(".claude/projects").is_dir();
+        let has_claude_sessions = recording_evidence::has_claude_sessions(&self.effective_home);
         let should_dump = panicking || self.record_on_success;
         if should_dump {
             // The flat files are the current reel-compatible recording. The
@@ -2777,9 +2791,9 @@ impl Drop for TuiDeck {
             // Successful real-Claude runs retain metadata even without an
             // opt-in cast. Missing transcript observations remain explicit.
             let dir = workspace_recordings_root().join(sanitize_test_name(&self.test_name));
-            if let Err(error) = std::fs::create_dir_all(&dir)
-                .and_then(|()| self.write_provenance(&dir, outcome, &self.artifact_redactions()))
-            {
+            if let Err(error) = recording_evidence::publish_recording(&dir, || {
+                self.write_provenance(&dir, outcome, &self.artifact_redactions())
+            }) {
                 eprintln!("[tui-harness] failed to write Claude provenance to {dir:?}: {error}");
             }
         }
@@ -3246,16 +3260,14 @@ impl TuiDeck {
     }
 
     fn dump_recordings(&self, dir: &Path, outcome: RecordingOutcome) -> std::io::Result<()> {
-        std::fs::create_dir_all(dir)?;
+        recording_evidence::publish_recording(dir, || self.dump_recording_files(dir, outcome))
+    }
+
+    fn dump_recording_files(&self, dir: &Path, outcome: RecordingOutcome) -> std::io::Result<()> {
         let redactions = self.artifact_redactions();
 
-        // M4.3: atomic writes for every artifact in the per-test
-        // dir. Two `cargo test-e2e` runs on the same checkout (or one
-        // run racing `cargo xtask docs --tests` against the `.md`)
-        // can land here concurrently for the same test; tempfile +
-        // rename inside the destination directory keeps the
-        // post-rename file either fully old or fully new — never
-        // half-written.
+        // The caller holds the per-test lock across this entire publication;
+        // atomic writes also keep each artifact complete for unlocked readers.
 
         // final-grid.txt
         let grid = redact_known_credentials_text(&self.snapshot_grid(), &redactions);
@@ -3289,8 +3301,8 @@ impl TuiDeck {
         // one), which is not an error. Redacted like every other artifact,
         // because the daemon echoes `gh`'s stderr verbatim.
         if let Some(src) = self.daemon_log_path.as_deref() {
-            match std::fs::read(src) {
-                Ok(bytes) => {
+            match recording_evidence::sandbox_log(src) {
+                Ok(Some(bytes)) => {
                     let redacted = redact_known_credentials_bytes(&bytes, &redactions);
                     atomic_write(&dir.join("daemon.log"), &redacted)?;
                     if outcome == RecordingOutcome::Failed {
@@ -3301,7 +3313,7 @@ impl TuiDeck {
                         );
                     }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(None) => {}
                 Err(e) => return Err(e),
             }
         }
@@ -3312,8 +3324,8 @@ impl TuiDeck {
         // the login-shell capture or the installers took the time. Redacted like
         // the rest; its tail goes to stderr on a failure for the same reason.
         if let Some(src) = self.deck_log_path.as_deref() {
-            match std::fs::read(src) {
-                Ok(bytes) => {
+            match recording_evidence::sandbox_log(src) {
+                Ok(Some(bytes)) => {
                     let redacted = redact_known_credentials_bytes(&bytes, &redactions);
                     atomic_write(&dir.join("deck.log"), &redacted)?;
                     if outcome == RecordingOutcome::Failed {
@@ -3325,7 +3337,7 @@ impl TuiDeck {
                         );
                     }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(None) => {}
                 Err(e) => return Err(e),
             }
         }
@@ -3414,7 +3426,7 @@ impl TuiDeck {
             "run_id": std::env::var("NEXTEST_RUN_ID").unwrap_or_else(|_| "unknown".to_string()),
             "redaction_version": RECORDING_REDACTION_VERSION,
             "recorded_at_unix": recorded_at_unix,
-            "claude_sessions": recording_evidence::claude_session_provenance(&self.home),
+            "claude_sessions": recording_evidence::claude_session_provenance(&self.effective_home),
         });
         let mut bytes = serde_json::to_vec_pretty(&provenance)?;
         bytes.push(b'\n');
@@ -5622,21 +5634,6 @@ pub(crate) fn discard_recording_dir(dir: &Path) {
     recording_evidence::archive_before_discard(dir).unwrap_or_else(|error| {
         panic!("could not discard the previous recording at {}: {error} — refusing to run because its evidence could not be archived", dir.display())
     });
-    for name in RECORDING_ARTIFACTS {
-        let path = dir.join(name);
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => panic!(
-                "could not discard the previous recording at {}: {error} — refusing \
-                 to run, because a STALE artifact that survives this run still \
-                 satisfies the demo-reel adapter's existence check and can be \
-                 published. Delete it (or fix the directory's permissions) and \
-                 re-run",
-                path.display()
-            ),
-        }
-    }
 }
 
 /// Atomic file write: stage `bytes` in a sibling tempfile under

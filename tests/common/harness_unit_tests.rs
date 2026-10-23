@@ -255,6 +255,7 @@ fn recording_retention_waits_for_an_active_publisher() {
 
 /// Scenario: Retention encounters an abandoned old pending archive, a recent pending archive and an old one with a live writer lock.
 /// It reaps only the abandoned copy, then reaps the old live copy once its writer releases the lock.
+#[cfg(unix)]
 #[test]
 fn recording_retention_reaps_stale_pending_copies_without_touching_live_writers() {
     let root = harness_tempdir().unwrap();
@@ -469,6 +470,132 @@ fn recording_provenance_selects_newest_sessions_and_reports_the_file_cap() {
         sessions
             .iter()
             .all(|session| session["collection_truncated"] == true)
+    );
+}
+
+/// Scenario: Transcript collection encounters an oversized JSONL record followed by a normal mode observation, then an I/O failure.
+/// It skips the oversized record, preserves the later observation and explicitly marks the incomplete read.
+#[test]
+fn recording_provenance_bounds_records_and_marks_partial_read_errors() {
+    use std::io::Read;
+    let mut bytes = format!(
+        "{{\"permissionMode\":\"auto\",\"content\":\"{}\"}}\n",
+        "x".repeat(128 * 1024)
+    )
+    .into_bytes();
+    bytes.extend_from_slice(b"{\"permissionMode\":\"default\"}\n");
+    struct FailsAtEnd(std::io::Cursor<Vec<u8>>);
+    impl Read for FailsAtEnd {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.0.read(output)?;
+            if n == 0 {
+                Err(std::io::Error::other("injected transcript read failure"))
+            } else {
+                Ok(n)
+            }
+        }
+    }
+    let mut result = serde_json::json!({"permission_modes": [], "models": []});
+    recording_evidence::collect_session_records(
+        std::io::BufReader::new(FailsAtEnd(std::io::Cursor::new(bytes))),
+        false,
+        &mut result,
+    );
+    assert_eq!(result["permission_modes"], serde_json::json!(["default"]));
+    assert_eq!(result["permissionMode"], "default");
+    assert_eq!(result["truncated"], true);
+    assert!(
+        result["read_error"].is_string(),
+        "read errors must not look like a complete transcript: {result}"
+    );
+}
+
+/// Scenario: A transcript grows after the collector snapshots its length.
+/// Collection stops at the original end offset and cannot observe a later mode appended to the file.
+#[test]
+fn recording_provenance_tail_stops_at_the_snapshot_even_if_the_file_grows() {
+    let snapshot = b"{\"permissionMode\":\"default\"}\n";
+    let mut growing = snapshot.to_vec();
+    growing.extend_from_slice(b"{\"permissionMode\":\"auto\"}\n");
+    let mut result = serde_json::json!({"permission_modes": [], "models": []});
+    recording_evidence::collect_session_tail(
+        std::io::Cursor::new(growing),
+        snapshot.len() as u64,
+        1024,
+        &mut result,
+    );
+    assert_eq!(result["permission_modes"], serde_json::json!(["default"]));
+    assert_eq!(result["permissionMode"], "default");
+}
+
+/// Scenario: A custom log points outside the sandbox, escapes with parent components or uses a symlink to an outside file.
+/// Collection rejects those sources while retaining an ordinary log from the sandbox.
+#[cfg(unix)]
+#[test]
+fn recording_evidence_confines_custom_logs_to_the_sandbox() {
+    let root = harness_tempdir().unwrap();
+    let normal = root.path().join("deck.log");
+    std::fs::write(&normal, "sandbox log").unwrap();
+    assert_eq!(
+        recording_evidence::sandbox_log(&normal).unwrap().unwrap(),
+        b"sandbox log"
+    );
+    let host = Path::new("/etc/hosts");
+    assert!(recording_evidence::sandbox_log(host).unwrap().is_none());
+    let link = root.path().join("linked.log");
+    std::os::unix::fs::symlink(host, &link).unwrap();
+    assert!(recording_evidence::sandbox_log(&link).unwrap().is_none());
+    let escape = root.path().join("../../../../etc/hosts");
+    assert!(recording_evidence::sandbox_log(&escape).unwrap().is_none());
+}
+
+/// Scenario: Concurrent publishers and discarders share a test's recording directory.
+/// Every archived failure keeps its own grid and provenance together, including the final flat recording.
+#[test]
+fn recording_retention_concurrent_publications_never_mix_or_lose_failures() {
+    let root = harness_tempdir().unwrap();
+    let workers: Vec<_> = (0..16)
+        .map(|n| {
+            let dir = root.path().to_owned();
+            std::thread::spawn(move || {
+                if n % 2 == 0 {
+                    discard_recording_dir(&dir);
+                }
+                recording_evidence::publish_recording(&dir, || {
+                    std::fs::write(dir.join("final-grid.txt"), n.to_string())?;
+                    std::thread::yield_now();
+                    std::fs::write(
+                        dir.join("provenance.json"),
+                        serde_json::json!({"outcome":"failed", "session":n}).to_string(),
+                    )
+                })
+                .unwrap();
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    discard_recording_dir(root.path());
+    let mut ids = Vec::new();
+    for run in std::fs::read_dir(root.path().join("runs")).unwrap() {
+        let run = run.unwrap().path();
+        let grid = std::fs::read_to_string(run.join("final-grid.txt")).unwrap();
+        let provenance: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(run.join("provenance.json")).unwrap()).unwrap();
+        assert_eq!(
+            grid.parse::<u64>().unwrap(),
+            provenance["session"].as_u64().unwrap(),
+            "archive mixed two different runs"
+        );
+        ids.push(grid);
+    }
+    ids.sort();
+    ids.dedup();
+    assert_eq!(
+        ids.len(),
+        16,
+        "a concurrent publication lost failed evidence"
     );
 }
 
