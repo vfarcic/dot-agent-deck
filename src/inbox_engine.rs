@@ -766,6 +766,10 @@ fn issue_to(
 ) -> Vec<InboxDelivery> {
     let mut out = Vec::new();
     let mut used = 0usize;
+    // Each block is printed after its separator, the first one too, so a
+    // block is rendered within the budget less that separator: a first block
+    // alone over the budget is cut to fit it whole.
+    let within = budget.map(|budget| budget.less(super::BLOCK_SEPARATOR));
     for id in ids.iter().take(crate::inbox_prompt::MAX_IDS) {
         let Some(message) = st.inbox.get(id, &key.0).cloned() else {
             continue;
@@ -786,7 +790,7 @@ fn issue_to(
             .then(|| generation.model.next_attempt(id))
             .flatten();
         let len = budget.map(|budget| {
-            let text = render_marked(&message, Some(budget), marked, next).text;
+            let text = render_marked(&message, within, marked, next).text;
             budget.measure(&text) + budget.measure(super::BLOCK_SEPARATOR)
         });
         if let (Some(budget), Some(len)) = (budget, len)
@@ -826,7 +830,7 @@ fn issue_to(
             st.inbox.count_receipt_repeat(id, &key.0, &key.1);
         }
         let attempt = one_shot.then_some((issued.a, issued.e));
-        let mut delivery = render_marked(&message, budget, issued.kind.marked(), attempt);
+        let mut delivery = render_marked(&message, within, issued.kind.marked(), attempt);
         used += len.unwrap_or(0);
         delivery.attempt = Some(InboxDeliveryAttempt {
             a: issued.a,
