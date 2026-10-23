@@ -10,9 +10,9 @@
 //!   command line — Codex reads the `OTEL_EXPORTER_OTLP_*` header variables
 //!   from its environment once an exporter is on. Nothing is added when the
 //!   user's Codex configuration names an exporter itself, or the arguments
-//!   already pass an `otel.` override; or when an endpoint carries credentials
-//!   (a `user:password@` or a query string), which the command line would
-//!   show.
+//!   already pass an `otel` override with `-c`/`--config`; or when an
+//!   endpoint carries credentials (a `user:password@` or a query string),
+//!   which the command line would show.
 //! - **Devin** needs an endpoint in its user configuration and does not read
 //!   `OTEL_RESOURCE_ATTRIBUTES`. The shim writes a copy of the user's Devin
 //!   configuration with an `otel` block added — the endpoint of each signal
@@ -166,7 +166,7 @@ fn any_arg(args: &[OsString], matches: impl Fn(&str) -> bool) -> bool {
 /// traces and metrics exporters in `env`, the environment it starts with, or
 /// none — see the module docs.
 pub fn codex_args(args: &[OsString], env: &EnvMap) -> Vec<String> {
-    if sdk_disabled(env) || any_arg(args, |a| a.contains("otel.")) {
+    if sdk_disabled(env) || codex_overrides_otel(args) {
         return Vec::new();
     }
     let Some(home) = codex_home(env) else {
@@ -198,6 +198,32 @@ pub fn codex_args(args: &[OsString], env: &EnvMap) -> Vec<String> {
         ));
     }
     out
+}
+
+/// Whether `args` pass Codex a config override (`-c` / `--config`, in any of
+/// the forms its parser takes) whose key is `otel` or under it. Anything else
+/// that mentions `otel.` — a prompt, a model name, a path — is not one, and
+/// nothing after `--` is an option (issue #1845).
+fn codex_overrides_otel(args: &[OsString]) -> bool {
+    let is_otel = |value: &str| {
+        let key = value.split_once('=').map_or(value, |(key, _)| key).trim();
+        key == "otel" || key.starts_with("otel.")
+    };
+    let mut args = args.iter().map(|a| a.to_string_lossy().into_owned());
+    while let Some(arg) = args.next() {
+        let value = match arg.as_str() {
+            "--" => return false,
+            "-c" | "--config" => args.next(),
+            _ => ["--config=", "-c=", "-c"]
+                .iter()
+                .find_map(|prefix| arg.strip_prefix(prefix))
+                .map(str::to_string),
+        };
+        if value.is_some_and(|v| is_otel(&v)) {
+            return true;
+        }
+    }
+    false
 }
 
 /// The Codex home Codex reads in its environment `env`: its `CODEX_HOME`,
@@ -868,6 +894,45 @@ mod tests {
             "",
             "an unreadable config is left alone"
         );
+    }
+
+    /// Issue #1845: only a Codex config override whose key is `otel` or under
+    /// it is the user's own; `otel.` anywhere else in the arguments is not.
+    #[test]
+    fn codex_reads_otel_overrides_from_its_config_flag_only() {
+        let home = tempfile::tempdir().unwrap();
+        let env = env(&[
+            ("HOME", home.path().to_str().unwrap()),
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://c:4318"),
+        ]);
+        for args in [
+            &["fix the bug in otel.rs"][..],
+            &["--model", "otel.mini"],
+            &["-c", "model=\"otel.mini\""],
+            &["--cd", "/src/otel.d"],
+            &["exec", "--", "-c", "otel.exporter=x"],
+        ] {
+            assert_ne!(
+                codex_args(&os(args), &env),
+                Vec::<String>::new(),
+                "{args:?}"
+            );
+        }
+        for args in [
+            &["-c", "otel.exporter=x"][..],
+            &["-c", " otel.trace_exporter = \"none\""],
+            &["-cotel.exporter=x"],
+            &["-c=otel.exporter=x"],
+            &["--config", "otel.metrics_exporter=x"],
+            &["--config=otel.exporter=x"],
+            &["exec", "-c", "otel={exporter=\"none\"}", "a prompt"],
+        ] {
+            assert_eq!(
+                codex_args(&os(args), &env),
+                Vec::<String>::new(),
+                "{args:?}"
+            );
+        }
     }
 
     /// An endpoint that may carry a credential is not put on a command line.
