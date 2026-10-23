@@ -25,6 +25,8 @@ mod buildlock;
 #[cfg(target_os = "linux")]
 mod buildns;
 #[cfg(target_os = "linux")]
+mod capture;
+#[cfg(target_os = "linux")]
 mod ctl;
 #[cfg(target_os = "linux")]
 mod inner;

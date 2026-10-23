@@ -63,7 +63,7 @@ Publishing reads three values **from the environment** — that is the only cont
 
 Populate them however your environment manages secrets — a direct `export`, a `.env` file, your CI's secret store, or any secret manager. The engine just reads the three variables.
 
-> **Maintainer's setup (one example, not required).** In this repo they are sourced via [`vals`](../../.env.vals.yaml) from GCP Secret Manager: `.env.vals.yaml` maps each var to a `ref+gcpsecrets://vfarcic/youtube-dot-releases-*` reference that `vals env -export -f .env.vals.yaml` resolves into the environment (which `devbox shell` does automatically when `USE_VALS` is set). Substitute your own mechanism freely.
+> **Maintainer's setup (one example, not required).** In this repo they are sourced via [`vals`](../../.env.vals.yaml) from GCP Secret Manager: `.env.vals.yaml` maps each var to a `ref+gcpsecrets://vfarcic/youtube-dot-releases-*` reference that `vals env -export -f .env.vals.yaml` resolves into the environment (which `devbox shell` does automatically when `USE_VALS` is set). The same setup also supplies the maintainer's telemetry endpoint and Honeycomb ingest key (`OTEL_EXPORTER_OTLP_ENDPOINT`, and `OTEL_EXPORTER_OTLP_HEADERS`, which the `devbox.json` init hook composes from `HONEYCOMB_INGEST_KEY`). Substitute your own mechanism freely.
 
 > **One-time human provisioning.** The refresh token requires Google OAuth user consent, which a service account cannot grant cleanly for a personal channel, so the agent cannot self-provision it. Mint it once with the recipe below, then make the three values available as the env vars above. After that, every reel run reuses the stored refresh token.
 

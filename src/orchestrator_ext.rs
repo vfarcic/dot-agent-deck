@@ -45,7 +45,9 @@ pub const ENV_PI_AGENT_DIR: &str = "PI_CODING_AGENT_DIR";
 ///     #1666), which `index.ts` imports. Its `.d.ts` is for the extension's
 ///     type check only and is not materialized,
 ///   - `orchestrator.ts`    — the pure logic `index.ts` imports via
-///     `./orchestrator.ts`, and
+///     `./orchestrator.ts`,
+///   - `telemetry.ts`       — Pi's own OTLP export, inert unless the deck
+///     switches it on (PRD #1741), which `index.ts` imports, and
 ///   - `index.ts`           — the Pi-API glue (default-export factory).
 ///
 /// A `package.json` is intentionally **not** embedded: the subdirectory
@@ -64,6 +66,10 @@ pub const EXTENSION_FILES: &[(&str, &str)] = &[
     (
         "orchestrator.ts",
         include_str!("../pi-extension/src/orchestrator.ts"),
+    ),
+    (
+        "telemetry.ts",
+        include_str!("../pi-extension/src/telemetry.ts"),
     ),
     ("index.ts", include_str!("../pi-extension/src/index.ts")),
 ];
@@ -1760,7 +1766,11 @@ mod tests {
     /// `node_modules`; without one this prints `SKIP:` and passes.
     #[test]
     fn the_pi_extensions_node_suites_pass() {
-        const SUITES: [&str; 2] = ["test/inbox.test.ts", "test/orchestrator.test.ts"];
+        const SUITES: [&str; 3] = [
+            "test/inbox.test.ts",
+            "test/orchestrator.test.ts",
+            "test/telemetry.test.ts",
+        ];
         let Ok(node) = std::process::Command::new("node").arg("--version").output() else {
             eprintln!("SKIP: node is not available for the pi-extension suites {SUITES:?}");
             return;

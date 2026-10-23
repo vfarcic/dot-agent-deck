@@ -808,6 +808,10 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         state.write().await.set_last_command_store(Arc::new(store));
     }
     let event_tx = daemon.event_tx;
+    // PRD #1741: OTLP export of agent runs, read from this process's
+    // environment. Off unless it names an endpoint: no task, no client, and no
+    // variable added to any agent.
+    let telemetry = crate::telemetry::start_for_daemon(&event_tx, &pty_registry);
     // PRD #1666 S3: every inbox state change reaches attached clients.
     pty_registry.inbox().set_broadcast(event_tx.clone());
     // PRD #1666 part 2 §2.7: what a card tells the user to run when an
@@ -1081,6 +1085,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         worktree_registry.clone(),
     )
     .await;
+    telemetry.shutdown(Duration::from_secs(3)).await;
 
     if let Some(h) = attach_handle {
         h.abort();
