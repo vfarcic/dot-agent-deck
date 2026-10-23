@@ -2708,6 +2708,18 @@ pub fn auto_install() -> Vec<crate::hook_binary::HookPin> {
     auto_install_reporting().0
 }
 
+/// [`auto_install`] for `hooks refresh` (PRD #1666 part 3, R-3): whether
+/// OpenCode is installed here (a config root exists, as the install asks),
+/// and every integration file it could not write, which [`auto_install`]
+/// only logs.
+pub fn refresh_install() -> crate::hooks_refresh::InstallAttempt {
+    if !candidate_roots().iter().any(|root| root.exists()) {
+        return crate::hooks_refresh::InstallAttempt::Absent;
+    }
+    let (_, failed) = auto_install_reporting();
+    crate::hooks_refresh::InstallAttempt::Ran { failed }
+}
+
 /// PRD #1666 §11: [`auto_install`], run as an OpenCode generation starts and
 /// before its child does, so the agent loads the integration this deck checks
 /// it against. Returns the pins and every integration file it could not

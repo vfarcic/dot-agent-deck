@@ -840,3 +840,138 @@ fn install_014_a_backslash_in_the_deck_path_is_refused_and_the_settings_kept() {
     );
     assert!(!fixture.path().join("PWNED").exists());
 }
+
+// --- PRD #1666 part 3, R-3: `hooks refresh` reports what it could not update --
+
+impl Fixture {
+    /// Run `hooks refresh --json` from `deck` with `path` as `PATH`, returning
+    /// whether it exited 0 and the report it printed.
+    fn refresh(&self, deck: &Path, path: &Path) -> (bool, serde_json::Value, String) {
+        let out = Command::new(deck)
+            .current_dir(self.path())
+            .args(["hooks", "refresh", "--json"])
+            .env_clear()
+            .env("HOME", self.home())
+            .env("PATH", path)
+            .env("DOT_AGENT_DECK_LOG", self.path().join("deck.log"))
+            .output()
+            .expect("run hooks refresh");
+        let all = combined(&out);
+        let report = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|error| panic!("a JSON report: {error}\n{all}"));
+        (out.status.success(), report, all)
+    }
+
+    /// A `PATH` holding only a stand-in `codex`, so Codex counts as installed
+    /// and its hooks go to `<home>/.codex`.
+    fn codex_path(&self) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = self.path().join("codexbin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let codex = bin.join("codex");
+        std::fs::write(&codex, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+}
+
+fn report_texts(report: &serde_json::Value) -> Vec<String> {
+    report["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|line| line["text"].as_str().unwrap().to_string())
+        .collect()
+}
+
+fn report_commands(report: &serde_json::Value) -> Vec<String> {
+    report["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|line| line["command"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// Scenario: Run the real installed copy's `hooks refresh --json` where Claude Code's settings cannot be updated: once with malformed settings alone, once with malformed settings beside a Codex whose hooks it does update, and once with settings that already name this copy in a folder it cannot write. Each time the report is not ok, says Claude Code's hooks could not be updated, gives `hooks install --agent claude-code` and never says Claude Code's hooks now run this copy, and the settings are left as they were.
+#[spec("hooks/install/019")]
+#[test]
+fn install_019_refresh_reports_an_agent_whose_hooks_it_could_not_update() {
+    use std::os::unix::fs::PermissionsExt;
+    let claude_failed = |report: &serde_json::Value, all: &str| {
+        assert_eq!(report["ok"], false, "{all}");
+        let texts = report_texts(report);
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.starts_with("Claude Code's hooks could not be updated")),
+            "{all}"
+        );
+        assert!(
+            !texts.iter().any(|text| text.contains("No installed agent")),
+            "{all}"
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|text| text.contains("Claude Code") && text.contains("now run this copy")),
+            "{all}"
+        );
+        assert!(
+            report_commands(report)
+                .iter()
+                .any(|command| command.ends_with(" hooks install --agent claude-code")),
+            "{all}"
+        );
+    };
+
+    // Malformed settings, and no other agent.
+    let fixture = Fixture::installed_home();
+    let installed = fixture.home().join(".local/bin/dot-agent-deck");
+    fixture.copy_deck_to(&installed);
+    std::fs::write(fixture.settings(), b"{ not json").unwrap();
+    let (ok, report, all) = fixture.refresh(&installed, &fixture.path().join("emptybin"));
+    assert!(!ok, "{all}");
+    claude_failed(&report, &all);
+    assert_eq!(std::fs::read(fixture.settings()).unwrap(), b"{ not json");
+
+    // The same, beside a Codex whose hooks it updates.
+    let (ok, report, all) = fixture.refresh(&installed, &fixture.codex_path());
+    assert!(!ok, "{all}");
+    claude_failed(&report, &all);
+    assert!(
+        report_texts(&report)
+            .iter()
+            .any(|text| text.starts_with("Codex hooks now run this copy")),
+        "{all}"
+    );
+    assert_eq!(
+        report_commands(&report)
+            .iter()
+            .filter(|command| command.contains(" hooks install --agent codex"))
+            .count(),
+        0,
+        "{all}"
+    );
+
+    // Settings already naming this copy, but missing hooks, in a folder the
+    // update cannot write.
+    let fixture = Fixture::installed_home();
+    let installed = fixture.home().join(".local/bin/dot-agent-deck");
+    fixture.copy_deck_to(&installed);
+    std::fs::write(
+        fixture.settings(),
+        serde_json::to_string_pretty(&seeded_settings(&[("Stop", plain_form(&installed))]))
+            .unwrap(),
+    )
+    .unwrap();
+    let before = std::fs::read(fixture.settings()).unwrap();
+    let claude = fixture.home().join(".claude");
+    std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let result = fixture.refresh(&installed, &fixture.path().join("emptybin"));
+    std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (ok, report, all) = result;
+    assert!(!ok, "{all}");
+    claude_failed(&report, &all);
+    assert_eq!(std::fs::read(fixture.settings()).unwrap(), before);
+}

@@ -2714,6 +2714,13 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** the `claude --version` probe itself (covered by the issue #714 probe tests in the same file); that a real Claude Code honours the timeout (`question/live/*`).
 - **Platform coverage:** mac+linux.
 
+##### hooks/install/019 — `hooks refresh` reports an installed agent whose hooks it could not update (PRD #1666 part 3, R-3).
+- **Layer:** fast real-binary subprocess integration (`tests/scratch_binary_hook_install.rs`), the real `hooks refresh --json` from a copy in an isolated HOME's `.local/bin`.
+- **Agent:** none; a stand-in `codex` on `PATH` makes Codex count as installed.
+- **Asserts:** malformed Claude settings alone, the same beside a Codex whose hooks it updates, and settings already naming this copy in a folder it cannot write each give a non-zero exit, `ok: false`, `Claude Code's hooks could not be updated…`, a `hooks install --agent claude-code` command and no `now run this copy` line for Claude Code; Codex is reported as updated and gets no command; the settings are left byte for byte.
+- **Does not assert:** OpenCode's or Devin's failures (their `refresh_install` reuses the same startup install), an upgrade client showing the report (`self_upgrade::agent_hooks` unit tests, `upgrade/cli-upgrade/008`).
+- **Platform coverage:** mac+linux.
+
 #### hooks/stale
 
 ##### hooks/stale/001 — The notice names the agents, binary, versions and remedy, keeping the agents and both versions at 60 columns.

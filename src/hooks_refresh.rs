@@ -46,27 +46,61 @@ impl RefreshReport {
     }
 }
 
-/// Run every agent's startup install, then report what each installed agent's
-/// hooks run. An agent whose config is missing or could not be read is left
-/// out: its startup install refused or had nothing to do.
-pub fn refresh() -> RefreshReport {
-    use crate::agent_registry::ALL;
-    for spec in ALL {
-        if let Some(install) = spec.startup_auto_install {
-            install();
+/// What one agent's startup install came to, run for `hooks refresh`
+/// ([`crate::agent_registry::AgentSpec::refresh_install`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstallAttempt {
+    /// The agent is not installed here, so there was nothing to update.
+    Absent,
+    /// The install ran; `failed` says what it could not read or write.
+    Ran { failed: Vec<String> },
+}
+
+impl InstallAttempt {
+    /// From an install that is `None` when the agent is not installed, and
+    /// otherwise what it installed or why it installed nothing.
+    pub fn of<T>(attempt: Option<Result<T, String>>) -> Self {
+        match attempt {
+            None => Self::Absent,
+            Some(Ok(_)) => Self::Ran { failed: Vec::new() },
+            Some(Err(why)) => Self::Ran { failed: vec![why] },
         }
     }
-    let deck = DeckIdentity::current(crate::hook_binary::process_resolution());
-    let read = ALL
+}
+
+/// One installed agent after its install: what the install could not do,
+/// and what its config names now (`None` when it could not be read).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Installed {
+    pub agent: AgentType,
+    pub failed: Vec<String>,
+    pub pins: Option<Vec<HookPin>>,
+}
+
+/// Run every agent's startup install, then report what each installed agent's
+/// hooks run. An agent that is not installed is left out; one whose install
+/// failed, or whose config cannot be read back, needs attention.
+pub fn refresh() -> RefreshReport {
+    use crate::agent_registry::ALL;
+    let ran: Vec<_> = ALL
         .iter()
-        .filter_map(|spec| {
-            let read = spec.configured_pins?;
-            read().map(|pins| (spec.agent_type.clone(), pins))
+        .filter_map(|spec| match (spec.refresh_install?)() {
+            InstallAttempt::Absent => None,
+            InstallAttempt::Ran { failed } => Some((spec, failed)),
+        })
+        .collect();
+    let deck = DeckIdentity::current(crate::hook_binary::process_resolution());
+    let installed = ran
+        .into_iter()
+        .map(|(spec, failed)| Installed {
+            agent: spec.agent_type.clone(),
+            failed,
+            pins: spec.configured_pins.and_then(|read| read()),
         })
         .collect();
     report(
         &deck,
-        read,
+        installed,
         |binary| crate::hook_binary::names_this_deck(&deck, binary),
         |binary| {
             std::path::Path::new(binary)
@@ -80,12 +114,16 @@ pub fn refresh() -> RefreshReport {
 /// The most bytes of a configured path a report repeats.
 const MAX_SHOWN_BINARY_BYTES: usize = 512;
 
-/// The report for what the agents' configs name after the install: `read`
-/// holds, per installed agent, its pins; `is_this` says whether a pinned
-/// binary is this copy, and `version` what another one reports, if anything.
+/// The most bytes of why an install failed a report repeats.
+const MAX_SHOWN_REASON_BYTES: usize = 512;
+
+/// The report for what the agents' configs name after the install:
+/// `installed` holds every installed agent's outcome; `is_this` says whether
+/// a pinned binary is this copy, and `version` what another one reports, if
+/// anything.
 pub(crate) fn report(
     deck: &DeckIdentity,
-    read: Vec<(AgentType, Vec<HookPin>)>,
+    installed: Vec<Installed>,
     is_this: impl Fn(&str) -> bool,
     version: impl Fn(&str) -> Option<String>,
 ) -> RefreshReport {
@@ -93,7 +131,7 @@ pub(crate) fn report(
         text,
         command: None,
     };
-    if read.is_empty() {
+    if installed.is_empty() {
         return RefreshReport {
             ok: true,
             lines: vec![text(NO_AGENTS.to_string())],
@@ -102,8 +140,33 @@ pub(crate) fn report(
     let mut current = Vec::new();
     let mut attention = Vec::new();
     let mut notes = Vec::new();
-    for (agent, pins) in read {
+    for Installed {
+        agent,
+        failed,
+        pins,
+    } in installed
+    {
         let label = crate::hook_binary::agent_display_name(&agent);
+        // A failed install says so even when the config still names this
+        // copy: what it names is not what the install meant to write.
+        if !failed.is_empty() {
+            let why = crate::untrusted_text::display_line(
+                failed.join("; ").trim_end_matches('.'),
+                MAX_SHOWN_REASON_BYTES,
+            );
+            notes.push(text(format!(
+                "{label}'s hooks could not be updated: {why}."
+            )));
+            attention.push(agent);
+            continue;
+        }
+        let Some(pins) = pins else {
+            notes.push(text(format!(
+                "{label}'s hooks could not be read after the update."
+            )));
+            attention.push(agent);
+            continue;
+        };
         let mut binaries: Vec<String> = Vec::new();
         for pin in pins {
             if !binaries.contains(&pin.binary) {
@@ -208,7 +271,7 @@ mod tests {
         }
     }
 
-    fn pins(agent: AgentType, binaries: &[&str]) -> (AgentType, Vec<HookPin>) {
+    fn pins(agent: AgentType, binaries: &[&str]) -> Installed {
         let pins = binaries
             .iter()
             .map(|binary| HookPin {
@@ -217,10 +280,14 @@ mod tests {
                 binary: binary.to_string(),
             })
             .collect();
-        (agent, pins)
+        Installed {
+            agent,
+            failed: Vec::new(),
+            pins: Some(pins),
+        }
     }
 
-    fn run(read: Vec<(AgentType, Vec<HookPin>)>, versions: &[(&str, &str)]) -> RefreshReport {
+    fn run(read: Vec<Installed>, versions: &[(&str, &str)]) -> RefreshReport {
         report(
             &deck(),
             read,
@@ -358,6 +425,97 @@ mod tests {
         let none = run(Vec::new(), &[]);
         assert!(none.ok);
         assert_eq!(none.render(), vec![NO_AGENTS.to_string()]);
+    }
+
+    /// Scenario: Claude Code's install failed, once on settings it could not
+    /// read and once on a write that failed while its old settings still name
+    /// this copy, and beside a Codex whose install succeeded. Claude Code's
+    /// failure is said with why, it is never reported as running this copy,
+    /// the report is not ok, and its `hooks install` is the command; Codex is
+    /// reported as updated and given no command.
+    #[test]
+    fn a_failed_install_needs_attention_whatever_the_config_names() {
+        let failed = |pins: Option<Vec<HookPin>>| Installed {
+            agent: AgentType::ClaudeCode,
+            failed: vec!["left /home/u/.claude/settings.json unchanged: bad JSON.".into()],
+            pins,
+        };
+        let on_this = pins(AgentType::ClaudeCode, &[THIS]).pins;
+        for claude in [failed(None), failed(on_this)] {
+            let alone = run(vec![claude.clone()], &[]);
+            assert!(!alone.ok, "{alone:?}");
+            assert_eq!(
+                alone.lines[0].text,
+                "Claude Code's hooks could not be updated: left /home/u/.claude/settings.json unchanged: bad JSON."
+            );
+            assert!(
+                alone
+                    .lines
+                    .iter()
+                    .all(|line| !line.text.contains("now run")),
+                "{alone:?}"
+            );
+
+            let mixed = run(vec![claude, pins(AgentType::Codex, &[THIS])], &[]);
+            assert!(!mixed.ok, "{mixed:?}");
+            assert!(
+                mixed.lines[0]
+                    .text
+                    .starts_with("Codex hooks now run this copy"),
+                "{mixed:?}"
+            );
+            assert!(
+                mixed.lines[1]
+                    .text
+                    .starts_with("Claude Code's hooks could not")
+            );
+            let commands: Vec<_> = mixed
+                .lines
+                .iter()
+                .filter_map(|line| line.command.clone())
+                .collect();
+            assert_eq!(
+                commands,
+                vec![format!("{THIS} hooks install --agent claude-code")]
+            );
+        }
+    }
+
+    /// Scenario: the install ran without a complaint, but the config could
+    /// not be read back: the report cannot say what the hooks run, so the
+    /// agent needs attention rather than being left out.
+    #[test]
+    fn an_unreadable_config_after_the_install_needs_attention() {
+        let report = run(
+            vec![Installed {
+                agent: AgentType::ClaudeCode,
+                failed: Vec::new(),
+                pins: None,
+            }],
+            &[],
+        );
+        assert!(!report.ok, "{report:?}");
+        assert_eq!(
+            report.lines[0].text,
+            "Claude Code's hooks could not be read after the update."
+        );
+        assert!(report.lines.iter().any(|line| line.command.is_some()));
+    }
+
+    /// Scenario: the absent/failed split an agent's install reports.
+    #[test]
+    fn an_install_attempt_tells_absent_from_failed() {
+        assert_eq!(InstallAttempt::of::<()>(None), InstallAttempt::Absent);
+        assert_eq!(
+            InstallAttempt::of(Some(Ok(()))),
+            InstallAttempt::Ran { failed: Vec::new() }
+        );
+        assert_eq!(
+            InstallAttempt::of::<()>(Some(Err("x".into()))),
+            InstallAttempt::Ran {
+                failed: vec!["x".into()]
+            }
+        );
     }
 
     /// The JSON a newer copy prints decodes in an older client that knows

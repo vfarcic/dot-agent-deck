@@ -762,37 +762,32 @@ fn any_foreign_command_hook(root: &Value) -> bool {
 /// expected commands [`trust_deck_hooks_for`] compares against (issue #730) —
 /// the SAME values, so install and trust can never be about different binaries.
 pub fn auto_install() -> Option<Vec<String>> {
-    let home = codex_home()?;
+    try_auto_install_in(&codex_home()?)
+        .map_err(|e| tracing::warn!("auto-install: {e}"))
+        .ok()
+}
+
+/// [`auto_install`] into `home`, returning why it wrote nothing rather than
+/// logging it.
+fn try_auto_install_in(home: &Path) -> Result<Vec<String>, String> {
     // PRD #381: never `current_exe()` directly — a `target/debug` path written
     // here is gone the moment its worktree is pruned, and this write is silent
     // and automatic. A refusal writes nothing and warns; `hooks.json` is left
     // exactly as it was.
-    let binary_path = match crate::platform::paths::durable_binary_path() {
-        Ok(binary_path) => binary_path,
-        Err(e) => {
-            tracing::warn!("auto-install: {e}");
-            return None;
-        }
-    };
+    let binary_path = crate::platform::paths::durable_binary_path()?;
     // Automatic: another live durable install's entry is kept, and the trust
     // write is then about that install's command (PRD #1487).
-    match auto_install_to(&home, &binary_path) {
-        Ok((changed, named)) => {
-            if changed {
-                crate::agent_hook_config::log_auto_install_change(
-                    "codex",
-                    &home.join("hooks.json"),
-                    &named.join(", "),
-                    "codex auto-install",
-                );
-            }
-            Some(named)
-        }
-        Err(e) => {
-            tracing::warn!("auto-install: failed to write Codex hooks.json: {e}");
-            None
-        }
+    let (changed, named) = auto_install_to(home, &binary_path)
+        .map_err(|e| format!("failed to write Codex hooks.json: {e}"))?;
+    if changed {
+        crate::agent_hook_config::log_auto_install_change(
+            "codex",
+            &home.join("hooks.json"),
+            &named.join(", "),
+            "codex auto-install",
+        );
     }
+    Ok(named)
 }
 
 /// The exact hook command the deck writes for `binary_path` — what
@@ -2357,20 +2352,44 @@ fn codex_present_on_path() -> bool {
 /// takeover that is the new copy, and the trust recorded here is for its
 /// command, so Codex may ask the user once to review the changed hooks.
 pub fn auto_install_and_trust_at_startup() -> Vec<crate::hook_binary::HookPin> {
+    match install_and_trust_at_startup() {
+        Some(Ok(pins)) => pins,
+        Some(Err(e)) => {
+            tracing::warn!("auto-install: {e}");
+            Vec::new()
+        }
+        None => Vec::new(),
+    }
+}
+
+/// [`auto_install_and_trust_at_startup`] for `hooks refresh` (PRD #1666 part
+/// 3, R-3): whether Codex is installed here, and what the install could not
+/// write, which the startup install only logs.
+pub fn refresh_install() -> crate::hooks_refresh::InstallAttempt {
+    let attempt = install_and_trust_at_startup();
+    if let Some(Err(e)) = &attempt {
+        tracing::warn!("auto-install: {e}");
+    }
+    crate::hooks_refresh::InstallAttempt::of(attempt)
+}
+
+/// [`auto_install_and_trust_at_startup`]'s work: `None` when Codex is not
+/// installed here, else the pins or why the install wrote nothing.
+fn install_and_trust_at_startup() -> Option<Result<Vec<crate::hook_binary::HookPin>, String>> {
     if !codex_present_on_path() {
         tracing::debug!("codex startup install: skipped (codex not on PATH)");
-        return Vec::new();
+        return None;
     }
     let Some(home) = codex_home() else {
         tracing::debug!("codex startup install: skipped (no CODEX_HOME/HOME)");
-        return Vec::new();
+        return None;
     };
     // No durable path means nothing was installed, so there is no command to
     // trust and no entry of ours in the listing. Fail closed rather than falling
     // back to a wider predicate (issue #730).
-    let Some(binary_paths) = auto_install() else {
-        tracing::debug!("codex startup install: skipped trust (no durable binary path resolved)");
-        return Vec::new();
+    let binary_paths = match try_auto_install_in(&home) {
+        Ok(binary_paths) => binary_paths,
+        Err(e) => return Some(Err(e)),
     };
     let pins = binary_paths
         .iter()
@@ -2382,7 +2401,7 @@ pub fn auto_install_and_trust_at_startup() -> Vec<crate::hook_binary::HookPin> {
         .collect();
     let cwd = std::env::current_dir().unwrap_or_else(|_| home.clone());
     report_startup_trust(&trust_deck_hooks_for(&home, &cwd, &binary_paths), &cwd);
-    pins
+    Some(Ok(pins))
 }
 
 /// What Codex's hooks are pinned to now, read back from the active
