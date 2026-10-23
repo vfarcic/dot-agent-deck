@@ -116,7 +116,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### telemetry/otlp/014 — Shell operation metadata classifies safe command shapes without exporting content.
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
 - **Agent:** shell/cat stand-in with synthetic shell-tool and Read hooks.
-- **Asserts:** program/word classification of plain commands, assignments/prefixes/segments, independent program/word shape filtering, the word deny-list, first-line handling, neither program nor word for comments, command substitutions and variable expansions before the first word on both the Bash and Codex `shell` paths, child identity/duration/count and absence of sentinel, private and raw command text from captured bodies.
+- **Asserts:** program/word classification of plain commands, assignments/prefixes/segments, program shape filtering and conditional word filtering, the word deny-list, first-line handling, neither program nor word for comments, command substitutions and variable expansions before the first word, or a shell reserved word or `eval` as the program, on both the Bash and Codex `shell` paths, child identity/duration/count and absence of sentinel, private and raw command text from captured bodies.
 - **Does not assert:** native hook availability for each agent or nested shell grammar.
 - **Platform coverage:** mac+linux.
 

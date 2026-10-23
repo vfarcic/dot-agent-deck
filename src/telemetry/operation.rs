@@ -22,7 +22,9 @@
 //! other than a shell builtin that only sets up the next one
 //! ([`SETUP_PROGRAMS`]) is the one classified, after its leading `NAME=value`
 //! assignments and an `env`, `sudo`, `command`, `time` or `nice` in front,
-//! with the options each knows and the options' values. Every word read on
+//! with the options each knows and the options' values. A program that is
+//! shell grammar — a reserved word, `eval` or `exec`
+//! ([`UNSUPPORTED_PROGRAMS`]) — declines the command. Every word read on
 //! the way, up to and including the program's first non-option argument, must
 //! be a simple word (`is_simple_word`) or, where an assignment can stand, a
 //! simple assignment (`is_simple_assignment`). A quote, an escape, a `$`, a
@@ -99,6 +101,15 @@ pub const WORDLESS_PROGRAMS: &[&str] = &[
     "scp",
     "sftp",
     "rsync",
+];
+
+/// Shell grammar the classifier does not interpret — reserved words, `eval`
+/// and `exec`: a command whose program is one of them names nothing, since
+/// its operand is data or a command of its own. `time`, also a reserved word,
+/// is read as the wrapper it is.
+pub const UNSUPPORTED_PROGRAMS: &[&str] = &[
+    "eval", "exec", "if", "then", "elif", "else", "fi", "while", "until", "for", "select", "do",
+    "done", "case", "esac", "in", "function", "coproc",
 ];
 
 /// Shells whose `-c` argument is the command they run.
@@ -270,8 +281,8 @@ pub fn classify(command: Option<&str>) -> Operation {
 /// `["/bin/sh", "-lc", "<script>"]`), the first word of the script, each only
 /// when it is a simple word. A program that only sets up, prefixes or wraps
 /// the next one gives nothing, since that one's words may belong to a later
-/// argument; so does a line with an empty argument in it, or a shell with any
-/// other options.
+/// argument; so does a line with an empty argument in it, a shell with any
+/// other options, or one of [`UNSUPPORTED_PROGRAMS`].
 pub fn classify_joined_argv(command: Option<&str>) -> Operation {
     let line = command.and_then(|c| c.lines().next()).unwrap_or("");
     let words: Vec<&str> = line.split(' ').collect();
@@ -298,7 +309,8 @@ pub fn classify_joined_argv(command: Option<&str>) -> Operation {
     };
     let unsure = SETUP_PROGRAMS.contains(&program)
         || SHELLS.contains(&program)
-        || ["env", "sudo", "command", "time", "nice", "exec", "eval"].contains(&program);
+        || UNSUPPORTED_PROGRAMS.contains(&program)
+        || ["env", "sudo", "command", "time", "nice"].contains(&program);
     if unsure {
         return Operation::default();
     }
@@ -320,6 +332,9 @@ fn classify_words(segment: &[&str]) -> Option<Operation> {
     };
     let program = program_name(words.first()?);
     let rest = &words[1..];
+    if UNSUPPORTED_PROGRAMS.contains(&program) {
+        return Some(Operation::default());
+    }
     if SETUP_PROGRAMS.contains(&program) {
         // All of its words are read: a quote or a substitution in one could
         // hide where the next segment starts.
@@ -972,6 +987,62 @@ mod tests {
         }
     }
 
+    /// A shell reserved word, `eval` or `exec` is shell grammar rather than a
+    /// program: its operand is data or a command of its own, so the command
+    /// names nothing, however it is reached.
+    #[test]
+    fn shell_keywords_name_nothing() {
+        let bare = Operation::default();
+        for keyword in UNSUPPORTED_PROGRAMS {
+            for command in [
+                format!("{keyword} sentinelvalue"),
+                format!("sudo {keyword} sentinelvalue"),
+                format!("env {keyword} sentinelvalue"),
+                format!("FOO=1 time {keyword} sentinelvalue"),
+                format!("cd x && {keyword} sentinelvalue"),
+                format!("bash -c '{keyword} sentinelvalue'"),
+                format!("sh -lc \"{keyword} sentinelvalue\""),
+                format!("bash -c {keyword}"),
+            ] {
+                assert_eq!(classify(Some(&command)), bare, "{command}");
+            }
+            for command in [
+                format!("{keyword} sentinelvalue"),
+                format!("/bin/sh -lc {keyword} sentinelvalue"),
+            ] {
+                assert_eq!(
+                    classify_tool(Some("shell"), Some(&command)),
+                    bare,
+                    "{command}"
+                );
+            }
+        }
+        for command in [
+            "case sentinelvalue in a) true;; esac",
+            "eval sentinelvalue",
+            "exec sentinelvalue",
+            "sudo eval sentinelvalue",
+            "env case sentinelvalue in a) true;; esac",
+            "bash -c 'case sentinelvalue in a) true;; esac'",
+            "if test sentinelvalue; then cargo test; fi",
+            "for x in sentinelvalue; do cargo test; done",
+            "while sentinelvalue; do cargo test; done",
+            "function sentinelvalue",
+        ] {
+            assert_eq!(classify(Some(command)), bare, "{command}");
+        }
+        // `time` is a reserved word too, and the wrapper the classifier reads.
+        assert_eq!(
+            classify(Some("time cargo build")),
+            expected("cargo", Some("build"))
+        );
+        // Looked up, not run: the keyword is the word of `command -v`.
+        assert_eq!(
+            classify(Some("command -v case")),
+            expected("command", Some("case"))
+        );
+    }
+
     #[test]
     fn plain_commands_still_classify() {
         for (command, expected) in [
@@ -1093,8 +1164,10 @@ mod tests {
         assert_eq!(classify(Some("   ")), bare);
     }
 
+    /// A quote declines the command when it comes before the word, and is
+    /// not read when it comes after it.
     #[test]
-    fn quoted_operators_do_not_split() {
+    fn a_quote_before_the_word_names_nothing() {
         assert_eq!(
             classify(Some("cd x; 'my tool' run")),
             Operation::default(),
@@ -1106,8 +1179,9 @@ mod tests {
         );
     }
 
-    /// A shell comment is not a command: nothing in it is a program or a
-    /// word, and its separators split nothing.
+    /// A shell comment is not a command: a `#` up to the first argument
+    /// declines the command, so nothing after it — a separator included — gives
+    /// a program or a word.
     #[test]
     fn comments_are_not_commands() {
         let bare = Operation::default();

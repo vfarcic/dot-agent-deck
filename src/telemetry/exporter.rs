@@ -32,7 +32,9 @@
 //! remaining flush budget runs out. Redirects are not followed: a 3xx answer is
 //! a failed export, so a header meant for the configured endpoint never goes
 //! anywhere else. A success that reports spans the backend did not accept (the
-//! OTLP `partial_success`) is logged like a failure and not retried.
+//! OTLP `partial_success`) is logged like a failure and not retried. A log
+//! line about an export carries its counts, the HTTP status and the endpoint's
+//! scheme, host and port, never text the backend wrote or the error's own.
 //!
 //! **Shutdown.** An export in flight when shutdown begins gives way: its batch
 //! goes back into the buffer, and the final flush sends it with the runs the
@@ -91,8 +93,6 @@ const STOP_CLIENT_WINDOW: Duration = crate::agent_pty::DAEMON_STOP_POLL_BUDGET;
 pub const SHUTDOWN_HEADROOM: Duration = Duration::from_millis(500);
 /// Bytes of a successful answer read, at most, for its partial-success report.
 const MAX_RESPONSE_BODY: usize = 64 * 1024;
-/// Characters of a backend's own error message logged, at most.
-const MAX_LOGGED_ERROR_MESSAGE: usize = 256;
 
 enum ExportMsg {
     Span(Box<SpanRecord>),
@@ -1321,18 +1321,20 @@ async fn stopped(stop: &mut watch::Receiver<bool>) {
     }
 }
 
-/// A backend's own error message, for a log line: control characters dropped
-/// and at most [`MAX_LOGGED_ERROR_MESSAGE`] characters kept.
-fn logged_message(message: &str) -> String {
-    let mut chars = message.chars().filter(|c| !c.is_control());
-    let mut out: String = chars.by_ref().take(MAX_LOGGED_ERROR_MESSAGE).collect();
-    if chars.next().is_some() {
-        out.push('…');
+/// What a failed request is, for a log line: a fixed description of its
+/// kind. Never the error's own text, which can carry the endpoint.
+fn request_failure(e: &reqwest::Error) -> &'static str {
+    if e.is_timeout() {
+        "the request timed out"
+    } else if e.is_connect() {
+        "the backend could not be reached"
+    } else if e.is_request() {
+        "the request could not be sent"
+    } else if e.is_body() || e.is_decode() {
+        "the backend's answer could not be read"
+    } else {
+        "the request failed"
     }
-    if out.trim().is_empty() {
-        out = "it gave no reason".to_string();
-    }
-    out
 }
 
 impl Sender {
@@ -1384,13 +1386,15 @@ impl Sender {
         };
         let reportable = !matches!(outcome, SendOutcome::Delivered { .. });
         if reportable && let Some(suppressed) = self.errors.record(std::time::Instant::now()) {
+            // The backend's own message is not logged: it can echo the
+            // configured headers' values.
             if let SendOutcome::PartiallyRejected { rejected, .. } = outcome {
                 tracing::warn!(
                     spans = spans.len(),
                     rejected,
                     suppressed_failures = suppressed,
                     endpoint = %redacted_endpoint(&self.endpoint),
-                    "telemetry: the OTLP backend did not accept every span: {failure}"
+                    "telemetry: the OTLP backend did not accept every span"
                 );
             } else {
                 tracing::warn!(
@@ -1406,7 +1410,8 @@ impl Sender {
     }
 
     /// The attempts of one export: how it ended, how many there were, and
-    /// what to log about it.
+    /// what to log about it — fixed text and the HTTP status, nothing the
+    /// backend wrote.
     async fn deliver(
         &self,
         body: Vec<u8>,
@@ -1436,11 +1441,6 @@ impl Sender {
                         Some(partial)
                             if partial.rejected_spans > 0 || !partial.error_message.is_empty() =>
                         {
-                            failure = format!(
-                                "{} rejected; the backend said: {}",
-                                partial.rejected_spans,
-                                logged_message(&partial.error_message)
-                            );
                             break SendOutcome::PartiallyRejected {
                                 attempts,
                                 rejected: partial.rejected_spans,
@@ -1458,14 +1458,12 @@ impl Sender {
                     failure = format!("the backend answered HTTP {status}");
                     break SendOutcome::Rejected { status };
                 }
-                // `without_url`: the endpoint's userinfo or query can carry a
-                // token.
                 Err(e) if e.is_connect() || e.is_timeout() || e.is_request() => {
-                    failure = e.without_url().to_string();
+                    failure = request_failure(&e).to_string();
                     None
                 }
                 Err(e) => {
-                    failure = e.without_url().to_string();
+                    failure = request_failure(&e).to_string();
                     break SendOutcome::Failed;
                 }
             };
@@ -1749,6 +1747,43 @@ mod tests {
         assert_eq!(get(&run.env, "CLAUDE_CODE_ENABLE_TELEMETRY"), Some("1"));
         assert_eq!(get(&run.env, "OTEL_METRICS_EXPORTER"), Some("otlp"));
         assert_eq!(get(&run.env, "OTEL_LOGS_EXPORTER"), Some("otlp"));
+    }
+
+    /// Pi's extension is switched on only when the agent's own environment —
+    /// the daemon's with the spawn's overlay over it — leaves the SDK and the
+    /// logs exporter on.
+    #[test]
+    fn pi_is_not_switched_on_against_a_spawn_opt_out() {
+        let pi = || RunStart {
+            agent: AgentType::Pi,
+            ..run_start("p1")
+        };
+        let flag = |telemetry: &Arc<Telemetry>, overlay: &[(&str, &str)]| {
+            let overlay: Vec<_> = overlay
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let run = telemetry.prepare_run(pi(), &overlay, None).unwrap();
+            get(&run.env, super::super::launch::PI_TELEMETRY_ENV).map(str::to_string)
+        };
+        let telemetry = Arc::new(Telemetry::start(&env(&[(
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "http://127.0.0.1:9",
+        )])));
+        assert_eq!(flag(&telemetry, &[]).as_deref(), Some("1"));
+        for overlay in [
+            &[("OTEL_SDK_DISABLED", "true")][..],
+            &[("OTEL_SDK_DISABLED", "True")][..],
+            &[("OTEL_LOGS_EXPORTER", "none")][..],
+            &[("OTEL_LOGS_EXPORTER", "otlpx")][..],
+        ] {
+            assert_eq!(flag(&telemetry, overlay), None, "{overlay:?}");
+        }
+        let logs_off = Arc::new(Telemetry::start(&env(&[
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:9"),
+            ("OTEL_LOGS_EXPORTER", "none"),
+        ])));
+        assert_eq!(flag(&logs_off, &[]), None, "the daemon's own selector");
     }
 
     /// A Claude Code launch behind leading assignments or an `env` prefix,
@@ -3401,8 +3436,9 @@ mod tests {
     }
 
     /// Thread 3: a 200 that reports spans the backend did not accept, in
-    /// either encoding, is logged at the error rate, with the backend's message
-    /// capped, and not retried.
+    /// either encoding, is logged at the error rate, with the count it
+    /// rejected and none of the backend's own text, and not retried. A
+    /// backend's message can echo the configured header's value.
     #[tokio::test]
     async fn a_partial_success_is_logged_and_not_retried() {
         use tracing_subscriber::layer::SubscriberExt;
@@ -3419,13 +3455,14 @@ mod tests {
             );
         let _guard = crate::test_isolation::capture_tracing_on_this_thread(subscriber);
 
-        let long = "x".repeat(1000);
-        let json =
-            format!(r#"{{"partialSuccess":{{"rejectedSpans":"1","errorMessage":"{long}"}}}}"#);
+        let key = "sentinel-header-value-1741";
+        let json = format!(
+            r#"{{"partialSuccess":{{"rejectedSpans":"1","errorMessage":"invalid key {key}"}}}}"#
+        );
         let (addr, mut requests) = receiver_answering(vec![(OK.into(), json.into_bytes())]).await;
         let mut sender = sender_for(
             format!("http://{addr}/v1/traces"),
-            "",
+            &format!("x-api-key={key}"),
             Duration::from_secs(5),
         );
         sender.protocol = Protocol::HttpJson;
@@ -3482,9 +3519,11 @@ mod tests {
             2,
             "once per sender inside the interval: {logged}"
         );
-        assert!(logged.contains("late"), "{logged}");
-        assert!(logged.contains(&format!("{}…", "x".repeat(MAX_LOGGED_ERROR_MESSAGE))));
-        assert!(!logged.contains(&"x".repeat(MAX_LOGGED_ERROR_MESSAGE + 1)));
+        assert!(logged.contains("rejected=1"), "{logged}");
+        assert!(logged.contains("rejected=2"), "{logged}");
+        for backend_text in [key, "invalid key", "late"] {
+            assert!(!logged.contains(backend_text), "{backend_text}: {logged}");
+        }
     }
 
     /// A rejection that is not transient is not retried.

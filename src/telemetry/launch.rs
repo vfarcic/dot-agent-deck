@@ -30,7 +30,10 @@
 //!   for Codex).
 //! - **Pi** exports through the deck's own Pi extension, which stays inert
 //!   unless the deck sets [`PI_TELEMETRY_ENV`] — which it does not when the
-//!   user set that variable themselves, so `0` keeps Pi's export off.
+//!   user set that variable themselves, so `0` keeps Pi's export off, nor when
+//!   the agent's environment sets `OTEL_SDK_DISABLED=true` or an
+//!   `OTEL_LOGS_EXPORTER` with no `otlp` in it. The extension declines on
+//!   those two as well.
 //!
 //! Codex's and Devin's decisions read the environment the agent really starts
 //! with — the shim's own, after whatever script or launcher ran it — so the
@@ -109,9 +112,11 @@ const LOGS: Signal = Signal {
 
 impl Signal {
     /// Whether the user switched this signal off, or to something other than
-    /// OTLP, with its `OTEL_*_EXPORTER` selector.
+    /// OTLP, with its `OTEL_*_EXPORTER` selector: set, with no `otlp` among
+    /// its comma-separated entries.
     fn declined(&self, env: &EnvMap) -> bool {
-        non_empty(env, self.exporter).is_some_and(|v| !v.to_ascii_lowercase().contains("otlp"))
+        non_empty(env, self.exporter)
+            .is_some_and(|v| !v.split(',').any(|e| e.trim().eq_ignore_ascii_case("otlp")))
     }
 
     /// Where this signal goes: its own endpoint as written, else the general
@@ -679,10 +684,12 @@ fn unlink_at(dir: &std::fs::File, name: &std::ffi::CStr) {
 // ---- Pi ----
 
 /// Whether the deck's Pi extension has somewhere to send logs: a logs
-/// endpoint, over OTLP/HTTP, not declined by the user. The extension sends
-/// OTLP/JSON.
+/// endpoint, over OTLP/HTTP, not declined by the user — with the extension's
+/// own variable, `OTEL_SDK_DISABLED` or `OTEL_LOGS_EXPORTER`. The extension
+/// sends OTLP/JSON, and reads those two opt-outs again itself.
 fn pi_exports(env: &EnvMap) -> bool {
     non_empty(env, PI_TELEMETRY_ENV).is_none()
+        && !sdk_disabled(env)
         && LOGS.endpoint(env).is_some()
         && LOGS.http_protocol(env).is_some()
 }
@@ -1392,6 +1399,27 @@ mod tests {
             .is_empty(),
             "the user's own value stands"
         );
+        for opt_out in [
+            ("OTEL_SDK_DISABLED", "true"),
+            ("OTEL_SDK_DISABLED", " TRUE "),
+            ("OTEL_LOGS_EXPORTER", "console"),
+            ("OTEL_LOGS_EXPORTER", "otlpx, console"),
+        ] {
+            assert!(
+                launch(&[("OTEL_EXPORTER_OTLP_ENDPOINT", "http://c"), opt_out]).is_empty(),
+                "{opt_out:?}"
+            );
+        }
+        for opt_in in [
+            ("OTEL_SDK_DISABLED", "false"),
+            ("OTEL_LOGS_EXPORTER", "console, OTLP"),
+        ] {
+            assert_eq!(
+                launch(&[("OTEL_EXPORTER_OTLP_ENDPOINT", "http://c"), opt_in]),
+                on,
+                "{opt_in:?}"
+            );
+        }
     }
 
     #[test]

@@ -1019,7 +1019,7 @@ fn telemetry_otlp_012_daemon_shutdown_flushes_open_run() {
     );
 }
 
-/// Scenario: Send shell-tool start/end hooks for ordinary, wrapped, sandboxed and private commands to a stand-in pane, including assignments whose values hold a path, comments, command substitutions and variable expansions before the program, in both the shell-split and Codex's joined-argv form, plus a non-shell tool. Close the pane and inspect completed operation spans: plain commands carry safe program/word metadata, commands with other shell syntax before their first word carry neither, and no request body holds a sentinel, private or raw command text, alongside parent identity, duration and count.
+/// Scenario: Send shell-tool start/end hooks for ordinary, wrapped, sandboxed and private commands to a stand-in pane, including assignments whose values hold a path, comments, command substitutions and variable expansions before the program, and shell reserved words or `eval` whose operand is a sentinel, in both the shell-split and Codex's joined-argv form, plus a non-shell tool. Close the pane and inspect completed operation spans: plain commands carry safe program/word metadata, commands with other shell syntax before their first word, or shell grammar as their program, carry neither, and no request body holds a sentinel, private or raw command text, alongside parent identity, duration and count.
 #[spec("telemetry/otlp/014")]
 #[test]
 fn telemetry_otlp_014_shell_operations_classify_without_content() {
@@ -1076,6 +1076,10 @@ fn telemetry_otlp_014_shell_operations_classify_without_content() {
             "",
         ),
         ("bash -c 'cd /tmp/x && cargo build'", "cargo", "build"),
+        // Shell grammar is not a program: its operand is data.
+        ("case sentinelvalue1741 in a) true;; esac", "", ""),
+        ("sudo eval sentinelvalue1741", "", ""),
+        ("bash -c 'eval sentinelvalue1741'", "", ""),
     ];
     // Codex's `shell` tool reports a joined argv: its program at most.
     let joined_cases = [
@@ -1098,6 +1102,11 @@ fn telemetry_otlp_014_shell_operations_classify_without_content() {
             "",
         ),
         ("/bin/sh -lc $VAR/x/sentinelvalue1741", "", ""),
+        (
+            "/bin/sh -lc case sentinelvalue1741 in a) true;; esac",
+            "",
+            "",
+        ),
     ];
     let all_cases: Vec<_> = cases
         .iter()

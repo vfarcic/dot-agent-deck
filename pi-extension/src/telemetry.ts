@@ -94,9 +94,22 @@ export function parsePairs(raw: string | undefined): Array<[string, string]> {
 	return out;
 }
 
-/** Where and how to export, or `undefined` when this extension should not. */
+/**
+ * Where and how to export, or `undefined` when this extension should not: the
+ * deck has not switched it on, `OTEL_SDK_DISABLED` is `true` (any case),
+ * `OTEL_LOGS_EXPORTER` is set and names no `otlp` exporter, or no http(s)
+ * endpoint is configured. The opt-outs are read here as well as by the deck,
+ * since a wrapper can change the environment after the deck's decision.
+ */
 export function telemetryConfig(env: Env): TelemetryConfig | undefined {
 	if (env[TELEMETRY_ENV] !== "1") {
+		return undefined;
+	}
+	if (nonEmpty(env.OTEL_SDK_DISABLED)?.toLowerCase() === "true") {
+		return undefined;
+	}
+	const exporters = nonEmpty(env.OTEL_LOGS_EXPORTER);
+	if (exporters !== undefined && !exporters.split(",").some((e) => e.trim().toLowerCase() === "otlp")) {
 		return undefined;
 	}
 	const general = nonEmpty(env.OTEL_EXPORTER_OTLP_ENDPOINT);

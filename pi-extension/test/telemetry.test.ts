@@ -118,6 +118,32 @@ describe("pi telemetry", () => {
 		assert.equal(telemetryConfig({ [TELEMETRY_ENV]: "1", OTEL_EXPORTER_OTLP_ENDPOINT: "file:///x" }), undefined);
 	});
 
+	test("the SDK and logs-exporter opt-outs win over the deck's flag", async () => {
+		for (const optOut of [
+			{ OTEL_SDK_DISABLED: "true" },
+			{ OTEL_SDK_DISABLED: " TRUE " },
+			{ OTEL_LOGS_EXPORTER: "none" },
+			{ OTEL_LOGS_EXPORTER: "console" },
+			{ OTEL_LOGS_EXPORTER: "otlpx, console" },
+		]) {
+			const env = { ...ON, ...optOut };
+			const sink = capture();
+			assert.equal(telemetryConfig(env), undefined, JSON.stringify(optOut));
+			const telemetry = createPiTelemetry(env, sink.fetch);
+			assert.equal(telemetry, undefined, JSON.stringify(optOut));
+			assert.equal(sink.calls.length, 0, JSON.stringify(optOut));
+		}
+		for (const optIn of [
+			{ OTEL_SDK_DISABLED: "false" },
+			{ OTEL_SDK_DISABLED: "" },
+			{ OTEL_LOGS_EXPORTER: "otlp" },
+			{ OTEL_LOGS_EXPORTER: "console, OTLP" },
+			{ OTEL_LOGS_EXPORTER: " " },
+		]) {
+			assert.ok(telemetryConfig({ ...ON, ...optIn }), JSON.stringify(optIn));
+		}
+	});
+
 	test("endpoint, headers and resource come from the standard variables", () => {
 		const config = telemetryConfig(ON);
 		assert.ok(config);
