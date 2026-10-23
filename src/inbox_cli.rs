@@ -495,6 +495,22 @@ pub const CLI_FOREIGN_SOCKET: &str = "Could not fetch messages: the deck socket 
 /// approval that ran out), or the receipt spool could not be read.
 pub const CLI_NOTHING_PRINTED: &str = "Could not fetch messages: none of them was printed, because the deck did not let this fetch hand them over (it may have taken them back, or this process could not read the deck's receipt records). The deck still has any that are waiting.";
 
+/// What `inbox fetch` says when its fetch request could not be sent whole,
+/// `timed_out` or on a lost connection. A request the deck took no byte of is
+/// one it never read, so no message was taken. Once part of it went, the deck
+/// may have read the whole request but its newline (a final line with none is
+/// read at the end of a connection) and served it, so it is worded as a fetch
+/// sent.
+#[cfg(unix)]
+fn request_not_sent(part_sent: bool, timed_out: bool) -> &'static str {
+    match (part_sent, timed_out) {
+        (false, true) => CLI_RECEIPTS_TIMED_OUT,
+        (false, false) => CLI_RECEIPTS_CONNECTION_LOST,
+        (true, true) => CLI_FETCH_TIMED_OUT,
+        (true, false) => CLI_FETCH_CONNECTION_LOST,
+    }
+}
+
 /// What `inbox fetch` says when its output was cut short or not confirmed
 /// written: what it printed may have reached the agent.
 pub const CLI_CUT_SHORT: &str = "Could not print every message: what was printed may have reached the agent, and the deck may hand some of them over again, marked as a possible repeat.";
@@ -589,16 +605,15 @@ fn fetch_one_shot<W: Write>(
         return ExitCode::FAILURE;
     };
     // The request gets a budget of its own from the answer, as the waiter's
-    // does. A line the deck never took whole is one it never read.
+    // does.
     let by = std::time::Instant::now() + wait;
     if let Err(error) = connection.send(&request, by) {
         return say(
             err,
-            if error.kind() == std::io::ErrorKind::TimedOut {
-                CLI_RECEIPTS_TIMED_OUT
-            } else {
-                CLI_RECEIPTS_CONNECTION_LOST
-            },
+            request_not_sent(
+                connection.left_a_line_cut(),
+                error.kind() == std::io::ErrorKind::TimedOut,
+            ),
         );
     }
     let reply = loop {
@@ -1614,6 +1629,21 @@ mod tests {
                 refused.iter().map(|&i| at(ids[i])).collect::<Vec<_>>(),
                 "refused {refused:?}"
             );
+        }
+    }
+
+    /// Round 3's review: a fetch request the deck took part of may have been
+    /// read whole but its newline, so its failure is worded as a fetch sent,
+    /// never as one that took nothing; one it took nothing of took nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_request_partly_written_is_worded_as_sent() {
+        assert_eq!(request_not_sent(false, true), CLI_RECEIPTS_TIMED_OUT);
+        assert_eq!(request_not_sent(false, false), CLI_RECEIPTS_CONNECTION_LOST);
+        for timed_out in [true, false] {
+            let said = request_not_sent(true, timed_out);
+            assert!(!said.contains("no message was taken"), "{said}");
+            assert!(said.contains("possible repeat"), "{said}");
         }
     }
 

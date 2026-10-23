@@ -1408,6 +1408,13 @@ impl Connection {
         self.ended
     }
 
+    /// Whether the last line [`Self::send`] gave up on was partly written.
+    /// The deck may have read all of such a line but its newline: it reads
+    /// a final line with none at the end of a connection.
+    pub fn left_a_line_cut(&self) -> bool {
+        self.cut
+    }
+
     /// Send one line within the time left before `deadline`, or fail with
     /// [`io::ErrorKind::TimedOut`] (a deck that does not read).
     /// The clock is checked before each piece is written, and each write is
