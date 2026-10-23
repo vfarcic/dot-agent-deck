@@ -4,6 +4,6 @@ When the TUI, `dot-agent-deck upgrade` or the desktop app installs a new CLI, it
 
 A Claude Code or Codex agent whose hooks come from a release before 0.47, which never ask for the agent's messages, showed nothing on its card. When those hooks' events identify the agent, its TUI card and desktop tile now say `this agent's deck hooks run a dot-agent-deck too old for its messages` with that agent's `hooks install` command, as soon as one of its hook events reaches the deck; hooks too old to carry the deck's hook capability token still show no notice. Its messages still reach it the old way meanwhile, through the doorbell that asks it to run `dot-agent-deck inbox fetch`; the notice clears once the agent's hooks are updated and the agent is restarted.
 
-In the TUI's Deck messages picker, a window too small for the line saying to make it taller now shows a shorter version of that line whole, instead of cutting it off.
+In the TUI's Deck messages picker, a window too small for the line saying to make it taller now shows a shorter version of that line whole, down to `… taller`, instead of cutting it off; a window too small even for that shows none.
 
 See [Installation → Your agents' hooks after an upgrade](https://agent-deck.devopstoolkit.ai/docs/installation.md#your-agents-hooks-after-an-upgrade).

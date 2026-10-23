@@ -600,7 +600,7 @@ fn status_028_deck_messages_shows_a_refused_connection_whole() {
     );
 }
 
-/// Scenario: The deck refused the agent's own request for its waiting messages, and the terminal is both narrow and short. Pressing `i` opens Deck messages with the notice from its headline, and where the rest does not fit the picker says to make the window taller, rather than silently dropping the remedy; in a window tall enough the whole notice shows and no such line does. In a window smaller still, a shorter such line takes its place whole, never cut off itself.
+/// Scenario: The deck refused the agent's own request for its waiting messages, and the terminal is both narrow and short. Pressing `i` opens Deck messages with the notice from its headline, and where the rest does not fit the picker says to make the window taller, rather than silently dropping the remedy; in a window tall enough the whole notice shows and no such line does. In a window smaller still, a shorter such line takes its place whole, and in one too small for even the shortest, none does, never a piece of one.
 #[spec("inbox/status/029")]
 #[test]
 fn status_029_a_refused_connection_too_long_for_the_window_says_to_make_it_taller() {
@@ -659,6 +659,21 @@ fn status_029_a_refused_connection_too_long_for_the_window_says_to_make_it_talle
         assert!(
             SHORTER.iter().any(|hint| shown.contains(hint)),
             "{size:?}: a whole line says to make the window taller:\n{rendered}"
+        );
+    }
+    // Round 2's U3: smaller still, where even `… taller` does not fit whole,
+    // there is no such line rather than a piece of one.
+    for size in [(11, 9), (9, 9), (12, 6)] {
+        let small = run(size);
+        let rendered = text(small.screen.as_ref().expect("the picker is drawn"));
+        let shown = flat(&rendered);
+        assert!(
+            !shown.contains("tall") && !shown.contains("make the"),
+            "{size:?}: no piece of the line:\n{rendered}"
+        );
+        assert!(
+            shown.contains("Mes"),
+            "{size:?}: the notice's start:\n{rendered}"
         );
     }
 }

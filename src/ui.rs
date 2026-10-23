@@ -19606,7 +19606,9 @@ fn inbox_attention_lines(
     // line saying to make the window taller, rather than losing its remedy
     // unannounced. The desktop tile has no such state: its list scrolls.
     // Round 2: in a window too small for that line whole, a shorter one, so
-    // the line is never cut off itself.
+    // the line is not cut off itself. A window too small for even the last
+    // rung (`… taller` needs six columns and two rows, or eight and one) gets
+    // no such line, rather than a fragment of one.
     let notice = if notice.len() > rows {
         let inner = width.saturating_sub(2);
         let taller = NOTICE_NEEDS_HEIGHT_LADDER
