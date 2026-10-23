@@ -4266,9 +4266,10 @@ async fn resize_worker(
     attached: Arc<Mutex<PaneAttachment>>,
     parser: Arc<Mutex<vt100::Parser>>,
 ) {
-    // Mark the initial `None` value as seen so the first `changed()` call
-    // waits for an actual resize, not the channel's seed value.
-    let _ = rx.borrow_and_update();
+    // A receiver from `watch::channel` already counts the seed `None` as seen,
+    // so the first `changed()` waits for an actual resize. Marking it seen here
+    // instead also marked a resize sent before this task first ran, and that
+    // one never reached the daemon.
     while rx.changed().await.is_ok() {
         let dims = *rx.borrow_and_update();
         let Some((rows, cols)) = dims else { continue };
