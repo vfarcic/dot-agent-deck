@@ -64,8 +64,9 @@ const holds = (section: Section | undefined, label: string) => !!section?.rows.s
 /// each that both daemons number the same; open the window with All Decks
 /// selected and see one section per deck, each holding only its own deck's
 /// row, and the deck counter read 2/2. Then stop the far daemon and see that
-/// deck degrade on its own: the local deck keeps its row and its connected
-/// lamp, the far deck's section stays on screen, and the counter reads 1/2.
+/// deck degrade on its own: its section stays on screen, reads disconnected
+/// and lists no agents, the local deck keeps its own row and its connected
+/// lamp, and the counter reads 1/2.
 test("fleet_001 All Decks shows two real daemons apart, and one stopping is that deck's problem alone", async () => {
   const command = "bash --noprofile --norc";
   // Labels distinctive enough that finding one in the other deck's section is
@@ -109,8 +110,9 @@ test("fleet_001 All Decks shows two real daemons apart, and one stopping is that
     await far.stopDaemon();
 
     // The far deck's problem, on its own: its section stays (it is still in
-    // the fleet's denominator) and stops reporting connected, while the local
-    // deck keeps its row and its lamp — and the counter says 1 of 2 rather
+    // the fleet's denominator), reads disconnected and lists no agents — what
+    // it runs is unknown now, not its last list — while the local deck keeps
+    // exactly its own row and its lamp, and the counter says 1 of 2 rather
     // than dropping the silent deck to read 1/1.
     const after = await sectionsWhere(deck, "the far deck alone to degrade and the counter to read 1/2", (seen, count) => {
       const nearNow = seen.find((section) => section.daemonId === nearSection.daemonId);
@@ -119,14 +121,17 @@ test("fleet_001 All Decks shows two real daemons apart, and one stopping is that
         count === "1/2" &&
         seen.length === 2 &&
         nearNow?.connected === "yes" &&
+        nearNow.rows.length === 1 &&
         holds(nearNow, nearLabel) &&
         /\bconnection-connected\b/.test(nearNow.lamp) &&
         farNow?.connected === "no" &&
-        !/\bconnection-connected\b/.test(farNow.lamp)
+        farNow.rows.length === 0 &&
+        /\bconnection-disconnected\b/.test(farNow.lamp)
       );
     });
     const farAfter = after.find((section) => section.daemonId === farSection.daemonId) as Section;
     assert.equal(farAfter.identity, FarDeck.NAME, "the degraded section is still the far deck's");
-    assert.ok(!holds(farAfter, nearLabel), `the degraded far deck's section took the local deck's row: ${JSON.stringify(after)}`);
+    const nearAfter = after.find((section) => section.daemonId === nearSection.daemonId) as Section;
+    assert.ok(!holds(nearAfter, farLabel), `the local deck's section took the stopped deck's row: ${JSON.stringify(after)}`);
   });
 });

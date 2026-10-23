@@ -198,11 +198,11 @@ async function nativeDriverBindFailure(log: string): Promise<string | undefined>
     ?.trim();
 }
 
-function run(file: string, args: string[], env: NodeJS.ProcessEnv): Promise<{ code: number; stdout: string }> {
+function run(file: string, args: string[], env: NodeJS.ProcessEnv): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((settle) => {
-    execFile(file, args, { env, timeout: WAIT_MS }, (error, stdout) => {
+    execFile(file, args, { env, timeout: WAIT_MS }, (error, stdout, stderr) => {
       const code = error ? (typeof error.code === "number" ? error.code : 1) : 0;
-      settle({ code, stdout });
+      settle({ code, stdout, stderr });
     });
   });
 }
@@ -929,8 +929,10 @@ export class Deck {
     } catch (error) {
       writeFileSync(join(dir, "capture-error.txt"), String(error));
     }
-    const farLogs = this.far ? FarDeck.LOGS : [];
-    for (const log of ["daemon.out", "driver.log", "deck.log", join("state", "daemon.log"), ...farLogs]) {
+    // Every scenario's far-deck paths, not only those whose far deck came up:
+    // a far deck that failed to start has the logs that say why, and a
+    // scenario without one has none of these files to copy.
+    for (const log of ["daemon.out", "driver.log", "deck.log", join("state", "daemon.log"), ...FarDeck.LOGS]) {
       try {
         writeFileSync(join(dir, log.replaceAll("/", "-")), readFileSync(join(this.sandbox, log)));
       } catch {
@@ -1078,8 +1080,8 @@ export class FarDeck {
     const hostKey = join(this.ssh, "hostkey");
     const clientKey = join(this.ssh, "clientkey");
     for (const key of [hostKey, clientKey]) {
-      const { code } = await run(paths.sshKeygen, ["-q", "-t", "ed25519", "-N", "", "-C", "dad-driver", "-f", key], this.deckEnv);
-      if (code !== 0) throw new Error(`${paths.sshKeygen} exited ${code} generating ${key}`);
+      const { code, stderr } = await run(paths.sshKeygen, ["-q", "-t", "ed25519", "-N", "", "-C", "dad-driver", "-f", key], this.deckEnv);
+      if (code !== 0) throw new Error(`${paths.sshKeygen} exited ${code} generating ${key}: ${stderr.trim()}`);
     }
     const authorizedKeys = join(this.ssh, "authorized_keys");
     writeFileSync(authorizedKeys, readFileSync(`${clientKey}.pub`), { mode: 0o600 });
@@ -1216,11 +1218,13 @@ export class FarDeck {
    */
   private async proveLogin(port: number, clientKey: string): Promise<void> {
     const args = ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10"];
-    const { code } = await run(this.tools.ssh, [...args, "-p", String(port), "-i", clientKey, "--", "127.0.0.1", "true"], this.windowEnv);
+    const { code, stderr } = await run(this.tools.ssh, [...args, "-p", String(port), "-i", clientKey, "--", "127.0.0.1", "true"], this.windowEnv);
     if (code !== 0) {
+      // ssh's own stderr carries the reason this check exists for (an unknown
+      // host key, a preload that did not load); the sshd log, the server's half.
       throw new Error(
         `a pubkey login to the far deck's sshd with strict host-key checking failed (exit ${code}); ` +
-          `sshd said: ${readFileSync(join(this.ssh, "sshd.log"), "utf8").trim()}`,
+          `ssh said: ${stderr.trim()}; sshd said: ${readFileSync(join(this.ssh, "sshd.log"), "utf8").trim()}`,
       );
     }
   }
