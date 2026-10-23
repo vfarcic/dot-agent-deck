@@ -805,6 +805,114 @@ async fn return_026_f8_a_reused_pane_is_never_taken_for_the_successor() {
     );
 }
 
+/// Scenario: (f4''') the routes are poisoned by a panic elsewhere while the report state stays whole, in a child process, and then the window panics. The abort cannot take the routes, so it writes nothing: the unit has no entry, the route still names A, no `dispatch ended` is posted, B is not closed and is running, and the injected payload reaches the respawn's caller.
+#[spec("dispatch/return/026")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn return_026_f4ppp_poisoned_routes_with_a_whole_state_make_the_abort_write_nothing() {
+    if !is_child() {
+        return in_child(
+            "return_026_f4ppp_poisoned_routes_with_a_whole_state_make_the_abort_write_nothing",
+        );
+    }
+    let deck = deck();
+    let (caller_pane, _, unit) = dispatched(&deck, false, "r026f4ppp").await;
+    let (pane, a) = (
+        unit.delivery_pane_id.clone(),
+        unit.delivery_agent_id.clone(),
+    );
+    let unit_id = unit.unit_id.clone().unwrap();
+    let registry = Arc::clone(&deck.registry);
+    let _ = std::thread::spawn(move || {
+        let _routes = registry.dispatch_returns.lock();
+        panic!("poison the routes (test)");
+    })
+    .join();
+    assert!(deck.registry.dispatch_returns.is_poisoned());
+    assert!(!deck.registry.inbox().reports_torn());
+    deck.registry.inject_fault_for_test(
+        FAULT_RESPAWN_AFTER_SPAWN,
+        TestFault::Panic("injected-f4ppp"),
+    );
+    let payload = respawn_panicking(&deck, &pane).await;
+    assert_eq!(payload.downcast_ref::<&str>(), Some(&"injected-f4ppp"));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        unit_entry(&deck, &unit_id).is_none(),
+        "the unit is not ended"
+    );
+    assert_eq!(route_agent(&deck, &pane).as_deref(), Some(a.as_str()));
+    assert_eq!(ended_notices(&deck, &caller_pane), 0);
+    assert!(deck.registry.abort_closes_for_test().is_empty());
+    let b = deck
+        .registry
+        .pane_current_agent_id(&pane)
+        .expect("B is live");
+    assert!(pinned_unit(&deck, &b).is_none());
+    assert!(deck.registry.child_pid(&b).is_some(), "B is running");
+    std::mem::forget(deck);
+}
+
+/// Scenario: B exits while the respawn is paused before its publish, so B's reader waits on the replacement's latch; then the window panics and the abort runs, paused right after it sent its latch. While the abort is paused, before its after-section helpers run, B's reader is already past the latch: B's exit signal has fired. Released, the unit ends once.
+#[spec("dispatch/return/026")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn return_026_f2l_the_latch_is_sent_before_the_after_section_helpers() {
+    let deck = deck();
+    let (caller_pane, _, unit) = dispatched(&deck, false, "r026f2l").await;
+    let pane = unit.delivery_pane_id.clone();
+    let unit_id = unit.unit_id.clone().unwrap();
+    let (reached, release) = deck
+        .registry
+        .pause_at_sync_for_test(PAUSE_RESPAWN_BEFORE_PUBLISH);
+    let respawn = {
+        let registry = Arc::clone(&deck.registry);
+        let pane = pane.clone();
+        tokio::spawn(async move { registry.respawn_agent_for_pane(&pane, "cat").await })
+    };
+    tokio::task::spawn_blocking(move || reached.recv_timeout(Duration::from_secs(10)))
+        .await
+        .unwrap()
+        .expect("the respawn reaches its window");
+    let b = deck
+        .registry
+        .pane_current_agent_id(&pane)
+        .expect("B is published");
+    let b_exited = deck.registry.agent_exit_signal(&b);
+    kill_child(&deck.registry, &b);
+    eventually("B exited", || {
+        deck.registry
+            .agent_record_any(&b)
+            .is_some_and(|r| r.crashed == Some(true))
+    })
+    .await;
+    let (latched, release_latched) = deck.registry.pause_at_sync_for_test(PAUSE_ABORT_LATCHED);
+    deck.registry.inject_fault_for_test(
+        FAULT_RESPAWN_BEFORE_PUBLISH_SECTION,
+        TestFault::Panic("injected-f2l"),
+    );
+    release.send(()).unwrap();
+    tokio::task::spawn_blocking(move || latched.recv_timeout(Duration::from_secs(10)))
+        .await
+        .unwrap()
+        .expect("the abort sends its latch");
+    let past_latch = tokio::time::timeout(Duration::from_secs(5), b_exited).await;
+    release_latched.send(()).unwrap();
+    assert!(
+        past_latch.is_ok(),
+        "B's reader must be past the latch before the abort's after-section helpers run"
+    );
+    assert!(respawn.await.is_err());
+    eventually("one dispatch ended", || {
+        ended_notices(&deck, &caller_pane) == 1
+    })
+    .await;
+    assert_eq!(
+        unit_entry(&deck, &unit_id),
+        Some(UnitEntry::Ended {
+            how: EndedHow::RespawnFailed
+        })
+    );
+}
+
 /// Scenario: A dispatch whose reply room is armed across its handling, and whose initial publication is installed, unwinds from a panic inside its unit registration's section, in a child process. The registration's tracker and routes are poisoned and the report state torn; the publication guard skips the poisoned routes without logging, counted once; the reply room comes back through the recovering hub; the injected payload escapes as an ordinary task panic; the inbox still delivers; and the next dispatch is refused before anything starts as the deck being degraded.
 #[spec("orchestration/work-done/056")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

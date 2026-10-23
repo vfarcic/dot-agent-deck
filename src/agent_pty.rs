@@ -5838,6 +5838,11 @@ pub(crate) const FAULT_TEAR_BEFORE_ABORT: &str = "tear-before-abort";
 /// ((f5b)'s second seam).
 pub(crate) const FAULT_ABORT_AFTER_SECTION: &str = "abort-after-section";
 
+/// PRD #1666 part 3, round 5: the synchronous pause in the replacement's
+/// abort right after its latch is sent, and before its after-section helpers
+/// run (mutant M83's oracle).
+pub(crate) const PAUSE_ABORT_LATCHED: &str = "respawn-abort-latched";
+
 /// PRD #1666 part 3, round 5 (plan D7): a respawn of a dispatched unit's
 /// terminal generation, from its `begin` until its `publish` or `abort`.
 ///
@@ -12285,6 +12290,7 @@ impl AgentPtyRegistry {
         // before the latch.
         let _ = self.fault_point(FAULT_ABORT_AFTER_SECTION);
         ticket.send(crate::inbox_hub::ReplacementOutcome::Aborted);
+        self.pause_point_sync(PAUSE_ABORT_LATCHED);
         if self
             .dispatched_units()
             .end(
