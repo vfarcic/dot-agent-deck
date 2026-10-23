@@ -244,7 +244,9 @@ impl Tokens {
     /// Whether the cache parts fit inside the input count that includes
     /// them; a total where they do not is not a count in this convention.
     fn is_consistent(&self) -> bool {
-        self.cache_read.saturating_add(self.cache_write) <= self.input
+        self.cache_read
+            .checked_add(self.cache_write)
+            .is_some_and(|cache| cache <= self.input)
     }
 }
 
@@ -831,7 +833,9 @@ pub struct OpenCodeUsage {
 /// it is `0` for a message that used tokens, which is what its subscription
 /// providers report. A message with no usage has its tokens and cost
 /// [`Unavailable::NotRecorded`], never zero, so a model whose messages mix
-/// the two has them [`Unavailable::Incomplete`].
+/// the two has its tokens [`Unavailable::Incomplete`], and its cost too
+/// unless every reported message is an explicit zero cost for zero tokens,
+/// which adds nothing and leaves the cost `not_recorded`.
 pub fn from_opencode(messages: &[OpenCodeMessageUsage]) -> AgentUsage {
     let models = per_model(messages.iter().map(|m| {
         let model = Ident::new(&m.model);
@@ -2805,7 +2809,9 @@ mod tests {
     /// counters OpenCode left at their initial 0) has its tokens and cost
     /// `not_recorded`, apart from a completed reply that reported zero
     /// tokens, which is a provider-reported zero; mixed with reported
-    /// usage, the model's tokens and cost are incomplete.
+    /// usage, the model's tokens are incomplete, and so is its cost unless
+    /// the reported cost is an explicit zero for zero tokens, which adds
+    /// nothing and leaves the cost `not_recorded`.
     #[test]
     fn opencode_absent_usage_is_not_recorded_and_a_reported_zero_is_zero() {
         let absent = from_opencode(&[opencode_unrecorded("gpt-5.5")]);
@@ -2838,6 +2844,19 @@ mod tests {
         assert_eq!(
             mixed.models[0].cost,
             Field::Unavailable(Unavailable::Incomplete)
+        );
+
+        let beside_zero = from_opencode(&[
+            opencode_unrecorded("gpt-5.5"),
+            opencode_message("gpt-5.5", false, 0.0),
+        ]);
+        assert_eq!(
+            beside_zero.models[0].tokens,
+            Field::Unavailable(Unavailable::Incomplete)
+        );
+        assert_eq!(
+            beside_zero.models[0].cost,
+            Field::Unavailable(Unavailable::NotRecorded)
         );
         let rolled = rollup([&RunRecord::new(
             identity("r", "opencode"),
@@ -3090,8 +3109,8 @@ mod tests {
         assert_eq!(reader.stats().unusable_totals, 0);
     }
 
-    /// A total whose cache parts exceed the input that includes them is not a
-    /// count: valid, then such a total with a lower input, then valid again
+    /// A total whose cache parts exceed the input that includes them, an
+    /// overflowing cache sum included, is not a count: valid, then such a total with a lower input, then valid again
     /// is the last valid total, with the baseline never moved by the middle
     /// one, and the run's tokens stay provider-reported.
     #[test]
@@ -3099,6 +3118,11 @@ mod tests {
         for inconsistent in [
             usage(0, 40, 10),
             r#"{"input_tokens":30,"cached_input_tokens":20,"cache_write_input_tokens":20,"output_tokens":10}"#.into(),
+            // The cache sum overflows: it is still more than the input.
+            format!(
+                r#"{{"input_tokens":{max},"cached_input_tokens":{max},"cache_write_input_tokens":1,"output_tokens":10}}"#,
+                max = u64::MAX
+            ),
         ] {
             let reader = read(&[
                 token_count(100, 40, 10, 1.0, 5),
@@ -3560,8 +3584,9 @@ mod tests {
     /// Strings reach the record only as identifiers, on every path a string
     /// enters by. Through the reader, a JSON escape is judged after decoding
     /// (an escaped hyphen or underscore is kept, an escaped line break is
-    /// not) and the 128/129-byte boundary holds, for each of the three string
-    /// fields it keeps: the turn's model, the plan and the error kind.
+    /// not), a space is dropped and the 128/129-byte boundary holds, for each
+    /// of the three string fields it keeps: the turn's model, the plan and
+    /// the error kind.
     /// Through each normaliser that takes a raw model name (Claude Code, Pi,
     /// OpenCode), a space, a line break and 129 bytes are dropped and 128
     /// kept. A run id or agent is an `Ident` before a record can hold it. An
@@ -3574,21 +3599,23 @@ mod tests {
 
         // The model, through the reader.
         let reader = read(&[
-            turn_context(r"gpt-5.5"),
+            turn_context(r"gpt\u002d5.5"),
             token_count(10, 0, 1, 1.0, 5),
             turn_context(&format!(r"{SENTINEL}\u000aline")),
             token_count(20, 0, 2, 1.0, 5),
             turn_context(&format!(r"{SENTINEL}é")),
             token_count(30, 0, 3, 1.0, 5),
-            turn_context(&over_limit),
+            turn_context(&format!("{SENTINEL} space")),
             token_count(40, 0, 4, 1.0, 5),
+            turn_context(&over_limit),
+            token_count(50, 0, 5, 1.0, 5),
             turn_context(&at_limit),
-            token_count_with(&usage(50, 0, 5), 1.0, 5, &format!("{SENTINEL}@example.com")),
+            token_count_with(&usage(60, 0, 6), 1.0, 5, &format!("{SENTINEL}@example.com")),
         ]);
         let summary = reader.summary();
         let keys: Vec<Option<Ident>> = summary.tokens_by_model.keys().cloned().collect();
         assert_eq!(keys, vec![None, Some(id(&at_limit)), Some(id("gpt-5.5"))]);
-        assert_eq!(summary.tokens_by_model[&None], tokens(30, 3));
+        assert_eq!(summary.tokens_by_model[&None], tokens(40, 4));
         assert_eq!(
             summary.quota_last.as_ref().unwrap().plan,
             Some(id(&format!("{SENTINEL}@example.com")))
@@ -3596,7 +3623,7 @@ mod tests {
 
         // The plan and the error kind, through the reader.
         let cases = [
-            (r"pro_lite".to_owned(), Some("pro_lite".to_owned())),
+            (r"pro\u005flite".to_owned(), Some("pro_lite".to_owned())),
             (format!(r"{SENTINEL}\u000aline"), None),
             (format!("{SENTINEL} space"), None),
             (at_limit.clone(), Some(at_limit.clone())),
