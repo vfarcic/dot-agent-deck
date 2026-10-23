@@ -5834,6 +5834,12 @@ pub(crate) const FAULT_ABORT_SKIPPED: &str = "abort-skipped";
 #[cfg(test)]
 pub(crate) const FAULT_TEAR_BEFORE_ABORT: &str = "tear-before-abort";
 
+/// PRD #1666 part 3, round 5: before the abort takes the routes, another
+/// thread panics while holding them, poisoning them with the report state
+/// whole ((f4''')'s seam).
+#[cfg(test)]
+pub(crate) const FAULT_POISON_ROUTES_BEFORE_ABORT: &str = "poison-routes-before-abort";
+
 /// PRD #1666 part 3, round 5: after the abort's section and before its latch
 /// ((f5b)'s second seam).
 pub(crate) const FAULT_ABORT_AFTER_SECTION: &str = "abort-after-section";
@@ -12258,6 +12264,15 @@ impl AgentPtyRegistry {
             let hub = Arc::clone(self.inbox());
             let _ = std::thread::spawn(move || {
                 hub.run_guarded_for_test(|_| panic!("tear the report state (test)"));
+            })
+            .join();
+        }
+        #[cfg(test)]
+        if self.fault_point(FAULT_POISON_ROUTES_BEFORE_ABORT) {
+            let registry = Arc::clone(self);
+            let _ = std::thread::spawn(move || {
+                let _routes = registry.dispatch_returns.lock();
+                panic!("poison the routes (test)");
             })
             .join();
         }

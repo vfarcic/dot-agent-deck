@@ -805,7 +805,7 @@ async fn return_026_f8_a_reused_pane_is_never_taken_for_the_successor() {
     );
 }
 
-/// Scenario: (f4''') the routes are poisoned by a panic elsewhere while the report state stays whole, in a child process, and then the window panics. The abort cannot take the routes, so it writes nothing: the unit has no entry, the route still names A, no `dispatch ended` is posted, B is not closed and is running, and the injected payload reaches the respawn's caller.
+/// Scenario: (f4''') the window panics, and then, before the abort takes the routes, a panic elsewhere poisons them while the report state stays whole, in a child process. The abort cannot take the routes, so it writes nothing: the unit has no entry, the route still names A, no `dispatch ended` is posted, B is not closed and is running, and the injected payload reaches the respawn's caller.
 #[spec("dispatch/return/026")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn return_026_f4ppp_poisoned_routes_with_a_whole_state_make_the_abort_write_nothing() {
@@ -821,20 +821,16 @@ async fn return_026_f4ppp_poisoned_routes_with_a_whole_state_make_the_abort_writ
         unit.delivery_agent_id.clone(),
     );
     let unit_id = unit.unit_id.clone().unwrap();
-    let registry = Arc::clone(&deck.registry);
-    let _ = std::thread::spawn(move || {
-        let _routes = registry.dispatch_returns.lock();
-        panic!("poison the routes (test)");
-    })
-    .join();
-    assert!(deck.registry.dispatch_returns.is_poisoned());
-    assert!(!deck.registry.inbox().reports_torn());
     deck.registry.inject_fault_for_test(
         FAULT_RESPAWN_AFTER_SPAWN,
         TestFault::Panic("injected-f4ppp"),
     );
+    deck.registry
+        .inject_fault_for_test(FAULT_POISON_ROUTES_BEFORE_ABORT, TestFault::Fail);
     let payload = respawn_panicking(&deck, &pane).await;
     assert_eq!(payload.downcast_ref::<&str>(), Some(&"injected-f4ppp"));
+    assert!(deck.registry.dispatch_returns.is_poisoned());
+    assert!(!deck.registry.inbox().reports_torn());
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
         unit_entry(&deck, &unit_id).is_none(),
