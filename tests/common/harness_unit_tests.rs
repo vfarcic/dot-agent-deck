@@ -396,8 +396,8 @@ fn recording_retention_prune_errors_do_not_republish_the_same_failure() {
 }
 
 /// Scenario: Claude's settings request auto mode, but the session transcript
-/// reports default and then acceptEdits, an actual model and a version. The
-/// provenance keeps the observed mode history and latest mode, ignoring settings.
+/// reports default and then acceptEdits, an actual model and a version, with or without a final newline.
+/// Provenance keeps the latest complete observation, marks a partial tail, and ignores settings.
 #[test]
 fn recording_provenance_carries_observed_claude_mode_version_and_model() {
     let home = harness_tempdir().unwrap();
@@ -433,6 +433,38 @@ fn recording_provenance_carries_observed_claude_mode_version_and_model() {
         !serde_json::to_string(&sessions)
             .unwrap()
             .contains("private transcript text")
+    );
+    for prefix in ["{\"permissionMode\":\"default\"}\n", ""] {
+        for ending in ["\n", ""] {
+            std::fs::write(
+                project.join("session.jsonl"),
+                format!(
+                    "{prefix}{{\"sessionId\":\"final-session\",\"permissionMode\":\"auto\",\"version\":\"final-version\",\"message\":{{\"model\":\"final-model\"}}}}{ending}"
+                ),
+            )
+            .unwrap();
+            let observed = recording_evidence::claude_session_provenance(home.path());
+            let final_session = &observed[0];
+            assert_eq!(
+                final_session["permissionMode"], "auto",
+                "latest complete record must survive EOF: prefix={prefix:?}, ending={ending:?}"
+            );
+            assert_eq!(final_session["session_id"], "final-session");
+            assert_eq!(final_session["version"], "final-version");
+            assert_eq!(final_session["model"], "final-model");
+            let modes = if prefix.is_empty() {
+                serde_json::json!(["auto"])
+            } else {
+                serde_json::json!(["default", "auto"])
+            };
+            assert_eq!(final_session["permission_modes"], modes);
+            assert_eq!(final_session["models"], serde_json::json!(["final-model"]));
+            assert_eq!(final_session["truncated"], false);
+        }
+    }
+    assert_eq!(
+        session["truncated"], true,
+        "a partial final record must mark the preserved observations incomplete"
     );
     std::fs::write(project.join("session.jsonl"), "{\"type\":\"system\"}\n").unwrap();
     let unknown = recording_evidence::claude_session_provenance(home.path());
@@ -511,7 +543,7 @@ fn recording_provenance_bounds_records_and_marks_partial_read_errors() {
 }
 
 /// Scenario: A transcript grows after the collector snapshots its length.
-/// Collection stops at the original end offset and cannot observe a later mode appended to the file.
+/// Collection stops at the original end offset and cannot observe a later mode appended to the file, or mistake a skipped first tail fragment for a complete record.
 #[test]
 fn recording_provenance_tail_stops_at_the_snapshot_even_if_the_file_grows() {
     let snapshot = b"{\"permissionMode\":\"default\"}\n";
@@ -526,6 +558,17 @@ fn recording_provenance_tail_stops_at_the_snapshot_even_if_the_file_grows() {
     );
     assert_eq!(result["permission_modes"], serde_json::json!(["default"]));
     assert_eq!(result["permissionMode"], "default");
+    let snapshot = b"ignored-prefix{\"permissionMode\":\"auto\"}";
+    let mut result = serde_json::json!({"permission_modes": [], "models": []});
+    recording_evidence::collect_session_tail(
+        std::io::Cursor::new(snapshot),
+        snapshot.len() as u64,
+        b"{\"permissionMode\":\"auto\"}".len() as u64,
+        &mut result,
+    );
+    assert_eq!(result["permission_modes"], serde_json::json!([]));
+    assert!(result["permissionMode"].is_null());
+    assert_eq!(result["truncated"], true);
 }
 
 /// Scenario: A custom log points outside the sandbox, escapes with parent components or uses a symlink to an outside file.
