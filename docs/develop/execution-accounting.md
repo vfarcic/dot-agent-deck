@@ -327,7 +327,7 @@ That is enough to argue against Stop, and against the narrowest Revise (outcome 
 
 ## Decision (milestone 5)
 
-**Outcome: Revise**, recorded on 2026-10-23. The orchestrator of PRD #633's discovery run made the call from the evidence on this page, and that evidence does not contradict it. It is not the PRD's narrowest Revise ("elapsed time, interventions, verification and outcomes"): the PRD's Revise trigger is token *or* cost accounting staying unreliable, and here only cost did, so the revision drops cost as spend and keeps tokens and quota.
+**Outcome: Revise**, recorded on 2026-10-23 in [the decision record](https://github.com/vfarcic/dot-agent-deck/issues/633#issuecomment-6370966969). The orchestrator of PRD #633's discovery run made the call from the evidence on this page, and that evidence does not contradict it. It is not the PRD's narrowest Revise ("elapsed time, interventions, verification and outcomes"): the PRD's Revise trigger is token *or* cost accounting staying unreliable, and here only cost did, so the revision drops cost as spend and keeps tokens and quota.
 
 ### Evidence against each Success Criterion
 
@@ -354,16 +354,16 @@ That is enough to argue against Stop, and against the narrowest Revise (outcome 
 
 | Follow-up | Why it exists | Depends on |
 | --- | --- | --- |
-| #TBD-run-usage-capture | the prototype captures nothing from a live run; this wires it (dropping its `cfg(test)`), attaches the run record's usage and termination fields to each run's exported telemetry for every supported agent, or names the gap, decides per field which identifier values the record may carry ([leakage risk](#leakage-risk)), and gives a nested agent run its own run id | #1741, and PRD #1666 part 3's hook and Pi-extension work merging |
-| #TBD-work-item-outcomes | disposition, verification, retries, contribution targets and roll-ups need runs attributed to work items, which fails the 90% bar by branch name; verification also needs the required-check list and the merged head's identity, which #1741's CI rollup does not carry | #628, #TBD-run-usage-capture |
-| #TBD-run-resource-attribution | #1692's collector direction, with phase A's finding that neither stock scraper checked can group processes by environment | #1741's run identity in each process's environment |
-| #TBD-host-figures-doc | a one-sentence user-doc change carried over from #1692, which this run could not make because the page is owned by another orchestration | PRD #1666 part 3 merging |
+| #1858 | the prototype captures nothing from a live run; this wires it (dropping its `cfg(test)`), attaches the run record's usage and termination fields to each run's exported telemetry for every supported agent, or names the gap, decides per field which identifier values the record may carry ([leakage risk](#leakage-risk)), and gives a nested agent run its own run id | #1741, and PRD #1666 part 3's hook and Pi-extension work merging |
+| #1860 | disposition, verification, retries, contribution targets and roll-ups need runs attributed to work items, which fails the 90% bar by branch name; verification also needs the required-check list and the merged head's identity, which #1741's CI rollup does not carry | #628, #1858 |
+| #1859 | #1692's collector direction, with phase A's finding that neither stock scraper checked can group processes by environment | #1741's run identity in each process's environment |
+| #1861 | a one-sentence user-doc change carried over from #1692, which this run could not make because the page is owned by another orchestration | PRD #1666 part 3 merging |
 
 Storage, retention and redaction controls and a user surface get no follow-up yet; they wait for the re-evaluation below.
 
 ### When Go is re-evaluated
 
-Go is re-evaluated once #1741's dogfooding has produced deck-observed values for real runs and #1829's analysis of them shows whether at least three of the kept metrics changed a real decision: a run stopped, retried or reassigned, a workflow or model switched, or a failure investigated. That needs #TBD-run-usage-capture shipped first, since without it the backend sees the runs but not their quota or run termination, and sees no tokens for OpenCode. If the analysis finds three, the decision becomes Go and storage, retention and a user surface get their own PRDs; if it finds the metrics read and ignored, the decision moves toward Stop.
+Go is re-evaluated once #1741's dogfooding has produced deck-observed values for real runs and #1829's analysis of them shows whether at least three of the kept metrics changed a real decision: a run stopped, retried or reassigned, a workflow or model switched, or a failure investigated. That needs #1858 shipped first, since without it the backend sees the runs but not their quota or run termination, and sees no tokens for OpenCode. If the analysis finds three, the decision becomes Go and storage, retention and a user surface get their own PRDs; if it finds the metrics read and ignored, the decision moves toward Stop.
 
 ## Not covered and open
 
