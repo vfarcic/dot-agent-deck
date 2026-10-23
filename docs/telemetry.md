@@ -4,7 +4,7 @@ The deck can send a record of every agent run to an OpenTelemetry backend of you
 
 **It is off unless you configure it.** With no OpenTelemetry endpoint set, the deck sends nothing and behaves exactly as it does without this feature. You turn it on with the standard OpenTelemetry environment variables, so a backend that accepts OTLP over HTTP with its credentials in a header works, hosted or your own; [Connections](#connections) has what the deck's connection does and does not support.
 
-The deck sends metadata only. Prompts, file contents, agent output and your API key are never part of it; [What is never sent](#what-is-never-sent) has the full list, the two values it sends exactly as you wrote them (your own service name and resource attributes), and the one thing it reads from a command line: a shell command's program and first word, filtered.
+The deck sends metadata only. Prompts, file contents, agent output and your API key are never part of it; [What is never sent](#what-is-never-sent) has the full list, the two values it sends exactly as you wrote them (your own service name and resource attributes), and the one thing it reads from a command line: the program and first word of each command in a shell command line, filtered.
 
 Telemetry behaves the same in the TUI and in the desktop app, because the daemon that runs the agents is what sends it. The only difference between the two clients is where you set the variables.
 
@@ -81,7 +81,7 @@ The deck's runs appear in a dataset named `dot-agent-deck` (or your `OTEL_SERVIC
 - `WHERE name = agent.run`, `GROUP BY deck.agent`, `VISUALIZE HEATMAP(duration_ms)` — how long runs take, per agent.
 - `WHERE name = agent.run`, `GROUP BY deck.role`, `VISUALIZE AVG(deck.interventions.count)` — which roles need you most.
 - `WHERE name = agent.status AND deck.status = blocked`, `GROUP BY host.name`, `VISUALIZE SUM(duration_ms)` — time spent waiting on a permission prompt, per machine.
-- `WHERE name = agent.operation`, `GROUP BY deck.operation.program, deck.operation.word`, `VISUALIZE SUM(duration_ms)` — where agents' shell time goes, for example how much of it `cargo test` takes against `cargo build`.
+- `WHERE name = agent.operation`, `GROUP BY deck.operation.commands`, `VISUALIZE SUM(duration_ms)` — where agents' shell time goes, for example how much of it `cargo test` takes against `cargo build`. Grouping by `deck.operation.commands` rather than by `deck.operation.program` and `deck.operation.word` keeps `cargo fmt && cargo test` apart from a plain `cargo fmt`.
 - `WHERE name = agent.ci AND deck.ci.result exists`, `GROUP BY deck.ci.result`, `VISUALIZE HEATMAP(duration_ms)` — how long CI takes on the pull requests agents open; compare two periods to see what a change to your CI setup did.
 
 To see everything one run did, take its `deck.run.id` from an `agent.run` span and query all datasets in the environment with `WHERE deck.run.id = <that id>`: the deck's spans and the agent's own events come back together.
@@ -99,7 +99,7 @@ A run starts when the deck starts an agent in a pane and ends when the agent exi
 | `service.name` | `dot-agent-deck`, or `OTEL_SERVICE_NAME` |
 | `service.version` | The deck's version |
 | `host.name` | The machine's hostname. Tells several machines apart in one backend. |
-| `deck.telemetry.schema_version` | `1`. It changes when the set or meaning of the attributes on this page changes, so data recorded before and after stays comparable. |
+| `deck.telemetry.schema_version` | `2`. It changes when the set or meaning of the attributes on this page changes, so data recorded before and after stays comparable. |
 | your own | Every pair from `OTEL_RESOURCE_ATTRIBUTES`. Your pairs cannot replace the four above; set `OTEL_SERVICE_NAME` to rename the service. |
 
 ### `agent.run`
@@ -147,13 +147,30 @@ One span per shell command the agent ran, from when the agent started it to when
 | --- | --- |
 | `deck.operation.program` | The program the command runs, without its directory: `cargo`, `npm`, `gh`. |
 | `deck.operation.word` | The first argument after the program, only when no option comes before it: `test` in `cargo test --workspace`, `pr` in `gh pr checks`, and nothing in `git -C repo status`. |
+| `deck.operation.commands` | Every command in the line, in order, each as its program or its program and word with a space between, joined with `,`: `cargo fmt,cargo xtask` for `cargo fmt && cargo xtask affected-checks --run`, and `cargo test` for a line of one command. At most 8 commands. Absent when the first command is recorded without a program. |
+| `deck.operation.wrapped.program`, `deck.operation.wrapped.word` | The program and word of the command a wrapper runs, when the first command is one of the wrappers listed below: `cargo` and `test` for `timeout 600 cargo test`. |
 | `deck.run.id`, `deck.pane.id` | The run, as on `agent.status`. |
 
 The span does not say whether the command succeeded. Some agents send that with their own telemetry, joined to the run by `deck.run.id`: Claude Code's tool-result events and Pi's `pi.tool_result` say whether each tool call succeeded ([Agents' own telemetry](#agents-own-telemetry)). Claude Code does not tell the deck when a command fails, so the span of a command that failed in Claude Code can last until the run ends.
 
-The deck describes the first command on the first line that does more than set up the next one, so `cd repo && cargo test` is `cargo test`, and it looks past `NAME=value` settings and a wrapper such as `env`, `sudo` or `time` in front of the program. **It sends the program and the word only for plain commands.** For the agents that report a command as it was typed (all of them but Codex), up to and including the first argument the command must be plain words made of letters, digits and `/ . _ + : , @ % -`, plus `NAME=value` settings with such a value. A command that uses other shell syntax before or in its first argument, such as quotes, a `$` variable or `$(…)`, backticks, a comment, brackets or braces, a redirection, `~` or a wildcard, is recorded without a program or word: only the span and its duration. That includes the programs listed below whose first argument is never sent, such as `grep`. So is a command whose wrapper options the deck does not know, and one whose command is shell grammar rather than a program: a reserved word of sh, bash or zsh other than `time` and `export`, which the deck looks past, such as `if`, `for`, `case` or zsh's `foreach` and `repeat`; a declaration such as `local` or `typeset`; a modifier such as `noglob` or `builtin`; or `eval` or `exec`. A shell that reads its script from standard input, such as `bash -s`, is the exception for the script's arguments: the deck sends the shell's name with no word and does not look at those arguments, so `bash -s '$X'` still sends `bash`. The shell's own options must still be plain, as for any command. What comes after the first argument is not read, so `cargo test 2>&1 | tail` is still `cargo test`, and a command run as `bash -c 'cargo test'` is described by the plain command inside the quotes. For Codex the deck sends the program only, and only when the word that names the program is itself plain; the table below says why.
+`deck.operation.program` and `deck.operation.word` describe the first command on the first line that does more than set up the next one, so `cd repo && cargo test` is `cargo test`, and it looks past `NAME=value` settings and a wrapper such as `env`, `sudo` or `time` in front of the program. **It sends the program and the word only for plain commands.** For the agents that report a command as it was typed (all of them but Codex), up to and including the first argument the command must be plain words made of letters, digits and `/ . _ + : , @ % -`, plus `NAME=value` settings with such a value. A command that uses other shell syntax before or in its first argument, such as quotes, a `$` variable or `$(…)`, backticks, a comment, brackets or braces, a redirection, `~` or a wildcard, is recorded without a program or word: only the span and its duration. That includes the programs listed below whose first argument is never sent, such as `grep`. So is a command whose wrapper options the deck does not know, and one whose command is shell grammar rather than a program: a reserved word of sh, bash or zsh other than `time` and `export`, which the deck looks past, such as `if`, `for`, `case` or zsh's `foreach` and `repeat`; a declaration such as `local` or `typeset`; a modifier such as `noglob` or `builtin`; or `eval` or `exec`. A shell that reads its script from standard input, such as `bash -s`, is the exception for the script's arguments: the deck sends the shell's name with no word and does not look at those arguments, so `bash -s '$X'` still sends `bash`. The shell's own options must still be plain, as for any command. What comes after the first argument is not read, so `cargo test 2>&1 | tail` is still `cargo test`, and a command run as `bash -c 'cargo test'` is described by the plain command inside the quotes. For Codex the deck sends the program only, and only when the word that names the program is itself plain; the table below says why.
 
-The program and the word are each sent **only when they look like a command word**: lowercase letters, digits, `.`, `_` and `-`, starting with a letter or digit, and at most 32 characters. A path, a URL, a quoted message, anything with an uppercase letter, an `=` or a space, or anything longer is left out. That shape does not make a word safe: a short lowercase password, file name or host name has it too. So for programs whose arguments are usually text, patterns, files, hosts or credentials — `echo`, `printf`, `cat`, `grep`, `rg`, `sed`, `awk`, `curl`, `wget`, `redis-cli`, `base64`, `head`, `tail`, `xargs`, `ssh`, `scp`, `sftp` and `rsync` — the word is never sent, only the program. For any other program the word is its first argument, and only when no option comes before it, since an option can take the next argument as its value: `sshpass -p <password> ssh host` and `mysql -u admin db` send the program and no word. If your agents run programs whose first argument can be private, drop `deck.operation.word` in a Collector ([Trim what is sent](#trim-what-is-sent)).
+**Chained commands.** An agent often runs several commands in one line, joined with `&&`, `||`, `;` or `|`. The span lasts for the whole line, and the agent does not report how long each command in it took, so `deck.operation.commands` says which commands shared that time rather than splitting it. Each command in the line is described by the same rules as the first, and commands that only set up the next one, such as `cd`, are left out. The list stops at the first command that would be recorded without a program, or a setup command that uses other shell syntax, such as `cd "$DIR"`, and nothing after it is read. It also stops after a command that has anything after its first argument other than plain words (a `=` in them is fine), text in one pair of quotes with no quote, `$`, backtick or `\` inside, and `2>&1`-style redirections to another output or to `/dev/null`: a `$` variable, a comment, a `>` to a file or a lone `&` ends it. So `cargo fmt && cargo test` sends `cargo fmt,cargo test`, `git commit -m 'Fix it' && git push` sends `git commit,git push`, and `cargo fmt > out.txt && cargo test` sends `cargo fmt`. The quoted message, like everything else after a command's first argument, is never sent.
+
+**Wrapped commands.** For a first command that runs another command, `deck.operation.wrapped.program` and `deck.operation.wrapped.word` describe the command it runs, by the same rules. This works only for these wrappers, in these forms:
+
+| Wrapper | Where the command it runs starts |
+| --- | --- |
+| `timeout` | After its options and the duration: `timeout 600 cargo test`. |
+| `nohup` | Straight after it: `nohup cargo build`. |
+| `docker exec` | After its options and the container: `docker exec -it box make ci`. An option given as `NAME=value`, such as `-e FOO=1`, sends no wrapped command. |
+| `kubectl exec` | After `--`: `kubectl exec -it pod -- make ci`. |
+| `nix develop`, `nix shell` | After `-c` or `--command`: `nix develop -c cargo test`. |
+| `devbox run` | After a `--` that has only options before it: `devbox run -- cargo test`. |
+
+For any other wrapper, such as `uv run pytest` or `poetry run pytest`, the span describes the wrapper alone, as it did before. A wrapper whose options the deck does not know, or with quotes or other shell syntax before the command it runs, sends no wrapped command. Prefixes such as `env`, `sudo` and `time`, which the deck already looks past, are not wrappers: `sudo cargo test` is still `cargo test` in `deck.operation.program`.
+
+The program and the word are each sent **only when they look like a command word**: lowercase letters, digits, `.`, `_` and `-`, starting with a letter or digit, and at most 32 characters. A path, a URL, a quoted message, anything with an uppercase letter, an `=` or a space, or anything longer is left out. That shape does not make a word safe: a short lowercase password, file name or host name has it too. So for programs whose arguments are usually text, patterns, files, hosts or credentials — `echo`, `printf`, `cat`, `grep`, `rg`, `sed`, `awk`, `curl`, `wget`, `redis-cli`, `base64`, `head`, `tail`, `xargs`, `ssh`, `scp`, `sftp` and `rsync` — the word is never sent, only the program. For any other program the word is its first argument, and only when no option comes before it, since an option can take the next argument as its value: `sshpass -p <password> ssh host` and `mysql -u admin db` send the program and no word. These rules apply to every command in `deck.operation.commands` and to the wrapped command, so a later command's first word, or a wrapped command's, is sent when the first command's would be. If your agents run programs whose first argument can be private, drop `deck.operation.word`, `deck.operation.commands` and `deck.operation.wrapped.word` in a Collector ([Trim what is sent](#trim-what-is-sent)).
 
 Which agents report their shell commands:
 
@@ -161,7 +178,7 @@ Which agents report their shell commands:
 | --- | --- |
 | Claude Code | Yes, its `Bash` tool. |
 | OpenCode | Yes, its `bash` tool. |
-| Codex | Yes, its shell tool, through the hooks the deck installs for Codex. Codex does not report where each argument of a command ends, so for Codex the deck sends the program only, never a word, and no program either when the word naming it is not plain or it is not certain which word is the program. |
+| Codex | Yes, its shell tool, through the hooks the deck installs for Codex. Codex does not report where each argument of a command ends, so for Codex the deck sends the program only, never a word, and no program either when the word naming it is not plain or it is not certain which word is the program. For the same reason Codex spans name one command at most: `deck.operation.commands` holds that program alone, and there is no wrapped command. |
 | Devin | Yes, its `exec` tool. |
 | Pi | Yes, its `bash` tool, through the deck's Pi extension. |
 
@@ -188,7 +205,7 @@ The deck builds what it sends from the attributes on this page. The values of `O
 - secrets: API keys, the values of environment variables, and the values of your OTLP headers (those go to the endpoint you configured as headers, and to nothing else, and the deck does not write them to its log);
 - pane titles, status details, branch names, working-directory paths, remote URLs, or command lines.
 
-**The one exception for command lines** is what [`agent.operation`](#agentoperation) describes: for each shell command, at most the name of the program and its first argument (for Codex, the program only), and only when they pass the rules that section gives. Nothing else from the command is sent, and the deck's telemetry does not log it. To drop even these, delete the `agent.operation` spans in a Collector ([Trim what is sent](#trim-what-is-sent)).
+**The one exception for command lines** is what [`agent.operation`](#agentoperation) describes: for each command in a shell command line, and for the command a listed wrapper runs, at most the name of the program and its first argument (for Codex, the program of one command only), and only when they pass the rules that section gives. Nothing else from the command line is sent, and the deck's telemetry does not log it. To drop even these, delete the `agent.operation` spans in a Collector ([Trim what is sent](#trim-what-is-sent)).
 
 This covers what the **deck** sends to your backend. The deck's own log on your machine, when you turn it on, is separate from telemetry: it can record details of agents' tool calls, such as the first line of a command an agent ran ([Enabling Debug Logs](troubleshooting.md#enabling-debug-logs)). What an agent sends with its own telemetry is decided by that agent and its settings; see the next section.
 
@@ -282,6 +299,8 @@ processors:
       - key: vcs.repository.name
         action: delete
       - key: deck.orchestration.name
+        action: delete
+      - key: deck.operation.commands
         action: delete
   # Drop whole spans: here, the per-status and per-command spans.
   filter/trim:
