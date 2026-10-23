@@ -4966,7 +4966,7 @@ fn refusal_of(hub: &InboxHub, pane: &str) -> Option<String> {
     hub.summary(pane, "a").notices.admission_refused
 }
 
-/// Scenario: The deck refuses a worker's own request for its messages before any wait: its card says nothing. Once a task delegated to it waits, the card names the refusal, a client is told so and the task's orchestrator is told; an admitted request clears it. A refusal in a new episode tells the task's orchestrator once more, naming the task and the cause, however often it repeats; an orchestrator in the worker's own pane is never told. The worker's exit clears the notice, and a refusal for a generation that no longer holds its pane is ignored.
+/// Scenario: The deck refuses a worker's own request for its messages: its card says nothing until a task delegated to it waits, then names the refusal, a client and the task's orchestrator are told, and an admitted request clears it. Each new refusal episode tells that orchestrator once, naming the task and the cause, never an orchestrator in the worker's own pane. The worker's exit clears the notice, and a refusal for a generation that no longer holds its pane is ignored.
 #[spec("inbox/boundary/065")]
 #[test]
 fn boundary_065_a_refused_request_marks_its_own_card_while_mail_waits() {
@@ -5062,7 +5062,7 @@ fn refusal_notices(hub: &InboxHub, pane: &str) -> Vec<String> {
         .collect()
 }
 
-/// Scenario: The deck refuses a worker's own request for its messages before anything is delegated to it. An orchestrator then delegates a task to it: that orchestrator is told once, naming the task and the cause, and is not told again however often the refusal repeats or it delegates again. A second orchestrator delegating into the same refusal is told once too. Once a request is admitted, a new refusal tells the orchestrator whose task waits then, once.
+/// Scenario: The deck refuses a worker's own request for its messages before anything is delegated to it, then an orchestrator delegates a task to it and is told once, naming the task and the cause, however often the refusal repeats or it delegates again. A second orchestrator delegating into the same refusal is told once too. Once a request is admitted, a new refusal tells the orchestrator whose task waits then, once.
 #[spec("inbox/boundary/066")]
 #[test]
 fn boundary_066_an_open_refusal_tells_each_orchestrator_that_delegates_into_it_once() {
