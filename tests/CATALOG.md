@@ -9694,6 +9694,20 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** a SessionStart whose event is not yet in when the fetch arrives (inbox/claude/024), or a stale doorbell with no Claude hook event at all, which the deck cannot tell from another agent's.
 - **Platform coverage:** mac+linux.
 
+##### inbox/claude/047 — A pre-inbox hook that never asks for mail is named, and recovers.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), real hook CLI children, the e2e-only `DOT_AGENT_DECK_INBOX_TEST_HOOK_INTEGRATION=pre-inbox` knob (no version stamp, no inbox requests). Extends `inbox/claude/022` (PRD #1666 part 3, R-3).
+- **Agent:** none (synthetic Claude parent; no credential).
+- **Asserts:** a SessionStart from the stand-in prints nothing and the card's notice becomes `hooks_too_old`, with the deck's `hooks install --agent claude-code` command when it composes one; a task posted then is queued, and after the stand-in's Stop the doorbell line naming it is typed while the notice stands (the notice holds no mail), and `dot-agent-deck inbox fetch` run in the pane is handed it and it is acknowledged; a SessionStart from the deck's own hook clears the notice, and a prompt hook given a second task's doorbell line is handed that task, which is acknowledged.
+- **Does not assert:** a genuine 0.46 binary, a hook older than the hook capability token (0.45 and earlier, refused before the deck can tell whose card it is), a real model choosing to run the fetch the doorbell names, or a real Claude reloading its hooks.
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/048 — An upgrade's hook refresh repairs pre-inbox hooks, keeps a live install, and the waiter delivers.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), a stand-in older binary whose `--version` is unreadable, named in an isolated Claude settings file with the status hook only, the real `hooks refresh --json` from the deck's durable copy in HOME. Extends `inbox/claude/020` (PRD #1666 part 3, R-3).
+- **Agent:** none (synthetic Claude parent; no credential).
+- **Asserts:** the stand-in's SessionStart raises `hooks_too_old` while a task waits; with the stand-in live, `hooks refresh` exits non-zero, reports `ok: false`, names the stand-in's path and a `hooks install --agent claude-code` command, and leaves the settings naming the stand-in; with the stand-in removed, `hooks refresh` succeeds, the settings gain the deck's waiter on the durable copy, that waiter is handed the task with exit 2, and the notice is gone.
+- **Does not assert:** a live older install being taken over, or one of the same release being kept as settled (`hooks_refresh` unit tests), the upgrade clients running the refresh (`self_upgrade::agent_hooks` unit tests), or a real Claude.
+- **Platform coverage:** mac+linux.
+
 ##### inbox/claude/023 — A raw exact commit needs the attempt's receipt.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), a raw `inbox_committed` sent to the hook socket by the scripted Claude parent itself (inside the agent's process tree), real waiter and hook CLI children, real spool.
 - **Agent:** none (synthetic Claude parent; no credential).

@@ -187,7 +187,11 @@ pub fn handle_hook(agent: &str) -> ExitCode {
     // PRD #1666 S6: what Claude Code's own hooks do for the deck's inbox, in a
     // deck pane only — every Claude session runs these global hooks.
     let mut announce = None;
+    // A test standing in for a hook from before the deck's messages does
+    // nothing for the inbox at all.
+    let pre_inbox = crate::inbox_oneshot::stands_in_for_pre_inbox_hooks();
     if matches!(agent, "claude-code" | "claude_code" | "claude")
+        && !pre_inbox
         && crate::inbox_prompt::in_deck_pane()
         && let Some(output) = claude_inbox_hooks(&input, &mut event, &mut announce)
     {
@@ -196,7 +200,7 @@ pub fn handle_hook(agent: &str) -> ExitCode {
     // PRD #1666 S7: Codex's side. A `Stop` that hands messages over keeps the
     // turn going, so it reports no Idle: the doorbell must not ring for the
     // rest while Codex works on what it was just given.
-    if agent == "codex" && crate::inbox_prompt::in_deck_pane() {
+    if agent == "codex" && !pre_inbox && crate::inbox_prompt::in_deck_pane() {
         match codex_inbox_hooks(&input, &mut event, &mut announce) {
             CodexInbox::Nothing => {}
             CodexInbox::Print(output) => output.print(),

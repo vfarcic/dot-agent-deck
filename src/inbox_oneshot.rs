@@ -782,6 +782,20 @@ pub fn declared_hook_integration() -> Option<u32> {
     Some(crate::inbox_hub::HOOK_INTEGRATION)
 }
 
+/// The [`ENV_TEST_HOOK_INTEGRATION`] value that stands in for a
+/// dot-agent-deck from before the deck's messages (0.46 and earlier): its hook
+/// sends the agent's events with no `deck_build` / `deck_exe` stamp and never
+/// asks the deck for mail.
+pub const TEST_PRE_INBOX_HOOKS: &str = "pre-inbox";
+
+/// Whether this process stands in for a hook from before the deck's messages
+/// ([`TEST_PRE_INBOX_HOOKS`]). Always false without the `e2e` feature.
+pub fn stands_in_for_pre_inbox_hooks() -> bool {
+    cfg!(feature = "e2e")
+        && std::env::var(ENV_TEST_HOOK_INTEGRATION)
+            .is_ok_and(|raw| raw.trim() == TEST_PRE_INBOX_HOOKS)
+}
+
 /// The socket-wait budget of a one-shot's receipts question: the connect's
 /// wait for the deck to accept, writing the question and waiting for the
 /// answer ([`Connection::open_receipts_within`]). A deck that has not answered

@@ -1635,7 +1635,9 @@ pub fn agent_event_line(event: &AgentEvent, token: Option<&str>) -> serde_json::
         }
         // Issue #1637: which deck sent this, so the daemon can tell when an
         // agent's hooks run an older copy than itself.
-        crate::hook_binary::stamp_hook_line(map);
+        if !crate::inbox_oneshot::stands_in_for_pre_inbox_hooks() {
+            crate::hook_binary::stamp_hook_line(map);
+        }
     }
     serde_json::to_string(&value)
 }
