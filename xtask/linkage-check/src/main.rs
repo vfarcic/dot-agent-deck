@@ -134,6 +134,9 @@ mod devbox_gtk_origin;
 /// repository files, which no compile step reads.
 #[cfg(test)]
 mod dispatch_base;
+/// Issue #1850: the OpenTelemetry spans `affected-checks --run` sends, off
+/// unless the standard `OTEL_*` variables turn them on.
+mod gate_telemetry;
 /// PR #966 / Renovate #989: the gh-aw `*.lock.yml` files are GENERATED, and
 /// Renovate bumps the action pins inside them without regenerating the body.
 /// That broke every PR-review agent job with a gateway config error. Tests
