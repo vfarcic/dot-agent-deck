@@ -8910,6 +8910,19 @@ pub(crate) mod restart_fixture {
         server: tokio::task::JoinHandle<()>,
     }
 
+    /// The daemon restarts as the scripted next process once `process` serves
+    /// `op` ([`RestartingDaemon::restart_after`]).
+    fn restart_after_serving(script: &Mutex<Script>, process: &'static str, op: &str) {
+        let mut script = script.lock().unwrap();
+        if script.current == process
+            && let Some((after, next)) = script.restart_after
+            && after == op
+        {
+            script.current = next;
+            script.restart_after = None;
+        }
+    }
+
     fn serve(op: &str) -> AttachResponse {
         match op {
             // A subscription's snapshot lists what a listing does (G-fix6).
@@ -9006,32 +9019,18 @@ pub(crate) mod restart_fixture {
                                     }
                                     reply.instance_id = (!process.starts_with("unnamed-"))
                                         .then(|| process.to_string());
+                                    // The restart lands before the reply is
+                                    // written, so no connection the client
+                                    // opens after reading it reaches `process`.
+                                    restart_after_serving(&script, process, "hello");
                                     let _ = write_resp(&mut stream, &reply).await;
                                     follow_on = request["follow_on"] == true;
-                                    {
-                                        let mut script = script.lock().unwrap();
-                                        if script.current == process
-                                            && let Some(("hello", next)) = script.restart_after
-                                        {
-                                            script.current = next;
-                                            script.restart_after = None;
-                                        }
-                                    }
                                     continue;
                                 }
                                 recorded.lock().unwrap().push(format!("{process}:{op}"));
                                 requests.lock().unwrap().push((process, request.clone()));
+                                restart_after_serving(&script, process, &op);
                                 let _ = write_resp(&mut stream, &serve(&op)).await;
-                                {
-                                    let mut script = script.lock().unwrap();
-                                    if script.current == process
-                                        && let Some((after, next)) = script.restart_after
-                                        && after == op
-                                    {
-                                        script.current = next;
-                                        script.restart_after = None;
-                                    }
-                                }
                                 // Hold an attach or subscription open, as a
                                 // daemon would, until the client leaves.
                                 while let Ok(Some(_)) = read_frame(&mut stream).await {}

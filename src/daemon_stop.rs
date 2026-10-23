@@ -683,6 +683,9 @@ pub async fn log_teardown_inventory(
     registry: &AgentPtyRegistry,
     path: &'static str,
 ) {
+    // PRD #1741: every path that drains passes here first, so this is when the
+    // teardown began, which sizes telemetry's final flush.
+    crate::telemetry::teardown_began(registry.telemetry(), path);
     let roles = match tokio::time::timeout(TEARDOWN_INVENTORY_LOCK_BUDGET, state.read()).await {
         Ok(guard) => Some(guard.live_orchestration_roles(registry)),
         Err(_) => {
