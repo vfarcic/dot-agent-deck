@@ -9489,6 +9489,24 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** an old binary against this daemon (the cross-version job), or that a handshake across a declared contract break connects.
 - **Platform coverage:** mac+linux.
 
+##### inbox/boundary/071 — An ack of a message never handed out changes nothing.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), `InboxHub::ack` against a queued direct task, an assigned offer and a receipt stream's hand-out (PRD #1666 part 3, H5).
+- **Agent:** none.
+- **Asserts:** an `ack` of a queued task or of an offer assigned but never handed out answers `unknown`, leaves the task queued with no hand-over counted and the offer assigned, unclaimed; a handed-out task's ack is acknowledged once, then already acknowledged, another agent's is the wrong agent's, and an undeliverable message says so.
+- **Platform coverage:** mac+linux.
+
+##### inbox/boundary/072 — A once wait from a hook component is refused.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), `serve_waiter` for Codex's, Devin's and an unknown component's once wait over an in-memory duplex (PRD #1666 part 3, H5).
+- **Agent:** none.
+- **Asserts:** each is refused `unsupported` and the connection ends; nothing arms, the task stays queued with no hand-over counted and no attempt is issued for it.
+- **Platform coverage:** mac+linux.
+
+##### inbox/boundary/073 — Every old way to take mail is refused and takes nothing.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_boundary.rs`), an isolated daemon and raw hook-socket verbs as an older `dot-agent-deck` sends them (PRD #1666 part 3, H5).
+- **Agent:** none (Codex, Devin and bare-command panes running a stand-in).
+- **Asserts:** a plain `inbox_fetch` (with and without `ack`) is refused `cli_too_old`, a doorbell or turn-end hook fetch declaring no integration `hooks_too_old`, a once wait from a hook component `unsupported`, and `get_seed` answers no seed with `get_seed_removed`; each answers at once, the task stays queued with no hand-over counted, the card shows the out-of-date hooks notice naming Codex's own `hooks install` for the Codex pane and no command for the others, and a current receipt fetch from the same pane is then handed the task.
+- **Platform coverage:** mac+linux.
+
 ##### inbox/status/001 — Human daemon status shows each agent's pending inbox counts and wake path.
 - **Layer:** Unit (`tests/inbox_status.rs`), pure status projection and table rendering.
 - **Agent:** none.

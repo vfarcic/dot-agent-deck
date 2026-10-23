@@ -5588,3 +5588,131 @@ async fn boundary_069_a_body_codexs_json_would_cut_is_saved_and_named() {
         );
     }
 }
+
+/// Scenario: A message the deck never handed out — a direct task still queued, and a job offered to this agent that it has not been handed — is acknowledged with `ack <id>`. Each answer is unknown and nothing changes: the task stays queued with no hand-over counted and the offer stays assigned, not claimed. A task a receipt stream was handed is acknowledged, a second ack says it already was, another agent's ack is the wrong agent's, and a message that became undeliverable says so.
+#[spec("inbox/boundary/071")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boundary_071_an_ack_of_a_message_never_handed_out_changes_nothing() {
+    let hub = hub_with(Duration::from_secs(30), Duration::from_secs(30));
+    let queued = hub
+        .post_direct(Recipient::bound("p", "a"), content("never handed out"))
+        .unwrap();
+    assert_eq!(
+        hub.ack(queued.as_str(), "p", "a", AckHow::Explicit),
+        AckOutcome::Unknown
+    );
+    let listed = |id: &MessageId| {
+        hub.list("p")
+            .into_iter()
+            .find(|m| m.id == *id)
+            .expect("the message is listed")
+    };
+    assert_eq!(listed(&queued).state, StateName::Queued);
+    assert_eq!(listed(&queued).deliveries, 0);
+    let offer = offer_to(
+        &hub,
+        "a job never handed out",
+        &[(Recipient::bound("p", "a"), "worker".to_string())],
+    );
+    assert_eq!(
+        hub.ack(offer.as_str(), "p", "a", AckHow::Explicit),
+        AckOutcome::Unknown
+    );
+    assert_eq!(listed(&offer).state, StateName::Queued);
+    // Controls: a hand-out is acknowledged once, and only by its agent.
+    let mut peer = Peer::open(&hub, "p", "a", InboxComponent::OpenCodePlugin, INTEGRATION).await;
+    assert!(peer.next().await.registered.is_some());
+    let handed = hub
+        .post_direct(Recipient::bound("p", "a"), content("handed out"))
+        .unwrap();
+    let mut ids = Vec::new();
+    while !ids.contains(&handed.as_str().to_string()) {
+        ids.extend(peer.handout().await.into_iter().map(|d| d.id));
+    }
+    assert_eq!(
+        hub.ack(handed.as_str(), "p", "b", AckHow::Explicit),
+        AckOutcome::WrongAgent
+    );
+    assert_eq!(
+        hub.ack(handed.as_str(), "p", "a", AckHow::Explicit),
+        AckOutcome::Acknowledged
+    );
+    assert_eq!(
+        hub.ack(handed.as_str(), "p", "a", AckHow::Explicit),
+        AckOutcome::AlreadyAcknowledged
+    );
+    let gone = hub
+        .post_direct(
+            Recipient::bound("p", "x"),
+            content("for an agent that left"),
+        )
+        .unwrap();
+    hub.agent_exited("p", "x");
+    assert_eq!(
+        hub.ack(gone.as_str(), "p", "x", AckHow::Explicit),
+        AckOutcome::Undeliverable
+    );
+    peer.close().await;
+}
+
+/// Scenario: Codex's, Devin's and an unknown component's once wait — which only a dot-agent-deck from before their hooks moved onto receipts sends — arms for an agent with a task waiting. Each is refused `unsupported` before anything arms: no waiter is counted, the task stays queued with no hand-over counted, and no attempt is issued for it.
+#[spec("inbox/boundary/072")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boundary_072_a_once_wait_from_a_hook_component_is_refused() {
+    for component in [
+        InboxComponent::CodexHooks,
+        InboxComponent::DevinHooks,
+        InboxComponent::Other,
+    ] {
+        let hub = hub_with(Duration::from_secs(30), Duration::from_secs(30));
+        let id = hub
+            .post_direct(Recipient::bound("p", "a"), content("waiting"))
+            .unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let (read, write) = tokio::io::split(server);
+        let serve = tokio::spawn(serve_waiter(
+            Arc::clone(&hub),
+            "p".to_string(),
+            "a".to_string(),
+            InboxWaitMode::Once,
+            component,
+            None,
+            ReceiptArm::default(),
+            BufReader::new(read),
+            write,
+            |_: &str| {},
+        ));
+        let mut lines = BufReader::new(client).lines();
+        let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("an answer in time")
+            .unwrap()
+            .expect("a line");
+        let reply: InboxWaitReply = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            reply.refused.as_deref(),
+            Some("unsupported"),
+            "{component:?}"
+        );
+        assert!(reply.messages.is_none(), "{component:?}");
+        tokio::time::timeout(Duration::from_secs(5), serve)
+            .await
+            .expect("the refusal ends the connection")
+            .unwrap();
+        assert_eq!(hub.armed("p", "a"), 0, "{component:?}");
+        let listed = hub.list("p").into_iter().find(|m| m.id == id).unwrap();
+        assert_eq!(
+            (listed.state, listed.deliveries),
+            (StateName::Queued, 0),
+            "{component:?}"
+        );
+        assert!(
+            hub.lock()
+                .receipts
+                .gens
+                .get(&("p".to_string(), "a".to_string()))
+                .is_none_or(|generation| generation.model.delivery(id.as_str()).is_none()),
+            "{component:?}: no attempt is issued"
+        );
+    }
+}

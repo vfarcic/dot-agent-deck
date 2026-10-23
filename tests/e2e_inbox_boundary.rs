@@ -469,3 +469,119 @@ fn boundary_054_a_devin_panes_model_run_fetch_is_a_one_shot_receiver() {
         .unwrap();
     assert_eq!(summary["ack_how"], "plugin_confirmed", "{summary}");
 }
+
+/// Scenario: A deck daemon serves Codex, Devin and bare-command panes, each with a task waiting, and an older dot-agent-deck asks for their mail the old ways: a plain `inbox fetch` (with and without its acknowledge-on-fetch), a doorbell and a turn-end hook fetch declaring no one-shot integration, a once wait from a hook component, and `get-seed`. Each is answered at once with a refusal, takes nothing and acknowledges nothing: the task stays queued with no hand-over counted. An old hook's refusal puts the out-of-date hooks notice on the card, naming Codex's own `hooks install` for the Codex pane and no command where the deck does not know the agent. A current receipt fetch from the same pane is then handed the task.
+#[spec("inbox/boundary/073")]
+#[test]
+fn boundary_073_every_old_way_to_take_mail_is_refused_and_takes_nothing() {
+    let daemon = daemon_unbound(&[]);
+    for (name, extra, command) in [
+        (
+            "old-codex",
+            json!({"agent_type":"codex"}),
+            Some("--agent codex"),
+        ),
+        ("old-devin", json!({"agent_type":"devin"}), None),
+        ("old-bare", json!({}), None),
+    ] {
+        let pane = pane_with(&daemon, name, extra);
+        let id = enqueue(&daemon, &pane, BODY);
+        let untouched = |what: &str| {
+            let listed = listing(&daemon, &pane);
+            let message = listed["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["id"] == id.as_str())
+                .cloned()
+                .unwrap_or(Value::Null);
+            assert_eq!(message["state"], "queued", "{name}: {what}: {listed}");
+            assert_eq!(message["deliveries"], 0, "{name}: {what}: {listed}");
+        };
+        for ack in [false, true] {
+            let mut req = request(&pane, "inbox_fetch");
+            req["consumer"] = json!("cli");
+            req["max_chars"] = json!(65536);
+            req["ack"] = json!(ack);
+            let started = std::time::Instant::now();
+            let reply = hook(&daemon, req);
+            assert_eq!(reply["refused"], "cli_too_old", "{name}: {reply}");
+            assert!(reply.get("messages").is_none(), "{name}: {reply}");
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "{name}: answered at once"
+            );
+            untouched("plain fetch");
+        }
+        for consumer in ["doorbell_hook", "turn_end_hook"] {
+            let mut req = request(&pane, "inbox_fetch");
+            req["consumer"] = json!(consumer);
+            req["max_chars"] = json!(9000);
+            req["ack"] = json!(true);
+            if consumer == "doorbell_hook" {
+                req["doorbell"] = json!(id);
+            }
+            let started = std::time::Instant::now();
+            let reply = hook(&daemon, req);
+            assert_eq!(
+                reply["refused"], "hooks_too_old",
+                "{name} {consumer}: {reply}"
+            );
+            assert!(reply.get("messages").is_none(), "{name}: {reply}");
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "{name}: answered at once"
+            );
+            untouched(consumer);
+        }
+        assert!(
+            common::wait_until(WAIT, || record_inbox(&daemon, &pane)["integration"]
+                == "hooks_too_old"),
+            "{name}: {}",
+            record_inbox(&daemon, &pane)
+        );
+        let named = record_inbox(&daemon, &pane)["integration_command"].clone();
+        match command {
+            Some(agent) => assert!(
+                named.as_str().is_some_and(|c| c.contains(agent)),
+                "{name}: the card names the agent's own hooks install: {named}"
+            ),
+            None => assert!(
+                named.is_null(),
+                "{name}: no command it cannot name: {named}"
+            ),
+        }
+        for component in ["codex_hooks", "other"] {
+            let mut req = request(&pane, "inbox_wait");
+            req["component"] = json!(component);
+            req["component_version"] = json!("synthetic-old");
+            req["mode"] = json!("once");
+            req["pid"] = json!(pane.pid);
+            let reply = line(&mut connect(&daemon, &req));
+            assert_eq!(
+                reply["refused"], "unsupported",
+                "{name} {component}: {reply}"
+            );
+            untouched("once wait");
+        }
+        armed(&daemon, &pane, 0);
+        let reply = hook(&daemon, request(&pane, "get_seed"));
+        assert!(reply["seed"].is_null(), "{name}: {reply}");
+        assert_eq!(reply["refused"], "get_seed_removed", "{name}: {reply}");
+        untouched("get-seed");
+        // A current receipt fetch is served.
+        let mut req = request(&pane, "inbox_receipt_fetch");
+        req["consumer"] = json!("cli");
+        req["hook_integration"] = json!(1);
+        let mut held = connect(&daemon, &req);
+        let reply = line(&mut held);
+        let handed = reply["messages"].as_array().cloned().unwrap_or_default();
+        assert!(
+            handed
+                .iter()
+                .any(|m| m["id"] == id.as_str() && m["a"].is_number()),
+            "{name}: a current fetch is handed the task: {reply}"
+        );
+        state(&daemon, &pane, &id, "fetched");
+    }
+}
