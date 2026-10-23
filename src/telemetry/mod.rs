@@ -45,6 +45,7 @@
 //! shim that switches on Codex's and Devin's own telemetry runs there
 //! ([`shim::run_if_invoked`]).
 
+pub mod accounting;
 pub mod ci;
 pub mod config;
 pub mod exporter;
