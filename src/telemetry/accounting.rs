@@ -688,7 +688,10 @@ pub fn from_claude(session: Option<&ClaudeSessionUsage>) -> AgentUsage {
 
 /// Codex: tokens provider-reported, by model, from its rollout's running
 /// total, or [`Unavailable::Incomplete`] once that total went down
-/// ([`CodexRolloutSummary::tokens_incomplete`]); no cost (the rollout carries
+/// ([`CodexRolloutSummary::tokens_incomplete`]) or while its last total is
+/// unusable ([`CodexRolloutSummary::total_unresolved`]); a total that reports
+/// zero in every count is a provider-reported zero, while a rollout with no
+/// usable total has its tokens `not_recorded`; no cost (the rollout carries
 /// none); the quota delta of its primary rate-limit window, unavailable when
 /// the window, its length or the plan changed, or its used share went down,
 /// during the run. The models pass through the same cap as every other
@@ -700,7 +703,7 @@ pub fn from_claude(session: Option<&ClaudeSessionUsage>) -> AgentUsage {
 /// window are indistinguishable here.
 pub fn from_codex(summary: &CodexRolloutSummary) -> AgentUsage {
     let models = per_model(summary.tokens_by_model.iter().map(|(model, tokens)| {
-        let tokens = if summary.tokens_incomplete {
+        let tokens = if summary.tokens_incomplete || summary.total_unresolved {
             Field::Unavailable(Unavailable::Incomplete)
         } else {
             Field::ProviderReported(*tokens)
@@ -1093,6 +1096,12 @@ pub struct CodexRolloutSummary {
     /// is wrong, so the run's token total is not known: [`from_codex`]
     /// reports it as [`Unavailable::Incomplete`].
     pub tokens_incomplete: bool,
+    /// The last running total the reader saw was unusable (incomplete or
+    /// inconsistent) and no usable total at or above the baseline has come
+    /// since, so the counts so far may stop short of the rollout's own:
+    /// [`from_codex`] reports them as [`Unavailable::Incomplete`] until a
+    /// later usable total covers the gap.
+    pub total_unresolved: bool,
     pub quota_first: Option<CodexRateSample>,
     pub quota_last: Option<CodexRateSample>,
     /// The first reason two consecutive quota samples could not be one simple
@@ -1428,14 +1437,18 @@ impl CodexRolloutSummary {
     /// Credit the growth of the running total to the current model. A
     /// total that is incomplete or not a count at all is skipped and leaves
     /// the baseline where it was, so the next usable total is measured from
-    /// the last good one. A usable total lower than the baseline in any count
-    /// is ambiguous: the counters may have restarted or the total may be
-    /// wrong, and the reader accepts nothing in the rollout as telling
-    /// which, so it makes the run's token total incomplete rather than adding
-    /// either reading, and also leaves the baseline where it was.
+    /// the last good one; until one at or above the baseline arrives, the
+    /// counts may stop short of the rollout's, so the total is unresolved. A
+    /// usable total lower than the baseline in any count is ambiguous: the
+    /// counters may have restarted or the total may be wrong, and the reader
+    /// accepts nothing in the rollout as telling which, so it makes the run's
+    /// token total incomplete rather than adding either reading, and also
+    /// leaves the baseline where it was. The first usable total is credited
+    /// even when every count is zero, so a reported zero is kept as one.
     fn observe_total(&mut self, usage: &CodexTokenUsage, stats: &mut ReaderStats) {
         let Some(total) = usage.usable(self.last_total.as_ref()) else {
             stats.unusable_totals += 1;
+            self.total_unresolved = true;
             return;
         };
         let delta = match &self.last_total {
@@ -1450,7 +1463,8 @@ impl CodexRolloutSummary {
             },
         };
         self.last_total = Some(total);
-        if delta.is_zero() {
+        self.total_unresolved = false;
+        if delta.is_zero() && !self.tokens_by_model.is_empty() {
             return;
         }
         let key = capped(&self.tokens_by_model, self.current_model.clone());
@@ -3060,6 +3074,126 @@ mod tests {
             assert_eq!(reader.stats().unusable_totals, 1, "{incomplete}");
             assert_eq!(reader.stats().regressions, 0, "{incomplete}");
             assert!(!reader.summary().tokens_incomplete, "{incomplete}");
+        }
+    }
+
+    /// An unusable total after a valid one leaves the counts so far short of
+    /// the rollout's own, so the tokens are incomplete while it is the last
+    /// total; a later valid total at or above the baseline covers the gap and
+    /// the tokens are provider-reported again.
+    #[test]
+    fn an_unusable_last_total_is_incomplete_until_a_valid_total_follows() {
+        for unusable in [
+            "{}".to_string(),
+            r#"{"input_tokens":120}"#.to_string(),
+            usage(0, 40, 10),
+        ] {
+            let mut lines = vec![
+                token_count(100, 0, 10, 1.0, 5),
+                token_count_with(&unusable, 1.0, 5, "prolite"),
+            ];
+            let reader = read(&lines);
+            assert!(reader.summary().total_unresolved, "{unusable}");
+            assert!(!reader.summary().tokens_incomplete, "{unusable}");
+            assert_eq!(reader.stats().unusable_totals, 1, "{unusable}");
+            let usage = from_codex(reader.summary());
+            assert_eq!(usage.models.len(), 1, "{unusable}");
+            assert_eq!(
+                usage.models[0].tokens,
+                Field::Unavailable(Unavailable::Incomplete),
+                "{unusable}"
+            );
+
+            lines.push(token_count(130, 0, 13, 1.0, 5));
+            let reader = read(&lines);
+            assert!(!reader.summary().total_unresolved, "{unusable}");
+            assert_eq!(
+                from_codex(reader.summary()).models[0].tokens,
+                Field::ProviderReported(tokens(130, 13)),
+                "{unusable}"
+            );
+        }
+    }
+
+    /// A rollout whose total reports zero in every count used no tokens by
+    /// Codex's own account: a provider-reported zero, kept through later
+    /// zero totals. A rollout with no usage record at all has its tokens
+    /// `not_recorded`, never zero.
+    #[test]
+    fn an_all_zero_codex_total_is_a_reported_zero_and_no_total_is_not_recorded() {
+        let reader = read(&[
+            turn_context("gpt-5.5"),
+            token_count(0, 0, 0, 1.0, 5),
+            token_count(0, 0, 0, 1.0, 5),
+        ]);
+        let usage = from_codex(reader.summary());
+        assert_eq!(usage.models.len(), 1);
+        assert_eq!(usage.models[0].model, Some(id("gpt-5.5")));
+        assert_eq!(
+            usage.models[0].tokens,
+            Field::ProviderReported(Tokens::default())
+        );
+        assert_eq!(
+            usage.models[0].cost,
+            Field::Unavailable(Unavailable::NoChannel)
+        );
+
+        let reader = read(&[
+            turn_context("gpt-5.5"),
+            task_started().to_string(),
+            task_complete().to_string(),
+        ]);
+        assert!(reader.summary().tokens_by_model.is_empty());
+        let usage = from_codex(reader.summary());
+        assert_eq!(usage.models.len(), 1);
+        assert_eq!(usage.models[0].model, None);
+        assert_eq!(
+            usage.models[0].tokens,
+            Field::Unavailable(Unavailable::NotRecorded)
+        );
+    }
+
+    /// The missing-data rule: no usage observation at all is `not_recorded`
+    /// for every agent, and a zero is only ever one the agent reported,
+    /// carried as `provider_reported`.
+    #[test]
+    fn an_empty_usage_observation_is_not_recorded_and_zero_is_only_reported() {
+        let not_recorded = Field::Unavailable(Unavailable::NotRecorded);
+        for usage in [
+            from_claude(None),
+            from_claude(Some(&ClaudeSessionUsage {
+                models: Vec::new(),
+                has_unknown_model_cost: false,
+                last_turn: None,
+            })),
+            from_codex(&CodexRolloutSummary::default()),
+            from_pi(&[]),
+            from_opencode(&[]),
+        ] {
+            assert_eq!(usage.models.len(), 1, "{usage:?}");
+            assert_eq!(usage.models[0].tokens, not_recorded, "{usage:?}");
+        }
+
+        let mut summary = CodexRolloutSummary::default();
+        summary.tokens_by_model.insert(None, Tokens::default());
+        let claude = ClaudeSessionUsage {
+            models: vec![ClaudeModelUsage {
+                model: "claude-haiku-4-5".into(),
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cost_usd: Some(0.0),
+            }],
+            has_unknown_model_cost: false,
+            last_turn: None,
+        };
+        for usage in [from_codex(&summary), from_claude(Some(&claude))] {
+            assert_eq!(
+                usage.models[0].tokens,
+                Field::ProviderReported(Tokens::default()),
+                "{usage:?}"
+            );
         }
     }
 
