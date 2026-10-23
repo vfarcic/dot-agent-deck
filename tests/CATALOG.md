@@ -11667,6 +11667,19 @@ Manual merge gate: opt in with `DOT_AGENT_DECK_INBOX_LOAD_TEST=1` only when sche
 - **Does not assert:** Persistence across daemon restart, exact model prose, or load-test execution in normal verification; only the scheduled opt-in run exercises the loaded scenario.
 - **Platform coverage:** mac+linux, local credentials only; never CI.
 
+## Desktop native driver scenarios
+
+These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[spec]` scanner, and run in CI's advisory `desktop-driver` job. `docs/develop/desktop-gui.md` ("The driver tier") describes the harness.
+
+##### desktop/fleet/001 — All Decks shows two real daemons apart, and one stopping is that deck's problem alone.
+
+- **Test:** `desktop/driver/fleet.test.ts`, `fleet_001`.
+- **Layer:** native Tauri/WebKitGTK driver (`tauri-driver` and `WebKitWebDriver` under Xvfb) against two real `daemon serve` processes. The second is reached as a remote deck through the app's own `ssh -N -L` tunnel to a loopback `sshd` the harness runs; the window runs under `nss_wrapper` so the app's strict host-key check reads the sandbox's `known_hosts`.
+- **Agent:** none; one `bash --noprofile --norc` per daemon, started over its attach socket. No credential.
+- **Asserts:** both daemons give their agent the same id (required, not assumed); with All Decks selected the window shows two connected sections, each holding only its own deck's row, with both lamps connected and the deck counter at `2/2`; after the far daemon is stopped, its section stays, reads disconnected with a lamp that is not connected and holds no local row, while the local deck keeps its row and its connected lamp, and the counter reads `1/2`.
+- **Does not assert:** three or more decks, a deck waiting to report, an unconfigured deck-list row, a deck coming back, New agent or a pane on the far deck, or a far deck on another machine; the far deck shares this machine's filesystem, so it says nothing about a window rendering a far host's paths.
+- **Platform coverage:** Linux WebKitGTK only. Needs a system `sshd` (`DAD_DRIVER_SSHD`) and `libnss_wrapper.so` (`DAD_DRIVER_NSS_WRAPPER`); the scenario fails naming whichever is missing.
+
 ## Desktop native network scenarios
 
 These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[spec]` scanner. They use the native driver harness, and network scenarios are explicitly opted into locally rather than included in the deterministic desktop CI run.
