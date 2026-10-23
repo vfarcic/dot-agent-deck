@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -2499,13 +2499,23 @@ pub enum DoorbellReady {
 }
 
 /// A human attach frame in flight for a pane
-/// ([`AgentPtyRegistry::human_frame_arriving`]); dropping it ends that.
+/// ([`AgentPtyRegistry::human_frame_arriving`]); dropping it ends that, and
+/// the pane's last one removes its count.
 #[must_use]
-pub struct HumanFrameInFlight(Arc<AtomicUsize>);
+pub struct HumanFrameInFlight {
+    counts: Arc<Mutex<HashMap<String, usize>>>,
+    pane_id_env: String,
+}
 
 impl Drop for HumanFrameInFlight {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        let mut counts = self.counts.lock().unwrap();
+        if let Some(count) = counts.get_mut(&self.pane_id_env) {
+            *count -= 1;
+            if *count == 0 {
+                counts.remove(&self.pane_id_env);
+            }
+        }
     }
 }
 
@@ -5526,8 +5536,9 @@ pub struct AgentPtyRegistry {
     /// ([`Self::human_frame_arriving`]). A frame counts from before it waits
     /// for the writer, so a doorbell holding the writer between its steps sees
     /// the keystroke queued behind it, which [`Self::draft_pending`] cannot
-    /// until the frame is written.
-    human_frames_in_flight: Mutex<HashMap<String, Arc<AtomicUsize>>>,
+    /// until the frame is written. A pane is in the map only while one of
+    /// its frames is in flight.
+    human_frames_in_flight: Arc<Mutex<HashMap<String, usize>>>,
     /// Issue #525: how long a guarded delivery waits on one PTY write before
     /// it stops waiting — [`PTY_WRITE_STALL_BOUND`], lowered by tests. In
     /// milliseconds so a test can change it through the `Arc` every caller
@@ -7420,7 +7431,7 @@ impl AgentPtyRegistry {
             shutting_down: AtomicBool::new(false),
             admission_frozen: AtomicBool::new(false),
             pane_input: Arc::new(Mutex::new(PaneInputState::default())),
-            human_frames_in_flight: Mutex::default(),
+            human_frames_in_flight: Arc::default(),
             pty_write_stall_bound_ms: AtomicU64::new(PTY_WRITE_STALL_BOUND.as_millis() as u64),
             repaint_nudges: Mutex::new(HashMap::new()),
             repaint_nudge_gap_ms: AtomicU64::new(
@@ -9331,15 +9342,16 @@ impl AgentPtyRegistry {
     /// It counts as in flight until the returned guard drops, which the
     /// caller does once the frame is written or refused.
     pub fn human_frame_arriving(&self, pane_id_env: &str) -> HumanFrameInFlight {
-        let count = Arc::clone(
-            self.human_frames_in_flight
-                .lock()
-                .unwrap()
-                .entry(pane_id_env.to_string())
-                .or_default(),
-        );
-        count.fetch_add(1, Ordering::SeqCst);
-        HumanFrameInFlight(count)
+        *self
+            .human_frames_in_flight
+            .lock()
+            .unwrap()
+            .entry(pane_id_env.to_string())
+            .or_default() += 1;
+        HumanFrameInFlight {
+            counts: Arc::clone(&self.human_frames_in_flight),
+            pane_id_env: pane_id_env.to_string(),
+        }
     }
 
     /// Whether a human attach frame for `pane_id_env` is in flight
@@ -9349,8 +9361,7 @@ impl AgentPtyRegistry {
         self.human_frames_in_flight
             .lock()
             .unwrap()
-            .get(pane_id_env)
-            .is_some_and(|count| count.load(Ordering::SeqCst) > 0)
+            .contains_key(pane_id_env)
     }
 
     /// PRD #1666: generation `agent_id` reported `edge` of a turn on
@@ -15342,6 +15353,30 @@ mod tests {
         }
     }
 
+    /// Qodo on PR #1817 (finding 17): a pane's human-frame count is kept only
+    /// while a frame for it is in flight, so a long-lived daemon holds none for
+    /// the panes it has finished with.
+    #[test]
+    fn a_pane_with_no_human_frame_in_flight_holds_no_count() {
+        let registry = AgentPtyRegistry::new();
+        let first = registry.human_frame_arriving("pane-a");
+        let second = registry.human_frame_arriving("pane-a");
+        let other = registry.human_frame_arriving("pane-b");
+        drop(first);
+        assert!(
+            registry.human_frame_in_flight("pane-a"),
+            "one frame is left"
+        );
+        drop(second);
+        drop(other);
+        assert!(!registry.human_frame_in_flight("pane-a"));
+        assert!(!registry.human_frame_in_flight("pane-b"));
+        assert!(
+            registry.human_frames_in_flight.lock().unwrap().is_empty(),
+            "a pane with no frame in flight keeps its count"
+        );
+    }
+
     /// Issue #714 (review): a blocked-worker notice task is cancellable only
     /// until it begins its write, and one that was cancelled first never
     /// begins it — so a cancel can never land on a write in progress.
@@ -20274,7 +20309,7 @@ mod spawn_tests {
                 .expect("spawn the doorbell's pane");
             let bus = Arc::clone(&registry.inner.lock().unwrap().agents[&id].bus);
             bus.push(FRAME.as_bytes().to_vec());
-            let checks = AtomicUsize::new(0);
+            let checks = std::sync::atomic::AtomicUsize::new(0);
             let outcome = registry
                 .write_doorbell_when_ready(
                     &pane,

@@ -112,7 +112,7 @@ Before starting implementation, validate that the PRD is ready:
 For documentation-first PRDs:
 - **Specification completeness**: Is the feature fully documented with user workflows?
 - **Integration points**: Are connections with existing features documented?
-- **API/Interface definitions**: Are all interfaces and data structures specified?
+- **API/Interface definitions**: For a file PRD, are all interfaces and data structures specified? For an issue PRD, are the interfaces the user sees specified (commands, flags, config keys)? An issue PRD's body carries implementation detail only under the two exceptions in [`issue-prd.md`](issue-prd.md) ("The body"), names the user sees and constraints the PRD exists to enforce, so the absence of any other implementation detail is not a readiness gap.
 - **Examples and usage**: Are concrete usage examples provided?
 
 ### Implementation Readiness Checklist

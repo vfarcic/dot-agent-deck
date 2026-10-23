@@ -363,6 +363,8 @@ fn wait_once(json: &str, question: Option<&str>) -> ExitCode {
         _ => None,
     };
     let Ok(mut stderr) = raw_stderr() else {
+        // Nothing reached Claude: the deck is told so, and requeues the batch.
+        batch.decline(&mut connection, Receiver::Waiter);
         return ExitCode::FAILURE;
     };
     let mut pieces = batch.plain_pieces("", crate::inbox_hub::BLOCK_SEPARATOR);

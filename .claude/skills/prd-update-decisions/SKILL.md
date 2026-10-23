@@ -98,6 +98,7 @@ Nothing is committed for an issue PRD.
 - Adjust scope management if features were added, deferred, or removed
 
 ### Code Example Validation and Updates
+For an issue PRD this section does not apply: its body carries no code examples, file paths or type and function names outside the two exceptions in [`../prd-start/issue-prd.md`](../prd-start/issue-prd.md) ("The body"), names the user sees and constraints the PRD exists to enforce. Record a decision about the code-level approach in its decision comment, and update the body when the decision changes the user-facing plan or a constraint the PRD exists to enforce. For a file PRD:
 - **Identify Outdated Examples**: Scan PRD for code snippets that may be affected by design decisions
 - **Interface Changes**: Update examples when function signatures, parameter types, or return values change
 - **API Modifications**: Revise examples when method names, class structures, or data formats evolve

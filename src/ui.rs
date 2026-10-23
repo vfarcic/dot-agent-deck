@@ -13578,7 +13578,6 @@ pub fn run_tui(
         poll_inbox_attention(&mut ui, &snapshot);
 
         let has_pane_control = pane.is_available();
-        let pane_layout = ui.pane_layout;
         let tab_view = match tab_manager.active_tab() {
             Tab::Dashboard { zoomed, .. } => ActiveTabView::Dashboard {
                 exclude_pane_ids: tab_manager.all_managed_pane_ids(),
@@ -13725,69 +13724,11 @@ pub fn run_tui(
             active_index: tab_manager.active_index(),
             orchestration_statuses: tab_bar_orchestration_statuses,
         };
-        // PRD #84 M4 (invariants 1, 2 & 4) — ONE layout pass per frame, then
-        // compute → resize → render, all against the SAME live frame area.
-        //
-        // `terminal.draw()` autoresizes the backing buffer to the live terminal
-        // size before invoking the closure, so we must autoresize HERE too
-        // before reading `get_frame().area()` (mirroring the hydration sweep at
-        // the `terminal.autoresize()` call above). Without it, the first frame
-        // after a terminal resize would size PTYs to the STALE pre-resize area
-        // while the widget renders into the NEW area — tripping the
-        // `contract_guaranteed` debug_assert in debug (one-frame empty band in
-        // release). `compute_frame_layout` is computed once here and fed to BOTH
-        // `resize_panes_to_layout` and `render_frame`, so PTY sizes and rendered
-        // rects are guaranteed identical this frame (no second layout pass).
-        let _ = terminal.autoresize();
-        let full_frame_area = terminal.get_frame().area();
-        // PRD #139 M4.1 + PRD #84: throwaway experimental footer, gated at the
-        // single user-visible seam (`show_experimental_footer()` — CLAUDE.md #9;
-        // grep that name to find this site at graduation). When ON, reserve the
-        // bottom row for the `experimental: on` label and lay the rest of the
-        // frame out above it; when OFF the layout is byte-for-byte the
-        // pre-feature baseline. The reservation happens HERE, before
-        // `compute_frame_layout`, so the whole layout pass (and the PTY sizing it
-        // drives) sits above the footer. Snapshot the flag ONCE per frame
-        // (Greptile P2) so the gate and the footer render observe the same
-        // value — reading it twice opened a TOCTOU window where the ~2s watcher
-        // could flip it between the reads, cropping the main content by a row.
-        let features_snap = crate::features::current();
-        // Issue #1637: one row above that for the hook-binary notice, on the
-        // dashboard only and only while the daemon reports one, so every other
-        // frame keeps its layout. PRD #1666 part 2 (`lifecycle/handshake/011`):
-        // one row above those for a protocol refusal, on every view, since
-        // nothing this TUI shows is live while it lasts.
+        // Issue #1637: one row above the experimental footer for the
+        // hook-binary notice, on the dashboard only and only while the daemon
+        // reports one, so every other frame keeps its layout.
         let show_hook_notice = !snapshot.hook_binary_notices.is_empty()
             && matches!(tab_view, ActiveTabView::Dashboard { zoomed: false, .. });
-        let protocol_refusal = snapshot.protocol_refusal;
-        let (frame_area, footer_rows) = FooterRows::reserve(
-            full_frame_area,
-            features_snap.experimental,
-            show_hook_notice,
-            protocol_refusal.is_some(),
-        );
-        let embedded_panes = pane.as_any().downcast_ref::<EmbeddedPaneController>();
-        let all_pane_ids = embedded_panes.map(|e| e.pane_ids()).unwrap_or_default();
-        let focused_pane_id = embedded_panes.and_then(|e| e.focused_pane_id());
-        // PRD #144: the bottom bar wraps to ADDITIONAL rows when its full-label
-        // buttons don't fit one row — three at 80 columns with the default set, and
-        // more as the terminal narrows (PRD #341 decision 4) — so reserve its
-        // actual height up front (the layout pass feeds both the PTY resize and the
-        // render this frame). "A second row" was only ever true of the 120-column
-        // reference width `render/layout/004` pins.
-        let bar_rows = bottom_bar_rows(&ui, frame_area.width, frame_area.height);
-        let frame_layout = compute_frame_layout(
-            frame_area,
-            &tab_view,
-            &tab_bar_info,
-            &all_pane_ids,
-            pane_layout,
-            focused_pane_id.as_deref(),
-            bar_rows,
-        );
-        if let Some(embedded) = embedded_panes {
-            resize_panes_to_layout(&frame_layout, embedded);
-        }
         // PRD #1666 part 2 (G-fix7g): input still queued behind the event that
         // opened a confirmation predates its first frame, so it is dropped
         // rather than answering a dialog the user has not seen — whichever path
@@ -13798,32 +13739,28 @@ pub fn run_tui(
                 let _ = event::read()?;
             }
         }
-        let completed = terminal.draw(|frame| {
-            render_frame(
-                frame,
-                &snapshot,
-                &mut ui,
-                &filtered,
+        draw_frame(
+            &mut terminal,
+            &mut ui,
+            &FrameSources {
+                snapshot: &snapshot,
+                filtered: &filtered,
                 tick,
                 has_pane_control,
-                &*pane,
-                &tab_view,
-                &tab_bar_info,
-                &frame_layout,
+                pane: &*pane,
+                tab_view: &tab_view,
+                tab_bar: &tab_bar_info,
+                // PRD #139 M4.1: snapshot the flag ONCE per frame (Greptile P2)
+                // so the footer's reservation and its label observe the same
+                // value — reading it twice opened a TOCTOU window where the ~2s
+                // watcher could flip it between the reads.
+                features: crate::features::current(),
+                show_hook_notice,
                 // Issue #413: the cards' clock, read once per frame here so
                 // every card on it measures `Last:` against the same instant.
-                Utc::now(),
-            );
-            footer_rows.render(
-                frame,
-                &features_snap,
-                &snapshot.hook_binary_notices,
-                protocol_refusal,
-            );
-        })?;
-        // PRD #1666 part 2 (G-fix7i): the open confirmation's record and click
-        // targets come from the frame as flushed, after every write above.
-        record_flushed_confirmation(&mut ui, completed.buffer);
+                wall_now: Utc::now(),
+            },
+        )?;
         tick = tick.wrapping_add(1);
 
         // Bell transition detection
@@ -15677,8 +15614,8 @@ fn pane_stack_rects(
 }
 
 /// PRD #84 M4 (invariant 2) — derive each local pane's PTY size from its layout
-/// rect and commit only the deltas. Runs once per frame, after
-/// `compute_frame_layout` and before `terminal.draw`, so every layout-changing
+/// rect and commit only the deltas. Runs once per frame inside [`draw_frame`],
+/// after `compute_frame_layout` and before `render_frame`, so every layout-changing
 /// path (resize, tab open/close, mode switch, orchestration role
 /// transition) converges here instead of pushing its own
 /// `resize_pane_pty` from a private dimension calculation.
@@ -16052,6 +15989,91 @@ fn render_card_grid(
     row_chunks[row_chunks.len() - 1]
 }
 
+/// What one run-loop frame is drawn from, besides the [`UiState`] the draw
+/// updates.
+struct FrameSources<'a> {
+    snapshot: &'a AppState,
+    filtered: &'a [(&'a String, &'a SessionState)],
+    tick: u64,
+    has_pane_control: bool,
+    pane: &'a dyn PaneController,
+    tab_view: &'a ActiveTabView,
+    tab_bar: &'a TabBarInfo,
+    features: Features,
+    show_hook_notice: bool,
+    wall_now: DateTime<Utc>,
+}
+
+/// One frame of the run loop: reserve the footer rows, lay the frame out,
+/// size the panes from that layout, draw it, and record the open
+/// confirmation from the flushed buffer.
+///
+/// PRD #84 M4 (invariants 1, 2 & 4): ONE layout pass per frame, fed to both
+/// `resize_panes_to_layout` and `render_frame`, so PTY sizes and rendered
+/// rects are identical this frame. Every step reads the size from
+/// `frame.area()`, the buffer this draw renders into: `terminal.draw`
+/// autoresizes before calling the closure, and a layout taken from an earlier
+/// read of the size is stale when the terminal shrinks between the two —
+/// the bottom bar then wrote at its old row, outside the smaller buffer, and
+/// the TUI panicked (`resize/layout/004`).
+fn draw_frame<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    ui: &mut UiState,
+    sources: &FrameSources,
+) -> Result<(), B::Error> {
+    let protocol_refusal = sources.snapshot.protocol_refusal;
+    let embedded_panes = sources
+        .pane
+        .as_any()
+        .downcast_ref::<EmbeddedPaneController>();
+    let all_pane_ids = embedded_panes.map(|e| e.pane_ids()).unwrap_or_default();
+    let focused_pane_id = embedded_panes.and_then(|e| e.focused_pane_id());
+    let completed = terminal.draw(|frame| {
+        let (frame_area, footer_rows) = FooterRows::reserve(
+            frame.area(),
+            sources.features.experimental,
+            sources.show_hook_notice,
+            protocol_refusal.is_some(),
+        );
+        // PRD #144: the bottom bar wraps to more rows when its buttons do not
+        // fit one, so its actual height is reserved before the layout pass.
+        let bar_rows = bottom_bar_rows(ui, frame_area.width, frame_area.height);
+        let frame_layout = compute_frame_layout(
+            frame_area,
+            sources.tab_view,
+            sources.tab_bar,
+            &all_pane_ids,
+            ui.pane_layout,
+            focused_pane_id.as_deref(),
+            bar_rows,
+        );
+        if let Some(embedded) = embedded_panes {
+            resize_panes_to_layout(&frame_layout, embedded);
+        }
+        render_frame(
+            frame,
+            sources.snapshot,
+            ui,
+            sources.filtered,
+            sources.tick,
+            sources.has_pane_control,
+            sources.pane,
+            sources.tab_view,
+            sources.tab_bar,
+            &frame_layout,
+            sources.wall_now,
+        );
+        footer_rows.render(
+            frame,
+            &sources.features,
+            &sources.snapshot.hook_binary_notices,
+            protocol_refusal,
+        );
+    })?;
+    record_flushed_confirmation(ui, completed.buffer);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_frame(
     frame: &mut Frame,
@@ -16072,10 +16094,10 @@ fn render_frame(
 ) {
     // PRD #84 + #139: `render_frame` reads the precomputed `FrameLayout` (one
     // layout pass per frame). The PRD #139 experimental-footer row is reserved
-    // in the main loop BEFORE `compute_frame_layout` (so the whole layout, and
+    // in [`draw_frame`] BEFORE `compute_frame_layout` (so the whole layout, and
     // the PTY sizing it drives, sits above the footer) and the footer itself is
-    // drawn there in the same `terminal.draw` — see the gating block around the
-    // `compute_frame_layout` call. So there is nothing footer-related to do here.
+    // drawn there in the same `terminal.draw`. So there is nothing
+    // footer-related to do here.
     // PRD #80 M4: rebuilt below only for the dashboard card grid; clearing here
     // means non-dashboard views (and the zero-card dashboard) leave no stale
     // card rects for the mouse hit-test.
@@ -28114,6 +28136,146 @@ mod tests {
                 req.0, req.1
             );
         }
+    }
+
+    /// A [`TestBackend`] that reports the sizes in `sizes` one `size()` query
+    /// at a time, repeating the last, so a test can change the terminal's size
+    /// between two reads inside one frame — the window a SIGWINCH lands in.
+    struct ScriptedSizeBackend {
+        inner: TestBackend,
+        sizes: std::cell::RefCell<std::collections::VecDeque<ratatui::layout::Size>>,
+    }
+
+    impl ScriptedSizeBackend {
+        fn new(sizes: &[(u16, u16)]) -> Self {
+            let (width, height) = sizes
+                .iter()
+                .fold((0, 0), |(w, h), &(sw, sh)| (w.max(sw), h.max(sh)));
+            Self {
+                inner: TestBackend::new(width, height),
+                sizes: std::cell::RefCell::new(
+                    sizes
+                        .iter()
+                        .map(|&(w, h)| ratatui::layout::Size::new(w, h))
+                        .collect(),
+                ),
+            }
+        }
+
+        /// Rows `0..height` of the inner buffer, cropped to `width` columns.
+        fn rows(&self, width: u16, height: u16) -> Vec<String> {
+            let buffer = self.inner.buffer();
+            (0..height)
+                .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+                .collect()
+        }
+    }
+
+    impl ratatui::backend::Backend for ScriptedSizeBackend {
+        type Error = std::convert::Infallible;
+
+        fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            self.inner.draw(content)
+        }
+        fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+            self.inner.hide_cursor()
+        }
+        fn show_cursor(&mut self) -> Result<(), Self::Error> {
+            self.inner.show_cursor()
+        }
+        fn get_cursor_position(&mut self) -> Result<Position, Self::Error> {
+            self.inner.get_cursor_position()
+        }
+        fn set_cursor_position<P: Into<Position>>(
+            &mut self,
+            position: P,
+        ) -> Result<(), Self::Error> {
+            self.inner.set_cursor_position(position)
+        }
+        fn clear(&mut self) -> Result<(), Self::Error> {
+            self.inner.clear()
+        }
+        fn clear_region(
+            &mut self,
+            clear_type: ratatui::backend::ClearType,
+        ) -> Result<(), Self::Error> {
+            self.inner.clear_region(clear_type)
+        }
+        fn size(&self) -> Result<ratatui::layout::Size, Self::Error> {
+            let mut sizes = self.sizes.borrow_mut();
+            Ok(if sizes.len() > 1 {
+                sizes.pop_front().expect("more than one size is queued")
+            } else {
+                sizes[0]
+            })
+        }
+        fn window_size(&mut self) -> Result<ratatui::backend::WindowSize, Self::Error> {
+            self.inner.window_size()
+        }
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            self.inner.flush()
+        }
+    }
+
+    /// Scenario: draw the empty dashboard, experimental footer on, through a
+    /// terminal that is 80x24 when the frame first measures it and 64x2 from
+    /// the next read on, so the shrink lands inside the frame, as a resize can
+    /// between the layout and the draw. Neither frame may panic, and the next
+    /// frame is drawn at 64x2 with the footer label on its bottom row.
+    #[spec("resize/layout/004")]
+    #[test]
+    fn resize_layout_004_a_terminal_that_shrinks_mid_frame_draws_without_a_panic() {
+        // `Terminal::new` takes the first size; the first frame's first read
+        // takes the second; every read after that sees 64x2.
+        let backend = ScriptedSizeBackend::new(&[(80, 24), (80, 24), (64, 2)]);
+        let mut terminal = Terminal::new(backend).expect("the backend constructs");
+        let state = AppState::default();
+        let mut ui = default_ui();
+        let filtered = filter_sessions(&state, &ui);
+        let pane = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+        let tab_view = ActiveTabView::Dashboard {
+            exclude_pane_ids: vec![],
+            zoomed: false,
+        };
+        let tab_bar = TabBarInfo {
+            show: false,
+            labels: vec!["Dashboard".into()],
+            active_index: 0,
+            orchestration_statuses: vec![],
+        };
+        let sources = FrameSources {
+            snapshot: &state,
+            filtered: &filtered,
+            tick: 0,
+            has_pane_control: true,
+            pane: &pane,
+            tab_view: &tab_view,
+            tab_bar: &tab_bar,
+            features: Features::test_with(true),
+            show_hook_notice: false,
+            wall_now: Utc::now(),
+        };
+
+        for frame in ["the frame the shrink lands in", "the frame after it"] {
+            let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                draw_frame(&mut terminal, &mut ui, &sources)
+            }));
+            assert!(
+                drawn.is_ok(),
+                "{frame} panicked: the terminal shrank to 64x2 between the size \
+                 the frame was laid out at and the size it was drawn into"
+            );
+        }
+
+        assert_eq!(terminal.get_frame().area(), Rect::new(0, 0, 64, 2));
+        let rows = terminal.backend().rows(64, 2);
+        assert!(
+            rows[1].starts_with("experimental: on"),
+            "the 64x2 frame keeps its footer label on the bottom row: {rows:#?}"
+        );
     }
 
     /// Scenario: PRD #313 M1 under the Tiled pane layout — tile an orchestration
