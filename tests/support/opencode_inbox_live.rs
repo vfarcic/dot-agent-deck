@@ -979,6 +979,9 @@ fn completed_reply(transcript: &Value, id: &str) -> Option<String> {
         .max_by_key(|m| m["time_created"].as_u64())?;
     // OpenCode may finish with a textless stop after a reply plus work-done
     // tools. Still require this delivery's stop before accepting its text.
+    // Order comes from `time_created` alone: this assumes OpenCode stamps a
+    // turn's messages with distinct, increasing values, so a message sharing
+    // the stop's timestamp counts as before it.
     messages
         .iter()
         .filter(|m| {
