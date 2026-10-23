@@ -5203,12 +5203,31 @@ fn admit_component(
     let Some(claimed) = claimed.filter(|_| used_as == ComponentUse::Receiver) else {
         return Ok(claimed);
     };
+    // Whether the agent `root` descends from `candidate`. A walk that ran out
+    // of steps is no answer here (round 1's U3): `descends` reads it as "no",
+    // which suits a membership check that refuses on "no", not this one,
+    // which admits on it.
+    let below = |root: u32, candidate: u32| match descends(root, candidate) {
+        Some(false)
+            if crate::platform::proc::ancestry_with(root, candidate, parent_of)
+                == crate::platform::proc::Ancestry::TooDeep =>
+        {
+            None
+        }
+        answer => answer,
+    };
     // Nor a process above the agent — the deck, a terminal, init — which the
     // caller descends from as every process of the pane does.
-    if claimed <= 1
-        || root.is_some_and(|root| claimed != root && descends(root, claimed) == Some(true))
-    {
+    if claimed <= 1 {
         return Err(ComponentRefusal::AboveAgent);
+    }
+    if let Some(root) = root.filter(|&root| claimed != root) {
+        match below(root, claimed) {
+            Some(false) => {}
+            Some(true) => return Err(ComponentRefusal::AboveAgent),
+            None if required => return Err(ComponentRefusal::Unidentified),
+            None => {}
+        }
     }
     match descends(peer.pid, claimed) {
         Some(true) => {}
@@ -5222,7 +5241,7 @@ fn admit_component(
     // it can name a shell on a branch it shares with the agent, which would
     // climb to the terminal or the deck above it.
     if let Some(root) = root.filter(|&root| instance != claimed && instance != root) {
-        match descends(root, instance) {
+        match below(root, instance) {
             Some(false) => {}
             Some(true) => return Err(ComponentRefusal::AboveAgent),
             None if required => return Err(ComponentRefusal::Unidentified),
@@ -12788,6 +12807,66 @@ mod hook_ingestion_tests {
             Err(ComponentRefusal::Unidentified)
         );
         assert_eq!(resolve(Evidence::BestEffort), Ok(Some(50)));
+    }
+
+    /// PRD #1666 part 3, round 2 (round 1's U3): a walk from the agent that
+    /// runs out of steps before it meets the terminal says nothing about
+    /// whether the terminal is above the agent. Under required evidence the
+    /// receiver is unidentified, whether a sibling shell resolves to the
+    /// terminal or the terminal is named directly; the same tree a few
+    /// processes shallower is refused as above the agent.
+    #[test]
+    fn a_walk_too_deep_to_place_the_receiver_is_not_evidence_it_is_below_the_agent() {
+        // 1 ── 5 terminal ── 6 bash ──┬── 1000 ── 1001 ── … ── 10 agent
+        //                             └── 30 sh ── 31 CLI
+        let tree = |depth: u32| {
+            move |pid: u32| match pid {
+                5 => Some(1),
+                6 => Some(5),
+                30 | 1000 => Some(6),
+                31 => Some(30),
+                10 => Some(1000 + depth - 1),
+                pid if (1001..1000 + depth).contains(&pid) => Some(pid - 1),
+                _ => None,
+            }
+        };
+        let executables = |pid: u32| {
+            Some(std::path::PathBuf::from(match pid {
+                5 => "/usr/bin/kitty",
+                6 => "/bin/bash",
+                10 => "/opt/claude",
+                31 => "/opt/dot-agent-deck",
+                30 => "/bin/sh",
+                _ => "/usr/bin/env",
+            }))
+        };
+        let admit = |depth: u32, claimed, evidence| {
+            let parents = tree(depth);
+            admit_component(
+                peer(31, Some(true)),
+                Some(claimed),
+                Some(10),
+                ComponentUse::Receiver,
+                evidence,
+                |pid, root| crate::platform::proc::descends_from_with(pid, root, parents),
+                parents,
+                executables,
+            )
+        };
+        let deep = crate::platform::proc::MAX_ANCESTRY_DEPTH as u32 + 8;
+        for claimed in [30, 5] {
+            assert_eq!(
+                admit(deep, claimed, Evidence::Required),
+                Err(ComponentRefusal::Unidentified),
+                "{claimed}"
+            );
+            // The control: shallow enough to read, it is placed above the agent.
+            assert_eq!(
+                admit(4, claimed, Evidence::Required),
+                Err(ComponentRefusal::AboveAgent),
+                "{claimed}"
+            );
+        }
     }
 
     /// Every refusal names its own cause, and a fixed message that says what
