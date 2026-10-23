@@ -205,9 +205,15 @@ pub fn handle_hook(agent: &str) -> ExitCode {
             CodexInbox::Nothing => {}
             CodexInbox::Print(output) => output.print(),
             // PRD #1666 part 3 (H4): a hand-over whose output was written and
-            // flushed whole with a block in it goes on with the turn. One cut
-            // short is not a decision Codex can read, and one the fence
-            // refused whole printed nothing, so either turn ends as usual.
+            // flushed whole with a block in it goes on with the turn. One the
+            // fence refused whole printed nothing, and one whose write or
+            // flush failed reports the turn's end too, its blocks only
+            // possibly handed — although a write that stopped at the
+            // trailing newline, or a flush that failed after every byte was
+            // taken, can leave a whole decision Codex still reads and goes
+            // on with (inbox/receipt/033): then the card reads idle while
+            // Codex works, and a block it did take may come again, marked as
+            // a possible repeat.
             #[cfg(unix)]
             CodexInbox::TurnEnd(injection) => {
                 if injection.print().continues_turn() {

@@ -8538,6 +8538,13 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 - **Does not assert:** the real hook binary reporting or withholding Idle (`inbox/codex/019`), or a write that fails partway (`inbox/receipt/030`).
 - **Platform coverage:** mac+linux.
 
+##### inbox/receipt/033 — A Stop cut at its newline or its flush reports the turn's end.
+- **Layer:** Fast (`src/inbox_prompt.rs`), `OneShotBatch::hand_over` of Codex's `Stop` decision into an in-memory writer that takes a set number of bytes and can fail its flush, and `Ran::continues_turn` (PRD #1666 part 3, round 3's U3, landed in round 4).
+- **Agent:** none.
+- **Asserts:** with every byte but the trailing newline taken, and with every byte taken and the flush failing, the bytes taken parse as a whole `{"decision":"block"}` Codex can read, yet `continues_turn` is false and the block is only possibly handed; with every byte taken and flushed it goes on with the turn and the block is written.
+- **Does not assert:** what a real Codex does with an output that lacks its newline.
+- **Platform coverage:** mac+linux.
+
 #### Protocol and waiter lifecycle
 
 ##### inbox/protocol/001 — Inbox verbs require an attested caller.

@@ -736,10 +736,13 @@ impl Ran {
     }
 
     /// Whether a hand-over that asks the agent to go on with its turn
-    /// (Codex's `Stop`) did ask it: its whole output was written and flushed,
-    /// and carried a block. A batch whose blocks the fence all refused wrote
-    /// nothing ([`Piece::Open`]); one the fence refused in part asked the
-    /// agent to go on with the blocks that passed.
+    /// (Codex's `Stop`) surely asked it: its whole output was written and
+    /// flushed, and carried a block. A batch whose blocks the fence all
+    /// refused wrote nothing ([`Piece::Open`]); one the fence refused in part
+    /// asked the agent to go on with the blocks that passed. `false` does not
+    /// prove the agent did not go on: a write that stopped at the trailing
+    /// newline, or a flush that failed after every byte was taken, can leave
+    /// a whole decision the agent reads (inbox/receipt/033).
     pub fn continues_turn(&self) -> bool {
         self.error.is_none() && self.outputs.contains(&Output::Written)
     }

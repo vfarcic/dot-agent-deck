@@ -1077,6 +1077,92 @@ mod tests {
         assert_eq!(controls[0].not_handed, attempts);
     }
 
+    /// Scenario: Codex's `Stop` writes its one-block decision into an output that takes every byte but the trailing newline, into one that takes every byte and then fails its flush, and into one that takes it all. In the first two the decision on stdout is whole JSON Codex can still read, yet the hook does not go on with the turn (it reports the turn's end) and the block is only possibly handed, not written; only the third goes on with the turn, the block written.
+    #[cfg(unix)]
+    #[spec("inbox/receipt/033")]
+    #[test]
+    fn receipt_033_a_stop_cut_at_its_newline_or_its_flush_reports_the_turns_end() {
+        use crate::event::{InboxDelivery, InboxDeliveryAttempt};
+        use crate::inbox_oneshot::{OneShotBatch, Output, Ran};
+        /// Takes `room` bytes, then refuses; its flush fails when `flush_fails`.
+        struct Short {
+            taken: Vec<u8>,
+            room: usize,
+            flush_fails: bool,
+        }
+        impl std::io::Write for Short {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let n = bytes.len().min(self.room);
+                if n == 0 && !bytes.is_empty() {
+                    return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+                }
+                self.taken.extend_from_slice(&bytes[..n]);
+                self.room -= n;
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                if self.flush_fails {
+                    Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let batch = OneShotBatch::new(vec![InboxDelivery {
+            id: ID.to_string(),
+            subject: "s".to_string(),
+            from: "the orchestrator".to_string(),
+            text: format!(
+                "[dot-agent-deck message {ID} delivery 1.1 from the orchestrator]\nbody\n[end of dot-agent-deck message {ID}]"
+            ),
+            attempt: Some(InboxDeliveryAttempt {
+                a: 1,
+                e: 1,
+                d: 1,
+                repeat: false,
+                caps: None,
+            }),
+        }]);
+        let parts = Envelope::Block.parts("framing", &[batch.text(0).unwrap()]);
+        let pieces = parts.pieces();
+        let whole: usize = pieces
+            .iter()
+            .map(|piece| match piece {
+                crate::inbox_oneshot::Piece::Frame(bytes)
+                | crate::inbox_oneshot::Piece::Block(_, bytes)
+                | crate::inbox_oneshot::Piece::Joint(bytes)
+                | crate::inbox_oneshot::Piece::Open(bytes)
+                | crate::inbox_oneshot::Piece::Close(bytes) => bytes.len(),
+            })
+            .sum();
+        for (what, room, flush_fails, goes_on) in [
+            ("cut at its newline", whole - 1, false, false),
+            ("its flush failed", whole, true, false),
+            ("written and flushed", whole, false, true),
+        ] {
+            let mut out = Short {
+                taken: Vec::new(),
+                room,
+                flush_fails,
+            };
+            let handed = batch.hand_over(&mut out, &pieces, |_| Ok(()));
+            let ran = Ran {
+                outputs: handed.outputs,
+                error: handed.error,
+            };
+            assert_eq!(ran.continues_turn(), goes_on, "{what}");
+            let expected = if goes_on {
+                Output::Written
+            } else {
+                Output::Possible
+            };
+            assert_eq!(ran.outputs, vec![expected], "{what}");
+            let decision: serde_json::Value = serde_json::from_slice(&out.taken)
+                .unwrap_or_else(|e| panic!("{what}: a decision Codex can read ({e})"));
+            assert_eq!(decision["decision"], "block", "{what}");
+        }
+    }
+
     /// Scenario: Codex's `Stop` hands a two-message batch over against a deck that refuses both grants, refuses the first, or grants both. With both refused it prints nothing and does not go on with the turn, so its Idle is reported as the turn ends; with the first refused it prints one `{"decision":"block"}` line carrying only the second block and goes on with the turn; with both granted it carries both and goes on. The deck is told exactly the blocks it printed committed.
     #[cfg(unix)]
     #[spec("inbox/receipt/032")]
