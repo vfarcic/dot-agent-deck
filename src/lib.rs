@@ -133,6 +133,7 @@ pub mod remote_daemon;
 pub mod remote_doctor;
 pub mod remote_tunnel;
 pub mod repo_identity;
+pub mod retained_store;
 pub mod schedule_cli;
 // Issue #1635: upgrading this machine's CLI and desktop app in place.
 pub mod scheduler;

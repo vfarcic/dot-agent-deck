@@ -292,10 +292,6 @@ mod unix {
 
         /// Make this directory's entries durable: `fsync` on the held
         /// descriptor.
-        #[cfg_attr(
-            not(test),
-            expect(dead_code, reason = "the retained-report store is its first caller")
-        )]
         pub(crate) fn sync(&self) -> io::Result<()> {
             // SAFETY: a live descriptor.
             cvt(unsafe { libc::fsync(self.fd.as_raw_fd()) })?;
@@ -309,10 +305,6 @@ mod unix {
         /// without a no-replace rename answers its own error (`EINVAL`,
         /// `ENOSYS`, `ENOTSUP`); there is no fallback to an overwriting rename
         /// or to a link and an unlink.
-        #[cfg_attr(
-            not(test),
-            expect(dead_code, reason = "the retained-report store is its first caller")
-        )]
         pub(crate) fn rename_into(
             &self,
             from: &str,

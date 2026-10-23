@@ -11925,12 +11925,172 @@ Manual merge gate: opt in with `DOT_AGENT_DECK_INBOX_LOAD_TEST=1` only when sche
 
 PRD #1666 part 3, round 5: where the deck keeps a worker's report, or a dispatch's result, when the agent it was for is no longer there to take it.
 
-##### inbox/recovery/018 — The retained store's directory moves never replace a file and stay in the directories the deck verified.
-- **Layer:** fast unit (`src/platform/trusted_dir.rs`, in-crate; real files in a temporary directory).
+##### inbox/recovery/001 — Admission refuses a new report at the byte budget or the file count, consuming nothing, and a dispatch at its result slots.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
 - **Agent:** none.
-- **Asserts:** `TrustedDir::rename_into` moves a file between two held directories; refuses with `EEXIST`, leaving both files unchanged, to replace a file at the destination name; refuses a name that is not a single component; after the parent of both directories is renamed away and an impostor tree put in its place, still moves within the pinned originals while the impostor receives nothing; and on an injected unsupported-rename error (`ENOSYS`) returns it with the file still in its source and no second name. `sync` succeeds on a held directory.
+- **Asserts:** with a 1000-byte budget and two file slots, reservations within both are admitted; one over the bytes is refused with the byte cause and one over the slots with the file-count cause, neither consuming anything; a released reservation frees its room; with one fallback slot, one dispatch reserves exactly `DISPATCH_RESULT_MAX_FILE` and the next is refused with its in-flight and unsaved counts.
+- **Why it exists:** plan D2: every acceptance and every dispatch reserves its room before anything is consumed, so the deck never acknowledges a report it has nowhere to keep.
+- **Does not assert:** the outcome-row bound and its overflow count (with the recovery index); the refusal sentences (with their callers).
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/002 — A saved report stays while it is pinned, whatever its age.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** a report that is neither acknowledged nor in recovery survives a sweep a hundred days later; once acknowledged it is kept a day less one second, and removed at the day.
+- **Why it exists:** plan D3: a report referenced by a claim, a ledger entry or a listed row is never removed to make room or by age.
+- **Does not assert:** what pins a report (the claims and the ledger).
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/003 — Expiry is measured from the recorded acknowledgement or recovery time, not from the file's mtime.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** an acknowledged report is kept 24 hours from its acknowledgement and one in recovery 7 days from its recovery, each removed at its deadline and not a second before, and the charge falls with each removal.
+- **Why it exists:** plan D14: retention is a promise measured from recorded times.
+- **Does not assert:** dismissal of a row (round 6), which never deletes the file.
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/004 — A live run's files are never touched by another run's startup or sweep, whatever their age.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** with run A live and its files' mtime set to 1970, run B starts and sweeps: B takes nothing over, charges nothing, and A's directory is unchanged.
+- **Why it exists:** reviewer R2: reclaiming by mtime would delete a live run's pinned reports.
+- **Does not assert:** two runs racing on one dead run (`/015`).
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/005 — A report that entered recovery late is kept its full seven days across a restart.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** written on day 0, recovered on day 6, its run ended; the run starting on day 8 adopts it with deadline day 13 and the recovered letter in its name, keeps it through day 12 and removes it on day 13.
+- **Why it exists:** plan D14: the recorded recovery time, not the restart, starts the seven days.
+- **Does not assert:** a forward wall-clock jump, which can shorten it (a stated limit).
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/006 — An acknowledgement that arrives after a restart does not shorten or renew an adopted report's retention.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** a pinned report's run ends; the next run adopts it with seven days from the takeover and the pinned letter; an acknowledgement in the new run changes nothing, and a third run keeps the same name.
+- **Why it exists:** plan D14: the task index is memory-only, so an adopted file's suffix is its whole retention record.
+- **Does not assert:** delivery after a restart, which round 5 does not do.
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/007 — Takeover charges the adopted bytes to the run that took them over.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** the adopted charge equals the inherited files' bytes, a reservation that fits beside them is admitted, and one that would pass the budget with them is refused.
+- **Why it exists:** reviewer R2: restarts must not stack budgets.
+- **Does not assert:** an aggregate bound across live daemons, which the budget is not.
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/008 — Concurrent reservations are all counted, and a report whose removal fails stays charged until a retry removes it.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** 200 reservations from eight threads give a count of 200; a due report whose unlink fails stays, charged and holding its slot, as an orphaned attempt; with the fault lifted the next sweep removes it and frees the charge.
+- **Why it exists:** plan D14: a failed removal never silently drops a charge.
+- **Does not assert:** a removal that keeps failing forever (it is retried each pass).
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/009 — A report its run never listed gets seven days from the first takeover, once.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** a report written before its run's inventory flushed is adopted with seven days from the takeover and the unlisted letter in its name; a restart a day later keeps that name.
+- **Why it exists:** plan D14: a crash before a flush lengthens a promise and never renews it.
+- **Does not assert:** a crash between the write and its directory sync (the write is synced before it is acknowledged).
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/010 — A store directory that already exists open to other users, as a symlink or as a file is refused, never repaired.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** each makes the store unusable, so every reservation (a report's and a dispatch's) answers unusable, and nothing is created, chmodded or written through it.
+- **Why it exists:** plan D3: the store refuses a directory it cannot trust rather than fixing it up.
+- **Does not assert:** another owner's directory (the receipt spool's tests cover the shared check; a test cannot run as two users).
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/011 — Renaming the store's directory after it opened redirects no write and no removal.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** with `retained-reports` renamed away and an impostor tree put at its path holding a due report-looking file, a new report lands in the pinned original and a sweep removes nothing from the impostor.
+- **Why it exists:** plan D3: every operation is relative to a held, verified directory descriptor.
+- **Does not assert:** Windows, whose checks are path-based and not confinement.
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/012 — Report files are exclusive and owner-only, and the envelope is one bounded ASCII line whose attribution a body cannot forge.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** a file is created 0600; a decoy file or a symlink at the name makes the write fail without touching either, and the failed attempt removes nothing; a body forging the magic line and an envelope is read as body, attribution coming from the first two lines; hostile producer labels (newline, CR, quote, brace, a bidi override, C0 controls, a 10 KiB label) give one ASCII line of at most 2 KiB that round-trips to the normalised, cut values and names the cut fields; an orchestration-named pane id stays in `producer_supplied`.
+- **Why it exists:** plan D3: the envelope is the deck's attribution of a report that may outlive every record of it.
+- **Does not assert:** authenticity against a process of the same user, which can write the same format (a stated limit).
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/014 — Three runs: a live adopter keeps one owner and one deadline per file.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** A writes files and ends; B adopts them and stays live; C starts: every file is in B's directory with a suffix, charged once by B and not by C, C opens nothing of B's and its sweep removes nothing; once B ends, D adopts them under the same names.
+- **Why it exists:** reviewer R12, auditor U2-3: ownership is the directory a file is in.
+- **Does not assert:** a host crash, which depends on the filesystem.
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/015 — A takeover cut short, then two starters at once, leave every file with exactly one owner.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** for k = 0, 1 and all of A's files moved before B's transfer is stopped and B ends, two runs starting together behind a barrier leave every report in exactly one live run's directory, charges summing to the files' sizes, B's adopted names unchanged, and A's lock and inventory gone only once its directory is empty.
+- **Why it exists:** plan D14: a no-replace rename under one exclusive lock is the whole transfer.
+- **Does not assert:** a host crash mid-rename (filesystem-dependent).
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/016 — A corrupt or foreign inventory leaves its run's own files in place, and the inventory writer never writes an older snapshot over a newer one.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** a wrong version, a symlink, a FIFO (refused without blocking), unparsable text, a line over 256 bytes, a header `max_files` over 65,536, more lines than its count, an invalid name and an unknown state each leave the unsuffixed file in place and uncharged while the suffixed file is adopted; an unrecognised name in an owned directory is left alone; the writer given revision n + 1 and then n holds n + 1.
+- **Why it exists:** reviewer U3-5: fail closed on anything the deck did not write.
+- **Does not assert:** every field-level malformation (the reader's own unit cases in `/022`).
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/017 — A dispatch result's whole file fits its 72 KiB limit, cut with a note when it would not.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** a text whose file is exactly the limit is saved whole with no note; one byte more is cut, carries the note and stays within the limit; a dispatch reserves exactly the limit.
+- **Why it exists:** reviewer U3-1, auditor U3-1: the reservation bounds the whole file.
+- **Does not assert:** the dispatch arm that composes it (with that arm).
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/018 — The retained store's directory moves never replace a file and stay in the directories the deck verified.
+- **Layer:** fast unit (`src/platform/trusted_dir.rs` and `src/retained_store_tests.rs`, in-crate; real files in a temporary directory).
+- **Agent:** none.
+- **Asserts:** an injected unsupported-rename error (`ENOSYS` on every move) stops the store's takeover of a dead run, its files left in place, uncharged and unretired. `TrustedDir::rename_into` moves a file between two held directories; refuses with `EEXIST`, leaving both files unchanged, to replace a file at the destination name; refuses a name that is not a single component; after the parent of both directories is renamed away and an impostor tree put in its place, still moves within the pinned originals while the impostor receives nothing; and on an injected unsupported-rename error (`ENOSYS`) returns it with the file still in its source and no second name. `sync` succeeds on a held directory.
 - **Why it exists:** the retained-report store transfers a dead run's files by one no-replace rename between held directories (plan D3, D14), so a file is in exactly one owned directory at every instant and no move can overwrite another run's file.
-- **Does not assert:** Windows, whose checks are path-based and are not confinement; that the store stops a transfer on the unsupported error (the store's own tests); durability across a host crash, which depends on the filesystem.
+- **Does not assert:** Windows, whose checks are path-based and are not confinement; durability across a host crash, which depends on the filesystem.
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/019 — An inventory a correct writer produced is never refused for its size by a successor configured smaller.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** 64 tiny reports with maximum-length ids fill a 64-file cap and the 65th is refused for the file count with bytes to spare; a run capped at 8 reads the predecessor's header and adopts all 64, charging their sizes, and a second restart keeps their names and charges each once; an inventory of 65,536 maximum-length entries reads back whole with every line within 256 bytes; the writer refuses a count over its own cap.
+- **Why it exists:** reviewer R19, auditor U2-2: the file count is what bounds the inventory.
+- **Does not assert:** a writer that bypasses admission (a bug the assertion catches).
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/020 — A dead run is retired only after both directories are durable, and an expired file it cannot remove is taken over for cleanup.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** a failed parent sync of this run's new directory leaves the store unusable; a failed sync of the dead run's directory leaves it unretired, its lock and inventory in place, and the next start retires it; an expired file whose unlink fails is moved here under its past suffix, charged, holding no slot and in no inventory, and removed by the next sweep once unlinks succeed; with the move failing too, it stays and the dead run is not retired.
+- **Why it exists:** reviewer U3-3/U3-4, auditor U3-3: durability before retirement, and no orphan left uncharged.
+- **Does not assert:** a host crash between the syncs.
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/021 — Files inherited for cleanup never take a file slot or enter the inventory.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** a 64-file run's expired files, with every source unlink failing, land in an 8-slot run under past suffixes, charged and uninventoried; it admits 8 own files and refuses the 9th with a valid inventory; the next run adopts both kinds, keeps the past deadlines and charges their sizes, and removes the 64 once unlinks succeed; two dead runs of 64 each are taken over with no slot used and a valid inventory.
+- **Why it exists:** reviewer R22, auditor U3-1: inheritance must not break the writer's count.
+- **Does not assert:** the number of adopted files, which `max_files` does not bound (a stated limit).
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/022 — The adopted charge follows the directory, and a scan that could not read everything never lowers it.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** three adopted files deleted from outside are uncharged by the next complete sweep and a refused reservation is then admitted; an own file deleted from outside is released and one failing with EACCES keeps its charge; a seeded sum near `u64::MAX` saturates; an EIO on one entry, a stream failing mid-pass or a generation moved mid-pass discards the recount and the next complete pass publishes it; a failed unlink subtracts nothing; two sweeps requested together do not overlap and end at the true total; each source state gets its letter, a second takeover keeps letter and deadline, and a name with an unknown or missing letter is left alone, uncharged; a 300-byte inventory line is refused with the reader's buffer never over 257 bytes, and trailing bytes, a duplicate and a suffixed name make an inventory invalid.
+- **Why it exists:** reviewer U3-3/U3-5, auditor U3-3/U3-5: conservative accounting, complete-scan-only recounts.
+- **Does not assert:** a same-user process writing a file under a valid adopted name, which is charged from the next sweep (a stated limit).
 - **Platform coverage:** mac+linux.
 
 ## Desktop native network scenarios
