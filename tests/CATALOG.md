@@ -9722,6 +9722,13 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** a live older install being taken over, or one of the same release being kept as settled (`hooks_refresh` unit tests), the upgrade clients running the refresh (`self_upgrade::agent_hooks` unit tests), or a real Claude.
 - **Platform coverage:** mac+linux.
 
+##### inbox/claude/049 — Live: hooks refreshed after an upgrade deliver to a restarted Haiku.
+- **Layer:** L2 lane 2 (`tests/e2e_inbox_claude_live.rs`), the real TUI in a PTY, genuine interactive Haiku panes, the real `hooks refresh --json` from the harness's durable copy (PRD #1666 part 3, R-3).
+- **Agent:** Claude Code (Haiku).
+- **Asserts:** with the settings made a pre-0.47 install (status hooks on a stand-in copy whose `--version` is unreadable, no waiter), a Haiku started under them has the `hooks_too_old` integration notice and `deck hooks run a dot-agent-deck too old` is on its card on screen; with the stand-in removed, `hooks refresh` succeeds with `ok: true` and the settings gain the waiter and lose the stand-in; a Haiku started afterwards arms its waiter, writes a sentinel-writing task's file once, the task is acknowledged after one hand-over with no doorbell, and the card labels it.
+- **Does not assert:** a real 0.46 binary, an upgrade client running the refresh (`self_upgrade::agent_hooks`, `upgrade/upgrade-dialog/015`, desktop `local_upgrade_008`–`010`), or the stale Haiku itself answering a doorbell with `inbox fetch`.
+- **Platform coverage:** mac+linux.
+
 ##### inbox/claude/023 — A raw exact commit needs the attempt's receipt.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), a raw `inbox_committed` sent to the hook socket by the scripted Claude parent itself (inside the agent's process tree), real waiter and hook CLI children, real spool.
 - **Agent:** none (synthetic Claude parent; no credential).

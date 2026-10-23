@@ -403,3 +403,145 @@ fn claude_046_live_outside_the_recorded_tree_takes_and_acknowledges() {
     );
     claude.done(&id, name, true);
 }
+
+/// PRD #1666 part 3 (R-3): start another interactive Haiku in `deck`, as
+/// `name`, and return its pane once the deck has recorded it.
+fn start_claude(deck: &common::TuiDeck, name: &str) -> inbox::Pane {
+    let reply = attach(
+        deck,
+        json!({"op":"start-agent","command":common::capability_export_command(&format!("exec {CLAUDE}")),
+               "cwd":deck.workdir(),"rows":40,"cols":140,"display_name":name,"agent_type":"claude_code",
+               "env":[["DOT_AGENT_DECK_PANE_ID",name]]}),
+    );
+    assert_eq!(reply["ok"], true, "start {name}: {reply}");
+    let agent = reply["id"].as_str().unwrap().to_string();
+    let record = std::cell::RefCell::new(Value::Null);
+    assert!(
+        common::wait_until(BUDGET, || {
+            *record.borrow_mut() = attach(deck, json!({"op":"list-agents"}))["agent_records"]
+                .as_array()
+                .and_then(|rs| rs.iter().find(|r| r["id"] == agent.as_str()))
+                .cloned()
+                .unwrap_or(Value::Null);
+            record.borrow()["pane_id_env"].is_string()
+        }),
+        "{name} must register"
+    );
+    let token = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(common::recorded_hook_capability(deck.workdir(), &agent))
+        .unwrap();
+    inbox::Pane {
+        id: record.borrow()["pane_id_env"].as_str().unwrap().into(),
+        agent,
+        token,
+        pid: 0,
+        capture: PathBuf::new(),
+        attach_socket: deck.attach_socket_path().into(),
+    }
+}
+
+/// Scenario: With genuine interactive Haiku running in the deck, Claude's settings are made a pre-0.47 install whose status hooks run another dot-agent-deck and that has no waiter, and a second Haiku is started under them: its card names its hooks as too old for its messages. That copy is then gone, as after an upgrade, and the deck's installed copy runs `hooks refresh`, which moves the hooks onto it and adds the waiter. A Haiku started after that is woken natively by a sentinel-writing task, does it once, and the task is acknowledged.
+#[spec("inbox/claude/049")]
+#[test]
+fn claude_049_live_hooks_refreshed_after_an_upgrade_deliver() {
+    use std::os::unix::fs::PermissionsExt;
+    skip_unless!(common::check_claude_available());
+    let claude = Claude::new();
+    let home = claude.deck.home_dir().to_path_buf();
+    let installed = home.join(".local/bin/dot-agent-deck");
+    assert!(
+        installed.exists(),
+        "the harness seeds the deck's durable copy"
+    );
+
+    // A pre-0.47 install: the status hooks run another copy, with no waiter.
+    let old = home.join("old-deck/dot-agent-deck");
+    std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+    std::fs::write(
+        &old,
+        format!(
+            "#!/bin/sh\n[ \"$1\" = --version ] && {{ echo 'dot-agent-deck (older)'; exit 0; }}\nDOT_AGENT_DECK_INBOX_TEST_HOOK_INTEGRATION=pre-inbox exec '{}' \"$@\"\n",
+            common::contained_deck_binary().display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let settings_path = home.join(".claude/settings.json");
+    let mut settings: Value =
+        serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
+    let ours = installed.to_string_lossy().into_owned();
+    for (_, rules) in settings["hooks"].as_object_mut().unwrap().iter_mut() {
+        for rule in rules.as_array_mut().unwrap() {
+            let handlers = rule["hooks"].as_array_mut().unwrap();
+            handlers.retain(|h| !h["command"].as_str().unwrap_or("").contains(" inbox wait "));
+            for handler in handlers.iter_mut() {
+                if let Some(command) = handler["command"].as_str()
+                    && command.contains(&ours)
+                {
+                    handler["command"] = json!(command.replace(&ours, &old.to_string_lossy()));
+                }
+            }
+        }
+    }
+    std::fs::write(&settings_path, settings.to_string()).unwrap();
+
+    let stale = start_claude(&claude.deck, "stale-haiku");
+    let notice = || {
+        attach(&claude.deck, json!({"op":"list-agents"}))["agent_records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == stale.agent.as_str())
+            .map(|r| r["inbox"]["integration"].clone())
+            .unwrap_or(Value::Null)
+    };
+    assert!(
+        common::wait_until(BUDGET, || notice() == "hooks_too_old"),
+        "the stale agent's card names its hooks; {}",
+        claude.evidence()
+    );
+    assert!(
+        claude.deck.wait_for_grid_string_within(
+            "deck hooks run a dot-agent-deck too old",
+            Duration::from_secs(30)
+        ),
+        "the notice is on screen; {}",
+        claude.evidence()
+    );
+
+    // The upgrade moved the older copy away; the installed copy refreshes.
+    std::fs::remove_file(&old).unwrap();
+    let out = std::process::Command::new(&installed)
+        .args(["hooks", "refresh", "--json"])
+        .env_clear()
+        .env("HOME", &home)
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .current_dir(claude.deck.workdir())
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|error| panic!("a JSON report: {error}; {out:?}"));
+    assert!(out.status.success() && report["ok"] == true, "{report}");
+    let refreshed = std::fs::read_to_string(&settings_path).unwrap();
+    assert!(
+        refreshed.contains(" inbox wait ") && !refreshed.contains("old-deck"),
+        "{refreshed}"
+    );
+
+    // Restarted on the refreshed hooks, the agent takes its next task.
+    let pane = start_claude(&claude.deck, "fresh-haiku");
+    let fresh = Claude {
+        pane,
+        deck: claude.deck,
+    };
+    assert!(
+        common::wait_until(BUDGET, || fresh.listing()["armed"].as_u64().unwrap_or(0)
+            > 0),
+        "the refreshed waiter arms; {}",
+        fresh.evidence()
+    );
+    let name = "refreshed-hooks-41c9e7.txt";
+    let id = fresh.post(&fresh.directive(name));
+    fresh.done(&id, name, true);
+}
