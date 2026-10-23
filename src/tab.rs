@@ -1706,6 +1706,25 @@ impl TabManager {
         }
         None
     }
+
+    /// PRD #1666 part 2 (G-fix7c): the role `pane_id` holds in an
+    /// orchestration tab, and that tab's name, as `(role, orchestration)`.
+    /// `None` for a pane no orchestration tab holds.
+    pub fn role_of_pane(&self, pane_id: &str) -> Option<(String, String)> {
+        let index = self.tab_index_for_pane(pane_id)?;
+        let Tab::Orchestration {
+            name,
+            role_pane_ids,
+            config,
+            ..
+        } = &self.tabs[index]
+        else {
+            return None;
+        };
+        let slot = role_pane_ids.iter().position(|id| id == pane_id)?;
+        let role = config.roles.get(slot)?.name.clone();
+        Some((role, name.clone()))
+    }
 }
 
 /// The identity rule behind [`TabManager::orchestration_tab_index_for`] and

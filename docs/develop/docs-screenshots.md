@@ -47,6 +47,7 @@ Each image is named `<scenario>-<client>.png`, so the `dashboard` scenario produ
 | `schedules` | TUI | Schedules manager with one disabled task, keeping the next-fire field stable. |
 | `help` | TUI | The `?` keyboard shortcut overlay. |
 | `host-metrics` | TUI, desktop | The TUI's **Host of this deck** overlay (`m`) and the desktop Dashboard's **Host** button opened to its popover, both for one fixed sample with the temp root at a warning level: the daemon reports `HOST_SAMPLE` from `tests/e2e_docs_screenshots.rs` through the `e2e`-only `DOT_AGENT_DECK_E2E_HOST_SAMPLE` seam, and the desktop's `docs` fixture carries the same figures. |
+| `restart-notice` | TUI, desktop | The deck restarted while the client was attached, and the notice names the two agents the restart stopped, `api-fix` and `docs-review`, over a deck running none (PRD #1666 part 2). TUI: the capture starts a daemon of its own with two stand-in panes (`tests/support/inbox_doorbell.rs`), attaches the TUI to it, stops it and starts an empty one on the same sockets. Desktop: the fixture's `docs-restart` state, whose deck is listed by one process and, `FIXTURE_RESTART_AFTER_MS` after the app subscribes, by another running no agents (`restartedFixtureSnapshot`). |
 
 The docs-only fleet fixture lives in `desktop/src/data/fixture.ts` and is selected by `/?fixture=1&state=docs-fleet`.
 

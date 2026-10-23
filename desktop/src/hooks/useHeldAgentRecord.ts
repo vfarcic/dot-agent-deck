@@ -73,7 +73,7 @@
  * is only ever read where there is no live one.
  */
 import { useRef } from "react";
-import { agentKey } from "../lib/agentKey";
+import { boundAgentKey } from "../lib/agentKey";
 import type { AgentSession } from "../types";
 
 /** A record that was true at {@link HeldAgentRecord.confirmedAt} and may not be now. */
@@ -103,11 +103,14 @@ export interface HeldAgentRecord {
  * same way `displayActivity` and `displayUptime` take theirs.
  */
 export function useHeldAgentRecord(
-  target: { deckId: string; agentId: string } | undefined,
+  target: { deckId: string; agentId: string; incarnation?: string } | undefined,
   live: AgentSession | undefined,
   now: () => number = Date.now,
 ): HeldAgentRecord | undefined {
-  const key = target && agentKey(target.deckId, target.agentId);
+  /* PRD #1666 part 2 (G-fix6): with the incarnation the pane was opened on,
+     so a record held for one daemon process is never shown under a view of
+     another's agent with the same id. */
+  const key = target && boundAgentKey({ deckId: target.deckId, agentId: target.agentId, incarnation: target.incarnation });
   const holder = useRef<{ key: string; record: HeldAgentRecord } | undefined>(undefined);
   if (key === undefined) {
     // No pane: nothing to hold FOR, and holding across a close would be a

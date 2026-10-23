@@ -1374,6 +1374,11 @@ fn is_retired_delivery_id(id: &str) -> bool {
 }
 
 fn main() -> ExitCode {
+    // PRD #1741: the telemetry PATH shim, first, so the agent's arguments it
+    // carries are never read as the deck's.
+    if let Some(code) = dot_agent_deck::telemetry::shim::run_if_invoked() {
+        return code;
+    }
     // PRD #89 M3.4: the `--continue` flag was removed — auto-restore is now the
     // default. Intercept a stale invocation before clap parsing so the user
     // gets a guiding message ("auto-restore is the default; just run
@@ -2895,10 +2900,10 @@ async fn run_tui_session() -> ExitCode {
         }
     }
 
-    let pane_controller: Arc<dyn PaneController> = Arc::new(EmbeddedPaneController::new(
-        attach_path.clone(),
-        tokio::runtime::Handle::current(),
-    ));
+    let pane_controller: Arc<dyn PaneController> = Arc::new(
+        EmbeddedPaneController::new(attach_path.clone(), tokio::runtime::Handle::current())
+            .with_protocol_gate(),
+    );
     let tui_state = state.clone();
     let tui_result = tokio::task::spawn_blocking(move || {
         run_tui(tui_state, pane_controller, config, keybindings)
@@ -2936,7 +2941,13 @@ fn spawn_event_subscriber(
         applied: Some(e2e_subscriber_applied),
         ..SubscriberConfig::default()
     };
-    tokio::spawn(run(DaemonClient::new(attach_path), state, config));
+    // PRD #1666 part 2 (`lifecycle/handshake/011`): every subscription,
+    // listing included, rides a connection whose own `Hello` passed.
+    tokio::spawn(run(
+        DaemonClient::new(attach_path).with_protocol_gate(),
+        state,
+        config,
+    ));
 }
 
 /// Issue #621 e2e seam: make this subscriber miss a conversation's events, the

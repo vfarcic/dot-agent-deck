@@ -379,10 +379,9 @@ mod tests {
         )
     }
 
-    /// The reported defect, at the seam where it happens: a second run on the
-    /// same default clone and target dir must not get them while a first run
-    /// holds them. Before the lock, nothing refused, so both "had" the clone at
-    /// once and either one's checkout could decide what the other built.
+    /// Scenario: A second run on the same clone and target dir is immediately
+    /// refused while the first holds them. After the first releases them, the
+    /// second waits for inherited subprocess descriptors to close and takes the locks.
     #[test]
     fn a_second_run_on_the_same_clone_and_target_dir_is_refused_while_the_first_holds_them() {
         let s = scratch("contend");
@@ -402,7 +401,7 @@ mod tests {
             "{err}"
         );
         drop(first);
-        take(&clone, &target, "pid 2 branch `b`", Duration::ZERO)
+        take(&clone, &target, "pid 2 branch `b`", Duration::from_secs(3))
             .expect("free again once the first run released it");
         let _ = std::fs::remove_dir_all(&s);
     }

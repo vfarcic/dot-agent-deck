@@ -30,6 +30,14 @@ mod secrets;
 // Tests only: the counted sweep that keeps `dto::DeckScope` from decaying into
 // a convention (issue #1116). No item outside `#[cfg(test)]`, so it adds
 // nothing to a normal build.
+// Tests only: the held client's acting requests against a replaced daemon
+// (PRD #1666 part 2).
+#[cfg(all(test, unix))]
+mod request_admission_tests;
+// Tests only: an action on an agent reaches the daemon process that listed it,
+// never a same-build restart that reuses the id (PRD #1666 part 2).
+#[cfg(all(test, unix))]
+mod restart_binding_tests;
 #[cfg(test)]
 mod selection_capture;
 mod selection_saves;
@@ -62,8 +70,8 @@ use dot_agent_deck::agent_pty::{
 };
 use dot_agent_deck::authoring_seeds::AuthoringKind;
 use dot_agent_deck::daemon_client::{
-    ClientError, DaemonClient, Endpoint, EventSubscription, GatedQuery, LastCommandKeeper,
-    StartAgentOptions,
+    ClientError, DaemonClient, Endpoint, EventSubscription, GatedQuery, Incarnation,
+    LastCommandKeeper, StartAgentOptions,
 };
 use dot_agent_deck::daemon_stop::{StopOutcome, run_daemon_stop};
 use dot_agent_deck::event::{AgentType, BroadcastMsg, PreparedOrchestration, ProjectRole};
@@ -408,9 +416,19 @@ trait OrchestrationDaemon {
         expected_agent_id: &str,
         timeout: Duration,
     ) -> Result<String, String>;
+    /// PRD #1666 part 2 (G-fix7): the daemon process this launch's handle is
+    /// bound to ([`bind_launch`]), which mints every role id it learns — or
+    /// [`Incarnation::UNNAMED`] for a handle bound to none.
+    fn launch_incarnation(&self) -> Incarnation {
+        Incarnation::UNNAMED
+    }
 }
 
 impl OrchestrationDaemon for DaemonClient {
+    fn launch_incarnation(&self) -> Incarnation {
+        self.binding().cloned().unwrap_or_default()
+    }
+
     async fn prepare_orchestration(
         &self,
         cwd: &str,
@@ -524,10 +542,28 @@ impl OrchestrationDaemon for DaemonClient {
     }
 }
 
+/// PRD #1666 part 2 (G-fix4): the handle an orchestration launch runs on —
+/// `client` bound to the daemon process answering now, before anything is
+/// prepared or started.
+///
+/// Every role id the launch learns then comes from that process, and every
+/// request it makes with one — the coordinator's post, a rollback's stop —
+/// reaches that process or nothing. Without it, a daemon restarted mid-launch
+/// (the same build included, which every compatibility check admits) would
+/// number unrelated agents with the role ids the rollback still holds, and the
+/// rollback would stop them.
+async fn bind_launch(client: &DaemonClient) -> Result<DaemonClient, String> {
+    crate::daemon_bridge::bounded_reply("Hello", client.bound_to_current()).await
+}
+
 #[derive(Debug)]
 struct OrchestrationLaunchResult {
     start_agent_id: String,
     agent_ids: Vec<String>,
+    /// The daemon process the launch ran on (PRD #1666 part 2, G-fix7): its
+    /// handle's binding ([`bind_launch`]), which minted every id above.
+    /// [`Incarnation::UNNAMED`] from an ungated handle.
+    incarnation: Incarnation,
 }
 
 /// PRD #1223 audit F4: how long one role's start may take — the whole
@@ -642,20 +678,22 @@ async fn bounded_role_stop<D: OrchestrationDaemon + Sync>(
 }
 
 /// PRD #1223 U4 — stop every one of `roles` at once, each under its own
-/// [`ORCHESTRATION_ROLE_STOP_TIMEOUT`], and return one outcome per role, aligned
-/// with `roles`: `None` for a confirmed stop, otherwise why it is not.
+/// [`ORCHESTRATION_ROLE_STOP_TIMEOUT`] and through its own daemon handle, and
+/// return one outcome per role, aligned with `roles`: `None` for a confirmed
+/// stop, otherwise why it is not.
 ///
 /// Concurrent, as the TUI's Ctrl+W closes a tab's panes
 /// (`close_panes_concurrently`): the stops are independent, so a wedged one
 /// costs one bound for the whole close rather than one per role behind it.
+/// A handle per role because each is bound to the daemon process that listed
+/// that role (PRD #1666 part 2, G-fix4).
 async fn stop_roles_concurrently<D: OrchestrationDaemon + Sync>(
-    daemon: &D,
-    roles: &[StartedRole],
+    roles: &[(&D, &StartedRole)],
 ) -> Vec<Option<UnconfirmedStop>> {
     join_ordered(
         roles
             .iter()
-            .map(|role| bounded_role_stop(daemon, role))
+            .map(|(daemon, role)| bounded_role_stop(*daemon, role))
             .collect(),
     )
     .await
@@ -952,6 +990,7 @@ async fn launch_orchestration<D: OrchestrationDaemon + Sync>(
     Ok(OrchestrationLaunchResult {
         start_agent_id,
         agent_ids: started.into_iter().map(|role| role.agent_id).collect(),
+        incarnation: daemon.launch_incarnation(),
     })
 }
 
@@ -1229,10 +1268,14 @@ async fn launch_configured_orchestration<D: OrchestrationDaemon + Sync>(
     Ok(OrchestrationLaunchResult {
         start_agent_id,
         agent_ids: started.into_iter().map(|role| role.agent_id).collect(),
+        incarnation: daemon.launch_incarnation(),
     })
 }
 
-fn ensure_main_webview(webview: &Webview) -> Result<(), String> {
+/// Generic over the runtime (PRD #1666 part 2, G-fix5) so a command built on
+/// it can also be invoked through Tauri's mock runtime, which is how a test
+/// drives a command's real body over IPC.
+fn ensure_main_webview<R: tauri::Runtime>(webview: &Webview<R>) -> Result<(), String> {
     if webview.label() == "main" {
         Ok(())
     } else {
@@ -1865,6 +1908,7 @@ async fn desktop_inbox_action(
     message_id: String,
     revision: u64,
     verb: String,
+    incarnation: Option<String>,
 ) -> Result<DesktopInboxActionResult, String> {
     ensure_main_webview(&webview)?;
     inbox_action_on(
@@ -1875,11 +1919,17 @@ async fn desktop_inbox_action(
         &message_id,
         revision,
         &verb,
+        &Incarnation::from(incarnation),
     )
     .await
 }
 
 /// [`desktop_inbox_action`] minus the webview.
+///
+/// Bound to `incarnation`, the daemon process that listed the tile (PRD #1666
+/// part 2, G-fix4): a successor that numbered an unrelated agent with this id
+/// is sent nothing.
+#[allow(clippy::too_many_arguments)]
 async fn inbox_action_on(
     state: &DesktopState,
     deck_id: &str,
@@ -1888,6 +1938,7 @@ async fn inbox_action_on(
     message_id: &str,
     revision: u64,
     verb: &str,
+    incarnation: &Incarnation,
 ) -> Result<DesktopInboxActionResult, String> {
     let retry = match verb {
         "retry" => true,
@@ -1900,6 +1951,7 @@ async fn inbox_action_on(
     let request_id = dot_agent_deck::daemon_client::generate_client_id();
     let answer = daemon
         .client
+        .bound_to(incarnation.clone())
         .inbox_action(pane_id, agent_id, message_id, revision, retry, &request_id)
         .await
         .map_err(|error| safe_message(error.to_string()))?;
@@ -2218,7 +2270,7 @@ async fn desktop_bootstrap(
 }
 
 #[tauri::command]
-// Eight, and the shape is the IPC boundary's rather than a design choice: Tauri
+// Nine, and the shape is the IPC boundary's rather than a design choice: Tauri
 // deserialises a command's arguments from the webview's payload by NAME, so each
 // wire field has to be a parameter. Grouping them into a struct would change the
 // JSON the frontend sends, not the number of things being passed.
@@ -2246,6 +2298,10 @@ async fn desktop_terminal_attach(
     // constrains nothing.
     rows: Option<u16>,
     cols: Option<u16>,
+    // PRD #1666 part 2 (G-fix5): the card's `DesktopAgent::incarnation`, the
+    // daemon process that listed the agent. The attach is bound to it; absent,
+    // it names no process and the attach is refused.
+    incarnation: Option<String>,
 ) -> Result<TerminalAttachResult, String> {
     ensure_main_webview(&webview)?;
     let viewport = match (rows, cols) {
@@ -2254,7 +2310,16 @@ async fn desktop_terminal_attach(
         // missing axis would register a constraint nobody asked for.
         _ => None,
     };
-    terminal::attach(&app, &state, deck_id, agent_id, on_output, viewport).await
+    terminal::attach(
+        &app,
+        &state,
+        deck_id,
+        agent_id,
+        Incarnation::from(incarnation),
+        on_output,
+        viewport,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -3661,18 +3726,42 @@ fn validate_voice_question_form(
 
 /// PRD #1631: the question `agent_id` on `deck_id` is waiting on, as the
 /// deck's snapshot has it now — never the webview's copy.
+///
+/// PRD #1666 part 2 (G-fix6): only the agent the daemon process `incarnation`
+/// listed. A row under the same id from another process — a restarted daemon
+/// numbers its agents again — is someone else's: the inner `Err` is the
+/// sentence that says so ([`listed_by`]), and its question is not read as this
+/// agent's.
 async fn pending_question_on(
     state: &DesktopState,
     deck_id: &str,
     agent_id: &str,
-) -> Result<Option<crate::dto::DesktopPendingQuestion>, String> {
+    incarnation: &Incarnation,
+) -> Result<Result<Option<crate::dto::DesktopPendingQuestion>, &'static str>, String> {
     let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
     let snapshot = crate::daemon_bridge::snapshot_of(scope.endpoint(), &state.daemon).await;
-    Ok(snapshot
+    let Some(agent) = snapshot
         .agents
         .into_iter()
         .find(|agent| agent.id == agent_id)
-        .and_then(|agent| agent.pending_question))
+    else {
+        return Ok(Ok(None));
+    };
+    Ok(listed_by(&agent.incarnation, incarnation).map(|()| agent.pending_question))
+}
+
+/// PRD #1666 part 2 (G-fix6): whether a row the daemon lists now, from process
+/// `listed`, is the agent the webview holds from process `held` — `Err` with
+/// the sentence both clients say when it is not: the gone sentence for another
+/// process, the identity sentence when either names none.
+fn listed_by(listed: &Incarnation, held: &Incarnation) -> Result<(), &'static str> {
+    if listed.is_unnamed() || held.is_unnamed() {
+        Err(dot_agent_deck::daemon_client::AGENT_IDENTITY_UNKNOWN)
+    } else if !listed.same_process(held) {
+        Err(dot_agent_deck::daemon_client::AGENT_GONE_AFTER_RESTART)
+    } else {
+        Ok(())
+    }
 }
 
 /// PRD #1631: one utterance said on an agent's own screen while that agent
@@ -3705,8 +3794,13 @@ async fn desktop_voice_question(
     form: Vec<voice::question::Selection>,
     awaiting_text: Option<voice::question::TextSlot>,
     local_only: Option<bool>,
+    incarnation: Option<String>,
 ) -> Result<voice::question::QuestionResult, String> {
     ensure_main_webview(&webview)?;
+    // PRD #1666 part 2 (G-fix6): the daemon process that listed the agent the
+    // pane shows. Absent, from an older webview or a deck that named none, is
+    // unnamed, and no row is then this agent's.
+    let incarnation = Incarnation::from(incarnation);
     if utterance.len() > MAX_UTTERANCE_BYTES {
         return Err(format!(
             "that answer is too long to send — {MAX_UTTERANCE_BYTES} bytes at most"
@@ -3725,7 +3819,19 @@ async fn desktop_voice_question(
     .await
     .map_err(|error| safe_message(format!("reading the voice settings failed: {error}")))?;
     let resolver = voice::resolver_for(&settings.intent, Arc::new(KeychainSecretStore::new()));
-    let Some(question) = pending_question_on(&state, &deck_id, &agent_id).await? else {
+    let question = match pending_question_on(&state, &deck_id, &agent_id, &incarnation).await? {
+        Ok(question) => question,
+        Err(sentence) => {
+            return Ok(voice::question::QuestionResult {
+                verdict: voice::question::QuestionVerdict::Refused {
+                    sentence: sentence.to_string(),
+                },
+                resolve_ms: None,
+                backend: resolver.backend_name(),
+            });
+        }
+    };
+    let Some(question) = question else {
         // Nothing is waiting any more: the utterance is the user's next
         // command, not an answer to a question that is gone.
         return Ok(voice::question::QuestionResult {
@@ -3781,10 +3887,15 @@ const VOICE_ANSWER_TIMEOUT: Duration = Duration::from_secs(15);
 /// immediately before the request is written — so a pane change during a
 /// stalled snapshot read or link sends nothing, and one that lands after the
 /// write is reported as too late rather than as nothing sent.
+///
+/// **Generic over the Tauri runtime** (PRD #1666 part 2, G-fix5) and nothing
+/// else: the app registers it on its own runtime, and a test registers the same
+/// command on [`tauri::test::MockRuntime`] and invokes it over IPC, so the pin
+/// on its incarnation binding runs this body rather than a copy of it.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
-async fn desktop_voice_answer_question(
-    webview: Webview,
+async fn desktop_voice_answer_question<R: tauri::Runtime>(
+    webview: Webview<R>,
     state: State<'_, DesktopState>,
     deck_id: String,
     agent_id: String,
@@ -3794,6 +3905,7 @@ async fn desktop_voice_answer_question(
     confirmed_always: bool,
     lease: String,
     revision: Option<u64>,
+    incarnation: Option<String>,
 ) -> Result<voice::question::AnswerOutcome, String> {
     ensure_main_webview(&webview)?;
     validate_voice_question_form(&deck_id, &agent_id, &question_id, &form)?;
@@ -3802,7 +3914,14 @@ async fn desktop_voice_answer_question(
     }
     let lease = state.voice_answer_leases.begin(&lease);
     let agent = voice_agent_name(&agent);
-    let Some(question) = pending_question_on(&state, &deck_id, &agent_id).await? else {
+    // PRD #1666 part 2 (G-fix6): the question of the agent that process
+    // listed; a successor's row under the same id is refused before anything
+    // is sent, with the sentence that says why.
+    let held = Incarnation::from(incarnation.clone());
+    let question = pending_question_on(&state, &deck_id, &agent_id, &held)
+        .await?
+        .map_err(str::to_string)?;
+    let Some(question) = question else {
         return Ok(voice::question::AnswerOutcome {
             kind: "refused",
             code: Some("no_pending_question"),
@@ -3821,6 +3940,10 @@ async fn desktop_voice_answer_question(
         Err(stale) => return Ok(stale),
     };
     let answers = voice::question::answers_of(&form);
+    // PRD #1666 part 2 (G-fix5): a send the binding refused wrote nothing, so
+    // it is reported as the refusal it is — never as an answer that "may have
+    // been sent", which is what a failure after the lease's gate reads as.
+    let refused = std::sync::Mutex::new(None::<String>);
     let leased = voice::lease::send_leased(&lease, |still_wanted| async {
         if !still_wanted() {
             return Ok(dot_agent_deck::daemon_client::AnswerReport::Superseded);
@@ -3828,7 +3951,13 @@ async fn desktop_voice_answer_question(
         let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
         let daemon = state.daemon.trusted(scope.endpoint()).await?;
         daemon.require_compatible()?;
-        let sent = daemon.client.answer_question_while(
+        // PRD #1666 part 2 (G-fix4): bound to the daemon process that listed
+        // the agent the panel shows, so a successor that numbered an unrelated
+        // agent with this id is not answered.
+        let client = daemon
+            .client
+            .bound_to(Incarnation::from(incarnation.clone()));
+        let sent = client.answer_question_while(
             still_wanted,
             &agent_id,
             &question_id,
@@ -3837,11 +3966,23 @@ async fn desktop_voice_answer_question(
             confirmed_always,
         );
         match tokio::time::timeout(VOICE_ANSWER_TIMEOUT, sent).await {
+            Ok(Err(
+                error @ (dot_agent_deck::daemon_client::ClientError::DaemonRestarted
+                | dot_agent_deck::daemon_client::ClientError::DaemonUnnamed),
+            )) => {
+                let sentence = error.to_string();
+                *refused.lock().unwrap_or_else(|p| p.into_inner()) = Some(sentence.clone());
+                Err(sentence)
+            }
             Ok(report) => report.map_err(|error| safe_message(error.to_string())),
             Err(_) => Err("the deck did not answer in time".to_string()),
         }
     })
-    .await?;
+    .await;
+    if let Some(sentence) = refused.into_inner().unwrap_or_else(|p| p.into_inner()) {
+        return Err(sentence);
+    }
+    let leased = leased?;
     Ok(voice::question::leased_outcome(
         &agent, &question, &form, leased,
     ))
@@ -4253,17 +4394,25 @@ async fn desktop_voice_speech_audio(
 /// Summaries are made Rust-side ([`voice::reading::read_turns`]) through the
 /// Commands connection, read per turn, so the agent's final reply never
 /// crosses into the webview — only the finished sentence does.
+///
+/// Generic over the runtime (PRD #1666 part 2, G-fix7) so a test registers this
+/// command on [`tauri::test::MockRuntime`] and invokes it over IPC, so the pin
+/// on its row check runs this body rather than a copy of it.
 #[tauri::command]
-async fn desktop_voice_reading_start(
-    webview: Webview,
+#[allow(clippy::too_many_arguments)]
+async fn desktop_voice_reading_start<R: tauri::Runtime>(
+    webview: Webview<R>,
     state: State<'_, DesktopState>,
     voice_state: State<'_, VoiceState>,
     deck_id: String,
     agent_id: String,
     agent_label: String,
     on_sentence: Channel<voice::reading::ReadingSentence>,
+    incarnation: Option<String>,
 ) -> Result<ReadingStart, String> {
     ensure_main_webview(&webview)?;
+    // PRD #1666 part 2 (G-fix6): the daemon process that listed the agent.
+    let incarnation = Incarnation::from(incarnation);
     let bad = |value: &str| value.is_empty() || value.len() > MAX_VOICE_DECK_ID_BYTES;
     if bad(&deck_id) || bad(&agent_id) || agent_label.len() > MAX_VOICE_DECK_ID_BYTES {
         return Err("the agent sent with that command is not one a pane shows".to_string());
@@ -4279,11 +4428,14 @@ async fn desktop_voice_reading_start(
     }
     let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
     let snapshot = daemon_bridge::snapshot_of(scope.endpoint(), &state.daemon).await;
-    let agent_type = snapshot
-        .agents
-        .iter()
-        .find(|agent| agent.id == agent_id)
-        .map(|agent| agent.agent_type.clone());
+    // G-fix6: only the row that process listed. A row under the same id from
+    // a successor is an unrelated agent, whose replies are not this one's: the
+    // agent the webview holds is gone, and nothing is subscribed to.
+    let listed = snapshot.agents.iter().find(|agent| agent.id == agent_id);
+    if listed.is_some_and(|agent| listed_by(&agent.incarnation, &incarnation).is_err()) {
+        return Ok(ReadingStart::Gone);
+    }
+    let agent_type = listed.map(|agent| agent.agent_type.clone());
     if let Some(gap) = agent_type.as_deref().and_then(voice::reading::agent_gap) {
         return Ok(ReadingStart::Unavailable {
             sentence: voice::reading::unavailable_sentence(&gap),
@@ -4303,7 +4455,10 @@ async fn desktop_voice_reading_start(
         agent_id,
         agent_type,
     };
-    let source = voice::reading::DaemonTurnEvents::new(daemon.client.clone());
+    // Bound to that process too, so a deck restarted after the listing serves
+    // its replies to nobody here.
+    let source =
+        voice::reading::DaemonTurnEvents::new(Arc::new(daemon.client.bound_to(incarnation)));
     let events = match voice::reading::TurnEventSource::subscribe(&source, &target).await {
         Ok(events) => events,
         // The agent exited between being listed and being subscribed.
@@ -4782,6 +4937,41 @@ async fn apply_selection(app: &AppHandle, state: &DesktopState) {
     refresh_and_emit(app, &state.daemon).await;
 }
 
+/// The `RenameAgent` arm of [`desktop_run_action`] minus the webview: read the
+/// agent's cwd from the deck's listing, then relabel it keeping that cwd.
+///
+/// Both requests are gated on the held client (PRD #1666 part 2), each on its
+/// own connection: a daemon replaced between the listing and the relabel is
+/// classified again before it is sent `SetAgentLabel`, so a refused
+/// replacement that reuses the agent's id is not relabelled.
+///
+/// Both are also bound to `incarnation`, the daemon process that listed the
+/// row the user renamed (G-fix4): a replacement of any build, the same one
+/// included, is sent neither, so it can neither lend the old agent's cwd nor
+/// receive the label on an unrelated agent of its own with the same id.
+async fn rename_agent_action(
+    links: &DaemonLinks,
+    agent_id: &str,
+    display_name: String,
+    incarnation: &Incarnation,
+) -> Result<(), String> {
+    let daemon = trusted_daemon(links).await?;
+    daemon.require_compatible()?;
+    let client = daemon.client.bound_to(incarnation.clone());
+    let existing_cwd = client
+        .list_agents()
+        .await
+        .map_err(|error| safe_message(error.to_string()))?
+        .into_iter()
+        .find(|record| record.id == agent_id)
+        .ok_or_else(|| format!("agent not found: {agent_id}"))?
+        .cwd;
+    client
+        .set_agent_label(agent_id, Some(display_name), existing_cwd)
+        .await
+        .map_err(|error| safe_message(error.to_string()))
+}
+
 /// Stop one agent on the selected deck, and tear down **that deck's** terminal
 /// session for it.
 ///
@@ -4828,14 +5018,21 @@ async fn stop_agent_action(
     state: &DesktopState,
     deck_id: &str,
     agent_id: &str,
+    incarnation: &Incarnation,
 ) -> Result<crate::dto::DeckScope, String> {
     validate_agent_id(agent_id)?;
     let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
     let daemon = state.daemon.trusted(scope.endpoint()).await?;
     daemon.require_compatible()?;
+    // PRD #1666 part 2 (G-fix4): bound to the daemon process that listed the
+    // row, which may be long gone by the time a confirmation is accepted. A
+    // successor that numbered an unrelated agent with this id is sent nothing.
     match tokio::time::timeout(
         ORCHESTRATION_ROLE_STOP_TIMEOUT,
-        daemon.client.stop_agent(agent_id),
+        daemon
+            .client
+            .bound_to(incarnation.clone())
+            .stop_agent(agent_id),
     )
     .await
     {
@@ -4856,7 +5053,7 @@ async fn stop_agent_action(
     //
     // The deck is the SCOPE's — the one this operation authenticated against
     // and stopped the agent on — and never a fresh read of the selection.
-    terminal::detach_agent_on(state, &scope.identity(), agent_id).await;
+    terminal::detach_agent_on(state, &scope.identity(), agent_id, incarnation).await;
     Ok(scope)
 }
 
@@ -4901,6 +5098,13 @@ async fn stop_orchestration_action(
     if let Err(error) = daemon.require_compatible() {
         return (Some(scope), Err(error.into()));
     }
+    // PRD #1666 part 2 (G-fix4): each stop bound to the daemon process that
+    // listed its role, so a role listed before a restart is not stopped on a
+    // successor that numbered an unrelated agent the same.
+    let clients: Vec<DaemonClient> = roles
+        .iter()
+        .map(|role| daemon.client.bound_to(role.incarnation.clone()))
+        .collect();
     let started: Vec<StartedRole> = roles
         .iter()
         .map(|role| StartedRole {
@@ -4908,14 +5112,23 @@ async fn stop_orchestration_action(
             role: role.name.clone(),
         })
         .collect();
-    let outcomes = stop_roles_concurrently(&*daemon.client, &started).await;
+    let stops: Vec<(&DaemonClient, &StartedRole)> = clients.iter().zip(&started).collect();
+    let outcomes = stop_roles_concurrently(&stops).await;
     let mut unconfirmed = Vec::new();
-    for (role, outcome) in started.iter().zip(outcomes) {
+    for ((role, listed), outcome) in started.iter().zip(roles).zip(outcomes) {
         match outcome {
             // A refused or unanswered stop leaves its terminal alone, as
             // `stop_agent_action` does: the agent may still be running.
             Some(stop) => unconfirmed.push(stop),
-            None => terminal::detach_agent_on(state, &scope.identity(), &role.agent_id).await,
+            None => {
+                terminal::detach_agent_on(
+                    state,
+                    &scope.identity(),
+                    &role.agent_id,
+                    &listed.incarnation,
+                )
+                .await
+            }
         }
     }
     if unconfirmed.is_empty() {
@@ -4974,6 +5187,9 @@ struct StartedAgent {
     /// The deck the agent was started on — captured once, before the first
     /// await, and the only deck any later step of the action may name.
     scope: crate::dto::DeckScope,
+    /// The daemon process that answered the start (PRD #1666 part 2, G-fix7):
+    /// [`Self::agent_id`] names an agent of that process only.
+    incarnation: Incarnation,
 }
 
 /// Start one plain agent on the deck `deck_id` names (PRD #1223 M3).
@@ -5114,6 +5330,7 @@ async fn start_agent_action(
     Ok(StartedAgent {
         agent_id: started.agent_id,
         scope,
+        incarnation: started.incarnation,
     })
 }
 
@@ -5152,6 +5369,9 @@ struct StartedOrchestration {
     agent_ids: Vec<String>,
     /// The deck, captured once before the first await.
     scope: crate::dto::DeckScope,
+    /// The daemon process the launch was bound to (PRD #1666 part 2, G-fix7),
+    /// which minted every id above.
+    incarnation: Incarnation,
 }
 
 /// [`DesktopAction::ActivateOrchestration`]'s fields, unpacked for
@@ -5216,8 +5436,9 @@ async fn activate_orchestration_action(
     let daemon = trusted_daemon(&state.daemon).await?;
     daemon.require_compatible()?;
     ensure_daemon_can_prepare(daemon.client.cached_capabilities().as_ref())?;
+    let launch_client = bind_launch(&daemon.client).await?;
     let (roles, prepared) = prepare_orchestration_launch(
-        daemon.client.as_ref(),
+        &launch_client,
         &name,
         &cwd,
         &task_prompt,
@@ -5227,7 +5448,7 @@ async fn activate_orchestration_action(
     .await?;
     let orchestration_id = mint_orchestration_id();
     launch_orchestration(
-        daemon.client.as_ref(),
+        &launch_client,
         &name,
         display_title.as_deref(),
         // The daemon's CANONICAL spelling, not the one that was sent.
@@ -5309,6 +5530,7 @@ async fn start_orchestration_action(
         return Err(reason.into());
     }
     ensure_one_orchestration_of_that_name(&daemon, &path, &orchestration).await?;
+    let launch_client = bind_launch(&daemon.client).await?;
     // Against a deck older than issue #1233, deliberately NOT under a
     // client-side deadline, unlike every other call this launch makes (PRD
     // #1223 audit V1). Such a deck resolves, composes, issues the token and
@@ -5331,8 +5553,7 @@ async fn start_orchestration_action(
     // preparation has neither: dropping it neither finds out what happened nor
     // says anything useful, so it is waited out instead.
     let prepare = async {
-        daemon
-            .client
+        launch_client
             .prepare_orchestration(&path, &orchestration, "", config_revision.as_deref())
             .await
             .map_err(|error| prepare_refusal_message(&error, &orchestration))
@@ -5357,7 +5578,7 @@ async fn start_orchestration_action(
         );
     }
     let launched = launch_configured_orchestration(
-        daemon.client.as_ref(),
+        &launch_client,
         &orchestration,
         display_title.as_deref(),
         &prepared,
@@ -5371,6 +5592,7 @@ async fn start_orchestration_action(
         start_agent_id: launched.start_agent_id,
         agent_ids: launched.agent_ids,
         scope,
+        incarnation: launched.incarnation,
     })
 }
 
@@ -5985,6 +6207,7 @@ async fn desktop_run_action(
 ) -> Result<DesktopActionResult, DesktopActionError> {
     ensure_main_webview(&webview)?;
     let mut result_agent_id = None;
+    let mut result_agent_incarnation = None;
     let mut result_agent_ids = Vec::new();
     let mut result_terminal = None;
     let mut result_message = None;
@@ -5999,6 +6222,7 @@ async fn desktop_run_action(
             return Ok(DesktopActionResult {
                 ok: snapshot.connection.status == ConnectionStatus::Connected,
                 agent_id: None,
+                agent_incarnation: None,
                 agent_ids: Vec::new(),
                 terminal: None,
                 message: None,
@@ -6036,6 +6260,7 @@ async fn desktop_run_action(
             }
             state.request_refetch(&started.scope.identity());
             result_agent_id = Some(started.agent_id);
+            result_agent_incarnation = Some(started.incarnation);
         }
         DesktopAction::StartOrchestration {
             deck_id,
@@ -6065,6 +6290,7 @@ async fn desktop_run_action(
             }
             state.request_refetch(&started.scope.identity());
             result_agent_id = Some(started.start_agent_id);
+            result_agent_incarnation = Some(started.incarnation);
             result_agent_ids = started.agent_ids;
         }
         DesktopAction::ActivateOrchestration {
@@ -6092,14 +6318,19 @@ async fn desktop_run_action(
             )
             .await?;
             result_agent_id = Some(launched.start_agent_id);
+            result_agent_incarnation = Some(launched.incarnation);
             result_agent_ids = launched.agent_ids;
             result_message = Some(
                 "Orchestration activated from its configuration. Commands were applied for this activation only; profile/model command write-back is not implemented."
                     .into(),
             );
         }
-        DesktopAction::StopAgent { deck_id, agent_id } => {
-            let scope = stop_agent_action(&state, &deck_id, &agent_id).await?;
+        DesktopAction::StopAgent {
+            deck_id,
+            agent_id,
+            incarnation,
+        } => {
+            let scope = stop_agent_action(&state, &deck_id, &agent_id, &incarnation).await?;
             // PRD #1223 U4: the TARGET deck, directly, for the StartAgent
             // arm's reason — the tail below refreshes only the selected one.
             if let Some(snapshot) = target_deck_snapshot(&state.daemon, &scope).await {
@@ -6183,6 +6414,7 @@ async fn desktop_run_action(
             return Ok(DesktopActionResult {
                 ok: true,
                 agent_id: None,
+                agent_incarnation: None,
                 agent_ids: Vec::new(),
                 terminal: None,
                 message: Some(
@@ -6194,6 +6426,7 @@ async fn desktop_run_action(
         DesktopAction::RenameAgent {
             agent_id,
             display_name,
+            incarnation,
         } => {
             validate_agent_id(&agent_id)?;
             if !is_valid_display_name(&display_name) {
@@ -6202,27 +6435,13 @@ async fn desktop_run_action(
                         .into(),
                 );
             }
-            let daemon = trusted_daemon(&state.daemon).await?;
-            daemon.require_compatible()?;
-            let existing_cwd = daemon
-                .client
-                .list_agents()
-                .await
-                .map_err(|error| safe_message(error.to_string()))?
-                .into_iter()
-                .find(|record| record.id == agent_id)
-                .ok_or_else(|| format!("agent not found: {agent_id}"))?
-                .cwd;
-            daemon
-                .client
-                .set_agent_label(&agent_id, Some(display_name), existing_cwd)
-                .await
-                .map_err(|error| safe_message(error.to_string()))?;
+            rename_agent_action(&state.daemon, &agent_id, display_name, &incarnation).await?;
             result_agent_id = Some(agent_id);
         }
         DesktopAction::AttachTerminal {
             agent_id,
             on_output,
+            incarnation,
         } => {
             let channel: Channel<Response> = on_output.channel_on(webview.clone());
             // PRD #882: this action carries no measured geometry (it is the
@@ -6232,8 +6451,16 @@ async fn desktop_run_action(
             // No deck: this action is the legacy declarative attach path and has
             // always meant the selected deck. The webview's own attach command
             // names one.
-            let attached =
-                terminal::attach(&app, &state, None, agent_id.clone(), channel, None).await?;
+            let attached = terminal::attach(
+                &app,
+                &state,
+                None,
+                agent_id.clone(),
+                incarnation,
+                channel,
+                None,
+            )
+            .await?;
             result_agent_id = Some(agent_id);
             result_terminal = Some(attached);
         }
@@ -6246,6 +6473,7 @@ async fn desktop_run_action(
     Ok(DesktopActionResult {
         ok: true,
         agent_id: result_agent_id,
+        agent_incarnation: result_agent_incarnation,
         agent_ids: result_agent_ids,
         terminal: result_terminal,
         message: result_message,
@@ -10532,7 +10760,8 @@ command = "configured-planner"
             .collect();
         let began = tokio::time::Instant::now();
 
-        let outcomes = stop_roles_concurrently(&daemon, &roles).await;
+        let stops: Vec<_> = roles.iter().map(|role| (&daemon, role)).collect();
+        let outcomes = stop_roles_concurrently(&stops).await;
 
         let mut attempts = daemon.stop_attempts.lock().unwrap().clone();
         attempts.sort();
@@ -10584,7 +10813,7 @@ command = "configured-planner"
         }
         assert!(matches!(
             serde_json::from_value::<DesktopAction>(serde_json::json!({"type": "stop_agent", "deckId": "deck-000000000000dec1", "agentId": "7"})),
-            Ok(DesktopAction::StopAgent { deck_id, agent_id }) if deck_id == "deck-000000000000dec1" && agent_id == "7"
+            Ok(DesktopAction::StopAgent { deck_id, agent_id, .. }) if deck_id == "deck-000000000000dec1" && agent_id == "7"
         ));
     }
 

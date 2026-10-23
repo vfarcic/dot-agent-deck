@@ -120,6 +120,13 @@ export type AgentViewTarget = {
   deckId: string;
   agentId: string;
   from: "deck" | "overview";
+  /**
+   * PRD #1666 part 2 (G-fix6): the daemon process that listed the agent, from
+   * an opener that holds its record. Absent where only the ids are known (a
+   * row resolved by number); the shell then binds the view to the record
+   * listed when it is opened.
+   */
+  incarnation?: string;
 };
 
 /** One agent, named the way every caller here names one. */
@@ -586,7 +593,7 @@ export const VOICE_ACTIONS = {
          carries `agentLabel` as well, which belongs to the dictation row and
          not in a `DeckView` — a spread would put it in the app's view state,
          where nothing reads it and everything compares it. */
-      context.navigate({ kind: "agent", deckId: target.deckId, agentId: target.agentId, from: target.from });
+      context.navigate({ kind: "agent", deckId: target.deckId, agentId: target.agentId, from: target.from, ...("incarnation" in target ? { incarnation: target.incarnation } : {}) });
     },
   },
 
@@ -1421,6 +1428,13 @@ export type VoiceDispatchTarget = AgentViewTarget & {
    * whose daemon reported no orchestration id is still a card (PRD #1223).
    */
   orchestrationAgentId?: string;
+  /**
+   * PRD #1666 part 2 (G-fix7) — the daemon process that listed
+   * {@link orchestrationAgentId} when the utterance was declared. A close
+   * confirms only the card whose member that process still lists; absent
+   * where the declaration did not list it.
+   */
+  orchestrationIncarnation?: string;
   /**
    * The words to type into the open agent's prompt, for the dictation row
    * (PRD #802 D6, rebuilt).

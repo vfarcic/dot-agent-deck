@@ -103,17 +103,27 @@ describe("useHeldAgentRecord", () => {
     expect(result.current).toBeUndefined();
   });
 
-  /** Scenario: the same fence for a different agent on the pane's own deck. */
-  it("never hands a record back under another agent's pane on the same deck", () => {
-    const { result, rerender } = renderHook(
-      ({ pane, agent }: { pane: { deckId: string; agentId: string }; agent: AgentSession | undefined }) =>
-        useHeldAgentRecord(pane, agent, () => 1_000),
-      { initialProps: { pane: target, agent: record() as AgentSession | undefined } },
-    );
+  /** Scenario: the same process reports a pane and then stops answering, so its last record remains available (control). Changing the agent or daemon incarnation, including dropping that identity, must not show the held record under the new pane. */
+  it("never hands a record back under another agent or incarnation on the same deck", () => {
+    const original: { deckId: string; agentId: string; incarnation: string | undefined } = { ...target, incarnation: "process-a" };
+    for (const replacement of [
+      { ...original, agentId: "reviewer" },
+      { ...original, incarnation: "process-b" },
+      { ...original, incarnation: undefined },
+    ]) {
+      const { result, rerender } = renderHook(
+        ({ pane, agent }: { pane: { deckId: string; agentId: string; incarnation: string | undefined }; agent: AgentSession | undefined }) =>
+          useHeldAgentRecord(pane, agent, () => 1_000),
+        { initialProps: { pane: original, agent: { ...record(), incarnation: "process-a" } as AgentSession | undefined } },
+      );
 
-    rerender({ pane: { deckId: FIXTURE_DAEMON_ID, agentId: "reviewer" }, agent: undefined });
+      rerender({ pane: original, agent: undefined });
+      expect(result.current?.agent.incarnation).toBe("process-a");
+      expect(result.current?.confirmedAt).toBe(1_000);
+      rerender({ pane: replacement, agent: undefined });
 
-    expect(result.current).toBeUndefined();
+      expect(result.current).toBeUndefined();
+    }
   });
 
   /**

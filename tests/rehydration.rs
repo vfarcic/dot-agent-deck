@@ -406,6 +406,7 @@ fn make_session(
         pending_question: None,
         pull_request: None,
         pull_request_revision: 0,
+        incarnation: Default::default(),
     }
 }
 
@@ -3278,6 +3279,7 @@ async fn live_007_list_agents_sanitizes_and_clamps_hostile_live_snapshot_inner()
         pending_question: None,
         pull_request: None,
         pull_request_revision: 0,
+        incarnation: Default::default(),
     };
     let (buffer, _) =
         render_card_grid_to_buffer(&[(&session, Some(name))], Some(0), 0, now, 80, 20);
@@ -3398,6 +3400,7 @@ fn live_008_event_none_agent_type_falls_back_to_spawn_time() {
         pending_question: None,
         pull_request: None,
         pull_request_revision: 0,
+        incarnation: Default::default(),
     };
 
     // The fix lands here: an event-derived AgentType::None must snapshot as

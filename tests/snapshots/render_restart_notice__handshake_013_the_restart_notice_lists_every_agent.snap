@@ -1,0 +1,20 @@
+---
+source: tests/render_restart_notice.rs
+expression: end
+---
+                                                                                
+    ┌ Restart notice · 13–20 of 20 ────────────────────────────────────────┐    
+    │  The deck restarted; these agents were stopped:                      │    
+    │                                                                      │    
+    │  agent-13                                                            │    
+    │  agent-14                                                            │    
+    │  agent-15                                                            │    
+    │  agent-16                                                            │    
+    │  agent-17                                                            │    
+    │  agent-18                                                            │    
+    │  agent-19                                                            │    
+The │  agent-20                                                            │and 
+    │  [Dismiss c] [Close]                                                 │s c]
+ COM│  j/k scroll · c dismiss · Esc to close                               │    
+[Tog└──────────────────────────────────────────────────────────────────────┘e g]
+[Schedules s]

@@ -10,6 +10,8 @@
  * key while the question waits ({@link questionOptionsToSay}).
  */
 
+import { AGENT_GONE_AFTER_RESTART } from "./agentIdentity";
+import { sameIncarnation } from "./agentKey";
 import { agentSpokenName } from "./agentNames";
 import type { AgentSession } from "../types";
 
@@ -104,7 +106,7 @@ export function questionAgentName(agent: Pick<AgentSession, "displayName" | "tab
 }
 
 /** Which question an utterance or a send is about: the agent by its composite identity, the name its pane shows, and the question id — and revision, audit A4 — it saw. */
-export type VoiceQuestionTarget = { deckId: string; agentId: string; agent: string; questionId: string; revision?: number };
+export type VoiceQuestionTarget = { deckId: string; agentId: string; agent: string; questionId: string; revision?: number; incarnation?: string };
 
 /**
  * PR #1698 — the options of `question` voice can pick, with the numbers the
@@ -141,19 +143,20 @@ export function questionCalledOff(why: string): string {
   return `Nothing was sent — ${why}.`;
 }
 
-/** The pane on screen, as far as a question countdown needs it. `terminalHidden`: another tab of the pane is showing, so the agent's prompt is not on screen. `inputBlocked`: why the pane takes no input, its deck not answering among them. */
-export type QuestionPane = { deckId: string; agentId: string; spawnedAtMs?: number; inputBlocked?: string; terminalHidden?: boolean; question?: PendingQuestionDto };
+/** The pane on screen, as far as a question countdown needs it. `terminalHidden`: another tab of the pane is showing, so the agent's prompt is not on screen. `inputBlocked`: why the pane takes no input, its deck not answering among them. `incarnation`: the daemon process that listed its agent. */
+export type QuestionPane = { deckId: string; agentId: string; spawnedAtMs?: number; inputBlocked?: string; terminalHidden?: boolean; question?: PendingQuestionDto; incarnation?: string };
 
 /** Why {@link questionLost} called a countdown off: a code, and the reason in words. */
-export type QuestionLost = { code: "question" | "pane" | "replaced" | "blocked" | "hidden" | "confirmation" | "deck"; why: string };
+export type QuestionLost = { code: "question" | "pane" | "restarted" | "replaced" | "blocked" | "hidden" | "confirmation" | "deck"; why: string };
 
 /**
  * PRD #1631 — the gate a running answer countdown is held to, on every
  * context change and immediately before the answer is sent. It answers
  * `undefined` while the answer still holds, or why not: the question waiting
  * is no longer the one answered (`question`), the pane on screen shows another
- * agent or none (`pane`), the agent was replaced under the same id
- * (`replaced`), the pane stopped taking input — its deck stopped answering,
+ * agent or none (`pane`), the deck restarted and the pane's agent is its new
+ * process's (`restarted`, PR #1817 review), the agent was replaced under the
+ * same id (`replaced`), the pane stopped taking input — its deck stopped answering,
  * say — since the answer was begun (`blocked`, issue #1726), the pane shows
  * another tab so the prompt being answered is not on screen (`hidden`, audit
  * A7), a confirmation is open (`confirmation`), or the selected deck changed
@@ -165,11 +168,12 @@ export type QuestionLost = { code: "question" | "pane" | "replaced" | "blocked" 
  * terminal.
  */
 export function questionLost(
-  aim: { deckId: string; agentId: string; questionId: string; revision?: number; spawnedAtMs?: number; inputBlocked?: string; deck?: string },
+  aim: { deckId: string; agentId: string; questionId: string; revision?: number; spawnedAtMs?: number; inputBlocked?: string; deck?: string; incarnation?: string },
   now: { pane?: QuestionPane; confirmation: boolean; deck?: string },
 ): QuestionLost | undefined {
   const pane = now.pane;
   if (!pane || pane.deckId !== aim.deckId || pane.agentId !== aim.agentId) return { code: "pane", why: pane ? "the pane on screen changed" : "the pane closed" };
+  if (!sameIncarnation(aim.incarnation, pane.incarnation)) return { code: "restarted", why: AGENT_GONE_AFTER_RESTART };
   if (aim.spawnedAtMs !== undefined && pane.spawnedAtMs !== undefined && aim.spawnedAtMs !== pane.spawnedAtMs) return { code: "replaced", why: "the agent in the pane was replaced" };
   if (pane.terminalHidden) return { code: "hidden", why: "its terminal is not shown" };
   if (pane.question?.id !== aim.questionId) return { code: "question", why: "the question changed" };

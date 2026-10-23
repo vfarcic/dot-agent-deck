@@ -8,7 +8,7 @@ use dot_agent_deck::agent_pty::{
     is_valid_orchestration_cwd, is_valid_pane_id_env,
 };
 use dot_agent_deck::authoring_seeds::AuthoringKind;
-use dot_agent_deck::daemon_client::Endpoint;
+use dot_agent_deck::daemon_client::{Endpoint, Incarnation};
 use dot_agent_deck::daemon_protocol::PROTOCOL_VERSION;
 use dot_agent_deck::event::{
     AgentType, ProjectListing, ProjectOrchestration, ResolvedProject, Writable,
@@ -461,6 +461,16 @@ pub struct DesktopConnection {
     /// this app and the TUI show the same words. Omitted when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub hook_binary_notices: Vec<HookBinaryNoticeDto>,
+    /// PRD #1666 part 2 (G-fix7c): on a connected snapshot, the daemon process
+    /// whose `ListAgents` reply its agents are — the same value each
+    /// [`DesktopAgent::incarnation`] carries, stated once for the deck so that
+    /// a restarted deck listing no agents still names its process. The webview
+    /// compares it with the one it last saw for the deck: another process is a
+    /// deck restart, and the agents listed before it are named in one notice.
+    /// Absent when the deck named none, and on a snapshot that is not
+    /// connected.
+    #[serde(skip_serializing_if = "Incarnation::is_unnamed")]
+    pub incarnation: Incarnation,
 }
 
 /// One hook-binary notice as the webview reads it (issue #1637). Every string
@@ -786,6 +796,18 @@ pub struct DesktopAgent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pull_request: Option<dot_agent_deck::pull_request_info::PullRequestInfo>,
     pub tab: DesktopTab,
+    /// PRD #1666 part 2 (G-fix4): the daemon process this row was listed by,
+    /// which the webview sends back with every action on the agent
+    /// (`StopAgent`, `StopOrchestration`, `RenameAgent`, an inbox action, a
+    /// voice answer, opening its terminal). The action is then sent only to that process: after a
+    /// restart, a successor that numbered an unrelated agent with this id is
+    /// sent nothing, and the action fails with
+    /// [`dot_agent_deck::daemon_client::AGENT_GONE_AFTER_RESTART`]. Absent
+    /// from a daemon that names no process, and then every action on the agent
+    /// is refused, an action sent without one included (G-fix5): such a
+    /// daemon cannot be told from its successor.
+    #[serde(skip_serializing_if = "Incarnation::is_unnamed")]
+    pub incarnation: Incarnation,
 }
 
 /// PRD #1666 §2.8: the webview's view of an `InboxSummary`.
@@ -810,10 +832,14 @@ pub struct DesktopInbox {
     /// Cancel. Sender and subject are display copies.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub attention: Vec<DesktopInboxAttention>,
-    /// PRD #1666 §11: `cli_too_old`, `adapter_too_old`, `not_armed` or
-    /// `refresh_failed`.
+    /// PRD #1666 §11: `cli_too_old`, `adapter_too_old`, `not_armed`,
+    /// `refresh_failed`, `refresh_failed_pi` or `hooks_too_old`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub integration: Option<String>,
+    /// PRD #1666 part 2 §2.7: the command that fixes `integration`, a display
+    /// copy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integration_command: Option<String>,
     /// PRD #1666 §3: the deck's error recording receipts, a display copy.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub receipts_degraded: Option<String>,
@@ -1259,6 +1285,10 @@ pub enum DesktopAction {
         /// decode rather than defaulted.
         deck_id: String,
         agent_id: String,
+        /// PRD #1666 part 2 (G-fix4): the row's
+        /// [`DesktopAgent::incarnation`], which the stop is bound to.
+        #[serde(default)]
+        incarnation: Incarnation,
     },
     /// PRD #1223 U4 — close a whole orchestration: stop every role the
     /// webview's fleet entry lists for it, on the deck `deck_id` names,
@@ -1292,10 +1322,20 @@ pub enum DesktopAction {
         agent_id: String,
         #[serde(alias = "name")]
         display_name: String,
+        /// PRD #1666 part 2 (G-fix4): the row's
+        /// [`DesktopAgent::incarnation`]. Both the listing that reads the
+        /// agent's cwd and the relabel are bound to it.
+        #[serde(default)]
+        incarnation: Incarnation,
     },
     AttachTerminal {
         agent_id: String,
         on_output: JavaScriptChannelId,
+        /// PRD #1666 part 2 (G-fix5): the row's
+        /// [`DesktopAgent::incarnation`], which the attach is bound to. A
+        /// caller that sends none names no process, and is refused.
+        #[serde(default)]
+        incarnation: Incarnation,
     },
     DetachTerminal {
         session_id: String,
@@ -1311,6 +1351,10 @@ pub enum DesktopAction {
 pub struct StopOrchestrationRole {
     pub agent_id: String,
     pub name: String,
+    /// PRD #1666 part 2 (G-fix4): the row's [`DesktopAgent::incarnation`],
+    /// which this role's stop is bound to.
+    #[serde(default)]
+    pub incarnation: Incarnation,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1437,6 +1481,14 @@ pub struct DesktopActionResult {
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
+    /// PRD #1666 part 2 (G-fix7): for a start, the daemon process that
+    /// answered it — the incarnation [`Self::agent_id`] (and every id in
+    /// [`Self::agent_ids`]) was minted by. Absent for an action that started
+    /// nothing; `null` for a start answered by a daemon that named no process.
+    /// The webview waits for, and opens, the agent with this pair, so a
+    /// restarted deck's agent under the same id is not taken for this one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_incarnation: Option<Incarnation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agent_ids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2256,6 +2308,11 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
             .integration
             .and_then(|notice| serde_json::to_value(notice).ok())
             .and_then(|value| value.as_str().map(str::to_string)),
+        integration_command: summary
+            .notices
+            .integration_command
+            .as_deref()
+            .map(safe_display_text),
         receipts_degraded: summary
             .notices
             .receipts_degraded
@@ -2297,6 +2354,9 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
         pending_question,
         pull_request,
         tab,
+        // Stamped by the snapshot that lists this record, which knows which
+        // daemon process answered (`daemon_bridge::connected_snapshot`).
+        incarnation: Incarnation::default(),
     }
 }
 
@@ -3102,6 +3162,7 @@ pub(crate) fn disconnected_snapshot(
             upgrade_offer: dot_agent_deck::daemon_upgrade::UpgradeOffer::Unknown,
             disconnected_reason: None,
             hook_binary_notices: Vec::new(),
+            incarnation: Incarnation::default(),
         },
         agents: Vec::new(),
         // Issue #887: nothing answered, so this daemon reported no revision.

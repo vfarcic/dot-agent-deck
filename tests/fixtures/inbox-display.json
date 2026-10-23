@@ -26,6 +26,8 @@
   "notArmed": "this agent's deck integration has not connected yet; its messages wait until it does",
   "refreshFailed": "the deck could not update this agent's deck integration: run dot-agent-deck hooks install --agent opencode to see why, then restart the agent",
   "refreshFailedPi": "the deck could not update this agent's Pi extension: run dot-agent-deck orchestrator setup with the same HOME and PI_CODING_AGENT_DIR as the agent to see why, then restart the agent",
+  "hooksTooOld": "this agent's deck hooks run a dot-agent-deck too old for its messages",
+  "hooksTooOldUpgrade": "upgrade the dot-agent-deck the hooks run, or run hooks install from the copy you want them to use, then restart the agent",
   "receiptsDegraded": "messages may repeat: the deck cannot record message receipts for this agent",
   "evidencePaused": "deck messages paused: {n} delivered messages still wait for proof that older copies cannot run; restart the agent to clear them",
   "actionUnsupported": "this deck cannot Retry or Cancel deck messages: upgrade dot-agent-deck",

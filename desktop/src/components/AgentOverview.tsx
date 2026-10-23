@@ -28,6 +28,8 @@ import { numberKey, type VoiceNumberedEntryDto, type VoiceNumberedSectionDto } f
 import { agentSpokenName, orchestrationTitle } from "../lib/agentNames";
 import { DISPLAY_LIMITS, deckName, displayActivity, displayIdentity, displayPath, displayText, displayTitle, displayUptime, domIdentity, rendersBlank } from "../lib/displayText";
 import { HookBinaryNotices } from "./HookBinaryNotice";
+import { sameIncarnation } from "../lib/agentKey";
+import { AGENT_GONE_AFTER_RESTART } from "../lib/agentIdentity";
 
 /**
  * The honest subset of `AgentSession`: every field a daemon genuinely reports
@@ -55,6 +57,8 @@ export type OverviewAgent = Pick<
   | "agentType" | "daemonStatus" | "authoringKind"
   /* PRD #1401 — the badge beside the agent's name. */
   | "pullRequest"
+  /* PRD #1666 part 2 — sent back with a stop, so it reaches the daemon process that listed the agent. */
+  | "incarnation"
 > & {
   /**
    * HONEST, and optional exactly as `AgentSession.cwd` is. It was optional here
@@ -81,7 +85,7 @@ export type OverviewAgent = Pick<
 };
 
 export function toOverviewAgent(agent: AgentSession): OverviewAgent {
-  const { id, daemonId, displayName, cli, status, cwd, activeTool, activeToolDetail, toolCount, tab, lastUserPrompt, lastActivityMs, spawnedAtMs, writeLease, agentType, daemonStatus, authoringKind, pullRequest } = agent;
+  const { id, daemonId, displayName, cli, status, cwd, activeTool, activeToolDetail, toolCount, tab, lastUserPrompt, lastActivityMs, spawnedAtMs, writeLease, agentType, daemonStatus, authoringKind, pullRequest, incarnation } = agent;
   return {
     id,
     daemonId,
@@ -101,6 +105,7 @@ export function toOverviewAgent(agent: AgentSession): OverviewAgent {
     spawnedAtMs,
     writeLease: writeLease === "unknown" ? undefined : writeLease,
     ...(pullRequest ? { pullRequest } : {}),
+    ...(incarnation ? { incarnation } : {}),
   };
 }
 
@@ -790,6 +795,12 @@ function rendersAgentRows(connection: ConnectionView): boolean {
 */
 /** The agent a spoken stop named is no longer on the overview. */
 export const STOP_TARGET_GONE = "That agent is not on the dashboard any more, so nothing was closed.";
+/**
+ * PRD #1666 part 2 (G-fix7) — the agent a spoken stop or close named is gone
+ * with its deck's restart: the deck now lists an unrelated agent under its id,
+ * and nothing is offered for that one. The TUI's sentence, then what happened.
+ */
+export const STOP_TARGET_RESTARTED = `${AGENT_GONE_AFTER_RESTART[0].toUpperCase()}${AGENT_GONE_AFTER_RESTART.slice(1)}, so nothing was closed.`;
 /** The orchestration a spoken close named is no longer on the overview. */
 export const ORCHESTRATION_GONE = "That orchestration is not on the dashboard any more, so nothing was closed.";
 /** A confirmation is already open; a second would replace it under the user's pointer. */
@@ -1054,6 +1065,10 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       const deck = decks.find((candidate) => candidate.connected && candidate.snapshot.connection.deckId === target.deckId);
       const agent = deck?.agents.find((candidate) => candidate.id === target.agentId);
       if (!agent) return STOP_TARGET_GONE;
+      /* PRD #1666 part 2 (G-fix7): the agent the utterance named, as the
+         daemon process that listed it then. A restarted deck's agent under
+         the same id is not it, and no confirmation is opened for it. */
+      if ("incarnation" in target && !sameIncarnation(target.incarnation, agent.incarnation)) return STOP_TARGET_RESTARTED;
       stopControls.stopAgent(agent);
       return undefined;
     },
@@ -1063,6 +1078,9 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       const deck = decks.find((candidate) => candidate.connected && candidate.snapshot.connection.deckId === target.deckId);
       const group = deck?.groups.find((candidate) => candidate.kind === "orchestration" && candidate.agents.some((agent) => agent.id === target.orchestrationAgentId));
       if (!group) return ORCHESTRATION_GONE;
+      /* G-fix7: the card's member as the process that listed it then. */
+      const member = group.agents.find((agent) => agent.id === target.orchestrationAgentId);
+      if ("orchestrationIncarnation" in target && !sameIncarnation(target.orchestrationIncarnation, member?.incarnation)) return STOP_TARGET_RESTARTED;
       stopControls.closeOrchestration(group);
       return undefined;
     },
@@ -1225,7 +1243,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
    * deck; see {@link OpenAgentContext}.
    */
   const openAgent = useCallback((agent: OverviewAgent) => {
-    VOICE_ACTIONS.openAgent.run(voiceContext, { deckId: agent.daemonId, agentId: agent.id, from: "overview" });
+    VOICE_ACTIONS.openAgent.run(voiceContext, { deckId: agent.daemonId, agentId: agent.id, from: "overview", incarnation: agent.incarnation });
   }, [voiceContext]);
   const [confirm, setConfirm] = useState<ConfirmState>();
   /** PRD #1487 M5 — the Upgrade dialog, for the deck whose card it was pressed on. */
@@ -1389,14 +1407,14 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
           body: `This sends a stop request to ${name} on ${deckName(deck.connection)}. Unsaved terminal work may be interrupted.`,
           label: "Close agent",
           busyLabel: "Stopping…",
-          action: () => run({ type: "stop_agent", deckId: agent.daemonId, agentId: agent.id }),
+          action: () => run({ type: "stop_agent", deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation }),
         });
       },
       closeOrchestration: (group) => {
         const deckId = group.agents[0]?.daemonId;
         const deck = deckId === undefined ? undefined : deckOf(deckId);
         if (deckId === undefined || !deck) return;
-        const roles = group.agents.map((agent) => ({ agentId: agent.id, name: stopTargetName(agent) }));
+        const roles = group.agents.map((agent) => ({ agentId: agent.id, name: stopTargetName(agent), ...(agent.incarnation ? { incarnation: agent.incarnation } : {}) }));
         const title = displayIdentity(group.title, DISPLAY_LIMITS.name, unnamedGroupLabel(group));
         const count = roles.length === 1 ? "its 1 role" : `all ${roles.length} of its roles`;
         setConfirm({
@@ -1657,7 +1675,9 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
             setNewAgentDraft(undefined);
             setNewAgent(undefined);
             // PRD #1223 M5: only now — the deck lists the agent, so the pane's
-            // retirement check has a record to find.
+            // retirement check has a record to find. `target` carries the
+            // start's own process (G-fix7), so the view is bound to it rather
+            // than to whichever record lists the id now.
             VOICE_ACTIONS.openAgent.run(voiceContext, { ...target, from: "overview" });
           }}
           onNotAppeared={({ deckName: onDeck, agentName }) => {

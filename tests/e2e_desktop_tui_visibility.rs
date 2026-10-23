@@ -123,12 +123,34 @@ fn proxy_connection(
     subscription_tx: &Sender<()>,
     event_tx: &Sender<Vec<u8>>,
 ) -> io::Result<()> {
-    let Some(request_frame) = read_wire_frame(&mut downstream)? else {
+    let Some(mut request_frame) = read_wire_frame(&mut downstream)? else {
         return Ok(());
     };
-    let request: AttachRequest = serde_json::from_slice(&request_frame.payload)
+    let mut request: AttachRequest = serde_json::from_slice(&request_frame.payload)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let mut upstream = UnixStream::connect(upstream_path)?;
+    // PRD #1666 part 2: the TUI checks the protocol with a `Hello` that keeps
+    // the connection open (`follow_on`) and sends its request after it on the
+    // same connection; relay the check and classify that request instead.
+    if let AttachRequest::Hello {
+        follow_on: true, ..
+    } = request
+    {
+        write_wire_frame(&mut upstream, &request_frame)?;
+        let checked = read_wire_frame(&mut upstream)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "daemon closed before its Hello reply",
+            )
+        })?;
+        write_wire_frame(&mut downstream, &checked)?;
+        let Some(follow_on) = read_wire_frame(&mut downstream)? else {
+            return Ok(());
+        };
+        request = serde_json::from_slice(&follow_on.payload)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        request_frame = follow_on;
+    }
     write_wire_frame(&mut upstream, &request_frame)?;
     let response_frame = read_wire_frame(&mut upstream)?.ok_or_else(|| {
         io::Error::new(

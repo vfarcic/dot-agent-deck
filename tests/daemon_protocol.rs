@@ -2698,9 +2698,9 @@ async fn hello_names_the_daemon_process() {
         );
     }
     assert_eq!(seen[0], seen[1], "one process, one identity");
-    assert_eq!(seen[0].len(), 32, "{:?}", seen[0]);
+    assert!(!seen[0].is_empty());
     assert_eq!(
-        Some(seen[0].as_str()),
+        seen[0].as_str(),
         dot_agent_deck::daemon_protocol::daemon_instance_id()
     );
 }

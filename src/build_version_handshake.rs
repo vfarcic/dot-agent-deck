@@ -1046,6 +1046,7 @@ fn interactive_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spec::spec;
 
     /// PRD #1487: only an explicit `1` keeps the daemon; anything else (unset,
     /// empty, `0`, `true`) leaves the ordinary mismatch handling in charge.
@@ -1258,6 +1259,46 @@ mod tests {
         assert_eq!(
             result.expect("an identical daemon must be attached to"),
             HandshakeOutcome::Match
+        );
+    }
+
+    /// Scenario: Decode the agent card's hooks-too-old notice, as this build
+    /// writes it, with the integration-notice enum as 0.47.0 shipped it
+    /// (protocol 11): the older reader cannot. This build speaks a newer
+    /// protocol, and its startup handshake refuses a daemon that speaks 11
+    /// and accepts its own, so a 0.47.0 client and a daemon that can send the
+    /// notice never attach to each other.
+    #[spec("inbox/claude/032")]
+    #[test]
+    fn claude_032_a_0_47_reader_of_hooks_too_old_is_refused_at_the_handshake() {
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum Released {
+            CliTooOld,
+            AdapterTooOld,
+            NotArmed,
+            RefreshFailed,
+            RefreshFailedPi,
+        }
+        let written =
+            serde_json::to_string(&crate::inbox_display::IntegrationNotice::HooksTooOld).unwrap();
+        assert_eq!(written, r#""hooks_too_old""#);
+        assert!(
+            serde_json::from_str::<Released>(&written).is_err(),
+            "a 0.47.0 reader cannot decode it"
+        );
+        const RELEASED_0_47: u32 = 11;
+        const { assert!(PROTOCOL_VERSION > RELEASED_0_47) };
+        assert_eq!(
+            ProtocolCheck::of(Some(RELEASED_0_47)),
+            ProtocolCheck::Skewed {
+                daemon: Some(RELEASED_0_47)
+            }
+        );
+        assert_eq!(
+            ProtocolCheck::of(Some(PROTOCOL_VERSION)),
+            ProtocolCheck::Compatible
         );
     }
 

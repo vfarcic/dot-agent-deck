@@ -156,16 +156,16 @@ describe("refitAllTerminals", () => {
   it("re-fits every registered pane once", () => {
     const first = vi.fn();
     const second = vi.fn();
-    registerRefit(DECK, "a", first);
-    registerRefit(DECK, "b", second);
+    registerRefit(DECK, "a", first, undefined);
+    registerRefit(DECK, "b", second, undefined);
     try {
       refitAllTerminals();
       vi.advanceTimersByTime(20);
       expect(first).toHaveBeenCalledTimes(1);
       expect(second).toHaveBeenCalledTimes(1);
     } finally {
-      unregisterRefit(DECK, "a", first);
-      unregisterRefit(DECK, "b", second);
+      unregisterRefit(DECK, "a", first, undefined);
+      unregisterRefit(DECK, "b", second, undefined);
     }
   });
 
@@ -173,7 +173,7 @@ describe("refitAllTerminals", () => {
   // without this a held zoom key forces one reflow per pane per key repeat.
   it("collapses many requests in one frame into a single pass", () => {
     const refit = vi.fn();
-    registerRefit(DECK, "a", refit);
+    registerRefit(DECK, "a", refit, undefined);
     try {
       for (let i = 0; i < 10; i += 1) refitAllTerminals();
       vi.advanceTimersByTime(20);
@@ -185,23 +185,23 @@ describe("refitAllTerminals", () => {
       vi.advanceTimersByTime(20);
       expect(refit).toHaveBeenCalledTimes(2);
     } finally {
-      unregisterRefit(DECK, "a", refit);
+      unregisterRefit(DECK, "a", refit, undefined);
     }
   });
 
   it("does not call a pane that unregistered before the frame ran", () => {
     const gone = vi.fn();
     const stays = vi.fn();
-    registerRefit(DECK, "gone", gone);
-    registerRefit(DECK, "stays", stays);
+    registerRefit(DECK, "gone", gone, undefined);
+    registerRefit(DECK, "stays", stays, undefined);
     try {
       refitAllTerminals();
-      unregisterRefit(DECK, "gone", gone);
+      unregisterRefit(DECK, "gone", gone, undefined);
       vi.advanceTimersByTime(20);
       expect(gone).not.toHaveBeenCalled();
       expect(stays).toHaveBeenCalledTimes(1);
     } finally {
-      unregisterRefit(DECK, "stays", stays);
+      unregisterRefit(DECK, "stays", stays, undefined);
     }
   });
 
@@ -211,10 +211,10 @@ describe("refitAllTerminals", () => {
   it("survives a pane unmounting a sibling from inside its own re-fit", () => {
     const victim = vi.fn();
     const survivor = vi.fn();
-    const remover = vi.fn(() => unregisterRefit(DECK, "victim", victim));
-    registerRefit(DECK, "remover", remover);
-    registerRefit(DECK, "victim", victim);
-    registerRefit(DECK, "survivor", survivor);
+    const remover = vi.fn(() => unregisterRefit(DECK, "victim", victim, undefined));
+    registerRefit(DECK, "remover", remover, undefined);
+    registerRefit(DECK, "victim", victim, undefined);
+    registerRefit(DECK, "survivor", survivor, undefined);
     try {
       refitAllTerminals();
       vi.advanceTimersByTime(20);
@@ -222,9 +222,9 @@ describe("refitAllTerminals", () => {
       expect(victim).not.toHaveBeenCalled();
       expect(survivor).toHaveBeenCalledTimes(1);
     } finally {
-      unregisterRefit(DECK, "remover", remover);
-      unregisterRefit(DECK, "victim", victim);
-      unregisterRefit(DECK, "survivor", survivor);
+      unregisterRefit(DECK, "remover", remover, undefined);
+      unregisterRefit(DECK, "victim", victim, undefined);
+      unregisterRefit(DECK, "survivor", survivor, undefined);
     }
   });
 
@@ -233,15 +233,15 @@ describe("refitAllTerminals", () => {
   it("keeps going when one pane's re-fit throws", () => {
     const angry = vi.fn(() => { throw new Error("no measurable box"); });
     const calm = vi.fn();
-    registerRefit(DECK, "angry", angry);
-    registerRefit(DECK, "calm", calm);
+    registerRefit(DECK, "angry", angry, undefined);
+    registerRefit(DECK, "calm", calm, undefined);
     try {
       refitAllTerminals();
       expect(() => vi.advanceTimersByTime(20)).not.toThrow();
       expect(calm).toHaveBeenCalledTimes(1);
     } finally {
-      unregisterRefit(DECK, "angry", angry);
-      unregisterRefit(DECK, "calm", calm);
+      unregisterRefit(DECK, "angry", angry, undefined);
+      unregisterRefit(DECK, "calm", calm, undefined);
     }
   });
 
@@ -251,16 +251,16 @@ describe("refitAllTerminals", () => {
   it("keeps a remounted pane's re-fit when the old one unregisters", () => {
     const old = vi.fn();
     const fresh = vi.fn();
-    registerRefit(DECK, "a", old);
-    registerRefit(DECK, "a", fresh);
-    unregisterRefit(DECK, "a", old);
+    registerRefit(DECK, "a", old, undefined);
+    registerRefit(DECK, "a", fresh, undefined);
+    unregisterRefit(DECK, "a", old, undefined);
     try {
       refitAllTerminals();
       vi.advanceTimersByTime(20);
       expect(old).not.toHaveBeenCalled();
       expect(fresh).toHaveBeenCalledTimes(1);
     } finally {
-      unregisterRefit(DECK, "a", fresh);
+      unregisterRefit(DECK, "a", fresh, undefined);
     }
   });
 

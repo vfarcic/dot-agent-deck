@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DesktopAgentDto, DesktopSnapshotDto, ObservedDeckDto, TerminalAttachResult } from "./bridge";
-import type { AgentTarget, DeckFleet, SendResult } from "../types";
+import type { AgentTarget, DeckAction, DeckFleet, SendResult } from "../types";
 
 const invoke = vi.fn();
 const listeners = new Map<string, (event: { payload: unknown }) => void>();
@@ -55,7 +55,7 @@ const snapshot: DesktopSnapshotDto = {
  * scattering the fixture's deck id through a hundred calls; the tests that are
  * ABOUT crossing decks build their targets explicitly.
  */
-const on = (agentId: string): AgentTarget => ({ deckId: snapshot.connection.deckId!, agentId });
+const on = (agentId: string): AgentTarget => ({ deckId: snapshot.connection.deckId!, agentId, incarnation: undefined });
 
 describe("TauriDeckBridge", () => {
   beforeEach(() => {
@@ -69,6 +69,36 @@ describe("TauriDeckBridge", () => {
   });
 
   afterEach(() => vi.restoreAllMocks());
+
+  /** Scenario: Open a card listed before a same-build restart. A backend that checks the card incarnation refuses it with the gone sentence; keyboard input rejects as not attached and no PTY bytes move. */
+  it("opening a stale card preserves its incarnation and transfers no PTY bytes", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const listed = structuredClone(snapshot);
+    listed.agents[0].incarnation = "process-a";
+    const gone = "that agent is gone (the deck restarted)";
+    const output = vi.fn();
+    invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "desktop_bootstrap") return listed;
+      if (command === "desktop_terminal_attach") {
+        if (args?.incarnation === "process-a") throw new Error(gone);
+        (args?.onOutput as MockChannel<ArrayBuffer>).onmessage?.(new Uint8Array([66]).buffer);
+        return { sessionId: "successor-session", agentId: "agent-1", generation: 8, reused: false };
+      }
+      return { ok: true };
+    });
+    const bridge = new TauriDeckBridge();
+    const updates = vi.fn();
+    await bridge.subscribe(updates, output);
+    const [view] = await bridge.connect();
+    const card = view.agents[0];
+    const oldTarget = { deckId: card.daemonId!, agentId: card.id, incarnation: card.incarnation };
+    await bridge.setShownTerminals([oldTarget]).catch(() => undefined);
+    await expect(bridge.sendTerminalInput(on("agent-1"), "old-card-input")).rejects.toThrow("Terminal for agent-1 is not attached.");
+    expect(output.mock.calls.filter(([event]) => event.stream === "output" && event.data.length > 0), "stale card must receive no successor PTY output").toEqual([]);
+    expect(invoke.mock.calls.filter(([command]) => command === "desktop_terminal_write"), "stale card must send no PTY input").toEqual([]);
+    expect(JSON.stringify(output.mock.calls)).toContain(gone);
+    await bridge.dispose();
+  });
 
   it("maps nullable daemon metadata honestly and uses session IDs for terminal RPCs", async () => {
     const { TauriDeckBridge, mapDesktopSnapshot } = await import("./bridge");
@@ -299,7 +329,9 @@ describe("TauriDeckBridge", () => {
       data: new Uint8Array(),
       stream: "error",
       operation: "append",
-      message: "Terminal attach failed. The agent is still running; reconnect to retry its terminal.",
+      // PRD #1666 part 2 (G-fix6): a failed attach asserts nothing about
+      // whether the agent is running.
+      message: "Terminal attach failed; reconnect to retry its terminal.",
     });
     expect(JSON.stringify(terminal.mock.calls)).not.toContain("secret token");
     expect(JSON.stringify(terminal.mock.calls)).not.toContain("/Users/private");
@@ -664,13 +696,36 @@ describe("TauriDeckBridge", () => {
     await bridge.dispose();
   });
 
-  it("sends stop_daemon through the live bridge", async () => {
-    const { TauriDeckBridge } = await import("./bridge");
+  /// Scenario: Stop a daemon, then send Stop, Rename, orchestration close, inbox Retry/Cancel and a voice answer from a listed card through the live bridge. Agent-directed IPC retains the incarnation that the snapshot row carried.
+  it("sends stop_daemon and preserves the listed incarnation on card actions through the live bridge", async () => {
+    const { TauriDeckBridge, mapDesktopSnapshot } = await import("./bridge");
     const bridge = new TauriDeckBridge();
 
     await bridge.runAction({ type: "stop_daemon" });
 
     expect(invoke).toHaveBeenCalledWith("desktop_run_action", { action: { type: "stop_daemon" } });
+    const listed = mapDesktopSnapshot({ ...snapshot, agents: [{ ...snapshot.agents[0], incarnation: "listed-process-a" }] }).agents[0];
+    expect(listed.incarnation).toBe("listed-process-a");
+    for (const action of [
+      { type: "stop_agent", deckId: listed.daemonId, agentId: listed.id, incarnation: listed.incarnation },
+      { type: "rename_agent", agentId: listed.id, displayName: "Renamed", incarnation: listed.incarnation },
+      { type: "stop_orchestration", deckId: listed.daemonId, roles: [{ agentId: listed.id, name: listed.role, incarnation: listed.incarnation }] },
+    ] satisfies DeckAction[]) {
+      await bridge.runAction(action);
+      expect(invoke).toHaveBeenLastCalledWith("desktop_run_action", { action });
+    }
+    for (const verb of ["retry", "cancel"] as const) {
+      await bridge.inboxAction({ deckId: listed.daemonId, agentId: listed.id, incarnation: listed.incarnation }, { paneId: "pane-1", messageId: "m-1", revision: 7 }, verb);
+      expect(invoke).toHaveBeenLastCalledWith("desktop_inbox_action", {
+        deckId: listed.daemonId, agentId: listed.id, incarnation: "listed-process-a",
+        paneId: "pane-1", messageId: "m-1", revision: 7, verb,
+      });
+    }
+    await bridge.sendVoiceAnswer({ deckId: listed.daemonId, agentId: listed.id, agent: listed.role, questionId: "q-1", incarnation: listed.incarnation }, [], false, "lease-test");
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_answer_question", {
+      deckId: listed.daemonId, agentId: listed.id, agent: listed.role, questionId: "q-1", incarnation: "listed-process-a",
+      form: [], confirmedAlways: false, lease: "lease-test", revision: null,
+    });
     await bridge.dispose();
   });
 
@@ -699,6 +754,30 @@ describe("TauriDeckBridge", () => {
     expect(invoke).toHaveBeenCalledTimes(1);
     expect(invoke).toHaveBeenCalledWith("desktop_run_action", { action });
     expect(result).toEqual({ ok: true, agentId: "7" });
+    await bridge.dispose();
+  });
+
+  /**
+   * Scenario (PRD #1666 part 2, G-fix7): a start answered by daemon process A
+   * hands back the id AND process A, so the caller can wait for that agent
+   * rather than any agent the id names; a start from a deck that named no
+   * process carries the key holding `undefined`, and a stop carries no key.
+   */
+  it("returns the daemon process that answered a start beside the id it minted", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    invoke.mockResolvedValueOnce({ ok: true, agentId: "7", agentIncarnation: "process-a", snapshot: {} });
+    invoke.mockResolvedValueOnce({ ok: true, agentId: "8", agentIncarnation: null, snapshot: {} });
+    invoke.mockResolvedValueOnce({ ok: true, agentId: "7", snapshot: {} });
+
+    const named = await bridge.runAction({ type: "start_agent", deckId: "deck-00000000000b0x01" });
+    const unnamed = await bridge.runAction({ type: "start_orchestration", deckId: "deck-00000000000b0x01", path: "/srv/repo", orchestration: "tdd" });
+    const stopped = await bridge.runAction({ type: "stop_agent", deckId: "deck-00000000000b0x01", agentId: "7", incarnation: "process-a" });
+
+    expect(named).toEqual({ ok: true, agentId: "7", agentIncarnation: "process-a" });
+    expect(unnamed.agentId).toBe("8");
+    expect("agentIncarnation" in unnamed && unnamed.agentIncarnation === undefined).toBe(true);
+    expect("agentIncarnation" in stopped).toBe(false);
     await bridge.dispose();
   });
 
@@ -2456,7 +2535,7 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     await bridge.dispose();
 
     expect.soft(live).toMatchObject({ agentId: "agent-4", deckId: remoteDeckId, operation: "append" });
-    expect.soft(geometry).toHaveBeenCalledWith("agent-4", 48, 160, remoteDeckId);
+    expect.soft(geometry).toHaveBeenCalledWith("agent-4", 48, 160, remoteDeckId, undefined);
   });
 
   /**

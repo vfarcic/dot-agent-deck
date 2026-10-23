@@ -2291,6 +2291,47 @@ mod tests {
         );
     }
 
+    /// PRD #1666 part 2 (wire audit W06): `hooks install` from another build
+    /// rewrites the prompt hook and both waiters together, so no mix of an
+    /// older prompt hook and a newer waiter (or the reverse) survives it.
+    #[test]
+    fn install_rewrites_the_prompt_hook_and_the_waiters_as_one_unit() {
+        let gates = ClaudeHookGates {
+            stop_failure: false,
+            permission_request: false,
+            async_rewake: true,
+        };
+        let old = crate::test_paths::abs("/opt/old/dot-agent-deck");
+        let new = crate::test_paths::abs("/opt/new/dot-agent-deck");
+        let mut settings = serde_json::json!({});
+        install_impl_gated(&mut settings, &old, gates);
+        install_impl_gated(&mut settings, &new, gates);
+        let commands = |hook_type: &str| -> Vec<String> {
+            settings["hooks"][hook_type]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|rule| rule["hooks"].as_array().cloned().unwrap_or_default())
+                .filter_map(|handler| handler["command"].as_str().map(str::to_string))
+                .collect()
+        };
+        let prompt = commands("UserPromptSubmit");
+        assert_eq!(prompt, [hook_command(&new)]);
+        for hook_type in WAITER_HOOK_TYPES {
+            let all = commands(hook_type);
+            let waiters: Vec<&String> = all
+                .iter()
+                .filter(|command| command.ends_with(WAITER_COMMAND_SUFFIX))
+                .collect();
+            assert_eq!(waiters.len(), 1, "{hook_type}: {all:?}");
+            assert_eq!(*waiters[0], waiter_command_for(&hook_command(&new)));
+            assert!(
+                all.iter().all(|command| !command.contains(old.as_str())),
+                "{hook_type} keeps nothing of the older build: {all:?}"
+            );
+        }
+    }
+
     /// Issue #714: the `StopFailure` gate — written for a Claude Code that
     /// accepts it, withheld (and a stale one removed) for one that does not,
     /// and swept by uninstall. The end-to-end half is `status/blocked/011` in

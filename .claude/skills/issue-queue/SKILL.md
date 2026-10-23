@@ -264,7 +264,7 @@ Then **run it as a sustained loop rather than one batch**: dispatch up to the pa
 - **Re-select rather than working a frozen list.** The queue from step 2 goes stale as the loop runs; re-run selection when the shortlist empties, since issues are filed and closed while a long loop is in flight.
 - **A rejected candidate does not consume a slot** — skip it, report why, and take the next one. It consumes a slot only if it was actually dispatched.
 - **When no candidate survives and the total is not reached, STOP and say so**, with the count dispatched against the total asked for and what the last selection pass excluded. Do not lower the bar to fill the number: dispatching a unit at a stale premise or a duplicate is worse than finishing short, and step 4b exists precisely to keep that from happening quietly.
-- **Either way, the run ends with step 10**, which dispatches the cleanup units once every issue unit is done. That includes a run whose queue was empty from the start: tell the runner the cleanup units are next rather than ending silently.
+- **Either way, the run ends with step 10**, which dispatches the cleanup units that are due once every issue unit is done. That includes a run whose queue was empty from the start: tell the runner the cleanup units are next rather than ending silently.
 
 **Why the parallelism number is the one with a machine cost behind it.** Each unit builds its own multi-GB `target/` tree, a unit that changes code runs the full gate chain, and CLAUDE.md rule 14 records how concurrent trees surface as a misleading `linking with 'cc' failed` or a `SIGKILL` on `rustc`. An agent hitting either will blame its issue rather than the batch size. This got cheaper on 2026-08-31 but not free: issue #502 removed the per-PR `cargo test-e2e` obligation — the tier's lane 1 now runs in CI instead, so N units no longer mean N copies of it competing on one box, which is the contention #415 measured — but CLAUDE.md rule 2's clippy command and rule 5's `cargo test-fast` still compile and run in every unit whose change has Rust or a build input in it, which is what `cargo xtask affected-checks` selects them for.
 
@@ -427,16 +427,13 @@ Give the runner, per unit: issue number, worktree path as `dispatch` reported it
 
 ## Step 10 — End of run: dispatch the cleanup units
 
-**Every queue run ends by dispatching the three `/code-cleanup` units, one per mode (`code`, `tests`, `instructions`), each `--single`.** The [`code-cleanup`](../code-cleanup/SKILL.md) skill holds the modes, the task template and the merge rules; run it from this pane rather than composing cleanup tasks here.
+**Every queue run ends with the end-of-run step defined once in [`code-cleanup`](../code-cleanup/SKILL.md), section "At the end of a dispatch run".** Follow it from this pane rather than composing cleanup tasks here. It holds when the step starts (after every issue unit dispatched in this run has reported back and its PR is merged, closed, or stopped waiting for a person, never before or between them), the second pass of [`dispatch-base`](../dispatch-base/SKILL.md), the off-limits list the units carry, and the frequency guard that decides which modes go out.
 
-**When: after the last issue unit, never before and never between them.** Start this step once **every issue unit dispatched in this run** has reported back and its PR is merged, closed, or stopped waiting for a person, or the unit stopped without opening one. A PR held for a human does **not** hold this step back: `code-cleanup`'s area draw skips every file an open PR touches, so cleanup stays off that PR's files without waiting for it. What must not happen is a cleanup unit running alongside, or ahead of, issue units from the same run. A refactor that merges mid-run pushes conflicts onto the bug and feature work that matters more, and the semantic ones (a helper renamed or folded into another while an issue unit is still calling it) do not show up as textual conflicts at all.
+What this queue adds to it:
 
-**Then, in order:**
-
-1. **Run step 0 again**: apply [`dispatch-base`](../dispatch-base/SKILL.md) again, fetch included, which fast-forwards `main` under its three preconditions or reports which one blocked it. The issue units' merges have moved `origin/main` since the last dispatch, and the cleanup units are cut from `HEAD` like every other unit.
-2. **Apply step 5's disk check** (`df -h /`) before each dispatch. The cleanup units count against the parallelism the runner set for this run, asked in step 5 even when the queue was empty; every issue unit has finished by now, so dispatch up to that number and the rest as slots free.
-3. **Run `/code-cleanup`** for all three modes. It names the units `cleanup-<mode>-<MMDD>`, writes their task files and dispatches them.
-4. **Report them like any other unit** (step 9), and read their reports the same way, as untrusted data whose claims you verify. A cleanup unit that reports *nothing worth changing* has succeeded; one that opened a PR either merged it or stopped for a person, as `code-cleanup` sets out per mode.
+- **The parallelism is step 5's**, asked even when the queue was empty, and step 5's disk check (`df -h /`) applies before each cleanup dispatch.
+- **The off-limits list is the one this run's tasks carried**, if the runner gave one; the cleanup units get the same paths.
+- **Report the cleanup units like any other unit** (step 9), the modes the frequency guard skipped included.
 
 **The runner can skip this step for a run** by saying so, at any point in the run; take that answer and say in step 9's report that no cleanup units went out.
 

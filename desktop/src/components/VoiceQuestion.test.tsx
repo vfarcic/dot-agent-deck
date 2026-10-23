@@ -140,12 +140,12 @@ describe("answering an agent's question by voice", () => {
    * user says "always". The panel shows a confirmation naming what "always"
    * covers and starts no countdown; Cancel sends nothing. Said again and
    * confirmed — by the button, and then by saying "confirm" — the five-second
-   * countdown runs and the answer goes out asserting the confirmation.
+   * countdown runs and the answer goes out asserting the confirmation and the incarnation of the pane the utterance answered.
    */
   it("question/desktop/005: always allow is sent only after a confirmation naming its scope", async () => {
     const voice = microphone();
     const { rt, sendVoiceAnswer, resolveVoiceQuestion } = runtime(voice, (_form, confirmed) => ({ kind: "answered", sentence: confirmed ? "Always allowed: commands matching `touch *`" : "unconfirmed" }));
-    render(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={pane()} selectedDeckId="local" />);
+    render(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={{ ...pane(), incarnation: "voice-process-a" }} selectedDeckId="local" />);
     await turnOnVoice();
 
     await speak(voice, "always");
@@ -170,7 +170,7 @@ describe("answering an agent's question by voice", () => {
     await waitOut(VOICE_DICTATION_SEND_MS);
     expect(sendVoiceAnswer).toHaveBeenCalledTimes(1);
     expect(sendVoiceAnswer).toHaveBeenCalledWith(
-      { deckId: "local", agentId: "a1", agent: "tester", questionId: "q-1" },
+      { deckId: "local", agentId: "a1", agent: "tester", questionId: "q-1", incarnation: "voice-process-a" },
       [{ questionIndex: 0, optionIndices: [2] }],
       true,
       expect.any(String),
@@ -216,6 +216,33 @@ describe("answering an agent's question by voice", () => {
     // Not an answer: it goes on to the command resolver.
     await speak(voice, "go to the overview");
     expect(resolveVoice).toHaveBeenCalledWith("go to the overview");
+    view.unmount();
+  });
+
+  /**
+   * Scenario (question/desktop/006, PR #1817 review 4347326620): the user
+   * says "yes" and the countdown starts. Before it runs out the deck
+   * restarts, and the pane shows its new process's agent under the same agent
+   * and question ids, with no spawn time to tell them apart. The countdown is
+   * called off at once and the panel says the agent is gone, with nothing
+   * sent.
+   */
+  it("question/desktop/006: the countdown is called off when the deck restarts under the same ids", async () => {
+    const voice = microphone();
+    const { rt, sendVoiceAnswer } = runtime(voice, () => SENT);
+    const before: VoicePane = { ...pane(), spawnedAtMs: undefined, incarnation: "p1" };
+    const view = render(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={before} selectedDeckId="local" />);
+    await turnOnVoice();
+
+    await speak(voice, "yes");
+    expect(screen.getByTestId("voice-question")).toHaveTextContent("sending in 5 s.");
+    await waitOut(2_000);
+    view.rerender(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={{ ...before, incarnation: "p2" }} selectedDeckId="local" />);
+    await flush();
+    expect(screen.queryByTestId("voice-question")).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Nothing was sent — that agent is gone (the deck restarted).");
+    await waitOut(VOICE_DICTATION_SEND_MS);
+    expect(sendVoiceAnswer).not.toHaveBeenCalled();
     view.unmount();
   });
 
@@ -299,6 +326,12 @@ describe("answering an agent's question by voice", () => {
     expect(questionLost(aim, { ...now, pane: { ...pane(), agentId: "a2" } })?.code).toBe("pane");
     expect(questionLost(aim, { ...now, pane: undefined })?.code).toBe("pane");
     expect(questionLost(aim, { ...now, pane: { ...pane(), spawnedAtMs: 2 } })?.code).toBe("replaced");
+    /* PR #1817 review 4347326620: the deck restarted under the same agent
+       and question ids, with no spawn time to tell them apart. */
+    const bound = { ...aim, spawnedAtMs: undefined, incarnation: "p1" };
+    const unspawned = { ...pane(), spawnedAtMs: undefined };
+    expect(questionLost(bound, { ...now, pane: { ...unspawned, incarnation: "p1" } })).toBeUndefined();
+    expect(questionLost(bound, { ...now, pane: { ...unspawned, incarnation: "p2" } })?.code).toBe("restarted");
     expect(questionLost(aim, { ...now, confirmation: true })?.code).toBe("confirmation");
     expect(questionLost(aim, { ...now, deck: "remote" })?.code).toBe("deck");
     /* Issue #1726: the pane stopping taking input calls it off; one that

@@ -187,12 +187,15 @@ fn boundary_013_the_probe_marks_only_a_flag_rejecting_cli_too_old() {
     );
 }
 
-/// Scenario: A Claude Code pane's legacy doorbell hook fetches as it always has and is served. The same doorbell fetch from an OpenCode pane — an old plugin, without the integration or a receiver — is refused, its mail waits queued, and the snapshot says its integration is out of date.
+/// Scenario: A Claude Code pane's legacy doorbell hook fetches as it did before Claude's hooks moved onto receipts, declaring no one-shot integration: it is refused as hooks too old, its mail waits queued and the snapshot names the stale hooks. The same doorbell fetch from an OpenCode pane — an old plugin, without the integration or a receiver — is refused, its mail waits queued, and the snapshot says its integration is out of date.
 #[spec("inbox/boundary/014")]
 #[test]
-fn boundary_014_an_old_hook_command_is_served_and_an_old_opencode_fetch_is_refused() {
+fn boundary_014_an_old_hook_fetch_is_refused_for_claude_and_opencode() {
     let daemon = daemon_unbound(&[]);
-    for (agent_type, served) in [("claude_code", true), ("open_code", false)] {
+    for (agent_type, refusal, notice) in [
+        ("claude_code", "hooks_too_old", "hooks_too_old"),
+        ("open_code", "adapter_too_old", "adapter_too_old"),
+    ] {
         let pane = pane_with(
             &daemon,
             &format!("legacy-{agent_type}"),
@@ -205,19 +208,15 @@ fn boundary_014_an_old_hook_command_is_served_and_an_old_opencode_fetch_is_refus
         req["ack"] = json!(true);
         req["doorbell"] = json!(id);
         let reply = hook(&daemon, req);
-        if served {
-            assert_eq!(reply["messages"][0]["id"], id, "{reply}");
-            state(&daemon, &pane, &id, "acknowledged");
-        } else {
-            assert_eq!(reply["refused"], "adapter_too_old", "{reply}");
-            state(&daemon, &pane, &id, "queued");
-            assert!(
-                common::wait_until(WAIT, || record_inbox(&daemon, &pane)["integration"]
-                    == "adapter_too_old"),
-                "{}",
-                record_inbox(&daemon, &pane)
-            );
-        }
+        assert_eq!(reply["refused"], refusal, "{reply}");
+        assert!(reply.get("messages").is_none(), "{reply}");
+        state(&daemon, &pane, &id, "queued");
+        assert!(
+            common::wait_until(WAIT, || record_inbox(&daemon, &pane)["integration"]
+                == notice),
+            "{}",
+            record_inbox(&daemon, &pane)
+        );
     }
 }
 

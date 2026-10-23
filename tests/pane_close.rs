@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use dot_agent_deck::agent_pty::AgentRecord;
 use dot_agent_deck::daemon_protocol::{
-    AttachRequest, AttachResponse, KIND_REQ, read_frame, write_resp,
+    AttachRequest, AttachResponse, KIND_REQ, PROTOCOL_VERSION, read_frame, write_resp,
 };
 use dot_agent_deck::embedded_pane::EmbeddedPaneController;
 use dot_agent_deck::pane::{PaneController, PaneDirection, PaneError, PaneInfo, RenameOutcome};
@@ -202,6 +202,17 @@ async fn handle_connection(
         serde_json::from_slice(&payload).expect("decode synthetic daemon request");
 
     match request {
+        // Auto-reattach checks the protocol before every lookup (PRD #1666
+        // part 2), and attaches only after a positive answer, as the real
+        // daemon gives one.
+        AttachRequest::Hello { .. } => {
+            write_resp(
+                &mut stream,
+                &AttachResponse::hello(PROTOCOL_VERSION).with_capabilities(),
+            )
+            .await
+            .expect("reply to Hello");
+        }
         AttachRequest::StartAgent { env, .. } => {
             *pane_id_env.lock().unwrap() = env
                 .into_iter()

@@ -94,9 +94,10 @@ mod affected_checks;
 mod build_gate;
 mod clean_tmp;
 /// PRD #1666: `/code-cleanup`'s instructions mode owns the `dot-ai-*` skills,
-/// which became project-owned when syncing from `dot-ai` stopped. Tests only,
-/// and Unix only: `pick-area.sh` is driven under `bash` against offline `git`
-/// and `gh` stand-ins.
+/// which became project-owned when syncing from `dot-ai` stopped. Issue #1819:
+/// its tool findings, off-limits paths, frequency guard and Renovate-read tool
+/// pins. Tests only, and Unix only: the skill's scripts are driven under `bash`
+/// against offline `git`, `gh`, `cargo` and `pnpm` stand-ins.
 #[cfg(all(test, unix))]
 mod code_cleanup_scope;
 /// Issue #801: a `changelog.d/<issue>.breaking.md` fragment and the

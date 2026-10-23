@@ -237,18 +237,37 @@ fn claude_012_live_busy_fold_at_stop() {
     );
 }
 
-/// Scenario: Run /clear twice in interactive Haiku so SessionStart waiters accumulate, then post one append task. Exactly one hand-over, acknowledgement and sentinel line must result, with no doorbell.
+/// Scenario: Run /clear twice in interactive Haiku. Each clear's SessionStart arms a new waiter, which takes the place of the one before it, so exactly one stays armed. Then post one append task. Exactly one hand-over, acknowledgement and sentinel line must result, with no doorbell.
 #[spec("inbox/claude/013")]
 #[test]
 fn claude_013_live_clear_waiters_claim_once() {
     skip_unless!(common::check_claude_available());
     let claude = Claude::new();
-    for count in [2, 3] {
+    let registered = || {
+        claude
+            .log()
+            .lines()
+            .filter(|line| {
+                line.contains("receipt receiver registered") && line.contains("once_waiter")
+            })
+            .count()
+    };
+    assert!(
+        common::wait_until(BUDGET, || registered() >= 1),
+        "startup must arm a waiter; {}",
+        claude.evidence()
+    );
+    for clear in ["first", "second"] {
+        let seen = registered();
         claude.deck.send_bytes(b"/clear\r");
         assert!(
-            common::wait_until(BUDGET, || claude.listing()["armed"].as_u64().unwrap_or(0)
-                >= count),
-            "clear must arm another waiter; {}",
+            common::wait_until(BUDGET, || registered() > seen),
+            "the {clear} clear must arm another waiter; {}",
+            claude.evidence()
+        );
+        assert!(
+            common::wait_until(BUDGET, || claude.listing()["armed"] == 1),
+            "the newer waiter takes the older one's place; {}",
             claude.evidence()
         );
     }

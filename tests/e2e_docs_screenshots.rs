@@ -22,6 +22,8 @@
 mod common;
 #[path = "support/fake_releases.rs"]
 mod fake_releases;
+#[path = "support/inbox_doorbell.rs"]
+mod inbox;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -1292,4 +1294,53 @@ fn docs_screenshot_inbox_attention() {
         assert!(!page.contains(leak), "{leak} reaches the image");
     }
     write_page("inbox-attention", &page);
+}
+
+/// Scenario: Start a deck daemon of its own running two stand-in agents,
+/// `api-fix` and `docs-review`, and attach the TUI to it. Stop that daemon and
+/// start a new one on the same sockets with no agents: the TUI removes both
+/// cards and its footer row names them, and that frame is written as
+/// `restart-notice-tui.html`.
+#[test]
+#[ignore = "docs-screenshot generator: run it with `cargo docs-screenshots`"]
+fn docs_screenshot_restart_notice() {
+    use dot_agent_deck::daemon_protocol::AttachRequest;
+
+    html_dir();
+    let mut original = common::spawn_daemon_serve_with_env(None, "0", &[]);
+    let agents = [
+        inbox::pane(&original, "api-fix"),
+        inbox::pane(&original, "docs-review"),
+    ];
+    let attach = original.attach_socket.to_string_lossy().to_string();
+    let hooks = original.hook_socket.to_string_lossy().to_string();
+    let deck = launch_with(|builder| {
+        builder
+            .with_env("DOT_AGENT_DECK_ATTACH_SOCKET", attach.clone())
+            .with_env("DOT_AGENT_DECK_SOCKET", hooks.clone())
+    });
+    deck.wait_until_grid("both agents have cards", |grid| {
+        grid.contains("api-fix") && grid.contains("docs-review")
+    });
+    assert!(
+        original
+            .send_attach_request(&AttachRequest::StopDaemon { force: true })
+            .expect("stop the scene's daemon")
+            .ok,
+        "the scene's daemon refused to stop"
+    );
+    assert!(original.wait_for_exit(Duration::from_secs(10)));
+    drop(agents);
+    let _restarted = common::spawn_daemon_serve_with_env(
+        None,
+        "0",
+        &[
+            ("DOT_AGENT_DECK_ATTACH_SOCKET", attach.as_str()),
+            ("DOT_AGENT_DECK_SOCKET", hooks.as_str()),
+        ],
+    );
+    capture(&deck, "restart-notice", |grid| {
+        grid.contains("The deck restarted; these agents were stopped: api-fix, docs-review.")
+            && grid.contains("No active agents")
+    });
 }

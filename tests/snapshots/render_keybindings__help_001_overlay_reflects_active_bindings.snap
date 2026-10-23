@@ -38,6 +38,7 @@ expression: text
         │  i                  Deck messages: Retry or Cancel                                                  │         
         │  o                  Open pull request                                                               │         
         │  u / Ctrl+u         Upgrade (update badge)                                                          │         
+        │  a / c              Restart notice: list / dismiss                                                  │         
         │  PageUp / PageDown  Scroll focused pane                                                             │         
         │  F1                 Toggle this help                                                                │         
         │  [Close]                                                                                            │         

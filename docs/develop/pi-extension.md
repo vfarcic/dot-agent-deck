@@ -113,7 +113,7 @@ A Pi pane installs no Claude Code hook and mutates no `~/.claude/settings.json` 
 
 ## Cross-version contract (rule 12)
 
-Inbox integration ships with `PROTOCOL_VERSION = 11`; older decks and daemons require a coordinated upgrade. The hook-socket inbox verbs carry the recipient generation and capability. Pi's extension no longer relies on the old `GetSeed` request or a typed fallback. An extension from before the receipt stream is refused by a daemon that has the Pi slice (its stream and its doorbell fetch without `--rx` answer `adapter_too_old`, its `get-seed` no seed), and the card says to restart the agent; a restart refreshes the extension when the deck identifies the agent as Pi. See [Agent messaging](agent-messaging.md#contract-and-validation) and [Versioning](versioning.md) for the current boundary.
+Inbox integration shipped with `PROTOCOL_VERSION = 11` (`v0.47.0`), and PRD #1666 part 2 moves it to 12 for a Claude Code notice; Pi's extension wire and `ADAPTER_INTEGRATION` are unchanged by that. Older decks and daemons require a coordinated upgrade. The hook-socket inbox verbs carry the recipient generation and capability. Pi's extension no longer relies on the old `GetSeed` request or a typed fallback. An extension from before the receipt stream is refused by a daemon that has the Pi slice (its stream and its doorbell fetch without `--rx` answer `adapter_too_old`, its `get-seed` no seed), and the card says to restart the agent; a restart refreshes the extension when the deck identifies the agent as Pi. See [Agent messaging](agent-messaging.md#contract-and-validation) and [Versioning](versioning.md) for the current boundary.
 
 ## Experimental gating
 

@@ -314,6 +314,14 @@ pub struct AgentSpec {
     /// [`crate::pane_screen_text::visible_rows_and_cursor`] reports them)
     /// and that exact line. `Some` exactly where `doorbell_composer` is.
     pub doorbell_stranded_line: Option<StrandedLineRecogniser>,
+    /// PRD #1666 part 2 (`inbox/doorbell/008`): recognises, in the pane's
+    /// screen rows, this agent's prompt being up, for an agent whose own
+    /// `SessionStart` arrives before it is ([`crate::state::ReadinessLevel`]).
+    /// Until the generation's own hooks report Idle, the doorbell writes no
+    /// byte to it unless this matches. `None` where the agent's own
+    /// `SessionStart` is readiness enough, or where [`Self::doorbell_composer`]
+    /// already guards every write.
+    pub doorbell_ready_screen: Option<fn(&[String]) -> bool>,
     /// PRD #1631: the options this agent draws on screen but never reports in
     /// a payload — its permission and plan menus, and the free-text entries it
     /// appends to a multiple-choice list — with the keys that pick each where
@@ -816,8 +824,47 @@ pub static CLAUDE_CODE: AgentSpec = AgentSpec {
     }),
     doorbell_composer: None,
     doorbell_stranded_line: None,
+    // PRD #1666 part 2: its `SessionStart` arrives early in boot (above),
+    // before its prompt is drawn, so a generation that has not yet reported
+    // Idle is rung only once that prompt is on screen.
+    doorbell_ready_screen: Some(claude_prompt_on_screen),
     questions: Some(&CLAUDE_CODE_QUESTIONS),
 };
+
+/// PRD #1666 part 2 (`inbox/doorbell/008`): do `rows`, one trimmed screen row
+/// each, show Claude Code's prompt up — a row opening with its `❯` (or `>`)
+/// marker that is not a numbered menu option, a rule of `─` directly above it,
+/// and another below it within [`CLAUDE_PROMPT_MAX_ROWS`] rows, as Claude Code
+/// 2.1.300 draws its input box. The rows are read as
+/// [`crate::pane_screen_text::visible_rows_and_cursor`] gives them, which
+/// shortens a rule to a few characters, so a rule is any row of `─` alone. Says only that the prompt is drawn, not that
+/// it is empty: the doorbell's draft tracking guards a draft. A dialog whose
+/// selected option opens with the same marker is a numbered option and does
+/// not match.
+pub fn claude_prompt_on_screen(rows: &[String]) -> bool {
+    let rule = |row: &str| !row.is_empty() && row.chars().all(|c| c == '─');
+    rows.iter().enumerate().skip(1).any(|(at, row)| {
+        let Some(rest) = row.strip_prefix('❯').or_else(|| row.strip_prefix('>')) else {
+            return false;
+        };
+        let option = rest
+            .trim_start()
+            .split_once('.')
+            .is_some_and(|(number, _)| {
+                !number.is_empty() && number.chars().all(|c| c.is_ascii_digit())
+            });
+        !option
+            && rule(&rows[at - 1])
+            && rows[at + 1..]
+                .iter()
+                .take(CLAUDE_PROMPT_MAX_ROWS)
+                .any(|below| rule(below))
+    })
+}
+
+/// How many rows below its marker [`claude_prompt_on_screen`] looks for the
+/// rule that closes Claude Code's prompt: a draft that wraps pushes it down.
+const CLAUDE_PROMPT_MAX_ROWS: usize = 8;
 
 /// OpenCode — plugin strategy (shipped).
 pub static OPEN_CODE: AgentSpec = AgentSpec {
@@ -855,6 +902,7 @@ pub static OPEN_CODE: AgentSpec = AgentSpec {
     }),
     doorbell_composer: None,
     doorbell_stranded_line: None,
+    doorbell_ready_screen: None,
     questions: Some(&OPEN_CODE_QUESTIONS),
 };
 
@@ -892,6 +940,7 @@ pub static PI: AgentSpec = AgentSpec {
     }),
     doorbell_composer: None,
     doorbell_stranded_line: None,
+    doorbell_ready_screen: None,
     questions: None,
 };
 
@@ -945,6 +994,7 @@ pub static CODEX: AgentSpec = AgentSpec {
     // dialogs are up, so the doorbell needs the composer itself.
     doorbell_composer: Some(codex_composer_on_screen),
     doorbell_stranded_line: Some(codex_composer_holds_doorbell_line),
+    doorbell_ready_screen: None,
     questions: Some(&CODEX_QUESTIONS),
 };
 
@@ -1156,6 +1206,7 @@ pub static DEVIN: AgentSpec = AgentSpec {
     prompt_keys: None,
     doorbell_composer: None,
     doorbell_stranded_line: None,
+    doorbell_ready_screen: None,
     questions: Some(&DEVIN_QUESTIONS),
 };
 
@@ -1182,6 +1233,7 @@ pub static NONE: AgentSpec = AgentSpec {
     prompt_keys: None,
     doorbell_composer: None,
     doorbell_stranded_line: None,
+    doorbell_ready_screen: None,
     questions: None,
 };
 
@@ -1288,6 +1340,44 @@ mod tests {
     /// row per line, as `crate::pane_screen_text` produces them.
     fn rows(screen: &str) -> Vec<String> {
         screen.lines().map(|line| line.trim().to_string()).collect()
+    }
+
+    /// PRD #1666 part 2: the Claude Code prompt recogniser accepts the input
+    /// box Claude Code 2.1.300 draws, empty or holding a draft that wraps, and
+    /// refuses a boot banner with no box, a numbered dialog option under a
+    /// rule, and a marker with no rule closing it — both on rows built here
+    /// and on the rows the doorbell's writer reads off a rendered screen,
+    /// which shorten each rule.
+    #[test]
+    fn claude_prompt_is_recognised_and_dialogs_are_not() {
+        let rendered = |screen: &str| {
+            crate::pane_screen_text::visible_rows_and_cursor(
+                screen.replace('\n', "\r\n").as_bytes(),
+                24,
+                80,
+            )
+            .expect("parsed")
+            .0
+        };
+        let rule = "─".repeat(78);
+        let frame =
+            format!("▐▛███▜▌   Claude Code v2.1.300\n\n{rule}\n❯\n{rule}\n  ? for shortcuts");
+        assert!(claude_prompt_on_screen(&rendered(&frame)));
+        assert!(!claude_prompt_on_screen(&rendered(&format!(
+            "{rule}\n❯ 1. Yes, I trust this folder\n  2. No, exit\n{rule}"
+        ))));
+        let prompt =
+            format!("▐▛███▜▌   Claude Code v2.1.300\n\n{rule}\n❯\n{rule}\n  ? for shortcuts");
+        assert!(claude_prompt_on_screen(&rows(&prompt)));
+        let wrapped = format!("{rule}\n❯ a draft that\n  wraps onto a second row\n{rule}\n");
+        assert!(claude_prompt_on_screen(&rows(&wrapped)));
+        assert!(!claude_prompt_on_screen(&rows(
+            "▐▛███▜▌   Claude Code v2.1.300\nDOORBELL-STANDIN-READY"
+        )));
+        let dialog = format!("{rule}\n❯ 1. Yes, I trust this folder\n  2. No, exit\n{rule}\n");
+        assert!(!claude_prompt_on_screen(&rows(&dialog)));
+        let unclosed = format!("{rule}\n❯\n\n  ? for shortcuts");
+        assert!(!claude_prompt_on_screen(&rows(&unclosed)));
     }
 
     /// PRD #1666 S7: the Codex composer recogniser accepts the measured 0.160.0

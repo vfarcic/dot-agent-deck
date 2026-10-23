@@ -1211,6 +1211,33 @@ describe("New agent dialog — after the start (PRD #1223 M5)", () => {
   });
 
   /**
+   * Scenario: daemon process A accepts the start and returns agent `7`. Before
+   * the wait sees it, the deck restarts as process B and lists an unrelated
+   * agent `7`: the dialog keeps waiting and opens nothing. When the deck lists
+   * A's `7` (control), the pane is asked for once, bound to process A; a start
+   * that named no process must likewise wait for an unnamed row.
+   */
+  it.each(["process-a", undefined])("never takes a restarted deck's agent with the same id for the one it started (%s)", async (startedBy) => {
+    const runtime = fakeRuntime({ runAction: vi.fn(async () => ({ ok: true, agentId: "7", agentIncarnation: startedBy })) });
+    const { onAppeared, rerenderWith } = renderDialog(runtime, { initialDeckId: LOCAL });
+    await reachForm();
+
+    fireEvent.click(screen.getByTestId("new-agent-start"));
+    expect(await screen.findByTestId("new-agent-waiting")).toBeVisible();
+
+    const listing = (incarnation: string | undefined) => [deck(LOCAL, { deckKind: "local" }, [{ ...createFixtureStartedAgent({ id: "7", daemonId: LOCAL }), incarnation }]), runtime.fleet[1]];
+    await act(async () => {
+      rerenderWith({ ...runtime, fleet: listing("process-b") });
+    });
+    expect(onAppeared).not.toHaveBeenCalled();
+    expect(screen.getByTestId("new-agent-waiting")).toBeVisible();
+
+    rerenderWith({ ...runtime, fleet: listing(startedBy) });
+    await waitFor(() => expect(onAppeared).toHaveBeenCalledTimes(1));
+    expect(onAppeared).toHaveBeenCalledWith({ deckId: LOCAL, agentId: "7", incarnation: startedBy });
+  });
+
+  /**
    * Scenario: the daemon accepts the start and never lists the agent. Once the
    * bound passes, the flow reports the agent as started on that daemon and not
    * yet listed — and a listing that arrives afterwards opens nothing.

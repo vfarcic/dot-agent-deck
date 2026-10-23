@@ -15,7 +15,7 @@
 //! stage report that comes before this watcher has read its registration, or
 //! before the daemon's `rebound` answer for its attempt, waits for them, the
 //! attempt held meanwhile. A final attempt of an earlier watcher of the same
-//! slot whose late commit still corrects the sender comes in the registration
+//! slot whose late commit can still correct the sender comes in the registration
 //! as `correctable`, with its commit cap alone (r8k R8G-03): the cap stays
 //! here, so a commit the component reports again for it is published, and the
 //! component is forwarded the bare ref. A stage report for an attempt whose cap this
@@ -58,13 +58,17 @@ pub const ENV_TEST_REBIND_DELAY_MS: &str = "DOT_AGENT_DECK_INBOX_TEST_REBIND_DEL
 /// report a stage to a replacement watcher before it has registered.
 pub const ENV_TEST_REGISTER_DELAY_MS: &str = "DOT_AGENT_DECK_INBOX_TEST_REGISTER_DELAY_MS";
 
-/// Every TEST knob above. A spawned agent inherits none of them from the
-/// daemon's environment (`agent_pty`); a test sets one explicitly.
-pub const TEST_KNOBS: [&str; 4] = [
+/// Every TEST knob above, and the one-shot receivers'
+/// ([`crate::inbox_oneshot::ENV_TEST_HOOK_INTEGRATION`],
+/// [`crate::inbox_oneshot::ENV_TEST_EXIT_AFTER_GRANT`]). A spawned agent
+/// inherits none of them from the daemon's environment (`agent_pty`); a test sets one explicitly.
+pub const TEST_KNOBS: [&str; 6] = [
     ENV_TEST_PUBLISH_DELAY_MS,
     ENV_TEST_DROP_COMMITTED,
     ENV_TEST_REBIND_DELAY_MS,
     ENV_TEST_REGISTER_DELAY_MS,
+    crate::inbox_oneshot::ENV_TEST_HOOK_INTEGRATION,
+    crate::inbox_oneshot::ENV_TEST_EXIT_AFTER_GRANT,
 ];
 
 #[cfg(not(unix))]
@@ -666,6 +670,7 @@ mod unix {
                     rx: 5,
                     slot: "opencode_tui".into(),
                     keepalive_ms: 30_000,
+                    grant_ttl_ms: None,
                 }),
                 correctable: vec![InboxCorrectable {
                     id: listed.id.clone(),
