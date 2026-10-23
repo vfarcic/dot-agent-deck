@@ -95,6 +95,30 @@ pub(crate) fn config_write_allowed(dest: &Path) -> bool {
     check_config_write(dest).is_ok()
 }
 
+/// Whether the deck's file logger may open `log` (issues #1791, #1796): always
+/// when containment is unarmed; in a test process only when `log` resolves
+/// inside an owned root and is not the deck's default debug log, which sits in
+/// the OS temp dir — itself a default root — and is shared by every deck on the
+/// machine that runs with `DOT_AGENT_DECK_LOG=1`.
+///
+/// Says nothing when it refuses: it is asked before a logger exists, and the
+/// processes asking include the wrapper, whose stderr is an agent's terminal.
+pub fn log_write_allowed(log: &Path) -> bool {
+    match armed_roots() {
+        Ok(None) => true,
+        Ok(Some(roots)) => check_within_roots(log, &roots).is_ok() && !is_default_debug_log(log),
+        Err(_) => false,
+    }
+}
+
+/// Whether `log` resolves to the same file as the default debug log. A default
+/// that cannot be resolved is compared as spelled.
+fn is_default_debug_log(log: &Path) -> bool {
+    let default = crate::platform::paths::default_debug_log_path();
+    let resolved = resolve_for_containment(&default).unwrap_or(default);
+    resolve_for_containment(log).is_ok_and(|log| log == resolved)
+}
+
 /// [`ensure_config_write_allowed`] without the log line.
 fn check_config_write(dest: &Path) -> io::Result<()> {
     let Some(roots) = armed_roots()? else {

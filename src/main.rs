@@ -2597,16 +2597,10 @@ async fn run_dashboard() -> ExitCode {
 /// soundness invariant the login-shell PATH capture relies on.
 fn init_logging_from_env() {
     if let Ok(log_val) = std::env::var("DOT_AGENT_DECK_LOG") {
-        // Issue #1135: the default is resolved per platform, not spelled as a
-        // Unix literal. `/tmp/...` is rooted but driveless on Windows, so it
-        // resolved against the current drive as `\tmp\dot-agent-deck.log` —
-        // a directory that usually does not exist, and the open below creates
-        // the file but never its parent, so the subscriber was never installed
-        // and nothing was logged. An explicit value is still used verbatim.
-        let log_path = if log_val.is_empty() || log_val == "1" {
-            dot_agent_deck::platform::paths::default_debug_log_path()
-        } else {
-            std::path::PathBuf::from(log_val)
+        // `None` only in a test process whose inherited log is not its own
+        // (issues #1791, #1796); see `logging::log_path`.
+        let Some(log_path) = dot_agent_deck::logging::log_path(&log_val) else {
+            return;
         };
         match std::fs::OpenOptions::new()
             .create(true)
