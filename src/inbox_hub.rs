@@ -1899,9 +1899,10 @@ impl InboxHub {
                 // deck never handed out, still waiting for its agent or
                 // assigned to it as an offer: no fetch is left that could have
                 // shown the agent its body. A settled, claimed or
-                // undeliverable copy still answers as the store does, so a
-                // late ack of a copy out of attempts still corrects its
-                // sender.
+                // undeliverable copy the model holds no attempt of answers as
+                // the store does. That is the only way this ack records a
+                // late ack of a copy out of attempts: one the model refused
+                // above answered `unknown`.
                 engine::ExplicitCommit::NoAttempt
                     if st.inbox.state_for(id, pane_id, agent_id) == Some(&MessageState::Queued) =>
                 {
