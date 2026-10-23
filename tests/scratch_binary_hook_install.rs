@@ -975,3 +975,73 @@ fn install_019_refresh_reports_an_agent_whose_hooks_it_could_not_update() {
     claude_failed(&report, &all);
     assert_eq!(std::fs::read(fixture.settings()).unwrap(), before);
 }
+
+/// Scenario: Run the real installed copy's `hooks refresh --json` where an agent's config folder cannot be looked at: OpenCode's config under a `~/.config` that cannot be searched, and Claude Code's `~/.claude` pointing into a folder that cannot be searched. Each time the report is not ok, says that agent's hooks could not be updated and gives its `hooks install` command, rather than leaving the agent out. A control with no OpenCode or Claude Code folder at all still reports that no installed agent was found.
+#[spec("hooks/install/020")]
+#[test]
+fn install_020_refresh_reports_an_agent_whose_config_folder_it_cannot_inspect() {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: `geteuid` has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        println!("SKIP: running as root, which ignores the directory modes this case relies on");
+        return;
+    }
+    let failed = |report: &serde_json::Value, all: &str, label: &str, agent: &str| {
+        assert_eq!(report["ok"], false, "{all}");
+        let texts = report_texts(report);
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.starts_with(&format!("{label} hooks could not be updated"))),
+            "{all}"
+        );
+        assert!(
+            !texts.iter().any(|text| text.contains("No installed agent")),
+            "{all}"
+        );
+        assert!(
+            report_commands(report)
+                .iter()
+                .any(|command| command.ends_with(&format!(" hooks install --agent {agent}"))),
+            "{all}"
+        );
+    };
+
+    // The control: neither agent's folder exists, so neither is installed.
+    let fixture = Fixture::installed_home();
+    let installed = fixture.home().join(".local/bin/dot-agent-deck");
+    fixture.copy_deck_to(&installed);
+    std::fs::remove_dir(fixture.home().join(".claude")).unwrap();
+    let (ok, report, all) = fixture.refresh(&installed, &fixture.path().join("emptybin"));
+    assert!(ok, "{all}");
+    assert_eq!(report["ok"], true, "{all}");
+    assert!(
+        report_texts(&report)
+            .iter()
+            .any(|text| text.contains("No installed agent")),
+        "{all}"
+    );
+
+    // OpenCode's XDG root exists under a `~/.config` that cannot be searched,
+    // and there is no legacy `~/.opencode`.
+    let config = fixture.home().join(".config");
+    std::fs::create_dir_all(config.join("opencode")).unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let result = fixture.refresh(&installed, &fixture.path().join("emptybin"));
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (ok, report, all) = result;
+    assert!(!ok, "{all}");
+    failed(&report, &all, "OpenCode's", "opencode");
+    std::fs::remove_dir_all(&config).unwrap();
+
+    // Claude Code's `~/.claude` points into a folder that cannot be searched.
+    let locked = fixture.path().join("locked");
+    std::fs::create_dir_all(locked.join("claude")).unwrap();
+    std::os::unix::fs::symlink(locked.join("claude"), fixture.home().join(".claude")).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let result = fixture.refresh(&installed, &fixture.path().join("emptybin"));
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (ok, report, all) = result;
+    assert!(!ok, "{all}");
+    failed(&report, &all, "Claude Code's", "claude-code");
+}

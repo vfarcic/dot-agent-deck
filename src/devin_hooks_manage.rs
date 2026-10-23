@@ -195,6 +195,8 @@ fn devin_present_on_path() -> bool {
     };
     std::env::split_paths(&path).any(|dir| {
         let candidate = dir.join("devin");
+        // Any error is absence here, not a failed inspection: a `devin` that
+        // cannot be inspected cannot be run from this `PATH` entry either.
         let Ok(meta) = std::fs::metadata(&candidate) else {
             return false;
         };

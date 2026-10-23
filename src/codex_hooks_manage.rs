@@ -2315,6 +2315,8 @@ fn codex_present_on_path() -> bool {
     };
     std::env::split_paths(&path).any(|dir| {
         let candidate = dir.join("codex");
+        // Any error is absence here, not a failed inspection: a `codex` that
+        // cannot be inspected cannot be run from this `PATH` entry either.
         let Ok(meta) = std::fs::metadata(&candidate) else {
             return false;
         };
@@ -2389,7 +2391,10 @@ fn install_and_trust_at_startup() -> Option<Result<Vec<crate::hook_binary::HookP
     // back to a wider predicate (issue #730).
     let binary_paths = match try_auto_install_in(&home) {
         Ok(binary_paths) => binary_paths,
-        Err(e) => return Some(Err(e)),
+        Err(e) => {
+            tracing::debug!("codex startup install: skipped trust (the install wrote nothing)");
+            return Some(Err(e));
+        }
     };
     let pins = binary_paths
         .iter()

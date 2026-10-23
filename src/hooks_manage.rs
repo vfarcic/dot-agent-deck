@@ -1547,8 +1547,8 @@ fn configured_pins_in(path: &Path) -> Option<Vec<crate::hook_binary::HookPin>> {
 /// that value never reaches the file.
 ///
 /// The resolver is called only after the settings *directory* check, so the
-/// common "Claude Code not installed" case still costs one `exists()` and no
-/// filesystem walk.
+/// common "Claude Code not installed" case still costs one `try_exists()` and
+/// no filesystem walk.
 ///
 /// Issue #714: this seam installs the base hook set, which every Claude Code
 /// accepts, and never the version-gated `StopFailure`; [`auto_install_to_gated`]
@@ -1583,8 +1583,16 @@ fn try_auto_install_to_gated(
     resolve: impl FnOnce() -> Result<String, String>,
     gates: impl FnOnce() -> ClaudeHookGates,
 ) -> Result<Option<crate::hook_binary::HookPin>, String> {
-    if path.parent().is_none_or(|p| !p.exists()) {
+    // Only a directory confirmed missing means Claude Code is not installed:
+    // one that cannot be inspected is a failure to report (PRD #1666 part 3),
+    // and nothing is written either way.
+    let Some(dir) = path.parent() else {
         return Ok(None);
+    };
+    match dir.try_exists() {
+        Ok(true) => {}
+        Ok(false) => return Ok(None),
+        Err(e) => return Err(format!("could not inspect {}: {e}", dir.display())),
     }
 
     // PRD #381 M6: no durable path means no write at all — not a bare

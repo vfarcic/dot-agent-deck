@@ -2721,6 +2721,13 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** OpenCode's or Devin's failures (their `refresh_install` reuses the same startup install), an upgrade client showing the report (`self_upgrade::agent_hooks` unit tests, `upgrade/cli-upgrade/008`).
 - **Platform coverage:** mac+linux.
 
+##### hooks/install/020 — `hooks refresh` reports an agent whose config folder it cannot inspect, rather than leaving it out (PRD #1666 part 3, R-3).
+- **Layer:** fast real-binary subprocess integration (`tests/scratch_binary_hook_install.rs`), the real `hooks refresh --json` from a copy in an isolated HOME's `.local/bin`.
+- **Agent:** none.
+- **Asserts:** with no Claude Code or OpenCode folder the report is ok and says no installed agent was found; an OpenCode XDG root under a `~/.config` that cannot be searched (no legacy `~/.opencode`), and a `~/.claude` symlink into a folder that cannot be searched, each give a non-zero exit, `ok: false`, `<agent>'s hooks could not be updated…` and that agent's `hooks install` command, and no `No installed agent` line.
+- **Does not assert:** Codex or Devin, which count as installed by an executable on `PATH` rather than by a config folder, and whose install creates and reports on that folder itself; a root run, which prints `SKIP:` because root ignores the directory modes.
+- **Platform coverage:** mac+linux.
+
 #### hooks/stale
 
 ##### hooks/stale/001 — The notice names the agents, binary, versions and remedy, keeping the agents and both versions at 60 columns.
