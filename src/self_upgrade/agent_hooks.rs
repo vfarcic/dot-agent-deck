@@ -59,10 +59,13 @@ pub fn after_upgrade(host: &dyn Host, plan: &UpgradePlan, outcome: &Outcome) -> 
     if let (Outcome::Staged { .. }, PlanAction::StagedInstall { target, .. }) =
         (outcome, &plan.action)
     {
-        return vec![
-            PlanLine::Text(NOT_INSTALLED.to_string()),
-            PlanLine::Command(refresh_command(target)),
-        ];
+        return match refresh_command(target) {
+            Some(command) => vec![
+                PlanLine::Text(NOT_INSTALLED.to_string()),
+                PlanLine::Command(command),
+            ],
+            None => vec![PlanLine::Text(NOT_INSTALLED_UNSHOWN.to_string())],
+        };
     }
     let Some(cli) = installed_cli(plan, outcome) else {
         return Vec::new();
@@ -92,17 +95,31 @@ pub fn after_upgrade(host: &dyn Host, plan: &UpgradePlan, outcome: &Outcome) -> 
 /// Said after a download the user has still to install.
 pub const NOT_INSTALLED: &str =
     "Agent hooks were not updated. Once it is installed, update them with:";
+/// Said instead of [`NOT_INSTALLED`] and its command when the install's path
+/// cannot be shown faithfully in one.
+pub const NOT_INSTALLED_UNSHOWN: &str = "Agent hooks were not updated. Once it is installed, run `hooks refresh` with the installed dot-agent-deck to update them; its path cannot be shown safely here.";
 /// The reason given when the installed copy's answer could not be read.
 const UNREADABLE: &str = "its answer could not be read";
 /// The reason given when the installed copy did not answer in time.
 const TIMED_OUT: &str = "it did not answer in time";
 
-/// `binary hooks refresh`, for this platform's default shell.
-fn refresh_command(binary: &std::path::Path) -> String {
-    format!(
-        "{} hooks refresh",
-        crate::hook_binary::shell_program(&binary.to_string_lossy())
-    )
+/// `binary hooks refresh`, for this platform's default shell, or `None` when
+/// `binary` cannot be shown faithfully in a command.
+fn refresh_command(binary: &std::path::Path) -> Option<String> {
+    command_for(binary, "hooks refresh")
+}
+
+/// `binary <args>` for this platform's default shell, through the upgrade's
+/// own check of a path a shown command names
+/// ([`crate::self_upgrade::plan::shown_path`]): `None` for a path that is not
+/// UTF-8, too long, or carries a character a reader would not see, so no
+/// command ever names another file than `binary`.
+fn command_for(binary: &std::path::Path, args: &str) -> Option<String> {
+    let shown = crate::self_upgrade::plan::shown_path(binary)?;
+    Some(format!(
+        "{} {args}",
+        crate::hook_binary::shell_program(shown)
+    ))
 }
 
 /// The installed copy's report as a client shows it: each text made one safe
@@ -131,17 +148,23 @@ fn shown(report: &RefreshReport) -> Vec<PlanLine> {
 /// What the client says when the installed copy's hooks could not be checked:
 /// why, and the command that updates Claude Code's hooks, the agent whose
 /// older hooks leave its messages waiting.
+/// When `cli` cannot be shown faithfully in a command, the same is said in
+/// words, with no command.
 fn unchecked(cli: &std::path::Path, reason: &str) -> Vec<PlanLine> {
-    vec![
-        PlanLine::Text(format!(
-            "The CLI was upgraded, but its agent hooks could not be checked: {reason}. To update Claude Code's hooks, run:"
-        )),
-        PlanLine::Command(format!(
-            "{} hooks install --agent claude-code",
-            crate::hook_binary::shell_program(&cli.to_string_lossy())
-        )),
-        PlanLine::Text(crate::hooks_refresh::RESTART_AFTER.to_string()),
-    ]
+    let lead = format!("The CLI was upgraded, but its agent hooks could not be checked: {reason}.");
+    match command_for(cli, "hooks install --agent claude-code") {
+        Some(command) => vec![
+            PlanLine::Text(format!("{lead} To update Claude Code's hooks, run:")),
+            PlanLine::Command(command),
+            PlanLine::Text(crate::hooks_refresh::RESTART_AFTER.to_string()),
+        ],
+        None => vec![
+            PlanLine::Text(format!(
+                "{lead} To update Claude Code's hooks, run `hooks install --agent claude-code` with the upgraded dot-agent-deck; its path cannot be shown safely here."
+            )),
+            PlanLine::Text(crate::hooks_refresh::RESTART_AFTER.to_string()),
+        ],
+    }
 }
 
 #[cfg(test)]
@@ -412,6 +435,133 @@ mod tests {
         );
         assert!(after_upgrade(&host, &app, &replaced()).is_empty());
         assert!(host.ran().is_empty(), "{:?}", host.ran());
+    }
+
+    /// The paths [`crate::self_upgrade::plan`] will not put in a shown
+    /// command (`plan_017`, `plan_018`): control and formatting characters, a
+    /// backslash, a path past the shown length, and one that is not UTF-8.
+    fn unshowable() -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = [
+            "/home/u/state\n/x",
+            "/home/u/st\u{1b}[2Jate/x",
+            "/home/u/\u{202E}etats/x",
+            "/home/u/sta\u{200B}te/x",
+            "/home/u/state\u{FEFF}/x",
+            "/home/u/state\u{0085}/x",
+            "/home/u/back\\slash/x",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        paths.push(PathBuf::from(format!(
+            "/home/u/{}",
+            "x".repeat(crate::self_upgrade::plan::MAX_SHOWN_PATH_CHARS)
+        )));
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            paths.push(PathBuf::from(OsStr::from_bytes(b"/home/u/st\xffate/x")));
+        }
+        paths
+    }
+
+    /// Scenario: the CLI is at a path no command can show faithfully. After a
+    /// download still to be installed, and after an upgrade whose refresh did
+    /// not answer, the client gives the recovery in words, naming the
+    /// subcommand to run from the installed copy, and shows no command and no
+    /// part of the path, rather than a command that names another file.
+    #[test]
+    fn an_unshowable_path_gets_words_not_a_command() {
+        for bad in unshowable() {
+            let staged_plan = plan(
+                CopyKind::Cli,
+                PlanAction::StagedInstall {
+                    target: bad.clone(),
+                    asset: "dot-agent-deck-linux-amd64".into(),
+                    pkexec: None,
+                },
+            );
+            let staged = Outcome::Staged {
+                path: PathBuf::from("/stage/dot-agent-deck"),
+                command: None,
+                version: "0.48.0".into(),
+                provenance: Provenance::Skipped {
+                    reason: "no gh".into(),
+                },
+            };
+            let host = Fake::failing(std::io::ErrorKind::NotFound);
+            let lines = after_upgrade(&host, &staged_plan, &staged);
+            assert!(commands(&lines).is_empty(), "{bad:?}: {lines:?}");
+            let text = texts(&lines);
+            assert!(text.contains("hooks refresh"), "{bad:?}: {text}");
+            assert!(!text.contains("/home/u"), "{bad:?}: {text}");
+
+            let outcome = Outcome::Replaced {
+                path: bad.clone(),
+                version: "0.48.0".into(),
+                provenance: Provenance::Skipped {
+                    reason: "no gh".into(),
+                },
+                synced: true,
+            };
+            let lines = after_upgrade(&host, &replace(), &outcome);
+            assert!(commands(&lines).is_empty(), "{bad:?}: {lines:?}");
+            let text = texts(&lines);
+            assert!(text.contains("could not be checked"), "{bad:?}: {text}");
+            assert!(
+                text.contains("hooks install --agent claude-code"),
+                "{bad:?}: {text}"
+            );
+            assert!(!text.contains("/home/u"), "{bad:?}: {text}");
+        }
+    }
+
+    /// Scenario: the words that replace a command for an unshowable path reach
+    /// the user unchanged in the CLI's output and in the TUI's dialog, which
+    /// both filter what they show, so neither client shows something the
+    /// other does not; the desktop app's side is `self_upgrade_036`.
+    #[test]
+    fn the_clients_show_an_unshowable_paths_recovery_alike() {
+        let host = Fake::failing(std::io::ErrorKind::NotFound);
+        for bad in unshowable() {
+            let outcome = Outcome::Replaced {
+                path: bad.clone(),
+                version: "0.48.0".into(),
+                provenance: Provenance::Skipped {
+                    reason: "no gh".into(),
+                },
+                synced: true,
+            };
+            let lines = after_upgrade(&host, &replace(), &outcome);
+            let words: Vec<String> = lines
+                .iter()
+                .map(|line| match line {
+                    PlanLine::Text(text) => text.clone(),
+                    PlanLine::Command(command) => panic!("{bad:?}: a command {command:?}"),
+                })
+                .collect();
+            let mut printed = Vec::new();
+            crate::self_upgrade::cli::say_items(&mut printed, &lines);
+            assert_eq!(
+                String::from_utf8(printed).unwrap(),
+                format!("{}\n", words.join("\n")),
+                "{bad:?}"
+            );
+            let result = crate::upgrade_dialog::RunResult::from_outcome_and_hooks(
+                &replace(),
+                &outcome,
+                lines.clone(),
+                false,
+            );
+            assert!(result.lines.ends_with(&lines), "{bad:?}");
+            for word in &words {
+                assert_eq!(
+                    crate::untrusted_text::strip_control_and_bidi(word, false),
+                    *word,
+                    "the TUI draws it as it is"
+                );
+            }
+        }
     }
 
     /// Scenario: a `brew upgrade` that reached the release refreshes from the

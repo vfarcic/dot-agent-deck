@@ -53,7 +53,7 @@ pub const COMMAND_NOT_SHOWN: &str =
 /// indented and exactly as the core built it. The core builds no command that
 /// [`say`]'s filter would change, so one that it would is not printed in any
 /// form, rewritten or not: [`COMMAND_NOT_SHOWN`] says it was left out.
-fn say_items(out: &mut dyn Write, items: &[plan::PlanLine]) {
+pub(crate) fn say_items(out: &mut dyn Write, items: &[plan::PlanLine]) {
     for item in items {
         match item {
             plan::PlanLine::Text(text) => say(out, text),

@@ -1857,6 +1857,80 @@ mod tests {
         assert!(state.claim(SelfCopy::Cli, id).is_ok());
     }
 
+    /// PRD #1666 part 3 (R-3): a CLI at a path no command can show faithfully
+    /// gets its hooks recovery from the core in words, after a staged download
+    /// and after an upgrade whose refresh did not answer. The app shows those
+    /// words as the core wrote them, as the TUI and the CLI do
+    /// (`the_clients_show_an_unshowable_paths_recovery_alike`), with nothing
+    /// to copy.
+    #[test]
+    fn self_upgrade_036_an_unshowable_cli_path_gets_the_hooks_recovery_in_words() {
+        let bad = PathBuf::from("/home/u/\u{202E}etats/dot-agent-deck");
+        let cli_plan = |action| UpgradePlan {
+            installation: Installation {
+                copy: CopyKind::Cli,
+                executable: bad.clone(),
+                version: CURRENT.into(),
+                platform: Some(Platform::LinuxAmd64),
+                method: dot_agent_deck::self_upgrade::InstallMethod::DownloadedWritable {
+                    binary: bad.clone(),
+                },
+                tools: Default::default(),
+            },
+            latest: LATEST.into(),
+            action,
+            provenance: ProvenanceCheck::Unavailable {
+                reason: "no gh".into(),
+            },
+            stable_switch: None,
+        };
+        let staged = (
+            cli_plan(PlanAction::StagedInstall {
+                target: bad.clone(),
+                asset: "dot-agent-deck-linux-amd64".into(),
+                pkexec: None,
+            }),
+            Outcome::Staged {
+                path: PathBuf::from("/stage/dot-agent-deck"),
+                command: None,
+                version: LATEST.into(),
+                provenance: provenance(),
+            },
+        );
+        let replaced = (
+            cli_plan(PlanAction::ReplaceBinary {
+                target: bad.clone(),
+                asset: "dot-agent-deck-linux-amd64".into(),
+            }),
+            Outcome::Replaced {
+                path: bad.clone(),
+                version: LATEST.into(),
+                provenance: provenance(),
+                synced: true,
+            },
+        );
+        for (run_plan, outcome) in [staged, replaced] {
+            let hooks = agent_hooks::after_upgrade(&Fake::linux(), &run_plan, &outcome);
+            let words: Vec<String> = hooks
+                .iter()
+                .map(|line| match line {
+                    PlanLine::Text(text) => text.clone(),
+                    PlanLine::Command(command) => panic!("a command {command:?}"),
+                })
+                .collect();
+            assert!(!words.is_empty());
+            let dto = outcome_dto(SelfCopy::Cli, &outcome, hooks);
+            assert!(commands(&dto.lines).is_empty(), "{:?}", dto.lines);
+            let texts = texts(&dto.lines);
+            let shown = &texts[texts.len() - words.len()..];
+            assert_eq!(shown, &words[..]);
+            assert!(
+                shown.iter().all(|text| !text.contains("etats")),
+                "{shown:?}"
+            );
+        }
+    }
+
     /// PRD #1666 part 3 (R-3): what the core says about the agents' hooks
     /// after a CLI upgrade follows the upgrade's own lines, and its command
     /// is copyable exactly as the core built it.
