@@ -1019,7 +1019,7 @@ fn telemetry_otlp_012_daemon_shutdown_flushes_open_run() {
     );
 }
 
-/// Scenario: Send shell-tool start/end hooks for ordinary, wrapped, sandboxed and private commands to a stand-in pane, including assignments whose values hold a path in both the shell-split and Codex's joined-argv form, plus a non-shell tool. Close the pane and inspect completed operation spans for safe program/word metadata, parent identity, duration and count, rejecting private or raw command text from every request body.
+/// Scenario: Send shell-tool start/end hooks for ordinary, wrapped, sandboxed and private commands to a stand-in pane, including assignments whose values hold a path, comments, command substitutions and variable expansions before the program, in both the shell-split and Codex's joined-argv form, plus a non-shell tool. Close the pane and inspect completed operation spans: plain commands carry safe program/word metadata, commands with other shell syntax before their first word carry neither, and no request body holds a sentinel, private or raw command text, alongside parent identity, duration and count.
 #[spec("telemetry/otlp/014")]
 #[test]
 fn telemetry_otlp_014_shell_operations_classify_without_content() {
@@ -1039,7 +1039,7 @@ fn telemetry_otlp_014_shell_operations_classify_without_content() {
         ("cat PRIVATE_FILE_1741_91bd", "cat", ""),
         ("kubectl apply -f /secret/path", "kubectl", "apply"),
         ("npm run \"Weird Name\"", "npm", "run"),
-        ("npm \"Weird Name\"", "npm", ""),
+        ("npm \"Weird Name\"", "", ""),
         (
             "env FOO=1 sudo command time nice /usr/bin/cargo --locked check",
             "cargo",
@@ -1064,6 +1064,18 @@ fn telemetry_otlp_014_shell_operations_classify_without_content() {
             "test",
         ),
         ("1WORKDIR=/private/sentinelvalue1741 cargo test", "", ""),
+        // Shell syntax other than plain words before the first word.
+        ("X=$(printf /x/sentinelvalue1741 ) cargo test", "", ""),
+        ("X=$(cat /x/sentinelvalue1741 ) cargo test", "", ""),
+        ("#/private/sentinelvalue1741 cargo test", "", ""),
+        ("cd /tmp/x && #/private/sentinelvalue1741", "", ""),
+        ("$VAR/x/sentinelvalue1741 cargo", "", ""),
+        (
+            "bash -c 'X=$(cat /x/sentinelvalue1741 ) cargo test'",
+            "",
+            "",
+        ),
+        ("bash -c 'cd /tmp/x && cargo build'", "cargo", "build"),
     ];
     // Codex's `shell` tool reports a joined argv: its program at most.
     let joined_cases = [
@@ -1074,6 +1086,18 @@ fn telemetry_otlp_014_shell_operations_classify_without_content() {
             "",
         ),
         ("/bin/sh -lc /usr/bin/cargo test", "cargo", ""),
+        ("/bin/sh -lc #/private/sentinelvalue1741", "", ""),
+        (
+            "/bin/sh -lc #note/private/sentinelvalue1741 cargo test",
+            "",
+            "",
+        ),
+        (
+            "/bin/sh -lc X=$(printf /x/sentinelvalue1741 ) cargo test",
+            "",
+            "",
+        ),
+        ("/bin/sh -lc $VAR/x/sentinelvalue1741", "", ""),
     ];
     let all_cases: Vec<_> = cases
         .iter()

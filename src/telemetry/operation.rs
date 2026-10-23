@@ -15,19 +15,22 @@
 //! neither a program nor a word, nor does a program that is not kept. The text
 //! itself is not stored, logged or returned.
 //!
-//! Only the first line counts, as the deck's cards show it, and only up to a
-//! shell comment: an unquoted `#` starting a word ends it. It is split on
-//! `&&`, `||`, `;` and `|` outside quotes into words, and those words keep the
-//! boundaries the shell gives them: a quoted argument stays one word wherever
-//! it is unwrapped from, and a shell's `-c` script is read as a script, its
-//! later arguments not. A shell reading its script from
-//! standard input (`bash -s …`) gives its name only. The first segment that runs
-//! something other than a shell builtin that only sets up the next one
-//! ([`SETUP_PROGRAMS`]) is the one classified — after its leading `VAR=value`
+//! **Only a plain command names anything.** Shell syntax is not parsed: a
+//! word read that an allow-list does not match declines the command, neither
+//! program nor word. Only the first line counts, as the deck's cards show it,
+//! split on `&&`, `||`, `;` and `|`. The first segment that runs something
+//! other than a shell builtin that only sets up the next one
+//! ([`SETUP_PROGRAMS`]) is the one classified, after its leading `NAME=value`
 //! assignments and an `env`, `sudo`, `command`, `time` or `nice` in front,
-//! with their options and the options' values. A program word that still has
-//! a `=` in it names no program: what follows its last `/` may be part of a
-//! value.
+//! with the options each knows and the options' values. Every word read on
+//! the way, up to and including the program's first non-option argument, must
+//! be a simple word (`is_simple_word`) or, where an assignment can stand, a
+//! simple assignment (`is_simple_assignment`). A quote, an escape, a `$`, a
+//! backtick, a comment, a group, a redirection or a glob in one of them
+//! declines the command, and no later segment is read. Words after the first
+//! argument are not read. The one quoted word read is a shell's `-c` script:
+//! a single `'…'` or `"…"` with no quote, `$`, backtick or `\` inside
+//! (`unquote`), whose inside is read by this same rule.
 
 /// What [`classify`] keeps of a command.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -111,9 +114,10 @@ struct Options {
     short_values: &'static str,
     /// Short options that take none.
     short_flags: &'static str,
-    /// Long options that take a value: `--chdir dir` or `--chdir=dir`.
+    /// Long options that take a value: `--chdir dir`. An attached
+    /// `--chdir=dir` is not a simple word, so it declines.
     long_values: &'static [&'static str],
-    /// Long options that take none, or only an attached `=value`.
+    /// Long options that take none.
     long_flags: &'static [&'static str],
     /// Whether a number is an option: `nice -10`.
     numbers: bool,
@@ -217,11 +221,45 @@ pub fn is_command_word(word: &str) -> bool {
         && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
 }
 
+/// The punctuation a simple word may hold besides ASCII letters and digits.
+const SIMPLE_WORD_PUNCTUATION: &[u8] = b"/._+:,@%-";
+
+/// `^[A-Za-z0-9/._+:,@%-]+$`: a word the shell reads as it is written. No
+/// `$`, backtick, quote, `#`, `(`, `)`, `{`, `}`, `[`, `]`, `\`, `<`, `>`, `*`,
+/// `?`, `!`, `~`, `=`, `&`, `;`, `|` or whitespace.
+fn is_simple_word(word: &str) -> bool {
+    !word.is_empty()
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || SIMPLE_WORD_PUNCTUATION.contains(&b))
+}
+
+/// `NAME=value`, `NAME` matching `^[A-Za-z_][A-Za-z0-9_]*$` and `value` empty
+/// or a simple word.
+fn is_simple_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, value)| {
+        name.bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            && (value.is_empty() || is_simple_word(value))
+    })
+}
+
+/// The inside of `word` when it is one quoted string, `'…'` or `"…"`, with no
+/// quote, `$`, backtick or `\` inside: the shell reads it literally either way.
+fn unquote(word: &str) -> Option<&str> {
+    let quote = word.chars().next().filter(|c| matches!(c, '\'' | '"'))?;
+    word[1..]
+        .strip_suffix(quote)
+        .filter(|inside| !inside.contains(['\'', '"', '$', '`', '\\']))
+}
+
 /// Classify the command a shell tool call reported. `None` for no text gives
 /// an operation with neither program nor word.
 pub fn classify(command: Option<&str>) -> Operation {
     let line = command.and_then(|c| c.lines().next()).unwrap_or("");
-    classify_line(line, 0)
+    classify_line(line)
 }
 
 /// [`classify`] for a command reported as an argv joined with single spaces,
@@ -229,11 +267,11 @@ pub fn classify(command: Option<&str>) -> Operation {
 /// is lost, so no word is read from it at all: only the program, and only
 /// where it is certain. That is the first word of the line, or, for a shell
 /// run as `<shell> -c <script>` (Codex runs its commands as
-/// `["/bin/sh", "-lc", "<script>"]`), the first word of the script. A program
-/// that only sets up, prefixes or wraps the next one gives nothing, since that
-/// one's words may belong to a later argument; so does a program word with a
-/// `=` in it (a `VAR=value` assignment among them), a line with an empty
-/// argument in it, or a shell with any other options.
+/// `["/bin/sh", "-lc", "<script>"]`), the first word of the script, each only
+/// when it is a simple word. A program that only sets up, prefixes or wraps
+/// the next one gives nothing, since that one's words may belong to a later
+/// argument; so does a line with an empty argument in it, or a shell with any
+/// other options.
 pub fn classify_joined_argv(command: Option<&str>) -> Operation {
     let line = command.and_then(|c| c.lines().next()).unwrap_or("");
     let words: Vec<&str> = line.split(' ').collect();
@@ -244,22 +282,19 @@ pub fn classify_joined_argv(command: Option<&str>) -> Operation {
     }
     let program = match words.as_slice() {
         [shell, flags, script @ ..]
-            if program_name(shell).is_some_and(|shell| SHELLS.contains(&shell)) =>
+            if is_simple_word(shell) && SHELLS.contains(&program_name(shell)) =>
         {
             let dash_c = flags.strip_prefix('-').is_some_and(|cluster| {
                 cluster.contains('c')
                     && cluster.chars().all(|c| c == 'c' || SHELL_FLAGS.contains(c))
             });
             match script {
-                [program, ..] if dash_c => program_name(program),
+                [program, ..] if dash_c && is_simple_word(program) => program_name(program),
                 _ => return Operation::default(),
             }
         }
-        [program, ..] => program_name(program),
-        [] => return Operation::default(),
-    };
-    let Some(program) = program else {
-        return Operation::default();
+        [program, ..] if is_simple_word(program) => program_name(program),
+        _ => return Operation::default(),
     };
     let unsure = SETUP_PROGRAMS.contains(&program)
         || SHELLS.contains(&program)
@@ -270,38 +305,42 @@ pub fn classify_joined_argv(command: Option<&str>) -> Operation {
     named(program, &[])
 }
 
-/// How deep `sh -c '…'` nesting is followed.
-const MAX_NESTING: usize = 2;
-
-fn classify_line(line: &str, depth: usize) -> Operation {
+fn classify_line(line: &str) -> Operation {
     segments(line)
         .iter()
-        .find_map(|segment| classify_words(segment, depth))
+        .find_map(|segment| classify_words(segment))
         .unwrap_or(Operation::default())
 }
 
 /// Classify one segment's words. `None` when the segment only sets up the
 /// next one.
-fn classify_words(segment: &[String], depth: usize) -> Option<Operation> {
+fn classify_words(segment: &[&str]) -> Option<Operation> {
     let Some(words) = command_words(segment) else {
         return Some(Operation::default());
     };
-    let first = words.first()?;
-    let Some(program) = program_name(first) else {
-        return Some(Operation::default());
-    };
-    if SETUP_PROGRAMS.contains(&program) {
-        return None;
-    }
+    let program = program_name(words.first()?);
     let rest = &words[1..];
+    if SETUP_PROGRAMS.contains(&program) {
+        // All of its words are read: a quote or a substitution in one could
+        // hide where the next segment starts.
+        let plain = rest
+            .iter()
+            .all(|w| is_simple_word(w) || is_simple_assignment(w));
+        return (!plain).then(Operation::default);
+    }
     if SHELLS.contains(&program) {
         return Some(match shell_operand(rest) {
             None => Operation::default(),
             Some(ShellInput::File(at)) => named(program, &rest[at..]),
             Some(ShellInput::Stdin) => named(program, &[]),
-            Some(ShellInput::Command(_)) if depth >= MAX_NESTING => named(program, &[]),
-            Some(ShellInput::Command(at)) => match rest.get(at) {
-                Some(script) => classify_line(script, depth + 1),
+            // A quoted script holds no quote, so a script inside it is one
+            // simple word: the nesting ends there.
+            Some(ShellInput::Command(at)) => match rest.get(at).and_then(|&script| {
+                Some(script)
+                    .filter(|s| is_simple_word(s))
+                    .or_else(|| unquote(script))
+            }) {
+                Some(script) => classify_line(script),
                 None => Operation::default(),
             },
         });
@@ -311,54 +350,63 @@ fn classify_words(segment: &[String], depth: usize) -> Option<Operation> {
 
 /// An operation running `program` with `args`, its words filtered. No
 /// word is kept for a program that is not kept: what it is cannot be told.
-fn named(program: &str, args: &[String]) -> Operation {
-    let program = Some(program.to_string()).filter(|p| is_command_word(p));
-    let word = match &program {
-        Some(program) if !WORDLESS_PROGRAMS.contains(&program.as_str()) => args
-            .iter()
-            .find(|a| !a.starts_with('-') && !a.starts_with('+'))
-            .filter(|w| is_command_word(w))
-            .cloned(),
-        _ => None,
-    };
-    Operation { program, word }
+/// The arguments are read up to the first that is not an option, each a
+/// simple word, or the command declines — for one of [`WORDLESS_PROGRAMS`]
+/// too, though its word is then dropped.
+fn named(program: &str, args: &[&str]) -> Operation {
+    if !is_command_word(program) {
+        return Operation::default();
+    }
+    let mut word = None;
+    for arg in args {
+        if !is_simple_word(arg) {
+            return Operation::default();
+        }
+        if !arg.starts_with('-') && !arg.starts_with('+') {
+            word = Some(arg.to_string())
+                .filter(|w| is_command_word(w) && !WORDLESS_PROGRAMS.contains(&program));
+            break;
+        }
+    }
+    Operation {
+        program: Some(program.to_string()),
+        word,
+    }
 }
 
-/// The basename of the program `word` runs. `None` for a word with a `=` in
-/// it: an assignment, or a path through one, whose last part is a value's,
-/// not a program's.
-fn program_name(word: &str) -> Option<&str> {
-    (!word.contains('=')).then(|| word.rsplit('/').next().unwrap_or(word))
+/// The basename of the program a simple word runs.
+fn program_name(word: &str) -> &str {
+    word.rsplit('/').next().unwrap_or(word)
 }
 
 /// A segment's words from its program on: leading assignments and the prefix
 /// programs in front of it, with their options, the options' values and
-/// assignments, dropped. `None` when a prefix's options cannot be told apart
-/// from the command it runs.
-fn command_words(segment: &[String]) -> Option<&[String]> {
+/// assignments, dropped. `None` when one of those words is not simple, or a
+/// prefix's options cannot be told apart from the command it runs.
+fn command_words<'a>(segment: &'a [&'a str]) -> Option<&'a [&'a str]> {
     let mut words = segment;
     loop {
-        let assignments = words
-            .iter()
-            .take_while(|w| crate::event::is_env_assignment(w))
-            .count();
+        let assignments = words.iter().take_while(|w| is_simple_assignment(w)).count();
         words = &words[assignments..];
         let Some(first) = words.first() else {
             return Some(words);
         };
+        if !is_simple_word(first) {
+            return None;
+        }
         let prefix = program_name(first);
         let options = match prefix {
-            Some("env") => &ENV,
-            Some("sudo") => &SUDO,
-            Some("command") => &COMMAND,
-            Some("time") => &TIME,
-            Some("nice") => &NICE,
+            "env" => &ENV,
+            "sudo" => &SUDO,
+            "command" => &COMMAND,
+            "time" => &TIME,
+            "nice" => &NICE,
             _ => return Some(words),
         };
         let len = options_len(&words[1..], options)?;
         // `command -v cargo` looks `cargo` up and runs nothing: the program
         // is `command`.
-        if prefix == Some("command")
+        if prefix == "command"
             && words[1..=len]
                 .iter()
                 .any(|w| !w.starts_with("--") && w.starts_with('-') && w.contains(['v', 'V']))
@@ -370,49 +418,56 @@ fn command_words(segment: &[String]) -> Option<&[String]> {
 }
 
 /// How many of `words` are `options` with their values, up to the command
-/// they run (past a `--`). `None` when one is not an option `options` knows,
-/// or its value is missing.
-fn options_len(words: &[String], options: &Options) -> Option<usize> {
+/// they run (past a `--`). `None` when an option is not a simple word or not
+/// one `options` knows, or its value is missing or not a simple word.
+fn options_len(words: &[&str], options: &Options) -> Option<usize> {
     let mut i = 0;
-    while let Some(word) = words.get(i) {
+    while let Some(&word) = words.get(i) {
+        // The command, or an assignment in front of it, is read by the
+        // caller.
+        if !word.starts_with('-') || word == "-" {
+            break;
+        }
+        if !is_simple_word(word) {
+            return None;
+        }
         if word == "--" {
             return Some(i + 1);
         }
-        if let Some(long) = word.strip_prefix("--") {
-            let (name, attached) = match long.split_once('=') {
-                Some((name, _)) => (name, true),
-                None => (long, false),
-            };
-            if options.long_values.contains(&name) {
-                i += if attached { 1 } else { 2 };
-            } else if options.long_flags.contains(&name) {
-                i += 1;
+        let takes_value = if let Some(long) = word.strip_prefix("--") {
+            if options.long_values.contains(&long) {
+                true
+            } else if options.long_flags.contains(&long) {
+                false
             } else {
                 return None;
             }
-            continue;
-        }
-        let Some(cluster) = word.strip_prefix('-').filter(|c| !c.is_empty()) else {
-            break;
+        } else {
+            let cluster = &word[1..];
+            if options.numbers && cluster.bytes().all(|b| b.is_ascii_digit()) {
+                false
+            } else {
+                let mut takes_next = false;
+                for (at, c) in cluster.char_indices() {
+                    if options.short_values.contains(c) {
+                        // A value attached to the option is the rest of this
+                        // word.
+                        takes_next = at + c.len_utf8() == cluster.len();
+                        break;
+                    }
+                    if !options.short_flags.contains(c) {
+                        return None;
+                    }
+                }
+                takes_next
+            }
         };
-        if options.numbers && cluster.bytes().all(|b| b.is_ascii_digit()) {
-            i += 1;
-            continue;
+        if takes_value && !words.get(i + 1).is_some_and(|v| is_simple_word(v)) {
+            return None;
         }
-        let mut takes_next = false;
-        for (at, c) in cluster.char_indices() {
-            if options.short_values.contains(c) {
-                // A value attached to the option is the rest of this word.
-                takes_next = at + c.len_utf8() == cluster.len();
-                break;
-            }
-            if !options.short_flags.contains(c) {
-                return None;
-            }
-        }
-        i += if takes_next { 2 } else { 1 };
+        i += if takes_value { 2 } else { 1 };
     }
-    (i <= words.len()).then_some(i)
+    Some(i)
 }
 
 /// Where a shell reads the commands it runs.
@@ -427,46 +482,53 @@ enum ShellInput {
 }
 
 /// A shell's words after its name, read as its options: where it reads the
-/// commands it runs. `None` when an option is not one a shell has, or its
-/// value is missing.
-fn shell_operand(args: &[String]) -> Option<ShellInput> {
+/// commands it runs. `None` when an option is not a simple word or not one a
+/// shell has, or its value is missing or not a simple word.
+fn shell_operand(args: &[&str]) -> Option<ShellInput> {
     let mut command = false;
     let mut stdin = false;
     let mut i = 0;
-    while let Some(word) = args.get(i) {
+    while let Some(&word) = args.get(i) {
+        // The operand is read by the caller: a `-c` script may be quoted.
+        if !word.starts_with(['-', '+']) {
+            break;
+        }
+        if !is_simple_word(word) {
+            return None;
+        }
         if word == "--" || word == "-" {
             i += 1;
             break;
         }
-        if let Some(long) = word.strip_prefix("--") {
-            i += match long {
-                "rcfile" | "init-file" => 2,
+        let values = if let Some(long) = word.strip_prefix("--") {
+            match long {
+                "rcfile" | "init-file" => 1,
                 "login" | "norc" | "noprofile" | "noediting" | "posix" | "restricted"
                 | "verbose" | "debugger" | "dump-strings" | "dump-po-strings" | "help"
-                | "version" | "pretty-print" => 1,
-                _ => return None,
-            };
-            continue;
-        }
-        let (minus, cluster) = match (word.strip_prefix('-'), word.strip_prefix('+')) {
-            (Some(cluster), _) => (true, cluster),
-            (None, Some(cluster)) => (false, cluster),
-            (None, None) => break,
-        };
-        let mut values = 0;
-        for c in cluster.chars() {
-            match c {
-                'c' if minus => command = true,
-                's' => stdin = true,
-                'o' | 'O' => values += 1,
-                c if SHELL_FLAGS.contains(c) => {}
+                | "version" | "pretty-print" => 0,
                 _ => return None,
             }
+        } else {
+            let (minus, cluster) = match word.strip_prefix('-') {
+                Some(cluster) => (true, cluster),
+                None => (false, &word[1..]),
+            };
+            let mut values = 0;
+            for c in cluster.chars() {
+                match c {
+                    'c' if minus => command = true,
+                    's' => stdin = true,
+                    'o' | 'O' => values += 1,
+                    c if SHELL_FLAGS.contains(c) => {}
+                    _ => return None,
+                }
+            }
+            values
+        };
+        if !(1..=values).all(|at| args.get(i + at).is_some_and(|v| is_simple_word(v))) {
+            return None;
         }
         i += 1 + values;
-    }
-    if i > args.len() {
-        return None;
     }
     Some(if command {
         ShellInput::Command(i)
@@ -477,87 +539,55 @@ fn shell_operand(args: &[String]) -> Option<ShellInput> {
     })
 }
 
-/// `line` split into segments on `&&`, `||`, `;` and `|` outside quotes, each
-/// a list of words with the shell's quotes and backslashes removed. A comment
-/// ends the line: an unquoted `#` that starts a word, or follows one of the
-/// shell's operator characters (`&`, `<`, `>`, `(`, `)`), and everything after
-/// it is dropped before any separator in it is read.
-fn segments(line: &str) -> Vec<Vec<String>> {
-    let mut out = Vec::new();
-    let mut words = Vec::new();
-    let mut word = String::new();
-    let mut in_word = false;
-    // Whether the last character read was an unquoted operator character
-    // kept in the word.
-    let mut after_operator = false;
-    let mut chars = line.chars().peekable();
-    let end_word = |word: &mut String, in_word: &mut bool, words: &mut Vec<String>| {
-        if *in_word {
-            words.push(std::mem::take(word));
-            *in_word = false;
+/// `line` split into segments on `&&`, `||`, `;` and `|`, each a list of its
+/// words as written, split on spaces and tabs. Nothing else in the shell's syntax is read, quotes
+/// included, but for one case: a word starting with a quote runs on to the
+/// matching quote, so a quoted `-c` script stays one word for `unquote`. Every
+/// word read before the one classified is a simple word, with no quote in it,
+/// so the split is the shell's up to there.
+fn segments(line: &str) -> Vec<Vec<&str>> {
+    let mut out = vec![Vec::new()];
+    let mut rest = line;
+    loop {
+        rest = rest.trim_start_matches(BLANKS);
+        let Some(first) = rest.chars().next() else {
+            break;
+        };
+        let separator = if rest.starts_with("&&") || rest.starts_with("||") {
+            2
+        } else if matches!(first, ';' | '|') {
+            1
+        } else {
+            0
+        };
+        if separator > 0 {
+            out.push(Vec::new());
+            rest = &rest[separator..];
+            continue;
         }
-    };
-    while let Some(c) = chars.next() {
-        let operator_before = std::mem::take(&mut after_operator);
-        match c {
-            '#' if !in_word || operator_before => break,
-            '\'' => {
-                in_word = true;
-                for q in chars.by_ref() {
-                    if q == '\'' {
-                        break;
-                    }
-                    word.push(q);
-                }
-            }
-            '"' => {
-                in_word = true;
-                while let Some(q) = chars.next() {
-                    match q {
-                        '"' => break,
-                        '\\' => {
-                            if let Some(escaped) = chars.next() {
-                                word.push(escaped);
-                            }
-                        }
-                        other => word.push(other),
-                    }
-                }
-            }
-            '\\' => {
-                in_word = true;
-                if let Some(escaped) = chars.next() {
-                    word.push(escaped);
-                }
-            }
-            ';' | '|' | '&' => {
-                let doubled = chars.peek() == Some(&c);
-                if c == '&' && !doubled {
-                    // A lone `&` (a redirection's or a background job's)
-                    // is kept in the segment.
-                    in_word = true;
-                    after_operator = true;
-                    word.push(c);
-                    continue;
-                }
-                end_word(&mut word, &mut in_word, &mut words);
-                if doubled {
-                    chars.next();
-                }
-                out.push(std::mem::take(&mut words));
-            }
-            c if c.is_whitespace() => end_word(&mut word, &mut in_word, &mut words),
-            other => {
-                in_word = true;
-                after_operator = matches!(other, '<' | '>' | '(' | ')');
-                word.push(other);
-            }
-        }
+        let quoted = match first {
+            '\'' | '"' => rest[1..].find(first).map_or(0, |at| at + 2),
+            _ => 0,
+        };
+        let end = quoted + word_len(&rest[quoted..]);
+        out.last_mut().expect("never empty").push(&rest[..end]);
+        rest = &rest[end..];
     }
-    end_word(&mut word, &mut in_word, &mut words);
-    out.push(words);
     out.retain(|segment| !segment.is_empty());
     out
+}
+
+/// What ends a word for the shell on one line. Any other whitespace is part
+/// of the word, and makes it not simple.
+const BLANKS: [char; 2] = [' ', '\t'];
+
+/// How long the word `text` starts with is, up to a blank or a separator.
+fn word_len(text: &str) -> usize {
+    text.char_indices()
+        .find(|&(at, c)| {
+            BLANKS.contains(&c) || matches!(c, ';' | '|') || text[at..].starts_with("&&")
+        })
+        .map_or(text.len(), |(at, _)| at)
 }
 
 #[cfg(test)]
@@ -639,18 +669,17 @@ mod tests {
         );
     }
 
-    /// A quoted argument stays one word however it is unwrapped, and a
-    /// shell's later arguments are not its script.
+    /// A quoted argument before the word declines the command, a shell's
+    /// later arguments are not its script, and a quoted script with a quote in
+    /// it is not read.
     #[test]
     fn word_boundaries_survive_unwrapping() {
+        let bare = Operation::default();
         for (command, expected) in [
-            ("cargo 'private payload'", expected("cargo", None)),
-            ("env cargo 'abc;node secret'", expected("cargo", None)),
-            ("sudo -u root cargo \"a && b\"", expected("cargo", None)),
-            (
-                r#"env bash -c 'node "private payload"'"#,
-                expected("node", None),
-            ),
+            ("cargo 'private payload'", bare.clone()),
+            ("env cargo 'abc;node secret'", bare.clone()),
+            ("sudo -u root cargo \"a && b\"", bare.clone()),
+            (r#"env bash -c 'node "private payload"'"#, bare.clone()),
             (
                 "FOO=1 env -u X sudo cargo test",
                 expected("cargo", Some("test")),
@@ -660,9 +689,9 @@ mod tests {
                 expected("cargo", Some("test")),
             ),
             ("bash -c cargo private", expected("cargo", None)),
-            ("sh -c 'node \"private payload\"' x", expected("node", None)),
-            (r#"sh -c 'sh -c "make ci"'"#, expected("make", Some("ci"))),
-            (r#"sh -c 'sh -c "sh -c make"'"#, expected("sh", None)),
+            ("sh -c 'node \"private payload\"' x", bare.clone()),
+            (r#"sh -c 'sh -c "make ci"'"#, bare.clone()),
+            ("sh -c 'sh -c make ci'", expected("make", None)),
         ] {
             assert_eq!(classify(Some(command)), expected, "{command}");
         }
@@ -682,10 +711,8 @@ mod tests {
                 "time -o out.txt -a cargo test",
                 expected("cargo", Some("test")),
             ),
-            (
-                "time --format=%e cargo test",
-                expected("cargo", Some("test")),
-            ),
+            // An attached `=value` is not a simple word.
+            ("time --format=%e cargo test", unresolved.clone()),
             (
                 "time --output out -p cargo test",
                 expected("cargo", Some("test")),
@@ -701,9 +728,10 @@ mod tests {
             ("env -u hunter2 cargo test", expected("cargo", Some("test"))),
             ("env -iu x Y=1 cargo test", expected("cargo", Some("test"))),
             (
-                "env --unset=x -- cargo test",
+                "env --unset x -- cargo test",
                 expected("cargo", Some("test")),
             ),
+            ("env --unset=x -- cargo test", unresolved.clone()),
             ("env -S 'cargo test'", unresolved.clone()),
             ("env --split-string='cargo test'", unresolved.clone()),
             ("env --bogus x cargo test", unresolved.clone()),
@@ -711,10 +739,7 @@ mod tests {
                 "nice --adjustment 10 cargo test",
                 expected("cargo", Some("test")),
             ),
-            (
-                "nice --adjustment=10 cargo test",
-                expected("cargo", Some("test")),
-            ),
+            ("nice --adjustment=10 cargo test", unresolved.clone()),
             ("nice -n 10 cargo test", expected("cargo", Some("test"))),
             ("nice -n10 cargo test", expected("cargo", Some("test"))),
             ("nice -10 cargo test", expected("cargo", Some("test"))),
@@ -723,9 +748,15 @@ mod tests {
                 expected("systemctl", Some("restart")),
             ),
             (
-                "sudo --user=root -H make install",
+                "sudo --user root -H make install",
                 expected("make", Some("install")),
             ),
+            ("sudo --user=root -H make install", unresolved.clone()),
+            (
+                "sudo -u '/x/sentinelvalue' make install",
+                unresolved.clone(),
+            ),
+            ("bash -o 'x y' -c 'make ci'", unresolved.clone()),
             (
                 "sudo -uroot make install",
                 expected("make", Some("install")),
@@ -859,6 +890,118 @@ mod tests {
         }
     }
 
+    /// Shell syntax other than plain words before the word — a comment, a
+    /// substitution, a quote, a group, an escape, a redirection — names
+    /// nothing, however much of the command a parser could have recovered.
+    #[test]
+    fn shell_syntax_before_the_word_names_nothing() {
+        let bare = Operation::default();
+        for command in [
+            "#/private/sentinelvalue",
+            "#/private/sentinelvalue cargo test",
+            "cd x && #/private/sentinelvalue",
+            "X=$(printf /x/sentinelvalue ) cargo test",
+            "X=$(cat /x/sentinelvalue ) cargo test",
+            "X=`cat /x/sentinelvalue` cargo test",
+            "`cat /x/sentinelvalue` cargo test",
+            "$(cat /x/sentinelvalue) test",
+            "$VAR/x/sentinelvalue cargo",
+            "${VAR}/x/sentinelvalue cargo",
+            "X=\"/x/sentinelvalue y\" cargo",
+            "X='/x/sentinelvalue y' cargo",
+            "{ cargo; }",
+            "(cd x; cargo test)",
+            "<<EOF /x/sentinelvalue",
+            "python3 - <<EOF",
+            r"\cargo test",
+            "<(cat /x/sentinelvalue) cargo",
+            "diff <(cat /x/sentinelvalue) b",
+            "cd \"$DIR\" && cargo test",
+            "cd x; make '#'; hunter2",
+            "! cargo test",
+            "~/bin/sentinelvalue run",
+            "/x/sentinel*value run",
+            "bash -c 'X=$(cat /x/sentinelvalue ) cargo test'",
+            "bash -c \"cd $DIR && cargo test\"",
+            "bash -c 'cargo test'x",
+            // Only a space or a tab ends a word for the shell.
+            "X=a\u{a0}/x/sentinelvalue cargo test",
+            "X=a\u{2003}/x/sentinelvalue cargo test",
+            "X=a\u{b}/x/sentinelvalue cargo test",
+        ] {
+            assert_eq!(classify(Some(command)), bare, "{command}");
+        }
+        for command in [
+            "/bin/sh -lc #/private/sentinelvalue",
+            "/bin/sh -lc #note/private/sentinelvalue",
+            "/bin/sh -lc #/private/sentinelvalue cargo test",
+            "#/private/sentinelvalue",
+            "/bin/sh -lc $(cat /x/sentinelvalue)",
+            "/bin/sh -lc `/x/sentinelvalue`",
+            "/bin/sh -lc $VAR/x/sentinelvalue",
+            "/bin/sh -lc \\/x/sentinelvalue",
+            "$VAR/x/sentinelvalue cargo",
+            "'/bin/sh' -lc cargo",
+        ] {
+            assert_eq!(
+                classify_tool(Some("shell"), Some(command)),
+                bare,
+                "{command}"
+            );
+        }
+        // A program whose word is never sent is read up to its first
+        // argument all the same.
+        for command in [
+            "cat <<EOF > /x/sentinelvalue",
+            "cat <(cat /x/sentinelvalue) | cargo test",
+            "grep --include=*.rs sentinelvalue",
+            "echo \"$(cat /x/sentinelvalue)\"",
+        ] {
+            assert_eq!(classify(Some(command)), bare, "{command}");
+        }
+        // After the word nothing is read.
+        for (command, expected) in [
+            (
+                "cargo test $(cat /x/sentinelvalue)",
+                expected("cargo", Some("test")),
+            ),
+            ("cat notes.txt > /x/sentinelvalue", expected("cat", None)),
+            ("grep -r sentinelvalue \"$X\"", expected("grep", None)),
+        ] {
+            assert_eq!(classify(Some(command)), expected, "{command}");
+        }
+    }
+
+    #[test]
+    fn plain_commands_still_classify() {
+        for (command, expected) in [
+            ("cargo test --workspace", expected("cargo", Some("test"))),
+            (
+                "cargo test 2>&1 | tail -50",
+                expected("cargo", Some("test")),
+            ),
+            ("npm run build", expected("npm", Some("run"))),
+            ("gh pr checks 1814", expected("gh", Some("pr"))),
+            ("FOO=1 cargo test", expected("cargo", Some("test"))),
+            ("RUST_LOG=debug cargo run", expected("cargo", Some("run"))),
+            ("FOO= cargo test", expected("cargo", Some("test"))),
+            ("cd repo && cargo test", expected("cargo", Some("test"))),
+            ("cd repo; cargo test", expected("cargo", Some("test"))),
+            ("sudo -u root apt install", expected("apt", Some("install"))),
+            ("time cargo build", expected("cargo", Some("build"))),
+            ("/usr/bin/cargo test", expected("cargo", Some("test"))),
+            ("./scripts/check.sh", expected("check.sh", None)),
+            (
+                "rwx sandbox exec -- cargo test",
+                expected("rwx", Some("sandbox")),
+            ),
+            ("bash -c 'cargo test'", expected("cargo", Some("test"))),
+            ("bash -c \"cargo test\"", expected("cargo", Some("test"))),
+        ] {
+            assert_eq!(classify(Some(command)), expected, "{command}");
+        }
+    }
+
     #[test]
     fn only_the_first_line_counts() {
         assert_eq!(
@@ -885,8 +1028,8 @@ mod tests {
                 "kubectl get secret/db-PASSWORD",
                 expected("kubectl", Some("get")),
             ),
-            ("node -e 'console.log(1)'", expected("node", None)),
-            ("tool TOKEN=abc", expected("tool", None)),
+            ("node -e 'console.log(1)'", Operation::default()),
+            ("tool TOKEN=abc", Operation::default()),
             (
                 "make aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 expected("make", None),
@@ -920,7 +1063,7 @@ mod tests {
                 "curl --oauth2-bearer hunter2 https://example.invalid",
                 "curl",
             ),
-            ("curl -u 'hunter2' https://example.invalid", "curl"),
+            ("curl -u hunter2 https://example.invalid", "curl"),
             ("wget hunter2.example", "wget"),
             ("redis-cli -a hunter2 ping", "redis-cli"),
             ("ssh internal-prod", "ssh"),
@@ -978,30 +1121,48 @@ mod tests {
             ("cd /repo &# note; hunter2", bare.clone()),
             ("cd /repo >#note; hunter2", bare.clone()),
             ("cargo test # hunter2", expected("cargo", Some("test"))),
-            ("cargo # hunter2", expected("cargo", None)),
-            ("cd x && make # ci; hunter2", expected("make", None)),
+            ("cargo # hunter2", bare.clone()),
+            ("cd x && make # ci; hunter2", bare.clone()),
             ("bash -c 'cd x # y; hunter2'", bare.clone()),
-            // Quoted or inside a word, `#` is not a comment.
-            ("cd x; make '#'; hunter2", expected("make", None)),
-            ("cd x; make ci#1", expected("make", None)),
+            // A `#` anywhere in a word up to the first argument declines,
+            // quoted, escaped or not.
+            ("cd x; make ci#1", bare.clone()),
+            (r"cd x; make \#; hunter2", bare.clone()),
+            ("cd x; make issue#1; hunter2 run", bare.clone()),
+            // After the first argument, nothing is read.
             (
                 r#"git log --format="%H #%s" | head"#,
                 expected("git", Some("log")),
             ),
-            (r"cd x; make \#; hunter2", expected("make", None)),
-            ("cd x; make issue#1; hunter2 run", expected("make", None)),
         ] {
             assert_eq!(classify(Some(command)), expected, "{command}");
         }
+    }
+
+    /// Segments split on the separators alone, except inside a word that
+    /// starts with a quote.
+    #[test]
+    fn segments_split_on_separators_outside_a_leading_quote() {
         assert_eq!(
-            segments("cd x; make issue#1; hunter2 run"),
+            segments("cd x;make issue#1&&hunter2 run 2>&1||y|z"),
             [
                 vec!["cd", "x"],
                 vec!["make", "issue#1"],
-                vec!["hunter2", "run"]
+                vec!["hunter2", "run", "2>&1"],
+                vec!["y"],
+                vec!["z"]
             ]
         );
-        assert_eq!(segments("make '#' # x; y"), [vec!["make", "#"]]);
+        assert_eq!(
+            segments("bash -c 'a; b' && c \"d | e\"f; g"),
+            [
+                vec!["bash", "-c", "'a; b'"],
+                vec!["c", "\"d | e\"f"],
+                vec!["g"]
+            ]
+        );
+        assert_eq!(segments("a 'b c"), [vec!["a", "'b", "c"]]);
+        assert_eq!(segments(" ; "), Vec::<Vec<&str>>::new());
     }
 
     /// A shell reading its script from standard input: its operands are the
@@ -1015,10 +1176,11 @@ mod tests {
             ("zsh -s -- hunter2", "zsh"),
             ("bash -s", "bash"),
             ("bash", "bash"),
-            ("bash < script.sh", "bash"),
         ] {
             assert_eq!(classify(Some(command)), expected(shell, None), "{command}");
         }
+        // A redirection before the word is not a plain command.
+        assert_eq!(classify(Some("bash < script.sh")), Operation::default());
         assert_eq!(
             classify(Some("bash ci.sh hunter2")),
             expected("bash", Some("ci.sh"))
