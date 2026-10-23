@@ -79,6 +79,54 @@ pub(crate) const FAULT_COMMIT_RETURNED: &str = "commit-returned-before-handover"
 /// Test fault: a panic in the after-section helpers, after the handover.
 pub(crate) const FAULT_AFTER_HANDOVER: &str = "work-done-after-handover";
 
+/// PRD #1666 part 3, round 5: the lane-1 twin of the in-crate pause and
+/// fault points, for a real daemon a test drives through the real CLI
+/// (`orchestration/work-done/036` and `/040`). The directory
+/// `DOT_AGENT_DECK_TEST_WORK_DONE_PAUSE_DIR` names, one component under HOME as
+/// the doorbell's is, holds markers: `<seam>.armed` makes the next pass of
+/// that pause point write `<seam>.reached` and wait for `<seam>.release`, and
+/// `<seam>.fault` makes the next pass of that fault point fail. Only the
+/// `work-done-*` seams read them. Built only with the `e2e` feature.
+#[cfg(feature = "e2e")]
+pub(crate) mod e2e_seams {
+    use std::time::Duration;
+
+    const VAR: &str = "DOT_AGENT_DECK_TEST_WORK_DONE_PAUSE_DIR";
+    /// How long a pause waits for its release before it gives up, writes
+    /// `<seam>.timed-out` and lets the report go on.
+    const RELEASE_WAIT: Duration = Duration::from_secs(30);
+
+    fn root(name: &str) -> Option<std::path::PathBuf> {
+        if !name.starts_with("work-done-") {
+            return None;
+        }
+        crate::doorbell::test_control_dir(VAR)
+    }
+
+    pub(crate) async fn pause(name: &str) {
+        let Some(root) = root(name) else {
+            return;
+        };
+        if std::fs::remove_file(root.join(format!("{name}.armed"))).is_err() {
+            return;
+        }
+        let _ = std::fs::write(root.join(format!("{name}.reached")), b"");
+        let deadline = tokio::time::Instant::now() + RELEASE_WAIT;
+        while !root.join(format!("{name}.release")).exists() {
+            if tokio::time::Instant::now() >= deadline {
+                let _ = std::fs::write(root.join(format!("{name}.timed-out")), b"");
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    pub(crate) fn fault(name: &str) -> bool {
+        root(name)
+            .is_some_and(|root| std::fs::remove_file(root.join(format!("{name}.fault"))).is_ok())
+    }
+}
+
 /// How long a repeat waits for a claim already saving its task or unit
 /// before it answers `report_pending`, unless [`ENV_CLAIM_WAIT_MS`] says.
 pub const CLAIM_WAIT: Duration = Duration::from_secs(30);

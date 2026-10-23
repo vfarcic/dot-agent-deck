@@ -48,7 +48,7 @@ fn delegate_003_work_done_posts_one_untrusted_report() {
     let (orch, worker) = route::team(&daemon, false);
     let id = route::delegate(&daemon, &orch, route::TASK, false);
     route::fetched(&daemon, &worker, &id, route::TASK, "the orchestrator");
-    route::done(&daemon, &worker, route::REPORT, false);
+    route::report(&daemon, &worker, &id, route::REPORT);
     let reports = route::count(&daemon, &orch, 1);
     let id = reports[0]["id"].as_str().unwrap();
     let block = route::fetched(
@@ -68,10 +68,10 @@ fn delegate_003_work_done_posts_one_untrusted_report() {
     assert_eq!(route::count(&daemon, &orch, 1).len(), 1);
 }
 
-/// Scenario: Complete one task and require an identical follow-up to be
-/// fetchable by the same worker. In a second run, supersede an acknowledged
-/// task and report only that older task done; the newer queued task must still
-/// produce its own undelivered notice and remain available to fetch.
+/// Scenario: Complete one task by its id and require an identical follow-up to
+/// be fetchable by the same worker. In a second run, supersede an acknowledged
+/// task and then send a late report that names no task; the newer queued task
+/// must still produce its own undelivered notice and remain available to fetch.
 #[spec("orchestration/delegate/021")]
 #[test]
 fn delegate_021_work_done_releases_only_its_own_delivery_state() {
@@ -80,7 +80,7 @@ fn delegate_021_work_done_releases_only_its_own_delivery_state() {
         let (orch, worker) = route::team(&daemon, false);
         let first = route::delegate(&daemon, &orch, route::TASK, false);
         route::fetched(&daemon, &worker, &first, route::TASK, "the orchestrator");
-        route::done(&daemon, &worker, route::REPORT, false);
+        route::report(&daemon, &worker, &first, route::REPORT);
         route::count(&daemon, &orch, 1);
         let second = route::delegate(&daemon, &orch, route::TASK, false);
         assert_ne!(first, second, "identical follow-up needs a fresh inbox id");
@@ -162,8 +162,7 @@ fn route_008_refused_post_releases_the_commission_for_a_fresh_delegate() {
     route::count(&daemon, &orch, 2);
     let report = fetch(&daemon, &orch, true).to_string();
     assert!(
-        report.contains("UNCOMMISSIONED-AFTER-REFUSAL")
-            && report.contains("no outstanding delegation"),
+        report.contains("UNCOMMISSIONED-AFTER-REFUSAL") && report.contains(route::NOTE_LABEL),
         "{report}"
     );
     assert!(
@@ -284,7 +283,7 @@ fn route_002_worker_notices_are_bound_deck_messages() {
     }
 }
 
-/// Scenario: Exit a bound worker before fetching its delegated message. The task remains inspectable as Undeliverable and the orchestrator receives a daemon notice naming that exact task id, rather than losing the task or delivering it to another generation.
+/// Scenario: Exit a bound worker before fetching its delegated message. The task remains inspectable as Undeliverable and the orchestrator receives a daemon notice naming that exact task id, rather than losing the task or delivering it to another generation. Then, in a second team, replace the orchestrator before its worker runs the real `work-done --task-id`: the CLI says the report was saved in Deck notices, the deck's recovery rows list it as a worker report for that task, and the successor orchestrator gets nothing.
 #[spec("inbox/route/003")]
 #[test]
 fn route_003_exited_bound_agent_is_undeliverable_and_notifies_sender() {
@@ -318,6 +317,68 @@ fn route_003_exited_bound_agent_is_undeliverable_and_notifies_sender() {
     assert!(
         notice.to_ascii_lowercase().contains("undeliverable"),
         "exit must name undeliverable state: {notice}"
+    );
+
+    // PRD #1666 part 3, round 5: a report whose orchestrator was replaced is
+    // kept for recovery, not handed to the successor.
+    let daemon = daemon_unbound(&[]);
+    let (orch, worker) = route::team(&daemon, false);
+    let id = route::delegate(&daemon, &orch, route::TASK, false);
+    route::fetched(&daemon, &worker, &id, route::TASK, "the orchestrator");
+    let record = common::agent_records_on(daemon.attach_socket())
+        .into_iter()
+        .find(|r| r.id == orch.agent)
+        .expect("the orchestrator's record");
+    std::process::Command::new("kill")
+        .args(["-TERM", &orch.pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(
+        common::wait_until(WAIT, || common::agent_records_on(daemon.attach_socket())
+            .iter()
+            .all(|r| r.id != orch.agent || r.crashed == Some(true))),
+        "the orchestrator must exit"
+    );
+    let successor = route::start(
+        &daemon,
+        &orch.id,
+        json!({"tab_membership": record.tab_membership}),
+    );
+    assert_ne!(successor.agent, orch.agent);
+    let out = route::cli_output(
+        &daemon,
+        &worker,
+        daemon.cwd(),
+        &["work-done", "--task-id", &id, "--task", route::REPORT],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!(
+            "Reported task {id}. Its orchestrator is no longer running, so the deck saved the \
+             report in Deck notices.\n"
+        )
+    );
+    let rows = attach(&daemon, json!({"op":"list-outcomes"}));
+    let outcomes = rows["deck_outcomes"]["outcomes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("list-outcomes answers rows: {rows}"));
+    assert!(
+        outcomes
+            .iter()
+            .any(|row| row["phase"] == "worker_report" && row["task_id"] == id.as_str()),
+        "a worker_report row for the task: {rows}"
+    );
+    route::no_messages(&daemon, &successor, Duration::from_millis(500));
+    assert!(
+        fetch(&daemon, &successor, false)["messages"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "the successor fetches nothing"
     );
 }
 

@@ -15689,6 +15689,8 @@ impl AgentPtyRegistry {
                 let _ = release.await;
             }
         }
+        #[cfg(feature = "e2e")]
+        crate::task_completion::e2e_seams::pause(_name).await;
     }
 
     /// PRD #1666 part 3, round 5 test seam: the synchronous twin of
@@ -15746,6 +15748,10 @@ impl AgentPtyRegistry {
                 Some(TestFault::Fail) => return true,
                 None => {}
             }
+        }
+        #[cfg(feature = "e2e")]
+        if crate::task_completion::e2e_seams::fault(_name) {
+            return true;
         }
         false
     }

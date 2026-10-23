@@ -4252,10 +4252,10 @@ without depending on the config struct API.
 - **Does not assert:** the no-cwd and mkdir-only variants of the same failure (unit-tested on `write_work_done_summary`); the stale-file READ itself (the pointer's absence is what makes it unreachable); recovery of the file on a later delegation.
 - **Platform coverage:** mac+linux (unix-only — raw-mode shell observer).
 
-##### orchestration/work-done/004 — Run the real work-done CLI from an uncommissioned synthetic worker. One bound Untrusted report is fetched and rendered in the orchestrator pane, labelled unsolicited, with no commissioned summary file.
+##### orchestration/work-done/004 — Run the real work-done CLI from an uncommissioned synthetic worker. One bound Untrusted report is fetched and rendered in the orchestrator pane, labelled as a note that completes no task, with no commissioned summary file.
 - **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
 - **Agent:** none.
-- **Asserts:** Run the real work-done CLI from an uncommissioned synthetic worker. One bound Untrusted report is fetched and rendered in the orchestrator pane, labelled unsolicited, with no commissioned summary file.
+- **Asserts:** Run the real work-done CLI from an uncommissioned synthetic worker. One bound Untrusted report is fetched and rendered in the orchestrator pane, labelled as a note that completes no task, with no commissioned summary file.
 - **Test:** `work_done_004_unsolicited_completion_is_visibly_labelled_in_the_attached_tui` in `tests/e2e_work_done_reporting.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
@@ -4333,10 +4333,10 @@ without depending on the config struct API.
 - **Does not assert:** a successor that arrives through `pane restart` or a `clear = true` respawn (those retire on replacement, issue #590); the idle-worker and silent-worker watches, which the exit sweep already retires; a successor reporting while a delegate to the pane is still queued, which is credited to that queued commission by design.
 - **Platform coverage:** mac+linux (unix-only — raw-mode shell observer).
 
-##### orchestration/work-done/015 — Complete a commissioned task, delegate again, then let the worker exit naturally and start a successor in the same pane. Its report reaches the orchestrator inbox as uncommissioned work and leaves the earlier commissioned report file intact.
+##### orchestration/work-done/015 — Complete a commissioned task, delegate again, then let the worker exit naturally and start a successor in the same pane. Its report, which names no task, reaches the orchestrator inbox as a note that completes no task and leaves the earlier commissioned report file intact.
 - **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
 - **Agent:** none.
-- **Asserts:** Complete a commissioned task, delegate again, then let the worker exit naturally and start a successor in the same pane. Its report reaches the orchestrator inbox as uncommissioned work and leaves the earlier commissioned report file intact.
+- **Asserts:** Complete a commissioned task, delegate again, then let the worker exit naturally and start a successor in the same pane. Its report, which names no task, reaches the orchestrator inbox as a note that completes no task and leaves the earlier commissioned report file intact.
 - **Test:** `work_done_015_a_successor_in_an_exited_worker_s_pane_is_not_credited_with_its_task` in `tests/e2e_delegate_exited_worker.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
@@ -4477,6 +4477,51 @@ without depending on the config struct API.
 - **Does not assert:** that the daemon's own paths take the locks in order (the whole fast tier runs with the checker active, which is what does); R0 (`AppState`'s `RwLock`), which the checker cannot see; release-build behaviour, where no rank is checked.
 - **Platform coverage:** mac+linux+windows.
 
+##### orchestration/work-done/033 — The real `work-done --task-id` reports the task its instructions name.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** the worker's fetched task names its id after `--task-id`; the real CLI with that id prints `Reported task <id> to the orchestrator.`; the orchestrator's inbox lists one report whose provenance is that task; a plain follow-up delegate to the worker is accepted.
+- **Test:** `work_done_033_the_real_cli_reports_the_task_its_instructions_name` in `tests/e2e_work_done_reporting.rs`.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.4): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor; the in-crate controls cannot see the real CLI and the real daemon in separate processes.
+- **Does not assert:** a real agent (`orchestration/work-done/037`, lane 2); the desktop app; Windows.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/034 — A real `work-done` without `--task-id` is a note, and the task stays owed.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** the CLI says the report went as a note that completes no task; the orchestrator's copy has `uncorrelated` provenance and the note label; a plain follow-up delegate is refused as busy.
+- **Test:** `work_done_034_a_report_without_a_task_id_is_a_note_and_the_task_stays_owed` in `tests/e2e_work_done_reporting.rs`.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.4): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor; the in-crate controls cannot see the real CLI and the real daemon in separate processes.
+- **Does not assert:** a real agent (`orchestration/work-done/037`, lane 2); the desktop app; Windows.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/035 — A repeated real `work-done --task-id` is answered once and delivered once.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** the same command run twice: the orchestrator lists one report; the second run exits 0 with `Task <id> was already reported; nothing new was sent.`
+- **Test:** `work_done_035_a_repeated_report_is_answered_once_and_delivered_once` in `tests/e2e_work_done_reporting.rs`.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.4): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor; the in-crate controls cannot see the real CLI and the real daemon in separate processes.
+- **Does not assert:** a real agent (`orchestration/work-done/037`, lane 2); the desktop app; Windows.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/036 — A real `work-done` whose save fails reports nothing and keeps the task open.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** with the save fault armed through `DOT_AGENT_DECK_TEST_WORK_DONE_PAUSE_DIR`, the CLI exits 1 with the save-failed sentence and prints nothing on stdout; the orchestrator's inbox is empty; a plain delegate is refused as busy; the same command once the fault is spent is accepted.
+- **Test:** `work_done_036_a_failed_save_reports_nothing_and_keeps_the_task_open` in `tests/e2e_work_done_reporting.rs`.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.4): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor; the in-crate controls cannot see the real CLI and the real daemon in separate processes.
+- **Does not assert:** a real agent (`orchestration/work-done/037`, lane 2); the desktop app; Windows.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/037 — A real worker reports the task it was given, by its id.
+- **Layer:** L2, lane 2 (real binary, attached PTY, a `cat` orchestrator stand-in and an interactive Claude Code worker on Haiku; needs the developer's Claude credential).
+- **Agent:** Claude Code (Haiku).
+- **Asserts:** delegated a directive task with a unique sentinel file, the worker creates the file and reports with `work-done --task-id` as its instructions say; the orchestrator's inbox lists a report whose provenance is that task's id; a plain follow-up delegate to the worker is accepted.
+- **Test:** `work_done_037_a_real_worker_reports_the_task_it_was_given` in `tests/e2e_task_report_live.rs`.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §9, CLAUDE.md rule 4): the accounting a real agent drives — that a real worker follows the footer's `--task-id`, so its task is completed and its debt released.
+- **Does not assert:** the report rendered in an attached client, or a reel clip (round 6); Codex, OpenCode, Pi or Devin workers; the desktop app.
+- **Platform coverage:** mac+linux.
+
 ##### orchestration/work-done/038 — The answer is written only after the commit.
 - **Layer:** fast unit (`src/daemon.rs` hook-ingestion tests; the real hook loop on a socket, `cat` stand-ins).
 - **Agent:** none.
@@ -4491,6 +4536,15 @@ without depending on the config struct API.
 - **Asserts:** At `work-done-acked` the line is readable and the arm, watch and open task are already gone.
 - **Why it exists:** PRD #1666 part 3, round 5 (plan §6.7): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
 - **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/040 — The real CLI's answer follows the saved and committed report.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** paused after the save, the CLI is still running and has printed nothing; paused after the commit, it is still running and the orchestrator's inbox already lists the report with that task id; released, stdout is exactly `Reported task <id> to the orchestrator.` and stderr is empty. For a second task, a save failure injected while the save is paused makes the CLI exit 1 with one stderr line, the save-failed sentence, and nothing new is posted.
+- **Test:** `work_done_040_the_answer_follows_the_saved_and_committed_report` in `tests/e2e_work_done_reporting.rs`.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.4): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor; the in-crate controls cannot see the real CLI and the real daemon in separate processes.
+- **Does not assert:** a real agent (`orchestration/work-done/037`, lane 2); the desktop app; Windows.
 - **Platform coverage:** mac+linux.
 
 ##### orchestration/work-done/041 — A claimed task is not superseded.
@@ -9303,6 +9357,15 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 - **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
 - **Platform coverage:** mac+linux.
 
+##### inbox/protocol/029 — The real CLI asks first and reports on the confirming connection.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** against a stub hook socket that never answers the capability question, the real `work-done --task-id` sends only the question and exits 1 saying the daemon did not confirm it supports task reports; against a stub that confirms version 1, it sends `work_done_task` with the task id and report on the same connection, opens no second connection and sends nothing more, and the stub's `accepted` answer makes it print `Reported task <id> to the orchestrator.` and exit 0.
+- **Test:** `protocol_029_the_real_cli_asks_first_and_reports_on_the_confirming_connection` in `tests/e2e_work_done_reporting.rs`.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D1, §6.5): `/024` and `/027` drive `send_gated` in-crate; this drives the shipped binary's argv path.
+- **Does not assert:** a real daemon (`orchestration/work-done/033`); the other gate outcomes (`inbox/protocol/025`, `/026`, `/028`, `/030`, `/031`).
+- **Platform coverage:** mac+linux.
+
 ##### inbox/protocol/030 — Only version 1 confirms.
 - **Layer:** fast unit (`src/hook.rs`; the real sender against a scripted daemon socket).
 - **Agent:** none.
@@ -11494,12 +11557,12 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
 
-##### inbox/route/003 — Exit a bound worker before fetching its delegated message. The task remains inspectable as Undeliverable and the orchestrator receives a daemon notice naming that exact task id, rather than losing the task or delivering it to another generation.
+##### inbox/route/003 — An exited worker's task stays inspectable and its orchestrator is told; a report whose orchestrator was replaced is kept for recovery, not handed to the successor.
 - **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
 - **Agent:** none.
-- **Asserts:** Exit a bound worker before fetching its delegated message. The task remains inspectable as Undeliverable and the orchestrator receives a daemon notice naming that exact task id, rather than losing the task or delivering it to another generation.
+- **Asserts:** Exit a bound worker before fetching its delegated message. The task remains inspectable as Undeliverable and the orchestrator receives a daemon notice naming that exact task id, rather than losing the task or delivering it to another generation. Then, in a second team, the orchestrator exits and a successor takes its pane before the worker runs the real `work-done --task-id`: the CLI prints that the report was saved in Deck notices, `list-outcomes` lists a `worker_report` row for that task, and the successor's inbox stays empty and its fetch gets nothing.
 - **Test:** `route_003_exited_bound_agent_is_undeliverable_and_notifies_sender` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
-- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
+- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds; how a client shows the recovery row (round 6).
 - **Platform coverage:** mac+linux.
 
 ##### inbox/route/004 — Each supported agent starts with one inbox seed, without typed task content.

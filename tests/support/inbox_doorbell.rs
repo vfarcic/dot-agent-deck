@@ -390,6 +390,25 @@ pub fn hook(daemon: &impl Endpoint, req: Value) -> Value {
     line(&mut connect(daemon, &req))
 }
 
+/// PRD #1666 part 3, round 5: a `work-done` as this release's CLI sends it —
+/// the capability question, then, on the same connection once the daemon
+/// confirmed, the report in `mode` (`{"kind":"task","task_id":…}`,
+/// `{"kind":"uncorrelated"}` or `{"kind":"terminal"}`). Returns the reply.
+pub fn work_done_task(daemon: &impl Endpoint, pane: &Pane, mode: Value, report: &str) -> Value {
+    let mut socket = connect(daemon, &request(pane, "hook_capabilities"));
+    let caps = line(&mut socket);
+    assert_eq!(
+        caps["task_scoped_completion"], 1,
+        "capability answer: {caps}"
+    );
+    let mut req = request(pane, "work_done_task");
+    req["mode"] = mode;
+    req["report"] = json!(report);
+    req["timestamp"] = json!(chrono::Utc::now());
+    write_all_budgeted(socket.get_mut(), format!("{req}\n").as_bytes()).unwrap();
+    line(&mut socket)
+}
+
 /// The version stamp a synthetic hook line carries. Every hook line from a
 /// current deck is stamped, and an unstamped Claude line reads as hooks from
 /// before the deck's messages (PRD #1666 part 3, R-3); an empty build counts as
