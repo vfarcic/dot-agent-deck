@@ -5208,10 +5208,10 @@ without depending on the config struct API.
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
 
-##### dispatch/return/003 — Dispatch a single stand-in and send an unrelated pane completion before the unit completes. Only the unit acknowledgement and completion are bound to the caller inbox, and its fetched report appears in the attached pane.
+##### dispatch/return/003 — Dispatch a single stand-in and send an unrelated pane completion before the unit completes; that pane's `work-done --done` is refused with `incompatible_mode`. Only the unit acknowledgement and completion are bound to the caller inbox, and its fetched report appears in the attached pane.
 - **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
 - **Agent:** none.
-- **Asserts:** Dispatch a single stand-in and send an unrelated pane completion before the unit completes. Only the unit acknowledgement and completion are bound to the caller inbox, and its fetched report appears in the attached pane.
+- **Asserts:** Dispatch a single stand-in and send an unrelated pane completion before the unit completes; that pane's `work-done --done` is refused with `incompatible_mode`. Only the unit acknowledgement and completion are bound to the caller inbox, and its fetched report appears in the attached pane.
 - **Test:** `dispatch_return_003_single_completion_routes_while_unknown_pane_stays_inert` in `tests/e2e_dispatch_return.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.

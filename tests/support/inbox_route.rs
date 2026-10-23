@@ -858,7 +858,9 @@ pub fn dispatch_return(case: u8) {
     }
     if case == 3 {
         let unknown = start(&deck, "unrelated", json!({}));
-        cli(
+        // PRD #1666 part 3, round 5: a pane that is no unit's last agent has
+        // nothing for `--done` to complete, and is told so.
+        let refused = cli_output(
             &deck,
             &unknown,
             deck.workdir(),
@@ -869,6 +871,9 @@ pub fn dispatch_return(case: u8) {
                 "UNKNOWN-RETURN-DO-NOT-ROUTE",
             ],
         );
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert_eq!(refused.status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains("[incompatible_mode]"), "{stderr}");
     }
     let report = if case == 8 {
         format!(
