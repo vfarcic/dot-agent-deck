@@ -255,7 +255,19 @@ The deck's hooks in Claude Code take deck messages for it and confirm them to th
 - `the connection to the deck daemon was lost before it answered whether it serves message receipts` — the deck daemon may have stopped or restarted. If the error goes on to name the message in this prompt, Claude Code has that message, but the deck was not told. Check that the deck daemon is running with `dot-agent-deck daemon status`. If this keeps happening while it runs, restart the agent.
 - `the deck socket refused this hook access` — another user's deck listens on the socket, or the permissions of the socket or a directory above it keep you out. If you set `DOT_AGENT_DECK_SOCKET` or `DOT_AGENT_DECK_ATTACH_SOCKET`, point them at your own deck's sockets, or unset them; otherwise fix the permissions of the socket and the directories above it. Then restart the agent.
 
-`hooks install` rewrites all of Claude Code's deck hooks together; restarting the agent alone does not change them. While the hooks and the deck disagree, `dot-agent-deck inbox fetch`, run in the agent's pane, can still read a waiting message that the deck is handing over the older way; some messages need the updated hooks instead.
+`hooks install` rewrites all of Claude Code's deck hooks together; restarting the agent alone does not change them. While the hooks are older than the deck daemon, `dot-agent-deck inbox fetch`, run in the agent's pane, can still read its waiting messages. When the daemon is the older one, `inbox fetch` from the newer release takes nothing either: see the next section.
+
+### Codex's deck hook or `inbox fetch` shows an error
+
+Codex's deck hooks and `dot-agent-deck inbox fetch` take deck messages and confirm each one to the deck. They check first that the deck daemon can take that confirmation, and when it cannot, they take no message and say why. The messages stay with the deck. Codex shows the hook's error, which starts with `dot-agent-deck:`, when it shows a failing hook's output. `inbox fetch` prints its error where it was run, so a model that ran it after the doorbell sees it and can tell you:
+
+- `Could not fetch messages: the deck daemon did not confirm that it can hand them to this dot-agent-deck inbox fetch, so no message was taken and they stay waiting` — the deck daemon most likely runs an older `dot-agent-deck` than the one on the agent's `PATH`. Restart the deck daemon on the newer release ([Recycling the daemon](#recycling-the-daemon)), or run `inbox fetch` with the `dot-agent-deck` the daemon runs.
+- `Could not fetch messages: the deck daemon did not answer in time whether it can hand them to this dot-agent-deck inbox fetch` — the deck daemon is busy, or older than this `dot-agent-deck`, which looks the same from here. Run the command again; if it keeps happening, restart the deck daemon on the newer release.
+- `Could not fetch messages: the deck daemon did not answer this fetch in time` or `the connection to the deck daemon was lost after this fetch was sent` — the deck may have set messages aside for this fetch. It offers any it did again later, marked as a possible repeat; nothing else is needed.
+- `Could not print every message` or `none of them was printed` — the command's output was closed or cut short, or the deck took the messages back before they were written (for example after you pressed **Cancel**). What was printed may have reached the agent. The deck offers again any message still waiting, marked as a possible repeat when part of it was printed.
+- From Codex's hook, `the deck daemon did not confirm that it serves message receipts` or `did not answer in time` — the same as the first two, for Codex's hooks. Restart the deck daemon on the hooks' release, or run `dot-agent-deck hooks install --agent codex` with the release the daemon runs, then restart the agent.
+
+The connection and socket errors read as they do for Claude Code, above, and have the same fixes.
 
 ### An agent finishes an interrupted request before a delegated task
 
@@ -310,7 +322,7 @@ Note: the deck's Codex hook for PreToolUse is turned off in Codex's /hooks list,
 
 The deck's log also records a warning naming those hooks each time the deck records trust. To get the detail back, turn the hook on again in Codex's `/hooks` list.
 
-While Codex's hooks are not trusted, or if you turn off the deck's `UserPromptSubmit` hook in Codex's `/hooks` list, a doorbell asks Codex to run `dot-agent-deck inbox fetch` itself. That command acknowledges receipt and needs sandbox network access. Trust the hooks to restore automatic message hand-over, including at turn end.
+While Codex's hooks are not trusted, or if you turn off the deck's `UserPromptSubmit` hook in Codex's `/hooks` list, a doorbell asks Codex to run `dot-agent-deck inbox fetch` itself. That command confirms each message it prints to the deck, and needs sandbox network access to reach the deck. When Codex's sandbox also keeps it from writing the deck's receipt records, the agent's card in the TUI, or its tile in the desktop app, says messages may repeat: the messages are still delivered, and one may be sent twice. Trust the hooks to restore automatic message hand-over, including at turn end.
 
 ### Codex as a role or worker: allow sandbox network access
 
