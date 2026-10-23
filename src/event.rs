@@ -1984,14 +1984,11 @@ impl DaemonMessage {
                 orchestrations: Vec::new(),
                 error: Some(message.to_string()),
             }),
-            // A refused `get-seed` answers exactly as "no seed pending" does.
-            // The extension then no-sends and the daemon's own PTY-injection
-            // safety net still delivers the seed to the pane's real occupant, so
-            // a refusal costs the legitimate pane nothing — while an `error`
-            // field the response has never carried would have to be invented,
-            // and would tell a caller that guessed a pane id that the pane
-            // exists.
-            DaemonMessage::GetSeed(_) => serde_json::to_string(&GetSeedResponse { seed: None }),
+            // A refused `get-seed` answers exactly as an admitted one does:
+            // since PRD #1666 part 3 (H5) the verb takes nothing for anyone
+            // ([`GetSeedResponse::withdrawn`]), so the answer tells a caller
+            // that guessed a pane id nothing about the pane.
+            DaemonMessage::GetSeed(_) => serde_json::to_string(&GetSeedResponse::withdrawn()),
             DaemonMessage::WorkDone(_)
             | DaemonMessage::Dispatch(_)
             | DaemonMessage::Ack(_)
@@ -2307,9 +2304,8 @@ pub struct GetSeedRequest {
     /// older CLI omits it, which deserializes to `None`.
     ///
     /// `None` therefore means "the caller could not say", not "the caller is
-    /// nobody", and the daemon treats it as such: it hands over a message only
-    /// for the agent the request's token attests, and refuses a request that
-    /// names a different one (`get_seed_inbox_alias` in `crate::daemon`).
+    /// nobody". Since PRD #1666 part 3 (H5) the daemon hands over nothing for
+    /// any agent, named or not (`get_seed_withdrawn` in `crate::daemon`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
     /// Issue #1077: the per-spawn hook capability token from the sender's
@@ -2335,10 +2331,34 @@ pub struct GetSeedRequest {
 /// single JSON line back on the hook-socket connection. `seed` is `None`
 /// (serialized as `null`) when no seed is pending for the pane — the pane is
 /// unknown, or the seed was already delivered (pulled or injected).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GetSeedResponse {
     #[serde(default)]
     pub seed: Option<String>,
+    /// PRD #1666 part 3 (H5): why no seed was handed over. Additive: an
+    /// older reader ignores it and reads `seed: null` as nothing pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// PRD #1666 part 3 (H5): [`GetSeedResponse::withdrawn`]'s code.
+pub const GET_SEED_REMOVED: &str = "get_seed_removed";
+
+impl GetSeedResponse {
+    /// The answer to every `get-seed` since PRD #1666 part 3 (H5): the verb
+    /// takes no message any more. A pane's seed is its first inbox message,
+    /// which the agent's own receiver takes.
+    pub fn withdrawn() -> Self {
+        Self {
+            seed: None,
+            refused: Some(GET_SEED_REMOVED.to_string()),
+            error: Some(
+                "get-seed no longer takes messages: the deck hands the agent its seed as its first message".to_string(),
+            ),
+        }
+    }
 }
 
 /// PRD #220: payload of [`DaemonMessage::ListTargets`] — the pane whose repo's
@@ -4708,6 +4728,7 @@ mod tests {
         // Some(seed) round-trips…
         let resp = GetSeedResponse {
             seed: Some("Read .dot-agent-deck/worker-task-coder.md for your task.".into()),
+            ..GetSeedResponse::default()
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: GetSeedResponse = serde_json::from_str(&json).unwrap();
@@ -4716,11 +4737,22 @@ mod tests {
             Some("Read .dot-agent-deck/worker-task-coder.md for your task.")
         );
         // …and "no seed" is a null the get-seed CLI reads as "print nothing".
-        let none = GetSeedResponse { seed: None };
+        let none = GetSeedResponse::default();
         let json = serde_json::to_string(&none).unwrap();
         assert_eq!(json, "{\"seed\":null}");
         let back: GetSeedResponse = serde_json::from_str(&json).unwrap();
         assert!(back.seed.is_none());
+        // PRD #1666 part 3 (H5): the withdrawal's fields are additive, so a
+        // reader of `{"seed": …}` alone still reads no seed.
+        let withdrawn = serde_json::to_value(GetSeedResponse::withdrawn()).unwrap();
+        assert!(withdrawn["seed"].is_null());
+        assert_eq!(withdrawn["refused"], GET_SEED_REMOVED);
+        #[derive(serde::Deserialize)]
+        struct OldReader {
+            seed: Option<String>,
+        }
+        let old: OldReader = serde_json::from_value(withdrawn).unwrap();
+        assert!(old.seed.is_none());
     }
 
     #[test]

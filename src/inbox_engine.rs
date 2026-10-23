@@ -160,6 +160,10 @@ pub(super) struct Floor {
     /// no [`super::HOOK_INTEGRATION`], or a lower one: the agent's hooks run
     /// an older dot-agent-deck.
     pub(super) hooks_too_old: bool,
+    /// PRD #1666 part 3 (H5): whose hooks [`Self::hooks_too_old`] refused, when
+    /// the deck knows: the card names that agent's own `hooks install`, and
+    /// none when it does not know the agent.
+    pub(super) hooks_too_old_agent: Option<crate::event::AgentType>,
     /// PRD #1666 part 3 (R-3): the agent whose hook lines from this
     /// generation carry no version stamp, so its hooks run a dot-agent-deck
     /// from before the deck's messages, which never asks for them. A notice,
@@ -562,6 +566,7 @@ pub(super) fn register(
         floor.registered = true;
         floor.adapter_too_old = false;
         floor.hooks_too_old = false;
+        floor.hooks_too_old_agent = None;
         floor.hooks_unstamped = None;
         floor.cli_too_old = false;
         floor.refresh_failed = None;
@@ -646,12 +651,14 @@ pub(super) fn refuse_adapter(st: &mut HubState, key: &AgentKey) {
 /// or a lower one. Nothing was registered or issued; the generation's mail
 /// waits queued, its doorbell stays silent and its card names the command
 /// that updates the hooks.
-pub(super) fn refuse_hooks(st: &mut HubState, key: &AgentKey) {
-    st.receipts
-        .floors
-        .entry(key.clone())
-        .or_default()
-        .hooks_too_old = true;
+pub(super) fn refuse_hooks(
+    st: &mut HubState,
+    key: &AgentKey,
+    agent: Option<crate::event::AgentType>,
+) {
+    let floor = st.receipts.floors.entry(key.clone()).or_default();
+    floor.hooks_too_old = true;
+    floor.hooks_too_old_agent = agent;
 }
 
 /// PRD #1666 part 3 (R-3): a hook line of `agent`'s from `key`'s
@@ -1957,12 +1964,15 @@ pub(super) fn notices(st: &HubState, key: &AgentKey, now: Instant) -> InboxCardN
         integration_command: (integration == Some(IntegrationNotice::HooksTooOld))
             .then(|| {
                 // R-3: the command for the agent whose hooks are unstamped;
-                // a refused fetch is Claude's.
-                let agent = match st.receipts.floors.get(key) {
-                    Some(floor) if !floor.hooks_too_old => floor.hooks_unstamped.clone(),
-                    _ => None,
-                }
-                .unwrap_or(crate::event::AgentType::ClaudeCode);
+                // H5: a refused fetch names the agent whose hooks it came
+                // from, and no command when the deck does not know it.
+                let agent = st.receipts.floors.get(key).and_then(|floor| {
+                    if floor.hooks_too_old {
+                        floor.hooks_too_old_agent.clone()
+                    } else {
+                        floor.hooks_unstamped.clone()
+                    }
+                })?;
                 st.hooks_remedies.get(&agent).cloned()
             })
             .flatten(),

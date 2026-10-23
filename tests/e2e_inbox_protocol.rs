@@ -147,18 +147,91 @@ fn armed(daemon: &DaemonProc, pane: &Pane, expected: u64) {
     );
 }
 
-/// A legacy Once waiter, armed from the test process. Claude's waiter is on
-/// receipts since PRD #1666 part 2's H3 (inbox/claude/006, inbox/boundary/052);
-/// the legacy once path these tests pin stays for any other component until
-/// H5 deletes it.
+/// Claude Code's once waiter on receipts (PRD #1666 part 2's H3), armed from
+/// the test process at the one-shot integration; returns once the deck
+/// registered it. A newer one supersedes it at once.
 fn waiter(daemon: &DaemonProc, pane: &Pane) -> BufReader<UnixStream> {
     let mut req = request(pane, "inbox_wait");
-    req["component"] = json!("other");
+    req["component"] = json!("claude_waiter");
+    req["hook_integration"] = json!(1);
     req["component_version"] = json!("synthetic-s2");
     req["mode"] = json!("once");
     req["session"] = json!({"source":"startup", "session_id":"inbox-s2"});
     req["pid"] = json!(pane.pid);
-    connect(daemon, &req)
+    let mut socket = connect(daemon, &req);
+    let registered = line(&mut socket);
+    assert!(
+        registered["registered"].is_object(),
+        "a receipt once waiter registers first: {registered}"
+    );
+    socket
+}
+
+/// A receipt stream in `component`'s slot (`opencode_plugin`,
+/// `opencode_mini`), armed from the test process at the adapter floor;
+/// returns once the deck registered it.
+fn stream(daemon: &DaemonProc, pane: &Pane, component: &str) -> BufReader<UnixStream> {
+    let mut req = request(pane, "inbox_wait");
+    req["component"] = json!(component);
+    req["component_version"] = json!("synthetic-s2");
+    req["mode"] = json!("stream");
+    req["pid"] = json!(pane.pid);
+    req["adapter_integration"] = json!(2);
+    let mut socket = connect(daemon, &req);
+    let registered = line(&mut socket);
+    assert!(
+        registered["registered"].is_object(),
+        "a receipt stream registers first: {registered}"
+    );
+    socket
+}
+
+/// The next line on `socket` that is not a keepalive.
+fn next_reply(socket: &mut BufReader<UnixStream>) -> Value {
+    let started = Instant::now();
+    loop {
+        let reply = line(socket);
+        if reply["keepalive"] != true {
+            return reply;
+        }
+        assert!(started.elapsed() < WAIT, "bounded wait for a reply");
+    }
+}
+
+/// A current `inbox fetch` (PRD #1666 part 3): a one-shot receipt fetch,
+/// consumer `cli`, at the one-shot integration, within `max_bytes` when set.
+/// With `ack`, each message it was handed is then acknowledged by id; without,
+/// the hand-out stays issued and unacknowledged.
+fn receipt_fetch(daemon: &DaemonProc, pane: &Pane, ack: bool, max_bytes: Option<u64>) -> Value {
+    let mut req = request(pane, "inbox_receipt_fetch");
+    req["consumer"] = json!("cli");
+    req["hook_integration"] = json!(1);
+    if let Some(max_bytes) = max_bytes {
+        req["max_chars"] = json!(max_bytes);
+        req["max_bytes"] = json!(max_bytes);
+    }
+    let mut socket = connect(daemon, &req);
+    let reply = line(&mut socket);
+    assert!(reply["messages"].is_array(), "receipt fetch: {reply}");
+    for (q, message) in reply["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let may =
+            json!({"may": {"q": q, "id": message["id"], "a": message["a"], "e": message["e"]}});
+        writeln!(socket.get_mut(), "{may}").unwrap();
+        assert_eq!(line(&mut socket)["grant"]["ok"], true, "{message}");
+    }
+    if ack {
+        for message in reply["messages"].as_array().into_iter().flatten() {
+            let mut ack = request(pane, "ack");
+            ack["delivery_id"] = message["id"].clone();
+            assert_eq!(hook(daemon, ack)["delivery"], "acknowledged", "{message}");
+        }
+    }
+    reply
 }
 
 fn enqueue(daemon: &DaemonProc, pane: &Pane) -> String {
@@ -200,7 +273,8 @@ fn state(daemon: &DaemonProc, pane: &Pane, id: &str, expected: &str) {
 fn blocks(reply: &Value, id: &str) {
     let text = reply["messages"].to_string();
     assert!(
-        text.contains(&format!("[dot-agent-deck message {id} from "))
+        (text.contains(&format!("[dot-agent-deck message {id} from "))
+            || text.contains(&format!("[dot-agent-deck message {id} delivery ")))
             && text.contains(BODY)
             && text.contains(&format!("[end of dot-agent-deck message {id}]")),
         "wait/fetch must return the rendered message block: {reply}"
@@ -283,7 +357,7 @@ fn success(result: &Output) {
     );
 }
 
-/// Scenario: Start a token-bearing stand-in pane, announce its inbox component and fetch its empty inbox. Repeat fetch, list, announce, wait and ack with the token removed; each must explicitly refuse the caller rather than return messages or acknowledge anything.
+/// Scenario: Start a token-bearing stand-in pane, announce its inbox component and fetch its empty inbox as a current `inbox fetch` does, on receipts. Repeat that fetch, the old plain fetch, list, announce, wait and ack with the token removed; each must explicitly refuse the caller rather than return messages or acknowledge anything.
 #[spec("inbox/protocol/001")]
 #[test]
 fn inbox_protocol_001_attested_only_verbs() {
@@ -296,11 +370,14 @@ fn inbox_protocol_001_attested_only_verbs() {
     announce["pid"] = json!(pane.pid);
     let reply = hook(&daemon, announce.clone());
     assert_eq!(reply["accepted"], true, "attested announce: {reply}");
-    let mut fetch = request(&pane, "inbox_fetch");
+    let mut fetch = request(&pane, "inbox_receipt_fetch");
     fetch["consumer"] = json!("cli");
-    fetch["max_chars"] = json!(9000);
-    fetch["ack"] = json!(true);
+    fetch["hook_integration"] = json!(1);
     assert_eq!(hook(&daemon, fetch.clone())["messages"], json!([]));
+    let mut plain = request(&pane, "inbox_fetch");
+    plain["consumer"] = json!("cli");
+    plain["max_chars"] = json!(9000);
+    plain["ack"] = json!(true);
     let mut ack = request(&pane, "ack");
     ack["delivery_id"] = json!("m-abcdefgh-0123456789abcdef");
     let mut list = request(&pane, "inbox_list");
@@ -308,7 +385,8 @@ fn inbox_protocol_001_attested_only_verbs() {
     let mut wait = announce.clone();
     wait["message_type"] = json!("inbox_wait");
     wait["mode"] = json!("once");
-    for mut req in [fetch, ack, list, announce, wait] {
+    wait["hook_integration"] = json!(1);
+    for mut req in [fetch, plain, ack, list, announce, wait] {
         req.as_object_mut().unwrap().remove("token");
         let reply = hook(&daemon, req);
         assert!(
@@ -369,7 +447,7 @@ fn inbox_protocol_003_legacy_delivery_id_is_unknown() {
     );
 }
 
-/// Scenario: Arm two Once waiters on a stand-in and enqueue a message. Only the newest waiter receives its rendered block, the inbox shows Fetched, and a repeat ack from its owner is idempotent.
+/// Scenario: Arm Claude Code's once waiter on a stand-in, then a second one, which supersedes the first at once: the first is told so and ends, and one waiter stays armed. Enqueue a message: only the newer waiter receives its rendered block, naming its delivery, and the inbox shows Fetched; an explicit ack settles it and a repeat ack says it already was. A once wait from a hook component, which only an older dot-agent-deck sends, is refused and a message queued after it stays queued.
 #[spec("inbox/protocol/004")]
 #[test]
 fn inbox_protocol_004_once_claims_newest_and_explicit_ack() {
@@ -378,53 +456,87 @@ fn inbox_protocol_004_once_claims_newest_and_explicit_ack() {
     let mut older = waiter(&daemon, &pane);
     armed(&daemon, &pane, 1);
     let mut newer = waiter(&daemon, &pane);
-    armed(&daemon, &pane, 2);
-    let id = enqueue(&daemon, &pane);
-    blocks(&line(&mut newer), &id);
-    state(&daemon, &pane, &id, "fetched");
+    assert_eq!(next_reply(&mut older)["superseded"], true);
     armed(&daemon, &pane, 1);
-    older
-        .get_ref()
-        .set_read_timeout(Some(Duration::from_millis(150)))
-        .unwrap();
-    let mut duplicate = String::new();
-    let result = older.read_line(&mut duplicate);
+    let id = enqueue(&daemon, &pane);
+    let batch = next_reply(&mut newer);
+    blocks(&batch, &id);
     assert!(
-        matches!(result, Err(ref error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)),
-        "older Once waiter must receive no duplicate batch: {result:?}, line={duplicate:?}"
+        batch["messages"][0]["a"].is_number(),
+        "the batch names its attempt: {batch}"
     );
-    drop(older);
-    armed(&daemon, &pane, 0);
+    state(&daemon, &pane, &id, "fetched");
+    let mut rest = String::new();
+    assert!(
+        matches!(older.read_line(&mut rest), Ok(0)),
+        "the superseded waiter gets no batch: {rest:?}"
+    );
     let mut req = request(&pane, "ack");
     req["delivery_id"] = json!(id);
     success(&output(&mut cli(&daemon, Some(&pane), &["ack", &id])));
     state(&daemon, &pane, &id, "acknowledged");
     assert_eq!(hook(&daemon, req)["delivery"], "already_acknowledged");
+    drop(newer);
+    armed(&daemon, &pane, 0);
+    let mut old = request(&pane, "inbox_wait");
+    old["component"] = json!("other");
+    old["component_version"] = json!("synthetic-old");
+    old["mode"] = json!("once");
+    old["pid"] = json!(pane.pid);
+    let reply = line(&mut connect(&daemon, &old));
+    assert_eq!(reply["refused"], "unsupported", "{reply}");
+    let queued = enqueue(&daemon, &pane);
+    armed(&daemon, &pane, 0);
+    state(&daemon, &pane, &queued, "queued");
 }
 
-/// Scenario: Arm nine Once waiters for one pane, exceeding its default cap of eight. The oldest gets Superseded and the newest still receives the next message while the public armed count stays bounded.
+/// Scenario: Queue nine messages for a stand-in and hold eight hook receivers open, each a one-shot `inbox fetch` handed one message within a one-character budget. A ninth is refused as too many hooks at once: it is handed nothing and its message stays queued, and none of the hooks counts as an armed waiter. Once one hook closes, a fresh fetch is admitted and handed the ninth message.
 #[spec("inbox/protocol/005")]
 #[test]
-fn inbox_protocol_005_waiter_cap_supersedes_oldest() {
+fn inbox_protocol_005_hook_receivers_are_bounded_and_freed_by_closing() {
     let daemon = daemon();
     let pane = pane(&daemon, "cap", "exec /bin/cat");
-    let mut oldest = waiter(&daemon, &pane);
-    armed(&daemon, &pane, 1);
-    let mut rest = Vec::new();
-    for count in 2..=8 {
-        rest.push(waiter(&daemon, &pane));
-        armed(&daemon, &pane, count);
+    let ids: Vec<String> = (0..9).map(|_| enqueue(&daemon, &pane)).collect();
+    let open = || {
+        let mut req = request(&pane, "inbox_receipt_fetch");
+        req["consumer"] = json!("cli");
+        req["hook_integration"] = json!(1);
+        req["max_chars"] = json!(1);
+        let mut socket = connect(&daemon, &req);
+        let reply = line(&mut socket);
+        (socket, reply)
+    };
+    let mut hooks = Vec::new();
+    for count in 1..=8 {
+        let (socket, reply) = open();
+        assert_eq!(
+            reply["messages"].as_array().map(Vec::len),
+            Some(1),
+            "hook {count} is handed one message: {reply}"
+        );
+        hooks.push(socket);
     }
-    let mut newest = waiter(&daemon, &pane);
-    assert_eq!(line(&mut oldest)["superseded"], true);
-    armed(&daemon, &pane, 8);
-    let id = enqueue(&daemon, &pane);
-    blocks(&line(&mut newest), &id);
-    drop(rest);
     armed(&daemon, &pane, 0);
+    let (_refused, reply) = open();
+    assert_eq!(reply["refused"], "too_many_hooks", "{reply}");
+    assert!(reply.get("messages").is_none_or(Value::is_null), "{reply}");
+    state(&daemon, &pane, &ids[8], "queued");
+    drop(hooks.remove(0));
+    let admitted = RefCell::new(Value::Null);
+    assert!(
+        common::wait_until(WAIT, || {
+            let (_socket, reply) = open();
+            *admitted.borrow_mut() = reply;
+            admitted.borrow()["refused"] != "too_many_hooks"
+        }),
+        "a closed hook frees its place: {}",
+        admitted.borrow()
+    );
+    let reply = admitted.into_inner();
+    assert_eq!(reply["messages"][0]["id"], ids[8].as_str(), "{reply}");
 }
 
-/// Scenario: Run the daemon with a short hook idle timeout and keepalive interval, then leave a waiter idle across several idle windows. It must keep emitting keepalives, remain armed, and receive a later message rather than being reaped.
+/// Scenario: Run the daemon with a short hook idle timeout and keepalive interval, then leave Claude Code's receipt once waiter idle across several idle windows. It must keep emitting keepalives, remain armed, and receive a later message rather than being reaped.
 #[spec("inbox/protocol/006")]
 #[test]
 fn inbox_protocol_006_waiter_outlives_hook_idle_timeout() {
@@ -458,32 +570,42 @@ fn inbox_protocol_006_waiter_outlives_hook_idle_timeout() {
     }
     armed(&daemon, &pane, 1);
     let id = enqueue(&daemon, &pane);
-    let batch = loop {
-        let reply = line(&mut wait);
-        if reply["keepalive"] != true {
-            break reply;
-        }
-        assert!(start.elapsed() < WAIT, "bounded wait for batch");
-    };
-    blocks(&batch, &id);
+    blocks(&next_reply(&mut wait), &id);
 }
 
-/// Scenario: Open two waiters for a stand-in and close their sockets one at a time without a message. Inbox list must show the armed count fall from two to one to zero, and a subsequent message must remain Queued for a fresh consumer.
+/// Scenario: Register two receipt streams in different slots for a stand-in and close their sockets one at a time without a message: inbox list must show the armed count fall from two to one to zero, and a message posted then stays Queued until a fresh stream registers and is handed it. That stream's socket then closes while it holds the message: the message stays Fetched, not handed back at once, since it may have reached the agent.
 #[spec("inbox/protocol/007")]
 #[test]
 fn inbox_protocol_007_waiter_eof_deregisters() {
     let daemon = daemon();
     let pane = pane(&daemon, "eof", "exec /bin/cat");
-    let first = waiter(&daemon, &pane);
+    let first = stream(&daemon, &pane, "opencode_plugin");
     armed(&daemon, &pane, 1);
-    let second = waiter(&daemon, &pane);
+    let second = stream(&daemon, &pane, "opencode_mini");
     armed(&daemon, &pane, 2);
     drop(first);
     armed(&daemon, &pane, 1);
     drop(second);
     armed(&daemon, &pane, 0);
     let id = enqueue(&daemon, &pane);
-    state(&daemon, &pane, &id, "queued");
+    let stays = |expected: &str| {
+        assert!(
+            !common::wait_until(Duration::from_millis(300), || {
+                !listing(&daemon, &pane)["messages"]
+                    .to_string()
+                    .contains(&format!("\"state\":\"{expected}\""))
+            }),
+            "message {id} must stay {expected}: {}",
+            listing(&daemon, &pane)
+        );
+    };
+    stays("queued");
+    let mut fresh = stream(&daemon, &pane, "opencode_plugin");
+    blocks(&next_reply(&mut fresh), &id);
+    state(&daemon, &pane, &id, "fetched");
+    drop(fresh);
+    armed(&daemon, &pane, 0);
+    stays("fetched");
 }
 
 /// Scenario: Register a legacy hook-only pane which has never received a capability, then fetch and acknowledge as that pane without a token. These inbox operations must explicitly refuse even though the legacy hook provenance policy admits the pane's status events.
@@ -517,21 +639,21 @@ fn inbox_protocol_008_legacy_unattested_pane_cannot_fetch_or_ack() {
     }
 }
 
-/// Scenario: Arm forty waiters across five panes, exceeding the ordinary hook pool's thirty-two connections without exceeding any pane's waiter cap. Inbox list and announce on another connection must still answer, proving armed waiters do not hold hook-ingest slots.
+/// Scenario: Register forty receipt streams across twenty panes, two slots each, exceeding the ordinary hook pool's thirty-two connections. Inbox list and announce on another connection must still answer, proving armed receivers do not hold hook-ingest slots, and closing the streams removes their armed registrations.
 #[spec("inbox/protocol/009")]
 #[test]
 fn inbox_protocol_009_waiters_do_not_exhaust_hook_ingest_pool() {
     let daemon = daemon();
-    let mut waiters = Vec::new();
+    let mut streams = Vec::new();
     let mut panes = Vec::new();
-    for index in 0..5 {
+    for index in 0..20 {
         let pane = pane(&daemon, &format!("pool-{index}"), "exec /bin/cat");
-        for count in 1..=8 {
-            waiters.push(waiter(&daemon, &pane));
-            armed(&daemon, &pane, count);
-        }
+        streams.push(stream(&daemon, &pane, "opencode_plugin"));
+        streams.push(stream(&daemon, &pane, "opencode_mini"));
+        armed(&daemon, &pane, 2);
         panes.push(pane);
     }
+    assert_eq!(streams.len(), 40);
     let pane = &panes[0];
     let mut announce = request(pane, "inbox_announce");
     announce["component"] = json!("claude_waiter");
@@ -540,9 +662,9 @@ fn inbox_protocol_009_waiters_do_not_exhaust_hook_ingest_pool() {
     announce["pid"] = json!(pane.pid);
     assert_eq!(hook(&daemon, announce)["accepted"], true);
     for pane in &panes {
-        armed(&daemon, pane, 8);
+        armed(&daemon, pane, 2);
     }
-    drop(waiters);
+    drop(streams);
     for pane in &panes {
         armed(&daemon, pane, 0);
     }
@@ -571,12 +693,7 @@ fn inbox_protocol_011_oversized_post_is_saved_whole_and_named() {
         "background detail line\n".repeat(1_500)
     );
     let id = post(&daemon, &pane, &body);
-    let mut fetch = request(&pane, "inbox_fetch");
-    fetch["consumer"] = json!("cli");
-    fetch["max_chars"] = json!(4_800);
-    fetch["max_bytes"] = json!(4_800);
-    fetch["ack"] = json!(false);
-    let reply = hook(&daemon, fetch);
+    let reply = receipt_fetch(&daemon, &pane, false, Some(4_800));
     let text = reply["messages"][0]["text"]
         .as_str()
         .unwrap_or_else(|| panic!("one block: {reply}"));
@@ -605,7 +722,7 @@ fn inbox_protocol_011_oversized_post_is_saved_whole_and_named() {
     state(&daemon, &pane, &id, "fetched");
 }
 
-/// Scenario: Stop a stand-in, start its replacement in the same pane and queue a task for the replacement. The predecessor's still-resolvable token then calls get-seed naming the replacement, and naming nobody; neither call may hand over or acknowledge the replacement's task, which its own token can still fetch.
+/// Scenario: Stop a stand-in, start its replacement in the same pane and queue a task for the replacement. The predecessor's still-resolvable token then calls get-seed naming the replacement, and naming nobody; neither call may hand over or acknowledge the replacement's task, which the replacement's own token can still fetch on receipts. The predecessor's token cannot take it that way either.
 #[spec("inbox/protocol/012")]
 #[test]
 fn inbox_protocol_012_get_seed_never_fetches_for_another_generation() {
@@ -628,11 +745,21 @@ fn inbox_protocol_012_get_seed_never_fetches_for_another_generation() {
         );
         state(&daemon, &new, &id, "queued");
     }
-    let mut fetch = request(&new, "inbox_fetch");
-    fetch["consumer"] = json!("cli");
-    fetch["max_chars"] = json!(9000);
-    fetch["ack"] = json!(true);
-    blocks(&hook(&daemon, fetch), &id);
+    let mut stale = request(&old, "inbox_receipt_fetch");
+    stale["consumer"] = json!("cli");
+    stale["hook_integration"] = json!(1);
+    stale["pane_id"] = json!(new.id);
+    stale["agent_id"] = json!(new.agent);
+    let reply = hook(&daemon, stale);
+    assert!(
+        reply["messages"]
+            .as_array()
+            .is_none_or(|messages| messages.is_empty()),
+        "a predecessor's capability took the replacement's task: {reply}"
+    );
+    state(&daemon, &new, &id, "queued");
+    blocks(&receipt_fetch(&daemon, &new, true, None), &id);
+    state(&daemon, &new, &id, "acknowledged");
 }
 
 /// Scenario: Run the daemon with the legacy warn provenance policy, queue a task for a token-bearing stand-in and call get-seed for its pane with no token. The unattested call must get no seed, and the task must stay Queued for its own agent.
@@ -688,17 +815,14 @@ fn inbox_protocol_014_a_process_cannot_register_another_process_as_the_receiver(
     state(&daemon, &pane, &id, "queued");
 }
 
-/// Scenario: With the daemon's production admission on, a process outside the pane, running as the deck's own user and presenting the pane's current token and agent id, fetches the agent's queued task without acknowledging it, acknowledges it by id, and then takes a second task through the get-seed alias. Each is admitted: the first task is handed over and Acknowledged, and get-seed hands over the second and acknowledges it.
+/// Scenario: With the daemon's production admission on, a process outside the pane, running as the deck's own user and presenting the pane's current token and agent id, fetches the agent's queued task on receipts without acknowledging it, then acknowledges it by id: both are admitted, the task is handed over and Acknowledged. Its get-seed is answered with no seed and takes nothing: a second task stays Queued.
 #[spec("inbox/protocol/015")]
 #[test]
 fn inbox_protocol_015_the_panes_capability_takes_and_settles_its_mail_from_outside_it() {
     let daemon = common::spawn_daemon_serve(None, "0");
     let pane = pane(&daemon, "bound-mail", "exec /bin/cat");
     let id = enqueue(&daemon, &pane);
-    let mut fetch = request(&pane, "inbox_fetch");
-    fetch["consumer"] = json!("cli");
-    fetch["ack"] = json!(false);
-    let reply = hook(&daemon, fetch);
+    let reply = receipt_fetch(&daemon, &pane, false, None);
     assert!(reply["refused"].is_null(), "fetch: {reply}");
     blocks(&reply, &id);
     state(&daemon, &pane, &id, "fetched");
@@ -709,13 +833,9 @@ fn inbox_protocol_015_the_panes_capability_takes_and_settles_its_mail_from_outsi
     state(&daemon, &pane, &id, "acknowledged");
     let second = post(&daemon, &pane, "SEED-SENTINEL-3b81: the second task");
     let reply = hook(&daemon, request(&pane, "get_seed"));
-    assert!(
-        reply["seed"]
-            .as_str()
-            .is_some_and(|seed| seed.contains("SEED-SENTINEL-3b81")),
-        "get_seed: {reply}"
-    );
-    state(&daemon, &pane, &second, "acknowledged");
+    assert!(reply["seed"].is_null(), "get_seed takes nothing: {reply}");
+    assert_eq!(reply["refused"], "get_seed_removed", "{reply}");
+    state(&daemon, &pane, &second, "queued");
 }
 
 /// Scenario: With the daemon binding inbox components to the pane's agent, a process outside the pane sends a raw hook event with the pane's own token that names the agent's queued task as a prompt it observed. The task must stay Queued; the real Claude waiter, run inside the pane, is then handed the task, and the real Claude hook, run inside the pane for a prompt carrying the block the waiter wrote, commits it.
@@ -989,10 +1109,7 @@ fn inbox_protocol_023_a_refused_request_of_the_agents_own_shows_on_its_card() {
         record(&daemon, &victim)
     );
 
-    let mut fetch = request(&own, "inbox_fetch");
-    fetch["consumer"] = json!("cli");
-    fetch["ack"] = json!(true);
-    blocks(&hook(&daemon, fetch), &id);
+    blocks(&receipt_fetch(&daemon, &own, true, None), &id);
     assert!(
         common::wait_until(WAIT, || record(&daemon, &own)["inbox"]
             .get("admission_refused")

@@ -2079,6 +2079,13 @@ impl InboxHub {
             let key = (pane_id.to_string(), agent_id.to_string());
             // PRD #1666 §13 step 4: a receipt-owned assignment is settled
             // through its attempt model, never by the legacy ack alone.
+            // A repeated ack is answered as one, the model left alone.
+            if matches!(
+                st.inbox.state_for(id, pane_id, agent_id),
+                Some(MessageState::Acknowledged { .. })
+            ) {
+                return AckOutcome::AlreadyAcknowledged;
+            }
             let receipt_owned = st.inbox.owner_of(id, pane_id, agent_id)
                 == Some(crate::inbox::AssignmentOwner::Receipt);
             let committed = receipt_owned.then(|| engine::explicit_commit(&mut st, &key, id, now));
@@ -2086,6 +2093,17 @@ impl InboxHub {
             // changes nothing, and does not fall through to the legacy ack,
             // which would acknowledge the inbox copy the model still queues.
             if committed == Some(engine::ExplicitCommit::Refused) {
+                return AckOutcome::Unknown;
+            }
+            // PRD #1666 part 3 (H5): nor does an ack of a message the deck
+            // never handed out, still waiting for its agent or assigned to it
+            // as an offer: no fetch is left that could have shown the agent
+            // its body. A settled, claimed or undeliverable copy still answers
+            // as the store does, so a late ack of a copy out of attempts still
+            // corrects its sender.
+            if committed != Some(engine::ExplicitCommit::Committed)
+                && st.inbox.state_for(id, pane_id, agent_id) == Some(&MessageState::Queued)
+            {
                 return AckOutcome::Unknown;
             }
             if committed == Some(engine::ExplicitCommit::Committed) {
@@ -3168,12 +3186,22 @@ impl InboxHub {
         };
     }
 
-    /// Part 2 §2.7: a one-shot receiver declared no [`HOOK_INTEGRATION`], or
-    /// a lower one. Nothing is issued; its card names the fix.
-    pub fn refuse_old_hooks(&self, pane_id: &str, agent_id: &str) {
+    /// Part 2 §2.7: a one-shot receiver of `component` declared no
+    /// [`HOOK_INTEGRATION`], or a lower one. Nothing is issued; its card names
+    /// the fix: that agent's own `hooks install`, or none for a component the
+    /// deck cannot tie to an agent (PRD #1666 part 3, H5).
+    pub fn refuse_old_hooks(&self, pane_id: &str, agent_id: &str, component: InboxComponent) {
+        let agent = match component {
+            InboxComponent::ClaudeWaiter | InboxComponent::ClaudeHooks => {
+                Some(crate::event::AgentType::ClaudeCode)
+            }
+            InboxComponent::CodexHooks => Some(crate::event::AgentType::Codex),
+            InboxComponent::DevinHooks => Some(crate::event::AgentType::Devin),
+            _ => None,
+        };
         let mut st = self.lock();
         let key = (pane_id.to_string(), agent_id.to_string());
-        engine::refuse_hooks(&mut st, &key);
+        engine::refuse_hooks(&mut st, &key, agent);
         engine::broadcast_notices(&mut st, &key, Instant::now());
     }
 
@@ -3710,7 +3738,7 @@ pub async fn serve_hook<R, W>(
         .is_none_or(|declared| declared < HOOK_INTEGRATION)
     {
         if !fetch.cli() {
-            hub.refuse_old_hooks(&pane_id, &agent_id);
+            hub.refuse_old_hooks(&pane_id, &agent_id, component);
         }
         warn!(
             pane_id = %pane_id,
@@ -5438,22 +5466,15 @@ pub async fn serve_waiter<R, W, P>(
     P: Fn(&str),
 {
     let deadline = hub.write_deadline();
-    // PRD #1666 part 3 (H4): Codex's, Devin's and an unknown component's
-    // hooks are receivers of their own fetch, so none of them streams; a
-    // legacy once wait from one (`inbox_wait`, which only an older binary
-    // sends: this one's goes on the receipt verb, refused unless it is Claude
-    // Code's waiter) keeps the legacy waiter below until H5 deletes it. The
-    // hook mapping grants none of them a native wake.
-    let legacy_once = mode == InboxWaitMode::Once
-        && matches!(
-            component,
-            InboxComponent::CodexHooks | InboxComponent::DevinHooks | InboxComponent::Other
-        );
     // Part 2 §2.4, §2.7: Claude's once-waiter is served by the receipt
     // engine at the one-shot integration floor; below it nothing registers or
     // is issued, and its card names the command that updates the hooks. A
-    // one-shot component never streams.
-    if !legacy_once && engine::one_shot_component(component) {
+    // one-shot component never streams. PRD #1666 part 3 (H5): nor does any
+    // other one-shot component wait: Codex's, Devin's and an unknown
+    // component's hooks are receivers of their own fetch, so a once wait from
+    // one (which only an older dot-agent-deck sends) is refused before
+    // anything arms, and the hook mapping grants none of them a native wake.
+    if engine::one_shot_component(component) {
         if mode == InboxWaitMode::Once && component == InboxComponent::ClaudeWaiter {
             if arm
                 .hook_integration
@@ -5462,7 +5483,7 @@ pub async fn serve_waiter<R, W, P>(
                 serve_once(hub, pane_id, agent_id, component, instance, reader, writer).await;
                 return;
             }
-            hub.refuse_old_hooks(&pane_id, &agent_id);
+            hub.refuse_old_hooks(&pane_id, &agent_id, component);
             warn!(
                 pane_id = %pane_id,
                 ?component,
@@ -5478,10 +5499,14 @@ pub async fn serve_waiter<R, W, P>(
             return;
         }
         warn!(pane_id = %pane_id, ?component, ?mode, "inbox: refused a wait a one-shot component cannot make");
+        let why = match mode {
+            InboxWaitMode::Once => crate::inbox_display::WAIT_UNSUPPORTED,
+            InboxWaitMode::Stream => crate::inbox_display::STREAM_UNSUPPORTED,
+        };
         let _ = write_line_within(
             deadline,
             &mut writer,
-            &InboxWaitReply::refused("unsupported", crate::inbox_display::STREAM_UNSUPPORTED),
+            &InboxWaitReply::refused("unsupported", why),
         )
         .await;
         return;
@@ -5489,7 +5514,7 @@ pub async fn serve_waiter<R, W, P>(
     // PRD #1666 §13 step 4, §11: a component the receipt policy covers is
     // served by the receipt engine, at the floor or above; below it nothing
     // registers and its card says the integration is out of date.
-    if !legacy_once && receipt_component(component) {
+    if receipt_component(component) {
         if mode == InboxWaitMode::Stream
             && arm
                 .adapter_integration

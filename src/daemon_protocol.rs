@@ -1595,6 +1595,19 @@ pub const CONTRACT_BREAKS: &[&str] = &[
     // is who takes mail on receipts and what settles it.
     // `changelog.d/1666-remaining-inbox.breaking.md` is its fragment.
     "1666-remaining-inbox-one-shot-receipts",
+    // PRD #1666 part 3 (H5), at 12 without moving it. The legacy delivery
+    // policy is withdrawn: a plain `inbox_fetch` with no stream bound takes
+    // nothing whatever it asks, `ack` included (`cli_too_old`, or for an
+    // agent's hook the one-shot floor's `hooks_too_old`); a once `inbox_wait`
+    // from Codex's, Devin's or an unknown component is refused `unsupported`;
+    // `get_seed` hands nothing over and answers no seed with the additive
+    // `refused: get_seed_removed`; and an `ack` of a message the deck never
+    // handed out answers `unknown` and changes nothing, where an older daemon
+    // acknowledged the queued copy. The attach wire, `ListInbox`'s nested
+    // vocabulary (the legacy `ack_how` spellings included) and the
+    // stream-bound fetch are unchanged; what moved is who may take mail.
+    // `changelog.d/1666-legacy-inbox.breaking.md` is its fragment.
+    "1666-legacy-inbox-delivery-withdrawal",
 ];
 
 /// What comparing this build's [`CONTRACT_BREAKS`] against a peer's found.

@@ -3910,7 +3910,7 @@ without depending on the config struct API.
 ##### orchestration/delegate/013 — In separate runs leave a delegate Queued or Fetched past the accelerated undelivered deadline. The orchestrator receives one daemon-labelled inbox notice naming the message, worker, state and doorbell path, without pane text being typed.
 - **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
 - **Agent:** none.
-- **Asserts:** In separate runs leave a delegate Queued or Fetched past the accelerated undelivered deadline. The orchestrator receives one daemon-labelled inbox notice naming the message, worker, state and doorbell path, without pane text being typed. A replacement orchestrator must receive no stale notice from its predecessor's still-unacknowledged task, which remains fetchable by the original worker.
+- **Asserts:** In separate runs leave a delegate Queued or Fetched past the accelerated undelivered deadline. For the Queued one the orchestrator receives one daemon-labelled inbox notice naming the message, worker, state and doorbell path, without pane text being typed; the Fetched one, which may have reached the worker, raises none (PRD #1666 part 3, H5). A replacement orchestrator must receive no stale notice from its predecessor's still-unacknowledged task, which remains fetchable by the original worker.
 - **Test:** `delegate_013_silent_worker_surfaces_notice_in_orchestrator_pane` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
@@ -8543,7 +8543,7 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 ##### inbox/protocol/001 — Inbox verbs require an attested caller.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), isolated real daemon process and JSON-lines hook socket.
 - **Agent:** none (capability-exporting `cat` stand-in).
-- **Asserts:** attested announce and empty fetch succeed; fetch, ack, list, announce and wait with no token explicitly refuse without exposing messages.
+- **Asserts:** attested announce and an empty receipt fetch (`inbox_receipt_fetch`, as a current `inbox fetch` asks) succeed; that fetch, the old plain fetch, ack, list, announce and wait with no token explicitly refuse without exposing messages.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/protocol/002 — A different attested agent cannot acknowledge a message.
@@ -8558,28 +8558,29 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 - **Asserts:** an old `d-…` id returns Unknown and the CLI refuses to claim an acknowledgement.
 - **Platform coverage:** mac+linux.
 
-##### inbox/protocol/004 — Once hands a batch to the newest waiter and requires explicit ack.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), isolated daemon and two hook-socket waiters of the legacy once path (component `other`; Claude's waiter is on receipts since part 2's H3, inbox/claude/016), which stays until H5 deletes it.
+##### inbox/protocol/004 — A newer once waiter supersedes the older, takes the batch and needs an explicit ack.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), isolated daemon and two hook-socket receipt once waiters (Claude Code's `claude_waiter` at the one-shot integration), the real `ack` CLI, and an old `other` once wait.
 - **Agent:** none (`cat` stand-in).
-- **Asserts:** newest gets the complete rendered block, oldest remains armed, state becomes Fetched, owner ack moves it to Acknowledged, and repeated ack returns AlreadyAcknowledged.
+- **Asserts:** the second waiter supersedes the first at once (`superseded`, armed stays one); the newer gets the complete rendered block naming its delivery attempt, the state becomes Fetched and the superseded waiter gets no batch; an explicit ack moves it to Acknowledged and a repeated ack returns AlreadyAcknowledged; an `other` once wait is refused `unsupported` and a message queued after it stays Queued (PRD #1666 part 3, H5).
 - **Platform coverage:** mac+linux.
 
-##### inbox/protocol/005 — The per-agent waiter cap supersedes the oldest.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), nine hook-socket waiters of the legacy once path (component `other`, until H5).
+##### inbox/protocol/005 — Live hook receivers are bounded at eight and freed by closing.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), nine receipt fetches (`inbox_receipt_fetch`, consumer `cli`) with a one-character budget, eight held open.
 - **Agent:** none (`cat` stand-in).
-- **Asserts:** waiter nine supersedes waiter one, armed stays at eight, and the newest waiter receives the next message.
+- **Asserts:** each of eight held hooks is handed one message and none counts as an armed waiter; a ninth is refused `too_many_hooks`, handed nothing, and its message stays Queued; once one hook closes, a fresh fetch is admitted and handed that message (PRD #1666 part 3, H5, which retired the legacy per-agent waiter cap).
+- **Does not assert:** the deck-wide `MAX_INBOX_WAITERS` (`inbox_hub` unit tests).
 - **Platform coverage:** mac+linux.
 
 ##### inbox/protocol/006 — Idle waiters survive the hook read timeout.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), shortened hook-idle and inbox-keepalive environment overrides, a legacy once waiter (component `other`, until H5).
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), shortened hook-idle and inbox-keepalive environment overrides, Claude Code's receipt once waiter.
 - **Agent:** none (`cat` stand-in).
-- **Asserts:** a waiter emits keepalives beyond several idle windows, remains armed, and receives a subsequent message.
+- **Asserts:** a waiter emits keepalives beyond several idle windows, remains armed, and receives a subsequent message; an ordinary silent hook connection is still closed at the short idle timeout.
 - **Platform coverage:** mac+linux.
 
-##### inbox/protocol/007 — Waiter EOF removes its armed registration.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), real socket closure and InboxList observation, legacy once waiters (component `other`, until H5).
+##### inbox/protocol/007 — Receiver EOF removes its armed registration, and a closed receiver keeps what it may hold.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), real socket closure and InboxList observation, receipt streams in two slots (`opencode_plugin`, `opencode_mini`).
 - **Agent:** none (`cat` stand-in).
-- **Asserts:** armed moves two → one → zero as peers disconnect, and the next message stays Queued.
+- **Asserts:** armed moves two → one → zero as the streams disconnect; a message posted then stays Queued until a fresh stream registers and is handed it; that stream closing while it holds the message leaves it Fetched, not handed back at once.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/protocol/008 — Legacy Unattested status producers cannot access inbox messages.
@@ -8588,22 +8589,22 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 - **Asserts:** fetch and ack refuse without a token even for the legacy Unattested provenance class.
 - **Platform coverage:** mac+linux.
 
-##### inbox/protocol/009 — Waiters leave ordinary hook-ingest slots available.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), forty live legacy once waiters (component `other`, until H5) across five daemon-owned panes.
-- **Agent:** none (five `cat` stand-ins).
-- **Asserts:** list and announce continue answering above the ordinary thirty-two hook-connection limit, and closing the waiters removes their armed registrations.
+##### inbox/protocol/009 — Receivers leave ordinary hook-ingest slots available.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), forty live receipt streams (two slots in each of twenty daemon-owned panes).
+- **Agent:** none (twenty `cat` stand-ins).
+- **Asserts:** list and announce continue answering above the ordinary thirty-two hook-connection limit, and closing the streams removes their armed registrations.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/protocol/011 — An oversized post is saved whole and named.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), attach PostMessage and a byte-budgeted hook-socket fetch.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), attach PostMessage and a byte-budgeted receipt fetch on the hook socket.
 - **Agent:** none (`cat` stand-in).
 - **Asserts:** the fetched block fits 4,800 bytes, names a file instead of carrying the tail, and that owner-only file holds the whole task including the directive at its end.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/protocol/012 — get-seed never fetches for another agent generation.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), stop-agent and a replacement in the same pane, raw get_seed on the hook socket.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), stop-agent and a replacement in the same pane, raw get_seed and receipt fetches on the hook socket.
 - **Agent:** none (two `cat` stand-ins).
-- **Asserts:** the predecessor's token naming the replacement, or naming nobody, gets no seed and leaves the replacement's task Queued; the replacement still fetches it.
+- **Asserts:** the predecessor's token naming the replacement, or naming nobody, gets no seed and leaves the replacement's task Queued; a receipt fetch with the predecessor's token naming the replacement takes nothing; the replacement's own receipt fetch takes the task and its ack settles it.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/protocol/013 — An unattested get-seed hands over no inbox message.
@@ -8619,9 +8620,9 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 - **Platform coverage:** mac+linux.
 
 ##### inbox/protocol/015 — The pane's capability takes and settles its mail from outside the agent's tree.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), daemon with its production admission on, hook-socket fetch, ack and get_seed from the test process, running as the deck's user outside every pane.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), daemon with its production admission on, hook-socket receipt fetch, ack and get_seed from the test process, running as the deck's user outside every pane.
 - **Agent:** none (`cat` stand-in).
-- **Asserts:** with the pane's current token, a fetch without ack hands the task over (Fetched), an explicit ack of its id is accepted (Acknowledged), and get_seed hands over a second task and acknowledges it (PRD #1666 part 3, R-1). The refusals of a wrong, missing or earlier capability are `inbox/protocol/022`.
+- **Asserts:** with the pane's current token, a receipt fetch without ack hands the task over (Fetched), and an explicit ack of its id is accepted (Acknowledged) (PRD #1666 part 3, R-1); get_seed answers no seed with `get_seed_removed` and a second task stays Queued (H5). The refusals of a wrong, missing or earlier capability are `inbox/protocol/022`.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/protocol/016 — A raw event from outside the agent acknowledges nothing.
@@ -8666,14 +8667,14 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 ##### inbox/protocol/022 — A wrong, missing or earlier capability takes nothing.
 - **Layer:** Fast tier (`tests/inbox_process_identity.rs`), the real binary as `daemon serve` with its production admission on, hook-socket requests from the test process, outside every pane.
 - **Agent:** none (`cat` stand-ins).
-- **Asserts:** a fetch and an ack for one pane's task carrying another pane's capability are refused `token_names_another_pane`, with no capability `missing_token`, and with the capability of a generation replaced in its pane `unknown_token`, whether they name the earlier or the current agent; every task stays queued; the same outside process with the pane's current capability is handed the task, and it is acknowledged.
+- **Asserts:** a receipt fetch and an ack for one pane's task carrying another pane's capability are refused `token_names_another_pane`, with no capability `missing_token`, and with the capability of a generation replaced in its pane `unknown_token`, whether they name the earlier or the current agent; every task stays queued; the same outside process with the pane's current capability is refused the old plain fetch (`cli_too_old`, the task still queued), then a receipt fetch hands it the task and its ack settles it.
 - **Does not assert:** a peer running as another user (the `daemon.rs` unit test `a_capability_holder_outside_the_tree_must_be_the_decks_user` pins it, since a test cannot run as two users), or the card notice (`inbox/protocol/023`).
 - **Platform coverage:** mac+linux.
 
 ##### inbox/protocol/023 — A refused request of the agent's own shows on its card; another pane's does not.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), daemon with its production admission on; refused requests go over a connection whose creator exited, the rest from the test process; the card state is read from `list-agents`, the snapshot both clients hydrate from.
 - **Agent:** none (`cat` stand-ins).
-- **Asserts:** with a task queued, a fetch carrying the pane's own token over an exited creator's connection is refused `inbox_peer_unidentified` with a remedy in its error, and the agent's record carries `inbox.admission_refused: "inbox_peer_unidentified"`; a request naming a second pane with the first pane's token is refused `token_names_another_pane` and the second pane's record carries no refusal; an admitted fetch with the pane's token clears the first pane's.
+- **Asserts:** with a task queued, a fetch carrying the pane's own token over an exited creator's connection is refused `inbox_peer_unidentified` with a remedy in its error, and the agent's record carries `inbox.admission_refused: "inbox_peer_unidentified"`; a request naming a second pane with the first pane's token is refused `token_names_another_pane` and the second pane's record carries no refusal; an admitted receipt fetch with the pane's token, its task then acknowledged, clears the first pane's.
 - **Does not assert:** the orchestrator notice (`inbox/boundary/065`) or the rendering (`inbox/status/027`, `/028`, desktop `inboxWords.test.ts`).
 - **Platform coverage:** mac+linux.
 
@@ -8765,7 +8766,7 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/doorbell/005 — Queued work re-rings on schedule and fetching stops retries.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), real binary and daemon-owned PTY, byte capture and vt100 replay.
 - **Agent:** none (raw Python stand-in; no agent executable or credential).
-- **Asserts:** Accelerated increasing retry intervals reach the repeating final delay, with lower bounds on observed submissions; Fetched stops the schedule before ack and Acknowledged keeps it stopped.
+- **Asserts:** Accelerated increasing retry intervals reach the repeating final delay, with lower bounds on observed submissions; Fetched by a receipt fetch whose receiver stays open stops the schedule before ack and Acknowledged keeps it stopped.
 - **Does not assert:** a real agent editor or real-model response; native agent adapters and producer migration have separate coverage.
 - **Platform coverage:** mac+linux.
 
@@ -9198,7 +9199,7 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/boundary/030 — A Pi extension from before the receipt stream is refused.
 - **Layer:** Fast (`src/daemon.rs`), the hub's stream server over an in-memory duplex and the daemon's own fetch and get-seed handlers.
 - **Agent:** none.
-- **Asserts:** a Pi or OpenCode stream without the deck's integration is refused `adapter_too_old`; a Pi generation's plain doorbell fetch and its get-seed are refused the same way; each leaves the message queued and puts the out-of-date notice on the card; a Claude hook's plain doorbell fetch is still served.
+- **Asserts:** a Pi or OpenCode stream without the deck's integration is refused `adapter_too_old`; a Pi generation's plain doorbell fetch and its get-seed are refused the same way; each leaves the message queued and puts the out-of-date notice on the card; a Claude hook's plain doorbell fetch is no adapter's: it is routed to the hooks' one-shot floor as Claude's, and the withdrawn legacy fetch takes nothing (PRD #1666 part 3, H5).
 - **Does not assert:** the clients' rendering of the notice (inbox/status, desktop words test).
 - **Platform coverage:** all.
 
@@ -9531,7 +9532,7 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/status/004 — Attached clients receive each direct-message lifecycle transition as a recognized Inbox broadcast.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_status.rs`), real binary and streaming attach subscription.
 - **Agent:** none (raw Python stand-in; no credential).
-- **Asserts:** Queued → Fetched → Queued (ack-wait run out) → Fetched → Acknowledged (explicit `ack`) and Queued → Undeliverable (agent stop) arrive in order with pane_id, message_id, subject and from_label; BroadcastMsg recognizes and preserves the inbox payload.
+- **Asserts:** Queued → Fetched → Queued (a receipt fetch that reports it printed nothing) → Fetched → Acknowledged (explicit `ack`) and Queued → Undeliverable (agent stop) arrive in order with pane_id, message_id, subject and from_label; BroadcastMsg recognizes and preserves the inbox payload.
 - **Does not assert:** offers, publishes, real agent adapters or frontend rendering.
 - **Platform coverage:** mac+linux.
 
@@ -10060,17 +10061,17 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** the private unresolved-worker dispatch branch or commission expiry arithmetic; the ledger unit tests retain those arithmetic checks.
 - **Platform coverage:** mac+linux.
 
-##### inbox/route/010 — A late ack after max_deliver corrects the orchestrator.
-- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_route.rs`), real sandbox daemon with ack-wait 1500 ms and `max_deliver` 1.
-- **Agent:** scripted stand-ins; the worker fetches through `inbox fetch` without acknowledging, as a hook does, and later acknowledges through the explicit `ack` route.
-- **Asserts:** the task becomes undeliverable and the orchestrator is told so; the worker's later ack makes it acknowledged and the orchestrator receives a correction naming the task and the worker's role.
-- **Does not assert:** the recipient card's cleared notice (the `inbox_hub` and `state` unit tests).
+##### inbox/route/010 — A late ack after the repeats ran out corrects the orchestrator.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_route.rs`), real sandbox daemon with ack-wait 1500 ms and a 300 ms keepalive.
+- **Agent:** scripted stand-ins; the worker's `inbox fetch` (a receipt fetch, granted and reported possibly handed) exits without confirming, and the worker later acknowledges through the explicit `ack` route.
+- **Asserts:** no receiver takes the marked repeat in time, so the orchestrator is told the task's delivery is uncertain; the worker's later ack makes it acknowledged and the orchestrator receives a correction naming the task and the worker's role.
+- **Does not assert:** a late commit after the task ran out of attempts on not-handed reports, nor the recipient card's cleared notice (`a_commit_after_running_out_of_attempts_corrects_the_sender_and_the_card` in `src/inbox_engine_tests.rs`).
 - **Platform coverage:** mac+linux.
 
 ##### inbox/route/011 — An ack after the "has not reached the worker" notice corrects the orchestrator once.
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_route.rs`), real sandbox daemon with ack-wait 1500 ms, `max_deliver` 100 and the undelivered notice at 3000 ms.
-- **Agent:** scripted stand-ins; the worker fetches through `inbox fetch` without acknowledging and later acknowledges through the explicit `ack` route.
-- **Asserts:** the orchestrator is told the task has not reached the worker; the worker's ack makes it acknowledged and the orchestrator receives one correction naming the task and the worker's role, and no second one.
+- **Agent:** scripted stand-ins; the worker leaves the task queued, then its `inbox fetch` (a receipt fetch) takes it and it acknowledges through the explicit `ack` route.
+- **Asserts:** the orchestrator is told the queued task has not reached the worker; the worker's ack makes it acknowledged and the orchestrator receives one correction naming the task and the worker's role, and no second one.
 - **Does not assert:** the correction after "is undeliverable" (inbox/route/010) or the told-both case (the `inbox_hub` unit tests).
 - **Platform coverage:** mac+linux.
 

@@ -184,7 +184,8 @@ fn publish_002_same_name_instances_do_not_leak_and_subscribers_get_fenced_conten
             .as_str()
             .expect("framed agent text");
         assert!(
-            text.contains(&format!("[dot-agent-deck message {id} from "))
+            text.contains(&format!("[dot-agent-deck message {id} delivery "))
+                && text.contains(" from ")
                 && text.contains(&format!("[end of dot-agent-deck message {id}]")),
             "message frame: {text}"
         );

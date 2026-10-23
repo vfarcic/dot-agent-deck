@@ -119,6 +119,23 @@ fn hook(daemon: &DaemonProc, request: &Value) -> Value {
     serde_json::from_str(&raw).unwrap_or_else(|error| panic!("reply ({error}): {raw:?}"))
 }
 
+/// A hook-socket connection that has sent `request`, kept open.
+fn connect(daemon: &DaemonProc, request: &Value) -> BufReader<UnixStream> {
+    let mut socket = UnixStream::connect(&daemon.hook_socket).expect("hook socket");
+    socket.set_read_timeout(Some(WAIT)).unwrap();
+    writeln!(socket, "{request}").unwrap();
+    BufReader::new(socket)
+}
+
+/// The next JSON line on `socket`.
+fn read_line(socket: &mut BufReader<UnixStream>) -> Value {
+    let mut raw = String::new();
+    socket
+        .read_line(&mut raw)
+        .unwrap_or_else(|error| panic!("no reply ({error}): {raw:?}"));
+    serde_json::from_str(&raw).unwrap_or_else(|error| panic!("reply ({error}): {raw:?}"))
+}
+
 /// The pids from `pid`'s parent up to the top of the process table, read with
 /// `ps`, so the walk is the platform's own and not the daemon's.
 fn ancestors_of(pid: u32) -> Vec<u32> {
@@ -269,7 +286,7 @@ fn inbox_protocol_021_a_pane_capability_holder_outside_the_agent_tree_takes_its_
     );
 }
 
-/// Scenario: Two panes run, and a third pane's agent is stopped and started again so it has a new generation. From outside every pane, requests for the first pane's queued task carrying the second pane's capability, no capability at all, or the third pane's earlier generation's capability are each refused with their own named cause, and every task stays queued. The same outside process holding the first pane's current capability then fetches its task.
+/// Scenario: Two panes run, and a third pane's agent is stopped and started again so it has a new generation. From outside every pane, requests for the first pane's queued task carrying the second pane's capability, no capability at all, or the third pane's earlier generation's capability are each refused with their own named cause, and every task stays queued. The same outside process holding the first pane's current capability is refused the old plain fetch, which takes nothing, then fetches its task on receipts and acknowledges it.
 #[spec("inbox/protocol/022")]
 #[test]
 fn inbox_protocol_022_a_wrong_missing_or_earlier_capability_takes_nothing() {
@@ -278,8 +295,8 @@ fn inbox_protocol_022_a_wrong_missing_or_earlier_capability_takes_nothing() {
     let other = pane(&daemon, "capability-other", "exec /bin/cat");
     let task = post(&daemon, &owner, "owner task", BODY);
     let fetch = |pane: &str, agent: &str, token: Option<&str>| {
-        let mut request = json!({"message_type":"inbox_fetch", "pane_id":pane,
-            "agent_id":agent, "consumer":"cli", "ack":true});
+        let mut request = json!({"message_type":"inbox_receipt_fetch", "pane_id":pane,
+            "agent_id":agent, "consumer":"cli", "hook_integration":1});
         if let Some(token) = token {
             request["token"] = json!(token);
         }
@@ -332,13 +349,29 @@ fn inbox_protocol_022_a_wrong_missing_or_earlier_capability_takes_nothing() {
     assert_eq!(reply["reason"], "unknown_token", "{reply}");
     assert!(state_of(&daemon, &current, &successor_task).contains("queued"));
 
-    // The pane's current capability, from the same outside process.
-    let reply = fetch(&owner.id, &owner.agent, Some(&owner.token));
+    // The pane's current capability, from the same outside process: the old
+    // plain fetch is refused for what it is (PRD #1666 part 3, H5), and a
+    // current fetch takes the task, which its ack settles.
+    let mut plain = json!({"message_type":"inbox_fetch", "pane_id":owner.id,
+        "agent_id":owner.agent, "consumer":"cli", "ack":true, "token":owner.token});
+    let reply = hook(&daemon, &plain);
+    assert_eq!(reply["refused"], "cli_too_old", "{reply}");
+    assert!(state_of(&daemon, &owner, &task).contains("queued"));
+    plain["message_type"] = json!("inbox_receipt_fetch");
+    plain["hook_integration"] = json!(1);
+    let mut socket = connect(&daemon, &plain);
+    let reply = read_line(&mut socket);
     assert!(
         reply["refused"].is_null(),
         "the current capability is admitted: {reply}"
     );
     assert!(reply["messages"].to_string().contains(BODY), "{reply}");
+    let held = &reply["messages"][0];
+    let may = json!({"may": {"q": 0, "id": held["id"], "a": held["a"], "e": held["e"]}});
+    writeln!(socket.get_mut(), "{may}").unwrap();
+    assert_eq!(read_line(&mut socket)["grant"]["ok"], true);
+    let reply = ack(&owner.id, &owner.agent, Some(&owner.token), &task);
+    assert_eq!(reply["delivery"], "acknowledged", "{reply}");
     assert!(
         common::wait_until(WAIT, || state_of(&daemon, &owner, &task)
             .contains("acknowledged")),

@@ -1524,6 +1524,12 @@ impl Inbox {
         true
     }
 
+    /// The state of the copy of `id` this agent may act on.
+    pub fn state_for(&self, id: &str, pane_id: &str, agent_id: &str) -> Option<&MessageState> {
+        self.find_for(id, pane_id, agent_id)
+            .map(|index| &self.messages[index].state)
+    }
+
     /// The owner of the copy of `id` this agent may act on.
     pub fn owner_of(&self, id: &str, pane_id: &str, agent_id: &str) -> Option<AssignmentOwner> {
         self.find_for(id, pane_id, agent_id)

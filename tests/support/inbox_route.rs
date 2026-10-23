@@ -368,18 +368,20 @@ pub fn undelivered(fetched: bool) {
     let (orch, worker) = team(&daemon, false);
     let id = delegate(&daemon, &orch, TASK, false);
     if fetched {
+        // PRD #1666 part 3 (H5): a hand-out that may have reached the worker
+        // is held by the deck's receipts, not one that has not reached it:
+        // past the deadline the orchestrator is told nothing.
         inbox::fetch(&daemon, &worker, false);
         inbox::state(&daemon, &worker, &id, "fetched");
-    } else {
-        inbox::state(&daemon, &worker, &id, "queued");
+        no_messages(&daemon, &orch, Duration::from_millis(1500));
+        return;
     }
+    inbox::state(&daemon, &worker, &id, "queued");
     let block = notice(&daemon, &orch, &id).to_string();
     assert!(
         block.contains("has not reached the worker")
             && block.contains("coder")
-            && block
-                .to_ascii_lowercase()
-                .contains(if fetched { "fetched" } else { "queued" })
+            && block.to_ascii_lowercase().contains("queued")
             && block.to_ascii_lowercase().contains("doorbell"),
         "actionable undelivered notice: {block}"
     );

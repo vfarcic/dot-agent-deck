@@ -451,7 +451,7 @@ fn route_007_tui_config_generation_posts_bound_message() {
     route::count(&deck, &pane, 1);
 }
 
-/// Scenario: In separate runs leave a delegate Queued or Fetched past the accelerated undelivered deadline. The orchestrator receives one daemon-labelled inbox notice naming the message, worker, state and doorbell path, without pane text being typed. Replace another task's orchestrator before that deadline and require its successor to receive no stale notice while the worker's original task stays fetchable.
+/// Scenario: In separate runs leave a delegate Queued or Fetched past the accelerated undelivered deadline. For the Queued one the orchestrator receives one daemon-labelled inbox notice naming the message, worker, state and doorbell path, without pane text being typed; the Fetched one, which may have reached the worker, raises none. Replace another task's orchestrator before that deadline and require its successor to receive no stale notice while the worker's original task stays fetchable.
 #[spec("orchestration/delegate/013")]
 #[test]
 fn delegate_013_silent_worker_surfaces_notice_in_orchestrator_pane() {
@@ -550,8 +550,8 @@ fn idle_worker_030_a_waiting_notice_survives_its_own_pointer_landing_while_it_wa
     route::idle_clock(30);
 }
 
-/// The worker fetches its task through `inbox fetch` without acknowledging
-/// it, as a hook does, and returns it.
+/// The worker's `inbox fetch` takes its task and may have printed it (on
+/// receipts: issued and granted), and nothing acknowledges it yet.
 fn fetched_unacknowledged(daemon: &common::DaemonProc, worker: &Pane, id: &str) {
     let reply = fetch(daemon, worker, false);
     assert!(
@@ -566,7 +566,8 @@ fn fetched_unacknowledged(daemon: &common::DaemonProc, worker: &Pane, id: &str) 
 fn acknowledge(daemon: &common::DaemonProc, worker: &Pane, id: &str) {
     let mut ack = request(worker, "ack");
     ack["delivery_id"] = json!(id);
-    assert_eq!(hook(daemon, ack)["accepted"], true);
+    let answer = hook(daemon, ack);
+    assert_eq!(answer["delivery"], "acknowledged", "{answer}");
 }
 
 fn message_state(daemon: &common::DaemonProc, worker: &Pane, id: &str) -> serde_json::Value {
@@ -611,21 +612,20 @@ fn route_013_a_task_possessed_through_a_long_turn_raises_no_false_notice() {
     route::no_messages(&daemon, &orch, Duration::from_millis(1200));
 }
 
-/// Scenario: A worker fetches a delegated task without acknowledging it, so when its one allowed hand-over's ack-wait runs out the task is undeliverable and the orchestrator is told so. The worker then acknowledges it: the task is recorded as delivered and the orchestrator gets a correction naming the task, saying it reached the worker after all.
+/// Scenario: A worker's `inbox fetch` takes a delegated task and may have printed it, then exits with nothing confirming it. No receiver takes the deck's marked repeat in time, so the task's delivery is uncertain and the orchestrator is told so. The worker then acknowledges it: the task is recorded as delivered and the orchestrator gets a correction naming the task, saying it reached the worker after all.
 #[spec("inbox/route/010")]
 #[test]
-fn route_010_a_late_ack_after_max_deliver_corrects_the_orchestrator() {
+fn route_010_a_late_ack_after_the_repeats_ran_out_corrects_the_orchestrator() {
     let daemon = daemon_unbound(&[
         ("DOT_AGENT_DECK_INBOX_ACK_WAIT_MS", "1500"),
-        ("DOT_AGENT_DECK_INBOX_MAX_DELIVER", "1"),
+        ("DOT_AGENT_DECK_INBOX_KEEPALIVE_MS", "300"),
         (route::UNDELIVERED_MS, "4500"),
         ("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0"),
     ]);
     let (orch, worker) = route::team(&daemon, false);
     let id = route::delegate(&daemon, &orch, route::TASK, false);
     fetched_unacknowledged(&daemon, &worker, &id);
-    state(&daemon, &worker, &id, "undeliverable");
-    route::notice(&daemon, &orch, "is undeliverable");
+    route::notice(&daemon, &orch, "may or may not have reached the worker");
     acknowledge(&daemon, &worker, &id);
     state(&daemon, &worker, &id, "acknowledged");
     let correction = route::notice(&daemon, &orch, "after all").to_string();
@@ -635,7 +635,7 @@ fn route_010_a_late_ack_after_max_deliver_corrects_the_orchestrator() {
     );
 }
 
-/// Scenario: A worker fetches a delegated task without acknowledging it, so the orchestrator is told the task has not reached the worker. The worker then acknowledges it before the deck stops trying: the task is recorded as delivered, and the orchestrator gets exactly one correction naming the task and the worker's role, saying it reached the worker after all.
+/// Scenario: A worker leaves a delegated task queued past the deadline, so the orchestrator is told the task has not reached the worker. The worker's `inbox fetch` then takes it and the worker acknowledges it: the task is recorded as delivered, and the orchestrator gets exactly one correction naming the task and the worker's role, saying it reached the worker after all.
 #[spec("inbox/route/011")]
 #[test]
 fn route_011_an_ack_after_the_not_reached_notice_corrects_the_orchestrator_once() {
@@ -647,9 +647,9 @@ fn route_011_an_ack_after_the_not_reached_notice_corrects_the_orchestrator_once(
     ]);
     let (orch, worker) = route::team(&daemon, false);
     let id = route::delegate(&daemon, &orch, route::TASK, false);
-    fetched_unacknowledged(&daemon, &worker, &id);
     let notice = route::notice(&daemon, &orch, "has not reached the worker").to_string();
     assert!(notice.contains(&id), "the notice names the task: {notice}");
+    fetched_unacknowledged(&daemon, &worker, &id);
     acknowledge(&daemon, &worker, &id);
     state(&daemon, &worker, &id, "acknowledged");
     let correction = route::notice(&daemon, &orch, "after all").to_string();

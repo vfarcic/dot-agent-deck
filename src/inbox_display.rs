@@ -132,6 +132,11 @@ pub const NOT_ARMED: &str =
 /// waiter take their mail once at a time.
 pub const STREAM_UNSUPPORTED: &str =
     "this inbox component cannot stream; only a deck integration on message receipts can";
+/// PRD #1666 part 3 (H5): an `inbox wait` once from a component whose hooks
+/// take their messages themselves (Codex's, Devin's, an unknown one's), which
+/// only a dot-agent-deck from before those hooks moved onto message receipts
+/// sends.
+pub const WAIT_UNSUPPORTED: &str = "this inbox component cannot wait for messages: the agent's hooks or `dot-agent-deck inbox fetch` take them, so update the dot-agent-deck the agent runs";
 /// PRD #1666 §3: receipts cannot be recorded for this generation; `({error})`
 /// follows.
 pub const RECEIPTS_DEGRADED: &str =

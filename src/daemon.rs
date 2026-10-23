@@ -5340,44 +5340,27 @@ fn nested_between(
     Some(false)
 }
 
-/// PRD #1666 hardening H2: the inbox half of `get-seed` — the oldest message
-/// queued for the agent, rendered and acknowledged, which an extension that
-/// predates the inbox reads as its seed. It acts only for `attested`, the
-/// agent the request's token attests, and only while that agent is the pane's
-/// `live` one: an unattested request (admitted under the `warn` provenance
-/// policy) gets nothing, and so does one naming any other agent (`requested`),
-/// so no generation can take another's work.
-///
-/// PRD #1666 G10: a Pi generation (`pi`) is on the receipt stream, so only
-/// an extension from before it asks; it is refused like an old adapter — no
-/// seed, its mail stays queued for the receiver and its card says to restart
-/// the agent.
-fn get_seed_inbox_alias(
-    hub: &crate::inbox_hub::InboxHub,
+/// PRD #1666 part 3 (H5): the answer to `get-seed`, which takes no message
+/// any more. Until H5 it handed the agent's oldest queued message over and
+/// acknowledged it in the same step, the verb an extension from before the
+/// inbox read its seed with; a seed is the pane's first inbox message, which
+/// the agent's own receiver takes. Every caller is answered at once with no
+/// seed and a refusal an older reader ignores, and nothing is taken or
+/// acknowledged. A Pi generation (`attested`, the pane's `live` agent) asking
+/// runs an extension from before the receipt stream, so its card says to
+/// restart the agent (G10).
+fn get_seed_withdrawn(
+    registry: &AgentPtyRegistry,
     pane_id: &str,
-    requested: Option<&str>,
     attested: Option<&str>,
     live: Option<&str>,
-    pi: bool,
-) -> Option<String> {
-    let agent = attested?;
-    if requested.is_some_and(|requested| !requested.is_empty() && requested != agent) {
-        warn!(
-            pane_id = %escape_id_for_log(pane_id),
-            "get-seed named an agent other than the one its token attests; no inbox message \
-             was handed over"
-        );
-        return None;
+) -> crate::event::GetSeedResponse {
+    if let Some(agent) = attested.filter(|agent| live == Some(*agent))
+        && pi_generation(registry, pane_id, agent)
+    {
+        registry.inbox().refuse_old_adapter(pane_id, agent);
     }
-    if live != Some(agent) {
-        return None;
-    }
-    if pi {
-        hub.refuse_old_adapter(pane_id, agent);
-        return None;
-    }
-    hub.fetch_first_acked(pane_id, agent, crate::inbox::AckHow::ExtensionConfirmed)
-        .map(|delivery| delivery.text)
+    crate::event::GetSeedResponse::withdrawn()
 }
 
 /// PRD #1666 G10: whether `agent_id` in `pane_id` is a Pi generation: started
@@ -5770,18 +5753,78 @@ fn receipt_fetch_component(
     }
 }
 
+/// PRD #1666 G10, part 3 (H5): whether `req`, a fetch on the legacy verb, is
+/// a doorbell fetch from an OpenCode plugin or Pi extension from before the
+/// receipt stream (no stream bound): refused as an out-of-date adapter.
+fn old_adapter_doorbell(
+    registry: &AgentPtyRegistry,
+    req: &crate::event::InboxFetchRequest,
+    agent_id: &str,
+) -> bool {
+    use crate::event::{AgentType, InboxComponent, InboxFetchConsumer};
+    req.consumer == InboxFetchConsumer::DoorbellHook
+        && req.rx.is_none()
+        && (registry.spawn_agent_type(agent_id) == Some(AgentType::OpenCode)
+            || pi_generation(registry, &req.pane_id, agent_id)
+            || matches!(
+                registry.inbox().announced_component(&req.pane_id, agent_id),
+                Some(InboxComponent::OpenCodePlugin | InboxComponent::OpenCodeMini)
+            ))
+}
+
+/// PRD #1666 part 3 (H5): whether `req`, a fetch on the legacy verb, is an
+/// agent hook's: a doorbell or turn-end fetch with no stream bound, from no
+/// out-of-date adapter. It meets the one-shot floor ([`crate::inbox_hub::serve_hook`]):
+/// one from an older dot-agent-deck, declaring no integration, is refused.
+fn legacy_verb_hook_fetch(
+    registry: &AgentPtyRegistry,
+    req: &crate::event::InboxFetchRequest,
+    agent_id: &str,
+) -> bool {
+    req.consumer != crate::event::InboxFetchConsumer::Cli
+        && req.rx.is_none()
+        && !old_adapter_doorbell(registry, req, agent_id)
+}
+
+/// PRD #1666 part 3 (H5): the hook component a legacy-verb hook fetch from
+/// `agent_id` comes from, for its card's remedy: the agent's type (the spawn's,
+/// else the one its hooks reported, a hint and not authority), else a Claude
+/// component it announced, else none the deck can name.
+fn legacy_hook_component(
+    registry: &AgentPtyRegistry,
+    req: &crate::event::InboxFetchRequest,
+    agent_id: &str,
+) -> crate::event::InboxComponent {
+    use crate::event::{AgentType, InboxComponent};
+    if let Some(component) = req.component {
+        return component;
+    }
+    match registry
+        .spawn_agent_type(agent_id)
+        .or_else(|| registry.reported_agent_type(agent_id))
+    {
+        Some(AgentType::ClaudeCode) => InboxComponent::ClaudeHooks,
+        Some(AgentType::Codex) => InboxComponent::CodexHooks,
+        Some(AgentType::Devin) => InboxComponent::DevinHooks,
+        _ => match registry.inbox().announced_component(&req.pane_id, agent_id) {
+            Some(InboxComponent::ClaudeHooks | InboxComponent::ClaudeWaiter) => {
+                InboxComponent::ClaudeHooks
+            }
+            _ => InboxComponent::Other,
+        },
+    }
+}
+
+/// PRD #1666 part 3 (H5): what an `inbox fetch` from an older dot-agent-deck
+/// is told: it fetches the way the deck no longer serves.
+const CLI_FETCH_TOO_OLD: &str = "this dot-agent-deck is older than the deck daemon and can no longer take messages, so none was taken and they stay waiting: run inbox fetch with the dot-agent-deck the daemon runs, or upgrade dot-agent-deck";
+
 fn handle_inbox_fetch(
     registry: &AgentPtyRegistry,
     req: &crate::event::InboxFetchRequest,
     agent_id: &str,
 ) -> crate::event::InboxWaitReply {
     use crate::event::InboxFetchConsumer;
-    use crate::inbox::{AckHow, Consumer};
-    let (consumer, how) = match req.consumer {
-        InboxFetchConsumer::Cli => (Consumer::FetchCli, AckHow::FetchedByCli),
-        InboxFetchConsumer::TurnEndHook => (Consumer::TurnEndHook, AckHow::HookHandover),
-        InboxFetchConsumer::DoorbellHook => (Consumer::DoorbellHook, AckHow::HookHandover),
-    };
     let budget = fetch_budget(req);
     let doorbell = req
         .doorbell
@@ -5825,32 +5868,34 @@ fn handle_inbox_fetch(
     }
     // PRD #1666 G10: Pi's too — a plain doorbell fetch is an extension from
     // before the receipt stream.
-    if req.consumer == InboxFetchConsumer::DoorbellHook
-        && (registry.spawn_agent_type(agent_id) == Some(crate::event::AgentType::OpenCode)
-            || pi_generation(registry, &req.pane_id, agent_id))
-    {
+    if old_adapter_doorbell(registry, req, agent_id) {
         registry.inbox().refuse_old_adapter(&req.pane_id, agent_id);
         return crate::event::InboxWaitReply::refused(
             "adapter_too_old",
             crate::inbox_display::ADAPTER_TOO_OLD,
         );
     }
-    let messages = registry.inbox().fetch_named_within(
-        &req.pane_id,
-        agent_id,
-        consumer,
-        budget,
-        req.ack.then_some(how),
-        doorbell,
-    );
-    info!(
+    // PRD #1666 part 3 (H5): the legacy fetch is withdrawn. Whatever it
+    // asked, `ack` included, nothing is taken or acknowledged and the mail
+    // stays queued for the agent's own receiver; an agent's hook meets the
+    // one-shot floor before it gets here.
+    warn!(
         pane_id = %escape_id_for_log(&req.pane_id),
         consumer = ?req.consumer,
         ack = req.ack,
-        count = messages.len(),
-        "Received inbox fetch"
+        "inbox: refused a fetch the way only an older dot-agent-deck asks; nothing was taken"
     );
-    crate::event::InboxWaitReply::messages(messages)
+    match req.consumer {
+        InboxFetchConsumer::Cli => {
+            crate::event::InboxWaitReply::refused("cli_too_old", CLI_FETCH_TOO_OLD)
+        }
+        InboxFetchConsumer::DoorbellHook | InboxFetchConsumer::TurnEndHook => {
+            crate::event::InboxWaitReply::refused(
+                "hooks_too_old",
+                crate::inbox_display::HOOKS_TOO_OLD,
+            )
+        }
+    }
 }
 
 /// PRD #1666: `inbox_list` — the caller's own inbox, or with `all` an
@@ -6623,7 +6668,7 @@ async fn run_hook_loop_with_limits(
                                         component = served;
                                         HookRoute::OneShot
                                     } else {
-                                        route_hook_fetch(
+                                        let route = route_hook_fetch(
                                             &pty_registry,
                                             &req,
                                             &agent_id,
@@ -6631,7 +6676,21 @@ async fn run_hook_loop_with_limits(
                                             ingest.seq(),
                                             HOOK_ROUTE_WAIT,
                                         )
-                                        .await
+                                        .await;
+                                        // PRD #1666 part 3 (H5): no legacy
+                                        // service is left, so a hook's fetch
+                                        // on the legacy verb meets the one-shot
+                                        // floor whatever the route said, and
+                                        // the card names that agent's hooks.
+                                        if route == HookRoute::Legacy
+                                            && legacy_verb_hook_fetch(&pty_registry, &req, &agent_id)
+                                        {
+                                            component =
+                                                legacy_hook_component(&pty_registry, &req, &agent_id);
+                                            HookRoute::OneShot
+                                        } else {
+                                            route
+                                        }
                                     };
                                     if route == HookRoute::OneShot {
                                         if let Err(refusal) = mail_taker_admitted(
@@ -7224,23 +7283,13 @@ async fn run_hook_loop_with_limits(
                                     }
                                 }
                                 DaemonMessage::GetSeed(req) => {
-                                    // PRD #1666 S5 (the design's S9 alias): a
-                                    // seed is the pane's first inbox message, so
-                                    // `get-seed` hands over the agent's oldest
-                                    // queued message, rendered, and acknowledges
-                                    // it — the verb a Pi extension that predates
-                                    // the inbox used. A Pi generation is refused
-                                    // since G10 (`pi` below). `None` →
-                                    // `{"seed":null}`.
-                                    //
-                                    // Hardening H2: it acts only for the agent
-                                    // the token attests, never for an id the
-                                    // caller names or the pane's occupant
-                                    // ([`get_seed_inbox_alias`]).
-                                    //
-                                    // PR #1735 review: and only from a member of
-                                    // its pane; a refusal answers as "no seed
-                                    // pending" does.
+                                    // PRD #1666 part 3 (H5): `get-seed` takes
+                                    // no message any more
+                                    // ([`get_seed_withdrawn`]): every caller is
+                                    // answered at once with no seed. Only a
+                                    // member of the pane, for the agent its
+                                    // token attests, marks a Pi generation's
+                                    // card (G10, PR #1735 review).
                                     let attested = attested_agent.as_deref().filter(|agent| {
                                         mail_taker_admitted(
                                             &pty_registry,
@@ -7251,27 +7300,19 @@ async fn run_hook_loop_with_limits(
                                         )
                                         .is_ok()
                                     });
-                                    let pi = attested.is_some_and(|agent| {
-                                        pi_generation(&pty_registry, &req.pane_id, agent)
-                                    });
-                                    let seed = get_seed_inbox_alias(
-                                        pty_registry.inbox(),
+                                    let resp = get_seed_withdrawn(
+                                        &pty_registry,
                                         &req.pane_id,
-                                        req.agent_id.as_deref(),
                                         attested,
                                         pty_registry
                                             .pane_current_agent_id(&req.pane_id)
                                             .as_deref(),
-                                        pi,
                                     );
                                     info!(
                                         pane_id = %escape_id_for_log(&req.pane_id),
                                         agent_id = ?req.agent_id,
-                                        has_seed = seed.is_some(),
-                                        "Received get-seed request"
+                                        "Refused a get-seed request: get-seed takes no message any more"
                                     );
-                                    let resp =
-                                        crate::event::GetSeedResponse { seed };
                                     if let Ok(json) = serde_json::to_string(&resp) {
                                         let line = format!("{json}\n");
                                         let _ =
@@ -10503,7 +10544,7 @@ mod hook_ingestion_tests {
             "dispatch from unknown pane",
             "Received work-done signal",
             "work-done from unknown pane",
-            "Received get-seed request",
+            "Refused a get-seed request",
             "Received list-targets request",
             "Received event",
             "unrecognized event_type",
@@ -13296,47 +13337,44 @@ mod hook_ingestion_tests {
         let _ = outer.wait();
     }
 
-    /// PRD #1666 hardening H2: the inbox half of get-seed hands over only the
-    /// attested agent's own message, and only while it is the pane's live one.
+    /// PRD #1666 part 3 (H5): `get-seed` takes nothing for any caller — not
+    /// for the attested live agent either — and answers each with no seed
+    /// and the withdrawal; the message stays queued with no hand-over
+    /// counted.
     #[test]
-    fn get_seed_inbox_alias_acts_only_for_the_attested_live_agent() {
-        let hub = crate::inbox_hub::InboxHub::new(
-            crate::inbox::DeckId::parse("k3xzq2ab").unwrap(),
-            crate::inbox::InboxLimits::default(),
-            crate::inbox_hub::DEFAULT_KEEPALIVE,
-        );
+    fn get_seed_takes_nothing_for_any_caller() {
+        let registry = AgentPtyRegistry::new();
+        let hub = Arc::clone(registry.inbox());
         let id = hub
             .post_direct(
                 crate::inbox::Recipient::bound("p", "new"),
                 crate::inbox::Content::from_deck("seed", "task", "the successor's task"),
             )
             .unwrap();
-        let queued = || {
-            hub.list("p")
-                .iter()
-                .any(|m| m.id == id && m.state == crate::inbox::StateName::Queued)
-        };
-        for (requested, attested, live) in [
-            (Some("new"), Some("old"), Some("new")),
-            (None, Some("old"), Some("new")),
-            (Some("new"), None, Some("new")),
-            (None, None, Some("new")),
-            (Some("old"), Some("new"), Some("new")),
-            (None, Some("new"), Some("newer")),
+        for (attested, live) in [
+            (Some("old"), Some("new")),
+            (None, Some("new")),
+            (Some("new"), Some("newer")),
+            (Some("new"), Some("new")),
         ] {
+            let answer = get_seed_withdrawn(&registry, "p", attested, live);
+            assert!(answer.seed.is_none(), "{attested:?} {live:?}");
             assert_eq!(
-                get_seed_inbox_alias(&hub, "p", requested, attested, live, false),
-                None,
-                "{requested:?} {attested:?} {live:?}"
+                answer.refused.as_deref(),
+                Some(crate::event::GET_SEED_REMOVED),
+                "{attested:?} {live:?}"
             );
-            assert!(queued(), "{requested:?} {attested:?} {live:?}");
+            let listed = hub.list("p").into_iter().find(|m| m.id == id).unwrap();
+            assert_eq!(
+                (listed.state, listed.deliveries),
+                (crate::inbox::StateName::Queued, 0),
+                "{attested:?} {live:?}"
+            );
         }
-        let seed = get_seed_inbox_alias(&hub, "p", Some("new"), Some("new"), Some("new"), false)
-            .expect("its own agent gets it");
-        assert!(seed.contains("the successor's task"));
+        assert_eq!(hub.integration_notice("p", "new"), None);
     }
 
-    /// Scenario: A Pi generation whose extension predates the receipt stream holds a queued deck message. Its stream without the deck's integration, its plain doorbell fetch and its get-seed are each refused as an out-of-date adapter: the message stays queued and the card says to restart the agent. An OpenCode generation's stream is refused the same way, and a Claude hook's plain doorbell fetch is still served.
+    /// Scenario: A Pi generation whose extension predates the receipt stream holds a queued deck message. Its stream without the deck's integration, its plain doorbell fetch and its get-seed are each refused as an out-of-date adapter: the message stays queued and the card says to restart the agent. An OpenCode generation's stream is refused the same way, and a Claude hook's plain doorbell fetch is no adapter's: it meets the hooks' one-shot floor, and the legacy fetch takes nothing.
     #[spec("inbox/boundary/030")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn boundary_030_a_pi_extension_from_before_the_receipt_stream_is_refused() {
@@ -13408,23 +13446,19 @@ mod hook_ingestion_tests {
         };
         let reply = handle_inbox_fetch(&registry, &fetch("p"), "a");
         assert_eq!(reply.refused.as_deref(), Some("adapter_too_old"));
-        assert_eq!(
-            get_seed_inbox_alias(
-                &hub,
-                "p",
-                None,
-                Some("a"),
-                Some("a"),
-                pi_generation(&registry, "p", "a")
-            ),
-            None
+        assert!(
+            get_seed_withdrawn(&registry, "p", Some("a"), Some("a"))
+                .seed
+                .is_none()
         );
         assert!(queued("p", &id), "no seed, no fetch: it stays queued");
         assert_eq!(
             hub.integration_notice("p", "a"),
             Some(IntegrationNotice::AdapterTooOld)
         );
-        // A Claude hook's doorbell fetch is still served.
+        // A Claude hook's plain doorbell fetch is no adapter's: it meets the
+        // one-shot floor as Claude's (PRD #1666 part 3, H5), never the
+        // legacy fetch.
         hub.announce(
             "c",
             "a",
@@ -13436,9 +13470,16 @@ mod hook_ingestion_tests {
         let claude = post("c", "a");
         let mut req = fetch("c");
         req.doorbell = Some(claude.as_str().to_string());
+        assert!(!old_adapter_doorbell(&registry, &req, "a"));
+        assert!(legacy_verb_hook_fetch(&registry, &req, "a"));
+        assert_eq!(
+            legacy_hook_component(&registry, &req, "a"),
+            InboxComponent::ClaudeHooks
+        );
+        assert!(!legacy_verb_hook_fetch(&registry, &fetch("p"), "a"));
         let reply = handle_inbox_fetch(&registry, &req, "a");
-        assert_eq!(reply.refused, None);
-        assert_eq!(reply.messages.map(|m| m.len()), Some(1));
+        assert!(reply.messages.is_none());
+        assert!(queued("c", &claude), "the legacy fetch takes nothing");
     }
 
     // ---------------------------------------------------------------------
