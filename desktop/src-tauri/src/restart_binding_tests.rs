@@ -175,21 +175,25 @@ impl RestartingDeck {
                                     recorded.lock().unwrap().push((process, op.clone()));
                                 }
                                 let live = script.lock().unwrap().live.clone();
-                                with_live(serve(&op), live)
+                                let reply = with_live(serve(&op), live);
+                                // The restart lands before the reply is
+                                // written: no connection the client opens
+                                // after reading it reaches `process`, and a
+                                // `restart_after` set after the client read
+                                // it never fires on this request.
+                                let mut script = script.lock().unwrap();
+                                if script.current == process
+                                    && let Some((after, next)) = script.restart_after
+                                    && after == op
+                                {
+                                    script.current = next;
+                                    script.restart_after = None;
+                                }
+                                reply
                             };
                             let encoded = serde_json::to_vec(&reply).expect("serialize the reply");
                             let _ = write_frame(&mut writer, KIND_RESP, &encoded).await;
                             if op != "hello" {
-                                {
-                                    let mut script = script.lock().unwrap();
-                                    if script.current == process
-                                        && let Some((after, next)) = script.restart_after
-                                        && after == op
-                                    {
-                                        script.current = next;
-                                        script.restart_after = None;
-                                    }
-                                }
                                 if op == "attach-stream" && script.lock().unwrap().terminal_probe {
                                     let _ = write_frame(
                                         &mut writer,
