@@ -977,8 +977,9 @@ pub struct ClaimGatingConfig {
     #[serde(rename = "claim_gating", default, skip_serializing_if = "is_false")]
     pub gating: bool,
     /// `claim_ttl_hours`: how long after its last edit a claim record stays
-    /// live. At least 1 (checked at load); default
-    /// [`crate::issue_dispatch::DEFAULT_CLAIM_TTL_HOURS`].
+    /// live. From 1 to [`crate::issue_dispatch::MAX_CLAIM_TTL_HOURS`] (checked
+    /// at load); default [`crate::issue_dispatch::DEFAULT_CLAIM_TTL_HOURS`].
+    /// The deck's claim records carry it, and other decks read them with it.
     #[serde(
         rename = "claim_ttl_hours",
         default = "default_claim_ttl_hours",
@@ -3465,12 +3466,17 @@ repo = "vfarcic/dot-ai"
     }
 
     // PRD #421 M3.4 — `claim_ttl_hours` is validated like the other keys: a
-    // value below 1, or one that is not a non-negative integer, rejects the
-    // entry while its siblings still load.
+    // value below 1 or above 2160 (90 days), or one that is not a non-negative
+    // integer, rejects the entry while its siblings still load.
     #[test]
-    fn issue_dispatch_rejects_a_claim_ttl_below_one_hour() {
+    fn issue_dispatch_rejects_a_claim_ttl_outside_one_hour_to_ninety_days() {
+        assert!(
+            loaded_claim(&issue_dispatch_toml("0 9 * * *", "claim_ttl_hours = 2160")).ttl_hours
+                == 2160
+        );
         for keys in [
             "claim_ttl_hours = 0",
+            "claim_ttl_hours = 2161",
             "claim_ttl_hours = -5",
             "claim_ttl_hours = \"a week\"",
             "claim_gating = \"yes\"",

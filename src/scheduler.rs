@@ -291,33 +291,76 @@ pub fn fires_at<Z: TimeZone>(schedule: &CronSchedule, instant: DateTime<Z>) -> b
     schedule.includes(instant)
 }
 
-/// The longest interval between two consecutive fires of `schedule` after
-/// `from` (PRD #421 M3.1: a claim's TTL must be at least twice this). The walk
-/// takes every fire up to `from + horizon` and the first fire past it, so the
-/// gap straddling the horizon's end counts too, and a schedule sparser than
-/// the horizon still yields one gap. `None` when no gap can be computed: the
+/// What [`fire_gap_over`] found about the gaps between consecutive fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FireGap {
+    /// No gap is longer than the threshold the walk was given.
+    Within,
+    /// The longest gap, which is longer than that threshold.
+    Longest(chrono::Duration),
+}
+
+/// Whether any interval between two consecutive fires of `schedule` after
+/// `from` is longer than `threshold`, and if so the longest one (PRD #421
+/// M3.1: a claim's TTL must be at least twice the longest gap). The walk covers
+/// every gap that starts at a fire up to `from + horizon`, so the gap
+/// straddling the horizon's end counts too, and a schedule sparser than the
+/// horizon still yields one gap. `None` when no answer can be computed: the
 /// schedule stops firing before the walk passes the horizon, or the walk would
-/// take more than `max_fires` fires.
-pub fn longest_fire_gap<Z: TimeZone>(
+/// take more than `max_steps` steps.
+///
+/// The walk does not visit every fire. From a fire `f` it jumps to the LAST
+/// fire at or before `f + threshold`: every fire in between lies inside one
+/// window no longer than the threshold, so no gap among them can exceed it,
+/// whatever the cron's shape. Only when no fire follows `f` within the window
+/// does it step to the next fire, and that gap, longer than the threshold, is
+/// the one recorded; the threshold then rises to it, so the walk goes on
+/// looking only for a longer one and the answer is the exact longest gap. A
+/// jump is taken only when the fire it lands on is provably inside the window,
+/// so a lookup that misreads a daylight-saving change costs a single step,
+/// never a missed gap. Every two steps move the walk more than `threshold`
+/// forward, so it takes at most about `2 × horizon / threshold` steps: a
+/// dense cron costs no more than a sparse one, and a long gap anywhere in the
+/// horizon is found because the walk reaches every part of it.
+pub fn fire_gap_over<Z: TimeZone>(
     schedule: &CronSchedule,
     from: &DateTime<Z>,
     horizon: chrono::Duration,
-    max_fires: usize,
-) -> Option<chrono::Duration> {
+    threshold: chrono::Duration,
+    max_steps: usize,
+) -> Option<FireGap> {
     let end = from.clone().checked_add_signed(horizon)?;
-    let mut fires = schedule.after(from);
-    let mut previous = fires.next()?;
-    let mut longest: Option<chrono::Duration> = None;
-    for (walked, fire) in (2..).zip(fires) {
-        if walked > max_fires {
-            return None;
+    let mut threshold = threshold.max(chrono::Duration::zero());
+    let mut longest = None;
+    let mut previous = schedule.after(from).next()?;
+    let mut covered_a_gap = false;
+    for _ in 0..max_steps {
+        if covered_a_gap && previous > end {
+            return Some(longest.map_or(FireGap::Within, FireGap::Longest));
         }
-        let gap = fire.clone().signed_duration_since(previous);
-        longest = Some(longest.map_or(gap, |longest| longest.max(gap)));
-        if fire > end {
-            return longest;
+        covered_a_gap = true;
+        // The last fire at or before `previous + threshold`: fires are whole
+        // seconds, and a reverse walk yields the fires strictly before its
+        // start, so it starts one second past the window's end.
+        let window_end = previous.clone().checked_add_signed(threshold);
+        let last_in_window = window_end.clone().and_then(|window_end| {
+            let after_window = window_end.checked_add_signed(chrono::Duration::seconds(1))?;
+            schedule.after(&after_window).next_back()
+        });
+        if let (Some(window_end), Some(fire)) = (window_end, last_in_window)
+            && fire > previous
+            && fire <= window_end
+        {
+            previous = fire;
+            continue;
         }
-        previous = fire;
+        let next = schedule.after(&previous).next()?;
+        let gap = next.clone().signed_duration_since(previous);
+        if gap > threshold {
+            longest = Some(gap);
+            threshold = gap;
+        }
+        previous = next;
     }
     None
 }
@@ -1362,55 +1405,175 @@ mod tests {
     // PRD #421 M3.1 — the longest gap between consecutive fires, which a
     // claim TTL must be at least twice. Evaluated in UTC so no DST hour moves it.
     #[test]
-    fn longest_fire_gap_finds_the_weekday_cron_weekend_gap() {
+    fn fire_gap_over_finds_the_weekday_cron_weekend_gap() {
         let schedule = parse_cron("0 9 * * MON-FRI").unwrap();
         let two_weeks = chrono::Duration::days(14);
-        // 2026-10-21 is a Wednesday; 2026-10-24 a Saturday.
+        // 2026-10-21 is a Wednesday; 2026-10-24 a Saturday. Whatever the
+        // threshold below the weekend, the answer is the weekend itself.
         for from in [utc_at(2026, 10, 21, 0), utc_at(2026, 10, 24, 12)] {
+            for threshold in [0, 1, 23, 24, 30, 71] {
+                assert_eq!(
+                    fire_gap_over(
+                        &schedule,
+                        &from,
+                        two_weeks,
+                        chrono::Duration::hours(threshold),
+                        1_000
+                    ),
+                    Some(FireGap::Longest(chrono::Duration::hours(72))),
+                    "from {from}, threshold {threshold}h"
+                );
+            }
             assert_eq!(
-                longest_fire_gap(&schedule, &from, two_weeks, 1_000),
-                Some(chrono::Duration::hours(72)),
+                fire_gap_over(
+                    &schedule,
+                    &from,
+                    two_weeks,
+                    chrono::Duration::hours(72),
+                    1_000
+                ),
+                Some(FireGap::Within),
                 "from {from}"
             );
         }
         // A 2-day horizon from Monday 00:00 ends Wednesday 00:00; the walk
-        // still takes the first fire past it, Wednesday 09:00, and sees no
-        // weekend.
+        // still takes the gap from the last fire before it, Tuesday 09:00, to
+        // Wednesday 09:00, and sees no weekend.
         let monday = utc_at(2026, 10, 19, 0);
         assert_eq!(
-            longest_fire_gap(&schedule, &monday, chrono::Duration::days(2), 1_000),
-            Some(chrono::Duration::hours(24))
+            fire_gap_over(
+                &schedule,
+                &monday,
+                chrono::Duration::days(2),
+                chrono::Duration::hours(1),
+                1_000
+            ),
+            Some(FireGap::Longest(chrono::Duration::hours(24)))
         );
     }
 
     #[test]
-    fn longest_fire_gap_walks_past_the_horizon_for_a_sparse_cron() {
+    fn fire_gap_over_walks_past_the_horizon_for_a_sparse_cron() {
         // Fires once a year: the horizon ends long before the second fire.
         let schedule = parse_cron("0 9 1 1 *").unwrap();
         let from = utc_at(2026, 10, 21, 0);
         assert_eq!(
-            longest_fire_gap(&schedule, &from, chrono::Duration::days(14), 1_000),
-            Some(utc_at(2028, 1, 1, 9) - utc_at(2027, 1, 1, 9))
+            fire_gap_over(
+                &schedule,
+                &from,
+                chrono::Duration::days(14),
+                chrono::Duration::hours(1),
+                1_000
+            ),
+            Some(FireGap::Longest(
+                utc_at(2028, 1, 1, 9) - utc_at(2027, 1, 1, 9)
+            ))
         );
     }
 
     #[test]
-    fn longest_fire_gap_is_none_when_it_cannot_be_computed() {
+    fn fire_gap_over_is_none_when_it_cannot_be_computed() {
         let from = utc_at(2026, 10, 21, 0);
         let year = chrono::Duration::days(366);
+        let hour = chrono::Duration::hours(1);
         // Stops firing at the end of 2026, before the walk passes the horizon.
         let ending = parse_cron("0 0 9 * * * 2026").unwrap();
-        assert_eq!(longest_fire_gap(&ending, &from, year, 1_000), None);
+        assert_eq!(fire_gap_over(&ending, &from, year, hour, 1_000), None);
         // A single fire left: no gap at all.
         let once = parse_cron("0 0 9 1 1 * 2027").unwrap();
-        assert_eq!(longest_fire_gap(&once, &from, year, 1_000), None);
-        // More fires than the walk may take.
+        assert_eq!(fire_gap_over(&once, &from, year, hour, 1_000), None);
+        // More steps than the walk may take: a threshold below the gap makes
+        // the walk step fire by fire.
         let hourly = parse_cron("0 * * * *").unwrap();
-        assert_eq!(longest_fire_gap(&hourly, &from, year, 100), None);
+        let half_hour = chrono::Duration::minutes(30);
+        assert_eq!(fire_gap_over(&hourly, &from, year, half_hour, 100), None);
         assert_eq!(
-            longest_fire_gap(&hourly, &from, chrono::Duration::days(1), 100),
-            Some(chrono::Duration::hours(1))
+            fire_gap_over(&hourly, &from, chrono::Duration::days(1), half_hour, 100),
+            Some(FireGap::Longest(hour))
         );
+    }
+
+    /// The fire-by-fire walk [`fire_gap_over`] replaces, as the reference its
+    /// answers are checked against.
+    fn longest_gap_fire_by_fire(
+        schedule: &CronSchedule,
+        from: &DateTime<chrono::Utc>,
+        horizon: chrono::Duration,
+    ) -> chrono::Duration {
+        let end = *from + horizon;
+        let mut fires = schedule.after(from);
+        let mut previous = fires.next().unwrap();
+        let mut longest = chrono::Duration::zero();
+        for fire in fires {
+            longest = longest.max(fire - previous);
+            if fire > end {
+                return longest;
+            }
+            previous = fire;
+        }
+        unreachable!("the reference crons keep firing")
+    }
+
+    #[test]
+    fn fire_gap_over_jumps_dense_stretches_without_missing_a_long_gap() {
+        let from = utc_at(2026, 10, 21, 0);
+        let year = chrono::Duration::days(366);
+        let hour = chrono::Duration::hours(1);
+        // Dense crons answer within the step bound of their threshold, and
+        // their gap never exceeds it.
+        for (cron, threshold) in [
+            ("* * * * *", chrono::Duration::minutes(30)),
+            ("*/5 * * * *", chrono::Duration::minutes(30)),
+            ("*/10 * * * *", hour * 83),
+            ("* * * * * *", chrono::Duration::minutes(30)),
+        ] {
+            let schedule = parse_cron(cron).unwrap();
+            assert_eq!(
+                fire_gap_over(&schedule, &from, year, threshold, 100_000),
+                Some(FireGap::Within),
+                "{cron}"
+            );
+        }
+        // Dense for part of the time and silent for the rest: every five
+        // minutes on the 1st of the month only, every minute in March only
+        // (four months after the walk's start, then silent for eleven), every
+        // fifteen minutes on weekdays only, and every five minutes in office
+        // hours only. The fire-by-fire walk is the reference.
+        for (cron, longest) in [
+            ("*/5 * 1 * *", None),
+            ("* * * 3 *", None),
+            (
+                "*/15 * * * MON-FRI",
+                Some(chrono::Duration::minutes(48 * 60 + 15)),
+            ),
+            (
+                "*/5 9-17 * * *",
+                Some(chrono::Duration::minutes(15 * 60 + 5)),
+            ),
+        ] {
+            let schedule = parse_cron(cron).unwrap();
+            let reference = longest_gap_fire_by_fire(&schedule, &from, year);
+            if let Some(longest) = longest {
+                assert_eq!(reference, longest, "{cron}: the reference walk");
+            }
+            for threshold in [
+                hour / 2,
+                hour,
+                hour * 12,
+                reference - chrono::Duration::seconds(1),
+            ] {
+                assert_eq!(
+                    fire_gap_over(&schedule, &from, year, threshold, 100_000),
+                    Some(FireGap::Longest(reference)),
+                    "{cron} at threshold {threshold}"
+                );
+            }
+            assert_eq!(
+                fire_gap_over(&schedule, &from, year, reference, 100_000),
+                Some(FireGap::Within),
+                "{cron}"
+            );
+        }
     }
 
     // PRD #421 M3.1 — a task whose `claim_gating` the load turned off is still

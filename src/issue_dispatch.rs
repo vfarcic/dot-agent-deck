@@ -209,6 +209,13 @@ pub const CLAIM_RECORD_MARKER: &str = "<!-- dot-agent-deck:claim -->";
 const CLAIM_RECORD_TASK_FIELD: &str = "- Task: ";
 const CLAIM_RECORD_HOST_FIELD: &str = "- Machine: ";
 const CLAIM_RECORD_CLAIMED_AT_FIELD: &str = "- Claimed at: ";
+/// The record's lifetime: how many hours after its last edit the deck that
+/// wrote it holds it live, so a reader judges it by its writer's
+/// `claim_ttl_hours` rather than its own. Records written before the field
+/// existed (v0.48.0 and earlier) have none. Those builds read a record line
+/// by line and skip lines they do not know, so they still parse a record
+/// carrying it and still find their own by its task and machine.
+const CLAIM_RECORD_TTL_FIELD: &str = "- Lifetime (hours): ";
 
 /// The domain separator [`claim_host_id`] hashes in front of the host name, so
 /// the digest differs from a plain SHA-256 of the bare name computed for some
@@ -383,13 +390,28 @@ pub fn edit_claim_record_argv(repo: &str, comment_id: u64, body: &str) -> Vec<St
 /// [`find_own_claim_record`] takes that from the comment's `user.id`, which
 /// GitHub sets and a body cannot forge.
 ///
-/// `claimed_at` is `None` for a record written before the field existed; such
-/// a record is still a record, and gains the field on its next edit.
+/// `claimed_at` and `ttl_hours` are `None` for a record written before the
+/// field existed; such a record is still a record, and gains the field on its
+/// next edit by a deck that writes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimRecord {
     pub task: String,
     pub host: String,
     pub claimed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The `claim_ttl_hours` of the deck that wrote the record, as written:
+    /// [`ClaimRecord::ttl`] bounds it before anything is judged by it.
+    pub ttl_hours: Option<u32>,
+}
+
+impl ClaimRecord {
+    /// How long after its last edit this record stays live: the lifetime its
+    /// writer stated, kept within 1 hour and [`MAX_CLAIM_TTL_HOURS`], or
+    /// `fallback` — the reader's own TTL — for a record that states none.
+    pub fn ttl(&self, fallback: chrono::Duration) -> chrono::Duration {
+        self.ttl_hours.map_or(fallback, |hours| {
+            chrono::Duration::hours(i64::from(hours.clamp(1, MAX_CLAIM_TTL_HOURS)))
+        })
+    }
 }
 
 /// Render the body of a claimant record for `task` on the machine `host_id`
@@ -406,17 +428,45 @@ pub struct ClaimRecord {
 /// and a re-claim takes its time from [`next_claim_time`], which is at least a
 /// millisecond past the time the edited record carries, so the two bodies
 /// differ even when the wall clock repeats or steps back.
+///
+/// This is the record without a lifetime, as v0.48.0 and earlier wrote it,
+/// which a reader judges by its own TTL; the deck writes
+/// [`render_claim_record_with_ttl`].
 pub fn render_claim_record(
     task: &str,
     host_id: &str,
     claimed_at: chrono::DateTime<chrono::Utc>,
 ) -> String {
+    render_claim_record_body(task, host_id, claimed_at, None)
+}
+
+/// [`render_claim_record`] with the writer's `claim_ttl_hours` as the
+/// record's lifetime, on a line after the others, so any deck reading the
+/// record ages it by the TTL its writer refreshes it against.
+pub fn render_claim_record_with_ttl(
+    task: &str,
+    host_id: &str,
+    claimed_at: chrono::DateTime<chrono::Utc>,
+    ttl_hours: u32,
+) -> String {
+    render_claim_record_body(task, host_id, claimed_at, Some(ttl_hours))
+}
+
+fn render_claim_record_body(
+    task: &str,
+    host_id: &str,
+    claimed_at: chrono::DateTime<chrono::Utc>,
+    ttl_hours: Option<u32>,
+) -> String {
     let quote = |value: &str| serde_json::Value::from(value).to_string();
     let claimed_at = claimed_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let ttl = ttl_hours.map_or_else(String::new, |hours| {
+        format!("{CLAIM_RECORD_TTL_FIELD}{hours}\n")
+    });
     format!(
         "{CLAIM_RECORD_MARKER}\nAn agent was dispatched to work on this issue by dot-agent-deck \
          on machine `{host_id}`, last claimed at {claimed_at}.\n\n\
-         {CLAIM_RECORD_TASK_FIELD}{}\n{CLAIM_RECORD_HOST_FIELD}{}\n{CLAIM_RECORD_CLAIMED_AT_FIELD}{}\n",
+         {CLAIM_RECORD_TASK_FIELD}{}\n{CLAIM_RECORD_HOST_FIELD}{}\n{CLAIM_RECORD_CLAIMED_AT_FIELD}{}\n{ttl}",
         quote(task),
         quote(host_id),
         quote(&claimed_at)
@@ -445,8 +495,10 @@ pub fn next_claim_time(
 /// Parse a comment body as a claimant record. Only a body whose first line is
 /// [`CLAIM_RECORD_MARKER`] counts, so a reply quoting a record (`> <!-- …`) is
 /// not mistaken for one; the task and machine fields must be present. The
-/// claim time is optional — records written before it existed have none — and
-/// one that does not parse as an RFC 3339 time reads as absent.
+/// claim time and the lifetime are optional — records written before they
+/// existed have none — and one that does not parse (an RFC 3339 time; a whole
+/// number of hours) reads as absent. Lines it does not know are skipped, which
+/// is what lets a later build add a field that this one can still read past.
 pub fn parse_claim_record(body: &str) -> Option<ClaimRecord> {
     let mut lines = body.trim_start().lines();
     if lines.next()?.trim_end() != CLAIM_RECORD_MARKER {
@@ -455,6 +507,7 @@ pub fn parse_claim_record(body: &str) -> Option<ClaimRecord> {
     let mut task = None;
     let mut host = None;
     let mut claimed_at = None;
+    let mut ttl_hours = None;
     for line in lines {
         let line = line.trim_end();
         if let Some(value) = line.strip_prefix(CLAIM_RECORD_TASK_FIELD) {
@@ -468,12 +521,15 @@ pub fn parse_claim_record(body: &str) -> Option<ClaimRecord> {
                     .and_then(|time| chrono::DateTime::parse_from_rfc3339(&time).ok())
                     .map(|time| time.with_timezone(&chrono::Utc))
             });
+        } else if let Some(value) = line.strip_prefix(CLAIM_RECORD_TTL_FIELD) {
+            ttl_hours = ttl_hours.or_else(|| value.parse::<u32>().ok());
         }
     }
     Some(ClaimRecord {
         task: task?,
         host: host?,
         claimed_at,
+        ttl_hours,
     })
 }
 
@@ -543,9 +599,23 @@ pub const DEFAULT_CLAIM_TTL_HOURS: u32 = 168;
 /// the walk.
 const CLAIM_CRON_HORIZON_DAYS: i64 = 366;
 
-/// The most fires [`check_claim_ttl_against_cron`] walks before it gives up
-/// on computing the gap — about ten weeks of an every-minute cron.
-const CLAIM_CRON_MAX_FIRES: usize = 100_000;
+/// The shortest window [`check_claim_ttl_against_cron`] looks for gaps
+/// longer than. Its walk takes about `2 × horizon / window` steps whatever the
+/// cron ([`crate::scheduler::fire_gap_over`]), so the floor bounds the walk at
+/// about 35,000 steps. It decides nothing on its own: every TTL from 2 hours
+/// up looks for gaps of at least this, and a 1-hour TTL fails for any cron.
+const CLAIM_CRON_MIN_WINDOW: chrono::Duration = chrono::Duration::minutes(30);
+
+/// The most steps [`check_claim_ttl_against_cron`] lets its walk take before
+/// it gives up on computing the gap: a backstop, about three times what
+/// [`CLAIM_CRON_MIN_WINDOW`] lets a walk need.
+const CLAIM_CRON_MAX_STEPS: usize = 100_000;
+
+/// The longest `claim_ttl_hours`, and the longest lifetime a claim record is
+/// read with whatever lifetime it states: 90 days. A record that names a
+/// longer one still lapses 90 days after its last edit, so no account can
+/// hold an issue back for longer without editing its record again.
+pub const MAX_CLAIM_TTL_HOURS: u32 = 2160;
 
 /// What [`check_claim_ttl_against_cron`] adds to twice the longest gap between
 /// fires. The owner refreshes from a fire, but its record was written some
@@ -851,7 +921,10 @@ impl std::fmt::Display for Claimant {
 /// on it is live (PRD #421 M3.2: the claim gates iff at least ONE record is
 /// individually live — each aged on its own clock, never an aggregate — and,
 /// when foreign, written by an author GitHub vouches for). Of several live
-/// records the most recently active one is named.
+/// records the most recently active one is named. Each record is judged by
+/// the lifetime it states ([`ClaimRecord::ttl`]), so decks with different
+/// `claim_ttl_hours` read one another's claims the way their writers refresh
+/// them; `ttl`, the reader's own, judges records that state none.
 pub fn live_claimant(
     records: &[IssueClaimRecord],
     me: &ClaimIdentity<'_>,
@@ -869,7 +942,7 @@ pub fn live_claimant(
                 own_work_alive,
                 found.author_is_trusted(),
                 age,
-                ttl,
+                found.record.ttl(ttl),
             )
             .then(|| Claimant {
                 task: found.record.task.clone(),
@@ -895,7 +968,17 @@ pub fn claim_refresh_due(
     last_edit.is_none_or(|last_edit| now.signed_duration_since(last_edit) >= ttl / 2)
 }
 
-/// Check `claim_ttl_hours` itself: at least 1.
+/// Whether this deck's own `record` should be rewritten although it is not yet
+/// half a TTL old: it states a lifetime other than the deck's `ttl_hours`, or
+/// none. Other decks age the record by the lifetime it states, so a TTL raised
+/// since the record was written would otherwise let it lapse for them before
+/// the owner's next refresh fell due.
+pub fn claim_record_ttl_outdated(record: &ClaimRecord, ttl_hours: u32) -> bool {
+    record.ttl_hours != Some(ttl_hours)
+}
+
+/// Check `claim_ttl_hours` itself: at least 1 and at most
+/// [`MAX_CLAIM_TTL_HOURS`].
 pub fn validate_claim_ttl_hours(ttl_hours: u32) -> Result<(), String> {
     if ttl_hours < 1 {
         return Err(
@@ -903,6 +986,12 @@ pub fn validate_claim_ttl_hours(ttl_hours: u32) -> Result<(), String> {
              live gates nothing)"
                 .to_string(),
         );
+    }
+    if ttl_hours > MAX_CLAIM_TTL_HOURS {
+        return Err(format!(
+            "issue_dispatch claim_ttl_hours must be at most {MAX_CLAIM_TTL_HOURS} (90 days); \
+             got {ttl_hours}"
+        ));
     }
     Ok(())
 }
@@ -914,40 +1003,69 @@ pub fn validate_claim_ttl_hours(ttl_hours: u32) -> Result<(), String> {
 /// and only once the record is half a TTL old, so a gap wider than half the
 /// TTL can let a live claim expire; the headroom covers the record being
 /// written after its fire and the refresh landing after its check.
-/// `Err` says why gating cannot be trusted for the task — including when the
-/// gap cannot be computed (an invalid cron, one that stops firing, or one too
-/// dense to walk).
+/// `Err` says why gating cannot be trusted for the task, naming the TTL the
+/// cron needs — including when the gap cannot be computed (an invalid cron or
+/// one that stops firing).
+///
+/// The walk looks only for gaps longer than the TTL allows
+/// ([`crate::scheduler::fire_gap_over`]), so a cron firing every minute costs
+/// no more to check than one firing daily.
 pub fn check_claim_ttl_against_cron<Z: chrono::TimeZone>(
     cron: &str,
     ttl_hours: u32,
     from: &chrono::DateTime<Z>,
 ) -> Result<(), String> {
+    use crate::scheduler::FireGap;
     let schedule = crate::scheduler::parse_cron(cron).map_err(|e| e.to_string())?;
-    let gap = crate::scheduler::longest_fire_gap(
+    let ttl = chrono::Duration::hours(i64::from(ttl_hours));
+    // The longest gap the TTL allows: `ttl >= 2 × gap + headroom`.
+    let allowed = (ttl - CLAIM_TTL_HEADROOM) / 2;
+    let window = allowed.max(CLAIM_CRON_MIN_WINDOW);
+    let found = crate::scheduler::fire_gap_over(
         &schedule,
         from,
         chrono::Duration::days(CLAIM_CRON_HORIZON_DAYS),
-        CLAIM_CRON_MAX_FIRES,
+        window,
+        CLAIM_CRON_MAX_STEPS,
     )
     .ok_or_else(|| {
         format!(
             "the longest gap between fires of cron {cron:?} cannot be computed \
-             (it stops firing within a year, or fires more than {CLAIM_CRON_MAX_FIRES} \
-             times before the walk ends)"
+             (it stops firing within a year)"
         )
     })?;
-    let ttl = chrono::Duration::hours(i64::from(ttl_hours));
-    let needed = gap * 2 + CLAIM_TTL_HEADROOM;
-    if ttl < needed {
-        let needed_hours = (needed.num_seconds() + 3599) / 3600;
-        return Err(format!(
-            "claim_ttl_hours = {ttl_hours} is less than twice the longest gap between fires \
-             of cron {cron:?} ({}) plus an hour, so a live claim could expire before its \
-             owner's next fire refreshes it; set claim_ttl_hours to at least {needed_hours}",
-            format_claim_duration(gap)
-        ));
-    }
-    Ok(())
+    let (gap, needed_hours) = match found {
+        FireGap::Longest(gap) => {
+            let needed = gap * 2 + CLAIM_TTL_HEADROOM;
+            if ttl >= needed {
+                return Ok(());
+            }
+            (
+                format_claim_duration(gap),
+                (needed.num_seconds() + 3599) / 3600,
+            )
+        }
+        FireGap::Within if window == allowed => return Ok(()),
+        // Only a TTL under twice the floor plus the headroom gets here, and
+        // every gap is at most the floor, so 2 hours is enough.
+        FireGap::Within => (
+            format!("at most {}", format_claim_duration(window)),
+            (window * 2 + CLAIM_TTL_HEADROOM).num_hours(),
+        ),
+    };
+    let remedy = if needed_hours > i64::from(MAX_CLAIM_TTL_HOURS) {
+        format!(
+            "the {needed_hours} hours it needs are more than the {MAX_CLAIM_TTL_HOURS}-hour \
+             maximum, so claim gating needs a cron that fires more often"
+        )
+    } else {
+        format!("set claim_ttl_hours to at least {needed_hours}")
+    };
+    Err(format!(
+        "claim_ttl_hours = {ttl_hours} is less than twice the longest gap between fires \
+         of cron {cron:?} ({gap}) plus an hour, so a live claim could expire before its \
+         owner's next fire refreshes it; {remedy}"
+    ))
 }
 
 /// Render a duration for a log line: whole days, hours, minutes and seconds,
@@ -1490,6 +1608,7 @@ mod tests {
                 task: "dispatch-task".into(),
                 host: "build-box".into(),
                 claimed_at: Some(when),
+                ttl_hours: None,
             })
         );
         // Awkward task names survive the round trip on a single field line.
@@ -1500,8 +1619,138 @@ mod tests {
                 task: tricky.into(),
                 host: "h".into(),
                 claimed_at: Some(when),
+                ttl_hours: None,
             })
         );
+    }
+
+    #[test]
+    fn claim_record_round_trips_its_writers_lifetime_on_a_line_of_its_own() {
+        let when = at("2026-10-22T05:00:13.250Z");
+        let body = render_claim_record_with_ttl("dispatch-task", "build-box", when, 48);
+        assert!(
+            body.ends_with("- Claimed at: \"2026-10-22T05:00:13.250Z\"\n- Lifetime (hours): 48\n"),
+            "{body}"
+        );
+        assert_eq!(
+            parse_claim_record(&body),
+            Some(ClaimRecord {
+                task: "dispatch-task".into(),
+                host: "build-box".into(),
+                claimed_at: Some(when),
+                ttl_hours: Some(48),
+            })
+        );
+        // Without a lifetime the body is exactly what v0.48.0 wrote.
+        assert_eq!(
+            render_claim_record("dispatch-task", "build-box", when),
+            body.replace("- Lifetime (hours): 48\n", "")
+        );
+        // A lifetime that is not a whole number of hours reads as absent.
+        for garbled in ["\"48\"", "-1", "4.5", "a week", "99999999999"] {
+            let body = body.replace(": 48\n", &format!(": {garbled}\n"));
+            assert_eq!(
+                parse_claim_record(&body).unwrap().ttl_hours,
+                None,
+                "{garbled}"
+            );
+        }
+    }
+
+    /// `parse_claim_record` and the own-record match exactly as v0.48.0 — the
+    /// last release before records carried a lifetime — shipped them, frozen
+    /// here so the tolerance below is checked against the rules older decks
+    /// actually run.
+    fn parse_claim_record_as_v0_48(
+        body: &str,
+    ) -> Option<(String, String, Option<chrono::DateTime<chrono::Utc>>)> {
+        let mut lines = body.trim_start().lines();
+        if lines.next()?.trim_end() != "<!-- dot-agent-deck:claim -->" {
+            return None;
+        }
+        let mut task = None;
+        let mut host = None;
+        let mut claimed_at = None;
+        for line in lines {
+            let line = line.trim_end();
+            if let Some(value) = line.strip_prefix("- Task: ") {
+                task = task.or_else(|| serde_json::from_str::<String>(value).ok());
+            } else if let Some(value) = line.strip_prefix("- Machine: ") {
+                host = host.or_else(|| serde_json::from_str::<String>(value).ok());
+            } else if let Some(value) = line.strip_prefix("- Claimed at: ") {
+                claimed_at = claimed_at.or_else(|| {
+                    serde_json::from_str::<String>(value)
+                        .ok()
+                        .and_then(|time| chrono::DateTime::parse_from_rfc3339(&time).ok())
+                        .map(|time| time.with_timezone(&chrono::Utc))
+                });
+            }
+        }
+        Some((task?, host?, claimed_at))
+    }
+
+    #[test]
+    fn a_record_carrying_a_lifetime_reads_the_same_to_v0_48_rules() {
+        // v0.48.0 finds its own record by task and machine (and author), and
+        // re-claims from the claim time it reads: a record a newer deck wrote
+        // must give it all three, or it would post a duplicate record.
+        let when = at("2026-10-22T05:00:13.250Z");
+        let tricky = "Issues vfarcic/dot-ai \"quoted\"\nsecond line";
+        for task in ["dispatch-task", tricky] {
+            let body = render_claim_record_with_ttl(task, "h1-0123456789abcdef", when, 48);
+            assert_eq!(
+                parse_claim_record_as_v0_48(&body),
+                Some((
+                    task.to_string(),
+                    "h1-0123456789abcdef".to_string(),
+                    Some(when)
+                )),
+                "{body}"
+            );
+        }
+        // And the frozen copy is faithful: it reads today's lifetime-less
+        // record the way the current parser does.
+        let legacy = render_claim_record("t", "h", when);
+        let current = parse_claim_record(&legacy).unwrap();
+        assert_eq!(
+            parse_claim_record_as_v0_48(&legacy),
+            Some((current.task, current.host, current.claimed_at))
+        );
+    }
+
+    #[test]
+    fn a_record_is_read_with_its_writers_lifetime_kept_within_bounds() {
+        let record = |ttl_hours| ClaimRecord {
+            task: "t".into(),
+            host: "h".into(),
+            claimed_at: None,
+            ttl_hours,
+        };
+        let reader = hours(24);
+        assert_eq!(
+            record(None).ttl(reader),
+            reader,
+            "older records: the reader's own"
+        );
+        assert_eq!(record(Some(3)).ttl(reader), hours(3));
+        assert_eq!(record(Some(168)).ttl(reader), hours(168));
+        assert_eq!(record(Some(0)).ttl(reader), hours(1));
+        assert_eq!(record(Some(MAX_CLAIM_TTL_HOURS)).ttl(reader), hours(2160));
+        assert_eq!(record(Some(u32::MAX)).ttl(reader), hours(2160));
+    }
+
+    #[test]
+    fn an_own_record_is_rewritten_when_its_lifetime_is_not_the_decks() {
+        let record = |ttl_hours| ClaimRecord {
+            task: "t".into(),
+            host: "h".into(),
+            claimed_at: None,
+            ttl_hours,
+        };
+        assert!(!claim_record_ttl_outdated(&record(Some(168)), 168));
+        assert!(claim_record_ttl_outdated(&record(Some(24)), 168));
+        assert!(claim_record_ttl_outdated(&record(Some(168)), 24));
+        assert!(claim_record_ttl_outdated(&record(None), 168));
     }
 
     #[test]
@@ -1529,6 +1778,7 @@ mod tests {
                 task: "t".into(),
                 host: "h1-0123456789abcdef".into(),
                 claimed_at: None,
+                ttl_hours: None,
             })
         );
         // A claim time that is not a time reads as absent, not as no record.
@@ -2336,6 +2586,7 @@ mod tests {
                 task: task.to_string(),
                 host: host.to_string(),
                 claimed_at: Some(t0()),
+                ttl_hours: None,
             },
             updated_at: Some(at(updated_at)),
         }
@@ -2535,6 +2786,46 @@ mod tests {
     }
 
     #[test]
+    fn live_claimant_judges_each_record_by_its_writers_lifetime() {
+        // The reviewer's case: a reader with a 3-hour TTL and an owner on the
+        // 168-hour default, which refreshes only every 84 hours. Ten hours
+        // after its last edit the owner's claim is live, whatever the reader's
+        // own TTL; a record from an older deck, stating no lifetime, is judged
+        // by the reader's.
+        let with_ttl = |id, ttl_hours: Option<u32>, updated_at: &str| {
+            let mut record = found(id, 4242, "theirs", "h1-bbbb", updated_at);
+            record.record.ttl_hours = ttl_hours;
+            record
+        };
+        let ten_hours_ago = "2026-10-23T02:00:00Z";
+        let decide = |record: IssueClaimRecord, reader_ttl| {
+            live_claimant(&[record], &me(), false, None, at(NOW), reader_ttl).is_some()
+        };
+        assert!(decide(with_ttl(1, Some(168), ten_hours_ago), hours(3)));
+        assert!(!decide(with_ttl(1, None, ten_hours_ago), hours(3)));
+        assert!(decide(with_ttl(1, None, ten_hours_ago), hours(168)));
+        // A shorter lifetime than the reader's lapses on the writer's clock.
+        assert!(!decide(with_ttl(1, Some(3), ten_hours_ago), hours(168)));
+        // A lifetime past 90 days still lapses at 90 days; one of 0 at an hour.
+        assert!(decide(
+            with_ttl(1, Some(u32::MAX), "2026-07-26T12:00:00Z"),
+            hours(3)
+        ));
+        assert!(!decide(
+            with_ttl(1, Some(u32::MAX), "2026-07-25T11:00:00Z"),
+            hours(3)
+        ));
+        assert!(!decide(
+            with_ttl(1, Some(0), "2026-10-23T10:59:00Z"),
+            hours(168)
+        ));
+        assert!(decide(
+            with_ttl(1, Some(0), "2026-10-23T11:01:00Z"),
+            hours(168)
+        ));
+    }
+
+    #[test]
     fn live_claimant_gates_on_an_own_record_only_while_its_work_is_alive() {
         let own_old = found(1, ME, "mine", "h1-aaaa", "2026-01-01T00:00:00Z");
         let own_old = std::slice::from_ref(&own_old);
@@ -2558,10 +2849,14 @@ mod tests {
     }
 
     #[test]
-    fn claim_ttl_hours_must_be_at_least_one() {
+    fn claim_ttl_hours_must_be_between_one_hour_and_ninety_days() {
         assert!(validate_claim_ttl_hours(0).is_err());
         assert!(validate_claim_ttl_hours(1).is_ok());
         assert!(validate_claim_ttl_hours(DEFAULT_CLAIM_TTL_HOURS).is_ok());
+        assert!(validate_claim_ttl_hours(MAX_CLAIM_TTL_HOURS).is_ok());
+        assert_eq!(MAX_CLAIM_TTL_HOURS, 90 * 24);
+        let err = validate_claim_ttl_hours(MAX_CLAIM_TTL_HOURS + 1).unwrap_err();
+        assert!(err.contains("at most 2160"), "{err}");
     }
 
     fn utc(y: i32, mo: u32, d: u32) -> chrono::DateTime<chrono::Utc> {
@@ -2596,8 +2891,68 @@ mod tests {
         assert!(check_claim_ttl_against_cron("not a cron", 168, &from).is_err());
         // A schedule that stops firing (7-field form with a past year range).
         assert!(check_claim_ttl_against_cron("0 0 9 * * * 2026", 10_000, &from).is_err());
-        // Too dense to walk: every second.
-        assert!(check_claim_ttl_against_cron("* * * * * *", 168, &from).is_err());
+    }
+
+    #[test]
+    fn frequent_crons_keep_gating_on_at_the_default_ttl() {
+        // The walk jumps over stretches with no long gap, so a cron firing
+        // every minute (or every second) is as checkable as a daily one.
+        let from = utc(2026, 10, 21);
+        for cron in ["* * * * *", "*/5 * * * *", "*/10 * * * *", "* * * * * *"] {
+            assert_eq!(
+                check_claim_ttl_against_cron(cron, DEFAULT_CLAIM_TTL_HOURS, &from),
+                Ok(()),
+                "{cron}"
+            );
+            // Twice a gap of at most ten minutes plus the hour's headroom
+            // fits in two hours, and never in one.
+            assert_eq!(
+                check_claim_ttl_against_cron(cron, 2, &from),
+                Ok(()),
+                "{cron}"
+            );
+            let err = check_claim_ttl_against_cron(cron, 1, &from).unwrap_err();
+            assert!(err.contains("at least 2"), "{cron}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_long_gap_late_in_the_year_turns_gating_off() {
+        // Dense for most of the year with a long silence somewhere in it: the
+        // check must find the silence however many fires come before it.
+        let from = utc(2027, 1, 15);
+        // Every five minutes on the 1st of the month only: 30 days and five
+        // minutes from a 31-day month's 1st at 23:55 to the next 1st.
+        let monthly = "*/5 * 1 * *";
+        let err =
+            check_claim_ttl_against_cron(monthly, DEFAULT_CLAIM_TTL_HOURS, &from).unwrap_err();
+        assert!(
+            err.contains("(30d 5m)") && err.contains("at least 1442"),
+            "{err}"
+        );
+        assert!(check_claim_ttl_against_cron(monthly, 1441, &from).is_err());
+        assert_eq!(check_claim_ttl_against_cron(monthly, 1442, &from), Ok(()));
+        // Every five minutes except in December, eleven months after the
+        // walk's start: 31 days and five minutes without a fire.
+        let not_december = "*/5 * * 1-11 *";
+        let err =
+            check_claim_ttl_against_cron(not_december, DEFAULT_CLAIM_TTL_HOURS, &from).unwrap_err();
+        assert!(
+            err.contains("(31d 5m)") && err.contains("at least 1490"),
+            "{err}"
+        );
+        assert_eq!(
+            check_claim_ttl_against_cron(not_december, 1490, &from),
+            Ok(())
+        );
+        // Every five minutes in March only: no TTL up to the maximum covers
+        // the eleven months between Marches, and the warning says so.
+        let err =
+            check_claim_ttl_against_cron("*/5 * * 3 *", MAX_CLAIM_TTL_HOURS, &from).unwrap_err();
+        assert!(
+            err.contains("more than the 2160-hour maximum") && !err.contains("set claim_ttl_hours"),
+            "{err}"
+        );
     }
 
     #[test]

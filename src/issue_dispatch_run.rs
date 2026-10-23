@@ -593,7 +593,7 @@ pub async fn run_issue_dispatch(
                 // "dispatched" is the issue's last word in this run: nothing
                 // writes to GitHub for it after that line.
                 Ok(IssueOutcome::Dispatched { claims_unchecked }) => {
-                    claim_issue(task_name, &cfg.repo, issue, &mut claim_run, notifier).await;
+                    claim_issue(task_name, cfg, issue, &mut claim_run, notifier).await;
                     // M1.3 — surface the per-issue dispatch success.
                     notifier.notify(NotifyEvent::IssueDispatched {
                         task: task_name.to_string(),
@@ -1140,7 +1140,7 @@ async fn refresh_claim_on_worktree_skip(
     issue: u64,
     run: &mut ClaimRun,
 ) {
-    match refresh_own_claim(task_name, &cfg.repo, issue, cfg.claim.ttl(), run).await {
+    match refresh_own_claim(task_name, &cfg.repo, issue, cfg.claim.ttl_hours, run).await {
         Ok(Some(comment_id)) => tracing::info!(
             task = task_name,
             repo = cfg.repo,
@@ -1161,17 +1161,22 @@ async fn refresh_claim_on_worktree_skip(
 
 /// [`refresh_claim_on_worktree_skip`]'s work: `Ok(Some(id))` when the record
 /// `id` was edited, `Ok(None)` when there is no own record or it is not due.
+/// A record stating a lifetime other than `ttl_hours` is due whatever its age
+/// ([`claim_record_ttl_outdated`]), and every edit writes `ttl_hours` into it.
+///
+/// [`claim_record_ttl_outdated`]: crate::issue_dispatch::claim_record_ttl_outdated
 async fn refresh_own_claim(
     task_name: &str,
     repo: &str,
     issue: u64,
-    ttl: chrono::Duration,
+    ttl_hours: u32,
     run: &mut ClaimRun,
 ) -> Result<Option<u64>, String> {
     use crate::issue_dispatch::{
-        ClaimIdentity, claim_refresh_due, edit_claim_record_argv, next_claim_time,
-        render_claim_record,
+        ClaimIdentity, claim_record_ttl_outdated, claim_refresh_due, edit_claim_record_argv,
+        next_claim_time, render_claim_record_with_ttl,
     };
+    let ttl = chrono::Duration::hours(i64::from(ttl_hours));
     let records = run.claim_records(repo, issue).await?;
     if records.is_empty() {
         return Ok(None);
@@ -1188,19 +1193,22 @@ async fn refresh_own_claim(
     let now = run.now();
     // The label floor can only make the record younger, so the events are
     // read only when the record's own clock already says a refresh is due.
-    if !claim_refresh_due(now, own.updated_at, ttl) {
-        return Ok(None);
-    }
-    let label = run.claim_label(repo, issue).await?;
-    if !claim_refresh_due(now, own.updated_at.max(label.added_at), ttl) {
-        return Ok(None);
+    if !claim_record_ttl_outdated(&own.record, ttl_hours) {
+        if !claim_refresh_due(now, own.updated_at, ttl) {
+            return Ok(None);
+        }
+        let label = run.claim_label(repo, issue).await?;
+        if !claim_refresh_due(now, own.updated_at.max(label.added_at), ttl) {
+            return Ok(None);
+        }
     }
     // A new claim time, so the edit changes the body: GitHub leaves
     // `updated_at` alone on an edit that repeats it.
-    let body = render_claim_record(
+    let body = render_claim_record_with_ttl(
         task_name,
         &run.host_id,
         next_claim_time(now, own.record.claimed_at),
+        ttl_hours,
     );
     run.call(
         &edit_claim_record_argv(repo, own.comment_id, &body),
@@ -1853,11 +1861,12 @@ impl ClaimRun {
 /// provisioned once more and the add retried ([`ClaimRun::should_reprovision`]).
 async fn claim_issue(
     task_name: &str,
-    repo: &str,
+    cfg: &IssueDispatchConfig,
     issue: u64,
     run: &mut ClaimRun,
     notifier: &dyn Notifier,
 ) {
+    let repo = cfg.repo.as_str();
     if run.budget.is_spent() {
         let skipped = format!("the claim was skipped: {CLAIM_BUDGET_SPENT}");
         tracing::warn!(
@@ -1899,7 +1908,9 @@ async fn claim_issue(
         );
     }
 
-    let record_error = write_claim_record(task_name, repo, issue, run).await.err();
+    let record_error = write_claim_record(task_name, repo, issue, cfg.claim.ttl_hours, run)
+        .await
+        .err();
 
     if label_error.is_some() || record_error.is_some() {
         tracing::warn!(
@@ -1925,15 +1936,18 @@ async fn claim_issue(
 /// `gh` is signed in with — and edit it if there is one, so a re-claim never
 /// appends a second record. If the account or the comments cannot be read,
 /// nothing is posted: a blind post is how a duplicate record would appear.
+/// The record states `ttl_hours`, the task's `claim_ttl_hours`, as its
+/// lifetime.
 async fn write_claim_record(
     task_name: &str,
     repo: &str,
     issue: u64,
+    ttl_hours: u32,
     run: &mut ClaimRun,
 ) -> Result<(), String> {
     use crate::issue_dispatch::{
         create_claim_record_argv, edit_claim_record_argv, find_own_claim_record,
-        issue_comments_argv, next_claim_time, render_claim_record, sanitize_claim_error,
+        issue_comments_argv, next_claim_time, render_claim_record_with_ttl, sanitize_claim_error,
     };
     let user_id = run.account().await?;
     let comments = run
@@ -1946,7 +1960,7 @@ async fn write_claim_record(
     let own = find_own_claim_record(&comments, task_name, &run.host_id, user_id)
         .map_err(|e| sanitize_claim_error(&e))?;
     let claimed_at = next_claim_time(run.now(), own.as_ref().and_then(|record| record.claimed_at));
-    let body = render_claim_record(task_name, &run.host_id, claimed_at);
+    let body = render_claim_record_with_ttl(task_name, &run.host_id, claimed_at, ttl_hours);
     match own {
         Some(record) => {
             let id = record.id;
