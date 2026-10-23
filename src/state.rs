@@ -4048,7 +4048,17 @@ impl PointerQueueClock {
 
 impl Drop for PointerQueueClock {
     fn drop(&mut self) {
-        self.dequeue();
+        // PRD #1666 part 3, round 5 (C4b): the destructor form, which skips a
+        // poisoned tracker where `dequeue` would panic, for the reason
+        // `CommissionDispatchInFlight`'s `Drop` gives: this guard is armed on
+        // the delegate path, whose tracker-then-hub sections can poison the
+        // tracker, and a panic here during that unwind would abort the daemon.
+        if std::mem::take(&mut self.queued)
+            && let Some(seq) = self.delegation_seq
+        {
+            self.registry
+                .dequeue_delegation_pointer_write_in_drop(&self.worker_pane_id, seq);
+        }
     }
 }
 

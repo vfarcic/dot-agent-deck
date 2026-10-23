@@ -5712,6 +5712,12 @@ pub struct AgentPtyRegistry {
     named_faults: Mutex<HashMap<String, TestFault>>,
 }
 
+/// PRD #1666 part 3, round 5 (C4b): each destructor that reaches a ranked lock,
+/// run during an unwind with that lock poisoned or a higher rank held.
+#[cfg(test)]
+#[path = "agent_pty_unwind_tests.rs"]
+mod unwind_tests;
+
 /// PRD #1666 part 3, round 5: the synchronous pause in a respawn's
 /// replacement window, after the replacement's spawn returned and before the
 /// dispatched unit follows it ([`AgentPtyRegistry::pause_at_sync_for_test`]).
@@ -5777,7 +5783,16 @@ struct RespawnTicket<'a> {
 
 impl Drop for RespawnTicket<'_> {
     fn drop(&mut self) {
-        let mut inner = self.registry.inner.lock_recovering();
+        // PRD #1666 part 3, round 5 (C4b): recovers a poisoned lock, as it
+        // always has, and skips a rank violation instead of panicking in an
+        // unwind (`crate::lock_rank::RankedMutex::lock_in_drop`).
+        let Some(mut inner) = self
+            .registry
+            .inner
+            .lock_in_drop(crate::lock_rank::OnPoison::Recover)
+        else {
+            return;
+        };
         inner.respawns_in_flight = inner.respawns_in_flight.saturating_sub(1);
         inner.respawning_dirs.remove(&self.agent_id);
         inner.respawning_members.remove(&self.agent_id);
@@ -6289,7 +6304,19 @@ impl std::fmt::Debug for CommissionDispatchInFlight {
 
 impl Drop for CommissionDispatchInFlight {
     fn drop(&mut self) {
-        let mut tracker = self.registry.delegations.lock();
+        // PRD #1666 part 3, round 5 (C4b): SKIPS a poisoned tracker, where it
+        // used to panic. The delegate path that arms this guard takes the
+        // tracker and then the hub, so a panic there poisons the tracker, and a
+        // panic in this `Drop` during that unwind would abort the daemon. A
+        // skip leaves one stale in-flight entry in a tracker whose every other
+        // user already panics on the same poison.
+        let Some(mut tracker) = self
+            .registry
+            .delegations
+            .lock_in_drop(crate::lock_rank::OnPoison::Skip)
+        else {
+            return;
+        };
         if let Some(guards) = tracker
             .commission_dispatches_in_flight
             .get_mut(&self.worker_pane_id)
@@ -7095,8 +7122,13 @@ impl Drop for SpawnReservation<'_> {
         if armed {
             // A poisoned lock means some other thread panicked mid-mutation;
             // there is nothing useful to do here and panicking in `Drop` would
-            // abort. The stale entry is bounded by one per panicking spawn.
-            if let Ok(mut inner) = self.registry.inner.try_lock() {
+            // abort. The stale entry is bounded by one per panicking spawn. A
+            // rank violation is skipped the same way (PRD #1666 part 3, C4b).
+            if let Some(mut inner) = self
+                .registry
+                .inner
+                .lock_in_drop(crate::lock_rank::OnPoison::Skip)
+            {
                 self.give_up(&mut inner);
             }
             self.registry.release_abandoned_turns();
@@ -7134,7 +7166,10 @@ impl Drop for DirRemovalHold<'_> {
         // A poisoned lock leaves the hold behind, which refuses spawns into one
         // directory for the rest of the daemon's life: the fail-safe direction
         // for a deletion guard, and bounded by one entry per panicking removal.
-        if let Ok(mut inner) = self.registry.inner.try_lock()
+        if let Some(mut inner) = self
+            .registry
+            .inner
+            .lock_in_drop(crate::lock_rank::OnPoison::Skip)
             && let Some(at) = inner.removal_holds.iter().position(|d| *d == self.dir)
         {
             inner.removal_holds.swap_remove(at);
@@ -7232,8 +7267,13 @@ pub struct GenerationCloseGuard {
 
 impl Drop for GenerationCloseGuard {
     fn drop(&mut self) {
-        let mut inner = self.registry.inner.lock_recovering();
-        inner.closing_generations.remove(&self.agent_id);
+        if let Some(mut inner) = self
+            .registry
+            .inner
+            .lock_in_drop(crate::lock_rank::OnPoison::Recover)
+        {
+            inner.closing_generations.remove(&self.agent_id);
+        }
     }
 }
 
@@ -7259,7 +7299,13 @@ impl InstanceCloseGuard {
 
 impl Drop for InstanceCloseGuard {
     fn drop(&mut self) {
-        let mut inner = self.registry.inner.lock_recovering();
+        let Some(mut inner) = self
+            .registry
+            .inner
+            .lock_in_drop(crate::lock_rank::OnPoison::Recover)
+        else {
+            return;
+        };
         inner.closing_instances.remove(&self.instance);
         if self.finished {
             AgentPtyRegistry::mark_instance_ended_locked(&mut inner, &self.instance);
@@ -7338,7 +7384,11 @@ impl Drop for PaneCleanupHold {
         // another thread panicked mid-mutation, and panicking in `Drop` would
         // abort. A leaked hold blocks reuse of ONE pane id on a registry that is
         // already unable to answer any ownership question at all.
-        if let Ok(mut inner) = self.registry.inner.try_lock() {
+        if let Some(mut inner) = self
+            .registry
+            .inner
+            .lock_in_drop(crate::lock_rank::OnPoison::Skip)
+        {
             inner.cleanup_holds.remove(&self.pane_id);
         }
     }
@@ -7891,6 +7941,22 @@ impl AgentPtyRegistry {
     /// no-op if the record is gone or a newer one replaced it.
     pub fn dequeue_delegation_pointer_write(&self, worker_pane_id: &str, seq: u64) {
         let mut tracker = self.delegations.lock();
+        Self::dequeue_pointer_locked(&mut tracker, worker_pane_id, seq);
+    }
+
+    /// [`Self::dequeue_delegation_pointer_write`] for a destructor: a poisoned
+    /// tracker, or a rank violation, is skipped instead of panicking during an
+    /// unwind (PRD #1666 part 3, round 5, C4b).
+    pub(crate) fn dequeue_delegation_pointer_write_in_drop(&self, worker_pane_id: &str, seq: u64) {
+        if let Some(mut tracker) = self
+            .delegations
+            .lock_in_drop(crate::lock_rank::OnPoison::Skip)
+        {
+            Self::dequeue_pointer_locked(&mut tracker, worker_pane_id, seq);
+        }
+    }
+
+    fn dequeue_pointer_locked(tracker: &mut DelegationTracker, worker_pane_id: &str, seq: u64) {
         if let Some(record) = tracker.records.get_mut(worker_pane_id)
             && record.seq == seq
         {
@@ -9481,10 +9547,15 @@ impl AgentPtyRegistry {
     /// so a start that never publishes leaves no clock for the rest of the
     /// daemon's run. Takes the registry lock only to collect them, and calls
     /// the hub after releasing it.
+    ///
+    /// Called only from destructors (`SpawnReservation`'s and
+    /// `ReleaseAbandonedTurns`'), so it takes both locks the destructor way:
+    /// it skips a poisoned registry lock, as it always has, and the hub
+    /// recovers (PRD #1666 part 3, round 5, C4b).
     fn release_abandoned_turns(&self) {
-        let abandoned = match self.inner.try_lock() {
-            Ok(mut inner) => std::mem::take(&mut inner.abandoned_turns),
-            Err(_) => return,
+        let abandoned = match self.inner.lock_in_drop(crate::lock_rank::OnPoison::Skip) {
+            Some(mut inner) => std::mem::take(&mut inner.abandoned_turns),
+            None => return,
         };
         if let Some(hub) = self.inbox.get() {
             for (pane, agent) in abandoned {
@@ -12118,8 +12189,16 @@ impl AgentPtyRegistry {
     /// Silent about an unknown agent or token: a viewer is released on the
     /// teardown path, where the agent may already be gone, and a teardown that
     /// errors on a race it cannot prevent is noise rather than information.
+    ///
+    /// Called from the attach stream's viewer guard as it drops, so it takes the
+    /// registry lock the destructor way: a poisoned lock, or a rank violation,
+    /// is skipped instead of panicking during an unwind, where it used to panic
+    /// (PRD #1666 part 3, round 5, C4b). The viewer's entry then stays, on a
+    /// registry every other user of which panics on the same poison.
     pub fn release_viewer(&self, id: &str, token: &str) {
-        let mut guard = self.inner.lock();
+        let Some(mut guard) = self.inner.lock_in_drop(crate::lock_rank::OnPoison::Skip) else {
+            return;
+        };
         let inner = &mut *guard;
         let focused = inner.focused_client.as_deref();
         let Some(agent) = inner.agents.get_mut(id) else {
@@ -15422,6 +15501,11 @@ impl AgentPtyRegistry {
 
 impl Drop for AgentPtyRegistry {
     fn drop(&mut self) {
+        // PRD #1666 part 3, round 5 (C4b): deliberately NOT moved to
+        // `lock_in_drop`. This is the final owner's teardown, and
+        // `shutdown_all`'s registry lock still panics on poison: skipping it
+        // would leave every child running. It is the existing boundary C4b's
+        // audit names, not a destructor it proved cannot panic.
         self.shutdown_all();
     }
 }

@@ -570,8 +570,13 @@ pub struct ReplyReservation {
 
 impl Drop for ReplyReservation {
     fn drop(&mut self) {
-        if let Some(hub) = self.hub.take() {
-            hub.lock().inbox.release_reply();
+        // Recovers a poisoned hub, as every hub path does, and skips a rank
+        // violation rather than panic in an unwind: the room then stays
+        // reserved (PRD #1666 part 3, round 5, C4b).
+        if let Some(hub) = self.hub.take()
+            && let Some(mut st) = hub.lock_in_drop(crate::lock_rank::OnPoison::Recover)
+        {
+            st.inbox.release_reply();
         }
     }
 }
@@ -789,6 +794,12 @@ impl InboxHub {
         self.state.lock_recovering()
     }
 
+    /// The hub's state for a destructor, or for a helper only destructors
+    /// call: never panics (`crate::lock_rank::RankedMutex::lock_in_drop`).
+    fn lock_in_drop(&self, on_poison: crate::lock_rank::OnPoison) -> Option<HubGuard<'_>> {
+        self.state.lock_in_drop(on_poison)
+    }
+
     /// PRD #1666 S3: broadcast every later state change to attached clients as
     /// [`BroadcastMsg::Inbox`].
     pub fn set_broadcast(&self, tx: broadcast::Sender<BroadcastMsg>) {
@@ -892,6 +903,18 @@ impl InboxHub {
         Ok(ReplyReservation {
             hub: Some(Arc::clone(self)),
         })
+    }
+
+    /// TEST: poison the hub's state lock, as a panic in a hub path would.
+    #[cfg(test)]
+    pub(crate) fn poison_for_test(self: &Arc<Self>) {
+        let hub = Arc::clone(self);
+        let _ = std::thread::spawn(move || {
+            let _held = hub.lock();
+            panic!("poison the inbox hub's lock on purpose (test)");
+        })
+        .join();
+        assert!(self.state.is_poisoned());
     }
 
     /// TEST: how many reservations the inbox holds.
@@ -999,8 +1022,14 @@ impl InboxHub {
 
     /// PRD #1666 S5: the task minted under `id` will not be posted (its
     /// dispatch ended without a worker to post it to).
+    ///
+    /// Reached from `AbandonPostOnDrop`'s destructor, so it takes the hub the
+    /// destructor way (PRD #1666 part 3, round 5, C4b).
     pub fn abandon_post(&self, id: &str) {
-        if self.lock().pending_posts.remove(id) {
+        let removed = self
+            .lock_in_drop(crate::lock_rank::OnPoison::Recover)
+            .is_some_and(|mut st| st.pending_posts.remove(id));
+        if removed {
             self.changed.notify_waiters();
         }
     }
@@ -2467,8 +2496,15 @@ impl InboxHub {
     /// clock goes, and as at an exit its key joins the bounded set of exited
     /// generations, which refuses a delayed edge for it while the key is
     /// still there.
+    ///
+    /// Reached only from destructors, through
+    /// `AgentPtyRegistry::release_abandoned_turns`, so it takes the hub the
+    /// destructor way (PRD #1666 part 3, round 5, C4b): it recovers as every hub
+    /// path does, and skips a rank violation rather than panic in an unwind.
     pub fn turns_abandoned(&self, pane_id: &str, agent_id: &str) {
-        let mut st = self.lock();
+        let Some(mut st) = self.lock_in_drop(crate::lock_rank::OnPoison::Recover) else {
+            return;
+        };
         engine::forget_turns(&mut st, &(pane_id.to_string(), agent_id.to_string()));
     }
 

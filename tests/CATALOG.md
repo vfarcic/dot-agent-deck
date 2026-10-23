@@ -4349,6 +4349,22 @@ without depending on the config struct API.
 - **Does not assert:** that the daemon's own paths take the locks in order (the whole fast tier runs with the checker active, which is what does); R0 (`AppState`'s `RwLock`), which the checker cannot see; release-build behaviour, where no rank is checked.
 - **Platform coverage:** mac+linux+windows.
 
+##### orchestration/work-done/056 — A destructor armed across a dispatch or a respawn does not abort the daemon when it drops during an unwind.
+- **Layer:** fast unit, one child process per case (`src/agent_pty_unwind_tests.rs`; the outer test re-executes its own binary filtered to itself, so an abort reads as a failed status, `SIGABRT`, instead of a hung runner).
+- **Agent:** none.
+- **Asserts:** for the reply-room reservation a dispatch holds across its handling, a respawn's in-flight ticket and a commission-dispatch guard, each dropped during an unwind with an injected payload: once with its lock poisoned and once (debug builds) with a higher rank held on the unwinding thread, the child survives and the injected payload is what escapes; no `tracing` event is emitted during the unwind (a subscriber that panics on any event); poisoned, the reservation gives its room back through the recovering hub and the ticket settles its respawn, while the commission guard skips (it used to panic); with the rank held, each skips and leaves its entry.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D6, D15 rule 5; reviewer R26): the round's new tracker → hub sections can poison a lock these destructors take, and a destructor that panics during an unwind aborts the process.
+- **Does not assert:** the whole dispatch arm unwinding with its publication guard (added with that guard); destructors that reach no ranked lock; the registry's own final teardown, which still panics on a poisoned lock and is the documented boundary.
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/work-done/057 — A spawn's reservation, its abandoned-turn release and the holds, close guards and viewer release survive an unwind.
+- **Layer:** fast unit, one child process per case (`src/agent_pty_unwind_tests.rs`).
+- **Agent:** none.
+- **Asserts:** the spawn reservation, the abandoned-turn release, the directory-removal and pane-cleanup holds, the generation and instance close guards, and the helpers behind the pointer-queue clock, a pending post's abandonment and an attach viewer's release, each dropped during an unwind once with its lock poisoned and once (debug) with a higher rank held: the child survives with the injected payload and no `tracing` event; poisoned, the reservation, the holds, the tracker-taking pointer dequeue and the viewer release skip (the last two used to panic), while the abandoned-turn release, the close guards and the post's abandonment recover; with the rank held, each skips.
+- **Why it exists:** auditor U2-2: a spawn that unwinds drops its reservation, whose cleanup reaches the registry and then the hub, inside the same unwind.
+- **Does not assert:** a real spawn unwinding inside the respawn's replacement window (added with that window); destructors in files that reach no ranked lock.
+- **Platform coverage:** mac+linux+windows.
+
 #### orchestration/provenance
 
 ##### orchestration/provenance/001 — On the REAL binary, under the DEFAULT policy, a `work-done` forged from outside a pane with nothing but that pane's id is refused and the refusal is reported to its sender, while the same verb issued from inside the pane still lands (issues #1077, #1129).
