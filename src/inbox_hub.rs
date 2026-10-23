@@ -538,7 +538,7 @@ struct HubState {
     /// dot-agent-deck too old for its messages
     /// ([`crate::hook_binary::remedy_for`]), `None` when the deck can offer
     /// none.
-    hooks_remedy: Option<String>,
+    hooks_remedies: HashMap<crate::event::AgentType, String>,
     /// PRD #1666 part 3 (R-2): agent generations whose own request for their
     /// messages the deck refused at admission, with the refusal's code, until
     /// one of theirs is admitted or they exit. One entry per live generation
@@ -748,7 +748,7 @@ impl InboxHub {
                 spool: None,
                 spool_error: None,
                 action_presses: HashMap::new(),
-                hooks_remedy: None,
+                hooks_remedies: HashMap::new(),
                 admission_refused: HashMap::new(),
             }),
             spill_manifest: Mutex::new(None),
@@ -3143,7 +3143,17 @@ impl InboxHub {
     /// dot-agent-deck too old for its messages, composed by the daemon at
     /// start from its own install path.
     pub fn set_hooks_remedy(&self, command: Option<String>) {
-        self.lock().hooks_remedy = command;
+        self.set_agent_hooks_remedy(&crate::event::AgentType::ClaudeCode, command);
+    }
+
+    /// [`Self::set_hooks_remedy`] for `agent`'s hooks (PRD #1666 part 3,
+    /// R-3: Codex's hooks from before the deck's messages are named too).
+    pub fn set_agent_hooks_remedy(&self, agent: &crate::event::AgentType, command: Option<String>) {
+        let mut st = self.lock();
+        match command {
+            Some(command) => st.hooks_remedies.insert(agent.clone(), command),
+            None => st.hooks_remedies.remove(agent),
+        };
     }
 
     /// Part 2 §2.7: a one-shot receiver declared no [`HOOK_INTEGRATION`], or
@@ -3153,6 +3163,25 @@ impl InboxHub {
         let key = (pane_id.to_string(), agent_id.to_string());
         engine::refuse_hooks(&mut st, &key);
         engine::broadcast_notices(&mut st, &key, Instant::now());
+    }
+
+    /// PRD #1666 part 3 (R-3): a hook line of `agent`'s attested to
+    /// `agent_id`'s generation, `stamped` when it carries the sending deck's
+    /// version ([`crate::hook_binary::HookLineSender::is_reported`]). An
+    /// unstamped one names the hooks too old on the card; a stamped one clears
+    /// that again.
+    pub fn observe_hook_stamp(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        agent: &crate::event::AgentType,
+        stamped: bool,
+    ) {
+        let mut st = self.lock();
+        let key = (pane_id.to_string(), agent_id.to_string());
+        if engine::observe_hook_stamp(&mut st, &key, agent, stamped) {
+            engine::broadcast_notices(&mut st, &key, Instant::now());
+        }
     }
 
     /// Part 2 §1.3: Claude's prompt hook commits the exact attempts a

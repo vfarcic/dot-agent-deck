@@ -9370,6 +9370,13 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** the card notice (`inbox/boundary/065`), or which requests the daemon reports (`inbox/protocol/023`).
 - **Platform coverage:** all.
 
+##### inbox/boundary/067 — Unstamped Claude Code or Codex hook lines name that agent's fix, and hold nothing.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub's `observe_hook_stamp` and `set_agent_hooks_remedy`.
+- **Agent:** none.
+- **Asserts:** with a Claude Code and a Codex `hooks install` command set and a task waiting, a stamped line raises no notice; an unstamped line of either agent's makes the integration notice `hooks_too_old` with that agent's command, the doorbell is not blocked, and a stamped line from the same generation clears it (PRD #1666 part 3, R-3).
+- **Does not assert:** the daemon reading the stamp off a real hook line (`inbox/claude/047`), or the TUI and desktop rendering the notice (`inbox/claude/020`'s notice, part 2's renderers).
+- **Platform coverage:** all.
+
 ##### inbox/status/001 — Human daemon status shows each agent's pending inbox counts and wake path.
 - **Layer:** Unit (`tests/inbox_status.rs`), pure status projection and table rendering.
 - **Agent:** none.

@@ -1254,6 +1254,7 @@ fn claude_024_a_stale_hook_waits_for_the_session_start_connected_before_it() {
     // connects, says so, and sends the event only once told to.
     let event = json!({"session_id":format!("native-{}", pane.agent),
         "pane_id":pane.id,"agent_id":pane.agent,"token":pane.token,
+        "deck_build":SYNTHETIC_DECK_BUILD,
         "agent_type":"claude_code","event_type":"session_start",
         "timestamp":chrono::Utc::now(),"cwd":daemon.cwd(),"metadata":{}});
     let line = sidecar(&pane, "session-start-line");

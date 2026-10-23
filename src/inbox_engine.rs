@@ -155,6 +155,14 @@ pub(super) struct Floor {
     /// no [`super::HOOK_INTEGRATION`], or a lower one: the agent's hooks run
     /// an older dot-agent-deck.
     pub(super) hooks_too_old: bool,
+    /// PRD #1666 part 3 (R-3): the agent whose hook lines from this
+    /// generation carry no version stamp, so its hooks run a dot-agent-deck
+    /// from before the deck's messages, which never asks for them. A notice,
+    /// not a block: the doorbell still asks the model to run
+    /// `dot-agent-deck inbox fetch`, which hands the mail over without the
+    /// hooks. A stamped line from the generation clears it, as does a
+    /// registration.
+    pub(super) hooks_unstamped: Option<crate::event::AgentType>,
     /// The deck could not rewrite the generation's integration files as it
     /// started (`refresh_for_spawn`), so restarting does not update them:
     /// the notice in that integration's words.
@@ -167,7 +175,7 @@ impl Floor {
             Some(IntegrationNotice::CliTooOld)
         } else if let Some(notice) = self.refresh_failed.filter(|_| !self.registered) {
             Some(notice)
-        } else if self.hooks_too_old {
+        } else if self.hooks_too_old || self.hooks_unstamped.is_some() {
             Some(IntegrationNotice::HooksTooOld)
         } else if self.adapter_too_old {
             Some(IntegrationNotice::AdapterTooOld)
@@ -536,6 +544,7 @@ pub(super) fn register(
     floor.registered = true;
     floor.adapter_too_old = false;
     floor.hooks_too_old = false;
+    floor.hooks_unstamped = None;
     floor.cli_too_old = false;
     floor.refresh_failed = None;
     let grant_ttl = st.receipts.limits.grant_ttl();
@@ -624,6 +633,29 @@ pub(super) fn refuse_hooks(st: &mut HubState, key: &AgentKey) {
         .entry(key.clone())
         .or_default()
         .hooks_too_old = true;
+}
+
+/// PRD #1666 part 3 (R-3): a hook line of `agent`'s from `key`'s
+/// generation, `stamped` when it carries the sending deck's version.
+/// Unstamped, the agent's hooks run a dot-agent-deck from before the deck's
+/// messages, and its card names the command that updates them; its mail is
+/// still offered by the doorbell ([`Floor::hooks_unstamped`]). Answers whether
+/// that changed the floor.
+pub(super) fn observe_hook_stamp(
+    st: &mut HubState,
+    key: &AgentKey,
+    agent: &crate::event::AgentType,
+    stamped: bool,
+) -> bool {
+    if stamped {
+        return st
+            .receipts
+            .floors
+            .get_mut(key)
+            .is_some_and(|floor| floor.hooks_unstamped.take().is_some());
+    }
+    let floor = st.receipts.floors.entry(key.clone()).or_default();
+    floor.hooks_unstamped.replace(agent.clone()).as_ref() != Some(agent)
 }
 
 /// The stream `rx` of `key` ended. It decides nothing at once (§4: a stream
@@ -1898,7 +1930,16 @@ pub(super) fn notices(st: &HubState, key: &AgentKey, now: Instant) -> InboxCardN
         // Part 2 §2.7: composed by the deck from its own install path, never
         // from anything a hook sent.
         integration_command: (integration == Some(IntegrationNotice::HooksTooOld))
-            .then(|| st.hooks_remedy.clone())
+            .then(|| {
+                // R-3: the command for the agent whose hooks are unstamped;
+                // a refused fetch is Claude's.
+                let agent = match st.receipts.floors.get(key) {
+                    Some(floor) if !floor.hooks_too_old => floor.hooks_unstamped.clone(),
+                    _ => None,
+                }
+                .unwrap_or(crate::event::AgentType::ClaudeCode);
+                st.hooks_remedies.get(&agent).cloned()
+            })
             .flatten(),
         // PRD #1666 part 3 (R-2): while messages wait for the agent.
         admission_refused: st

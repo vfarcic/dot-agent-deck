@@ -3821,6 +3821,41 @@ fn integration_notice(hub: &InboxHub) -> (Option<IntegrationNotice>, Option<Stri
     (notices.integration, notices.integration_command)
 }
 
+/// Scenario: Hook lines from a Claude Code agent and then a Codex agent arrive with no version stamp, as hooks from before the deck's messages send them. Each card names the hooks-too-old notice with that agent's own `hooks install` command, while the task waiting for it is not held from the doorbell; a stamped line from the same generation clears the notice, and a stamped line alone never raises one.
+#[spec("inbox/boundary/067")]
+#[test]
+fn boundary_067_unstamped_hook_lines_name_each_agents_fix_and_hold_nothing() {
+    use crate::event::AgentType;
+    let hub = hub_with(Duration::from_secs(30), Duration::from_secs(60));
+    let claude = "/opt/deck/dot-agent-deck hooks install --agent claude-code";
+    let codex = "/opt/deck/dot-agent-deck hooks install --agent codex";
+    hub.set_hooks_remedy(Some(claude.to_string()));
+    hub.set_agent_hooks_remedy(&AgentType::Codex, Some(codex.to_string()));
+    hub.post_direct(Recipient::bound("p", "a"), content("waits"))
+        .unwrap();
+
+    hub.observe_hook_stamp("p", "a", &AgentType::ClaudeCode, true);
+    assert_eq!(
+        integration_notice(&hub),
+        (None, None),
+        "a stamped line raises nothing"
+    );
+    for (agent, fix) in [(AgentType::ClaudeCode, claude), (AgentType::Codex, codex)] {
+        hub.observe_hook_stamp("p", "a", &agent, false);
+        assert_eq!(
+            integration_notice(&hub),
+            (Some(IntegrationNotice::HooksTooOld), Some(fix.to_string())),
+            "{agent:?}"
+        );
+        assert!(
+            !hub.doorbell_facts("p", "a").blocked,
+            "{agent:?}: the doorbell still offers the task"
+        );
+        hub.observe_hook_stamp("p", "a", &agent, true);
+        assert_eq!(integration_notice(&hub), (None, None), "{agent:?}");
+    }
+}
+
 /// Scenario: A Claude once-waiter that declares no one-shot integration, and one that declares less than the deck's, are each refused as hooks too old before anything is issued: the queued task stays queued with no attempt, and the agent's card names the hooks-too-old notice with the deck's own hooks install command. A Claude prompt hook's fetch is refused the same way. A waiter at the integration registers as the once-waiter slot with its approval window, and is handed the task with its opener naming attempt 1.1, without the attempt's caps, whose caps file the deck has written for the prompt hook; the notice is gone.
 #[spec("inbox/boundary/048")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

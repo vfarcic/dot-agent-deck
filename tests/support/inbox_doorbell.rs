@@ -377,9 +377,16 @@ pub fn hook(daemon: &impl Endpoint, req: Value) -> Value {
     line(&mut connect(daemon, &req))
 }
 
+/// The version stamp a synthetic hook line carries. Every hook line from a
+/// current deck is stamped, and an unstamped Claude line reads as hooks from
+/// before the deck's messages (PRD #1666 part 3, R-3); an empty build counts as
+/// stamped and is never compared with the daemon's own.
+pub const SYNTHETIC_DECK_BUILD: &str = "";
+
 pub fn status(daemon: &impl Endpoint, pane: &Pane, event: &str, agent_type: &str) {
     let req = json!({"session_id":format!("doorbell-{}", pane.agent),
         "pane_id":pane.id,"agent_id":pane.agent,"token":pane.token,
+        "deck_build":SYNTHETIC_DECK_BUILD,
         "agent_type":agent_type,"event_type":event,"timestamp":chrono::Utc::now(),
         "cwd":daemon.cwd(),"metadata":if event == "quota_blocked" {
             json!({"quota_blocked_kind":"usage_limit","quota_blocked_detail":"synthetic quota"})

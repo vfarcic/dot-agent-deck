@@ -815,9 +815,15 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // from this deck's own install path.
     {
         let deck = state.read().await.hook_binaries.deck().clone();
-        let remedy =
-            crate::hook_binary::remedy_for(&deck, false, &[crate::event::AgentType::ClaudeCode]);
-        pty_registry.inbox().set_hooks_remedy(remedy.command);
+        for agent in [
+            crate::event::AgentType::ClaudeCode,
+            crate::event::AgentType::Codex,
+        ] {
+            let remedy = crate::hook_binary::remedy_for(&deck, false, std::slice::from_ref(&agent));
+            pty_registry
+                .inbox()
+                .set_agent_hooks_remedy(&agent, remedy.command);
+        }
     }
     // Issue #424: give the spawn-time delivery path a way to REPORT a failed
     // delivery as state on the pane's card instead of typing a diagnostic line
@@ -1646,13 +1652,15 @@ pub async fn ingest_event(
 /// (its `deck_build` / `deck_exe` stamp, or the absence of one), and broadcast
 /// the notices when that changes them. Under the state's write guard, so a
 /// `SubscribeEventsWithSnapshot` reply holds a change or its stream does.
+/// Answers whether the line carried a stamp.
 async fn observe_hook_sender(
     state: &SharedState,
     event_tx: &broadcast::Sender<BroadcastMsg>,
     agent_type: &crate::event::AgentType,
     line: &str,
-) {
+) -> bool {
     let sender = crate::hook_binary::HookLineSender::from_line(line);
+    let stamped = sender.is_reported();
     // The steady state — an agent's hooks sending the stamp they sent last time
     // — changes nothing, so it is settled under a read guard and never queues
     // behind or blocks the event's own write.
@@ -1662,7 +1670,7 @@ async fn observe_hook_sender(
         .hook_binaries
         .would_change(agent_type, &sender)
     {
-        return;
+        return stamped;
     }
     let mut state = state.write().await;
     if state.hook_binaries.observe(agent_type, &sender) {
@@ -1672,6 +1680,7 @@ async fn observe_hook_sender(
             },
         ));
     }
+    stamped
 }
 
 /// Issue #1637: every [`crate::hook_binary::HOOK_PIN_REFRESH_INTERVAL`], read
@@ -7576,8 +7585,28 @@ async fn run_hook_loop_with_limits(
                             // Issue #1637: which deck binary sent this line,
                             // read off the line like the token, and never part
                             // of the event.
-                            observe_hook_sender(&state, &event_tx, &event.agent_type, &line)
-                                .await;
+                            let stamped =
+                                observe_hook_sender(&state, &event_tx, &event.agent_type, &line)
+                                    .await;
+                            // PRD #1666 part 3 (R-3): Claude Code's and
+                            // Codex's hooks from before the deck's messages
+                            // never ask for them, and their lines carry no
+                            // stamp. Only a line attested to its generation
+                            // says whose card.
+                            if matches!(
+                                event.agent_type,
+                                crate::event::AgentType::ClaudeCode
+                                    | crate::event::AgentType::Codex
+                            ) && let (Some(pane_id), Some(agent_id)) =
+                                (event.pane_id.as_deref(), attested_agent.as_deref())
+                            {
+                                pty_registry.inbox().observe_hook_stamp(
+                                    pane_id,
+                                    agent_id,
+                                    &event.agent_type,
+                                    stamped,
+                                );
+                            }
                             ingest_hook_event(
                                 &state,
                                 &event_tx,
