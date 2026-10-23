@@ -9572,7 +9572,7 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/status/029 — A refused connection too long for a short, narrow window says to make it taller.
 - **Layer:** L1 (`tests/render_inbox_attention.rs`), the real key handler and picker over a TestBackend.
 - **Agent:** none.
-- **Asserts:** at 30×12, `i` opens Deck messages with the refusal's headline and, where the remedy does not fit, a closing `make the window taller to read the whole notice`; at 30×40 the whole notice shows and that line does not (PRD #1666 part 3, round 1).
+- **Asserts:** at 30×12, `i` opens Deck messages with the refusal's headline and, where the remedy does not fit, a closing `make the window taller to read the whole notice`; at 30×40 the whole notice shows and that line does not (PRD #1666 part 3, round 1); at smaller sizes down to 12×8, where the remedy does not fit, a shorter whole line (`make the window taller`, or `… taller`) still says so (round 2).
 - **Does not assert:** scrolling the notice, or the desktop tile, whose list scrolls.
 - **Platform coverage:** all.
 

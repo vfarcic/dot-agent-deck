@@ -600,7 +600,7 @@ fn status_028_deck_messages_shows_a_refused_connection_whole() {
     );
 }
 
-/// Scenario: The deck refused the agent's own request for its waiting messages, and the terminal is both narrow and short. Pressing `i` opens Deck messages with the notice from its headline, and where the rest does not fit the picker says to make the window taller, rather than silently dropping the remedy; in a window tall enough the whole notice shows and no such line does.
+/// Scenario: The deck refused the agent's own request for its waiting messages, and the terminal is both narrow and short. Pressing `i` opens Deck messages with the notice from its headline, and where the rest does not fit the picker says to make the window taller, rather than silently dropping the remedy; in a window tall enough the whole notice shows and no such line does. In a window smaller still, a shorter such line takes its place whole, never cut off itself.
 #[spec("inbox/status/029")]
 #[test]
 fn status_029_a_refused_connection_too_long_for_the_window_says_to_make_it_taller() {
@@ -642,4 +642,23 @@ fn status_029_a_refused_connection_too_long_for_the_window_says_to_make_it_talle
         "{rendered}"
     );
     assert!(!flat(&rendered).contains(TALLER), "{rendered}");
+
+    // Round 1's U3: in a window too small for even that line, a shorter one
+    // takes its place whole; it is never cut off itself.
+    const SHORTER: [&str; 3] = [TALLER, "make the window taller", "… taller"];
+    for size in [(30, 9), (30, 8), (24, 9), (16, 9), (12, 8)] {
+        let small = run(size);
+        let Some(screen) = small.screen.as_ref() else {
+            continue;
+        };
+        let rendered = text(screen);
+        let shown = flat(&rendered);
+        if shown.contains(words["admissionRefusedRemedy"].as_str().unwrap()) {
+            continue;
+        }
+        assert!(
+            SHORTER.iter().any(|hint| shown.contains(hint)),
+            "{size:?}: a whole line says to make the window taller:\n{rendered}"
+        );
+    }
 }

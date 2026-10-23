@@ -19605,8 +19605,18 @@ fn inbox_attention_lines(
     // PRD #1666 part 3, round 1: a notice taller than the body ends with a
     // line saying to make the window taller, rather than losing its remedy
     // unannounced. The desktop tile has no such state: its list scrolls.
+    // Round 2: in a window too small for that line whole, a shorter one, so
+    // the line is never cut off itself.
     let notice = if notice.len() > rows {
-        let taller = crate::upgrade_dialog::wrap(NOTICE_NEEDS_HEIGHT, width.saturating_sub(2));
+        let inner = width.saturating_sub(2);
+        let taller = NOTICE_NEEDS_HEIGHT_LADDER
+            .iter()
+            .map(|hint| crate::upgrade_dialog::wrap(hint, inner))
+            // Whole: it fits, and no word of it was split to.
+            .zip(NOTICE_NEEDS_HEIGHT_LADDER)
+            .find(|(lines, hint)| lines.len() <= rows && lines.join(" ") == *hint)
+            .map(|(lines, _)| lines)
+            .unwrap_or_default();
         let keep = rows.saturating_sub(taller.len());
         notice.into_iter().take(keep).chain(taller).collect()
     } else {
@@ -19839,6 +19849,11 @@ const RETRY_NEEDS_WIDTH: &str = "make the window wider to see what Retry does";
 /// PRD #1666 part 3, round 1: the line closing a refusal notice the picker is
 /// too short to show whole.
 const NOTICE_NEEDS_HEIGHT: &str = "… make the window taller to read the whole notice";
+
+/// [`NOTICE_NEEDS_HEIGHT`], then the shorter lines that take its place in a
+/// picker too small to show it whole, longest first.
+const NOTICE_NEEDS_HEIGHT_LADDER: [&str; 3] =
+    [NOTICE_NEEDS_HEIGHT, "… make the window taller", "… taller"];
 
 /// Which way the picker drawn in `area` is too small to show what Retry does
 /// on the cursor's row: width when the explanation's words do not fit across
