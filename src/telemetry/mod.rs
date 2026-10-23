@@ -45,7 +45,11 @@
 //! shim that switches on Codex's and Devin's own telemetry runs there
 //! ([`shim::run_if_invoked`]).
 
-pub mod accounting;
+/// PRD #633's execution-accounting prototype, compiled for tests only: no
+/// product path calls it, and wiring it (and dropping this `cfg(test)`) is
+/// the follow-up PRD's first step.
+#[cfg(test)]
+mod accounting;
 pub mod ci;
 pub mod config;
 pub mod exporter;

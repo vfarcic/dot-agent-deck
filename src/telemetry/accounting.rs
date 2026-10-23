@@ -1,18 +1,25 @@
 //! PRD #633, discovery milestone 4: a narrow prototype of the execution
-//! record, following `docs/develop/execution-accounting.md`. Nothing in the
-//! product calls it yet: no daemon, TUI, hook or exporter path reaches this
-//! module, and nothing here locates, watches or tails a file by itself.
+//! record, following `docs/develop/execution-accounting.md`. It is compiled
+//! for tests only (`#[cfg(test)]` in `src/telemetry/mod.rs`), so it is no
+//! product API and ships in no release build; wiring it to a live run, and
+//! dropping that `cfg(test)`, is the follow-up PRD's first step. Nothing here
+//! locates, watches or tails a file by itself.
 //!
 //! * **Provenance on every value** ([`Field`]): measured, provider-reported,
 //!   estimated, agent-asserted, or unavailable with a reason. Unavailable is a
 //!   value the record carries, not a missing field, and a cost of `0` for
 //!   replies that used tokens is unavailable ([`Unavailable::SubscriptionZero`]),
 //!   never a free run.
+//! * **Identifier-shaped strings only** ([`Ident`]): every string the record
+//!   holds or exports is an `Ident`, whose one constructor checks its shape,
+//!   so neither a normaliser nor a record built by hand outside this module
+//!   can put free text in it. The shape check is not a privacy allow-list
+//!   (see [`Ident`]).
 //! * **Normalisers** from each agent's usage observation, as typed usage-only
 //!   structs, to one shape ([`AgentUsage`]): [`from_claude`], [`from_codex`],
 //!   [`from_pi`], [`from_opencode`]. No input struct has a field that could
 //!   hold a prompt, a reply, a tool's input or output, or file content.
-//! * **Local capture** of one agent's store ([`CodexUsageReader`]): an
+//! * **Local capture** of one agent's store ([`CodexUsageReader`]): a bounded,
 //!   incremental reader of a Codex rollout at a path it is given, reading only
 //!   bytes appended since its last poll and deserialising only the model,
 //!   usage, quota and turn-end fields of the few record types that carry them.
@@ -24,11 +31,12 @@
 //!   `deck.*` for provenance and outcomes, keyed by a closed enum
 //!   ([`AccountingKey`]) as #1741's [`AttrKey`] is.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read as _, Seek as _, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
@@ -81,9 +89,18 @@ pub enum Unavailable {
     UnknownPrice,
     /// The channel exists but held no value for this run.
     NotRecorded,
-    /// The quota window reset or changed during the run, so a delta would
-    /// mislead.
+    /// Some of the replies behind a total had the value and some did not (or
+    /// lacked it for different reasons), so their sum would be a part
+    /// presented as the whole.
+    Incomplete,
+    /// The quota window reset or changed length during the run, so a delta
+    /// would mislead.
     WindowReset,
+    /// The plan named on the quota samples changed during the run.
+    PlanChanged,
+    /// The used share of the window went down during the run, which a
+    /// simple delta cannot account for.
+    QuotaDecreased,
     /// The run has not ended, so how it ended is not known yet.
     RunNotEnded,
     /// The run serves no known work item.
@@ -97,7 +114,10 @@ impl Unavailable {
             Unavailable::SubscriptionZero => "subscription_zero",
             Unavailable::UnknownPrice => "unknown_price",
             Unavailable::NotRecorded => "not_recorded",
+            Unavailable::Incomplete => "incomplete",
             Unavailable::WindowReset => "window_reset",
+            Unavailable::PlanChanged => "plan_changed",
+            Unavailable::QuotaDecreased => "quota_decreased",
             Unavailable::RunNotEnded => "run_not_ended",
             Unavailable::NoWorkItem => "no_work_item",
         }
@@ -107,7 +127,7 @@ impl Unavailable {
 /// A value with its provenance. There is no way to hold a value without
 /// saying where it came from, nor to leave a field out: an unknown value is
 /// [`Field::Unavailable`] with its reason.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field<T> {
     Measured(T),
     ProviderReported(T),
@@ -146,6 +166,43 @@ impl<T> Field<T> {
 }
 
 // ---------------------------------------------------------------------------
+// Identifiers
+// ---------------------------------------------------------------------------
+
+/// A short identifier — a run id, an agent, a model, a plan, an error kind, a
+/// work item — and the only string type the record holds. [`Ident::new`] is
+/// its one constructor, and it refuses anything that is not ASCII letters,
+/// digits and `._-:/@+`, at most [`Ident::MAX_BYTES`] bytes, so no line
+/// break, quote, space or non-ASCII byte can travel through a field meant for
+/// a name, whoever outside this module builds the record.
+///
+/// **That is a shape check, not a privacy allow-list.** An absolute path
+/// (`/home/x/.ssh/id`), an email address and many credentials have the
+/// shape, and pass. Which values each field may carry — the registry's agent
+/// names, deck-minted run ids, known model names with a rule for unknown
+/// ones, enumerated plan and error kinds — is for the follow-up that wires
+/// the record to decide per field.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Ident(String);
+
+impl Ident {
+    pub const MAX_BYTES: usize = 128;
+
+    pub fn new(value: &str) -> Option<Ident> {
+        let ok = !value.is_empty()
+            && value.len() <= Self::MAX_BYTES
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-:/@+".contains(&b));
+        ok.then(|| Ident(value.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Values
 // ---------------------------------------------------------------------------
 
@@ -169,6 +226,16 @@ impl Tokens {
         self.cache_write = self.cache_write.saturating_add(other.cache_write);
     }
 
+    /// `self - earlier`, or `None` when any count went down.
+    fn since(&self, earlier: &Tokens) -> Option<Tokens> {
+        Some(Tokens {
+            input: self.input.checked_sub(earlier.input)?,
+            output: self.output.checked_sub(earlier.output)?,
+            cache_read: self.cache_read.checked_sub(earlier.cache_read)?,
+            cache_write: self.cache_write.checked_sub(earlier.cache_write)?,
+        })
+    }
+
     pub fn is_zero(&self) -> bool {
         *self == Tokens::default()
     }
@@ -184,13 +251,19 @@ impl MicroUsd {
     pub fn from_usd(usd: f64) -> Option<MicroUsd> {
         (usd.is_finite() && usd >= 0.0).then(|| MicroUsd((usd * 1_000_000.0).round() as u64))
     }
+
+    fn plus(self, other: MicroUsd) -> MicroUsd {
+        MicroUsd(self.0.saturating_add(other.0))
+    }
 }
 
 /// One model's usage within a run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelUsage {
-    /// `None` when the usage cannot be tied to a model.
-    pub model: Option<String>,
+    /// `None` when the usage cannot be tied to a model: none was named, the
+    /// name was not an [`Ident`], or [`MAX_MODELS`] models were already
+    /// tracked.
+    pub model: Option<Ident>,
     pub tokens: Field<Tokens>,
     pub cost: Field<MicroUsd>,
 }
@@ -200,7 +273,7 @@ pub struct ModelUsage {
 /// that overlapped another it is an upper bound.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuotaDelta {
-    pub plan: Option<String>,
+    pub plan: Option<Ident>,
     pub window_minutes: u64,
     /// When the window resets, in seconds since the Unix epoch: it names the
     /// window instance, so two runs' deltas are comparable only when it is
@@ -245,53 +318,74 @@ impl RunTermination {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Termination {
     pub outcome: RunTermination,
-    pub error_type: Option<String>,
+    pub error_type: Option<Ident>,
 }
 
-/// What an agent's own record says about its last turn.
+/// What an agent's own record says about its last turn. It is the last
+/// turn's status, not the run's end: an interactive agent completes a turn
+/// and then waits for the next one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentTurnEnd {
     Completed,
     /// `kind` is the agent's error identifier, never its message.
     Failed {
-        kind: Option<String>,
+        kind: Option<Ident>,
     },
     Interrupted,
-    /// The record ends inside a turn.
+    /// The record ends inside a turn, for example on a reply that asked for a
+    /// tool.
     MidTurn,
+    /// The record's last turn ends in a way this prototype does not read, or
+    /// names no end.
+    Unknown,
+}
+
+impl AgentTurnEnd {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            AgentTurnEnd::Completed => "completed",
+            AgentTurnEnd::Failed { .. } => "failed",
+            AgentTurnEnd::Interrupted => "interrupted",
+            AgentTurnEnd::MidTurn => "mid_turn",
+            AgentTurnEnd::Unknown => "unknown",
+        }
+    }
 }
 
 /// A run's termination from what the deck saw (`end`, `None` while the run is
 /// open) and what the agent's own record says about its last turn.
 ///
-/// The agent's word decides a failure, an interruption and a completion
-/// (provider-reported). A record that ends mid-turn is decided by the deck: a
-/// run it closed or shut down was interrupted, any other end is unknown
-/// (measured). With no agent record the deck knows only that the run ended.
+/// Until the deck reports an end the run has not terminated, whatever its
+/// last turn says: an interactive agent that completed a turn is waiting, not
+/// finished. Once it has ended, the agent's word decides a failure, an
+/// interruption and a completion (provider-reported). A record that ends
+/// mid-turn is decided by the deck: a run it closed or shut down was
+/// interrupted, any other end is unknown (measured). A last turn the record
+/// does not name, or no agent record, leaves only that the run ended:
+/// unknown.
 pub fn run_termination(end: Option<EndReason>, agent: Option<&AgentTurnEnd>) -> Field<Termination> {
+    let Some(end) = end else {
+        return Field::Unavailable(Unavailable::RunNotEnded);
+    };
     let of = |outcome| Termination {
         outcome,
         error_type: None,
     };
-    match (agent, end) {
-        (Some(AgentTurnEnd::Failed { kind }), _) => Field::ProviderReported(Termination {
+    match agent {
+        Some(AgentTurnEnd::Failed { kind }) => Field::ProviderReported(Termination {
             outcome: RunTermination::Failed,
-            error_type: kind.as_deref().and_then(identifier),
+            error_type: kind.clone(),
         }),
-        (Some(AgentTurnEnd::Interrupted), _) => {
-            Field::ProviderReported(of(RunTermination::Interrupted))
-        }
-        (Some(AgentTurnEnd::Completed), _) => {
-            Field::ProviderReported(of(RunTermination::Completed))
-        }
-        (Some(AgentTurnEnd::MidTurn), None) | (None, None) => {
-            Field::Unavailable(Unavailable::RunNotEnded)
-        }
-        (Some(AgentTurnEnd::MidTurn), Some(EndReason::Closed | EndReason::DaemonShutdown)) => {
+        Some(AgentTurnEnd::Interrupted) => Field::ProviderReported(of(RunTermination::Interrupted)),
+        Some(AgentTurnEnd::Completed) => Field::ProviderReported(of(RunTermination::Completed)),
+        Some(AgentTurnEnd::MidTurn)
+            if matches!(end, EndReason::Closed | EndReason::DaemonShutdown) =>
+        {
             Field::Measured(of(RunTermination::Interrupted))
         }
-        (Some(AgentTurnEnd::MidTurn), Some(EndReason::Exited | EndReason::Unknown))
-        | (None, Some(_)) => Field::Measured(of(RunTermination::Unknown)),
+        Some(AgentTurnEnd::MidTurn | AgentTurnEnd::Unknown) | None => {
+            Field::Measured(of(RunTermination::Unknown))
+        }
     }
 }
 
@@ -361,37 +455,42 @@ pub fn work_disposition(
     Field::Measured(disposition)
 }
 
-/// Whether a work item's change was verified.
+/// What the checks on a work item's pull request showed: the observed CI
+/// rollup, **not verification**. #1741's CI state aggregates every check the
+/// forge lists, optional ones included, and reads a rollup of only skipped
+/// checks as passing; it names no commit. Verification proper (the required
+/// checks passed on the head that merged) needs the required-check list and
+/// the commit identity, and is deferred to the follow-up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Verification {
-    Verified,
+pub enum ObservedChecks {
+    Passing,
     Failing,
-    Unverified,
+    Pending,
 }
 
-impl Verification {
+impl ObservedChecks {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Verification::Verified => "verified",
-            Verification::Failing => "failing",
-            Verification::Unverified => "unverified",
+            ObservedChecks::Passing => "passing",
+            ObservedChecks::Failing => "failing",
+            ObservedChecks::Pending => "pending",
         }
     }
 }
 
-/// Verification from the checks on the item's head (#1741's `agent.ci`,
-/// measured), else from the agent's own claim that its tests passed
-/// (agent-asserted), else unavailable.
-pub fn verification(
-    checks_on_head: Option<CiState>,
+/// The observed checks from the CI rollup on the item's pull request
+/// (#1741's `agent.ci`, measured), else from the agent's own claim that its
+/// checks passed (agent-asserted), else unavailable.
+pub fn observed_checks(
+    rollup: Option<CiState>,
     agent_claim: Option<bool>,
-) -> Field<Verification> {
-    match (checks_on_head, agent_claim) {
-        (Some(CiState::Passing), _) => Field::Measured(Verification::Verified),
-        (Some(CiState::Failing), _) => Field::Measured(Verification::Failing),
-        (Some(CiState::Pending), _) => Field::Measured(Verification::Unverified),
-        (None, Some(true)) => Field::AgentAsserted(Verification::Verified),
-        (None, Some(false)) => Field::AgentAsserted(Verification::Failing),
+) -> Field<ObservedChecks> {
+    match (rollup, agent_claim) {
+        (Some(CiState::Passing), _) => Field::Measured(ObservedChecks::Passing),
+        (Some(CiState::Failing), _) => Field::Measured(ObservedChecks::Failing),
+        (Some(CiState::Pending), _) => Field::Measured(ObservedChecks::Pending),
+        (None, Some(true)) => Field::AgentAsserted(ObservedChecks::Passing),
+        (None, Some(false)) => Field::AgentAsserted(ObservedChecks::Failing),
         (None, None) => Field::Unavailable(Unavailable::NoChannel),
     }
 }
@@ -400,24 +499,28 @@ pub fn verification(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkItemRecord {
     pub disposition: Field<Disposition>,
-    pub verification: Field<Verification>,
-}
-
-/// A short identifier from an agent's store — a model, a plan, an error kind —
-/// or `None` for anything that does not look like one, so that no free text
-/// can travel through a field meant for a name.
-fn identifier(value: &str) -> Option<String> {
-    let ok = !value.is_empty()
-        && value.len() <= 128
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"._-:/@+".contains(&b));
-    ok.then(|| value.to_owned())
+    pub checks: Field<ObservedChecks>,
 }
 
 // ---------------------------------------------------------------------------
 // Normalisers
 // ---------------------------------------------------------------------------
+
+/// The most distinct named models one run tracks. Usage of any further model
+/// is credited to `None` (not tied to a model), so the state a run holds is
+/// bounded whatever its input names.
+pub const MAX_MODELS: usize = 32;
+
+/// The key `model` is counted under in `by_model`: itself, or `None` once
+/// [`MAX_MODELS`] other named models are there.
+fn capped<V>(by_model: &BTreeMap<Option<Ident>, V>, model: Option<Ident>) -> Option<Ident> {
+    let named = by_model.len() - usize::from(by_model.contains_key(&None));
+    if named >= MAX_MODELS && !by_model.contains_key(&model) {
+        None
+    } else {
+        model
+    }
+}
 
 /// One agent's usage for one run, in the record's shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -436,13 +539,71 @@ fn usage_unavailable(reason: Unavailable) -> Vec<ModelUsage> {
     }]
 }
 
-/// An agent's own cost figure for `tokens`, as `estimated`: a `0` for replies
-/// that used tokens is a subscription's, not a free run's.
+/// An agent's own cost figure for one reply's `tokens`, as `estimated`: a `0`
+/// for a reply that used tokens is a subscription's, not a free reply's.
 fn agent_cost(cost: Option<MicroUsd>, tokens: &Tokens) -> Field<MicroUsd> {
     match cost {
         None => Field::Unavailable(Unavailable::NotRecorded),
         Some(MicroUsd(0)) if !tokens.is_zero() => Field::Unavailable(Unavailable::SubscriptionZero),
         Some(cost) => Field::Estimated(cost),
+    }
+}
+
+/// Two costs, each already classified, as one. Values of one provenance add;
+/// a reply with no tokens and no cost adds nothing; any other mix — a priced
+/// reply with an unpriced one, or two reasons for unavailable — is
+/// [`Unavailable::Incomplete`], never the priced part alone.
+fn add_cost(sum: Field<MicroUsd>, next: Field<MicroUsd>) -> Field<MicroUsd> {
+    match (sum, next) {
+        (Field::Estimated(MicroUsd(0)), other) | (other, Field::Estimated(MicroUsd(0))) => other,
+        (Field::Estimated(a), Field::Estimated(b)) => Field::Estimated(a.plus(b)),
+        (Field::ProviderReported(a), Field::ProviderReported(b)) => {
+            Field::ProviderReported(a.plus(b))
+        }
+        (Field::Unavailable(a), Field::Unavailable(b)) if a == b => Field::Unavailable(a),
+        _ => Field::Unavailable(Unavailable::Incomplete),
+    }
+}
+
+/// Usage per model from per-reply (or per-model) entries, each with its cost
+/// already classified: tokens summed, costs combined by [`add_cost`], at most
+/// [`MAX_MODELS`] named models.
+fn per_model(
+    entries: impl IntoIterator<Item = (Option<Ident>, Tokens, Field<MicroUsd>)>,
+) -> Vec<ModelUsage> {
+    let mut by_model: BTreeMap<Option<Ident>, (Tokens, Field<MicroUsd>)> = BTreeMap::new();
+    for (model, tokens, cost) in entries {
+        match by_model.entry(capped(&by_model, model)) {
+            Entry::Vacant(entry) => {
+                entry.insert((tokens, cost));
+            }
+            Entry::Occupied(mut entry) => {
+                let (sum, sum_cost) = entry.get_mut();
+                sum.add(&tokens);
+                *sum_cost = add_cost(*sum_cost, cost);
+            }
+        }
+    }
+    if by_model.is_empty() {
+        return usage_unavailable(Unavailable::NotRecorded);
+    }
+    by_model
+        .into_iter()
+        .map(|(model, (tokens, cost))| ModelUsage {
+            model,
+            tokens: Field::ProviderReported(tokens),
+            cost,
+        })
+        .collect()
+}
+
+/// Tokens from an agent that counts input without the cache.
+fn input_plus_cache(input: u64, output: u64, cache_read: u64, cache_write: u64) -> Tokens {
+    Tokens {
+        input: input.saturating_add(cache_read).saturating_add(cache_write),
+        output,
+        cache_read,
+        cache_write,
     }
 }
 
@@ -480,31 +641,20 @@ pub fn from_claude(session: Option<&ClaudeSessionUsage>) -> AgentUsage {
             last_turn: None,
         };
     };
-    let models = session
-        .models
-        .iter()
-        .map(|m| {
-            let tokens = Tokens {
-                input: m
-                    .input_tokens
-                    .saturating_add(m.cache_read_input_tokens)
-                    .saturating_add(m.cache_creation_input_tokens),
-                output: m.output_tokens,
-                cache_read: m.cache_read_input_tokens,
-                cache_write: m.cache_creation_input_tokens,
-            };
-            let cost = if session.has_unknown_model_cost {
-                Field::Unavailable(Unavailable::UnknownPrice)
-            } else {
-                agent_cost(m.cost_usd.and_then(MicroUsd::from_usd), &tokens)
-            };
-            ModelUsage {
-                model: identifier(&m.model),
-                tokens: Field::ProviderReported(tokens),
-                cost,
-            }
-        })
-        .collect();
+    let models = per_model(session.models.iter().map(|m| {
+        let tokens = input_plus_cache(
+            m.input_tokens,
+            m.output_tokens,
+            m.cache_read_input_tokens,
+            m.cache_creation_input_tokens,
+        );
+        let cost = if session.has_unknown_model_cost {
+            Field::Unavailable(Unavailable::UnknownPrice)
+        } else {
+            agent_cost(m.cost_usd.and_then(MicroUsd::from_usd), &tokens)
+        };
+        (Ident::new(&m.model), tokens, cost)
+    }));
     AgentUsage {
         models,
         quota: Field::Unavailable(Unavailable::NoChannel),
@@ -514,7 +664,12 @@ pub fn from_claude(session: Option<&ClaudeSessionUsage>) -> AgentUsage {
 
 /// Codex: tokens provider-reported, by model, from its rollout's running
 /// total; no cost (the rollout carries none); the quota delta of its primary
-/// rate-limit window.
+/// rate-limit window, unavailable when the window, its length or the plan
+/// changed, or its used share went down, during the run.
+///
+/// Quota is assumed to be one account's: the samples name a plan, not an
+/// account, so deltas from several machines or accounts on the same plan and
+/// window are indistinguishable here.
 pub fn from_codex(summary: &CodexRolloutSummary) -> AgentUsage {
     let models = if summary.tokens_by_model.is_empty() {
         usage_unavailable(Unavailable::NotRecorded)
@@ -530,24 +685,37 @@ pub fn from_codex(summary: &CodexRolloutSummary) -> AgentUsage {
             .collect()
     };
     let quota = match (&summary.quota_first, &summary.quota_last) {
-        (Some(first), Some(last))
-            if first.resets_at == last.resets_at && first.window_minutes == last.window_minutes =>
-        {
-            Field::ProviderReported(QuotaDelta {
-                plan: last.plan.clone(),
-                window_minutes: last.window_minutes,
-                resets_at: last.resets_at,
-                from_bp: first.used_bp,
-                to_bp: last.used_bp,
-            })
+        (Some(first), Some(last)) => {
+            match summary.quota_break.or_else(|| quota_break(first, last)) {
+                Some(reason) => Field::Unavailable(reason),
+                None => Field::ProviderReported(QuotaDelta {
+                    plan: last.plan.clone(),
+                    window_minutes: last.window_minutes,
+                    resets_at: last.resets_at,
+                    from_bp: first.used_bp,
+                    to_bp: last.used_bp,
+                }),
+            }
         }
-        (Some(_), Some(_)) => Field::Unavailable(Unavailable::WindowReset),
         _ => Field::Unavailable(Unavailable::NotRecorded),
     };
     AgentUsage {
         models,
         quota,
         last_turn: summary.last_turn.clone(),
+    }
+}
+
+/// Why `next` cannot follow `prev` in one simple quota delta, if it cannot.
+fn quota_break(prev: &CodexRateSample, next: &CodexRateSample) -> Option<Unavailable> {
+    if prev.resets_at != next.resets_at || prev.window_minutes != next.window_minutes {
+        Some(Unavailable::WindowReset)
+    } else if prev.plan != next.plan {
+        Some(Unavailable::PlanChanged)
+    } else if next.used_bp < prev.used_bp {
+        Some(Unavailable::QuotaDecreased)
+    } else {
+        None
     }
 }
 
@@ -576,45 +744,27 @@ pub struct PiReplyUsage {
     pub stop_reason: Option<PiStopReason>,
 }
 
-/// Pi: tokens provider-reported, summed per model; cost as Pi's estimate,
-/// unavailable for a model when any of its replies has none.
+/// Pi: tokens provider-reported, summed per model; each reply's cost
+/// classified as Pi's estimate (or unavailable) before it is summed. The last
+/// reply names the last turn's end: a reply that asked for a tool leaves the
+/// turn open, and one with no stop reason leaves it unknown.
 pub fn from_pi(replies: &[PiReplyUsage]) -> AgentUsage {
-    let mut by_model: BTreeMap<Option<String>, (Tokens, Option<MicroUsd>)> = BTreeMap::new();
-    for reply in replies {
-        let tokens = Tokens {
-            input: reply
-                .input
-                .saturating_add(reply.cache_read)
-                .saturating_add(reply.cache_write),
-            output: reply.output,
-            cache_read: reply.cache_read,
-            cache_write: reply.cache_write,
-        };
-        let entry = by_model
-            .entry(identifier(&reply.model))
-            .or_insert((Tokens::default(), Some(MicroUsd(0))));
-        entry.0.add(&tokens);
-        entry.1 = match (entry.1, reply.cost_total_usd.and_then(MicroUsd::from_usd)) {
-            (Some(sum), Some(cost)) => Some(MicroUsd(sum.0.saturating_add(cost.0))),
-            _ => None,
-        };
-    }
-    let models = if by_model.is_empty() {
-        usage_unavailable(Unavailable::NotRecorded)
-    } else {
-        by_model
-            .into_iter()
-            .map(|(model, (tokens, cost))| ModelUsage {
-                model,
-                cost: agent_cost(cost, &tokens),
-                tokens: Field::ProviderReported(tokens),
-            })
-            .collect()
-    };
+    let models = per_model(replies.iter().map(|reply| {
+        let tokens = input_plus_cache(
+            reply.input,
+            reply.output,
+            reply.cache_read,
+            reply.cache_write,
+        );
+        let cost = agent_cost(reply.cost_total_usd.and_then(MicroUsd::from_usd), &tokens);
+        (Ident::new(&reply.model), tokens, cost)
+    }));
     let last_turn = replies.last().map(|r| match r.stop_reason {
+        Some(PiStopReason::Stop | PiStopReason::Length) => AgentTurnEnd::Completed,
+        Some(PiStopReason::ToolUse) => AgentTurnEnd::MidTurn,
         Some(PiStopReason::Error) => AgentTurnEnd::Failed { kind: None },
         Some(PiStopReason::Aborted) => AgentTurnEnd::Interrupted,
-        _ => AgentTurnEnd::Completed,
+        None => AgentTurnEnd::Unknown,
     });
     AgentUsage {
         models,
@@ -635,42 +785,16 @@ pub struct OpenCodeMessageUsage {
     pub cost_usd: f64,
 }
 
-/// OpenCode: tokens provider-reported per model; cost as OpenCode's own
-/// figure, unavailable when it is `0` for messages that used tokens, which is
-/// what its subscription providers report.
+/// OpenCode: tokens provider-reported per model; each message's cost
+/// classified as OpenCode's own figure before it is summed, unavailable when
+/// it is `0` for a message that used tokens, which is what its subscription
+/// providers report.
 pub fn from_opencode(messages: &[OpenCodeMessageUsage]) -> AgentUsage {
-    let mut by_model: BTreeMap<Option<String>, (Tokens, Option<MicroUsd>)> = BTreeMap::new();
-    for m in messages {
-        let tokens = Tokens {
-            input: m
-                .input
-                .saturating_add(m.cache_read)
-                .saturating_add(m.cache_write),
-            output: m.output,
-            cache_read: m.cache_read,
-            cache_write: m.cache_write,
-        };
-        let entry = by_model
-            .entry(identifier(&m.model))
-            .or_insert((Tokens::default(), Some(MicroUsd(0))));
-        entry.0.add(&tokens);
-        entry.1 = match (entry.1, MicroUsd::from_usd(m.cost_usd)) {
-            (Some(sum), Some(cost)) => Some(MicroUsd(sum.0.saturating_add(cost.0))),
-            _ => None,
-        };
-    }
-    let models = if by_model.is_empty() {
-        usage_unavailable(Unavailable::NotRecorded)
-    } else {
-        by_model
-            .into_iter()
-            .map(|(model, (tokens, cost))| ModelUsage {
-                model,
-                cost: agent_cost(cost, &tokens),
-                tokens: Field::ProviderReported(tokens),
-            })
-            .collect()
-    };
+    let models = per_model(messages.iter().map(|m| {
+        let tokens = input_plus_cache(m.input, m.output, m.cache_read, m.cache_write);
+        let cost = agent_cost(MicroUsd::from_usd(m.cost_usd), &tokens);
+        (Ident::new(&m.model), tokens, cost)
+    }));
     AgentUsage {
         models,
         quota: Field::Unavailable(Unavailable::NoChannel),
@@ -683,19 +807,32 @@ pub fn from_opencode(messages: &[OpenCodeMessageUsage]) -> AgentUsage {
 // ---------------------------------------------------------------------------
 
 /// What the deck knows about a run without asking the agent (#1741).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunIdentity {
-    pub run_id: String,
-    pub agent: String,
+    pub run_id: Ident,
+    pub agent: Ident,
     /// The run whose pane started this one, if any.
-    pub parent_run_id: Option<String>,
+    pub parent_run_id: Option<Ident>,
     /// The run whose own total already contains this run's usage — a Claude
     /// Code subagent's parent session. Its usage is then counted there and
     /// never again here.
-    pub usage_included_in: Option<String>,
-    pub orchestration_id: Option<String>,
+    pub usage_included_in: Option<Ident>,
+    pub orchestration_id: Option<Ident>,
     /// The issue or pull request the run serves, when known (#628).
-    pub work_item: Option<String>,
+    pub work_item: Option<Ident>,
+}
+
+impl RunIdentity {
+    pub fn new(run_id: Ident, agent: Ident) -> Self {
+        RunIdentity {
+            run_id,
+            agent,
+            parent_run_id: None,
+            usage_included_in: None,
+            orchestration_id: None,
+            work_item: None,
+        }
+    }
 }
 
 /// One run's accounting record.
@@ -704,18 +841,27 @@ pub struct RunRecord {
     pub identity: RunIdentity,
     pub models: Vec<ModelUsage>,
     pub quota: Field<QuotaDelta>,
+    /// How the run ended; unavailable while it is open.
     pub termination: Field<Termination>,
+    /// The agent's last turn, kept apart from the termination, so an open
+    /// run still says where its agent is.
+    pub last_turn: Field<AgentTurnEnd>,
 }
 
 impl RunRecord {
     /// The record from the deck's view of the run and the agent's usage.
     pub fn new(identity: RunIdentity, usage: AgentUsage, end: Option<EndReason>) -> Self {
         let termination = run_termination(end, usage.last_turn.as_ref());
+        let last_turn = match usage.last_turn {
+            Some(turn) => Field::ProviderReported(turn),
+            None => Field::Unavailable(Unavailable::NotRecorded),
+        };
         RunRecord {
             identity,
             models: usage.models,
             quota: usage.quota,
             termination,
+            last_turn,
         }
     }
 }
@@ -724,11 +870,12 @@ impl RunRecord {
 // Aggregation
 // ---------------------------------------------------------------------------
 
-/// One plan window instance, the unit quota rolls up in.
+/// One plan window instance, the unit quota rolls up in. It names no
+/// account, so a set of runs is assumed to be one account's.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct QuotaKey {
-    pub agent: String,
-    pub plan: Option<String>,
+    pub agent: Ident,
+    pub plan: Option<Ident>,
     pub window_minutes: u64,
     pub resets_at: i64,
 }
@@ -741,7 +888,7 @@ pub struct Rollup {
     pub runs: usize,
     /// Runs whose usage was already in another run of the set.
     pub runs_included_elsewhere: usize,
-    pub tokens: BTreeMap<(Option<String>, Provenance), Tokens>,
+    pub tokens: BTreeMap<(Option<Ident>, Provenance), Tokens>,
     pub tokens_unavailable: usize,
     pub cost: BTreeMap<Provenance, MicroUsd>,
     pub cost_unavailable: usize,
@@ -754,30 +901,65 @@ pub struct Rollup {
     pub terminations_unavailable: usize,
 }
 
-/// Roll `runs` up. A run id seen more than once is counted once, as its last
-/// record, since a later snapshot of a running total supersedes an earlier
-/// one. Distinct run ids are distinct attempts and are all counted, so a
-/// retried work item costs what both attempts cost. A run whose usage is
-/// included in another run of the set counts as a run and a termination but
-/// adds no usage.
-pub fn rollup<'a>(runs: impl IntoIterator<Item = &'a RunRecord>) -> Rollup {
+/// Each run id's last record, in the order run ids were first seen: a later
+/// snapshot of a running total supersedes an earlier one, membership in a
+/// work item or orchestration included.
+fn latest<'a>(runs: impl IntoIterator<Item = &'a RunRecord>) -> Vec<&'a RunRecord> {
     let mut order: Vec<&RunRecord> = Vec::new();
-    let mut index: HashMap<&str, usize> = HashMap::new();
+    let mut index: HashMap<&Ident, usize> = HashMap::new();
     for run in runs {
-        match index.get(run.identity.run_id.as_str()) {
+        match index.get(&run.identity.run_id) {
             Some(&i) => order[i] = run,
             None => {
-                index.insert(run.identity.run_id.as_str(), order.len());
+                index.insert(&run.identity.run_id, order.len());
                 order.push(run);
             }
         }
     }
+    order
+}
+
+/// Roll `runs` up. A run id seen more than once is counted once, as its last
+/// record. Distinct run ids are distinct attempts and are all counted, so a
+/// retried work item costs what both attempts cost. A run whose usage is
+/// included in another run of the set counts as a run and a termination but
+/// adds no usage.
+pub fn rollup<'a>(runs: impl IntoIterator<Item = &'a RunRecord>) -> Rollup {
+    rollup_distinct(&latest(runs))
+}
+
+/// The runs that served `work_item`, rolled up. Snapshots are collapsed to
+/// each run's last before membership is decided, so a run whose work item was
+/// corrected counts under the corrected one only.
+pub fn rollup_work_item(runs: &[RunRecord], work_item: &str) -> Rollup {
+    let selected: Vec<&RunRecord> = latest(runs)
+        .into_iter()
+        .filter(|r| r.identity.work_item.as_ref().map(Ident::as_str) == Some(work_item))
+        .collect();
+    rollup_distinct(&selected)
+}
+
+/// The runs of `orchestration_id`, rolled up, with membership decided on each
+/// run's last snapshot as in [`rollup_work_item`].
+pub fn rollup_orchestration(runs: &[RunRecord], orchestration_id: &str) -> Rollup {
+    let selected: Vec<&RunRecord> = latest(runs)
+        .into_iter()
+        .filter(|r| {
+            r.identity.orchestration_id.as_ref().map(Ident::as_str) == Some(orchestration_id)
+        })
+        .collect();
+    rollup_distinct(&selected)
+}
+
+/// `runs`, already one record per run id, rolled up.
+fn rollup_distinct(runs: &[&RunRecord]) -> Rollup {
+    let ids: HashSet<&Ident> = runs.iter().map(|r| &r.identity.run_id).collect();
     let mut out = Rollup {
-        runs: order.len(),
+        runs: runs.len(),
         ..Rollup::default()
     };
     let mut quota_ranges: BTreeMap<QuotaKey, Vec<(u32, u32)>> = BTreeMap::new();
-    for run in &order {
+    for run in runs {
         match run.termination.value() {
             Some(t) => *out.terminations.entry(t.outcome).or_default() += 1,
             None => out.terminations_unavailable += 1,
@@ -785,8 +967,8 @@ pub fn rollup<'a>(runs: impl IntoIterator<Item = &'a RunRecord>) -> Rollup {
         if run
             .identity
             .usage_included_in
-            .as_deref()
-            .is_some_and(|parent| index.contains_key(parent))
+            .as_ref()
+            .is_some_and(|parent| ids.contains(parent))
         {
             out.runs_included_elsewhere += 1;
             continue;
@@ -803,7 +985,7 @@ pub fn rollup<'a>(runs: impl IntoIterator<Item = &'a RunRecord>) -> Rollup {
             match usage.cost.value() {
                 Some(cost) => {
                     let sum = out.cost.entry(usage.cost.provenance()).or_default();
-                    sum.0 = sum.0.saturating_add(cost.0);
+                    *sum = sum.plus(*cost);
                 }
                 None => out.cost_unavailable += 1,
             }
@@ -843,22 +1025,6 @@ pub fn rollup<'a>(runs: impl IntoIterator<Item = &'a RunRecord>) -> Rollup {
     out
 }
 
-/// The runs that served `work_item`, rolled up.
-pub fn rollup_work_item(runs: &[RunRecord], work_item: &str) -> Rollup {
-    rollup(
-        runs.iter()
-            .filter(|r| r.identity.work_item.as_deref() == Some(work_item)),
-    )
-}
-
-/// The runs of `orchestration_id`, rolled up.
-pub fn rollup_orchestration(runs: &[RunRecord], orchestration_id: &str) -> Rollup {
-    rollup(
-        runs.iter()
-            .filter(|r| r.identity.orchestration_id.as_deref() == Some(orchestration_id)),
-    )
-}
-
 // ---------------------------------------------------------------------------
 // Local capture: a Codex rollout
 // ---------------------------------------------------------------------------
@@ -869,18 +1035,21 @@ pub struct CodexRolloutSummary {
     /// Each `token_count`'s growth of the running total, credited to the model
     /// of the turn it came in, so the sum over models is the rollout's own
     /// total.
-    pub tokens_by_model: BTreeMap<Option<String>, Tokens>,
+    pub tokens_by_model: BTreeMap<Option<Ident>, Tokens>,
     pub quota_first: Option<CodexRateSample>,
     pub quota_last: Option<CodexRateSample>,
+    /// The first reason two consecutive quota samples could not be one simple
+    /// delta ([`quota_break`]), if any.
+    pub quota_break: Option<Unavailable>,
     pub last_turn: Option<AgentTurnEnd>,
-    current_model: Option<String>,
+    current_model: Option<Ident>,
     last_total: Option<Tokens>,
 }
 
 /// One sample of a Codex plan's primary rate-limit window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexRateSample {
-    pub plan: Option<String>,
+    pub plan: Option<Ident>,
     pub used_bp: u32,
     pub window_minutes: u64,
     pub resets_at: i64,
@@ -891,6 +1060,10 @@ pub struct CodexRateSample {
 /// longest line of a kind the reader parses was about 10 KiB (a
 /// `turn_context`); the long lines are tool output.
 pub const MAX_LINE_BYTES: usize = 256 * 1024;
+
+/// How many bytes one poll reads at most, unless the reader is built with
+/// another budget: a large backlog is drained over several polls.
+pub const DEFAULT_POLL_BUDGET: u64 = 4 * 1024 * 1024;
 
 /// How much the reader reads per `read` call, into a buffer on the stack, so
 /// a poll allocates nothing for the read itself.
@@ -908,30 +1081,66 @@ pub struct ReaderStats {
     pub overlong: u64,
     /// Times the file was truncated or replaced and reading started over.
     pub restarts: u64,
+    /// Running totals skipped without moving the baseline: missing a primary
+    /// count, missing a cache count that was not zero before, or lower in a
+    /// count other than input while input did not go down.
+    pub unusable_totals: u64,
+    /// Running totals whose input count went down: the counters restarted,
+    /// so the whole total is new usage.
+    pub counter_restarts: u64,
+    /// Token deltas credited to no model because [`MAX_MODELS`] models were
+    /// already tracked.
+    pub models_overflowed: u64,
+    /// Bytes the file held past the reader's offset when the last poll ended.
+    pub backlog: u64,
+    /// Polls that stopped at their byte budget with bytes left to read.
+    pub polls_cut_short: u64,
 }
 
 /// An incremental reader of one Codex rollout, at the path it is given.
 ///
-/// Each [`poll`](Self::poll) reads only the bytes appended since the last one.
-/// A line is kept across polls until its newline arrives (at most
-/// [`MAX_LINE_BYTES`]), then dropped. Only lines naming one of the record
-/// types that carry usage are deserialised, and only into structs holding the
-/// model, token counts, quota and turn-end kind, so a prompt, reply, tool
-/// output or file content is scanned by the parser and, while its line is
-/// incomplete, buffered, but kept in nothing the reader returns.
+/// Each [`poll`](Self::poll) reads only bytes appended since the last one,
+/// at most its budget ([`DEFAULT_POLL_BUDGET`]) and never past the file's
+/// length when the poll began, so one call is bounded however large the
+/// backlog is or however fast the file grows; the rest waits for the next
+/// poll ([`ReaderStats::backlog`]). A line is kept across polls until its
+/// newline arrives (at most [`MAX_LINE_BYTES`]), then dropped. Only lines
+/// naming one of the record types that carry usage are deserialised, and only
+/// into structs holding the model, token counts, quota and turn-end kind, so
+/// a prompt, reply, tool output or file content is scanned by the parser and,
+/// while its line is incomplete, buffered, but kept in nothing the reader
+/// returns, and its `Debug` shows neither the buffer nor the path.
+///
+/// On Unix the path is opened without following a symlink and without
+/// blocking, and anything but a regular file is refused before a byte is
+/// read; elsewhere it is a plain open, and the regular-file check follows it.
 ///
 /// A file that gets shorter, or whose path now names another file (Unix),
 /// is read again from the start with the summary reset: that is a new rollout
-/// as far as the reader can tell.
-#[derive(Debug)]
+/// as far as the reader can tell. A file truncated and regrown past the
+/// reader's offset between two polls, keeping its inode, is not noticed: the
+/// reader carries on from its offset into the new content.
 pub struct CodexUsageReader {
     path: PathBuf,
     identity: Option<(u64, u64)>,
     offset: u64,
     partial: Vec<u8>,
     skipping: bool,
+    poll_budget: u64,
     summary: CodexRolloutSummary,
     stats: ReaderStats,
+}
+
+impl fmt::Debug for CodexUsageReader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CodexUsageReader")
+            .field("offset", &self.offset)
+            .field("partial_bytes", &self.partial.len())
+            .field("skipping", &self.skipping)
+            .field("poll_budget", &self.poll_budget)
+            .field("stats", &self.stats)
+            .finish_non_exhaustive()
+    }
 }
 
 impl CodexUsageReader {
@@ -942,9 +1151,17 @@ impl CodexUsageReader {
             offset: 0,
             partial: Vec::new(),
             skipping: false,
+            poll_budget: DEFAULT_POLL_BUDGET,
             summary: CodexRolloutSummary::default(),
             stats: ReaderStats::default(),
         }
+    }
+
+    /// The same reader with a byte budget per poll other than
+    /// [`DEFAULT_POLL_BUDGET`] (at least one byte).
+    pub fn with_poll_budget(mut self, bytes: u64) -> Self {
+        self.poll_budget = bytes.max(1);
+        self
     }
 
     pub fn summary(&self) -> &CodexRolloutSummary {
@@ -955,26 +1172,41 @@ impl CodexUsageReader {
         self.stats
     }
 
-    /// Read what was appended since the last poll.
+    /// Read what was appended since the last poll, within the budget.
     pub fn poll(&mut self) -> io::Result<()> {
-        let mut file = File::open(&self.path)?;
+        let mut file = open_rollout(&self.path)?;
         let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
+        }
         let identity = file_identity(&meta);
-        if (self.identity.is_some() && identity != self.identity) || meta.len() < self.offset {
+        let end = meta.len();
+        if (self.identity.is_some() && identity != self.identity) || end < self.offset {
             self.restart();
         }
         self.identity = identity;
+        let stop = end.min(self.offset.saturating_add(self.poll_budget));
         file.seek(SeekFrom::Start(self.offset))?;
         let mut buf = [0u8; READ_CHUNK];
-        loop {
-            let n = file.read(&mut buf)?;
+        while self.offset < stop {
+            let want =
+                usize::try_from(stop - self.offset).map_or(READ_CHUNK, |n| n.min(READ_CHUNK));
+            let n = file.read(&mut buf[..want])?;
             if n == 0 {
-                return Ok(());
+                break;
             }
             self.offset += n as u64;
             self.stats.bytes_read += n as u64;
             self.feed(&buf[..n]);
         }
+        self.stats.backlog = end.saturating_sub(self.offset);
+        if self.stats.backlog > 0 {
+            self.stats.polls_cut_short += 1;
+        }
+        Ok(())
     }
 
     fn restart(&mut self) {
@@ -1029,11 +1261,27 @@ impl CodexUsageReader {
         match serde_json::from_slice::<NarrowRecord>(line) {
             Ok(record) => {
                 self.stats.parsed += 1;
-                self.summary.observe(record);
+                self.summary.observe(record, &mut self.stats);
             }
             Err(_) => self.stats.malformed += 1,
         }
     }
+}
+
+/// Open `path` for reading without following a final symlink and without
+/// blocking (a FIFO with no writer would otherwise block the open).
+#[cfg(unix)]
+fn open_rollout(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_rollout(path: &Path) -> io::Result<File> {
+    File::open(path)
 }
 
 #[cfg(unix)]
@@ -1064,17 +1312,20 @@ fn line_is_candidate(line: &[u8]) -> bool {
 }
 
 impl CodexRolloutSummary {
-    fn observe(&mut self, record: NarrowRecord) {
+    fn observe(&mut self, record: NarrowRecord, stats: &mut ReaderStats) {
         let payload = record.payload.unwrap_or_default();
         match (record.kind.0.as_deref(), payload.kind.0.as_deref()) {
             (Some("turn_context"), _) => {
-                self.current_model = payload.model.0.as_deref().and_then(identifier);
+                self.current_model = payload.model.0.as_deref().and_then(Ident::new);
             }
             (Some("event_msg"), Some("token_count")) => {
                 if let Some(total) = payload.info.and_then(|i| i.total_token_usage) {
-                    self.observe_total(total.tokens());
+                    self.observe_total(&total, stats);
                 }
                 if let Some(sample) = payload.rate_limits.and_then(NarrowRateLimits::sample) {
+                    if let Some(last) = &self.quota_last {
+                        self.quota_break = self.quota_break.or_else(|| quota_break(last, &sample));
+                    }
                     self.quota_first.get_or_insert_with(|| sample.clone());
                     self.quota_last = Some(sample);
                 }
@@ -1085,7 +1336,7 @@ impl CodexRolloutSummary {
             (Some("event_msg"), Some("task_complete")) => {
                 self.last_turn = Some(match payload.error {
                     Some(ErrorKind(kind)) => AgentTurnEnd::Failed {
-                        kind: kind.as_deref().and_then(identifier),
+                        kind: kind.as_deref().and_then(Ident::new),
                     },
                     None => AgentTurnEnd::Completed,
                 });
@@ -1097,32 +1348,39 @@ impl CodexRolloutSummary {
         }
     }
 
-    /// Credit the growth of the running total to the current model. A total
-    /// that went down means the counters restarted, so all of it is new.
-    fn observe_total(&mut self, total: Tokens) {
-        let delta = match self.last_total {
-            Some(prev)
-                if total.input >= prev.input
-                    && total.output >= prev.output
-                    && total.cache_read >= prev.cache_read
-                    && total.cache_write >= prev.cache_write =>
-            {
-                Tokens {
-                    input: total.input - prev.input,
-                    output: total.output - prev.output,
-                    cache_read: total.cache_read - prev.cache_read,
-                    cache_write: total.cache_write - prev.cache_write,
-                }
+    /// Credit the growth of the running total to the current model. An
+    /// incomplete or partly lower total is skipped and leaves the baseline
+    /// where it was, so the next complete total is measured from the last
+    /// good one; a total whose input went down is a counter restart, and all
+    /// of it is new.
+    fn observe_total(&mut self, usage: &CodexTokenUsage, stats: &mut ReaderStats) {
+        let Some(total) = usage.complete(self.last_total.as_ref()) else {
+            stats.unusable_totals += 1;
+            return;
+        };
+        let delta = match &self.last_total {
+            None => total,
+            Some(prev) if total.input < prev.input => {
+                stats.counter_restarts += 1;
+                total
             }
-            _ => total,
+            Some(prev) => match total.since(prev) {
+                Some(delta) => delta,
+                None => {
+                    stats.unusable_totals += 1;
+                    return;
+                }
+            },
         };
         self.last_total = Some(total);
-        if !delta.is_zero() {
-            self.tokens_by_model
-                .entry(self.current_model.clone())
-                .or_default()
-                .add(&delta);
+        if delta.is_zero() {
+            return;
         }
+        let key = capped(&self.tokens_by_model, self.current_model.clone());
+        if key.is_none() && self.current_model.is_some() {
+            stats.models_overflowed += 1;
+        }
+        self.tokens_by_model.entry(key).or_default().add(&delta);
     }
 }
 
@@ -1158,30 +1416,38 @@ struct NarrowInfo {
     total_token_usage: Option<CodexTokenUsage>,
 }
 
-/// Codex's token counts. Its `input_tokens` already includes the cached
-/// tokens, as OpenAI's API counts them. Whether it also includes
-/// `cache_write_input_tokens` is not known: that count was 0 on every sampled
-/// record, so it is taken as included, the same as cached tokens.
+/// Codex's token counts, each as the rollout has it or `None` when absent.
+/// Its `input_tokens` already includes the cached tokens, as OpenAI's API
+/// counts them. Whether it also includes `cache_write_input_tokens` is not
+/// known: that count was 0 on every sampled record, so it is taken as
+/// included, the same as cached tokens.
 #[derive(Deserialize)]
 struct CodexTokenUsage {
     #[serde(default)]
-    input_tokens: u64,
+    input_tokens: Option<u64>,
     #[serde(default)]
-    cached_input_tokens: u64,
+    cached_input_tokens: Option<u64>,
     #[serde(default)]
-    cache_write_input_tokens: u64,
+    cache_write_input_tokens: Option<u64>,
     #[serde(default)]
-    output_tokens: u64,
+    output_tokens: Option<u64>,
 }
 
 impl CodexTokenUsage {
-    fn tokens(&self) -> Tokens {
-        Tokens {
-            input: self.input_tokens,
-            output: self.output_tokens,
-            cache_read: self.cached_input_tokens,
-            cache_write: self.cache_write_input_tokens,
-        }
+    /// The total, or `None` when it is incomplete: input or output missing,
+    /// or a cache count missing that was not zero in `prev`. A cache count
+    /// missing that was zero (or with nothing before it) is read as zero.
+    fn complete(&self, prev: Option<&Tokens>) -> Option<Tokens> {
+        let cache = |value: Option<u64>, before: u64| value.or((before == 0).then_some(0));
+        Some(Tokens {
+            input: self.input_tokens?,
+            output: self.output_tokens?,
+            cache_read: cache(self.cached_input_tokens, prev.map_or(0, |p| p.cache_read))?,
+            cache_write: cache(
+                self.cache_write_input_tokens,
+                prev.map_or(0, |p| p.cache_write),
+            )?,
+        })
     }
 }
 
@@ -1210,7 +1476,7 @@ impl NarrowRateLimits {
             .used_percent
             .filter(|p| p.is_finite() && *p >= 0.0)?;
         Some(CodexRateSample {
-            plan: self.plan_type.0.as_deref().and_then(identifier),
+            plan: self.plan_type.0.as_deref().and_then(Ident::new),
             used_bp: (used * 100.0).round().min(u32::MAX as f64) as u32,
             window_minutes: primary.window_minutes?,
             resets_at: primary.resets_at?,
@@ -1337,9 +1603,10 @@ impl<'de> Deserialize<'de> for ErrorKind {
 
 /// Every attribute key the accounting record maps to. As with [`AttrKey`],
 /// the closed set is the allow-list. `gen_ai.*` names follow the GenAI
-/// semantic conventions, all in development status as of 2026-10-23
-/// (`open-telemetry/semantic-conventions-genai`), so a change there may
-/// rename them; `error.type` is stable.
+/// semantic conventions, all in development status as read at
+/// `open-telemetry/semantic-conventions-genai` commit
+/// `9ffc7e00c639be7712e544e3e54331e885dccf84`, so a change there may rename
+/// them; `error.type` is stable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AccountingKey {
     RunId,
@@ -1356,6 +1623,7 @@ pub enum AccountingKey {
     CostUnavailableReason,
     QuotaPlan,
     QuotaWindowMinutes,
+    QuotaResetsAt,
     QuotaFromBp,
     QuotaToBp,
     QuotaProvenance,
@@ -1363,18 +1631,20 @@ pub enum AccountingKey {
     Termination,
     TerminationProvenance,
     TerminationUnavailableReason,
+    LastTurn,
+    LastTurnProvenance,
+    LastTurnUnavailableReason,
     ErrorType,
     Disposition,
     DispositionProvenance,
     DispositionUnavailableReason,
-    Verification,
-    VerificationProvenance,
-    VerificationUnavailableReason,
+    Checks,
+    ChecksProvenance,
+    ChecksUnavailableReason,
 }
 
 impl AccountingKey {
     /// Every key, for the allow-list test.
-    #[cfg(test)]
     pub const ALL: &'static [AccountingKey] = &[
         AccountingKey::RunId,
         AccountingKey::Agent,
@@ -1390,6 +1660,7 @@ impl AccountingKey {
         AccountingKey::CostUnavailableReason,
         AccountingKey::QuotaPlan,
         AccountingKey::QuotaWindowMinutes,
+        AccountingKey::QuotaResetsAt,
         AccountingKey::QuotaFromBp,
         AccountingKey::QuotaToBp,
         AccountingKey::QuotaProvenance,
@@ -1397,13 +1668,16 @@ impl AccountingKey {
         AccountingKey::Termination,
         AccountingKey::TerminationProvenance,
         AccountingKey::TerminationUnavailableReason,
+        AccountingKey::LastTurn,
+        AccountingKey::LastTurnProvenance,
+        AccountingKey::LastTurnUnavailableReason,
         AccountingKey::ErrorType,
         AccountingKey::Disposition,
         AccountingKey::DispositionProvenance,
         AccountingKey::DispositionUnavailableReason,
-        AccountingKey::Verification,
-        AccountingKey::VerificationProvenance,
-        AccountingKey::VerificationUnavailableReason,
+        AccountingKey::Checks,
+        AccountingKey::ChecksProvenance,
+        AccountingKey::ChecksUnavailableReason,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -1422,6 +1696,7 @@ impl AccountingKey {
             AccountingKey::CostUnavailableReason => "deck.cost.unavailable_reason",
             AccountingKey::QuotaPlan => "deck.quota.plan",
             AccountingKey::QuotaWindowMinutes => "deck.quota.window_minutes",
+            AccountingKey::QuotaResetsAt => "deck.quota.resets_at",
             AccountingKey::QuotaFromBp => "deck.quota.used_from_bp",
             AccountingKey::QuotaToBp => "deck.quota.used_to_bp",
             AccountingKey::QuotaProvenance => "deck.quota.provenance",
@@ -1431,32 +1706,43 @@ impl AccountingKey {
             AccountingKey::TerminationUnavailableReason => {
                 "deck.run.termination.unavailable_reason"
             }
+            AccountingKey::LastTurn => "deck.run.last_turn",
+            AccountingKey::LastTurnProvenance => "deck.run.last_turn.provenance",
+            AccountingKey::LastTurnUnavailableReason => "deck.run.last_turn.unavailable_reason",
             AccountingKey::ErrorType => "error.type",
             AccountingKey::Disposition => "deck.work.disposition",
             AccountingKey::DispositionProvenance => "deck.work.disposition.provenance",
             AccountingKey::DispositionUnavailableReason => {
                 "deck.work.disposition.unavailable_reason"
             }
-            AccountingKey::Verification => "deck.work.verification",
-            AccountingKey::VerificationProvenance => "deck.work.verification.provenance",
-            AccountingKey::VerificationUnavailableReason => {
-                "deck.work.verification.unavailable_reason"
-            }
+            AccountingKey::Checks => "deck.work.checks",
+            AccountingKey::ChecksProvenance => "deck.work.checks.provenance",
+            AccountingKey::ChecksUnavailableReason => "deck.work.checks.unavailable_reason",
         }
     }
 }
 
-/// One allow-listed accounting attribute.
+/// One allow-listed accounting attribute. Its fields are private, and the
+/// only constructors take an enum's name or an [`Ident`], so a string value
+/// is always one of those.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountingAttribute {
-    pub key: AccountingKey,
-    pub value: AttrValue,
+    key: AccountingKey,
+    value: AttrValue,
 }
 
-fn s(key: AccountingKey, value: &str) -> AccountingAttribute {
+/// An enum's name.
+fn name(key: AccountingKey, value: &'static str) -> AccountingAttribute {
     AccountingAttribute {
         key,
         value: AttrValue::Str(value.to_owned()),
+    }
+}
+
+fn ident(key: AccountingKey, value: &Ident) -> AccountingAttribute {
+    AccountingAttribute {
+        key,
+        value: AttrValue::Str(value.as_str().to_owned()),
     }
 }
 
@@ -1474,9 +1760,9 @@ fn provenance<T>(
     key: AccountingKey,
     reason_key: AccountingKey,
 ) {
-    out.push(s(key, field.provenance().as_str()));
+    out.push(name(key, field.provenance().as_str()));
     if let Some(reason) = field.unavailable() {
-        out.push(s(reason_key, reason.as_str()));
+        out.push(name(reason_key, reason.as_str()));
     }
 }
 
@@ -1492,13 +1778,13 @@ pub struct RunExport {
 pub fn run_attributes(record: &RunRecord) -> RunExport {
     use AccountingKey as K;
     let mut run = vec![
-        s(K::RunId, &record.identity.run_id),
-        s(K::Agent, &record.identity.agent),
+        ident(K::RunId, &record.identity.run_id),
+        ident(K::Agent, &record.identity.agent),
     ];
     if let Some(t) = record.termination.value() {
-        run.push(s(K::Termination, t.outcome.as_str()));
+        run.push(name(K::Termination, t.outcome.as_str()));
         if let Some(kind) = &t.error_type {
-            run.push(s(K::ErrorType, kind));
+            run.push(ident(K::ErrorType, kind));
         }
     }
     provenance(
@@ -1507,11 +1793,24 @@ pub fn run_attributes(record: &RunRecord) -> RunExport {
         K::TerminationProvenance,
         K::TerminationUnavailableReason,
     );
+    if let Some(turn) = record.last_turn.value() {
+        run.push(name(K::LastTurn, turn.as_str()));
+    }
+    provenance(
+        &mut run,
+        &record.last_turn,
+        K::LastTurnProvenance,
+        K::LastTurnUnavailableReason,
+    );
     if let Some(q) = record.quota.value() {
         if let Some(plan) = &q.plan {
-            run.push(s(K::QuotaPlan, plan));
+            run.push(ident(K::QuotaPlan, plan));
         }
         run.push(int(K::QuotaWindowMinutes, q.window_minutes));
+        run.push(AccountingAttribute {
+            key: K::QuotaResetsAt,
+            value: AttrValue::Int(q.resets_at),
+        });
         run.push(int(K::QuotaFromBp, u64::from(q.from_bp)));
         run.push(int(K::QuotaToBp, u64::from(q.to_bp)));
     }
@@ -1527,7 +1826,7 @@ pub fn run_attributes(record: &RunRecord) -> RunExport {
         .map(|usage| {
             let mut attrs = Vec::new();
             if let Some(model) = &usage.model {
-                attrs.push(s(K::ResponseModel, model));
+                attrs.push(ident(K::ResponseModel, model));
             }
             if let Some(t) = usage.tokens.value() {
                 attrs.push(int(K::InputTokens, t.input));
@@ -1561,7 +1860,7 @@ pub fn work_item_attributes(item: &WorkItemRecord) -> Vec<AccountingAttribute> {
     use AccountingKey as K;
     let mut out = Vec::new();
     if let Some(d) = item.disposition.value() {
-        out.push(s(K::Disposition, d.as_str()));
+        out.push(name(K::Disposition, d.as_str()));
     }
     provenance(
         &mut out,
@@ -1569,14 +1868,14 @@ pub fn work_item_attributes(item: &WorkItemRecord) -> Vec<AccountingAttribute> {
         K::DispositionProvenance,
         K::DispositionUnavailableReason,
     );
-    if let Some(v) = item.verification.value() {
-        out.push(s(K::Verification, v.as_str()));
+    if let Some(c) = item.checks.value() {
+        out.push(name(K::Checks, c.as_str()));
     }
     provenance(
         &mut out,
-        &item.verification,
-        K::VerificationProvenance,
-        K::VerificationUnavailableReason,
+        &item.checks,
+        K::ChecksProvenance,
+        K::ChecksUnavailableReason,
     );
     out
 }
@@ -1585,6 +1884,7 @@ pub fn work_item_attributes(item: &WorkItemRecord) -> Vec<AccountingAttribute> {
 mod tests {
     use super::*;
     use std::io::Write as _;
+    use std::time::{Duration, Instant};
 
     // --- fixtures (synthetic; shaped like Codex 0.164.0's records) ---
 
@@ -1594,11 +1894,23 @@ mod tests {
         )
     }
 
-    fn token_count(input: u64, cached: u64, output: u64, used: f64, resets_at: i64) -> String {
+    /// A `total_token_usage` object with every count present.
+    fn usage(input: u64, cached: u64, output: u64) -> String {
         format!(
-            r#"{{"timestamp":"t","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{input},"cached_input_tokens":{cached},"cache_write_input_tokens":0,"output_tokens":{output},"reasoning_output_tokens":0,"total_tokens":{t}}},"last_token_usage":{{"input_tokens":1,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0,"total_tokens":2}},"model_context_window":1000}},"rate_limits":{{"limit_id":"codex","primary":{{"used_percent":{used},"window_minutes":10080,"resets_at":{resets_at}}},"secondary":null,"plan_type":"prolite"}}}}}}"#,
+            r#"{{"input_tokens":{input},"cached_input_tokens":{cached},"cache_write_input_tokens":0,"output_tokens":{output},"reasoning_output_tokens":0,"total_tokens":{t}}}"#,
             t = input + output
         )
+    }
+
+    /// A `token_count` record with `total` as its running total.
+    fn token_count_with(total: &str, used: f64, resets_at: i64, plan: &str) -> String {
+        format!(
+            r#"{{"timestamp":"t","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{total},"last_token_usage":{{"input_tokens":1,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0,"total_tokens":2}},"model_context_window":1000}},"rate_limits":{{"limit_id":"codex","primary":{{"used_percent":{used},"window_minutes":10080,"resets_at":{resets_at}}},"secondary":null,"plan_type":"{plan}"}}}}}}"#
+        )
+    }
+
+    fn token_count(input: u64, cached: u64, output: u64, used: f64, resets_at: i64) -> String {
+        token_count_with(&usage(input, cached, output), used, resets_at, "prolite")
     }
 
     fn task_started() -> &'static str {
@@ -1617,12 +1929,24 @@ mod tests {
         file.flush().unwrap();
     }
 
+    /// A reader that has polled a fresh rollout holding `lines`.
+    fn read(lines: &[String]) -> CodexUsageReader {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let mut file = File::create(&path).unwrap();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        write_lines(&mut file, &refs);
+        let mut reader = CodexUsageReader::new(&path);
+        reader.poll().unwrap();
+        reader
+    }
+
+    fn id(value: &str) -> Ident {
+        Ident::new(value).unwrap()
+    }
+
     fn identity(run_id: &str, agent: &str) -> RunIdentity {
-        RunIdentity {
-            run_id: run_id.into(),
-            agent: agent.into(),
-            ..RunIdentity::default()
-        }
+        RunIdentity::new(id(run_id), id(agent))
     }
 
     fn tokens(input: u64, output: u64) -> Tokens {
@@ -1637,7 +1961,7 @@ mod tests {
         RunRecord {
             identity,
             models: vec![ModelUsage {
-                model: Some(model.into()),
+                model: Some(id(model)),
                 tokens: Field::ProviderReported(t),
                 cost,
             }],
@@ -1646,10 +1970,35 @@ mod tests {
                 outcome: RunTermination::Completed,
                 error_type: None,
             }),
+            last_turn: Field::ProviderReported(AgentTurnEnd::Completed),
         }
     }
 
-    // --- provenance ---
+    fn pi_reply(model: &str, cost: Option<f64>, stop: Option<PiStopReason>) -> PiReplyUsage {
+        PiReplyUsage {
+            model: model.into(),
+            input: 10,
+            output: 2,
+            cache_read: 100,
+            cache_write: 0,
+            cost_total_usd: cost,
+            stop_reason: stop,
+        }
+    }
+
+    fn opencode_message(model: &str, used_tokens: bool, cost: f64) -> OpenCodeMessageUsage {
+        let n = u64::from(used_tokens);
+        OpenCodeMessageUsage {
+            model: model.into(),
+            input: 5 * n,
+            output: 3 * n,
+            cache_read: 7 * n,
+            cache_write: 0,
+            cost_usd: cost,
+        }
+    }
+
+    // --- provenance and names ---
 
     #[test]
     fn each_provenance_names_itself_and_only_unavailable_lacks_a_value() {
@@ -1678,6 +2027,84 @@ mod tests {
         assert_eq!(Provenance::AgentAsserted.as_str(), "agent_asserted");
     }
 
+    /// Every name the export can emit for an enum is distinct within its enum
+    /// and snake_case, the reserved ones (`timed_out`, `abandoned`) included.
+    #[test]
+    fn every_exported_enum_name_is_distinct_and_snake_case() {
+        let groups: [Vec<&str>; 6] = [
+            [
+                Provenance::Measured,
+                Provenance::ProviderReported,
+                Provenance::Estimated,
+                Provenance::AgentAsserted,
+                Provenance::Unavailable,
+            ]
+            .map(Provenance::as_str)
+            .to_vec(),
+            [
+                Unavailable::NoChannel,
+                Unavailable::SubscriptionZero,
+                Unavailable::UnknownPrice,
+                Unavailable::NotRecorded,
+                Unavailable::Incomplete,
+                Unavailable::WindowReset,
+                Unavailable::PlanChanged,
+                Unavailable::QuotaDecreased,
+                Unavailable::RunNotEnded,
+                Unavailable::NoWorkItem,
+            ]
+            .map(Unavailable::as_str)
+            .to_vec(),
+            [
+                RunTermination::Completed,
+                RunTermination::Failed,
+                RunTermination::Interrupted,
+                RunTermination::TimedOut,
+                RunTermination::Unknown,
+            ]
+            .map(RunTermination::as_str)
+            .to_vec(),
+            [
+                AgentTurnEnd::Completed,
+                AgentTurnEnd::Failed { kind: None },
+                AgentTurnEnd::Interrupted,
+                AgentTurnEnd::MidTurn,
+                AgentTurnEnd::Unknown,
+            ]
+            .iter()
+            .map(AgentTurnEnd::as_str)
+            .collect(),
+            [
+                Disposition::Merged,
+                Disposition::Superseded,
+                Disposition::Rejected,
+                Disposition::ResolvedWithoutChange,
+                Disposition::Deferred,
+                Disposition::Abandoned,
+                Disposition::Open,
+            ]
+            .map(Disposition::as_str)
+            .to_vec(),
+            [
+                ObservedChecks::Passing,
+                ObservedChecks::Failing,
+                ObservedChecks::Pending,
+            ]
+            .map(ObservedChecks::as_str)
+            .to_vec(),
+        ];
+        for names in groups {
+            let distinct: HashSet<&str> = names.iter().copied().collect();
+            assert_eq!(distinct.len(), names.len(), "{names:?}");
+            for name in names {
+                assert!(
+                    name.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'),
+                    "{name}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_subscription_zero_is_unavailable_and_a_tokenless_zero_is_zero() {
         let used = tokens(10, 1);
@@ -1703,79 +2130,223 @@ mod tests {
     }
 
     #[test]
-    fn termination_takes_the_agents_word_and_the_decks_end_for_a_cut_turn() {
+    fn costs_are_classified_before_they_are_added() {
+        let est = |n| Field::Estimated(MicroUsd(n));
+        let zero = Field::Unavailable(Unavailable::SubscriptionZero);
+        let none = Field::Unavailable(Unavailable::NotRecorded);
+        let incomplete = Field::Unavailable(Unavailable::Incomplete);
+        assert_eq!(add_cost(est(2), est(3)), est(5));
+        assert_eq!(add_cost(zero, zero), zero);
+        assert_eq!(add_cost(zero, est(1_000_000)), incomplete);
+        assert_eq!(add_cost(est(1_000_000), zero), incomplete);
+        assert_eq!(add_cost(zero, none), incomplete, "two different reasons");
+        assert_eq!(
+            add_cost(est(4), Field::ProviderReported(MicroUsd(4))),
+            incomplete,
+            "two provenances are never one sum"
+        );
+        assert_eq!(
+            add_cost(est(0), zero),
+            zero,
+            "a tokenless reply adds nothing"
+        );
+        assert_eq!(add_cost(zero, est(0)), zero);
+        assert_eq!(add_cost(est(0), est(7)), est(7));
+    }
+
+    // --- run termination ---
+
+    #[test]
+    fn an_ended_run_takes_the_agents_word_and_the_decks_end_for_a_cut_turn() {
         let failed = AgentTurnEnd::Failed {
-            kind: Some("server_overloaded".into()),
+            kind: Some(id("server_overloaded")),
         };
         let t = run_termination(Some(EndReason::Exited), Some(&failed));
         assert_eq!(t.provenance(), Provenance::ProviderReported);
         assert_eq!(t.value().unwrap().outcome, RunTermination::Failed);
-        assert_eq!(
-            t.value().unwrap().error_type.as_deref(),
-            Some("server_overloaded")
-        );
-        let prose = AgentTurnEnd::Failed {
-            kind: Some("the provider said no".into()),
-        };
-        assert_eq!(
-            run_termination(None, Some(&prose))
-                .value()
-                .unwrap()
-                .error_type,
-            None,
-            "an error kind that is not an identifier is dropped"
-        );
+        assert_eq!(t.value().unwrap().error_type, Some(id("server_overloaded")));
+        use AgentTurnEnd as A;
+        use EndReason as E;
+        use RunTermination as T;
         let cases = [
             (
-                Some(EndReason::Closed),
-                Some(AgentTurnEnd::MidTurn),
-                Field::Measured(RunTermination::Interrupted),
+                E::Closed,
+                Some(A::MidTurn),
+                Provenance::Measured,
+                T::Interrupted,
             ),
             (
-                Some(EndReason::DaemonShutdown),
-                Some(AgentTurnEnd::MidTurn),
-                Field::Measured(RunTermination::Interrupted),
+                E::DaemonShutdown,
+                Some(A::MidTurn),
+                Provenance::Measured,
+                T::Interrupted,
             ),
             (
-                Some(EndReason::Exited),
-                Some(AgentTurnEnd::MidTurn),
-                Field::Measured(RunTermination::Unknown),
+                E::Exited,
+                Some(A::MidTurn),
+                Provenance::Measured,
+                T::Unknown,
             ),
             (
-                None,
-                Some(AgentTurnEnd::MidTurn),
-                Field::Unavailable(Unavailable::RunNotEnded),
+                E::Unknown,
+                Some(A::MidTurn),
+                Provenance::Measured,
+                T::Unknown,
             ),
             (
-                Some(EndReason::Closed),
-                Some(AgentTurnEnd::Completed),
-                Field::ProviderReported(RunTermination::Completed),
+                E::Closed,
+                Some(A::Unknown),
+                Provenance::Measured,
+                T::Unknown,
             ),
             (
-                Some(EndReason::Exited),
-                Some(AgentTurnEnd::Interrupted),
-                Field::ProviderReported(RunTermination::Interrupted),
+                E::Exited,
+                Some(A::Unknown),
+                Provenance::Measured,
+                T::Unknown,
             ),
             (
-                Some(EndReason::Exited),
-                None,
-                Field::Measured(RunTermination::Unknown),
+                E::Closed,
+                Some(A::Completed),
+                Provenance::ProviderReported,
+                T::Completed,
             ),
-            (None, None, Field::Unavailable(Unavailable::RunNotEnded)),
+            (
+                E::Exited,
+                Some(A::Interrupted),
+                Provenance::ProviderReported,
+                T::Interrupted,
+            ),
+            (E::Exited, None, Provenance::Measured, T::Unknown),
+            (E::Closed, None, Provenance::Measured, T::Unknown),
         ];
-        for (end, agent, want) in cases {
-            let got = run_termination(end, agent.as_ref());
-            assert_eq!(got.provenance(), want.provenance(), "{end:?} {agent:?}");
+        for (end, agent, provenance, outcome) in cases {
+            let got = run_termination(Some(end), agent.as_ref());
+            assert_eq!(got.provenance(), provenance, "{end:?} {agent:?}");
             assert_eq!(
                 got.value().map(|t| t.outcome),
-                want.value().copied(),
+                Some(outcome),
                 "{end:?} {agent:?}"
             );
         }
     }
 
+    /// While the deck reports no end, the run has not terminated, whatever
+    /// the agent's last turn says, and the record still carries that turn.
     #[test]
-    fn disposition_and_verification_follow_the_forge_then_the_agent() {
+    fn an_open_run_has_no_termination_and_keeps_its_last_turn() {
+        let turns = [
+            None,
+            Some(AgentTurnEnd::Completed),
+            Some(AgentTurnEnd::Failed {
+                kind: Some(id("server_overloaded")),
+            }),
+            Some(AgentTurnEnd::Interrupted),
+            Some(AgentTurnEnd::MidTurn),
+            Some(AgentTurnEnd::Unknown),
+        ];
+        for turn in turns {
+            assert_eq!(
+                run_termination(None, turn.as_ref()),
+                Field::Unavailable(Unavailable::RunNotEnded),
+                "{turn:?}"
+            );
+            let record = RunRecord::new(
+                identity("r", "codex"),
+                AgentUsage {
+                    models: usage_unavailable(Unavailable::NotRecorded),
+                    quota: Field::Unavailable(Unavailable::NotRecorded),
+                    last_turn: turn.clone(),
+                },
+                None,
+            );
+            assert_eq!(
+                record.termination,
+                Field::Unavailable(Unavailable::RunNotEnded)
+            );
+            match &turn {
+                Some(turn) => assert_eq!(record.last_turn, Field::ProviderReported(turn.clone())),
+                None => assert_eq!(
+                    record.last_turn,
+                    Field::Unavailable(Unavailable::NotRecorded)
+                ),
+            }
+            let export = run_attributes(&record);
+            assert!(
+                !export
+                    .run
+                    .iter()
+                    .any(|a| a.key == AccountingKey::Termination),
+                "an open run exports no termination"
+            );
+        }
+    }
+
+    /// A Pi run whose last reply asked for a tool was cut off mid-turn: closed
+    /// by the deck it was interrupted, otherwise its end is unknown — never
+    /// completed.
+    #[test]
+    fn a_pi_run_ending_on_a_tool_call_is_not_completed() {
+        let replies = [
+            pi_reply("gpt-5.5", Some(0.01), Some(PiStopReason::Stop)),
+            pi_reply("gpt-5.5", Some(0.01), Some(PiStopReason::ToolUse)),
+        ];
+        assert_eq!(from_pi(&replies).last_turn, Some(AgentTurnEnd::MidTurn));
+        let closed = RunRecord::new(
+            identity("r", "pi"),
+            from_pi(&replies),
+            Some(EndReason::Closed),
+        );
+        assert_eq!(
+            closed.termination,
+            Field::Measured(Termination {
+                outcome: RunTermination::Interrupted,
+                error_type: None
+            })
+        );
+        let exited = RunRecord::new(
+            identity("r", "pi"),
+            from_pi(&replies),
+            Some(EndReason::Exited),
+        );
+        assert_eq!(
+            exited.termination.value().map(|t| t.outcome),
+            Some(RunTermination::Unknown)
+        );
+        let mapping = [
+            (Some(PiStopReason::Stop), AgentTurnEnd::Completed),
+            (Some(PiStopReason::Length), AgentTurnEnd::Completed),
+            (Some(PiStopReason::ToolUse), AgentTurnEnd::MidTurn),
+            (
+                Some(PiStopReason::Error),
+                AgentTurnEnd::Failed { kind: None },
+            ),
+            (Some(PiStopReason::Aborted), AgentTurnEnd::Interrupted),
+            (None, AgentTurnEnd::Unknown),
+        ];
+        for (stop, turn) in mapping {
+            assert_eq!(
+                from_pi(&[pi_reply("gpt-5.5", Some(0.01), stop)]).last_turn,
+                Some(turn),
+                "{stop:?}"
+            );
+        }
+        let unstated = [pi_reply("gpt-5.5", Some(0.01), None)];
+        let closed = RunRecord::new(
+            identity("r", "pi"),
+            from_pi(&unstated),
+            Some(EndReason::Closed),
+        );
+        assert_eq!(
+            closed.termination.value().map(|t| t.outcome),
+            Some(RunTermination::Unknown)
+        );
+    }
+
+    // --- work items ---
+
+    #[test]
+    fn disposition_and_checks_follow_the_forge_then_the_agent() {
         use PullRequestState as Pr;
         let cases = [
             (Some(Pr::Merged), None, Some(Disposition::Merged)),
@@ -1820,21 +2391,43 @@ mod tests {
             );
         }
         assert_eq!(
-            verification(Some(CiState::Passing), Some(false)),
-            Field::Measured(Verification::Verified)
+            observed_checks(Some(CiState::Passing), Some(false)),
+            Field::Measured(ObservedChecks::Passing)
         );
         assert_eq!(
-            verification(Some(CiState::Pending), None),
-            Field::Measured(Verification::Unverified)
+            observed_checks(Some(CiState::Pending), None),
+            Field::Measured(ObservedChecks::Pending)
         );
         assert_eq!(
-            verification(None, Some(true)),
-            Field::AgentAsserted(Verification::Verified)
+            observed_checks(None, Some(true)),
+            Field::AgentAsserted(ObservedChecks::Passing)
         );
         assert_eq!(
-            verification(None, None),
+            observed_checks(None, None),
             Field::Unavailable(Unavailable::NoChannel)
         );
+    }
+
+    /// The prototype records the CI rollup it observed, which counts optional
+    /// checks and reads a skipped-only rollup as passing, so it exports that
+    /// as `deck.work.checks = passing`: there is no `verified` value and no
+    /// verification key, which the follow-up adds from the required checks
+    /// on the merged head.
+    #[test]
+    fn a_passing_rollup_is_observed_checks_not_verification() {
+        let item = WorkItemRecord {
+            disposition: work_disposition(Some(PullRequestState::Merged), None),
+            checks: observed_checks(Some(CiState::Passing), None),
+        };
+        let attrs = work_item_attributes(&item);
+        assert!(attrs.contains(&name(AccountingKey::Checks, "passing")));
+        assert!(attrs.contains(&name(AccountingKey::ChecksProvenance, "measured")));
+        for key in AccountingKey::ALL {
+            assert!(!key.as_str().contains("verif"), "{}", key.as_str());
+        }
+        for attr in &attrs {
+            assert_ne!(attr.value, AttrValue::Str("verified".into()));
+        }
     }
 
     // --- normalisers ---
@@ -1886,20 +2479,23 @@ mod tests {
         );
     }
 
-    #[test]
-    fn codex_has_no_cost_and_a_quota_delta_only_within_one_window() {
-        let mut summary = CodexRolloutSummary::default();
-        summary
-            .tokens_by_model
-            .insert(Some("gpt-5.5".into()), tokens(100, 5));
-        let sample = |bp, resets_at| CodexRateSample {
-            plan: Some("prolite".into()),
+    fn sample(plan: &str, bp: u32, resets_at: i64) -> CodexRateSample {
+        CodexRateSample {
+            plan: Some(id(plan)),
             used_bp: bp,
             window_minutes: 10080,
             resets_at,
-        };
-        summary.quota_first = Some(sample(2600, 99));
-        summary.quota_last = Some(sample(4500, 99));
+        }
+    }
+
+    #[test]
+    fn codex_has_no_cost_and_a_quota_delta_only_within_one_window_and_plan() {
+        let mut summary = CodexRolloutSummary::default();
+        summary
+            .tokens_by_model
+            .insert(Some(id("gpt-5.5")), tokens(100, 5));
+        summary.quota_first = Some(sample("prolite", 2600, 99));
+        summary.quota_last = Some(sample("prolite", 4500, 99));
         let usage = from_codex(&summary);
         assert_eq!(
             usage.models[0].cost,
@@ -1911,10 +2507,22 @@ mod tests {
         );
         assert_eq!(usage.quota.value().unwrap().consumed_bp(), 1900);
 
-        summary.quota_last = Some(sample(100, 200));
+        let quota_with = |last| {
+            let mut s = summary.clone();
+            s.quota_last = Some(last);
+            from_codex(&s).quota
+        };
         assert_eq!(
-            from_codex(&summary).quota,
+            quota_with(sample("prolite", 100, 200)),
             Field::Unavailable(Unavailable::WindowReset)
+        );
+        assert_eq!(
+            quota_with(sample("pro", 4500, 99)),
+            Field::Unavailable(Unavailable::PlanChanged)
+        );
+        assert_eq!(
+            quota_with(sample("prolite", 2000, 99)),
+            Field::Unavailable(Unavailable::QuotaDecreased)
         );
         assert_eq!(
             from_codex(&CodexRolloutSummary::default()).models[0].tokens,
@@ -1922,26 +2530,55 @@ mod tests {
         );
     }
 
+    /// A plan change or a drop between two samples in the middle of a rollout
+    /// breaks the delta even when the first and last samples look comparable.
+    #[test]
+    fn a_mid_run_plan_change_or_drop_in_the_reader_breaks_the_quota_delta() {
+        let total = usage(10, 0, 1);
+        let reader = read(&[
+            token_count_with(&total, 20.0, 99, "prolite"),
+            token_count_with(&total, 25.0, 99, "pro"),
+            token_count_with(&total, 30.0, 99, "prolite"),
+        ]);
+        assert_eq!(
+            from_codex(reader.summary()).quota,
+            Field::Unavailable(Unavailable::PlanChanged)
+        );
+        let reader = read(&[
+            token_count_with(&total, 20.0, 99, "prolite"),
+            token_count_with(&total, 5.0, 99, "prolite"),
+            token_count_with(&total, 30.0, 99, "prolite"),
+        ]);
+        assert_eq!(
+            from_codex(reader.summary()).quota,
+            Field::Unavailable(Unavailable::QuotaDecreased)
+        );
+        let reader = read(&[
+            token_count_with(&total, 20.0, 99, "prolite"),
+            token_count_with(&total, 20.0, 99, "prolite"),
+            token_count_with(&total, 30.0, 99, "prolite"),
+        ]);
+        assert_eq!(
+            from_codex(reader.summary())
+                .quota
+                .value()
+                .unwrap()
+                .consumed_bp(),
+            1000
+        );
+    }
+
     #[test]
     fn pi_sums_per_model_and_its_last_reply_names_the_turn_end() {
-        let reply = |model: &str, cost, stop| PiReplyUsage {
-            model: model.into(),
-            input: 10,
-            output: 2,
-            cache_read: 100,
-            cache_write: 0,
-            cost_total_usd: cost,
-            stop_reason: stop,
-        };
         let usage = from_pi(&[
-            reply("gpt-5.5", Some(0.01), Some(PiStopReason::ToolUse)),
-            reply("gpt-5.5", Some(0.02), Some(PiStopReason::Stop)),
-            reply("other", None, Some(PiStopReason::Error)),
+            pi_reply("gpt-5.5", Some(0.01), Some(PiStopReason::ToolUse)),
+            pi_reply("gpt-5.5", Some(0.02), Some(PiStopReason::Stop)),
+            pi_reply("other", None, Some(PiStopReason::Error)),
         ]);
         let gpt = usage
             .models
             .iter()
-            .find(|m| m.model.as_deref() == Some("gpt-5.5"))
+            .find(|m| m.model == Some(id("gpt-5.5")))
             .unwrap();
         assert_eq!(
             gpt.tokens,
@@ -1956,11 +2593,11 @@ mod tests {
         let other = usage
             .models
             .iter()
-            .find(|m| m.model.as_deref() == Some("other"))
+            .find(|m| m.model == Some(id("other")))
             .unwrap();
         assert_eq!(other.cost, Field::Unavailable(Unavailable::NotRecorded));
         assert_eq!(usage.last_turn, Some(AgentTurnEnd::Failed { kind: None }));
-        let zero = from_pi(&[reply("gpt-5.5", Some(0.0), None)]);
+        let zero = from_pi(&[pi_reply("gpt-5.5", Some(0.0), None)]);
         assert_eq!(
             zero.models[0].cost,
             Field::Unavailable(Unavailable::SubscriptionZero)
@@ -1971,17 +2608,73 @@ mod tests {
         );
     }
 
+    /// One model's replies, one on a subscription (cost 0 with tokens) and
+    /// one priced: the total is incomplete, not the priced reply's cost.
+    #[test]
+    fn mixed_subscription_and_priced_replies_make_an_incomplete_cost() {
+        let pi = from_pi(&[
+            pi_reply("gpt-5.5", Some(0.0), Some(PiStopReason::Stop)),
+            pi_reply("gpt-5.5", Some(1.0), Some(PiStopReason::Stop)),
+        ]);
+        assert_eq!(pi.models.len(), 1);
+        assert_eq!(
+            pi.models[0].cost,
+            Field::Unavailable(Unavailable::Incomplete)
+        );
+        let pi = from_pi(&[
+            pi_reply("gpt-5.5", Some(1.0), Some(PiStopReason::Stop)),
+            pi_reply("gpt-5.5", None, Some(PiStopReason::Stop)),
+        ]);
+        assert_eq!(
+            pi.models[0].cost,
+            Field::Unavailable(Unavailable::Incomplete)
+        );
+
+        let opencode = from_opencode(&[
+            opencode_message("gpt-5.5", true, 0.0),
+            opencode_message("gpt-5.5", true, 1.0),
+        ]);
+        assert_eq!(opencode.models.len(), 1);
+        assert_eq!(
+            opencode.models[0].cost,
+            Field::Unavailable(Unavailable::Incomplete)
+        );
+        let opencode = from_opencode(&[
+            opencode_message("gpt-5.5", true, 1.0),
+            opencode_message("gpt-5.5", true, 0.0),
+        ]);
+        assert_eq!(
+            opencode.models[0].cost,
+            Field::Unavailable(Unavailable::Incomplete)
+        );
+        // A failed request with no tokens and no cost leaves a subscription
+        // total a subscription total.
+        let opencode = from_opencode(&[
+            opencode_message("gpt-5.5", false, 0.0),
+            opencode_message("gpt-5.5", true, 0.0),
+        ]);
+        assert_eq!(
+            opencode.models[0].cost,
+            Field::Unavailable(Unavailable::SubscriptionZero)
+        );
+        let rolled = rollup([&RunRecord::new(
+            identity("r", "opencode"),
+            from_opencode(&[
+                opencode_message("gpt-5.5", true, 0.0),
+                opencode_message("gpt-5.5", true, 1.0),
+            ]),
+            Some(EndReason::Exited),
+        )]);
+        assert!(rolled.cost.is_empty(), "{:?}", rolled.cost);
+        assert_eq!(rolled.cost_unavailable, 1);
+    }
+
     #[test]
     fn opencode_subscription_zero_is_unavailable_not_free() {
-        let message = |cost| OpenCodeMessageUsage {
-            model: "gpt-5.5".into(),
-            input: 5,
-            output: 3,
-            cache_read: 7,
-            cache_write: 0,
-            cost_usd: cost,
-        };
-        let subscription = from_opencode(&[message(0.0), message(0.0)]);
+        let subscription = from_opencode(&[
+            opencode_message("gpt-5.5", true, 0.0),
+            opencode_message("gpt-5.5", true, 0.0),
+        ]);
         assert_eq!(
             subscription.models[0].cost,
             Field::Unavailable(Unavailable::SubscriptionZero)
@@ -1995,15 +2688,28 @@ mod tests {
                 cache_write: 0
             })
         );
-        let priced = from_opencode(&[message(0.5)]);
+        let priced = from_opencode(&[opencode_message("gpt-5.5", true, 0.5)]);
         assert_eq!(priced.models[0].cost, Field::Estimated(MicroUsd(500_000)));
+    }
+
+    #[test]
+    fn a_normaliser_tracks_at_most_max_models_named_models() {
+        let messages: Vec<OpenCodeMessageUsage> = (0..MAX_MODELS + 5)
+            .map(|i| opencode_message(&format!("m{i}"), true, 0.5))
+            .collect();
+        let usage = from_opencode(&messages);
+        let named = usage.models.iter().filter(|m| m.model.is_some()).count();
+        assert_eq!(named, MAX_MODELS);
+        let other = usage.models.iter().find(|m| m.model.is_none()).unwrap();
+        assert_eq!(other.tokens.value().unwrap().output, 3 * 5);
+        assert_eq!(other.cost, Field::Estimated(MicroUsd(2_500_000)));
     }
 
     // --- the incremental reader ---
 
     #[test]
     fn the_reader_credits_each_models_growth_and_reads_only_what_was_appended() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_temp::tempdir().unwrap();
         let path = dir.path().join("rollout-a.jsonl");
         let mut file = File::create(&path).unwrap();
         write_lines(
@@ -2033,7 +2739,7 @@ mod tests {
         assert_eq!(reader.stats().bytes_read - first_bytes, appended);
         let summary = reader.summary();
         assert_eq!(
-            summary.tokens_by_model.get(&Some("gpt-5.5".into())),
+            summary.tokens_by_model.get(&Some(id("gpt-5.5"))),
             Some(&Tokens {
                 input: 100,
                 output: 10,
@@ -2042,7 +2748,7 @@ mod tests {
             })
         );
         assert_eq!(
-            summary.tokens_by_model.get(&Some("gpt-5.5-mini".into())),
+            summary.tokens_by_model.get(&Some(id("gpt-5.5-mini"))),
             Some(&Tokens {
                 input: 50,
                 output: 2,
@@ -2060,11 +2766,12 @@ mod tests {
             appended,
             "nothing new"
         );
+        assert_eq!(reader.stats().backlog, 0);
     }
 
     #[test]
     fn a_partial_trailing_line_waits_for_its_newline() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_temp::tempdir().unwrap();
         let path = dir.path().join("rollout-b.jsonl");
         let mut file = File::create(&path).unwrap();
         let line = token_count(100, 0, 10, 1.0, 5);
@@ -2090,25 +2797,17 @@ mod tests {
 
     #[test]
     fn malformed_and_overlong_lines_are_counted_and_skipped() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("rollout-c.jsonl");
-        let mut file = File::create(&path).unwrap();
         let overlong = format!(
             r#"{{"type":"event_msg","payload":{{"type":"token_count","pad":"{}"}}}}"#,
             "x".repeat(MAX_LINE_BYTES)
         );
-        write_lines(
-            &mut file,
-            &[
-                r#"{"type":"event_msg","payload":{"type":"token_count","info":"#,
-                r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":"many"}}}}"#,
-                "not json at all",
-                &overlong,
-                &token_count(7, 0, 1, 1.0, 5),
-            ],
-        );
-        let mut reader = CodexUsageReader::new(&path);
-        reader.poll().unwrap();
+        let reader = read(&[
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":"#.into(),
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":"many"}}}}"#.into(),
+            "not json at all".into(),
+            overlong,
+            token_count(7, 0, 1, 1.0, 5),
+        ]);
         let stats = reader.stats();
         assert_eq!(stats.malformed, 2);
         assert_eq!(stats.overlong, 1);
@@ -2120,9 +2819,108 @@ mod tests {
         );
     }
 
+    /// An incomplete total between two valid ones is skipped without moving
+    /// the baseline, so the valid totals are not counted twice: 100 then
+    /// `{}` then 110 is 110, not 210.
+    #[test]
+    fn an_incomplete_running_total_does_not_reset_the_baseline() {
+        for incomplete in [
+            "{}",
+            r#"{"output_tokens":10}"#,
+            r#"{"input_tokens":100}"#,
+            r#"{"input_tokens":null,"output_tokens":10}"#,
+        ] {
+            let reader = read(&[
+                token_count(100, 0, 10, 1.0, 5),
+                token_count_with(incomplete, 1.0, 5, "prolite"),
+                token_count(110, 0, 11, 1.0, 5),
+            ]);
+            assert_eq!(
+                reader.summary().tokens_by_model.get(&None),
+                Some(&tokens(110, 11)),
+                "{incomplete}"
+            );
+            assert_eq!(reader.stats().unusable_totals, 1, "{incomplete}");
+            assert_eq!(reader.stats().counter_restarts, 0, "{incomplete}");
+        }
+    }
+
+    /// A cache count left out after it was non-zero is incomplete; left out
+    /// while it was zero, it reads as zero.
+    #[test]
+    fn an_omitted_cache_count_is_incomplete_only_when_it_was_not_zero() {
+        let reader = read(&[
+            token_count(100, 40, 10, 1.0, 5),
+            token_count_with(
+                r#"{"input_tokens":120,"output_tokens":12}"#,
+                1.0,
+                5,
+                "prolite",
+            ),
+            token_count(130, 50, 13, 1.0, 5),
+        ]);
+        assert_eq!(
+            reader.summary().tokens_by_model.get(&None),
+            Some(&Tokens {
+                input: 130,
+                output: 13,
+                cache_read: 50,
+                cache_write: 0
+            })
+        );
+        assert_eq!(reader.stats().unusable_totals, 1);
+
+        let reader = read(&[
+            token_count_with(
+                r#"{"input_tokens":100,"output_tokens":10}"#,
+                1.0,
+                5,
+                "prolite",
+            ),
+            token_count(130, 50, 13, 1.0, 5),
+        ]);
+        assert_eq!(
+            reader.summary().tokens_by_model.get(&None),
+            Some(&Tokens {
+                input: 130,
+                output: 13,
+                cache_read: 50,
+                cache_write: 0
+            })
+        );
+        assert_eq!(reader.stats().unusable_totals, 0);
+    }
+
+    /// A complete total whose input went down is a counter restart, and all
+    /// of it is new; one where only another count went down is skipped.
+    #[test]
+    fn a_lower_input_is_a_counter_restart_and_a_lower_other_count_is_skipped() {
+        let reader = read(&[
+            token_count(500, 0, 50, 1.0, 5),
+            token_count(30, 0, 3, 1.0, 5),
+        ]);
+        assert_eq!(
+            reader.summary().tokens_by_model.get(&None),
+            Some(&tokens(530, 53))
+        );
+        assert_eq!(reader.stats().counter_restarts, 1);
+
+        let reader = read(&[
+            token_count(500, 0, 50, 1.0, 5),
+            token_count(510, 0, 40, 1.0, 5),
+            token_count(520, 0, 52, 1.0, 5),
+        ]);
+        assert_eq!(
+            reader.summary().tokens_by_model.get(&None),
+            Some(&tokens(520, 52))
+        );
+        assert_eq!(reader.stats().unusable_totals, 1);
+        assert_eq!(reader.stats().counter_restarts, 0);
+    }
+
     #[test]
     fn a_truncated_or_replaced_rollout_is_read_again_from_the_start() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_temp::tempdir().unwrap();
         let path = dir.path().join("rollout-d.jsonl");
         let mut file = File::create(&path).unwrap();
         write_lines(
@@ -2173,7 +2971,7 @@ mod tests {
 
     #[test]
     fn a_failed_and_an_aborted_turn_are_read_by_kind_only() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_temp::tempdir().unwrap();
         let path = dir.path().join("rollout-f.jsonl");
         let mut file = File::create(&path).unwrap();
         write_lines(
@@ -2188,7 +2986,7 @@ mod tests {
         assert_eq!(
             reader.summary().last_turn,
             Some(AgentTurnEnd::Failed {
-                kind: Some("server_overloaded".into())
+                kind: Some(id("server_overloaded"))
             })
         );
         write_lines(
@@ -2200,6 +2998,157 @@ mod tests {
         );
         reader.poll().unwrap();
         assert_eq!(reader.summary().last_turn, Some(AgentTurnEnd::Interrupted));
+    }
+
+    /// More distinct models than [`MAX_MODELS`], across several polls: the
+    /// named set stops growing, the rest is credited to no model, and the
+    /// total still equals the rollout's own.
+    #[test]
+    fn model_cardinality_is_capped_across_polls() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("rollout-m.jsonl");
+        let mut file = File::create(&path).unwrap();
+        let mut reader = CodexUsageReader::new(&path);
+        let extra = 8;
+        for i in 0..(MAX_MODELS + extra) as u64 {
+            write_lines(
+                &mut file,
+                &[
+                    &turn_context(&format!("model-{i}")),
+                    &token_count(10 * (i + 1), 0, i + 1, 1.0, 5),
+                ],
+            );
+            if i % 5 == 0 {
+                reader.poll().unwrap();
+            }
+        }
+        reader.poll().unwrap();
+        let summary = reader.summary();
+        let named = summary
+            .tokens_by_model
+            .keys()
+            .filter(|k| k.is_some())
+            .count();
+        assert_eq!(named, MAX_MODELS);
+        assert_eq!(reader.stats().models_overflowed, extra as u64);
+        assert_eq!(
+            summary.tokens_by_model[&None],
+            tokens(10 * extra as u64, extra as u64)
+        );
+        let mut sum = Tokens::default();
+        for t in summary.tokens_by_model.values() {
+            sum.add(t);
+        }
+        let n = (MAX_MODELS + extra) as u64;
+        assert_eq!(sum, tokens(10 * n, n));
+    }
+
+    /// The reader's `Debug` shows its counters, not the bytes of a line it
+    /// is still waiting on, nor the path it was given.
+    #[test]
+    fn the_readers_debug_shows_neither_buffered_bytes_nor_its_path() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join(format!("{SENTINEL}-rollout.jsonl"));
+        let mut file = File::create(&path).unwrap();
+        file.write_all(
+            format!(r#"{{"type":"response_item","payload":{{"text":"{SENTINEL}"#).as_bytes(),
+        )
+        .unwrap();
+        file.flush().unwrap();
+        let mut reader = CodexUsageReader::new(&path);
+        reader.poll().unwrap();
+        assert!(
+            reader
+                .partial
+                .windows(SENTINEL.len())
+                .any(|w| w == SENTINEL.as_bytes())
+        );
+        let debug = format!("{reader:?}");
+        assert!(!debug.contains(SENTINEL), "{debug}");
+        assert!(!debug.contains("rollout.jsonl"), "{debug}");
+        assert!(debug.contains("partial_bytes"), "{debug}");
+    }
+
+    /// A FIFO with no writer would block a plain open forever; the reader
+    /// refuses it at once, as it refuses anything but a regular file.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_is_refused_without_blocking() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let fifo = dir.path().join("rollout-fifo.jsonl");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).expect("cstring");
+        // SAFETY: `c_path` is a valid NUL-terminated string that outlives the
+        // call, and `mkfifo` only reads through it.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", io::Error::last_os_error());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = CodexUsageReader::new(&fifo);
+            let _ = tx.send(reader.poll().map_err(|e| e.kind()));
+        });
+        let got = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the poll blocked on a FIFO");
+        assert_eq!(got, Err(io::ErrorKind::InvalidInput));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_is_refused() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let real = dir.path().join("rollout-real.jsonl");
+        let mut file = File::create(&real).unwrap();
+        write_lines(&mut file, &[&token_count(7, 0, 1, 1.0, 5)]);
+        let link = dir.path().join("rollout-link.jsonl");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut reader = CodexUsageReader::new(&link);
+        let err = reader.poll().unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP), "{err}");
+        assert_eq!(reader.stats().bytes_read, 0);
+        assert!(reader.summary().tokens_by_model.is_empty());
+    }
+
+    /// A backlog larger than the budget is drained over several polls, none
+    /// reading more than its budget, with lines cut by a budget completed on
+    /// the next poll, and the total the same as one unbounded read.
+    #[test]
+    fn a_large_backlog_is_drained_over_bounded_polls() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("rollout-big.jsonl");
+        let mut file = File::create(&path).unwrap();
+        let lines: Vec<String> = (1..=400u64)
+            .map(|i| token_count(10 * i, 0, i, 1.0, 5))
+            .collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        write_lines(&mut file, &refs);
+        let budget = 8 * 1024;
+        let mut reader = CodexUsageReader::new(&path).with_poll_budget(budget);
+        let mut polls = 0u64;
+        loop {
+            let before = reader.stats().bytes_read;
+            reader.poll().unwrap();
+            polls += 1;
+            assert!(reader.stats().bytes_read - before <= budget);
+            if reader.stats().backlog == 0 {
+                break;
+            }
+            assert!(polls < 1_000, "the backlog never drained");
+        }
+        assert!(polls > 10, "{polls} polls");
+        assert_eq!(reader.stats().polls_cut_short, polls - 1);
+        assert_eq!(reader.stats().parsed, 400);
+        assert_eq!(reader.stats().malformed, 0);
+        assert_eq!(
+            reader.summary().tokens_by_model.get(&None),
+            Some(&tokens(4000, 400))
+        );
+        write_lines(&mut file, &[&token_count(4010, 0, 401, 1.0, 5)]);
+        reader.poll().unwrap();
+        assert_eq!(reader.stats().backlog, 0);
+        assert_eq!(
+            reader.summary().tokens_by_model.get(&None),
+            Some(&tokens(4010, 401))
+        );
     }
 
     // --- leakage ---
@@ -2220,11 +3169,8 @@ mod tests {
     /// pre-filter's markers, so it is deserialised rather than skipped.
     #[test]
     fn content_never_reaches_the_summary_the_record_or_the_attributes() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("rollout-g.jsonl");
-        let mut file = File::create(&path).unwrap();
         let s = SENTINEL;
-        let lines = [
+        let reader = read(&[
             format!(
                 r#"{{"type":"session_meta","payload":{{"cwd":"/{s}","base_instructions":{{"text":"{s}"}},"cli_version":"0.164.0"}}}}"#
             ),
@@ -2250,11 +3196,7 @@ mod tests {
             format!(
                 r#"{{"type":"event_msg","payload":{{"type":"task_complete","last_agent_message":"{s}","error":{{"message":"{s}","codex_error_info":"{s} is not an identifier"}}}}}}"#
             ),
-        ];
-        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
-        write_lines(&mut file, &refs);
-        let mut reader = CodexUsageReader::new(&path);
-        reader.poll().unwrap();
+        ]);
         assert_eq!(
             reader.stats().parsed,
             7,
@@ -2283,13 +3225,172 @@ mod tests {
         }));
     }
 
+    /// What the identifier check keeps and drops. Path-, email- and
+    /// credential-shaped values are kept: the check is about shape, so it is
+    /// no privacy filter. Unicode, a line break, a space, a quote, a
+    /// backslash, the empty string and 129 bytes are dropped; 128 are kept.
+    #[test]
+    fn the_identifier_check_is_a_shape_check_not_a_privacy_filter() {
+        let at_limit = "a".repeat(Ident::MAX_BYTES);
+        let over_limit = "a".repeat(Ident::MAX_BYTES + 1);
+        for kept in [
+            format!("/home/{SENTINEL}/.ssh/id_ed25519"),
+            format!("{SENTINEL}@example.com"),
+            format!("sk-{SENTINEL}0123456789abcdef"),
+            at_limit,
+        ] {
+            assert!(Ident::new(&kept).is_some(), "{kept}");
+        }
+        for dropped in [
+            format!("{SENTINEL}\u{e9}"),
+            format!("{SENTINEL}\u{2028}x"),
+            format!("{SENTINEL}\nnext"),
+            format!("{SENTINEL} with spaces"),
+            format!("{SENTINEL}\"quoted"),
+            format!("{SENTINEL}\\"),
+            String::new(),
+            over_limit,
+        ] {
+            assert!(Ident::new(&dropped).is_none(), "{dropped:?}");
+        }
+    }
+
+    /// Strings reach the record through the reader and the normalisers only
+    /// as identifiers: a JSON escape is judged after decoding, so an escaped
+    /// hyphen is kept and an escaped line break is not, and the 128/129-byte
+    /// boundary holds on both paths. An identifier-shaped plan is kept and
+    /// exported, which is the residual risk the doc names.
+    #[test]
+    fn strings_reach_the_record_only_as_identifiers() {
+        let at_limit = "a".repeat(Ident::MAX_BYTES);
+        let over_limit = "b".repeat(Ident::MAX_BYTES + 1);
+        let reader = read(&[
+            turn_context(r"gpt-5.5"),
+            token_count(10, 0, 1, 1.0, 5),
+            turn_context(&format!(r"{SENTINEL}\u000aline")),
+            token_count(20, 0, 2, 1.0, 5),
+            turn_context(&format!(r"{SENTINEL}é")),
+            token_count(30, 0, 3, 1.0, 5),
+            turn_context(&over_limit),
+            token_count(40, 0, 4, 1.0, 5),
+            turn_context(&at_limit),
+            token_count_with(&usage(50, 0, 5), 1.0, 5, &format!("{SENTINEL}@example.com")),
+        ]);
+        let summary = reader.summary();
+        let keys: Vec<Option<Ident>> = summary.tokens_by_model.keys().cloned().collect();
+        assert_eq!(keys, vec![None, Some(id(&at_limit)), Some(id("gpt-5.5"))]);
+        assert_eq!(summary.tokens_by_model[&None], tokens(30, 3));
+        assert_eq!(
+            summary.quota_last.as_ref().unwrap().plan,
+            Some(id(&format!("{SENTINEL}@example.com")))
+        );
+
+        let pi = from_pi(&[
+            pi_reply(&format!("{SENTINEL} with space"), Some(0.1), None),
+            pi_reply(&format!("/home/{SENTINEL}/.ssh/id"), Some(0.1), None),
+        ]);
+        let models: Vec<Option<&str>> = pi
+            .models
+            .iter()
+            .map(|m| m.model.as_ref().map(Ident::as_str))
+            .collect();
+        assert_eq!(
+            models,
+            vec![None, Some(format!("/home/{SENTINEL}/.ssh/id").as_str())]
+        );
+    }
+
+    /// Every string value the export can emit is an enum's name or an
+    /// [`Ident`], for records built by the normalisers from hostile input and
+    /// for a record built field by field by hand, since an `Ident` has no
+    /// other constructor than its check.
+    #[test]
+    fn every_exported_string_is_identifier_shaped() {
+        let hostile = format!("{SENTINEL}\n\"quoted\" é");
+        let by_hand = RunRecord {
+            identity: RunIdentity {
+                parent_run_id: Ident::new(&hostile),
+                usage_included_in: Some(id("p")),
+                orchestration_id: Some(id("o1")),
+                work_item: Some(id("issue-1")),
+                ..identity("r1", "claude")
+            },
+            models: vec![ModelUsage {
+                model: Ident::new(&hostile),
+                tokens: Field::Measured(tokens(1, 1)),
+                cost: Field::AgentAsserted(MicroUsd(1)),
+            }],
+            quota: Field::ProviderReported(QuotaDelta {
+                plan: Ident::new(&hostile),
+                window_minutes: 1,
+                resets_at: -1,
+                from_bp: 1,
+                to_bp: 2,
+            }),
+            termination: Field::Measured(Termination {
+                outcome: RunTermination::Failed,
+                error_type: Ident::new(&hostile),
+            }),
+            last_turn: Field::ProviderReported(AgentTurnEnd::Failed {
+                kind: Ident::new(&hostile),
+            }),
+        };
+        let records = [
+            by_hand,
+            RunRecord::new(
+                identity("r2", "pi"),
+                from_pi(&[pi_reply(&hostile, Some(0.5), Some(PiStopReason::Error))]),
+                Some(EndReason::Closed),
+            ),
+            RunRecord::new(
+                identity("r3", "claude"),
+                from_claude(Some(&ClaudeSessionUsage {
+                    models: vec![ClaudeModelUsage {
+                        model: hostile.clone(),
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        cache_read_input_tokens: 0,
+                        cache_creation_input_tokens: 0,
+                        cost_usd: Some(0.1),
+                    }],
+                    has_unknown_model_cost: false,
+                    last_turn: Some(AgentTurnEnd::Failed {
+                        kind: Ident::new(&hostile),
+                    }),
+                })),
+                Some(EndReason::Exited),
+            ),
+        ];
+        let item = WorkItemRecord {
+            disposition: work_disposition(None, None),
+            checks: observed_checks(None, Some(false)),
+        };
+        let mut seen = 0;
+        let mut check = |attrs: &[AccountingAttribute]| {
+            for attr in attrs {
+                if let AttrValue::Str(value) = &attr.value {
+                    seen += 1;
+                    assert!(Ident::new(value).is_some(), "{value:?}");
+                    assert!(!value.contains(SENTINEL), "{value:?}");
+                }
+            }
+        };
+        for record in &records {
+            let export = run_attributes(record);
+            check(&export.run);
+            export.models.iter().for_each(|m| check(m));
+        }
+        check(&work_item_attributes(&item));
+        assert!(seen > 20, "{seen}");
+    }
+
     // --- aggregation ---
 
     #[test]
     fn a_retry_is_a_second_attempt_and_a_repeated_run_id_counts_once() {
         let mut first = run(
             RunIdentity {
-                work_item: Some("issue-1676".into()),
+                work_item: Some(id("issue-1676")),
                 ..identity("a1", "claude")
             },
             "claude-opus-5-5",
@@ -2298,7 +3399,7 @@ mod tests {
         );
         let second = run(
             RunIdentity {
-                work_item: Some("issue-1676".into()),
+                work_item: Some(id("issue-1676")),
                 ..identity("a2", "claude")
             },
             "claude-opus-5-5",
@@ -2317,12 +3418,45 @@ mod tests {
         let r = rollup_work_item(&runs, "issue-1676");
         assert_eq!(r.runs, 2);
         assert_eq!(
-            r.tokens[&(Some("claude-opus-5-5".into()), Provenance::ProviderReported)],
+            r.tokens[&(Some(id("claude-opus-5-5")), Provenance::ProviderReported)],
             tokens(450, 45),
             "the later snapshot of a1 replaces the earlier one"
         );
         assert_eq!(r.cost[&Provenance::Estimated], MicroUsd(13_000_000));
         assert_eq!(r.terminations[&RunTermination::Completed], 2);
+    }
+
+    /// A run first attributed to one work item (and orchestration) and then
+    /// corrected to another counts under the corrected one only.
+    #[test]
+    fn a_corrected_membership_counts_under_the_later_snapshot_only() {
+        let snapshot = |work_item: &str, orchestration: &str, t| {
+            run(
+                RunIdentity {
+                    work_item: Some(id(work_item)),
+                    orchestration_id: Some(id(orchestration)),
+                    ..identity("r", "codex")
+                },
+                "gpt-5.5",
+                t,
+                Field::Unavailable(Unavailable::NoChannel),
+            )
+        };
+        let runs = [
+            snapshot("issue-a", "o-a", tokens(10, 1)),
+            snapshot("issue-b", "o-b", tokens(20, 2)),
+        ];
+        let a = rollup_work_item(&runs, "issue-a");
+        assert_eq!(a.runs, 0);
+        assert!(a.tokens.is_empty());
+        let b = rollup_work_item(&runs, "issue-b");
+        assert_eq!(b.runs, 1);
+        assert_eq!(
+            b.tokens[&(Some(id("gpt-5.5")), Provenance::ProviderReported)],
+            tokens(20, 2)
+        );
+        assert_eq!(rollup_orchestration(&runs, "o-a").runs, 0);
+        assert_eq!(rollup_orchestration(&runs, "o-b").runs, 1);
     }
 
     #[test]
@@ -2335,8 +3469,8 @@ mod tests {
         );
         let subagent = run(
             RunIdentity {
-                parent_run_id: Some("p".into()),
-                usage_included_in: Some("p".into()),
+                parent_run_id: Some(id("p")),
+                usage_included_in: Some(id("p")),
                 ..identity("p-sub", "claude")
             },
             "claude-haiku-5-5",
@@ -2345,7 +3479,7 @@ mod tests {
         );
         let child = run(
             RunIdentity {
-                parent_run_id: Some("p".into()),
+                parent_run_id: Some(id("p")),
                 ..identity("c", "codex")
             },
             "gpt-5.5",
@@ -2355,14 +3489,14 @@ mod tests {
         let r = rollup([&parent, &subagent, &child]);
         assert_eq!(r.runs, 3);
         assert_eq!(r.runs_included_elsewhere, 1);
-        assert!(!r.tokens.contains_key(&(
-            Some("claude-haiku-5-5".into()),
-            Provenance::ProviderReported
-        )));
+        assert!(
+            !r.tokens
+                .contains_key(&(Some(id("claude-haiku-5-5")), Provenance::ProviderReported))
+        );
         assert_eq!(r.cost[&Provenance::Estimated], MicroUsd(9));
         assert_eq!(r.cost_unavailable, 1);
         assert_eq!(
-            r.tokens[&(Some("gpt-5.5".into()), Provenance::ProviderReported)],
+            r.tokens[&(Some(id("gpt-5.5")), Provenance::ProviderReported)],
             tokens(50, 5)
         );
         // Without its parent in the set, the subagent's usage is not lost.
@@ -2373,11 +3507,11 @@ mod tests {
 
     #[test]
     fn an_orchestration_rolls_up_by_run_id_with_duplicates_collapsed() {
-        let in_orch = |id: &str, agent: &str, t| {
+        let in_orch = |run_id: &str, agent: &str, t| {
             run(
                 RunIdentity {
-                    orchestration_id: Some("o1".into()),
-                    ..identity(id, agent)
+                    orchestration_id: Some(id("o1")),
+                    ..identity(run_id, agent)
                 },
                 "m",
                 t,
@@ -2400,9 +3534,26 @@ mod tests {
         let r = rollup_orchestration(&runs, "o1");
         assert_eq!(r.runs, 3);
         assert_eq!(
-            r.tokens[&(Some("m".into()), Provenance::ProviderReported)],
+            r.tokens[&(Some(id("m")), Provenance::ProviderReported)],
             tokens(60, 6)
         );
+    }
+
+    fn with_quota(run_id: &str, from: u32, to: u32, resets_at: i64) -> RunRecord {
+        let mut r = run(
+            identity(run_id, "codex"),
+            "gpt-5.5",
+            tokens(1, 1),
+            Field::Unavailable(Unavailable::NoChannel),
+        );
+        r.quota = Field::ProviderReported(QuotaDelta {
+            plan: Some(id("prolite")),
+            window_minutes: 10080,
+            resets_at,
+            from_bp: from,
+            to_bp: to,
+        });
+        r
     }
 
     #[test]
@@ -2425,32 +3576,16 @@ mod tests {
             tokens(1, 1),
             Field::Unavailable(Unavailable::SubscriptionZero),
         );
-        let quota = |id: &str, from, to, resets_at| {
-            let mut r = run(
-                identity(id, "codex"),
-                "gpt-5.5",
-                tokens(1, 1),
-                Field::Unavailable(Unavailable::NoChannel),
-            );
-            r.quota = Field::ProviderReported(QuotaDelta {
-                plan: Some("prolite".into()),
-                window_minutes: 10080,
-                resets_at,
-                from_bp: from,
-                to_bp: to,
-            });
-            r
-        };
         // Two overlapping runs in one window, one run after them, and one in
         // the next window.
         let runs = [
             claude,
             api_key,
             opencode,
-            quota("q1", 2600, 3000, 1),
-            quota("q2", 2800, 3400, 1),
-            quota("q3", 4000, 4500, 1),
-            quota("q4", 100, 300, 2),
+            with_quota("q1", 2600, 3000, 1),
+            with_quota("q2", 2800, 3400, 1),
+            with_quota("q3", 4000, 4500, 1),
+            with_quota("q4", 100, 300, 2),
         ];
         let r = rollup(&runs);
         assert_eq!(r.cost.len(), 2, "never one number: {:?}", r.cost);
@@ -2458,8 +3593,8 @@ mod tests {
         assert_eq!(r.cost[&Provenance::ProviderReported], MicroUsd(4_000_000));
         assert_eq!(r.cost_unavailable, 5);
         let window = |resets_at| QuotaKey {
-            agent: "codex".into(),
-            plan: Some("prolite".into()),
+            agent: id("codex"),
+            plan: Some(id("prolite")),
             window_minutes: 10080,
             resets_at,
         };
@@ -2470,11 +3605,18 @@ mod tests {
 
     // --- export mapping ---
 
+    fn has(attrs: &[AccountingAttribute], key: AccountingKey, value: &str) -> bool {
+        attrs.contains(&AccountingAttribute {
+            key,
+            value: AttrValue::Str(value.into()),
+        })
+    }
+
     #[test]
     fn the_export_names_provenance_and_reasons_and_uses_1741s_run_keys() {
         let record = RunRecord::new(
             RunIdentity {
-                work_item: Some("issue-1".into()),
+                work_item: Some(id("issue-1")),
                 ..identity("r1", "opencode")
             },
             from_opencode(&[OpenCodeMessageUsage {
@@ -2488,15 +3630,17 @@ mod tests {
             Some(EndReason::Exited),
         );
         let export = run_attributes(&record);
-        let has = |attrs: &[AccountingAttribute], key: AccountingKey, value: &str| {
-            attrs.contains(&s(key, value))
-        };
         assert!(has(&export.run, AccountingKey::RunId, "r1"));
         assert!(has(&export.run, AccountingKey::Termination, "unknown"));
         assert!(has(
             &export.run,
             AccountingKey::TerminationProvenance,
             "measured"
+        ));
+        assert!(has(
+            &export.run,
+            AccountingKey::LastTurnUnavailableReason,
+            "not_recorded"
         ));
         assert!(has(
             &export.run,
@@ -2528,22 +3672,67 @@ mod tests {
 
         let item = WorkItemRecord {
             disposition: work_disposition(Some(PullRequestState::Merged), None),
-            verification: verification(None, Some(true)),
+            checks: observed_checks(None, Some(true)),
         };
         let attrs = work_item_attributes(&item);
         assert!(has(&attrs, AccountingKey::Disposition, "merged"));
-        assert!(has(&attrs, AccountingKey::Verification, "verified"));
+        assert!(has(&attrs, AccountingKey::Checks, "passing"));
         assert!(has(
             &attrs,
-            AccountingKey::VerificationProvenance,
+            AccountingKey::ChecksProvenance,
             "agent_asserted"
         ));
     }
 
+    /// Two deltas alike but for their window instance export different
+    /// attributes, so a backend can keep successive windows apart.
+    #[test]
+    fn deltas_in_different_quota_windows_export_different_attributes() {
+        let this_week = run_attributes(&with_quota("q", 100, 300, 1_000)).run;
+        let next_week = run_attributes(&with_quota("q", 100, 300, 2_000)).run;
+        assert_ne!(this_week, next_week);
+        let resets_at = |attrs: &[AccountingAttribute]| {
+            attrs
+                .iter()
+                .find(|a| a.key == AccountingKey::QuotaResetsAt)
+                .map(|a| a.value.clone())
+        };
+        assert_eq!(resets_at(&this_week), Some(AttrValue::Int(1_000)));
+        assert_eq!(resets_at(&next_week), Some(AttrValue::Int(2_000)));
+        assert_eq!(
+            AccountingKey::QuotaResetsAt.as_str(),
+            "deck.quota.resets_at"
+        );
+    }
+
+    /// The exact spellings of the keys borrowed from OpenTelemetry's
+    /// conventions, so a rename on either side is a visible test change.
+    #[test]
+    fn the_borrowed_keys_are_spelled_as_the_conventions_spell_them() {
+        let table = [
+            (AccountingKey::InputTokens, "gen_ai.usage.input_tokens"),
+            (AccountingKey::OutputTokens, "gen_ai.usage.output_tokens"),
+            (
+                AccountingKey::CacheReadInputTokens,
+                "gen_ai.usage.cache_read.input_tokens",
+            ),
+            (
+                AccountingKey::CacheWriteInputTokens,
+                "gen_ai.usage.cache_write.input_tokens",
+            ),
+            (AccountingKey::ResponseModel, "gen_ai.response.model"),
+            (AccountingKey::ErrorType, "error.type"),
+            (AccountingKey::RunId, "deck.run.id"),
+            (AccountingKey::Agent, "deck.agent"),
+        ];
+        for (key, spelling) in table {
+            assert_eq!(key.as_str(), spelling);
+        }
+    }
+
     #[test]
     fn every_accounting_key_is_unique_and_reuses_1741s_names_where_shared() {
-        let names: std::collections::HashSet<_> =
-            AccountingKey::ALL.iter().map(|k| k.as_str()).collect();
+        let names: HashSet<_> = AccountingKey::ALL.iter().map(|k| k.as_str()).collect();
         assert_eq!(names.len(), AccountingKey::ALL.len());
         for key in AccountingKey::ALL {
             let name = key.as_str();
@@ -2558,5 +3747,172 @@ mod tests {
                 "{name} collides with a #1741 key"
             );
         }
+    }
+
+    // --- overhead benchmark ---
+
+    /// The `.jsonl` files under `dir`, with their lengths, not following
+    /// symlinks.
+    fn rollouts_under(dir: &Path, out: &mut Vec<(PathBuf, u64)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            let path = entry.path();
+            if meta.is_dir() {
+                rollouts_under(&path, out);
+            } else if meta.is_file() && path.extension().is_some_and(|e| e == "jsonl") {
+                out.push((path, meta.len()));
+            }
+        }
+    }
+
+    fn load_average() -> String {
+        std::fs::read_to_string("/proc/loadavg")
+            .map(|s| s.split_whitespace().take(3).collect::<Vec<_>>().join(" / "))
+            .unwrap_or_else(|_| "unavailable".into())
+    }
+
+    /// The `p`th quantile of `sorted`, in microseconds.
+    fn quantile_us(sorted: &[Duration], p: f64) -> f64 {
+        let i = ((sorted.len() - 1) as f64 * p).round() as usize;
+        sorted[i].as_secs_f64() * 1e6
+    }
+
+    /// The overhead benchmark behind the doc's "Overhead" table. Not a
+    /// `#[spec]` test, and a no-op unless `DAD_ACCOUNTING_BENCH_DIR` names a
+    /// directory of Codex rollouts: then it reads every `.jsonl` under it
+    /// whole, against a `serde_json::Value` baseline, checks each rollout's
+    /// per-model sums against its own running total, replays the largest ones
+    /// a line at a time into a scratch file polling after each line, and
+    /// times idle polls. It prints aggregates only — counts, bytes, times,
+    /// the load average — and never a path, a file name or a line. Run it in
+    /// a release build; `docs/develop/execution-accounting.md` has the
+    /// command.
+    #[test]
+    fn overhead_over_a_directory_of_rollouts() {
+        let Some(dir) = std::env::var_os("DAD_ACCOUNTING_BENCH_DIR") else {
+            return;
+        };
+        let mut files = Vec::new();
+        rollouts_under(Path::new(&dir), &mut files);
+        assert!(!files.is_empty(), "no .jsonl file under the directory");
+        let total_bytes: u64 = files.iter().map(|(_, len)| len).sum();
+        println!("load average at start: {}", load_average());
+        println!("rollouts: {}, bytes: {total_bytes}", files.len());
+
+        for pass in 1..=3 {
+            let started = Instant::now();
+            let (mut stats, mut errors, mut agree, mut restarted) =
+                (ReaderStats::default(), 0, 0, 0);
+            for (path, _) in &files {
+                let mut reader = CodexUsageReader::new(path).with_poll_budget(u64::MAX);
+                if reader.poll().is_err() {
+                    errors += 1;
+                    continue;
+                }
+                let s = reader.stats();
+                stats.lines += s.lines;
+                stats.parsed += s.parsed;
+                stats.malformed += s.malformed;
+                stats.overlong += s.overlong;
+                stats.unusable_totals += s.unusable_totals;
+                stats.counter_restarts += s.counter_restarts;
+                let summary = reader.summary();
+                let mut sum = Tokens::default();
+                for t in summary.tokens_by_model.values() {
+                    sum.add(t);
+                }
+                if s.counter_restarts > 0 {
+                    restarted += 1;
+                } else if summary.last_total.unwrap_or_default() == sum {
+                    agree += 1;
+                }
+            }
+            let secs = started.elapsed().as_secs_f64();
+            println!(
+                "full read, pass {pass}: {secs:.2} s, {:.0} MB/s; lines {}, deserialised {}, malformed {}, overlong {}, unusable totals {}, counter restarts {}, open errors {errors}; per-model sums equal the running total in {agree} rollouts, {restarted} with a counter restart",
+                total_bytes as f64 / 1e6 / secs,
+                stats.lines,
+                stats.parsed,
+                stats.malformed,
+                stats.overlong,
+                stats.unusable_totals,
+                stats.counter_restarts,
+            );
+        }
+
+        let started = Instant::now();
+        let mut values = 0u64;
+        for (path, _) in &files {
+            let Ok(bytes) = std::fs::read(path) else {
+                continue;
+            };
+            for line in bytes.split(|b| *b == b'\n') {
+                if line_is_candidate(line)
+                    && serde_json::from_slice::<serde_json::Value>(line).is_ok()
+                {
+                    values += 1;
+                }
+            }
+        }
+        println!(
+            "baseline, whole file into serde_json::Value: {:.2} s, {values} lines parsed",
+            started.elapsed().as_secs_f64()
+        );
+
+        let mut largest = files.clone();
+        largest.sort_by_key(|(_, len)| std::cmp::Reverse(*len));
+        largest.truncate(20);
+        let scratch = crate::test_temp::tempdir().unwrap();
+        let mut polls: Vec<Duration> = Vec::new();
+        let mut appended = 0u64;
+        let mut idle: Vec<Duration> = Vec::new();
+        for (i, (path, _)) in largest.iter().enumerate() {
+            let Ok(bytes) = std::fs::read(path) else {
+                continue;
+            };
+            let target = scratch.path().join(format!("replay-{i}.jsonl"));
+            let mut out = File::create(&target).unwrap();
+            let mut reader = CodexUsageReader::new(&target);
+            for line in bytes.split_inclusive(|b| *b == b'\n') {
+                out.write_all(line).unwrap();
+                out.flush().unwrap();
+                appended += line.len() as u64;
+                let started = Instant::now();
+                reader.poll().unwrap();
+                polls.push(started.elapsed());
+            }
+            for _ in 0..100 {
+                let started = Instant::now();
+                reader.poll().unwrap();
+                idle.push(started.elapsed());
+            }
+        }
+        if !polls.is_empty() {
+            let total: Duration = polls.iter().sum();
+            polls.sort_unstable();
+            idle.sort_unstable();
+            println!(
+                "incremental, {} rollouts, {appended} bytes in {} polls: mean {:.1} µs, median {:.1} µs, p99 {:.1} µs, max {:.1} µs, {:.2} µs per KB appended",
+                largest.len(),
+                polls.len(),
+                total.as_secs_f64() * 1e6 / polls.len() as f64,
+                quantile_us(&polls, 0.5),
+                quantile_us(&polls, 0.99),
+                quantile_us(&polls, 1.0),
+                total.as_secs_f64() * 1e6 / (appended as f64 / 1024.0),
+            );
+            println!(
+                "idle poll, nothing appended, {} polls: median {:.1} µs, p99 {:.1} µs",
+                idle.len(),
+                quantile_us(&idle, 0.5),
+                quantile_us(&idle, 0.99),
+            );
+        }
+        println!("load average at end: {}", load_average());
     }
 }
