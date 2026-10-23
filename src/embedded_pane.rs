@@ -7463,8 +7463,14 @@ mod incarnation_binding_tests {
         assert_eq!(daemon.received_by("b"), Vec::<String>::new());
     }
 
-    /// Rename, message, resize and close the pane, in that order.
-    fn act_on(controller: &EmbeddedPaneController, pane: &str) -> Result<(), PaneError> {
+    /// Rename, message, resize and close the pane, in that order. The resize
+    /// is sent by the pane's resize worker, which a close aborts with the
+    /// pane, so the close waits for `sent` to say the daemon was asked.
+    fn act_on(
+        controller: &EmbeddedPaneController,
+        pane: &str,
+        sent: impl Fn(),
+    ) -> Result<(), PaneError> {
         let _ = controller.rename_pane(pane, "renamed");
         let _ = controller.post_message(
             &BoundPane::held_by_controller(pane),
@@ -7473,6 +7479,7 @@ mod incarnation_binding_tests {
             crate::inbox_hub::PostOrigin::OrchestratorRemit,
         );
         controller.resize_pane_pty(pane, 30, 100)?;
+        sent();
         controller.close_pane(pane)
     }
 
@@ -7494,7 +7501,12 @@ mod incarnation_binding_tests {
             .expect("a pane on the first process");
         daemon.restart_as("b");
 
-        let closed = act_on(&controller, &pane);
+        let closed = act_on(&controller, &pane, || {
+            wait_for(
+                "the rename, message and resize to ask the restarted daemon",
+                || daemon.hellos("b") >= ACTIONS.len() - 1,
+            )
+        });
         wait_for("every action to ask the restarted daemon", || {
             daemon.hellos("b") >= ACTIONS.len()
         });
@@ -7521,7 +7533,12 @@ mod incarnation_binding_tests {
         let pane = controller
             .create_pane(Some("cat"), None)
             .expect("a pane on the control daemon");
-        act_on(&controller, &pane).expect("control: the close stops the agent");
+        act_on(&controller, &pane, || {
+            wait_for("control: the resize to reach the daemon", || {
+                control.received_by("a").contains(&"resize".to_string())
+            })
+        })
+        .expect("control: the close stops the agent");
         wait_for("control: every action to reach the daemon", || {
             let reached = control.received_by("a");
             ACTIONS.iter().all(|op| reached.iter().any(|r| r == op))
