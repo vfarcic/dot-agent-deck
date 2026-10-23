@@ -661,7 +661,7 @@ fn fetch_one_shot<W: Write>(
         pieces.push(Piece::Frame(b"{\"messages\":["));
         for (i, message) in public.iter().enumerate() {
             if i > 0 {
-                pieces.push(Piece::Frame(b","));
+                pieces.push(Piece::Joint(b","));
             }
             pieces.push(Piece::Block(i, message.as_bytes()));
         }
@@ -670,8 +670,11 @@ fn fetch_one_shot<W: Write>(
         pieces.push(Piece::Frame(b"No dot-agent-deck messages are waiting.\n"));
     } else {
         pieces.push(Piece::Frame(AGENT_FRAMING.as_bytes()));
+        pieces.push(Piece::Frame(crate::inbox_hub::BLOCK_SEPARATOR.as_bytes()));
         for i in 0..batch.len() {
-            pieces.push(Piece::Frame(crate::inbox_hub::BLOCK_SEPARATOR.as_bytes()));
+            if i > 0 {
+                pieces.push(Piece::Joint(crate::inbox_hub::BLOCK_SEPARATOR.as_bytes()));
+            }
             pieces.push(Piece::Block(
                 i,
                 batch.text(i).unwrap_or_default().as_bytes(),
@@ -684,7 +687,8 @@ fn fetch_one_shot<W: Write>(
         // deck ended this fetch already.
         connection.finish();
         let written = pieces.iter().try_for_each(|piece| match piece {
-            Piece::Frame(bytes) | Piece::Block(_, bytes) => stdout.write_all(bytes),
+            Piece::Frame(bytes) => stdout.write_all(bytes),
+            Piece::Block(..) | Piece::Joint(_) => Ok(()),
         });
         return if written.and_then(|()| stdout.flush()).is_ok() {
             ExitCode::SUCCESS

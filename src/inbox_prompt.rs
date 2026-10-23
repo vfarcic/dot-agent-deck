@@ -595,9 +595,14 @@ pub struct HookOutputParts {
 impl HookOutputParts {
     pub fn pieces(&self) -> Vec<crate::inbox_oneshot::Piece<'_>> {
         use crate::inbox_oneshot::Piece;
-        let mut pieces = vec![Piece::Frame(self.head.as_bytes())];
+        let mut pieces = vec![
+            Piece::Frame(self.head.as_bytes()),
+            Piece::Frame(self.separator.as_bytes()),
+        ];
         for (i, block) in self.blocks.iter().enumerate() {
-            pieces.push(Piece::Frame(self.separator.as_bytes()));
+            if i > 0 {
+                pieces.push(Piece::Joint(self.separator.as_bytes()));
+            }
             pieces.push(Piece::Block(i, block.as_bytes()));
         }
         pieces.push(Piece::Frame(self.tail.as_bytes()));
@@ -1192,7 +1197,9 @@ mod tests {
         let bytes: Vec<u8> = pieces
             .iter()
             .flat_map(|piece| match piece {
-                Piece::Frame(bytes) | Piece::Block(_, bytes) => bytes.to_vec(),
+                Piece::Frame(bytes) | Piece::Block(_, bytes) | Piece::Joint(bytes) => {
+                    bytes.to_vec()
+                }
             })
             .collect();
         let printed = String::from_utf8(bytes).unwrap();

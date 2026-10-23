@@ -93,6 +93,12 @@ impl std::fmt::Debug for OneShotBatch {
 pub enum Piece<'a> {
     Frame(&'a [u8]),
     Block(usize, &'a [u8]),
+    /// What goes between two blocks (a separator, a JSON array's comma):
+    /// held until the next block that passes its fence, and written just
+    /// before it only when an earlier block passed its fence too. A block the
+    /// fence refuses drops it, so the blocks written are joined as if the
+    /// refused ones had never been in the batch.
+    Joint(&'a [u8]),
 }
 
 /// What [`OneShotBatch::hand_over`] did: each block's [`Output`], in batch
@@ -185,7 +191,7 @@ impl OneShotBatch {
     }
 
     /// The pieces of a plain-text hand-over: `head`, then each block with
-    /// `separator` between two blocks.
+    /// `separator` between two blocks written.
     pub fn plain_pieces<'a>(&'a self, head: &'a str, separator: &'a str) -> Vec<Piece<'a>> {
         let mut pieces = Vec::new();
         if !head.is_empty() {
@@ -193,7 +199,7 @@ impl OneShotBatch {
         }
         for (i, block) in self.blocks.iter().enumerate() {
             if i > 0 {
-                pieces.push(Piece::Frame(separator.as_bytes()));
+                pieces.push(Piece::Joint(separator.as_bytes()));
             }
             pieces.push(Piece::Block(i, block.text.as_bytes()));
         }
@@ -264,9 +270,15 @@ impl OneShotBatch {
             }
         }
         let mut error = None;
+        let mut joint: Option<&[u8]> = None;
+        let mut passed_any = false;
         for piece in pieces {
             let (block, bytes) = match *piece {
                 Piece::Frame(bytes) => (None, bytes),
+                Piece::Joint(bytes) => {
+                    joint = Some(bytes);
+                    continue;
+                }
                 Piece::Block(i, bytes) => {
                     let Some(at) = self.blocks.get(i).map(|block| &block.at) else {
                         continue;
@@ -274,9 +286,24 @@ impl OneShotBatch {
                     if bytes.is_empty() {
                         continue;
                     }
+                    let first = progress[i].fenced.is_none();
                     let passed = *progress[i].fenced.get_or_insert_with(|| fence(at).is_ok());
                     if !passed {
+                        joint = None;
                         continue;
+                    }
+                    if first {
+                        let lead = joint.take().filter(|_| passed_any);
+                        passed_any = true;
+                        // Written after the fence and before the block's
+                        // first byte: a lead that fails leaves the block
+                        // not handed.
+                        if let Some(lead) = lead
+                            && let (_, Some(failed)) = write_counted(out, lead)
+                        {
+                            error = Some(failed);
+                            break;
+                        }
                     }
                     (Some(i), bytes)
                 }
@@ -1901,8 +1928,8 @@ pub(crate) mod tests {
         assert_eq!(handed.outputs, vec![Output::Written, Output::NotHanded]);
         assert_eq!(
             String::from_utf8(out.written).unwrap(),
-            format!("{}{SEP}", batch.text(0).unwrap()),
-            "no byte of the refused block"
+            batch.text(0).unwrap(),
+            "no byte of the refused block, nor the separator before it"
         );
         deck.daemon.write_revoke(ID1, 1, 1).unwrap();
         let mut out = pipe(vec![]);
