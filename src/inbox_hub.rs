@@ -4813,12 +4813,19 @@ pub fn compose_late_ack_notice(message_id: &str, role: &str, report: LateAckRepo
 }
 
 /// PRD #1666 hardening H4: the smallest hand-over any agent's component gets
-/// once its framing heads it — Codex's byte budget less [`AGENT_FRAMING`]. A
+/// once its framing heads it — Codex's, whose hooks print the whole hand-over
+/// as one JSON line within its byte budget: the JSON-escaped room the tighter
+/// of its two envelopes leaves around [`AGENT_FRAMING`]
+/// ([`crate::inbox_prompt::json_room`]), as each hook asks the deck for it. A
 /// message that renders within it reaches every agent whole.
 pub fn tightest_hand_over() -> InboxBudget {
-    InboxComponent::CodexHooks
-        .inline_budget()
-        .less(AGENT_FRAMING)
+    let limit = InboxComponent::CodexHooks.inline_budget().limit();
+    let room = crate::inbox_prompt::codex_envelopes()
+        .iter()
+        .map(|envelope| crate::inbox_prompt::json_room(limit, envelope, AGENT_FRAMING))
+        .min()
+        .unwrap_or(limit);
+    InboxBudget::JsonBytes(room)
 }
 
 /// Whether [`retain_full_body_minted`] would save `content` for `pane_id`: it
@@ -4853,9 +4860,12 @@ fn fits_every_hand_over(deck: &DeckId, pane_id: &str, content: &Content) -> bool
         assign_deadline: None,
         owner: None,
     };
-    // Counted with the separator a hand-over puts before each block.
+    // Counted as the tightest hand-over can print it: after the separator it
+    // puts before each block, as a marked repeat whose opener names the
+    // longest attempt there can be.
     let budget = tightest_hand_over().less(BLOCK_SEPARATOR);
-    budget.measure(&render_within(&message, None).text) <= budget.limit()
+    let block = render_marked(&message, None, true, Some((u32::MAX, u32::MAX)));
+    budget.measure(&block.text) <= budget.limit()
 }
 
 /// Audit F5: why a publish or offer resolved from earlier facts was not

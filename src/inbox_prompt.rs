@@ -406,9 +406,7 @@ pub fn one_shot_request(
         token,
     );
     if let InboxBudget::Bytes(limit) = budget {
-        let rest = limit
-            .saturating_sub(envelope_bytes(hand.envelope, hand.framing))
-            .max(1);
+        let rest = json_room(limit, hand.envelope, hand.framing);
         request.max_chars = Some(rest);
         request.max_bytes = Some(rest);
         request.max_json_bytes = Some(rest);
@@ -424,6 +422,27 @@ pub fn one_shot_request(
 fn envelope_bytes(envelope: &Envelope, framing: &str) -> usize {
     let parts = envelope.parts(framing, &[]);
     parts.head.len() + parts.tail.len()
+}
+
+/// The JSON-escaped bytes left for the blocks, each with its separator, of a
+/// hand-over printed in `envelope` and headed by `framing` when the whole
+/// line has `limit` bytes.
+pub fn json_room(limit: usize, envelope: &Envelope, framing: &str) -> usize {
+    limit
+        .saturating_sub(envelope_bytes(envelope, framing))
+        .max(1)
+}
+
+/// PRD #1666 part 3 (H4): the envelopes Codex's hooks print a hand-over in:
+/// its prompt hook's context ([`crate::hook::deck_prompt_submit`]) and its
+/// `Stop`'s block.
+pub fn codex_envelopes() -> [Envelope; 2] {
+    [
+        Envelope::Context {
+            hook_event_name: "UserPromptSubmit".to_string(),
+        },
+        Envelope::Block,
+    ]
 }
 
 /// The doorbell fetch `request` on the receipt verb at the deck at `path`:
