@@ -1080,6 +1080,12 @@ fn telemetry_otlp_014_shell_operations_classify_without_content() {
         ("case sentinelvalue1741 in a) true;; esac", "", ""),
         ("sudo eval sentinelvalue1741", "", ""),
         ("bash -c 'eval sentinelvalue1741'", "", ""),
+        (
+            "zsh -c 'foreach sentinelvalue1741 (a b); true; end'",
+            "",
+            "",
+        ),
+        ("repeat sentinelvalue1741 do true; done", "", ""),
     ];
     // Codex's `shell` tool reports a joined argv: its program at most.
     let joined_cases = [
@@ -1104,6 +1110,16 @@ fn telemetry_otlp_014_shell_operations_classify_without_content() {
         ("/bin/sh -lc $VAR/x/sentinelvalue1741", "", ""),
         (
             "/bin/sh -lc case sentinelvalue1741 in a) true;; esac",
+            "",
+            "",
+        ),
+        (
+            "/bin/zsh -lc foreach sentinelvalue1741 (a b); true; end",
+            "",
+            "",
+        ),
+        (
+            "/bin/zsh -lc repeat sentinelvalue1741 do true; done",
             "",
             "",
         ),

@@ -23,8 +23,9 @@
 //! ([`SETUP_PROGRAMS`]) is the one classified, after its leading `NAME=value`
 //! assignments and an `env`, `sudo`, `command`, `time` or `nice` in front,
 //! with the options each knows and the options' values. A program that is
-//! shell grammar — a reserved word, `eval` or `exec`
-//! ([`UNSUPPORTED_PROGRAMS`]) — declines the command. Every word read on
+//! shell grammar — a reserved word, a declaration builtin, a precommand
+//! modifier, `eval` or `exec` ([`UNSUPPORTED_PROGRAMS`]) — declines the
+//! command. Every word read on
 //! the way, up to and including the program's first non-option argument, must
 //! be a simple word (`is_simple_word`) or, where an assignment can stand, a
 //! simple assignment (`is_simple_assignment`). A quote, an escape, a `$`, a
@@ -103,13 +104,57 @@ pub const WORDLESS_PROGRAMS: &[&str] = &[
     "rsync",
 ];
 
-/// Shell grammar the classifier does not interpret — reserved words, `eval`
-/// and `exec`: a command whose program is one of them names nothing, since
-/// its operand is data or a command of its own. `time`, also a reserved word,
-/// is read as the wrapper it is.
+/// Shell grammar the classifier does not interpret — the reserved words,
+/// declaration builtins and precommand modifiers of [`SHELLS`], `eval` and
+/// `exec`: a command whose program is one of them names nothing, since its
+/// operand is a name, data or a command of its own. `time`, a reserved word
+/// of bash and zsh, is read as the wrapper it is, and `export`, one of zsh's,
+/// is skipped as a [`SETUP_PROGRAMS`] word. The punctuation words already
+/// decline, as words that are not simple or not command words, and are
+/// listed to keep the list whole.
 pub const UNSUPPORTED_PROGRAMS: &[&str] = &[
-    "eval", "exec", "if", "then", "elif", "else", "fi", "while", "until", "for", "select", "do",
-    "done", "case", "esac", "in", "function", "coproc",
+    "eval",
+    "exec",
+    // POSIX sh's reserved words (Shell Command Language, 2.4), which are
+    // dash's too.
+    "!",
+    "{",
+    "}",
+    "case",
+    "do",
+    "done",
+    "elif",
+    "else",
+    "esac",
+    "fi",
+    "for",
+    "if",
+    "in",
+    "then",
+    "until",
+    "while",
+    // bash's: `compgen -k` and the bash manual's "Reserved Words".
+    "[[",
+    "]]",
+    "coproc",
+    "function",
+    "select",
+    // zsh's: the "Reserved Words" of its Shell Grammar documentation.
+    "end",
+    "foreach",
+    "repeat",
+    "nocorrect",
+    "declare",
+    "float",
+    "integer",
+    "local",
+    "readonly",
+    "typeset",
+    // zsh's precommand modifiers (Shell Grammar, "Precommand Modifiers")
+    // that are not read as prefixes; `builtin` is bash's too.
+    "-",
+    "noglob",
+    "builtin",
 ];
 
 /// Shells whose `-c` argument is the command they run.
@@ -1037,6 +1082,87 @@ mod tests {
             expected("cargo", Some("build"))
         );
         // Looked up, not run: the keyword is the word of `command -v`.
+        assert_eq!(
+            classify(Some("command -v case")),
+            expected("command", Some("case"))
+        );
+    }
+
+    /// Every reserved word and declaration or precommand word of the shells
+    /// the classifier unwraps names nothing. The words are listed here, not
+    /// read from [`UNSUPPORTED_PROGRAMS`], so a word missing from that list
+    /// fails this test.
+    #[test]
+    fn shell_reserved_words_name_nothing() {
+        // POSIX sh and dash.
+        let posix = [
+            "case", "do", "done", "elif", "else", "esac", "fi", "for", "if", "in", "then", "until",
+            "while",
+        ];
+        // bash's `compgen -k` and the bash manual's reserved words.
+        let bash = ["coproc", "function", "select"];
+        // zsh's Shell Grammar "Reserved Words", its declaration builtins and
+        // precommand modifiers.
+        let zsh = [
+            "end",
+            "foreach",
+            "repeat",
+            "nocorrect",
+            "noglob",
+            "builtin",
+            "declare",
+            "typeset",
+            "local",
+            "readonly",
+            "integer",
+            "float",
+        ];
+        let bare = Operation::default();
+        for word in posix.iter().chain(&bash).chain(&zsh) {
+            for command in [
+                format!("{word} sentinelvalue"),
+                format!("time {word} sentinelvalue"),
+                format!("sudo {word} sentinelvalue"),
+                format!("cd repo && {word} sentinelvalue"),
+                format!("zsh -c '{word} sentinelvalue'"),
+                format!("bash -c '{word} sentinelvalue'"),
+            ] {
+                assert_eq!(classify(Some(&command)), bare, "{command}");
+            }
+            for command in [
+                format!("{word} sentinelvalue"),
+                format!("/bin/zsh -lc {word} sentinelvalue"),
+            ] {
+                assert_eq!(
+                    classify_tool(Some("shell"), Some(&command)),
+                    bare,
+                    "{command}"
+                );
+            }
+        }
+        for command in [
+            "zsh -c 'foreach sentinelvalue (a b); true; end'",
+            "zsh -c 'repeat sentinelvalue do true; done'",
+            "time foreach sentinelvalue (a b); true; end",
+            "cd repo && foreach sentinelvalue (a b); true; end",
+            "integer sentinelvalue",
+            "float sentinelvalue",
+        ] {
+            assert_eq!(classify(Some(command)), bare, "{command}");
+        }
+        assert_eq!(
+            classify_tool(
+                Some("shell"),
+                Some("/bin/zsh -lc foreach sentinelvalue (a b); true; end")
+            ),
+            bare
+        );
+        // `time` is the wrapper the classifier reads, and `command -v` looks
+        // a word up rather than running it.
+        assert_eq!(
+            classify(Some("time cargo build")),
+            expected("cargo", Some("build"))
+        );
         assert_eq!(
             classify(Some("command -v case")),
             expected("command", Some("case"))
