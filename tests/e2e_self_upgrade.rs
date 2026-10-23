@@ -30,7 +30,9 @@ use std::process::{Command, Output};
 use std::time::Duration;
 
 use common::TuiDeck;
-use fake_releases::{FakeReleases, cli_asset, release_script, sha256_hex};
+use fake_releases::{
+    FakeReleases, cli_asset, release_script, release_script_recording, sha256_hex,
+};
 use spec::spec;
 
 /// What a running copy older than the release reports.
@@ -137,14 +139,15 @@ fn run_upgrade(server: &FakeReleases, exe: &Path, home: &Path, args: &[&str]) ->
     command.output().expect("run dot-agent-deck upgrade")
 }
 
-/// Scenario: Start the TUI as an old copy installed in a writable folder, with a fake release server offering a newer release. The footer badge names the CLI, the release and the key; pressing `u` opens the dialog with the core's in-place plan, which says provenance will not be checked and that upgrading does not restart the running daemon; choosing Upgrade replaces the file with the served release and the dialog shows the result and says to restart the TUI.
+/// Scenario: Start the TUI as an old copy installed in a writable folder, with a fake release server offering a newer release. The footer badge names the CLI, the release and the key; pressing `u` opens the dialog with the core's in-place plan, which says provenance will not be checked and that upgrading does not restart the running daemon; choosing Upgrade replaces the file with the served release, runs `hooks refresh --json` from it, and the dialog shows the result, the refresh's report and says to restart the TUI.
 #[spec("upgrade/tui-upgrade/001")]
 #[test]
 fn tui_upgrade_001_badge_key_confirm_replaces_the_binary() {
     let version = RELEASE;
-    let (asset, manifest) = release(true);
-    let server = FakeReleases::start(version, asset.clone(), manifest);
     let dir = common::harness_tempdir().expect("tempdir");
+    let log = dir.path().join("release-invocations.log");
+    let (asset, manifest) = recording_release(&log);
+    let server = FakeReleases::start(version, asset.clone(), manifest);
     let exe = writable_install(dir.path());
     let old = std::fs::read(&exe).unwrap();
 
@@ -179,7 +182,15 @@ fn tui_upgrade_001_badge_key_confirm_replaces_the_binary() {
     );
     deck.wait_for_string("Upgraded ");
     deck.wait_for_string("Build provenance was not checked");
+    // PRD #1666 part 3, R-3: the installed file refreshed the hooks.
+    deck.wait_for_string("hooks now run this copy (v9.9.9)");
     deck.wait_for_string("start it again");
+    let ran = invocations(&log);
+    assert_eq!(
+        ran.last().map(String::as_str),
+        Some("hooks refresh --json"),
+        "{ran:?}"
+    );
 
     deck.send_keys(b"\x1b");
     deck.wait_for_absence(&format!("Upgrade to v{version}"));
@@ -286,14 +297,35 @@ fn cli_upgrade_001_check_prints_the_plan_and_changes_nothing() {
     assert_eq!(std::fs::read(&exe).unwrap(), old, "--check changes nothing");
 }
 
-/// Scenario: Run `dot-agent-deck upgrade --yes` as an old copy in a writable folder against a fake release server. It downloads the release, checks it against the checksum manifest, replaces the file and says so.
+/// What the recording release's `hooks refresh --json` reports.
+const REFRESHED: &str = "Claude Code hooks now run this copy (v9.9.9). Restart agents that were already running so they use them.";
+
+/// [`release`], recording each invocation of the release binary in `log`
+/// ([`release_script_recording`]).
+fn recording_release(log: &Path) -> (Vec<u8>, String) {
+    let asset = release_script_recording(RELEASE, log, REFRESHED);
+    let manifest = format!("{}  {}\n", sha256_hex(&asset), cli_asset());
+    (asset, manifest)
+}
+
+/// What the release binary was run with, one invocation a line.
+fn invocations(log: &Path) -> Vec<String> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Scenario: Run `dot-agent-deck upgrade --yes` as an old copy in a writable folder against a fake release server. It downloads the release, checks it against the checksum manifest, replaces the file and says so. Then it runs `hooks refresh --json` from the file it installed and prints that report.
 #[spec("upgrade/cli-upgrade/002")]
 #[test]
 fn cli_upgrade_002_yes_replaces_the_binary() {
     let version = RELEASE;
-    let (asset, manifest) = release(true);
-    let server = FakeReleases::start(version, asset.clone(), manifest);
     let dir = common::harness_tempdir().expect("tempdir");
+    let log = dir.path().join("release-invocations.log");
+    let (asset, manifest) = recording_release(&log);
+    let server = FakeReleases::start(version, asset.clone(), manifest);
     let exe = writable_install(dir.path());
 
     let out = run_upgrade(&server, &exe, dir.path(), &["--yes"]);
@@ -312,6 +344,62 @@ fn cli_upgrade_002_yes_replaces_the_binary() {
         asset,
         "the file is the served release"
     );
+    // PRD #1666 part 3, R-3: the installed copy refreshed the agents' hooks,
+    // after its version check, and the CLI printed its report.
+    let ran = invocations(&log);
+    assert_eq!(
+        ran.last().map(String::as_str),
+        Some("hooks refresh --json"),
+        "{ran:?}"
+    );
+    assert_eq!(
+        ran.iter().filter(|line| line.starts_with("hooks")).count(),
+        1,
+        "{ran:?}"
+    );
+    assert!(stdout.contains(REFRESHED), "{stdout}");
+}
+
+/// Scenario: Run `dot-agent-deck upgrade --yes` as an old copy in a folder the user cannot write, against a fake release server. The download is checked and left staged with the command that installs it, nothing runs `hooks refresh` from it, and the output says the hooks were not updated and gives the `hooks refresh` command for the installed path.
+#[spec("upgrade/cli-upgrade/008")]
+#[test]
+fn cli_upgrade_008_a_staged_download_refreshes_no_hooks() {
+    use std::os::unix::fs::PermissionsExt;
+    if common::effective_uid() == 0 {
+        println!("SKIP: root can write any folder, so nothing is staged");
+        return;
+    }
+    let dir = common::harness_tempdir().expect("tempdir");
+    let log = dir.path().join("release-invocations.log");
+    let (asset, manifest) = recording_release(&log);
+    let server = FakeReleases::start(RELEASE, asset, manifest);
+    let exe = writable_install(dir.path());
+    let old = std::fs::read(&exe).unwrap();
+    let bin = exe.parent().unwrap().to_path_buf();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let out = run_upgrade(&server, &exe, dir.path(), &["--yes"]);
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(std::fs::read(&exe).unwrap(), old, "{stdout}\n{stderr}");
+    let ran = invocations(&log);
+    assert!(
+        ran.iter().any(|line| line == "--version"),
+        "the download was checked: {ran:?}\n{stdout}\n{stderr}"
+    );
+    assert!(
+        !ran.iter().any(|line| line.starts_with("hooks")),
+        "nothing refreshed from the staged file: {ran:?}"
+    );
+    assert!(
+        stdout.contains(dot_agent_deck::self_upgrade::agent_hooks::NOT_INSTALLED),
+        "{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains(&format!("  {} hooks refresh", exe.display())),
+        "{stdout}\n{stderr}"
+    );
+    assert!(!stdout.contains(REFRESHED), "{stdout}");
 }
 
 /// Scenario: Run `dot-agent-deck upgrade --yes` against a fake release server whose checksum manifest does not match the download. The upgrade aborts with the core's mismatch message, exits non-zero, and leaves the old file in place.

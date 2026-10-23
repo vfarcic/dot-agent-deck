@@ -5592,9 +5592,9 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 #### upgrade/tui-upgrade
 
 ##### upgrade/tui-upgrade/001 — The badge's key opens the dialog, and confirming replaces the running copy's binary with the served release.
-- **Layer:** L2 (lane 1, real TUI under portable-pty, fake release server in the test serving a script that answers only `--version`, as the release, and fails on any other invocation, `e2e`-only seams for the running version, the running executable's path and the release URLs).
+- **Layer:** L2 (lane 1, real TUI under portable-pty, fake release server in the test serving a script that answers `--version`, as the release, and `hooks refresh --json`, records each invocation and fails on any other, `e2e`-only seams for the running version, the running executable's path and the release URLs).
 - **Agent:** none.
-- **Asserts:** the footer shows `dot-agent-deck CLI: update available: v<release> (current: v0.0.1)` and `u to upgrade`; `u` opens `Upgrade to v<release>` with the in-place plan, `Upgrading does not restart the daemon on this machine` (issue #1753), `Build provenance will NOT be checked` and `> Cancel`; the file is untouched until Down + Enter; then it becomes the served bytes, and the dialog shows `Upgraded …`, the provenance result and the restart line; Escape closes it.
+- **Asserts:** the footer shows `dot-agent-deck CLI: update available: v<release> (current: v0.0.1)` and `u to upgrade`; `u` opens `Upgrade to v<release>` with the in-place plan, `Upgrading does not restart the daemon on this machine` (issue #1753), `Build provenance will NOT be checked` and `> Cancel`; the file is untouched until Down + Enter; then it becomes the served bytes, the installed file is last run as `hooks refresh --json`, and the dialog shows `Upgraded …`, the provenance result, the refresh's report (PRD #1666 part 3, R-3) and the restart line; Escape closes it.
 - **Does not assert:** provenance verification with an authenticated `gh`, the desktop app's upgrade, a real GitHub release.
 - **Platform coverage:** mac+linux.
 
@@ -5621,11 +5621,11 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Does not assert:** the confirmation prompt on a terminal (`self_upgrade::cli` unit tests).
 - **Platform coverage:** mac+linux.
 
-##### upgrade/cli-upgrade/002 — `upgrade --yes` replaces a downloaded binary with the checked release.
-- **Layer:** L2 (lane 1, real subprocess, fake release server).
+##### upgrade/cli-upgrade/002 — `upgrade --yes` replaces a downloaded binary with the checked release, then refreshes the agents' hooks from it.
+- **Layer:** L2 (lane 1, real subprocess, fake release server serving a script that records its invocations and answers `hooks refresh --json`).
 - **Agent:** none.
-- **Asserts:** exit 0, `Upgraded <path> to v<release>.`, and the file is the served release byte for byte.
-- **Does not assert:** provenance verification, the non-writable `sudo` path.
+- **Asserts:** exit 0, `Upgraded <path> to v<release>.`, and the file is the served release byte for byte; the installed file was last run as `hooks refresh --json`, once, and its report is printed (PRD #1666 part 3, R-3).
+- **Does not assert:** provenance verification, the non-writable `sudo` path (`upgrade/cli-upgrade/008`), a real `hooks refresh` (`hooks/install/019`, `inbox/claude/048`).
 - **Platform coverage:** mac+linux.
 
 ##### upgrade/cli-upgrade/003 — A checksum mismatch aborts and leaves the old binary.
@@ -5654,6 +5654,13 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Agent:** none.
 - **Asserts:** the stand-in `brew` and its `sleep` are gone after the signal; non-zero exit; `failed: it was cancelled and stopped`, then `Cancelled.` as the last line.
 - **Does not assert:** `SIGTERM` (same handler), a command that cannot be stopped (`self_upgrade` unit tests), Ctrl+C at the confirmation question.
+- **Platform coverage:** mac+linux.
+
+##### upgrade/cli-upgrade/008 — A download staged for a folder the user cannot write refreshes no hooks and says how to, once installed.
+- **Layer:** L2 (lane 1, real subprocess, fake release server serving a script that records its invocations; the install's folder made read-only).
+- **Agent:** none.
+- **Asserts:** the installed file is unchanged; the download was run as `--version` and never as `hooks …`; the output has `Agent hooks were not updated. Once it is installed, update them with:` and `<path> hooks refresh` for the installed path, and no refresh report (PRD #1666 part 3, R-3).
+- **Does not assert:** the privilege prompt (the CLI has none), the TUI and desktop clients (`upgrade/upgrade-dialog/015`, desktop `self_upgrade_034`–`036`). Prints `SKIP:` when run as root, which can write the folder.
 - **Platform coverage:** mac+linux.
 
 ##### upgrade/cli-upgrade/007 — Ctrl+C after the release's `--version` check exited, while its output is still read, leaves the binary.
