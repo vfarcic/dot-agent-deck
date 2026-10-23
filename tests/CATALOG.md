@@ -2595,7 +2595,7 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Layer:** fast tier (`tests/deck_log_containment.rs`): the real binary's `wrap --agent codex -- /bin/true` with a cleared environment, the containment marker and an explicit owned root.
 - **Agent:** none (`/bin/true` stands in for the wrapped child; `CODEX_HOME` outside the root makes the automatic install log a containment refusal).
 - **Asserts:** with `DOT_AGENT_DECK_LOG` naming a file in a separate directory standing in for the developer's state dir, that file is never created; with the log inside the owned root, the same run writes the refusal there, so the absence is the logger refusing the path and not a run with nothing to log.
-- **Does not assert:** a log inherited from the shell that lies inside an owned root (the temp dir included), which the binary cannot tell apart from a log a test chose; the default debug log, which a test cannot write without touching the shared file (the `logging` unit test pins its refusal).
+- **Does not assert:** a log inherited from the shell that lies inside an owned root (the temp dir included), which the binary cannot tell apart from a log a test chose; the default debug log, which a test cannot write without touching the shared file (the `config_write_guard` unit test `a_test_process_opens_only_a_log_it_owns` pins its refusal).
 - **Platform coverage:** mac+linux.
 
 ##### logging/containment/002 — A process armed only by nextest's environment never opens a deck.log outside every test scratch root.

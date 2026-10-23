@@ -101,6 +101,12 @@ pub(crate) fn config_write_allowed(dest: &Path) -> bool {
 /// the OS temp dir — itself a default root — and is shared by every deck on the
 /// machine that runs with `DOT_AGENT_DECK_LOG=1`.
 ///
+/// Why: a test run inherits `DOT_AGENT_DECK_LOG` from the shell that started
+/// it — a developer's, or the deck pane's the tests were started in — and every
+/// deck binary a test spawned without clearing its environment appended to that
+/// real `deck.log`, where its lines read as the production daemon's own. A
+/// user's process is not armed, and gets its log unchanged.
+///
 /// Says nothing when it refuses: it is asked before a logger exists, and the
 /// processes asking include the wrapper, whose stderr is an agent's terminal.
 pub fn log_write_allowed(log: &Path) -> bool {
@@ -340,6 +346,29 @@ fn resolve_for_containment(dest: &Path) -> io::Result<PathBuf> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// Scenario: in this unit-test process, which is a test process by
+    /// construction, a log in a test scratch directory may be opened, while a
+    /// log outside every owned root and the deck's default debug log are
+    /// refused — and deciding creates nothing.
+    #[test]
+    fn a_test_process_opens_only_a_log_it_owns() {
+        let fixture = crate::test_temp::tempdir().unwrap();
+        let owned = fixture.path().join("deck.log");
+        assert!(
+            log_write_allowed(&owned),
+            "a scratch-dir log is the test's own"
+        );
+        assert!(
+            !log_write_allowed(Path::new("/deck.log")),
+            "outside every root"
+        );
+        assert!(
+            !log_write_allowed(&crate::platform::paths::default_debug_log_path()),
+            "the default debug log is shared by every deck on the machine"
+        );
+        assert!(!owned.exists(), "deciding the path must not create the log");
+    }
 
     /// Scenario: a stand-in for the shared debug log exists in one directory;
     /// a hard link to it in another directory is the same log, and so is a
