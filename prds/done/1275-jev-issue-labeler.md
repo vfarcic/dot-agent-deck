@@ -5,7 +5,7 @@
 **Closed**: 2026-10-20
 **Priority**: Low
 **Created**: 2026-09-24
-**Related**: [PRD #1273](1273-jev-voice-command-backend.md) (Jev as a voice command model — same model, independent decision), [PRD #421](../421-issue-triage-labels-and-dispatch-claims.md) (the other classification mechanism; the interlock below still holds)
+**Related**: [PRD #1273](1273-jev-voice-command-backend.md) (Jev as a voice command model — same model, independent decision), [PRD #421](https://github.com/vfarcic/dot-agent-deck/issues/421) (the other classification mechanism; the interlock below still holds)
 
 ## Problem Statement
 

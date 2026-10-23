@@ -113,5 +113,5 @@ Per-milestone interactive validation is explicitly *not* required (per `feedback
 - `src/terminal_widget.rs:94-117` — col clamp + cursor-anchored row windowing (removed in M5)
 - `src/embedded_pane.rs:272-295` — `resize_pane_pty` (the one resize primitive; stream-backed panes have no remote resize op)
 - `prds/77-tui-testing-harness.md` — testing harness used by M1 (may need extension)
-- `prds/81-remote-kubernetes-transport.md` — separate effort that owns daemon-side PTY resize
+- [PRD #81](https://github.com/vfarcic/dot-agent-deck/issues/81) — separate effort that owns daemon-side PTY resize
 - `feedback_validate_pre_pr.md` — single pre-PR validation pass policy
