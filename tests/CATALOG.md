@@ -9183,7 +9183,7 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/boundary/027 — An offer moved from a hook worker to OpenCode is not settled by a late ack.
 - **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub over an in-memory duplex and a real spool.
 - **Agent:** none.
-- **Asserts:** a job a Claude worker's `inbox fetch` was handed and positively did not hand over goes to the OpenCode worker's receipt stream; the Claude worker's late acknowledgement claims nothing, the OpenCode copy keeps its one open attempt, and the OpenCode commit claims it.
+- **Asserts:** a job a Claude worker's `inbox fetch` was handed and positively did not hand over goes to the OpenCode worker's receipt stream; the Claude worker's late acknowledgement claims nothing, the OpenCode copy keeps its one open attempt, and the OpenCode commit claims it. A Claude worker that claimed the job and then released it, or let its claim expire, before the job moved to OpenCode gets `wrong_agent` for a later ack, the OpenCode copy stays fetched with one attempt, and the OpenCode worker's ack claims it.
 - **Does not assert:** Pi, which is on receipts (inbox/boundary/035).
 - **Platform coverage:** all.
 

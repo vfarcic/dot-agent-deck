@@ -1581,7 +1581,7 @@ async fn boundary_026_an_offer_moved_from_opencode_to_a_hook_worker_is_not_settl
     oc.close().await;
 }
 
-/// Scenario: A job is offered first to a Claude worker, whose `inbox fetch` (a hook receiver) is handed it and positively does not hand it over, and then to an OpenCode worker, whose receipt stream is handed it. The Claude worker's late acknowledgement of its earlier copy settles nothing: the OpenCode worker's copy stays with its open attempt until the OpenCode worker commits it.
+/// Scenario: A job is offered first to a Claude worker, whose `inbox fetch` (a hook receiver) is handed it and positively does not hand it over, and then to an OpenCode worker, whose receipt stream is handed it. The Claude worker's late acknowledgement of its earlier copy settles nothing: the OpenCode worker's copy stays with its open attempt until the OpenCode worker commits it. A Claude worker that did claim the job, then released it or let the claim run out before it moved on to OpenCode, is answered `wrong_agent` when it acknowledges it again, and the OpenCode worker's own ack still claims it.
 #[spec("inbox/boundary/027")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn boundary_027_an_offer_moved_from_a_hook_worker_to_opencode_is_not_settled_by_a_late_ack() {
@@ -1624,6 +1624,64 @@ async fn boundary_027_an_offer_moved_from_a_hook_worker_to_opencode_is_not_settl
     })
     .await;
     oc.close().await;
+
+    // A previous holder that did take the job, and gave it back by releasing
+    // it or by letting its claim run out, is not its holder either: its
+    // committed attempt is history, and its ack answers `wrong_agent`.
+    for expire in [false, true] {
+        let (hub, _state) = hub_with_spool(Duration::from_secs(30), Duration::from_secs(60));
+        let mut oc = Peer::open(&hub, "oc", "a", InboxComponent::OpenCodePlugin, INTEGRATION).await;
+        oc.next().await;
+        let id = offer_to(&hub, "mixed job", &candidates);
+        let hook = hub.test_hook_fetch("claude", "c", None);
+        assert_eq!(hook.ids(), vec![id.as_str().to_string()]);
+        assert!(matches!(
+            hub.ack(id.as_str(), "claude", "c", AckHow::Explicit),
+            AckOutcome::Claimed { .. }
+        ));
+        hub.test_hook_close(hook);
+        if expire {
+            // The store's clock past any claim's longest allowed life.
+            let mut st = hub.lock();
+            st.inbox
+                .tick(Instant::now() + Duration::from_secs(2 * 24 * 60 * 60));
+            drain_events(&mut st);
+            drop(st);
+            hub.post_owed_notices();
+            assert!(
+                hub.lock().inbox.unassigned_offers().contains(&id),
+                "the Claude worker's claim ran out"
+            );
+        } else {
+            assert_eq!(
+                hub.release(id.as_str(), "claude", "c"),
+                ClaimOutcome::Released
+            );
+        }
+        assert_eq!(
+            hub.assign_offer(&id, &candidates, &live_all),
+            Some(Recipient::bound("oc", "a")),
+            "the next holder is OpenCode (expired: {expire})"
+        );
+        let handed = oc.handout().await;
+        assert_eq!(handed[0].id, id.as_str());
+        assert_eq!(
+            hub.ack(id.as_str(), "claude", "c", AckHow::Explicit),
+            AckOutcome::WrongAgent,
+            "the previous holder's ack is not the job's (expired: {expire})"
+        );
+        assert_eq!(state_of(&hub, "oc", id.as_str()), StateName::Fetched);
+        assert_eq!(attempts_of(&hub, "oc", "a", id.as_str()), 1);
+        assert!(
+            matches!(
+                hub.ack(id.as_str(), "oc", "a", AckHow::Explicit),
+                AckOutcome::Claimed { .. }
+            ),
+            "the current holder's ack claims it (expired: {expire})"
+        );
+        assert_eq!(state_of(&hub, "oc", id.as_str()), StateName::Claimed);
+        oc.close().await;
+    }
 }
 
 /// The current revision of `id` in `pane`/`agent`'s attempt model.
