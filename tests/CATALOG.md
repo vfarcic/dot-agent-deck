@@ -4341,6 +4341,14 @@ without depending on the config struct API.
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
 
+##### orchestration/work-done/032 — The daemon's ranked locks are taken in rank order, and no acquisition form clears poison or panics where it must not.
+- **Layer:** fast unit (`src/lock_rank.rs`, in-crate; no PTY, no daemon).
+- **Agent:** none.
+- **Asserts:** in a debug build, an acquisition out of rank order (R3 under R4, the leaf under a ranked guard, a re-entered rank) panics with the held ranks in its message instead of deadlocking, and a panic under a guard leaves the thread's rank stack consistent for its next acquisition; on a poisoned lock `try_lock` answers `Poisoned` without changing the data, `lock_recovering` and `lock_in_drop(Recover)` hand out the recovered guard, `lock_in_drop(Skip)` answers `None`, `lock` panics, and the lock is still poisoned afterwards; `try_lock` and `lock_in_drop` answer a rank violation without panicking; a guard dropped while its thread's stack is borrowed does nothing and does not panic; `lock_in_drop` in a destructor during an unwind, with a rank violation and a poisoned lock, makes no `tracing` call (a subscriber that panics on any event proves it), counts both skips in `SKIPPED_IN_UNWIND`, and the next ordinary acquisition reports and resets the count.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D6, D15): the report transaction nests R1 → R2 → R3 → R4 → R5, and a destructor that reaches a ranked lock must not panic during an unwind, which would abort the daemon.
+- **Does not assert:** that the daemon's own paths take the locks in order (the whole fast tier runs with the checker active, which is what does); R0 (`AppState`'s `RwLock`), which the checker cannot see; release-build behaviour, where no rank is checked.
+- **Platform coverage:** mac+linux+windows.
+
 #### orchestration/provenance
 
 ##### orchestration/provenance/001 — On the REAL binary, under the DEFAULT policy, a `work-done` forged from outside a pane with nothing but that pane's id is refused and the refusal is reported to its sender, while the same verb issued from inside the pane still lands (issues #1077, #1129).
@@ -11896,6 +11904,18 @@ Manual merge gate: opt in with `DOT_AGENT_DECK_INBOX_LOAD_TEST=1` only when sche
 - **Asserts:** 20 messages across genuine spawn seed, idle and a sleep-tool turn are acknowledged and acted on, and the actual inbox list CLI lists each as acknowledged, within a 300-second agent window; a message left queued fails it (until 2026-10-14 a queued message passed, so a run with nothing acknowledged was green). Three busy-loop processes per available CPU run throughout and are killed/reaped using captured children in Drop; PSI load context is emitted on success and failure; vt100 bottom rows contain no stranded doorbell line or message opener after settling.
 - **Does not assert:** Persistence across daemon restart, exact model prose, or load-test execution in normal verification; only the scheduled opt-in run exercises the loaded scenario.
 - **Platform coverage:** mac+linux, local credentials only; never CI.
+
+#### inbox/recovery
+
+PRD #1666 part 3, round 5: where the deck keeps a worker's report, or a dispatch's result, when the agent it was for is no longer there to take it.
+
+##### inbox/recovery/018 — The retained store's directory moves never replace a file and stay in the directories the deck verified.
+- **Layer:** fast unit (`src/platform/trusted_dir.rs`, in-crate; real files in a temporary directory).
+- **Agent:** none.
+- **Asserts:** `TrustedDir::rename_into` moves a file between two held directories; refuses with `EEXIST`, leaving both files unchanged, to replace a file at the destination name; refuses a name that is not a single component; after the parent of both directories is renamed away and an impostor tree put in its place, still moves within the pinned originals while the impostor receives nothing; and on an injected unsupported-rename error (`ENOSYS`) returns it with the file still in its source and no second name. `sync` succeeds on a held directory.
+- **Why it exists:** the retained-report store transfers a dead run's files by one no-replace rename between held directories (plan D3, D14), so a file is in exactly one owned directory at every instant and no move can overwrite another run's file.
+- **Does not assert:** Windows, whose checks are path-based and are not confinement; that the store stops a transfer on the unsupported error (the store's own tests); durability across a host crash, which depends on the filesystem.
+- **Platform coverage:** mac+linux.
 
 ## Desktop native network scenarios
 

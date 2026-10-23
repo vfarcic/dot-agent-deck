@@ -31,3 +31,6 @@ pub mod shell;
 /// PRD #741 M3 — the attach transport seam: boxed, splittable halves whose
 /// write half carries the half-close-on-drop contract the protocol depends on.
 pub mod transport;
+/// PRD #1666 part 3, round 5: verified directory handles, shared by the receipt
+/// spool and the retained-report store.
+pub mod trusted_dir;

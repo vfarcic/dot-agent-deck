@@ -14,7 +14,10 @@
 //! ([`MAX_INBOX_WAITERS`]), never one of the hook-ingest slots.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
+
+/// A held [`InboxHub`] state lock (rank R3, `crate::lock_rank`).
+type HubGuard<'a> = crate::lock_rank::RankedGuard<'a, { crate::lock_rank::R3 }, HubState>;
 use std::time::{Duration, Instant, SystemTime};
 
 use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt};
@@ -583,7 +586,7 @@ impl std::fmt::Debug for ReplyReservation {
 
 /// The daemon's inbox and the components armed on it. See the module docs.
 pub struct InboxHub {
-    state: Mutex<HubState>,
+    state: crate::lock_rank::RankedMutex<{ crate::lock_rank::R3 }, HubState>,
     /// PR #1735 fifth review (B-05): this run's list of the saved bodies
     /// [`HubState::spills`] tracks, and the revision it last wrote. Taken
     /// only once the hub's lock is released, so a slow write holds up no
@@ -697,7 +700,7 @@ impl InboxHub {
     pub fn new(deck: DeckId, limits: InboxLimits, keepalive: Duration) -> Self {
         let (limits_max_deliver, limits_ack_wait) = (limits.max_deliver, limits.ack_wait);
         Self {
-            state: Mutex::new(HubState {
+            state: crate::lock_rank::RankedMutex::new(HubState {
                 spills: crate::inbox_spills::SpillLedger::default(),
                 spills_revision: 0,
                 inbox: Inbox::new(deck, limits),
@@ -779,8 +782,11 @@ impl InboxHub {
         hub
     }
 
-    fn lock(&self) -> MutexGuard<'_, HubState> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    /// The hub's state, continuing on it if a thread panicked while it held
+    /// it: every existing hub path recovers (PRD #1666 part 3, round 5, plan
+    /// D15 rule 1).
+    fn lock(&self) -> HubGuard<'_> {
+        self.state.lock_recovering()
     }
 
     /// PRD #1666 S3: broadcast every later state change to attached clients as
@@ -2038,7 +2044,7 @@ impl InboxHub {
     /// Answers whether the manifest now holds this revision or a newer one. A
     /// failed write is logged: it costs only the cleanup of those bodies after
     /// this run ends, and the next record writes the whole ledger again.
-    fn record_spills(&self, mut st: MutexGuard<'_, HubState>) -> bool {
+    fn record_spills(&self, mut st: HubGuard<'_>) -> bool {
         st.spills_revision += 1;
         let revision = st.spills_revision;
         let text = st.spills.manifest_text();

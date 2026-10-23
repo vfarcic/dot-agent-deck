@@ -5472,7 +5472,7 @@ fn inbox_probe_binary(
 /// the in-process API; M1.2 wires it to the streaming attach protocol via
 /// [`AgentBus`] and [`AttachHandle`].
 pub struct AgentPtyRegistry {
-    inner: Mutex<RegistryInner>,
+    inner: crate::lock_rank::RankedMutex<{ crate::lock_rank::R4 }, RegistryInner>,
     /// Per-pane dispatch mutex held by `AppState::handle_delegate`
     /// across the entire respawn+write window for a `clear = true`
     /// delegate. Two concurrent connections submitting `Delegate`
@@ -5596,7 +5596,10 @@ pub struct AgentPtyRegistry {
     /// the same reason: the dispatch path, the hook loop's `work-done` arm and
     /// the attach protocol's stop and close arms share this registry and
     /// nothing else.
-    dispatched_units: Mutex<crate::dispatched_units::DispatchedUnits>,
+    dispatched_units: crate::lock_rank::RankedMutex<
+        { crate::lock_rank::LEAF },
+        crate::dispatched_units::DispatchedUnits,
+    >,
     /// Issue #424 (reviewer blocker 3 / auditor MEDIUM): where a daemon-side
     /// delivery failure is REPORTED, so the report is durable state on the
     /// pane's card rather than bytes typed into the agent's input buffer.
@@ -5614,7 +5617,7 @@ pub struct AgentPtyRegistry {
     /// under a `read()` guard on the shared state — putting a mutable map on
     /// `AppState` would force those hot call sites to `write()`. Same
     /// interior-mutability shape as `dispatch_mutexes` / `pane_input`.
-    delegations: Mutex<DelegationTracker>,
+    delegations: crate::lock_rank::RankedMutex<{ crate::lock_rank::R1 }, DelegationTracker>,
     /// PRD #126: monotonic generation stamped onto each
     /// [`OutstandingDelegation`]. A re-delegation to the same worker pane
     /// overwrites the record with a *newer* seq, so delegation #1's still
@@ -5644,7 +5647,10 @@ pub struct AgentPtyRegistry {
     /// under the state READ lock, which cannot mutate a plain `AppState` field.
     /// This registry is already the daemon's interior-mutable home for exactly
     /// this shape of per-pane bookkeeping (delegations, commissions), and it is the one thing both ends are handed.
-    dispatch_returns: Mutex<crate::dispatch_return::DispatchReturns>,
+    dispatch_returns: crate::lock_rank::RankedMutex<
+        { crate::lock_rank::R2 },
+        crate::dispatch_return::DispatchReturns,
+    >,
     /// PRD #1105 — the coalescing gate every `focus-gained` request passes
     /// through before [`Self::record_focus`]; see [`Self::accept_focus_claim`].
     /// Its own lock, never held across a re-apply, so accepting a claim does
@@ -5771,11 +5777,7 @@ struct RespawnTicket<'a> {
 
 impl Drop for RespawnTicket<'_> {
     fn drop(&mut self) {
-        let mut inner = self
-            .registry
-            .inner
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut inner = self.registry.inner.lock_recovering();
         inner.respawns_in_flight = inner.respawns_in_flight.saturating_sub(1);
         inner.respawning_dirs.remove(&self.agent_id);
         inner.respawning_members.remove(&self.agent_id);
@@ -6264,7 +6266,7 @@ impl CommissionDispatchInFlight {
     /// [`AgentPtyRegistry::cancel_watches_of_replaced_agent`] keeps the pane's
     /// idle record rather than risk cancelling this dispatch's.
     pub fn bind_idle_record(&self, seq: Option<u64>) {
-        let mut tracker = self.registry.delegations.lock().unwrap();
+        let mut tracker = self.registry.delegations.lock();
         if let Some(slot) = tracker
             .commission_dispatches_in_flight
             .get_mut(&self.worker_pane_id)
@@ -6287,7 +6289,7 @@ impl std::fmt::Debug for CommissionDispatchInFlight {
 
 impl Drop for CommissionDispatchInFlight {
     fn drop(&mut self) {
-        let mut tracker = self.registry.delegations.lock().unwrap();
+        let mut tracker = self.registry.delegations.lock();
         if let Some(guards) = tracker
             .commission_dispatches_in_flight
             .get_mut(&self.worker_pane_id)
@@ -7094,7 +7096,7 @@ impl Drop for SpawnReservation<'_> {
             // A poisoned lock means some other thread panicked mid-mutation;
             // there is nothing useful to do here and panicking in `Drop` would
             // abort. The stale entry is bounded by one per panicking spawn.
-            if let Ok(mut inner) = self.registry.inner.lock() {
+            if let Ok(mut inner) = self.registry.inner.try_lock() {
                 self.give_up(&mut inner);
             }
             self.registry.release_abandoned_turns();
@@ -7132,7 +7134,7 @@ impl Drop for DirRemovalHold<'_> {
         // A poisoned lock leaves the hold behind, which refuses spawns into one
         // directory for the rest of the daemon's life: the fail-safe direction
         // for a deletion guard, and bounded by one entry per panicking removal.
-        if let Ok(mut inner) = self.registry.inner.lock()
+        if let Ok(mut inner) = self.registry.inner.try_lock()
             && let Some(at) = inner.removal_holds.iter().position(|d| *d == self.dir)
         {
             inner.removal_holds.swap_remove(at);
@@ -7230,10 +7232,7 @@ pub struct GenerationCloseGuard {
 
 impl Drop for GenerationCloseGuard {
     fn drop(&mut self) {
-        let mut inner = match self.registry.inner.lock() {
-            Ok(inner) => inner,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut inner = self.registry.inner.lock_recovering();
         inner.closing_generations.remove(&self.agent_id);
     }
 }
@@ -7260,10 +7259,7 @@ impl InstanceCloseGuard {
 
 impl Drop for InstanceCloseGuard {
     fn drop(&mut self) {
-        let mut inner = match self.registry.inner.lock() {
-            Ok(inner) => inner,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut inner = self.registry.inner.lock_recovering();
         inner.closing_instances.remove(&self.instance);
         if self.finished {
             AgentPtyRegistry::mark_instance_ended_locked(&mut inner, &self.instance);
@@ -7342,7 +7338,7 @@ impl Drop for PaneCleanupHold {
         // another thread panicked mid-mutation, and panicking in `Drop` would
         // abort. A leaked hold blocks reuse of ONE pane id on a registry that is
         // already unable to answer any ownership question at all.
-        if let Ok(mut inner) = self.registry.inner.lock() {
+        if let Ok(mut inner) = self.registry.inner.try_lock() {
             inner.cleanup_holds.remove(&self.pane_id);
         }
     }
@@ -7441,7 +7437,7 @@ impl crate::state::AgentOwnership for AgentPtyRegistry {
 impl AgentPtyRegistry {
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(RegistryInner {
+            inner: crate::lock_rank::RankedMutex::new(RegistryInner {
                 next_id: 1,
                 respawns_in_flight: 0,
                 focused_client: None,
@@ -7488,11 +7484,15 @@ impl AgentPtyRegistry {
             ),
             hook_socket: Mutex::new(None),
             attach_endpoint: Mutex::new(AttachEndpoint::NotConfigured),
-            dispatched_units: Mutex::new(crate::dispatched_units::DispatchedUnits::default()),
+            dispatched_units: crate::lock_rank::RankedMutex::new(
+                crate::dispatched_units::DispatchedUnits::default(),
+            ),
             delivery_notice_sink: Mutex::new(None),
-            delegations: Mutex::new(DelegationTracker::default()),
+            delegations: crate::lock_rank::RankedMutex::new(DelegationTracker::default()),
             delegation_seq: AtomicU64::new(1),
-            dispatch_returns: Mutex::new(crate::dispatch_return::DispatchReturns::default()),
+            dispatch_returns: crate::lock_rank::RankedMutex::new(
+                crate::dispatch_return::DispatchReturns::default(),
+            ),
             focus_claims: Mutex::new(FocusClaims::default()),
             focus_pass: Mutex::new(()),
             focus_applied: tokio::sync::watch::Sender::new(0),
@@ -7810,7 +7810,7 @@ impl AgentPtyRegistry {
         orchestrator_agent_id: &str,
         orchestration: Option<&crate::state::OrchestrationIdentity>,
     ) -> Option<ArmedDelegation> {
-        let mut tracker = self.delegations.lock().unwrap();
+        let mut tracker = self.delegations.lock();
         if tracker.closing_panes.contains(worker_pane_id)
             || tracker.closing_panes.contains(orchestrator_pane_id)
         {
@@ -7860,7 +7860,7 @@ impl AgentPtyRegistry {
         seq: u64,
         worker_agent_id: &str,
     ) {
-        let mut tracker = self.delegations.lock().unwrap();
+        let mut tracker = self.delegations.lock();
         if let Some(record) = tracker.records.get_mut(worker_pane_id)
             && record.seq == seq
         {
@@ -7876,7 +7876,7 @@ impl AgentPtyRegistry {
     /// its report, and that dequeue must follow on every path, written or not.
     /// A no-op if the record is gone or a newer one replaced it.
     pub fn queue_delegation_pointer_write(&self, worker_pane_id: &str, seq: u64) {
-        let mut tracker = self.delegations.lock().unwrap();
+        let mut tracker = self.delegations.lock();
         if let Some(record) = tracker.records.get_mut(worker_pane_id)
             && record.seq == seq
         {
@@ -7890,7 +7890,7 @@ impl AgentPtyRegistry {
     /// idle clock then runs as late as the queue held it. Idempotent, and a
     /// no-op if the record is gone or a newer one replaced it.
     pub fn dequeue_delegation_pointer_write(&self, worker_pane_id: &str, seq: u64) {
-        let mut tracker = self.delegations.lock().unwrap();
+        let mut tracker = self.delegations.lock();
         if let Some(record) = tracker.records.get_mut(worker_pane_id)
             && record.seq == seq
         {
@@ -7904,7 +7904,7 @@ impl AgentPtyRegistry {
     /// [`Self::finish_delegation_pointer_write`], the idle-worker watch holds
     /// its report. A no-op if the record is gone or a newer one replaced it.
     pub fn begin_delegation_pointer_write(&self, worker_pane_id: &str, seq: u64) {
-        let mut tracker = self.delegations.lock().unwrap();
+        let mut tracker = self.delegations.lock();
         if let Some(record) = tracker.records.get_mut(worker_pane_id)
             && record.seq == seq
         {
@@ -7922,7 +7922,7 @@ impl AgentPtyRegistry {
         seq: u64,
         deferred: Duration,
     ) {
-        let mut tracker = self.delegations.lock().unwrap();
+        let mut tracker = self.delegations.lock();
         if let Some(record) = tracker.records.get_mut(worker_pane_id)
             && record.seq == seq
         {
@@ -7947,7 +7947,7 @@ impl AgentPtyRegistry {
         worker_pane_id: &str,
         seq: u64,
     ) -> Option<DelegationIdleClock> {
-        let tracker = self.delegations.lock().unwrap();
+        let tracker = self.delegations.lock();
         tracker
             .records
             .get(worker_pane_id)
@@ -8079,7 +8079,7 @@ impl AgentPtyRegistry {
         now: Instant,
         occupant: Option<&str>,
     ) -> CommissionArm {
-        let mut tracker = self.delegations.lock().unwrap();
+        let mut tracker = self.delegations.lock();
         if tracker.closing_panes.contains(worker_pane_id)
             || tracker.closing_panes.contains(orchestrator_pane_id)
         {
@@ -8182,7 +8182,7 @@ impl AgentPtyRegistry {
     /// "worker exited without work-done" report that a racing `work-done` has
     /// already contradicted.
     pub fn owes_delegation_commission(&self, worker_pane_id: &str) -> bool {
-        let mut tracker = self.delegations.lock().unwrap();
+        let mut tracker = self.delegations.lock();
         Self::expire_commissions(&mut tracker, worker_pane_id, Instant::now());
         tracker
             .commissions
@@ -8229,7 +8229,7 @@ impl AgentPtyRegistry {
         worker_pane_id: &str,
         accept: impl Fn(&DelegationCommission) -> bool,
     ) -> Option<CommissionOwner> {
-        let mut tracker = self.delegations.lock().unwrap();
+        let mut tracker = self.delegations.lock();
         Self::expire_commissions(&mut tracker, worker_pane_id, Instant::now());
         tracker
             .commissions
@@ -8257,7 +8257,7 @@ impl AgentPtyRegistry {
         arm_id: u64,
         worker_agent_id: &str,
     ) -> bool {
-        let mut tracker = self.delegations.lock().unwrap();
+        let mut tracker = self.delegations.lock();
         let Some(entry) = tracker.commissions.get_mut(worker_pane_id) else {
             return false;
         };
@@ -8303,7 +8303,7 @@ impl AgentPtyRegistry {
         cooldown: Duration,
         reopen_settled: bool,
     ) -> Option<ArmedWaitingNotice> {
-        let mut tracker = self.delegations.lock().unwrap();
+        let mut tracker = self.delegations.lock();
         if tracker.closing_panes.contains(worker_pane_id) {
             return None;
         }
@@ -8344,7 +8344,7 @@ impl AgentPtyRegistry {
     /// agent is left alone: one agent leaving its prompt says nothing about
     /// whether another is still at its own (Qodo, #1347).
     pub fn cancel_waiting_notice(&self, worker_pane_id: &str, worker_agent_id: &str) -> bool {
-        let mut tracker = self.delegations.lock().unwrap();
+        let mut tracker = self.delegations.lock();
         if !tracker
             .waiting_notices
             .get(worker_pane_id)
@@ -8362,7 +8362,6 @@ impl AgentPtyRegistry {
     pub fn waiting_notice_is_current(&self, worker_pane_id: &str, seq: u64) -> bool {
         self.delegations
             .lock()
-            .unwrap()
             .waiting_notices
             .get(worker_pane_id)
             .is_some_and(|open| open.seq == seq && !open.settled)
@@ -8376,7 +8375,7 @@ impl AgentPtyRegistry {
     /// which last case recording a cooldown would throttle whatever agent next
     /// takes the pane id (Qodo, #1347).
     pub fn settle_waiting_notice(&self, worker_pane_id: &str, seq: u64, submitted: bool) {
-        let mut tracker = self.delegations.lock().unwrap();
+        let mut tracker = self.delegations.lock();
         let Some(open) = tracker
             .waiting_notices
             .get_mut(worker_pane_id)
@@ -8417,7 +8416,7 @@ impl AgentPtyRegistry {
         // Issue #507: read before the tracker lock, which this method never
         // holds together with the registry's own.
         let reporting_agent = self.pane_current_agent_id(worker_pane_id);
-        let mut tracker = self.delegations.lock().unwrap();
+        let mut tracker = self.delegations.lock();
         Self::expire_commissions(&mut tracker, worker_pane_id, now);
         let retired = Self::retire_commissions_of_a_previous_occupant(
             &mut tracker,
@@ -8537,7 +8536,7 @@ impl AgentPtyRegistry {
     /// delegations apart, such as [`Self::retire_commissions_of_replaced_agent`],
     /// took it already), the oldest goes, so the count stays right either way.
     pub fn release_delegation_commission(&self, worker_pane_id: &str, arm_id: Option<u64>) -> bool {
-        let mut tracker = self.delegations.lock().unwrap();
+        let mut tracker = self.delegations.lock();
         let Some(entry) = tracker.commissions.get_mut(worker_pane_id) else {
             return false;
         };
@@ -8570,7 +8569,7 @@ impl AgentPtyRegistry {
     /// has not yet said which record it armed; otherwise it is the replaced
     /// agent's, including when every queued dispatch armed none.
     pub fn cancel_watches_of_replaced_agent(&self, worker_pane_id: &str) -> bool {
-        let mut tracker = self.delegations.lock().unwrap();
+        let mut tracker = self.delegations.lock();
         let record_seq = tracker.records.get(worker_pane_id).map(|record| record.seq);
         let owned_by_a_queued_dispatch = record_seq.is_some_and(|seq| {
             tracker
@@ -8624,7 +8623,7 @@ impl AgentPtyRegistry {
         worker_pane_id: &str,
         keep_own: bool,
     ) -> u32 {
-        let mut tracker = self.delegations.lock().unwrap();
+        let mut tracker = self.delegations.lock();
         let in_flight = tracker
             .commission_dispatches_in_flight
             .get(worker_pane_id)
@@ -8661,7 +8660,7 @@ impl AgentPtyRegistry {
         worker_pane_id: &str,
         seq: u64,
     ) -> Option<OutstandingDelegation> {
-        let mut tracker = self.delegations.lock().unwrap();
+        let mut tracker = self.delegations.lock();
         if tracker
             .records
             .get(worker_pane_id)
@@ -8679,7 +8678,6 @@ impl AgentPtyRegistry {
     pub fn outstanding_delegation_seq(&self, worker_pane_id: &str) -> Option<u64> {
         self.delegations
             .lock()
-            .unwrap()
             .records
             .get(worker_pane_id)
             .map(|record| record.seq)
@@ -8731,7 +8729,7 @@ impl AgentPtyRegistry {
     /// Reinstating oldest-first means putting a generation on the wire, not
     /// flipping this back.
     pub fn retire_outstanding_delegation(&self, worker_pane_id: &str) -> DelegationRetirement {
-        let mut tracker = self.delegations.lock().unwrap();
+        let mut tracker = self.delegations.lock();
         let Some(delegation) = tracker.records.remove(worker_pane_id) else {
             return DelegationRetirement::Nothing;
         };
@@ -8764,11 +8762,10 @@ impl AgentPtyRegistry {
         unit_agent_id: &str,
         caller: crate::dispatch_return::DispatchCaller,
     ) {
-        let displaced =
-            self.dispatch_returns
-                .lock()
-                .unwrap()
-                .register(unit_pane_id, unit_agent_id, caller);
+        let displaced = self
+            .dispatch_returns
+            .lock()
+            .register(unit_pane_id, unit_agent_id, caller);
         if let Some(stale) = displaced {
             tracing::debug!(
                 unit_pane_id = %unit_pane_id,
@@ -8799,18 +8796,18 @@ impl AgentPtyRegistry {
         // #508, PR #1341 review): the unit's cwd — where an over-long report is
         // saved — is read from that exact agent's record, never re-resolved by
         // pane id, which a successor may already hold.
-        self.dispatch_returns.lock().unwrap().take(unit_pane_id)
+        self.dispatch_returns.lock().take(unit_pane_id)
     }
 
     /// PRD #1666 S11: every outstanding dispatch return as an edge, with the
     /// agent that held each end when the dispatch was made (audit F1).
     pub fn dispatch_edges(&self) -> Vec<crate::dispatch_return::DispatchEdge> {
-        self.dispatch_returns.lock().unwrap().edges()
+        self.dispatch_returns.lock().edges()
     }
 
     /// How many dispatched units still owe a report. Observability and tests.
     pub fn outstanding_dispatch_returns(&self) -> usize {
-        self.dispatch_returns.lock().unwrap().len()
+        self.dispatch_returns.lock().len()
     }
 
     /// PRD #220 Phase 2 review/audit (finding A3): the dispatch-return half of
@@ -8835,7 +8832,6 @@ impl AgentPtyRegistry {
         let dropped = self
             .dispatch_returns
             .lock()
-            .unwrap()
             .evict_exited(pane_id, exited_agent_id);
         if dropped > 0 {
             tracing::debug!(
@@ -8869,14 +8865,14 @@ impl AgentPtyRegistry {
     /// watches by the same two roles, for the same reason — a closed worker owes
     /// no proof of life, and a closed orchestrator has no pane to be told in.
     pub fn begin_pane_close(&self, pane_id: &str) -> Vec<OutstandingDelegation> {
-        let mut tracker = self.delegations.lock().unwrap();
+        let mut tracker = self.delegations.lock();
         tracker.closing_panes.insert(pane_id.to_string());
         // PRD #220 M2.0: the same sweep for the dispatch return edge, and by the
         // same two roles. A closing pane is either a dispatched unit that will
         // now never complete, or a caller with nowhere left to be reported to;
         // either way the entry is undeliverable and must not sit in the map
         // waiting for a pane id to be recycled underneath it.
-        let dropped_returns = self.dispatch_returns.lock().unwrap().evict_pane(pane_id);
+        let dropped_returns = self.dispatch_returns.lock().evict_pane(pane_id);
         if dropped_returns > 0 {
             tracing::debug!(
                 pane_id = %pane_id,
@@ -8930,7 +8926,7 @@ impl AgentPtyRegistry {
     /// the deck holds no delegation on record, not that nobody made one
     /// (`compose_work_done_feedback` in `state.rs`).
     pub fn finish_pane_close(&self, pane_id: &str, closed: bool) -> Vec<OutstandingDelegation> {
-        let mut tracker = self.delegations.lock().unwrap();
+        let mut tracker = self.delegations.lock();
         drop(tracker.close_waiters.remove(pane_id));
         tracker.waiting_notices.remove(pane_id);
         tracker.waiting_notice_sent_at.remove(pane_id);
@@ -8951,11 +8947,7 @@ impl AgentPtyRegistry {
     /// before writing (inside the guarded-send revalidation) so a close that
     /// started after the record was taken still suppresses the prompt.
     pub fn is_pane_closing(&self, pane_id: &str) -> bool {
-        self.delegations
-            .lock()
-            .unwrap()
-            .closing_panes
-            .contains(pane_id)
+        self.delegations.lock().closing_panes.contains(pane_id)
     }
 
     /// PRD #249 round-6 review (Greptile): a future that resolves when
@@ -8982,7 +8974,7 @@ impl AgentPtyRegistry {
     /// the waiter list tracks live waits rather than growing with every delegate.
     pub fn pane_close_signal(&self, pane_id: &str) -> oneshot::Receiver<()> {
         let (tx, rx) = oneshot::channel();
-        let mut tracker = self.delegations.lock().unwrap();
+        let mut tracker = self.delegations.lock();
         if tracker.closing_panes.contains(pane_id) {
             // Dropping `tx` here resolves `rx` immediately.
             return rx;
@@ -9007,7 +8999,7 @@ impl AgentPtyRegistry {
     /// reused, so this can never be satisfied by a successor on the same pane.
     pub fn agent_exit_signal(&self, agent_id: &str) -> oneshot::Receiver<()> {
         let (tx, rx) = oneshot::channel();
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         let live = inner
             .agents
             .get(agent_id)
@@ -9025,7 +9017,7 @@ impl AgentPtyRegistry {
     /// Resolve every [`Self::agent_exit_signal`] waiter for `agent_id`, by
     /// dropping their senders. Called by `pump_reader` at EOF.
     fn signal_agent_exit(&self, agent_id: &str) {
-        let Ok(mut inner) = self.inner.lock() else {
+        let Ok(mut inner) = self.inner.try_lock() else {
             // A poisoned registry lock means the daemon is already in trouble;
             // the waiters' own timeouts still bound them, so this degrades to
             // the pre-#584 behaviour rather than failing anything.
@@ -9052,7 +9044,7 @@ impl AgentPtyRegistry {
         // in this file holds `delegations` while taking `inner`, and this keeps
         // it that way from the other direction too.
         let held_for_cleanup = {
-            let Ok(inner) = self.inner.lock() else {
+            let Ok(inner) = self.inner.try_lock() else {
                 // A poisoned registry lock is not evidence that the pane is
                 // free; fall through to the closing mark rather than inventing
                 // an answer that would let a spawn race a live teardown.
@@ -9076,7 +9068,7 @@ impl AgentPtyRegistry {
     /// conflict. `closing_panes` does not enter into it: `spawn_agent` does not
     /// consult it, so a `DuplicatePaneId` is never attributable to it.
     fn pane_held_for_cleanup(&self, pane_id: &str) -> bool {
-        let Ok(inner) = self.inner.lock() else {
+        let Ok(inner) = self.inner.try_lock() else {
             // A poisoned registry lock is not evidence the pane is free — the
             // same call [`Self::pane_close_in_flight`] makes, and here it fails
             // toward retrying inside a deadline rather than toward reporting a
@@ -9223,7 +9215,7 @@ impl AgentPtyRegistry {
         pane_id: &str,
         exited_agent_id: &str,
     ) -> Vec<OutstandingDelegation> {
-        let mut tracker = self.delegations.lock().unwrap();
+        let mut tracker = self.delegations.lock();
         let swept =
             Self::drain_delegations_touching_for_exit(&mut tracker, pane_id, exited_agent_id);
         if !swept.is_empty() {
@@ -9245,7 +9237,7 @@ impl AgentPtyRegistry {
     /// resulting EOF is observed, the entry is already gone and this
     /// correctly answers `false`.
     fn is_agent_still_registered(&self, agent_id: &str) -> bool {
-        self.inner.lock().unwrap().agents.contains_key(agent_id)
+        self.inner.lock().agents.contains_key(agent_id)
     }
 
     /// Marks `agent_id`'s entry as crashed if it is still registered — a
@@ -9259,7 +9251,7 @@ impl AgentPtyRegistry {
     /// call followed by a second locked mutation, which would reopen exactly
     /// the race this method exists to avoid.
     fn mark_agent_crashed(&self, agent_id: &str) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         if let Some(agent) = inner.agents.get_mut(agent_id) {
             agent.crashed = Some(true);
         }
@@ -9363,7 +9355,7 @@ impl AgentPtyRegistry {
     /// recover the **orchestration cwd** for config resolution, which PRD #140's
     /// `Instance` routing identity no longer carries.
     pub fn pane_orchestration(&self, pane_id: &str) -> Option<PaneOrchestration> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         inner
             .agents
             .values()
@@ -9447,7 +9439,7 @@ impl AgentPtyRegistry {
     /// it on to the inbox's turn clock in order (PRD #1666 G3); `None` when
     /// it touched nothing.
     pub fn note_turn(&self, pane_id_env: &str, agent_id: &str, edge: TurnEdge) -> Option<TurnSeen> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         let owner = inner
             .agents
             .iter()
@@ -9490,7 +9482,7 @@ impl AgentPtyRegistry {
     /// daemon's run. Takes the registry lock only to collect them, and calls
     /// the hub after releasing it.
     fn release_abandoned_turns(&self) {
-        let abandoned = match self.inner.lock() {
+        let abandoned = match self.inner.try_lock() {
             Ok(mut inner) => std::mem::take(&mut inner.abandoned_turns),
             Err(_) => return,
         };
@@ -9580,7 +9572,6 @@ impl AgentPtyRegistry {
     pub fn spawn_agent_type(&self, agent_id: &str) -> Option<AgentType> {
         self.inner
             .lock()
-            .unwrap()
             .agents
             .get(agent_id)
             .and_then(|agent| agent.spawn_agent_type.clone())
@@ -9600,7 +9591,6 @@ impl AgentPtyRegistry {
     pub fn reported_agent_type(&self, agent_id: &str) -> Option<AgentType> {
         self.inner
             .lock()
-            .unwrap()
             .agents
             .get(agent_id)
             .and_then(|agent| agent.agent_type.clone())
@@ -9634,7 +9624,7 @@ impl AgentPtyRegistry {
     /// carried one (see [`spawn`]); `None` means it ran under the daemon's own
     /// default shell.
     pub fn configured_launch_of(&self, agent_id: &str) -> Option<ConfiguredLaunch> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         let agent = inner.agents.get(agent_id)?;
         let command = agent.spawn_command.clone()?;
         let agent_type = agent.spawn_agent_type.clone().or_else(|| {
@@ -9661,7 +9651,6 @@ impl AgentPtyRegistry {
     pub fn agent_is_live(&self, agent_id: &str) -> bool {
         self.inner
             .lock()
-            .unwrap()
             .agents
             .get(agent_id)
             .map(|a| !a.exited.load(Ordering::SeqCst))
@@ -9677,7 +9666,7 @@ impl AgentPtyRegistry {
     /// published. A reservation that is abandoned without publishing stops
     /// counting once it is released.
     pub fn agent_is_live_on_pane(&self, agent_id: &str, pane_id_env: &str) -> bool {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         inner
             .pending_spawns
             .get(agent_id)
@@ -9693,7 +9682,7 @@ impl AgentPtyRegistry {
     /// rather than "any agent for the task", so it never re-delivers into a
     /// dead pane while a sibling role pane happens to still be alive.
     pub fn pane_is_live(&self, pane_id_env: &str) -> bool {
-        self.inner.lock().unwrap().agents.values().any(|a| {
+        self.inner.lock().agents.values().any(|a| {
             a.pane_id_env.as_deref() == Some(pane_id_env) && !a.exited.load(Ordering::SeqCst)
         })
     }
@@ -9803,14 +9792,7 @@ impl AgentPtyRegistry {
         pane: &str,
         cwd: Option<&str>,
     ) -> Result<Option<crate::project_resolve::VerifiedProjectDir>, AgentPtyError> {
-        let Some(expected) = self
-            .inner
-            .lock()
-            .unwrap()
-            .prepared_pane_dirs
-            .get(pane)
-            .copied()
-        else {
+        let Some(expected) = self.inner.lock().prepared_pane_dirs.get(pane).copied() else {
             return Ok(None);
         };
         let Some(cwd) = cwd else {
@@ -10277,7 +10259,7 @@ impl AgentPtyRegistry {
         // removes the turn clock of a reservation that reported a turn once
         // the lock is released.
         let _abandoned_turns = ReleaseAbandonedTurns(self);
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         // Issue #454: hand ownership over from the reservation to `agents`
         // WITHOUT releasing the lock in between — each early return below gives
         // the reservation up (and undoes a prepared binding) under this
@@ -10627,7 +10609,7 @@ impl AgentPtyRegistry {
     /// PRD #1666 S11: every pane with a live (non-exited) agent, as `(pane id,
     /// agent id)`.
     pub fn live_pane_agents(&self) -> Vec<(String, String)> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         inner
             .agents
             .iter()
@@ -10637,7 +10619,7 @@ impl AgentPtyRegistry {
     }
 
     pub fn pane_current_agent_id(&self, pane_id: &str) -> Option<String> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         inner
             .agents
             .iter()
@@ -10662,7 +10644,7 @@ impl AgentPtyRegistry {
     /// could non-deterministically return the retired one instead of the
     /// pane's actual current occupant.
     pub fn agent_id_for_pane_any(&self, pane_id_env: &str) -> Option<String> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         inner
             .agents
             .iter()
@@ -10678,7 +10660,7 @@ impl AgentPtyRegistry {
     /// published this stays `false`; a generation that exited with nothing
     /// published after it still holds the pane.
     fn publication_owns_pane(&self, pane_id_env: &str, agent_id: &str) -> bool {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         inner
             .agents
             .get(agent_id)
@@ -10692,7 +10674,7 @@ impl AgentPtyRegistry {
     /// entry. `false`
     /// for a live pane and for a pane with no entry at all.
     pub fn pane_occupant_has_exited(&self, pane_id_env: &str) -> bool {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         let mut occupants = inner
             .agents
             .values()
@@ -10721,7 +10703,7 @@ impl AgentPtyRegistry {
     /// authorization call site would be re-opening the stale-read race, not
     /// reusing a helper.
     pub fn pane_has_live_attach(&self, pane_id: &str) -> bool {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         inner.agents.values().any(|a| {
             a.pane_id_env.as_deref() == Some(pane_id)
                 && !a.exited.load(Ordering::SeqCst)
@@ -10734,7 +10716,7 @@ impl AgentPtyRegistry {
     /// to the agent the question belongs to. Skips exited entries, like
     /// [`Self::writer_target_for_pane`].
     fn writer_target_for_agent(&self, agent_id: &str) -> Option<PaneWriterTarget> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         inner
             .agents
             .get(agent_id)
@@ -10747,7 +10729,7 @@ impl AgentPtyRegistry {
     }
 
     fn writer_target_for_pane(&self, pane_id: &str) -> Option<PaneWriterTarget> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         inner
             .agents
             .iter()
@@ -11049,7 +11031,7 @@ impl AgentPtyRegistry {
         }
         let mut closed_pane = None;
         let mut agent = {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock();
             let agent = inner
                 .agents
                 .remove(id)
@@ -11239,7 +11221,6 @@ impl AgentPtyRegistry {
             let checked = self
                 .inner
                 .lock()
-                .unwrap()
                 .agents
                 .iter()
                 .find(|(_, a)| a.pane_id_env.as_deref() == Some(pane_id_env))
@@ -11264,7 +11245,7 @@ impl AgentPtyRegistry {
                 return Err(AgentPtyError::CwdNotADirectory(cwd.clone()));
             }
 
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock();
             // Issue #1114: a pane held for cleanup has no record this respawn
             // may replace, EVEN THOUGH it still has one. `spawn_agent` refuses a
             // held pane outright (its third exclusion, issue #454 round 3), and
@@ -11629,7 +11610,7 @@ impl AgentPtyRegistry {
         // badge the fresh child's own hook already reported is left alone, with
         // the origin that hook gave it.
         if let Some(observed) = observed_agent_type.filter(|t| *t != AgentType::None)
-            && let Some(agent) = self.inner.lock().unwrap().agents.get_mut(&new_agent_id)
+            && let Some(agent) = self.inner.lock().agents.get_mut(&new_agent_id)
             && agent.agent_type.is_none()
         {
             agent.agent_type = Some(observed);
@@ -11974,7 +11955,7 @@ impl AgentPtyRegistry {
                 "viewer rows and cols must be > 0 (got {rows}x{cols})"
             )));
         }
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock();
         // Reborrowed so the agent can be borrowed mutably beside the focus
         // record, which the sizing rule reads.
         let inner = &mut *guard;
@@ -12138,7 +12119,7 @@ impl AgentPtyRegistry {
     /// teardown path, where the agent may already be gone, and a teardown that
     /// errors on a race it cannot prevent is noise rather than information.
     pub fn release_viewer(&self, id: &str, token: &str) {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock();
         let inner = &mut *guard;
         let focused = inner.focused_client.as_deref();
         let Some(agent) = inner.agents.get_mut(id) else {
@@ -12315,7 +12296,7 @@ impl AgentPtyRegistry {
     /// Takes the id as given; the protocol handler validates it first.
     fn record_focus(&self, client_id: &str) {
         let moved: Vec<String> = {
-            let mut guard = self.inner.lock().unwrap();
+            let mut guard = self.inner.lock();
             let inner = &mut *guard;
             if inner.focused_client.as_deref() == Some(client_id) {
                 return;
@@ -12334,7 +12315,7 @@ impl AgentPtyRegistry {
                 .collect()
         };
         for id in moved {
-            let mut guard = self.inner.lock().unwrap();
+            let mut guard = self.inner.lock();
             let inner = &mut *guard;
             let focused = inner.focused_client.as_deref();
             // Gone since the scan: its viewers went with it.
@@ -12350,21 +12331,21 @@ impl AgentPtyRegistry {
     /// PRD #1105 — how many times agent `id`'s PTY has actually been resized;
     /// `None` for an unknown agent. See [`RunningAgent::geometry_changes`].
     pub fn geometry_changes_of(&self, id: &str) -> Option<u64> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         inner.agents.get(id).map(|agent| agent.geometry_changes)
     }
 
     /// PRD #1105 — the last-focused client recorded by [`Self::record_focus`],
     /// or `None` if no claim has arrived since this daemon started.
     pub fn focused_client(&self) -> Option<String> {
-        self.inner.lock().unwrap().focused_client.clone()
+        self.inner.lock().focused_client.clone()
     }
 
     /// PRD #1105 — the registered viewers of agent `id`, keyed by viewer token.
     /// Empty for an unknown agent. A copy, taken under the registry lock, for
     /// tests and diagnostics; the sizing policy reads the live map.
     pub fn viewers_of(&self, id: &str) -> HashMap<String, Viewer> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         inner
             .agents
             .get(id)
@@ -12401,7 +12382,7 @@ impl AgentPtyRegistry {
             )));
         }
         let (rows, cols) = clamp_pty_dims_reporting(id, rows, cols);
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock();
         let inner = &mut *guard;
         let focused = inner.focused_client.as_deref();
         let agent = inner
@@ -12542,7 +12523,7 @@ impl AgentPtyRegistry {
     /// if no live agent matches the pane id. Used by tests; production
     /// callers don't need this.
     pub fn pty_size_for_pane(&self, pane_id_env: &str) -> Option<(u16, u16)> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         inner
             .agents
             .values()
@@ -12561,7 +12542,7 @@ impl AgentPtyRegistry {
     ///
     /// [`pty_size_for_pane`]: Self::pty_size_for_pane
     pub fn pty_size_for_agent(&self, id: &str) -> Option<(u16, u16)> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         inner.agents.get(id).map(|a| (a.pty_rows, a.pty_cols))
     }
 
@@ -12584,7 +12565,7 @@ impl AgentPtyRegistry {
     /// [`resize`]: Self::resize
     /// [`pty_size_for_pane`]: Self::pty_size_for_pane
     pub fn snapshot_with_pty_size(&self, id: &str) -> Result<(Vec<u8>, u16, u16), AgentPtyError> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         let agent = inner
             .agents
             .get(id)
@@ -12670,7 +12651,7 @@ impl AgentPtyRegistry {
     /// The nudge's first ioctl: the recorded size, one column narrower.
     /// `false` when the agent is gone or too narrow to shrink.
     fn nudge_shrink(&self, agent_id: &str) -> bool {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         let Some(agent) = inner.agents.get(agent_id) else {
             return false;
         };
@@ -12690,7 +12671,7 @@ impl AgentPtyRegistry {
 
     /// The nudge's second ioctl: back to the size recorded now.
     fn nudge_restore(&self, agent_id: &str) {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         if let Some(agent) = inner.agents.get(agent_id) {
             let _ = agent.master.resize(PtySize {
                 rows: agent.pty_rows,
@@ -12724,7 +12705,7 @@ impl AgentPtyRegistry {
         fn(&[String]) -> bool,
         Option<crate::agent_registry::StrandedLineRecogniser>,
     )> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         let agent = inner.agents.get(agent_id)?;
         let spec = crate::agent_registry::spec(agent.spawn_agent_type.as_ref()?);
         Some((spec.doorbell_composer?, spec.doorbell_stranded_line))
@@ -12738,7 +12719,7 @@ impl AgentPtyRegistry {
         agent_id: &str,
     ) -> Option<(Vec<String>, crate::pane_screen_text::ScreenCursor)> {
         let (bus, rows, cols) = {
-            let inner = self.inner.lock().unwrap();
+            let inner = self.inner.lock();
             let agent = inner.agents.get(agent_id)?;
             (Arc::clone(&agent.bus), agent.pty_rows, agent.pty_cols)
         };
@@ -12762,7 +12743,7 @@ impl AgentPtyRegistry {
     /// straggler from a replaced agent must not clear its successor's block. A
     /// pane with no live agent is a no-op.
     pub fn quota_note_work_event(&self, pane_id: &str, agent_id: Option<&str>) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         for (id, agent) in inner.agents.iter_mut() {
             if agent.pane_id_env.as_deref() == Some(pane_id)
                 && !agent.exited.load(Ordering::SeqCst)
@@ -12781,7 +12762,7 @@ impl AgentPtyRegistry {
         agent_id: &str,
         f: impl FnOnce(&mut Option<u64>) -> T,
     ) -> Option<T> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         let (id, agent) = inner.agents.iter_mut().find(|(_, a)| {
             a.pane_id_env.as_deref() == Some(pane_id) && !a.exited.load(Ordering::SeqCst)
         })?;
@@ -12822,7 +12803,7 @@ impl AgentPtyRegistry {
         worker_agent_id: &str,
         seq: Option<u64>,
     ) -> Option<WorkerBlockedNotice> {
-        let mut tracker = self.delegations.lock().unwrap();
+        let mut tracker = self.delegations.lock();
         Self::claim_worker_blocked_notice_in(&mut tracker, worker_pane_id, worker_agent_id, seq)
     }
 
@@ -12858,7 +12839,7 @@ impl AgentPtyRegistry {
     /// that was retired or superseded since keeps its own flag. Returns whether
     /// the claim was released.
     pub fn release_worker_blocked_notice(&self, worker_pane_id: &str, seq: u64) -> bool {
-        let mut tracker = self.delegations.lock().unwrap();
+        let mut tracker = self.delegations.lock();
         match tracker.records.get_mut(worker_pane_id) {
             Some(record) if record.seq == seq => {
                 record.blocked_reported = false;
@@ -12889,7 +12870,7 @@ impl AgentPtyRegistry {
         epoch: u64,
         seq: Option<u64>,
     ) -> Option<tokio::task::JoinHandle<()>> {
-        let mut tracker = self.delegations.lock().unwrap();
+        let mut tracker = self.delegations.lock();
         let notice = Self::claim_worker_blocked_notice_in(
             &mut tracker,
             worker_pane_id,
@@ -13080,7 +13061,7 @@ impl AgentPtyRegistry {
 
     /// Take just the current scrollback snapshot for an agent.
     pub fn snapshot(&self, id: &str) -> Result<Vec<u8>, AgentPtyError> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         let agent = inner
             .agents
             .get(id)
@@ -13091,7 +13072,7 @@ impl AgentPtyRegistry {
     /// Current number of live broadcast subscribers for an agent. Returns
     /// `None` if the agent is not in the registry.
     pub fn receiver_count(&self, id: &str) -> Option<usize> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         inner.agents.get(id).map(|a| a.bus.receiver_count())
     }
 
@@ -13101,7 +13082,7 @@ impl AgentPtyRegistry {
     /// catches regressions where the child is killed but the registry
     /// entry survives, or vice versa.
     pub fn child_pid(&self, id: &str) -> Option<u32> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         inner.agents.get(id).and_then(|a| a.child.process_id())
     }
 
@@ -13123,7 +13104,7 @@ impl AgentPtyRegistry {
     /// the same handler. Cleanup is exactly the case where a dead entry is the
     /// thing you are looking for.
     pub fn agent_record_any(&self, id: &str) -> Option<AgentRecord> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         inner
             .agents
             .get(id)
@@ -13135,7 +13116,7 @@ impl AgentPtyRegistry {
     /// acquisition. A close has to see a dead role as well as a live one: it is
     /// still registered, and closing it is what cleans up after it.
     pub fn agent_records_including_exited(&self) -> Vec<(AgentRecord, bool)> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         let mut records: Vec<(AgentRecord, bool)> = inner
             .agents
             .iter()
@@ -13156,7 +13137,6 @@ impl AgentPtyRegistry {
     pub fn set_spawned_at_for_test(&self, agent_id: &str, at: chrono::DateTime<chrono::Utc>) {
         self.inner
             .lock()
-            .unwrap()
             .agents
             .get_mut(agent_id)
             .expect("fixture owns the live agent")
@@ -13228,7 +13208,7 @@ impl AgentPtyRegistry {
     /// of a claim as a grant of its own must not, and could not tell the two
     /// apart while this returned a `bool`.
     pub fn generation_ownership(&self, pane_id: Option<&str>, agent_id: Option<&str>) -> Ownership {
-        let Ok(inner) = self.inner.lock() else {
+        let Ok(inner) = self.inner.try_lock() else {
             tracing::error!("generation_ownership: registry lock is poisoned; cannot answer");
             return Ownership::Unknown;
         };
@@ -13346,7 +13326,7 @@ impl AgentPtyRegistry {
         agent_id: &str,
     ) -> Option<crate::event::GenerationVerdict> {
         use crate::event::GenerationVerdict;
-        let Ok(inner) = self.inner.lock() else {
+        let Ok(inner) = self.inner.try_lock() else {
             tracing::error!("pane_generation_verdict: registry lock is poisoned; cannot answer");
             return None;
         };
@@ -13424,7 +13404,7 @@ impl AgentPtyRegistry {
         pane_id: &str,
         stopping_id: &str,
     ) -> Option<PaneCleanupHold> {
-        let Ok(mut inner) = self.inner.lock() else {
+        let Ok(mut inner) = self.inner.try_lock() else {
             tracing::error!(
                 pane_id = %pane_id,
                 stopping = %stopping_id,
@@ -13471,7 +13451,6 @@ impl AgentPtyRegistry {
     pub(crate) fn reserve_pane_for_test(&self, agent_id: &str, pane_id: &str) {
         self.inner
             .lock()
-            .expect("registry lock poisoned in a test seam")
             .pending_spawns
             .insert(agent_id.to_string(), Some(pane_id.to_string()));
     }
@@ -13536,7 +13515,7 @@ impl AgentPtyRegistry {
     /// pane on the dashboard or, worse, race the live entry for
     /// which one wins the local pane_id slot in `wire_stream_pane`.
     pub fn agent_records(&self) -> Vec<AgentRecord> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         let mut records: Vec<AgentRecord> = inner
             .agents
             .iter()
@@ -13658,7 +13637,7 @@ impl AgentPtyRegistry {
         &self,
         shapes: &[crate::platform::proc::ShellToolShape],
     ) -> Vec<ShellActivityCandidate> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         inner
             .agents
             .iter()
@@ -13740,7 +13719,7 @@ impl AgentPtyRegistry {
     /// under the state write lock right before a sample is applied, so a pane
     /// replaced while the sample was in flight is left to the next one.
     pub fn shell_activity_candidate_current(&self, candidate: &ShellActivityCandidate) -> bool {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         inner.agents.get(&candidate.agent_id).is_some_and(|agent| {
             !agent.exited.load(Ordering::SeqCst)
                 && agent.pane_id_env.as_deref() == Some(candidate.pane_id.as_str())
@@ -13756,12 +13735,7 @@ impl AgentPtyRegistry {
     /// entirely.
     #[cfg(test)]
     pub(crate) fn agent_writer(&self, id: &str) -> Option<Arc<AsyncMutex<PaneWriter>>> {
-        self.inner
-            .lock()
-            .unwrap()
-            .agents
-            .get(id)
-            .map(|a| a.writer.clone())
+        self.inner.lock().agents.get(id).map(|a| a.writer.clone())
     }
 
     /// Issue #876 test-only seam: swap a live agent's PTY writer for one a test
@@ -13790,7 +13764,7 @@ impl AgentPtyRegistry {
         inner: Box<dyn std::io::Write + Send>,
     ) -> Box<dyn std::io::Write + Send> {
         let writer = {
-            let guard = self.inner.lock().unwrap();
+            let guard = self.inner.lock();
             guard
                 .agents
                 .get(agent_id)
@@ -13851,7 +13825,7 @@ impl AgentPtyRegistry {
             Some(pane_id),
             Box::new(IdleTestMaster),
         );
-        if let Some(agent) = self.inner.lock().unwrap().agents.get_mut(&id) {
+        if let Some(agent) = self.inner.lock().agents.get_mut(&id) {
             agent.tab_membership = Some(TabMembership::Orchestration {
                 name: "team".to_string(),
                 role_index: usize::from(!is_start_role),
@@ -13906,7 +13880,7 @@ impl AgentPtyRegistry {
         let writer = master
             .take_writer()
             .expect("take_writer for a synthetic test agent");
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         inner.next_id += 1;
         let id = format!("test-agent-{}", inner.next_id);
         let pane_retired = Arc::new(AtomicBool::new(false));
@@ -13977,7 +13951,7 @@ impl AgentPtyRegistry {
         id: &str,
         kind: crate::authoring_seeds::AuthoringKind,
     ) -> Result<(), AgentPtyError> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         let agent = inner
             .agents
             .get_mut(id)
@@ -14025,7 +13999,7 @@ impl AgentPtyRegistry {
         // an agent once worked in still in use leaves it, which is the safe
         // direction, and the list grows only by distinct directories.
         let learned = spawn_dirs(cwd.as_deref(), None);
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         let agent = inner
             .agents
             .get_mut(id)
@@ -14081,7 +14055,7 @@ impl AgentPtyRegistry {
         if pane_id_env.is_empty() {
             return false;
         }
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         inner.agents.values().any(|a| {
             a.pane_id_env.as_deref() == Some(pane_id_env) && !a.exited.load(Ordering::SeqCst)
         })
@@ -14102,7 +14076,7 @@ impl AgentPtyRegistry {
         if pane_id_env.is_empty() {
             return false;
         }
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         inner
             .pending_spawns
             .values()
@@ -14135,7 +14109,7 @@ impl AgentPtyRegistry {
         if *agent_type == AgentType::None || pane_id_env.is_empty() {
             return;
         }
-        let Ok(mut inner) = self.inner.lock() else {
+        let Ok(mut inner) = self.inner.try_lock() else {
             return;
         };
         let speaks = |inner: &RegistryInner, id: &str| {
@@ -14166,7 +14140,7 @@ impl AgentPtyRegistry {
         if *agent_type == AgentType::None || pane_id_env.is_empty() {
             return;
         }
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         if let Some(agent) = inner
             .agents
             .values_mut()
@@ -14208,7 +14182,7 @@ impl AgentPtyRegistry {
         instance: Option<&str>,
         admitted_respawn: bool,
     ) -> Result<(String, SpawnReservation<'_>), AgentPtyError> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         // PRD #1589 D4: no pane joins an instance a `close` is taking down or
         // has finished. Under the same acquisition as the reservation, so a
         // close that begins after this check sees the reservation instead. An
@@ -14313,7 +14287,7 @@ impl AgentPtyRegistry {
     /// its first report must not be refused as `UnknownToken`. A token that was
     /// never minted is in neither map.
     pub fn owner_of_hook_token(&self, token: &str) -> Option<crate::hook_provenance::TokenOwner> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         inner
             .agents
             .iter()
@@ -14352,7 +14326,6 @@ impl AgentPtyRegistry {
     pub fn hook_token_of(&self, agent_id: &str) -> Option<String> {
         self.inner
             .lock()
-            .unwrap()
             .agents
             .get(agent_id)
             .map(|a| a.hook_token.clone())
@@ -14406,7 +14379,7 @@ impl AgentPtyRegistry {
     /// left in place, as a start that is refused after its reservation does.
     #[cfg(test)]
     pub(crate) fn release_spawn_for_test(&self, id: &str) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         inner.pending_spawns.remove(id);
         inner.pending_hook_tokens.remove(id);
         inner.pending_spawn_dirs.remove(id);
@@ -14435,7 +14408,7 @@ impl AgentPtyRegistry {
     /// reservation and its record, because its reservation is released under
     /// the same acquisition that publishes it.
     pub fn dir_in_use(&self, dir: &std::path::Path) -> bool {
-        Self::dir_in_use_locked(&self.inner.lock().unwrap(), dir)
+        Self::dir_in_use_locked(&self.inner.lock(), dir)
     }
 
     /// Issue #1612: authorise deleting `dir`. `None` when anything this
@@ -14452,7 +14425,7 @@ impl AgentPtyRegistry {
     /// no daemon at all, starts in `dir`, and directories are compared by path
     /// ([`path_within`]).
     pub fn hold_dir_for_removal(&self, dir: &std::path::Path) -> Option<DirRemovalHold<'_>> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         if Self::dir_in_use_locked(&inner, dir) {
             return None;
         }
@@ -14501,7 +14474,7 @@ impl AgentPtyRegistry {
     /// `None` when another close already holds the instance, or one finished
     /// it.
     pub fn begin_instance_close(self: &Arc<Self>, instance: &str) -> Option<InstanceCloseGuard> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         if Self::instance_refuses_spawns_locked(&inner, instance) {
             return None;
         }
@@ -14522,7 +14495,7 @@ impl AgentPtyRegistry {
         self: &Arc<Self>,
         agent_id: &str,
     ) -> Option<GenerationCloseGuard> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         if !inner.closing_generations.insert(agent_id.to_string()) {
             return None;
         }
@@ -14535,18 +14508,14 @@ impl AgentPtyRegistry {
     /// PRD #1589: whether a close holds the generation `agent_id` right now.
     #[cfg(test)]
     pub(crate) fn is_generation_closing(&self, agent_id: &str) -> bool {
-        self.inner
-            .lock()
-            .unwrap()
-            .closing_generations
-            .contains(agent_id)
+        self.inner.lock().closing_generations.contains(agent_id)
     }
 
     /// PRD #1589 (auditor SF5): the pane id of the record — live or exited —
     /// of the generation `agent_id`, read by its key rather than by walking
     /// the registry.
     pub fn generation_pane(&self, agent_id: &str) -> Option<String> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         #[cfg(test)]
         self.member_visits.fetch_add(1, Ordering::Relaxed);
         inner.agents.get(agent_id)?.pane_id_env.clone()
@@ -14562,7 +14531,7 @@ impl AgentPtyRegistry {
     /// a new projection would take it past 1,024 retained pane ids, rather
     /// than calling this once per candidate that lists the instance.
     pub fn instance_panes(&self, instance: &str, limit: usize) -> (Vec<String>, bool) {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         let mut first: std::collections::BTreeSet<(bool, u64, &str, &str)> =
             std::collections::BTreeSet::new();
         let mut more = false;
@@ -14612,7 +14581,7 @@ impl AgentPtyRegistry {
     /// replaced generation's agent id. Those are members a close cannot
     /// enumerate from the registry's records and must not read as gone.
     pub fn respawning_members(&self) -> Vec<AgentRecord> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         let mut members: Vec<AgentRecord> = inner.respawning_members.values().cloned().collect();
         members.sort_by_key(|r| r.id.parse::<u64>().unwrap_or(0));
         members
@@ -14631,7 +14600,7 @@ impl AgentPtyRegistry {
             tokio::pin!(settled);
             settled.as_mut().enable();
             let pending = {
-                let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+                let inner = self.inner.lock_recovering();
                 agent_ids
                     .iter()
                     .any(|id| inner.respawning_members.contains_key(id))
@@ -14653,7 +14622,7 @@ impl AgentPtyRegistry {
     /// registration that sees the record lands before the close's unregister,
     /// and one that does not see it is of a generation already closed.
     pub fn generation_registered(&self, agent_id: &str) -> bool {
-        self.inner.lock().unwrap().agents.contains_key(agent_id)
+        self.inner.lock().agents.contains_key(agent_id)
     }
 
     /// PRD #1589 test seam: the next handler that published a generation and
@@ -14718,7 +14687,7 @@ impl AgentPtyRegistry {
 
     /// PRD #1589: whether a close holds `instance` right now, or finished it.
     pub fn is_instance_closing(&self, instance: &str) -> bool {
-        Self::instance_refuses_spawns_locked(&self.inner.lock().unwrap(), instance)
+        Self::instance_refuses_spawns_locked(&self.inner.lock(), instance)
     }
 
     /// PRD #1589 (auditor S1): whether a close finished `instance`, so nothing
@@ -14726,7 +14695,6 @@ impl AgentPtyRegistry {
     pub fn is_instance_ended(&self, instance: &str) -> bool {
         self.inner
             .lock()
-            .unwrap()
             .ended_instances
             .iter()
             .any(|ended| ended == instance)
@@ -14757,7 +14725,7 @@ impl AgentPtyRegistry {
     /// close — a `--pane` close of one role — and still never leave an ended
     /// unit beside a live role of its instance.
     pub fn seal_instance_if_empty(&self, instance: &str) -> bool {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         let member = |membership: Option<&TabMembership>| {
             orchestration_instance_of(membership) == Some(instance)
         };
@@ -14869,10 +14837,12 @@ impl AgentPtyRegistry {
     /// await or while taking the registry lock.
     pub fn dispatched_units(
         &self,
-    ) -> std::sync::MutexGuard<'_, crate::dispatched_units::DispatchedUnits> {
-        self.dispatched_units
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    ) -> crate::lock_rank::RankedGuard<
+        '_,
+        { crate::lock_rank::LEAF },
+        crate::dispatched_units::DispatchedUnits,
+    > {
+        self.dispatched_units.lock_recovering()
     }
 
     /// PRD #1589 D5: a unit's natural EOF. Called from the PTY-EOF path for
@@ -14883,7 +14853,7 @@ impl AgentPtyRegistry {
     /// generation, so it cannot touch a successor's unit.
     pub fn note_unit_member_exited(&self, agent_id: &str, pane_id: Option<&str>) {
         let (instance, instance_all_exited) = {
-            let inner = self.inner.lock().unwrap();
+            let inner = self.inner.lock();
             let instance = inner
                 .agents
                 .get(agent_id)
@@ -14943,7 +14913,7 @@ impl AgentPtyRegistry {
             _ => None,
         };
         let instance_has_records = instance.as_deref().is_some_and(|instance| {
-            self.inner.lock().unwrap().agents.values().any(|a| {
+            self.inner.lock().agents.values().any(|a| {
                 matches!(
                     &a.tab_membership,
                     Some(TabMembership::Orchestration {
@@ -14998,11 +14968,7 @@ impl AgentPtyRegistry {
     /// any record (a respawn removes the old one before inserting the new) while
     /// the daemon's role maps still grant it authority. See that field.
     pub fn pane_was_issued_a_hook_token(&self, pane_id: &str) -> bool {
-        self.inner
-            .lock()
-            .unwrap()
-            .hook_token_panes
-            .contains(pane_id)
+        self.inner.lock().hook_token_panes.contains(pane_id)
     }
 
     /// Issue #318: whether this daemon has EVER issued a hook capability token
@@ -15012,18 +14978,17 @@ impl AgentPtyRegistry {
     pub fn paneless_agent_was_issued_a_hook_token(&self, agent_id: &str) -> bool {
         self.inner
             .lock()
-            .unwrap()
             .hook_token_paneless_agents
             .contains(agent_id)
     }
 
     /// Number of agents currently owned by the registry.
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().agents.len()
+        self.inner.lock().agents.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner.lock().unwrap().agents.is_empty()
+        self.inner.lock().agents.is_empty()
     }
 
     /// PRD #93 round-2 reviewer REV-3: count of *live* (non-exited) agents.
@@ -15036,7 +15001,6 @@ impl AgentPtyRegistry {
     pub fn live_count(&self) -> usize {
         self.inner
             .lock()
-            .unwrap()
             .agents
             .values()
             .filter(|a| !a.exited.load(Ordering::SeqCst))
@@ -15088,7 +15052,7 @@ impl AgentPtyRegistry {
         settle: Duration,
     ) -> Result<AdmissionFreeze<'_>, RespawnsInFlight> {
         let freeze = {
-            let _publishing = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let _publishing = self.inner.lock_recovering();
             self.admission_frozen.store(true, Ordering::SeqCst);
             AdmissionFreeze {
                 registry: self,
@@ -15102,11 +15066,7 @@ impl AgentPtyRegistry {
             let settled = self.respawns_settled.notified();
             tokio::pin!(settled);
             settled.as_mut().enable();
-            let in_flight = self
-                .inner
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .respawns_in_flight;
+            let in_flight = self.inner.lock_recovering().respawns_in_flight;
             if in_flight == 0 {
                 return Ok(freeze);
             }
@@ -15375,7 +15335,7 @@ impl AgentPtyRegistry {
     /// SIGKILL every agent and drain the registry. Idempotent.
     pub fn shutdown_all(&self) {
         let agents: Vec<RunningAgent> = {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock();
             inner.agents.drain().map(|(_, a)| a).collect()
         };
         Self::force_kill_and_reap_all(agents);
@@ -15404,7 +15364,7 @@ impl AgentPtyRegistry {
             return;
         }
         let mut agents: Vec<RunningAgent> = {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock();
             inner.agents.drain().map(|(_, a)| a).collect()
         };
 
@@ -15483,7 +15443,7 @@ mod tests {
         let ids: Vec<String> = (0..300)
             .map(|n| registry.insert_idle_member_for_test(&format!("idle-{n}"), "idle", n == 0))
             .collect();
-        let inner = registry.inner.lock().unwrap();
+        let inner = registry.inner.lock();
         for id in &ids {
             assert_eq!(
                 inner.agents[id].master.as_raw_fd(),
@@ -17042,7 +17002,7 @@ mod spawn_tests {
         let registry = AgentPtyRegistry::new();
         let pane = "verdict-pane-320";
         {
-            let mut inner = registry.inner.lock().unwrap();
+            let mut inner = registry.inner.lock();
             inner
                 .pane_generations
                 .entry(pane.to_string())
@@ -17088,7 +17048,7 @@ mod spawn_tests {
     fn a_reserved_spawn_is_owned_before_its_agent_is_published() {
         let registry = AgentPtyRegistry::new();
         {
-            let mut inner = registry.inner.lock().unwrap();
+            let mut inner = registry.inner.lock();
             inner
                 .pending_spawns
                 .insert("77".to_string(), Some("in-flight-pane-454".to_string()));
@@ -17146,7 +17106,7 @@ mod spawn_tests {
             })
             .expect("spawn /bin/sh");
         assert!(
-            registry.inner.lock().unwrap().pending_spawns.is_empty(),
+            registry.inner.lock().pending_spawns.is_empty(),
             "a published agent must not also hold a reservation"
         );
         assert!(owns(&registry, Some("reserved-ok-454"), Some(&id)));
@@ -17176,7 +17136,7 @@ mod spawn_tests {
     async fn a_second_reservation_for_one_pane_is_refused_before_it_forks() {
         let registry = Arc::new(AgentPtyRegistry::new());
         {
-            let mut inner = registry.inner.lock().unwrap();
+            let mut inner = registry.inner.lock();
             inner.next_id = 900;
             inner
                 .pending_spawns
@@ -17197,7 +17157,7 @@ mod spawn_tests {
              one; got {loser:?}"
         );
 
-        let inner = registry.inner.lock().unwrap();
+        let inner = registry.inner.lock();
         assert_eq!(
             inner.pending_spawns.len(),
             1,
@@ -17216,7 +17176,7 @@ mod spawn_tests {
              report would otherwise be written against the winner's card"
         );
 
-        registry.inner.lock().unwrap().pending_spawns.clear();
+        registry.inner.lock().pending_spawns.clear();
         registry.shutdown_all();
     }
 
@@ -17240,7 +17200,7 @@ mod spawn_tests {
             "precondition: spawning a nonexistent command must fail; got {failed:?}"
         );
         assert!(
-            registry.inner.lock().unwrap().pending_spawns.is_empty(),
+            registry.inner.lock().pending_spawns.is_empty(),
             "a failed spawn must not leave a reservation admitting events for a \
              child that never started — and, now that the reservation is \
              exclusive, must not lock the pane out of ever being spawned again"
@@ -17330,7 +17290,7 @@ mod spawn_tests {
             "a role whose orchestration cwd is held is refused; got {by_orchestration:?}"
         );
         {
-            let inner = registry.inner.lock().unwrap();
+            let inner = registry.inner.lock();
             assert!(
                 inner.agents.is_empty() && inner.pending_spawns.is_empty(),
                 "a refused start forks nothing and leaves no reservation"
@@ -17347,7 +17307,7 @@ mod spawn_tests {
 
         drop(hold);
         assert!(
-            registry.inner.lock().unwrap().removal_holds.is_empty(),
+            registry.inner.lock().removal_holds.is_empty(),
             "dropping the hold releases it"
         );
         let after = registry
@@ -17413,7 +17373,7 @@ mod spawn_tests {
         assert!(registry.dir_in_use(&wt), "the replacement now holds it");
         registry.close_agent(&id).unwrap();
         assert!(
-            registry.inner.lock().unwrap().respawning_dirs.is_empty(),
+            registry.inner.lock().respawning_dirs.is_empty(),
             "the respawn window's entry ends with it"
         );
         assert!(registry.hold_dir_for_removal(&wt).is_some());
@@ -17819,7 +17779,7 @@ mod spawn_tests {
     fn a_pane_a_successor_has_only_reserved_refuses_the_predecessors_cleanup_hold() {
         let registry = Arc::new(AgentPtyRegistry::new());
         {
-            let mut inner = registry.inner.lock().unwrap();
+            let mut inner = registry.inner.lock();
             inner.pending_spawns.insert(
                 "successor-454".to_string(),
                 Some("stop-race-pane-454".to_string()),
@@ -17991,7 +17951,7 @@ mod spawn_tests {
     fn a_poisoned_registry_answers_unknown_rather_than_unclaimed() {
         let registry = std::mem::ManuallyDrop::new(AgentPtyRegistry::new());
         let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _held = registry.inner.lock().unwrap();
+            let _held = registry.inner.lock();
             panic!("poison the registry lock");
         }));
         assert!(
@@ -17999,7 +17959,7 @@ mod spawn_tests {
             "precondition: the closure must have panicked"
         );
         assert!(
-            registry.inner.lock().is_err(),
+            registry.inner.is_poisoned(),
             "precondition: the lock must now be poisoned"
         );
 
@@ -18300,7 +18260,7 @@ mod spawn_tests {
         // Capture child PIDs so we can verify they're actually gone after
         // shutdown_all (not just absent from the registry map).
         let pids: Vec<u32> = {
-            let inner = registry.inner.lock().unwrap();
+            let inner = registry.inner.lock();
             [&id1, &id2]
                 .into_iter()
                 .map(|id| inner.agents.get(id).unwrap().child.process_id().unwrap())
@@ -18430,7 +18390,6 @@ mod spawn_tests {
             pid = registry
                 .inner
                 .lock()
-                .unwrap()
                 .agents
                 .get(&id)
                 .unwrap()
@@ -18600,7 +18559,6 @@ mod spawn_tests {
             registry
                 .inner
                 .lock()
-                .unwrap()
                 .agents
                 .get(&id)
                 .and_then(|a| a.shell_foreground_busy(&[]))
@@ -18615,7 +18573,7 @@ mod spawn_tests {
         assert_eq!(state, Some(false), "an idle shell should not read busy");
 
         let writer = {
-            let inner = registry.inner.lock().unwrap();
+            let inner = registry.inner.lock();
             inner.agents.get(&id).unwrap().writer.clone()
         };
         {
@@ -19196,7 +19154,7 @@ mod spawn_tests {
                 Err(AgentPtyError::CwdNotADirectory(_)) => {}
                 other => panic!("{pane_env:?}: expected CwdNotADirectory, got {other:?}"),
             }
-            let inner = registry.inner.lock().unwrap();
+            let inner = registry.inner.lock();
             assert!(
                 inner.pending_spawns.is_empty(),
                 "{pane_env:?}: the refused spawn must give up its reservation"
@@ -19221,14 +19179,7 @@ mod spawn_tests {
             registry.owner_of_hook_token(&token).map(|o| o.agent_id),
             Some(id)
         );
-        assert!(
-            registry
-                .inner
-                .lock()
-                .unwrap()
-                .pending_hook_tokens
-                .is_empty()
-        );
+        assert!(registry.inner.lock().pending_hook_tokens.is_empty());
         registry.shutdown_all();
     }
 
@@ -20396,7 +20347,7 @@ mod spawn_tests {
     /// fresh write look stuck behind a stale baseline.
     fn write_and_wait_for_scrollback(registry: &AgentPtyRegistry, id: &str, bytes: &[u8]) {
         let writer = {
-            let inner = registry.inner.lock().unwrap();
+            let inner = registry.inner.lock();
             let agent = inner.agents.get(id).expect("agent must exist");
             agent.writer.clone()
         };
@@ -20447,7 +20398,7 @@ mod spawn_tests {
                     ..SpawnOptions::default()
                 })
                 .expect("spawn the doorbell's pane");
-            let bus = Arc::clone(&registry.inner.lock().unwrap().agents[&id].bus);
+            let bus = Arc::clone(&registry.inner.lock().agents[&id].bus);
             bus.push(FRAME.as_bytes().to_vec());
             let checks = std::sync::atomic::AtomicUsize::new(0);
             let outcome = registry
@@ -20500,7 +20451,7 @@ mod spawn_tests {
                 ..SpawnOptions::default()
             })
             .expect("spawn the doorbell's pane");
-        let bus = Arc::clone(&registry.inner.lock().unwrap().agents[&id].bus);
+        let bus = Arc::clone(&registry.inner.lock().agents[&id].bus);
         // The repaint is pushed from another thread, as the reader pushes it.
         // The resize gives that push half a second to land before it clears:
         // it lands at once unless the resize holds the ring meanwhile.
@@ -20936,7 +20887,7 @@ mod spawn_tests {
     /// PRD #1666 S8: the size the kernel holds for agent `id`'s PTY, which a
     /// repaint nudge moves without the registry's record.
     fn kernel_size(registry: &AgentPtyRegistry, id: &str) -> (u16, u16) {
-        let inner = registry.inner.lock().unwrap();
+        let inner = registry.inner.lock();
         let size = inner.agents[id]
             .master
             .get_size()
@@ -20953,9 +20904,7 @@ mod spawn_tests {
     fn repaint_nudge_moves_only_the_kernel_size_and_a_real_resize_wins() {
         let registry = Arc::new(AgentPtyRegistry::new());
         let id = spawn_focus_agent(&registry);
-        let mut geometry = registry.inner.lock().unwrap().agents[&id]
-            .geometry_tx
-            .subscribe();
+        let mut geometry = registry.inner.lock().agents[&id].geometry_tx.subscribe();
         let before = registry.snapshot_with_pty_size(&id).expect("agent");
         let changes = registry.geometry_changes_of(&id).expect("agent");
         let untouched = |geometry: &mut broadcast::Receiver<(u16, u16)>| {
@@ -22322,7 +22271,6 @@ mod spawn_tests {
         registry
             .inner
             .lock()
-            .unwrap()
             .pending_spawns
             .insert("pending-successor".to_string(), Some(PANE.to_string()));
 
@@ -22331,7 +22279,6 @@ mod spawn_tests {
         registry
             .inner
             .lock()
-            .unwrap()
             .pending_spawns
             .remove("pending-successor");
     }
@@ -23692,7 +23639,7 @@ mod spawn_tests {
             }
         }
         let retire = |reg: &Arc<AgentPtyRegistry>, reporting: Option<&str>| {
-            let mut tracker = reg.delegations.lock().unwrap();
+            let mut tracker = reg.delegations.lock();
             AgentPtyRegistry::retire_commissions_of_a_previous_occupant(
                 &mut tracker,
                 "worker",
@@ -23752,7 +23699,7 @@ mod spawn_tests {
         // Read under the lock and asserted after it: a failed assertion with the
         // tracker held would poison it for `queued`'s drop and abort the run.
         let (retired, kept) = {
-            let mut tracker = reg.delegations.lock().unwrap();
+            let mut tracker = reg.delegations.lock();
             let retired = AgentPtyRegistry::retire_commissions_of_a_previous_occupant(
                 &mut tracker,
                 "worker",
@@ -23790,7 +23737,7 @@ mod spawn_tests {
             reg.bind_commission_worker_agent_id("worker", in_flight.arm_id(), agent);
             drop(in_flight);
         }
-        let mut tracker = reg.delegations.lock().unwrap();
+        let mut tracker = reg.delegations.lock();
         assert_eq!(
             AgentPtyRegistry::retire_commissions_of_a_previous_occupant(
                 &mut tracker,
@@ -23828,7 +23775,6 @@ mod spawn_tests {
         drop(newer);
         reg.delegations
             .lock()
-            .unwrap()
             .commissions
             .get_mut("worker")
             .expect("two commissions owed")
@@ -23971,7 +23917,7 @@ mod spawn_tests {
         }
         let _live = reg.pane_close_signal("worker");
         assert_eq!(
-            reg.delegations.lock().unwrap().close_waiters["worker"].len(),
+            reg.delegations.lock().close_waiters["worker"].len(),
             1,
             "senders whose receiver is gone must be pruned on the next call"
         );
@@ -24604,7 +24550,6 @@ mod spawn_tests {
             let id = registry
                 .inner
                 .lock()
-                .unwrap()
                 .pending_spawns
                 .keys()
                 .next()
@@ -25302,7 +25247,7 @@ mod spawn_tests {
         // The child's environment is the only channel to the CLI, so a token the
         // daemon kept but did not export would refuse every legitimate message.
         let exported = {
-            let inner = registry.inner.lock().unwrap();
+            let inner = registry.inner.lock();
             inner.agents[&id]
                 .spawn_env
                 .iter()
@@ -25362,7 +25307,7 @@ mod spawn_tests {
             "the planted value must attest nothing"
         );
         let exported: Vec<String> = {
-            let inner = registry.inner.lock().unwrap();
+            let inner = registry.inner.lock();
             inner.agents[&id]
                 .spawn_env
                 .iter()
@@ -25420,7 +25365,7 @@ mod spawn_tests {
         // to win over it — otherwise the fresh child would present a token the
         // daemon has just retired.
         let exported = {
-            let inner = registry.inner.lock().unwrap();
+            let inner = registry.inner.lock();
             inner.agents[&second]
                 .spawn_env
                 .iter()
