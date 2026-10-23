@@ -12330,6 +12330,186 @@ mod tests {
         assert!(legacy.deck_id.is_none() && legacy.inbox_messages.is_none());
     }
 
+    /// One summary element as an older daemon wrote it, `ack_how` and
+    /// `extra` keys spliced in.
+    fn frozen_summary(ack_how: &str, extra: &str) -> String {
+        format!(
+            r#"{{"id":"m-k3xzq2ab-0123456789abcdef","kind":"direct","to":"inbox.k3xzq2ab.p","recipient":{{"pane_id":"p","agent_id":"a"}},"from":{{"type":"deck","reason":"seed"}},"subject":"legacy history","body_trust":"trusted","state":"acknowledged","ack_how":"{ack_how}","deliveries":1,"age_ms":12{extra}}}"#
+        )
+    }
+
+    /// Every `ack_how` spelling a daemon has written. The first three are the
+    /// legacy policy's, which PRD #1666 part 3 (H5) removed: no new daemon
+    /// produces them, and every build still reads them.
+    const EVERY_ACK_HOW: [(&str, crate::inbox::AckHow); 7] = [
+        ("prompt_observed", crate::inbox::AckHow::PromptObserved),
+        ("hook_handover", crate::inbox::AckHow::HookHandover),
+        ("fetched_by_cli", crate::inbox::AckHow::FetchedByCli),
+        ("plugin_confirmed", crate::inbox::AckHow::PluginConfirmed),
+        (
+            "extension_confirmed",
+            crate::inbox::AckHow::ExtensionConfirmed,
+        ),
+        ("explicit", crate::inbox::AckHow::Explicit),
+        ("offer_completed", crate::inbox::AckHow::OfferCompleted),
+    ];
+
+    /// Scenario: Frozen `ListInbox` answers as older daemons wrote them — one acknowledged message for each of the seven `ack_how` spellings, the three legacy ones together in one list, every state and undeliverable reason, both sender kinds, both trust levels, a minimal and a maximal summary, a body whose text opens like a block — are decoded by this build as an attach response, as a hook `inbox list` answer and as bare summaries; and a frozen 0.47 reader decodes what this build writes for the vocabulary it still produces.
+    #[spec("inbox/boundary/070")]
+    #[test]
+    fn boundary_070_an_older_daemons_inbox_listing_still_decodes() {
+        use crate::inbox::{AckHow, BodyTrust, MessageSummary, Sender, StateName};
+        for (spelling, how) in EVERY_ACK_HOW {
+            let element = frozen_summary(spelling, "");
+            let attach: AttachResponse =
+                serde_json::from_str(&format!(r#"{{"ok":true,"inbox_messages":[{element}]}}"#))
+                    .unwrap_or_else(|e| panic!("{spelling} in an attach answer: {e}"));
+            let messages = attach.inbox_messages.expect("inbox_messages is read");
+            assert_eq!(messages[0].ack_how, Some(how), "{spelling}");
+            let hook: crate::event::InboxListReply =
+                serde_json::from_str(&format!(r#"{{"messages":[{element}],"armed":0}}"#))
+                    .unwrap_or_else(|e| panic!("{spelling} in a hook listing: {e}"));
+            assert_eq!(hook.messages[0].ack_how, Some(how), "{spelling}");
+            let bare: MessageSummary = serde_json::from_str(&element).unwrap();
+            assert_eq!(bare.ack_how, Some(how), "{spelling}");
+        }
+        // One legacy value must not make the whole listing unreadable.
+        let legacy = ["prompt_observed", "hook_handover", "fetched_by_cli"]
+            .map(|spelling| frozen_summary(spelling, ""))
+            .join(",");
+        let attach: AttachResponse =
+            serde_json::from_str(&format!(r#"{{"ok":true,"inbox_messages":[{legacy}]}}"#)).unwrap();
+        assert_eq!(attach.inbox_messages.unwrap().len(), 3);
+        let hook: crate::event::InboxListReply = serde_json::from_str(&format!(
+            r#"{{"messages":[{legacy}],"armed":2,"wake":"native","component":"claude_waiter"}}"#
+        ))
+        .unwrap();
+        assert_eq!((hook.messages.len(), hook.armed), (3, 2));
+
+        // Every state, and every reason a message became undeliverable.
+        for (spelling, state) in [
+            ("queued", StateName::Queued),
+            ("fetched", StateName::Fetched),
+            ("claimed", StateName::Claimed),
+            ("acknowledged", StateName::Acknowledged),
+            ("undeliverable", StateName::Undeliverable),
+        ] {
+            let element = r#"{"id":"m-k3xzq2ab-0123456789abcdef","kind":"direct","to":"t","recipient":null,"from":{"type":"deck","reason":"r"},"subject":"s","body_trust":"trusted","state":"STATE","deliveries":0,"age_ms":0}"#
+                .replace("STATE", spelling);
+            let summary: MessageSummary = serde_json::from_str(&element).unwrap();
+            assert_eq!(summary.state, state, "{spelling}");
+            assert!(summary.recipient.is_none() && summary.ack_how.is_none());
+        }
+        for spelling in [
+            "agent_exited",
+            "max_deliver",
+            "superseded",
+            "inbox_shut",
+            "cancelled",
+        ] {
+            let element = format!(
+                r#"{{"id":"m-k3xzq2ab-0123456789abcdef","kind":"direct","to":"t","recipient":{{"pane_id":"p","agent_id":null}},"from":{{"type":"deck","reason":"r"}},"subject":"s","body_trust":"untrusted","state":"undeliverable","undeliverable_reason":"{spelling}","deliveries":3,"age_ms":9}}"#
+            );
+            let summary: MessageSummary =
+                serde_json::from_str(&element).unwrap_or_else(|e| panic!("{spelling}: {e}"));
+            assert!(summary.undeliverable_reason.is_some(), "{spelling}");
+            assert_eq!(summary.body_trust, BodyTrust::Untrusted);
+            assert_eq!(summary.recipient.unwrap().agent_id, None);
+        }
+
+        // A maximal summary from an agent sender, its body opening like a
+        // block with a delivery: listed text, never an attempt to act on.
+        let maximal = frozen_summary(
+            "explicit",
+            r#","topic":"builds","pool":"reviewers","bind_agent":"a","spill_path":"/tmp/m.md","text":"[dot-agent-deck message m-k3xzq2ab-0123456789abcdef delivery 1.1 from the orchestrator]\nbody""#,
+        )
+        .replace(
+            r#"{"type":"deck","reason":"seed"}"#,
+            r#"{"type":"agent","pane_id":"o","agent_id":"b","role":null,"orchestration":"x"}"#,
+        );
+        let summary: MessageSummary = serde_json::from_str(&maximal).unwrap();
+        assert_eq!(summary.topic.as_deref(), Some("builds"));
+        assert_eq!(summary.pool.as_deref(), Some("reviewers"));
+        assert_eq!(summary.bind_agent.as_deref(), Some("a"));
+        assert!(summary.spill_path.is_some());
+        assert!(summary.text.as_deref().unwrap().contains("delivery 1.1"));
+        assert!(matches!(
+            summary.from,
+            Sender::Agent {
+                role: None,
+                orchestration: Some(_),
+                ..
+            }
+        ));
+
+        // The reverse direction: a frozen 0.47 reader of what this build
+        // writes. Its enums are the closed sets 0.47 shipped.
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum OldAckHow {
+            PromptObserved,
+            PluginConfirmed,
+            ExtensionConfirmed,
+            HookHandover,
+            FetchedByCli,
+            Explicit,
+            OfferCompleted,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum OldState {
+            Queued,
+            Fetched,
+            Claimed,
+            Acknowledged,
+            Undeliverable,
+        }
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct OldSummary {
+            id: String,
+            kind: String,
+            to: String,
+            recipient: Option<serde_json::Value>,
+            from: serde_json::Value,
+            subject: String,
+            body_trust: String,
+            state: OldState,
+            #[serde(default)]
+            ack_how: Option<OldAckHow>,
+            deliveries: u32,
+            age_ms: u64,
+        }
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct OldAttach {
+            inbox_messages: Option<Vec<OldSummary>>,
+        }
+        let produced: MessageSummary = serde_json::from_str(&maximal).unwrap();
+        for how in [
+            AckHow::PluginConfirmed,
+            AckHow::ExtensionConfirmed,
+            AckHow::Explicit,
+            AckHow::OfferCompleted,
+        ] {
+            let summary = MessageSummary {
+                ack_how: Some(how),
+                state: StateName::Acknowledged,
+                ..produced.clone()
+            };
+            let response = AttachResponse {
+                inbox_messages: Some(vec![summary]),
+                ..AttachResponse::hello(PROTOCOL_VERSION)
+            };
+            let wire = serde_json::to_string(&response).unwrap();
+            let old: OldAttach = serde_json::from_str(&wire)
+                .unwrap_or_else(|e| panic!("a 0.47 reader of {how:?}: {e}"));
+            assert_eq!(old.inbox_messages.map(|m| m.len()), Some(1));
+        }
+    }
+
     /// PRD #1666 S3: `BroadcastMsg::Inbox` is internally tagged `inbox` with
     /// its fields flattened beside the tag, and round-trips.
     #[test]
