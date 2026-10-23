@@ -1232,6 +1232,17 @@ impl RetainedStore {
         self.state.is_poisoned()
     }
 
+    /// TEST: poison the store's lock (R5), as a panic under it would.
+    #[cfg(test)]
+    pub(crate) fn poison_for_test(self: &Arc<Self>) {
+        let store = Arc::clone(self);
+        let _ = std::thread::spawn(move || {
+            let _held = store.state.lock();
+            panic!("poison the retained store (test)");
+        })
+        .join();
+    }
+
     pub fn counts(&self) -> Option<StoreCounts> {
         let st = self.state.try_lock().ok()?;
         Some(StoreCounts {
@@ -1364,6 +1375,26 @@ impl RetainedStore {
                     st.revision += 1;
                     Err(WriteFailure::IoOrphaned(error.to_string()))
                 }
+            }
+        }
+    }
+
+    /// Remove `report_id`'s own file, written and not published (its save
+    /// failed after the write), and give its room back. When the removal
+    /// fails, the file stays charged as an orphan whose removal the sweep
+    /// retries, as a failed write's does.
+    pub fn discard(&self, report_id: &str) {
+        let Some(dirs) = &self.dirs else {
+            return;
+        };
+        let name = own_name(report_id);
+        let removed = self.unlink(&dirs.mine, &name).is_ok();
+        if let Ok(mut st) = self.state.try_lock() {
+            if removed {
+                st.drop_own(&name);
+            } else if let Some(file) = st.own.get_mut(&name) {
+                file.state = OwnState::OrphanUnlink;
+                st.revision += 1;
             }
         }
     }

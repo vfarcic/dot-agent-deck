@@ -42,7 +42,7 @@ pub(crate) trait RecordView {
 #[derive(Debug, Default)]
 #[must_use = "run it with InboxHub::after_section once every guard is released"]
 pub(crate) struct AfterSection {
-    wakes: Vec<Recipient>,
+    pub(super) wakes: Vec<Recipient>,
 }
 
 impl InboxHub {
@@ -679,8 +679,11 @@ fn settle_unit_end(
     match reports.units.get(&route.unit_id) {
         Some(UnitEntry::Claimed { claim_id }) => {
             // The claim commits to its snapshot caller; nothing is emitted now
-            // (D12 rule 7). Claims arrive with the report transaction.
-            let _ = claim_id;
+            // (D12 rule 7). A failure of the claim ends the unit instead.
+            let claim_id = *claim_id;
+            if let Some(claim) = reports.claims.get_mut(claim_id) {
+                claim.unit_gone.get_or_insert(how);
+            }
         }
         Some(UnitEntry::Completed { .. } | UnitEntry::Ended { .. }) => {}
         None => {
@@ -688,6 +691,33 @@ fn settle_unit_end(
             dispatch_ended(st, reports, route, pane_id, how, after);
         }
     }
+}
+
+/// [`dispatch_ended`] for a failed terminal claim whose unit ended while it
+/// was being saved: the claim's snapshot caller is told (D12 rule 9).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn dispatch_ended_for(
+    st: &mut HubState,
+    reports: &mut ReportState,
+    unit_id: &str,
+    unit_name: &str,
+    caller: &Recipient,
+    unit_pane_id: &str,
+    unit_agent_id: &str,
+    how: EndedHow,
+    after: &mut AfterSection,
+) {
+    let route = RetainedReturn {
+        unit_agent_id: unit_agent_id.to_string(),
+        caller: DispatchCaller {
+            pane_id: caller.pane_id.clone(),
+            agent_id: caller.agent_id.clone().unwrap_or_default(),
+            unit_name: unit_name.to_string(),
+        },
+        unit_id: unit_id.to_string(),
+        orphaned: false,
+    };
+    dispatch_ended(st, reports, &route, unit_pane_id, how, after);
 }
 
 /// A unit's `dispatch ended` outcome (D7): a deck notice in a live caller's

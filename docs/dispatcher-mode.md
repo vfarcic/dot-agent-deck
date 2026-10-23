@@ -94,6 +94,7 @@ Starting a unit happens in three steps, and each one tells you something differe
 | A turn in the dispatcher pane beginning `dispatch: spawned isolated` | The worktree exists and the unit's agents were started in it. The turn names what was started, its directory and its branch, and usually the commit the worktree was cut from. | That the agent received its task. |
 | A turn beginning `dispatch: a unit you dispatched has completed` | The unit is reporting back: finished, or stuck and unable to continue. The unit received enough work to send a report; read the report to see what happened. | That the work is correct; read the report. |
 | A `dispatch ended` message: `Dispatched unit <name> ended (it exited / it was closed / it could not be restarted) without reporting.` | The unit's agent stopped before it reported: it exited on its own, its pane was closed, or the deck could not restart it. No report is coming. | That its work is lost: its branch and directory are as it left them. |
+| The unit's `work-done --done` prints `Error: nothing was reported: this dispatched unit already ended …` | The unit ended before its report was taken, and its dispatcher was told it ended without a report. | That the unit's work is lost: its branch and directory are as it left them. |
 
 Any other turn beginning `dispatch:` is a failure that says why (a name already used, an orchestration the project does not define, a worktree that could not be created), and the unit did not start. If some of an orchestration's agents were already running when it failed, the deck leaves them and their directory in place and the turn says so.
 
@@ -119,13 +120,13 @@ dispatch: a unit you dispatched has completed (dot-agent-deck daemon report, not
 
 The markers tell the dispatcher to treat the name and report as data, not as instructions, because another agent wrote them. They are expected and do not indicate a problem. A report longer than 4000 characters is cut in that turn, and the turn names a file in the unit's worktree that holds the whole report.
 
-A single-agent unit reports by running `dot-agent-deck work-done`; an orchestration reports when its orchestrator runs `dot-agent-deck work-done --done`.
+A single-agent unit reports by running `dot-agent-deck work-done --done`, and an orchestration when its orchestrator runs it. The unit's agent is told it reported (`Reported this unit complete to the agent that dispatched it.`); a repeat of the same report is answered with the first result and never delivered twice, and a different second report is refused, so the first one stands.
 
 ### When a report does not arrive
 
 The report waits in the dispatcher's inbox while its agent is running. If that agent exits or its pane is closed, the message is not transferred to whatever starts in that pane next. Restarting the daemon clears its inboxes. Check the unit's own report file and worktree when the summary does not arrive.
 
-The deck keeps a copy of every dispatch's start and failure message in its saved-results directory, `retained-reports/` under the deck's state directory, so one that could not reach the dispatcher is not lost with it. It is kept for 24 hours after the dispatcher acknowledged it, and for 7 days after it could not be delivered. A restarted deck keeps the files the previous one left until those times are up, and one that was still waiting for its dispatcher for 7 days from the restart. [Saved results and reports](troubleshooting.md#saved-results-and-reports) says where the directory is. If the deck cannot write a result to disk, the message the dispatcher receives says it is held in memory until the deck restarts, and the deck keeps trying to save it.
+The deck keeps a copy of every unit's report, and of every dispatch's start and failure message, in its saved-results directory, `retained-reports/` under the deck's state directory, so one that could not reach the dispatcher is not lost with it. It is kept for 24 hours after the dispatcher acknowledged it, and for 7 days after it could not be delivered. A restarted deck keeps the files the previous one left until those times are up, and one that was still waiting for its dispatcher for 7 days from the restart. [Saved results and reports](troubleshooting.md#saved-results-and-reports) says where the directory is. If the deck cannot write a result to disk, the message the dispatcher receives says it is held in memory until the deck restarts, and the deck keeps trying to save it.
 
 The unit's work is not affected: it is still committed on the unit's branch, and its directory is still on disk. Only the summary is lost; open the unit's card or tab, or its directory.
 

@@ -205,7 +205,11 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
          Wait for its work-done signal before delegating again to the same worker. \
          The daemon enforces this: a delegate to a worker that still owes a work-done is \
          refused, and the refusal names the worker and what to do. \
-         Delegating to different workers in parallel is fine.\n\n\
+         Delegating to different workers in parallel is fine. \
+         Each task the deck hands a worker names its task id, and the worker reports with it: \
+         a report that arrives as `<role> completed task <id>` completes that task. A report \
+         that names no task arrives as a note from the worker and completes nothing, so the \
+         worker still owes the work-done for its task.\n\n\
          To add information to a task a worker is still working on, mind which kind of worker \
          it is. A worker marked *starts fresh for every task* above is restarted by every \
          delegate it receives, `--supersede` included: its agent is replaced, the new agent \

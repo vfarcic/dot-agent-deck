@@ -1657,6 +1657,15 @@ pub enum DaemonMessage {
     /// Worker (or orchestrator with `done`) reports task completion.
     #[serde(rename = "work_done")]
     WorkDone(WorkDoneSignal),
+    /// PRD #1666 part 3, round 5 (plan D1): which hook verbs this daemon
+    /// serves, answered with a [`HookCapabilitiesReply`] on the same
+    /// connection, which then carries the mutation.
+    #[serde(rename = "hook_capabilities")]
+    HookCapabilities(HookCapabilitiesRequest),
+    /// PRD #1666 part 3, round 5 (plan D1): a task-scoped `work-done`,
+    /// answered with a [`WorkDoneTaskReply`] once the deck kept the report.
+    #[serde(rename = "work_done_task")]
+    WorkDoneTask(WorkDoneTaskRequest),
     /// PRD #201 native prompt delivery: a READ-ONLY request for the seed the
     /// daemon prepared for a pane, so the pane's extension can deliver it
     /// NATIVELY (`pi.sendUserMessage`) instead of the daemon typing it into the
@@ -1812,6 +1821,8 @@ impl DaemonMessage {
         match self {
             DaemonMessage::Delegate(s) => &s.pane_id,
             DaemonMessage::WorkDone(s) => &s.pane_id,
+            DaemonMessage::HookCapabilities(r) => &r.pane_id,
+            DaemonMessage::WorkDoneTask(r) => &r.pane_id,
             DaemonMessage::GetSeed(r) => &r.pane_id,
             DaemonMessage::Dispatch(s) => &s.pane_id,
             DaemonMessage::ListTargets(r) => &r.pane_id,
@@ -1839,6 +1850,8 @@ impl DaemonMessage {
         match self {
             DaemonMessage::Delegate(s) => s.token.as_deref(),
             DaemonMessage::WorkDone(s) => s.token.as_deref(),
+            DaemonMessage::HookCapabilities(r) => r.token.as_deref(),
+            DaemonMessage::WorkDoneTask(r) => r.token.as_deref(),
             DaemonMessage::GetSeed(r) => r.token.as_deref(),
             DaemonMessage::Dispatch(s) => s.token.as_deref(),
             DaemonMessage::ListTargets(r) => r.token.as_deref(),
@@ -1881,6 +1894,8 @@ impl DaemonMessage {
             | DaemonMessage::Ack(_) => true,
             DaemonMessage::Delegate(_)
             | DaemonMessage::WorkDone(_)
+            | DaemonMessage::HookCapabilities(_)
+            | DaemonMessage::WorkDoneTask(_)
             | DaemonMessage::GetSeed(_)
             | DaemonMessage::Dispatch(_)
             | DaemonMessage::ListTargets(_)
@@ -1909,6 +1924,8 @@ impl DaemonMessage {
             }
             DaemonMessage::Delegate(_)
             | DaemonMessage::WorkDone(_)
+            | DaemonMessage::HookCapabilities(_)
+            | DaemonMessage::WorkDoneTask(_)
             | DaemonMessage::GetSeed(_)
             | DaemonMessage::Dispatch(_)
             | DaemonMessage::ListTargets(_)
@@ -1926,6 +1943,8 @@ impl DaemonMessage {
         match self {
             DaemonMessage::Delegate(_) => "delegate",
             DaemonMessage::WorkDone(_) => "work_done",
+            DaemonMessage::HookCapabilities(_) => "hook_capabilities",
+            DaemonMessage::WorkDoneTask(_) => "work_done_task",
             DaemonMessage::GetSeed(_) => "get_seed",
             DaemonMessage::Dispatch(_) => "dispatch",
             DaemonMessage::ListTargets(_) => "list_targets",
@@ -1989,6 +2008,16 @@ impl DaemonMessage {
             // ([`GetSeedResponse::withdrawn`]), so the answer tells a caller
             // that guessed a pane id nothing about the pane.
             DaemonMessage::GetSeed(_) => serde_json::to_string(&GetSeedResponse::withdrawn()),
+            // A refused question names the refusal and confirms no verb, so
+            // the sender withholds its mutation and says why.
+            DaemonMessage::HookCapabilities(_) => serde_json::to_string(&HookCapabilitiesReply {
+                task_scoped_completion: None,
+                code: Some(reason.to_string()),
+                message: Some(message.to_string()),
+            }),
+            DaemonMessage::WorkDoneTask(_) => {
+                serde_json::to_string(&WorkDoneTaskReply::refused(reason, message))
+            }
             DaemonMessage::WorkDone(_)
             | DaemonMessage::Dispatch(_)
             | DaemonMessage::Ack(_)
@@ -2059,6 +2088,8 @@ impl DaemonMessage {
         match self {
             DaemonMessage::Dispatch(_) => serde_json::to_string(&SignalAck::accepted()).ok(),
             DaemonMessage::WorkDone(_)
+            | DaemonMessage::HookCapabilities(_)
+            | DaemonMessage::WorkDoneTask(_)
             | DaemonMessage::Delegate(_)
             | DaemonMessage::RestartRole(_)
             | DaemonMessage::SpawnRole(_)
@@ -4137,6 +4168,112 @@ pub struct WorkDoneSignal {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
     pub timestamp: DateTime<Utc>,
+}
+
+/// PRD #1666 part 3, round 5 (plan D1): the version of task-scoped
+/// completion this daemon serves, answered to [`HookCapabilitiesRequest`].
+/// A sender requires equality, never `>=`: a later version says it still
+/// serves version-1 senders by advertising version 1.
+pub const TASK_SCOPED_COMPLETION: u32 = 1;
+
+/// PRD #1666 part 3, round 5 (plan D1): which hook verbs this daemon serves,
+/// asked on the connection that will carry the mutation. An older daemon
+/// decodes it as nothing it knows and answers nothing, so a sender withholds
+/// its mutation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HookCapabilitiesRequest {
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
+/// The answer to a [`HookCapabilitiesRequest`]. Additive: a field a sender
+/// does not know is ignored, and one it needs but is absent reads as "not
+/// served".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookCapabilitiesReply {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_scoped_completion: Option<u32>,
+    /// On a refusal (the provenance gate), its stable code and sentence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// What a [`WorkDoneTaskRequest`] reports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkDoneMode {
+    /// The delegated task with this id is complete.
+    Task { task_id: String },
+    /// The dispatched unit this agent is the terminal of is complete
+    /// (`--done`).
+    Terminal,
+    /// A note to the orchestrator that completes no task.
+    Uncorrelated,
+    /// A mode this daemon does not know; refused `unsupported_mode`.
+    #[serde(other)]
+    Unknown,
+}
+
+/// PRD #1666 part 3, round 5 (plan D1): a `work-done`, sent only on a
+/// connection where the daemon confirmed [`TASK_SCOPED_COMPLETION`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkDoneTaskRequest {
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    pub mode: WorkDoneMode,
+    pub report: String,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// How a [`WorkDoneTaskRequest`] was settled (plan D5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkDoneDisposition {
+    Accepted,
+    AlreadyAccepted,
+    Uncorrelated,
+    Refused,
+    /// A disposition a newer daemon added: the sender reads it as unconfirmed.
+    #[serde(other)]
+    Unknown,
+}
+
+/// The answer to a [`WorkDoneTaskRequest`] (plan D5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkDoneTaskReply {
+    pub disposition: WorkDoneDisposition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<crate::report_recovery::Destination>,
+    /// A repeat whose body differs from the report already taken.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub differs: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl WorkDoneTaskReply {
+    /// A refusal with its stable `code` and the sentence the worker reads.
+    pub fn refused(code: &str, message: &str) -> Self {
+        WorkDoneTaskReply {
+            disposition: WorkDoneDisposition::Refused,
+            task_id: None,
+            report_id: None,
+            destination: None,
+            differs: false,
+            code: Some(code.to_string()),
+            message: Some(message.to_string()),
+        }
+    }
 }
 
 #[cfg(test)]

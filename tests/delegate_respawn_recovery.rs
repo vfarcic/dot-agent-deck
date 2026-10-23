@@ -35,9 +35,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dot_agent_deck::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, TabMembership};
-use dot_agent_deck::event::{
-    AgentEvent, AgentType, DelegateResponse, DelegateSignal, EventType, WorkDoneSignal,
-};
+use dot_agent_deck::event::{AgentEvent, AgentType, DelegateResponse, DelegateSignal, EventType};
 use spec::spec;
 
 mod common;
@@ -1988,21 +1986,19 @@ async fn send_addendum_with_supersede(clear: bool) -> SupersededWorker {
     .unwrap_or_default();
 
     // The worker reports once, and the orchestrator delegates its next task.
-    fx.daemon
-        .state
-        .read()
-        .await
-        .handle_work_done(
-            WorkDoneSignal {
-                pane_id: WORKER_PANE.to_string(),
-                task: "Finished the task and the addendum.".to_string(),
-                done: false,
-                timestamp: chrono::Utc::now(),
-                token: None,
-            },
-            &fx.daemon.registry,
-        )
-        .await;
+    let (request, provenance) = dot_agent_deck::task_completion::worker_report(
+        &fx.daemon.registry,
+        WORKER_PANE,
+        "Finished the task and the addendum.",
+        false,
+    );
+    let _ = dot_agent_deck::task_completion::complete(
+        &fx.daemon.state,
+        &fx.daemon.registry,
+        request,
+        &provenance,
+    )
+    .await;
     let next = delegate_with(&fx, "The next task.", false).await;
     SupersededWorker {
         working,

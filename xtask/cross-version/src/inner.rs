@@ -1631,7 +1631,9 @@ fn with_attached_tui(
                     cast.daemon_side.to_uppercase(),
                     row.map(|r| r.status.clone()).unwrap_or_default()
                 ),
-                None,
+                // The `work-done` half measured this pane too, and a declared
+                // break that explains it names it (PRD #1666 part 3).
+                row.map(|r| r.pane_id.clone()).filter(|p| !p.is_empty()),
             )
         }
         StatusWait::Unsatisfied(rows, why) => (

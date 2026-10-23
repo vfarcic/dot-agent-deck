@@ -4234,7 +4234,7 @@ without depending on the config struct API.
 ##### orchestration/work-done/001 — A `work-done` from a worker with NO outstanding delegation is reported to the orchestrator as unsolicited, and does not overwrite the last commissioned report (issue #448).
 - **Layer:** fast integration (real `handle_work_done` against daemon-owned PTYs; `cat` stand-ins, no LLM and no `e2e` feature gate).
 - **Agent:** none (a raw no-echo `cat` orchestrator observer, whose inbox is the observable, plus a `cat` worker).
-- **Asserts:** with an earlier delegation's report already parked at `.dot-agent-deck/work-done-coder.md` and nothing delegated, the worker's `work-done` posts one message to the orchestrator's inbox whose deck-written preface carries the unsolicited label (`the deck has no outstanding delegation to that worker on record`, reworded by issue #505); the filed-report note (`Their full report is also saved at .dot-agent-deck/work-done-coder.md.`) is ABSENT; the worker's report travels in the message inside the `[UNTRUSTED-WORKER-REPORT:` frame with the test's fresh sentinel; and the parked earlier report is still on disk byte-for-byte. The inbox is read whole, rendered as `inbox fetch` prints it, with no state changed (PRD #1666 S5).
+- **Asserts:** with an earlier delegation's report already parked at `.dot-agent-deck/work-done-coder.md` and nothing delegated, the worker's `work-done` posts one message to the orchestrator's inbox whose deck-written preface carries the unsolicited label (`the deck has no outstanding delegation to that worker on record`, reworded by issue #505); the filed-report note (`Their full report is also saved at .dot-agent-deck/work-done-coder.md.`) is ABSENT; the worker's report travels in the message inside the `[UNTRUSTED-WORKER-REPORT:` frame with the test's fresh sentinel; and the parked earlier report is still on disk byte-for-byte. The inbox is read whole, rendered as `inbox fetch` prints it, with no state changed (PRD #1666 S5). PRD #1666 part 3, round 5 (plan D10, §8, rewritten on purpose): a report that names no task is a note, and its label is now `This report names no task, so the deck marked no task complete`.
 - **Does not assert:** what the orchestrator then DOES with the label (an LLM decision); the commonest sibling trace — a worker redirected by a human mid-delegation, which produces a well-formed completion for a diverged task and involves no defect (#445/#369); the ledger's own arithmetic (unit-tested on `AgentPtyRegistry::retire_delegation_commission`).
 - **Platform coverage:** mac+linux (unix-only — raw-mode shell observer).
 
@@ -4263,7 +4263,7 @@ without depending on the config struct API.
 ##### orchestration/work-done/005 — A `clear = true` delegate whose respawn FAILS releases its commission, so the next uncommissioned `work-done` from that worker is still reported as unsolicited (issue #448 review, round 2).
 - **Layer:** fast integration (real `handle_delegate` + `handle_work_done` against daemon-owned PTYs; `cat` stand-ins).
 - **Agent:** none (raw no-echo `cat` orchestrator observer; the worker's `cat` is live, and the role COMMAND points at a binary that does not exist).
-- **Asserts:** with the `coder` role at `clear = true` and BOTH delegation watches switched off (`worker_response_timeout_minutes = 0`), a role command naming a nonexistent single-word binary makes the respawn dispose of the live worker and then fail deterministically at `spawn_agent`, and the dispatch takes its respawn-error return. In failure order: the orchestrator's inbox receives the respawn-failure report as a daemon notice naming the worker pane and no role, and nothing of it is typed into the orchestrator's pane; the commission is already released when the notice is visible; the worker's following `work-done` is labelled unsolicited, names no filed report, and writes no summary file; and after the user types into the orchestrator a second delegate posts a second, byte-identical notice (PRD #1666 S5).
+- **Asserts:** with the `coder` role at `clear = true` and BOTH delegation watches switched off (`worker_response_timeout_minutes = 0`), a role command naming a nonexistent single-word binary makes the respawn dispose of the live worker and then fail deterministically at `spawn_agent`, and the dispatch takes its respawn-error return. In failure order: the orchestrator's inbox receives the respawn-failure report as a daemon notice naming the worker pane and no role, and nothing of it is typed into the orchestrator's pane; the commission is already released when the notice is visible; the worker's following `work-done` is labelled unsolicited, names no filed report, and writes no summary file; and after the user types into the orchestrator a second delegate posts a second, byte-identical notice (PRD #1666 S5). PRD #1666 part 3, round 5 (plan D10, §8, rewritten on purpose): a report that names no task is a note, and its label is now `This report names no task, so the deck marked no task complete`.
 - **Also asserts:** hold the real dispatch order lock after a non-clearing delegate is admitted, close its worker and release the lock; the unresolved worker receives no inbox task, the orchestrator gets a bound non-delivery notice, and the next completion is unsolicited with no saved summary. Inbox-admission refusal is covered by `inbox/route/008`; the ledger's own-arm expiry arithmetic remains in `commission_ledger_releases_an_undelivered_delegations_commission` and `commission_ledger_keeps_the_queued_commission_by_arm_id`.
 - **Does not assert:** native adapter behavior or real-model completion.
 - **Platform coverage:** mac+linux (unix-only — raw-mode shell observer).
@@ -4280,7 +4280,7 @@ without depending on the config struct API.
 ##### orchestration/work-done/007 — An unsolicited report longer than the inline bound is cut in the feedback but saved in full to a file the feedback names, and no saved report overwrites another (issue #508).
 - **Layer:** fast integration (real `handle_work_done` against daemon-owned PTYs; `cat` stand-ins, no LLM and no `e2e` feature gate).
 - **Agent:** none (raw no-echo `cat` orchestrator observer plus a `cat` worker).
-- **Asserts:** with an earlier delegation's report parked at `.dot-agent-deck/work-done-coder.md` and nothing delegated, the worker reports `work-done` twice, each time with a multi-line markdown report of ~7 KB whose opening and closing sentinels differ. For each report, in failure order: the message posted to the orchestrator's inbox carries the unsolicited label, the `[UNTRUSTED-WORKER-REPORT:` frame and the report's opening (control: delivered at all); the closing sentinel is ABSENT (control: really cut at 4000 characters, as a one-line excerpt); the preface names a saved file under the coordination directory that holds the WHOLE report between the frame's marker lines, lines intact; the two saved files differ; and the parked earlier report is untouched (PRD #1666 S5).
+- **Asserts:** with an earlier delegation's report parked at `.dot-agent-deck/work-done-coder.md` and nothing delegated, the worker reports `work-done` twice, each time with a multi-line markdown report of ~7 KB whose opening and closing sentinels differ. For each report, in failure order: the message posted to the orchestrator's inbox carries the unsolicited label, the `[UNTRUSTED-WORKER-REPORT:` frame and the report's opening (control: delivered at all); the closing sentinel is ABSENT (control: really cut at 4000 characters, as a one-line excerpt); the preface names a saved file under the coordination directory that holds the WHOLE report between the frame's marker lines, lines intact; the two saved files differ; and the parked earlier report is untouched (PRD #1666 S5). PRD #1666 part 3, round 5 (plan D10, §8, rewritten on purpose): a report that names no task is a note, and its label is now `This report names no task, so the deck marked no task complete`.
 - **Why it exists:** #448 stopped an unsolicited completion writing the role-keyed file, which was correct, but left the inlined copy as the only one — so past 4000 characters the rest of the report was in no file anywhere, while the feedback said "the worker still holds the rest", which a worker following its delivery instructions (delete the `--task-file` once the signal lands) does not. Confirmed red on `main` at `9083c6b` with exactly that message, and red again with only the `save_full_report` call removed from `handle_work_done`.
 - **Does not assert:** the Unfiled path's copy (its coordination directory is usually what broke, so the save usually fails and says so — `state::tests::compose_work_done_feedback_bounds_an_oversized_report_and_says_so` pins the wording, and `save_full_report_never_overwrites_and_says_when_it_could_not_save` the failure); the retention sweep eventually removing the file (`is_sweepable_coordination_name` is asserted on the name in that unit test); an orchestrator actually reading the file (an LLM decision).
 - **Platform coverage:** mac+linux (unix-only — raw-mode shell observer).
@@ -4304,7 +4304,7 @@ without depending on the config struct API.
 ##### orchestration/work-done/011 — A delegated worker's completion after an ABANDONED pane close is not reported to the orchestrator as work it never commissioned (issue #505).
 - **Layer:** fast integration (real `handle_delegate` + `handle_work_done` against daemon-owned PTYs, with the registry's own `begin_pane_close` / `finish_pane_close(_, false)` pair — the calls `StopAgent` makes when `close_agent` fails; `cat` stand-ins, no LLM and no `e2e` feature gate).
 - **Agent:** none (raw no-echo `cat` orchestrator observer plus a `cat` worker). Both delegation watches are off (`worker_response_timeout_minutes = 0`) and `roles = []` keeps `clear` unresolved, so the delegate reaches the live worker without a respawn — `002`'s shape, which that test pins as reporting the ordinary pointer.
-- **Asserts:** two arms, each on a fresh harness: the abandoned close is of the WORKER's pane, then of the ORCHESTRATOR's pane. Control first: after the delegate the ledger owes a commission for the worker. After the abandoned close, the worker's `work-done` still reaches the orchestrator's inbox with its report framed as untrusted (control: delivered at all); the delivered text carries NONE of `You did not commission this work`, `most likely tasked directly by a person` or `you have no outstanding delegation`; it DOES carry the reworded unsolicited label; and it names no filed report (PRD #1666 S5).
+- **Asserts:** two arms, each on a fresh harness: the abandoned close is of the WORKER's pane, then of the ORCHESTRATOR's pane. Control first: after the delegate the ledger owes a commission for the worker. After the abandoned close, the worker's `work-done` still reaches the orchestrator's inbox with its report framed as untrusted (control: delivered at all); the delivered text carries NONE of `You did not commission this work`, `most likely tasked directly by a person` or `you have no outstanding delegation`; it DOES carry the reworded unsolicited label; and it names no filed report (PRD #1666 S5). PRD #1666 part 3, round 5 (§8, rewritten on purpose): the report names its task, which the close did not sweep, so it is that task's report, filed and pointed at, and carries no note label.
 - **Why it exists:** a pane close sweeps the commission ledger when it starts and restores nothing when it fails, so a still-delegated completion arrives with no commission on record. Restoring on failure was rejected (a failed close is usually a `NotFound` for an agent that is already gone, and a restored commission would be credited to the pane's successor — `finish_pane_close`'s doc comment); the fix is that the label asserts only what the deck knows.
 - **Does not assert:** a genuinely failed `StopAgent` round trip through the attach socket (the registry pair is the seam it calls, and `close_agent` failing is not reachable deterministically from a test); the #448 arm-refused-mid-close path, which reaches the same label by a different route; what an orchestrator then does with the reworded label (an LLM decision).
 - **Platform coverage:** mac+linux (unix-only — raw-mode shell observer).
@@ -4328,7 +4328,7 @@ without depending on the config struct API.
 ##### orchestration/work-done/014 — An agent that takes the pane id of a worker that EXITED ON ITS OWN does not inherit that worker's delegation commission: its `work-done` is reported as unsolicited and the last commissioned report stays filed (issue #507).
 - **Layer:** fast integration (`tests/work_done_reporting.rs`: real `handle_delegate` + `handle_work_done` against daemon-owned PTYs, and the registry's own `spawn_agent` for the successor — the spawn the daemon's `StartAgent` makes; no `e2e` feature gate).
 - **Agent:** none (raw no-echo `cat` orchestrator observer; the first worker is a shell loop that exits on a trigger file, the successor is `cat`). Both delegation watches are off (`worker_response_timeout_minutes = 0`) and `roles = []` keeps `clear` unresolved, so each delegate reaches the live worker without a respawn.
-- **Asserts:** control first — a delegate answered by the first worker is filed at `.dot-agent-deck/work-done-coder.md` (sentinel `commissioned-report-body-5e2c`) and named once in the orchestrator's inbox. A second delegate's task is then posted to the first worker's inbox and the ledger owes that commission to that agent. The worker's process exits on its own (no `StopAgent`, no `begin_pane_close`), a different agent takes the same pane id and reports `work-done`: the orchestrator's inbox still names the filed report exactly once, receives the successor's report labelled unsolicited with its sentinel, and `work-done-coder.md` still holds the commissioned report (PRD #1666 S5).
+- **Asserts:** control first — a delegate answered by the first worker is filed at `.dot-agent-deck/work-done-coder.md` (sentinel `commissioned-report-body-5e2c`) and named once in the orchestrator's inbox. A second delegate's task is then posted to the first worker's inbox and the ledger owes that commission to that agent. The worker's process exits on its own (no `StopAgent`, no `begin_pane_close`), a different agent takes the same pane id and reports `work-done`: the orchestrator's inbox still names the filed report exactly once, receives the successor's report labelled unsolicited with its sentinel, and `work-done-coder.md` still holds the commissioned report (PRD #1666 S5). PRD #1666 part 3, round 5 (plan D10, §8, rewritten on purpose): a report that names no task is a note, and its label is now `This report names no task, so the deck marked no task complete`.
 - **Why it exists:** the natural-exit sweep deliberately leaves commissions standing, so the predecessor's was still owed (its TTL is 7 days) and the successor's first `work-done` spent it: credited as delegated work and filed over the role's report. Confirmed red on `main` at `c7ef92f9` (a second "has completed their task" pointer, `left: 2`), and red again with only the crediting-time retire disabled. The keep-what-is-queued half and a successor that was itself delegated to are unit-tested (`agent_pty::spawn_tests::commission_ledger_retires_what_only_a_previous_occupant_owed`, `commission_ledger_keeps_the_queued_commission_by_arm_id`, `commission_ledger_retires_a_predecessor_s_commission_beside_the_successor_s_own`); the same scenario through the real binary is `orchestration/work-done/015`.
 - **Does not assert:** a successor that arrives through `pane restart` or a `clear = true` respawn (those retire on replacement, issue #590); the idle-worker and silent-worker watches, which the exit sweep already retires; a successor reporting while a delegate to the pane is still queued, which is credited to that queued commission by design.
 - **Platform coverage:** mac+linux (unix-only — raw-mode shell observer).
@@ -4339,6 +4339,118 @@ without depending on the config struct API.
 - **Asserts:** Complete a commissioned task, delegate again, then let the worker exit naturally and start a successor in the same pane. Its report reaches the orchestrator inbox as uncommissioned work and leaves the earlier commissioned report file intact.
 - **Test:** `work_done_015_a_successor_in_an_exited_worker_s_pane_is_not_credited_with_its_task` in `tests/e2e_delegate_exited_worker.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/016 — A repeat of an earlier task's report is answered with its first result and touches the newer task nothing.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** After t1 is reported and t2 delegated, t1's identical report answers `already_accepted` with t1's report id, and t2's arm, watch, open entry and the orchestrator's inbox are unchanged.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.1, D4): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/017 — A report with no task id is a note that completes nothing.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** It answers `uncorrelated` to the inbox, the orchestrator gets `note from coder`, and the task stays open with its arm and watch, so the worker still owes its `work-done`.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.1, D10): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/018 — A report from another worker, another generation or another orchestration is refused.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** Each is refused `unknown_task` and the snapshot of arms, watches, open tasks, the orchestrator's inbox, rows, saved files and claims is unchanged.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.1, D9): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/019 — An unknown, malformed or forgotten task id is refused.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** Each is refused `unknown_task` (the forgotten one with the 'does not know task' wording, its tombstone evicted at a bound of 1) and nothing changes.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.1, D2): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/020 — A double report is answered with the first.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** The repeat answers `already_accepted` with the first report id and destination, exit 0, and nothing new is posted, saved or retired.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.1, D4): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/021 — A differing duplicate is not delivered.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** The repeat answers `differs`, the CLI exits 1 saying it was NOT delivered, and the first report stands.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.1, D4): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/022 — An accepted report retires exactly its own task.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** Its own arm, watch and open entry go; a sibling worker's arm, watch and task stay; the orchestrator gets one report naming the task id.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.1, D6): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/023 — A superseded task's report is refused, naming its successor.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** `task_superseded`, the message names the newer task, nothing changes.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.1, D8): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/024 — Unattested task and terminal reports are refused.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** Both are refused `unattested` before anything is read, and nothing changes.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.1, D1): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/025 — A report whose orchestrator was replaced is kept in recovery.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** Two tasks reported after the orchestrator was replaced give two `recipient_exited` rows whose saved files carry the envelope and the report; the successor gets nothing.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.2, D7): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/026 — A failed save changes nothing, and a retry is accepted.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** An injected save failure answers `report_save_failed` with no effect; the same report again is accepted.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.2): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/027 — The orchestrator exiting during the save sends the report to recovery.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** Paused after its save, the orchestrator exits and a successor takes its pane; released, the report is accepted to recovery and a row names the task.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.2, D12): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/028 — An unconsumed report becomes a row when its recipient exits.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** An acknowledged report leaves no row; an unacknowledged one becomes one `recipient_exited`, `never_handed` row.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.2, D13): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/029 — A full store and an oversized report are refused.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** With one file slot taken, `report_store_full` with no effect; over the size limit, `report_too_large`.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.2, D2): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
 - **Platform coverage:** mac+linux.
 
 ##### orchestration/work-done/030 — The task ledger binds each delegated task once, and bounds its tombstones.
@@ -4364,6 +4476,134 @@ without depending on the config struct API.
 - **Why it exists:** PRD #1666 part 3, round 5 (plan D6, D15): the report transaction nests R1 → R2 → R3 → R4 → R5, and a destructor that reaches a ranked lock must not panic during an unwind, which would abort the daemon.
 - **Does not assert:** that the daemon's own paths take the locks in order (the whole fast tier runs with the checker active, which is what does); R0 (`AppState`'s `RwLock`), which the checker cannot see; release-build behaviour, where no rank is checked.
 - **Platform coverage:** mac+linux+windows.
+
+##### orchestration/work-done/038 — The answer is written only after the commit.
+- **Layer:** fast unit (`src/daemon.rs` hook-ingestion tests; the real hook loop on a socket, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** Paused after the save, no byte for 300 ms and an injected failure's only line is `report_save_failed`; paused at `work-done-committed`, no byte while the report is in the orchestrator's inbox and the task retired; released, one `accepted` line.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.7, D12 rule 8): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/039 — The answer follows every part of the commit.
+- **Layer:** fast unit (`src/daemon.rs` hook-ingestion tests; the real hook loop on a socket, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** At `work-done-acked` the line is readable and the arm, watch and open task are already gone.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.7): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/041 — A claimed task is not superseded.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** T2 is armed beside the paused t1; t1's commit releases its own arm once; t2's arm and open task are untouched.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.6, D8): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/042 — Supersede first, then the report is refused.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** `task_superseded`, no effect.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.6, D8): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/043 — A claim before the worker exits commits with no exit notice.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** The worker exits during the paused save; released, the report is accepted and the orchestrator holds only the report.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.6, D12 rule 4): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/044 — A report after the worker exited is refused.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** `task_closed`, and the orchestrator was told of the exit exactly once.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.6, D9): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/045 — A save failure after the worker's exit posts the withheld notices once, and plain exits owe what their tasks owe.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** Through the real EOF: a claimed task's 'worker exited' or 'not delivered' notice is withheld at the exit and posted once by the failure, never on success; a newer task's notice at the exit; a failure before the exit leaves the exit's own notice; a plain exit owes an unacknowledged task one 'not delivered' notice and an acknowledged one one 'worker exited' notice; a close owes no 'worker exited' notice and an unacknowledged task's close today's one undeliverable notice.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.6, D12 rule 4): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/046 — A waiting duplicate follows the first attempt.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** After the first fails, the duplicate is accepted fresh; after the first succeeds, it answers `already_accepted` with the first report id.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.6, D4): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/047 — One generation holds one claim.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** T2's report while t1's is paused answers `report_pending` with no effect.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.6, D12 rule 1): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/048 — A note never reaches a successor or another orchestration.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** A note paused while the orchestrator is replaced is kept in recovery and the successor gets nothing; a note from a pane now in another instance is refused `not_a_worker`, and nothing is sent.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.6, §2 step 1): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/049 — A report out of hand-overs survives history pressure and its recipient's exit.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** With one hand-over and one history row, the report's row exists marked `delivery_failed` and its saved file holds the report.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.2, D13): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/050 — A report out of hand-overs survives a close, and a late ack marks it.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** Its row exists after hand-overs run out, a late commit marks it `acknowledged_late`, and it outlives the pane's close.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.2, D13): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/051 — Duplicates are answered only after the mark and the commit.
+- **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** With A paused after the unit mark, A and two duplicates have no answer for 300 ms while the unit reads as reported and the caller holds nothing; released, A is accepted and the duplicates `already_accepted` with A's report id, and the caller holds one report.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.7, D12 rules 8, 10): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/052 — A save outlives its connection.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** The reporting future is dropped during the paused save; released, the claim settles and a repeat answers from it.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.6, D12 rule 2): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/053 — A panicking save task is settled by its supervisor.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins); `src/agent_pty_terminal_tests.rs` for (j).
+- **Agent:** none.
+- **Asserts:** Before staging `report_save_failed`; after staging, after the mark, after the commit and in the helpers `accepted`; a note panicking before the handover `uncorrelated`; a panic inside the commit after the post: unconfirmed, the state torn, the one inserted message, the file kept, a repeat `deck_unavailable`; a failure asked for a staged claim refuses; the store unavailable before the commit: unconfirmed, nothing written, a repeat `deck_unavailable`.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.6, D12 rule 11, D15): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/054 — A close acting on the mark, then a panic, still delivers once.
+- **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** Rolled forward: one report, no `dispatch ended`, the unit completed; a panic before the post leaves the caller nothing and the connection unconfirmed; one after the post leaves the one inserted report.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.6, D12 rule 8, D15): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
 
 ##### orchestration/work-done/056 — A destructor armed across a dispatch or a respawn does not abort the daemon when it drops during an unwind.
 - **Layer:** fast unit, one child process per case (`src/agent_pty_unwind_tests.rs`; the outer test re-executes its own binary filtered to itself, so an abort reads as a failed status, `SIGABRT`, instead of a hung runner).
@@ -4925,7 +5165,7 @@ without depending on the config struct API.
 ##### dispatch/return/004 — A dispatched unit's completion is refused, with nothing posted and no bytes written, when the caller pane has changed hands before the unit completes (PRD #220 M2.1 / issue #617).
 - **Layer:** fast integration (the real `AppState::handle_work_done` completion path and the inbox's live-agent check against daemon-owned PTYs; no daemon process, git, LLM, credential or `e2e` feature gate).
 - **Agent:** none — the dispatched unit, original caller and successor are raw no-echo `cat` observers. The successor deliberately inherits the caller's `DOT_AGENT_DECK_PANE_ID` while receiving a new registry agent id; readiness markers prove each stub reached raw mode before the test relies on its scrollback.
-- **Asserts:** in failure order, the caller and unit observers are ready; registering the unit retains exactly one return edge; closing the original caller without the deliberate-close sweep and spawning the successor produces a different registry agent id on the same pane; terminal `handle_work_done` consumes the return edge even though delivery is refused; an authorized `GuardedSend::Applied` barrier reaches the successor and its scrollback holds no `dispatch:` text, unit name or report; the caller pane's inbox holds nothing; and the daemon log records the completion refused because its caller is `no longer the live agent`, with `nothing posted` (PRD #1666 S5).
+- **Asserts:** in failure order, the caller and unit observers are ready; registering the unit retains exactly one return edge; closing the original caller without the deliberate-close sweep and spawning the successor produces a different registry agent id on the same pane; terminal `handle_work_done` consumes the return edge even though delivery is refused; an authorized `GuardedSend::Applied` barrier reaches the successor and its scrollback holds no `dispatch:` text, unit name or report; the caller pane's inbox holds nothing; and the daemon log records the completion refused because its caller is `no longer the live agent`, with `nothing posted` (PRD #1666 S5). PRD #1666 part 3, round 5 (plan D7, §8, rewritten on purpose): the completion is not dropped; it is kept as exactly one `dispatch_finished` recovery row naming the gone caller, cause `recipient_exited`, with its saved report.
 - **Why it exists:** the completion sits behind a different path and a much wider race window — the dispatched unit's entire lifetime. A pane id is reusable, so delivery keyed only by that string would submit the old unit's report as a turn to an unrelated successor that may act on it. The test deliberately uses `close_agent` rather than `begin_pane_close` so the retained edge survives until completion and the guarded delivery itself is the only protection under test; bypassing that identity binding leaks the full report into the barriered successor snapshot and makes the absence assertion fail.
 - **Does not assert:** dispatch spawning or callback registration through `handle_dispatch` (`dispatch/return/001-003` own the real CLI boundary), deliberate-close eviction (`dispatch/return/005`), the `Ambiguous` partial-write branch, retry beyond asserting the entry is consumed, or real-agent behavior.
 - **Platform coverage:** mac+linux (unix-only fast test — every observer is a POSIX-shell raw `cat`).
@@ -4933,7 +5173,7 @@ without depending on the config struct API.
 ##### dispatch/return/005 — Closing a dispatch caller orphans its retained return edge, so a later unit completion reaches no alternate pane (PRD #220 M2.2; PRD #1666 part 3, round 5).
 - **Layer:** fast integration (the real `AgentPtyRegistry::begin_pane_close` / `finish_pane_close` lifecycle and `AppState::handle_work_done` against daemon-owned PTYs; no daemon process, git, LLM, credential or `e2e` feature gate).
 - **Agent:** none — raw no-echo `cat` observers stand in for the still-live dispatched unit, the caller that is deliberately closed, and an unrelated alternate recipient. Distinct readiness markers prove all relevant PTYs are live before the close and completion.
-- **Asserts:** in failure order, caller, unit and alternate observers are ready; registering the unit retains exactly one return edge; `begin_pane_close` on the CALLER keeps the edge, orphaned, and drops it from the dispatch tree (`dispatch_edges` is empty) before the child is closed; the full close lifecycle completes; the unit's terminal `handle_work_done` consumes the orphaned edge without panic and recreates or reroutes nothing; an authorized `GuardedSend::Applied` barrier reaches the unrelated pane; its drained snapshot contains none of the fenced completion turn — neither `dispatch:`, the unit name that would occupy `UNTRUSTED-ROLE-LABEL`, nor the report that would occupy `UNTRUSTED-WORKER-REPORT`; the close log says it orphaned the caller's routes; and the late completion is logged as refused because its caller is no longer the live agent, with nothing posted.
+- **Asserts:** in failure order, caller, unit and alternate observers are ready; registering the unit retains exactly one return edge; `begin_pane_close` on the CALLER keeps the edge, orphaned, and drops it from the dispatch tree (`dispatch_edges` is empty) before the child is closed; the full close lifecycle completes; the unit's terminal `handle_work_done` consumes the orphaned edge without panic and recreates or reroutes nothing; an authorized `GuardedSend::Applied` barrier reaches the unrelated pane; its drained snapshot contains none of the fenced completion turn — neither `dispatch:`, the unit name that would occupy `UNTRUSTED-ROLE-LABEL`, nor the report that would occupy `UNTRUSTED-WORKER-REPORT`; the close log says it orphaned the caller's routes; and the late completion is logged as refused because its caller is no longer the live agent, with nothing posted. PRD #1666 part 3, round 5 (plan D7, §8, rewritten on purpose): the completion is not dropped; it is kept as exactly one `dispatch_finished` recovery row naming the gone caller, cause `recipient_exited`, with its saved report.
 - **Why it exists:** once the caller is gone there is no valid recipient, and its route must not become a pane-reuse hazard. PRD #1666 part 3, round 5 (plan D7, §8) changed eviction to orphaning: the route is kept so the unit's end is still recorded and its result goes to recovery rather than vanishing, and an orphaned route gives no successor a place in the dispatch tree.
 - **Does not assert:** pane-id hand-over refusal (`dispatch/return/004`), the recovery row the completion becomes once task-scoped completion is active (`dispatch/return/009`), unit-pane close (the registry unit tests), daemon restart, exact completion-report wording, or the TUI close dialog.
 - **Platform coverage:** mac+linux (unix-only fast test — every observer is a POSIX-shell raw `cat`).
@@ -4990,6 +5230,38 @@ without depending on the config struct API.
 - **Does not assert:** a dispatch result's own refused post (it rides reserved room).
 - **Platform coverage:** mac+linux.
 
+##### dispatch/return/013 — A terminal report paused across its unit's exit reaches the caller once.
+- **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** Accepted; one `dispatch completed`, no `dispatch ended`, the unit `Completed`.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D12 rule 7): a unit's terminal report is decided at the routes' linearization point and reaches the caller once.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/014 — A terminal report paused across its unit's close reaches the caller once.
+- **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** Accepted; one report, no `dispatch ended`.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D12 rule 7): a unit's terminal report is decided at the routes' linearization point and reaches the caller once.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/015 — A terminal report paused across a respawn reaches the caller once.
+- **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** Accepted; the successor's identical report answers `already_accepted` with the first report id.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D12 rule 7): a unit's terminal report is decided at the routes' linearization point and reaches the caller once.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/016 — A failed terminal save after the unit's exit ends the unit.
+- **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** `report_save_failed`, one `dispatch ended`, the unit `Ended` and not marked, no saved file.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D12 rule 9): a unit's terminal report is decided at the routes' linearization point and reaches the caller once.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
 ##### dispatch/return/017 — A unit that ends without a report tells its caller exactly once — a notice to a live caller, a row for a gone one.
 - **Layer:** fast unit, in-crate (`src/agent_pty_dispatch_lifecycle_tests.rs`; the real registry, inbox hub and retained store, with `cat` stand-ins for every agent and the daemon's live check installed).
 - **Agent:** none: `cat` stand-ins.
@@ -5004,6 +5276,38 @@ without depending on the config struct API.
 - **Asserts:** a failure that started nothing and a start each save a file; with the row bound at 1 the evicted row's file stays and its envelope names the unit and the caller; a store too full for the result refuses with `report_store_full` and a store whose directory was refused with `report_save_failed`, each sentence its own and ending "nothing was started".
 - **Why it exists:** reviewer R6, R14: a row is never the only copy of a result, and room is guaranteed at admission.
 - **Does not assert:** the hook socket's reply line itself (the arm writes the same code and sentence).
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/019 — A differing terminal repeat is not delivered.
+- **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** `differs`, exit 1, one report.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D4): a unit's terminal report is decided at the routes' linearization point and reaches the caller once.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/020 — Termination before the claim answers `task_closed`.
+- **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** Paused before the routes, the unit exits (or is closed); released, `task_closed` with the ended wording, one `dispatch ended`, no claim, no file.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §2 step 2): a unit's terminal report is decided at the routes' linearization point and reaches the caller once.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/021 — A claim before termination still reaches the caller.
+- **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** The claim learns its unit is gone; released, one report, no `dispatch ended`, the route gone.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D12 rule 7): a unit's terminal report is decided at the routes' linearization point and reaches the caller once.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/022 — Terminal retries after the route was consumed.
+- **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** For a single and an orchestration unit: identical repeat `already_accepted`, differing `differs`, after the close still answered through the index, a generation naming no unit `incompatible_mode`; one report.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §2 step 2): a unit's terminal report is decided at the routes' linearization point and reaches the caller once.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
 - **Platform coverage:** mac+linux.
 
 ##### dispatch/return/023 — A `dispatch ended` notice a caller exits without acknowledging is salvaged as a row.
@@ -5022,10 +5326,18 @@ without depending on the config struct API.
 - **Does not assert:** the hourly retry's timing; a body's 24-hour or 7-day expiry.
 - **Platform coverage:** mac+linux.
 
+##### dispatch/return/025 — A close against the unit mark.
+- **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** A forced close before the mark: `UnitEndedFirst`, one report, no `dispatch ended`; a close after the mark: one report.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D12 rule 8): a unit's terminal report is decided at the routes' linearization point and reaches the caller once.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
 ##### dispatch/return/026 — A respawned unit terminal's replacement settles its unit, route and successor exactly once on every path, and never takes another occupant of the pane for its successor.
 - **Layer:** fast unit, in-crate (`src/agent_pty_replacement_tests.rs`; the real registry, inbox hub and retained store, `cat` stand-ins, named pauses and fault points; the arms marked "child process" re-execute the test binary so an abort reads as `SIGABRT`).
 - **Agent:** none: `cat` stand-ins.
-- **Asserts:** publish: the route compare-and-sets to B, (P, B) is indexed and B carries the unit pinned, and B's exit ends the unit once (one notice, or one row for an orphaned caller), for a single unit and an orchestration unit; a predecessor's held EOF ends nothing; B killed while the window is paused waits for the publication, then ends the unit once; (f1) a failed spawn ends the unit `RespawnFailed`, its route, publication and leaf unit gone, one notice, nothing closed; (f2), (f3), (f2') a panic after the spawn, before the publish section, or inside the spawn after B is published aborts with B taken from the reserved slot, indexed and closed by its id, the injected payload resumed; (f2s) an exited record on the pane is never indexed or closed; (f7) a competing start makes the reservation refuse, the unit end, and the competitor untouched; (f8) a pane reused after B exited leaves the new occupant untouched while B is closed by id; (f6) a respawn cancelled before `begin` installs nothing; (g) a close during the window ends the unit once and keeps the publication, closed, until publish removes it, resurrecting no route; child process: (f4) a panic inside publish leaves the routes poisoned, the state torn, the route moved by the compare-and-set, the leaf on B, B running, nothing posted or closed, and the inbox still working; (f4') a state torn by another thread with healthy routes makes the abort write nothing; (f4'') an unrelated hub panic leaves the abort working; (f5a) a dropped latch makes B's reader abort; (f5b) a panicking abort leaves B's reader to find what it left.
+- **Asserts:** publish: the route compare-and-sets to B, (P, B) is indexed and B carries the unit pinned, and B's exit ends the unit once (one notice, or one row for an orphaned caller), for a single unit and an orchestration unit; a predecessor's held EOF ends nothing; B killed while the window is paused waits for the publication, then ends the unit once; (f1) a failed spawn ends the unit `RespawnFailed`, its route, publication and leaf unit gone, one notice, nothing closed; (f2), (f3), (f2') a panic after the spawn, before the publish section, or inside the spawn after B is published aborts with B taken from the reserved slot, indexed and closed by its id, the injected payload resumed; (f2s) an exited record on the pane is never indexed or closed; (f7) a competing start makes the reservation refuse, the unit end, and the competitor untouched; (f8) a pane reused after B exited leaves the new occupant untouched while B is closed by id; (f6) a respawn cancelled before `begin` installs nothing; (g) a close during the window ends the unit once and keeps the publication, closed, until publish removes it, resurrecting no route; child process: (f4) a panic inside publish leaves the routes poisoned, the state torn, the route moved by the compare-and-set, the leaf on B, B running, nothing posted or closed, and the inbox still working; (f4') a state torn by another thread with healthy routes makes the abort write nothing; (f4'') an unrelated hub panic leaves the abort working; (f5a) a dropped latch makes B's reader abort; (f5b) a panicking abort leaves B's reader to find what it left. Reports during a replacement (`src/agent_pty_terminal_tests.rs`): (e1) the successor's terminal report before its publish reads `report_pending` and nothing is saved; after it, it is accepted to the original caller once; (e3) a directly started orchestration's orchestrator answers `destination: none` before and after its own respawn.
 - **Why it exists:** reviewer R17, R20, R25, R27, auditor U2-1, U3-2: the respawn moves a unit's terminal generation, and its EOF, reports and failure paths must agree on one unit.
 - **Does not assert:** the arms that send a terminal `work-done` (they arrive with task-scoped completion); the torn report state's contents after a panic, which are discarded with it (only the routes, records and leaf are read).
 - **Platform coverage:** mac+linux.
@@ -5033,7 +5345,7 @@ without depending on the config struct API.
 ##### dispatch/return/027 — A unit that ends before its route is registered is recorded ended, and an instance's contradictory origin is pinned as a conflict.
 - **Layer:** fast unit, in-crate (`src/agent_pty_dispatch_lifecycle_tests.rs`; the real registry, inbox hub and retained store, with `cat` stand-ins for every agent and the daemon's live check installed).
 - **Agent:** none: `cat` stand-ins.
-- **Asserts:** (e) the terminal generation exiting, and (f) its pane being marked closing, while the dispatch is paused before registration: registration records `Ended { Exited }` or `Ended { Closed }`, inserts no route, indexes the generation, and tells the live caller once; (i) a second role of a dispatched instance spawned with origin `Direct` has its origin pinned as `Conflict`.
+- **Asserts:** (e) the terminal generation exiting, and (f) its pane being marked closing, while the dispatch is paused before registration: registration records `Ended { Exited }` or `Ended { Closed }`, inserts no route, indexes the generation, and tells the live caller once; (i) a second role of a dispatched instance spawned with origin `Direct` has its origin pinned as `Conflict`. Reports (`src/agent_pty_terminal_tests.rs`): (a), (b) a terminal report paused before the routes and released after the unit's close or exit reads `task_closed`, one `dispatch ended`; (c) one sent while the dispatch is paused before registration reads `report_pending`, and the next after registration is accepted once; (g) one released after its unit was closed and evicted reads `unknown_task`, forgotten wording, with nothing saved or ended twice; (i) an orchestrator whose origin is `Conflict` reads `incompatible_mode`.
 - **Why it exists:** reviewer R16, auditor U3-3, U3-4: every order of exit, close and registration is covered.
 - **Does not assert:** the terminal reports these generations then send (they arrive with task-scoped completion).
 - **Platform coverage:** mac+linux.
@@ -8951,6 +9263,78 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 - **Does not assert:** the orchestrator notice (`inbox/boundary/065`) or the rendering (`inbox/status/027`, `/028`, desktop `inboxWords.test.ts`).
 - **Platform coverage:** mac+linux.
 
+##### inbox/protocol/024 — A silent daemon gets no report.
+- **Layer:** fast unit (`src/hook.rs`; the real sender against a scripted daemon socket).
+- **Agent:** none.
+- **Asserts:** No answer within the wait: not confirmed, and no mutation is read.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D1): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### inbox/protocol/025 — A wrong answer withholds the report.
+- **Layer:** fast unit (`src/hook.rs`; the real sender against a scripted daemon socket).
+- **Agent:** none.
+- **Asserts:** An empty object, a legacy ack, a null capability: not confirmed, nothing sent.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D1): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### inbox/protocol/026 — Malformed, closed and late answers withhold the report.
+- **Layer:** fast unit (`src/hook.rs`; the real sender against a scripted daemon socket).
+- **Agent:** none.
+- **Asserts:** Each is not confirmed and nothing is sent after it.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D1): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### inbox/protocol/027 — A confirmed report rides the asking connection.
+- **Layer:** fast unit (`src/hook.rs`; the real sender against a scripted daemon socket).
+- **Agent:** none.
+- **Asserts:** One connection carries the question and the report; its answer is what the sender reads.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D1): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### inbox/protocol/028 — A lost answer is unconfirmed.
+- **Layer:** fast unit (`src/hook.rs`; the real sender against a scripted daemon socket).
+- **Agent:** none.
+- **Asserts:** The daemon closes after the report: unconfirmed, sent once.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D1): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### inbox/protocol/030 — Only version 1 confirms.
+- **Layer:** fast unit (`src/hook.rs`; the real sender against a scripted daemon socket).
+- **Agent:** none.
+- **Asserts:** 2, -1 and the string "1" withhold the report.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D1): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### inbox/protocol/031 — Cut reports and unknown dispositions are unconfirmed.
+- **Layer:** fast unit (`src/hook.rs`; the real sender against a scripted daemon socket).
+- **Agent:** none.
+- **Asserts:** A reset mid-report is unconfirmed; an unknown disposition reads `unknown` and the CLI prints the unconfirmed wording for its mode, exit 1.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D1, D5): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### inbox/protocol/032 — `ListOutcomes` is sent only after a fresh advertisement.
+- **Layer:** fast unit (`src/daemon_client.rs`; the real client against a scripted attach daemon).
+- **Agent:** none.
+- **Asserts:** No capability, or another incarnation than the pinned one: no `list-outcomes` frame and unsupported; advertised and matching: asked once.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D10): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### inbox/protocol/033 — The legacy verb is gated by what it reports.
+- **Layer:** fast unit (`src/daemon.rs` hook-ingestion tests; the real hook loop on a socket, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** Under `warn`, a token-less `--done` is refused `unattested` with nothing changed; a token-less report without it is a note, the task stays open and its commission owed.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D1): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
 #### Agent CLI
 
 ##### inbox/cli/001 — In-pane fetch frames the task, acknowledges it and updates list.
@@ -9779,6 +10163,14 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_boundary.rs`), an isolated daemon and raw hook-socket verbs as an older `dot-agent-deck` sends them (PRD #1666 part 3, H5).
 - **Agent:** none (Codex, Devin and bare-command panes running a stand-in).
 - **Asserts:** a plain `inbox_fetch` (with and without `ack`) is refused `cli_too_old`, a doorbell or turn-end hook fetch declaring no integration `hooks_too_old`, a once wait from a hook component `unsupported`, and `get_seed` answers no seed with `get_seed_removed`; each answers at once, the task stays queued with no hand-over counted, the card shows the out-of-date hooks notice naming Codex's own `hooks install` for the Codex pane and no command for the others, and a current receipt fetch from the same pane is then handed the task.
+- **Platform coverage:** mac+linux.
+
+##### inbox/boundary/074 — Report provenance crosses versions.
+- **Layer:** fast unit (`src/daemon_protocol.rs`).
+- **Agent:** none.
+- **Asserts:** 0.47's readers decode a summary and a notice carrying every provenance kind; this build decodes unknown provenance, dispatch phase, outcome phase, cause, delivery, operation and disposition values as `unknown`; an unknown work-done mode is refused `unsupported_mode` with nothing changed.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D10, §4): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/status/001 — Human daemon status shows each agent's pending inbox counts and wake path.

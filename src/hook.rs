@@ -2406,6 +2406,150 @@ pub const SIGNAL_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// older daemon starts reporting a phantom failure, while
 /// [`SocketReply::Unreachable`] is the one case the caller may report as "not
 /// delivered".
+/// PRD #1666 part 3, round 5 (plan D1): what [`send_gated`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Gated {
+    /// The daemon did not confirm the verb, so the mutation was withheld:
+    /// nothing was sent. `refusal` is the daemon's own `(code, message)`
+    /// when it refused the question; `why` names the rest, for the log.
+    NotConfirmed {
+        refusal: Option<(String, String)>,
+        why: &'static str,
+    },
+    /// The mutation was attempted and no well-formed answer came back: it
+    /// may or may not have been taken. `why` names the case, for the log.
+    Unconfirmed(&'static str),
+    /// The daemon's answer to the mutation, one line.
+    Reply(String),
+}
+
+/// How long [`send_gated`] waits for the answer to its question.
+pub const GATED_QUESTION_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long [`send_gated`] waits for the answer to its mutation: the daemon
+/// answers once the report is kept, after a bounded wait on any earlier
+/// report of the same task.
+pub const GATED_REPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// The longest line [`send_gated`] reads.
+const GATED_MAX_LINE: usize = 64 * 1024;
+
+/// PRD #1666 part 3, round 5 (plan D1): ask the daemon, on one connection,
+/// whether it serves a verb (`question`), and send `mutation` on the same
+/// connection only when `confirms` accepts the answer. It never reconnects,
+/// and never falls back to an older verb. Once the mutation is attempted,
+/// every outcome but one well-formed line is [`Gated::Unconfirmed`]: a write
+/// error or partial write, the connection closing, the deadline.
+pub fn send_gated(
+    question: &str,
+    mutation: &str,
+    confirms: impl Fn(&str) -> Result<(), Option<(String, String)>>,
+) -> Gated {
+    send_gated_at(
+        &client_socket_path(),
+        question,
+        mutation,
+        confirms,
+        GATED_QUESTION_WAIT,
+        GATED_REPLY_WAIT,
+    )
+}
+
+/// [`send_gated`] against an explicit endpoint and deadlines.
+pub fn send_gated_at(
+    path: &std::path::Path,
+    question: &str,
+    mutation: &str,
+    confirms: impl Fn(&str) -> Result<(), Option<(String, String)>>,
+    question_wait: std::time::Duration,
+    reply_wait: std::time::Duration,
+) -> Gated {
+    let not_confirmed = |why| Gated::NotConfirmed { refusal: None, why };
+    let Ok(mut client) = crate::platform::ipc::IpcClient::connect_timeout(path, question_wait)
+    else {
+        return not_confirmed("no daemon answered");
+    };
+    if client.set_timeouts(question_wait).is_err() {
+        return not_confirmed("the connection could not be bounded");
+    }
+    if client
+        .write_all(format!("{question}\n").as_bytes())
+        .and_then(|()| client.flush())
+        .is_err()
+    {
+        return not_confirmed("the question could not be sent");
+    }
+    let answer = match read_gated_line(&mut client) {
+        Ok(Some(line)) => line,
+        Ok(None) => return not_confirmed("the daemon closed the connection unanswered"),
+        Err(_) => return not_confirmed("no answer within the wait"),
+    };
+    if let Err(refusal) = confirms(&answer) {
+        return Gated::NotConfirmed {
+            refusal,
+            why: "the daemon did not confirm the verb",
+        };
+    }
+    if client.set_timeouts(reply_wait).is_err() {
+        return not_confirmed("the connection could not be bounded");
+    }
+    if client
+        .write_all(format!("{mutation}\n").as_bytes())
+        .and_then(|()| client.flush())
+        .is_err()
+    {
+        return Gated::Unconfirmed("the report could not be written whole");
+    }
+    match read_gated_line(&mut client) {
+        Ok(Some(line)) => Gated::Reply(line),
+        Ok(None) => Gated::Unconfirmed("the daemon closed the connection with no answer"),
+        Err(_) => Gated::Unconfirmed("no answer within the wait"),
+    }
+}
+
+/// One line, at most [`GATED_MAX_LINE`] bytes: `Ok(None)` at a clean end of
+/// the connection, an error for a read failure, a deadline or an over-long
+/// line.
+fn read_gated_line(client: &mut impl std::io::Read) -> std::io::Result<Option<String>> {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match client.read(&mut byte)? {
+            0 if line.is_empty() => return Ok(None),
+            0 => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "the line was cut",
+                ));
+            }
+            _ if byte[0] == b'\n' => {
+                return String::from_utf8(line).map(Some).map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "not UTF-8")
+                });
+            }
+            _ if line.len() >= GATED_MAX_LINE => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "the line is too long",
+                ));
+            }
+            _ => line.push(byte[0]),
+        }
+    }
+}
+
+/// PRD #1666 part 3, round 5 (plan D1): whether a capabilities answer
+/// confirms task-scoped completion, by equality with the version this build
+/// speaks. A refusal of the question comes back with its code and message.
+pub fn confirms_task_scoped_completion(line: &str) -> Result<(), Option<(String, String)>> {
+    let Ok(reply) = serde_json::from_str::<crate::event::HookCapabilitiesReply>(line.trim()) else {
+        return Err(None);
+    };
+    if reply.task_scoped_completion == Some(crate::event::TASK_SCOPED_COMPLETION) {
+        return Ok(());
+    }
+    Err(reply.code.zip(reply.message))
+}
+
 pub fn send_and_await_signal_ack(json: &str) -> SocketReply {
     request_from_socket_inner(json, Some(SIGNAL_ACK_TIMEOUT))
 }
@@ -6952,5 +7096,235 @@ mod opencode_child_permission_tests {
             SessionStatus::Thinking,
             "the old-client view of the answer is the legacy Thinking"
         );
+    }
+}
+
+/// PRD #1666 part 3, round 5 (plan D1, §6.5): the task-scoped `work-done`
+/// sender against a scripted daemon on a socket of its own: what it sends,
+/// on which connection, and what it reads as unconfirmed.
+#[cfg(all(test, unix))]
+mod gated_send_tests {
+    use std::io::BufRead as _;
+    use std::os::unix::net::UnixListener;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use spec::spec;
+
+    use super::*;
+
+    /// What the scripted daemon does after it reads the question.
+    #[derive(Clone)]
+    enum Script {
+        /// Answer nothing, holding the connection open.
+        Silent,
+        /// Close the connection without answering.
+        Close,
+        /// Answer this line, after `delay`.
+        Answer(&'static str, Duration),
+        /// Confirm, read the mutation, then answer `reply` (`None`: close).
+        Confirm(Option<&'static str>),
+        /// Confirm, read part of the mutation, then reset the connection.
+        ConfirmThenCut,
+    }
+
+    const CONFIRMED: &str = r#"{"task_scoped_completion":1}"#;
+
+    struct Stub {
+        path: std::path::PathBuf,
+        _dir: tempfile::TempDir,
+        /// Every line the stub read, by connection.
+        lines: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    fn stub(script: Script) -> Stub {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("hook.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let lines: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
+        let seen = Arc::clone(&lines);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut read = Vec::new();
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                read.push(line.trim().to_string());
+                let index = {
+                    let mut seen = seen.lock().unwrap();
+                    seen.push(read.clone());
+                    seen.len() - 1
+                };
+                let record = |line: &str| seen.lock().unwrap()[index].push(line.trim().to_string());
+                match script.clone() {
+                    Script::Silent => std::thread::sleep(Duration::from_secs(2)),
+                    Script::Close => {}
+                    Script::Answer(answer, delay) => {
+                        std::thread::sleep(delay);
+                        let _ = writeln!(stream, "{answer}");
+                        let mut more = String::new();
+                        if reader.read_line(&mut more).unwrap_or(0) > 0 {
+                            record(&more);
+                        }
+                    }
+                    Script::Confirm(reply) => {
+                        writeln!(stream, "{CONFIRMED}").unwrap();
+                        let mut mutation = String::new();
+                        if reader.read_line(&mut mutation).unwrap_or(0) > 0 {
+                            record(&mutation);
+                        }
+                        if let Some(reply) = reply {
+                            let _ = writeln!(stream, "{reply}");
+                        }
+                    }
+                    Script::ConfirmThenCut => {
+                        writeln!(stream, "{CONFIRMED}").unwrap();
+                        let mut first = [0u8; 8];
+                        let _ = std::io::Read::read(&mut reader, &mut first);
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                    }
+                }
+            }
+        });
+        Stub {
+            path,
+            _dir: dir,
+            lines,
+        }
+    }
+
+    fn send(stub: &Stub) -> Gated {
+        send_gated_at(
+            &stub.path,
+            r#"{"message_type":"hook_capabilities","pane_id":"p"}"#,
+            r#"{"message_type":"work_done_task","pane_id":"p","mode":{"kind":"uncorrelated"},"report":"r","timestamp":"2026-01-01T00:00:00Z"}"#,
+            confirms_task_scoped_completion,
+            Duration::from_millis(300),
+            Duration::from_millis(500),
+        )
+    }
+
+    fn mutations(stub: &Stub) -> usize {
+        std::thread::sleep(Duration::from_millis(100));
+        stub.lines
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .filter(|line| line.contains("work_done_task"))
+            .count()
+    }
+
+    /// Scenario: A daemon that answers the capabilities question with nothing, within the wait, gets no report: the sender says the daemon did not confirm, and the stub never reads a mutation.
+    #[spec("inbox/protocol/024")]
+    #[test]
+    fn protocol_024_a_silent_daemon_gets_no_report() {
+        let stub = stub(Script::Silent);
+        assert!(matches!(send(&stub), Gated::NotConfirmed { .. }));
+        assert_eq!(mutations(&stub), 0);
+    }
+
+    /// Scenario: A daemon that answers the question with something else — an empty object, a legacy acknowledgement, a refusal with no capability — gets no report.
+    #[spec("inbox/protocol/025")]
+    #[test]
+    fn protocol_025_a_wrong_answer_withholds_the_report() {
+        for answer in [
+            "{}",
+            r#"{"kind":"signal_ack","accepted":true}"#,
+            r#"{"task_scoped_completion":null}"#,
+        ] {
+            let stub = stub(Script::Answer(answer, Duration::ZERO));
+            assert!(
+                matches!(send(&stub), Gated::NotConfirmed { .. }),
+                "{answer}"
+            );
+            assert_eq!(mutations(&stub), 0, "{answer}");
+        }
+    }
+
+    /// Scenario: A malformed answer, a closed connection, and an answer that arrives after the wait each withhold the report; nothing is sent after them.
+    #[spec("inbox/protocol/026")]
+    #[test]
+    fn protocol_026_malformed_closed_and_late_answers_withhold_the_report() {
+        for script in [
+            Script::Answer("not json at all", Duration::ZERO),
+            Script::Close,
+            Script::Answer(CONFIRMED, Duration::from_millis(700)),
+        ] {
+            let stub = stub(script);
+            assert!(matches!(send(&stub), Gated::NotConfirmed { .. }));
+            assert_eq!(mutations(&stub), 0);
+        }
+    }
+
+    /// Scenario: A daemon that confirms gets the report on the same connection that asked, once, and its one answer is what the sender reads.
+    #[spec("inbox/protocol/027")]
+    #[test]
+    fn protocol_027_a_confirmed_report_rides_the_asking_connection() {
+        let stub = stub(Script::Confirm(Some(r#"{"disposition":"uncorrelated"}"#)));
+        assert_eq!(
+            send(&stub),
+            Gated::Reply(r#"{"disposition":"uncorrelated"}"#.to_string())
+        );
+        let lines = stub.lines.lock().unwrap().clone();
+        assert_eq!(lines.len(), 1, "one connection: {lines:?}");
+        assert_eq!(
+            lines[0].len(),
+            2,
+            "the question, then the report: {lines:?}"
+        );
+    }
+
+    /// Scenario: The report is sent and the daemon closes without answering: the sender reads it as unconfirmed, and does not send it again.
+    #[spec("inbox/protocol/028")]
+    #[test]
+    fn protocol_028_a_lost_answer_is_unconfirmed() {
+        let stub = stub(Script::Confirm(None));
+        assert!(matches!(send(&stub), Gated::Unconfirmed(_)));
+        assert_eq!(mutations(&stub), 1, "sent once, never again");
+    }
+
+    /// Scenario: A capability of 2, of -1, or given as a string is not version 1: the report is withheld (equality, not at-least).
+    #[spec("inbox/protocol/030")]
+    #[test]
+    fn protocol_030_only_version_one_confirms() {
+        for answer in [
+            r#"{"task_scoped_completion":2}"#,
+            r#"{"task_scoped_completion":-1}"#,
+            r#"{"task_scoped_completion":"1"}"#,
+        ] {
+            let stub = stub(Script::Answer(answer, Duration::ZERO));
+            assert!(
+                matches!(send(&stub), Gated::NotConfirmed { .. }),
+                "{answer}"
+            );
+            assert_eq!(mutations(&stub), 0, "{answer}");
+        }
+    }
+
+    /// Scenario: The daemon resets the connection partway through reading the report: unconfirmed, sent once. An answer whose disposition this build does not know is read as unconfirmed too, with exit 1 and the wording for its mode.
+    #[spec("inbox/protocol/031")]
+    #[test]
+    fn protocol_031_cut_reports_and_unknown_dispositions_are_unconfirmed() {
+        let stub = stub(Script::ConfirmThenCut);
+        assert!(matches!(send(&stub), Gated::Unconfirmed(_)));
+        let reply: crate::event::WorkDoneTaskReply =
+            serde_json::from_str(r#"{"disposition":"from_the_future"}"#).unwrap();
+        assert_eq!(
+            reply.disposition,
+            crate::event::WorkDoneDisposition::Unknown
+        );
+        for task in [Some("m-1"), None] {
+            let answer = crate::work_done_text::cli_answer(&reply, task, false);
+            assert!(!answer.success);
+            assert_eq!(
+                answer.stderr,
+                Some(crate::work_done_text::unconfirmed(task)),
+                "{task:?}"
+            );
+        }
     }
 }

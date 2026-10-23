@@ -482,6 +482,26 @@ impl DispatchedUnits {
         Some(unit.id.clone())
     }
 
+    /// PRD #1666 part 3, round 5 (plan D12 rule 8): mark unit `unit_id`
+    /// complete, by its stable id, before its terminal report is published.
+    /// Idempotent: an existing mark is kept. `UnitEndedFirst` when the unit is
+    /// no longer live (a close already ended it), which the commit records.
+    pub fn mark_completed_unit(
+        &mut self,
+        unit_id: &str,
+        now_ms: i64,
+    ) -> crate::report_recovery::UnitMark {
+        match self.live.iter_mut().find(|u| u.id == unit_id) {
+            Some(unit) => {
+                if unit.completed_at_ms.is_none() {
+                    unit.completed_at_ms = Some(now_ms);
+                }
+                crate::report_recovery::UnitMark::Marked
+            }
+            None => crate::report_recovery::UnitMark::UnitEndedFirst,
+        }
+    }
+
     /// PRD #1589 D5: the generation `old_agent_id` in `pane_id` was replaced
     /// in place by `new_agent_id` (a respawn). A unit bound to the old
     /// generation — a single unit that IS it, or an orchestration whose

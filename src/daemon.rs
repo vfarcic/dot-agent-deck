@@ -4408,52 +4408,6 @@ async fn run_shell_activity_monitor_with<S, F>(
     }
 }
 
-/// PRD #1589 D5: mark a dispatched unit complete from a `work-done --done`,
-/// gated on the generation the hook gate ATTESTED for this report.
-///
-/// Threaded from the `WorkDone` arm rather than resolved inside
-/// `prepare_dispatch_completion`, because that seam sees only the signal and
-/// the registry: looking the pane's occupant up there would launder a
-/// predecessor's late report into its successor, and reading the retained
-/// return's own agent id would compare the record to itself (auditor B2). Only
-/// an attested sender that is the unit's authorized terminal generation, and
-/// still speaks for its pane, marks it; a missing token admitted under
-/// `DOT_AGENT_DECK_HOOK_PROVENANCE=warn`, an unattested pane, a superseded
-/// generation and a worker role of an orchestration never do. The return
-/// route's delivery is unchanged and runs whatever this decides. Returns the
-/// unit id it marked, if any.
-pub(crate) fn mark_dispatched_unit_completion(
-    registry: &crate::agent_pty::AgentPtyRegistry,
-    signal: &crate::event::WorkDoneSignal,
-    provenance: &crate::hook_provenance::Provenance,
-) -> Option<String> {
-    if !signal.done {
-        return None;
-    }
-    let crate::hook_provenance::Provenance::Attested { agent_id, .. } = provenance else {
-        return None;
-    };
-    if registry.generation_ownership(Some(&signal.pane_id), Some(agent_id))
-        != crate::state::Ownership::Owned
-    {
-        return None;
-    }
-    let marked = registry.dispatched_units().mark_completed(
-        &signal.pane_id,
-        agent_id,
-        chrono::Utc::now().timestamp_millis(),
-    );
-    if let Some(unit_id) = marked.as_deref() {
-        info!(
-            unit_id = %unit_id,
-            pane_id = %signal.pane_id,
-            agent_id = %agent_id,
-            "dispatch: unit reported done; it may now be closed without --force"
-        );
-    }
-    marked
-}
-
 /// PRD #1589 D2: the `(agent id, cwd)` a `dispatch` is recorded and run under,
 /// resolved as ONE pair from one record.
 ///
@@ -6855,27 +6809,100 @@ async fn run_hook_loop_with_limits(
                                     // PRD #1631: the `work-done` CLI is acked
                                     // HERE, from the result of the report's
                                     // whole handling, not at the provenance
-                                    // gate. Acked at the gate, a worker's
-                                    // second report could reach the
-                                    // orchestrator ahead of its first. Acked
-                                    // after, a sender that waits for its ack is
-                                    // ordered, and the wait is the state change
-                                    // and the post, never the agent reading it.
-                                    // PRD #1666 part 3, round 5: that handling
-                                    // is `task_completion::complete`.
-                                    let disposition = crate::task_completion::complete(
+                                    // gate. PRD #1666 part 3, round 5: the
+                                    // legacy verb runs the task-scoped
+                                    // transaction, `--done` as a terminal
+                                    // report and anything else as a note
+                                    // (plan D1), and an unconfirmed outcome
+                                    // closes the connection with no line.
+                                    let (claimed_pane, terminal) =
+                                        (signal.pane_id.clone(), signal.done);
+                                    let completion = crate::task_completion::complete_legacy(
                                         &state,
                                         &pty_registry,
                                         signal,
                                         &provenance,
                                     )
                                     .await;
+                                    // Said once per report, because an older
+                                    // CLI's `work-done` used to complete the
+                                    // worker's task and now does not. The
+                                    // cross-version harness reads this line
+                                    // (`xtask/cross-version/src/breaks.rs`).
+                                    if !terminal
+                                        && matches!(
+                                            &completion,
+                                            crate::task_completion::Completion::Reply(reply)
+                                                if reply.disposition
+                                                    == crate::event::WorkDoneDisposition::Uncorrelated
+                                        )
+                                    {
+                                        warn!(
+                                            verb = "work_done",
+                                            claimed_pane = %escape_id_for_log(&claimed_pane),
+                                            reason = "no_task",
+                                            "hook socket: delivered a work-done that names no task as a note that completes no task; a dot-agent-deck CLI older than this daemon sends that, and `work-done --task-id` completes a task"
+                                        );
+                                    }
                                     pty_registry
                                         .pause_point(crate::task_completion::PAUSE_COMMITTED)
                                         .await;
-                                    if let Ok(json) =
-                                        serde_json::to_string(&disposition.to_signal_ack())
-                                    {
+                                    let Some(ack) = completion.to_signal_ack() else {
+                                        break;
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&ack) {
+                                        let line = format!("{json}\n");
+                                        let _ = write_half.write_all(line.as_bytes()).await;
+                                        let _ = write_half.flush().await;
+                                    }
+                                    pty_registry
+                                        .pause_point(crate::task_completion::PAUSE_ACKED)
+                                        .await;
+                                }
+                                DaemonMessage::HookCapabilities(_) => {
+                                    // PRD #1666 part 3, round 5 (plan D1): the
+                                    // question, answered on this connection,
+                                    // which then carries the mutation.
+                                    let reply = crate::event::HookCapabilitiesReply {
+                                        task_scoped_completion: Some(
+                                            crate::event::TASK_SCOPED_COMPLETION,
+                                        ),
+                                        ..Default::default()
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&reply) {
+                                        let line = format!("{json}\n");
+                                        let _ = write_half.write_all(line.as_bytes()).await;
+                                        let _ = write_half.flush().await;
+                                    }
+                                }
+                                DaemonMessage::WorkDoneTask(request) => {
+                                    info!(
+                                        pane_id = %escape_id_for_log(&request.pane_id),
+                                        mode = ?std::mem::discriminant(&request.mode),
+                                        "Received a task-scoped work-done"
+                                    );
+                                    let completion = crate::task_completion::complete(
+                                        &state,
+                                        &pty_registry,
+                                        crate::task_completion::CompletionRequest {
+                                            pane_id: request.pane_id,
+                                            mode: request.mode,
+                                            report: request.report,
+                                        },
+                                        &provenance,
+                                    )
+                                    .await;
+                                    pty_registry
+                                        .pause_point(crate::task_completion::PAUSE_COMMITTED)
+                                        .await;
+                                    let crate::task_completion::Completion::Reply(reply) =
+                                        completion
+                                    else {
+                                        // Unconfirmed: no line, and the
+                                        // connection closes.
+                                        break;
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&reply) {
                                         let line = format!("{json}\n");
                                         let _ = write_half.write_all(line.as_bytes()).await;
                                         let _ = write_half.flush().await;
@@ -7433,7 +7460,7 @@ mod orphan_watchdog_tests {
 mod close_verb_seam_tests {
     use super::*;
     use crate::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
-    use crate::hook_provenance::{Provenance, Refusal};
+    use crate::hook_provenance::Provenance;
 
     fn spawn(registry: &Arc<AgentPtyRegistry>, pane: &str, cwd: &str, command: &str) -> String {
         registry
@@ -7454,104 +7481,6 @@ mod close_verb_seam_tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("the child never exited");
-    }
-
-    fn done(pane: &str, done: bool) -> crate::event::WorkDoneSignal {
-        serde_json::from_value(serde_json::json!({
-            "pane_id": pane,
-            "task": "finished",
-            "done": done,
-            "timestamp": chrono::Utc::now(),
-        }))
-        .expect("a work-done signal")
-    }
-
-    fn unit(registry: &AgentPtyRegistry, pane: &str, agent: &str) -> String {
-        registry
-            .dispatched_units()
-            .register(crate::dispatched_units::NewUnit {
-                name: format!("unit-{pane}"),
-                worktree: std::path::PathBuf::from("/wt"),
-                branch: "b".to_string(),
-                clone_dir: std::path::PathBuf::from("/repo"),
-                dispatcher: crate::dispatched_units::Dispatcher {
-                    pane_id: "disp".to_string(),
-                    agent_id: "disp-agent".to_string(),
-                },
-                kind: crate::dispatched_units::UnitKind::Single {
-                    pane_id: pane.to_string(),
-                    agent_id: agent.to_string(),
-                },
-                dispatched_at_ms: 1,
-            })
-    }
-
-    fn completed(registry: &AgentPtyRegistry, id: &str) -> bool {
-        registry
-            .dispatched_units()
-            .get(id)
-            .is_some_and(|u| u.completed_at_ms.is_some())
-    }
-
-    /// Scenario: a dispatched unit's `work-done --done` marks it complete only
-    /// when the hook gate attested the report to the unit's own terminal
-    /// generation. A token-less report admitted under the `warn` escape hatch,
-    /// an unattested pane, another generation's token, a non-terminal report,
-    /// and a superseded generation's late `--done` mark nothing.
-    #[test]
-    fn completion_is_marked_only_by_the_attested_current_terminal_generation() {
-        let registry = Arc::new(AgentPtyRegistry::new());
-        let agent = spawn(&registry, "unit-pane", "/tmp", "sleep 30");
-        let id = unit(&registry, "unit-pane", &agent);
-        let signal = done("unit-pane", true);
-        for provenance in [
-            Provenance::Unattested,
-            Provenance::Refused(Refusal::Missing),
-            Provenance::Attested {
-                agent_id: "someone-else".to_string(),
-                facts: Default::default(),
-            },
-        ] {
-            assert_eq!(
-                mark_dispatched_unit_completion(&registry, &signal, &provenance),
-                None,
-                "{provenance:?}"
-            );
-        }
-        let attested = Provenance::Attested {
-            agent_id: agent.clone(),
-            facts: Default::default(),
-        };
-        assert_eq!(
-            mark_dispatched_unit_completion(&registry, &done("unit-pane", false), &attested),
-            None,
-            "progress without --done is not completion"
-        );
-        assert!(!completed(&registry, &id));
-        assert_eq!(
-            mark_dispatched_unit_completion(&registry, &signal, &attested),
-            Some(id.clone())
-        );
-        assert!(completed(&registry, &id));
-
-        // A generation whose pane was handed over cannot mark its unit late.
-        let old = spawn(&registry, "recycled", "/tmp", "/usr/bin/true");
-        let old_unit = unit(&registry, "recycled", &old);
-        wait_exited(&registry, &old);
-        let _new = spawn(&registry, "recycled", "/tmp", "sleep 30");
-        assert_eq!(
-            mark_dispatched_unit_completion(
-                &registry,
-                &done("recycled", true),
-                &Provenance::Attested {
-                    agent_id: old,
-                    facts: Default::default()
-                },
-            ),
-            None
-        );
-        assert!(!completed(&registry, &old_unit));
-        registry.shutdown_all();
     }
 
     /// Scenario: a dispatcher A exits and B takes its pane in another
@@ -13020,6 +12949,16 @@ mod hook_ingestion_tests {
             let dir = tempfile::tempdir().unwrap();
             std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
                 .expect("chmod tempdir");
+            // The retained store the daemon opens at its start: a report is
+            // accepted only once kept there (PRD #1666 part 3, round 5).
+            std::fs::create_dir_all(dir.path().join("state")).expect("state dir");
+            registry
+                .inbox()
+                .set_retained_store(crate::retained_store::RetainedStore::open(
+                    &dir.path().join("state"),
+                    crate::retained_store::StoreConfig::default(),
+                    crate::retained_store::Now::current(),
+                ));
             let sock = dir.path().join("hook.sock");
             let listener = IpcListener::from_tokio_listener(
                 UnixListener::bind(&sock).expect("bind hook socket"),
@@ -13215,6 +13154,231 @@ mod hook_ingestion_tests {
 
     /// PRD #1666 S5: whether any message in `pane_id`'s inbox, rendered whole,
     /// contains `needle`.
+    /// PRD #1666 part 3, round 5: a hook connection carrying a task-scoped
+    /// `work-done`, as the CLI sends it: the capabilities question, its
+    /// answer, then the report.
+    struct TaskReport {
+        reader: tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
+        _writer: tokio::net::unix::OwnedWriteHalf,
+    }
+
+    impl TaskReport {
+        async fn send(fx: &ProvenanceFixture, task_id: &str, report: &str) -> Self {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+            let stream = UnixStream::connect(&fx.sock).await.expect("connect");
+            let (read, mut write) = stream.into_split();
+            let mut reader = tokio::io::BufReader::new(read);
+            let token = Some(fx.worker_token.clone());
+            let question = crate::event::DaemonMessage::HookCapabilities(
+                crate::event::HookCapabilitiesRequest {
+                    pane_id: PROV_WORKER_PANE.to_string(),
+                    token: token.clone(),
+                },
+            );
+            write
+                .write_all(format!("{}\n", serde_json::to_string(&question).unwrap()).as_bytes())
+                .await
+                .unwrap();
+            let mut answer = String::new();
+            reader.read_line(&mut answer).await.unwrap();
+            assert_eq!(
+                crate::hook::confirms_task_scoped_completion(&answer),
+                Ok(()),
+                "{answer:?}"
+            );
+            let mutation =
+                crate::event::DaemonMessage::WorkDoneTask(crate::event::WorkDoneTaskRequest {
+                    pane_id: PROV_WORKER_PANE.to_string(),
+                    token,
+                    mode: crate::event::WorkDoneMode::Task {
+                        task_id: task_id.to_string(),
+                    },
+                    report: report.to_string(),
+                    timestamp: chrono::Utc::now(),
+                });
+            write
+                .write_all(format!("{}\n", serde_json::to_string(&mutation).unwrap()).as_bytes())
+                .await
+                .unwrap();
+            TaskReport {
+                reader,
+                _writer: write,
+            }
+        }
+
+        /// The next line, if one arrives within `budget`.
+        async fn line_within(&mut self, budget: Duration) -> Option<String> {
+            use tokio::io::AsyncBufReadExt;
+            let mut line = String::new();
+            match tokio::time::timeout(budget, self.reader.read_line(&mut line)).await {
+                Ok(Ok(n)) if n > 0 => Some(line),
+                _ => None,
+            }
+        }
+    }
+
+    /// Delegate the fixture's task and answer its id, once posted.
+    async fn delegated_task(fx: &ProvenanceFixture) -> String {
+        let response = fx
+            .delegate(PROV_ORCH_PANE, Some(&fx.orchestrator_token))
+            .await;
+        assert!(response.error.is_none(), "{response:?}");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(task) = fx.registry.inbox().open_tasks_of(PROV_WORKER_PANE).pop() {
+                return task;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the task was never posted"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Send a legacy `work_done` with no token and read its acknowledgement.
+    async fn legacy_unattested(fx: &ProvenanceFixture, done: bool) -> crate::event::SignalAck {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let msg = DaemonMessage::WorkDone(crate::event::WorkDoneSignal {
+            pane_id: PROV_WORKER_PANE.to_string(),
+            task: "LEGACY-033".to_string(),
+            done,
+            timestamp: chrono::Utc::now(),
+            token: None,
+        });
+        let mut stream = UnixStream::connect(&fx.sock).await.expect("connect");
+        stream
+            .write_all(format!("{}\n", serde_json::to_string(&msg).unwrap()).as_bytes())
+            .await
+            .unwrap();
+        stream.shutdown().await.unwrap();
+        let mut buf = String::new();
+        stream.read_to_string(&mut buf).await.unwrap();
+        serde_json::from_str(buf.trim()).unwrap_or_else(|e| panic!("{e}: {buf:?}"))
+    }
+
+    /// Scenario: Under the `warn` escape hatch, an older CLI's token-less `work-done --done` is refused `unattested` and changes nothing; its token-less report without `--done` is delivered as a note that completes nothing, so the worker's task stays open and its commission owed.
+    #[spec("inbox/protocol/033")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn protocol_033_the_legacy_verb_is_gated_by_what_it_reports() {
+        let _lock = HOOK_PROVENANCE_ENV_LOCK.lock().await;
+        let _env = HookProvenanceEnv::set("warn");
+        let fx = ProvenanceFixture::start().await;
+        let task = delegated_task(&fx).await;
+        let refused = legacy_unattested(&fx, true).await;
+        assert!(!refused.accepted, "{refused:?}");
+        assert_eq!(refused.reason.as_deref(), Some("unattested"), "{refused:?}");
+        assert_eq!(
+            fx.registry.inbox().open_tasks_of(PROV_WORKER_PANE),
+            vec![task.clone()]
+        );
+        let note = legacy_unattested(&fx, false).await;
+        assert!(note.accepted, "{note:?}");
+        assert!(
+            fx.orchestrator_saw("LEGACY-033", Duration::from_secs(10))
+                .await
+        );
+        assert_eq!(
+            fx.registry.inbox().open_tasks_of(PROV_WORKER_PANE),
+            vec![task]
+        );
+        assert!(fx.registry.owes_delegation_commission(PROV_WORKER_PANE));
+        fx.stop().await;
+    }
+
+    /// Scenario: A worker's task report over the real hook socket. Paused after its save, no byte is readable on the connection for 300 ms; a save failure injected meanwhile makes the only line `report_save_failed`. Paused at `work-done-committed`, no byte is readable while the report is already in the orchestrator's inbox and the task already retired; released, exactly one line, `accepted`.
+    #[spec("orchestration/work-done/038")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn work_done_038_the_answer_is_written_only_after_the_commit() {
+        let fx = ProvenanceFixture::start().await;
+        let task = delegated_task(&fx).await;
+
+        let (reached, release) = fx
+            .registry
+            .pause_at_for_test(crate::task_completion::PAUSE_SAVED);
+        let mut report = TaskReport::send(&fx, &task, "first try").await;
+        reached.await.unwrap();
+        assert_eq!(report.line_within(Duration::from_millis(300)).await, None);
+        fx.registry.inject_fault_for_test(
+            crate::task_completion::FAULT_FAIL_SAVE,
+            crate::agent_pty::TestFault::Fail,
+        );
+        release.send(()).unwrap();
+        let line = report
+            .line_within(Duration::from_secs(10))
+            .await
+            .expect("a line");
+        let refused: crate::event::WorkDoneTaskReply = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(
+            refused.code.as_deref(),
+            Some("report_save_failed"),
+            "{line}"
+        );
+
+        let (reached, release) = fx
+            .registry
+            .pause_at_for_test(crate::task_completion::PAUSE_COMMITTED);
+        let mut report = TaskReport::send(&fx, &task, "WORK-DONE-038-REPORT").await;
+        reached.await.unwrap();
+        assert_eq!(report.line_within(Duration::from_millis(300)).await, None);
+        assert!(pane_inbox_contains(
+            &fx.registry,
+            PROV_ORCH_PANE,
+            "WORK-DONE-038-REPORT"
+        ));
+        assert!(
+            fx.registry
+                .inbox()
+                .open_tasks_of(PROV_WORKER_PANE)
+                .is_empty()
+        );
+        release.send(()).unwrap();
+        let line = report
+            .line_within(Duration::from_secs(10))
+            .await
+            .expect("a line");
+        let accepted: crate::event::WorkDoneTaskReply = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(
+            accepted.disposition,
+            crate::event::WorkDoneDisposition::Accepted,
+            "{line}"
+        );
+        assert_eq!(
+            report.line_within(Duration::from_millis(200)).await,
+            None,
+            "one line"
+        );
+        fx.stop().await;
+    }
+
+    /// Scenario: Paused right after the answer's line is written: the line is readable, and by then the task's commission arm and delivery watch are already gone and the task is reported. The answer never precedes any part of the commit.
+    #[spec("orchestration/work-done/039")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn work_done_039_the_answer_follows_every_part_of_the_commit() {
+        let fx = ProvenanceFixture::start().await;
+        let task = delegated_task(&fx).await;
+        let (reached, release) = fx
+            .registry
+            .pause_at_for_test(crate::task_completion::PAUSE_ACKED);
+        let mut report = TaskReport::send(&fx, &task, "done").await;
+        reached.await.unwrap();
+        let line = report
+            .line_within(Duration::from_secs(5))
+            .await
+            .expect("written");
+        assert!(line.contains("accepted"), "{line}");
+        assert!(!fx.registry.owes_delegation_commission(PROV_WORKER_PANE));
+        assert!(!fx.registry.inbox().watched_tasks_for_test().contains(&task));
+        assert!(
+            fx.registry
+                .inbox()
+                .open_tasks_of(PROV_WORKER_PANE)
+                .is_empty()
+        );
+        release.send(()).unwrap();
+        fx.stop().await;
+    }
+
     fn pane_inbox_contains(registry: &AgentPtyRegistry, pane_id: &str, needle: &str) -> bool {
         registry
             .inbox()

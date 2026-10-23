@@ -38,7 +38,7 @@ use dot_agent_deck::agent_pty::{
     AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, DoorbellWrite, SpawnOptions, TabMembership,
 };
 use dot_agent_deck::dispatch_return::DispatchCaller;
-use dot_agent_deck::event::{BroadcastMsg, DelegateSignal, WorkDoneSignal};
+use dot_agent_deck::event::{BroadcastMsg, DelegateSignal};
 use dot_agent_deck::state::{AppState, OrchestrationIdentity};
 use spec::spec;
 
@@ -58,10 +58,12 @@ const ORCHESTRATION_INSTANCE: &str = "work-done-test-orchestration-instance-1";
 const POINTER_NEEDLE: &str =
     "Their full report is also saved at .dot-agent-deck/work-done-coder.md.";
 
-/// The #448 label. Spelled out here rather than imported from `src/` so a silent
-/// rewording of the daemon's own template fails these tests instead of following
-/// them — the same discipline as `idle_worker_detector.rs`'s `IDLE_NEEDLE`.
-const UNSOLICITED_NEEDLE: &str = "the deck has no outstanding delegation to that worker on record";
+/// The label of a report that names no task (the #448 label until PRD #1666
+/// part 3, round 5, plan D10: such a report is a note, and completes nothing).
+/// Spelled out here rather than imported from `src/` so a silent rewording of
+/// the daemon's own template fails these tests instead of following them — the
+/// same discipline as `idle_worker_detector.rs`'s `IDLE_NEEDLE`.
+const UNSOLICITED_NEEDLE: &str = "This report names no task, so the deck marked no task complete";
 
 /// The #433 label, for a commissioned completion whose file could not be written.
 const UNFILED_NEEDLE: &str = "could not write .dot-agent-deck/work-done-coder.md";
@@ -110,6 +112,16 @@ impl WorkDoneHarness {
         }
         let cwd_str = cwd.path().to_string_lossy().to_string();
         let registry = std::sync::Arc::new(AgentPtyRegistry::new());
+        // The retained store the daemon opens at its start: a report is
+        // accepted only once kept there (PRD #1666 part 3, round 5).
+        std::fs::create_dir_all(cwd.path().join(".deck-state")).expect("state dir");
+        registry
+            .inbox()
+            .set_retained_store(dot_agent_deck::retained_store::RetainedStore::open(
+                &cwd.path().join(".deck-state"),
+                dot_agent_deck::retained_store::StoreConfig::default(),
+                dot_agent_deck::retained_store::Now::current(),
+            ));
 
         // Raw no-echo cat: one observable copy of every byte the daemon submits.
         // The readiness marker proves termios has already changed, so nothing the
@@ -199,7 +211,9 @@ impl WorkDoneHarness {
     /// puts on the hook socket, handled by the real daemon-side handler, so the
     /// commission ledger is armed the way production arms it.
     async fn delegate(&self) -> dot_agent_deck::event::DelegateResponse {
-        self.state
+        let before = self.registry.inbox().open_tasks_of(WORKER_PANE).len();
+        let response = self
+            .state
             .handle_delegate(
                 DelegateSignal {
                     pane_id: ORCH_PANE.to_string(),
@@ -212,24 +226,37 @@ impl WorkDoneHarness {
                 &self.registry,
                 &self.event_tx,
             )
-            .await
+            .await;
+        // The task is posted by the delegate's dispatch, after this returns. A
+        // worker reports a task it was given, so wait for the post (PRD #1666
+        // part 3, round 5: a report names its task).
+        if response.delivered.iter().any(|role| role == WORKER_ROLE) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while self.registry.inbox().open_tasks_of(WORKER_PANE).len() <= before
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        response
     }
 
     /// The real work-done path: the signal `dot-agent-deck work-done --task-file`
     /// puts on the hook socket, from the WORKER's pane.
     async fn work_done(&self, summary: &str) {
-        self.state
-            .handle_work_done(
-                WorkDoneSignal {
-                    pane_id: WORKER_PANE.to_string(),
-                    task: summary.to_string(),
-                    done: false,
-                    timestamp: chrono::Utc::now(),
-                    token: None,
-                },
-                &self.registry,
-            )
-            .await;
+        let (request, provenance) = dot_agent_deck::task_completion::worker_report(
+            &self.registry,
+            WORKER_PANE,
+            summary,
+            false,
+        );
+        let _ = dot_agent_deck::task_completion::complete_with_state(
+            &self.state,
+            &self.registry,
+            request,
+            &provenance,
+        )
+        .await;
     }
 
     fn summary_path(&self) -> std::path::PathBuf {
@@ -955,6 +982,16 @@ impl DispatchReturnHarness {
         let cwd = common::race_safe_tempdir();
         let cwd_string = cwd.path().to_string_lossy().into_owned();
         let registry = std::sync::Arc::new(AgentPtyRegistry::new());
+        // The retained store the daemon opens at its start: a report is
+        // accepted only once kept there (PRD #1666 part 3, round 5).
+        std::fs::create_dir_all(cwd.path().join(".deck-state")).expect("state dir");
+        registry
+            .inbox()
+            .set_retained_store(dot_agent_deck::retained_store::RetainedStore::open(
+                &cwd.path().join(".deck-state"),
+                dot_agent_deck::retained_store::StoreConfig::default(),
+                dot_agent_deck::retained_store::Now::current(),
+            ));
         let caller_agent_id =
             spawn_dispatch_return_observer(&registry, &cwd_string, caller_pane, caller_ready);
         let unit_agent_id =
@@ -1004,18 +1041,15 @@ impl DispatchReturnHarness {
     }
 
     async fn complete(&self, unit_pane: &str, report: &str) {
-        self.state
-            .handle_work_done(
-                WorkDoneSignal {
-                    pane_id: unit_pane.to_string(),
-                    task: report.to_string(),
-                    done: true,
-                    timestamp: chrono::Utc::now(),
-                    token: None,
-                },
-                &self.registry,
-            )
-            .await;
+        let (request, provenance) =
+            dot_agent_deck::task_completion::worker_report(&self.registry, unit_pane, report, true);
+        let _ = dot_agent_deck::task_completion::complete_with_state(
+            &self.state,
+            &self.registry,
+            request,
+            &provenance,
+        )
+        .await;
     }
 }
 
@@ -1087,17 +1121,9 @@ fn dispatch_return_004_completion_is_refused_when_the_caller_pane_changed_hands(
             "the completion must not be posted to the pane's new occupant; inbox = {:?}",
             harness.registry.inbox().list(CALLER_PANE)
         );
-        let log = dispatch_return_logs();
-        assert!(
-            log.lines().any(|line| {
-                line.contains(CALLER_PANE)
-                    && line.contains("refused the completion report")
-                    && line.contains("no longer the live agent")
-                    && line.contains("nothing posted")
-            }),
-            "the completion must be observably refused for its caller's absence, with nothing \
-             posted; captured log = {log:?}"
-        );
+        // PRD #1666 part 3, round 5 (plan D7): the report is not dropped; it is
+        // kept as a recovery row naming its gone caller.
+        assert_completion_kept(&harness, CALLER_PANE);
     });
 }
 
@@ -1180,16 +1206,35 @@ fn dispatch_return_005_completion_is_dropped_after_the_caller_pane_is_gone() {
             "the caller close must log that it orphaned the retained return edge; captured log = \
              {log:?}"
         );
-        assert!(
-            log.lines().any(|line| {
-                line.contains(CALLER_PANE)
-                    && line.contains("refused the completion report")
-                    && line.contains("no longer the live agent")
-            }),
-            "the late completion must be refused for its missing caller, with nothing posted; \
-             captured log = {log:?}"
-        );
+        assert_completion_kept(&harness, CALLER_PANE);
     });
+}
+
+/// PRD #1666 part 3, round 5 (plan D7): a unit's completion whose caller is
+/// gone is kept as exactly one recovery row, saved in the deck's retained
+/// store, naming the caller it was for, rather than dropped.
+fn assert_completion_kept(harness: &DispatchReturnHarness, caller_pane: &str) {
+    let rows = harness.registry.inbox().deck_outcome_rows();
+    let kept: Vec<_> = rows
+        .iter()
+        .filter(|row| {
+            row.phase == dot_agent_deck::report_recovery::OutcomePhase::DispatchFinished
+                && row.original.pane_id == caller_pane
+        })
+        .collect();
+    assert_eq!(
+        kept.len(),
+        1,
+        "one recovery row for the completion; rows = {rows:?}"
+    );
+    assert_eq!(
+        kept[0].cause,
+        dot_agent_deck::report_recovery::OutcomeCause::RecipientExited
+    );
+    assert!(
+        kept[0].report_id.is_some(),
+        "the row names its saved report"
+    );
 }
 
 /// Issue #508: the opening of a report that is longer than the daemon will inline.
@@ -1444,7 +1489,7 @@ const FALSE_PROVENANCE_CLAIMS: &[&str] = &[
     "you have no outstanding delegation",
 ];
 
-/// Scenario: Delegate to `coder`, then start a close of one pane of the pair — the worker's in one run, the orchestrator's in the other — and abandon it, the way a failed `StopAgent` does, leaving both agents live. When the worker then reports `work-done`, the orchestrator pane must receive its report without being told it did not commission the work or that a person most likely tasked the worker: the deck lost its record of the delegation, and says only that.
+/// Scenario: Delegate to `coder`, then start a close of one pane of the pair — the worker's in one run, the orchestrator's in the other — and abandon it, the way a failed `StopAgent` does, leaving both agents live. When the worker then reports its task, the orchestrator pane must receive the report as that task's, filed and pointed at, and never be told it did not commission the work: the close swept the commission record, but the task itself is still on record.
 #[spec("orchestration/work-done/011")]
 #[test]
 fn work_done_011_abandoned_close_does_not_make_the_deck_deny_a_real_delegation() {
@@ -1498,14 +1543,16 @@ fn work_done_011_abandoned_close_does_not_make_the_deck_deny_a_real_delegation()
                      snapshot = {snapshot:?}"
                 );
             }
+            // PRD #1666 part 3, round 5: the report names its task, which the
+            // close did not sweep, so it is that task's report.
             assert!(
-                snapshot.contains(UNSOLICITED_NEEDLE),
-                "{arm}: with no commission on record the completion still carries the \
-                 unsolicited label, worded as what the deck can assert; snapshot = {snapshot:?}"
+                !snapshot.contains(UNSOLICITED_NEEDLE),
+                "{arm}: the report names a task on record, so it is not a note; \
+                 snapshot = {snapshot:?}"
             );
             assert!(
-                !snapshot.contains(POINTER_NEEDLE),
-                "{arm}: nothing was filed, so nothing may be pointed at; snapshot = {snapshot:?}"
+                snapshot.contains(POINTER_NEEDLE),
+                "{arm}: the task's report is filed and pointed at; snapshot = {snapshot:?}"
             );
         });
     }

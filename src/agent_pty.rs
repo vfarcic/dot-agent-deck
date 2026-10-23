@@ -2394,31 +2394,10 @@ fn pump_reader(
                 "pane EOF: an idle-worker record named no ledger task; reporting it from the record"
             );
         }
-        // PRD #1666 S5: with the idle-worker detector switched off no delegation
-        // record exists, but the commission still says this agent owed a
-        // work-done. Its orchestrator is told the same way.
-        if worker_exits.is_empty()
-            && let Some(owner) = registry.commission_owed_to_agent(pane_id, &agent_id)
-            && owner.orchestrator_pane_id != pane_id
-            && let Some(orchestrator_agent_id) = owner.orchestrator_agent_id
-        {
-            match crate::inbox_hub::post_notice_to_live(
-                &registry,
-                crate::inbox::Recipient::bound(&owner.orchestrator_pane_id, &orchestrator_agent_id),
-                "worker exited",
-                crate::state::compose_worker_exited_notice(pane_id),
-            ) {
-                Ok(_) => tracing::info!(
-                    worker_pane_id = %pane_id,
-                    "pane EOF: reported a worker that exited without work-done to the orchestrator"
-                ),
-                Err(error) => tracing::warn!(
-                    worker_pane_id = %pane_id,
-                    %error,
-                    "pane EOF: the orchestrator's inbox refused the worker-exited report"
-                ),
-            }
-        }
+        // PRD #1666 part 3, round 5 (plan D12 rule 4): with the idle-worker
+        // detector switched off, the hub's ledger walk above has already told
+        // the orchestrator which tasks the exit left unreported, whatever the
+        // commission count says, so the commission's own notice is gone.
         if !worker_exits.is_empty() {
             match runtime_handle {
                 Some(handle) => {
@@ -2495,8 +2474,6 @@ pub struct AttachHandle {
 /// What [`AgentPtyRegistry::deliver_worker_exited_notice`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExitedNotice {
-    /// A `work-done` already credited the delegation, so nothing was owed.
-    NotOwed,
     /// Posted to the orchestrator's inbox.
     Posted,
     /// The orchestrator's inbox refused it.
@@ -5799,6 +5776,14 @@ mod dispatch_lifecycle_tests;
 #[path = "agent_pty_replacement_tests.rs"]
 mod replacement_tests;
 
+#[cfg(all(test, unix))]
+#[path = "agent_pty_report_tests.rs"]
+mod report_tests;
+
+#[cfg(all(test, unix))]
+#[path = "agent_pty_terminal_tests.rs"]
+mod terminal_tests;
+
 /// PRD #1666 part 3, round 5: the synchronous pause in a respawn's
 /// replacement window, after the replacement's spawn returned and before the
 /// dispatched unit follows it ([`AgentPtyRegistry::pause_at_sync_for_test`]).
@@ -8975,6 +8960,119 @@ impl AgentPtyRegistry {
         }
     }
 
+    /// PRD #1666 part 3, round 5 (plan D12): the facts generation `agent_id`
+    /// attests with, from its record or its pending reservation: what its
+    /// hook token's provenance carries.
+    pub fn attest_facts(&self, agent_id: &str) -> Option<crate::hook_provenance::AttestFacts> {
+        let inner = self.inner.lock_recovering();
+        inner
+            .agents
+            .get(agent_id)
+            .map(|agent| agent.attest_facts.clone())
+            .or_else(|| inner.pending_facts.get(agent_id).cloned())
+    }
+
+    /// PRD #1666 part 3, round 5 (plan §2 step 2): a terminal report's
+    /// admission, at the linearization point: the routes (R2), then the hub
+    /// under them. With the routes unavailable it consumes nothing and refuses
+    /// as the deck being unavailable.
+    pub(crate) fn admit_terminal_claim(
+        &self,
+        spec: &crate::inbox_hub::ClaimSpec,
+        facts: &crate::hook_provenance::AttestFacts,
+    ) -> crate::inbox_hub::Admission {
+        let Ok(mut returns) = self.dispatch_returns.try_lock() else {
+            let dir = self
+                .inbox()
+                .retained_store()
+                .map(|store| store.dir().display().to_string())
+                .unwrap_or_default();
+            return crate::inbox_hub::Admission::Answer(crate::event::WorkDoneTaskReply::refused(
+                crate::work_done_text::code::DECK_UNAVAILABLE,
+                &crate::work_done_text::deck_unavailable(&dir),
+            ));
+        };
+        self.inbox()
+            .install_terminal_claim(&mut returns, spec, facts)
+    }
+
+    /// PRD #1666 part 3, round 5 (plan D12 rule 8): commit claim `claim_id`.
+    /// The tracker (R1) and, for a terminal claim, the routes (R2) are taken
+    /// first, without panicking; the hub's commit runs under them; then the
+    /// task's own debt is released exactly, still under R1. Nothing is
+    /// written when a lock is unavailable. What the section owes comes back
+    /// with the outcome, for the caller to run after handing the result over.
+    pub(crate) fn commit_claim(
+        &self,
+        claim_id: u64,
+        terminal: bool,
+    ) -> (
+        crate::inbox_hub::CommitOutcome,
+        Option<crate::inbox_hub::AfterSection>,
+    ) {
+        let Ok(mut tracker) = self.delegations.try_lock() else {
+            return (crate::inbox_hub::CommitOutcome::Unavailable, None);
+        };
+        let mut returns = if terminal {
+            match self.dispatch_returns.try_lock() {
+                Ok(returns) => Some(returns),
+                Err(_) => return (crate::inbox_hub::CommitOutcome::Unavailable, None),
+            }
+        } else {
+            None
+        };
+        // The recipient's liveness, read under the hub's lock (R3 → R4).
+        let live =
+            |pane: &str, agent: &str| self.pane_current_agent_id(pane).as_deref() == Some(agent);
+        let (outcome, after) = self
+            .inbox()
+            .commit_claim_locked(returns.as_mut(), claim_id, &live);
+        if let crate::inbox_hub::CommitOutcome::Committed {
+            debt: Some((pane, debt)),
+            ..
+        } = &outcome
+        {
+            if let Some(arm_id) = debt.commission_arm_id {
+                tracker.remove_arm_exact(pane, arm_id);
+            }
+            if let Some(seq) = debt.delegation_seq {
+                let _ = tracker.take_record_if(pane, seq);
+            }
+        }
+        drop(returns);
+        drop(tracker);
+        (outcome, Some(after))
+    }
+
+    /// PRD #1666 part 3, round 5 (plan D12 rule 9): fail claim `claim_id`,
+    /// with the tracker (R1) taken first, without panicking; a task the
+    /// failure closes has its own debt released exactly, still under R1.
+    pub(crate) fn fail_claim(
+        &self,
+        claim_id: u64,
+    ) -> (
+        crate::inbox_hub::FailOutcome,
+        Option<crate::inbox_hub::AfterSection>,
+    ) {
+        let Ok(mut tracker) = self.delegations.try_lock() else {
+            return (crate::inbox_hub::FailOutcome::Unavailable, None);
+        };
+        let (outcome, after) = self.inbox().fail_claim_locked(claim_id);
+        if let crate::inbox_hub::FailOutcome::Failed {
+            debt: Some((pane, debt)),
+        } = &outcome
+        {
+            if let Some(arm_id) = debt.commission_arm_id {
+                tracker.remove_arm_exact(pane, arm_id);
+            }
+            if let Some(seq) = debt.delegation_seq {
+                let _ = tracker.take_record_if(pane, seq);
+            }
+        }
+        drop(tracker);
+        (outcome, Some(after))
+    }
+
     /// Issue #1423: the generation of `worker_pane_id`'s armed idle-worker
     /// record, or `None` when no delegation to that pane is outstanding.
     /// Read-only, so a check cannot itself retire the record it is checking.
@@ -9725,18 +9823,10 @@ impl AgentPtyRegistry {
         worker_pane_id: &str,
         delegation: OutstandingDelegation,
     ) -> ExitedNotice {
-        // A completion that lands between the EOF sweep and this line is caught
-        // by the commission check here; one after it arrives as its own message.
-        // Issue #708: a `work-done` credited since the sweep means the
-        // delegation did NOT fail — see this function's doc.
-        if !self.owes_delegation_commission(worker_pane_id) {
-            tracing::debug!(
-                worker_pane_id = %worker_pane_id,
-                role = %delegation.role,
-                "pane EOF: a work-done already credited the delegation; no worker-exited notice"
-            );
-            return ExitedNotice::NotOwed;
-        }
+        // PRD #1666 part 3, round 5 (plan D12 rule 4): this is the fallback for
+        // a record that names no ledger task, so no `work-done` can have
+        // credited it: a report names its task, and a task's exit is decided
+        // by the hub's ledger. Its early commission check went with that.
         let notice = crate::state::compose_worker_exited_notice(worker_pane_id);
         // PRD #1666 S5: a daemon notice in the orchestrator generation's inbox.
         match crate::inbox_hub::post_notice_to_live(
@@ -15576,6 +15666,17 @@ impl AgentPtyRegistry {
             .unwrap()
             .insert(name.to_string(), (reached_tx, release_rx));
         (reached_rx, release_tx)
+    }
+
+    /// TEST: the commission arms `worker_pane_id` owes, by id, oldest first.
+    #[cfg(test)]
+    pub(crate) fn commission_arm_ids_for_test(&self, worker_pane_id: &str) -> Vec<u64> {
+        self.delegations
+            .lock()
+            .commissions
+            .get(worker_pane_id)
+            .map(|entry| entry.armed_at.iter().map(|armed| armed.arm_id).collect())
+            .unwrap_or_default()
     }
 
     /// Where [`Self::pause_at_for_test`] waits. A no-op outside tests.
@@ -23793,23 +23894,16 @@ mod spawn_tests {
         assert!(!reg.owes_delegation_commission(WORKER));
     }
 
-    /// Issue #708 (Greptile P1 and P2 on PR #1338); PRD #1666 S5: two
-    /// properties of the worker-exited report's ONE production call site,
-    /// driven through `deliver_worker_exited_notice` itself rather than through
-    /// the primitives it calls.
-    ///
-    /// 1. **A `work-done` already credited means the delegation did not fail.**
-    ///    The EOF sweep takes the `OutstandingDelegation` first, and a racing
-    ///    `work-done` then finds none and retires the COMMISSION instead, so a
-    ///    report whose worker no longer owes one is not posted as a failure to
-    ///    act on. The control is the same report with the commission standing,
-    ///    which IS posted.
-    /// 2. **A repeat is still posted after the user has typed** into the
-    ///    orchestrator's pane: the same worker pane exiting again composes
-    ///    byte-identical text, and the orchestrator must hear about the second
-    ///    failure too.
+    /// Issue #708 (Greptile P1 and P2 on PR #1338); PRD #1666 S5: the
+    /// worker-exited report's fallback call site, driven through
+    /// `deliver_worker_exited_notice` itself. **A repeat is still posted after
+    /// the user has typed** into the orchestrator's pane: the same worker pane
+    /// exiting again composes byte-identical text, and the orchestrator must
+    /// hear about the second failure too. (Its other half, that a credited
+    /// commission suppresses the report, went with PRD #1666 part 3, round 5:
+    /// a task's exit is decided by the hub's ledger, plan D12 rule 4.)
     #[tokio::test]
-    async fn worker_exited_report_refuses_a_credited_commission_and_resubmits_after_user_input() {
+    async fn worker_exited_report_resubmits_after_user_input() {
         const ORCH: &str = "exit-report-orchestrator";
         const WORKER: &str = "exit-report-worker";
         let reg = Arc::new(AgentPtyRegistry::new());
@@ -23821,15 +23915,7 @@ mod spawn_tests {
             })
             .expect("spawn orchestrator stand-in");
 
-        // 1. Nothing owed: a work-done credited the delegation after the sweep.
-        assert!(!reg.owes_delegation_commission(WORKER));
-        let credited = reg
-            .deliver_worker_exited_notice(WORKER, swept_delegation(ORCH, &orchestrator))
-            .await;
-
-        // Control, and the first delivery of part 2: the commission is standing.
-        assert!(arm_commission(&reg, WORKER, ORCH));
-        assert!(reg.owes_delegation_commission(WORKER));
+        // The first delivery.
         let first = reg
             .deliver_worker_exited_notice(WORKER, swept_delegation(ORCH, &orchestrator))
             .await;
@@ -23842,19 +23928,7 @@ mod spawn_tests {
             .await;
         reg.shutdown_all();
 
-        assert_eq!(
-            credited,
-            ExitedNotice::NotOwed,
-            "a worker-exited report must not be posted once a work-done has credited the \
-             worker's commission: the delegation finished, and the orchestrator would be told \
-             it failed"
-        );
-        assert_eq!(
-            first,
-            ExitedNotice::Posted,
-            "control: the same report with the commission still owed must be posted, or the \
-             refusal above proves nothing about the commission check"
-        );
+        assert_eq!(first, ExitedNotice::Posted, "the first report is posted");
         assert_eq!(
             repeat,
             ExitedNotice::Posted,

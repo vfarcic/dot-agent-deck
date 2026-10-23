@@ -726,11 +726,20 @@ pub struct Task {
     pub exit_walked: bool,
 }
 
+/// A task that is not open, and the worker generation it was bound to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettledTask {
+    pub tombstone: Tombstone,
+    pub worker_pane: String,
+    pub worker_agent: String,
+    instance: String,
+}
+
 /// What the ledger knows about a task id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskLookup<'a> {
     Open(&'a Task),
-    Settled(&'a Tombstone),
+    Settled(&'a SettledTask),
     Unknown,
 }
 
@@ -749,7 +758,7 @@ const NO_INSTANCE: &str = "";
 #[derive(Debug)]
 pub struct TaskLedger {
     open: HashMap<String, Task>,
-    settled: HashMap<String, (String, Tombstone)>,
+    settled: HashMap<String, SettledTask>,
     by_instance: HashMap<String, VecDeque<String>>,
     order: VecDeque<String>,
     per_instance: usize,
@@ -791,7 +800,7 @@ impl TaskLedger {
             return TaskLookup::Open(task);
         }
         match self.settled.get(task_id) {
-            Some((_, tombstone)) => TaskLookup::Settled(tombstone),
+            Some(settled) => TaskLookup::Settled(settled),
             None => TaskLookup::Unknown,
         }
     }
@@ -831,8 +840,15 @@ impl TaskLedger {
             .instance
             .clone()
             .unwrap_or_else(|| NO_INSTANCE.to_string());
-        self.settled
-            .insert(task_id.to_string(), (instance.clone(), tombstone));
+        self.settled.insert(
+            task_id.to_string(),
+            SettledTask {
+                tombstone,
+                worker_pane: task.binding.worker_pane.clone(),
+                worker_agent: task.binding.worker_agent.clone(),
+                instance: instance.clone(),
+            },
+        );
         self.by_instance
             .entry(instance.clone())
             .or_default()
@@ -861,7 +877,7 @@ impl TaskLedger {
             let Some(oldest) = self.order.pop_front() else {
                 break;
             };
-            if let Some((instance, _)) = self.settled.remove(&oldest)
+            if let Some(SettledTask { instance, .. }) = self.settled.remove(&oldest)
                 && let Some(ids) = self.by_instance.get_mut(&instance)
             {
                 ids.retain(|id| *id != oldest);
@@ -881,6 +897,165 @@ impl TaskLedger {
     pub fn settled_len(&self) -> usize {
         self.settled.len()
     }
+
+    /// TEST: lower the bound, evicting past it at the next settlement.
+    #[cfg(test)]
+    pub fn set_bound_for_test(&mut self, per_instance: usize) {
+        self.per_instance = per_instance.max(1);
+        self.global = self.per_instance.saturating_mul(16);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The claim table (D12)
+// ---------------------------------------------------------------------------
+
+/// What a claim reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimMode {
+    /// Delegated task `task_id`.
+    Task { task_id: String },
+    /// Dispatched unit `unit_id`, whose terminal is on `unit_pane`.
+    Terminal { unit_id: String, unit_pane: String },
+    /// A note that completes no task.
+    Uncorrelated,
+}
+
+/// How far a claim's save has come, advanced under the hub's lock before
+/// each step it names (D12 rule 11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ClaimPhase {
+    Admitted,
+    Saving,
+    /// The composed post is in the claim: only roll-forward from here.
+    Staged,
+    /// A terminal claim's unit is marked complete.
+    Marked,
+    /// Inside the commit's section.
+    Applying,
+}
+
+/// What waiters on a claim are told.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimState {
+    Pending,
+    Committed,
+    Failed,
+}
+
+/// Where a committed report went, as its answer and a repeat read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Committed {
+    pub report_id: Option<String>,
+    pub destination: Destination,
+}
+
+/// A report being saved (D12). It owns what its acceptance will consume
+/// until it commits or fails.
+#[derive(Debug)]
+pub struct Claim {
+    pub claim_id: u64,
+    pub mode: ClaimMode,
+    /// The reporting generation.
+    pub worker_pane: String,
+    pub worker_agent: String,
+    /// Who the report goes to, captured at admission; `None` keeps it in
+    /// recovery.
+    pub recipient: Option<Recipient>,
+    /// The worker's role, for the post and the rows.
+    pub role: Option<String>,
+    /// The debt the task's delegate armed, released exactly at the commit.
+    pub arm_id: Option<u64>,
+    pub seq: Option<u64>,
+    pub digest: [u8; 32],
+    pub report_id: String,
+    /// The id the commit posts under, minted at admission.
+    pub message_id: String,
+    /// One counted reply room is held for the post.
+    pub room: bool,
+    /// The recipient is known gone (an orphaned caller route): the report
+    /// goes to recovery whoever holds its pane now.
+    pub recipient_gone: bool,
+    /// The bytes held in the retained store for the report's file.
+    pub reserved_bytes: u64,
+    /// The worker generation ended while the report was being saved.
+    pub worker_gone: Option<EndedHow>,
+    /// The unit ended while its terminal report was being saved.
+    pub unit_gone: Option<EndedHow>,
+    /// Exit notices owed only if this report is not accepted (D12 rule 4).
+    pub withheld: Vec<(Recipient, &'static str, String)>,
+    pub phase: ClaimPhase,
+    /// The composed post, once staged.
+    pub prepared: Option<crate::inbox::Content>,
+    /// When the unit's completion was marked, for a terminal claim.
+    pub unit_mark: Option<UnitMark>,
+    /// The dispatched unit's name, for a terminal claim.
+    pub unit_name: Option<String>,
+    pub settled: tokio::sync::watch::Sender<ClaimState>,
+}
+
+/// Every claim, and which generation holds one (at most one each).
+#[derive(Debug, Default)]
+pub struct ClaimTable {
+    claims: HashMap<u64, Claim>,
+    by_generation: HashMap<(String, String), u64>,
+    next: u64,
+}
+
+impl ClaimTable {
+    /// A fresh claim id.
+    pub fn mint(&mut self) -> u64 {
+        self.next += 1;
+        self.next
+    }
+
+    /// The claim `(pane, agent)` holds, if any.
+    pub fn of_generation(&self, pane_id: &str, agent_id: &str) -> Option<u64> {
+        self.by_generation
+            .get(&(pane_id.to_string(), agent_id.to_string()))
+            .copied()
+    }
+
+    pub fn insert(&mut self, claim: Claim) {
+        self.by_generation.insert(
+            (claim.worker_pane.clone(), claim.worker_agent.clone()),
+            claim.claim_id,
+        );
+        self.claims.insert(claim.claim_id, claim);
+    }
+
+    pub fn get(&self, claim_id: u64) -> Option<&Claim> {
+        self.claims.get(&claim_id)
+    }
+
+    pub fn get_mut(&mut self, claim_id: u64) -> Option<&mut Claim> {
+        self.claims.get_mut(&claim_id)
+    }
+
+    pub fn remove(&mut self, claim_id: u64) -> Option<Claim> {
+        let claim = self.claims.remove(&claim_id)?;
+        let key = (claim.worker_pane.clone(), claim.worker_agent.clone());
+        if self.by_generation.get(&key) == Some(&claim_id) {
+            self.by_generation.remove(&key);
+        }
+        Some(claim)
+    }
+
+    /// The claim a task's report holds, if any.
+    pub fn of_task(&self, task_id: &str) -> Option<u64> {
+        self.claims
+            .values()
+            .find(|c| matches!(&c.mode, ClaimMode::Task { task_id: id } if id == task_id))
+            .map(|c| c.claim_id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.claims.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.claims.is_empty()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -897,6 +1072,7 @@ pub struct ReportState {
     pub publications: Publications,
     pub fallback: FallbackBodies,
     pub tasks: TaskLedger,
+    pub claims: ClaimTable,
     /// Tasks a worker's exit walk decided (D12 rule 4), until the exit's
     /// `AgentExited` event for each is settled: `settle_delegate` posts no
     /// notice of its own for them.
@@ -916,6 +1092,7 @@ impl ReportState {
             publications: HashMap::new(),
             fallback: HashMap::new(),
             tasks: TaskLedger::new(tombstones_max_from_env()),
+            claims: ClaimTable::default(),
             exit_walked: HashSet::new(),
             incarnation: bytes.iter().map(|b| format!("{b:02x}")).collect(),
         }
@@ -1026,7 +1203,10 @@ mod tests {
                 );
                 "reported"
             }
-            TaskLookup::Settled(Tombstone::Reported { .. }) => "already reported",
+            TaskLookup::Settled(SettledTask {
+                tombstone: Tombstone::Reported { .. },
+                ..
+            }) => "already reported",
             _ => "unknown",
         }
     }
@@ -1081,7 +1261,15 @@ mod tests {
             })
         ));
         tasks.settle("t1", Tombstone::Closed).unwrap();
-        assert_eq!(tasks.lookup("t1"), TaskLookup::Settled(&Tombstone::Closed));
+        assert!(matches!(
+            tasks.lookup("t1"),
+            TaskLookup::Settled(SettledTask {
+                tombstone: Tombstone::Closed,
+                worker_pane,
+                worker_agent,
+                ..
+            }) if worker_pane == "w" && worker_agent == "a"
+        ));
         assert_eq!(
             tasks.bind("t1", binding("w", "a", Some("i1"))),
             Err(Rebind),

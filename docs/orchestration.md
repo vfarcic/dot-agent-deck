@@ -98,7 +98,7 @@ Type your request into the orchestrator's pane, for example *"Add input validati
 **Check each hand-off:**
 
 - When the orchestrator delegates, the `coder` card (TUI) or tile (desktop) shows `✉1 queued` until the coder takes the task, then `✉ delivered`, and its status changes to a working one. The task reaches the coder's pane as a deck message whose `Sent by:` line names the orchestrator; see [Delivery in the TUI and desktop app](#delivery-in-the-tui-and-desktop-app) for how each agent shows it. In the desktop app, the handoff rail shows `delegated · queued`, then `delivered · working`. A copy of the task is also saved to `.dot-agent-deck/worker-task-coder.md` in the project directory.
-- When the coder finishes, it runs `dot-agent-deck work-done`. Its report appears in the orchestrator's pane and is saved to `.dot-agent-deck/work-done-coder.md`.
+- When the coder finishes, it runs `dot-agent-deck work-done` with the task's id. Its report appears in the orchestrator's pane and is saved to `.dot-agent-deck/work-done-coder.md`.
 - The orchestrator then delegates to `reviewer`, and the same two signs appear for it.
 
 If a step does not happen, see [When something goes wrong](#when-something-goes-wrong). If a worker stops responding, the deck reports it to the orchestrator; see [Idle Workers & Notifications](idle-workers-and-notifications.md).
@@ -405,8 +405,8 @@ While the TUI is **locked**, it moves focus within the active orchestration tab:
 
 1. The orchestrator runs `dot-agent-deck delegate --to <role> --task-file <file>` (or `--task "<text>"`).
 2. The deck writes the worker's task file, `.dot-agent-deck/worker-task-<role>.md` in the worker's directory: the role's `prompt_template`, then `## Task`, then the task. It queues an inbox message pointing the worker to that file.
-3. The worker's integration receives and acknowledges the message. The worker does the work and runs `dot-agent-deck work-done --task-file <file>`.
-4. The deck saves the report to `.dot-agent-deck/work-done-<role>.md` and puts a message in the orchestrator's inbox.
+3. The worker's integration receives and acknowledges the message. The task names its id, and the worker does the work and runs `dot-agent-deck work-done --task-id <id> --task-file <file>`.
+4. The deck keeps the report, saves a copy to `.dot-agent-deck/work-done-<role>.md`, and puts `<role> completed task <id>` in the orchestrator's inbox. That completes the task, and the worker is free for the next one.
 
 The deck teaches the orchestrator and the workers these commands when they start, so a `prompt_template` only needs to describe your workflow.
 
@@ -419,7 +419,7 @@ These commands work only from a pane the deck started, which sets `DOT_AGENT_DEC
 | Command | Who runs it | What it does |
 |---|---|---|
 | `dot-agent-deck delegate --to <role> [--to <role> …] (--task <text> \| --task-file <path>) [--supersede]` | orchestrator | Sends a task to one or more workers. `--task-file -` reads the task from stdin. `--task-file` is the safe choice for text with quotes, backticks, `$` or newlines; the file must be a regular file of at most 1 MiB. `--supersede` sends even to a worker that still owes a `work-done` ([One task per worker at a time](#one-task-per-worker-at-a-time)). |
-| `dot-agent-deck work-done (--task <text> \| --task-file <path>) [--done]` | worker, or orchestrator with `--done` | Reports a finished task to the orchestrator. The orchestrator uses `--done` to mark the whole orchestration complete; in a dispatched unit, that reports back to the dispatcher ([Dispatcher Mode](dispatcher-mode.md)). |
+| `dot-agent-deck work-done [--task-id <id>] (--task <text> \| --task-file <path>) [--done]` | worker, or orchestrator with `--done` | Reports a finished task to the orchestrator. `--task-id` names the task the report completes, as the task's instructions give it. Without `--task-id` or `--done`, the report is delivered as a note that completes no task. The orchestrator uses `--done` to mark the whole orchestration complete; in a dispatched unit, that reports back to the dispatcher ([Dispatcher Mode](dispatcher-mode.md)). |
 | `dot-agent-deck ack <message-id>` | worker or agent integration | Acknowledges a message. The installed integration normally does this itself. Acknowledge a message only after taking it with the integration or `inbox fetch`: when the deck has not handed the message to the agent yet, or has recorded that none of its current hand-overs reached the agent, it answers `unknown` and does not mark the message delivered. Exits non-zero when the deck answers that the id is unknown, belongs to another agent or can no longer be delivered. |
 | `dot-agent-deck inbox list [--all] [--json]` | agent | Lists its inbox messages and their delivery states. An orchestrator can use `--all` to inspect its orchestration's inboxes. |
 | `dot-agent-deck inbox fetch [--json]` | agent | Reads its waiting messages and confirms to the deck each one it printed in full. Run inside the recipient's deck pane; fetching changes delivery state. `--json` prints each message's id, subject, sender and text. |
@@ -438,7 +438,20 @@ These commands work only from a pane the deck started, which sets `DOT_AGENT_DEC
 
 A role "reaches no worker" when it is not in the file, when it is the orchestrator itself, when its pane was closed, or when it was renamed or added after the orchestration started.
 
-`work-done` exits 0 when the daemon accepted the report (or gave no reply it could read), and non-zero with `Error: the daemon did not accept this …` when it refused it, or `Failed to send work-done signal to daemon socket.` when no daemon answered.
+`work-done` answers once the deck has kept the report:
+
+| Outcome | Exit status | Printed |
+|---|---|---|
+| The task's report was taken | 0 | `Reported task <id> to the orchestrator.`, or, when the orchestrator is no longer running, that the deck saved it in Deck notices |
+| The same report was already taken | 0 | `Task <id> was already reported; nothing new was sent.` |
+| A different report for a task already reported | non-zero | `Task <id> was already reported; this different report was NOT delivered. …` |
+| No `--task-id` | 0 | `Sent to the orchestrator as a note that completes no task. …` |
+| Refused | non-zero | `Error: nothing was reported: …`, saying why and what to do: the task is unknown, was replaced, or ended with its agent; the deck cannot save the report; or it is too large |
+| An earlier `work-done` for the same task is still being saved | non-zero | `Error: nothing new was reported: … Run the same command again in a moment …` |
+| The report was sent and no answer came back | non-zero | `The report may have been accepted; its result is unconfirmed. …` |
+| The deck daemon is older than this `dot-agent-deck` | non-zero | `Error: this deck daemon did not confirm it supports task work-done reports; nothing was reported. …` |
+
+A repeat of a report with the same `--task-id` is answered with the first result while the deck still remembers the task (its last 256 tasks per orchestration, until the daemon restarts), and is never delivered twice. [Troubleshooting](troubleshooting.md#work-done-is-refused-pending-or-unconfirmed) explains each refusal.
 
 ### One task per worker at a time
 
@@ -557,7 +570,7 @@ Preserve your other plugin entries, then restart OpenCode. The installer prints 
 
 The deck knows where each message stands for every agent, so it sends one again only as described in [Delivery in the TUI and desktop app](#delivery-in-the-tui-and-desktop-app), marked as a possible repeat. A message that an older `dot-agent-deck`'s hooks or `inbox fetch` took and never acknowledged becomes available again after the deck's wait instead; its id stays the same so an agent can recognise a repeat. The deck stops retrying after the delivery limit and shows `not delivered`; a delegated task that remains unacknowledged also produces a notice for its orchestrator. Restarting an agent does not move an already bound message to the replacement: delegate the task again when needed.
 
-In both clients, replacing an earlier task with a new delegation or restarting the worker stops delivery notices for the superseded task. A late `work-done` for a task the worker acknowledged leaves a newer task it has not taken queued, and the orchestrator is still told if that newer task does not reach the worker. A worker that reports `work-done` twice for one task, though, can make the deck drop a newer task it has not taken yet, without telling the orchestrator; delegate that task again if the worker never picked it up. If the worker takes a task directly from its file, it should acknowledge the message id too: otherwise its completion can stop delivery notices for other tasks waiting in its inbox, or, if it acknowledged an earlier task it never finished, the deck can report the task it took from the file as not delivered and hand it to the worker again.
+In both clients, replacing an earlier task with a new delegation or restarting the worker stops delivery notices for the superseded task. A worker's report names its task, so it completes that task and no other: a late report of a task that was replaced is refused, and a newer task stays queued and watched until it is reported or delivered. A worker that takes its task directly from its file reports it the same way, by the id its task file names.
 
 ### A deck prompt waits while you have an unsent draft
 

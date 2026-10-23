@@ -1618,23 +1618,28 @@ pub const CONTRACT_BREAKS: &[&str] = &[
     // stream-bound fetch are unchanged; what moved is who may take mail.
     // `changelog.d/1666-legacy-inbox.breaking.md` is its fragment.
     "1666-legacy-inbox-delivery-withdrawal",
-    // PRD #1666 part 3, round 5, at 12 without moving it. What a dispatched
-    // unit's end and a dispatch's result now mean: a unit that ends without a
-    // report produces a `dispatch ended` outcome for its caller; a dispatch's
-    // start or failure result is retained by the daemon (as a file, or held in
-    // memory and labelled so) and outlives the caller that should read it; a
-    // `dispatch` is refused before anything starts when its result could not be
-    // kept (`report_store_full`, `report_save_failed`, `dispatch_slots_full`,
-    // and `deck_unavailable` once the daemon's report state was torn by an
-    // internal panic); a failed respawn of a unit's terminal ends the unit; and
-    // `InboxNotice` / `MessageSummary` carry report provenance, an additive
-    // optional field. `delegate --supersede` now ends the task it replaces,
-    // debt included, and a worker's exit releases its tasks' debt, so what a
-    // worker owes changed too. The task-scoped `work-done` half of the same
-    // break lands with its gated verb. Nothing on the attach wire moved shape;
-    // `ListOutcomes` is a new request every sender withholds until the daemon
-    // advertises `CAP_DECK_OUTCOMES`. What moved is which dispatches are
-    // refused and what a unit's end tells its caller.
+    // PRD #1666 part 3, round 5, at 12 without moving it. A worker's
+    // `work-done` completes the task it names (`work_done_task`, sent only
+    // after `hook_capabilities` confirms version 1 on the same connection); a
+    // legacy `work_done` without `done` is a note that completes no task, and
+    // a terminal report (`done`) requires attestation. Reports are retained
+    // before they are acknowledged and go to a recovery row when their
+    // recipient is gone; `InboxNotice` / `MessageSummary` carry report
+    // provenance (an additive optional field); a unit that ends without a
+    // report produces a `dispatch ended` outcome, and a terminal report from a
+    // unit that already ended is refused (`task_closed`); a worker's exit
+    // notice names the task ids it is about; `destination: none` only for the
+    // orchestrator of a directly started orchestration (pinned at the spawn),
+    // `report_pending` for a generation a publication covers; a failed respawn
+    // of a unit's terminal ends the unit; a report from a forgotten or
+    // replaced generation is refused (`unknown_task`, `task_closed`); an
+    // attested note from a pane now in another orchestration is refused
+    // (`not_a_worker`); a daemon whose report state was torn by an internal
+    // panic refuses reports (`deck_unavailable`); a `dispatch` is refused
+    // before anything starts when its result could not be kept; and
+    // `delegate --supersede` ends the task it replaces, debt included. Nothing
+    // on the attach wire moved shape: `ListOutcomes` is a new request every
+    // sender withholds until the daemon advertises `CAP_DECK_OUTCOMES`.
     // `changelog.d/1666-task-scoped-completion.breaking.md` is its fragment.
     "1666-task-scoped-completion-and-recovery",
 ];
@@ -12427,6 +12432,160 @@ mod tests {
         ("explicit", crate::inbox::AckHow::Explicit),
         ("offer_completed", crate::inbox::AckHow::OfferCompleted),
     ];
+
+    /// Scenario: A 0.47 reader decodes a message summary and an inbox notice this build writes with report provenance set, for every provenance kind. This build decodes a provenance kind, a dispatch phase, an outcome phase, cause, delivery and operation, and a work-done disposition it does not know as `unknown`; a task-scoped work-done whose mode it does not know is refused `unsupported_mode` and changes nothing.
+    #[spec("inbox/boundary/074")]
+    #[tokio::test]
+    async fn boundary_074_report_provenance_crosses_versions() {
+        use crate::report_recovery::{
+            DispatchPhase, OutcomeCause, OutcomeDelivery, OutcomeOp, OutcomePhase, Producer,
+            ReportProvenance,
+        };
+        // 0.47's readers, field for field (no `deny_unknown_fields`, as 0.47).
+        #[allow(dead_code)]
+        mod v047 {
+            use serde::Deserialize;
+
+            #[derive(Deserialize)]
+            #[serde(rename_all = "snake_case")]
+            pub enum StateName {
+                Queued,
+                Fetched,
+                Claimed,
+                Acknowledged,
+                Undeliverable,
+            }
+
+            #[derive(Deserialize)]
+            pub struct MessageSummary {
+                pub id: String,
+                pub kind: String,
+                pub to: String,
+                pub subject: String,
+                pub state: StateName,
+                pub deliveries: u32,
+                pub age_ms: u64,
+            }
+
+            #[derive(Deserialize)]
+            pub struct InboxNotice {
+                pub pane_id: String,
+                #[serde(default)]
+                pub agent_id: Option<String>,
+                pub message_id: String,
+                pub subject: String,
+                pub from_label: String,
+                pub state: StateName,
+                #[serde(default)]
+                pub returned: bool,
+            }
+        }
+        let producer = Producer {
+            pane_id: "w".into(),
+            agent_id: "2".into(),
+            role: Some("coder".into()),
+        };
+        let every = [
+            ReportProvenance::Task {
+                task_id: "m-k3xzq2ab-0123456789abcdef".into(),
+                report_id: "r".into(),
+                producer: producer.clone(),
+            },
+            ReportProvenance::Terminal {
+                unit_id: "u".into(),
+                report_id: "r".into(),
+                producer: producer.clone(),
+            },
+            ReportProvenance::Uncorrelated {
+                report_id: "r".into(),
+                producer,
+            },
+            ReportProvenance::DispatchResult {
+                unit_id: Some("u".into()),
+                phase: DispatchPhase::Ended,
+                report_id: None,
+            },
+        ];
+        let base: crate::inbox::MessageSummary =
+            serde_json::from_str(&frozen_summary("explicit", "")).unwrap();
+        for provenance in every {
+            let summary = crate::inbox::MessageSummary {
+                provenance: Some(provenance.clone()),
+                ..base.clone()
+            };
+            let written = serde_json::to_string(&summary).unwrap();
+            assert!(written.contains("provenance"), "{written}");
+            serde_json::from_str::<v047::MessageSummary>(&written)
+                .unwrap_or_else(|e| panic!("0.47 reads {written}: {e}"));
+            let notice = serde_json::json!({
+                "pane_id": "o",
+                "agent_id": "1",
+                "message_id": "m-k3xzq2ab-0123456789abcdef",
+                "subject": "s",
+                "from_label": "l",
+                "state": "queued",
+            });
+            let mut notice: crate::event::InboxNotice = serde_json::from_value(notice).unwrap();
+            notice.provenance = Some(provenance);
+            let written = serde_json::to_string(&notice).unwrap();
+            serde_json::from_str::<v047::InboxNotice>(&written)
+                .unwrap_or_else(|e| panic!("0.47 reads {written}: {e}"));
+        }
+
+        // This build reads what a newer one may add.
+        assert_eq!(
+            serde_json::from_str::<ReportProvenance>(r#"{"kind":"later"}"#).unwrap(),
+            ReportProvenance::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<DispatchPhase>(r#""later""#).unwrap(),
+            DispatchPhase::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<OutcomePhase>(r#""later""#).unwrap(),
+            OutcomePhase::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<OutcomeCause>(r#""later""#).unwrap(),
+            OutcomeCause::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<OutcomeDelivery>(r#""later""#).unwrap(),
+            OutcomeDelivery::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<OutcomeOp>(r#""later""#).unwrap(),
+            OutcomeOp::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<crate::event::WorkDoneTaskReply>(r#"{"disposition":"later"}"#)
+                .unwrap()
+                .disposition,
+            crate::event::WorkDoneDisposition::Unknown
+        );
+        let request: crate::event::WorkDoneTaskRequest = serde_json::from_str(
+            r#"{"pane_id":"p","mode":{"kind":"later"},"report":"r","timestamp":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        assert_eq!(request.mode, crate::event::WorkDoneMode::Unknown);
+        let registry = std::sync::Arc::new(crate::agent_pty::AgentPtyRegistry::new());
+        let completion = crate::task_completion::complete(
+            &tokio::sync::RwLock::new(crate::state::AppState::default()),
+            &registry,
+            crate::task_completion::CompletionRequest {
+                pane_id: request.pane_id,
+                mode: request.mode,
+                report: request.report,
+            },
+            &crate::hook_provenance::Provenance::Unattested,
+        )
+        .await;
+        let crate::task_completion::Completion::Reply(reply) = completion else {
+            panic!("an answer");
+        };
+        assert_eq!(reply.code.as_deref(), Some("unsupported_mode"));
+        assert!(registry.inbox().deck_outcome_rows().is_empty());
+    }
 
     /// Scenario: Frozen `ListInbox` answers as older daemons wrote them — one acknowledged message for each of the seven `ack_how` spellings, the three legacy ones together in one list, every state and undeliverable reason, both sender kinds, both trust levels, a minimal and a maximal summary, a body whose text opens like a block — are decoded by this build as an attach response, as a hook `inbox list` answer and as bare summaries; and a frozen copy of 0.47's reader, its nested types and closed enums included, decodes what this build writes as an attach response and as a hook `inbox list` answer: every state, undeliverable reason and `ack_how` spelling, both senders, each recipient shape, every wake, and a summary with every optional field set and one with none.
     #[spec("inbox/boundary/070")]

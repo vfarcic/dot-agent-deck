@@ -46,7 +46,7 @@ use dot_agent_deck::daemon_protocol::{
     AttachRequest, bind_attach_listener, serve_attach_with_counter,
 };
 use dot_agent_deck::env_override;
-use dot_agent_deck::event::{BroadcastMsg, DelegateSignal, WorkDoneSignal};
+use dot_agent_deck::event::{BroadcastMsg, DelegateSignal};
 use dot_agent_deck::state::{
     AppState, OrchestrationIdentity, SharedState, worker_response_timeout,
 };
@@ -271,6 +271,16 @@ impl IdleHarness {
         }
         let cwd_str = cwd.path().to_string_lossy().to_string();
         let registry = Arc::new(AgentPtyRegistry::new());
+        // The retained store the daemon opens at its start: a report is
+        // accepted only once kept there (PRD #1666 part 3, round 5).
+        std::fs::create_dir_all(cwd.path().join(".deck-state")).expect("state dir");
+        registry
+            .inbox()
+            .set_retained_store(dot_agent_deck::retained_store::RetainedStore::open(
+                &cwd.path().join(".deck-state"),
+                dot_agent_deck::retained_store::StoreConfig::default(),
+                dot_agent_deck::retained_store::Now::current(),
+            ));
 
         // Raw no-echo cat gives one observable copy per injected prompt. The
         // readiness marker ensures termios has changed before a timer can fire.
@@ -417,27 +427,20 @@ impl IdleHarness {
     /// outstanding delegation and with it the idle watch. The report is then
     /// delivered, as `handle_work_done` does, before this returns.
     async fn work_done(&self, role: &str) -> tokio::time::Instant {
-        let state = self.state.read().await;
-        let delivery = state
-            .prepare_work_done(
-                WorkDoneSignal {
-                    pane_id: worker_pane(role),
-                    task: "The delegated test task is complete.".to_string(),
-                    done: false,
-                    timestamp: chrono::Utc::now(),
-                    token: None,
-                },
-                &self.registry,
-            )
-            .await;
-        let accepted = tokio::time::Instant::now();
-        let room = self
-            .registry
-            .inbox()
-            .reserve_reply()
-            .expect("room for the report");
-        delivery.deliver(&self.registry, room).await;
-        accepted
+        let (request, provenance) = dot_agent_deck::task_completion::worker_report(
+            &self.registry,
+            &worker_pane(role),
+            "The delegated test task is complete.",
+            false,
+        );
+        let _ = dot_agent_deck::task_completion::complete(
+            &self.state,
+            &self.registry,
+            request,
+            &provenance,
+        )
+        .await;
+        tokio::time::Instant::now()
     }
 
     fn snapshot_of(&self, agent_id: &str) -> String {

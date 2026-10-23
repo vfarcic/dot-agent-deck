@@ -200,8 +200,13 @@ enum Commands {
         #[arg(long = "task-file", value_name = "PATH")]
         task_file: Option<String>,
         /// Signal that the entire orchestration is complete (orchestrator only)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "task_id")]
         done: bool,
+        /// The id of the delegated task this report completes, as your task
+        /// names it. Without it, the report is a note to your orchestrator
+        /// that completes no task.
+        #[arg(long = "task-id", value_name = "ID")]
+        task_id: Option<String>,
     },
     /// Close dispatched units, one agent, or one orchestration.
     ///
@@ -1169,6 +1174,87 @@ fn ack_report(reply: &AckReply) -> (AckStream, String) {
 /// handler runs, and for `work-done` once the report is queued, before it is
 /// written into any pane. See `dot_agent_deck::event::SignalAck` for what
 /// stays invisible.
+/// PRD #1666 part 3, round 5 (plan D1, D10): `work-done`, sent only once the
+/// daemon confirms on the same connection that it serves task-scoped
+/// completion, and answered in the words of `work_done_text`.
+fn run_work_done(pane_id: String, report: String, done: bool, task_id: Option<String>) -> ExitCode {
+    use dot_agent_deck::event::{
+        DaemonMessage, HookCapabilitiesRequest, WorkDoneMode, WorkDoneTaskReply,
+        WorkDoneTaskRequest,
+    };
+    use dot_agent_deck::hook::Gated;
+    use dot_agent_deck::work_done_text as text;
+    let token = dot_agent_deck::hook_provenance::token_from_env();
+    let mode = match (&task_id, done) {
+        (Some(task_id), _) => WorkDoneMode::Task {
+            task_id: task_id.clone(),
+        },
+        (None, true) => WorkDoneMode::Terminal,
+        (None, false) => WorkDoneMode::Uncorrelated,
+    };
+    let question = DaemonMessage::HookCapabilities(HookCapabilitiesRequest {
+        pane_id: pane_id.clone(),
+        token: token.clone(),
+    });
+    let mutation = DaemonMessage::WorkDoneTask(WorkDoneTaskRequest {
+        pane_id,
+        token,
+        mode,
+        report,
+        timestamp: chrono::Utc::now(),
+    });
+    let (Ok(question), Ok(mutation)) = (
+        serde_json::to_string(&question),
+        serde_json::to_string(&mutation),
+    ) else {
+        eprintln!("Failed to serialize work-done signal");
+        return ExitCode::FAILURE;
+    };
+    let reply = match dot_agent_deck::hook::send_gated(
+        &question,
+        &mutation,
+        dot_agent_deck::hook::confirms_task_scoped_completion,
+    ) {
+        Gated::NotConfirmed {
+            refusal: Some((code, message)),
+            ..
+        } => {
+            // The code is the word the daemon also put in its own `warn!`
+            // line, as `dispatch`'s refusal carries it.
+            eprintln!("Error: the daemon did not accept this work-done report: {message} [{code}]");
+            return ExitCode::FAILURE;
+        }
+        Gated::NotConfirmed { why, .. } => {
+            eprintln!("{}", text::NOT_CONFIRMED);
+            eprintln!("({why})");
+            return ExitCode::FAILURE;
+        }
+        Gated::Unconfirmed(why) => {
+            eprintln!("{}", text::unconfirmed(task_id.as_deref()));
+            eprintln!("({why})");
+            return ExitCode::FAILURE;
+        }
+        Gated::Reply(line) => line,
+    };
+    let Ok(reply) = serde_json::from_str::<WorkDoneTaskReply>(reply.trim()) else {
+        eprintln!("{}", text::unconfirmed(task_id.as_deref()));
+        eprintln!("(the daemon's answer could not be read)");
+        return ExitCode::FAILURE;
+    };
+    let answer = text::cli_answer(&reply, task_id.as_deref(), done);
+    if let Some(line) = answer.stdout {
+        println!("{line}");
+    }
+    if let Some(line) = answer.stderr {
+        eprintln!("{line}");
+    }
+    if answer.success {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
 fn send_signal_and_report_ack(json: &str, verb: &str, subject: &str) -> ExitCode {
     use dot_agent_deck::hook::SocketReply;
     match dot_agent_deck::hook::send_and_await_signal_ack(json) {
@@ -1763,6 +1849,7 @@ fn main() -> ExitCode {
             task,
             task_file,
             done,
+            task_id,
         }) => {
             let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
                 Ok(id) => id,
@@ -1780,22 +1867,7 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let signal = dot_agent_deck::event::WorkDoneSignal {
-                pane_id,
-                task,
-                done,
-                timestamp: chrono::Utc::now(),
-                token: dot_agent_deck::hook_provenance::token_from_env(),
-            };
-            let msg = dot_agent_deck::event::DaemonMessage::WorkDone(signal);
-            let json = match serde_json::to_string(&msg) {
-                Ok(j) => j,
-                Err(e) => {
-                    eprintln!("Failed to serialize work-done signal: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            send_signal_and_report_ack(&json, "work-done", "work-done report")
+            run_work_done(pane_id, task, done, task_id)
         }
         Some(Commands::Inbox { action }) => match action {
             InboxAction::Fetch {
@@ -4553,10 +4625,12 @@ mod tests {
                 task,
                 task_file,
                 done,
+                task_id,
             }) => {
                 assert_eq!(task, None);
                 assert_eq!(task_file.as_deref(), Some("-"));
                 assert!(!done);
+                assert_eq!(task_id, None);
             }
             _ => panic!("expected `work-done`"),
         }

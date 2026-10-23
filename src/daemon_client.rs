@@ -6604,6 +6604,105 @@ mod tests {
         drop(dir);
     }
 
+    /// Scenario: `ListOutcomes` is sent only on a connection whose fresh `Hello` advertises it. A daemon without the capability, and a daemon answering from another incarnation than the one the caller pinned, each get no `list-outcomes` frame, and the call answers unsupported; a daemon that advertises it and matches is asked, once.
+    #[cfg(unix)]
+    #[spec("inbox/protocol/032")]
+    #[test]
+    fn protocol_032_list_outcomes_is_sent_only_after_a_fresh_advertisement() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            for (capabilities, instance, pinned, asked) in [
+                (
+                    vec![crate::daemon_protocol::CAP_HELLO_FOLLOW_ON],
+                    "i1",
+                    Some("i1"),
+                    false,
+                ),
+                (
+                    vec![
+                        crate::daemon_protocol::CAP_HELLO_FOLLOW_ON,
+                        crate::daemon_protocol::CAP_DECK_OUTCOMES,
+                    ],
+                    "i2",
+                    Some("i1"),
+                    false,
+                ),
+                (
+                    vec![
+                        crate::daemon_protocol::CAP_HELLO_FOLLOW_ON,
+                        crate::daemon_protocol::CAP_DECK_OUTCOMES,
+                    ],
+                    "i1",
+                    Some("i1"),
+                    true,
+                ),
+            ] {
+                let (dir, path, listener) = {
+                    let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+                    let dir = tempfile::tempdir().unwrap();
+                    let path = dir.path().join("outcomes-daemon.sock");
+                    let listener = bind_attach_listener(&path).expect("bind scripted daemon");
+                    (dir, path, listener)
+                };
+                let ops = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+                let seen = Arc::clone(&ops);
+                let server = tokio::spawn(async move {
+                    let Ok(Ok(mut stream)) =
+                        tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept())
+                            .await
+                    else {
+                        return;
+                    };
+                    while let Ok(Ok(Some((KIND_REQ, payload)))) = tokio::time::timeout(
+                        std::time::Duration::from_millis(500),
+                        read_frame(&mut stream),
+                    )
+                    .await
+                    {
+                        let request: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                        let op = request["op"].as_str().unwrap_or_default().to_string();
+                        seen.lock().unwrap().push(op.clone());
+                        let response = match op.as_str() {
+                            "hello" => AttachResponse {
+                                capabilities: Some(
+                                    capabilities.iter().map(|c| c.to_string()).collect(),
+                                ),
+                                instance_id: Some(instance.to_string()),
+                                ..AttachResponse::hello(PROTOCOL_VERSION)
+                            },
+                            "list-outcomes" => AttachResponse {
+                                deck_outcomes: Some(crate::report_recovery::DeckOutcomes {
+                                    deck_id: "d".into(),
+                                    incarnation: instance.into(),
+                                    revision: 0,
+                                    overflow: 0,
+                                    outcomes: Vec::new(),
+                                }),
+                                ..AttachResponse::ok()
+                            },
+                            _ => AttachResponse::ok(),
+                        };
+                        crate::daemon_protocol::write_resp(&mut stream, &response)
+                            .await
+                            .unwrap();
+                    }
+                });
+                let client = DaemonClient::new(path);
+                let answer = client.list_outcomes(pinned).await.unwrap();
+                drop(client);
+                server.await.unwrap();
+                let ops = ops.lock().unwrap().clone();
+                let listed = ops.iter().filter(|op| *op == "list-outcomes").count();
+                assert_eq!(listed, usize::from(asked), "{ops:?}");
+                assert_eq!(matches!(answer, GatedQuery::Answered(_)), asked, "{ops:?}");
+                drop(dir);
+            }
+        });
+    }
+
     /// PRD #1223 M6 — a configured-command prepared start withholds against the
     /// two older daemons a desktop will meet: one advertising nothing (pre-PRD
     /// #819), and one advertising everything up to M7 — `start-prepared-agent`

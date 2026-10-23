@@ -140,9 +140,16 @@ pub const ONE_SHOT_SENDERS: &[crate::event::InboxOneShotSender] = &[
 mod engine;
 #[path = "inbox_reports.rs"]
 mod reports;
+
+#[path = "inbox_claims.rs"]
+mod claims;
+
+#[cfg(test)]
+pub(crate) use claims::claim_seams;
+pub(crate) use claims::{Admission, ClaimSpec, Claimed, CommitOutcome, FailOutcome};
 #[cfg(test)]
 pub(crate) use reports::seams as report_seams;
-pub(crate) use reports::{RecordView, Registration, ReplacementOutcome};
+pub(crate) use reports::{AfterSection, RecordView, Registration, ReplacementOutcome};
 #[cfg(test)]
 #[path = "inbox_engine_tests.rs"]
 mod engine_tests;
@@ -523,10 +530,6 @@ struct HubState {
     exited_ledgers: Vec<DelegateLedger>,
     /// Ids minted for a delegated task that is not yet posted, nor abandoned.
     pending_posts: HashSet<String>,
-    /// PRD #1666 delegate_021: worker panes that acknowledged a delegated task
-    /// and have not reported `work-done` since
-    /// ([`InboxHub::retire_answered_delegates_to`]).
-    received_since_done: HashSet<String>,
     /// PRD #1666 §2.8: where a recipient's card is told a message could not
     /// reach it — the daemon's delivery-notice channel, installed by
     /// [`InboxHub::set_card_notice_sink`]. Nothing is owed while it is unset.
@@ -816,7 +819,6 @@ impl InboxHub {
                 rings: HashMap::new(),
                 exited_ledgers: Vec::new(),
                 pending_posts: std::collections::HashSet::new(),
-                received_since_done: std::collections::HashSet::new(),
                 card_notice_sink: None,
                 owed_card_notices: Vec::new(),
                 late_acks: HashMap::new(),
@@ -1465,72 +1467,60 @@ impl InboxHub {
         })
     }
 
-    /// PRD #1666 S5: what a worker's `work-done` retires, as superseded, so no
-    /// undelivered notice is posted about a task the worker has answered. A
-    /// `work-done` names no task, so which one it answers is inferred:
-    ///
-    /// * when the worker acknowledged a delegated task since its last
-    ///   `work-done`, the completion answers that task (delegate_021). Only the
-    ///   tasks that reached the worker since — fetched at least once and not
-    ///   acknowledged — are retired with it; a newer task never fetched stays
-    ///   queued and watched, so its orchestrator is still told if it does not
-    ///   reach the worker.
-    /// * otherwise the worker answered a task it took some other way, such as
-    ///   its task file, without acknowledging the message (idle-worker/029),
-    ///   and every task to the pane not yet acknowledged is retired.
-    ///
-    /// Nothing ties a completion to a task, so the worker steers the inference
-    /// for its own pane, and no other (audit A2-3): a second `work-done` after
-    /// the one that answered an acknowledged task takes the second branch and
-    /// retires a newer task the worker never fetched, unreported; and a task
-    /// acknowledged but never completed makes the completion of a later task
-    /// taken from its file take the first branch, which leaves that later task
-    /// queued — its orchestrator may be told it did not reach the worker, and
-    /// it may be handed out again. A `work-done` naming its task id would close
-    /// both; it is not implemented.
-    pub fn retire_answered_delegates_to(&self, pane_id: &str) -> usize {
-        let received = self.lock().received_since_done.remove(pane_id);
-        let retired = if received {
-            self.retire_delegates_to(pane_id, |message| message.deliveries > 0)
-        } else {
-            self.retire_delegates_to(pane_id, |_| true)
-        };
-        // PRD #1666 part 3, round 5: until task-scoped completion, a legacy
-        // `work-done` answers the pane's tasks it retired above and the ones
-        // already acknowledged, as before; the ledger records them reported,
-        // so the worker's exit owes nothing for them. A task still watched (a
-        // newer one never fetched) stays open.
+    /// TEST: every message `pane_id` holds, live or settled, as its subject
+    /// and body.
+    #[cfg(test)]
+    pub(crate) fn bodies_for_test(&self, pane_id: &str) -> Vec<(String, String)> {
+        let st = self.lock();
+        st.inbox
+            .list(pane_id)
+            .into_iter()
+            .filter_map(|m| {
+                st.inbox
+                    .get(m.id.as_str(), pane_id)
+                    .map(|full| (m.subject.clone(), full.body.to_string()))
+            })
+            .collect()
+    }
+
+    /// TEST: the delegated tasks whose delivery is watched, by id.
+    #[cfg(test)]
+    pub(crate) fn watched_tasks_for_test(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.lock().delegates.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    /// TEST: lower the task ledger's tombstone bound to `per_instance`.
+    #[cfg(test)]
+    pub(crate) fn set_task_tombstones_for_test(&self, per_instance: usize) {
         let mut st = self.lock();
-        let answered = st.guarded_section(|st, reports| {
-            for id in reports.tasks.open_of_pane(pane_id) {
-                let claimed = matches!(
-                    reports.tasks.lookup(&id),
-                    crate::report_recovery::TaskLookup::Open(task)
-                        if matches!(task.state, crate::report_recovery::TaskState::Reporting { .. })
-                );
-                if claimed || st.delegates.contains_key(&id) {
-                    continue;
-                }
-                let _ = reports.tasks.settle(
-                    &id,
-                    crate::report_recovery::Tombstone::Reported {
-                        report_id: None,
-                        digest: None,
-                        destination: crate::report_recovery::Destination::Inbox,
-                    },
-                );
-            }
-        });
-        if answered.is_err() {
-            st.log_torn_once("work-done");
-        }
-        retired
+        let _ = st.guarded_section(|_, reports| reports.tasks.set_bound_for_test(per_instance));
+    }
+
+    /// PRD #1666 part 3, round 5: the recovery rows ("Deck notices"), oldest
+    /// first; empty when the report state is torn. What `ListOutcomes`
+    /// answers, for tests and diagnostics.
+    pub fn deck_outcome_rows(&self) -> Vec<crate::report_recovery::DeckOutcome> {
+        self.deck_outcomes()
+            .map(|outcomes| outcomes.outcomes)
+            .unwrap_or_default()
+    }
+
+    /// PRD #1666 part 3, round 5: the delegated tasks still open for any
+    /// generation of `pane_id`, by id. What a worker's task instructions name,
+    /// for tests and diagnostics; empty when the report state is torn.
+    pub fn open_tasks_of(&self, pane_id: &str) -> Vec<String> {
+        self.lock()
+            .guarded_read(|reports| reports.tasks.open_of_pane(pane_id))
+            .unwrap_or_default()
     }
 
     /// PRD #1666 S5: retire every delegated task to `pane_id` that is not yet
     /// acknowledged, as superseded — a newer delegation, or the pane's agent
     /// restarting, has made it moot. Superseded tasks are not reported. A
-    /// worker's `work-done` retires less: [`Self::retire_answered_delegates_to`].
+    /// worker's report retires the one task it names (PRD #1666 part 3,
+    /// round 5, [`retire_reported_task`]).
     pub fn supersede_delegates_to(&self, pane_id: &str) -> usize {
         let retired = self.retire_delegates_to(pane_id, |_| true);
         // PRD #1666 part 3, round 5 (plan D8): a restart supersedes the pane's
@@ -1568,7 +1558,7 @@ impl InboxHub {
                 });
                 let reported = looked
                     .iter()
-                    .all(|l| matches!(l, TaskLookup::Settled(Tombstone::Reported { .. })));
+                    .all(|l| matches!(l, TaskLookup::Settled(settled) if matches!(settled.tombstone, Tombstone::Reported { .. })));
                 reporting || reported
             });
             if decided == Ok(true) {
@@ -2071,7 +2061,6 @@ impl InboxHub {
         for waiter in st.waiters.remove(&key).unwrap_or_default() {
             let _ = waiter.tx.try_send(WaiterSignal::Superseded);
         }
-        st.received_since_done.remove(pane_id);
         // PR #1735 sixth review (B2-02): the exited worker's tasks are retired,
         // so their saved bodies are held no longer.
         st.spills.release_tasks(pane_id, |_, agent| {
@@ -4365,7 +4354,48 @@ fn walk_exited_tasks(
         let Some(task) = reports.tasks.open_task_mut(&id) else {
             continue;
         };
-        if matches!(task.state, TaskState::Reporting { .. }) {
+        // A claimed task (D12 rule 4): the claim decides. Its notices are
+        // withheld on the claim, owed only if its report is not accepted, and
+        // a "worker exited" notice names it alone; its debt goes now, since
+        // the worker is gone whichever way the claim settles.
+        if let TaskState::Reporting { claim_id } = task.state {
+            task.exit_walked = true;
+            let task = task.clone();
+            reports.exit_walked.insert(id.clone());
+            debt.push(task_debt(&task));
+            if let Some(claim) = reports.claims.get_mut(claim_id) {
+                claim.worker_gone.get_or_insert(match kind {
+                    ExitKind::Natural => crate::report_recovery::EndedHow::Exited,
+                    ExitKind::Removed => crate::report_recovery::EndedHow::Closed,
+                });
+                if let Some(orchestrator) = task.binding.orchestrator.clone() {
+                    match task.delivery {
+                        TaskDelivery::Live => claim.withheld.push((
+                            orchestrator,
+                            UNDELIVERED_SUBJECT,
+                            compose_undeliverable_notice(
+                                &id,
+                                &task.binding.role,
+                                UndeliverableReason::AgentExited,
+                            ),
+                        )),
+                        TaskDelivery::Acknowledged | TaskDelivery::Ended
+                            if kind == ExitKind::Natural =>
+                        {
+                            claim.withheld.push((
+                                orchestrator,
+                                WORKER_EXITED_SUBJECT,
+                                crate::state::compose_worker_exited_notice_for_tasks(
+                                    pane_id,
+                                    std::slice::from_ref(&id),
+                                ),
+                            ));
+                        }
+                        TaskDelivery::Acknowledged | TaskDelivery::Ended => {}
+                    }
+                    debug_assert!(claim.withheld.len() <= 2, "a claim withholds at most two");
+                }
+            }
             continue;
         }
         task.exit_walked = true;
@@ -4467,6 +4497,23 @@ fn settle_task(
     }
 }
 
+/// PRD #1666 part 3, round 5 (plan D12 rule 8): what a reported task leaves
+/// behind in the hub, retired with it: its delivery watch (whose end is
+/// signalled), its message if the worker never took it, and the hold on its
+/// saved body.
+fn retire_reported_task(st: &mut HubState, now: Instant, task_id: &str, worker_pane: &str) {
+    if let Some(mut watch) = remove_watch(st, task_id)
+        && let Some(end) = watch.end.take()
+    {
+        let _ = end.send(DelegateEnd::Ended);
+    }
+    let _ = st
+        .inbox
+        .retire(now, task_id, worker_pane, UndeliverableReason::Superseded);
+    st.spills
+        .release_tasks(worker_pane, |message, _| message == task_id);
+}
+
 fn remove_watch(st: &mut HubState, id: &str) -> Option<DelegateWatch> {
     let watch = st.delegates.remove(id)?;
     engine::forget_uncertain(st, id);
@@ -4480,10 +4527,6 @@ fn remove_watch(st: &mut HubState, id: &str) -> Option<DelegateWatch> {
 /// nothing re-takes R5).
 pub(crate) enum StoreAccess<'a, 'b> {
     Take(Option<&'a crate::retained_store::RetainedStore>),
-    #[expect(
-        dead_code,
-        reason = "the report commit, which holds the store through its section, is its first user"
-    )]
     Held(&'a mut crate::retained_store::StoreLock<'b>),
 }
 
@@ -4998,7 +5041,6 @@ fn settle_delegate(st: &mut HubState, event: &InboxEvent, verdicts: &TaskVerdict
             let body = compose_late_ack_notice(id, &watch.role, LateAckReport::NotReached);
             st.owed_notices.push((to, LATE_ACK_SUBJECT, body));
         }
-        st.received_since_done.insert(watch.worker.pane_id);
         return;
     }
     let reason = match event.undeliverable_reason {
@@ -5169,8 +5211,7 @@ fn remember_cancelled_task(st: &mut HubState, id: &str, to: Recipient, role: &st
 /// PRD #1666 long-turn delivery: a message reported undeliverable after
 /// `max_deliver` hand-overs was acknowledged after all ([`Inbox::ack`] records
 /// the late ack). While its record is still held, the orchestrator told it
-/// was undeliverable gets a correction, the worker counts as having received a task
-/// (`received_since_done`), and a card the deck told can be cleared, once no
+/// was undeliverable gets a correction, and a card the deck told can be cleared, once no
 /// other message it was told about is still owed a correction. Without the
 /// record, this function does none of these.
 fn settle_late_ack(st: &mut HubState, event: &InboxEvent) {
@@ -5190,8 +5231,6 @@ fn settle_late_ack(st: &mut HubState, event: &InboxEvent) {
         "inbox: a message reported undeliverable was acknowledged after all"
     );
     if let Some((to, role)) = record.orchestrator {
-        st.received_since_done
-            .insert(record.recipient.pane_id.clone());
         let body = compose_late_ack_notice(
             event.message_id.as_str(),
             &role,
@@ -7446,7 +7485,7 @@ mod tests {
         let worker = Recipient::bound("w", "wa");
         let (c, spill) = saved_long(&hub, dir.path(), "TASK");
         let task_path = spill.path().unwrap().to_path_buf();
-        let (_task, _end) = delegate_saved(&hub, &worker, c, spill);
+        let (task, _end) = delegate_saved(&hub, &worker, c, spill);
         let taken = hub.test_take_acked("w", "wa");
         assert_eq!(taken.len(), 1, "the worker acknowledged its task");
 
@@ -7475,7 +7514,7 @@ mod tests {
             "the byte bound reclaimed the reports"
         );
 
-        hub.retire_answered_delegates_to("w");
+        report_task(&hub, "w", &task);
         hub.tick();
         assert!(!task_path.exists(), "its work-done retired the task");
     }
@@ -7522,6 +7561,13 @@ mod tests {
         )
         .map(|posted| (posted.id, posted.ended))
         .unwrap()
+    }
+
+    /// What a worker's report of `task` retires in the hub, as the commit
+    /// retires it (PRD #1666 part 3, round 5).
+    fn report_task(hub: &InboxHub, pane: &str, task: &MessageId) {
+        let mut st = hub.lock();
+        retire_reported_task(&mut st, Instant::now(), task.as_str(), pane);
     }
 
     /// The saved bodies `hub` answers for removal `age` after now, as the
@@ -7586,13 +7632,13 @@ mod tests {
         let worker = Recipient::bound("w", "wa");
         let (c, spill) = saved_long(&hub, dir.path(), "TASK");
         let path = spill.path().unwrap().to_path_buf();
-        let (_task, _end) = delegate_saved(&hub, &worker, c, spill);
+        let (task, _end) = delegate_saved(&hub, &worker, c, spill);
         assert_eq!(
             hub.lock().spills.held_paths(),
             vec![path.clone()],
             "the body is held from the moment the task is accepted"
         );
-        hub.retire_answered_delegates_to("w");
+        report_task(&hub, "w", &task);
         hub.tick();
         let grace = crate::inbox_spills::DEFAULT_SPILL_PROTECTED_GRACE;
         let minute = Duration::from_secs(60);
@@ -8088,43 +8134,6 @@ mod tests {
         .0
     }
 
-    /// PRD #1666 delegate_021: a worker's `work-done` answers the task it
-    /// fetched, not a newer one still queued for it. That newer task stays
-    /// queued and watched, so the orchestrator is told it has not reached the
-    /// worker, and the worker can still fetch it.
-    #[tokio::test]
-    async fn work_done_leaves_a_queued_newer_delegate_owed() {
-        let mut hub = hub();
-        hub.undelivered_after = Duration::ZERO;
-        let first = delegate(&hub, "OLDER-TASK");
-        let fetched = hub.test_take_acked("w", "wa");
-        assert_eq!(fetched.len(), 1);
-        assert_eq!(state_in(&hub, "w", &first), StateName::Acknowledged);
-        let second = delegate(&hub, "NEWER-TASK-STILL-OWED");
-
-        assert_eq!(hub.retire_answered_delegates_to("w"), 0);
-        assert_eq!(state_in(&hub, "w", &second), StateName::Queued);
-
-        hub.tick();
-        let notices: Vec<_> = hub
-            .list("o")
-            .into_iter()
-            .filter(|m| m.subject == UNDELIVERED_SUBJECT)
-            .collect();
-        assert_eq!(notices.len(), 1, "{notices:?}");
-        let body = rendered(&hub, "o", "oa", None)
-            .into_iter()
-            .map(|d| d.text)
-            .collect::<String>();
-        assert!(body.contains(second.as_str()), "{body}");
-        assert!(body.contains("has not reached the worker"), "{body}");
-
-        let taken = hub.test_hook_fetch("w", "wa", None);
-        assert_eq!(taken.deliveries.len(), 1);
-        assert!(taken.deliveries[0].text.contains("NEWER-TASK-STILL-OWED"));
-        hub.test_hook_close(taken);
-    }
-
     /// delegate_023: a task whose worker left after the dispatch last saw it
     /// live — and was swept from the inbox before the post — is not posted to
     /// the departed agent, where no exit sweep would ever end it.
@@ -8145,93 +8154,6 @@ mod tests {
             "the task was queued for the departed agent"
         );
         assert!(hub.lock().delegates.is_empty(), "a watch was left for it");
-    }
-
-    /// PRD #1666 S5 (idle-worker/029): a worker that acknowledged no delegated
-    /// task since its last `work-done` answered one it took some other way —
-    /// its task file — so its `work-done` retires a task never fetched, and no
-    /// undelivered notice is posted about it.
-    #[tokio::test]
-    async fn work_done_with_no_task_received_retires_an_unfetched_delegate_silently() {
-        let mut hub = hub();
-        hub.undelivered_after = Duration::from_secs(3600);
-        let task = delegate(&hub, "TASK-READ-FROM-ITS-FILE");
-        assert_eq!(hub.retire_answered_delegates_to("w"), 1);
-        assert_eq!(state_in(&hub, "w", &task), StateName::Undeliverable);
-        hub.undelivered_after = Duration::ZERO;
-        hub.tick();
-        assert!(
-            hub.list("o").is_empty(),
-            "a task the worker answered is not reported"
-        );
-
-        // After a work-done answered an acknowledged task, the next one with
-        // nothing acknowledged in between is back to retiring everything.
-        let first = delegate(&hub, "ACKNOWLEDGED");
-        hub.test_take_acked("w", "wa");
-        let second = delegate(&hub, "QUEUED");
-        assert_eq!(hub.retire_answered_delegates_to("w"), 0);
-        assert_eq!(state_in(&hub, "w", &first), StateName::Acknowledged);
-        assert_eq!(hub.retire_answered_delegates_to("w"), 1);
-        assert_eq!(state_in(&hub, "w", &second), StateName::Undeliverable);
-    }
-
-    /// PRD #1666 delegate_021, the companion: after an acknowledged task, a
-    /// task the worker fetched and has not acknowledged is retired by its
-    /// `work-done` as superseded — whether the receiver it was handed to is
-    /// still open or has gone with nothing confirmed — and no undelivered
-    /// notice is posted about it.
-    #[tokio::test]
-    async fn work_done_retires_a_fetched_unacknowledged_delegate_silently() {
-        let mut hub = hub();
-        hub.undelivered_after = Duration::from_secs(3600);
-        // Each worker acknowledged an earlier task, so a work-done may be its
-        // answer and retires only what reached the worker since.
-        for (pane, agent) in [("w", "wa"), ("w2", "wa2")] {
-            hub.post_delegate(
-                Recipient::bound(pane, agent),
-                "coder",
-                Some(Recipient::bound("o", "oa")),
-                DelegateLedger::default(),
-                content("EARLIER-TASK"),
-                &|| true,
-            )
-            .unwrap();
-            hub.test_take_acked(pane, agent);
-        }
-        let fetched = delegate(&hub, "FETCHED-TASK");
-        let held = hub.test_hook_fetch("w", "wa", None);
-        assert_eq!(held.deliveries.len(), 1);
-        assert_eq!(state_in(&hub, "w", &fetched), StateName::Fetched);
-        // A second worker's task is fetched by a receiver that then goes,
-        // confirming nothing: it may have reached the worker all the same.
-        let other = hub
-            .post_delegate(
-                Recipient::bound("w2", "wa2"),
-                "coder",
-                Some(Recipient::bound("o", "oa")),
-                DelegateLedger::default(),
-                content("UNCONFIRMED-TASK"),
-                &|| true,
-            )
-            .unwrap()
-            .0;
-        let gone = hub.test_hook_fetch("w2", "wa2", None);
-        assert_eq!(gone.deliveries.len(), 1);
-        hub.test_hook_close(gone);
-        assert_eq!(state_in(&hub, "w2", &other), StateName::Fetched);
-
-        assert_eq!(hub.retire_answered_delegates_to("w"), 1);
-        assert_eq!(hub.retire_answered_delegates_to("w2"), 1);
-        assert_eq!(state_in(&hub, "w", &fetched), StateName::Undeliverable);
-        assert_eq!(state_in(&hub, "w2", &other), StateName::Undeliverable);
-        hub.undelivered_after = Duration::ZERO;
-        hub.tick();
-        assert!(
-            hub.list("o").is_empty(),
-            "a task the worker answered is not reported"
-        );
-        hub.test_hook_close(held);
     }
 
     /// PRD #1666 long-turn delivery: a delegated task its orchestrator was told

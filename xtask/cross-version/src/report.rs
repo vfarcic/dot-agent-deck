@@ -58,9 +58,10 @@ pub struct Tell {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failed_parts: Vec<String>,
     /// The pane a failed half measured, as the daemon itself named it — for
-    /// tell-4's `status` half, the reviewer's pane id from the last readable
-    /// `daemon status` rows. `breaks.rs` requires a refusal to name this pane
-    /// before attributing the failure to a declared break.
+    /// tell-4, whose `work-done` and `status` halves both run in the reviewer's
+    /// pane, that pane's id from the last readable `daemon status` rows.
+    /// `breaks.rs` requires a log line to name this pane before attributing
+    /// the failure to a declared break.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_pane: Option<String>,
     /// Set on a FAILED tell when a contract break the two builds declare

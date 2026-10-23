@@ -507,21 +507,39 @@ pass --force to stop anyway
 
 Treat `--force` at that point as abandoning those runs.
 
+### `work-done` is refused, pending or unconfirmed
+
+`work-done` prints why when it reports nothing, and in each case nothing was reported or changed:
+
+| Message | What happened | What to do |
+|---|---|---|
+| `Error: this deck daemon did not confirm it supports task work-done reports; nothing was reported.` | The deck daemon is older than the `dot-agent-deck` the agent ran. | Restart the deck daemon on this release ([Recycling the daemon](#recycling-the-daemon)), or run `work-done` with the `dot-agent-deck` the daemon runs. |
+| `Error: nothing was reported: the deck does not know task <id> …` | The id is not one of this agent's tasks: mistyped, another worker's, or a task the deck reported long ago and no longer remembers. | Check the id in the task's instructions. |
+| `Error: nothing was reported: task <id> was replaced by task <id> …` | The orchestrator replaced the task with `delegate --supersede`. | Report the newer task with its id, if your work answers it. |
+| `Error: nothing was reported: task <id> ended before this report was taken …` | The agent the task was delegated to exited or was closed first; the orchestrator was told. | Nothing; the orchestrator decides what happens to the task. |
+| `Error: nothing new was reported: an earlier work-done for this task is still being saved. …` | The same report is still being saved, or this agent has another report in progress. | Run the same command again in a moment; it is answered with that report's result. |
+| `Error: nothing was reported: the deck cannot keep this report: its saved-results store is full …` | See [Saved results and reports](#saved-results-and-reports). | Remove saved files you no longer need. |
+| `Error: nothing was reported: the deck could not save this report (…)` | Writing the report's file failed. | Fix what the message names, then run the same command again. |
+| `The report may have been accepted; its result is unconfirmed.` | The report was sent and no answer came back. | With `--task-id`, run the same command again: a repeat is answered with the first result and is not reported twice. Without it, check with the orchestrator first: a repeat would be a second note. |
+| `Error: nothing was reported: the deck daemon hit an internal error and has stopped taking reports …` | See [The deck stopped taking reports or dispatches](#the-deck-stopped-taking-reports-or-dispatches). | Restart the deck daemon. |
+
+A `work-done` without `--task-id` is not refused for want of one: it reaches the orchestrator as a note that completes no task, and the worker still owes the report for its task.
+
 ### Saved results and reports
 
-The deck saves the start and failure message of every dispatch as a file, so one is not lost when the dispatcher that should read it has gone. The files are under `retained-reports/` in the deck's state directory (`$XDG_STATE_HOME/dot-agent-deck`, else `~/.local/state/dot-agent-deck`, or `DOT_AGENT_DECK_STATE_DIR` when it is set), one folder per deck daemon run under `retained-reports/files/`. The directory and its files are readable by your user only; another program running as you can still read and write them.
+The deck saves every worker report it accepts, and the start and failure message of every dispatch, as a file, so none is lost when the agent that should read it has gone: a report whose orchestrator or dispatcher is no longer running is kept there instead of being handed to whoever took over its pane. The files are under `retained-reports/` in the deck's state directory (`$XDG_STATE_HOME/dot-agent-deck`, else `~/.local/state/dot-agent-deck`, or `DOT_AGENT_DECK_STATE_DIR` when it is set), one folder per deck daemon run under `retained-reports/files/`. The directory and its files are readable by your user only; another program running as you, any of your agents included, can still read and write them. How well a saved file survives a power loss depends on the filesystem.
 
-The deck removes a file 24 hours after the dispatcher acknowledged its message, and 7 days after the message could not be delivered. It keeps at most 256 MiB and 4096 files per daemon run; [Daemon behaviour](configuration.md#daemon-behaviour) has the settings that change those limits. When either limit is reached, `dispatch` is refused with `the deck cannot keep this dispatch's result: its saved-results store is full (<dir>)` or `… holds the most reports it keeps (<n> files, <dir>)`, and nothing is started. Remove files you no longer need from the named directory: the deck counts them again at its next hourly cleanup and at its next start.
+The deck removes a file 24 hours after its recipient acknowledged the message, and 7 days after the message could not be delivered. It keeps at most 256 MiB and 4096 files per daemon run; [Daemon behaviour](configuration.md#daemon-behaviour) has the settings that change those limits. When either limit is reached, `dispatch` is refused with `the deck cannot keep this dispatch's result: its saved-results store is full (<dir>)` or `… holds the most reports it keeps (<n> files, <dir>)`, and nothing is started; `work-done` is refused the same way, and nothing is reported. Remove files you no longer need from the named directory: the deck counts them again at its next hourly cleanup and at its next start.
 
 When the deck cannot write a file, it holds the message in memory, says so in the message itself (`The deck could not save this result to disk; it is held in memory until the deck restarts.`) and tries to save it again. A deck restart loses a message held only in memory.
 
 ### The deck stopped taking reports or dispatches
 
-`dispatch` is refused with `the deck cannot keep this dispatch's result: the deck daemon hit an internal error and has stopped recording results`. The deck daemon hit an internal error while it was recording a result, so it no longer trusts what it holds and refuses new dispatches rather than risk losing their results. Its log (see [Enabling Debug Logs](#enabling-debug-logs)) names the error. Agents that are already running keep working.
+`dispatch` is refused with `the deck cannot keep this dispatch's result: the deck daemon hit an internal error and has stopped recording results`, and `work-done` with `the deck daemon hit an internal error and has stopped taking reports`. The deck daemon hit an internal error while it was recording a report or a result, so it no longer trusts what it holds and refuses new ones rather than risk losing them. A `work-done` sent when the error happened may print that its result is unconfirmed. Its log (see [Enabling Debug Logs](#enabling-debug-logs)) names the error. Agents that are already running keep working.
 
 Restarting the deck daemon clears it. Before you do, know what a restart costs:
 
-- A message the deck holds only in memory, because its file could not be written, is lost. Files already saved are kept.
+- A message the deck holds only in memory, because its file could not be written, is lost. Reports and results already saved are kept in [the saved-results directory](#saved-results-and-reports), but the restarted daemon does not deliver or list them.
 - Orchestration roles are held in memory only. `daemon stop` refuses while any are live and lists them, as [An orchestration stops being able to delegate](#an-orchestration-stops-being-able-to-delegate-the-daemon-holds-no-orchestration-role-for-pane-) describes; `--force` stops it anyway and leaves those orchestrations unable to delegate. Let them finish first when you can.
 
 ## Panes and the dashboard
