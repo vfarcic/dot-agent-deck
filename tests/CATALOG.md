@@ -4354,7 +4354,8 @@ without depending on the config struct API.
 - **Agent:** none.
 - **Asserts:** for the reply-room reservation a dispatch holds across its handling, a respawn's in-flight ticket and a commission-dispatch guard, each dropped during an unwind with an injected payload: once with its lock poisoned and once (debug builds) with a higher rank held on the unwinding thread, the child survives and the injected payload is what escapes; no `tracing` event is emitted during the unwind (a subscriber that panics on any event); poisoned, the reservation gives its room back through the recovering hub and the ticket settles its respawn, while the commission guard skips (it used to panic); with the rank held, each skips and leaves its entry.
 - **Why it exists:** PRD #1666 part 3, round 5 (plan D6, D15 rule 5; reviewer R26): the round's new tracker → hub sections can poison a lock these destructors take, and a destructor that panics during an unwind aborts the process.
-- **Does not assert:** the whole dispatch arm unwinding with its publication guard (added with that guard); destructors that reach no ranked lock; the registry's own final teardown, which still panics on a poisoned lock and is the documented boundary.
+- **Asserts (scenario arm, child process, `src/agent_pty_replacement_tests.rs`):** a dispatch whose reply room is armed and whose initial publication is installed unwinds from a panic inside its unit registration's section: the tracker and routes are poisoned and the report state torn; the publication guard skips the poisoned routes once during the unwind; the reply room comes back; the injected payload escapes as an ordinary task panic; an unrelated message is still delivered and acknowledged; the next dispatch is refused before anything starts with the degraded sentence.
+- **Does not assert:** destructors that reach no ranked lock; the registry's own final teardown, which still panics on a poisoned lock and is the documented boundary; the work-done refusal after it (arrives with task-scoped completion).
 - **Platform coverage:** mac+linux+windows.
 
 ##### orchestration/work-done/057 — A spawn's reservation, its abandoned-turn release and the holds, close guards and viewer release survive an unwind.
@@ -4362,7 +4363,8 @@ without depending on the config struct API.
 - **Agent:** none.
 - **Asserts:** the spawn reservation, the abandoned-turn release, the directory-removal and pane-cleanup holds, the generation and instance close guards, and the helpers behind the pointer-queue clock, a pending post's abandonment and an attach viewer's release, each dropped during an unwind once with its lock poisoned and once (debug) with a higher rank held: the child survives with the injected payload and no `tracing` event; poisoned, the reservation, the holds, the tracker-taking pointer dequeue and the viewer release skip (the last two used to panic), while the abandoned-turn release, the close guards and the post's abandonment recover; with the rank held, each skips.
 - **Why it exists:** auditor U2-2: a spawn that unwinds drops its reservation, whose cleanup reaches the registry and then the hub, inside the same unwind.
-- **Does not assert:** a real spawn unwinding inside the respawn's replacement window (added with that window); destructors in files that reach no ranked lock.
+- **Asserts (arm (c), child process, `src/agent_pty_replacement_tests.rs`):** a respawn's successor spawn panics after its fork and before its record is published, inside the replacement window, with the hub's lock poisoned: the reservation gives itself up during the unwind (no pending entry or token left), the window aborts the replacement (the unit ends `RespawnFailed`, one notice), and the injected payload reaches the respawn's caller.
+- **Does not assert:** destructors in files that reach no ranked lock; that no `tracing` event happens anywhere in an unwind whose abort, in ordinary code, logs.
 - **Platform coverage:** mac+linux+windows.
 
 #### orchestration/provenance
@@ -4912,12 +4914,12 @@ without depending on the config struct API.
 - **Does not assert:** dispatch spawning or callback registration through `handle_dispatch` (`dispatch/return/001-003` own the real CLI boundary), deliberate-close eviction (`dispatch/return/005`), the `Ambiguous` partial-write branch, retry beyond asserting the entry is consumed, or real-agent behavior.
 - **Platform coverage:** mac+linux (unix-only fast test — every observer is a POSIX-shell raw `cat`).
 
-##### dispatch/return/005 — Closing a dispatch caller evicts its retained return edge, so a later unit completion is dropped and logged without reaching any alternate pane (PRD #220 M2.2).
+##### dispatch/return/005 — Closing a dispatch caller orphans its retained return edge, so a later unit completion reaches no alternate pane (PRD #220 M2.2; PRD #1666 part 3, round 5).
 - **Layer:** fast integration (the real `AgentPtyRegistry::begin_pane_close` / `finish_pane_close` lifecycle and `AppState::handle_work_done` against daemon-owned PTYs; no daemon process, git, LLM, credential or `e2e` feature gate).
 - **Agent:** none — raw no-echo `cat` observers stand in for the still-live dispatched unit, the caller that is deliberately closed, and an unrelated alternate recipient. Distinct readiness markers prove all relevant PTYs are live before the close and completion.
-- **Asserts:** in failure order, caller, unit and alternate observers are ready; registering the unit retains exactly one return edge; `begin_pane_close` on the CALLER immediately reduces the retained count to zero before the child is closed; the full close lifecycle completes; the unit's terminal `handle_work_done` returns without panic and does not recreate or reroute an edge; an authorized `GuardedSend::Applied` barrier reaches the unrelated pane; its drained snapshot contains none of the fenced completion turn — neither `dispatch:`, the unit name that would occupy `UNTRUSTED-ROLE-LABEL`, nor the report that would occupy `UNTRUSTED-WORKER-REPORT`; the close log says it dropped dispatch-return entries touching the caller pane; and the late completion is logged under its unit pane by the existing `work-done from unknown pane` path.
-- **Why it exists:** once the caller is gone there is neither a valid recipient nor a promised durable outbox, so keeping its callback would leak daemon memory and leave a pane-reuse hazard waiting for a future occupant. The close sweep must cover entries that point TO the caller as well as entries keyed BY a closing unit. Temporarily skipping `evict_pane` leaves the observable count at one and makes the first post-close assertion fail, proving the test does not pass merely because the eventual guarded write would also refuse a missing pane.
-- **Does not assert:** pane-id hand-over refusal (`dispatch/return/004`), unit-pane close eviction (covered by the registry unit tests), daemon restart or durable outcome storage, exact completion-report wording, or the TUI close dialog.
+- **Asserts:** in failure order, caller, unit and alternate observers are ready; registering the unit retains exactly one return edge; `begin_pane_close` on the CALLER keeps the edge, orphaned, and drops it from the dispatch tree (`dispatch_edges` is empty) before the child is closed; the full close lifecycle completes; the unit's terminal `handle_work_done` consumes the orphaned edge without panic and recreates or reroutes nothing; an authorized `GuardedSend::Applied` barrier reaches the unrelated pane; its drained snapshot contains none of the fenced completion turn — neither `dispatch:`, the unit name that would occupy `UNTRUSTED-ROLE-LABEL`, nor the report that would occupy `UNTRUSTED-WORKER-REPORT`; the close log says it orphaned the caller's routes; and the late completion is logged as refused because its caller is no longer the live agent, with nothing posted.
+- **Why it exists:** once the caller is gone there is no valid recipient, and its route must not become a pane-reuse hazard. PRD #1666 part 3, round 5 (plan D7, §8) changed eviction to orphaning: the route is kept so the unit's end is still recorded and its result goes to recovery rather than vanishing, and an orphaned route gives no successor a place in the dispatch tree.
+- **Does not assert:** pane-id hand-over refusal (`dispatch/return/004`), the recovery row the completion becomes once task-scoped completion is active (`dispatch/return/009`), unit-pane close (the registry unit tests), daemon restart, exact completion-report wording, or the TUI close dialog.
 - **Platform coverage:** mac+linux (unix-only fast test — every observer is a POSIX-shell raw `cat`).
 
 ##### dispatch/return/006 — A real dispatched single agent independently signals completion and its discovered sentinel report lands visibly in the real dispatcher's pane (PRD #220 M2.3/M4.2). [reel]
@@ -4947,6 +4949,86 @@ without depending on the config struct API.
 - **Platform coverage:** mac+linux.
 
 #### dispatch/close
+
+##### dispatch/return/009 — A dispatch caller that goes away — closed, exited or replaced by a respawn — orphans its units' routes, and its successor gets no place in the tree.
+- **Layer:** fast unit, in-crate (`src/agent_pty_dispatch_lifecycle_tests.rs`; the real registry, inbox hub and retained store, with `cat` stand-ins for every agent and the daemon's live check installed).
+- **Agent:** none: `cat` stand-ins.
+- **Asserts:** for each of a close of the caller's pane, the caller's own exit and a respawn replacing it: the unit's route is kept and marked orphaned, `dispatch_edges` is empty, and nothing is posted to whoever holds the caller's pane.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D7): a route keyed to a gone caller used to be evicted, which lost the unit's outcome; orphaning keeps it recordable while giving no successor the caller's place.
+- **Does not assert:** the `dispatch_finished` row a later completion becomes (arrives with task-scoped completion).
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/010 — A dispatch result for a caller that exited during the spawn becomes a row naming its own saved file.
+- **Layer:** fast unit, in-crate (`src/agent_pty_dispatch_lifecycle_tests.rs`; the real registry, inbox hub and retained store, with `cat` stand-ins for every agent and the daemon's live check installed).
+- **Agent:** none: `cat` stand-ins.
+- **Asserts:** two start results, retained and posted to a caller that is no longer the pane's agent, give two `dispatch_started` rows with cause `recipient_exited` and `storage: artifact`, each naming its own report id, whose file reads the start text; the pane gets nothing.
+- **Why it exists:** plan §3.2: every dispatch result is saved before it is posted, so a result nobody can take is recoverable.
+- **Does not assert:** the daemon's hook-socket dispatch arm (its admission and reservation are `/018` and `/024`).
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/011 — A `dispatch ended` notice a live caller's full inbox refuses becomes a `recipient_refused` row.
+- **Layer:** fast unit, in-crate (`src/agent_pty_dispatch_lifecycle_tests.rs`; the real registry, inbox hub and retained store, with `cat` stand-ins for every agent and the daemon's live check installed).
+- **Agent:** none: `cat` stand-ins.
+- **Asserts:** with the caller's inbox filled, the unit's exit records `Ended { Exited }`, posts no notice, and leaves one `dispatch_ended` row with cause `recipient_refused` and `storage: none`.
+- **Why it exists:** plan D7: a unit's end is never lost because its caller's inbox was full.
+- **Does not assert:** a dispatch result's own refused post (it rides reserved room).
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/017 — A unit that ends without a report tells its caller exactly once — a notice to a live caller, a row for a gone one.
+- **Layer:** fast unit, in-crate (`src/agent_pty_dispatch_lifecycle_tests.rs`; the real registry, inbox hub and retained store, with `cat` stand-ins for every agent and the daemon's live check installed).
+- **Agent:** none: `cat` stand-ins.
+- **Asserts:** for a single unit and an orchestration unit: with the caller already exited, the unit's exit leaves one `dispatch_ended` row (`recipient_exited`, summary saying it exited) and no notice; with the caller live, one `dispatch ended` notice with `dispatch_result` provenance (phase `ended`) and no row; a second termination of the same unit emits nothing more.
+- **Why it exists:** reviewer R9: an acknowledged start followed by the caller's and then the unit's exit used to leave nothing at all.
+- **Does not assert:** what an agent does with the notice.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/018 — Dispatch results are saved files that outlive their rows, and a dispatch the deck cannot keep a result for is refused before anything starts.
+- **Layer:** fast unit, in-crate (`src/agent_pty_dispatch_lifecycle_tests.rs`; the real registry, inbox hub and retained store, with `cat` stand-ins for every agent and the daemon's live check installed).
+- **Agent:** none: `cat` stand-ins.
+- **Asserts:** a failure that started nothing and a start each save a file; with the row bound at 1 the evicted row's file stays and its envelope names the unit and the caller; a store too full for the result refuses with `report_store_full` and a store whose directory was refused with `report_save_failed`, each sentence its own and ending "nothing was started".
+- **Why it exists:** reviewer R6, R14: a row is never the only copy of a result, and room is guaranteed at admission.
+- **Does not assert:** the hook socket's reply line itself (the arm writes the same code and sentence).
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/023 — A `dispatch ended` notice a caller exits without acknowledging is salvaged as a row.
+- **Layer:** fast unit, in-crate (`src/agent_pty_dispatch_lifecycle_tests.rs`; the real registry, inbox hub and retained store, with `cat` stand-ins for every agent and the daemon's live check installed).
+- **Agent:** none: `cat` stand-ins.
+- **Asserts:** posted to a live caller that then exits unacknowledged, the notice becomes a `dispatch_ended` row with its summary and `storage: none`; acknowledged first, it leaves no row.
+- **Why it exists:** reviewer U3-4: the deck's own outcome notices go through the accepted-report ledger like any result.
+- **Does not assert:** an ack through the receipt engine (the store-level ack is used).
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/024 — Dispatch results that cannot be saved are held in a bounded set of slots, retried, and each refusal names only its own cause.
+- **Layer:** fast unit, in-crate (`src/agent_pty_dispatch_lifecycle_tests.rs`; the real registry, inbox hub and retained store, with `cat` stand-ins for every agent and the daemon's live check installed).
+- **Agent:** none: `cat` stand-ins.
+- **Asserts:** with two slots and every write failing: two results are held in memory under their report ids with rows reading `storage: memory`, and a third dispatch is refused with the unsaved-results sentence and no in-flight clause; a retry with writes working saves both (rows read `artifact`) and a new dispatch is admitted; with no failure, two in-flight dispatches make a third refused with the in-flight sentence, which mentions no disk and no restart; one in flight and one held name both causes.
+- **Why it exists:** reviewer R14, U3-1: the fallback never overflows or replaces a body, and healthy load is never reported as a disk failure.
+- **Does not assert:** the hourly retry's timing; a body's 24-hour or 7-day expiry.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/026 — A respawned unit terminal's replacement settles its unit, route and successor exactly once on every path, and never takes another occupant of the pane for its successor.
+- **Layer:** fast unit, in-crate (`src/agent_pty_replacement_tests.rs`; the real registry, inbox hub and retained store, `cat` stand-ins, named pauses and fault points; the arms marked "child process" re-execute the test binary so an abort reads as `SIGABRT`).
+- **Agent:** none: `cat` stand-ins.
+- **Asserts:** publish: the route compare-and-sets to B, (P, B) is indexed and B carries the unit pinned, and B's exit ends the unit once (one notice, or one row for an orphaned caller), for a single unit and an orchestration unit; a predecessor's held EOF ends nothing; B killed while the window is paused waits for the publication, then ends the unit once; (f1) a failed spawn ends the unit `RespawnFailed`, its route, publication and leaf unit gone, one notice, nothing closed; (f2), (f3), (f2') a panic after the spawn, before the publish section, or inside the spawn after B is published aborts with B taken from the reserved slot, indexed and closed by its id, the injected payload resumed; (f2s) an exited record on the pane is never indexed or closed; (f7) a competing start makes the reservation refuse, the unit end, and the competitor untouched; (f8) a pane reused after B exited leaves the new occupant untouched while B is closed by id; (f6) a respawn cancelled before `begin` installs nothing; (g) a close during the window ends the unit once and keeps the publication, closed, until publish removes it, resurrecting no route; child process: (f4) a panic inside publish leaves the routes poisoned, the state torn, the route moved by the compare-and-set, the leaf on B, B running, nothing posted or closed, and the inbox still working; (f4') a state torn by another thread with healthy routes makes the abort write nothing; (f4'') an unrelated hub panic leaves the abort working; (f5a) a dropped latch makes B's reader abort; (f5b) a panicking abort leaves B's reader to find what it left.
+- **Why it exists:** reviewer R17, R20, R25, R27, auditor U2-1, U3-2: the respawn moves a unit's terminal generation, and its EOF, reports and failure paths must agree on one unit.
+- **Does not assert:** the arms that send a terminal `work-done` (they arrive with task-scoped completion); the torn report state's contents after a panic, which are discarded with it (only the routes, records and leaf are read).
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/027 — A unit that ends before its route is registered is recorded ended, and an instance's contradictory origin is pinned as a conflict.
+- **Layer:** fast unit, in-crate (`src/agent_pty_dispatch_lifecycle_tests.rs`; the real registry, inbox hub and retained store, with `cat` stand-ins for every agent and the daemon's live check installed).
+- **Agent:** none: `cat` stand-ins.
+- **Asserts:** (e) the terminal generation exiting, and (f) its pane being marked closing, while the dispatch is paused before registration: registration records `Ended { Exited }` or `Ended { Closed }`, inserts no route, indexes the generation, and tells the live caller once; (i) a second role of a dispatched instance spawned with origin `Direct` has its origin pinned as `Conflict`.
+- **Why it exists:** reviewer R16, auditor U3-3, U3-4: every order of exit, close and registration is covered.
+- **Does not assert:** the terminal reports these generations then send (they arrive with task-scoped completion).
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/028 — A unit's entry and index outlive no generation that can still attest, and no shorter.
+- **Layer:** fast unit, in-crate (`src/agent_pty_dispatch_lifecycle_tests.rs`; the real registry, inbox hub and retained store, with `cat` stand-ins for every agent and the daemon's live check installed).
+- **Agent:** none: `cat` stand-ins.
+- **Asserts:** with the tombstone knob at 1 (16 units daemon-wide), a dispatched unit whose terminal generation is still registered keeps its entry while 32 other units' are evicted; once its record is removed, the next insertion evicts it.
+- **Why it exists:** plan D2: a generation that can still attest freshly always finds its unit's entry.
+- **Does not assert:** the publication protection (exercised by `/026` (g)); a fresh report presenting the removed token (refused `unattested` before admission).
+- **Platform coverage:** mac+linux.
 
 ##### dispatch/close/001 — A dispatched single-agent card closes on the FIRST confirmed Ctrl+W, instead of surviving until the user closes it a second time (PRD #220 follow-up).
 - **Layer:** L2 PTY-attached (`TuiDeck` on the `minimal` fixture) driving the REAL `dot-agent-deck dispatch --single` CLI, then closing the resulting card through the production Ctrl+W → confirm path.
@@ -12020,6 +12102,14 @@ PRD #1666 part 3, round 5: where the deck keeps a worker's report, or a dispatch
 - **Why it exists:** plan D3: the envelope is the deck's attribution of a report that may outlive every record of it.
 - **Does not assert:** authenticity against a process of the same user, which can write the same format (a stated limit).
 - **Platform coverage:** mac+linux.
+
+##### inbox/recovery/013 — Every accepted report ends in exactly one of acknowledged, set aside, or still live.
+- **Layer:** fast unit, property (`src/inbox_reports.rs`; a real inbox hub, twelve deterministic seeds of 60 random steps).
+- **Agent:** none.
+- **Asserts:** across random posts of reports with ledger entries, acknowledgements and recipient exits over three agents, every posted report is in exactly one place afterwards: acknowledged (no ledger entry, no row), set aside (a row naming its report, no ledger entry), or live (a ledger entry, no row).
+- **Why it exists:** plan D13: the ledger is settled from the inbox's own events, so no transition the inbox makes may leave a report in two places or none.
+- **Does not assert:** MaxDeliver, cancellation or history trimming (their causes are mapped by the same settlement and pinned elsewhere); the row bound's eviction (the sequences stay below it).
+- **Platform coverage:** mac+linux+windows.
 
 ##### inbox/recovery/014 — Three runs: a live adopter keeps one owner and one deadline per file.
 - **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).

@@ -3251,6 +3251,7 @@ async fn prepare_dispatch_completion(
     let crate::dispatch_return::RetainedReturn {
         unit_agent_id,
         caller,
+        ..
     } = registry.take_dispatch_return(&signal.pane_id)?;
     // PRD #220 Phase 2 review (finding A4): the unit name is producer-supplied and
     // rode into this line raw. Escaped and clamped through the module that already
@@ -3328,6 +3329,7 @@ impl PendingDispatchReturn {
             spill_path: None,
             id: None,
             preface: None,
+            provenance: None,
         };
         match crate::inbox_hub::post_reserved_reply_or_notice_to_live(
             registry,
@@ -3450,6 +3452,7 @@ impl WorkDoneDelivery {
                 error,
                 max_body,
             )),
+            provenance: None,
         };
         match crate::inbox_hub::post_reserved_reply_or_notice_to_live(
             registry,
@@ -3576,6 +3579,7 @@ fn compose_work_done_message(
         spill_path,
         id: None,
         preface: Some(format!("{head}{tail}")),
+        provenance: None,
     }
 }
 
@@ -5789,6 +5793,7 @@ async fn dispatch_one_owned(
         spill_path: None,
         id: Some(message_id),
         preface: None,
+        provenance: None,
     };
     // PR #1735 fifth review (N8): a task the inbox would refuse is refused
     // before anything is retired or restarted for it, so the worker's older
@@ -11580,6 +11585,10 @@ pub async fn handle_spawn_role_with_state(
             orchestration_id: orchestration_id.clone(),
         }),
         agent_type: resolved.role_config.resolved_agent_type(),
+        // PRD #1666 part 3, round 5 (plan D7): a role added to a running
+        // instance takes the origin its instance was started with, from a
+        // record of it.
+        origin: registry.origin_of_instance(&resolved.identity.id),
         ..crate::agent_pty::SpawnOptions::default()
     });
 
@@ -20441,6 +20450,7 @@ mod tests {
             attention_update: false,
             requeued: false,
             notices: Default::default(),
+            provenance: None,
         }
     }
 

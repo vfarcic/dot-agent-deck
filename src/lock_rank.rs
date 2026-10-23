@@ -77,6 +77,17 @@ pub const LEAF: u8 = u8::MAX;
 /// logs the count at `error!` and resets it.
 pub static SKIPPED_IN_UNWIND: AtomicU64 = AtomicU64::new(0);
 
+/// Every skip [`SKIPPED_IN_UNWIND`] ever counted, never reset: a test reads
+/// it, since any thread's next acquisition resets the reported count.
+#[cfg(test)]
+pub static SKIPPED_IN_UNWIND_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+fn count_skip_in_unwind() {
+    SKIPPED_IN_UNWIND.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    SKIPPED_IN_UNWIND_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Why [`RankedMutex::try_lock`] or [`RankedMutex::lock_in_drop`] did not
 /// hand out a guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,7 +197,7 @@ impl<const RANK: u8, T> RankedMutex<RANK, T> {
                 OnPoison::Skip => {
                     drop(poisoned);
                     if std::thread::panicking() {
-                        SKIPPED_IN_UNWIND.fetch_add(1, Ordering::Relaxed);
+                        count_skip_in_unwind();
                     }
                     None
                 }
@@ -254,7 +265,7 @@ fn report_skipped_in_unwind() {
 /// A destructor's acquisition was skipped.
 fn skipped(rank: u8, why: &str) {
     if std::thread::panicking() {
-        SKIPPED_IN_UNWIND.fetch_add(1, Ordering::Relaxed);
+        count_skip_in_unwind();
     } else {
         tracing::error!(rank, why, "lock ranks: a destructor skipped a ranked lock");
     }

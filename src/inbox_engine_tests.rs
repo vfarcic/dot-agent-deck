@@ -23,6 +23,7 @@ fn content(body: &str) -> Content {
         spill_path: None,
         id: None,
         preface: None,
+        provenance: None,
     }
 }
 

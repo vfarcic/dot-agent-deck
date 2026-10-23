@@ -441,6 +441,7 @@ async fn publish_in(
         spill_path: None,
         id: None,
         preface: None,
+        provenance: None,
     };
     if let Err(error) = registry.inbox().admit_publish(&content, &recipients) {
         info!(pane_id = %req.pane_id, %error, "inbox: publish refused");
@@ -566,6 +567,7 @@ async fn offer_in(
         spill_path: None,
         preface: Some(offer_preface(&id, &req.pool)),
         id: Some(id),
+        provenance: None,
     };
     let claim_ttl = req.claim_ttl_ms.map(Duration::from_millis);
     if let Err(error) = registry
@@ -744,11 +746,13 @@ mod tests {
         registry.register_dispatch_return(
             unit.0,
             unit.1,
+            &format!("unit-{}", unit.0),
             DispatchCaller {
                 pane_id: caller.0.to_string(),
                 agent_id: caller.1.to_string(),
                 unit_name: "unit".to_string(),
             },
+            None,
         );
     }
 
@@ -808,11 +812,12 @@ mod tests {
         registry.shutdown_all();
     }
 
-    /// Audit F1, the unit side: the successor of a dispatched unit's agent was
-    /// never dispatched, so it is not in its predecessor's dispatch tree, and
-    /// the edge no longer makes its caller an orchestrator.
+    /// Audit F1, the unit side, as PRD #1666 part 3, round 5 (plan D7) changed
+    /// it: a respawn of a dispatched unit's terminal generation retargets the
+    /// unit's route, so the unit stays in its caller's tree under its
+    /// successor, and the predecessor's id is in no edge.
     #[tokio::test]
-    async fn a_respawned_unit_is_not_in_its_predecessors_dispatch_tree() {
+    async fn a_respawned_unit_is_in_its_callers_tree_only_under_its_successor() {
         let registry = Arc::new(AgentPtyRegistry::new());
         let caller = spawn_in(&registry, "f1b-caller", None);
         let unit = spawn_in(&registry, "f1b-unit", None);
@@ -824,16 +829,18 @@ mod tests {
             "f1b-unit"
         ));
 
-        registry
+        let successor = registry
             .respawn_agent_for_pane("f1b-unit", "cat")
             .await
             .expect("respawn the unit");
         assert_eq!(registry.outstanding_dispatch_returns(), 1);
-
-        let view = ScopeView::gather(&state, &registry).await;
-        assert!(!in_scope(&view, "f1b-caller", "f1b-unit"));
-        assert!(!in_scope(&view, "f1b-unit", "f1b-caller"));
-        assert!(!view.may_offer("f1b-caller"));
+        // PRD #1666 part 3, round 5 (plan D7, §8): the respawn retargets the
+        // unit's route to its successor, which continues the unit, so the
+        // tree's edge names the successor and never the predecessor.
+        let edges = registry.dispatch_edges();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].unit_agent_id, successor);
+        assert_ne!(edges[0].unit_agent_id, unit);
         registry.shutdown_all();
     }
 

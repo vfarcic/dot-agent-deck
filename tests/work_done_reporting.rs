@@ -988,11 +988,13 @@ impl DispatchReturnHarness {
         self.registry.register_dispatch_return(
             unit_pane,
             &self.unit_agent_id,
+            &format!("unit-{unit_pane}"),
             DispatchCaller {
                 pane_id: caller_pane.to_string(),
                 agent_id: self.caller_agent_id.clone(),
                 unit_name: unit_name.to_string(),
             },
+            None,
         );
         assert_eq!(
             self.registry.outstanding_dispatch_returns(),
@@ -1099,7 +1101,7 @@ fn dispatch_return_004_completion_is_refused_when_the_caller_pane_changed_hands(
     });
 }
 
-/// Scenario: Retain a dispatched unit's return edge, deliberately close its caller pane, and then let the still-live unit complete while an unrelated pane is observable. The close must evict the edge, the late completion must take the logged unknown-pane drop path without panicking, and no report bytes may reach the unrelated pane.
+/// Scenario: Retain a dispatched unit's return edge, deliberately close its caller pane, and then let the still-live unit complete while an unrelated pane is observable. The close must orphan the edge — kept, out of the dispatch tree — the late completion must be refused for its missing caller without panicking, and no report bytes may reach the unrelated pane.
 #[spec("dispatch/return/005")]
 #[test]
 fn dispatch_return_005_completion_is_dropped_after_the_caller_pane_is_gone() {
@@ -1131,10 +1133,16 @@ fn dispatch_return_005_completion_is_dropped_after_the_caller_pane_is_gone() {
         harness.register(CALLER_PANE, UNIT_PANE, UNIT);
 
         drop(harness.registry.begin_pane_close(CALLER_PANE));
+        // PRD #1666 part 3, round 5 (plan D7): orphaned, not evicted, so the
+        // unit's end is still recorded; it leaves the dispatch tree.
         assert_eq!(
             harness.registry.outstanding_dispatch_returns(),
-            0,
-            "begin_pane_close must evict every retained return edge whose caller is going away"
+            1,
+            "begin_pane_close must keep the route of a caller that is going away, orphaned"
+        );
+        assert!(
+            harness.registry.dispatch_edges().is_empty(),
+            "an orphaned route gives nobody a place in the dispatch tree"
         );
         harness
             .registry
@@ -1146,7 +1154,7 @@ fn dispatch_return_005_completion_is_dropped_after_the_caller_pane_is_gone() {
         assert_eq!(
             harness.registry.outstanding_dispatch_returns(),
             0,
-            "the late completion must not recreate or reroute an evicted return edge"
+            "the late completion consumes the orphaned route and recreates nothing"
         );
 
         let snapshot = barrier_dispatch_return_observer(
@@ -1167,18 +1175,18 @@ fn dispatch_return_005_completion_is_dropped_after_the_caller_pane_is_gone() {
         let log = dispatch_return_logs();
         assert!(
             log.lines().any(|line| {
-                line.contains(CALLER_PANE)
-                    && line
-                        .contains("pane close: dropped dispatch return entries touching this pane")
+                line.contains(CALLER_PANE) && line.contains("orphaned its caller routes")
             }),
-            "the caller close must log that it dropped the retained return edge; captured log = \
+            "the caller close must log that it orphaned the retained return edge; captured log = \
              {log:?}"
         );
         assert!(
             log.lines().any(|line| {
-                line.contains(UNIT_PANE) && line.contains("work-done from unknown pane")
+                line.contains(CALLER_PANE)
+                    && line.contains("refused the completion report")
+                    && line.contains("no longer the live agent")
             }),
-            "the late completion must be dropped on the existing logged unknown-pane path; \
+            "the late completion must be refused for its missing caller, with nothing posted; \
              captured log = {log:?}"
         );
     });

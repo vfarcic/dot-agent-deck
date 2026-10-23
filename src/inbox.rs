@@ -548,6 +548,8 @@ pub struct Message {
     /// Offers only: when an offer assigned to a holder that has not fetched
     /// it goes back to its pool ([`InboxLimits::offer_assign_wait`]).
     pub assign_deadline: Option<Instant>,
+    /// See [`Content::provenance`].
+    pub provenance: Option<crate::report_recovery::ReportProvenance>,
 }
 
 impl Message {
@@ -582,6 +584,7 @@ impl Message {
             deliveries: self.deliveries,
             age_ms: millis(now.saturating_duration_since(self.created_at)),
             text: None,
+            provenance: self.provenance.clone(),
         }
     }
 
@@ -630,6 +633,11 @@ pub struct MessageSummary {
     /// ([`crate::daemon_protocol::AttachRequest::ListInbox`]'s `bodies`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// PRD #1666 part 3, round 5: what this message is, when it is a report
+    /// or a dispatch result. Additive: a reader that does not know it ignores
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<crate::report_recovery::ReportProvenance>,
 }
 
 /// Per-pane counts for status and cards.
@@ -663,6 +671,8 @@ pub struct InboxEvent {
     /// The message went back to the queue from being taken (fetched or
     /// claimed) — a hand-back, not a new post.
     pub requeued: bool,
+    /// See [`Content::provenance`].
+    pub provenance: Option<crate::report_recovery::ReportProvenance>,
 }
 
 /// An offer leaving the holder it was assigned to.
@@ -812,6 +822,9 @@ pub struct Content {
     /// untrusted frame — what the deck itself says about an agent-authored
     /// body (an unsolicited report, where the full text was saved).
     pub preface: Option<String>,
+    /// PRD #1666 part 3, round 5 (plan D10): what this message is, when it is
+    /// a report or a dispatch result; `None` for every other message.
+    pub provenance: Option<crate::report_recovery::ReportProvenance>,
 }
 
 impl Content {
@@ -832,6 +845,7 @@ impl Content {
             spill_path: None,
             id: None,
             preface: None,
+            provenance: None,
         }
     }
 }
@@ -1769,6 +1783,7 @@ impl Inbox {
             history: Vec::new(),
             excluded: Vec::new(),
             assign_deadline: None,
+            provenance: content.provenance.clone(),
         };
         self.messages.push(message);
         let index = self.messages.len() - 1;
@@ -1883,6 +1898,7 @@ impl Inbox {
             },
             returned: None,
             requeued,
+            provenance: message.provenance.clone(),
         });
     }
 
@@ -2257,6 +2273,7 @@ mod tests {
             spill_path: None,
             id: None,
             preface: None,
+            provenance: None,
         }
     }
 

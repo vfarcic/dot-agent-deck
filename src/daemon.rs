@@ -752,6 +752,21 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
                 hub.set_spool_error(&error.to_string());
             }
         }
+        // PRD #1666 part 3, round 5 (plan D3, D14): the store that keeps
+        // reports and dispatch results whose recipient may be gone, with the
+        // files of daemon runs that ended taken over. A directory it cannot
+        // use makes every report it would keep refused, which it logs.
+        let retained_dir = std::path::absolute(&state_dir).unwrap_or_else(|_| state_dir.clone());
+        let retained = crate::retained_store::RetainedStore::open(
+            &retained_dir,
+            crate::retained_store::StoreConfig::from_env(),
+            crate::retained_store::Now::current(),
+        );
+        hub.set_retained_store(std::sync::Arc::clone(&retained));
+        drop(crate::retained_store::spawn_maintenance(
+            std::sync::Arc::clone(&hub),
+            retained,
+        ));
         pty_registry.install_inbox(hub);
     }
     let inbox_ticker = pty_registry.inbox().spawn_ticker();
@@ -4415,7 +4430,7 @@ pub(crate) fn mark_dispatched_unit_completion(
     if !signal.done {
         return None;
     }
-    let crate::hook_provenance::Provenance::Attested { agent_id } = provenance else {
+    let crate::hook_provenance::Provenance::Attested { agent_id, .. } = provenance else {
         return None;
     };
     if registry.generation_ownership(Some(&signal.pane_id), Some(agent_id))
@@ -4458,7 +4473,7 @@ pub(crate) fn resolve_dispatch_caller(
     provenance: &crate::hook_provenance::Provenance,
 ) -> Option<(String, String)> {
     match provenance {
-        crate::hook_provenance::Provenance::Attested { agent_id } => {
+        crate::hook_provenance::Provenance::Attested { agent_id, .. } => {
             if registry.pane_current_agent_id(pane_id).as_deref() != Some(agent_id.as_str()) {
                 return None;
             }
@@ -5889,6 +5904,10 @@ async fn run_hook_loop_with_limits(
                             // dispatch is accepted (below) until the result is
                             // posted in the `Dispatch` arm.
                             let mut dispatch_result_room = None;
+                            // PRD #1666 part 3, round 5 (plan §3.2): and the
+                            // room the result's file and fallback body need,
+                            // reserved before anything starts.
+                            let mut dispatch_result_store = None;
                             match crate::hook_provenance::admits(
                                 &provenance,
                                 crate::hook_provenance::policy(),
@@ -5978,6 +5997,28 @@ async fn run_hook_loop_with_limits(
                                                 continue;
                                             }
                                         }
+                                        match crate::dispatch_return::admit_dispatch_result(
+                                            &pty_registry,
+                                        ) {
+                                            Ok(room) => dispatch_result_store = room,
+                                            Err((code, message)) => {
+                                                warn!(
+                                                    claimed_pane = %escape_id_for_log(msg.claimed_pane()),
+                                                    code,
+                                                    "hook socket: refused a dispatch; the deck \
+                                                     cannot keep its result"
+                                                );
+                                                let refusal =
+                                                    crate::event::SignalAck::refused(code, &message);
+                                                if let Ok(json) = serde_json::to_string(&refusal) {
+                                                    let line = format!("{json}\n");
+                                                    let _ =
+                                                        write_half.write_all(line.as_bytes()).await;
+                                                    let _ = write_half.flush().await;
+                                                }
+                                                continue;
+                                            }
+                                        }
                                     }
                                     if let Some(json) = msg.provenance_ack_reply() {
                                         let line = format!("{json}\n");
@@ -6015,7 +6056,7 @@ async fn run_hook_loop_with_limits(
                             // admitted above for its status events, but has no
                             // agent this daemon can bind a message to.
                             let attested_agent = match &provenance {
-                                crate::hook_provenance::Provenance::Attested { agent_id } => {
+                                crate::hook_provenance::Provenance::Attested { agent_id, .. } => {
                                     Some(agent_id.clone())
                                 }
                                 _ => None,
@@ -6572,6 +6613,7 @@ async fn run_hook_loop_with_limits(
                                     let sender_agent_id = match &provenance {
                                         crate::hook_provenance::Provenance::Attested {
                                             agent_id,
+                                            ..
                                         } => Some(agent_id.clone()),
                                         _ => None,
                                     };
@@ -6779,6 +6821,20 @@ async fn run_hook_loop_with_limits(
                                     let Some(room) = dispatch_result_room.take() else {
                                         continue;
                                     };
+                                    // PRD #1666 part 3, round 5 (plan §3.2):
+                                    // the result is saved, or held in memory,
+                                    // before it is posted.
+                                    let record = crate::dispatch_return::retain_dispatch_result(
+                                        &pty_registry,
+                                        dispatch_result_store.take(),
+                                        &signal.pane_id,
+                                        &caller_agent_id,
+                                        &signal.name,
+                                        &result.message,
+                                        result.success,
+                                        result.unit_id.clone(),
+                                    )
+                                    .await;
                                     crate::dispatch_return::post_dispatch_result(
                                         &pty_registry,
                                         room,
@@ -6787,6 +6843,7 @@ async fn run_hook_loop_with_limits(
                                         &signal.name,
                                         result.success,
                                         &result.message,
+                                        record,
                                     );
                                 }
                                 DaemonMessage::WorkDone(signal) => {
@@ -6837,6 +6894,7 @@ async fn run_hook_loop_with_limits(
                                     let attested_agent_id = match &provenance {
                                         crate::hook_provenance::Provenance::Attested {
                                             agent_id,
+                                            ..
                                         } => Some(agent_id.as_str()),
                                         _ => None,
                                     };
@@ -7097,7 +7155,7 @@ async fn run_hook_loop_with_limits(
                                 crate::hook_provenance::Provenance::Unattested
                             );
                             let attested_agent = match &provenance {
-                                crate::hook_provenance::Provenance::Attested { agent_id } => {
+                                crate::hook_provenance::Provenance::Attested { agent_id, .. } => {
                                     Some(agent_id.clone())
                                 }
                                 _ => None,
@@ -7451,6 +7509,7 @@ mod close_verb_seam_tests {
             Provenance::Refused(Refusal::Missing),
             Provenance::Attested {
                 agent_id: "someone-else".to_string(),
+                facts: Default::default(),
             },
         ] {
             assert_eq!(
@@ -7461,6 +7520,7 @@ mod close_verb_seam_tests {
         }
         let attested = Provenance::Attested {
             agent_id: agent.clone(),
+            facts: Default::default(),
         };
         assert_eq!(
             mark_dispatched_unit_completion(&registry, &done("unit-pane", false), &attested),
@@ -7483,7 +7543,10 @@ mod close_verb_seam_tests {
             mark_dispatched_unit_completion(
                 &registry,
                 &done("recycled", true),
-                &Provenance::Attested { agent_id: old },
+                &Provenance::Attested {
+                    agent_id: old,
+                    facts: Default::default()
+                },
             ),
             None
         );
@@ -7515,7 +7578,14 @@ mod close_verb_seam_tests {
         );
         let b_cwd = b_dir.path().to_string_lossy().into_owned();
         assert_eq!(
-            resolve_dispatch_caller(&registry, "disp", &Provenance::Attested { agent_id: a }),
+            resolve_dispatch_caller(
+                &registry,
+                "disp",
+                &Provenance::Attested {
+                    agent_id: a,
+                    facts: Default::default()
+                }
+            ),
             None,
             "a superseded generation must not dispatch as its successor"
         );
@@ -7524,7 +7594,8 @@ mod close_verb_seam_tests {
                 &registry,
                 "disp",
                 &Provenance::Attested {
-                    agent_id: b.clone()
+                    agent_id: b.clone(),
+                    facts: Default::default(),
                 }
             ),
             Some((b.clone(), b_cwd.clone()))
@@ -14956,14 +15027,16 @@ mod hook_provenance_audit_tests {
         assert_eq!(
             classify_event(Some(pane), Some(&agent), Some(&token), &*registry),
             Provenance::Attested {
-                agent_id: agent.clone()
+                agent_id: agent.clone(),
+                facts: Default::default(),
             },
             "a token minted for an in-flight spawn names that spawn"
         );
         assert_eq!(
             classify_event(None, Some(&paneless), Some(&paneless_token), &*registry),
             Provenance::Attested {
-                agent_id: paneless.clone()
+                agent_id: paneless.clone(),
+                facts: Default::default(),
             },
             "the paneless in-flight spawn resolves the same way"
         );

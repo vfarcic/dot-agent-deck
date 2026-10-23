@@ -853,6 +853,7 @@ mod tests {
             attention_update: false,
             requeued: false,
             notices: Default::default(),
+            provenance: None,
         };
 
         let dir = tempfile::tempdir().unwrap();

@@ -3372,6 +3372,52 @@ impl DaemonClient {
         Ok(())
     }
 
+    /// PRD #1666 part 3, round 5 (plan D10): the deck's recovery rows.
+    ///
+    /// Gated on ONE connection: a fresh `Hello` asks the daemon that will
+    /// answer, and the request follows only when that `Hello` advertises
+    /// [`crate::daemon_protocol::CAP_DECK_OUTCOMES`] — and, when the caller
+    /// pinned a daemon process (`pinned_instance`), only when that `Hello` is
+    /// from it. Otherwise no frame is sent and the answer is
+    /// [`GatedQuery::Unsupported`]. No cached capability set is consulted.
+    pub async fn list_outcomes(
+        &self,
+        pinned_instance: Option<&str>,
+    ) -> Result<GatedQuery<crate::report_recovery::DeckOutcomes>, ClientError> {
+        let (mut rd, mut wr) = self.connect().await?;
+        let hello = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::Hello {
+                client_version: crate::daemon_protocol::PROTOCOL_VERSION,
+                client_build_version: None,
+                follow_on: true,
+            },
+        )
+        .await?;
+        if !hello.ok {
+            return Ok(GatedQuery::Unsupported);
+        }
+        let capabilities = DaemonCapabilities::from_hello(&hello);
+        if !capabilities.supports(crate::daemon_protocol::CAP_DECK_OUTCOMES)
+            || !capabilities.supports(crate::daemon_protocol::CAP_HELLO_FOLLOW_ON)
+        {
+            return Ok(GatedQuery::Unsupported);
+        }
+        if let Some(pinned) = pinned_instance
+            && hello.instance_id.as_deref() != Some(pinned)
+        {
+            return Ok(GatedQuery::Unsupported);
+        }
+        let resp = issue_command(&mut rd, &mut wr, &AttachRequest::ListOutcomes).await?;
+        match resp.deck_outcomes {
+            Some(outcomes) => Ok(GatedQuery::Answered(outcomes)),
+            None => Err(ClientError::Server(resp.error.unwrap_or_else(|| {
+                "the daemon answered ListOutcomes with no listing".into()
+            }))),
+        }
+    }
+
     /// PRD #1589 — send [`AttachRequest::CloseAgents`] and return the daemon's
     /// report. Refusals are in the report, not an error.
     ///

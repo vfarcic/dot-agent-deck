@@ -138,6 +138,11 @@ pub const ONE_SHOT_SENDERS: &[crate::event::InboxOneShotSender] = &[
 
 #[path = "inbox_engine.rs"]
 mod engine;
+#[path = "inbox_reports.rs"]
+mod reports;
+#[cfg(test)]
+pub(crate) use reports::seams as report_seams;
+pub(crate) use reports::{RecordView, Registration, ReplacementOutcome};
 #[cfg(test)]
 #[path = "inbox_engine_tests.rs"]
 mod engine_tests;
@@ -536,6 +541,51 @@ struct HubState {
     /// at most: only a request the generation's current capability attests
     /// sets one ([`InboxHub::admission_refused`]).
     admission_refused: HashMap<AgentKey, AdmissionEpisode>,
+    /// PRD #1666 part 3, round 5 (plan D15): everything this round adds to
+    /// the hub, reachable only through [`HubState::guarded_section`] and
+    /// [`HubState::guarded_read`], and torn for the rest of the run by a panic
+    /// inside a section that was writing it.
+    reports: crate::guarded::Guarded<crate::report_recovery::ReportState>,
+    /// Whether the torn report state was logged, so it is logged once.
+    torn_logged: bool,
+    /// PRD #1666 part 3, round 5: this run's retained-report store, once the
+    /// daemon opened one ([`InboxHub::set_retained_store`]). Rank R5: taken
+    /// only under this lock or with nothing ranked held.
+    retained: Option<Arc<crate::retained_store::RetainedStore>>,
+}
+
+impl HubState {
+    /// Run `f` as one guarded section over this round's report state
+    /// (`crate::guarded`), handing it the rest of the hub's state too.
+    /// `Err(Torn)` once a panic inside a section tore it; `f` must not reach
+    /// for the report state again, and is handed it instead.
+    fn guarded_section<R>(
+        &mut self,
+        f: impl FnOnce(&mut HubState, &mut crate::report_recovery::ReportState) -> R,
+    ) -> Result<R, crate::guarded::Torn> {
+        crate::guarded::Guarded::section(self, |st| &mut st.reports, f)
+    }
+
+    /// Read this round's report state, unless a section tore it.
+    fn guarded_read<R>(
+        &self,
+        f: impl FnOnce(&crate::report_recovery::ReportState) -> R,
+    ) -> Result<R, crate::guarded::Torn> {
+        self.reports.read(f)
+    }
+
+    /// Log, once per run, that an existing path skipped its guarded part
+    /// because the report state is torn (plan D15 rule 4).
+    fn log_torn_once(&mut self, what: &str) {
+        if !self.torn_logged {
+            self.torn_logged = true;
+            tracing::error!(
+                what,
+                "inbox: the deck's report state was torn by an earlier internal panic; reports \
+                 and dispatch results are no longer recorded until the daemon restarts"
+            );
+        }
+    }
 }
 
 /// PRD #1666 part 3 (R-2): one refusal episode of an agent generation's own
@@ -611,6 +661,14 @@ pub struct InboxHub {
     undelivered_after: Duration,
     /// Hardening M4: how long one write to a waiter's connection may take.
     write_deadline: Duration,
+    /// PRD #1666 part 3, round 5 (§3.2): when held dispatch results were last
+    /// retried on a refused dispatch's behalf, so that happens at most once a
+    /// minute.
+    fallback_retry: std::sync::Mutex<Option<Instant>>,
+    /// Held for one retry pass over the held dispatch results, so two passes
+    /// never take the bodies out at once. Never held with a ranked lock
+    /// already held.
+    fallback_retry_pass: std::sync::Mutex<()>,
     /// Test seam: while set, each once batch's caps-file writes tell the
     /// first end they started and wait for the second before going on.
     #[cfg(test)]
@@ -746,6 +804,11 @@ impl InboxHub {
                 action_presses: HashMap::new(),
                 hooks_remedies: HashMap::new(),
                 admission_refused: HashMap::new(),
+                reports: crate::guarded::Guarded::new(
+                    crate::report_recovery::ReportState::from_env(),
+                ),
+                torn_logged: false,
+                retained: None,
             }),
             spill_manifest: Mutex::new(None),
             changed: Arc::new(Notify::new()),
@@ -755,6 +818,8 @@ impl InboxHub {
             pause_waiter_delivery: false,
             undelivered_after: DEFAULT_UNDELIVERED_NOTICE_AFTER,
             write_deadline: DEFAULT_WAITER_WRITE_DEADLINE,
+            fallback_retry: std::sync::Mutex::new(None),
+            fallback_retry_pass: std::sync::Mutex::new(()),
             #[cfg(test)]
             hold_caps: std::sync::Mutex::new(None),
         }
@@ -798,6 +863,16 @@ impl InboxHub {
     /// call: never panics (`crate::lock_rank::RankedMutex::lock_in_drop`).
     fn lock_in_drop(&self, on_poison: crate::lock_rank::OnPoison) -> Option<HubGuard<'_>> {
         self.state.lock_in_drop(on_poison)
+    }
+
+    /// PRD #1666 part 3, round 5: this run's retained-report store.
+    pub fn set_retained_store(&self, store: Arc<crate::retained_store::RetainedStore>) {
+        self.lock().retained = Some(store);
+    }
+
+    /// This run's retained-report store, if the daemon opened one.
+    pub fn retained_store(&self) -> Option<Arc<crate::retained_store::RetainedStore>> {
+        self.lock().retained.clone()
     }
 
     /// PRD #1666 S3: broadcast every later state change to attached clients as
@@ -879,7 +954,7 @@ impl InboxHub {
     /// Post one direct message and hand it straight to an armed waiter if the
     /// recipient has one.
     pub fn post_direct(&self, to: Recipient, content: Content) -> Result<MessageId, PostError> {
-        self.post_with(to, content, Inbox::post_direct, None)
+        self.post_with(to, content, Inbox::post_direct, None, None)
     }
 
     /// [`Self::post_direct`] for a message bound to an agent generation that
@@ -892,7 +967,7 @@ impl InboxHub {
         content: Content,
         live: &dyn Fn() -> bool,
     ) -> Result<MessageId, PostError> {
-        self.post_with(to, content, Inbox::post_direct, Some(live))
+        self.post_with(to, content, Inbox::post_direct, Some(live), None)
     }
 
     /// PR #1735 second review: [`Inbox::reserve_reply`], held until the
@@ -903,6 +978,24 @@ impl InboxHub {
         Ok(ReplyReservation {
             hub: Some(Arc::clone(self)),
         })
+    }
+
+    /// TEST: acknowledge `id` in the message store for `agent_id`, as a
+    /// receiver that was handed it would, without the receipt engine — and
+    /// settle the events it raises.
+    #[cfg(test)]
+    pub(crate) fn ack_in_store_for_test(
+        &self,
+        id: &str,
+        pane_id: &str,
+        agent_id: &str,
+    ) -> AckOutcome {
+        let mut st = self.lock();
+        let outcome = st
+            .inbox
+            .ack(Instant::now(), id, pane_id, agent_id, AckHow::Explicit);
+        drain_events(&mut st);
+        outcome
     }
 
     /// TEST: poison the hub's state lock, as a panic in a hub path would.
@@ -941,7 +1034,7 @@ impl InboxHub {
         to: Recipient,
         content: Content,
     ) -> Result<MessageId, PostError> {
-        self.post_reserved_reply_with(reservation, to, content, None)
+        self.post_reserved_reply_with(reservation, to, content, None, None)
     }
 
     /// [`Self::post_reserved_reply`] checked as [`Self::post_direct_where`] is.
@@ -952,7 +1045,21 @@ impl InboxHub {
         content: Content,
         live: &dyn Fn() -> bool,
     ) -> Result<MessageId, PostError> {
-        self.post_reserved_reply_with(reservation, to, content, Some(live))
+        self.post_reserved_reply_with(reservation, to, content, Some(live), None)
+    }
+
+    /// [`Self::post_reserved_reply_where`] for a report or dispatch result:
+    /// the post enters the accepted-report ledger in its own section (plan
+    /// D13).
+    pub(crate) fn post_reserved_reply_where_recorded(
+        &self,
+        reservation: ReplyReservation,
+        to: Recipient,
+        content: Content,
+        live: &dyn Fn() -> bool,
+        accepted: Option<crate::report_recovery::AcceptedReport>,
+    ) -> Result<MessageId, PostError> {
+        self.post_reserved_reply_with(reservation, to, content, Some(live), accepted)
     }
 
     fn post_reserved_reply_with(
@@ -961,8 +1068,9 @@ impl InboxHub {
         to: Recipient,
         content: Content,
         live: Option<&dyn Fn() -> bool>,
+        accepted: Option<crate::report_recovery::AcceptedReport>,
     ) -> Result<MessageId, PostError> {
-        let id = self.post_with(to, content, Inbox::post_reserved_reply, live)?;
+        let id = self.post_with(to, content, Inbox::post_reserved_reply, live, accepted)?;
         // The post used the reservation's room.
         reservation.hub = None;
         Ok(id)
@@ -971,12 +1079,16 @@ impl InboxHub {
     /// Post under the lock. A message bound to an agent generation goes in
     /// only while `live` — or, without one, the installed
     /// [`Self::set_live_agent_check`] — says that agent still holds its pane.
+    /// PRD #1666 part 3, round 5 (plan D13): with `accepted`, the posted
+    /// message is a report or dispatch result, entered in the accepted-report
+    /// ledger in the same section as the post, before its events are drained.
     fn post_with(
         &self,
         to: Recipient,
         content: Content,
         post: fn(&mut Inbox, Instant, Recipient, Content) -> Result<MessageId, PostError>,
         live: Option<&dyn Fn() -> bool>,
+        accepted: Option<crate::report_recovery::AcceptedReport>,
     ) -> Result<MessageId, PostError> {
         let id = {
             let mut st = self.lock();
@@ -995,7 +1107,29 @@ impl InboxHub {
                 }
             }
             let id = post(&mut st.inbox, Instant::now(), to.clone(), content)?;
-            drain_events(&mut st);
+            match accepted {
+                Some(entry) => {
+                    let store = st.retained.clone();
+                    let recorded = st.guarded_section(|st, reports| {
+                        reports.accepted.insert(id.to_string(), entry);
+                        drain_events_in_section(
+                            st,
+                            reports,
+                            &mut StoreAccess::Take(store.as_deref()),
+                        );
+                    });
+                    if recorded.is_err() {
+                        st.log_torn_once("a posted result");
+                        tracing::error!(
+                            message_id = %id,
+                            "inbox: a result was posted, but the deck's report state is torn, so \
+                             it is not tracked for recovery"
+                        );
+                        drain_events(&mut st);
+                    }
+                }
+                None => drain_events(&mut st),
+            }
             id
         };
         info!(message_id = %id, pane_id = %to.pane_id, "inbox: message posted");
@@ -4015,8 +4149,144 @@ fn remove_watch(st: &mut HubState, id: &str) -> Option<DelegateWatch> {
 
 /// Log the inbox's state changes and broadcast each one to attached clients.
 /// An offer back in its pool has no pane to show it on, so it is only logged.
+/// PRD #1666 part 3, round 5: how event settlement reaches the retained
+/// store — taking it, or through a guard the caller already holds (plan D6:
+/// nothing re-takes R5).
+pub(crate) enum StoreAccess<'a, 'b> {
+    Take(Option<&'a crate::retained_store::RetainedStore>),
+    #[expect(
+        dead_code,
+        reason = "the report commit, which holds the store through its section, is its first user"
+    )]
+    Held(&'a mut crate::retained_store::StoreLock<'b>),
+}
+
+impl StoreAccess<'_, '_> {
+    fn acknowledged(&mut self, report_id: &str, now: crate::retained_store::Now) {
+        match self {
+            StoreAccess::Take(Some(store)) => store.acknowledged(report_id, now),
+            StoreAccess::Take(None) => {}
+            StoreAccess::Held(held) => held.acknowledged(report_id, now),
+        }
+    }
+
+    fn recovered(&mut self, report_id: &str, now: crate::retained_store::Now) {
+        match self {
+            StoreAccess::Take(Some(store)) => store.recovered(report_id, now),
+            StoreAccess::Take(None) => {}
+            StoreAccess::Held(held) => held.recovered(report_id, now),
+        }
+    }
+}
+
+/// PRD #1666 part 3, round 5 (plan D13): settle the accepted-report entry an
+/// inbox event is about, before any other consumer sees the event. A handed
+/// message is marked handed; an acknowledged one releases its entry and
+/// starts its file's 24 hours; one set aside for any reason becomes a
+/// recovery row at once (the daemon stopping only starts its file's 7 days).
+/// A late acknowledgement of a message already set aside marks its row.
+/// Each change checks its target first, keyed by the message id.
+fn settle_accepted_report(
+    reports: &mut crate::report_recovery::ReportState,
+    store: &mut StoreAccess<'_, '_>,
+    event: &InboxEvent,
+    now: crate::retained_store::Now,
+) {
+    let id = event.message_id.as_str();
+    match event.state {
+        StateName::Fetched | StateName::Claimed => {
+            if let Some(entry) = reports.accepted.get_mut(id) {
+                entry.handed = true;
+            }
+        }
+        StateName::Acknowledged => {
+            if let Some(entry) = reports.accepted.remove(id) {
+                if let Some(report) = entry.report_id.as_deref() {
+                    store.acknowledged(report, now);
+                    if let Some(body) = reports.fallback.get_mut(report) {
+                        body.expires = Some(now.mono + crate::retained_store::ACK_RETENTION);
+                    }
+                }
+            } else if let Some(report) = reports.outcomes.acknowledged_late(id)
+                && let Some(report) = report.as_deref()
+            {
+                store.acknowledged(report, now);
+            }
+        }
+        StateName::Undeliverable => {
+            let Some(entry) = reports.accepted.remove(id) else {
+                return;
+            };
+            let reason = event
+                .undeliverable_reason
+                .unwrap_or(UndeliverableReason::AgentExited);
+            let report = entry.report_id.clone();
+            match crate::report_recovery::cause_of(reason) {
+                None => {}
+                Some(cause) => {
+                    if reason == UndeliverableReason::Superseded {
+                        warn!(
+                            message_id = %id,
+                            "inbox: a report was superseded, which no report can be; it is \
+                             set aside as a recovery row"
+                        );
+                        debug_assert!(false, "a report cannot be superseded");
+                    }
+                    reports.outcomes.insert(
+                        entry.into_row(cause, chrono::Utc::now().timestamp_millis()),
+                        Some(id.to_string()),
+                    );
+                }
+            }
+            if let Some(report) = report.as_deref() {
+                store.recovered(report, now);
+                if let Some(body) = reports.fallback.get_mut(report)
+                    && body.expires.is_none()
+                {
+                    body.expires = Some(now.mono + crate::retained_store::RECOVERY_RETENTION);
+                }
+            }
+        }
+        StateName::Queued => {}
+    }
+}
+
 fn drain_events(st: &mut HubState) {
-    for event in st.inbox.drain_events() {
+    let events = st.inbox.drain_events();
+    if !events.is_empty() {
+        let store = st.retained.clone();
+        let now = crate::retained_store::Now::current();
+        let settled = st.guarded_section(|_, reports| {
+            let mut access = StoreAccess::Take(store.as_deref());
+            for event in &events {
+                settle_accepted_report(reports, &mut access, event, now);
+            }
+        });
+        if settled.is_err() {
+            st.log_torn_once("drain_events");
+        }
+    }
+    consume_events(st, events);
+}
+
+/// [`drain_events`] for code already inside a guarded section, holding the
+/// report state (and, when it holds it, the retained store): nothing is taken
+/// again (reviewer U3-2).
+fn drain_events_in_section(
+    st: &mut HubState,
+    reports: &mut crate::report_recovery::ReportState,
+    store: &mut StoreAccess<'_, '_>,
+) {
+    let events = st.inbox.drain_events();
+    let now = crate::retained_store::Now::current();
+    for event in &events {
+        settle_accepted_report(reports, store, event, now);
+    }
+    consume_events(st, events);
+}
+
+fn consume_events(st: &mut HubState, events: Vec<InboxEvent>) {
+    for event in events {
         // PR #1735 fifth review (R5): the message a stalled wake was recorded
         // against left the queue, so something took it, and clients are told
         // the stall ended.
@@ -4067,6 +4337,7 @@ fn drain_events(st: &mut HubState) {
                 attention_update: false,
                 requeued: false,
                 notices: InboxCardNotices::default(),
+                provenance: event.provenance.clone(),
             }));
         }
         let Some(recipient) = event.recipient else {
@@ -4095,6 +4366,7 @@ fn drain_events(st: &mut HubState) {
             attention_update: false,
             requeued: event.requeued,
             notices: InboxCardNotices::default(),
+            provenance: event.provenance.clone(),
         }));
         if let Some(key) = refused {
             engine::broadcast_notices(st, &key, Instant::now());
@@ -4130,6 +4402,7 @@ fn broadcast_wake_stall(st: &HubState, pane_id: &str, agent_id: &str, id: &str, 
         attention_update: false,
         requeued: false,
         notices: InboxCardNotices::default(),
+        provenance: None,
     }));
 }
 
@@ -4774,6 +5047,7 @@ fn fits_every_hand_over(deck: &DeckId, pane_id: &str, content: &Content) -> bool
         history: Vec::new(),
         excluded: Vec::new(),
         assign_deadline: None,
+        provenance: None,
     };
     // Counted as the tightest hand-over can print it: after the separator it
     // puts before each block, as a marked repeat whose opener names the
@@ -5023,7 +5297,21 @@ pub fn post_reserved_reply_or_notice_to_live(
     content: Content,
     notice: impl FnOnce(&str) -> Content,
 ) -> Result<MessageId, String> {
-    match post_live_keeping(registry, to.clone(), content, Some(reservation)) {
+    post_reserved_reply_or_notice_to_live_recorded(registry, reservation, to, content, notice, None)
+}
+
+/// PRD #1666 part 3, round 5: [`post_reserved_reply_or_notice_to_live`] for
+/// a report or dispatch result, which enters the accepted-report ledger with
+/// its post (plan D13). A notice posted in its place does not.
+pub(crate) fn post_reserved_reply_or_notice_to_live_recorded(
+    registry: &crate::agent_pty::AgentPtyRegistry,
+    reservation: ReplyReservation,
+    to: Recipient,
+    content: Content,
+    notice: impl FnOnce(&str) -> Content,
+    accepted: Option<crate::report_recovery::AcceptedReport>,
+) -> Result<MessageId, String> {
+    match post_live_keeping(registry, to.clone(), content, Some(reservation), accepted) {
         Ok(id) => Ok(id),
         Err((error, Some(reservation))) => {
             post_live(registry, to, notice(&error), Some(reservation))
@@ -5039,7 +5327,7 @@ fn post_live(
     content: Content,
     reservation: Option<ReplyReservation>,
 ) -> Result<MessageId, String> {
-    post_live_keeping(registry, to, content, reservation).map_err(|(error, _)| error)
+    post_live_keeping(registry, to, content, reservation, None).map_err(|(error, _)| error)
 }
 
 /// [`post_live`], answering a refusal of a post its recipient could still take
@@ -5049,6 +5337,7 @@ fn post_live_keeping(
     to: Recipient,
     content: Content,
     reservation: Option<ReplyReservation>,
+    accepted: Option<crate::report_recovery::AcceptedReport>,
 ) -> Result<MessageId, (String, Option<ReplyReservation>)> {
     if let Some(agent) = to.agent_id.as_deref()
         && registry.pane_current_agent_id(&to.pane_id).as_deref() != Some(agent)
@@ -5085,7 +5374,13 @@ fn post_live_keeping(
     // refusal removes the saved body and gives a reservation's room back.
     let live = || registry.pane_current_agent_id(&to.pane_id).as_deref() == to.agent_id.as_deref();
     let id = match reservation {
-        Some(reservation) => hub.post_reserved_reply_where(reservation, to.clone(), content, &live),
+        Some(reservation) => hub.post_reserved_reply_where_recorded(
+            reservation,
+            to.clone(),
+            content,
+            &live,
+            accepted,
+        ),
         None => hub.post_direct_where(to.clone(), content, &live),
     }
     .map_err(|error| (error.to_string(), None))?;
@@ -5482,6 +5777,7 @@ mod tests {
             spill_path: None,
             id: None,
             preface: None,
+            provenance: None,
         }
     }
 

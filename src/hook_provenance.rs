@@ -255,6 +255,47 @@ pub struct TokenOwner {
     /// daemon-spawned agent without a pane id is a supported shape, and a token
     /// minted for one can never attest a pane claim.
     pub pane_id: Option<String>,
+    /// PRD #1666 part 3, round 5: the facts pinned on that spawn, read under
+    /// the same acquisition that matched the token ([`AttestFacts`]).
+    pub facts: AttestFacts,
+}
+
+/// PRD #1666 part 3, round 5 (plan D7): how an orchestration instance came to
+/// be, written by the daemon's spawn path and never taken from the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstanceOrigin {
+    /// Started directly: nobody dispatched it, so no caller is owed its
+    /// result.
+    Direct,
+    /// Started by a `dispatch`, whose caller is owed its result.
+    Dispatched,
+    /// Its generations disagree, which the reservation logged: never read as
+    /// either.
+    Conflict,
+}
+
+/// The orchestration seat a generation was spawned into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Seat {
+    /// The instance token its membership carries.
+    pub instance: String,
+    /// Whether it is the instance's orchestrator.
+    pub is_orchestrator: bool,
+    /// `None` only for a spawn site that passed none: answered
+    /// `report_pending` by a terminal report, never read as either origin.
+    pub origin: Option<InstanceOrigin>,
+}
+
+/// PRD #1666 part 3, round 5 (plan D12): the facts a generation's token
+/// attests with, pinned on its record from its spawn reservation. `seat` is
+/// written once, at the reservation; `unit` goes from `None` to `Some` once,
+/// when the generation becomes a dispatched unit's terminal. A request carries
+/// them as they were when its token attested, whatever is closed, evicted or
+/// reused later.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AttestFacts {
+    pub seat: Option<Seat>,
+    pub unit: Option<String>,
 }
 
 /// What the daemon's registry has to answer for [`classify`] to decide.
@@ -351,6 +392,9 @@ pub enum Provenance {
         /// The registry agent id the token was minted for. Equal to the agent
         /// the claimed pane is occupied by, since the token names one spawn.
         agent_id: String,
+        /// PRD #1666 part 3, round 5: that generation's pinned facts, as they
+        /// were when the token attested ([`AttestFacts`]).
+        facts: AttestFacts,
     },
     /// This daemon has no record of the claimed pane at all, so there is nothing
     /// to check the message against.
@@ -461,6 +505,7 @@ pub fn classify(
     match owner.pane_id.as_deref() {
         Some(pane) if pane == claimed_pane => Provenance::Attested {
             agent_id: owner.agent_id,
+            facts: owner.facts,
         },
         other => Provenance::Refused(Refusal::WrongPane {
             token_pane: other.map(str::to_string),
@@ -522,12 +567,12 @@ pub fn classify_event(
         }
     };
     match verdict {
-        Provenance::Attested { ref agent_id }
+        Provenance::Attested { ref agent_id, .. }
             if claimed_agent.is_some_and(|claimed| claimed != agent_id) =>
         {
             Provenance::Refused(Refusal::WrongAgent)
         }
-        Provenance::Attested { ref agent_id }
+        Provenance::Attested { ref agent_id, .. }
             if claimed_agent.is_none()
                 && claimed_pane
                     .is_some_and(|pane| !directory.token_owner_speaks_for_pane(agent_id, pane)) =>
@@ -557,6 +602,7 @@ fn classify_paneless(
     match owner.pane_id {
         None if owner.agent_id == claimed_agent => Provenance::Attested {
             agent_id: owner.agent_id,
+            facts: owner.facts,
         },
         None => Provenance::Refused(Refusal::WrongAgent),
         Some(pane) => Provenance::Refused(Refusal::WrongPane {
@@ -682,6 +728,7 @@ mod tests {
                 .map(|(agent_id, pane_id)| TokenOwner {
                     agent_id: agent_id.clone(),
                     pane_id: pane_id.clone(),
+                    facts: AttestFacts::default(),
                 })
         }
 
@@ -721,7 +768,8 @@ mod tests {
         assert_eq!(
             classify("pane-orchestrator", Some(&"aa".repeat(32)), &fixture()),
             Provenance::Attested {
-                agent_id: "agent-1".to_string()
+                agent_id: "agent-1".to_string(),
+                facts: Default::default(),
             }
         );
     }
@@ -797,7 +845,8 @@ mod tests {
         assert!(
             admits(
                 &Provenance::Attested {
-                    agent_id: "a".into()
+                    agent_id: "a".into(),
+                    facts: Default::default(),
                 },
                 p
             )
@@ -948,13 +997,15 @@ mod tests {
         assert_eq!(
             classify_event(pane, Some("agent-1"), Some(&own), &dir),
             Provenance::Attested {
-                agent_id: "agent-1".to_string()
+                agent_id: "agent-1".to_string(),
+                facts: Default::default(),
             }
         );
         assert_eq!(
             classify_event(pane, None, Some(&own), &dir),
             Provenance::Attested {
-                agent_id: "agent-1".to_string()
+                agent_id: "agent-1".to_string(),
+                facts: Default::default(),
             }
         );
         assert_eq!(
@@ -1002,7 +1053,8 @@ mod tests {
         assert_eq!(
             classify_event(Some("pane-orchestrator"), None, Some(&own), &dir),
             Provenance::Attested {
-                agent_id: "agent-1".to_string()
+                agent_id: "agent-1".to_string(),
+                facts: Default::default(),
             },
             "a generation that still speaks for its pane keeps the untagged shape"
         );
@@ -1014,7 +1066,8 @@ mod tests {
         assert_eq!(
             classify_event(Some("pane-orchestrator"), Some("agent-1"), Some(&own), &dir),
             Provenance::Attested {
-                agent_id: "agent-1".to_string()
+                agent_id: "agent-1".to_string(),
+                facts: Default::default(),
             },
             "a tagged event keeps its existing path: the state's generation \
              check judges it, and an attached client reads the daemon's stamp"
@@ -1030,7 +1083,8 @@ mod tests {
         assert_eq!(
             classify_event(None, Some("agent-3"), Some(&own), &dir),
             Provenance::Attested {
-                agent_id: "agent-3".to_string()
+                agent_id: "agent-3".to_string(),
+                facts: Default::default(),
             }
         );
         assert_eq!(

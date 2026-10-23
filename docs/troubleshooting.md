@@ -507,6 +507,23 @@ pass --force to stop anyway
 
 Treat `--force` at that point as abandoning those runs.
 
+### Saved results and reports
+
+The deck saves the start and failure message of every dispatch as a file, so one is not lost when the dispatcher that should read it has gone. The files are under `retained-reports/` in the deck's state directory (`$XDG_STATE_HOME/dot-agent-deck`, else `~/.local/state/dot-agent-deck`, or `DOT_AGENT_DECK_STATE_DIR` when it is set), one folder per deck daemon run under `retained-reports/files/`. The directory and its files are readable by your user only; another program running as you can still read and write them.
+
+The deck removes a file 24 hours after the dispatcher acknowledged its message, and 7 days after the message could not be delivered. It keeps at most 256 MiB and 4096 files per daemon run; [Daemon behaviour](configuration.md#daemon-behaviour) has the settings that change those limits. When either limit is reached, `dispatch` is refused with `the deck cannot keep this dispatch's result: its saved-results store is full (<dir>)` or `… holds the most reports it keeps (<n> files, <dir>)`, and nothing is started. Remove files you no longer need from the named directory: the deck counts them again at its next hourly cleanup and at its next start.
+
+When the deck cannot write a file, it holds the message in memory, says so in the message itself (`The deck could not save this result to disk; it is held in memory until the deck restarts.`) and tries to save it again. A deck restart loses a message held only in memory.
+
+### The deck stopped taking reports or dispatches
+
+`dispatch` is refused with `the deck cannot keep this dispatch's result: the deck daemon hit an internal error and has stopped recording results`. The deck daemon hit an internal error while it was recording a result, so it no longer trusts what it holds and refuses new dispatches rather than risk losing their results. Its log (see [Enabling Debug Logs](#enabling-debug-logs)) names the error. Agents that are already running keep working.
+
+Restarting the deck daemon clears it. Before you do, know what a restart costs:
+
+- A message the deck holds only in memory, because its file could not be written, is lost. Files already saved are kept.
+- Orchestration roles are held in memory only. `daemon stop` refuses while any are live and lists them, as [An orchestration stops being able to delegate](#an-orchestration-stops-being-able-to-delegate-the-daemon-holds-no-orchestration-role-for-pane-) describes; `--force` stops it anyway and leaves those orchestrations unable to delegate. Let them finish first when you can.
+
 ## Panes and the dashboard
 
 ### Shift+Enter or Ctrl+Enter Sends the Message

@@ -1116,6 +1116,14 @@ pub const CAP_CLOSE_AGENTS: &str = "close-agents";
 /// reply advertised [`CAP_CLOSE_AGENTS`]. Advertised on every platform.
 pub const CAP_HELLO_FOLLOW_ON: &str = "hello-follow-on";
 
+/// Capability string for [`AttachRequest::ListOutcomes`] (PRD #1666 part 3,
+/// round 5, plan D10): the deck's recovery rows — reports and dispatch results
+/// set aside because their recipient was gone. Sent only by
+/// [`crate::daemon_client::DaemonClient::list_outcomes`], after a fresh
+/// `Hello` on the connection that carries it, so no [`PROTOCOL_VERSION`]
+/// bump. Advertised on every platform.
+pub const CAP_DECK_OUTCOMES: &str = "deck-outcomes";
+
 /// The longest [`FinalReply::text`] the daemon stores or sends, in bytes. A
 /// longer reply is cut to its longest valid UTF-8 prefix within the bound
 /// ([`clamp_turn_reply`]). Reading speaks a summary of the reply, so the head
@@ -1295,6 +1303,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_HOST_METRICS,
     CAP_CLOSE_AGENTS,
     CAP_HELLO_FOLLOW_ON,
+    CAP_DECK_OUTCOMES,
 ];
 #[cfg(not(unix))]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
@@ -1316,6 +1325,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_INBOX_ACTIONS,
     CAP_CLOSE_AGENTS,
     CAP_HELLO_FOLLOW_ON,
+    CAP_DECK_OUTCOMES,
 ];
 
 // ---------------------------------------------------------------------------
@@ -1608,6 +1618,23 @@ pub const CONTRACT_BREAKS: &[&str] = &[
     // stream-bound fetch are unchanged; what moved is who may take mail.
     // `changelog.d/1666-legacy-inbox.breaking.md` is its fragment.
     "1666-legacy-inbox-delivery-withdrawal",
+    // PRD #1666 part 3, round 5, at 12 without moving it. What a dispatched
+    // unit's end and a dispatch's result now mean: a unit that ends without a
+    // report produces a `dispatch ended` outcome for its caller; a dispatch's
+    // start or failure result is retained by the daemon (as a file, or held in
+    // memory and labelled so) and outlives the caller that should read it; a
+    // `dispatch` is refused before anything starts when its result could not be
+    // kept (`report_store_full`, `report_save_failed`, `dispatch_slots_full`,
+    // and `deck_unavailable` once the daemon's report state was torn by an
+    // internal panic); a failed respawn of a unit's terminal ends the unit; and
+    // `InboxNotice` / `MessageSummary` carry report provenance, an additive
+    // optional field. The task-scoped `work-done` half of the same break lands
+    // with its gated verb. Nothing on the attach wire moved shape;
+    // `ListOutcomes` is a new request every sender withholds until the daemon
+    // advertises `CAP_DECK_OUTCOMES`. What moved is which dispatches are
+    // refused and what a unit's end tells its caller.
+    // `changelog.d/1666-task-scoped-completion.breaking.md` is its fragment.
+    "1666-task-scoped-completion-and-recovery",
 ];
 
 /// What comparing this build's [`CONTRACT_BREAKS`] against a peer's found.
@@ -2212,6 +2239,11 @@ pub enum AttachRequest {
     ///
     /// **Withheld unless the daemon advertises [`CAP_CLOSE_AGENTS`]**, so no
     /// [`PROTOCOL_VERSION`] bump: every sender gates in the client library.
+    /// PRD #1666 part 3, round 5 (plan D10): the deck's recovery rows.
+    ///
+    /// **Withheld unless the daemon advertises [`CAP_DECK_OUTCOMES`]** on the
+    /// connection that carries it, so no [`PROTOCOL_VERSION`] bump.
+    ListOutcomes,
     CloseAgents {
         selector: CloseSelector,
         /// The calling agent's pane claim. Absent: a person.
@@ -3900,6 +3932,11 @@ pub struct AttachResponse {
     /// [`PROTOCOL_VERSION`] bump.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub close_report: Option<CloseReport>,
+    /// PRD #1666 part 3, round 5: the answer to [`AttachRequest::ListOutcomes`].
+    /// `None` on every other response, and on a refusal. Additive and
+    /// optional, and its request is capability-gated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deck_outcomes: Option<crate::report_recovery::DeckOutcomes>,
 }
 
 /// PRD #1487: this daemon process's identity for [`AttachResponse::instance_id`]
@@ -6042,6 +6079,9 @@ async fn handle_connection(
                 env,
                 tab_membership,
                 agent_type,
+                // PRD #1666 part 3, round 5 (plan D7): a client's start is an
+                // orchestration nobody dispatched.
+                origin: Some(crate::hook_provenance::InstanceOrigin::Direct),
             };
             #[cfg(unix)]
             let spawned = match prepared_dir.as_ref() {
@@ -6492,6 +6532,22 @@ async fn handle_connection(
             // desktop both mint fresh ones), and one that relied on the stronger
             // order would still race older daemons.
             drop(pane_cleanup_hold);
+        }
+        AttachRequest::ListOutcomes => {
+            // PRD #1666 part 3, round 5 (plan D15 rule 4): never a listing
+            // read from torn report state.
+            let resp = match registry.inbox().deck_outcomes() {
+                Ok(outcomes) => AttachResponse {
+                    deck_outcomes: Some(outcomes),
+                    ..AttachResponse::ok()
+                },
+                Err(_) => AttachResponse::err(
+                    "the deck daemon hit an internal error and has stopped recording results \
+                     (its log has the details); restart the deck daemon to list them again"
+                        .to_string(),
+                ),
+            };
+            write_resp(&mut stream, &resp).await?
         }
         AttachRequest::CloseAgents {
             selector,
@@ -7321,6 +7377,7 @@ fn post_message(
         spill_path: spill_path.map(std::path::PathBuf::from),
         id: None,
         preface: None,
+        provenance: None,
     };
     let to = crate::inbox::Recipient::bound(pane_id, live.clone());
     // Audit F2: a post the inbox would refuse is refused before anything is
@@ -9646,6 +9703,7 @@ mod tests {
                         spill_path: None,
                         id: None,
                         preface: None,
+                        provenance: None,
                     },
                 )
                 .expect("post")
@@ -9897,6 +9955,7 @@ mod tests {
                         spill_path: None,
                         id: None,
                         preface: None,
+                        provenance: None,
                     },
                 )
                 .expect("post");
@@ -12710,6 +12769,7 @@ mod tests {
             attention_update: false,
             requeued: false,
             notices: Default::default(),
+            provenance: None,
         });
         let value = serde_json::to_value(&msg).unwrap();
         assert_eq!(

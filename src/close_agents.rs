@@ -416,7 +416,7 @@ pub fn establish_caller(
         return Ok(Caller::Person);
     };
     match crate::hook_provenance::classify(&claim.pane_id, Some(&claim.token), registry) {
-        crate::hook_provenance::Provenance::Attested { agent_id } => {
+        crate::hook_provenance::Provenance::Attested { agent_id, .. } => {
             if registry.pane_current_agent_id(&claim.pane_id).as_deref() != Some(&agent_id) {
                 return Err(CloseRefusal {
                     reason: CloseRefusalReason::Superseded,

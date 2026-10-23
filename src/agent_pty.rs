@@ -968,6 +968,13 @@ pub struct SpawnOptions<'a> {
     /// backwards-compatible). The TUI computes the value at the spawn site
     /// via [`AgentType::from_command`].
     pub agent_type: Option<AgentType>,
+    /// PRD #1666 part 3, round 5 (plan D7): for an orchestration membership,
+    /// whether its instance was dispatched or started directly, set by the
+    /// daemon's spawn path and never taken from the wire. Pinned on the
+    /// generation at its reservation ([`crate::hook_provenance::AttestFacts`]).
+    /// Every production spawn site with an orchestration membership passes
+    /// one; `None` there answers a terminal report `report_pending`.
+    pub origin: Option<crate::hook_provenance::InstanceOrigin>,
 }
 
 impl Default for SpawnOptions<'_> {
@@ -981,6 +988,7 @@ impl Default for SpawnOptions<'_> {
             env: Vec::new(),
             tab_membership: None,
             agent_type: None,
+            origin: None,
         }
     }
 }
@@ -2272,6 +2280,12 @@ fn pump_reader(
     }
     exited.store(true, Ordering::SeqCst);
     change_notify.notify_one();
+    // PRD #1666 part 3, round 5 (plan D7): a respawned unit terminal's
+    // successor waits, holding no lock, until its replacement settled, so its
+    // EOF ends the route that names it, or finds the unit already ended.
+    if let Some(registry) = registry.upgrade() {
+        registry.await_replacement(&agent_id);
+    }
     // Issue #584: release anyone waiting on THIS agent's liveness
     // ([`AgentPtyRegistry::agent_exit_signal`]) before the delegation sweep
     // below, so the wait ends at EOF rather than at its own timeout. A dropped
@@ -2320,6 +2334,11 @@ fn pump_reader(
             }
         }
         registry.inbox().post_owed_notices();
+        // PRD #1666 part 3, round 5 (plan D7): whatever the exit — natural,
+        // closed, or this generation replaced by a respawn — the units it
+        // dispatched lose their caller. Identity-gated, so a predecessor
+        // orphans its own routes and never its successor's.
+        registry.orphan_caller_routes(pane_id, &agent_id);
     }
     if let Some(pane_id) = pane_id_env.as_deref()
         && let Some(registry) = registry.upgrade()
@@ -2918,6 +2937,14 @@ pub struct RunningAgent {
     /// agent. Per record, so a respawn — a new record with a new prompt —
     /// starts without one.
     pub authoring_kind: Option<crate::authoring_seeds::AuthoringKind>,
+    /// PRD #1666 part 3, round 5 (plan D12): the facts this generation's
+    /// token attests with, moved here from its reservation when it is
+    /// published. Never on the wire.
+    pub attest_facts: crate::hook_provenance::AttestFacts,
+    /// PRD #1666 part 3, round 5 (plan D7): the replacement ticket this
+    /// generation was reserved under, when it is a respawned unit terminal's
+    /// successor. Never on the wire.
+    pub replacement_of: Option<u64>,
 }
 
 /// Issue #714: the source of [`RunningAgent::quota_block`] epochs. Only
@@ -4728,12 +4755,22 @@ enum Admission<'a> {
     /// Holding the ticket is the proof the respawn is counted in flight.
     Respawn {
         _ticket: &'a RespawnTicket<'a>,
+        /// PRD #1666 part 3, round 5 (plan D7): the replacement this respawn
+        /// is, when it replaces a dispatched unit's terminal generation.
+        replacement: Option<&'a ReplacementTicket>,
     },
 }
 
-impl Admission<'_> {
-    fn is_admitted_respawn(self) -> bool {
+impl<'a> Admission<'a> {
+    fn is_admitted_respawn(&self) -> bool {
         matches!(self, Self::Respawn { .. })
+    }
+
+    fn replacement(&self) -> Option<&'a ReplacementTicket> {
+        match self {
+            Self::Respawn { replacement, .. } => *replacement,
+            Self::Fresh => None,
+        }
     }
 }
 
@@ -5587,6 +5624,10 @@ pub struct AgentPtyRegistry {
     /// that a partial close is reported from.
     #[cfg(test)]
     close_failures: Mutex<HashSet<String>>,
+    /// PRD #1666 part 3, round 5 test seam: the agents a replacement's abort
+    /// closed ([`Self::abort_closes_for_test`]).
+    #[cfg(test)]
+    abort_closes: Mutex<Vec<String>>,
     /// PRD #1589 test seam: records visited projecting a unit's panes for a
     /// report. See [`Self::member_visits_for_test`].
     #[cfg(test)]
@@ -5718,6 +5759,17 @@ pub struct AgentPtyRegistry {
 #[path = "agent_pty_unwind_tests.rs"]
 mod unwind_tests;
 
+/// PRD #1666 part 3, round 5 (plan §6.2): a dispatched unit's lifecycle.
+#[cfg(test)]
+#[path = "agent_pty_dispatch_lifecycle_tests.rs"]
+mod dispatch_lifecycle_tests;
+
+/// PRD #1666 part 3, round 5 (plan D7): a respawned unit terminal's
+/// replacement.
+#[cfg(test)]
+#[path = "agent_pty_replacement_tests.rs"]
+mod replacement_tests;
+
 /// PRD #1666 part 3, round 5: the synchronous pause in a respawn's
 /// replacement window, after the replacement's spawn returned and before the
 /// dispatched unit follows it ([`AgentPtyRegistry::pause_at_sync_for_test`]).
@@ -5727,6 +5779,70 @@ pub(crate) const PAUSE_RESPAWN_BEFORE_PUBLISH: &str = "respawn-before-publish";
 /// [`PAUSE_RESPAWN_BEFORE_PUBLISH`], just after it
 /// ([`AgentPtyRegistry::inject_fault_for_test`]).
 pub(crate) const FAULT_RESPAWN_AFTER_SPAWN: &str = "respawn-after-spawn";
+
+/// PRD #1666 part 3, round 5: the fault point after the replacement's leaf
+/// move and before its `publish` section ((f3)'s seam).
+pub(crate) const FAULT_RESPAWN_BEFORE_PUBLISH_SECTION: &str = "respawn-before-publish-section";
+
+/// PRD #1666 part 3, round 5: a spawn's fault point after its record is
+/// published and before it returns ((f2')'s seam).
+pub(crate) const FAULT_SPAWN_AFTER_INSERT: &str = "spawn-after-insert";
+
+/// PRD #1666 part 3, round 5: a spawn's fault point after its fork and before
+/// its record is published, with its reservation armed (`/057` (c)).
+pub(crate) const FAULT_SPAWN_BEFORE_PUBLISH: &str = "spawn-before-publish";
+
+/// PRD #1666 part 3, round 5: a spawn's fault point before its reservation:
+/// `Fail` makes it fail ((f1)'s seam).
+pub(crate) const FAULT_SPAWN_FAILS: &str = "spawn-fails";
+
+/// PRD #1666 part 3, round 5: the replacement's abort fault point: `Fail`
+/// drops its ticket with no transition ((f5a)'s seam).
+pub(crate) const FAULT_ABORT_SKIPPED: &str = "abort-skipped";
+
+/// PRD #1666 part 3, round 5: before the abort takes the routes, another
+/// thread panics inside a guarded section ((f4')'s seam).
+#[cfg(test)]
+pub(crate) const FAULT_TEAR_BEFORE_ABORT: &str = "tear-before-abort";
+
+/// PRD #1666 part 3, round 5: after the abort's section and before its latch
+/// ((f5b)'s second seam).
+pub(crate) const FAULT_ABORT_AFTER_SECTION: &str = "abort-after-section";
+
+/// PRD #1666 part 3, round 5 (plan D7): a respawn of a dispatched unit's
+/// terminal generation, from its `begin` until its `publish` or `abort`.
+///
+/// The successor B is bound to it at B's spawn reservation, by the exact id
+/// minted for B, in the successor slot — after every refusal check, so a
+/// refused reservation leaves it empty. The abort reads the slot and never
+/// looks at the pane. The latch tells B's reader which transition settled;
+/// dropped with no value (the abort's own section panicked), it tells the
+/// reader to run the abort itself. The ticket's `Drop` takes no lock and
+/// calls nothing: no replacement work runs in a destructor (D15 rule 5).
+pub(crate) struct ReplacementTicket {
+    id: u64,
+    pane_id: String,
+    unit_id: String,
+    from: String,
+    successor: Arc<std::sync::OnceLock<String>>,
+    latch: std::sync::mpsc::SyncSender<crate::inbox_hub::ReplacementOutcome>,
+    /// Handed to B's reservation, which keeps it for B's reader.
+    latch_rx: Mutex<Option<std::sync::mpsc::Receiver<crate::inbox_hub::ReplacementOutcome>>>,
+}
+
+/// What B's reader waits on at its EOF, kept with B's reservation.
+struct ReplacementWait {
+    rx: std::sync::mpsc::Receiver<crate::inbox_hub::ReplacementOutcome>,
+    pane_id: String,
+    unit_id: String,
+    ticket: u64,
+}
+
+impl ReplacementTicket {
+    fn send(&self, outcome: crate::inbox_hub::ReplacementOutcome) {
+        let _ = self.latch.try_send(outcome);
+    }
+}
 
 /// See [`AgentPtyRegistry::pause_at_for_test`].
 #[cfg(test)]
@@ -6949,6 +7065,17 @@ struct RegistryInner {
     /// reservation given up without publishing moves its pane and id to
     /// [`Self::abandoned_turns`].
     pending_turned: HashMap<String, String>,
+    /// PRD #1666 part 3, round 5 (plan D12): the facts every spawn in
+    /// [`Self::pending_spawns`] attests with, by pre-allocated agent id, from
+    /// the reservation that mints its token until its record carries them.
+    pending_facts: HashMap<String, crate::hook_provenance::AttestFacts>,
+    /// PRD #1666 part 3, round 5 (plan D7): the replacement ticket each
+    /// reserved respawn successor belongs to, carried onto its record.
+    pending_replacement_of: HashMap<String, u64>,
+    /// PRD #1666 part 3, round 5 (plan D7): what each reserved respawn
+    /// successor's reader waits on at its EOF, by its agent id. Taken by the
+    /// reader; dropped with a reservation that is given up.
+    replacement_waits: HashMap<String, ReplacementWait>,
     /// PRD #1666 G3 (R2-05): `(pane, agent id)` of reservations given up
     /// after reporting a turn, whose clock entry
     /// [`AgentPtyRegistry::release_abandoned_turns`] removes once this lock
@@ -7080,7 +7207,17 @@ impl<'a> SpawnReservation<'a> {
         if let Some(id) = &self.id {
             inner.pending_turned.remove(id);
         }
+        // PRD #1666 part 3, round 5: a published successor's reader still
+        // waits on its replacement's latch; only an abandoned reservation
+        // drops it.
+        let wait = self
+            .id
+            .as_ref()
+            .and_then(|id| inner.replacement_waits.remove(id).map(|w| (id.clone(), w)));
         self.give_up(inner);
+        if let Some((id, wait)) = wait {
+            inner.replacement_waits.insert(id, wait);
+        }
     }
 
     /// The start was refused after the fork: give up the reservation and undo
@@ -7095,6 +7232,9 @@ impl<'a> SpawnReservation<'a> {
             inner.pending_hook_tokens.remove(&id);
             inner.pending_spawn_dirs.remove(&id);
             inner.pending_busy.remove(&id);
+            inner.pending_facts.remove(&id);
+            inner.pending_replacement_of.remove(&id);
+            inner.replacement_waits.remove(&id);
             if let Some(pane) = inner.pending_turned.remove(&id) {
                 inner.abandoned_turns.push((pane, id));
             }
@@ -7503,6 +7643,9 @@ impl AgentPtyRegistry {
                 pending_spawn_dirs: HashMap::new(),
                 pending_busy: HashSet::new(),
                 pending_turned: HashMap::new(),
+                pending_facts: HashMap::new(),
+                pending_replacement_of: HashMap::new(),
+                replacement_waits: HashMap::new(),
                 abandoned_turns: Vec::new(),
                 turn_seq: 0,
                 removal_holds: Vec::new(),
@@ -7553,6 +7696,8 @@ impl AgentPtyRegistry {
             publish_pause: Mutex::new(None),
             #[cfg(test)]
             close_failures: Mutex::new(HashSet::new()),
+            #[cfg(test)]
+            abort_closes: Mutex::new(Vec::new()),
             #[cfg(test)]
             member_visits: std::sync::atomic::AtomicUsize::new(0),
             respawns_settled: Notify::new(),
@@ -8822,30 +8967,101 @@ impl AgentPtyRegistry {
     /// handle as the pane id: the EOF sweep matches it before releasing an entry,
     /// so a dead predecessor cannot evict a live successor's route (PR #1081
     /// review, Greptile finding 1).
+    ///
+    /// PRD #1666 part 3, round 5 (plan D7): one R1 → R2 → R3 (→ R4) section.
+    /// It reads whether the terminal pane is closing (R1) and whether the
+    /// terminal generation already exited (R4), removes the dispatch's initial
+    /// `publication`, indexes the generation to `unit_id` and pins the unit on
+    /// it, and inserts the route — or, when the unit already ended, records
+    /// that and tells its caller, with no route.
     pub fn register_dispatch_return(
         &self,
         unit_pane_id: &str,
         unit_agent_id: &str,
+        unit_id: &str,
         caller: crate::dispatch_return::DispatchCaller,
+        publication: Option<InitialPublication>,
     ) {
-        let displaced = self
-            .dispatch_returns
-            .lock()
-            .register(unit_pane_id, unit_agent_id, caller);
-        if let Some(stale) = displaced {
-            tracing::debug!(
-                unit_pane_id = %unit_pane_id,
-                stale_caller_pane_id = %stale.caller.pane_id,
-                // Producer-supplied: the name the caller typed after `dispatch`
-                // reaches this field raw, and a raw LF forges a whole log line
-                // (PR #1081 review, Greptile finding 3 — the same treatment
-                // `return_dispatch_completion` already applies).
-                stale_unit = %crate::config_validation::escape_field_for_log(
-                    &stale.caller.unit_name,
-                    crate::config_validation::MAX_QUOTED_VALUE_CHARS,
-                ),
-                "dispatch return: a recycled unit pane displaced an undelivered entry"
+        // The guard stays armed until the section returns: a panic inside it
+        // drops the guard during the unwind, which removes the publication
+        // or, with the routes poisoned, skips it (plan D7, `/056`).
+        let publication_key = publication
+            .as_ref()
+            .and_then(|p| p.key.clone())
+            .unwrap_or_else(|| crate::report_recovery::PublishKey::Pane(unit_pane_id.to_string()));
+        let after = {
+            let tracker = self.delegations.lock();
+            let closing = tracker.closing_panes.contains(unit_pane_id);
+            let mut returns = self.dispatch_returns.lock();
+            let exited = {
+                let inner = self.inner.try_lock();
+                match inner {
+                    Ok(inner) => match inner.agents.get(unit_agent_id) {
+                        Some(agent) => agent.exited.load(Ordering::SeqCst),
+                        // A close removed the record before the publication
+                        // guard; the existing check refuses that start.
+                        None => false,
+                    },
+                    Err(_) => false,
+                }
+            };
+            let ended = if exited {
+                Some(crate::report_recovery::EndedHow::Exited)
+            } else if closing {
+                Some(crate::report_recovery::EndedHow::Closed)
+            } else {
+                None
+            };
+            let after = self.inbox().unit_route_registered(
+                &mut returns,
+                self,
+                crate::inbox_hub::Registration {
+                    unit_id: unit_id.to_string(),
+                    pane_id: unit_pane_id.to_string(),
+                    agent_id: unit_agent_id.to_string(),
+                    caller,
+                    publication: publication_key,
+                    ended,
+                },
             );
+            drop(returns);
+            drop(tracker);
+            after
+        };
+        if let Some(publication) = publication {
+            publication.consume();
+        }
+        self.inbox().after_section(after);
+    }
+
+    /// PRD #1666 part 3, round 5 (plan D7): install a dispatch's initial
+    /// publication, before the spawn reservation of any generation it covers.
+    /// `None` when the report state is torn or the routes are unavailable:
+    /// the dispatch then runs with no publication, and a terminal report in
+    /// its registration window is refused rather than read as a direct
+    /// orchestrator's.
+    pub(crate) fn install_initial_publication(
+        self: &Arc<Self>,
+        key: crate::report_recovery::PublishKey,
+    ) -> Option<InitialPublication> {
+        let Ok(mut returns) = self.dispatch_returns.try_lock() else {
+            tracing::error!("dispatch: the deck's dispatch routes are unavailable; no publication");
+            return None;
+        };
+        match self.inbox().install_publication(
+            &mut returns,
+            key.clone(),
+            crate::report_recovery::Publication::Initial,
+        ) {
+            Ok(true) => Some(InitialPublication {
+                registry: Arc::clone(self),
+                key: Some(key),
+            }),
+            Ok(false) => {
+                tracing::error!("dispatch: a publication already covers this dispatch's key");
+                None
+            }
+            Err(_) => None,
         }
     }
 
@@ -8894,17 +9110,50 @@ impl AgentPtyRegistry {
     /// releases nothing; see
     /// [`crate::dispatch_return::DispatchReturns::evict_exited`] for why, and for
     /// what the residual is.
+    ///
+    /// PRD #1666 part 3, round 5 (plan D7): the unit half only, and as one
+    /// R2 → R3 section that records the unit's end and tells its caller once.
+    /// The caller half is orphaned instead, by [`Self::orphan_caller_routes`].
     fn sweep_dispatch_returns_on_exit(&self, pane_id: &str, exited_agent_id: &str) {
-        let dropped = self
-            .dispatch_returns
-            .lock()
-            .evict_exited(pane_id, exited_agent_id);
-        if dropped > 0 {
+        let after = {
+            let mut returns = self.dispatch_returns.lock();
+            let removed = returns.evict_exited(pane_id, exited_agent_id);
+            if removed.is_empty() {
+                return;
+            }
             tracing::debug!(
                 pane_id = %pane_id,
                 agent_id = %exited_agent_id,
-                dropped_returns = dropped,
-                "pane EOF: dropped dispatch return entries for a pane whose process exited"
+                dropped_returns = removed.len(),
+                "pane EOF: a dispatched unit's process exited; its route ends"
+            );
+            self.inbox().unit_routes_ended(
+                &mut returns,
+                self,
+                removed,
+                pane_id,
+                crate::report_recovery::EndedHow::Exited,
+            )
+        };
+        self.inbox().after_section(after);
+    }
+
+    /// PRD #1666 part 3, round 5 (plan D7): the caller `(pane, agent)` is
+    /// gone — its EOF, or a respawn replacing it — so its routes are
+    /// orphaned: kept, so each unit's end is still recorded, and out of the
+    /// dispatch tree. Identity-gated, so a predecessor orphans its own routes
+    /// and never its successor's. R2 alone.
+    pub(crate) fn orphan_caller_routes(&self, pane_id: &str, agent_id: &str) {
+        let orphaned = self
+            .dispatch_returns
+            .lock()
+            .orphan_caller(pane_id, agent_id);
+        if !orphaned.is_empty() {
+            tracing::debug!(
+                pane_id = %pane_id,
+                agent_id = %agent_id,
+                orphaned = orphaned.len(),
+                "dispatch return: a caller is gone; its units' results go to recovery"
             );
         }
     }
@@ -8938,14 +9187,30 @@ impl AgentPtyRegistry {
         // now never complete, or a caller with nowhere left to be reported to;
         // either way the entry is undeliverable and must not sit in the map
         // waiting for a pane id to be recycled underneath it.
-        let dropped_returns = self.dispatch_returns.lock().evict_pane(pane_id);
-        if dropped_returns > 0 {
-            tracing::debug!(
-                pane_id = %pane_id,
-                dropped_returns,
-                "pane close: dropped dispatch return entries touching this pane"
-            );
-        }
+        //
+        // PRD #1666 part 3, round 5 (plan D7): the unit half is evicted and
+        // its end recorded, in one R1 → R2 → R3 section; the caller half is
+        // orphaned, not evicted.
+        let route_after = {
+            let mut returns = self.dispatch_returns.lock();
+            let removed = returns.evict_pane(pane_id);
+            let orphaned = returns.orphan_caller_pane(pane_id);
+            if !removed.is_empty() || orphaned > 0 {
+                tracing::debug!(
+                    pane_id = %pane_id,
+                    dropped_returns = removed.len(),
+                    orphaned,
+                    "pane close: ended the unit route on this pane and orphaned its caller routes"
+                );
+            }
+            self.inbox().unit_routes_ended(
+                &mut returns,
+                self,
+                removed,
+                pane_id,
+                crate::report_recovery::EndedHow::Closed,
+            )
+        };
         // PRD #249 round-6 review (Greptile): wake anything waiting on this pane
         // BEFORE the up-to-`AGENT_TERMINATE_GRACE` termination starts, by dropping
         // its senders. Same ordering argument as the sweeps below.
@@ -8963,7 +9228,10 @@ impl AgentPtyRegistry {
                 "pane close: dropped delegation commissions touching this pane"
             );
         }
-        Self::drain_delegations_touching(&mut tracker, pane_id)
+        let drained = Self::drain_delegations_touching(&mut tracker, pane_id);
+        drop(tracker);
+        self.inbox().after_section(route_after);
+        drained
     }
 
     /// PRD #126: finish the close transition opened by
@@ -9916,6 +10184,11 @@ impl AgentPtyRegistry {
         if self.admission_frozen.load(Ordering::SeqCst) && !admission.is_admitted_respawn() {
             return Err(AgentPtyError::Spawn(ADMISSION_FROZEN_REASON.into()));
         }
+        // PRD #1666 part 3, round 5 test seam: a spawn that fails before its
+        // reservation ((f1)'s seam).
+        if self.fault_point(FAULT_SPAWN_FAILS) {
+            return Err(AgentPtyError::Spawn("injected spawn failure (test)".into()));
+        }
 
         // Capture the caller-supplied `DOT_AGENT_DECK_PANE_ID` *before*
         // moving `opts` into `spawn`, so the registry retains a copy for
@@ -10184,6 +10457,20 @@ impl AgentPtyRegistry {
             }) => Some(id.clone()),
             _ => None,
         };
+        // PRD #1666 part 3, round 5 (plan D7): the orchestration seat this
+        // generation is spawned into, pinned at its reservation.
+        let seat = match tab_membership.as_ref() {
+            Some(TabMembership::Orchestration {
+                orchestration_id: Some(id),
+                is_start_role,
+                ..
+            }) => Some(crate::hook_provenance::Seat {
+                instance: id.clone(),
+                is_orchestrator: *is_start_role,
+                origin: opts.origin,
+            }),
+            _ => None,
+        };
         let (preallocated_id, reservation) = self.reserve_spawn(
             &pane_id_env,
             &hook_token_for_record,
@@ -10191,6 +10478,8 @@ impl AgentPtyRegistry {
             root_dirs.clone(),
             instance.as_deref(),
             admission.is_admitted_respawn(),
+            seat,
+            admission.replacement(),
         )?;
         opts.env.retain(|(k, _)| k != DOT_AGENT_DECK_AGENT_ID);
         opts.env
@@ -10330,6 +10619,9 @@ impl AgentPtyRegistry {
         // removes the turn clock of a reservation that reported a turn once
         // the lock is released.
         let _abandoned_turns = ReleaseAbandonedTurns(self);
+        // PRD #1666 part 3, round 5 test seam: a panic after the fork and
+        // before the record is published, with the reservation armed.
+        let _ = self.fault_point(FAULT_SPAWN_BEFORE_PUBLISH);
         let mut inner = self.inner.lock();
         // Issue #454: hand ownership over from the reservation to `agents`
         // WITHOUT releasing the lock in between — each early return below gives
@@ -10421,6 +10713,13 @@ impl AgentPtyRegistry {
         // reported starting while reserved is carried onto its fresh stream
         // below (r8k R8G-02).
         let busy_before_publication = inner.pending_busy.remove(&preallocated_id);
+        // PRD #1666 part 3, round 5: the facts the reservation pinned travel
+        // with the record from the instant it is published.
+        let attest_facts = inner
+            .pending_facts
+            .remove(&preallocated_id)
+            .unwrap_or_default();
+        let replacement_of = inner.pending_replacement_of.remove(&preallocated_id);
         reservation.publish_locked(&mut inner);
         // Issue #424 H3: this agent is the pane's new occupant, so whatever the
         // previous one's guarded sends recorded about that input box describes a
@@ -10570,6 +10869,10 @@ impl AgentPtyRegistry {
             // Issue #1496: set after the spawn, by the `StartAgent` handler
             // that accepted an authoring start.
             authoring_kind: None,
+            // PRD #1666 part 3, round 5: moved from the reservation, under
+            // the lock that publishes the record.
+            attest_facts,
+            replacement_of,
         };
 
         // Use the id we pre-allocated above (before spawn) and injected
@@ -10602,6 +10905,9 @@ impl AgentPtyRegistry {
         // harmless — the monitor will re-check counters anyway.
         self.change_notify.notify_one();
         drop(inner);
+        // PRD #1666 part 3, round 5 test seam: a panic after the record is
+        // published and before the spawn returns ((f2')'s seam).
+        let _ = self.fault_point(FAULT_SPAWN_AFTER_INSERT);
         // PRD #1666 §2.8 (auditor R9S-A01): every generation published on a
         // pane — a first start, a respawn, a re-created pane — hands the pane's
         // inbox over to it, before anything the spawn owes that inbox below. A
@@ -11499,6 +11805,12 @@ impl AgentPtyRegistry {
             geometry_tx: _,
             geometry_changes: _,
             exited: _,
+            // PRD #1666 part 3, round 5 (plan D7): a respawn copies its
+            // predecessor's seat, origin included, so the replacement attests
+            // as the same orchestration seat. Its `unit` is set when the
+            // replacement is published, never copied.
+            attest_facts: previous_facts,
+            replacement_of: _,
             // Issue #454: the OLD record is being removed outright, so its
             // handover flag has nothing left to disown. The fresh generation
             // starts `false` and takes the pane over in `spawn_agent`.
@@ -11657,59 +11969,273 @@ impl AgentPtyRegistry {
             env: spawn_env,
             tab_membership,
             agent_type: respawn_agent_type,
+            origin: previous_facts.seat.as_ref().and_then(|seat| seat.origin),
         };
-        // Off Unix `verified_dir` is an uninhabited `None`, so this is the
-        // pathname spawn there.
-        let new_agent_id = self.spawn_agent_with_dir(
-            opts,
-            verified_dir.as_ref(),
-            Admission::Respawn {
-                _ticket: &in_flight,
+        // PRD #1666 part 3, round 5 (plan D7): from here to the end of the
+        // replacement's `publish` there is no `.await`, so the window runs as
+        // one synchronous block inside `catch_unwind`: a dropped respawn future
+        // cannot leave a publication behind, and a panic in it is caught and
+        // aborted in ordinary code below, never in a destructor. `begin` comes
+        // first, before the successor's spawn reservation, which is the first
+        // instant the successor's token attests.
+        let replacement = self.begin_replacement(pane_id_env, &in_flight.agent_id);
+        let window = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Off Unix `verified_dir` is an uninhabited `None`, so this is the
+            // pathname spawn there.
+            let new_agent_id = self.spawn_agent_with_dir(
+                opts,
+                verified_dir.as_ref(),
+                Admission::Respawn {
+                    _ticket: &in_flight,
+                    replacement: replacement.as_ref(),
+                },
+            )?;
+            // Step 4 (PRD #225 M2): re-apply the observed badge so the
+            // dashboard card keeps the agent label the previous child taught us
+            // (`list_agents` → `AgentRecord.agent_type`) instead of reverting to
+            // "No agent" until the fresh child's first hook lands. Upgrade-only,
+            // so a pane created with an explicit identity keeps that identity,
+            // and a fresh child that turns out to be a different agent still
+            // corrects the badge via its own hooks. Deliberately AFTER the
+            // spawn, and to the display badge only, which is what guarantees it
+            // cannot influence the launch shape.
+            //
+            // Issue #1602: written here under one lock rather than through
+            // `set_agent_type`, so the badge's origin travels with it — and so a
+            // badge the fresh child's own hook already reported is left alone,
+            // with the origin that hook gave it.
+            if let Some(observed) = observed_agent_type.filter(|t| *t != AgentType::None)
+                && let Some(agent) = self.inner.lock().agents.get_mut(&new_agent_id)
+                && agent.agent_type.is_none()
+            {
+                agent.agent_type = Some(observed);
+                agent.badge_command = previous_badge_command;
+            }
+            // PRD #1666 part 3, round 5 test seams: the replacement window,
+            // after the replacement's spawn and before the dispatched unit
+            // follows it.
+            self.pause_point_sync(PAUSE_RESPAWN_BEFORE_PUBLISH);
+            let _ = self.fault_point(FAULT_RESPAWN_AFTER_SPAWN);
+            // PRD #1589 D5: a dispatched unit bound to the replaced generation
+            // — a single unit's agent, or an orchestration's terminal
+            // generation — follows it to the replacement, so the replacement's
+            // completion marks the unit and a close of the unit reaches it.
+            // Before the ticket is released, so a close waiting on this respawn
+            // reads the moved unit.
+            if let Some(unit_id) = self.dispatched_units().note_generation_replaced(
+                pane_id_env,
+                &in_flight.agent_id,
+                &new_agent_id,
+            ) {
+                tracing::debug!(
+                    unit_id = %unit_id,
+                    pane_id = %pane_id_env,
+                    agent_id = %new_agent_id,
+                    "respawn: the dispatched unit follows its replaced generation"
+                );
+            }
+            let _ = self.fault_point(FAULT_RESPAWN_BEFORE_PUBLISH_SECTION);
+            if let Some(ticket) = replacement.as_ref() {
+                self.publish_replacement(ticket, &new_agent_id);
+            }
+            Ok(new_agent_id)
+        }));
+        match window {
+            Ok(Ok(new_agent_id)) => Ok(new_agent_id),
+            Ok(Err(error)) => {
+                if let Some(ticket) = replacement {
+                    self.abort_replacement(ticket);
+                }
+                Err(error)
+            }
+            Err(payload) => {
+                if let Some(ticket) = replacement {
+                    self.abort_replacement(ticket);
+                }
+                std::panic::resume_unwind(payload)
+            }
+        }
+    }
+
+    /// PRD #1666 part 3, round 5 (plan D7): the replacement's `begin`, for a
+    /// respawn of `from` on `pane_id`. A ticket only when `from` is a
+    /// dispatched unit's terminal and the routes and report state are
+    /// available; otherwise the respawn runs as before round 5.
+    fn begin_replacement(&self, pane_id: &str, from: &str) -> Option<ReplacementTicket> {
+        static NEXT_TICKET: AtomicU64 = AtomicU64::new(1);
+        let ticket = NEXT_TICKET.fetch_add(1, Ordering::Relaxed);
+        let Ok(mut returns) = self.dispatch_returns.try_lock() else {
+            tracing::error!(pane_id = %pane_id, "respawn: the dispatch routes are unavailable");
+            return None;
+        };
+        let unit_id = self
+            .inbox()
+            .replacement_begin(&mut returns, pane_id, from, ticket)?;
+        let (latch, latch_rx) = std::sync::mpsc::sync_channel(1);
+        Some(ReplacementTicket {
+            id: ticket,
+            pane_id: pane_id.to_string(),
+            unit_id,
+            from: from.to_string(),
+            successor: Arc::new(std::sync::OnceLock::new()),
+            latch,
+            latch_rx: Mutex::new(Some(latch_rx)),
+        })
+    }
+
+    /// PRD #1666 part 3, round 5 (plan D7): at `agent_id`'s EOF, when it is a
+    /// replacement's successor, wait for the replacement's transition. A latch
+    /// closed with no value means the abort's own section panicked: the reader
+    /// runs the abort itself, with itself as the successor. `Unavailable`, or
+    /// an abort that finds the report state torn, does no replacement work,
+    /// and the reader's ordinary cleanup runs as before round 5.
+    fn await_replacement(self: &Arc<Self>, agent_id: &str) {
+        let wait = match self.inner.try_lock() {
+            Ok(mut inner) => inner.replacement_waits.remove(agent_id),
+            Err(_) => None,
+        };
+        let Some(wait) = wait else {
+            return;
+        };
+        match wait.rx.recv() {
+            Ok(_) => {}
+            Err(_) => {
+                let settled = match self.dispatch_returns.try_lock() {
+                    Ok(mut returns) => self.inbox().replacement_abort(
+                        &mut returns,
+                        self.as_ref(),
+                        &wait.pane_id,
+                        &wait.unit_id,
+                        wait.ticket,
+                        Some(agent_id),
+                    ),
+                    Err(_) => Err(crate::guarded::Torn),
+                };
+                match settled {
+                    Ok(after) => {
+                        let _ = self.dispatched_units().end(
+                            &wait.unit_id,
+                            crate::dispatched_units::EndReason::RespawnFailed,
+                            chrono::Utc::now().timestamp_millis(),
+                        );
+                        self.inbox().after_section(after);
+                    }
+                    Err(_) => tracing::error!(
+                        unit_id = %wait.unit_id,
+                        agent_id = %agent_id,
+                        "respawn: a dispatched unit's restart was left unsettled and its report \
+                         state is unavailable"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// The replacement's `publish`, after the leaf moved the unit to
+    /// `successor`, then its latch.
+    fn publish_replacement(&self, ticket: &ReplacementTicket, successor: &str) {
+        let outcome = match self.dispatch_returns.try_lock() {
+            Ok(mut returns) => match self.inbox().replacement_publish(
+                &mut returns,
+                self,
+                &ticket.pane_id,
+                &ticket.unit_id,
+                &ticket.from,
+                ticket.id,
+                successor,
+            ) {
+                Ok(()) => crate::inbox_hub::ReplacementOutcome::Published,
+                Err(_) => crate::inbox_hub::ReplacementOutcome::Unavailable,
             },
-        )?;
-        // Step 4 (PRD #225 M2): re-apply the observed badge so the dashboard
-        // card keeps the agent label the previous child taught us (`list_agents`
-        // → `AgentRecord.agent_type`) instead of reverting to "No agent" until
-        // the fresh child's first hook lands. Upgrade-only, so a pane created
-        // with an explicit identity keeps that identity, and a fresh child that
-        // turns out to be a different agent still corrects the badge via its own
-        // hooks. Deliberately AFTER the spawn, and to the display badge only,
-        // which is what guarantees it cannot influence the launch shape.
-        //
-        // Issue #1602: written here under one lock rather than through
-        // `set_agent_type`, so the badge's origin travels with it — and so a
-        // badge the fresh child's own hook already reported is left alone, with
-        // the origin that hook gave it.
-        if let Some(observed) = observed_agent_type.filter(|t| *t != AgentType::None)
-            && let Some(agent) = self.inner.lock().agents.get_mut(&new_agent_id)
-            && agent.agent_type.is_none()
+            Err(_) => crate::inbox_hub::ReplacementOutcome::Unavailable,
+        };
+        ticket.send(outcome);
+    }
+
+    /// The replacement's `abort` (D7 step 3), in ordinary code: the section,
+    /// then the latch FIRST, then the unit's leaf end, the owed notices, and
+    /// the successor closed by its exact id on a detached task. With the
+    /// routes or the report state unavailable it does nothing to the hub,
+    /// the route, the leaf or the successor, and tells the reader so.
+    fn abort_replacement(self: &Arc<Self>, ticket: ReplacementTicket) {
+        // Test seam ((f5a)): the latch's sender dropped with no value and no
+        // abort run, as an abort section that panicked leaves it.
+        if self.fault_point(FAULT_ABORT_SKIPPED) {
+            drop(ticket);
+            return;
+        }
+        let successor = ticket.successor.get().cloned();
+        // Test seam ((f4')): another thread panics inside a guarded section
+        // here, tearing the report state with the routes left healthy.
+        #[cfg(test)]
+        if self.fault_point(FAULT_TEAR_BEFORE_ABORT) {
+            let hub = Arc::clone(self.inbox());
+            let _ = std::thread::spawn(move || {
+                hub.run_guarded_for_test(|_| panic!("tear the report state (test)"));
+            })
+            .join();
+        }
+        let settled = match self.dispatch_returns.try_lock() {
+            Ok(mut returns) => self.inbox().replacement_abort(
+                &mut returns,
+                self.as_ref(),
+                &ticket.pane_id,
+                &ticket.unit_id,
+                ticket.id,
+                successor.as_deref(),
+            ),
+            Err(_) => Err(crate::guarded::Torn),
+        };
+        let after = match settled {
+            Ok(after) => after,
+            Err(_) => {
+                tracing::error!(
+                    unit_id = %ticket.unit_id,
+                    pane_id = %ticket.pane_id,
+                    successor = ?successor,
+                    "respawn: a failed restart of a dispatched unit could not be settled; the \
+                     deck's report state or dispatch routes are unavailable until it restarts"
+                );
+                ticket.send(crate::inbox_hub::ReplacementOutcome::Unavailable);
+                return;
+            }
+        };
+        // Test seam ((f5b), second arm): a panic after the section and
+        // before the latch.
+        let _ = self.fault_point(FAULT_ABORT_AFTER_SECTION);
+        ticket.send(crate::inbox_hub::ReplacementOutcome::Aborted);
+        if self
+            .dispatched_units()
+            .end(
+                &ticket.unit_id,
+                crate::dispatched_units::EndReason::RespawnFailed,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .is_some()
         {
-            agent.agent_type = Some(observed);
-            agent.badge_command = previous_badge_command;
+            tracing::info!(unit_id = %ticket.unit_id, "respawn: a dispatched unit whose restart failed has ended");
         }
-        // PRD #1666 part 3, round 5 test seams: the replacement window, after
-        // the replacement's spawn and before the dispatched unit follows it.
-        // The window has no `.await`, so its pause is the synchronous one.
-        self.pause_point_sync(PAUSE_RESPAWN_BEFORE_PUBLISH);
-        let _ = self.fault_point(FAULT_RESPAWN_AFTER_SPAWN);
-        // PRD #1589 D5: a dispatched unit bound to the replaced generation — a
-        // single unit's agent, or an orchestration's terminal generation —
-        // follows it to the replacement, so the replacement's completion marks
-        // the unit and a close of the unit reaches it. Before the ticket is
-        // released, so a close waiting on this respawn reads the moved unit.
-        if let Some(unit_id) = self.dispatched_units().note_generation_replaced(
-            pane_id_env,
-            &in_flight.agent_id,
-            &new_agent_id,
-        ) {
-            tracing::debug!(
-                unit_id = %unit_id,
-                pane_id = %pane_id_env,
-                agent_id = %new_agent_id,
-                "respawn: the dispatched unit follows its replaced generation"
-            );
+        self.inbox().after_section(after);
+        if let Some(successor) = successor {
+            let registry = Arc::clone(self);
+            let close = move || {
+                #[cfg(test)]
+                registry.note_abort_close_for_test(&successor);
+                match registry.close_agent(&successor) {
+                    Ok(()) | Err(AgentPtyError::NotFound(_)) => {}
+                    Err(error) => tracing::warn!(
+                        agent_id = %successor,
+                        %error,
+                        "respawn: could not close the replacement of a dispatched unit whose \
+                         restart failed"
+                    ),
+                }
+            };
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => drop(handle.spawn_blocking(close)),
+                Err(_) => close(),
+            }
         }
-        Ok(new_agent_id)
     }
 
     /// [`Self::respawn_agent_for_pane`], but a pane with no record left is
@@ -11955,6 +12481,11 @@ impl AgentPtyRegistry {
             .agent_type
             .clone()
             .or_else(|| AgentType::from_command(Some(command)));
+        // PRD #1666 part 3, round 5 (plan D7): a re-created pane has no record
+        // to copy its seat from, so it takes its instance's origin from a
+        // record of the same instance; with none left, it has none.
+        let origin = orchestration_instance_of(identity.tab_membership.as_ref())
+            .and_then(|instance| self.origin_of_instance(instance));
         self.spawn_agent(SpawnOptions {
             command: Some(command),
             cwd: identity.cwd.as_deref(),
@@ -11967,7 +12498,26 @@ impl AgentPtyRegistry {
             env,
             tab_membership: identity.tab_membership.clone(),
             agent_type,
+            origin,
         })
+    }
+
+    /// PRD #1666 part 3, round 5 (plan D7): the origin the records of
+    /// `instance` were spawned with, read from any of them, published or
+    /// reserved. `None` when none is left or none carries one.
+    pub(crate) fn origin_of_instance(
+        &self,
+        instance: &str,
+    ) -> Option<crate::hook_provenance::InstanceOrigin> {
+        let inner = self.inner.lock();
+        inner
+            .agents
+            .values()
+            .map(|agent| &agent.attest_facts)
+            .chain(inner.pending_facts.values())
+            .filter_map(|facts| facts.seat.as_ref())
+            .find(|seat| seat.instance == instance)
+            .and_then(|seat| seat.origin)
     }
 
     /// Subscribe to an agent's live output and take its scrollback snapshot
@@ -14016,6 +14566,8 @@ impl AgentPtyRegistry {
                 crashed: None,
                 quota_block: None,
                 authoring_kind: None,
+                attest_facts: crate::hook_provenance::AttestFacts::default(),
+                replacement_of: None,
             },
         );
         id
@@ -14252,6 +14804,7 @@ impl AgentPtyRegistry {
     /// refuses the spawn with [`AgentPtyError::DirBeingRemoved`]; otherwise they
     /// are recorded in [`RegistryInner::pending_spawn_dirs`] with the rest of
     /// the reservation, so a removal sees the start before its record exists.
+    #[allow(clippy::too_many_arguments)]
     fn reserve_spawn(
         &self,
         pane_id_env: &Option<String>,
@@ -14260,6 +14813,8 @@ impl AgentPtyRegistry {
         spawn_dirs: Vec<PathBuf>,
         instance: Option<&str>,
         admitted_respawn: bool,
+        seat: Option<crate::hook_provenance::Seat>,
+        replacement: Option<&ReplacementTicket>,
     ) -> Result<(String, SpawnReservation<'_>), AgentPtyError> {
         let mut inner = self.inner.lock();
         // PRD #1589 D4: no pane joins an instance a `close` is taking down or
@@ -14307,6 +14862,62 @@ impl AgentPtyRegistry {
             .pending_hook_tokens
             .insert(id.clone(), hook_token.to_string());
         inner.pending_spawn_dirs.insert(id.clone(), spawn_dirs);
+        // PRD #1666 part 3, round 5 (plan D7, D12): the seat this generation
+        // attests with, from the instant its token can. An origin that
+        // contradicts another generation of the same instance is recorded as
+        // `Conflict`, never read as either.
+        let seat = seat.map(|mut seat| {
+            if let Some(origin) = seat.origin {
+                let disagrees = inner
+                    .agents
+                    .values()
+                    .filter(|agent| !agent.exited.load(Ordering::SeqCst))
+                    .map(|agent| &agent.attest_facts)
+                    .chain(inner.pending_facts.values())
+                    .filter_map(|facts| facts.seat.as_ref())
+                    .filter(|other| other.instance == seat.instance)
+                    .filter_map(|other| other.origin)
+                    .find(|other| *other != origin);
+                if let Some(other) = disagrees {
+                    tracing::error!(
+                        instance = %crate::config_validation::escape_id_for_log(&seat.instance),
+                        new = ?origin,
+                        existing = ?other,
+                        "spawn: an orchestration instance's generations disagree on how it \
+                         was started; this generation's origin is recorded as a conflict"
+                    );
+                    seat.origin = Some(crate::hook_provenance::InstanceOrigin::Conflict);
+                }
+            }
+            seat
+        });
+        inner.pending_facts.insert(
+            id.clone(),
+            crate::hook_provenance::AttestFacts { seat, unit: None },
+        );
+        // PRD #1666 part 3, round 5 (plan D7): a replacement's successor is
+        // bound to its ticket here, by the id just minted, after every refusal
+        // above — a refused reservation never reaches this.
+        if let Some(ticket) = replacement {
+            let _ = ticket.successor.set(id.clone());
+            inner.pending_replacement_of.insert(id.clone(), ticket.id);
+            if let Some(rx) = ticket
+                .latch_rx
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+            {
+                inner.replacement_waits.insert(
+                    id.clone(),
+                    ReplacementWait {
+                        rx,
+                        pane_id: ticket.pane_id.clone(),
+                        unit_id: ticket.unit_id.clone(),
+                        ticket: ticket.id,
+                    },
+                );
+            }
+        }
         // Issue #1077: from this instant the pane requires a token, and it
         // keeps requiring one for the life of the daemon — see
         // `RegistryInner::hook_token_panes`. Recorded under the SAME lock
@@ -14374,6 +14985,7 @@ impl AgentPtyRegistry {
             .map(|(id, agent)| crate::hook_provenance::TokenOwner {
                 agent_id: id.clone(),
                 pane_id: agent.pane_id_env.clone(),
+                facts: agent.attest_facts.clone(),
             })
             .or_else(|| {
                 inner
@@ -14385,6 +14997,7 @@ impl AgentPtyRegistry {
                             crate::hook_provenance::TokenOwner {
                                 agent_id: id.clone(),
                                 pane_id: pane.clone(),
+                                facts: inner.pending_facts.get(id).cloned().unwrap_or_default(),
                             }
                         })
                     })
@@ -14430,6 +15043,8 @@ impl AgentPtyRegistry {
                 Vec::new(),
                 None,
                 false,
+                None,
+                None,
             )
             .expect("reserve a spawn");
         // Disarm the guard so the reservation outlives this call.
@@ -14448,8 +15063,16 @@ impl AgentPtyRegistry {
         cwd: &std::path::Path,
     ) -> Result<String, AgentPtyError> {
         let token = crate::hook_provenance::mint();
-        let (id, mut reservation) =
-            self.reserve_spawn(&None, &token, None, vec![cwd.to_path_buf()], None, false)?;
+        let (id, mut reservation) = self.reserve_spawn(
+            &None,
+            &token,
+            None,
+            vec![cwd.to_path_buf()],
+            None,
+            false,
+            None,
+            None,
+        )?;
         reservation.id = None;
         Ok(id)
     }
@@ -14752,6 +15375,19 @@ impl AgentPtyRegistry {
             let _ = reached.send(());
             let _ = release.await;
         }
+    }
+
+    /// PRD #1666 part 3, round 5 test seam: record that a replacement's abort
+    /// closes `agent_id`.
+    #[cfg(test)]
+    pub(crate) fn note_abort_close_for_test(&self, agent_id: &str) {
+        self.abort_closes.lock().unwrap().push(agent_id.to_string());
+    }
+
+    /// The agents a replacement's abort has closed, in order.
+    #[cfg(test)]
+    pub(crate) fn abort_closes_for_test(&self) -> Vec<String> {
+        self.abort_closes.lock().unwrap().clone()
     }
 
     /// PRD #1589 test seam: make the next [`Self::close_agent`] of `agent_id`
@@ -15496,6 +16132,105 @@ impl AgentPtyRegistry {
         Self::force_kill_and_reap_all(agents);
 
         self.change_notify.notify_one();
+    }
+}
+
+/// PRD #1666 part 3, round 5: the hub's view of the registry's records, read
+/// under the hub's lock (R3 → R4, `crate::inbox_hub::RecordView`). Each takes
+/// the record table through the non-panicking `try_lock`: unavailable, a
+/// generation reads as registered (so nothing is evicted for it) and no unit
+/// is pinned.
+impl crate::inbox_hub::RecordView for AgentPtyRegistry {
+    fn registered(&self, agent_id: &str) -> bool {
+        match self.inner.try_lock() {
+            Ok(inner) => {
+                inner.agents.contains_key(agent_id) || inner.pending_spawns.contains_key(agent_id)
+            }
+            Err(_) => true,
+        }
+    }
+
+    fn pin_unit(&self, agent_id: &str, unit_id: &str, ticket: Option<u64>) -> bool {
+        let Ok(mut inner) = self.inner.try_lock() else {
+            return false;
+        };
+        Self::pin_unit_locked(&mut inner, agent_id, unit_id, ticket)
+    }
+}
+
+impl AgentPtyRegistry {
+    /// [`crate::inbox_hub::RecordView::pin_unit`] under a held record table.
+    fn pin_unit_locked(
+        inner: &mut RegistryInner,
+        agent_id: &str,
+        unit_id: &str,
+        ticket: Option<u64>,
+    ) -> bool {
+        let (facts, reserved_under) = match inner.agents.get_mut(agent_id) {
+            Some(agent) => (&mut agent.attest_facts, agent.replacement_of),
+            None => match inner.pending_facts.get_mut(agent_id) {
+                Some(facts) => (facts, inner.pending_replacement_of.get(agent_id).copied()),
+                None => return false,
+            },
+        };
+        if ticket.is_some() && reserved_under != ticket {
+            tracing::error!(
+                agent_id = %agent_id,
+                "dispatch: a replacement's successor was not reserved under its ticket; its \
+                 unit is not pinned"
+            );
+            return false;
+        }
+        if facts.unit.is_none() {
+            facts.unit = Some(unit_id.to_string());
+        }
+        true
+    }
+}
+
+/// PRD #1666 part 3, round 5 (plan D7): a dispatch's initial publication,
+/// held from before its first role's spawn reservation until its unit is
+/// registered, which consumes it. Dropped unconsumed — the dispatch returned
+/// an error or unwound — it removes the publication and nothing else. Its
+/// `Drop` takes the routes and the hub only through `lock_in_drop`, so it
+/// never panics, and logs only when the thread is not panicking (plan D6).
+#[must_use = "dropping it removes the publication"]
+pub struct InitialPublication {
+    registry: Arc<AgentPtyRegistry>,
+    key: Option<crate::report_recovery::PublishKey>,
+}
+
+impl InitialPublication {
+    /// The registration's section removed it.
+    fn consume(mut self) {
+        self.key = None;
+    }
+}
+
+impl Drop for InitialPublication {
+    fn drop(&mut self) {
+        let Some(key) = self.key.take() else {
+            return;
+        };
+        let Some(mut returns) = self
+            .registry
+            .dispatch_returns
+            .lock_in_drop(crate::lock_rank::OnPoison::Skip)
+        else {
+            return;
+        };
+        if self
+            .registry
+            .inbox()
+            .remove_publication_in_drop(&mut returns, &key)
+            .is_err()
+            && !std::thread::panicking()
+        {
+            tracing::error!(
+                "dispatch: an aborted dispatch's publication could not be removed; the deck's \
+                 report state is unavailable"
+            );
+        }
     }
 }
 
@@ -20100,6 +20835,7 @@ mod spawn_tests {
                     spill_path: None,
                     id: None,
                     preface: None,
+                    provenance: None,
                 },
             )
             .unwrap();
@@ -22408,61 +23144,82 @@ mod spawn_tests {
     /// pins is the wiring, which is the half that can silently not happen — a map
     /// whose eviction call was never made keeps answering correctly in its own
     /// tests forever.
+    ///
+    /// PRD #1666 part 3, round 5 (plan D7, §8): a close of the UNIT's pane
+    /// ends its route and records the unit's end; a close of the CALLER's pane
+    /// orphans its routes, which stay recorded and leave the dispatch tree.
     #[test]
-    fn begin_pane_close_evicts_dispatch_returns_touching_the_closing_pane() {
+    fn begin_pane_close_ends_the_unit_route_and_orphans_the_caller_routes() {
         let reg = AgentPtyRegistry::new();
         let caller = |pane: &str, unit: &str| crate::dispatch_return::DispatchCaller {
             pane_id: pane.to_string(),
             agent_id: "agent-7".to_string(),
             unit_name: unit.to_string(),
         };
-        reg.register_dispatch_return("unit-pane-a", "unit-agent-a", caller("caller-1", "a"));
-        reg.register_dispatch_return("unit-pane-b", "unit-agent-b", caller("caller-1", "b"));
-        reg.register_dispatch_return("unit-pane-c", "unit-agent-c", caller("caller-2", "c"));
+        reg.register_dispatch_return(
+            "unit-pane-a",
+            "unit-agent-a",
+            "u-a",
+            caller("caller-1", "a"),
+            None,
+        );
+        reg.register_dispatch_return(
+            "unit-pane-b",
+            "unit-agent-b",
+            "u-b",
+            caller("caller-1", "b"),
+            None,
+        );
+        reg.register_dispatch_return(
+            "unit-pane-c",
+            "unit-agent-c",
+            "u-c",
+            caller("caller-2", "c"),
+            None,
+        );
         assert_eq!(reg.outstanding_dispatch_returns(), 3);
 
-        // The dispatched unit's own tab closing: nothing will ever complete there.
         drop(reg.begin_pane_close("unit-pane-a"));
         assert_eq!(reg.outstanding_dispatch_returns(), 2);
-        assert!(
-            reg.take_dispatch_return("unit-pane-a").is_none(),
-            "a closed unit must not stay resolvable against a recyclable pane id"
-        );
+        assert!(reg.take_dispatch_return("unit-pane-a").is_none());
+        assert!(matches!(
+            reg.inbox()
+                .read_reports(|r| r.units.get("u-a").cloned())
+                .unwrap(),
+            Some(crate::report_recovery::UnitEntry::Ended {
+                how: crate::report_recovery::EndedHow::Closed
+            })
+        ));
 
-        // The CALLER's pane closing: every unit it started loses its recipient.
         drop(reg.begin_pane_close("caller-1"));
         assert_eq!(
             reg.outstanding_dispatch_returns(),
-            1,
-            "closing the caller evicts its remaining unit too"
+            2,
+            "closing the caller orphans its unit's route rather than evicting it"
         );
-        assert!(reg.take_dispatch_return("unit-pane-b").is_none());
+        assert!(
+            reg.dispatch_returns
+                .lock()
+                .resolve("unit-pane-b")
+                .unwrap()
+                .orphaned
+        );
+        assert_eq!(reg.dispatch_edges().len(), 1);
 
-        // And the other caller's unit is untouched, then consumed by delivery.
         assert_eq!(
             reg.take_dispatch_return("unit-pane-c")
                 .map(|r| r.caller.unit_name),
             Some("c".to_string())
         );
-        assert_eq!(
-            reg.outstanding_dispatch_returns(),
-            0,
-            "resolving a return evicts it, so no report can be delivered twice"
-        );
     }
 
-    /// PRD #220 Phase 2 review/audit (finding A3), through the registry rather
-    /// than the map: the PTY-EOF sweep evicts return entries too.
-    ///
-    /// The wiring is the half that can silently not happen, and here it silently
-    /// did not: `pump_reader`'s EOF branch swept delegations and silence watches
-    /// and walked straight past this map, so a dispatched unit that exited without
-    /// signalling `work-done --done` left its entry resident for the daemon's
-    /// lifetime. The pure-data rules — including why BOTH sides are identity-gated
-    /// (PR #1081 review, Greptile finding 1) — live in
-    /// [`crate::dispatch_return`].
+    /// PRD #220 Phase 2 review/audit (finding A3), through the registry: the
+    /// PTY-EOF sweep ends a unit's route, identity-gated on the route's
+    /// current generation; PRD #1666 part 3, round 5 (§8): a caller's exit
+    /// orphans its routes ([`AgentPtyRegistry::orphan_caller_routes`]) rather
+    /// than evicting them.
     #[test]
-    fn the_eof_sweep_evicts_dispatch_returns_for_a_pane_that_exited() {
+    fn the_eof_sweep_ends_the_route_of_a_unit_that_exited() {
         let reg = AgentPtyRegistry::new();
         let caller = |pane: &str, agent: &str, unit: &str| crate::dispatch_return::DispatchCaller {
             pane_id: pane.to_string(),
@@ -22472,59 +23229,31 @@ mod spawn_tests {
         reg.register_dispatch_return(
             "unit-pane-a",
             "unit-agent-a",
+            "u-a",
             caller("caller-1", "agent-7", "a"),
+            None,
         );
         reg.register_dispatch_return(
             "unit-pane-b",
             "unit-agent-b",
+            "u-b",
             caller("caller-1", "agent-7", "b"),
+            None,
         );
-        reg.register_dispatch_return(
-            "unit-pane-c",
-            "unit-agent-c",
-            caller("caller-2", "agent-9", "c"),
-        );
-        assert_eq!(reg.outstanding_dispatch_returns(), 3);
-
-        // A DIFFERENT agent exiting on the dispatched unit's pane changes nothing:
-        // the entry belongs to the unit that was actually dispatched, not to
-        // whoever else has held that recycled pane id.
-        reg.sweep_dispatch_returns_on_exit("unit-pane-a", "whatever-agent-ran-there");
-        assert_eq!(
-            reg.outstanding_dispatch_returns(),
-            3,
-            "a predecessor's late EOF must not evict the live unit's return route"
-        );
-
-        // The dispatched unit's own process dying: it will never complete now.
-        reg.sweep_dispatch_returns_on_exit("unit-pane-a", "unit-agent-a");
         assert_eq!(reg.outstanding_dispatch_returns(), 2);
-        assert!(
-            reg.take_dispatch_return("unit-pane-a").is_none(),
-            "an exited unit must not stay resolvable against a recyclable pane id"
-        );
 
-        // A DIFFERENT agent exiting on the caller's pane changes nothing: the
-        // entry belongs to whoever actually dispatched it.
-        reg.sweep_dispatch_returns_on_exit("caller-1", "some-earlier-occupant");
-        assert_eq!(
-            reg.outstanding_dispatch_returns(),
-            2,
-            "a predecessor's late EOF must not cancel the live caller's units"
-        );
+        reg.sweep_dispatch_returns_on_exit("unit-pane-a", "whatever-agent-ran-there");
+        assert_eq!(reg.outstanding_dispatch_returns(), 2);
 
-        // The caller itself exiting: its remaining unit loses its recipient.
-        reg.sweep_dispatch_returns_on_exit("caller-1", "agent-7");
+        reg.sweep_dispatch_returns_on_exit("unit-pane-a", "unit-agent-a");
         assert_eq!(reg.outstanding_dispatch_returns(), 1);
-        assert!(reg.take_dispatch_return("unit-pane-b").is_none());
+        assert!(reg.take_dispatch_return("unit-pane-a").is_none());
 
-        // The unrelated caller's unit is untouched.
-        assert_eq!(
-            reg.take_dispatch_return("unit-pane-c")
-                .map(|r| r.caller.unit_name),
-            Some("c".to_string())
-        );
-        assert_eq!(reg.outstanding_dispatch_returns(), 0);
+        reg.orphan_caller_routes("caller-1", "some-earlier-occupant");
+        assert_eq!(reg.dispatch_edges().len(), 1);
+        reg.orphan_caller_routes("caller-1", "agent-7");
+        assert_eq!(reg.outstanding_dispatch_returns(), 1);
+        assert!(reg.dispatch_edges().is_empty());
     }
 
     #[test]
@@ -25351,6 +26080,7 @@ mod spawn_tests {
             crate::hook_provenance::TokenOwner {
                 agent_id: id.clone(),
                 pane_id: Some("prov-pane".to_string()),
+                facts: Default::default(),
             }
         );
         assert!(registry.pane_was_issued_a_hook_token("prov-pane"));

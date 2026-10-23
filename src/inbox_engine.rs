@@ -2053,6 +2053,7 @@ fn send_notices(st: &HubState, key: &AgentKey, notices: InboxCardNotices) {
         attention_update: true,
         requeued: false,
         notices,
+        provenance: None,
     }));
 }
 

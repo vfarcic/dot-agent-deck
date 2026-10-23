@@ -3140,6 +3140,11 @@ pub struct InboxNotice {
     /// reads every unseen queued message as new, as before it existed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub requeued: bool,
+    /// PRD #1666 part 3, round 5 (plan D10): what the message is, when it is
+    /// a report or a dispatch result, so a client moves the task or unit it
+    /// names by id. Additive: a client that does not know it ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<crate::report_recovery::ReportProvenance>,
     #[serde(flatten, default)]
     pub notices: crate::inbox_hub::InboxCardNotices,
 }

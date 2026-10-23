@@ -62,6 +62,7 @@ pub mod error;
 pub mod event;
 pub mod event_subscriber;
 pub mod features;
+pub mod guarded;
 // PRD #1105 M11: when the TUI claims focus on its daemon (terminal focus-in and
 // throttled input).
 pub mod focus_report;
@@ -133,6 +134,7 @@ pub mod remote_daemon;
 pub mod remote_doctor;
 pub mod remote_tunnel;
 pub mod repo_identity;
+pub mod report_recovery;
 pub mod retained_store;
 pub mod schedule_cli;
 // Issue #1635: upgrading this machine's CLI and desktop app in place.

@@ -230,6 +230,10 @@ pub enum EndReason {
     /// Closed through an ordinary stop: the TUI, the desktop app, or a raw
     /// `StopAgent`.
     Stopped,
+    /// PRD #1666 part 3, round 5 (plan D7): its terminal agent was being
+    /// restarted and the restart failed. Additive: an older reader reads it
+    /// as `Unknown`.
+    RespawnFailed,
     #[serde(other)]
     Unknown,
 }
@@ -720,6 +724,7 @@ fn already_ended(stone: &Tombstone) -> Refused {
     let how = match stone.reason {
         EndReason::ClosedByVerb => "closed with `close`",
         EndReason::Stopped => "closed from the TUI, the desktop app or a stop",
+        EndReason::RespawnFailed => "its restart failed",
         EndReason::Unknown => "ended",
     };
     Refused::new(

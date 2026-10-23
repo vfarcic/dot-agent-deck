@@ -1022,6 +1022,66 @@ impl std::fmt::Debug for RetainedStore {
     }
 }
 
+/// The store's state, held: see [`RetainedStore::lock`].
+pub struct StoreLock<'a> {
+    st: crate::lock_rank::RankedGuard<'a, { R5 }, StoreState>,
+    store: &'a RetainedStore,
+}
+
+impl StoreLock<'_> {
+    /// See [`RetainedStore::acknowledged`].
+    pub fn acknowledged(&mut self, report_id: &str, now: Now) {
+        self.transition(report_id, now, |state| match state {
+            OwnState::OrphanUnlink => None,
+            _ => Some(OwnState::Acknowledged(now.wall)),
+        });
+    }
+
+    /// See [`RetainedStore::recovered`].
+    pub fn recovered(&mut self, report_id: &str, now: Now) {
+        self.transition(report_id, now, |state| match state {
+            OwnState::Pinned => Some(OwnState::Recovered(now.wall)),
+            _ => None,
+        });
+    }
+
+    /// See [`RetainedStore::reserve`].
+    pub fn reserve(&mut self, bytes: u64) -> Result<Reservation, StoreRefusal> {
+        self.store.refuse_unusable()?;
+        self.store.admit(&self.st, bytes)?;
+        self.st.reserved_bytes += bytes;
+        self.st.reserved_slots += 1;
+        Ok(Reservation { bytes })
+    }
+
+    /// See [`RetainedStore::release`].
+    pub fn release(&mut self, reservation: Reservation) {
+        self.st.release(reservation.bytes);
+    }
+
+    fn transition(
+        &mut self,
+        report_id: &str,
+        now: Now,
+        to: impl FnOnce(OwnState) -> Option<OwnState>,
+    ) {
+        let changed = match self.st.own.get_mut(&own_name(report_id)) {
+            Some(file) => match to(file.state) {
+                Some(next) => {
+                    file.state = next;
+                    file.since = Some(now.mono);
+                    true
+                }
+                None => false,
+            },
+            None => false,
+        };
+        if changed {
+            self.st.revision += 1;
+        }
+    }
+}
+
 /// Whether `error` says the platform or filesystem has no no-replace rename.
 fn unsupported_rename(error: &io::Error) -> bool {
     #[cfg(unix)]
@@ -1160,6 +1220,13 @@ impl RetainedStore {
         self.unusable.as_deref()
     }
 
+    /// Test seam: every write fails, as a full or broken disk would, until
+    /// it is switched off.
+    #[cfg(test)]
+    pub(crate) fn fail_writes_for_test(&self, fail: bool) {
+        self.seams.fail_all_writes.store(fail, Ordering::SeqCst);
+    }
+
     /// Whether a thread panicked holding the store's state.
     pub fn is_poisoned(&self) -> bool {
         self.state.is_poisoned()
@@ -1207,14 +1274,9 @@ impl RetainedStore {
     /// Reserve `bytes` and one file slot, or refuse, consuming nothing.
     pub fn reserve(&self, bytes: u64) -> Result<Reservation, StoreRefusal> {
         self.refuse_unusable()?;
-        let mut st = self
-            .state
-            .try_lock()
-            .map_err(|_: Unavailable| StoreRefusal::Unavailable)?;
-        self.admit(&st, bytes)?;
-        st.reserved_bytes += bytes;
-        st.reserved_slots += 1;
-        Ok(Reservation { bytes })
+        self.lock()
+            .map_err(|_: Unavailable| StoreRefusal::Unavailable)?
+            .reserve(bytes)
     }
 
     /// Give a reservation back unused.
@@ -1251,7 +1313,9 @@ impl RetainedStore {
             let mut file = dirs.mine.create_new_owner_only(&name)?;
             created = true;
             #[cfg(test)]
-            if self.seams.fail_write.swap(false, Ordering::SeqCst) {
+            if self.seams.fail_write.swap(false, Ordering::SeqCst)
+                || self.seams.fail_all_writes.load(Ordering::SeqCst)
+            {
                 return Err(io::Error::other("injected write failure"));
             }
             file.write_all(contents)?;
@@ -1306,39 +1370,26 @@ impl RetainedStore {
 
     /// `report_id`'s message was acknowledged: kept [`ACK_RETENTION`] more.
     pub fn acknowledged(&self, report_id: &str, now: Now) {
-        self.transition(report_id, now, |state| match state {
-            OwnState::OrphanUnlink => None,
-            _ => Some(OwnState::Acknowledged(now.wall)),
-        });
+        if let Ok(mut held) = self.lock() {
+            held.acknowledged(report_id, now);
+        }
     }
 
     /// `report_id` entered recovery: kept [`RECOVERY_RETENTION`] from now, if
     /// it was not already in recovery or acknowledged.
     pub fn recovered(&self, report_id: &str, now: Now) {
-        self.transition(report_id, now, |state| match state {
-            OwnState::Pinned => Some(OwnState::Recovered(now.wall)),
-            _ => None,
-        });
+        if let Ok(mut held) = self.lock() {
+            held.recovered(report_id, now);
+        }
     }
 
-    fn transition(&self, report_id: &str, now: Now, to: impl FnOnce(OwnState) -> Option<OwnState>) {
-        let Ok(mut st) = self.state.try_lock() else {
-            return;
-        };
-        let changed = match st.own.get_mut(&own_name(report_id)) {
-            Some(file) => match to(file.state) {
-                Some(next) => {
-                    file.state = next;
-                    file.since = Some(now.mono);
-                    true
-                }
-                None => false,
-            },
-            None => false,
-        };
-        if changed {
-            st.revision += 1;
-        }
+    /// The store's state, held (R5), for code that does several things under
+    /// one acquisition, or already holds it and must not take it again.
+    pub fn lock(&self) -> Result<StoreLock<'_>, Unavailable> {
+        Ok(StoreLock {
+            st: self.state.try_lock()?,
+            store: self,
+        })
     }
 
     /// The state the store holds for `report_id`'s own file.
@@ -1395,6 +1446,16 @@ impl RetainedStore {
             }
         }
         held
+    }
+
+    /// A dispatch reservation dropped unused — the dispatch never reached its
+    /// result — from a destructor: its room and slot are freed, through
+    /// `lock_in_drop`, which never panics.
+    pub fn release_dispatch_in_drop(&self, reservation: DispatchReservation) {
+        if let Some(mut st) = self.state.lock_in_drop(crate::lock_rank::OnPoison::Skip) {
+            st.release(reservation.file.bytes);
+            st.in_flight = st.in_flight.saturating_sub(1);
+        }
     }
 
     /// Retry saving a held result. Saved, its fallback slot is free.
@@ -1903,6 +1964,48 @@ impl RetainedStore {
     }
 }
 
+/// How often the inventory is written when it changed.
+const INVENTORY_FLUSH_EVERY: Duration = Duration::from_secs(2);
+/// How often the store is swept, and held dispatch results retried.
+const SWEEP_EVERY: Duration = Duration::from_secs(60 * 60);
+
+/// Run the store's upkeep for the daemon's life (plan D14): write the
+/// inventory whenever it changed, every two seconds at most, and sweep the
+/// store and retry the dispatch results held in memory every hour. Every pass
+/// runs on the blocking pool, holding no ranked lock.
+pub fn spawn_maintenance(
+    hub: Arc<crate::inbox_hub::InboxHub>,
+    store: Arc<RetainedStore>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut flush = tokio::time::interval(INVENTORY_FLUSH_EVERY);
+        let mut sweep = tokio::time::interval(SWEEP_EVERY);
+        sweep.tick().await;
+        loop {
+            tokio::select! {
+                _ = flush.tick() => {
+                    let store = Arc::clone(&store);
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if let Err(error) = store.flush_inventory() {
+                            warn!(%error, "retained reports: could not write this run's inventory");
+                        }
+                    })
+                    .await;
+                }
+                _ = sweep.tick() => {
+                    let store = Arc::clone(&store);
+                    let hub = Arc::clone(&hub);
+                    let _ = tokio::task::spawn_blocking(move || {
+                        store.sweep(Now::current());
+                        hub.retry_fallback_bodies(&store);
+                    })
+                    .await;
+                }
+            }
+        }
+    })
+}
+
 fn collect_names(dir: &TrustedDir) -> io::Result<Vec<std::ffi::OsString>> {
     let mut stream = dir.stream()?;
     let mut names = Vec::new();
@@ -1926,6 +2029,7 @@ mod seams {
     #[derive(Default)]
     pub(super) struct Seams {
         pub(super) fail_write: AtomicBool,
+        pub(super) fail_all_writes: AtomicBool,
         pub(super) fail_unlink: AtomicBool,
         /// A persistent errno for every move, 0 for none.
         pub(super) move_errno: AtomicI32,
