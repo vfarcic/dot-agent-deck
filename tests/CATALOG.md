@@ -7956,18 +7956,18 @@ The inbox's pure in-memory data model (`src/inbox.rs`, `src/deck_identity.rs`). 
 - **Does not assert:** the CLI's `--id` option (S2/S11).
 - **Platform coverage:** mac+linux+windows.
 
-##### inbox/core/004 — An unacknowledged fetch is redelivered when its ack-wait passes.
+##### inbox/core/004 — A fetched message has no ack-wait in the store.
 - **Layer:** L1 unit (src/inbox.rs).
 - **Agent:** none.
-- **Asserts:** with the ack-wait set through `DOT_AGENT_DECK_INBOX_ACK_WAIT_MS` (read through an injected lookup), the message stays fetched until its deadline, returns to queued at it, and its next fetch counts a second delivery; `next_deadline` reports the deadline.
-- **Does not assert:** the daemon's timer driving `tick` (S2).
+- **Asserts:** with the ack-wait set through `DOT_AGENT_DECK_INBOX_ACK_WAIT_MS` (read through an injected lookup, which the attempt model uses), a message handed to a receipt receiver gets no store deadline (`next_deadline` is none) and stays fetched far past the ack-wait; positively not handed, it returns to queued with its delivery count kept, and its next hand-out counts a second delivery (PRD #1666 part 3, H5).
+- **Does not assert:** the attempt model's possession and lapse (inbox/attempts/028–033).
 - **Platform coverage:** mac+linux+windows.
 
-##### inbox/core/005 — After `max_deliver` unacknowledged hand-overs a message is undeliverable.
-- **Layer:** L1 unit (src/inbox.rs).
+##### inbox/core/005 — After `max_deliver` hand-outs positively not handed over a message is undeliverable.
+- **Layer:** L1 unit (src/inbox.rs), through the hub's hook receiver.
 - **Agent:** none.
-- **Asserts:** five expired fetches make the message undeliverable for `max_deliver`, the last event says so, and no fetch returns it again.
-- **Does not assert:** the sender's undelivered notice (S5).
+- **Asserts:** five hook hand-outs each reported not handed over make the message undeliverable for `max_deliver` with five deliveries counted, the last broadcast says so, and no further fetch is handed it.
+- **Does not assert:** the sender's undelivered notice (the `inbox_hub` unit tests).
 - **Platform coverage:** mac+linux+windows.
 
 ##### inbox/core/006 — Every bound refuses explicitly and drops nothing.
@@ -7977,18 +7977,18 @@ The inbox's pure in-memory data model (`src/inbox.rs`, `src/deck_identity.rs`). 
 - **Does not assert:** how the refusal reaches the sender over the wire (S2/S5).
 - **Platform coverage:** mac+linux+windows.
 
-##### inbox/core/007 — A fetched message is handed to one consumer until it returns to the queue.
+##### inbox/core/007 — A fetched message is handed to one receiver until it returns to the queue.
 - **Layer:** L1 unit (src/inbox.rs).
 - **Agent:** none.
-- **Asserts:** a second and third consumer get nothing while the message is fetched; a dropped consumer's messages return to queued and are fetched again; a message bound to another agent generation of the pane is not handed over, an unbound one is.
-- **Does not assert:** waiter connections and their EOF handling (S2).
+- **Asserts:** a second and third receiver get nothing while the message is fetched; positively not handed over, it returns to queued and is handed out again; a message bound to another agent generation of the pane is not handed over, an unbound one is.
+- **Does not assert:** receiver connections and their EOF handling (inbox/protocol/007).
 - **Platform coverage:** mac+linux+windows.
 
 ##### inbox/core/008 — Ack outcomes are explicit.
 - **Layer:** L1 unit (src/inbox.rs).
 - **Agent:** none.
-- **Asserts:** another pane's agent and another generation of the same pane get `WrongAgent` with the state unchanged; the owner's ack is `Acknowledged`, a repeat `AlreadyAcknowledged`; an old `d-…` id or an absent id is `Unknown`; a retired message answers `Undeliverable`; fetch-and-ack acknowledges in one step.
-- **Does not assert:** attestation of the acking agent (S2).
+- **Asserts:** another pane's agent and another generation of the same pane get `WrongAgent` with the state unchanged; the owner's ack of a handed-out message is `Acknowledged`, a repeat `AlreadyAcknowledged`; an old `d-…` id or an absent id is `Unknown`; a retired message answers `Undeliverable`.
+- **Does not assert:** attestation of the acking agent (S2), or the hub's `unknown` for a message never handed out (inbox/boundary/071).
 - **Platform coverage:** mac+linux+windows.
 
 ##### inbox/core/009 — An offer goes to exactly one taker.
@@ -7998,10 +7998,10 @@ The inbox's pure in-memory data model (`src/inbox.rs`, `src/deck_identity.rs`). 
 - **Does not assert:** the offerer's notices (S11).
 - **Platform coverage:** mac+linux+windows.
 
-##### inbox/core/010 — An expired or released claim re-offers to someone who has not held it.
+##### inbox/core/010 — An expired, released or not-handed holder never gets the offer again.
 - **Layer:** L1 unit (src/inbox.rs).
 - **Agent:** none.
-- **Asserts:** after a claim expires the offer waits unassigned and goes to the next candidate; after a release it goes to the third; an unacknowledged fetch also excludes its holder; with every candidate excluded it waits unassigned; `offer_candidates` drops excluded holders.
+- **Asserts:** after a claim expires the offer waits unassigned and goes to the next candidate; after a release it goes to the third; a hand-out positively not handed over also excludes its holder; with every candidate excluded it waits unassigned; `offer_candidates` drops excluded holders.
 - **Does not assert:** when the daemon calls `assign_offer` (S11).
 - **Platform coverage:** mac+linux+windows.
 
@@ -8015,7 +8015,7 @@ The inbox's pure in-memory data model (`src/inbox.rs`, `src/deck_identity.rs`). 
 ##### inbox/core/017 — Unfetched offers leave their holder at the undelivered deadline.
 - **Layer:** L1 unit (`tests/inbox_offer_deadlines.rs`), explicit store clock without sleeps.
 - **Agent:** none.
-- **Asserts:** The job stays assigned just before the deadline, returns exactly at undelivered_after, drops the previous holder's count, excludes that holder on reassignment and starts a fresh assignment deadline; fetch and claim replace it with ack wait and claim TTL.
+- **Asserts:** The job stays assigned just before the deadline, returns exactly at undelivered_after, drops the previous holder's count, excludes that holder on reassignment and starts a fresh assignment deadline; a receipt hand-out ends it with no store deadline of its own; a claim installs its TTL, holds just before it and returns the job to its pool at it, both holders excluded.
 - **Does not assert:** Daemon candidate discovery or native delivery.
 - **Platform coverage:** all.
 
@@ -8057,8 +8057,8 @@ The inbox's pure in-memory data model (`src/inbox.rs`, `src/deck_identity.rs`). 
 ##### inbox/core/019 — A late ack after max_deliver is recorded.
 - **Layer:** L1 unit (src/inbox.rs).
 - **Agent:** none.
-- **Asserts:** an ack from the bound agent for a message undeliverable for `max_deliver` answers acknowledged, moves it to acknowledged with one event, and a repeat answers already acknowledged; another agent's ack is refused; a message undeliverable because its agent exited still answers undeliverable; an offer that ran out of hand-overs is not acknowledged.
-- **Does not assert:** the corrections the daemon posts (inbox/route/010 and the `inbox_hub` unit tests).
+- **Asserts:** the store's ack from the bound agent for a message undeliverable for `max_deliver` answers acknowledged, moves it to acknowledged with one event, and a repeat answers already acknowledged; another agent's ack is refused; a message undeliverable because its agent exited still answers undeliverable; an offer that ran out of hand-overs (positively not handed over) is not acknowledged.
+- **Does not assert:** the corrections the daemon posts (`a_commit_after_running_out_of_attempts_corrects_the_sender_and_the_card` and the `inbox_hub` unit tests).
 - **Platform coverage:** mac+linux+windows.
 
 #### inbox/attempts
@@ -8991,11 +8991,11 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 
 #### inbox/boundary
 
-##### inbox/boundary/001 — The legacy ack-wait touches only legacy-owned assignments.
-- **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub served over an in-memory duplex
+##### inbox/boundary/001 — No ack-wait redelivers a receipt hand-out.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub served over an in-memory duplex and its hook receiver.
 - **Agent:** none.
-- **Asserts:** with the ack-wait elapsed, a message `inbox fetch` took is redelivered and a receipt-owned hand-out is not, even with its own ack deadline run out; a receipt receiver never takes the legacy-owned one back.
-- **Does not assert:** a legacy stream, which the deck no longer serves (inbox/boundary/036).
+- **Asserts:** a stream's possessed hand-out stays fetched with one attempt and no store deadline while the ack-wait runs out more than `max_deliver` times over and the clock ticks, and nothing is handed out again; a hook hand-out positively not handed over returns to the queue at once and is handed out again unmarked (PRD #1666 part 3, H5, which removed the legacy ack-wait this pinned against).
+- **Does not assert:** a legacy stream or once wait, which the deck refuses (inbox/boundary/036, /072).
 - **Platform coverage:** all.
 
 ##### inbox/boundary/002 — Returning a reservation removes the attempt's files.
@@ -9166,17 +9166,17 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** a real OpenCode.
 - **Platform coverage:** mac+linux.
 
-##### inbox/boundary/026 — An offer moved from OpenCode to a legacy-fetch worker is not settled by a late receipt.
+##### inbox/boundary/026 — An offer moved from OpenCode to a hook worker is not settled by a late receipt.
 - **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub over an in-memory duplex and a real spool.
 - **Agent:** none.
-- **Asserts:** after the OpenCode worker's positive not-handed witness the job returns to its pool and goes to a Claude worker's hook fetch; a commit receipt the OpenCode watcher publishes later tells the offerer the job also reached its earlier holder, and leaves the Claude copy fetched until its hook acknowledges it.
+- **Asserts:** after the OpenCode worker's positive not-handed witness the job returns to its pool and goes to a Claude worker's `inbox fetch` (a hook receiver); a commit receipt the OpenCode watcher publishes later tells the offerer the job also reached its earlier holder, and leaves the Claude copy fetched until the Claude worker acknowledges it.
 - **Does not assert:** Pi, which is on receipts (inbox/boundary/034).
 - **Platform coverage:** all.
 
-##### inbox/boundary/027 — An offer moved from a legacy-fetch worker to OpenCode is not settled by a late ack.
+##### inbox/boundary/027 — An offer moved from a hook worker to OpenCode is not settled by a late ack.
 - **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub over an in-memory duplex and a real spool.
 - **Agent:** none.
-- **Asserts:** a job a Claude worker's hook fetched, whose ack-wait then ran out, goes to the OpenCode worker's receipt stream; the hook's late acknowledgement claims nothing, the OpenCode copy keeps its one open attempt, and the OpenCode commit claims it.
+- **Asserts:** a job a Claude worker's `inbox fetch` was handed and positively did not hand over goes to the OpenCode worker's receipt stream; the Claude worker's late acknowledgement claims nothing, the OpenCode copy keeps its one open attempt, and the OpenCode commit claims it.
 - **Does not assert:** Pi, which is on receipts (inbox/boundary/035).
 - **Platform coverage:** all.
 

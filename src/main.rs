@@ -314,14 +314,6 @@ enum Commands {
         #[arg(long = "turn-reply-failed")]
         turn_reply_failed: bool,
     },
-    /// Print the seed/prompt the daemon prepared for this pane, then clear it
-    /// (PRD #201). A compatibility alias: the daemon posts a pane's seed as its
-    /// first inbox message (PRD #1666 S5), and this verb takes it from the
-    /// inbox and prints it to stdout (empty output = no seed). A Pi generation
-    /// is refused (PRD #1666 G10); the bundled Pi extension no longer calls it.
-    /// Uses `DOT_AGENT_DECK_PANE_ID` to scope the request, exactly like
-    /// `agent-event`.
-    GetSeed,
     /// Report a question an agent is asking and wait for the deck's answer
     /// (PRD #1631). Run by the deck's OpenCode plugin and Pi extension, not by
     /// hand: prints one line — what the producer should answer the agent with —
@@ -1653,9 +1645,9 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            // `--list-targets` is a READ-ONLY daemon round-trip (the `get-seed`
-            // pattern): the daemon answers from the PANE's cwd and config, which is
-            // the same basis the dispatch itself resolves from. Computing it here
+            // `--list-targets` is a READ-ONLY daemon round-trip: the daemon
+            // answers from the PANE's cwd and config, which is the same basis
+            // the dispatch itself resolves from. Computing it here
             // from the CLI's own `current_dir()` diverged whenever the agent had
             // `cd`'d, and offered targets the dispatch could not start.
             //
@@ -2019,78 +2011,6 @@ fn main() -> ExitCode {
                 check,
                 yes,
             })
-        }
-        Some(Commands::GetSeed) => {
-            let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
-                Ok(id) => id,
-                Err(_) => {
-                    eprintln!(
-                        "Error: DOT_AGENT_DECK_PANE_ID environment variable not set.\nThis command should be run from within a dot-agent-deck managed pane."
-                    );
-                    return ExitCode::FAILURE;
-                }
-            };
-            // Issue #916: present our own registry agent id so the daemon can
-            // scope the take by identity instead of trusting the pane id alone.
-            // Optional for the same reason the `agent-event` verb's is — the
-            // daemon injects it at spawn, and a producer that never got one
-            // sends nothing rather than failing. An older daemon ignores the
-            // field; the take then falls back to the pane's live occupant.
-            //
-            // Round-2 audit (finding 6): the empty string is filtered out, so
-            // "could not say" and "said nothing" are the same case — which is
-            // what `GetSeedRequest::agent_id`'s own doc says `None` means. A
-            // bare `.ok()` yields `Some("")` for a variable that is present but
-            // empty, and on THIS verb the daemon's keyed lookup then finds no
-            // record at all and refuses the pull, costing the agent its opening
-            // task. The sibling verbs that read the same variable are left
-            // alone: their failure mode on an empty value is a different one
-            // (an event that loses its attribution, not a refused request), so
-            // widening this is a separate question rather than the same fix.
-            let agent_id = std::env::var(DOT_AGENT_DECK_AGENT_ID)
-                .ok()
-                .filter(|id| !id.is_empty());
-            // Ask the daemon (over the hook socket) for the seed it prepared
-            // for this pane. READ-ONLY request/response — the one hook-socket
-            // verb that reads a reply. A missing daemon / older daemon that
-            // doesn't answer → `None` → we print nothing and exit 0, so the
-            // extension no-sends and the daemon's PTY-injection safety net
-            // still delivers (graceful cross-version degradation, no
-            // PROTOCOL_VERSION dependency).
-            let req = dot_agent_deck::event::DaemonMessage::GetSeed(
-                dot_agent_deck::event::GetSeedRequest {
-                    pane_id,
-                    agent_id,
-                    token: dot_agent_deck::hook_provenance::token_from_env(),
-                },
-            );
-            let json = match serde_json::to_string(&req) {
-                Ok(j) => j,
-                Err(e) => {
-                    eprintln!("Failed to serialize get-seed request: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            match dot_agent_deck::hook::request_from_socket(&json) {
-                Some(line) if !line.trim().is_empty() => {
-                    match serde_json::from_str::<dot_agent_deck::event::GetSeedResponse>(&line) {
-                        Ok(resp) => {
-                            if let Some(seed) = resp.seed {
-                                // Print the seed verbatim (no trailing newline)
-                                // so the extension captures exactly the prepared
-                                // text. Empty seed → print nothing.
-                                print!("{seed}");
-                            }
-                            ExitCode::SUCCESS
-                        }
-                        // A reply we can't parse is treated as "no seed": print
-                        // nothing, exit 0 — the fallback still covers delivery.
-                        Err(_) => ExitCode::SUCCESS,
-                    }
-                }
-                // No reply (no daemon / older daemon / no seed) → no seed.
-                _ => ExitCode::SUCCESS,
-            }
         }
         Some(Commands::Orchestrator { cmd }) => match cmd {
             // PRD #201 M3.2: thin wrapper — wire real PATH-detection + the real

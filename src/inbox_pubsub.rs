@@ -1131,9 +1131,9 @@ mod tests {
         (Arc::new(tokio::sync::RwLock::new(state)), panes)
     }
 
-    /// Offer a job from `o` and put it back in its pool: the first taker
-    /// fetches it and its ack-wait runs out, so it is now never offered to that
-    /// taker.
+    /// Offer a job from `o` and put it back in its pool: the first taker's
+    /// `inbox fetch` is handed it and positively does not hand it over, so it
+    /// is now never offered to that taker.
     async fn pooled_offer(
         registry: &Arc<AgentPtyRegistry>,
         state: &SharedState,
@@ -1142,12 +1142,10 @@ mod tests {
     ) -> PooledOffer {
         let reply = handle_offer(registry, state, &offer_from(&o.0, &o.1), &o.1).await;
         assert!(reply.refused.is_none(), "{reply:?}");
-        let fetched =
-            registry
-                .inbox()
-                .fetch(&t1.0, &t1.1, crate::inbox::Consumer::FetchCli, None, None);
-        assert_eq!(fetched.len(), 1, "the first taker holds the job");
-        registry.inbox().run_out_ack_wait(&fetched[0].id, &t1.0);
+        let hook = registry.inbox().test_hook_fetch(&t1.0, &t1.1, None);
+        assert_eq!(hook.deliveries.len(), 1, "the first taker holds the job");
+        registry.inbox().test_hook_not_handed(&hook);
+        registry.inbox().test_hook_close(hook);
         let pooled = registry.inbox().pooled_offers();
         assert_eq!(pooled.len(), 1, "the job is back in its pool");
         pooled.into_iter().next().unwrap()

@@ -21087,7 +21087,7 @@ mod tests {
     /// its fetch and its acknowledgement — 1, 1, 1, 0 — and ends delivered.
     #[test]
     fn a_stall_notice_for_a_message_the_summary_counted_counts_nothing() {
-        use crate::inbox::{AckHow, Consumer, Recipient};
+        use crate::inbox::{AckHow, Recipient};
         let hub = crate::inbox_hub::InboxHub::new(
             crate::inbox::DeckId::generate(),
             crate::inbox::InboxLimits::default(),
@@ -21108,12 +21108,13 @@ mod tests {
             "the stall notice for the queued message must not count it again"
         );
 
-        let taken = hub.fetch("pane-q", "agent-q", Consumer::FetchCli, None, None);
-        assert_eq!(taken.len(), 1);
+        let taken = hub.test_hook_fetch("pane-q", "agent-q", None);
+        assert_eq!(taken.deliveries.len(), 1);
         follow_notices(&mut state, &mut rx);
         assert_eq!((card(&state).pending, card(&state).stalled), (1, false));
 
         hub.ack(id.as_str(), "pane-q", "agent-q", AckHow::Explicit);
+        hub.test_hook_close(taken);
         follow_notices(&mut state, &mut rx);
         assert_eq!(card(&state).pending, 0, "no phantom message is left queued");
         assert!(card(&state).delivered);

@@ -1830,9 +1830,70 @@ async fn dispatch_003_the_dispatch_and_startagent_paths_respawn_identically() {
 const ORIGINAL_TASK: &str = "Implement the change. original-task-body-1784";
 const ADDENDUM: &str = "Addendum to your current task: also cover the empty input. addendum-1784";
 
+/// PRD #1666 part 3 (H5): take and settle `agent`'s oldest waiting message in
+/// `pane` the way a model-run `inbox fetch` and its agent's `ack` do: a hook
+/// receiver ([`dot_agent_deck::inbox_hub::serve_hook`]) is handed what waits,
+/// the agent acknowledges the oldest by id, and the receiver reports the rest
+/// not handed over, which puts them back in the queue at once. Answers the
+/// text of the one it settled, or `None` when nothing waits.
+async fn take_acked(
+    hub: &Arc<dot_agent_deck::inbox_hub::InboxHub>,
+    pane: &str,
+    agent: &str,
+) -> Option<String> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let (client, server) = tokio::io::duplex(1 << 16);
+    let (read, write) = tokio::io::split(server);
+    let serve = tokio::spawn(dot_agent_deck::inbox_hub::serve_hook(
+        Arc::clone(hub),
+        pane.to_string(),
+        agent.to_string(),
+        dot_agent_deck::event::InboxComponent::Other,
+        dot_agent_deck::inbox_hub::HookFetch {
+            named: None,
+            budget: None,
+            hook_integration: Some(dot_agent_deck::inbox_hub::HOOK_INTEGRATION),
+            consumer: dot_agent_deck::event::InboxFetchConsumer::Cli,
+        },
+        BufReader::new(read),
+        write,
+    ));
+    let (from, mut to) = tokio::io::split(client);
+    let mut lines = BufReader::new(from).lines();
+    let line = lines.next_line().await.ok().flatten();
+    let mut handed = line
+        .and_then(|line| serde_json::from_str::<dot_agent_deck::event::InboxWaitReply>(&line).ok())
+        .and_then(|reply| reply.messages)
+        .unwrap_or_default()
+        .into_iter();
+    let first = handed.next();
+    if let Some(delivery) = &first {
+        hub.ack(
+            &delivery.id,
+            pane,
+            agent,
+            dot_agent_deck::inbox::AckHow::Explicit,
+        );
+    }
+    let rest: Vec<serde_json::Value> = handed
+        .filter_map(|delivery| {
+            let at = delivery.attempt?;
+            Some(serde_json::json!({"id": delivery.id, "a": at.a, "e": at.e}))
+        })
+        .collect();
+    if !rest.is_empty() {
+        let control = format!("{}\n", serde_json::json!({"not_handed": rest}));
+        let _ = to.write_all(control.as_bytes()).await;
+    }
+    let _ = to.shutdown().await;
+    drop(lines);
+    let _ = serve.await;
+    first.map(|delivery| delivery.text)
+}
+
 /// Issue #1784: take the next task the worker pane holds the way an agent's
-/// component does — fetch and acknowledge it — for whichever agent holds the
-/// pane once a task is waiting for it. Answers that agent and the text it was
+/// component does — fetch and acknowledge it ([`take_acked`]) — for whichever
+/// agent holds the pane once a task is waiting for it. Answers that agent and the text it was
 /// handed.
 async fn take_worker_task(
     registry: &AgentPtyRegistry,
@@ -1841,13 +1902,9 @@ async fn take_worker_task(
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if let Some(agent) = registry.pane_current_agent_id(WORKER_PANE)
-            && let Some(delivery) = registry.inbox().fetch_first_acked(
-                WORKER_PANE,
-                &agent,
-                dot_agent_deck::inbox::AckHow::FetchedByCli,
-            )
+            && let Some(text) = take_acked(registry.inbox(), WORKER_PANE, &agent).await
         {
-            return Some((agent, delivery.text));
+            return Some((agent, text));
         }
         if tokio::time::Instant::now() >= deadline {
             return None;

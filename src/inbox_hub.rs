@@ -7,21 +7,18 @@
 //! registry and nothing else.
 //!
 //! **Waiters.** An `inbox wait` connection registers here as armed for one agent
-//! generation (pane plus agent id). A message for an agent with armed waiters is
-//! handed, together with every other queued message for that agent that fits the
-//! component's budget, to the most recently armed one. A `once` waiter is spent by
-//! that hand-over. A `stream` is a receipt receiver's, served by the receipt
-//! engine (`serve_receipt`); one from any other component is refused.
-//! Waiters hold a slot in their own pool ([`MAX_INBOX_WAITERS`]), never one of
-//! the hook-ingest slots, and past [`MAX_WAITERS_PER_AGENT`] for one agent the
-//! oldest is told it was superseded.
+//! generation (pane plus agent id), as a receipt receiver of the engine: a
+//! `stream` from a receipt component (`serve_receipt`), or Claude Code's `once`
+//! waiter (`serve_once`), which a newer one supersedes; a wait from any other
+//! component is refused before it arms. Waiters hold a slot in their own pool
+//! ([`MAX_INBOX_WAITERS`]), never one of the hook-ingest slots.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
 use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot};
+use tokio::sync::{Notify, Semaphore, broadcast, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 use crate::event::{
@@ -50,22 +47,12 @@ pub const AGENT_FRAMING: &str = "This session runs inside dot-agent-deck, the wo
 /// Live `inbox wait` connections, daemon-wide.
 pub const MAX_INBOX_WAITERS: usize = 512;
 
-/// Live `inbox wait` connections for one agent generation. Claude arms a new
-/// waiter at every `SessionStart` and `Stop`, and `/clear` piles them up; past
-/// this the oldest is superseded.
-pub const MAX_WAITERS_PER_AGENT: usize = 8;
-
 /// How often an idle waiter is sent a keepalive line.
 pub const DEFAULT_KEEPALIVE: Duration = Duration::from_secs(30);
 
 /// PRD #1666 hardening M4: the default for [`InboxHub::write_deadline`]. A
 /// peer that has not taken one line in this long is not reading.
 pub const DEFAULT_WAITER_WRITE_DEADLINE: Duration = Duration::from_secs(10);
-
-/// Hardening M4: how many signals may wait for one waiter's connection task.
-/// A hand-over is queued only while there is room; a waiter whose queue is
-/// full is not reading, and is disarmed rather than handed more.
-const WAITER_SIGNAL_CAPACITY: usize = 4;
 
 /// Overrides [`DEFAULT_KEEPALIVE`], in milliseconds.
 pub const ENV_KEEPALIVE_MS: &str = "DOT_AGENT_DECK_INBOX_KEEPALIVE_MS";
@@ -315,8 +302,6 @@ fn component_name(component: InboxComponent) -> Option<String> {
 /// What a waiter's connection task is told.
 #[derive(Debug)]
 pub enum WaiterSignal {
-    /// Messages to write; they are already `fetched` by this waiter.
-    Deliver(Vec<InboxDelivery>),
     /// A newer waiter for the same agent took this one's place.
     Superseded,
     /// PRD #1666 §4: one line for a receipt stream to write as it is.
@@ -359,17 +344,8 @@ impl ArmError {
     }
 }
 
-/// A registered waiter, handed back to its connection task.
-pub struct ArmedWaiter {
-    pub conn_id: u64,
-    pub rx: mpsc::Receiver<WaiterSignal>,
-    /// Released when the connection task ends.
-    _slot: OwnedSemaphorePermit,
-}
-
 struct Waiter {
     conn_id: u64,
-    mode: InboxWaitMode,
     component: InboxComponent,
     tx: mpsc::Sender<WaiterSignal>,
 }
@@ -916,15 +892,6 @@ impl InboxHub {
     #[cfg(test)]
     pub fn reserved_replies(&self) -> usize {
         self.lock().inbox.reserved_replies()
-    }
-
-    /// TEST: the ack-wait of message `id`, fetched in `pane_id`, runs out and
-    /// the hub ticks: the legacy policy redelivers it, or makes it
-    /// undeliverable at `max_deliver`.
-    #[cfg(test)]
-    pub fn run_out_ack_wait(&self, id: &str, pane_id: &str) {
-        self.lock().inbox.run_out_ack_wait(id, pane_id);
-        self.tick();
     }
 
     /// [`Inbox::admit_reserved_reply`]: the refusal posting `content` under a
@@ -1630,82 +1597,11 @@ impl InboxHub {
         }
     }
 
-    /// Register a waiter for `agent_id` in `pane_id`. Supersedes the oldest
-    /// waiter past [`MAX_WAITERS_PER_AGENT`], then hands over anything already
-    /// queued.
-    ///
-    /// [`serve_waiter`] arms only once-waiters here: it hands a stream from a
-    /// receipt component to the receipt engine and refuses one from any other
-    /// component before it arms.
-    ///
-    /// Audit F3: the first instance to arm or announce is the generation's
-    /// receiver from then on, whatever is armed at the moment
-    /// ([`HubState::admit_receiver`]).
-    pub fn arm(
-        &self,
-        pane_id: &str,
-        agent_id: &str,
-        mode: InboxWaitMode,
-        component: InboxComponent,
-        instance: Option<u32>,
-    ) -> Result<ArmedWaiter, ArmError> {
-        let slot = Arc::clone(&self.waiter_slots)
-            .try_acquire_owned()
-            .map_err(|_| ArmError::NoSlots)?;
-        let (tx, rx) = mpsc::channel(WAITER_SIGNAL_CAPACITY);
-        let conn_id = {
-            let mut st = self.lock();
-            let key = (pane_id.to_string(), agent_id.to_string());
-            st.admit_receiver(&key, instance)?;
-            let conn_id = st.next_conn;
-            st.next_conn += 1;
-            let list = st.waiters.entry(key).or_default();
-            while list.len() >= MAX_WAITERS_PER_AGENT {
-                let oldest = list.remove(0);
-                debug!(
-                    conn_id = oldest.conn_id,
-                    "inbox: superseding the oldest waiter past the per-agent cap"
-                );
-                let _ = oldest.tx.try_send(WaiterSignal::Superseded);
-            }
-            list.push(Waiter {
-                conn_id,
-                mode,
-                component,
-                tx,
-            });
-            conn_id
-        };
-        debug!(conn_id, ?mode, ?component, "inbox: waiter armed");
-        self.dispatch_agent(pane_id, agent_id);
-        Ok(ArmedWaiter {
-            conn_id,
-            rx,
-            _slot: slot,
-        })
-    }
-
     /// PRD #1666 hardening M3: `pane_id` was closed — no record or
     /// reservation names it any more — so its acknowledged and undeliverable
     /// history goes. Live messages stay (they end through the agent's exit).
     pub fn forget_pane_history(&self, pane_id: &str) {
         self.lock().inbox.forget_pane_history(pane_id);
-    }
-
-    /// Remove waiter `conn_id`, if it is still registered.
-    pub fn disarm(&self, pane_id: &str, agent_id: &str, conn_id: u64) -> bool {
-        let mut st = self.lock();
-        let key = (pane_id.to_string(), agent_id.to_string());
-        let Some(list) = st.waiters.get_mut(&key) else {
-            return false;
-        };
-        let before = list.len();
-        list.retain(|w| w.conn_id != conn_id);
-        let removed = list.len() != before;
-        if list.is_empty() {
-            st.waiters.remove(&key);
-        }
-        removed
     }
 
     /// Live waiters armed for `agent_id` in `pane_id`.
@@ -1971,106 +1867,6 @@ impl InboxHub {
         }
     }
 
-    /// Hand `agent_id` its queued messages, rendered, up to `max_chars`; with
-    /// `ack`, acknowledge them in the same step.
-    pub fn fetch(
-        &self,
-        pane_id: &str,
-        agent_id: &str,
-        consumer: Consumer,
-        max_chars: Option<usize>,
-        ack: Option<AckHow>,
-    ) -> Vec<InboxDelivery> {
-        self.fetch_within(
-            pane_id,
-            agent_id,
-            consumer,
-            max_chars.map(InboxBudget::Chars),
-            ack,
-        )
-    }
-
-    /// [`Self::fetch`] within a budget in either unit ([`fitting`] says what
-    /// counts against it).
-    pub fn fetch_within(
-        &self,
-        pane_id: &str,
-        agent_id: &str,
-        consumer: Consumer,
-        budget: Option<InboxBudget>,
-        ack: Option<AckHow>,
-    ) -> Vec<InboxDelivery> {
-        self.fetch_named_within(pane_id, agent_id, consumer, budget, ack, None)
-    }
-
-    /// [`Self::fetch_within`] for a fetch a doorbell started: with `named`,
-    /// nothing is fetched unless message `named` is still queued for the
-    /// agent, decided under the same lock as the fetch, so a doorbell whose
-    /// message another consumer took never pulls newer mail into its turn.
-    pub fn fetch_named_within(
-        &self,
-        pane_id: &str,
-        agent_id: &str,
-        consumer: Consumer,
-        budget: Option<InboxBudget>,
-        ack: Option<AckHow>,
-        named: Option<&str>,
-    ) -> Vec<InboxDelivery> {
-        let deliveries = {
-            let mut st = self.lock();
-            let now = Instant::now();
-            if let Some(id) = named
-                && !queued_for(&st.inbox, pane_id, agent_id).any(|m| m.id.as_str() == id)
-            {
-                return Vec::new();
-            }
-            let count = fitting(&st.inbox, pane_id, agent_id, budget);
-            if count == 0 {
-                return Vec::new();
-            }
-            let fetched = match ack {
-                Some(how) => {
-                    st.inbox
-                        .fetch_acked(now, pane_id, agent_id, consumer, how, Some(count))
-                }
-                None => st
-                    .inbox
-                    .fetch(now, pane_id, agent_id, consumer, Some(count)),
-            };
-            drain_events(&mut st);
-            fetched.iter().map(|m| render_within(m, budget)).collect()
-        };
-        self.changed.notify_one();
-        self.post_owed_notices();
-        deliveries
-    }
-
-    /// PRD #1666 S5: hand `agent_id` its oldest queued message, rendered whole,
-    /// and acknowledge it in the same step — the `get-seed` alias.
-    pub fn fetch_first_acked(
-        &self,
-        pane_id: &str,
-        agent_id: &str,
-        how: AckHow,
-    ) -> Option<InboxDelivery> {
-        let delivery = {
-            let mut st = self.lock();
-            let fetched = st.inbox.fetch_acked(
-                Instant::now(),
-                pane_id,
-                agent_id,
-                Consumer::FetchCli,
-                how,
-                Some(1),
-            );
-            drain_events(&mut st);
-            fetched.first().map(|m| render(m, None))
-        };
-        self.changed.notify_one();
-        self.post_owed_notices();
-        delivery
-    }
-
     /// Acknowledge message `id` for `agent_id` in `pane_id`.
     pub fn ack(&self, id: &str, pane_id: &str, agent_id: &str, how: AckHow) -> AckOutcome {
         let outcome = {
@@ -2127,22 +1923,6 @@ impl InboxHub {
         self.changed.notify_one();
         self.post_owed_notices();
         outcome
-    }
-
-    /// A consumer whose connection ended before it handed its messages over:
-    /// they are queued again for the agent's other waiters.
-    pub fn requeue_consumer(&self, pane_id: &str, agent_id: &str, consumer: &Consumer) -> usize {
-        let count = {
-            let mut st = self.lock();
-            let count = st.inbox.requeue_consumer(Instant::now(), consumer);
-            drain_events(&mut st);
-            count
-        };
-        self.post_owed_notices();
-        if count > 0 {
-            self.dispatch_agent(pane_id, agent_id);
-        }
-        count
     }
 
     /// Every message the inbox holds, live and recent history, across panes.
@@ -2461,94 +2241,30 @@ impl InboxHub {
         }
     }
 
-    /// Hand `agent_id`'s queued messages to its most recently armed waiter.
+    /// Hand `agent_id`'s waiting messages to its receipt receivers: the
+    /// receipt engine decides which receiver takes what. A generation with no
+    /// receipt receiver is handed nothing here (its doorbell, or a fetch of
+    /// its own, takes its mail).
     fn dispatch_agent(&self, pane_id: &str, agent_id: &str) {
         if self.pause_waiter_delivery {
             return;
         }
         let mut st = self.lock();
         let key = (pane_id.to_string(), agent_id.to_string());
-        // PRD #1666 §13 step 4: a generation with a receipt receiver is
-        // handed its mail by the receipt engine; the legacy waiters below never
-        // see it.
-        if st.receipts.gens.contains_key(&key) {
-            let mut out = engine::Outbox::new();
-            engine::dispatch(&mut st, &key, Instant::now(), &mut out);
-            drop(st);
-            engine::flush(out);
-            // A batch just staged has a staging deadline, which the ticker
-            // must know before the spool work below can stall (U1, R2-fix3).
-            self.changed.notify_one();
-            // Releasing a batch can reclaim what it held back, whose files
-            // go with the rest of the spool work.
-            self.spool_work();
-            self.changed.notify_one();
+        if !st.receipts.gens.contains_key(&key) {
             return;
         }
-        loop {
-            let Some(waiter) = st.waiters.get(&key).and_then(|list| list.last()) else {
-                return;
-            };
-            let (conn_id, mode, budget) = (
-                waiter.conn_id,
-                waiter.mode,
-                waiter.component.inline_budget(),
-            );
-            // Hardening M4: a waiter whose connection has not taken what it
-            // was already handed is not reading; it is disarmed, and gets
-            // nothing more. Its connection task ends on its write deadline and
-            // puts back what it holds.
-            if waiter.tx.capacity() == 0 {
-                warn!(conn_id, "inbox: disarming a waiter that is not reading");
-                if let Some(list) = st.waiters.get_mut(&key) {
-                    list.retain(|w| w.conn_id != conn_id);
-                    if list.is_empty() {
-                        st.waiters.remove(&key);
-                    }
-                }
-                continue;
-            }
-            let count = fitting(&st.inbox, pane_id, agent_id, Some(budget));
-            if count == 0 {
-                return;
-            }
-            let consumer = match mode {
-                InboxWaitMode::Once => Consumer::Waiter { conn_id },
-                InboxWaitMode::Stream => Consumer::Stream { conn_id },
-            };
-            let now = Instant::now();
-            let fetched = st
-                .inbox
-                .fetch(now, pane_id, agent_id, consumer.clone(), Some(count));
-            drain_events(&mut st);
-            let batch: Vec<InboxDelivery> = fetched
-                .iter()
-                .map(|m| render_within(m, Some(budget)))
-                .collect();
-            let list = st.waiters.get_mut(&key).expect("waiter list checked above");
-            let tx = list.last().expect("waiter checked above").tx.clone();
-            if mode == InboxWaitMode::Once {
-                // Spent: a once waiter carries exactly one hand-over.
-                list.pop();
-                if list.is_empty() {
-                    st.waiters.remove(&key);
-                }
-            }
-            if tx.try_send(WaiterSignal::Deliver(batch)).is_ok() {
-                self.changed.notify_one();
-                return;
-            }
-            // The connection task is gone: forget it, put its batch back, and
-            // try the next waiter.
-            if let Some(list) = st.waiters.get_mut(&key) {
-                list.retain(|w| w.conn_id != conn_id);
-                if list.is_empty() {
-                    st.waiters.remove(&key);
-                }
-            }
-            st.inbox.requeue_consumer(now, &consumer);
-            drain_events(&mut st);
-        }
+        let mut out = engine::Outbox::new();
+        engine::dispatch(&mut st, &key, Instant::now(), &mut out);
+        drop(st);
+        engine::flush(out);
+        // A batch just staged has a staging deadline, which the ticker must
+        // know before the spool work below can stall (U1, R2-fix3).
+        self.changed.notify_one();
+        // Releasing a batch can reclaim what it held back, whose files go
+        // with the rest of the spool work.
+        self.spool_work();
+        self.changed.notify_one();
     }
 }
 
@@ -3425,7 +3141,6 @@ async fn serve_receipt<R, W, P>(
                 list.retain(|w| w.component != component);
                 list.push(Waiter {
                     conn_id,
-                    mode: InboxWaitMode::Stream,
                     component,
                     tx: tx.clone(),
                 });
@@ -3483,11 +3198,6 @@ async fn serve_receipt<R, W, P>(
                 Some(WaiterSignal::Line(reply)) => {
                     if write_line_within(deadline, &mut writer, &*reply).await.is_err() {
                         debug!(conn_id, "inbox: a receipt stream stopped reading");
-                        break;
-                    }
-                }
-                Some(WaiterSignal::Deliver(batch)) => {
-                    if write_line_within(deadline, &mut writer, &InboxWaitReply::messages(batch)).await.is_err() {
                         break;
                     }
                 }
@@ -3585,7 +3295,6 @@ async fn serve_once<R, W>(
                 );
                 st.waiters.entry(key.clone()).or_default().push(Waiter {
                     conn_id,
-                    mode: InboxWaitMode::Once,
                     component,
                     tx: tx.clone(),
                 });
@@ -3665,8 +3374,6 @@ async fn serve_once<R, W>(
                     break;
                 }
                 Some(WaiterSignal::Close) | None => break,
-                // Only a legacy waiter is handed a batch this way.
-                Some(WaiterSignal::Deliver(_)) => {}
             },
             line = lines.recv() => match line {
                 Some(line) => match serde_json::from_str::<InboxStreamControl>(&line) {
@@ -3882,7 +3589,7 @@ pub async fn serve_hook<R, W>(
                         }
                     }
                     Some(WaiterSignal::Superseded | WaiterSignal::Close) | None => break,
-                    Some(WaiterSignal::Once(_) | WaiterSignal::Deliver(_)) => {}
+                    Some(WaiterSignal::Once(_)) => {}
                 },
                 line = lines.recv() => match line {
                     Some(line) => match serde_json::from_str::<InboxStreamControl>(&line) {
@@ -3949,6 +3656,171 @@ where
     })
     .await;
     crate::inbox_oneshot::classify_frame(bytes, Some(accepted), matches!(wrote, Ok(Ok(()))))
+}
+
+/// TEST: a hook receiver of its own fetch (a model-run `inbox fetch`) that
+/// [`InboxHub::test_hook_fetch`] registered and issued, as [`serve_hook`]
+/// does, with no connection: it holds what it was issued while it stays
+/// open (its hold), until [`InboxHub::test_hook_close`].
+#[cfg(test)]
+pub(crate) struct TestHook {
+    pub key: AgentKey,
+    pub rx: crate::inbox_attempts::Rx,
+    pub conn_id: u64,
+    /// What it was issued, each block naming its attempt.
+    pub deliveries: Vec<InboxDelivery>,
+    _signals: mpsc::Receiver<WaiterSignal>,
+}
+
+#[cfg(test)]
+impl TestHook {
+    /// The attempts it was issued.
+    pub fn attempts(&self) -> Vec<crate::event::InboxAttemptRef> {
+        self.deliveries
+            .iter()
+            .filter_map(|delivery| {
+                let at = delivery.attempt.as_ref()?;
+                Some(crate::event::InboxAttemptRef {
+                    id: delivery.id.clone(),
+                    a: at.a,
+                    e: at.e,
+                })
+            })
+            .collect()
+    }
+
+    /// The ids it was issued.
+    pub fn ids(&self) -> Vec<String> {
+        self.deliveries.iter().map(|d| d.id.clone()).collect()
+    }
+}
+
+#[cfg(test)]
+impl InboxHub {
+    /// TEST: register a hook receiver for `agent_id` in `pane_id` and issue it
+    /// what waits for it within `budget`, as [`serve_hook`] does for a
+    /// model-run `inbox fetch` (PRD #1666 part 3). The fixture that replaced
+    /// the legacy fetch in these tests (H5).
+    pub(crate) fn test_hook_fetch(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        budget: Option<InboxBudget>,
+    ) -> TestHook {
+        self.test_hook_fetch_named(pane_id, agent_id, None, budget)
+    }
+
+    /// TEST: [`Self::test_hook_fetch`] for a doorbell that named `named`:
+    /// nothing is issued unless that message still waits.
+    pub(crate) fn test_hook_fetch_named(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        named: Option<&str>,
+        budget: Option<InboxBudget>,
+    ) -> TestHook {
+        let key = (pane_id.to_string(), agent_id.to_string());
+        let spool = self.generation_spool(pane_id, agent_id);
+        let (tx, signals) = mpsc::channel(engine::RECEIPT_SIGNAL_CAPACITY);
+        let (conn_id, rx, deliveries, out) = {
+            let mut st = self.lock();
+            let conn_id = st.next_conn;
+            st.next_conn += 1;
+            let now = Instant::now();
+            let mut out = engine::Outbox::new();
+            let first = engine::register(
+                &mut st,
+                &key,
+                InboxComponent::Other,
+                engine::Registrant::Cli,
+                false,
+                false,
+                conn_id,
+                tx,
+                spool,
+                now,
+            );
+            let rx = crate::inbox_attempts::Rx(
+                first
+                    .as_ref()
+                    .and_then(|first| first.registered.as_ref())
+                    .map_or(0, |r| r.rx),
+            );
+            let deliveries = engine::hook_fetch(
+                &mut st,
+                &key,
+                rx,
+                Consumer::FetchCli,
+                named,
+                budget,
+                now,
+                &mut out,
+            );
+            (conn_id, rx, deliveries, out)
+        };
+        engine::flush(out);
+        self.after_receipts();
+        self.post_owed_notices();
+        TestHook {
+            key,
+            rx,
+            conn_id,
+            deliveries,
+            _signals: signals,
+        }
+    }
+
+    /// TEST: `hook` positively did not hand what it was issued to its agent
+    /// (it printed nothing).
+    pub(crate) fn test_hook_not_handed(&self, hook: &TestHook) {
+        self.receipt_control(
+            &hook.key,
+            hook.rx,
+            &InboxStreamControl {
+                not_handed: hook.attempts(),
+                ..InboxStreamControl::default()
+            },
+        );
+        self.post_owed_notices();
+    }
+
+    /// TEST: `hook`'s agent started on what it was issued of `ids` (its
+    /// `committed` control).
+    pub(crate) fn test_hook_committed(&self, hook: &TestHook, ids: &[&str]) {
+        self.receipt_control(
+            &hook.key,
+            hook.rx,
+            &InboxStreamControl {
+                committed: hook
+                    .attempts()
+                    .into_iter()
+                    .filter(|at| ids.contains(&at.id.as_str()))
+                    .collect(),
+                ..InboxStreamControl::default()
+            },
+        );
+        self.post_owed_notices();
+    }
+
+    /// TEST: `hook`'s connection ends.
+    pub(crate) fn test_hook_close(&self, hook: TestHook) {
+        self.receipt_closed(&hook.key, hook.rx, hook.conn_id);
+        self.post_owed_notices();
+    }
+
+    /// TEST: what waits for `agent_id` in `pane_id`, taken by a hook receiver
+    /// and acknowledged by the agent (`ack <id>`), as a model-run `inbox
+    /// fetch` followed by its agent's explicit ack settles it. Answers what
+    /// it was issued.
+    pub(crate) fn test_take_acked(&self, pane_id: &str, agent_id: &str) -> Vec<InboxDelivery> {
+        let hook = self.test_hook_fetch(pane_id, agent_id, None);
+        for id in hook.ids() {
+            self.ack(&id, pane_id, agent_id, AckHow::Explicit);
+        }
+        let deliveries = hook.deliveries.clone();
+        self.test_hook_close(hook);
+        deliveries
+    }
 }
 
 impl InboxHub {
@@ -4027,31 +3899,6 @@ fn queued_for<'a>(
                 .as_ref()
                 .is_some_and(|r| r.admits(pane_id, agent_id))
     })
-}
-
-/// How many of `agent_id`'s queued messages fit `budget`, in the order a fetch
-/// takes them, and never more than [`crate::inbox_prompt::MAX_IDS`]. Each
-/// block is counted with the [`BLOCK_SEPARATOR`] ahead of it, so a caller that
-/// heads the blocks with framing asks for its budget less the framing and
-/// stays within the whole. At least one when any is queued: a single message
-/// too big for the budget is rendered with its head only.
-fn fitting(inbox: &Inbox, pane_id: &str, agent_id: &str, budget: Option<InboxBudget>) -> usize {
-    let queued = queued_for(inbox, pane_id, agent_id);
-    let Some(budget) = budget else {
-        return queued.count();
-    };
-    let mut used = 0usize;
-    let mut count = 0usize;
-    for message in queued.take(crate::inbox_prompt::MAX_IDS) {
-        let len = budget.measure(&render_within(message, Some(budget)).text)
-            + budget.measure(BLOCK_SEPARATOR);
-        if count > 0 && used + len > budget.limit() {
-            break;
-        }
-        used += len;
-        count += 1;
-    }
-    count
 }
 
 /// How many watched tasks to `pane_id` are still live: those a newer
@@ -5442,8 +5289,9 @@ pub fn render_marked(
 /// the hook-ingest pool, until the waiter is spent, superseded or its peer goes
 /// away.
 ///
-/// A stream is served by the receipt engine; one from a component the receipt
-/// policy does not cover is refused `unsupported`.
+/// A stream from a receipt component, and Claude Code's once waiter, are
+/// served by the receipt engine at their floors; any other wait is refused
+/// before it arms.
 ///
 /// `repaint` is called with the agent id when the stream asks for a repaint
 /// (PRD #1666 S8) — only from an [`InboxComponent::OpenCodeMini`] stream; the
@@ -5511,136 +5359,35 @@ pub async fn serve_waiter<R, W, P>(
         .await;
         return;
     }
-    // PRD #1666 §13 step 4, §11: a component the receipt policy covers is
-    // served by the receipt engine, at the floor or above; below it nothing
-    // registers and its card says the integration is out of date.
-    if receipt_component(component) {
-        if mode == InboxWaitMode::Stream
-            && arm
-                .adapter_integration
-                .is_some_and(|declared| declared >= ADAPTER_INTEGRATION)
-        {
-            serve_receipt(
-                hub, pane_id, agent_id, component, instance, arm, reader, writer, repaint,
-            )
-            .await;
-            return;
-        }
-        hub.refuse_old_adapter(&pane_id, &agent_id);
-        warn!(
-            pane_id = %pane_id,
-            ?component,
-            declared = ?arm.adapter_integration,
-            "inbox: refused a component whose integration is out of date"
-        );
-        let _ = write_line_within(
-            deadline,
-            &mut writer,
-            &InboxWaitReply::refused("adapter_too_old", crate::inbox_display::ADAPTER_TOO_OLD),
+    // PRD #1666 §13 step 4, §11: every other component is a receipt stream's,
+    // served by the receipt engine at the floor or above; below it nothing
+    // registers and its card says the integration is out of date. Only a
+    // receipt receiver streams, and nothing waits once but Claude Code's
+    // waiter above (part 3, H5 removed the legacy waiter).
+    if mode == InboxWaitMode::Stream
+        && arm
+            .adapter_integration
+            .is_some_and(|declared| declared >= ADAPTER_INTEGRATION)
+    {
+        serve_receipt(
+            hub, pane_id, agent_id, component, instance, arm, reader, writer, repaint,
         )
         .await;
         return;
     }
-    // PRD #1666 step 4: only a receipt receiver streams. A legacy stream's
-    // ack/nack/hold loop went with the last component that used it (Pi's old
-    // extension, refused above), so a stream from any other component is
-    // refused before it arms and its mail stays queued.
-    if mode == InboxWaitMode::Stream {
-        warn!(pane_id = %pane_id, ?component, "inbox: refused a stream from a component that cannot stream");
-        let _ = write_line_within(
-            deadline,
-            &mut writer,
-            &InboxWaitReply::refused("unsupported", crate::inbox_display::STREAM_UNSUPPORTED),
-        )
-        .await;
-        return;
-    }
-    let armed = match hub.arm(&pane_id, &agent_id, mode, component, instance) {
-        Ok(armed) => armed,
-        Err(error) => {
-            let _ = write_line_within(
-                deadline,
-                &mut writer,
-                &InboxWaitReply::refused(error.code(), &error.message()),
-            )
-            .await;
-            return;
-        }
-    };
-    let ArmedWaiter {
-        conn_id, mut rx, ..
-    } = armed;
-    let consumer = match mode {
-        InboxWaitMode::Once => Consumer::Waiter { conn_id },
-        InboxWaitMode::Stream => Consumer::Stream { conn_id },
-    };
-    // Lines from the peer, read on their own task so the select below never
-    // drops a half-read line. Ends (closing the channel) at EOF or an error.
-    let (line_tx, mut lines) = mpsc::channel::<String>(16);
-    let read_task = tokio::spawn(async move {
-        let mut reader = reader;
-        while let Ok(Some(line)) = crate::bounded_read::read_capped_line(
-            &mut reader,
-            crate::bounded_read::MAX_HOOK_LINE_BYTES,
-        )
-        .await
-        {
-            if line_tx.send(line).await.is_err() {
-                break;
-            }
-        }
-    });
-    let mut keepalive = tokio::time::interval(hub.keepalive());
-    keepalive.tick().await;
-    // Whether a Once waiter's hand-over reached its peer: only then is its
-    // batch the peer's to acknowledge rather than the queue's to take back.
-    let mut handed_over = false;
-    loop {
-        tokio::select! {
-            signal = rx.recv() => match signal {
-                Some(WaiterSignal::Deliver(batch)) => {
-                    let ids: Vec<String> = batch.iter().map(|d| d.id.clone()).collect();
-                    if write_line_within(deadline, &mut writer, &InboxWaitReply::messages(batch)).await.is_err() {
-                        debug!(conn_id, "inbox: waiter vanished or stopped reading before its hand-over");
-                        break;
-                    }
-                    info!(conn_id, ?ids, "inbox: messages handed to a waiter");
-                    if mode == InboxWaitMode::Once {
-                        handed_over = true;
-                        break;
-                    }
-                }
-                Some(WaiterSignal::Superseded) => {
-                    let _ = write_line_within(deadline, &mut writer, &InboxWaitReply::superseded()).await;
-                    break;
-                }
-                // Only a receipt receiver is sent these.
-                Some(WaiterSignal::Line(_) | WaiterSignal::Once(_)) => {}
-                Some(WaiterSignal::Close) | None => break,
-            },
-            line = lines.recv() => match line {
-                // A once waiter has nothing to say after its request.
-                Some(_) => {}
-                None => {
-                    debug!(conn_id, "inbox: waiter closed its connection");
-                    break;
-                }
-            },
-            _ = keepalive.tick() => {
-                if write_line_within(deadline, &mut writer, &InboxWaitReply::keepalive()).await.is_err() {
-                    debug!(conn_id, "inbox: keepalive failed; waiter is gone or not reading");
-                    break;
-                }
-            }
-        }
-    }
-    read_task.abort();
-    hub.disarm(&pane_id, &agent_id, conn_id);
-    if !handed_over {
-        // A once batch that never reached its peer goes back to the queue.
-        hub.requeue_consumer(&pane_id, &agent_id, &consumer);
-    }
-    let _ = tokio::time::timeout(deadline, writer.shutdown()).await;
+    hub.refuse_old_adapter(&pane_id, &agent_id);
+    warn!(
+        pane_id = %pane_id,
+        ?component,
+        declared = ?arm.adapter_integration,
+        "inbox: refused a component whose integration is out of date"
+    );
+    let _ = write_line_within(
+        deadline,
+        &mut writer,
+        &InboxWaitReply::refused("adapter_too_old", crate::inbox_display::ADAPTER_TOO_OLD),
+    )
+    .await;
 }
 
 /// [`write_line`], bounded by `deadline` (hardening M4): a peer that does not
@@ -5702,6 +5449,90 @@ mod tests {
         InboxHub::new(deck(), InboxLimits::default(), DEFAULT_KEEPALIVE)
     }
 
+    /// What `agent` in `pane` would be handed for each waiting message,
+    /// rendered as a fetch renders it within `budget`, without taking it: for
+    /// tests of the rendering alone.
+    fn rendered(
+        hub: &InboxHub,
+        pane: &str,
+        agent: &str,
+        budget: Option<InboxBudget>,
+    ) -> Vec<InboxDelivery> {
+        let st = hub.lock();
+        queued_for(&st.inbox, pane, agent)
+            .map(|message| render_within(message, budget))
+            .collect()
+    }
+
+    /// Claude Code's once waiter on receipts, over an in-memory connection
+    /// ([`serve_waiter`] at the one-shot integration).
+    struct OnceWaiter {
+        lines: tokio::io::Lines<tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+        to: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        serve: tokio::task::JoinHandle<()>,
+    }
+
+    impl OnceWaiter {
+        /// Arm one for `agent` in `pane`, run by process `instance`; answers
+        /// it and its first line (`registered`, or a refusal).
+        async fn open(
+            hub: &Arc<InboxHub>,
+            pane: &str,
+            agent: &str,
+            instance: Option<u32>,
+        ) -> (OnceWaiter, InboxWaitReply) {
+            use tokio::io::AsyncBufReadExt;
+            let (client, server) = tokio::io::duplex(1 << 16);
+            let (read, write) = tokio::io::split(server);
+            let serve = tokio::spawn(serve_waiter(
+                Arc::clone(hub),
+                pane.to_string(),
+                agent.to_string(),
+                InboxWaitMode::Once,
+                InboxComponent::ClaudeWaiter,
+                instance,
+                ReceiptArm {
+                    hook_integration: Some(HOOK_INTEGRATION),
+                    ..ReceiptArm::default()
+                },
+                tokio::io::BufReader::new(read),
+                write,
+                |_: &str| {},
+            ));
+            let (from, to) = tokio::io::split(client);
+            let mut waiter = OnceWaiter {
+                lines: tokio::io::BufReader::new(from).lines(),
+                to,
+                serve,
+            };
+            let first = waiter.next().await.expect("the deck answers the wait");
+            (waiter, first)
+        }
+
+        /// The next line that is not a keepalive; `None` once the deck ended
+        /// the connection.
+        async fn next(&mut self) -> Option<InboxWaitReply> {
+            loop {
+                let line = tokio::time::timeout(Duration::from_secs(5), self.lines.next_line())
+                    .await
+                    .expect("the deck writes in time")
+                    .ok()
+                    .flatten()?;
+                let reply: InboxWaitReply = serde_json::from_str(&line).unwrap();
+                if !reply.keepalive {
+                    return Some(reply);
+                }
+            }
+        }
+
+        async fn close(mut self) {
+            use tokio::io::AsyncWriteExt;
+            let _ = self.to.shutdown().await;
+            drop(self.lines);
+            let _ = tokio::time::timeout(Duration::from_secs(5), self.serve).await;
+        }
+    }
+
     /// Audit F3 (a): the first process to arm or announce for an agent
     /// generation is its native receiver for the rest of that generation.
     /// Any other instance is refused — between arms as much as while a waiter
@@ -5710,7 +5541,7 @@ mod tests {
     /// the generation.
     #[tokio::test]
     async fn the_first_receiver_instance_is_pinned_for_the_generation() {
-        let hub = hub();
+        let hub = Arc::new(hub());
         hub.announce(
             "p",
             "a",
@@ -5719,26 +5550,10 @@ mod tests {
             Some(100),
         )
         .unwrap();
-        let once = |instance| {
-            hub.arm(
-                "p",
-                "a",
-                InboxWaitMode::Once,
-                InboxComponent::ClaudeWaiter,
-                instance,
-            )
-            .err()
-        };
-        let again = |instance| {
-            hub.arm(
-                "p",
-                "a",
-                InboxWaitMode::Once,
-                InboxComponent::ClaudeWaiter,
-                instance,
-            )
-        };
-        assert_eq!(once(Some(200)), Some(ArmError::OtherInstance));
+        let refused = ArmError::OtherInstance.code();
+        let (gone, first) = OnceWaiter::open(&hub, "p", "a", Some(200)).await;
+        assert_eq!(first.refused.as_deref(), Some(refused));
+        gone.close().await;
         assert_eq!(
             hub.announce(
                 "p",
@@ -5754,27 +5569,29 @@ mod tests {
             Some(InboxWake::TurnEnd),
             "a refused announcement must not change how the pane is woken"
         );
-        let first = again(Some(100)).expect("the pinned instance arms");
-        let second = again(Some(100)).expect("and arms again");
-        assert!(again(Some(200)).is_err());
-        hub.disarm("p", "a", first.conn_id);
-        hub.disarm("p", "a", second.conn_id);
+        let (first, armed) = OnceWaiter::open(&hub, "p", "a", Some(100)).await;
+        assert!(armed.registered.is_some(), "the pinned instance arms");
+        let (second, armed) = OnceWaiter::open(&hub, "p", "a", Some(100)).await;
+        assert!(armed.registered.is_some(), "and arms again");
+        let (gone, other) = OnceWaiter::open(&hub, "p", "a", Some(200)).await;
+        assert_eq!(other.refused.as_deref(), Some(refused));
+        gone.close().await;
+        first.close().await;
+        second.close().await;
         assert_eq!(hub.armed("p", "a"), 0);
-        assert_eq!(again(Some(200)).err(), Some(ArmError::OtherInstance));
-        assert_eq!(again(None).err(), Some(ArmError::OtherInstance));
+        for instance in [Some(200), None] {
+            let (gone, other) = OnceWaiter::open(&hub, "p", "a", instance).await;
+            assert_eq!(other.refused.as_deref(), Some(refused), "{instance:?}");
+            gone.close().await;
+        }
 
         hub.agent_exited("p", "a");
+        let (successor, armed) = OnceWaiter::open(&hub, "p", "b", Some(200)).await;
         assert!(
-            hub.arm(
-                "p",
-                "b",
-                InboxWaitMode::Once,
-                InboxComponent::ClaudeWaiter,
-                Some(200)
-            )
-            .is_ok(),
+            armed.registered.is_some(),
             "a successor generation pins its own receiver"
         );
+        successor.close().await;
     }
 
     /// PR #1735 second review: a reserved answer's room is the deck's last
@@ -5815,9 +5632,9 @@ mod tests {
         ));
     }
 
-    /// PRD #1666 §2.8: a message handed over the most times allowed, none
-    /// acknowledged, owes its recipient's card a notice through the installed
-    /// sink — once, with the fixed not-delivered text.
+    /// PRD #1666 §2.8: a message handed out the most times allowed, each
+    /// positively not handed over, owes its recipient's card a notice through
+    /// the installed sink — once, with the fixed not-delivered text.
     #[test]
     fn an_undeliverable_message_tells_its_recipients_card() {
         let limits = InboxLimits {
@@ -5837,10 +5654,12 @@ mod tests {
             .post_direct(Recipient::bound("p", "a"), content("task"))
             .unwrap()
             .to_string();
-        hub.fetch("p", "a", Consumer::FetchCli, None, None);
+        let hook = hub.test_hook_fetch("p", "a", None);
         assert!(told.lock().unwrap().is_empty(), "a fetch owes no notice");
-        // Unacknowledged after its one allowed hand-over: undeliverable.
-        hub.run_out_ack_wait(&id, "p");
+        // Positively not handed over on its one allowed hand-over:
+        // undeliverable.
+        hub.test_hook_not_handed(&hook);
+        hub.test_hook_close(hook);
         assert_eq!(
             *told.lock().unwrap(),
             [format!(
@@ -5923,8 +5742,9 @@ mod tests {
             .unwrap();
         hub.post_direct(Recipient::bound("p", "b"), content("other generation"))
             .unwrap();
-        let taken = hub.fetch("p", "a", Consumer::FetchCli, Some(1), None);
-        assert_eq!(taken.len(), 1);
+        let hub = Arc::new(hub);
+        let taken = hub.test_hook_fetch("p", "a", Some(InboxBudget::Chars(1)));
+        assert_eq!(taken.deliveries.len(), 1);
         let s = hub.summary("p", "a");
         assert_eq!((s.queued, s.fetched, s.undeliverable), (1, 1, 0));
         assert_eq!(s.wake, WakePath::Doorbell);
@@ -5932,9 +5752,10 @@ mod tests {
         assert_eq!(s.last_acked_at, None);
 
         assert_eq!(
-            hub.ack(&taken[0].id, "p", "a", AckHow::Explicit),
+            hub.ack(&taken.deliveries[0].id, "p", "a", AckHow::Explicit),
             AckOutcome::Acknowledged
         );
+        hub.test_hook_close(taken);
         assert!(hub.summary("p", "a").last_acked_at.is_some());
 
         // A Native announcement with nothing armed is still the doorbell.
@@ -5959,22 +5780,15 @@ mod tests {
         assert_eq!(s.wake, WakePath::TurnEnd);
         assert_eq!(s.component.as_deref(), Some("codex_hooks"));
 
-        // An armed waiter wins over any announcement, and names itself. A
-        // once-waiter is spent by a hand-over, so nothing is left queued for it.
-        hub.fetch("p", "a", Consumer::FetchCli, None, None);
-        let waiter = hub
-            .arm(
-                "p",
-                "a",
-                InboxWaitMode::Once,
-                InboxComponent::ClaudeWaiter,
-                None,
-            )
-            .unwrap();
+        // An armed waiter wins over any announcement, and names itself.
+        let rest = hub.test_hook_fetch("p", "a", None);
+        hub.test_hook_close(rest);
+        let (waiter, armed) = OnceWaiter::open(&hub, "p", "a", None).await;
+        assert!(armed.registered.is_some());
         let s = hub.summary("p", "a");
         assert_eq!(s.wake, WakePath::Native);
         assert_eq!(s.component.as_deref(), Some("claude_waiter"));
-        assert!(hub.disarm("p", "a", waiter.conn_id));
+        waiter.close().await;
         assert_eq!(hub.summary("p", "a").wake, WakePath::TurnEnd);
 
         // The other generation's message is its own.
@@ -5988,11 +5802,17 @@ mod tests {
     fn every_state_change_is_broadcast_and_an_exit_is_undeliverable() {
         use crate::inbox::{StateName, UndeliverableReason};
         let hub = hub();
-        let (tx, mut rx) = broadcast::channel(16);
+        let (tx, mut rx) = broadcast::channel(64);
         hub.set_broadcast(tx);
-        let mut next = || match rx.try_recv() {
-            Ok(BroadcastMsg::Inbox(notice)) => notice,
-            other => panic!("expected an inbox broadcast, got {other:?}"),
+        let mut next = || loop {
+            match rx.try_recv() {
+                // A receiver's registration repaints the card's notices.
+                Ok(BroadcastMsg::Inbox(notice))
+                    if notice.attention_update || notice.wake_update => {}
+                Ok(BroadcastMsg::Inbox(notice)) => break notice,
+                Ok(_) => continue,
+                other => panic!("expected an inbox broadcast, got {other:?}"),
+            }
         };
         let id = hub
             .post_direct(Recipient::bound("p", "a"), content("hello"))
@@ -6008,9 +5828,10 @@ mod tests {
             "dot-agent-deck (the prompt this session was started with)"
         );
         assert_eq!(posted.state, StateName::Queued);
-        hub.fetch("p", "a", Consumer::FetchCli, None, None);
+        let hook = hub.test_hook_fetch("p", "a", None);
         assert_eq!(next().state, StateName::Fetched);
-        hub.run_out_ack_wait(&id, "p");
+        hub.test_hook_not_handed(&hook);
+        hub.test_hook_close(hook);
         assert_eq!(next().state, StateName::Queued);
 
         let other = hub
@@ -6022,10 +5843,18 @@ mod tests {
         assert_eq!(lost.message_id, id);
         assert_eq!(lost.state, StateName::Undeliverable);
         assert_eq!(lost.reason, Some(UndeliverableReason::AgentExited));
-        assert!(matches!(
-            rx.try_recv(),
-            Err(broadcast::error::TryRecvError::Empty)
-        ));
+        loop {
+            match rx.try_recv() {
+                Ok(BroadcastMsg::Inbox(notice))
+                    if notice.attention_update || notice.wake_update => {}
+                Ok(BroadcastMsg::Inbox(notice)) => panic!("one exit, one change: {notice:?}"),
+                Ok(_) => continue,
+                Err(error) => {
+                    assert_eq!(error, broadcast::error::TryRecvError::Empty);
+                    break;
+                }
+            }
+        }
         let kept = hub.list("p");
         assert!(
             kept.iter()
@@ -6039,18 +5868,22 @@ mod tests {
     #[test]
     fn a_hand_back_is_broadcast_as_one() {
         let hub = hub();
-        let (tx, mut rx) = broadcast::channel(16);
+        let (tx, mut rx) = broadcast::channel(64);
         hub.set_broadcast(tx);
-        let mut next = || match rx.try_recv() {
-            Ok(BroadcastMsg::Inbox(notice)) => (notice.state, notice.requeued),
-            other => panic!("expected an inbox broadcast, got {other:?}"),
+        let mut next = || loop {
+            match rx.try_recv() {
+                Ok(BroadcastMsg::Inbox(notice))
+                    if notice.attention_update || notice.wake_update => {}
+                Ok(BroadcastMsg::Inbox(notice)) => break (notice.state, notice.requeued),
+                Ok(_) => continue,
+                other => panic!("expected an inbox broadcast, got {other:?}"),
+            }
         };
-        let id = hub
-            .post_direct(Recipient::bound("p", "a"), content("hello"))
-            .unwrap()
-            .to_string();
-        hub.fetch("p", "a", Consumer::FetchCli, None, None);
-        hub.run_out_ack_wait(&id, "p");
+        hub.post_direct(Recipient::bound("p", "a"), content("hello"))
+            .unwrap();
+        let hook = hub.test_hook_fetch("p", "a", None);
+        hub.test_hook_not_handed(&hook);
+        hub.test_hook_close(hook);
         use crate::inbox::StateName::{Fetched, Queued};
         assert_eq!(
             [next(), next(), next()],
@@ -6058,80 +5891,82 @@ mod tests {
         );
     }
 
+    /// PRD #1666 part 2 (C-2), part 3 (H5): a newer once waiter supersedes
+    /// the older at once, takes the batch, each block naming its attempt, and
+    /// the older is told and gets none; spent by its batch, the newer leaves
+    /// none armed.
     #[tokio::test]
     async fn newest_once_waiter_takes_the_batch_and_is_spent() {
-        let hub = hub();
-        let mut older = hub
-            .arm(
-                "p",
-                "a",
-                InboxWaitMode::Once,
-                InboxComponent::ClaudeWaiter,
-                None,
-            )
-            .unwrap();
-        let mut newer = hub
-            .arm(
-                "p",
-                "a",
-                InboxWaitMode::Once,
-                InboxComponent::ClaudeWaiter,
-                None,
-            )
-            .unwrap();
+        let hub = Arc::new(hub());
+        let (mut older, armed) = OnceWaiter::open(&hub, "p", "a", None).await;
+        assert!(armed.registered.is_some());
+        let (mut newer, armed) = OnceWaiter::open(&hub, "p", "a", None).await;
+        assert!(armed.registered.is_some());
+        assert!(older.next().await.is_some_and(|reply| reply.superseded));
         let id = hub
             .post_direct(Recipient::bound("p", "a"), content("hello"))
             .unwrap();
-        match newer.rx.try_recv() {
-            Ok(WaiterSignal::Deliver(batch)) => {
-                assert_eq!(batch.len(), 1);
-                assert!(batch[0].text.contains(&format!("{BLOCK_OPENER}{id} from ")));
-                assert!(batch[0].text.contains("hello"));
-            }
-            other => panic!("newest waiter must get the batch: {other:?}"),
-        }
-        assert!(older.rx.try_recv().is_err());
-        assert_eq!(hub.armed("p", "a"), 1);
+        let batch = newer.next().await.and_then(|reply| reply.messages);
+        let batch = batch.expect("the newest waiter gets the batch");
+        assert_eq!(batch.len(), 1);
+        let at = batch[0].attempt.as_ref().expect("a receipt hand-out");
+        assert!(batch[0].text.contains(&format!(
+            "{BLOCK_OPENER}{id} delivery {}.{} from ",
+            at.a, at.e
+        )));
+        assert!(batch[0].text.contains("hello"));
+        assert!(older.next().await.is_none(), "the superseded one ends");
+        assert_eq!(
+            hub.armed("p", "a"),
+            0,
+            "the older was superseded and the newer is spent by its batch"
+        );
+        older.close().await;
+        newer.close().await;
     }
 
-    /// PR #1735 fifth review (N1): Claude's prompt hook acknowledges the ids
-    /// whose openers the prompt carries, so one hand-over must never carry
-    /// more blocks than that hook reads. Seventeen short messages fit a once
-    /// waiter's character budget easily; the waiter's batch, as `inbox wait`
-    /// joins it for Claude, must be recognised id for id, and what did not fit
-    /// stays queued for the next hand-over.
+    /// PR #1735 fifth review (N1), part 2 §1.3: Claude's prompt hook commits
+    /// the exact attempts whose openers the prompt carries, so one hand-over
+    /// must never carry more blocks than that hook reads. Seventeen short
+    /// messages fit a once waiter's character budget easily; the waiter's
+    /// batch, as `inbox wait` joins it for Claude, must be recognised attempt
+    /// for attempt, and what did not fit stays queued for the next hand-over.
     #[tokio::test]
-    async fn a_once_waiters_batch_is_every_id_its_prompt_hook_acknowledges() {
-        let hub = hub();
+    async fn a_once_waiters_batch_is_every_attempt_its_prompt_hook_commits() {
+        let hub = Arc::new(hub());
         for n in 0..17 {
             hub.post_direct(Recipient::bound("p", "a"), content(&format!("note {n}")))
                 .unwrap();
         }
-        let mut waiter = hub
-            .arm(
-                "p",
-                "a",
-                InboxWaitMode::Once,
-                InboxComponent::ClaudeWaiter,
-                None,
-            )
-            .unwrap();
-        let batch = match waiter.rx.try_recv() {
-            Ok(WaiterSignal::Deliver(batch)) => batch,
-            other => panic!("the waiter must get a batch: {other:?}"),
-        };
+        let (mut waiter, armed) = OnceWaiter::open(&hub, "p", "a", None).await;
+        assert!(armed.registered.is_some());
+        let batch = waiter
+            .next()
+            .await
+            .and_then(|reply| reply.messages)
+            .expect("the waiter must get a batch");
         let prompt = batch
             .iter()
             .map(|delivery| delivery.text.as_str())
             .collect::<Vec<_>>()
             .join(BLOCK_SEPARATOR);
-        let handed: Vec<String> = batch.iter().map(|d| d.id.clone()).collect();
+        let handed: Vec<(String, u32, u32)> = batch
+            .iter()
+            .map(|d| {
+                let at = d.attempt.as_ref().unwrap();
+                (d.id.clone(), at.a, at.e)
+            })
+            .collect();
+        let scanned: Vec<(String, u32, u32)> = crate::inbox_prompt::delivered(&prompt)
+            .into_iter()
+            .map(|at| (at.id, at.a, at.e))
+            .collect();
         assert_eq!(
-            crate::inbox_prompt::scan(&prompt).opened,
-            handed,
-            "every id one hand-over carries is one the prompt hook acknowledges"
+            scanned, handed,
+            "every attempt one hand-over carries is one the prompt hook commits"
         );
         assert_eq!(hub.summary("p", "a").queued, 17 - handed.len());
+        waiter.close().await;
     }
 
     /// A registry with one stand-in agent (`cat`) in `pane`, run in `cwd`.
@@ -6227,7 +6062,7 @@ mod tests {
         assert!(!hub.summary("p", "a").wake_stalled);
         hub.set_wake_stalled("p", "a", true);
         while rx.try_recv().is_ok() {}
-        let taken = hub.fetch("p", "a", Consumer::FetchCli, None, Some(AckHow::Explicit));
+        let taken = hub.test_take_acked("p", "a");
         assert!(!taken.is_empty());
         assert!(
             !hub.summary("p", "a").wake_stalled,
@@ -6484,7 +6319,7 @@ mod tests {
             .push((to.clone(), "owed subject", "owed body".to_string()));
         hub.post_owed_notices();
         assert_eq!(hub.summary("o", "x").queued, 1, "the inbox is full");
-        let taken = hub.fetch("o", "x", Consumer::FetchCli, None, Some(AckHow::Explicit));
+        let taken = hub.test_take_acked("o", "x");
         assert_eq!(taken.len(), 1);
         hub.post_owed_notices();
         let owed: Vec<_> = hub
@@ -6499,37 +6334,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn past_the_cap_the_oldest_is_superseded() {
-        let hub = hub();
-        let mut waiters: Vec<ArmedWaiter> = (0..MAX_WAITERS_PER_AGENT)
-            .map(|_| {
-                hub.arm(
-                    "p",
-                    "a",
-                    InboxWaitMode::Once,
-                    InboxComponent::ClaudeWaiter,
-                    None,
-                )
-                .unwrap()
-            })
-            .collect();
-        let _newest = hub
-            .arm(
-                "p",
-                "a",
-                InboxWaitMode::Once,
-                InboxComponent::ClaudeWaiter,
-                None,
-            )
-            .unwrap();
-        assert!(matches!(
-            waiters[0].rx.try_recv(),
-            Ok(WaiterSignal::Superseded)
-        ));
-        assert_eq!(hub.armed("p", "a"), MAX_WAITERS_PER_AGENT);
-    }
-
     /// PR #1735 review: a fetch a doorbell started takes nothing once the
     /// message that doorbell named is no longer queued — another consumer took
     /// it — even while newer mail waits; while it is queued, the fetch takes
@@ -6540,30 +6344,17 @@ mod tests {
         let named = hub
             .post_direct(Recipient::bound("p", "a"), content("named"))
             .unwrap();
-        let taken = hub.fetch("p", "a", Consumer::FetchCli, None, Some(AckHow::Explicit));
+        let taken = hub.test_take_acked("p", "a");
         assert_eq!(taken.len(), 1);
         let newer = hub
             .post_direct(Recipient::bound("p", "a"), content("newer"))
             .unwrap();
-        let stale = hub.fetch_named_within(
-            "p",
-            "a",
-            Consumer::DoorbellHook,
-            None,
-            None,
-            Some(named.as_str()),
-        );
-        assert!(stale.is_empty(), "{stale:?}");
-        let current = hub.fetch_named_within(
-            "p",
-            "a",
-            Consumer::DoorbellHook,
-            None,
-            None,
-            Some(newer.as_str()),
-        );
-        assert_eq!(current.len(), 1);
-        assert_eq!(current[0].id, newer.to_string());
+        let stale = hub.test_hook_fetch_named("p", "a", Some(named.as_str()), None);
+        assert!(stale.deliveries.is_empty(), "{:?}", stale.deliveries);
+        hub.test_hook_close(stale);
+        let current = hub.test_hook_fetch_named("p", "a", Some(newer.as_str()), None);
+        assert_eq!(current.ids(), vec![newer.to_string()]);
+        hub.test_hook_close(current);
     }
 
     /// PR #1735 review: a waiter whose agent exited is told it was superseded,
@@ -6615,7 +6406,7 @@ mod tests {
             orchestration: None,
         };
         let id = hub.post_direct(Recipient::bound("p", "a"), c).unwrap();
-        let out = hub.fetch("p", "a", Consumer::FetchCli, None, None);
+        let out = rendered(&hub, "p", "a", None);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].text.matches(BLOCK_CLOSER).count(), 1);
         assert!(out[0].text.ends_with(&format!("{BLOCK_CLOSER}{id}]")));
@@ -6642,7 +6433,7 @@ mod tests {
         };
         c.preface = Some("Sent by: the user.".to_string());
         let id = hub.post_direct(Recipient::bound("p", "a"), c).unwrap();
-        let text = &hub.fetch("p", "a", Consumer::FetchCli, None, None)[0].text;
+        let text = &rendered(&hub, "p", "a", None)[0].text;
         let lines: Vec<&str> = text.lines().collect();
         assert!(lines[0].starts_with(&format!("{BLOCK_OPENER}{id} from ")));
         assert_eq!(
@@ -6724,7 +6515,7 @@ mod tests {
         for (c, expected) in cases {
             let hub = hub();
             hub.post_direct(Recipient::bound("p", "a"), c).unwrap();
-            let text = &hub.fetch("p", "a", Consumer::FetchCli, None, None)[0].text;
+            let text = &rendered(&hub, "p", "a", None)[0].text;
             assert_eq!(text.lines().nth(1), Some(expected), "{text}");
         }
     }
@@ -6735,7 +6526,7 @@ mod tests {
         let mut c = content(&"x".repeat(20_000));
         c.spill_path = Some(std::path::PathBuf::from(".dot-agent-deck/task.md"));
         hub.post_direct(Recipient::bound("p", "a"), c).unwrap();
-        let out = hub.fetch("p", "a", Consumer::FetchCli, Some(9_000), None);
+        let out = rendered(&hub, "p", "a", Some(InboxBudget::Chars(9_000)));
         assert_eq!(out.len(), 1);
         assert!(out[0].text.chars().count() < 9_000);
         assert!(
@@ -6871,7 +6662,7 @@ mod tests {
         assert_eq!(hub.owned_spills(), vec![path.clone()]);
         hub.tick();
         assert!(path.exists(), "a live message keeps its file");
-        let taken = hub.fetch("w", "wa", Consumer::FetchCli, None, Some(AckHow::Explicit));
+        let taken = hub.test_take_acked("w", "wa");
         assert_eq!(taken.len(), 1);
         hub.tick();
         assert!(path.exists(), "an acknowledgement alone removes nothing");
@@ -6905,7 +6696,7 @@ mod tests {
             .unwrap()
             .set_modified(std::time::SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60))
             .unwrap();
-        let taken = before.fetch("w", "wa", Consumer::FetchCli, None, Some(AckHow::Explicit));
+        let taken = before.test_take_acked("w", "wa");
         assert_eq!(taken.len(), 1);
         before.tick();
         drop(before);
@@ -6970,7 +6761,7 @@ mod tests {
         let (c, spill) = saved_long(&hub, dir.path(), "TASK");
         let task_path = spill.path().unwrap().to_path_buf();
         let (_task, _end) = delegate_saved(&hub, &worker, c, spill);
-        let taken = hub.fetch("w", "wa", Consumer::FetchCli, None, Some(AckHow::Explicit));
+        let taken = hub.test_take_acked("w", "wa");
         assert_eq!(taken.len(), 1, "the worker acknowledged its task");
 
         // Other agents' long reports settle, well past the byte bound and
@@ -6987,7 +6778,7 @@ mod tests {
             let id = hub.post_direct(Recipient::bound("o", "oa"), c).unwrap();
             hub.own_spill(spill, &id);
         }
-        hub.fetch("o", "oa", Consumer::FetchCli, None, Some(AckHow::Explicit));
+        hub.test_take_acked("o", "oa");
         hub.tick();
         assert!(
             task_path.exists(),
@@ -7014,7 +6805,7 @@ mod tests {
         let (c, spill) = saved_long(&hub, dir.path(), "TASK");
         let path = spill.path().unwrap().to_path_buf();
         let (_task, _end) = delegate_saved(&hub, &worker, c, spill);
-        hub.fetch("w", "wa", Consumer::FetchCli, None, Some(AckHow::Explicit));
+        hub.test_take_acked("w", "wa");
         hub.tick();
         assert!(path.exists(), "held while the worker works");
         hub.agent_exited("w", "another-agent");
@@ -7142,7 +6933,7 @@ mod tests {
         let path = spill.path().unwrap().to_path_buf();
         let id = hub.post_direct(Recipient::bound("w", "wa"), c).unwrap();
         hub.own_spill(spill, &id);
-        hub.fetch("w", "wa", Consumer::FetchCli, None, Some(AckHow::Explicit));
+        hub.test_take_acked("w", "wa");
         hub.lock().spills.retention = Duration::ZERO;
         let context = path.parent().unwrap().to_path_buf();
         let mode = |m| std::fs::set_permissions(&context, std::fs::Permissions::from_mode(m));
@@ -7172,7 +6963,7 @@ mod tests {
         let path = spill.path().unwrap().to_path_buf();
         let id = hub.post_direct(Recipient::bound("w", "wa"), c).unwrap();
         hub.own_spill(spill, &id);
-        hub.fetch("w", "wa", Consumer::FetchCli, None, Some(AckHow::Explicit));
+        hub.test_take_acked("w", "wa");
         hub.lock().spills.retention = Duration::ZERO;
         let context = path.parent().unwrap().to_path_buf();
         let mode = |m| std::fs::set_permissions(&context, std::fs::Permissions::from_mode(m));
@@ -7202,7 +6993,7 @@ mod tests {
         let path = spill.path().unwrap().to_path_buf();
         let id = hub.post_direct(Recipient::bound("w", "wa"), c).unwrap();
         hub.own_spill(spill, &id);
-        hub.fetch("w", "wa", Consumer::FetchCli, None, Some(AckHow::Explicit));
+        hub.test_take_acked("w", "wa");
         hub.tick();
         assert!(path.exists(), "within its grace, the bound spares it");
         assert_eq!(hub.owned_spills(), vec![path]);
@@ -7246,7 +7037,7 @@ mod tests {
             matches!(refused, Err(PostError::InboxFull { .. })),
             "{refused:?}"
         );
-        hub.fetch("w", "a", Consumer::FetchCli, None, Some(AckHow::Explicit));
+        hub.test_take_acked("w", "a");
         assert!(
             hub.post_direct(worker, content("after they settled"))
                 .is_ok(),
@@ -7284,13 +7075,7 @@ mod tests {
         let report_path = spill.path().unwrap().to_path_buf();
         let report = hub.post_direct(Recipient::bound("w2", "wa2"), c).unwrap();
         hub.own_spill(spill, &report);
-        hub.fetch(
-            "w2",
-            "wa2",
-            Consumer::FetchCli,
-            None,
-            Some(AckHow::Explicit),
-        );
+        hub.test_take_acked("w2", "wa2");
         hub.lock().spills.retention = Duration::from_secs(3600);
         hub.tick();
         hub.forget_pane_history("w2");
@@ -7425,10 +7210,7 @@ mod tests {
     fn render_one(c: Content, budget: Option<InboxBudget>) -> (MessageId, String) {
         let hub = hub();
         let id = hub.post_direct(Recipient::bound("p", "a"), c).unwrap();
-        let text = hub
-            .fetch_within("p", "a", Consumer::FetchCli, budget, None)
-            .remove(0)
-            .text;
+        let text = rendered(&hub, "p", "a", budget).remove(0).text;
         (id, text)
     }
 
@@ -7525,8 +7307,8 @@ mod tests {
         }
     }
 
-    /// Hardening M6: several blocks rendered for one budget, counted by
-    /// `fitting`, still fit together.
+    /// Hardening M6: several blocks a hook receiver is handed within one
+    /// budget, each counted with its separator, still fit together.
     #[test]
     fn several_truncated_blocks_fit_their_budget_together() {
         let hub = hub();
@@ -7538,7 +7320,9 @@ mod tests {
             .unwrap();
         }
         let budget = InboxBudget::Bytes(6_000);
-        let out = hub.fetch_within("p", "a", Consumer::FetchCli, Some(budget), None);
+        let hook = hub.test_hook_fetch("p", "a", Some(budget));
+        let out = hook.deliveries.clone();
+        hub.test_hook_close(hook);
         let joined: String = out
             .iter()
             .map(|d| format!("{BLOCK_SEPARATOR}{}", d.text))
@@ -7625,13 +7409,7 @@ mod tests {
         let mut hub = hub();
         hub.undelivered_after = Duration::ZERO;
         let first = delegate(&hub, "OLDER-TASK");
-        let fetched = hub.fetch(
-            "w",
-            "wa",
-            Consumer::FetchCli,
-            None,
-            Some(AckHow::FetchedByCli),
-        );
+        let fetched = hub.test_take_acked("w", "wa");
         assert_eq!(fetched.len(), 1);
         assert_eq!(state_in(&hub, "w", &first), StateName::Acknowledged);
         let second = delegate(&hub, "NEWER-TASK-STILL-OWED");
@@ -7646,17 +7424,17 @@ mod tests {
             .filter(|m| m.subject == UNDELIVERED_SUBJECT)
             .collect();
         assert_eq!(notices.len(), 1, "{notices:?}");
-        let body = hub
-            .fetch("o", "oa", Consumer::FetchCli, None, None)
+        let body = rendered(&hub, "o", "oa", None)
             .into_iter()
             .map(|d| d.text)
             .collect::<String>();
         assert!(body.contains(second.as_str()), "{body}");
         assert!(body.contains("has not reached the worker"), "{body}");
 
-        let taken = hub.fetch("w", "wa", Consumer::FetchCli, None, None);
-        assert_eq!(taken.len(), 1);
-        assert!(taken[0].text.contains("NEWER-TASK-STILL-OWED"));
+        let taken = hub.test_hook_fetch("w", "wa", None);
+        assert_eq!(taken.deliveries.len(), 1);
+        assert!(taken.deliveries[0].text.contains("NEWER-TASK-STILL-OWED"));
+        hub.test_hook_close(taken);
     }
 
     /// delegate_023: a task whose worker left after the dispatch last saw it
@@ -7702,13 +7480,7 @@ mod tests {
         // After a work-done answered an acknowledged task, the next one with
         // nothing acknowledged in between is back to retiring everything.
         let first = delegate(&hub, "ACKNOWLEDGED");
-        hub.fetch(
-            "w",
-            "wa",
-            Consumer::FetchCli,
-            None,
-            Some(AckHow::FetchedByCli),
-        );
+        hub.test_take_acked("w", "wa");
         let second = delegate(&hub, "QUEUED");
         assert_eq!(hub.retire_answered_delegates_to("w"), 0);
         assert_eq!(state_in(&hub, "w", &first), StateName::Acknowledged);
@@ -7718,15 +7490,12 @@ mod tests {
 
     /// PRD #1666 delegate_021, the companion: after an acknowledged task, a
     /// task the worker fetched and has not acknowledged is retired by its
-    /// `work-done` as superseded — fetched once and handed back to the queue by
-    /// the ack-wait counts too — and no undelivered notice is posted about it.
+    /// `work-done` as superseded — whether the receiver it was handed to is
+    /// still open or has gone with nothing confirmed — and no undelivered
+    /// notice is posted about it.
     #[tokio::test]
     async fn work_done_retires_a_fetched_unacknowledged_delegate_silently() {
-        let limits = InboxLimits {
-            ack_wait: Duration::ZERO,
-            ..InboxLimits::default()
-        };
-        let mut hub = InboxHub::new(deck(), limits, DEFAULT_KEEPALIVE);
+        let mut hub = hub();
         hub.undelivered_after = Duration::from_secs(3600);
         // Each worker acknowledged an earlier task, so a work-done may be its
         // answer and retires only what reached the worker since.
@@ -7740,39 +7509,29 @@ mod tests {
                 &|| true,
             )
             .unwrap();
-            hub.fetch(
-                pane,
-                agent,
-                Consumer::FetchCli,
-                None,
-                Some(AckHow::FetchedByCli),
-            );
+            hub.test_take_acked(pane, agent);
         }
         let fetched = delegate(&hub, "FETCHED-TASK");
-        assert_eq!(
-            hub.fetch("w", "wa", Consumer::FetchCli, None, None).len(),
-            1
-        );
+        let held = hub.test_hook_fetch("w", "wa", None);
+        assert_eq!(held.deliveries.len(), 1);
         assert_eq!(state_in(&hub, "w", &fetched), StateName::Fetched);
-        // A second worker's task is fetched and then handed back by the
-        // ack-wait: it reached the worker all the same.
+        // A second worker's task is fetched by a receiver that then goes,
+        // confirming nothing: it may have reached the worker all the same.
         let other = hub
             .post_delegate(
                 Recipient::bound("w2", "wa2"),
                 "coder",
                 Some(Recipient::bound("o", "oa")),
                 DelegateLedger::default(),
-                content("REDELIVERED-TASK"),
+                content("UNCONFIRMED-TASK"),
                 &|| true,
             )
             .unwrap()
             .0;
-        assert_eq!(
-            hub.fetch("w2", "wa2", Consumer::FetchCli, None, None).len(),
-            1
-        );
-        hub.tick();
-        assert_eq!(state_in(&hub, "w2", &other), StateName::Queued);
+        let gone = hub.test_hook_fetch("w2", "wa2", None);
+        assert_eq!(gone.deliveries.len(), 1);
+        hub.test_hook_close(gone);
+        assert_eq!(state_in(&hub, "w2", &other), StateName::Fetched);
 
         assert_eq!(hub.retire_answered_delegates_to("w"), 1);
         assert_eq!(hub.retire_answered_delegates_to("w2"), 1);
@@ -7784,13 +7543,15 @@ mod tests {
             hub.list("o").is_empty(),
             "a task the worker answered is not reported"
         );
+        hub.test_hook_close(held);
     }
 
     /// PRD #1666 long-turn delivery: a delegated task its orchestrator was told
-    /// has not reached the worker, then acknowledged by the worker before the
-    /// deck stops trying, gets one correction naming it. The card was never
-    /// told, so it is not cleared. A task told both "has not reached" and
-    /// "undeliverable" before its late ack is still corrected once.
+    /// has not reached the worker — still queued — and then taken and
+    /// acknowledged by the worker gets one correction naming it. The card was
+    /// never told, so it is not cleared. A task told both "has not reached"
+    /// and "undeliverable" (its one hand-out positively not handed over) before
+    /// its agent's late commit is still corrected once.
     #[tokio::test]
     async fn an_ack_after_the_not_reached_notice_corrects_the_orchestrator_once() {
         let limits = InboxLimits {
@@ -7814,10 +7575,6 @@ mod tests {
         };
 
         let task = delegate(&hub, "TASK-NOT-REACHED");
-        assert_eq!(
-            hub.fetch("w", "wa", Consumer::FetchCli, None, None).len(),
-            1
-        );
         hub.tick();
         let notices = hub.list_with_bodies(Some("o"));
         assert_eq!(notices.len(), 1, "told it has not reached: {notices:?}");
@@ -7828,10 +7585,13 @@ mod tests {
                 .unwrap_or_default()
                 .contains("has not reached the worker")
         );
+        let hook = hub.test_hook_fetch("w", "wa", None);
+        assert_eq!(hook.ids(), vec![task.to_string()]);
         assert_eq!(
-            hub.ack(task.as_str(), "w", "wa", AckHow::ExtensionConfirmed),
+            hub.ack(task.as_str(), "w", "wa", AckHow::Explicit),
             AckOutcome::Acknowledged
         );
+        hub.test_hook_close(hook);
         let notices = hub.list_with_bodies(Some("o"));
         assert_eq!(notices.len(), 2, "one correction: {notices:?}");
         let correction = notices.last().unwrap();
@@ -7851,16 +7611,15 @@ mod tests {
         hub.tick();
         assert_eq!(corrections(&hub), 1);
 
-        // Told both, then acknowledged late: still one correction.
+        // Told both, then committed late: still one correction.
         let task = delegate(&hub, "TASK-TOLD-TWICE");
-        hub.fetch("w", "wa", Consumer::FetchCli, None, None);
         hub.tick();
-        hub.run_out_ack_wait(task.as_str(), "w");
+        let hook = hub.test_hook_fetch("w", "wa", None);
+        hub.test_hook_not_handed(&hook);
         assert_eq!(state_in(&hub, "w", &task), StateName::Undeliverable);
-        assert_eq!(
-            hub.ack(task.as_str(), "w", "wa", AckHow::ExtensionConfirmed),
-            AckOutcome::Acknowledged
-        );
+        hub.test_hook_committed(&hook, &[task.as_str()]);
+        hub.test_hook_close(hook);
+        assert_eq!(state_in(&hub, "w", &task), StateName::Acknowledged);
         hub.tick();
         assert_eq!(corrections(&hub), 2, "one more correction, for this task");
     }
@@ -7878,11 +7637,12 @@ mod tests {
     const CHECK_FIRST: &str =
         "Check the worker's pane before you re-delegate or reassign it, or notify the user.";
 
-    /// PRD #1666 part 2: a task that ran out of hand-overs was handed to the
-    /// worker each time, so its notice says the worker may have it and its
+    /// PRD #1666 part 2: a task that ran out of hand-overs was handed out
+    /// each time, and a commit can still contradict a hand-out reported not
+    /// handed over, so its notice says the worker may have it and its
     /// work-done can still arrive, and tells the orchestrator to check the pane
-    /// first. It promises no later correction: the record a late ack would
-    /// need can be evicted before the ack arrives.
+    /// first. It promises no later correction: the record a late commit would
+    /// need can be evicted before it arrives.
     #[tokio::test]
     async fn a_task_out_of_hand_overs_may_still_be_with_the_worker() {
         let limits = InboxLimits {
@@ -7891,11 +7651,10 @@ mod tests {
         };
         let hub = InboxHub::new(deck(), limits, DEFAULT_KEEPALIVE);
         let task = delegate(&hub, "TASK-OUT-OF-HAND-OVERS");
-        assert_eq!(
-            hub.fetch("w", "wa", Consumer::FetchCli, None, None).len(),
-            1
-        );
-        hub.run_out_ack_wait(task.as_str(), "w");
+        let hook = hub.test_hook_fetch("w", "wa", None);
+        assert_eq!(hook.deliveries.len(), 1);
+        hub.test_hook_not_handed(&hook);
+        hub.test_hook_close(hook);
         assert_eq!(state_in(&hub, "w", &task), StateName::Undeliverable);
         let told = undeliverable_bodies(&hub);
         assert_eq!(told.len(), 1, "{told:?}");
@@ -7923,11 +7682,10 @@ mod tests {
     async fn a_task_whose_worker_exited_may_have_reached_it() {
         let hub = hub();
         let task = delegate(&hub, "TASK-WORKER-EXITED");
-        assert_eq!(
-            hub.fetch("w", "wa", Consumer::FetchCli, None, None).len(),
-            1
-        );
+        let hook = hub.test_hook_fetch("w", "wa", None);
+        assert_eq!(hook.deliveries.len(), 1);
         hub.agent_exited("w", "wa");
+        hub.test_hook_close(hook);
         hub.post_owed_notices();
         assert_eq!(state_in(&hub, "w", &task), StateName::Undeliverable);
         let told = undeliverable_bodies(&hub);
@@ -8097,23 +7855,20 @@ mod tests {
         let report = hub
             .post_direct(Recipient::bound("w", "wa"), content("REPORT-B"))
             .unwrap();
-        assert_eq!(
-            hub.fetch("w", "wa", Consumer::FetchCli, None, None).len(),
-            2
-        );
-        hub.run_out_ack_wait(task.as_str(), "w");
-        hub.run_out_ack_wait(report.as_str(), "w");
+        let hook = hub.test_hook_fetch("w", "wa", None);
+        assert_eq!(hook.deliveries.len(), 2);
+        // Both reported not handed over on their one allowed hand-out.
+        hub.test_hook_not_handed(&hook);
         let notices = hub.list("o");
         assert_eq!(notices.len(), 1, "the orchestrator is told: {notices:?}");
-        assert_eq!(
-            *told.lock().unwrap(),
-            [(task.to_string(), false), (report.to_string(), false)]
-        );
+        let mut first_told = told.lock().unwrap().clone();
+        first_told.sort();
+        let mut expected = vec![(task.to_string(), false), (report.to_string(), false)];
+        expected.sort();
+        assert_eq!(first_told, expected);
 
-        assert_eq!(
-            hub.ack(task.as_str(), "w", "wa", AckHow::ExtensionConfirmed),
-            AckOutcome::Acknowledged
-        );
+        // The agent's commit contradicts that report: it got the task.
+        hub.test_hook_committed(&hook, &[task.as_str()]);
         assert_eq!(state_in(&hub, "w", &task), StateName::Acknowledged);
         let notices = hub.list_with_bodies(Some("o"));
         assert_eq!(notices.len(), 2, "one correction: {notices:?}");
@@ -8130,10 +7885,9 @@ mod tests {
             "the card still shows the report it was told about"
         );
 
-        assert_eq!(
-            hub.ack(report.as_str(), "w", "wa", AckHow::ExtensionConfirmed),
-            AckOutcome::Acknowledged
-        );
+        hub.test_hook_committed(&hook, &[report.as_str()]);
+        hub.test_hook_close(hook);
+        assert_eq!(state_in(&hub, "w", &report), StateName::Acknowledged);
         assert_eq!(
             hub.list("o").len(),
             2,

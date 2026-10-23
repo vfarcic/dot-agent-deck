@@ -448,10 +448,11 @@ pub enum UndeliverableReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MessageState {
     Queued,
+    /// Handed to a receipt receiver: its attempt model (`crate::inbox_attempts`)
+    /// decides what becomes of it, through the hub's receipt engine.
     Fetched {
         by: Consumer,
         at: Instant,
-        ack_deadline: Instant,
     },
     /// An offer whose recipient took it on.
     Claimed {
@@ -1071,25 +1072,6 @@ impl Inbox {
         self.reserved_replies
     }
 
-    /// TEST: the ack-wait of message `id`, fetched in `pane_id`, has run out,
-    /// so the next [`Self::tick`] treats it as unacknowledged.
-    #[cfg(test)]
-    pub fn run_out_ack_wait(&mut self, id: &str, pane_id: &str) {
-        for message in &mut self.messages {
-            if message.id.as_str() == id
-                && message
-                    .recipient
-                    .as_ref()
-                    .is_some_and(|r| r.pane_id == pane_id)
-                && let MessageState::Fetched {
-                    at, ack_deadline, ..
-                } = &mut message.state
-            {
-                *ack_deadline = *at;
-            }
-        }
-    }
-
     /// Give back one reservation [`Self::reserve_reply`] made, unused.
     pub fn release_reply(&mut self) {
         self.reserved_replies = self.reserved_replies.saturating_sub(1);
@@ -1311,74 +1293,6 @@ impl Inbox {
             .collect()
     }
 
-    /// Hand `agent_id` in `pane_id` every queued message it may receive, up to
-    /// `max`, oldest first. Each becomes fetched by `consumer`: no other
-    /// consumer gets it until it returns to the queue.
-    pub fn fetch(
-        &mut self,
-        now: Instant,
-        pane_id: &str,
-        agent_id: &str,
-        consumer: Consumer,
-        max: Option<usize>,
-    ) -> Vec<Message> {
-        let ack_deadline = now + self.limits.ack_wait;
-        let indices: Vec<usize> = self
-            .messages
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| {
-                m.state == MessageState::Queued
-                    && m.owner != Some(AssignmentOwner::Receipt)
-                    && m.recipient
-                        .as_ref()
-                        .is_some_and(|r| r.admits(pane_id, agent_id))
-            })
-            .map(|(i, _)| i)
-            .take(max.unwrap_or(usize::MAX))
-            .collect();
-        let mut out = Vec::with_capacity(indices.len());
-        for index in indices {
-            // An offer counted its delivery when it was assigned.
-            if !self.messages[index].is_offer() {
-                self.messages[index].deliveries += 1;
-            }
-            self.messages[index]
-                .owner
-                .get_or_insert(AssignmentOwner::Legacy);
-            self.transition(
-                index,
-                now,
-                MessageState::Fetched {
-                    by: consumer.clone(),
-                    at: now,
-                    ack_deadline,
-                },
-            );
-            out.push(self.messages[index].clone());
-        }
-        out
-    }
-
-    /// [`Inbox::fetch`] and acknowledge in one step, for a consumer whose
-    /// hand-over is itself the delivery (the CLI, a turn-end hook). Offers are
-    /// claimed rather than acknowledged.
-    pub fn fetch_acked(
-        &mut self,
-        now: Instant,
-        pane_id: &str,
-        agent_id: &str,
-        consumer: Consumer,
-        how: AckHow,
-        max: Option<usize>,
-    ) -> Vec<Message> {
-        let fetched = self.fetch(now, pane_id, agent_id, consumer, max);
-        for message in &fetched {
-            self.ack(now, message.id.as_str(), pane_id, agent_id, how);
-        }
-        fetched
-    }
-
     /// Acknowledge message `id` on behalf of `agent_id` in `pane_id`. A queued
     /// message may be acknowledged directly (its content was seen without a
     /// fetch). Any id that is not a message id answers `Unknown`.
@@ -1466,14 +1380,12 @@ impl Inbox {
             message.deliveries += 1;
         }
         message.owner = Some(AssignmentOwner::Receipt);
-        let ack_deadline = now + self.limits.ack_wait;
         self.transition(
             index,
             now,
             MessageState::Fetched {
                 by: consumer,
                 at: now,
-                ack_deadline,
             },
         );
         Some(self.messages[index].clone())
@@ -1534,26 +1446,6 @@ impl Inbox {
     pub fn owner_of(&self, id: &str, pane_id: &str, agent_id: &str) -> Option<AssignmentOwner> {
         self.find_for(id, pane_id, agent_id)
             .and_then(|index| self.messages[index].owner)
-    }
-
-    /// A consumer whose connection dropped before it handed its messages
-    /// over: everything it fetched and nobody acknowledged is redelivered.
-    pub fn requeue_consumer(&mut self, now: Instant, consumer: &Consumer) -> usize {
-        let indices: Vec<usize> = self
-            .messages
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| {
-                m.owner != Some(AssignmentOwner::Receipt)
-                    && matches!(&m.state, MessageState::Fetched { by, .. } if by == consumer)
-            })
-            .map(|(i, _)| i)
-            .collect();
-        for &index in &indices {
-            self.redeliver(index, now);
-        }
-        self.trim_history(now);
-        indices.len()
     }
 
     /// The claimant of offer `id` finished the job.
@@ -1657,24 +1549,16 @@ impl Inbox {
         true
     }
 
-    /// Apply every deadline that has passed by `now`: unacknowledged fetches
-    /// are redelivered (or become undeliverable at `max_deliver`), expired
-    /// claims and offers their holder never fetched return to their pool, and
-    /// the dedup and rate windows move on.
+    /// Apply every deadline that has passed by `now`: expired claims and
+    /// offers their holder never fetched return to their pool, and the dedup
+    /// and rate windows move on. A fetched message has no deadline here: its
+    /// attempt model ends it (PRD #1666 §13 step 4; part 3, H5 removed the
+    /// legacy ack-wait).
     pub fn tick(&mut self, now: Instant) {
         let mut index = self.messages.len();
         while index > 0 {
             index -= 1;
             match &self.messages[index].state {
-                // PRD #1666 §13 step 4: the ack-wait is the legacy policy's;
-                // a `Receipt`-owned hand-out ends only through the attempt
-                // model.
-                MessageState::Fetched { ack_deadline, .. }
-                    if *ack_deadline <= now
-                        && self.messages[index].owner != Some(AssignmentOwner::Receipt) =>
-                {
-                    self.redeliver(index, now);
-                }
                 MessageState::Claimed { expires, .. } if *expires <= now => {
                     self.return_offer(index, now, ReturnCause::ClaimExpired);
                 }
@@ -1701,18 +1585,13 @@ impl Inbox {
         });
     }
 
-    /// The earliest ack deadline, claim expiry or unfetched offer's
-    /// assignment deadline, so the daemon can sleep until there is something
-    /// for [`Inbox::tick`] to do.
+    /// The earliest claim expiry or unfetched offer's assignment deadline, so
+    /// the daemon can sleep until there is something for [`Inbox::tick`] to
+    /// do.
     pub fn next_deadline(&self) -> Option<Instant> {
         self.messages
             .iter()
             .filter_map(|m| match &m.state {
-                MessageState::Fetched { ack_deadline, .. }
-                    if m.owner != Some(AssignmentOwner::Receipt) =>
-                {
-                    Some(*ack_deadline)
-                }
                 MessageState::Claimed { expires, .. } => Some(*expires),
                 MessageState::Queued => m.assign_deadline,
                 _ => None,
@@ -1976,26 +1855,6 @@ impl Inbox {
             self.trim_history(now);
         }
         due
-    }
-
-    /// A fetched message that was not acknowledged goes back to the queue, or
-    /// becomes undeliverable once it has been handed over `max_deliver` times.
-    /// An offer goes back to its pool instead, excluding its holder.
-    fn redeliver(&mut self, index: usize, now: Instant) {
-        if self.messages[index].is_offer() {
-            self.return_offer(index, now, ReturnCause::AckWaitExpired);
-        } else if self.messages[index].deliveries >= self.limits.max_deliver {
-            self.transition(
-                index,
-                now,
-                MessageState::Undeliverable {
-                    at: now,
-                    reason: UndeliverableReason::MaxDeliver,
-                },
-            );
-        } else {
-            self.transition(index, now, MessageState::Queued);
-        }
     }
 
     /// An offer leaves its holder and returns to its pool, never to be offered
@@ -2451,6 +2310,32 @@ mod tests {
         Recipient::bound("2", "agent-w1")
     }
 
+    /// Hand `agent` in `pane` every queued message it may receive, oldest
+    /// first and up to `max`, as a receipt receiver is handed them
+    /// ([`Inbox::take_receipt`]): the store half of an issue.
+    fn take(
+        inbox: &mut Inbox,
+        now: Instant,
+        pane: &str,
+        agent: &str,
+        consumer: Consumer,
+        max: Option<usize>,
+    ) -> Vec<Message> {
+        let ids: Vec<String> = inbox
+            .list(pane)
+            .into_iter()
+            .filter(|m| {
+                m.state == MessageState::Queued
+                    && m.recipient.as_ref().is_some_and(|r| r.admits(pane, agent))
+            })
+            .map(|m| m.id.as_str().to_string())
+            .take(max.unwrap_or(usize::MAX))
+            .collect();
+        ids.iter()
+            .filter_map(|id| inbox.take_receipt(now, id, pane, agent, consumer.clone()))
+            .collect()
+    }
+
     fn state_of(inbox: &Inbox, id: &MessageId, pane: &str) -> StateName {
         inbox
             .get(id.as_str(), pane)
@@ -2589,31 +2474,32 @@ mod tests {
         assert_eq!(inbox.post_direct(t0, worker(), first).unwrap(), chosen);
     }
 
-    /// Scenario: Fetch a message and let its ack-wait pass without an ack,
-    /// with the ack-wait set through `DOT_AGENT_DECK_INBOX_ACK_WAIT_MS`. It
-    /// stays fetched until the deadline, returns to queued at it with its
-    /// delivery count kept, and is then fetched again.
+    /// Scenario: A message is handed to a receipt receiver, with the ack-wait
+    /// set through `DOT_AGENT_DECK_INBOX_ACK_WAIT_MS`. The store sets it no
+    /// deadline: past the ack-wait it stays fetched, since its attempt model
+    /// decides what becomes of it (PRD #1666 part 3, H5 removed the store's
+    /// ack-wait). Positively not handed, it returns to queued with its delivery
+    /// count kept, and is handed out again as a second delivery.
     #[spec("inbox/core/004")]
     #[test]
-    fn inbox_core_004_unacknowledged_fetch_is_redelivered_after_ack_wait() {
+    fn inbox_core_004_a_fetched_message_has_no_ack_wait_in_the_store() {
         let t0 = Instant::now();
         let limits =
             InboxLimits::from_lookup(|name| (name == ENV_ACK_WAIT_MS).then(|| "5000".to_string()));
         assert_eq!(limits.ack_wait, Duration::from_secs(5));
         let mut inbox = inbox_with(limits);
         let id = inbox.post_direct(t0, worker(), from_deck()).unwrap();
-        let fetched = inbox.fetch(t0, "2", "agent-w1", Consumer::FetchCli, None);
+        let fetched = take(&mut inbox, t0, "2", "agent-w1", Consumer::FetchCli, None);
         assert_eq!(fetched.len(), 1);
-        assert_eq!(inbox.next_deadline(), Some(t0 + Duration::from_secs(5)));
-
-        inbox.tick(t0 + Duration::from_millis(4999));
+        assert_eq!(inbox.next_deadline(), None);
+        inbox.tick(t0 + Duration::from_secs(50));
         assert_eq!(state_of(&inbox, &id, "2"), StateName::Fetched);
-        inbox.tick(t0 + Duration::from_secs(5));
+
+        assert!(inbox.requeue_receipt(t0 + Duration::from_secs(6), id.as_str(), "2"));
         assert_eq!(state_of(&inbox, &id, "2"), StateName::Queued);
         assert_eq!(inbox.get(id.as_str(), "2").unwrap().deliveries, 1);
-        assert_eq!(inbox.next_deadline(), None);
-
-        let again = inbox.fetch(
+        let again = take(
+            &mut inbox,
             t0 + Duration::from_secs(6),
             "2",
             "agent-w1",
@@ -2632,8 +2518,8 @@ mod tests {
         let t0 = Instant::now();
         let mut inbox = inbox();
         let id = inbox.post_direct(t0, worker(), from_deck()).unwrap();
-        inbox.fetch(t0, "2", "agent-w1", Consumer::FetchCli, None);
-        inbox.tick(t0 + DEFAULT_ACK_WAIT);
+        take(&mut inbox, t0, "2", "agent-w1", Consumer::FetchCli, None);
+        assert!(inbox.requeue_receipt(t0 + SECOND, id.as_str(), "2"));
         assert_eq!(state_of(&inbox, &id, "2"), StateName::Queued);
         let events: Vec<_> = inbox
             .drain_events()
@@ -2650,44 +2536,55 @@ mod tests {
         );
     }
 
-    /// Scenario: Fetch a message and let every ack-wait expire, five times.
-    /// After the fifth unacknowledged hand-over it becomes undeliverable for
-    /// `max_deliver`, an event says so, and no further fetch returns it.
+    /// Scenario: A hook receiver is handed a message and positively does not
+    /// hand it to its agent, five times. After the fifth it becomes
+    /// undeliverable for `max_deliver`, an event says so, and no further fetch
+    /// is handed it.
     #[spec("inbox/core/005")]
     #[test]
     fn inbox_core_005_max_deliver_makes_a_message_undeliverable() {
-        let t0 = Instant::now();
-        let mut inbox = inbox();
-        let id = inbox.post_direct(t0, worker(), from_deck()).unwrap();
-        let mut now = t0;
-        for round in 1..=DEFAULT_MAX_DELIVER {
-            let fetched = inbox.fetch(now, "2", "agent-w1", Consumer::Waiter { conn_id: 7 }, None);
-            assert_eq!(fetched.len(), 1, "round {round}");
-            now += DEFAULT_ACK_WAIT;
-            inbox.tick(now);
-        }
-        let message = inbox.get(id.as_str(), "2").unwrap();
-        assert_eq!(
-            message.state,
-            MessageState::Undeliverable {
-                at: now,
-                reason: UndeliverableReason::MaxDeliver,
-            }
+        let hub = crate::inbox_hub::InboxHub::new(
+            deck(),
+            InboxLimits::default(),
+            crate::inbox_hub::DEFAULT_KEEPALIVE,
         );
-        assert_eq!(message.deliveries, DEFAULT_MAX_DELIVER);
-        let events = inbox.drain_events();
-        let last = events.last().unwrap();
-        assert_eq!(last.state, StateName::Undeliverable);
+        let (tx, mut changes) = tokio::sync::broadcast::channel(64);
+        hub.set_broadcast(tx);
+        let id = hub.post_direct(worker(), from_deck()).unwrap();
+        for round in 1..=DEFAULT_MAX_DELIVER {
+            let hook = hub.test_hook_fetch("2", "agent-w1", None);
+            assert_eq!(hook.ids(), vec![id.as_str().to_string()], "round {round}");
+            hub.test_hook_not_handed(&hook);
+            hub.test_hook_close(hook);
+        }
+        let message = hub.list("2").into_iter().find(|m| m.id == id).unwrap();
+        assert_eq!(message.state, StateName::Undeliverable);
         assert_eq!(
-            last.undeliverable_reason,
+            message.undeliverable_reason,
             Some(UndeliverableReason::MaxDeliver)
         );
-        assert!(
-            inbox
-                .fetch(now, "2", "agent-w1", Consumer::FetchCli, None)
-                .is_empty()
+        assert_eq!(message.deliveries, DEFAULT_MAX_DELIVER);
+        let mut last = None;
+        while let Ok(change) = changes.try_recv() {
+            if let crate::event::BroadcastMsg::Inbox(event) = change
+                && event.message_id == id.as_str()
+            {
+                last = Some(event);
+            }
+        }
+        let last = last.expect("the message's changes are broadcast");
+        assert_eq!(last.state, StateName::Undeliverable);
+        assert_eq!(last.reason, Some(UndeliverableReason::MaxDeliver));
+        let hook = hub.test_hook_fetch("2", "agent-w1", None);
+        assert!(hook.deliveries.is_empty());
+        hub.test_hook_close(hook);
+        assert_eq!(
+            hub.list("2")
+                .iter()
+                .filter(|m| m.state == StateName::Undeliverable)
+                .count(),
+            1
         );
-        assert_eq!(inbox.counts("2").undeliverable, 1);
     }
 
     /// Scenario: A message runs out of hand-overs and becomes undeliverable,
@@ -2705,9 +2602,17 @@ mod tests {
         };
         let mut inbox = inbox_with(limits);
         let id = inbox.post_direct(t0, worker(), from_deck()).unwrap();
-        inbox.fetch(t0, "2", "agent-w1", Consumer::Waiter { conn_id: 3 }, None);
+        take(
+            &mut inbox,
+            t0,
+            "2",
+            "agent-w1",
+            Consumer::Waiter { conn_id: 3 },
+            None,
+        );
         let now = t0 + DEFAULT_ACK_WAIT;
-        inbox.tick(now);
+        // The attempt model ran it out of hand-overs.
+        assert!(inbox.retire(now, id.as_str(), "2", UndeliverableReason::MaxDeliver));
         assert_eq!(state_of(&inbox, &id, "2"), StateName::Undeliverable);
         inbox.drain_events();
         assert_eq!(
@@ -2715,14 +2620,14 @@ mod tests {
             AckOutcome::WrongAgent
         );
         assert_eq!(
-            inbox.ack(now, id.as_str(), "2", "agent-w1", AckHow::PromptObserved),
+            inbox.ack(now, id.as_str(), "2", "agent-w1", AckHow::PluginConfirmed),
             AckOutcome::Acknowledged
         );
         assert_eq!(
             inbox.get(id.as_str(), "2").unwrap().state,
             MessageState::Acknowledged {
                 at: now,
-                how: AckHow::PromptObserved,
+                how: AckHow::PluginConfirmed,
             }
         );
         let events = inbox.drain_events();
@@ -2750,9 +2655,11 @@ mod tests {
                 &[Recipient::bound("2", "agent-w1")],
             )
             .unwrap();
-        inbox.fetch(now, "2", "agent-w1", Consumer::FetchCli, None);
+        take(&mut inbox, now, "2", "agent-w1", Consumer::FetchCli, None);
         let later = now + DEFAULT_ACK_WAIT;
-        inbox.tick(later);
+        // Positively not handed: the offer goes back to its pool, out of
+        // hand-overs.
+        assert!(inbox.requeue_receipt(later, offered.id.as_str(), "2"));
         assert_ne!(
             inbox.ack(
                 later,
@@ -2830,10 +2737,10 @@ mod tests {
         assert_eq!(InboxLimits::default().max_body_bytes, 1024 * 1024);
     }
 
-    /// Scenario: Two consumers fetch the same pane's inbox one after the
-    /// other, and a third consumer's connection drops after it fetched. The
-    /// first fetch takes the message; the second gets nothing while it is
-    /// fetched; a dropped consumer's messages return to the queue.
+    /// Scenario: Three receipt receivers are handed the same pane's inbox one
+    /// after the other. The first takes the message; the others get nothing
+    /// while it is fetched; once the first positively did not hand it over it
+    /// returns to the queue and is handed out again.
     #[spec("inbox/core/007")]
     #[test]
     fn inbox_core_007_a_fetched_message_is_handed_to_one_consumer() {
@@ -2841,31 +2748,31 @@ mod tests {
         let mut inbox = inbox();
         let id = inbox.post_direct(t0, worker(), from_deck()).unwrap();
         let waiter = Consumer::Waiter { conn_id: 1 };
-        assert_eq!(
-            inbox.fetch(t0, "2", "agent-w1", waiter.clone(), None).len(),
-            1
-        );
+        assert_eq!(take(&mut inbox, t0, "2", "agent-w1", waiter, None).len(), 1);
+        assert!(take(&mut inbox, t0, "2", "agent-w1", Consumer::FetchCli, None).is_empty());
         assert!(
-            inbox
-                .fetch(t0, "2", "agent-w1", Consumer::FetchCli, None)
-                .is_empty()
+            take(
+                &mut inbox,
+                t0,
+                "2",
+                "agent-w1",
+                Consumer::Stream { conn_id: 2 },
+                None
+            )
+            .is_empty()
         );
-        assert!(
-            inbox
-                .fetch(t0, "2", "agent-w1", Consumer::Stream { conn_id: 2 }, None)
-                .is_empty()
-        );
-
-        assert_eq!(
-            inbox.requeue_consumer(t0 + SECOND, &Consumer::Stream { conn_id: 2 }),
-            0
-        );
-        assert_eq!(inbox.requeue_consumer(t0 + SECOND, &waiter), 1);
+        assert!(inbox.requeue_receipt(t0 + SECOND, id.as_str(), "2"));
         assert_eq!(state_of(&inbox, &id, "2"), StateName::Queued);
         assert_eq!(
-            inbox
-                .fetch(t0 + SECOND, "2", "agent-w1", Consumer::FetchCli, None)
-                .len(),
+            take(
+                &mut inbox,
+                t0 + SECOND,
+                "2",
+                "agent-w1",
+                Consumer::FetchCli,
+                None
+            )
+            .len(),
             1
         );
 
@@ -2877,16 +2784,17 @@ mod tests {
         inbox
             .post_direct(t0, Recipient::unbound("2"), from_deck())
             .unwrap();
-        let got = inbox.fetch(t0, "2", "agent-w1", Consumer::FetchCli, None);
+        let got = take(&mut inbox, t0, "2", "agent-w1", Consumer::FetchCli, None);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].recipient, Some(Recipient::unbound("2")));
     }
 
     /// Scenario: Acknowledge messages as their own agent, as another agent,
     /// twice, after they turned undeliverable, and with an old `d-…` id. Each
-    /// answer is explicit: acknowledged, wrong agent (state unchanged),
-    /// already acknowledged, undeliverable, unknown; fetch-and-ack does both
-    /// in one step.
+    /// answer is the store's, explicit: acknowledged, wrong agent (state
+    /// unchanged), already acknowledged, undeliverable, unknown. (The hub
+    /// answers an ack of a message never handed out `unknown` before it asks
+    /// the store: inbox/boundary/071.)
     #[spec("inbox/core/008")]
     #[test]
     fn inbox_core_008_ack_outcomes_are_explicit() {
@@ -2902,13 +2810,20 @@ mod tests {
             AckOutcome::WrongAgent
         );
         assert_eq!(state_of(&inbox, &id, "2"), StateName::Queued);
-        inbox.fetch(t0, "2", "agent-w1", Consumer::DoorbellHook, None);
+        take(
+            &mut inbox,
+            t0,
+            "2",
+            "agent-w1",
+            Consumer::DoorbellHook,
+            None,
+        );
         assert_eq!(
-            inbox.ack(t0, id.as_str(), "2", "agent-w1", AckHow::PromptObserved),
+            inbox.ack(t0, id.as_str(), "2", "agent-w1", AckHow::PluginConfirmed),
             AckOutcome::Acknowledged
         );
         assert_eq!(
-            inbox.ack(t0, id.as_str(), "2", "agent-w1", AckHow::PromptObserved),
+            inbox.ack(t0, id.as_str(), "2", "agent-w1", AckHow::Explicit),
             AckOutcome::AlreadyAcknowledged
         );
         assert_eq!(inbox.counts("2").last_acked_at, Some(t0));
@@ -2933,18 +2848,6 @@ mod tests {
             inbox.ack(t0, gone.as_str(), "2", "agent-w1", AckHow::Explicit),
             AckOutcome::Undeliverable
         );
-
-        let a = inbox.post_direct(t0, worker(), from_deck()).unwrap();
-        let taken = inbox.fetch_acked(
-            t0,
-            "2",
-            "agent-w1",
-            Consumer::FetchCli,
-            AckHow::FetchedByCli,
-            None,
-        );
-        assert_eq!(taken.len(), 1);
-        assert_eq!(state_of(&inbox, &a, "2"), StateName::Acknowledged);
     }
 
     fn scope() -> Scope {
@@ -2975,15 +2878,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(offered.offered_to, Some(alice.clone()));
-        assert!(
-            inbox
-                .fetch(t0, "6", "agent-b", Consumer::FetchCli, None)
-                .is_empty()
-        );
+        assert!(take(&mut inbox, t0, "6", "agent-b", Consumer::FetchCli, None).is_empty());
         assert_eq!(
-            inbox
-                .fetch(t0, "5", "agent-a", Consumer::FetchCli, None)
-                .len(),
+            take(&mut inbox, t0, "5", "agent-a", Consumer::FetchCli, None).len(),
             1
         );
         assert_eq!(
@@ -3042,7 +2939,7 @@ mod tests {
                     std::slice::from_ref(&alice),
                 )
                 .unwrap();
-            inbox.fetch(t0, "5", "agent-a", Consumer::FetchCli, None);
+            take(&mut inbox, t0, "5", "agent-a", Consumer::FetchCli, None);
             inbox.ack(t0, offered.id.as_str(), "5", "agent-a", AckHow::Explicit);
             let late = t0 + ttl + SECOND;
             let outcome = if complete {
@@ -3058,10 +2955,11 @@ mod tests {
         }
     }
 
-    /// Scenario: Let a claimed offer's claim expire, then release the next
-    /// claim. Each time the offer returns to its pool and is re-offered to a
-    /// candidate that has not held it, never to a previous claimant; with only
-    /// previous claimants left it waits unassigned.
+    /// Scenario: Let a claimed offer's claim expire, release the next claim,
+    /// and have the third holder positively not hand it over. Each time the
+    /// offer returns to its pool and is re-offered to a candidate that has not
+    /// held it, never to a previous holder; with only previous holders left it
+    /// waits unassigned.
     #[spec("inbox/core/010")]
     #[test]
     fn inbox_core_010_claim_expiry_reoffers_excluding_previous_claimants() {
@@ -3097,9 +2995,17 @@ mod tests {
         );
         assert_eq!(inbox.assign_offer(t0 + ttl, &id, &all), Some(carol));
 
-        // Carol's fetch is never acknowledged: the offer leaves her too.
-        inbox.fetch(t0 + ttl, "7", "agent-c", Consumer::FetchCli, None);
-        inbox.tick(t0 + ttl + DEFAULT_ACK_WAIT);
+        // Carol is handed it and positively does not hand it over: the offer
+        // leaves her too.
+        take(
+            &mut inbox,
+            t0 + ttl,
+            "7",
+            "agent-c",
+            Consumer::FetchCli,
+            None,
+        );
+        assert!(inbox.requeue_receipt(t0 + ttl + SECOND, id.as_str(), "7"));
         assert_eq!(inbox.assign_offer(t0 + 2 * ttl, &id, &all), None);
         assert_eq!(inbox.unassigned_offers(), vec![id.clone()]);
         let excluded = &inbox.get(id.as_str(), "").unwrap().excluded;
@@ -3133,7 +3039,7 @@ mod tests {
         let mut inbox = inbox();
         let bound = inbox.post_direct(t0, worker(), from_deck()).unwrap();
         let fetched = inbox.post_direct(t0, worker(), from_deck()).unwrap();
-        inbox.fetch(t0, "2", "agent-w1", Consumer::FetchCli, Some(1));
+        take(&mut inbox, t0, "2", "agent-w1", Consumer::FetchCli, Some(1));
         let unbound = inbox
             .post_direct(t0, Recipient::unbound("2"), from_deck())
             .unwrap();
@@ -3157,8 +3063,7 @@ mod tests {
         assert_eq!(inbox.unassigned_offers(), vec![offer.clone()]);
         assert_eq!(inbox.assign_offer(t0, &offer, &[worker()]), None);
         assert_eq!(
-            inbox
-                .fetch(t0, "2", "agent-w2", Consumer::FetchCli, None)
+            take(&mut inbox, t0, "2", "agent-w2", Consumer::FetchCli, None)
                 .iter()
                 .map(|m| m.id.clone())
                 .collect::<Vec<_>>(),

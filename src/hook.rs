@@ -387,112 +387,6 @@ impl HookOutput {
     }
 }
 
-/// How many times a hook asks the deck to record one acknowledgement.
-const HOOK_ACK_ATTEMPTS: u32 = 3;
-/// The wait before a hook asks again; it doubles for each ask after that.
-const HOOK_ACK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
-
-/// PR #1735 review: acknowledge `ids`, which this hook fetched and has just
-/// handed to its agent, and confirm each with the deck ([`acknowledge_at`]).
-/// Nothing is sent without the pane's token. One the deck never records costs
-/// a second hand-over after the ack-wait, never the message.
-pub(crate) fn acknowledge_handed_over(ids: &[String]) {
-    if ids.is_empty() {
-        return;
-    }
-    let Some(pane_id) = std::env::var(DOT_AGENT_DECK_PANE_ID)
-        .ok()
-        .filter(|pane| !pane.is_empty())
-    else {
-        return;
-    };
-    let Some(token) = crate::hook_provenance::token_from_env() else {
-        return;
-    };
-    let agent_id = std::env::var(crate::agent_pty::DOT_AGENT_DECK_AGENT_ID)
-        .ok()
-        .filter(|agent| !agent.is_empty());
-    let acks: Vec<(String, String)> = ids
-        .iter()
-        .filter_map(|id| {
-            serde_json::to_string(&crate::event::DaemonMessage::Ack(crate::event::AckSignal {
-                pane_id: pane_id.clone(),
-                delivery_id: id.clone(),
-                agent_id: agent_id.clone(),
-                token: Some(token.clone()),
-            }))
-            .ok()
-            .map(|line| (id.clone(), line))
-        })
-        .collect();
-    acknowledge_at(
-        &client_socket_path(),
-        &acks,
-        SIGNAL_ACK_TIMEOUT,
-        &mut std::io::stderr(),
-    );
-}
-
-/// [`acknowledge_handed_over`] against an explicit endpoint: `acks` pairs each
-/// message id with its `ack` line.
-///
-/// PR #1735 third review: each acknowledgement is sent on its own connection
-/// and confirmed by the deck's answer ([`ack_confirmation`]). One the deck
-/// does not answer for is asked again, up to [`HOOK_ACK_ATTEMPTS`] times,
-/// [`HOOK_ACK_RETRY_DELAY`] apart and doubling — an `ack` is idempotent, so
-/// asking again after an answer that was lost records nothing twice. The whole
-/// exchange stays within `budget`, as the single connection it replaces did.
-/// One the deck refuses by id, or never answers for, is written to `report`
-/// (the hook's stderr), naming the message.
-fn acknowledge_at(
-    path: &std::path::Path,
-    acks: &[(String, String)],
-    budget: std::time::Duration,
-    report: &mut dyn std::io::Write,
-) {
-    let deadline = std::time::Instant::now() + budget;
-    let mut left: Vec<&(String, String)> = acks.iter().collect();
-    let mut delay = HOOK_ACK_RETRY_DELAY;
-    for attempt in 0..HOOK_ACK_ATTEMPTS {
-        if attempt > 0 {
-            if std::time::Instant::now() + delay >= deadline {
-                break;
-            }
-            std::thread::sleep(delay);
-            delay *= 2;
-        }
-        let mut unanswered = Vec::new();
-        for ack in left {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                unanswered.push(ack);
-                continue;
-            }
-            match ack_confirmation(&request_from_socket_at(path, &ack.1, Some(remaining))) {
-                AckConfirmation::Recorded => {}
-                AckConfirmation::Refused(reason) => {
-                    let _ = writeln!(
-                        report,
-                        "dot-agent-deck: the deck could not record message {} as delivered ({reason})",
-                        ack.0
-                    );
-                }
-                AckConfirmation::Unconfirmed => unanswered.push(ack),
-            }
-        }
-        left = unanswered;
-        if left.is_empty() {
-            return;
-        }
-    }
-    for (id, _) in left {
-        let _ = writeln!(
-            report,
-            "dot-agent-deck: the deck did not confirm message {id} as delivered; it may hand it over again"
-        );
-    }
-}
-
 /// PR #1735 third review: what the deck said to one `ack`, for a component
 /// that confirms its acknowledgements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -656,7 +550,7 @@ pub fn deck_prompt_submit(
             .as_ref()
             .map(crate::inbox_prompt::OneShotInjection::ids)
             .unwrap_or_default();
-        let _ = crate::inbox_prompt::mark_event(event, &ids, &fetched);
+        crate::inbox_prompt::mark_event(event, &ids, &fetched);
         injection.map(|injection| HookOutput {
             stdout: String::new(),
             one_shot: Some(injection),
@@ -667,7 +561,7 @@ pub fn deck_prompt_submit(
     #[cfg(not(unix))]
     {
         let _ = (component, framing);
-        let _ = crate::inbox_prompt::mark_event(event, &ids, &[]);
+        crate::inbox_prompt::mark_event(event, &ids, &[]);
         None
     }
 }
@@ -2243,7 +2137,7 @@ pub fn build_agent_event_cli(
         let ids = crate::inbox_prompt::scan(prompt);
         if !ids.is_empty() {
             let handed_over: Vec<String> = ids.opened.clone();
-            let _ = crate::inbox_prompt::mark_event(&mut event, &ids, &handed_over);
+            crate::inbox_prompt::mark_event(&mut event, &ids, &handed_over);
         }
     }
     event
@@ -6185,108 +6079,6 @@ mod question_tests {
             );
         }
         assert!(opencode_question_event(r#"{"session_id":"s","event":"session.idle"}"#).is_none());
-    }
-
-    /// A stand-in daemon that answers one line per connection, the `n`th
-    /// connection with `replies[n]` (the last for every later one; `None`
-    /// closes without an answer), until the returned flag is set; the join
-    /// hands back each connection's line.
-    #[cfg(unix)]
-    fn scripted_daemon(
-        replies: Vec<Option<String>>,
-    ) -> (
-        tempfile::TempDir,
-        std::path::PathBuf,
-        std::sync::Arc<std::sync::atomic::AtomicBool>,
-        std::thread::JoinHandle<Vec<String>>,
-    ) {
-        use std::io::BufRead as _;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("hook.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let stop = done.clone();
-        let handle = std::thread::spawn(move || {
-            let mut lines = Vec::new();
-            loop {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        stream.set_nonblocking(false).unwrap();
-                        let mut reader = std::io::BufReader::new(stream);
-                        let mut line = String::new();
-                        reader.read_line(&mut line).unwrap();
-                        let reply = replies[lines.len().min(replies.len() - 1)].clone();
-                        lines.push(line.trim().to_owned());
-                        if let Some(reply) = reply {
-                            let _ = writeln!(reader.get_mut(), "{reply}");
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        if stop.load(std::sync::atomic::Ordering::SeqCst) {
-                            return lines;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(5));
-                    }
-                    Err(e) => panic!("accept: {e}"),
-                }
-            }
-        });
-        (dir, path, done, handle)
-    }
-
-    /// PR #1735 third review: a hook's acknowledgement of what it handed its
-    /// agent is confirmed by the deck's answer. While the deck does not answer
-    /// it is asked again on a new connection, a bounded number of times; a
-    /// refusal by id stops at once. Either outcome without a record is written
-    /// to the hook's stderr, naming the message.
-    #[cfg(unix)]
-    #[test]
-    fn a_hooks_acknowledgement_is_asked_again_until_the_deck_records_it() {
-        use crate::event::{AckDelivery, SignalAck};
-        let id = "m-k3xzq2ab-0f3c9a71d2e4b850".to_owned();
-        let acks = vec![(
-            id.clone(),
-            format!(r#"{{"message_type":"ack","delivery_id":"{id}"}}"#),
-        )];
-        let recorded =
-            serde_json::to_string(&SignalAck::acknowledged(AckDelivery::Acknowledged)).unwrap();
-        let undeliverable =
-            serde_json::to_string(&SignalAck::acknowledged(AckDelivery::Undeliverable)).unwrap();
-        let run = |replies: Vec<Option<String>>| {
-            let (_dir, path, done, server) = scripted_daemon(replies);
-            let mut report = Vec::new();
-            acknowledge_at(&path, &acks, SIGNAL_ACK_TIMEOUT, &mut report);
-            done.store(true, std::sync::atomic::Ordering::SeqCst);
-            (server.join().unwrap(), String::from_utf8(report).unwrap())
-        };
-
-        let (asked, report) = run(vec![None, Some(recorded)]);
-        assert_eq!(
-            asked.len(),
-            2,
-            "asked again after no answer, then no more: {asked:?}"
-        );
-        assert!(asked.iter().all(|line| line.contains(&id)), "{asked:?}");
-        assert_eq!(report, "", "a recorded acknowledgement reports nothing");
-
-        let (asked, report) = run(vec![None]);
-        assert_eq!(
-            asked.len(),
-            HOOK_ACK_ATTEMPTS as usize,
-            "a silent deck is asked a bounded number of times"
-        );
-        assert!(
-            report.contains(&id),
-            "the hook says which message: {report:?}"
-        );
-
-        let (asked, report) = run(vec![Some(undeliverable)]);
-        assert_eq!(asked.len(), 1, "a refusal by id is final: {asked:?}");
-        assert!(
-            report.contains(&id) && report.contains("undeliverable"),
-            "{report:?}"
-        );
     }
 
     /// A one-shot stand-in daemon: accepts one connection, reads one line,

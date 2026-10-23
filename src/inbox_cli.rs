@@ -435,9 +435,10 @@ fn refusal(line: &str) -> Option<String> {
 /// command, fetches on that connection, and commits what it wrote and flushed
 /// to stdout. A deck that does not confirm it serves it, an older one
 /// included, is sent nothing that could take mail. The one-shot is Unix only:
-/// elsewhere, and from a process standing in for an older dot-agent-deck
-/// ([`crate::inbox_oneshot::declared_hook_integration`]), the fetch is the
-/// legacy one, acknowledged once printed.
+/// elsewhere it takes nothing and says so (H5: the deck no longer serves the
+/// legacy fetch). A process standing in for an older dot-agent-deck
+/// ([`crate::inbox_oneshot::declared_hook_integration`], a test knob) sends
+/// the legacy fetch an older one sends, which a current deck refuses.
 pub fn fetch(json: bool) -> ExitCode {
     #[cfg(unix)]
     if crate::inbox_oneshot::declared_hook_integration().is_some() {
@@ -459,8 +460,20 @@ pub fn fetch(json: bool) -> ExitCode {
             &mut std::io::stderr(),
         );
     }
+    #[cfg(not(unix))]
+    {
+        let _ = json;
+        eprintln!("{FETCH_NOT_ON_THIS_PLATFORM}");
+        ExitCode::FAILURE
+    }
+    #[cfg(unix)]
     fetch_as(json, None, None, None)
 }
+
+/// PRD #1666 part 3 (H5): what `inbox fetch` says where it cannot take
+/// messages on receipts, which the deck requires.
+#[cfg(not(unix))]
+const FETCH_NOT_ON_THIS_PLATFORM: &str = "Could not fetch messages: dot-agent-deck inbox fetch does not run on this platform yet, so no message was taken and they stay waiting.";
 
 /// PRD #1666 part 3 (H4): what `inbox fetch` says when the deck did not
 /// confirm that it serves this command on receipts
@@ -789,21 +802,16 @@ fn fetch_as(
         identity,
         &mut request,
         &mut std::io::stdout().lock(),
-        &mut |ids| crate::hook::acknowledge_handed_over(ids),
     )
 }
 
-/// [`fetch_as`] with its three effects passed in: `send` asks the deck,
-/// `out` is where the content goes, and `settle` acknowledges what reached
-/// `out`.
+/// [`fetch_as`] with its two effects passed in: `send` asks the deck, and
+/// `out` is where the content goes.
 ///
-/// PR #1735 fifth review (N2): the fetch never acknowledges. A plain fetch
-/// writes the content, flushes it, and only then acknowledges exactly what it
-/// wrote, so a reply lost on the way, a request that timed out or a closed
-/// stdout leaves the messages to be handed over again instead of shown as
-/// delivered. A doorbell fetch acknowledges nothing here: its component does,
-/// once its agent has the content. `get-seed`, the compatibility alias, keeps
-/// its own acknowledge-on-fetch in the daemon and does not come through here.
+/// The fetch on the legacy verb acknowledges nothing (PR #1735 fifth review,
+/// N2): a doorbell fetch's component acknowledges once its agent has the
+/// content. A plain one, which only a process standing in for an older
+/// dot-agent-deck sends, is refused by a current deck (PRD #1666 part 3, H5).
 fn fetch_with(
     json: bool,
     doorbell: Option<&str>,
@@ -811,7 +819,6 @@ fn fetch_with(
     identity: Identity,
     send: &mut dyn FnMut(&DaemonMessage) -> Result<String, String>,
     out: &mut dyn Write,
-    settle: &mut dyn FnMut(&[String]),
 ) -> ExitCode {
     let message = DaemonMessage::InboxFetch(InboxFetchRequest {
         pane_id: identity.pane_id,
@@ -866,10 +873,6 @@ fn fetch_with(
     };
     if written.and_then(|()| out.flush()).is_err() {
         return ExitCode::FAILURE;
-    }
-    if doorbell.is_none() {
-        let ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
-        settle(&ids);
     }
     ExitCode::SUCCESS
 }
@@ -1225,15 +1228,13 @@ mod tests {
         }
     }
 
-    /// PR #1735 fifth review (N2): plain `inbox fetch` asks the deck for the
-    /// messages without acknowledging them, writes them, and acknowledges
-    /// exactly what it wrote, only once the write succeeded. Output that
-    /// never reaches the caller — a closed stdout — acknowledges nothing, so
-    /// the deck hands the message over again rather than showing it
-    /// delivered. A doorbell fetch, which the component acknowledges itself,
-    /// settles nothing here.
+    /// PR #1735 fifth review (N2), PRD #1666 part 3 (H5): a fetch on the
+    /// legacy verb — the doorbell fetch of OpenCode's plugin, or the plain one
+    /// a stand-in for an older dot-agent-deck sends — asks without
+    /// acknowledging, writes what it got, and acknowledges nothing; output
+    /// that never reaches the caller (a closed stdout) is a failure.
     #[test]
-    fn a_plain_fetch_acknowledges_only_what_it_wrote() {
+    fn a_fetch_on_the_legacy_verb_acknowledges_nothing() {
         let delivery = crate::event::InboxDelivery {
             id: "m-k3xzq2ab-0123456789abcdef".to_string(),
             subject: "subject".to_string(),
@@ -1250,7 +1251,6 @@ mod tests {
         };
         let run = |json: bool, doorbell: Option<&str>, out: &mut dyn Write| {
             let mut asked = Vec::new();
-            let mut settled = Vec::new();
             let code = fetch_with(
                 json,
                 doorbell,
@@ -1261,36 +1261,29 @@ mod tests {
                     Ok(answer.clone())
                 },
                 out,
-                &mut |ids| settled.extend_from_slice(ids),
             );
-            (code, asked, settled)
+            (code, asked)
         };
         let acked = |asked: &[DaemonMessage]| match asked {
             [DaemonMessage::InboxFetch(request)] => request.ack,
             other => panic!("one inbox_fetch, got {other:?}"),
         };
 
-        let (code, asked, settled) = run(false, None, &mut Closed);
+        let (code, asked) = run(false, None, &mut Closed);
         assert_eq!(code, ExitCode::FAILURE);
         assert!(!acked(&asked), "the fetch itself must not acknowledge");
-        assert!(settled.is_empty(), "nothing was written: {settled:?}");
 
-        for json in [false, true] {
+        for (json, doorbell) in [
+            (false, None),
+            (true, None),
+            (true, Some(delivery.id.as_str())),
+        ] {
             let mut out = Vec::new();
-            let (code, asked, settled) = run(json, None, &mut out);
+            let (code, asked) = run(json, doorbell, &mut out);
             assert_eq!(code, ExitCode::SUCCESS);
-            assert!(!acked(&asked));
+            assert!(!acked(&asked), "json: {json}, doorbell: {doorbell:?}");
             assert!(String::from_utf8(out).unwrap().contains(&delivery.text));
-            assert_eq!(settled, vec![delivery.id.clone()], "json: {json}");
         }
-
-        let mut out = Vec::new();
-        let (_, asked, settled) = run(true, Some(delivery.id.as_str()), &mut out);
-        assert!(!acked(&asked));
-        assert!(
-            settled.is_empty(),
-            "a doorbell fetch's component acknowledges"
-        );
     }
 
     /// The two caps every stand-in hand-out below carries, which no output

@@ -59,8 +59,8 @@ pub const DECK_MESSAGE_METADATA_KEY: &str = "deck_message";
 const UNKNOWN_SUBJECT: &str = "dot-agent-deck message";
 
 /// The most ids one prompt is read for, and so the most blocks one budgeted
-/// hand-over carries (`inbox_hub`'s batch fitting): a prompt hook settles
-/// only the ids or attempts it reads here (Claude's commits, Codex's `ack`),
+/// hand-over carries (the receipt engine's batches): a prompt hook settles
+/// only the attempts it reads here (Claude's and Codex's commits),
 /// so a block past this count would be in the model's context unsettled and
 /// handed over again (PR #1735 fifth review, N1). It also caps the attempts
 /// one `inbox_committed` names.
@@ -933,11 +933,12 @@ pub fn hook_output(hook_event_name: &str, context: &str) -> String {
 }
 
 /// Mark `event` as carrying the deck's prompt: the raw prompt is dropped, and
-/// the ids go to the daemon to label the card ([`stamp_deck_message_prompt`]).
-/// Answers the opened ids `fetched` does not already account for: their
-/// content is in the prompt, so the caller acknowledges them
-/// ([`crate::hook::acknowledge_handed_over`]).
-pub fn mark_event(event: &mut AgentEvent, ids: &DeckPromptIds, fetched: &[String]) -> Vec<String> {
+/// the ids go to the daemon to label the card ([`stamp_deck_message_prompt`]):
+/// those `fetched` handed over and those the prompt opened or rang for. It
+/// acknowledges nothing: what a prompt carried is committed by its exact
+/// attempts, never by id (PRD #1666 part 2 §1.3; part 3, H5 removed the
+/// returned ids an older hook acknowledged).
+pub fn mark_event(event: &mut AgentEvent, ids: &DeckPromptIds, fetched: &[String]) {
     event.user_prompt = None;
     let mut all: Vec<&str> = Vec::new();
     for id in fetched.iter().chain(&ids.opened).chain(&ids.rung) {
@@ -948,11 +949,6 @@ pub fn mark_event(event: &mut AgentEvent, ids: &DeckPromptIds, fetched: &[String
     event
         .metadata
         .insert(DECK_MESSAGE_IDS_METADATA_KEY.to_string(), all.join(","));
-    ids.opened
-        .iter()
-        .filter(|id| !fetched.iter().any(|done| done == *id))
-        .cloned()
-        .collect()
 }
 
 /// Whether `event`'s prompt is a deck message's label rather than the user's
@@ -1367,7 +1363,7 @@ mod tests {
     }
 
     #[test]
-    fn mark_event_drops_the_prompt_and_acks_only_unfetched_opened_ids() {
+    fn mark_event_drops_the_prompt_and_names_every_id_it_carried() {
         let mut event = AgentEvent {
             session_id: "s".into(),
             agent_type: crate::event::AgentType::ClaudeCode,
@@ -1390,13 +1386,12 @@ mod tests {
             opened: vec![ID.into(), OTHER.into()],
             rung: vec![],
         };
-        let to_ack = mark_event(&mut event, &ids, &[OTHER.to_string()]);
+        mark_event(&mut event, &ids, &[OTHER.to_string()]);
         assert_eq!(event.user_prompt, None);
         assert_eq!(
             event.metadata[DECK_MESSAGE_IDS_METADATA_KEY],
             format!("{OTHER},{ID}")
         );
-        assert_eq!(to_ack, vec![ID.to_string()]);
         assert!(
             !event
                 .metadata

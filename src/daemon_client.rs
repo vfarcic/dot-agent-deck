@@ -7273,8 +7273,8 @@ start = true
 
     /// PRD #1223 M7; PRD #1666 S5 — a Pi authoring agent is seeded the way
     /// every agent now is: the composed seed is the pane's first inbox message,
-    /// which the extension's `get-seed` alias takes whole, and nothing is typed
-    /// into the PTY. The type comes from the command here, as it does for a
+    /// which the agent's own receiver takes whole on receipts (PRD #1666 part
+    /// 3, H5 withdrew `get-seed`), and nothing is typed into the PTY. The type comes from the command here, as it does for a
     /// client that sends no `agent_type`.
     #[cfg(unix)]
     #[tokio::test]
@@ -7311,15 +7311,17 @@ start = true
             panic!("a daemon at this build advertises `authoring-kind`");
         };
         // PRD #1666 S5: the seed is the pane's first inbox message, which the
-        // extension's `get-seed` alias takes whole.
+        // agent's own receiver takes whole and settles.
         let seed = registry
             .inbox()
-            .fetch_first_acked(
-                "pi-authoring-pane",
-                &id,
-                crate::inbox::AckHow::ExtensionConfirmed,
-            )
+            .test_take_acked("pi-authoring-pane", &id)
+            .into_iter()
+            .next()
             .expect("the Pi pane's first message is its seed");
+        assert_eq!(
+            registry.inbox().list("pi-authoring-pane")[0].state,
+            crate::inbox::StateName::Acknowledged
+        );
         assert!(
             seed.text
                 .contains(&kind.compose_seed(std::path::Path::new(cwd))),
