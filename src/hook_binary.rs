@@ -806,6 +806,12 @@ pub fn is_newer_release(candidate: &str, than: &str) -> bool {
     crate::daemon_upgrade::client_is_newer(candidate, than)
 }
 
+/// How release `a` compares with release `b`, read as [`is_newer_release`]
+/// reads them, or `None` when either side cannot be parsed.
+pub fn compare_releases(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    crate::daemon_upgrade::release_order(a, b)
+}
+
 /// The release a build id (`<version>-g<sha>[-dirty]`, or `<version>-unknown`
 /// when git was unavailable at build time) was built from.
 pub fn release_of_build(build: &str) -> &str {

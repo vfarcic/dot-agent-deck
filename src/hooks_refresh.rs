@@ -118,19 +118,23 @@ pub(crate) fn report(
         let mut settled = true;
         for binary in binaries.iter().filter(|binary| !is_this(binary)) {
             let shown = crate::untrusted_text::display_line(binary, MAX_SHOWN_BINARY_BYTES);
+            // Settled only when both releases were read: an answer the probe
+            // accepted but that does not parse says nothing about readiness.
+            let order =
+                |release: &str| crate::hook_binary::compare_releases(&deck.version, release);
             match version(binary) {
-                Some(release) if !crate::hook_binary::is_newer_release(&deck.version, &release) => {
+                Some(release) if order(&release).is_some_and(|o| o.is_le()) => {
                     notes.push(text(format!(
                         "{label}'s hooks run another copy, {shown} (v{release}), which was left as it is."
                     )));
                 }
-                Some(release) => {
+                Some(release) if order(&release).is_some() => {
                     notes.push(text(format!(
                         "{label}'s hooks still run an older copy, {shown} (v{release})."
                     )));
                     settled = false;
                 }
-                None => {
+                _ => {
                     notes.push(text(format!(
                         "{label}'s hooks still run another copy, {shown}."
                     )));
@@ -290,6 +294,53 @@ mod tests {
             assert!(kept.render().iter().any(|line| line.contains(other)));
             assert_eq!(kept.lines.last().unwrap().text, RESTART_AFTER);
         }
+    }
+
+    /// Scenario: the kept copy's `--version` answer passed the probe's check,
+    /// but its release cannot be compared with this one's. Only a comparison
+    /// that read both releases settles it: the same release and a newer one
+    /// are left as they are, and the unreadable one needs this copy's
+    /// `hooks install`, as a copy that answered no version does.
+    #[test]
+    fn a_kept_copy_is_settled_only_by_a_release_both_sides_parse() {
+        let other = "/opt/homebrew/bin/dot-agent-deck";
+        assert_eq!(
+            crate::version::parse_version_output("dot-agent-deck 0.46.bad").as_deref(),
+            Some("0.46.bad"),
+            "the probe accepts it"
+        );
+        for settled in ["0.48.0", "0.49.0"] {
+            let report = run(
+                vec![pins(AgentType::ClaudeCode, &[other])],
+                &[(other, settled)],
+            );
+            assert!(report.ok, "{settled}: {report:?}");
+            assert!(report.lines[0].text.contains("which was left as it is"));
+        }
+        let report = run(
+            vec![pins(AgentType::ClaudeCode, &[other])],
+            &[(other, "0.46.bad")],
+        );
+        assert!(!report.ok, "{report:?}");
+        assert!(
+            report
+                .lines
+                .iter()
+                .all(|line| !line.text.contains("left as it is")),
+            "{report:?}"
+        );
+        assert_eq!(
+            report.lines[0].text,
+            format!("Claude Code's hooks still run another copy, {other}.")
+        );
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|line| line.command
+                    == Some(format!("{THIS} hooks install --agent claude-code"))),
+            "{report:?}"
+        );
     }
 
     /// Scenario: an installed agent whose config names no deck binary after the
