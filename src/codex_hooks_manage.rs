@@ -2355,7 +2355,7 @@ fn codex_present_on_path() -> bool {
 /// command, so Codex may ask the user once to review the changed hooks.
 pub fn auto_install_and_trust_at_startup() -> Vec<crate::hook_binary::HookPin> {
     match install_and_trust_at_startup() {
-        Some(Ok(pins)) => pins,
+        Some(Ok(Installed { pins, .. })) => pins,
         Some(Err(e)) => {
             tracing::warn!("auto-install: {e}");
             Vec::new()
@@ -2366,18 +2366,49 @@ pub fn auto_install_and_trust_at_startup() -> Vec<crate::hook_binary::HookPin> {
 
 /// [`auto_install_and_trust_at_startup`] for `hooks refresh` (PRD #1666 part
 /// 3, R-3): whether Codex is installed here, and what the install could not
-/// write, which the startup install only logs.
+/// write, which the startup install only logs. Since part 3's H4 that
+/// includes a trust write that failed or recorded none of the deck's hooks
+/// ([`trust_failure`]): hooks Codex will not run are not ready.
 pub fn refresh_install() -> crate::hooks_refresh::InstallAttempt {
     let attempt = install_and_trust_at_startup();
     if let Some(Err(e)) = &attempt {
         tracing::warn!("auto-install: {e}");
     }
-    crate::hooks_refresh::InstallAttempt::of(attempt)
+    crate::hooks_refresh::InstallAttempt::of(attempt.map(|installed| {
+        installed.and_then(|installed| match installed.trust_failed {
+            Some(why) => Err(why),
+            None => Ok(installed.pins),
+        })
+    }))
+}
+
+/// What [`install_and_trust_at_startup`] installed: the pins, and why the
+/// trust write left the deck's hooks untrusted, if it did.
+struct Installed {
+    pins: Vec<crate::hook_binary::HookPin>,
+    trust_failed: Option<String>,
+}
+
+/// PRD #1666 part 3 (H4, round 2's U3): why a startup trust write leaves the
+/// deck's Codex hooks untrusted, in the words `hooks refresh` shows after
+/// "Codex's hooks could not be updated:", or `None` when it trusted them or
+/// cannot tell (`NothingListed`: Codex listed none of them as eligible, which
+/// an earlier matching trust record also explains).
+fn trust_failure(result: &std::io::Result<TrustOutcome>) -> Option<String> {
+    match result {
+        Ok(TrustOutcome::Trusted { .. } | TrustOutcome::NothingListed) => None,
+        Ok(TrustOutcome::Unrecognised { .. }) => Some(
+            "Codex listed the deck's hooks, but none with the command this update wrote, so none was recorded as trusted and Codex may not run them".to_string(),
+        ),
+        Err(e) => Some(format!(
+            "their trust could not be recorded in Codex's config ({e}), so Codex may not run them"
+        )),
+    }
 }
 
 /// [`auto_install_and_trust_at_startup`]'s work: `None` when Codex is not
-/// installed here, else the pins or why the install wrote nothing.
-fn install_and_trust_at_startup() -> Option<Result<Vec<crate::hook_binary::HookPin>, String>> {
+/// installed here, else what it installed or why the install wrote nothing.
+fn install_and_trust_at_startup() -> Option<Result<Installed, String>> {
     if !codex_present_on_path() {
         tracing::debug!("codex startup install: skipped (codex not on PATH)");
         return None;
@@ -2392,7 +2423,7 @@ fn install_and_trust_at_startup() -> Option<Result<Vec<crate::hook_binary::HookP
     let binary_paths = match try_auto_install_in(&home) {
         Ok(binary_paths) => binary_paths,
         Err(e) => {
-            tracing::debug!("codex startup install: skipped trust (the install wrote nothing)");
+            tracing::debug!("codex startup install: skipped trust (hook installation failed)");
             return Some(Err(e));
         }
     };
@@ -2405,8 +2436,12 @@ fn install_and_trust_at_startup() -> Option<Result<Vec<crate::hook_binary::HookP
         })
         .collect();
     let cwd = std::env::current_dir().unwrap_or_else(|_| home.clone());
-    report_startup_trust(&trust_deck_hooks_for(&home, &cwd, &binary_paths), &cwd);
-    Some(Ok(pins))
+    let trusted = trust_deck_hooks_for(&home, &cwd, &binary_paths);
+    report_startup_trust(&trusted, &cwd);
+    Some(Ok(Installed {
+        pins,
+        trust_failed: trust_failure(&trusted),
+    }))
 }
 
 /// What Codex's hooks are pinned to now, read back from the active
@@ -2479,6 +2514,36 @@ fn report_startup_trust(result: &std::io::Result<TrustOutcome>, cwd: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Scenario (PRD #1666 part 3, round 2's U3): a startup trust write that
+    /// failed, or that recorded none of the deck's hooks because none listed
+    /// carried this install's command, is a failure `hooks refresh` reports,
+    /// in words that say Codex may not run the hooks; one that trusted them,
+    /// or found none eligible, is not.
+    #[test]
+    fn a_trust_write_that_leaves_the_hooks_untrusted_is_not_ready() {
+        assert_eq!(
+            trust_failure(&Ok(TrustOutcome::Trusted {
+                count: 3,
+                reports_prompts: true,
+                turned_off: Vec::new(),
+            })),
+            None
+        );
+        assert_eq!(trust_failure(&Ok(TrustOutcome::NothingListed)), None);
+        for failed in [
+            trust_failure(&Ok(TrustOutcome::Unrecognised { listed: 2 })),
+            trust_failure(&Err(std::io::Error::other("config.toml is read-only"))),
+        ] {
+            let why = failed.expect("a failure");
+            assert!(why.contains("Codex may not run them"), "{why}");
+            let attempt = crate::hooks_refresh::InstallAttempt::of::<()>(Some(Err(why)));
+            assert!(
+                matches!(attempt, crate::hooks_refresh::InstallAttempt::Ran { ref failed } if failed.len() == 1),
+                "{attempt:?}"
+            );
+        }
+    }
 
     /// Scenario (issue #1637): the daemon's pin refresh reads back every binary
     /// Codex's `hooks.json` pins, one per distinct binary across events and

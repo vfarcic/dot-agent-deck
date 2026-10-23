@@ -863,13 +863,29 @@ impl Fixture {
     }
 
     /// A `PATH` holding only a stand-in `codex`, so Codex counts as installed
-    /// and its hooks go to `<home>/.codex`.
+    /// and its hooks go to `<home>/.codex`. Its app server answers the deck's
+    /// trust exchange with no hooks listed, as a Codex with nothing to trust
+    /// yet does.
     fn codex_path(&self) -> PathBuf {
+        self.codex_stand_in(
+            "codexbin",
+            "#!/usr/bin/python3\nimport json, sys\nif 'app-server' in sys.argv:\n    for line in sys.stdin:\n        req = json.loads(line)\n        if 'id' not in req: continue\n        result = {'userAgent':'refresh-fixture'} if req['method'] == 'initialize' else {'hooks':[]}\n        print(json.dumps({'id':req['id'],'result':result}), flush=True)\n",
+        )
+    }
+
+    /// PRD #1666 part 3 (H4, round 2's U3): a directory holding a stand-in
+    /// `codex` that exits at once, so its app server never answers the trust
+    /// exchange and no trust can be recorded.
+    fn codex_without_trust_path(&self) -> PathBuf {
+        self.codex_stand_in("codexbin-untrusted", "#!/bin/sh\nexit 0\n")
+    }
+
+    fn codex_stand_in(&self, dir: &str, script: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
-        let bin = self.path().join("codexbin");
+        let bin = self.path().join(dir);
         std::fs::create_dir_all(&bin).unwrap();
         let codex = bin.join("codex");
-        std::fs::write(&codex, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::write(&codex, script).unwrap();
         std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
         bin
     }
@@ -893,7 +909,7 @@ fn report_commands(report: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
-/// Scenario: Run the real installed copy's `hooks refresh --json` where Claude Code's settings cannot be updated: once with malformed settings alone, once with malformed settings beside a Codex whose hooks it does update, and once with settings that already name this copy in a folder it cannot write. Each time the report is not ok, says Claude Code's hooks could not be updated, gives `hooks install --agent claude-code` and never says Claude Code's hooks now run this copy, and the settings are left as they were.
+/// Scenario: Run the real installed copy's `hooks refresh --json` where Claude Code's settings cannot be updated: once with malformed settings alone, once with malformed settings beside a Codex whose hooks it does update, once beside a Codex whose hooks' trust it cannot record (also not ok, Codex's hooks not updated, `hooks install --agent codex` given), and once with settings that already name this copy in a folder it cannot write. Each time the report is not ok, says Claude Code's hooks could not be updated, gives `hooks install --agent claude-code` and never says Claude Code's hooks now run this copy, and the settings are left as they were.
 #[spec("hooks/install/019")]
 #[test]
 fn install_019_refresh_reports_an_agent_whose_hooks_it_could_not_update() {
@@ -951,6 +967,41 @@ fn install_019_refresh_reports_an_agent_whose_hooks_it_could_not_update() {
             .filter(|command| command.contains(" hooks install --agent codex"))
             .count(),
         0,
+        "{all}"
+    );
+
+    // PRD #1666 part 3 (round 2's U3): beside a Codex whose hooks it writes
+    // but whose trust it cannot record, Codex is not ready either.
+    let (ok, report, all) = fixture.refresh(&installed, &fixture.codex_without_trust_path());
+    assert!(!ok, "{all}");
+    assert!(
+        report_texts(&report)
+            .iter()
+            .any(|text| text.starts_with("Claude Code's hooks could not be updated")),
+        "{all}"
+    );
+    assert!(
+        report_commands(&report)
+            .iter()
+            .any(|command| command.contains(" hooks install --agent claude-code")),
+        "{all}"
+    );
+    assert!(
+        report_texts(&report).iter().any(|text| text
+            .starts_with("Codex's hooks could not be updated")
+            && text.contains("Codex may not run them")),
+        "{all}"
+    );
+    assert!(
+        !report_texts(&report)
+            .iter()
+            .any(|text| text.starts_with("Codex hooks now run this copy")),
+        "{all}"
+    );
+    assert!(
+        report_commands(&report)
+            .iter()
+            .any(|command| command.contains(" hooks install --agent codex")),
         "{all}"
     );
 
