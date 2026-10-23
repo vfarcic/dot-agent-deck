@@ -21,8 +21,9 @@
 //!   hold a prompt, a reply, a tool's input or output, or file content.
 //! * **Local capture** of one agent's store ([`CodexUsageReader`]): a bounded,
 //!   incremental reader of a Codex rollout at a path it is given, reading only
-//!   bytes appended since its last poll and deserialising only the model,
-//!   usage, quota and turn-end fields of the few record types that carry them.
+//!   bytes appended since its last poll, deserialising only lines that contain
+//!   one of five marker words, and keeping only the model, usage, quota and
+//!   turn-end fields of the record types that carry them.
 //! * **Aggregation** ([`rollup`]) of runs to a work item or an orchestration,
 //!   without counting a run twice, a Claude Code subagent inside its parent's
 //!   total, or money of different provenance as one number.
@@ -238,6 +239,12 @@ impl Tokens {
 
     pub fn is_zero(&self) -> bool {
         *self == Tokens::default()
+    }
+
+    /// Whether the cache parts fit inside the input count that includes
+    /// them; a total where they do not is not a count in this convention.
+    fn is_consistent(&self) -> bool {
+        self.cache_read.saturating_add(self.cache_write) <= self.input
     }
 }
 
@@ -550,8 +557,9 @@ fn agent_cost(cost: Option<MicroUsd>, tokens: &Tokens) -> Field<MicroUsd> {
 }
 
 /// Two costs, each already classified, as one. Values of one provenance add;
-/// a reply with no tokens and no cost adds nothing; any other mix — a priced
-/// reply with an unpriced one, or two reasons for unavailable — is
+/// a reply with zero tokens and an explicitly reported zero cost adds
+/// nothing; any other mix — a priced reply with an unpriced one, a reply
+/// whose cost was not recorded at all, or two reasons for unavailable — is
 /// [`Unavailable::Incomplete`], never the priced part alone.
 fn add_cost(sum: Field<MicroUsd>, next: Field<MicroUsd>) -> Field<MicroUsd> {
     match (sum, next) {
@@ -565,13 +573,27 @@ fn add_cost(sum: Field<MicroUsd>, next: Field<MicroUsd>) -> Field<MicroUsd> {
     }
 }
 
-/// Usage per model from per-reply (or per-model) entries, each with its cost
-/// already classified: tokens summed, costs combined by [`add_cost`], at most
-/// [`MAX_MODELS`] named models.
+/// Two token counts, each already classified, as one: provider-reported
+/// counts add, the same reason for unavailable stays, and any other mix is
+/// [`Unavailable::Incomplete`].
+fn add_tokens(sum: Field<Tokens>, next: Field<Tokens>) -> Field<Tokens> {
+    match (sum, next) {
+        (Field::ProviderReported(mut a), Field::ProviderReported(b)) => {
+            a.add(&b);
+            Field::ProviderReported(a)
+        }
+        (Field::Unavailable(a), Field::Unavailable(b)) if a == b => Field::Unavailable(a),
+        _ => Field::Unavailable(Unavailable::Incomplete),
+    }
+}
+
+/// Usage per model from per-reply (or per-model) entries, each with its
+/// tokens and cost already classified: tokens combined by [`add_tokens`],
+/// costs by [`add_cost`], at most [`MAX_MODELS`] named models.
 fn per_model(
-    entries: impl IntoIterator<Item = (Option<Ident>, Tokens, Field<MicroUsd>)>,
+    entries: impl IntoIterator<Item = (Option<Ident>, Field<Tokens>, Field<MicroUsd>)>,
 ) -> Vec<ModelUsage> {
-    let mut by_model: BTreeMap<Option<Ident>, (Tokens, Field<MicroUsd>)> = BTreeMap::new();
+    let mut by_model: BTreeMap<Option<Ident>, (Field<Tokens>, Field<MicroUsd>)> = BTreeMap::new();
     for (model, tokens, cost) in entries {
         match by_model.entry(capped(&by_model, model)) {
             Entry::Vacant(entry) => {
@@ -579,7 +601,7 @@ fn per_model(
             }
             Entry::Occupied(mut entry) => {
                 let (sum, sum_cost) = entry.get_mut();
-                sum.add(&tokens);
+                *sum = add_tokens(*sum, tokens);
                 *sum_cost = add_cost(*sum_cost, cost);
             }
         }
@@ -591,7 +613,7 @@ fn per_model(
         .into_iter()
         .map(|(model, (tokens, cost))| ModelUsage {
             model,
-            tokens: Field::ProviderReported(tokens),
+            tokens,
             cost,
         })
         .collect()
@@ -653,7 +675,7 @@ pub fn from_claude(session: Option<&ClaudeSessionUsage>) -> AgentUsage {
         } else {
             agent_cost(m.cost_usd.and_then(MicroUsd::from_usd), &tokens)
         };
-        (Ident::new(&m.model), tokens, cost)
+        (Ident::new(&m.model), Field::ProviderReported(tokens), cost)
     }));
     AgentUsage {
         models,
@@ -663,27 +685,30 @@ pub fn from_claude(session: Option<&ClaudeSessionUsage>) -> AgentUsage {
 }
 
 /// Codex: tokens provider-reported, by model, from its rollout's running
-/// total; no cost (the rollout carries none); the quota delta of its primary
-/// rate-limit window, unavailable when the window, its length or the plan
-/// changed, or its used share went down, during the run.
+/// total, or [`Unavailable::Incomplete`] once that total went down
+/// ([`CodexRolloutSummary::tokens_incomplete`]); no cost (the rollout carries
+/// none); the quota delta of its primary rate-limit window, unavailable when
+/// the window, its length or the plan changed, or its used share went down,
+/// during the run. The models pass through the same cap as every other
+/// normaliser's, so a summary built by hand with more than [`MAX_MODELS`]
+/// named models is bounded too.
 ///
 /// Quota is assumed to be one account's: the samples name a plan, not an
 /// account, so deltas from several machines or accounts on the same plan and
 /// window are indistinguishable here.
 pub fn from_codex(summary: &CodexRolloutSummary) -> AgentUsage {
-    let models = if summary.tokens_by_model.is_empty() {
-        usage_unavailable(Unavailable::NotRecorded)
-    } else {
-        summary
-            .tokens_by_model
-            .iter()
-            .map(|(model, tokens)| ModelUsage {
-                model: model.clone(),
-                tokens: Field::ProviderReported(*tokens),
-                cost: Field::Unavailable(Unavailable::NoChannel),
-            })
-            .collect()
-    };
+    let models = per_model(summary.tokens_by_model.iter().map(|(model, tokens)| {
+        let tokens = if summary.tokens_incomplete {
+            Field::Unavailable(Unavailable::Incomplete)
+        } else {
+            Field::ProviderReported(*tokens)
+        };
+        (
+            model.clone(),
+            tokens,
+            Field::Unavailable(Unavailable::NoChannel),
+        )
+    }));
     let quota = match (&summary.quota_first, &summary.quota_last) {
         (Some(first), Some(last)) => {
             match summary.quota_break.or_else(|| quota_break(first, last)) {
@@ -757,7 +782,11 @@ pub fn from_pi(replies: &[PiReplyUsage]) -> AgentUsage {
             reply.cache_write,
         );
         let cost = agent_cost(reply.cost_total_usd.and_then(MicroUsd::from_usd), &tokens);
-        (Ident::new(&reply.model), tokens, cost)
+        (
+            Ident::new(&reply.model),
+            Field::ProviderReported(tokens),
+            cost,
+        )
     }));
     let last_turn = replies.last().map(|r| match r.stop_reason {
         Some(PiStopReason::Stop | PiStopReason::Length) => AgentTurnEnd::Completed,
@@ -773,11 +802,23 @@ pub fn from_pi(replies: &[PiReplyUsage]) -> AgentUsage {
     }
 }
 
-/// One OpenCode message's usage (its database's per-message `tokens` and
-/// `cost`). Its input count excludes cache reads and writes.
+/// One OpenCode message: its model, and its usage when the provider
+/// returned one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpenCodeMessageUsage {
     pub model: String,
+    /// `None` when the message holds no usage from the provider. OpenCode
+    /// initialises a message's counters and cost to 0 and keeps them when the
+    /// request fails or the reply never completes, so those zeros are not a
+    /// count, and whoever extracts the message passes `None` for them; a
+    /// completed message that really used no tokens is `Some` of zeros.
+    pub usage: Option<OpenCodeUsage>,
+}
+
+/// One OpenCode message's usage (its database's per-message `tokens` and
+/// `cost`). Its input count excludes cache reads and writes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenCodeUsage {
     pub input: u64,
     pub output: u64,
     pub cache_read: u64,
@@ -788,12 +829,19 @@ pub struct OpenCodeMessageUsage {
 /// OpenCode: tokens provider-reported per model; each message's cost
 /// classified as OpenCode's own figure before it is summed, unavailable when
 /// it is `0` for a message that used tokens, which is what its subscription
-/// providers report.
+/// providers report. A message with no usage has its tokens and cost
+/// [`Unavailable::NotRecorded`], never zero, so a model whose messages mix
+/// the two has them [`Unavailable::Incomplete`].
 pub fn from_opencode(messages: &[OpenCodeMessageUsage]) -> AgentUsage {
     let models = per_model(messages.iter().map(|m| {
-        let tokens = input_plus_cache(m.input, m.output, m.cache_read, m.cache_write);
-        let cost = agent_cost(MicroUsd::from_usd(m.cost_usd), &tokens);
-        (Ident::new(&m.model), tokens, cost)
+        let model = Ident::new(&m.model);
+        let Some(u) = &m.usage else {
+            let none = Unavailable::NotRecorded;
+            return (model, Field::Unavailable(none), Field::Unavailable(none));
+        };
+        let tokens = input_plus_cache(u.input, u.output, u.cache_read, u.cache_write);
+        let cost = agent_cost(MicroUsd::from_usd(u.cost_usd), &tokens);
+        (model, Field::ProviderReported(tokens), cost)
     }));
     AgentUsage {
         models,
@@ -1036,6 +1084,11 @@ pub struct CodexRolloutSummary {
     /// of the turn it came in, so the sum over models is the rollout's own
     /// total.
     pub tokens_by_model: BTreeMap<Option<Ident>, Tokens>,
+    /// A running total went down in some count. The reader accepts nothing
+    /// in the rollout as saying whether its counters restarted or the total
+    /// is wrong, so the run's token total is not known: [`from_codex`]
+    /// reports it as [`Unavailable::Incomplete`].
+    pub tokens_incomplete: bool,
     pub quota_first: Option<CodexRateSample>,
     pub quota_last: Option<CodexRateSample>,
     /// The first reason two consecutive quota samples could not be one simple
@@ -1082,12 +1135,13 @@ pub struct ReaderStats {
     /// Times the file was truncated or replaced and reading started over.
     pub restarts: u64,
     /// Running totals skipped without moving the baseline: missing a primary
-    /// count, missing a cache count that was not zero before, or lower in a
-    /// count other than input while input did not go down.
+    /// count, missing a cache count that was not zero before, or not a count
+    /// at all (cache parts larger than the input that includes them).
     pub unusable_totals: u64,
-    /// Running totals whose input count went down: the counters restarted,
-    /// so the whole total is new usage.
-    pub counter_restarts: u64,
+    /// Usable running totals lower than the baseline in some count. Each one
+    /// makes the run's token total incomplete and leaves the baseline where
+    /// it was.
+    pub regressions: u64,
     /// Token deltas credited to no model because [`MAX_MODELS`] models were
     /// already tracked.
     pub models_overflowed: u64,
@@ -1103,17 +1157,31 @@ pub struct ReaderStats {
 /// at most its budget ([`DEFAULT_POLL_BUDGET`]) and never past the file's
 /// length when the poll began, so one call is bounded however large the
 /// backlog is or however fast the file grows; the rest waits for the next
-/// poll ([`ReaderStats::backlog`]). A line is kept across polls until its
-/// newline arrives (at most [`MAX_LINE_BYTES`]), then dropped. Only lines
-/// naming one of the record types that carry usage are deserialised, and only
-/// into structs holding the model, token counts, quota and turn-end kind, so
-/// a prompt, reply, tool output or file content is scanned by the parser and,
-/// while its line is incomplete, buffered, but kept in nothing the reader
-/// returns, and its `Debug` shows neither the buffer nor the path.
+/// poll ([`ReaderStats::backlog`]). That is a bound on bytes and parsing
+/// work per poll, not on wall-clock time: a read from a slow disk still takes
+/// as long as the disk does. A line is kept across polls until its newline
+/// arrives (at most [`MAX_LINE_BYTES`]), then dropped.
 ///
-/// On Unix the path is opened without following a symlink and without
-/// blocking, and anything but a regular file is refused before a byte is
-/// read; elsewhere it is a plain open, and the regular-file check follows it.
+/// Any complete line that contains one of five quoted marker words
+/// ([`line_is_candidate`]) is deserialised, wherever in the line the marker
+/// is, so a content line with a string that is exactly a marker word is
+/// deserialised too. What is kept is then decided by the parsed record's
+/// type and its payload's type: only `turn_context`, `token_count`,
+/// `task_started`, `task_complete` and `turn_aborted` update the summary,
+/// and only with the model, token counts, quota and turn-end kind, the
+/// fields the narrow structs name. So a prompt, reply, tool output or file
+/// content is scanned by the parser and, while its line is incomplete,
+/// buffered, but kept in nothing the reader returns, and its `Debug` shows
+/// neither the buffer nor the path.
+///
+/// On Unix the path is opened with `O_NOFOLLOW`, which refuses a symlink in
+/// its final component only: a symlinked parent directory is followed, so
+/// this is no confinement to a trusted root (that policy is #1858's to
+/// decide before the reader is wired). It is opened with `O_NONBLOCK` so a
+/// FIFO with no writer cannot stall the open, and anything but a regular
+/// file is refused, from the opened descriptor's own metadata, before a byte
+/// is read. Elsewhere it is a plain open, and the regular-file check follows
+/// it.
 ///
 /// A file that gets shorter, or whose path now names another file (Unix),
 /// is read again from the start with the summary reset: that is a new rollout
@@ -1268,8 +1336,10 @@ impl CodexUsageReader {
     }
 }
 
-/// Open `path` for reading without following a final symlink and without
-/// blocking (a FIFO with no writer would otherwise block the open).
+/// Open `path` for reading, refusing a symlink in its final component only
+/// (parent directories are followed), and without blocking on the open (a
+/// FIFO with no writer would otherwise block it). `O_NONBLOCK` does not make
+/// reading a regular file any faster on a slow disk.
 #[cfg(unix)]
 fn open_rollout(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -1304,7 +1374,10 @@ const CANDIDATE_MARKERS: [&[u8]; 5] = [
 ];
 
 /// Whether a line could be a record the reader uses: the cheap pre-filter
-/// that decides which lines are deserialised at all.
+/// that decides which lines are deserialised at all. It matches a quoted
+/// marker anywhere in the line, not only as the record's type, so it lets
+/// through some content lines, which [`CodexRolloutSummary::observe`] then
+/// ignores by type.
 fn line_is_candidate(line: &[u8]) -> bool {
     CANDIDATE_MARKERS
         .iter()
@@ -1348,26 +1421,26 @@ impl CodexRolloutSummary {
         }
     }
 
-    /// Credit the growth of the running total to the current model. An
-    /// incomplete or partly lower total is skipped and leaves the baseline
-    /// where it was, so the next complete total is measured from the last
-    /// good one; a total whose input went down is a counter restart, and all
-    /// of it is new.
+    /// Credit the growth of the running total to the current model. A
+    /// total that is incomplete or not a count at all is skipped and leaves
+    /// the baseline where it was, so the next usable total is measured from
+    /// the last good one. A usable total lower than the baseline in any count
+    /// is ambiguous: the counters may have restarted or the total may be
+    /// wrong, and the reader accepts nothing in the rollout as telling
+    /// which, so it makes the run's token total incomplete rather than adding
+    /// either reading, and also leaves the baseline where it was.
     fn observe_total(&mut self, usage: &CodexTokenUsage, stats: &mut ReaderStats) {
-        let Some(total) = usage.complete(self.last_total.as_ref()) else {
+        let Some(total) = usage.usable(self.last_total.as_ref()) else {
             stats.unusable_totals += 1;
             return;
         };
         let delta = match &self.last_total {
             None => total,
-            Some(prev) if total.input < prev.input => {
-                stats.counter_restarts += 1;
-                total
-            }
             Some(prev) => match total.since(prev) {
                 Some(delta) => delta,
                 None => {
-                    stats.unusable_totals += 1;
+                    stats.regressions += 1;
+                    self.tokens_incomplete = true;
                     return;
                 }
             },
@@ -1434,12 +1507,14 @@ struct CodexTokenUsage {
 }
 
 impl CodexTokenUsage {
-    /// The total, or `None` when it is incomplete: input or output missing,
-    /// or a cache count missing that was not zero in `prev`. A cache count
-    /// missing that was zero (or with nothing before it) is read as zero.
-    fn complete(&self, prev: Option<&Tokens>) -> Option<Tokens> {
+    /// The total, or `None` when it is incomplete — input or output
+    /// missing, or a cache count missing that was not zero in `prev` — or
+    /// inconsistent: its cache counts add up to more than the input that
+    /// includes them. A cache count missing that was zero (or with nothing
+    /// before it) is read as zero.
+    fn usable(&self, prev: Option<&Tokens>) -> Option<Tokens> {
         let cache = |value: Option<u64>, before: u64| value.or((before == 0).then_some(0));
-        Some(Tokens {
+        let total = Tokens {
             input: self.input_tokens?,
             output: self.output_tokens?,
             cache_read: cache(self.cached_input_tokens, prev.map_or(0, |p| p.cache_read))?,
@@ -1447,7 +1522,8 @@ impl CodexTokenUsage {
                 self.cache_write_input_tokens,
                 prev.map_or(0, |p| p.cache_write),
             )?,
-        })
+        };
+        total.is_consistent().then_some(total)
     }
 }
 
@@ -1986,15 +2062,26 @@ mod tests {
         }
     }
 
+    /// A message with usage; `used_tokens: false` is a reported zero.
     fn opencode_message(model: &str, used_tokens: bool, cost: f64) -> OpenCodeMessageUsage {
         let n = u64::from(used_tokens);
         OpenCodeMessageUsage {
             model: model.into(),
-            input: 5 * n,
-            output: 3 * n,
-            cache_read: 7 * n,
-            cache_write: 0,
-            cost_usd: cost,
+            usage: Some(OpenCodeUsage {
+                input: 5 * n,
+                output: 3 * n,
+                cache_read: 7 * n,
+                cache_write: 0,
+                cost_usd: cost,
+            }),
+        }
+    }
+
+    /// A failed or never-completed message: no usage from the provider.
+    fn opencode_unrecorded(model: &str) -> OpenCodeMessageUsage {
+        OpenCodeMessageUsage {
+            model: model.into(),
+            usage: None,
         }
     }
 
@@ -2647,8 +2734,8 @@ mod tests {
             opencode.models[0].cost,
             Field::Unavailable(Unavailable::Incomplete)
         );
-        // A failed request with no tokens and no cost leaves a subscription
-        // total a subscription total.
+        // A completed reply that reported zero tokens and a zero cost leaves
+        // a subscription total a subscription total.
         let opencode = from_opencode(&[
             opencode_message("gpt-5.5", false, 0.0),
             opencode_message("gpt-5.5", true, 0.0),
@@ -2692,6 +2779,75 @@ mod tests {
         assert_eq!(priced.models[0].cost, Field::Estimated(MicroUsd(500_000)));
     }
 
+    /// Only zero tokens with an explicitly reported zero cost adds nothing;
+    /// a tokenless reply whose cost was not recorded is not a zero, so beside
+    /// a priced reply it makes the model's cost incomplete.
+    #[test]
+    fn a_missing_cost_beside_a_priced_reply_is_incomplete_not_zero() {
+        let tokenless = |cost| PiReplyUsage {
+            input: 0,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+            ..pi_reply("gpt-5.5", cost, Some(PiStopReason::Stop))
+        };
+        let priced = pi_reply("gpt-5.5", Some(1.0), Some(PiStopReason::Stop));
+        let missing = from_pi(&[tokenless(None), priced.clone()]);
+        assert_eq!(
+            missing.models[0].cost,
+            Field::Unavailable(Unavailable::Incomplete)
+        );
+        let zero = from_pi(&[tokenless(Some(0.0)), priced]);
+        assert_eq!(zero.models[0].cost, Field::Estimated(MicroUsd(1_000_000)));
+    }
+
+    /// A message with no usage (a failed or never-completed request, whose
+    /// counters OpenCode left at their initial 0) has its tokens and cost
+    /// `not_recorded`, apart from a completed reply that reported zero
+    /// tokens, which is a provider-reported zero; mixed with reported
+    /// usage, the model's tokens and cost are incomplete.
+    #[test]
+    fn opencode_absent_usage_is_not_recorded_and_a_reported_zero_is_zero() {
+        let absent = from_opencode(&[opencode_unrecorded("gpt-5.5")]);
+        assert_eq!(absent.models.len(), 1);
+        assert_eq!(absent.models[0].model, Some(id("gpt-5.5")));
+        assert_eq!(
+            absent.models[0].tokens,
+            Field::Unavailable(Unavailable::NotRecorded)
+        );
+        assert_eq!(
+            absent.models[0].cost,
+            Field::Unavailable(Unavailable::NotRecorded)
+        );
+
+        let reported_zero = from_opencode(&[opencode_message("gpt-5.5", false, 0.0)]);
+        assert_eq!(
+            reported_zero.models[0].tokens,
+            Field::ProviderReported(Tokens::default())
+        );
+        assert_eq!(reported_zero.models[0].cost, Field::Estimated(MicroUsd(0)));
+
+        let mixed = from_opencode(&[
+            opencode_unrecorded("gpt-5.5"),
+            opencode_message("gpt-5.5", true, 0.0),
+        ]);
+        assert_eq!(
+            mixed.models[0].tokens,
+            Field::Unavailable(Unavailable::Incomplete)
+        );
+        assert_eq!(
+            mixed.models[0].cost,
+            Field::Unavailable(Unavailable::Incomplete)
+        );
+        let rolled = rollup([&RunRecord::new(
+            identity("r", "opencode"),
+            from_opencode(&[opencode_unrecorded("gpt-5.5")]),
+            Some(EndReason::Exited),
+        )]);
+        assert!(rolled.tokens.is_empty(), "{:?}", rolled.tokens);
+        assert_eq!(rolled.tokens_unavailable, 1);
+    }
+
     #[test]
     fn a_normaliser_tracks_at_most_max_models_named_models() {
         let messages: Vec<OpenCodeMessageUsage> = (0..MAX_MODELS + 5)
@@ -2703,6 +2859,48 @@ mod tests {
         let other = usage.models.iter().find(|m| m.model.is_none()).unwrap();
         assert_eq!(other.tokens.value().unwrap().output, 3 * 5);
         assert_eq!(other.cost, Field::Estimated(MicroUsd(2_500_000)));
+    }
+
+    /// A Codex summary built by hand, not by the reader, with more named
+    /// models than the cap and an unnamed bucket already in it: the
+    /// normaliser keeps at most [`MAX_MODELS`] named models and one unnamed
+    /// one, with the total conserved, however often it is called.
+    #[test]
+    fn the_codex_normaliser_caps_a_summary_built_by_hand() {
+        let mut summary = CodexRolloutSummary::default();
+        summary.tokens_by_model.insert(None, tokens(1000, 100));
+        let n = MAX_MODELS as u64 + 8;
+        for i in 0..n {
+            summary
+                .tokens_by_model
+                .insert(Some(id(&format!("m{i:02}"))), tokens(10, 1));
+        }
+        let total = |models: &[ModelUsage]| {
+            let mut sum = Tokens::default();
+            for m in models {
+                sum.add(m.tokens.value().unwrap());
+            }
+            sum
+        };
+        for _ in 0..3 {
+            let usage = from_codex(&summary);
+            let named = usage.models.iter().filter(|m| m.model.is_some()).count();
+            let unnamed: Vec<&ModelUsage> =
+                usage.models.iter().filter(|m| m.model.is_none()).collect();
+            assert_eq!(named, MAX_MODELS);
+            assert_eq!(unnamed.len(), 1);
+            assert_eq!(
+                unnamed[0].tokens,
+                Field::ProviderReported(tokens(1000 + 80, 100 + 8))
+            );
+            assert_eq!(total(&usage.models), tokens(1000 + 10 * n, 100 + n));
+            assert!(
+                usage
+                    .models
+                    .iter()
+                    .all(|m| m.cost == Field::Unavailable(Unavailable::NoChannel))
+            );
+        }
     }
 
     // --- the incremental reader ---
@@ -2841,7 +3039,8 @@ mod tests {
                 "{incomplete}"
             );
             assert_eq!(reader.stats().unusable_totals, 1, "{incomplete}");
-            assert_eq!(reader.stats().counter_restarts, 0, "{incomplete}");
+            assert_eq!(reader.stats().regressions, 0, "{incomplete}");
+            assert!(!reader.summary().tokens_incomplete, "{incomplete}");
         }
     }
 
@@ -2891,33 +3090,72 @@ mod tests {
         assert_eq!(reader.stats().unusable_totals, 0);
     }
 
-    /// A complete total whose input went down is a counter restart, and all
-    /// of it is new; one where only another count went down is skipped.
+    /// A total whose cache parts exceed the input that includes them is not a
+    /// count: valid, then such a total with a lower input, then valid again
+    /// is the last valid total, with the baseline never moved by the middle
+    /// one, and the run's tokens stay provider-reported.
     #[test]
-    fn a_lower_input_is_a_counter_restart_and_a_lower_other_count_is_skipped() {
-        let reader = read(&[
-            token_count(500, 0, 50, 1.0, 5),
-            token_count(30, 0, 3, 1.0, 5),
-        ]);
-        assert_eq!(
-            reader.summary().tokens_by_model.get(&None),
-            Some(&tokens(530, 53))
-        );
-        assert_eq!(reader.stats().counter_restarts, 1);
-
-        let reader = read(&[
-            token_count(500, 0, 50, 1.0, 5),
-            token_count(510, 0, 40, 1.0, 5),
-            token_count(520, 0, 52, 1.0, 5),
-        ]);
-        assert_eq!(
-            reader.summary().tokens_by_model.get(&None),
-            Some(&tokens(520, 52))
-        );
-        assert_eq!(reader.stats().unusable_totals, 1);
-        assert_eq!(reader.stats().counter_restarts, 0);
+    fn an_inconsistent_total_is_skipped_without_moving_the_baseline() {
+        for inconsistent in [
+            usage(0, 40, 10),
+            r#"{"input_tokens":30,"cached_input_tokens":20,"cache_write_input_tokens":20,"output_tokens":10}"#.into(),
+        ] {
+            let reader = read(&[
+                token_count(100, 40, 10, 1.0, 5),
+                token_count_with(&inconsistent, 1.0, 5, "prolite"),
+                token_count(110, 50, 11, 1.0, 5),
+            ]);
+            let want = Tokens {
+                input: 110,
+                output: 11,
+                cache_read: 50,
+                cache_write: 0,
+            };
+            assert_eq!(
+                reader.summary().tokens_by_model.get(&None),
+                Some(&want),
+                "{inconsistent}"
+            );
+            assert_eq!(reader.stats().unusable_totals, 1, "{inconsistent}");
+            assert_eq!(reader.stats().regressions, 0, "{inconsistent}");
+            assert_eq!(
+                from_codex(reader.summary()).models[0].tokens,
+                Field::ProviderReported(want),
+                "{inconsistent}"
+            );
+        }
     }
 
+    /// A usable total lower than the one before, in input or in any other
+    /// count, may be a counter restart or a wrong total, and the reader takes
+    /// nothing in the rollout as saying which: the run's token total becomes
+    /// incomplete, and stays so, rather than adding either reading.
+    #[test]
+    fn a_lower_running_total_makes_the_token_total_incomplete() {
+        for lower in [usage(30, 0, 3), usage(510, 0, 40), usage(500, 0, 50)] {
+            let mut lines = vec![token_count(500, 10, 50, 1.0, 5)];
+            lines.push(token_count_with(&lower, 1.0, 5, "prolite"));
+            lines.push(token_count(520, 10, 52, 1.0, 5));
+            let reader = read(&lines);
+            assert!(reader.summary().tokens_incomplete, "{lower}");
+            assert_eq!(reader.stats().regressions, 1, "{lower}");
+            assert_eq!(reader.stats().unusable_totals, 0, "{lower}");
+            let usage = from_codex(reader.summary());
+            assert!(!usage.models.is_empty());
+            for m in &usage.models {
+                assert_eq!(
+                    m.tokens,
+                    Field::Unavailable(Unavailable::Incomplete),
+                    "{lower}"
+                );
+                assert_eq!(m.cost, Field::Unavailable(Unavailable::NoChannel));
+            }
+        }
+    }
+
+    /// The one start-over the reader recognises: the file itself got shorter
+    /// or was replaced, so it is read as a new rollout with the summary reset,
+    /// and its lower totals are not a regression.
     #[test]
     fn a_truncated_or_replaced_rollout_is_read_again_from_the_start() {
         let dir = crate::test_temp::tempdir().unwrap();
@@ -2941,6 +3179,8 @@ mod tests {
         write_lines(&mut file, &[&token_count(3, 0, 1, 1.0, 5)]);
         reader.poll().unwrap();
         assert_eq!(reader.stats().restarts, 1);
+        assert_eq!(reader.stats().regressions, 0);
+        assert!(!reader.summary().tokens_incomplete);
         assert_eq!(
             reader.summary().tokens_by_model.get(&None),
             Some(&tokens(3, 1))
@@ -3108,6 +3348,71 @@ mod tests {
         assert!(reader.summary().tokens_by_model.is_empty());
     }
 
+    /// The policy today: only the final component is refused as a symlink,
+    /// and a symlinked parent directory is followed. Confining the reader to
+    /// a trusted root is #1858's decision; this test changes with it.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_parent_directory_is_followed() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let mut file = File::create(real.join("rollout.jsonl")).unwrap();
+        write_lines(&mut file, &[&token_count(7, 0, 1, 1.0, 5)]);
+        let linked = dir.path().join("linked");
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+        let mut reader = CodexUsageReader::new(linked.join("rollout.jsonl"));
+        reader.poll().unwrap();
+        assert_eq!(
+            reader.summary().tokens_by_model.get(&None),
+            Some(&tokens(7, 1))
+        );
+    }
+
+    /// Budget cuts landing inside a line longer than [`MAX_LINE_BYTES`]:
+    /// the buffer never holds more than that, the line is counted once as
+    /// overlong and skipped through its newline over later polls, and the
+    /// lines on either side of it are read.
+    #[test]
+    fn a_budget_cut_inside_an_overlong_line_skips_it_across_polls() {
+        let overlong = format!(
+            r#"{{"type":"event_msg","payload":{{"type":"token_count","pad":"{}"}}}}"#,
+            "x".repeat(MAX_LINE_BYTES + 40 * 1024)
+        );
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("rollout-cut.jsonl");
+        let mut file = File::create(&path).unwrap();
+        write_lines(
+            &mut file,
+            &[
+                &token_count(10, 0, 1, 1.0, 5),
+                &overlong,
+                &token_count(20, 0, 2, 1.0, 5),
+            ],
+        );
+        let mut reader = CodexUsageReader::new(&path).with_poll_budget(100 * 1024);
+        let mut polls = 0;
+        loop {
+            reader.poll().unwrap();
+            polls += 1;
+            assert!(reader.partial.len() <= MAX_LINE_BYTES);
+            if reader.stats().backlog == 0 {
+                break;
+            }
+            assert!(polls < 100, "the backlog never drained");
+        }
+        assert!(polls >= 3, "{polls} polls");
+        let stats = reader.stats();
+        assert_eq!(stats.overlong, 1);
+        assert_eq!(stats.parsed, 2);
+        assert_eq!(stats.malformed, 0);
+        assert_eq!(stats.lines, 3);
+        assert_eq!(
+            reader.summary().tokens_by_model.get(&None),
+            Some(&tokens(20, 2))
+        );
+    }
+
     /// A backlog larger than the budget is drained over several polls, none
     /// reading more than its budget, with lines cut by a budget completed on
     /// the next poll, and the total the same as one unbounded read.
@@ -3165,14 +3470,15 @@ mod tests {
     /// Content-bearing records carrying a sentinel — a prompt, a reply, tool
     /// input and output, an error message, developer instructions, compacted
     /// history — produce a summary, a record and attributes with no trace of
-    /// it. Each content line also holds a string that is exactly one of the
-    /// pre-filter's markers, so it is deserialised rather than skipped.
+    /// it. Each content line, `session_meta` and the tool call included, also
+    /// holds a string that is exactly one of the pre-filter's markers, so it
+    /// is deserialised rather than skipped.
     #[test]
     fn content_never_reaches_the_summary_the_record_or_the_attributes() {
         let s = SENTINEL;
         let reader = read(&[
             format!(
-                r#"{{"type":"session_meta","payload":{{"cwd":"/{s}","base_instructions":{{"text":"{s}"}},"cli_version":"0.164.0"}}}}"#
+                r#"{{"type":"session_meta","payload":{{"cwd":"/{s}","base_instructions":{{"text":"{s}"}},"originator":"task_started","cli_version":"0.164.0"}}}}"#
             ),
             format!(
                 r#"{{"type":"turn_context","payload":{{"model":"gpt-5.5","cwd":"/{s}","collaboration_mode":{{"settings":{{"developer_instructions":"{s}"}}}}}}}}"#
@@ -3181,7 +3487,7 @@ mod tests {
                 r#"{{"type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"{s}"}},{{"type":"input_text","text":"token_count"}},{{"type":"input_text","text":"turn_context"}}]}}}}"#
             ),
             format!(
-                r#"{{"type":"response_item","payload":{{"type":"function_call","name":"exec","arguments":"{{\"cmd\":\"cat {s}\"}}","model":"{s}"}}}}"#
+                r#"{{"type":"response_item","payload":{{"type":"function_call","name":"exec","arguments":"{{\"cmd\":\"cat {s}\"}}","call_id":"turn_context","model":"{s}"}}}}"#
             ),
             format!(
                 r#"{{"type":"response_item","payload":{{"type":"function_call_output","output":[{{"type":"text","text":"{s}"}},{{"type":"text","text":"task_complete"}}]}}}}"#
@@ -3197,11 +3503,7 @@ mod tests {
                 r#"{{"type":"event_msg","payload":{{"type":"task_complete","last_agent_message":"{s}","error":{{"message":"{s}","codex_error_info":"{s} is not an identifier"}}}}}}"#
             ),
         ]);
-        assert_eq!(
-            reader.stats().parsed,
-            7,
-            "the content lines were deserialised"
-        );
+        assert_eq!(reader.stats().parsed, 9, "every line was deserialised");
         assert_eq!(reader.stats().malformed, 0);
         let summary = reader.summary().clone();
         assert!(!format!("{summary:?}").contains(SENTINEL), "{summary:?}");
@@ -3255,15 +3557,22 @@ mod tests {
         }
     }
 
-    /// Strings reach the record through the reader and the normalisers only
-    /// as identifiers: a JSON escape is judged after decoding, so an escaped
-    /// hyphen is kept and an escaped line break is not, and the 128/129-byte
-    /// boundary holds on both paths. An identifier-shaped plan is kept and
-    /// exported, which is the residual risk the doc names.
+    /// Strings reach the record only as identifiers, on every path a string
+    /// enters by. Through the reader, a JSON escape is judged after decoding
+    /// (an escaped hyphen or underscore is kept, an escaped line break is
+    /// not) and the 128/129-byte boundary holds, for each of the three string
+    /// fields it keeps: the turn's model, the plan and the error kind.
+    /// Through each normaliser that takes a raw model name (Claude Code, Pi,
+    /// OpenCode), a space, a line break and 129 bytes are dropped and 128
+    /// kept. A run id or agent is an `Ident` before a record can hold it. An
+    /// identifier-shaped plan or model is kept, which is the residual risk
+    /// the doc names.
     #[test]
     fn strings_reach_the_record_only_as_identifiers() {
         let at_limit = "a".repeat(Ident::MAX_BYTES);
         let over_limit = "b".repeat(Ident::MAX_BYTES + 1);
+
+        // The model, through the reader.
         let reader = read(&[
             turn_context(r"gpt-5.5"),
             token_count(10, 0, 1, 1.0, 5),
@@ -3285,19 +3594,77 @@ mod tests {
             Some(id(&format!("{SENTINEL}@example.com")))
         );
 
-        let pi = from_pi(&[
-            pi_reply(&format!("{SENTINEL} with space"), Some(0.1), None),
-            pi_reply(&format!("/home/{SENTINEL}/.ssh/id"), Some(0.1), None),
-        ]);
-        let models: Vec<Option<&str>> = pi
-            .models
-            .iter()
-            .map(|m| m.model.as_ref().map(Ident::as_str))
-            .collect();
-        assert_eq!(
-            models,
-            vec![None, Some(format!("/home/{SENTINEL}/.ssh/id").as_str())]
-        );
+        // The plan and the error kind, through the reader.
+        let cases = [
+            (r"pro_lite".to_owned(), Some("pro_lite".to_owned())),
+            (format!(r"{SENTINEL}\u000aline"), None),
+            (format!("{SENTINEL} space"), None),
+            (at_limit.clone(), Some(at_limit.clone())),
+            (over_limit.clone(), None),
+        ];
+        for (raw, want) in &cases {
+            let reader = read(&[
+                token_count_with(&usage(10, 0, 1), 1.0, 5, raw),
+                format!(
+                    r#"{{"type":"event_msg","payload":{{"type":"task_complete","error":{{"message":"m","codex_error_info":"{raw}"}}}}}}"#
+                ),
+            ]);
+            let summary = reader.summary();
+            let want = want.as_deref().map(id);
+            assert_eq!(summary.quota_last.as_ref().unwrap().plan, want, "{raw}");
+            assert_eq!(
+                summary.last_turn,
+                Some(AgentTurnEnd::Failed { kind: want }),
+                "{raw}"
+            );
+        }
+
+        // The model, through every normaliser that takes a raw name.
+        let cases = [
+            (format!("{SENTINEL} with space"), None),
+            (format!("{SENTINEL}\nline"), None),
+            (over_limit.clone(), None),
+            (at_limit.clone(), Some(id(&at_limit))),
+            (
+                format!("/home/{SENTINEL}/.ssh/id"),
+                Some(id(&format!("/home/{SENTINEL}/.ssh/id"))),
+            ),
+        ];
+        for (raw, want) in &cases {
+            let claude = from_claude(Some(&ClaudeSessionUsage {
+                models: vec![ClaudeModelUsage {
+                    model: raw.clone(),
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    cost_usd: Some(0.1),
+                }],
+                has_unknown_model_cost: false,
+                last_turn: None,
+            }));
+            let pi = from_pi(&[pi_reply(raw, Some(0.1), None)]);
+            let opencode = from_opencode(&[opencode_message(raw, true, 0.1)]);
+            for (agent, got) in [("claude", claude), ("pi", pi), ("opencode", opencode)] {
+                assert_eq!(got.models.len(), 1, "{agent} {raw:?}");
+                assert_eq!(&got.models[0].model, want, "{agent} {raw:?}");
+            }
+        }
+
+        // A run id and an agent: no `Ident`, no record.
+        for hostile in [
+            format!("{SENTINEL}\nline"),
+            format!("{SENTINEL} space"),
+            over_limit.clone(),
+        ] {
+            assert!(Ident::new(&hostile).is_none(), "{hostile:?}");
+        }
+        let export = run_attributes(&RunRecord::new(
+            RunIdentity::new(id(&at_limit), id("codex")),
+            from_codex(&CodexRolloutSummary::default()),
+            None,
+        ));
+        assert!(has(&export.run, AccountingKey::RunId, &at_limit));
     }
 
     /// Every string value the export can emit is an enum's name or an
@@ -3358,6 +3725,14 @@ mod tests {
                         kind: Ident::new(&hostile),
                     }),
                 })),
+                Some(EndReason::Exited),
+            ),
+            RunRecord::new(
+                identity("r4", "opencode"),
+                from_opencode(&[
+                    opencode_message(&hostile, true, 0.5),
+                    opencode_unrecorded(&hostile),
+                ]),
                 Some(EndReason::Exited),
             ),
         ];
@@ -3621,11 +3996,13 @@ mod tests {
             },
             from_opencode(&[OpenCodeMessageUsage {
                 model: "gpt-5.5".into(),
-                input: 5,
-                output: 3,
-                cache_read: 0,
-                cache_write: 0,
-                cost_usd: 0.0,
+                usage: Some(OpenCodeUsage {
+                    input: 5,
+                    output: 3,
+                    cache_read: 0,
+                    cache_write: 0,
+                    cost_usd: 0.0,
+                }),
             }]),
             Some(EndReason::Exited),
         );
@@ -3806,7 +4183,7 @@ mod tests {
 
         for pass in 1..=3 {
             let started = Instant::now();
-            let (mut stats, mut errors, mut agree, mut restarted) =
+            let (mut stats, mut errors, mut agree, mut regressed) =
                 (ReaderStats::default(), 0, 0, 0);
             for (path, _) in &files {
                 let mut reader = CodexUsageReader::new(path).with_poll_budget(u64::MAX);
@@ -3820,28 +4197,28 @@ mod tests {
                 stats.malformed += s.malformed;
                 stats.overlong += s.overlong;
                 stats.unusable_totals += s.unusable_totals;
-                stats.counter_restarts += s.counter_restarts;
+                stats.regressions += s.regressions;
                 let summary = reader.summary();
                 let mut sum = Tokens::default();
                 for t in summary.tokens_by_model.values() {
                     sum.add(t);
                 }
-                if s.counter_restarts > 0 {
-                    restarted += 1;
+                if s.regressions > 0 {
+                    regressed += 1;
                 } else if summary.last_total.unwrap_or_default() == sum {
                     agree += 1;
                 }
             }
             let secs = started.elapsed().as_secs_f64();
             println!(
-                "full read, pass {pass}: {secs:.2} s, {:.0} MB/s; lines {}, deserialised {}, malformed {}, overlong {}, unusable totals {}, counter restarts {}, open errors {errors}; per-model sums equal the running total in {agree} rollouts, {restarted} with a counter restart",
+                "full read, pass {pass}: {secs:.2} s, {:.0} MB/s; lines {}, deserialised {}, malformed {}, overlong {}, unusable totals {}, regressions {}, open errors {errors}; per-model sums equal the running total in {agree} rollouts, {regressed} with a total that went down",
                 total_bytes as f64 / 1e6 / secs,
                 stats.lines,
                 stats.parsed,
                 stats.malformed,
                 stats.overlong,
                 stats.unusable_totals,
-                stats.counter_restarts,
+                stats.regressions,
             );
         }
 
