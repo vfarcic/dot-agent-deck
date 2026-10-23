@@ -4266,9 +4266,10 @@ async fn resize_worker(
     attached: Arc<Mutex<PaneAttachment>>,
     parser: Arc<Mutex<vt100::Parser>>,
 ) {
-    // Mark the initial `None` value as seen so the first `changed()` call
-    // waits for an actual resize, not the channel's seed value.
-    let _ = rx.borrow_and_update();
+    // A receiver from `watch::channel` already counts the seed `None` as seen,
+    // so the first `changed()` waits for an actual resize. Marking it seen here
+    // instead also marked a resize sent before this task first ran, and that
+    // one never reached the daemon.
     while rx.changed().await.is_ok() {
         let dims = *rx.borrow_and_update();
         let Some((rows, cols)) = dims else { continue };
@@ -7462,8 +7463,14 @@ mod incarnation_binding_tests {
         assert_eq!(daemon.received_by("b"), Vec::<String>::new());
     }
 
-    /// Rename, message, resize and close the pane, in that order.
-    fn act_on(controller: &EmbeddedPaneController, pane: &str) -> Result<(), PaneError> {
+    /// Rename, message, resize and close the pane, in that order. The resize
+    /// is sent by the pane's resize worker, which a close aborts with the
+    /// pane, so the close waits for `sent` to say the daemon was asked.
+    fn act_on(
+        controller: &EmbeddedPaneController,
+        pane: &str,
+        sent: impl Fn(),
+    ) -> Result<(), PaneError> {
         let _ = controller.rename_pane(pane, "renamed");
         let _ = controller.post_message(
             &BoundPane::held_by_controller(pane),
@@ -7472,6 +7479,7 @@ mod incarnation_binding_tests {
             crate::inbox_hub::PostOrigin::OrchestratorRemit,
         );
         controller.resize_pane_pty(pane, 30, 100)?;
+        sent();
         controller.close_pane(pane)
     }
 
@@ -7493,7 +7501,12 @@ mod incarnation_binding_tests {
             .expect("a pane on the first process");
         daemon.restart_as("b");
 
-        let closed = act_on(&controller, &pane);
+        let closed = act_on(&controller, &pane, || {
+            wait_for(
+                "the rename, message and resize to ask the restarted daemon",
+                || daemon.hellos("b") >= ACTIONS.len() - 1,
+            )
+        });
         wait_for("every action to ask the restarted daemon", || {
             daemon.hellos("b") >= ACTIONS.len()
         });
@@ -7520,7 +7533,12 @@ mod incarnation_binding_tests {
         let pane = controller
             .create_pane(Some("cat"), None)
             .expect("a pane on the control daemon");
-        act_on(&controller, &pane).expect("control: the close stops the agent");
+        act_on(&controller, &pane, || {
+            wait_for("control: the resize to reach the daemon", || {
+                control.received_by("a").contains(&"resize".to_string())
+            })
+        })
+        .expect("control: the close stops the agent");
         wait_for("control: every action to reach the daemon", || {
             let reached = control.received_by("a");
             ACTIONS.iter().all(|op| reached.iter().any(|r| r == op))
@@ -7978,5 +7996,44 @@ mod incarnation_binding_tests {
                 assert_eq!(controller.panes.lock().unwrap()[&pane].name, "renamed");
             }
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod resize_worker_tests {
+    use super::*;
+    use crate::daemon_client::restart_fixture::RestartingDaemon;
+
+    /// A resize asked for before the pane's resize worker first runs, as the
+    /// first layout pass after a pane is created can be, still reaches the
+    /// daemon. The pane records the request and draws at the new size either
+    /// way, so a lost one leaves the agent's PTY at the old size until the
+    /// layout changes again.
+    #[tokio::test]
+    async fn a_resize_asked_before_the_worker_first_runs_reaches_the_daemon() {
+        let daemon = RestartingDaemon::spawn("a");
+        let (resize_tx, resize_rx) = tokio::sync::watch::channel(None);
+        resize_tx.send_replace(Some((30, 100)));
+        let attached = Arc::new(Mutex::new(PaneAttachment {
+            agent_id: "1".into(),
+            viewer: None,
+            incarnation: None,
+        }));
+        let worker = tokio::spawn(resize_worker(
+            resize_rx,
+            DaemonClient::new(daemon.path.clone()),
+            attached,
+            Arc::new(Mutex::new(new_pane_parser(24, 80))),
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !daemon.received_by("a").contains(&"resize".to_string()) {
+            assert!(
+                Instant::now() < deadline,
+                "the resize never reached the daemon"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        worker.abort();
+        drop(resize_tx);
     }
 }
