@@ -669,8 +669,8 @@ fn fetch_one_shot<W: Write>(
     } else if batch.is_empty() {
         pieces.push(Piece::Frame(b"No dot-agent-deck messages are waiting.\n"));
     } else {
-        pieces.push(Piece::Frame(AGENT_FRAMING.as_bytes()));
-        pieces.push(Piece::Frame(crate::inbox_hub::BLOCK_SEPARATOR.as_bytes()));
+        pieces.push(Piece::Open(AGENT_FRAMING.as_bytes()));
+        pieces.push(Piece::Open(crate::inbox_hub::BLOCK_SEPARATOR.as_bytes()));
         for i in 0..batch.len() {
             if i > 0 {
                 pieces.push(Piece::Joint(crate::inbox_hub::BLOCK_SEPARATOR.as_bytes()));
@@ -680,7 +680,7 @@ fn fetch_one_shot<W: Write>(
                 batch.text(i).unwrap_or_default().as_bytes(),
             ));
         }
-        pieces.push(Piece::Frame(b"\n"));
+        pieces.push(Piece::Close(b"\n"));
     }
     if batch.is_empty() {
         // Nothing was issued, so there is nothing to approve or report: the
@@ -688,7 +688,7 @@ fn fetch_one_shot<W: Write>(
         connection.finish();
         let written = pieces.iter().try_for_each(|piece| match piece {
             Piece::Frame(bytes) => stdout.write_all(bytes),
-            Piece::Block(..) | Piece::Joint(_) => Ok(()),
+            Piece::Block(..) | Piece::Joint(_) | Piece::Open(_) | Piece::Close(_) => Ok(()),
         });
         return if written.and_then(|()| stdout.flush()).is_ok() {
             ExitCode::SUCCESS

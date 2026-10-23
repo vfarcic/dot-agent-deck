@@ -99,6 +99,14 @@ pub enum Piece<'a> {
     /// fence refuses drops it, so the blocks written are joined as if the
     /// refused ones had never been in the batch.
     Joint(&'a [u8]),
+    /// What opens an output that means something only with a block in it (a
+    /// hook's JSON envelope and framing): held until the first block that
+    /// passes its fence and written just before it, so a batch whose every
+    /// block is refused writes none of it.
+    Open(&'a [u8]),
+    /// What closes an [`Piece::Open`]ed output: written only once a block
+    /// passed its fence.
+    Close(&'a [u8]),
 }
 
 /// What [`OneShotBatch::hand_over`] did: each block's [`Output`], in batch
@@ -271,6 +279,7 @@ impl OneShotBatch {
         }
         let mut error = None;
         let mut joint: Option<&[u8]> = None;
+        let mut opening: Vec<&[u8]> = Vec::new();
         let mut passed_any = false;
         for piece in pieces {
             let (block, bytes) = match *piece {
@@ -279,6 +288,13 @@ impl OneShotBatch {
                     joint = Some(bytes);
                     continue;
                 }
+                Piece::Open(bytes) if !passed_any => {
+                    opening.push(bytes);
+                    continue;
+                }
+                Piece::Open(bytes) => (None, bytes),
+                Piece::Close(_) if !passed_any => continue,
+                Piece::Close(bytes) => (None, bytes),
                 Piece::Block(i, bytes) => {
                     let Some(at) = self.blocks.get(i).map(|block| &block.at) else {
                         continue;
@@ -293,13 +309,19 @@ impl OneShotBatch {
                         continue;
                     }
                     if first {
-                        let lead = joint.take().filter(|_| passed_any);
+                        let lead = if passed_any {
+                            joint.take().into_iter().collect()
+                        } else {
+                            joint = None;
+                            std::mem::take(&mut opening)
+                        };
                         passed_any = true;
                         // Written after the fence and before the block's
                         // first byte: a lead that fails leaves the block
                         // not handed.
-                        if let Some(lead) = lead
-                            && let (_, Some(failed)) = write_counted(out, lead)
+                        if let Some(failed) = lead
+                            .into_iter()
+                            .find_map(|bytes| write_counted(out, bytes).1)
                         {
                             error = Some(failed);
                             break;
@@ -714,9 +736,12 @@ impl Ran {
     }
 
     /// Whether a hand-over that asks the agent to go on with its turn
-    /// (Codex's `Stop`) did ask it: every block was written and flushed.
+    /// (Codex's `Stop`) did ask it: its whole output was written and flushed,
+    /// and carried a block. A batch whose blocks the fence all refused wrote
+    /// nothing ([`Piece::Open`]); one the fence refused in part asked the
+    /// agent to go on with the blocks that passed.
     pub fn continues_turn(&self) -> bool {
-        self.error.is_none() && self.outputs.iter().all(|output| *output == Output::Written)
+        self.error.is_none() && self.outputs.contains(&Output::Written)
     }
 }
 

@@ -584,7 +584,9 @@ fn pinned_spool() -> crate::inbox_oneshot::Pinned {
 
 /// [`hook_output`]'s bytes, or the `Stop` block's, for a framing and the
 /// blocks, each block's escaped text a piece of its own, so the hand-over
-/// judges each block by what of it was written.
+/// judges each block by what of it was written. The envelope opens only with
+/// the first block the fence lets through: a batch it refuses whole prints
+/// nothing.
 pub struct HookOutputParts {
     head: String,
     separator: String,
@@ -596,8 +598,8 @@ impl HookOutputParts {
     pub fn pieces(&self) -> Vec<crate::inbox_oneshot::Piece<'_>> {
         use crate::inbox_oneshot::Piece;
         let mut pieces = vec![
-            Piece::Frame(self.head.as_bytes()),
-            Piece::Frame(self.separator.as_bytes()),
+            Piece::Open(self.head.as_bytes()),
+            Piece::Open(self.separator.as_bytes()),
         ];
         for (i, block) in self.blocks.iter().enumerate() {
             if i > 0 {
@@ -605,7 +607,7 @@ impl HookOutputParts {
             }
             pieces.push(Piece::Block(i, block.as_bytes()));
         }
-        pieces.push(Piece::Frame(self.tail.as_bytes()));
+        pieces.push(Piece::Close(self.tail.as_bytes()));
         pieces
     }
 }
@@ -1197,9 +1199,11 @@ mod tests {
         let bytes: Vec<u8> = pieces
             .iter()
             .flat_map(|piece| match piece {
-                Piece::Frame(bytes) | Piece::Block(_, bytes) | Piece::Joint(bytes) => {
-                    bytes.to_vec()
-                }
+                Piece::Frame(bytes)
+                | Piece::Block(_, bytes)
+                | Piece::Joint(bytes)
+                | Piece::Open(bytes)
+                | Piece::Close(bytes) => bytes.to_vec(),
             })
             .collect();
         let printed = String::from_utf8(bytes).unwrap();

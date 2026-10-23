@@ -204,9 +204,10 @@ pub fn handle_hook(agent: &str) -> ExitCode {
         match codex_inbox_hooks(&input, &mut event, &mut announce) {
             CodexInbox::Nothing => {}
             CodexInbox::Print(output) => output.print(),
-            // PRD #1666 part 3 (H4): only a hand-over written and flushed whole
-            // goes on with the turn; one cut short or not written at all left
-            // Codex no block to act on, so the turn ends as usual.
+            // PRD #1666 part 3 (H4): a hand-over whose output was written and
+            // flushed whole with a block in it goes on with the turn. One cut
+            // short is not a decision Codex can read, and one the fence
+            // refused whole printed nothing, so either turn ends as usual.
             #[cfg(unix)]
             CodexInbox::TurnEnd(injection) => {
                 if injection.print().continues_turn() {
