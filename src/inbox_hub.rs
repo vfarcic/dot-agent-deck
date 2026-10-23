@@ -1865,12 +1865,17 @@ impl InboxHub {
             let mut st = self.lock();
             let now = Instant::now();
             let key = (pane_id.to_string(), agent_id.to_string());
-            // A repeated ack is answered as one, the model left alone.
-            if matches!(
-                st.inbox.state_for(id, pane_id, agent_id),
-                Some(MessageState::Acknowledged { .. })
-            ) {
-                return AckOutcome::AlreadyAcknowledged;
+            match st.inbox.state_for(id, pane_id, agent_id) {
+                // A repeated ack is answered as one, the model left alone.
+                Some(MessageState::Acknowledged { .. }) => {
+                    return AckOutcome::AlreadyAcknowledged;
+                }
+                // Only the copy's current recipient settles it: an offer's
+                // previous holder keeps its committed attempt after the offer
+                // moves on, which must not answer its ack as a success. The
+                // store answers `wrong_agent` (or `unknown`), changing nothing.
+                None => return st.inbox.ack(now, id, pane_id, agent_id, how),
+                Some(_) => {}
             }
             // PRD #1666 §13 step 4: a hand-out is settled through its attempt
             // model, never by the store's ack alone.
