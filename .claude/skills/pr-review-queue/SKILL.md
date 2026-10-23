@@ -123,7 +123,7 @@ Print every included PR with **number, title, author, whether it is the runner's
 
 Then **ask how many to dispatch**, recommending **2–3**. Do not assume "all of them", and do not offer "all" as the recommended option.
 
-Each unit that verifies runs `/verify-pr`, which since issue #502 **reads** the PR's `e2e-deterministic` CI run rather than reproducing lane 1 locally — so a verification is now dominated by the release build, `test-fast` and the windows cross-check rather than by tens of minutes of PTY time. It still builds its own multi-GB `target/`, and a unit may opt into a local lane-1 run with `--e2e` where CI's is missing. How much of that to spend at once is the user's call, not yours. Some of that need not land here at all: `ci.yml` is `workflow_dispatch`-able, so a unit working on **its own** branch can run the full matrix on GitHub's runners ([`docs/develop/ci-on-demand.md`](../../../docs/develop/ci-on-demand.md)). It relieves no gate — rule 2's run before a commit exists — and it buys nothing at all on someone else's PR, where the run already exists and is the unit's to read rather than to restart.
+Each unit that verifies runs `/verify-pr`, which since issue #502 **reads** the PR's `e2e-deterministic` CI run (or its `RWX: linux` status, when `.github/ci-backend` says `rwx`) rather than reproducing lane 1 locally — so a verification is now dominated by the release build, `test-fast` and the windows cross-check rather than by tens of minutes of PTY time. It still builds its own multi-GB `target/`, and a unit may opt into a local lane-1 run with `--e2e` where CI's is missing. How much of that to spend at once is the user's call, not yours. Some of that need not land here at all: `ci.yml` is `workflow_dispatch`-able, so a unit working on **its own** branch can run the full matrix on GitHub's runners ([`docs/develop/ci-on-demand.md`](../../../docs/develop/ci-on-demand.md)). It relieves no gate — rule 2's run before a commit exists — and it buys nothing at all on someone else's PR, where the run already exists and is the unit's to read rather than to restart.
 
 **The count is a security decision, not only a cost one.** N units means N concurrent agents, N independent chances for the untrusted-content problem in step 5 to land, and N simultaneous `cargo build` / `nextest` / `xtask` runs over code nobody has read yet. That is what a "just do all of them" answer is really buying.
 
@@ -574,3 +574,15 @@ Report the base too, as a distance from `origin/main` rather than a branch name:
 Also report, plainly: every PR skipped and why — closed since listing, become someone else's homework, or already under a live unit (name that unit) — every PR excluded at step 1, and the number dispatched against the number the user asked for if they differ.
 
 **Never write anything that implies results will report back here** — no "I'll let you know when they finish", no "waiting for the verdicts", no summary table with an empty Verdict column waiting to be filled. There is no mechanism behind any of those sentences. If the user wants a consolidated view later, they ask each pane, or re-attach to it.
+
+## Step 9 — End of run: dispatch the cleanup units
+
+**A review queue run ends with the end-of-run step defined once in [`code-cleanup`](../code-cleanup/SKILL.md), section "At the end of a dispatch run"**, exactly as `/issue-queue` runs end. Follow it from this pane rather than composing cleanup tasks here; it holds when the step starts, the second pass of [`dispatch-base`](../dispatch-base/SKILL.md), the off-limits list and the frequency guard.
+
+What this queue adds to it:
+
+- **It starts once every unit of this run has finished**: the PR it worked on merged, closed or waiting for a person, and the unit stopped. Read that from the PRs and the units' tabs rather than waiting for a report in this pane (step 8). If the runner leaves before then, the step does not run in this session; say so in step 8's report.
+- **The off-limits list is the one this run's tasks carried**, if the runner gave one.
+- **Report the cleanup units** as step 8 reports the review units, the modes the frequency guard skipped included.
+
+**The runner can skip this step for a run** by saying so; say in step 8's report that no cleanup units went out.

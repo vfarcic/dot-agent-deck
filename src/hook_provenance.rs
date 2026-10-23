@@ -310,9 +310,12 @@ pub trait HookTokenDirectory {
 pub enum Refusal {
     /// The presented value is not shaped like a token this daemon mints.
     Malformed,
-    /// A well-formed token this daemon has no record of. The ordinary cause is a
-    /// token minted by a **previous** daemon, held by an agent that survived the
-    /// restart; the other cause is a guess.
+    /// A well-formed token this daemon has no record of. The common cause is
+    /// teardown: closing an agent or shutting the daemon down removes the
+    /// agent's record, and its token with it, before the child exits, so the
+    /// dying agent's own last reports (its `SessionEnd`) present a token
+    /// nobody owns. Others are a token minted by a **previous** daemon, held
+    /// by an agent that survived the restart, and a guess.
     UnknownToken,
     /// A token this daemon minted, presented alongside a pane id it was not
     /// minted for. This is the forgery shape that a token-bearing sibling would

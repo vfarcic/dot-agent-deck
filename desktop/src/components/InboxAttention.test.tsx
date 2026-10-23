@@ -20,7 +20,7 @@ function item(messageId: string, kind: string, revision = 4) {
 
 function snapshot(inbox: Record<string, unknown>): DesktopSnapshotDto {
   const agent = {
-    id: "7", paneId: "worker", displayName: "Coder", agentType: "open_code" as const,
+    id: "7", paneId: "worker", displayName: "Coder", agentType: "open_code" as const, incarnation: "listed-inbox-process-a",
     rows: 24, cols: 80, status: "working" as const, toolCount: 3,
     lastUserPrompt: "inspect the fixture",
     tab: { kind: "orchestration" as const, name: "test", roleIndex: 1, roleName: "coder", isStartRole: false },
@@ -139,7 +139,7 @@ describe("deck messages that need a decision (PRD #1666 §6)", () => {
     const card = tile(agent, onInboxAction);
     fireEvent.click(within(card.getByTestId(`inbox-attention-${first}`)).getByRole("button", { name: words.retry }));
     await waitFor(() => expect(onInboxAction).toHaveBeenCalledWith(
-      { deckId: agent.daemonId, agentId: "7" },
+      { deckId: agent.daemonId, agentId: "7", incarnation: "listed-inbox-process-a" },
       { paneId: "worker", messageId: first, revision: 6 },
       "retry",
     ));
@@ -158,7 +158,7 @@ describe("deck messages that need a decision (PRD #1666 §6)", () => {
     const card = tile(agent, onInboxAction);
     fireEvent.click(within(card.getByTestId(`inbox-attention-${first}`)).getByRole("button", { name: words.retry }));
     await waitFor(() => expect(onInboxAction).toHaveBeenCalledWith(
-      { deckId: agent.daemonId, agentId: "7" },
+      { deckId: agent.daemonId, agentId: "7", incarnation: "listed-inbox-process-a" },
       { paneId: "worker", messageId: first, revision: 9 },
       "retry",
     ));
@@ -172,7 +172,7 @@ describe("deck messages that need a decision (PRD #1666 §6)", () => {
     const card = tile(agent, onInboxAction);
     fireEvent.click(within(card.getByTestId(`inbox-attention-${first}`)).getByRole("button", { name: words.cancel }));
     await waitFor(() => expect(onInboxAction).toHaveBeenCalledWith(
-      { deckId: agent.daemonId, agentId: "7" },
+      { deckId: agent.daemonId, agentId: "7", incarnation: "listed-inbox-process-a" },
       { paneId: "worker", messageId: first, revision: 4 },
       "cancel",
     ));
@@ -196,7 +196,7 @@ describe("deck messages that need a decision (PRD #1666 §6)", () => {
     }
     fireEvent.click(within(card.getByTestId(`inbox-attention-${ids[8]}`)).getByRole("button", { name: words.cancel }));
     await waitFor(() => expect(onInboxAction).toHaveBeenCalledWith(
-      { deckId: agent.daemonId, agentId: "7" },
+      { deckId: agent.daemonId, agentId: "7", incarnation: "listed-inbox-process-a" },
       { paneId: "worker", messageId: ids[8], revision: 18 },
       "cancel",
     ));
@@ -210,6 +210,16 @@ describe("deck messages that need a decision (PRD #1666 §6)", () => {
   ])("shows the %s integration notice", (code, text) => {
     const card = tile(mapDesktopSnapshot(snapshot({ integration: code })).agents[0]);
     expect(card.getByTestId("inbox-notice-7")).toHaveTextContent(text);
+  });
+
+  /// Scenario: The agent's deck hooks run a dot-agent-deck too old for its messages; the tile names the command the deck gives to update them, or says to upgrade when it gives none, in the words the TUI uses.
+  it("shows the hooks_too_old notice with its fix", () => {
+    const command = "/opt/deck/bin/dot-agent-deck hooks install --agent claude-code";
+    let card = tile(mapDesktopSnapshot(snapshot({ integration: "hooks_too_old", integrationCommand: command })).agents[0]);
+    expect(card.getByTestId("inbox-notice-7")).toHaveTextContent(`${words.hooksTooOld}: run ${command}, then restart the agent`);
+    document.body.innerHTML = "";
+    card = tile(mapDesktopSnapshot(snapshot({ integration: "hooks_too_old" })).agents[0]);
+    expect(card.getByTestId("inbox-notice-7")).toHaveTextContent(`${words.hooksTooOld}: ${words.hooksTooOldUpgrade}`);
   });
 
   /// Scenario: Hand-outs are paused for room in the evidence store, or receipts cannot be recorded; the tile says so in the words the TUI uses.

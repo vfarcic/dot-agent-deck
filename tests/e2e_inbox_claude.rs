@@ -8,6 +8,7 @@ mod inbox;
 use inbox::*;
 use serde_json::{Value, json};
 use spec::spec;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -30,6 +31,12 @@ fn sidecar(pane: &Pane, suffix: &str) -> PathBuf {
 }
 
 fn parent(endpoint: &impl Endpoint, name: &str) -> Pane {
+    parent_as(endpoint, name, Some("claude_code"))
+}
+
+/// [`parent`] spawned as `agent_type`; `None` starts it from its command
+/// alone, as a role or a resumed session is, with no agent type to go by.
+fn parent_as(endpoint: &impl Endpoint, name: &str, agent_type: Option<&str>) -> Pane {
     let script = endpoint.cwd().join(format!("{name}.py"));
     std::fs::write(&script, r#"import os, sys, tty, termios, json, subprocess, glob, select, time
 tty.setraw(0, termios.TCSANOW)
@@ -48,16 +55,32 @@ while True:
         os.unlink(path)
         tag = request['tag']
         payload = json.dumps(request['payload']).encode()
+        env = dict(os.environ)
+        env.update(request.get('env', {}))
         if request['kind'] == 'wait':
             out = open(base + '.stdout-' + tag, 'wb')
             err = open(base + '.stderr-' + tag, 'wb')
-            child = subprocess.Popen([deck, 'inbox', 'wait', '--agent', 'claude-code'], stdin=subprocess.PIPE, stdout=out, stderr=err)
+            argv = ['/bin/sh', '-c', request['shell']] if 'shell' in request else [deck, 'inbox', 'wait', '--agent', 'claude-code']
+            child = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=out, stderr=err, env=env)
             child.stdin.write(payload)
             child.stdin.close()
             publish('waiter-' + tag, child.pid)
             running[tag] = (child, out, err)
+        elif request['kind'] == 'raw':
+            import socket
+            conn = socket.socket(socket.AF_UNIX)
+            conn.settimeout(15)
+            conn.connect(request['socket'])
+            conn.sendall(payload + b'\n')
+            reply = b''
+            while not reply.endswith(b'\n'):
+                chunk = conn.recv(4096)
+                if not chunk: break
+                reply += chunk
+            conn.close()
+            publish('result-' + tag, {'code':0, 'stdout':reply.decode(), 'stderr':''})
         else:
-            result = subprocess.run([deck, 'hook', '--agent', 'claude-code'], input=payload, capture_output=True, timeout=15)
+            result = subprocess.run([deck, 'hook', '--agent', 'claude-code'], input=payload, capture_output=True, timeout=15, env=env)
             publish('result-' + tag, {'code':result.returncode, 'stdout':result.stdout.decode(), 'stderr':result.stderr.decode()})
             os.write(1, b'HOOK-FINISHED:' + tag.encode() + b'\r\n')
     for tag, (child, out, err) in list(running.items()):
@@ -83,12 +106,13 @@ while True:
         quote(&base),
         quote(std::path::Path::new(env!("CARGO_BIN_EXE_dot-agent-deck")))
     ));
-    let reply = attach(
-        endpoint,
-        json!({"op":"start-agent","command":command,
-        "cwd":endpoint.cwd(),"rows":40,"cols":140,"agent_type":"claude_code",
-        "env":[["DOT_AGENT_DECK_PANE_ID",name],["PATH",claude_path(endpoint.cwd())]],"display_name":name}),
-    );
+    let mut start = json!({"op":"start-agent","command":command,
+        "cwd":endpoint.cwd(),"rows":40,"cols":140,
+        "env":[["DOT_AGENT_DECK_PANE_ID",name],["PATH",claude_path(endpoint.cwd())]],"display_name":name});
+    if let Some(agent_type) = agent_type {
+        start["agent_type"] = json!(agent_type);
+    }
+    let reply = attach(endpoint, start);
     assert_eq!(reply["ok"], true, "scripted Claude spawn: {reply}");
     let agent = reply["id"].as_str().unwrap().to_string();
     let pid_path = base.with_extension("pid");
@@ -118,12 +142,15 @@ fn payload(pane: &Pane, event: &str) -> Value {
 }
 
 fn command(pane: &Pane, tag: &str, kind: &str, payload: Value) {
+    command_with(pane, tag, json!({"kind":kind,"payload":payload}));
+}
+
+/// [`command`] with the request's extra fields: `env` for the child, and for
+/// a waiter `shell`, the command line to run instead of the test's own deck.
+fn command_with(pane: &Pane, tag: &str, mut request: Value) {
+    request["tag"] = json!(tag);
     let pending = sidecar(pane, &format!("pending-{tag}"));
-    std::fs::write(
-        &pending,
-        serde_json::to_vec(&json!({"tag":tag,"kind":kind,"payload":payload})).unwrap(),
-    )
-    .unwrap();
+    std::fs::write(&pending, serde_json::to_vec(&request).unwrap()).unwrap();
     std::fs::rename(pending, sidecar(pane, &format!("cmd-{tag}"))).unwrap();
 }
 
@@ -227,7 +254,7 @@ fn claude_005_session_start_frames_and_announces_before_idle() {
     );
 }
 
-/// Scenario: Arm three real Once waiter children representing startup and two clears. Queue one task; only the newest waiter wakes with framed stderr and exit 2, while the two older waiters remain armed and no typed bytes enter Claude's pane.
+/// Scenario: Arm three real Once waiter children one after another, representing startup and two clears. Each newer waiter takes the older one's place, which exits quietly with nothing on stdout or stderr, so only one is ever armed. A queued task then wakes only the newest, with framed stderr and exit 2, and no typed bytes enter Claude's pane.
 #[spec("inbox/claude/006")]
 #[test]
 fn claude_006_clear_pileup_wakes_once_through_newest_waiter() {
@@ -235,7 +262,16 @@ fn claude_006_clear_pileup_wakes_once_through_newest_waiter() {
     let pane = parent(&daemon, "claude-pileup");
     for (index, source) in ["startup", "clear", "clear"].into_iter().enumerate() {
         wait(&pane, &format!("w{index}"), source);
-        armed(&daemon, &pane, index as u64 + 1);
+        armed(&daemon, &pane, 1);
+        if index > 0 {
+            let older = result(&pane, &format!("w{}", index - 1));
+            assert_eq!(
+                older["code"], 0,
+                "a superseded waiter exits quietly: {older}"
+            );
+            assert_eq!(older["stdout"], "");
+            assert_eq!(older["stderr"], "", "a superseded waiter wakes nothing");
+        }
     }
     let id = post(&daemon, &pane, NATIVE_BODY);
     let delivered = result(&pane, "w2");
@@ -243,17 +279,12 @@ fn claude_006_clear_pileup_wakes_once_through_newest_waiter() {
     assert_eq!(delivered["stdout"], "");
     let text = delivered["stderr"].as_str().unwrap();
     assert!(
-        text.contains(NATIVE_BODY) && text.contains(&format!("[dot-agent-deck message {id}")),
-        "framed native body: {text}"
+        text.contains(NATIVE_BODY)
+            && text.contains(&format!("[dot-agent-deck message {id} delivery 1.1 from ")),
+        "framed native body naming its attempt: {text}"
     );
     state(&daemon, &pane, &id, "fetched");
-    armed(&daemon, &pane, 2);
-    for old in ["w0", "w1"] {
-        assert!(
-            !sidecar(&pane, &format!("result-{old}")).exists(),
-            "older waiter duplicated the wake"
-        );
-    }
+    armed(&daemon, &pane, 0);
     assert!(bytes(&pane).is_empty());
 }
 
@@ -328,10 +359,10 @@ fn claude_008_doorbell_injects_content_even_when_leading_space_is_trimmed() {
     );
 }
 
-/// Scenario: Submit a human prompt in an attached scripted Claude pane, then deliver a framed native waiter notification. The notification must acknowledge the message and display its subject with an envelope while preserving the human prompt history instead of recording task-notification markup as a user prompt.
+/// Scenario: Submit a human prompt in an attached scripted Claude pane, then deliver a framed native waiter notification. The notification must commit the message's exact attempt, settling it, and display its subject with an envelope while preserving the human prompt history instead of recording task-notification markup as a user prompt.
 #[spec("inbox/claude/009")]
 #[test]
-fn claude_009_native_notification_acks_and_shows_subject_without_polluting_user_history() {
+fn claude_009_native_notification_settles_and_shows_subject_without_polluting_user_history() {
     let deck = common::TuiDeck::builder()
         .with_pty_size(160, 45)
         .launch_with_fixture("minimal");
@@ -504,4 +535,622 @@ fn claude_015_session_start_without_a_waiter_announces_nothing() {
         .filter(|line| line["event_type"] == "session_start")
         .count();
     assert_eq!(statuses, 2, "{connections:?} {more:?}");
+}
+
+/// Every cap the deck wrote for `id`'s attempts into a spool under `root`:
+/// the hex lines of each caps file named for it.
+fn caps_of(root: &std::path::Path, id: &str) -> Vec<String> {
+    fn walk(dir: &std::path::Path, id: &str, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, id, out);
+            } else if path.parent().and_then(|p| p.file_name()) == Some("caps".as_ref())
+                && entry.file_name().to_string_lossy().starts_with(id)
+                && let Ok(text) = std::fs::read_to_string(&path)
+            {
+                out.extend(text.lines().map(str::to_string));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, id, &mut out);
+    out
+}
+
+/// Whether `text` holds a run of 32 lowercase hex digits, the shape of a
+/// receipt cap.
+fn holds_cap_shaped(text: &str) -> bool {
+    let mut run = 0;
+    for c in text.chars() {
+        run = if c.is_ascii_digit() || ('a'..='f').contains(&c) {
+            run + 1
+        } else {
+            0
+        };
+        if run >= 32 {
+            return true;
+        }
+    }
+    false
+}
+
+/// A UserPromptSubmit hook payload carrying `prompt`, as Claude submits a
+/// waiter's notification.
+fn notification(pane: &Pane, stderr: &str) -> Value {
+    let mut hook = payload(pane, "UserPromptSubmit");
+    hook["prompt"] = json!(format!(
+        "<task-notification><system-reminder>Stop hook blocking error from command inbox wait: {stderr}</system-reminder></task-notification>"
+    ));
+    hook
+}
+
+fn message_of(endpoint: &impl Endpoint, pane: &Pane, id: &str) -> Value {
+    listing(endpoint, pane)["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == id)
+        .cloned()
+        .unwrap_or_else(|| panic!("missing message {id}"))
+}
+
+/// Scenario: Arm a real Claude waiter and queue a task. The waiter wakes Claude with the task's block on stderr, its opener naming the attempt as `delivery 1.1`, and no cap the deck wrote for it appears anywhere in its output. A submitted prompt carrying that block with another attempt's number, or with none, commits nothing; the real notification, submitted through the real prompt hook, commits exactly that attempt, which settles the task, and the hook prints nothing that carries a cap. A waiter armed again at Stop afterwards is handed nothing.
+#[spec("inbox/claude/016")]
+#[test]
+fn claude_016_a_notification_commits_its_exact_attempt_through_its_caps_file() {
+    let daemon = daemon(&[]);
+    let pane = parent(&daemon, "claude-exact");
+    wait(&pane, "wake", "startup");
+    armed(&daemon, &pane, 1);
+    let id = post(&daemon, &pane, NATIVE_BODY);
+    let delivered = result(&pane, "wake");
+    assert_eq!(delivered["code"], 2, "the waiter wakes Claude: {delivered}");
+    let stderr = delivered["stderr"].as_str().unwrap().to_string();
+    assert!(
+        stderr.contains(&format!("[dot-agent-deck message {id} delivery 1.1 from "))
+            && stderr.contains(NATIVE_BODY),
+        "the block names its attempt: {stderr}"
+    );
+    // The spool is under the daemon's state directory, beside its HOME.
+    let caps = caps_of(daemon.home().parent().unwrap(), &id);
+    assert_eq!(caps.len(), 2, "the deck wrote the attempt's two caps");
+    for cap in &caps {
+        assert!(!stderr.contains(cap.as_str()), "no cap on stderr");
+    }
+    assert!(
+        !holds_cap_shaped(&stderr),
+        "nothing cap-shaped on stderr: {stderr}"
+    );
+    state(&daemon, &pane, &id, "fetched");
+
+    for (tag, forged) in [
+        (
+            "other-attempt",
+            stderr.replace("delivery 1.1", "delivery 1.2"),
+        ),
+        ("no-attempt", stderr.replace(" delivery 1.1", "")),
+    ] {
+        let out = run_hook(&pane, tag, notification(&pane, &forged));
+        assert_eq!(out["stdout"], "", "{tag}: nothing to hand over");
+        state(&daemon, &pane, &id, "fetched");
+    }
+
+    let out = run_hook(&pane, "notification", notification(&pane, &stderr));
+    state(&daemon, &pane, &id, "acknowledged");
+    for text in [&out["stdout"], &out["stderr"]] {
+        let text = text.as_str().unwrap();
+        assert!(!holds_cap_shaped(text), "the hook prints no cap: {text}");
+    }
+    let mut stop = payload(&pane, "Stop");
+    stop["source"] = json!("stop");
+    command(&pane, "rearm", "wait", stop);
+    armed(&daemon, &pane, 1);
+    unchanged(&pane, Duration::from_millis(1500));
+    assert!(
+        !sidecar(&pane, "result-rearm").exists(),
+        "a settled task is handed to no later waiter"
+    );
+    assert_eq!(message_of(&daemon, &pane, &id)["deliveries"], 1);
+}
+
+/// Scenario: With a short ack-wait, arm a real Claude waiter and queue a task. The waiter delivers it and no prompt carrying it is ever submitted, while the agent stays idle; a waiter armed again receives one marked repeat of it, naming attempt 1.2 and saying it may repeat the earlier delivery. That one is lost too, and so is a second marked repeat; after the next idle grace the task is uncertain, offered for Retry or Cancel, and the waiter armed after it is handed nothing more.
+#[spec("inbox/claude/017")]
+#[test]
+fn claude_017_a_lost_notification_repeats_marked_then_turns_uncertain() {
+    let daemon = daemon(&[("DOT_AGENT_DECK_INBOX_ACK_WAIT_MS", "1500")]);
+    let pane = parent(&daemon, "claude-lost");
+    wait(&pane, "first", "startup");
+    armed(&daemon, &pane, 1);
+    let id = post(&daemon, &pane, NATIVE_BODY);
+    let first = result(&pane, "first");
+    assert_eq!(first["code"], 2, "{first}");
+    let repeat_line = format!("This may repeat dot-agent-deck message {id}");
+    assert!(!first["stderr"].as_str().unwrap().contains(&repeat_line));
+    for (tag, e) in [("second", 2), ("third", 3)] {
+        wait(&pane, tag, "stop");
+        armed(&daemon, &pane, 1);
+        let again = result(&pane, tag);
+        assert_eq!(again["code"], 2, "{tag}: {again}");
+        let text = again["stderr"].as_str().unwrap();
+        assert!(
+            text.contains(&format!(
+                "[dot-agent-deck message {id} delivery 1.{e} from "
+            )) && text.contains(&repeat_line),
+            "{tag}: a marked repeat: {text}"
+        );
+    }
+    wait(&pane, "after", "stop");
+    let uncertain = || {
+        record(&daemon, &pane)["inbox"]["attention"]
+            .as_array()
+            .is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| item["message_id"] == id && item["kind"] == "uncertain")
+            })
+    };
+    assert!(
+        common::wait_until(common::load_scaled(Duration::from_secs(15)), uncertain),
+        "uncertain after the repeats ran out: {}",
+        record(&daemon, &pane)
+    );
+    unchanged(&pane, Duration::from_millis(500));
+    assert!(!sidecar(&pane, "result-after").exists(), "no third repeat");
+    assert_eq!(message_of(&daemon, &pane, &id)["deliveries"], 3);
+}
+
+/// Scenario: With a short keepalive and ack-wait, a real Claude waiter armed at the end of the last turn delivers a task while the agent is in a tool call that reports nothing further for longer than three keepalives and two ack-waits. No repeat is handed out while the tool runs. The turn then ends, a waiter is armed again, and the queued notification is submitted: the task is committed once, with one delivery, and the new waiter is handed nothing.
+#[spec("inbox/claude/018")]
+#[test]
+fn claude_018_a_notification_queued_behind_a_long_quiet_tool_commits_once() {
+    let daemon = daemon(&[
+        ("DOT_AGENT_DECK_INBOX_ACK_WAIT_MS", "2000"),
+        ("DOT_AGENT_DECK_INBOX_KEEPALIVE_MS", "200"),
+    ]);
+    let pane = parent(&daemon, "claude-quiet");
+    wait(&pane, "armed", "stop");
+    armed(&daemon, &pane, 1);
+    let mut human = payload(&pane, "UserPromptSubmit");
+    human["prompt"] = json!(HUMAN);
+    run_hook(&pane, "prompt", human);
+    let mut tool = payload(&pane, "PreToolUse");
+    tool["tool_name"] = json!("Bash");
+    tool["tool_input"] = json!({"command": "sleep 150"});
+    run_hook(&pane, "tool", tool);
+    let id = post(&daemon, &pane, NATIVE_BODY);
+    let delivered = result(&pane, "armed");
+    assert_eq!(delivered["code"], 2, "{delivered}");
+    let stderr = delivered["stderr"].as_str().unwrap().to_string();
+    unchanged(&pane, common::load_scaled(Duration::from_millis(4500)));
+    assert_eq!(
+        message_of(&daemon, &pane, &id)["deliveries"],
+        1,
+        "nothing is repeated while the turn holds the notification"
+    );
+    state(&daemon, &pane, &id, "fetched");
+    let mut stop = payload(&pane, "Stop");
+    stop["stop_hook_active"] = json!(false);
+    run_hook(&pane, "stop", stop);
+    wait(&pane, "rearm", "stop");
+    armed(&daemon, &pane, 1);
+    run_hook(&pane, "notification", notification(&pane, &stderr));
+    state(&daemon, &pane, &id, "acknowledged");
+    unchanged(&pane, Duration::from_millis(1200));
+    assert!(!sidecar(&pane, "result-rearm").exists());
+    assert_eq!(message_of(&daemon, &pane, &id)["deliveries"], 1);
+}
+
+/// Scenario: In a pane started from its command alone, with no agent type, and with no waiter armed and a short ack-wait, give the real Claude prompt hook a doorbell line for a queued task: it takes the task as a receiver of its own, prints it as additionalContext with its opener naming the attempt, and that commits it, with nothing cap-shaped in what it prints. A second task's doorbell is then given to a hook that is killed after the deck approved its hand-over and before it printed anything: the task is not lost and not shown as delivered, and the next doorbell hands it over once more, marked as a possible repeat, which commits it.
+#[spec("inbox/claude/019")]
+#[test]
+fn claude_019_a_doorbell_hook_commits_what_it_printed_and_a_killed_one_repeats_marked() {
+    let daemon = daemon(&[("DOT_AGENT_DECK_INBOX_ACK_WAIT_MS", "1500")]);
+    let pane = parent_as(&daemon, "claude-doorbell", None);
+    let id = post(&daemon, &pane, NATIVE_BODY);
+    let mut hook = payload(&pane, "UserPromptSubmit");
+    hook["prompt"] = json!(fixed_line(&id));
+    let out = run_hook(&pane, "inject", hook);
+    let context = context(&out, "UserPromptSubmit");
+    assert!(
+        context.contains(&format!("[dot-agent-deck message {id} delivery 1.1 from "))
+            && context.contains(NATIVE_BODY),
+        "{context}"
+    );
+    assert!(!holds_cap_shaped(out["stdout"].as_str().unwrap()), "{out}");
+    assert!(!holds_cap_shaped(out["stderr"].as_str().unwrap()), "{out}");
+    state(&daemon, &pane, &id, "acknowledged");
+
+    let second = post(&daemon, &pane, &format!("{NATIVE_BODY}-second"));
+    let mut hook = payload(&pane, "UserPromptSubmit");
+    hook["prompt"] = json!(fixed_line(&second));
+    command_with(
+        &pane,
+        "killed",
+        json!({"kind":"hook","payload":hook,
+               "env":{"DOT_AGENT_DECK_INBOX_TEST_EXIT_AFTER_GRANT":"1"}}),
+    );
+    let killed = result(&pane, "killed");
+    assert_eq!(
+        killed["stdout"], "",
+        "the killed hook printed nothing: {killed}"
+    );
+    state(&daemon, &pane, &second, "fetched");
+    let repeat_line = format!("This may repeat dot-agent-deck message {second}");
+    let again = RefCell::new(String::new());
+    let tries = Cell::new(0);
+    assert!(
+        common::wait_until(common::load_scaled(Duration::from_secs(15)), || {
+            let mut hook = payload(&pane, "UserPromptSubmit");
+            hook["prompt"] = json!(fixed_line(&second));
+            tries.set(tries.get() + 1);
+            let out = run_hook(&pane, &format!("retry-{}", tries.get()), hook);
+            let printed = out["stdout"].as_str().unwrap_or_default().to_string();
+            *again.borrow_mut() = format!("{}{printed}|", again.borrow());
+            printed.contains(&repeat_line)
+        }),
+        "the next doorbell hands it over marked: {}",
+        again.borrow()
+    );
+    state(&daemon, &pane, &second, "acknowledged");
+    assert_eq!(message_of(&daemon, &pane, &second)["deliveries"], 2);
+}
+
+/// Scenario: Claude's settings name a dot-agent-deck too old for the deck's messages as the waiter. The waiter it starts is refused before anything is issued: it exits quietly, a queued task stays queued with no doorbell typed, and the agent's card names the hooks-too-old notice with the command the deck gives to fix it. Running `hooks install --agent claude-code` from the deck's own binary rewrites the settings; the waiter they now name registers, is handed the task, and the notice is gone.
+#[spec("inbox/claude/020")]
+#[test]
+fn claude_020_hooks_too_old_names_the_fix_and_the_fix_delivers() {
+    use std::os::unix::fs::PermissionsExt;
+    let daemon = daemon(&[]);
+    let home = daemon.home().to_path_buf();
+    let old = home.join("old-deck/dot-agent-deck");
+    std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+    std::fs::write(
+        &old,
+        format!(
+            "#!/bin/sh\nDOT_AGENT_DECK_INBOX_TEST_HOOK_INTEGRATION=none exec '{}' \"$@\"\n",
+            env!("CARGO_BIN_EXE_dot-agent-deck")
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let settings = home.join(".claude/settings.json");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    let rule = json!([{"hooks":[
+        {"type":"command","command":format!("'{}' hook --agent claude-code", old.display())},
+        {"type":"command","command":format!("'{}' inbox wait --agent claude-code", old.display()),
+         "asyncRewake":true,"timeout":86400}
+    ]}]);
+    std::fs::write(
+        &settings,
+        json!({"hooks":{"SessionStart":rule,"Stop":rule}}).to_string(),
+    )
+    .unwrap();
+    let waiter_command = || {
+        let value: Value = serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+        value["hooks"]["SessionStart"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|rule| rule["hooks"].as_array().unwrap().clone())
+            .find_map(|hook| {
+                hook["command"]
+                    .as_str()
+                    .filter(|command| command.ends_with(" inbox wait --agent claude-code"))
+                    .map(str::to_string)
+            })
+            .expect("a waiter in Claude's settings")
+    };
+    let pane = parent(&daemon, "claude-stale");
+    command_with(
+        &pane,
+        "stale",
+        json!({"kind":"wait","shell":waiter_command(),"payload":payload(&pane, "SessionStart")}),
+    );
+    let refused = result(&pane, "stale");
+    assert_eq!(refused["code"], 0, "refused quietly: {refused}");
+    assert_eq!(refused["stderr"], "");
+    let notice = || record(&daemon, &pane)["inbox"].clone();
+    assert!(
+        common::wait_until(WAIT, || notice()["integration"] == "hooks_too_old"),
+        "the card names the stale hooks: {}",
+        notice()
+    );
+    let command = notice()["integration_command"].clone();
+    if let Some(command) = command.as_str() {
+        assert!(
+            command.ends_with(" hooks install --agent claude-code"),
+            "the fix is the deck's own hooks install: {command}"
+        );
+    }
+    armed(&daemon, &pane, 0);
+    let id = post(&daemon, &pane, NATIVE_BODY);
+    unchanged(&pane, Duration::from_millis(1500));
+    state(&daemon, &pane, &id, "queued");
+    assert!(
+        bytes(&pane).is_empty(),
+        "no doorbell for hooks that cannot take it"
+    );
+
+    // The harness seeds the deck's durable copy into HOME; the daemon may be
+    // running it, so it is used as it is, never written over.
+    let installed = home.join(".local/bin/dot-agent-deck");
+    if !installed.exists() {
+        std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        if std::fs::hard_link(env!("CARGO_BIN_EXE_dot-agent-deck"), &installed).is_err() {
+            std::fs::copy(env!("CARGO_BIN_EXE_dot-agent-deck"), &installed).unwrap();
+        }
+    }
+    let install = std::process::Command::new(&installed)
+        .args(["hooks", "install", "--agent", "claude-code"])
+        .env_clear()
+        .env("HOME", &home)
+        .env("PATH", claude_path(&home))
+        .current_dir(&home)
+        .output()
+        .unwrap();
+    assert!(install.status.success(), "hooks install: {install:?}");
+    let fixed = waiter_command();
+    assert!(
+        !fixed.contains(&old.display().to_string()),
+        "the install re-pinned the waiter: {fixed}"
+    );
+    command_with(
+        &pane,
+        "fixed",
+        json!({"kind":"wait","shell":fixed,"payload":payload(&pane, "SessionStart")}),
+    );
+    let delivered = result(&pane, "fixed");
+    assert_eq!(
+        delivered["code"], 2,
+        "the fixed waiter is handed the task: {delivered}"
+    );
+    assert!(delivered["stderr"].as_str().unwrap().contains(NATIVE_BODY));
+    state(&daemon, &pane, &id, "fetched");
+    assert!(notice()["integration"].is_null(), "{}", notice());
+}
+
+/// The `caps` directory of the one generation spool under `root`.
+fn caps_dir(root: &std::path::Path) -> PathBuf {
+    fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if entry.file_name() == "caps" {
+                    out.push(path);
+                } else {
+                    walk(&path, out);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, &mut out);
+    assert_eq!(out.len(), 1, "one generation spool: {out:?}");
+    out.remove(0)
+}
+
+/// Send `request` to the deck's hook socket from inside `pane`'s agent, as a
+/// process the agent runs could, and return its one-line answer.
+fn raw(daemon: &impl Endpoint, pane: &Pane, tag: &str, request: Value) -> Value {
+    command_with(
+        pane,
+        tag,
+        json!({"kind":"raw","payload":request,"socket":daemon.hook_socket()}),
+    );
+    let out = result(pane, tag);
+    serde_json::from_str(out["stdout"].as_str().unwrap().trim())
+        .unwrap_or_else(|error| panic!("{tag}: a JSON answer: {error}; {out}"))
+}
+
+/// Scenario: In a pane started from its command alone, with no agent type and no deck waiter in Claude's settings, the real Claude SessionStart hook runs, so Claude's own hook event is all that says the agent is Claude. A queued task's doorbell is then given to a prompt hook too old for the deck's messages. Its fetch is refused as hooks too old instead of being served the old way: the hook prints nothing of the task, the task stays queued, and the agent's card names the hooks-too-old notice.
+#[spec("inbox/claude/022")]
+#[test]
+fn claude_022_a_stale_hook_in_a_bare_claude_pane_is_refused_visibly() {
+    let daemon = daemon(&[]);
+    let pane = parent_as(&daemon, "claude-bare-stale", None);
+    run_hook(&pane, "start", payload(&pane, "SessionStart"));
+    assert!(
+        common::wait_until(WAIT, || record(&daemon, &pane)["agent_type"]
+            == "claude_code"),
+        "Claude's hook event typed the pane: {}",
+        record(&daemon, &pane)
+    );
+    let id = post(&daemon, &pane, NATIVE_BODY);
+    let mut hook = payload(&pane, "UserPromptSubmit");
+    hook["prompt"] = json!(fixed_line(&id));
+    command_with(
+        &pane,
+        "stale",
+        json!({"kind":"hook","payload":hook,
+               "env":{"DOT_AGENT_DECK_INBOX_TEST_HOOK_INTEGRATION":"none"}}),
+    );
+    let stale = result(&pane, "stale");
+    assert!(
+        !stale["stdout"].as_str().unwrap().contains(NATIVE_BODY),
+        "the stale hook is handed nothing: {stale}"
+    );
+    let notice = || record(&daemon, &pane)["inbox"].clone();
+    assert!(
+        common::wait_until(WAIT, || notice()["integration"] == "hooks_too_old"),
+        "the card names the stale hooks: {}",
+        notice()
+    );
+    state(&daemon, &pane, &id, "queued");
+}
+
+/// Scenario: A process in a Claude agent's own tree sends the deck the prompt hook's exact-commit request directly, without the hook. First the deck cannot write the caps file of the task's first attempt, so it never sends it: a request naming that attempt commits nothing and the task stays queued. A waiter armed again is handed attempt 1.2: a request naming it, with no commit receipt in the spool, commits nothing either and the task stays fetched. The real notification through the real prompt hook, which publishes that receipt, commits it.
+#[spec("inbox/claude/023")]
+#[test]
+fn claude_023_a_raw_exact_commit_needs_the_attempts_receipt() {
+    use std::os::unix::fs::PermissionsExt;
+    let daemon = daemon(&[]);
+    let pane = parent(&daemon, "claude-raw");
+    wait(&pane, "first", "startup");
+    armed(&daemon, &pane, 1);
+    let caps = caps_dir(daemon.home().parent().unwrap());
+    std::fs::set_permissions(&caps, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let id = post(&daemon, &pane, NATIVE_BODY);
+    let first = result(&pane, "first");
+    std::fs::set_permissions(&caps, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(first["code"], 0, "nothing reached the waiter: {first}");
+    assert_eq!(first["stderr"], "", "{first}");
+    state(&daemon, &pane, &id, "queued");
+    let commit = |a: u32, e: u32| {
+        json!({"message_type":"inbox_committed","pane_id":pane.id,"agent_id":pane.agent,
+               "token":pane.token,"attempts":[{"id":id,"a":a,"e":e}]})
+    };
+    // The deck answers once it has applied what it accepted, so the state
+    // read after the answer is the request's outcome.
+    let reply = raw(&daemon, &pane, "never-sent", commit(1, 1));
+    assert!(reply.get("refused").is_none(), "admitted: {reply}");
+    state(&daemon, &pane, &id, "queued");
+
+    wait(&pane, "second", "stop");
+    let second = result(&pane, "second");
+    assert_eq!(second["code"], 2, "the next waiter is handed it: {second}");
+    let stderr = second["stderr"].as_str().unwrap().to_string();
+    assert!(stderr.contains(" delivery 1.2 from "), "{stderr}");
+    state(&daemon, &pane, &id, "fetched");
+    raw(&daemon, &pane, "no-receipt", commit(1, 2));
+    state(&daemon, &pane, &id, "fetched");
+
+    run_hook(&pane, "notification", notification(&pane, &stderr));
+    state(&daemon, &pane, &id, "acknowledged");
+}
+
+/// Scenario: In a pane started from its command alone, with no agent type and no deck waiter in Claude's settings, Claude's SessionStart hook — a process inside the pane's agent, as Claude's own hooks are — has connected to the deck but its event has not been read yet when a prompt hook too old for the deck's messages fetches a queued task's doorbell. The deck holds the fetch until the earlier connection's event is in: the hook prints nothing while it waits, and once the SessionStart event reports Claude Code the fetch is refused as hooks too old, the task stays queued and the card names the notice.
+#[spec("inbox/claude/024")]
+#[test]
+fn claude_024_a_stale_hook_waits_for_the_session_start_connected_before_it() {
+    let daemon = daemon(&[]);
+    let pane = parent_as(&daemon, "claude-bare-early", None);
+    let id = post(&daemon, &pane, NATIVE_BODY);
+    // SessionStart's connection, made from inside the pane's agent and
+    // accepted before the fetch's, with its line not yet sent: the child
+    // connects, says so, and sends the event only once told to.
+    let event = json!({"session_id":format!("native-{}", pane.agent),
+        "pane_id":pane.id,"agent_id":pane.agent,"token":pane.token,
+        "agent_type":"claude_code","event_type":"session_start",
+        "timestamp":chrono::Utc::now(),"cwd":daemon.cwd(),"metadata":{}});
+    let line = sidecar(&pane, "session-start-line");
+    std::fs::write(&line, format!("{event}\n")).unwrap();
+    let connected = sidecar(&pane, "session-start-connected");
+    let go = sidecar(&pane, "session-start-go");
+    let script = format!(
+        "import socket, os, time\n\
+         c = socket.socket(socket.AF_UNIX)\n\
+         c.connect({socket:?})\n\
+         open({connected:?}, 'w').close()\n\
+         end = time.time() + 30\n\
+         while not os.path.exists({go:?}) and time.time() < end: time.sleep(0.01)\n\
+         c.sendall(open({line:?}, 'rb').read())\n\
+         c.shutdown(socket.SHUT_WR)\n\
+         c.recv(4096)\n",
+        socket = daemon.hook_socket().to_string_lossy(),
+        connected = connected.to_string_lossy(),
+        go = go.to_string_lossy(),
+        line = line.to_string_lossy(),
+    );
+    let script_path = sidecar(&pane, "session-start.py");
+    std::fs::write(&script_path, script).unwrap();
+    command_with(
+        &pane,
+        "session-start",
+        json!({"kind":"wait","payload":{},
+               "shell":format!("python3 '{}'", script_path.to_string_lossy())}),
+    );
+    assert!(
+        common::wait_until(WAIT, || connected.exists()),
+        "SessionStart's hook connected: {:?}",
+        std::fs::read_to_string(sidecar(&pane, "stderr-session-start"))
+    );
+    let mut hook = payload(&pane, "UserPromptSubmit");
+    hook["prompt"] = json!(fixed_line(&id));
+    command_with(
+        &pane,
+        "stale",
+        json!({"kind":"hook","payload":hook,
+               "env":{"DOT_AGENT_DECK_INBOX_TEST_HOOK_INTEGRATION":"none"}}),
+    );
+    assert!(
+        !common::wait_until(Duration::from_millis(400), || sidecar(
+            &pane,
+            "result-stale"
+        )
+        .exists()),
+        "the fetch is held for the event connected before it: {:?}",
+        std::fs::read_to_string(sidecar(&pane, "result-stale"))
+    );
+    assert!(
+        record(&daemon, &pane)["agent_type"].is_null(),
+        "nothing typed the pane yet: {}",
+        record(&daemon, &pane)
+    );
+    std::fs::write(&go, b"").unwrap();
+    let stale = result(&pane, "stale");
+    assert!(
+        !stale["stdout"].as_str().unwrap().contains(NATIVE_BODY),
+        "the stale hook is handed nothing: {stale}"
+    );
+    let notice = || record(&daemon, &pane)["inbox"].clone();
+    assert!(
+        common::wait_until(WAIT, || notice()["integration"] == "hooks_too_old"),
+        "the card names the stale hooks: {}",
+        notice()
+    );
+    state(&daemon, &pane, &id, "queued");
+}
+
+/// Scenario: A process in a Claude agent's own tree asks the deck directly whether it serves one-shot receipts, then sends the receipt verbs for what they do not serve: a once-wait from a Codex component, a Claude stream wait, a CLI fetch and a fetch a stream bound. The deck answers the question with the receipt support it serves; it refuses each of the others as unsupported, and a task queued beforehand stays queued.
+#[spec("inbox/claude/031")]
+#[test]
+fn claude_031_the_deck_answers_its_receipts_and_refuses_what_they_do_not_serve() {
+    let daemon = daemon(&[]);
+    let pane = parent(&daemon, "claude-receipts");
+    let id = post(&daemon, &pane, NATIVE_BODY);
+    let ask = |tag: &str, verb: &str, extra: Value| {
+        let mut request = json!({"message_type":verb, "pane_id":pane.id,
+            "agent_id":pane.agent, "token":pane.token, "pid":pane.pid});
+        for (key, value) in extra.as_object().unwrap() {
+            request[key] = value.clone();
+        }
+        raw(&daemon, &pane, tag, request)
+    };
+    let answer = ask("question", "inbox_receipts", json!({}));
+    assert_eq!(answer["one_shot_receipts"], 1, "{answer}");
+    for (tag, verb, extra) in [
+        (
+            "codex-once",
+            "inbox_receipt_wait",
+            json!({"component":"codex_hooks", "mode":"once", "hook_integration":1}),
+        ),
+        (
+            "claude-stream",
+            "inbox_receipt_wait",
+            json!({"component":"claude_waiter", "mode":"stream", "hook_integration":1}),
+        ),
+        (
+            "cli-fetch",
+            "inbox_receipt_fetch",
+            json!({"consumer":"cli", "max_chars":65536, "hook_integration":1}),
+        ),
+        (
+            "bound-fetch",
+            "inbox_receipt_fetch",
+            json!({"consumer":"doorbell_hook", "max_chars":65536, "rx":7,
+                "hook_integration":1}),
+        ),
+    ] {
+        let reply = ask(tag, verb, extra);
+        assert_eq!(reply["refused"], "unsupported", "{tag}: {reply}");
+        assert!(reply.get("messages").is_none(), "{tag}: {reply}");
+    }
+    state(&daemon, &pane, &id, "queued");
 }

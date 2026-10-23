@@ -4,7 +4,7 @@ import { createDeckBridge, selectRuntimeMode } from "../lib/bridge";
 import type { DesktopSettingsDto, EndpointSettingsDto, RemoteEndpointDto, VoiceDictationTargetDto, VoiceDirectoriesDto, VoiceReadingStateDto, VoiceNewAgentDto, VoiceResolvedParamDto, VoiceScreen, VoiceSecretId } from "../lib/bridge";
 import type { ReadingSentenceDto, ReadingTarget } from "../lib/reading";
 import { voiceDeckStep } from "../lib/newAgent";
-import { agentKey } from "../lib/agentKey";
+import { boundAgentKey } from "../lib/agentKey";
 import { LaunchCleanupError } from "../lib/actionError";
 import { applyTerminalChunk } from "../lib/terminalBuffer";
 import { deckName } from "../lib/displayText";
@@ -132,13 +132,19 @@ export function useDeckRuntime(): DeckRuntimeState {
   // previous deck's output — written straight into the new xterm by
   // `TerminalViewport`'s `!previous` branch, under a correctly resolved
   // heading, with the live transcript empty and nothing on screen saying so.
+  //
+  // And by the daemon PROCESS too, `boundAgentKey`, since PRD #1666 part 2
+  // (G-fix7): a restarted deck numbers its agents from 1 again, so a
+  // `(deckId, agentId)` buffer handed a freshly opened successor the previous
+  // process's retained output — under the successor's heading, for as long as
+  // its own attach was pending or had failed.
   const terminalBuffersRef = useRef<Record<string, TerminalBuffer>>({});
   const terminalListenersRef = useRef<Map<string, Set<(buffer: TerminalBuffer) => void>>>(new Map());
 
   const terminalFeed = useMemo(() => ({
-    get: (deckId: string | undefined, agentId: string) => terminalBuffersRef.current[agentKey(deckId, agentId)],
-    subscribe: (deckId: string | undefined, agentId: string, listener: (buffer: TerminalBuffer) => void) => {
-      const key = agentKey(deckId, agentId);
+    get: (deckId: string | undefined, agentId: string, incarnation: string | undefined) => terminalBuffersRef.current[boundAgentKey({ deckId, agentId, incarnation })],
+    subscribe: (deckId: string | undefined, agentId: string, incarnation: string | undefined, listener: (buffer: TerminalBuffer) => void) => {
+      const key = boundAgentKey({ deckId, agentId, incarnation });
       const listeners = terminalListenersRef.current.get(key) ?? new Set();
       listeners.add(listener);
       terminalListenersRef.current.set(key, listeners);
@@ -156,7 +162,7 @@ export function useDeckRuntime(): DeckRuntimeState {
     // this runtime currently believes is selected, which is what a bare-id
     // producer implicitly meant. Never the other way round — the bridge's own
     // notion of the selection is a snapshot ahead of React's.
-    const key = agentKey(event.deckId ?? selectedDeckIdRef.current, event.agentId);
+    const key = boundAgentKey({ deckId: event.deckId ?? selectedDeckIdRef.current, agentId: event.agentId, incarnation: event.incarnation });
     const current = terminalBuffersRef.current[key];
     const next = applyTerminalChunk(current, { ...event, data });
     if (next === current) return;
@@ -396,10 +402,14 @@ export function useDeckRuntime(): DeckRuntimeState {
   // per-agent eviction removes an entry, so a bare-id map handed the pane for
   // deck B's `planner` deck A's grid, and an attach that beat the pane's first
   // fit submitted A's cached dimensions to B's PTY.
+  //
+  // And by `boundAgentKey` since PRD #1666 part 2 (G-fix7), for the buffers'
+  // reason: a restarted deck's agent with the same id is not the agent whose
+  // grid this cached.
   const [appliedGeometry, setAppliedGeometry] = useState<Record<string, { rows: number; cols: number }>>({});
   useEffect(() => {
-    return bridge.onTerminalGeometry((agentId, rows, cols, deckId) => {
-      const key = agentKey(deckId ?? selectedDeckIdRef.current, agentId);
+    return bridge.onTerminalGeometry((agentId, rows, cols, deckId, incarnation) => {
+      const key = boundAgentKey({ deckId: deckId ?? selectedDeckIdRef.current, agentId, incarnation });
       setAppliedGeometry((current) => {
         const existing = current[key];
         if (existing && existing.rows === rows && existing.cols === cols) return current;

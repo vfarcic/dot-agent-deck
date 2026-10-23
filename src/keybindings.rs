@@ -104,6 +104,11 @@ pub enum Action {
     /// PRD #1666 §6.4: open the picker of the selected card's deck messages
     /// that wait on the user's Retry or Cancel.
     InboxAttention,
+    /// PRD #1666 part 2 (G-fix7d): open the list of every agent the restart
+    /// notice names.
+    RestartNotice,
+    /// PRD #1666 part 2 (G-fix7d): dismiss the restart notice.
+    DismissRestartNotice,
 }
 
 /// Static description of one action: which section it lives in, its config
@@ -399,6 +404,24 @@ pub const ACTIONS: &[ActionSpec] = &[
         name: "inbox_attention",
         default: "i",
         description: "Deck messages: Retry or Cancel",
+    },
+    // PRD #1666 part 2 (G-fix7d): the restart notice's two keys, which do
+    // something only while the footer shows the notice. Last in canonical
+    // order, for the reason `host_metrics` is; `a` and `c` are free in
+    // command mode.
+    ActionSpec {
+        action: Action::RestartNotice,
+        section: Section::Dashboard,
+        name: "restart_notice",
+        default: "a",
+        description: "Agents a deck restart stopped",
+    },
+    ActionSpec {
+        action: Action::DismissRestartNotice,
+        section: Section::Dashboard,
+        name: "dismiss_restart_notice",
+        default: "c",
+        description: "Dismiss the restart notice",
     },
 ];
 

@@ -62,8 +62,12 @@ export interface NewAgentDialogProps {
    * state across mounts. See `lib/newAgentDraft.ts` for which actions keep it.
    */
   onClose: (draft?: NewAgentDraft) => void;
-  /** The started agent is listed by its deck: the caller opens its pane. */
-  onAppeared: (target: { deckId: string; agentId: string }) => void;
+  /**
+   * The started agent is listed by its deck: the caller opens its pane, bound
+   * to `incarnation` — the daemon process that answered the start (PRD #1666
+   * part 2, G-fix7), never whichever process lists the id by then.
+   */
+  onAppeared: (target: { deckId: string; agentId: string; incarnation: string | undefined }) => void;
   /** The deck accepted the start and has not listed the agent within the bound. */
   onNotAppeared: (report: { deckName: string; agentName: string }) => void;
   /** Test seam; production uses {@link NEW_AGENT_APPEAR_TIMEOUT_MS}. */
@@ -467,7 +471,12 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
    */
   const instanceId = useRef(`new-agent-${Math.random().toString(36).slice(2)}-${Date.now()}`);
   const [phase, setPhase] = useState<"idle" | "starting" | "waiting">("idle");
-  const [awaiting, setAwaiting] = useState<{ deckId: string; agentId: string; deckName: string; agentName: string }>();
+  /**
+   * The start being waited for: the id the deck minted AND the process that
+   * minted it (G-fix7), so a restarted deck listing an unrelated agent under
+   * the same id does not end the wait as if the started one had appeared.
+   */
+  const [awaiting, setAwaiting] = useState<{ deckId: string; agentId: string; incarnation: string | undefined; deckName: string; agentName: string }>();
 
   const deckListRef = useRef<HTMLUListElement>(null);
   const directoryListRef = useRef<HTMLUListElement>(null);
@@ -1505,7 +1514,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
       }
       if (!mounted.current) return;
       setPhase("waiting");
-      setAwaiting({ deckId: deck.deckId, agentId: result.agentId, deckName: deck.name, agentName: title });
+      setAwaiting({ deckId: deck.deckId, agentId: result.agentId, incarnation: result.agentIncarnation, deckName: deck.name, agentName: title });
     } catch (cause) {
       failStart(cause);
     }
@@ -1541,7 +1550,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
       }
       if (!mounted.current) return;
       setPhase("waiting");
-      setAwaiting({ deckId: deck.deckId, agentId: result.agentId, deckName: deck.name, agentName });
+      setAwaiting({ deckId: deck.deckId, agentId: result.agentId, incarnation: result.agentIncarnation, deckName: deck.name, agentName });
     } catch (cause) {
       failStart(cause);
     }
@@ -1592,9 +1601,9 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
   callbacks.current = { onAppeared, onNotAppeared };
   useEffect(() => {
     if (!awaiting || settled.current) return;
-    if (fleetLists(runtime.fleet, awaiting.deckId, awaiting.agentId)) {
+    if (fleetLists(runtime.fleet, awaiting.deckId, awaiting.agentId, awaiting.incarnation)) {
       settled.current = true;
-      callbacks.current.onAppeared({ deckId: awaiting.deckId, agentId: awaiting.agentId });
+      callbacks.current.onAppeared({ deckId: awaiting.deckId, agentId: awaiting.agentId, incarnation: awaiting.incarnation });
     }
   }, [awaiting, runtime.fleet]);
   useEffect(() => {

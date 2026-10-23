@@ -216,6 +216,31 @@ test.describe("the shortcut guide and the command menu together", () => {
   });
 });
 
+test.describe("a confirmation on the dashboard (issue #1709)", () => {
+  /**
+   * Scenario: on the dashboard press the Plan / architecture agent's Close
+   * button. The confirmation is drawn on top and the dashboard behind it is
+   * inert; "close this" closes the confirmation, stops nothing, and leaves the
+   * dashboard live with the agent still listed.
+   */
+  test("close dismisses the confirmation and stops nothing", async ({ page }) => {
+    await load(page, "connected", ["close this"]);
+    await selectOverview(page);
+    const openPlanner = page.getByRole("button", { name: "Open Plan / architecture agent" });
+    await page.getByRole("button", { name: "Close Plan / architecture agent" }).click();
+    const confirm = page.getByRole("alertdialog");
+    await expect(confirm).toBeVisible();
+    expect(await drawnOnTop(confirm.getByRole("button", { name: "Cancel" })), "the confirmation is drawn on top").toBe(true);
+    expect(await inert(openPlanner), "the dashboard behind the confirmation is fenced").toBe(true);
+
+    await pressVoice(page);
+    await expect(page.getByText("Closed.")).toBeVisible();
+    await expect(confirm).toHaveCount(0);
+    await expect(openPlanner).toBeVisible();
+    expect(await inert(openPlanner)).toBe(false);
+  });
+});
+
 test.describe("sheets, the agent pane and the pull request page", () => {
   /**
    * Scenario: Qodo's earlier case. On the dashboard open Settings, then the

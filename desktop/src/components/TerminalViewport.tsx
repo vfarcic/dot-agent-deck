@@ -73,6 +73,17 @@ interface TerminalViewportProps {
    * tests) has no deck to name; such a caller also supplies no feed.
    */
   deckId?: string;
+  /**
+   * PRD #1666 part 2 (G-fix7) — the daemon process that listed this agent.
+   *
+   * A restarted deck — the same build included — numbers its agents from 1
+   * again, so `(deckId, agentId)` names an unrelated successor too. The feed,
+   * the terminal registry and this component's own lifecycle are keyed by the
+   * bound pair, so a successor never reads the previous process's backlog and
+   * never inherits its xterm. Absent is a deck that named no process (and the
+   * standalone-render tests), which is its own key.
+   */
+  incarnation?: string;
   label: string;
   transcript: string;
   terminalFeed?: TerminalFeed;
@@ -120,6 +131,7 @@ interface TerminalViewportProps {
 export function TerminalViewport({
   agentId,
   deckId,
+  incarnation,
   label,
   transcript,
   terminalFeed,
@@ -303,7 +315,7 @@ export function TerminalViewport({
       return true;
     });
     // Expose the instance so the Reader overlay can snapshot the resolved buffer.
-    registerTerminal(deckId, agentId, terminal);
+    registerTerminal(deckId, agentId, terminal, incarnation);
     replay(transcriptRef.current);
 
     // Issue #1457 — a selection, or a drag still in progress, survives the
@@ -437,7 +449,7 @@ export function TerminalViewport({
     // PRD #882: `fit` reports the tile's box as a REQUEST and then restores the
     // applied grid, so a zoom-driven refit proposes a new size without ever
     // leaving xterm parsing at a geometry the PTY is not using.
-    registerRefit(deckId, agentId, fit);
+    registerRefit(deckId, agentId, fit, incarnation);
 
     return () => {
       applyGridRef.current = undefined;
@@ -450,8 +462,8 @@ export function TerminalViewport({
       selectionKeeper.dispose();
       wrapper?.removeEventListener("keydown", onCopyKey, true);
       wrapper?.removeEventListener("mousedown", onPress, true);
-      unregisterRefit(deckId, agentId, fit);
-      unregisterTerminal(deckId, agentId, terminal);
+      unregisterRefit(deckId, agentId, fit, incarnation);
+      unregisterTerminal(deckId, agentId, terminal, incarnation);
       webglAddon?.dispose();
       terminal.dispose();
       terminalRef.current = undefined;
@@ -473,8 +485,11 @@ export function TerminalViewport({
       The cost of having it here is a rebuilt terminal when the identity
       changes, which is exactly right — it is a different agent on a different
       machine, and carrying one pixel of the old one across is the defect.
+
+      `incarnation` is one for the same reason (PRD #1666 part 2, G-fix7): a
+      restarted deck's agent with the same id is a different agent too.
     */
-  }, [agentId, deckId]);
+  }, [agentId, deckId, incarnation]);
 
   // Issue #1042 — reconcile the input gate in place when the lease flips.
   //
@@ -575,10 +590,10 @@ export function TerminalViewport({
       }
       lastStreamRef.current = buffer;
     };
-    const backlog = terminalFeed.get(deckId, agentId);
+    const backlog = terminalFeed.get(deckId, agentId, incarnation);
     if (backlog) apply(backlog);
-    return terminalFeed.subscribe(deckId, agentId, apply);
-  }, [agentId, deckId, terminalFeed]);
+    return terminalFeed.subscribe(deckId, agentId, incarnation, apply);
+  }, [agentId, deckId, incarnation, terminalFeed]);
 
   return (
     <div

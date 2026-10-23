@@ -58,6 +58,8 @@ pub const WAIT_TTLS_BEFORE_UNCERTAIN: u32 = 2;
 /// `POSSESS_TTL`s a stream incarnation whose connection closed stays its
 /// slot's, for its context to reconnect and resume what it holds.
 pub const CLOSED_RETIRE_TTLS: u32 = 3;
+/// Live hook or `inbox fetch` receivers one generation admits at once (C-3).
+pub const MAX_LIVE_HOOKS: usize = 8;
 
 /// The model's bounds and clocks.
 #[derive(Debug, Clone, Copy)]
@@ -88,6 +90,18 @@ impl Limits {
     /// holds, before it is retired with no successor.
     pub fn closed_retire_after(&self) -> Duration {
         self.possess_ttl * CLOSED_RETIRE_TTLS
+    }
+
+    /// `HOOK_HOLD`: how long a hook receiver's connection holds what it
+    /// fetched before the clock closes it.
+    pub fn hook_hold(&self) -> Duration {
+        self.ack_wait
+    }
+
+    /// How long a one-shot's `may` approval stays usable, counted from when
+    /// it asked.
+    pub fn grant_ttl(&self) -> Duration {
+        self.ack_wait
     }
 }
 
@@ -249,6 +263,23 @@ pub struct Attempt {
     pub reclaimed: bool,
     issued_at: Instant,
     resume_deadline: Option<Instant>,
+    /// The slot of the incarnation it was issued to, kept after that
+    /// incarnation is gone: a once-waiter attempt's possession reads the
+    /// generation's turn clock, not its receiver (C-1).
+    pub slot: Slot,
+    /// A one-shot attempt fenced while its approval may still be in use:
+    /// no spool check takes its verifier away before then (C-4).
+    quiet_at: Option<Instant>,
+    /// Part 2 §2.4: issued to a once-waiter whose batch the deck still holds
+    /// while its caps file is written outside the lock. No byte of it has
+    /// left the deck, so it is not possibly handed, carries no commit
+    /// authority, keeps its message from ending and its evidence from being
+    /// reclaimed, until [`AttemptModel::released`] says what became of it,
+    /// or until `staged_until` passes ([`AttemptModel::tick_cleared`]).
+    pub withheld: bool,
+    /// R2F-R01: when a withheld attempt's staging runs out, one ack-wait
+    /// after it was staged.
+    staged_until: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -416,6 +447,11 @@ pub enum Effect {
     /// now (§7). Exit (T9) emits none, since the generation's whole spool
     /// goes with it.
     Reclaimed { id: String, a: u32, e: u32 },
+    /// Close a one-shot receiver's connection.
+    Close { rx: Rx },
+    /// R2F-R01: a withheld attempt's caps write outlasted its staging, so it
+    /// was released as not handed without it.
+    StagingLapsed { id: String, a: u32, e: u32 },
 }
 
 /// Why a hand-out was refused (T1).
@@ -477,7 +513,7 @@ pub struct Registration {
     /// Final attempts bound to a retired incarnation of the same slot that
     /// keep their late-commit verifier (§7) and are not reclaimed: a
     /// `HandedInert` one, and a `Fenced` one still verifying. Their late
-    /// commit still corrects the sender, and the context that holds such a
+    /// commit can still correct the sender, and the context that holds such a
     /// commit, its watcher having died with it, now answers on this
     /// incarnation. The caller hands each one's commit authority, and only
     /// that, to the new watcher: no stage, approval or callback comes with it.
@@ -570,12 +606,10 @@ struct Receiver {
     seen: u64,
     fresh_at: Instant,
     held: BTreeSet<(String, u32, u32)>,
-    /// A once-waiter's busy interval: busy from hand-out until Idle or an
-    /// error stop, then one ack-wait of grace from the first idle report.
-    busy: bool,
-    idle_since: Option<Instant>,
-    /// A hook or `inbox fetch` receiver's open connection.
-    connected: bool,
+    /// A hook or `inbox fetch` receiver's hold: the clock closes it then
+    /// (C-3). A closed one-shot receiver is removed, so a hook's possession
+    /// is its record being here with its hold not yet run out.
+    hold_until: Option<Instant>,
     /// A stream receiver's connection closed at this instant; with no
     /// successor registered, it is retired [`Limits::closed_retire_after`]
     /// later.
@@ -596,6 +630,17 @@ pub struct AttemptModel {
     evidence_reserved: usize,
     effects: Vec<Effect>,
     exited: bool,
+    /// The generation's turn clock, as the hub last fed it (C-1).
+    turn: TurnView,
+    /// Every slot a receiver ever registered on, pruned one-shots included.
+    seen_slots: BTreeSet<Slot>,
+}
+
+/// Why [`AttemptModel::commit_target`] names no attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitTargetRefusal {
+    NoAttempt,
+    NotHanded,
 }
 
 impl AttemptModel {
@@ -610,7 +655,72 @@ impl AttemptModel {
             evidence_reserved: 0,
             effects: Vec::new(),
             exited: false,
+            turn: TurnView::default(),
+            seen_slots: BTreeSet::new(),
         }
+    }
+
+    /// C-1: the generation's turn clock now reads `view`. A turn starting
+    /// where it read idle is possession regained for every once-waiter
+    /// attempt that can still be possessed, so a spool check prepared while
+    /// it was idle clears nothing.
+    pub fn turn(&mut self, now: Instant, view: TurnView) {
+        let started = view.busy && !self.turn.busy;
+        self.turn = view;
+        let mut touched = Vec::new();
+        for (id, msg) in self.messages.iter_mut() {
+            for at in msg.attempts.iter_mut().filter(|at| once_held(at)) {
+                if started {
+                    at.regained();
+                }
+                touched.push(id.clone());
+            }
+        }
+        touched.dedup();
+        for id in &touched {
+            self.finalize(now, id);
+        }
+    }
+
+    /// C-3: when the next hook receiver's hold runs out, so the clock wakes
+    /// for it.
+    pub fn hold_due_at(&self) -> Option<Instant> {
+        self.receivers.values().filter_map(|r| r.hold_until).min()
+    }
+
+    /// C-3: whether one more hook receiver may register: fewer than
+    /// [`MAX_LIVE_HOOKS`] are live.
+    pub fn hook_room(&self) -> bool {
+        self.receivers
+            .values()
+            .filter(|r| r.slot == Slot::Hook && !r.retired)
+            .count()
+            < MAX_LIVE_HOOKS
+    }
+
+    /// The receiver records this model keeps, live or retired.
+    pub fn receivers_held(&self) -> usize {
+        self.receivers.len()
+    }
+
+    /// C-5: the attempt an explicit `ack <id>` commits: the newest of the
+    /// current assignment that was not positively not handed and that the
+    /// deck no longer withholds. Every attempt positively not handed or
+    /// still withheld names none, since none of them reached the agent.
+    pub fn commit_target(&self, id: &str) -> Result<(u32, u32), CommitTargetRefusal> {
+        let msg = self
+            .messages
+            .get(id)
+            .ok_or(CommitTargetRefusal::NoAttempt)?;
+        let mut current = msg.attempts.iter().filter(|at| at.a == msg.a).peekable();
+        if current.peek().is_none() {
+            return Err(CommitTargetRefusal::NoAttempt);
+        }
+        current
+            .filter(|at| at.stage != Stage::NotHanded && !at.withheld)
+            .map(|at| (at.a, at.e))
+            .max()
+            .ok_or(CommitTargetRefusal::NotHanded)
     }
 
     pub fn post(&mut self, id: &str, offer: bool) {
@@ -640,9 +750,16 @@ impl AttemptModel {
     /// same slot, and only it, is retired: its controls and approvals are
     /// refused at once, and its open attempts wait for this registration's
     /// resume answer.
+    ///
+    /// A one-shot registration (C-2, C-3) resumes nothing and is handed back
+    /// nothing, since a one-shot commits through its cap, not through a
+    /// watcher. A new once-waiter supersedes the previous one, which is
+    /// fenced and closed at once ([`Effect::Close`]); a hook supersedes
+    /// nothing and is held until [`Limits::hook_hold`] has passed.
     pub fn register(&mut self, now: Instant, slot: Slot, queue_survived: bool) -> Registration {
         let rx = Rx(self.next_rx);
         self.next_rx += 1;
+        self.seen_slots.insert(slot);
         self.receivers.insert(
             rx,
             Receiver {
@@ -652,9 +769,7 @@ impl AttemptModel {
                 seen: 0,
                 fresh_at: now,
                 held: BTreeSet::new(),
-                busy: slot == Slot::OnceWaiter,
-                idle_since: None,
-                connected: slot == Slot::Hook,
+                hold_until: (slot == Slot::Hook).then(|| now + self.limits.hook_hold()),
                 closed_at: None,
                 queue_survived,
                 next_d: 0,
@@ -662,6 +777,19 @@ impl AttemptModel {
         );
         let mut resume = Vec::new();
         let mut correctable = Vec::new();
+        if one_shot(slot) {
+            if slot == Slot::OnceWaiter
+                && let Some(old) = self.slots.insert(slot, rx)
+            {
+                self.close_one_shot(now, old, true);
+            }
+            self.finalize_all(now);
+            return Registration {
+                rx,
+                resume,
+                correctable,
+            };
+        }
         if let Some(old) = self.slots.insert(slot, rx) {
             if let Some(r) = self.receivers.get_mut(&old) {
                 r.retired = true;
@@ -711,7 +839,16 @@ impl AttemptModel {
 
     /// Whether a receiver on `slot` ever registered with this generation.
     pub fn has_slot(&self, slot: Slot) -> bool {
-        self.receivers.values().any(|r| r.slot == slot)
+        self.seen_slots.contains(&slot)
+    }
+
+    /// The `(A, e)` [`Self::issue`] would give `id`'s next attempt, so a
+    /// hand-out can be measured with its opener's `delivery A.e` before it is
+    /// issued under the same lock. `None` for a message the model does not
+    /// hold.
+    pub fn next_attempt(&self, id: &str) -> Option<(u32, u32)> {
+        let msg = self.messages.get(id)?;
+        Some((msg.a, msg.attempts.len() as u32 + 1))
     }
 
     /// T1: hand `id` out to `rx`, if it is `Queued` or carries a repeat token
@@ -734,7 +871,8 @@ impl AttemptModel {
         }
         let kind = if let Some(token) = msg.token {
             let held = msg.attempts.iter().filter(|at| at.a == msg.a).any(|at| {
-                at.resume_pending || possessed(&self.receivers, &self.limits, id, at, now)
+                at.resume_pending
+                    || possessed(&self.receivers, &self.limits, self.turn, id, at, now)
             });
             // §3: an automatic repeat only once every possibly handed attempt
             // of the assignment was checked in the spool and found no receipt.
@@ -781,6 +919,7 @@ impl AttemptModel {
         };
         receiver.next_d += 1;
         let d = receiver.next_d;
+        let slot = receiver.slot;
         let Some(msg) = self.messages.get_mut(id) else {
             return Err(IssueRefusal::UnknownMessage);
         };
@@ -808,6 +947,10 @@ impl AttemptModel {
             reclaimed: false,
             issued_at: now,
             resume_deadline: None,
+            slot,
+            quiet_at: None,
+            withheld: false,
+            staged_until: None,
         });
         msg.issued += 1;
         if kind == IssueKind::AutoRepeat {
@@ -897,6 +1040,178 @@ impl AttemptModel {
         StageOutcome::Applied
     }
 
+    /// Part 2 §2.4: hold one-shot attempt `(a, e)` of `id` back while the
+    /// deck writes its caps file: it stays [`Attempt::withheld`] until
+    /// [`Self::released`], or until the clock's first step once one ack-wait
+    /// from `now` has passed ([`Self::expire_staging`]).
+    ///
+    /// R2F-R01: the write runs outside any lock and nothing bounds a stalled
+    /// filesystem call, so the hold is bounded here instead. A healthy write
+    /// takes milliseconds; the ack-wait is the window the model already gives
+    /// every answer a one-shot owes it (a resume answer, an approval, the
+    /// idle grace), so only a spool that stalls for that long is overtaken.
+    /// When it passes, [`Self::tick_cleared`] records the attempt not handed
+    /// ([`Self::staging_lapsed`]).
+    pub fn withhold(&mut self, now: Instant, id: &str, a: u32, e: u32) {
+        let until = now + self.limits.ack_wait;
+        if let Some(at) = self
+            .messages
+            .get_mut(id)
+            .and_then(|msg| msg.attempt_mut(a, e))
+        {
+            at.withheld = true;
+            at.staged_until = Some(until);
+        }
+    }
+
+    /// R2F-R01: whether `(a, e)` of `id` is still withheld, so a batch whose
+    /// staging every attempt has outrun is not worth its caps files.
+    pub fn is_withheld(&self, id: &str, a: u32, e: u32) -> bool {
+        self.messages
+            .get(id)
+            .and_then(|msg| msg.attempt(a, e))
+            .is_some_and(|at| at.withheld)
+    }
+
+    /// R2F-R01: whether `(a, e)` of `id` has had its evidence returned, or is
+    /// no longer known: a caps file written for it now is removed by whoever
+    /// wrote it, since the reclaim's own removal may have run first.
+    pub fn is_reclaimed(&self, id: &str, a: u32, e: u32) -> bool {
+        self.messages
+            .get(id)
+            .and_then(|msg| msg.attempt(a, e))
+            .is_none_or(|at| at.reclaimed)
+    }
+
+    /// R2F-R01: every withheld attempt whose staging ran out by `now` is
+    /// released as not handed, by the deck's own witness. That holds from
+    /// this transition on, not from the deadline's instant: the batch line
+    /// goes only from `engine::release`, under the same lock, after
+    /// [`Self::may_hand_over`], which refuses a final stage, so a release
+    /// that comes after this sends none of it. A release that wins the lock
+    /// first, even past the deadline, finds the attempt still withheld and
+    /// may send it; this then finds nothing withheld and records nothing.
+    /// The caps file a late write may leave is queued for removal by that
+    /// release, once the write is done.
+    fn staging_lapsed(&mut self, now: Instant) {
+        let mut lapsed = Vec::new();
+        for (id, msg) in self.messages.iter_mut() {
+            for at in msg.attempts.iter_mut() {
+                if at.withheld && at.staged_until.is_some_and(|until| now >= until) {
+                    at.withheld = false;
+                    at.staged_until = None;
+                    lapsed.push((id.clone(), at.a, at.e, at.rx));
+                }
+            }
+        }
+        for (id, a, e, rx) in lapsed {
+            self.effects.push(Effect::StagingLapsed {
+                id: id.clone(),
+                a,
+                e,
+            });
+            self.deck_not_handed(now, &id, a, e, rx);
+        }
+    }
+
+    /// U1 (R2-fix3): [`Self::staging_lapsed`] on its own, for the clock's
+    /// step that must run while a tick is held up in spool IO; what
+    /// [`Self::tick_cleared`] would also do is left to that tick.
+    pub fn expire_staging(&mut self, now: Instant) {
+        if !self.exited {
+            self.staging_lapsed(now);
+        }
+    }
+
+    /// R2F-R01: when the next withheld attempt's staging runs out
+    /// ([`Self::withhold`]), so the clock wakes for it.
+    pub fn staging_due_at(&self) -> Option<Instant> {
+        if self.exited {
+            return None;
+        }
+        self.messages
+            .values()
+            .flat_map(|msg| msg.attempts.iter())
+            .filter(|at| at.withheld)
+            .filter_map(|at| at.staged_until)
+            .min()
+    }
+
+    /// Part 2 §2.4: the deck decided a withheld attempt. `handed_over` is
+    /// whether its batch line went to the waiter's connection; when it did
+    /// not, no byte of it left the deck, and that is recorded as the deck's
+    /// own witness ([`Self::deck_not_handed`]) whatever became of the
+    /// receiver it was issued to.
+    pub fn released(&mut self, now: Instant, id: &str, a: u32, e: u32, handed_over: bool) {
+        let Some(at) = self
+            .messages
+            .get_mut(id)
+            .and_then(|msg| msg.attempt_mut(a, e))
+        else {
+            return;
+        };
+        at.withheld = false;
+        at.staged_until = None;
+        let rx = at.rx;
+        if handed_over {
+            self.finalize(now, id);
+        } else {
+            self.deck_not_handed(now, id, a, e, rx);
+        }
+    }
+
+    /// R2-R01: the deck's own witness that no byte of one-shot attempt
+    /// `(a, e)`, issued to `rx`, left it — its batch was never released, or
+    /// the counted write of its line was accepted no byte up to its newline.
+    /// Unlike a receiver's report it needs no live incarnation: the deck
+    /// holds the fact, so a waiter superseded or a hook expired meanwhile,
+    /// which fences the attempt possibly handed, does not keep it so. It
+    /// moves only `Issued` or `Fenced`; a stage a receiver or a cap reported
+    /// stands.
+    pub fn deck_not_handed(
+        &mut self,
+        now: Instant,
+        id: &str,
+        a: u32,
+        e: u32,
+        rx: Rx,
+    ) -> StageOutcome {
+        if self.exited {
+            return StageOutcome::Exited;
+        }
+        let Some(at) = self
+            .messages
+            .get_mut(id)
+            .and_then(|msg| msg.attempt_mut(a, e))
+        else {
+            return StageOutcome::Unknown;
+        };
+        if at.rx != rx || !one_shot(at.slot) {
+            return StageOutcome::WrongReceiver;
+        }
+        if !matches!(at.stage, Stage::Issued | Stage::Fenced) {
+            return StageOutcome::NoOp;
+        }
+        at.stage = Stage::NotHanded;
+        at.verifier = false;
+        at.quiet_at = None;
+        self.finalize(now, id);
+        StageOutcome::Applied
+    }
+
+    /// R2-A01: whether an `inbox_committed` naming one-shot attempt `(a, e)`
+    /// may commit it: the deck released it to its receiver and nothing
+    /// positively says it was not handed. A withheld attempt never left the
+    /// deck, and a not-handed one is the deck's or its receiver's witness
+    /// that it did not reach the agent; only a commit receipt published on
+    /// its cap (the clock's spool scan) contradicts that.
+    pub fn commit_admissible(&self, id: &str, a: u32, e: u32) -> bool {
+        self.messages
+            .get(id)
+            .and_then(|msg| msg.attempt(a, e))
+            .is_some_and(|at| one_shot(at.slot) && !at.withheld && at.stage != Stage::NotHanded)
+    }
+
     /// A stream receiver's possession snapshot (§4). `seen` is its contiguous
     /// observed prefix; a stale or replayed `seq`, or a retired incarnation's
     /// snapshot, is dropped.
@@ -952,30 +1267,6 @@ impl AttemptModel {
         SnapshotOutcome::Applied
     }
 
-    /// A once-waiter's busy interval (§4): busy from `Handed`; Idle or an
-    /// error stop starts one ack-wait of grace. A repeated idle report keeps
-    /// the first idle time, and only a resumed busy interval restarts it.
-    /// Other slots ignore it: a hook's possession is its connection.
-    pub fn busy(&mut self, now: Instant, rx: Rx, busy: bool) {
-        if let Some(r) = self.receivers.get_mut(&rx)
-            && r.slot == Slot::OnceWaiter
-        {
-            if busy {
-                r.busy = true;
-                r.idle_since = None;
-                for msg in self.messages.values_mut() {
-                    for at in msg.attempts.iter_mut().filter(|at| at.rx == rx) {
-                        at.regained();
-                    }
-                }
-            } else if r.busy || r.idle_since.is_none() {
-                r.busy = false;
-                r.idle_since = Some(now);
-            }
-        }
-        self.finalize_bound_to(now, rx);
-    }
-
     /// Whether `rx` is a live incarnation.
     pub fn live(&self, rx: Rx) -> bool {
         self.receivers.get(&rx).is_some_and(|r| !r.retired)
@@ -1003,7 +1294,7 @@ impl AttemptModel {
             for at in msg.attempts.iter().filter(|at| at.a == msg.a) {
                 if needs_clearance(at)
                     && !at.cleared
-                    && !possessed(&self.receivers, &self.limits, id, at, now)
+                    && !possessed(&self.receivers, &self.limits, self.turn, id, at, now)
                 {
                     out.push(LapseCheck {
                         id: id.clone(),
@@ -1020,8 +1311,8 @@ impl AttemptModel {
     /// The fenced attempts of ended messages that still keep their late-commit
     /// verifier (§7): each is looked up in the spool, and only a lookup that
     /// finds no commit lets [`Self::tick_verified`] return its evidence, so a
-    /// receipt its incarnation published before a Cancel ended the message
-    /// still corrects the sender.
+    /// receipt its incarnation published before a Cancel ended the message is
+    /// still seen, and can correct the sender.
     ///
     /// An attempt whose commit authority was handed back to an incarnation
     /// that is still live is left out (r8k B02): that incarnation may yet
@@ -1029,7 +1320,20 @@ impl AttemptModel {
     /// nothing about it. Verification resumes once that incarnation is
     /// retired — by a successor's registration, which hands the attempt back
     /// to the successor in turn, or by the clock with no successor.
-    pub fn verify_candidates(&self) -> Vec<LapseCheck> {
+    ///
+    /// A one-shot attempt fenced while an approval of it may still be in use
+    /// is left out until that approval has run out (C-4), so a call that
+    /// passed its own fence just before can still publish a commit that
+    /// corrects the sender.
+    ///
+    /// A once-waiter attempt is also left out for as long as the turn clock
+    /// still possesses it (C-1): its waiter may have written the block before
+    /// it was fenced, and Claude may still be holding that notification for
+    /// the end of a busy turn. Its commit then comes from the prompt that
+    /// carries the block, through the cap file, so the cap stays until the
+    /// turn has been idle for one ack-wait. A turn starting voids a check
+    /// prepared before it (the mark).
+    pub fn verify_candidates(&self, now: Instant) -> Vec<LapseCheck> {
         let mut out = Vec::new();
         if self.exited {
             return out;
@@ -1040,7 +1344,17 @@ impl AttemptModel {
             }
             for at in &msg.attempts {
                 let replaying = at.correcting.is_some_and(|rx| self.live(rx));
-                if at.stage == Stage::Fenced && at.verifier && !at.reclaimed && !replaying {
+                let quiet = at.quiet_at.is_none_or(|at| now >= at);
+                let held = at.slot == Slot::OnceWaiter
+                    && possessed(&self.receivers, &self.limits, self.turn, id, at, now);
+                if at.stage == Stage::Fenced
+                    && at.verifier
+                    && !at.reclaimed
+                    && !at.withheld
+                    && !replaying
+                    && quiet
+                    && !held
+                {
                     out.push(LapseCheck {
                         id: id.clone(),
                         a: at.a,
@@ -1051,6 +1365,40 @@ impl AttemptModel {
             }
         }
         out
+    }
+
+    /// When the next fenced attempt that keeps its verifier becomes a
+    /// [`Self::verify_candidates`] entry, if that is after `now`, so the
+    /// clock wakes for it: its `quiet_at`, and for a once-waiter attempt the
+    /// end of the turn clock's possession too. While the turn is busy a
+    /// once-waiter attempt has no such instant; the turn's end sets one.
+    pub fn verify_due_at(&self, now: Instant) -> Option<Instant> {
+        if self.exited {
+            return None;
+        }
+        self.messages
+            .values()
+            .filter(|msg| msg.state.is_terminal())
+            .flat_map(|msg| msg.attempts.iter())
+            .filter(|at| {
+                at.stage == Stage::Fenced
+                    && at.verifier
+                    && !at.reclaimed
+                    && !at.correcting.is_some_and(|rx| self.live(rx))
+            })
+            .filter_map(|at| {
+                let held_until = if at.slot == Slot::OnceWaiter {
+                    if self.turn.busy {
+                        return None;
+                    }
+                    Some(once_anchor(at, self.turn) + self.limits.ack_wait)
+                } else {
+                    None
+                };
+                [at.quiet_at, held_until].into_iter().flatten().max()
+            })
+            .filter(|due| *due > now)
+            .min()
     }
 
     /// The verify candidates whose spool lookup found no commit: each one
@@ -1108,13 +1456,54 @@ impl AttemptModel {
             .count()
     }
 
-    /// A hook or `inbox fetch` receiver's connection closed (§4): its
-    /// possession ends.
+    /// A one-shot receiver's connection closed (§4, C-2): no control can
+    /// arrive for it any more, so its open attempts are fenced (possibly
+    /// handed) and its record goes. A hook's possession ends with it; a
+    /// once-waiter attempt's stays with the turn clock (C-1).
     pub fn connection_closed(&mut self, now: Instant, rx: Rx) {
-        if let Some(r) = self.receivers.get_mut(&rx) {
-            r.connected = false;
+        if self.receivers.get(&rx).is_some_and(|r| one_shot(r.slot)) {
+            self.close_one_shot(now, rx, false);
         }
         self.finalize_bound_to(now, rx);
+    }
+
+    /// Retire one-shot receiver `rx` (C-2): fence its open attempts, which
+    /// stay out of verification until an approval of them would have run
+    /// out (C-4), and remove its record. `close` asks the hub to close its
+    /// connection.
+    fn close_one_shot(&mut self, now: Instant, rx: Rx, close: bool) {
+        let Some(r) = self.receivers.remove(&rx) else {
+            return;
+        };
+        if self.slots.get(&r.slot) == Some(&rx) {
+            self.slots.remove(&r.slot);
+        }
+        let quiet_at = now + self.limits.grant_ttl();
+        for msg in self.messages.values_mut() {
+            for at in msg.attempts.iter_mut().filter(|at| at.rx == rx) {
+                if !at.stage.is_final() {
+                    at.fence();
+                    at.quiet_at = Some(quiet_at);
+                }
+            }
+        }
+        if close {
+            self.effects.push(Effect::Close { rx });
+        }
+    }
+
+    /// C-3: close every hook receiver whose hold has run out.
+    fn expire_holds(&mut self, now: Instant) {
+        let due: Vec<Rx> = self
+            .receivers
+            .iter()
+            .filter(|(_, r)| r.hold_until.is_some_and(|until| now >= until))
+            .map(|(rx, _)| *rx)
+            .collect();
+        for rx in due {
+            self.close_one_shot(now, rx, true);
+            self.finalize_bound_to(now, rx);
+        }
     }
 
     /// A stream receiver's connection closed (§4). It decides nothing at
@@ -1245,6 +1634,9 @@ impl AttemptModel {
     /// policy (§3), under which no suppression is claimed, so every lapse
     /// candidate counts as checked.
     pub fn tick(&mut self, now: Instant) {
+        if !self.exited {
+            self.expire_holds(now);
+        }
         let checks = self.lapse_candidates(now);
         self.tick_cleared(now, &checks);
     }
@@ -1271,7 +1663,7 @@ impl AttemptModel {
             let valid = at.mark == check.mark
                 && at.a == msg.a
                 && needs_clearance(at)
-                && !possessed(&self.receivers, &self.limits, &check.id, at, now);
+                && !possessed(&self.receivers, &self.limits, self.turn, &check.id, at, now);
             if valid
                 && let Some(at) = self
                     .messages
@@ -1281,7 +1673,9 @@ impl AttemptModel {
                 at.cleared = true;
             }
         }
+        self.expire_holds(now);
         self.retire_closed(now);
+        self.staging_lapsed(now);
         let ids: Vec<String> = self.messages.keys().cloned().collect();
         for id in &ids {
             if let Some(msg) = self.messages.get_mut(id) {
@@ -1316,8 +1710,11 @@ impl AttemptModel {
     }
 
     /// [`Self::tick_cleared`], then G3's not-started attention against the
-    /// generation's turn clock ([`Self::note_turn`]).
+    /// generation's turn clock ([`Self::note_turn`]). The clock is applied
+    /// first ([`Self::turn`]), so a turn that started while the checks ran
+    /// voids them before they can clear anything.
     pub fn tick_turn(&mut self, now: Instant, cleared: &[LapseCheck], turn: TurnView) {
+        self.turn(now, turn);
         self.tick_cleared(now, cleared);
         self.note_turn(now, turn);
     }
@@ -1624,11 +2021,13 @@ impl AttemptModel {
         let committed = current.iter().any(|at| at.stage == Stage::Committed);
         let held = current
             .iter()
-            .any(|at| possessed(&self.receivers, &self.limits, id, at, now));
-        let resuming = current.iter().any(|at| at.resume_pending);
+            .any(|at| possessed(&self.receivers, &self.limits, self.turn, id, at, now));
+        // A withheld attempt waits on the deck's own answer, as a resuming
+        // one waits on its incarnation's (part 2 §2.4).
+        let resuming = current.iter().any(|at| at.resume_pending || at.withheld);
         let all_final = current
             .iter()
-            .all(|at| at.stage.is_final() && !at.resume_pending);
+            .all(|at| at.stage.is_final() && !at.resume_pending && !at.withheld);
         let all_not_handed =
             !current.is_empty() && current.iter().all(|at| at.stage == Stage::NotHanded);
         let none_issued = current.is_empty();
@@ -1639,7 +2038,7 @@ impl AttemptModel {
             .filter(|at| at.e > msg.not_started_after_e)
             .any(|at| {
                 at.stage == Stage::Handed
-                    || (possessed(&self.receivers, &self.limits, id, at, now)
+                    || (possessed(&self.receivers, &self.limits, self.turn, id, at, now)
                         && snapshot_holds(&self.receivers, &self.limits, id, at, now))
             });
         let cleared = current.iter().all(|at| !needs_clearance(at) || at.cleared);
@@ -1654,8 +2053,9 @@ impl AttemptModel {
                 // A message that ran out of attempts on not-handed reports a
                 // commit now contradicts (PR #1735 review 4298669219) reached
                 // the agent after all: it settles, and whoever was told it was
-                // undeliverable is corrected through the hub's late-ack record
-                // when the inbox copy follows (reviewer R9T-03). An offer went
+                // undeliverable can be corrected through the hub's late-ack
+                // record, while that is retained, when the inbox copy follows
+                // (reviewer R9T-03). An offer went
                 // back to its pool and stays out of attempts.
                 if msg.state == MessageState::Undeliverable(UndeliverableReason::MaxDeliver)
                     && !msg.offer
@@ -1672,8 +2072,9 @@ impl AttemptModel {
                 }
                 if msg.state.is_terminal() {
                     // A message ended as cancelled reached the agent after
-                    // all, and whoever was told otherwise is told so; it
-                    // stays cancelled.
+                    // all, and whoever was told otherwise can be told so
+                    // while the hub still holds a route to them; it stays
+                    // cancelled.
                     let despite_cancel = match msg.state {
                         MessageState::Undeliverable(UndeliverableReason::Cancelled) => Some(true),
                         MessageState::Undeliverable(UndeliverableReason::MaxDeliver) => Some(false),
@@ -1847,22 +2248,38 @@ impl AttemptModel {
     }
 
     /// Return an attempt's evidence reservation once it is quiescent (§7):
-    /// its message is terminal, it is final with no resume answer owed, and
-    /// it keeps no late-commit verifier (a `HandedInert` one's is kept while
+    /// its message is terminal, it is final with no resume answer owed, it
+    /// keeps no late-commit verifier (a `HandedInert` one's is kept while
     /// the message is not settled, a `Fenced` one's until a spool check after
-    /// the message ended).
+    /// the message ended), and the deck no longer withholds it: a caps file
+    /// still being written is removed only once that write is done (R2-R02).
     ///
-    /// Finality already implies that no approval under a current epoch is
-    /// outstanding, so the model carries no separate approval predicate:
-    /// every path to a final stage is either the approved incarnation
-    /// reporting what its callback did (the approval is spent, or revoked
-    /// locally before a `NotHanded`), a resume answer or its silence (the
-    /// incarnation was retired, which bumps the epoch), the retirement of a
-    /// stream that closed (no sooner than an approval it sent has expired),
-    /// or exit. A refused [`Self::may_hand_over`] is none of these, so it
-    /// stages nothing. That a surviving old JS context honours the epoch bump
-    /// and the expiry before its approved callback resumes is the adapter's
-    /// obligation (inbox/opencode/031, inbox/opencode/046), not this model's.
+    /// For a stream attempt, finality already implies that no approval under
+    /// a current epoch is outstanding, so the model carries no separate
+    /// approval predicate for it: every path to a final stage is either the
+    /// approved incarnation reporting what its callback did (the approval is
+    /// spent, or revoked locally before a `NotHanded`), a resume answer or
+    /// its silence (the incarnation was retired, which bumps the epoch), the
+    /// retirement of a stream that closed (no sooner than an approval it sent
+    /// has expired), or exit. A refused [`Self::may_hand_over`] is none of
+    /// these, so it stages nothing. That a surviving old JS context honours
+    /// the epoch bump and the expiry before its approved callback resumes is
+    /// the adapter's obligation (inbox/opencode/031, inbox/opencode/046), not
+    /// this model's.
+    ///
+    /// A one-shot attempt (once-waiter or hook) does not have that property:
+    /// it is fenced at once when its connection closes, its waiter is
+    /// superseded or its hold runs out (C-2, C-3), while an approval it was
+    /// granted can still be in use, and a once-waiter's block can sit in
+    /// Claude's queued notification for a whole busy turn. So a fenced
+    /// one-shot attempt keeps its verifier until
+    /// [`Self::verify_candidates`] admits it: after its `quiet_at` (C-4) and,
+    /// for a once-waiter, after the turn clock's possession (C-1). What is
+    /// left: a process paused between its fence and its write for longer
+    /// than `grant_ttl`, or a notification Claude submits more than one
+    /// ack-wait after its turn went idle, can deliver after the verifier is
+    /// gone. That loses the sender's late correction, not the message, which
+    /// is already terminal or on the lapse path.
     fn reclaim(&mut self, id: &str) {
         let Some(msg) = self.messages.get_mut(id) else {
             return;
@@ -1873,7 +2290,8 @@ impl AttemptModel {
             if settled {
                 at.verifier = false;
             }
-            if terminal && at.stage.is_final() && !at.resume_pending && !at.verifier {
+            if terminal && at.stage.is_final() && !at.resume_pending && !at.verifier && !at.withheld
+            {
                 at.reclaimed = true;
                 self.evidence_reserved =
                     self.evidence_reserved.saturating_sub(EVIDENCE_PER_ATTEMPT);
@@ -1923,6 +2341,7 @@ fn owes_revoke(at: &Attempt) -> bool {
 /// not seen (§3).
 fn needs_clearance(at: &Attempt) -> bool {
     !at.resume_pending
+        && !at.withheld
         && matches!(
             at.stage,
             Stage::Issued | Stage::Handed | Stage::Fenced | Stage::HandedInert
@@ -1945,24 +2364,49 @@ fn snapshot_holds(
     })
 }
 
+/// Whether a once-waiter attempt can still be possessed: it may be in the
+/// notification Claude has queued (C-1), whether its waiter is still there
+/// or not, and whether or not it was fenced.
+fn once_held(at: &Attempt) -> bool {
+    at.slot == Slot::OnceWaiter && !matches!(at.stage, Stage::Committed | Stage::NotHanded)
+}
+
+/// Where a once-waiter attempt's idle grace starts (C-1): the later of its
+/// issue and the end of the last turn.
+fn once_anchor(at: &Attempt, turn: TurnView) -> Instant {
+    at.issued_at.max(turn.idle_since.unwrap_or(at.issued_at))
+}
+
+/// Whether a slot's receivers are one-shot processes (C-2, C-3).
+fn one_shot(slot: Slot) -> bool {
+    matches!(slot, Slot::OnceWaiter | Slot::Hook)
+}
+
 /// Whether `at` is possessed right now (§4). A stream attempt is possessed
 /// while its live incarnation's fresh snapshot holds it, or while it is in
 /// issue grace (`d` above the watermark, less than one TTL since issue). A
-/// once-waiter attempt is possessed while its receiver is busy, or within one
-/// ack-wait of going idle; a hook attempt while its connection is open.
+/// once-waiter attempt is possessed while the generation's turn clock reads
+/// busy, or within one ack-wait of the later of its issue and the end of the
+/// last turn (C-1). A hook attempt is possessed while its receiver is open
+/// and its hold has not run out (C-3).
 fn possessed(
     receivers: &BTreeMap<Rx, Receiver>,
     limits: &Limits,
+    turn: TurnView,
     id: &str,
     at: &Attempt,
     now: Instant,
 ) -> bool {
-    if at.resume_pending
-        || matches!(
-            at.stage,
-            Stage::Committed | Stage::NotHanded | Stage::Fenced
-        )
-    {
+    if at.resume_pending {
+        return false;
+    }
+    if at.slot == Slot::OnceWaiter {
+        return once_held(at) && (turn.busy || now < once_anchor(at, turn) + limits.ack_wait);
+    }
+    if matches!(
+        at.stage,
+        Stage::Committed | Stage::NotHanded | Stage::Fenced
+    ) {
         return false;
     }
     let Some(r) = receivers.get(&at.rx) else {
@@ -1976,12 +2420,8 @@ fn possessed(
             snapshot_holds(receivers, limits, id, at, now)
                 || (at.d > r.seen && now < at.issued_at + limits.possess_ttl)
         }
-        Slot::OnceWaiter => {
-            r.busy
-                || r.idle_since
-                    .is_some_and(|since| now < since + limits.ack_wait)
-        }
-        Slot::Hook => r.connected,
+        Slot::OnceWaiter => false,
+        Slot::Hook => r.hold_until.is_some_and(|until| now < until),
     }
 }
 
@@ -3149,25 +3589,25 @@ mod tests {
         );
     }
 
-    /// Scenario: A Claude once-waiter's attempt is handed over and Claude
-    /// reports an error stop and then Idle within one ack-wait; separately it
-    /// goes busy, idle, busy again and idle; and a hook receiver's fetch
-    /// connection closes while it is reported busy. A repeated idle report
-    /// does not extend the one idle grace, a resumed busy interval restarts
-    /// it, and a hook's possession is its open connection, not a busy
-    /// interval.
+    /// Scenario: A once-waiter's handed attempt is held by the generation's
+    /// turn clock: an Idle reported again with the same idle edge does not
+    /// extend its one idle grace, and a turn that starts and ends again
+    /// restarts the grace at the new idle edge. A hook's attempt is held by
+    /// its open fetch connection whatever the turn clock says, and lapses
+    /// once that connection closes.
     #[spec("inbox/attempts/017")]
     #[test]
     fn attempts_017_one_idle_grace_and_the_hook_connection() {
         let (mut m, t) = model();
         let wait = Limits::default().ack_wait;
         let s = Duration::from_secs(1);
+        m.turn(t, busy());
         let rx = m.register(t, Slot::OnceWaiter, false).rx;
         m.post("dup", false);
         let d = m.issue(t, "dup", rx).unwrap();
         m.stage(t, "dup", 1, d.e, Stage::Handed, Some(rx));
-        m.busy(t, rx, false);
-        m.busy(t + wait - s, rx, false);
+        m.turn(t, idle_at(t));
+        m.turn(t + wait - s, idle_at(t));
         m.tick(t + wait - s);
         assert!(!m.delivery("dup").unwrap().repeat_scheduled());
         let t0 = t + wait + s;
@@ -3181,10 +3621,10 @@ mod tests {
         m.post("cycle", false);
         let c = m.issue(t0, "cycle", rx2).unwrap();
         m.stage(t0, "cycle", 1, c.e, Stage::Handed, Some(rx2));
-        m.busy(t0, rx2, true);
-        m.busy(t0 + s, rx2, false);
-        m.busy(t0 + 3 * s, rx2, true);
-        m.busy(t0 + 5 * s, rx2, false);
+        m.turn(t0, busy());
+        m.turn(t0 + s, idle_at(t0 + s));
+        m.turn(t0 + 3 * s, busy());
+        m.turn(t0 + 5 * s, idle_at(t0 + 5 * s));
         m.tick(t0 + 5 * s + wait - s);
         assert!(
             !m.delivery("cycle").unwrap().repeat_scheduled(),
@@ -3193,19 +3633,20 @@ mod tests {
         m.tick(t0 + 5 * s + wait + s);
         assert!(m.delivery("cycle").unwrap().repeat_scheduled());
 
-        let hook = m.register(t0, Slot::Hook, false).rx;
-        m.post("hook", false);
-        m.issue(t0, "hook", hook).unwrap();
         let later = t0 + 4 * wait;
-        m.tick(later);
+        m.turn(later, idle_at(t0 + 5 * s));
+        let hook = m.register(later, Slot::Hook, false).rx;
+        m.post("hook", false);
+        m.issue(later, "hook", hook).unwrap();
+        m.tick(later + wait - s);
         assert_eq!(m.state("hook"), Some(MessageState::Attempting));
         assert!(!m.delivery("hook").unwrap().repeat_scheduled());
-        m.busy(later, hook, true);
-        m.connection_closed(later, hook);
-        m.tick(later);
+        m.turn(later + wait - s, busy());
+        m.connection_closed(later + wait - s, hook);
+        m.tick(later + wait - s);
         assert!(
             m.delivery("hook").unwrap().repeat_scheduled(),
-            "a closed fetch connection holds nothing, whatever the status"
+            "a closed fetch connection holds nothing, whatever the turn clock says"
         );
     }
 
@@ -3382,7 +3823,7 @@ mod tests {
                     ActionOutcome::Applied { .. }
                 ));
                 assert!(m.state("m").unwrap().is_terminal());
-                assert_eq!(m.verify_candidates().len(), 1, "precondition: verifying");
+                assert_eq!(m.verify_candidates(t).len(), 1, "precondition: verifying");
                 m.drain_effects();
                 (m, t, at)
             };
@@ -3395,11 +3836,11 @@ mod tests {
             let handed_back = |e: u32| vec![("m".to_string(), 1, e)];
 
             let (mut m, t, at) = fenced_and_cancelled();
-            let before = m.verify_candidates();
+            let before = m.verify_candidates(t);
             let replacement = m.register(t, slot, false);
             assert_eq!(replacement.correctable, handed_back(at.e));
             m.tick_verified(&before);
-            let after = m.verify_candidates();
+            let after = m.verify_candidates(t);
             m.tick_verified(&after);
             assert_eq!(
                 reclaimed(&m.drain_effects()),
@@ -3449,7 +3890,7 @@ mod tests {
             m.stream_closed(t, replacement.rx);
             let gone = t + Limits::default().closed_retire_after();
             m.tick(gone);
-            let checks = m.verify_candidates();
+            let checks = m.verify_candidates(gone);
             assert_eq!(checks.len(), 1, "verification resumes once no one holds it");
             m.tick_verified(&checks);
             assert_eq!(reclaimed(&m.drain_effects()), 1);
@@ -3593,6 +4034,21 @@ mod tests {
 
     fn idle() -> TurnView {
         TurnView::default()
+    }
+
+    fn busy() -> TurnView {
+        TurnView {
+            busy: true,
+            idle_since: None,
+        }
+    }
+
+    /// Idle since the turn under way ended at `at`.
+    fn idle_at(at: Instant) -> TurnView {
+        TurnView {
+            busy: false,
+            idle_since: Some(at),
+        }
     }
 
     /// Register `slot`, post `id`, hand it out possessed and staged Handed.
@@ -4011,5 +4467,421 @@ mod tests {
             idle(),
         );
         assert!(m.delivery("m").unwrap().not_started());
+    }
+
+    fn repeat_scheduled(m: &AttemptModel, id: &str) -> bool {
+        m.delivery(id).unwrap().repeat_scheduled()
+    }
+
+    /// Scenario: Fresh mail reaches a Claude once-waiter of an agent that has
+    /// been idle for ten ack-waits, and of one that never reported a turn;
+    /// separately a handed attempt is held through an hour-long turn during
+    /// which the waiter is re-armed at Stop, and the turn ends. Each lapses
+    /// one ack-wait after the later of its issue and the turn's end, never
+    /// earlier, an Idle reported again extends nothing, and the re-arm
+    /// repeats nothing.
+    #[spec("inbox/attempts/028")]
+    #[test]
+    fn attempts_028_a_once_waiter_attempt_is_held_by_the_turn_clock() {
+        let wait = Limits::default().ack_wait;
+        let s = Duration::from_secs(1);
+        for view in [Some(10), None] {
+            let (mut m, t0) = model();
+            let t = t0 + wait * 10;
+            if view.is_some() {
+                m.turn(t0, busy());
+                m.turn(t0, idle_at(t0));
+            }
+            let rx = m.register(t, Slot::OnceWaiter, false).rx;
+            m.post("m", false);
+            m.issue(t, "m", rx).unwrap();
+            m.tick(t + wait - s);
+            assert!(
+                !repeat_scheduled(&m, "m"),
+                "{view:?}: fresh mail gets one ack-wait from its issue"
+            );
+            m.tick(t + wait + s);
+            assert!(repeat_scheduled(&m, "m"), "{view:?}: then it lapses");
+        }
+
+        let (mut m, t) = model();
+        m.turn(t, busy());
+        let rx = m.register(t, Slot::OnceWaiter, false).rx;
+        m.post("m", false);
+        let i = m.issue(t, "m", rx).unwrap();
+        m.stage(t, "m", i.a, i.e, Stage::Handed, Some(rx));
+        let later = t + Duration::from_secs(3600) - s;
+        m.tick(later);
+        assert_eq!(m.state("m"), Some(MessageState::Attempting));
+        assert!(!repeat_scheduled(&m, "m"), "a busy turn holds it");
+        let rearmed = m.register(later, Slot::OnceWaiter, false);
+        assert!(rearmed.resume.is_empty());
+        m.tick(later);
+        assert!(
+            !repeat_scheduled(&m, "m"),
+            "a Stop re-arm does not end what the queued notification holds"
+        );
+        let ended = later + s;
+        m.turn(ended, idle_at(ended));
+        m.tick(ended + wait - s);
+        m.turn(ended + wait - s, idle_at(ended));
+        assert!(!repeat_scheduled(&m, "m"));
+        m.tick(ended + wait + s);
+        assert!(
+            repeat_scheduled(&m, "m"),
+            "one ack-wait after the turn ended, never extended by a repeated Idle"
+        );
+        let repeat = m.issue(ended + wait + s, "m", rearmed.rx).unwrap();
+        assert_eq!(repeat.kind, IssueKind::AutoRepeat);
+    }
+
+    /// Scenario: A Claude waiter is issued a message and its connection
+    /// closes before it reports anything, while the agent is busy. The
+    /// attempt is fenced at once and stays held while the turn runs. A spool
+    /// check prepared after the turn ended is applied only after another
+    /// turn started and ended, and one is applied in the same tick that
+    /// first learns a turn started: neither clears it. The next check after
+    /// the grace does, the marked repeat goes out, and the first attempt's
+    /// late commit settles the message.
+    #[spec("inbox/attempts/029")]
+    #[test]
+    fn attempts_029_a_crashed_waiter_lapses_only_after_the_turn_clock_lets_it() {
+        let wait = Limits::default().ack_wait;
+        let s = Duration::from_secs(1);
+        let (mut m, t) = model();
+        m.turn(t, busy());
+        let rx = m.register(t, Slot::OnceWaiter, false).rx;
+        m.post("m", false);
+        let first = m.issue(t, "m", rx).unwrap();
+        m.connection_closed(t, rx);
+        assert_eq!(
+            m.delivery("m").unwrap().attempt(1, first.e).unwrap().stage,
+            Stage::Fenced,
+            "no control can come for it any more"
+        );
+        m.tick(t + wait * 5);
+        assert_eq!(m.state("m"), Some(MessageState::Attempting));
+        assert!(!repeat_scheduled(&m, "m"), "held while the turn runs");
+
+        let ended = t + wait * 5;
+        m.turn(ended, idle_at(ended));
+        let late = ended + wait + s;
+        let checks = m.lapse_candidates(late);
+        assert_eq!(checks.len(), 1, "precondition: a lapse candidate");
+        m.turn(late, busy());
+        let again = late + s;
+        m.turn(again, idle_at(again));
+        m.tick_cleared(again + wait + s, &checks);
+        assert!(
+            !repeat_scheduled(&m, "m"),
+            "a check prepared before a turn started clears nothing"
+        );
+
+        let now = again + wait + s;
+        let checks = m.lapse_candidates(now);
+        assert_eq!(checks.len(), 1);
+        m.tick_turn(now, &checks, busy());
+        assert!(
+            !repeat_scheduled(&m, "m"),
+            "the turn view is applied before the checks it would void"
+        );
+
+        let idle_again = now + s;
+        m.turn(idle_again, idle_at(idle_again));
+        m.tick(idle_again + wait + s);
+        assert!(repeat_scheduled(&m, "m"));
+        let next = m
+            .register(idle_again + wait + s, Slot::OnceWaiter, false)
+            .rx;
+        let repeat = m.issue(idle_again + wait + s, "m", next).unwrap();
+        assert!(repeat.kind.marked());
+        assert_eq!(
+            m.stage(
+                idle_again + wait + s,
+                "m",
+                1,
+                first.e,
+                Stage::Committed,
+                None
+            ),
+            StageOutcome::Applied
+        );
+        assert_eq!(m.state("m"), Some(MessageState::Settled));
+    }
+
+    /// Scenario: A Claude waiter of an agent allowed one attempt per message
+    /// is issued a message while the agent reads idle. Well past the idle
+    /// grace, the clock's tick is the first to learn that a turn started.
+    /// The message stays attempting with its revision unchanged: the turn
+    /// view is applied before anything decides on the stale idle one, so
+    /// the message never passes through uncertain on the way.
+    #[spec("inbox/attempts/035")]
+    #[test]
+    fn attempts_035_a_turn_learned_at_a_tick_is_applied_before_the_tick_decides() {
+        let limits = Limits {
+            max_attempts: 1,
+            ..Limits::default()
+        };
+        let (mut m, t) = model_with(limits);
+        let rx = m.register(t, Slot::OnceWaiter, false).rx;
+        m.post("m", false);
+        m.issue(t, "m", rx).unwrap();
+        let before = m.delivery("m").unwrap().revision;
+        m.tick_turn(t + limits.ack_wait * 2, &[], busy());
+        let d = m.delivery("m").unwrap();
+        assert_eq!(d.state, MessageState::Attempting);
+        assert_eq!(d.revision, before, "no state passed through on the way");
+    }
+
+    /// Scenario: While the agent is busy, a Claude waiter holds one message
+    /// it was issued and one it handed over, and a new waiter registers in
+    /// its place; a hook registers too. Neither registration is asked to
+    /// resume anything. The superseded waiter's issued attempt is fenced at
+    /// once but stays held by the turn, its handed one is untouched, the
+    /// deck is told to close its connection, and its stage reports and
+    /// approvals are refused, while a commit published with the attempt's
+    /// cap still settles its message.
+    #[spec("inbox/attempts/030")]
+    #[test]
+    fn attempts_030_a_one_shot_registration_resumes_nothing_and_fences_at_once() {
+        let wait = Limits::default().ack_wait;
+        let (mut m, t) = model();
+        m.turn(t, busy());
+        let old = m.register(t, Slot::OnceWaiter, false);
+        m.post("issued", false);
+        m.post("inert", false);
+        let issued = m.issue(t, "issued", old.rx).unwrap();
+        let inert = m.issue(t, "inert", old.rx).unwrap();
+        m.stage(t, "inert", 1, inert.e, Stage::Handed, Some(old.rx));
+        m.drain_effects();
+
+        let new = m.register(t, Slot::OnceWaiter, false);
+        assert!(
+            new.resume.is_empty(),
+            "a fresh waiter holds nothing to answer for"
+        );
+        assert!(new.correctable.is_empty());
+        let stage_of = |m: &AttemptModel, id: &str, e: u32| {
+            m.delivery(id).unwrap().attempt(1, e).unwrap().stage
+        };
+        assert_eq!(stage_of(&m, "issued", issued.e), Stage::Fenced);
+        assert_eq!(stage_of(&m, "inert", inert.e), Stage::HandedInert);
+        assert!(
+            m.drain_effects().contains(&Effect::Close { rx: old.rx }),
+            "the superseded waiter's connection is closed"
+        );
+        assert_eq!(
+            m.stage(t, "issued", 1, issued.e, Stage::Handed, Some(old.rx)),
+            StageOutcome::WrongReceiver
+        );
+        assert_eq!(
+            m.may_hand_over("issued", 1, issued.e, old.rx),
+            Err(HandOverRefusal::WrongReceiver)
+        );
+        m.tick(t + wait * 10);
+        for id in ["issued", "inert"] {
+            assert_eq!(m.state(id), Some(MessageState::Attempting), "{id}");
+            assert!(!repeat_scheduled(&m, id), "{id}: held by the busy turn");
+        }
+        assert_eq!(
+            m.stage(t + wait * 10, "issued", 1, issued.e, Stage::Committed, None),
+            StageOutcome::Applied
+        );
+        assert_eq!(m.state("issued"), Some(MessageState::Settled));
+
+        let hook = m.register(t, Slot::Hook, false);
+        assert!(hook.resume.is_empty());
+        assert!(hook.correctable.is_empty());
+        assert!(m.live(new.rx), "a hook retires no waiter");
+    }
+
+    /// Scenario: Two hook receivers of one agent each fetch a message, then
+    /// the first one's connection closes. Only the first one's attempt is
+    /// fenced and lapses; the second keeps holding its own. No more than the
+    /// bound of live hooks is admitted, and a closed hook leaves no receiver
+    /// record behind.
+    #[spec("inbox/attempts/031")]
+    #[test]
+    fn attempts_031_hook_receivers_coexist_and_are_bounded() {
+        let (mut m, t) = model();
+        let h1 = m.register(t, Slot::Hook, false).rx;
+        let h2 = m.register(t, Slot::Hook, false).rx;
+        assert!(m.live(h1) && m.live(h2), "neither retires the other");
+        m.post("a", false);
+        m.post("b", false);
+        let a = m.issue(t, "a", h1).unwrap();
+        let b = m.issue(t, "b", h2).unwrap();
+        let held = m.receivers_held();
+        m.connection_closed(t, h1);
+        assert_eq!(
+            m.delivery("a").unwrap().attempt(1, a.e).unwrap().stage,
+            Stage::Fenced
+        );
+        assert_eq!(
+            m.delivery("b").unwrap().attempt(1, b.e).unwrap().stage,
+            Stage::Issued
+        );
+        m.tick(t);
+        assert!(
+            repeat_scheduled(&m, "a"),
+            "the closed hook's attempt lapses"
+        );
+        assert!(
+            !repeat_scheduled(&m, "b"),
+            "the open one still holds its own"
+        );
+        assert!(!m.live(h1) && m.live(h2));
+        assert_eq!(m.receivers_held(), held - 1, "the closed hook is pruned");
+
+        assert!(m.hook_room());
+        let mut extra = Vec::new();
+        while m.hook_room() {
+            extra.push(m.register(t, Slot::Hook, false).rx);
+            assert!(extra.len() < MAX_LIVE_HOOKS, "the bound holds");
+        }
+        assert_eq!(extra.len() + 1, MAX_LIVE_HOOKS, "h2 and the extra ones");
+        m.connection_closed(t, h2);
+        assert!(m.hook_room(), "a closed hook frees its place");
+    }
+
+    /// Scenario: A hook receiver fetches a message and never reports a final
+    /// stage. At its hold the clock closes it, fences the attempt and
+    /// schedules the marked repeat, which another hook takes; the first
+    /// attempt's commit then arrives late and settles the message. A second
+    /// message, cancelled while its hook held it, ends cancelled at the hold
+    /// and its fenced attempt is not verified away before the approval it may
+    /// still hold has run out.
+    #[spec("inbox/attempts/032")]
+    #[test]
+    fn attempts_032_a_hook_past_its_hold_is_closed_and_its_late_commit_still_counts() {
+        let limits = Limits::default();
+        let hold = limits.hook_hold();
+        let s = Duration::from_secs(1);
+        let (mut m, t) = model();
+        let h = m.register(t, Slot::Hook, false).rx;
+        m.post("m", false);
+        let first = m.issue(t, "m", h).unwrap();
+        assert_eq!(m.hold_due_at(), Some(t + hold));
+        m.drain_effects();
+        m.tick(t + hold - s);
+        assert!(!repeat_scheduled(&m, "m"));
+        m.tick(t + hold);
+        assert!(m.drain_effects().contains(&Effect::Close { rx: h }));
+        assert_eq!(
+            m.delivery("m").unwrap().attempt(1, first.e).unwrap().stage,
+            Stage::Fenced
+        );
+        assert!(repeat_scheduled(&m, "m"));
+        assert_eq!(m.hold_due_at(), None);
+        let h2 = m.register(t + hold, Slot::Hook, false).rx;
+        let repeat = m.issue(t + hold, "m", h2).unwrap();
+        assert_eq!(repeat.kind, IssueKind::AutoRepeat);
+        assert_eq!(
+            m.stage(t + hold + s, "m", 1, first.e, Stage::Committed, None),
+            StageOutcome::Applied
+        );
+        assert_eq!(m.state("m"), Some(MessageState::Settled));
+
+        let (mut m, t) = model();
+        let h = m.register(t, Slot::Hook, false).rx;
+        m.post("c", false);
+        let c = m.issue(t, "c", h).unwrap();
+        let r = m.delivery("c").unwrap().revision;
+        m.cancel(t, "c", GEN, r);
+        assert_eq!(m.state("c"), Some(MessageState::CancelHeld));
+        m.tick(t + hold);
+        assert_eq!(
+            m.state("c"),
+            Some(MessageState::Undeliverable(UndeliverableReason::Cancelled))
+        );
+        let fenced = t + hold;
+        assert!(
+            m.verify_candidates(fenced + limits.grant_ttl() - s)
+                .is_empty(),
+            "not verified away while an approval may still be in use"
+        );
+        let checks = m.verify_candidates(fenced + limits.grant_ttl());
+        assert_eq!(checks.len(), 1);
+        assert_eq!((checks[0].a, checks[0].e), (1, c.e));
+    }
+
+    /// Scenario: A hook receiver reports, attempt after attempt, that it
+    /// handed nothing over. Each report queues the message again and counts,
+    /// until it is undeliverable; a commit of one of those attempts arriving
+    /// afterwards is reported as a contradicted witness and tells the sender
+    /// the message was delivered after all.
+    #[spec("inbox/attempts/033")]
+    #[test]
+    fn attempts_033_a_hooks_not_handed_requeues_and_counts() {
+        let (mut m, t) = model();
+        m.post("m", false);
+        let mut last = None;
+        for n in 1..=Limits::default().max_deliver {
+            let h = m.register(t, Slot::Hook, false).rx;
+            let i = m.issue(t, "m", h).unwrap();
+            assert_eq!(
+                m.stage(t, "m", i.a, i.e, Stage::NotHanded, Some(h)),
+                StageOutcome::Applied
+            );
+            m.connection_closed(t, h);
+            let state = m.state("m").unwrap();
+            if n < Limits::default().max_deliver {
+                assert_eq!(state, MessageState::Queued, "after report {n}");
+            }
+            last = Some(i);
+        }
+        assert_eq!(
+            m.state("m"),
+            Some(MessageState::Undeliverable(UndeliverableReason::MaxDeliver))
+        );
+        let last = last.unwrap();
+        m.drain_effects();
+        m.stage(t, "m", last.a, last.e, Stage::Committed, None);
+        let effects = m.drain_effects();
+        assert!(effects.contains(&Effect::WitnessViolation {
+            id: "m".into(),
+            a: last.a,
+            e: last.e
+        }));
+        assert!(effects.contains(&Effect::DeliveredAfterAll {
+            id: "m".into(),
+            despite_cancel: false
+        }));
+    }
+
+    /// Scenario: An agent says it has a message: the deck picks the newest
+    /// attempt of the current assignment that was not positively refused.
+    /// When every attempt was positively not handed, or none was issued, it
+    /// names none.
+    #[spec("inbox/attempts/034")]
+    #[test]
+    fn attempts_034_an_explicit_commit_never_lands_on_a_not_handed_attempt() {
+        let (mut m, t) = model();
+        let rx = m.register(t, Slot::Pi, false).rx;
+        m.post("m", false);
+        assert_eq!(m.commit_target("m"), Err(CommitTargetRefusal::NoAttempt));
+        let first = issue_held(&mut m, t, "m", rx, 1);
+        m.stage(t, "m", 1, first.e, Stage::NotHanded, Some(rx));
+        assert_eq!(m.state("m"), Some(MessageState::Queued));
+        assert_eq!(m.commit_target("m"), Err(CommitTargetRefusal::NotHanded));
+        let second = issue_held(&mut m, t, "m", rx, 2);
+        assert_eq!(m.commit_target("m"), Ok((1, second.e)));
+        m.stage(t, "m", 1, second.e, Stage::NotHanded, Some(rx));
+        let third = issue_held(&mut m, t, "m", rx, 3);
+        m.stage(t, "m", 1, third.e, Stage::Handed, Some(rx));
+        let later = past_ttl(t);
+        m.tick(later);
+        assert!(
+            repeat_scheduled(&m, "m"),
+            "precondition: the handed one lapsed"
+        );
+        let fourth = issue_held(&mut m, later, "m", rx, 4);
+        m.stage(later, "m", 1, fourth.e, Stage::NotHanded, Some(rx));
+        assert_eq!(
+            m.commit_target("m"),
+            Ok((1, third.e)),
+            "the newest attempt that may have reached the agent"
+        );
+        assert_eq!(m.commit_target("nope"), Err(CommitTargetRefusal::NoAttempt));
     }
 }

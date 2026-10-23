@@ -3,6 +3,8 @@
 mod common;
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
+#[path = "support/inbox_route.rs"]
+mod route;
 
 use inbox::*;
 use serde_json::json;
@@ -280,13 +282,30 @@ fn doorbell_007_outstanding_ring_gets_pre_ring_and_cleanup_cr() {
     }
 }
 
-/// Scenario: Hold a task behind an old agent's human draft, stop it, and spawn a new agent in the same pane identity. Reporting the replacement Idle must not ring the old task; a newly bound task must still ring normally.
+/// Scenario: Hold a task behind an old agent's human draft, stop it, and spawn a new agent in the same pane identity, on both one-worker and four-worker daemons. A predecessor-session ShellIdle must not type into the replacement at completed policy ages of 5 seconds, 10 seconds and up to one day, nor during the real observation window; its own Idle then submits only the newly bound task, which can be fetched.
 #[spec("inbox/doorbell/008")]
 #[test]
 fn doorbell_008_respawn_never_rings_old_agents_message() {
-    let daemon = daemon_unbound(&[]);
+    for workers in ["1", "4"] {
+        assert_respawn_waits_for_ready(workers);
+    }
+}
+
+fn assert_respawn_waits_for_ready(workers: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let daemon = daemon_unbound(&[
+        ("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_DIR", "ring-barriers"),
+        ("TOKIO_WORKER_THREADS", workers),
+    ]);
+    // Prepare this fixture's control directory before the first human-input
+    // observation. A daemon-side mkdir can race its socket-bind umask and
+    // leave the directory without the owner's search bit.
+    let controls = daemon.home.join("ring-barriers");
+    std::fs::create_dir_all(&controls).unwrap();
+    std::fs::set_permissions(&controls, std::fs::Permissions::from_mode(0o700)).unwrap();
     let old = pane(&daemon, "respawn");
-    status(&daemon, &old, "idle", "codex");
+    status(&daemon, &old, "idle", "claude_code");
     let user = input(&daemon, &old, DRAFT);
     let old_id = enqueue(&daemon, &old, BODY);
     unchanged(&old, Duration::from_millis(350));
@@ -302,18 +321,344 @@ fn doorbell_008_respawn_never_rings_old_agents_message() {
     }
     let new = pane(&daemon, "respawn");
     assert_ne!(old.agent, new.agent);
-    status(&daemon, &new, "idle", "codex");
-    unchanged(&new, Duration::from_millis(1200));
-    assert!(
-        bytes(&new).is_empty(),
-        "stale agent binding reached replacement"
-    );
     let id = enqueue(&daemon, &new, BODY);
+    // The monitor's first idle sample uses the retained old hook session id
+    // but the sampled NEW agent id. Match its marker-less ShellIdle carrier;
+    // the token merely admits this synthetic frame through the hook socket.
+    let event = json!({"session_id":format!("doorbell-{}", old.agent),
+        "pane_id":new.id,"agent_id":new.agent,"token":new.token,
+        "agent_type":"none","event_type":"shell_idle",
+        "timestamp":chrono::Utc::now(),"metadata":{}});
+    let mut socket = connect(&daemon, &event).into_inner();
+    socket.shutdown(std::net::Shutdown::Write).unwrap();
+    std::io::Read::read_to_end(&mut socket, &mut Vec::new()).unwrap();
+    for age_ms in [5_000, 10_000, 86_399_000, 86_400_000] {
+        clock_step(&daemon, &new, age_ms);
+    }
+    std::fs::remove_file(daemon.home.join("ring-barriers/clock-ms")).unwrap();
+    assert!(
+        !common::wait_until(Duration::from_millis(6500), || !bytes(&new).is_empty()),
+        "replacement received automatic input before current-generation readiness: {:?}; grid={}",
+        String::from_utf8_lossy(&bytes(&new)),
+        screen(&daemon, &new)
+    );
+    state(&daemon, &new, &id, "queued");
+    status(&daemon, &new, "idle", "claude_code");
+    assert!(
+        common::wait_until(Duration::from_secs(1), || !rings(&new).is_empty()),
+        "own ready must promptly submit replacement's fixed line"
+    );
     ring(&daemon, &new, &id);
     assert!(
-        !screen(&daemon, &new).contains(&old_id),
+        !String::from_utf8_lossy(&bytes(&new)).contains(&old_id),
         "old message rang in replacement"
     );
+    let fetched = fetch(&daemon, &new, true).to_string();
+    assert!(fetched.contains(&id) && fetched.contains(BODY), "{fetched}");
+}
+
+/// Scenario: Queue a task for a synthetic pane with a bare hydrated placeholder at the oldest representable startup, or its own native SessionStart aged to one day and the oldest representable startup in both session and process records. Each pane must receive zero automatic bytes until its own Idle hook permits the fixed line and an in-pane fetch.
+#[spec("inbox/doorbell/008")]
+#[test]
+fn doorbell_008_placeholder_alone_does_not_establish_readiness() {
+    for (session_start, old) in [
+        (false, chrono::DateTime::<chrono::Utc>::MIN_UTC),
+        (true, chrono::Utc::now() - chrono::Duration::days(1)),
+        (true, chrono::DateTime::<chrono::Utc>::MIN_UTC),
+    ] {
+        assert_aged_generation_waits_for_ready(session_start, old);
+    }
+}
+
+fn assert_aged_generation_waits_for_ready(session_start: bool, old: chrono::DateTime<chrono::Utc>) {
+    struct Fixture {
+        daemon: common::InProcDaemon,
+        root: tempfile::TempDir,
+    }
+    impl Endpoint for Fixture {
+        fn home(&self) -> &std::path::Path {
+            self.root.path()
+        }
+        fn cwd(&self) -> &std::path::Path {
+            self.root.path()
+        }
+        fn attach_socket(&self) -> &std::path::Path {
+            &self.daemon.attach_path
+        }
+        fn hook_socket(&self) -> &std::path::Path {
+            &self.daemon.hook_path
+        }
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let fixture = Fixture {
+        daemon: runtime.block_on(common::spawn_inprocess_daemon()),
+        root: common::harness_tempdir().unwrap(),
+    };
+    let pane = route::start(&fixture, "placeholder-readiness", json!({}));
+    if session_start {
+        status(&fixture, &pane, "session_start", "claude_code");
+    }
+    runtime.block_on(async {
+        let mut state = fixture.daemon.state.write().await;
+        if !session_start {
+            state.register_pane(pane.id.clone());
+            state.insert_placeholder_session(pane.id.clone(), None, None, Some(pane.agent.clone()));
+        }
+        // Age the data the real admission and its independent writer recheck
+        // read, rather than only the scheduler's injected decision clock.
+        let mut aged = 0;
+        for session in state.sessions.values_mut() {
+            if session.agent_id.as_deref() == Some(pane.agent.as_str()) {
+                session.started_at = old;
+                session.last_activity = old;
+                for event in &mut session.recent_events {
+                    event.timestamp = old;
+                }
+                aged += 1;
+            }
+        }
+        assert_eq!(
+            aged, 1,
+            "the actual generation must be aged (SessionStart={session_start})"
+        );
+        fixture
+            .daemon
+            .registry
+            .set_spawned_at_for_test(&pane.agent, old);
+        assert!(
+            fixture
+                .daemon
+                .registry
+                .agent_records()
+                .iter()
+                .any(|record| {
+                    record.id == pane.agent && record.spawned_at_ms == Some(old.timestamp_millis())
+                }),
+            "the independent process-start source must also be aged"
+        );
+    });
+    let id = enqueue(&fixture, &pane, BODY);
+    assert!(
+        !common::wait_until(Duration::from_millis(6500), || !bytes(&pane).is_empty()),
+        "aged generation received automatic input before current-generation readiness (SessionStart={session_start}, started_at={old}): {:?}; grid={}",
+        String::from_utf8_lossy(&bytes(&pane)),
+        screen(&fixture, &pane)
+    );
+    state(&fixture, &pane, &id, "queued");
+    route::fetch_enable(&pane);
+    status(&fixture, &pane, "idle", "claude_code");
+    assert!(
+        common::wait_until(Duration::from_secs(1), || bytes(&pane).ends_with(b"\r")),
+        "own ready must promptly submit placeholder's fixed line"
+    );
+    // Fetch from the fixture agent itself: this in-process daemon deliberately
+    // keeps real component ancestry admission, unlike daemon_unbound fixtures.
+    let fetched = route::fetched(&fixture, &pane, &id, BODY, "");
+    assert!(fetched.contains(&id) && fetched.contains(BODY), "{fetched}");
+}
+
+/// Scenario: Pause an outstanding task's retry after decision and acknowledge that task while the agent remains Idle and another message stays queued. Releasing the attempt must add no further bytes; an unchanged selected-message control still submits its retry.
+#[spec("inbox/doorbell/031")]
+#[test]
+fn doorbell_031_ack_after_decision_cancels_stale_rering() {
+    assert_ack_fences_rering("decided", true, false);
+}
+
+/// Scenario: Fetch the selected message without acknowledging it while its retry is paused after decision, then queue another task. The fetched ID must receive no further input while the queued control can progress.
+#[spec("inbox/doorbell/031")]
+#[test]
+fn doorbell_031_fetch_after_decision_cancels_stale_rering() {
+    assert_ack_fences_rering("decided", false, false);
+}
+
+/// Scenario: Pause a retry after its pre-ring CR, then acknowledge its selected task and leave another message queued without changing Idle. The already-written CR is allowed, but the retry payload and submission must be absent; an unchanged selected-message control still submits its line.
+#[spec("inbox/doorbell/031")]
+#[test]
+fn doorbell_031_ack_after_pre_cr_cancels_stale_payload() {
+    assert_ack_fences_rering("after-pre-cr", true, false);
+}
+
+/// Scenario: Settle the selected message while another remains queued after the inter-step delay. The paused retry must emit no further byte, while an unchanged selected message still completes its retry.
+#[spec("inbox/doorbell/031")]
+#[test]
+fn doorbell_031_ack_after_delay_cancels_remaining_bytes() {
+    assert_ack_fences_rering("after-delay", true, false);
+}
+
+/// Scenario: Settle the selected message while another remains queued just before the retry's final submit. The payload already written is allowed but the final CR must be withheld; the unchanged-message control still submits.
+#[spec("inbox/doorbell/031")]
+#[test]
+fn doorbell_031_ack_before_submit_cancels_final_cr() {
+    assert_ack_fences_rering("before-submit", true, false);
+}
+
+/// Scenario: Type a human draft while the retry is paused between its pre-ring CR and payload. Releasing the retry must not append automatic text or submit the draft.
+#[spec("inbox/doorbell/031")]
+#[test]
+fn doorbell_031_human_draft_between_steps_withholds_remaining_input() {
+    assert_ack_fences_rering("after-delay", true, true);
+}
+
+/// Scenario: A human input frame arrives while a retry is paused after decision, before writer admission. The queued task must remain deferred with the draft unsent; the unchanged-message control still completes its retry.
+#[spec("inbox/doorbell/031")]
+#[test]
+fn doorbell_031_human_draft_after_decision_withholds_retry() {
+    assert_ack_fences_rering("decided", true, true);
+}
+
+/// Scenario: After the retry payload reaches the pane, a human input frame arrives before its final submit CR. The already-written payload is allowed, but releasing the writer must deliver only the human draft and no automatic submit; the unchanged-message control still submits.
+#[spec("inbox/doorbell/031")]
+#[test]
+fn doorbell_031_human_draft_before_submit_withholds_final_cr() {
+    assert_ack_fences_rering("before-submit", true, true);
+}
+
+/// Scenario: Leave completion and writer-held barriers unreleased in separate fixtures until their test-only timeouts unwind the tasks. Each pane must then accept and submit another scheduled ring, proving recovery of its writer and logical busy slot.
+#[spec("inbox/doorbell/031")]
+#[test]
+fn doorbell_031_timed_out_barrier_does_not_strand_slot() {
+    for phase in ["completed", "after-delay"] {
+        let daemon = daemon_unbound(&[
+            ("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "500"),
+            ("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_PANE", "timeout-control"),
+            ("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_DIR", "ring-barriers"),
+        ]);
+        let root = daemon.home.join("ring-barriers");
+        std::fs::create_dir_all(&root).unwrap();
+        let pane = pane(&daemon, "timeout-control");
+        std::fs::write(root.join(format!("{phase}.armed")), "").unwrap();
+        status(&daemon, &pane, "idle", "claude_code");
+        let id = enqueue(&daemon, &pane, BODY);
+        ring(&daemon, &pane, &id);
+        assert!(
+            common::wait_until(WAIT, || root.join(format!("{phase}.reached")).exists()),
+            "timeout control must reach its seam"
+        );
+        assert!(
+            common::wait_until(WAIT, || root.join(format!("{phase}.timed-out")).exists()),
+            "unreleased seam must report its bounded timeout"
+        );
+        assert!(
+            common::wait_until(WAIT, || rings(&pane).len() >= 2),
+            "seam timeout stranded the doorbell's busy slot"
+        );
+        fetch(&daemon, &pane, true);
+    }
+}
+
+fn assert_ack_fences_rering(phase: &str, ack: bool, draft: bool) {
+    // Run the queued control FIRST, so a RED below still proves the barrier
+    // releases a real re-ring with the ordinary payload and submission.
+    for acknowledge in [false, true] {
+        let daemon = daemon_unbound(&[
+            ("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "500"),
+            ("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_PANE", "fenced"),
+            ("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_DIR", "ring-barriers"),
+            ("RUST_LOG", "dot_agent_deck::doorbell=debug"),
+        ]);
+        let root = daemon.home.join("ring-barriers");
+        std::fs::create_dir_all(&root).unwrap();
+        let pane = pane(&daemon, "fenced");
+        // Attach before the writer is parked. The observation seam proves the
+        // human frame arrived while its PTY write waits behind that writer.
+        let mut user = common::AttachInput::attach(&daemon.attach_socket, &pane.agent);
+        let _budget = InterleaveBudget::start(&root);
+        std::fs::write(root.join(format!("{phase}.armed")), "").unwrap();
+        status(&daemon, &pane, "idle", "claude_code");
+        let id = enqueue(&daemon, &pane, BODY);
+        ring(&daemon, &pane, &id);
+        let first = format!("{}\r", fixed_line(&id));
+        assert!(
+            common::wait_until(wait_budget(), || root
+                .join(format!("{phase}.reached"))
+                .exists()),
+            "re-ring must reach {phase} barrier"
+        );
+        let parked = match phase {
+            "decided" => first.clone(),
+            "before-submit" => format!("{first}\r{}", fixed_line(&id)),
+            _ => format!("{first}\r"),
+        };
+        assert!(
+            common::wait_until(wait_budget(), || bytes(&pane) == parked.as_bytes()),
+            "{phase}: barrier must precede payload: {:?}",
+            bytes(&pane)
+        );
+        if acknowledge && !draft {
+            let fetched = fetch(&daemon, &pane, ack).to_string();
+            assert!(fetched.contains(&id) && fetched.contains(BODY), "{fetched}");
+            state(
+                &daemon,
+                &pane,
+                &id,
+                if ack { "acknowledged" } else { "fetched" },
+            );
+        } else {
+            state(&daemon, &pane, &id, "queued");
+        }
+        let other = enqueue(&daemon, &pane, "SECOND-QUEUED-MESSAGE");
+        state(&daemon, &pane, &other, "queued");
+        if acknowledge && draft {
+            user.write(DRAFT);
+            assert!(
+                common::wait_until(wait_budget(), || std::fs::read_to_string(
+                    root.join("observations")
+                )
+                .unwrap_or_default()
+                .contains("human-arrived fenced")),
+                "human frame must arrive before releasing the writer"
+            );
+        }
+        std::fs::write(root.join("completed.armed"), "").unwrap();
+        std::fs::write(root.join(format!("{phase}.release")), "").unwrap();
+        assert!(
+            common::wait_until(wait_budget(), || root.join("completed.reached").exists()),
+            "{phase}: attempt must complete within the bounded seam; timeout={}",
+            root.join(format!("{phase}.timed-out")).exists()
+        );
+        drained(&pane);
+        if !acknowledge {
+            assert!(
+                common::wait_until(wait_budget(), || rings(&pane).len() >= 2),
+                "{phase}: still-queued control must submit its second ring"
+            );
+            assert_eq!(
+                bytes(&pane),
+                format!("{first}\r{}\r", fixed_line(&id)).as_bytes()
+            );
+            fetch(&daemon, &pane, true);
+            std::fs::write(root.join("completed.release"), "").unwrap();
+            continue;
+        }
+        let expected = if draft {
+            format!("{parked}{DRAFT}")
+        } else {
+            parked
+        };
+        if draft {
+            assert!(
+                common::wait_until(wait_budget(), || bytes(&pane).ends_with(DRAFT.as_bytes())),
+                "human input must resume after writer release"
+            );
+        }
+        assert_eq!(
+            String::from_utf8_lossy(&bytes(&pane)),
+            expected,
+            "{phase}: settled selected ID with another message queued (or intervening human draft) must emit no remaining payload or submit"
+        );
+        assert_eq!(rings(&pane).len(), 1, "ack must stop second submission");
+        std::fs::write(root.join("completed.release"), "").unwrap();
+        if draft {
+            unchanged(&pane, Duration::from_millis(600));
+        } else {
+            ring(&daemon, &pane, &other);
+            fetch(&daemon, &pane, true);
+        }
+    }
 }
 
 /// Scenario: Type a worker draft, queue a task, and keep typing while delivery waits. Enter must submit the human draft separately, after which exactly the fixed doorbell arrives without blocking the user's input.

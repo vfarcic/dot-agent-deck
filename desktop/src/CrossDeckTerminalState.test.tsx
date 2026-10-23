@@ -1,7 +1,7 @@
 import { act, render, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot, FIXTURE_DAEMON_ID } from "./data/fixture";
-import { agentKey } from "./lib/agentKey";
+import { agentKey, boundAgentKey } from "./lib/agentKey";
 import type { DeckBridge } from "./lib/bridge";
 import type { DeckSnapshot, TerminalChunk } from "./types";
 
@@ -307,8 +307,8 @@ describe("cross-deck terminal state", () => {
       generation: 1,
     }));
 
-    expect(result.current.terminalFeed?.get(FIXTURE_DAEMON_ID, "planner")).toBeDefined();
-    expect(result.current.terminalFeed?.get(REMOTE_DECK_ID, "planner")).toBeUndefined();
+    expect(result.current.terminalFeed?.get(FIXTURE_DAEMON_ID, "planner", undefined)).toBeDefined();
+    expect(result.current.terminalFeed?.get(REMOTE_DECK_ID, "planner", undefined)).toBeUndefined();
     expect(agentKey(FIXTURE_DAEMON_ID, "planner")).not.toBe(agentKey(REMOTE_DECK_ID, "planner"));
   });
 
@@ -331,7 +331,7 @@ describe("cross-deck terminal state", () => {
 
     act(() => pushGeometry?.("planner", 24, 80, FIXTURE_DAEMON_ID));
 
-    expect(result.current.appliedGeometry?.[agentKey(FIXTURE_DAEMON_ID, "planner")]).toEqual({ rows: 24, cols: 80 });
-    expect(result.current.appliedGeometry?.[agentKey(REMOTE_DECK_ID, "planner")]).toBeUndefined();
+    expect(result.current.appliedGeometry?.[boundAgentKey({ deckId: FIXTURE_DAEMON_ID, agentId: "planner", incarnation: undefined })]).toEqual({ rows: 24, cols: 80 });
+    expect(result.current.appliedGeometry?.[boundAgentKey({ deckId: REMOTE_DECK_ID, agentId: "planner", incarnation: undefined })]).toBeUndefined();
   });
 });

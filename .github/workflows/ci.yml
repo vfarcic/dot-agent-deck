@@ -180,123 +180,63 @@ jobs:
     outputs:
       devbox_only: ${{ steps.detect.outputs.devbox_only }}
       flake_only: ${{ steps.detect.outputs.flake_only }}
-      binary: ${{ steps.binary.outputs.binary }}
+      binary: ${{ steps.detect.outputs.binary }}
+      linux_backend: ${{ steps.backend.outputs.linux_backend }}
     steps:
+      # Which system runs the Linux jobs for a PULL REQUEST:
+      # `.github/ci-backend` says `rwx` or `gha`, read at the commit under
+      # test. Only pull requests move to RWX; a push to `main` always runs here,
+      # so post-merge verification does not depend on RWX credits or uptime.
+      # Anything other than `rwx` — a missing file, an API error, another word —
+      # means `gha`, the side that needs nothing outside this repository.
+      - id: backend
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          # The PR's HEAD, not `github.sha` (the merge commit): RWX reads the
+          # file at the head, and both sides must make the same choice. Read
+          # at the merge commit, a PR cut before `main` switched to `rwx`
+          # would make GHA skip its Linux jobs while RWX, reading `gha` at
+          # the head, skipped its own, and nothing would run.
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          backend=gha
+          if [ "$EVENT" = pull_request ]; then
+            file=$(gh api -H 'Accept: application/vnd.github.raw' \
+              "repos/$REPO/contents/.github/ci-backend?ref=$SHA" 2>/dev/null \
+              | tr -d '[:space:]' || true)
+            [ "$file" = rwx ] && backend=rwx
+          fi
+          echo "linux_backend=$backend" | tee -a "$GITHUB_OUTPUT"
+      # The path classification lives in scripts/ci-changes.sh, which
+      # `.rwx/ci.yml` runs too, so the two CI systems skip the same jobs for the
+      # same change. Its header has the reasoning for each output.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/ci-changes.sh
+          sparse-checkout-cone-mode: false
       - id: detect
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
-        run: |
-          set -euo pipefail
-
-          # Anything that is not a Renovate PR gets the full matrix. On `push` to
-          # main and on workflow_dispatch there is no pull_request payload, so
-          # PR_AUTHOR is empty and we exit here — which is what keeps the
-          # post-merge verification described above intact. That matters most for
-          # exactly these PRs: they land unreviewed, so the push-to-main run is
-          # the first time the Rust jobs ever see the merged result.
-          if [ "${PR_AUTHOR:-}" != "renovate[bot]" ]; then
-            echo "author='${PR_AUTHOR:-}' is not Renovate -> full CI"
-            echo "devbox_only=false" >> "$GITHUB_OUTPUT"
-            echo "flake_only=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # `|| true` so a transient API failure falls into the fail-safe below
-          # rather than aborting under `set -e`. A failed `changes` job would
-          # skip every Rust job via `needs`, which is the one outcome worth
-          # engineering against here.
-          files=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename' || true)
-          echo "changed files:"
-          echo "$files"
-
-          # Fail safe: an empty list means the API told us nothing useful. Run
-          # everything rather than read that as "nothing to test".
-          if [ -z "$files" ]; then
-            echo "no files reported -> full CI"
-            echo "devbox_only=false" >> "$GITHUB_OUTPUT"
-            echo "flake_only=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # Both flags start true and any file outside their family clears them,
-          # so a PR touching devbox.lock AND flake.lock clears both and gets the
-          # full matrix. Deliberate: the two reductions rest on different jobs
-          # surviving, and nothing here has looked at whether they interact.
-          devbox_only=true
-          flake_only=true
-          while IFS= read -r f; do
-            case "$f" in
-              devbox.json | devbox.lock) flake_only=false ;;
-              flake.nix | flake.lock) devbox_only=false ;;
-              *)
-                echo "'$f' is outside devbox and outside the flake -> full CI"
-                devbox_only=false
-                flake_only=false
-                break
-                ;;
-            esac
-          done <<< "$files"
-
-          if [ "$devbox_only" = true ]; then
-            echo "devbox files only -> skipping the Rust jobs and the nix job"
-          elif [ "$flake_only" = true ]; then
-            echo "flake files only -> skipping the Rust jobs, keeping nix"
-          fi
-          echo "devbox_only=$devbox_only" >> "$GITHUB_OUTPUT"
-          echo "flake_only=$flake_only" >> "$GITHUB_OUTPUT"
-
-      # Does this PR change what the `dot-agent-deck` binary is built from? Read
-      # by `cross-version` alone, for every PR author — the step above returns
-      # early for anyone but Renovate, so it cannot answer this. The TUI and the
-      # daemon are one binary (CLAUDE.md rule 18), so any change under `src/` can
-      # move the contract between them, and so can the build's own inputs:
-      # `build.rs` and the module it includes, the manifests, `.cargo/` (the
-      # linker), the scripts the linker runs and a toolchain file. `docs/` also
-      # reaches the binary — `build.rs` embeds the published pages — but as help
-      # text, which no TUI↔daemon contract reads, so a docs-only PR does not run
-      # the check.
-      - id: binary
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
           EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
-          # A dispatch is somebody asking for the run; give it to them.
-          if [ "$EVENT" = workflow_dispatch ]; then
-            echo "binary=true" >> "$GITHUB_OUTPUT"
-            exit 0
+          files=""
+          if [ "$EVENT" = pull_request ]; then
+            # `|| true` so a transient API failure reaches the script as an
+            # empty list, which it reads as "unknown" and answers with the
+            # full matrix, rather than failing this job and with it every job
+            # that `needs` it.
+            # A renamed file counts by its old path too (`previous_filename`),
+            # as `.rwx/ci.yml`'s `git diff --no-renames` list does.
+            files=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[] | .filename, (.previous_filename // empty)' || true)
           fi
-          # `push` and `merge_group` carry no PR whose branch could be paired
-          # with the previous release.
-          if [ "$EVENT" != pull_request ]; then
-            echo "binary=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          files=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename' || true)
-          # Fail safe, as above: no answer from the API is not "nothing changed".
-          if [ -z "$files" ]; then
-            echo "no files reported -> treating the binary as changed"
-            echo "binary=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          binary=false
-          while IFS= read -r f; do
-            case "$f" in
-              src/* | build.rs | build_version_resolve.rs | Cargo.toml | Cargo.lock | \
-                .cargo/* | scripts/link-gate.sh | scripts/build-gate.sh | \
-                rust-toolchain | rust-toolchain.toml | xtask/cross-version/*)
-                echo "'$f' feeds the binary or the harness -> cross-version runs"
-                binary=true
-                break
-                ;;
-            esac
-          done <<< "$files"
-          echo "binary=$binary" >> "$GITHUB_OUTPUT"
+          printf '%s' "$files" | scripts/ci-changes.sh "$EVENT" "${PR_AUTHOR:-}" | tee -a "$GITHUB_OUTPUT"
 
   # PR #416 review M2: the desktop web app's TypeScript tests and type-check
   # were previously run by no CI job anywhere (~800 lines of vitest invisible
@@ -305,7 +245,7 @@ jobs:
   # needs only Node + pnpm, so it starts (and fails) fast.
   desktop-web:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -376,7 +316,7 @@ jobs:
   # touch the bundle this job builds.
   desktop-browser:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
     runs-on: ubuntu-latest
     # NOT a measured runner wall clock — this job's own first run is the first
     # measurement, so this is derived rather than observed. Measured on a warm
@@ -385,11 +325,14 @@ jobs:
     # `webServer` runs first: 24.6s at 8 workers, 1m06s at `--workers=1`, which
     # is the shape CI runs in. On top of that CI pays for `pnpm install`, the
     # ~400 MiB browser download and the apt install for WebKit's runtime deps,
-    # and those three dominate. 20 minutes leaves room for all of it while still
-    # capping a wedged browser at a fraction of the 6-hour runner default.
-    # Re-tune downward once honest runs exist; do not raise it to paper over a
-    # hang.
-    timeout-minutes: 20
+    # and those three dominate. The original 20-minute budget aimed to leave
+    # room for all of it while capping a wedged browser at a fraction of the
+    # 6-hour runner default. Re-tune downward once honest runs exist; do not
+    # raise it to paper over a hang.
+    # On 2026-10-22 browser/apt downloads took 14–20 minutes, exhausting that
+    # budget, so allow 25 minutes for install, 15 for the suite (observed 8–12)
+    # and 5 for setup/reporting, with separate step limits bounding a hung suite.
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: desktop
@@ -438,12 +381,14 @@ jobs:
       # GStreamer runtime that the runner image does not carry in full. It runs
       # apt, so it is the slowest step here.
       - run: pnpm exec playwright install --with-deps chromium webkit
+        timeout-minutes: 25
       # Playwright transpiles specs without type-checking them, so a type error
       # under `desktop/e2e` would run happily and could pass. This is the gate
       # that makes it an error, and it is fast enough to run before the browsers
       # are launched.
       - run: pnpm test:browser:types
       - run: pnpm test:browser
+        timeout-minutes: 15
       # `retries` is 0 in `playwright.config.ts` — a retry turns a flake into a
       # green tick and deletes the evidence — so the trace and the HTML report
       # are the whole record of a failure. Both are written only on failure
@@ -491,15 +436,18 @@ jobs:
   # point: the handshake it checks has two ends.
   desktop-driver:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
     runs-on: ubuntu-latest
     # Measured once, on run 36231844544 (a workflow_dispatch of this job's own
     # branch, cold rust-cache): 6m55s end to end — the app's `tauri build`
     # 2m52s, the daemon's build 1m17s, `cargo install tauri-driver` 17s, the
-    # suite 86s. 30 minutes is four times that, and still caps a wedged window
-    # at a fraction of the 6-hour default. Re-tune from more runs; do not raise
-    # it to paper over a hang.
-    timeout-minutes: 30
+    # suite 86s. The original 30-minute budget was four times that, capping a
+    # wedged window at a fraction of the 6-hour default. Re-tune from more
+    # runs; do not raise it to paper over a hang.
+    # Slow downloads on 2026-10-22 warrant 25 minutes for apt, 10 for the suite
+    # and 15 for builds/setup/reporting (run 39821435797 used about 6 minutes
+    # outside the suite), with the suite's own limit bounding a wedged window.
+    timeout-minutes: 50
     env:
       # The ONE place tauri-driver's version is written. renovate.json's
       # tauri-driver customManager bumps this line, and
@@ -532,7 +480,9 @@ jobs:
       # reads that display's clipboard from outside the app for `terminal_002`
       # (issue #1403), and `xdotool` moves the display's focus to and from the
       # app's window for `terminal_003` (issue #1457).
-      - run: |
+      - name: Install driver system dependencies
+        timeout-minutes: 25
+        run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
             libayatana-appindicator3-dev librsvg2-dev libxdo-dev libasound2-dev \
@@ -564,6 +514,7 @@ jobs:
       - working-directory: desktop
         env:
           DAD_DRIVER_NATIVE_DRIVER: /usr/bin/WebKitWebDriver
+        timeout-minutes: 10
         run: xvfb-run -a -s "-screen 0 1920x1080x24 -dpi 96" pnpm test:driver
       # The harness writes a failing scenario's screenshot, page text,
       # terminal text and every sandbox log under `desktop/driver-results/`.
@@ -586,7 +537,7 @@ jobs:
   # aggregator, so the required context keeps its name and its meaning.
   fmt:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -600,7 +551,7 @@ jobs:
 
   clippy:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -683,7 +634,7 @@ jobs:
 
   build-release:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -714,7 +665,7 @@ jobs:
 
   test:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -814,7 +765,9 @@ jobs:
   # counts as passing, exactly as it counted the single job before the split.
   build:
     needs: [changes, fmt, clippy, build-release, test]
-    if: always() && needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    # Skipped, which the ruleset counts as passing, when `.rwx/ci.yml` runs
+    # these jobs instead; RWX's own check is then the one that must pass.
+    if: always() && needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
     runs-on: ubuntu-latest
     steps:
       - env:
@@ -912,7 +865,7 @@ jobs:
   # instead of ~20.
   e2e-build:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
     runs-on: ubuntu-latest
     env:
       # NO debug info in the e2e build, unlike the `test` job's line tables.
@@ -973,7 +926,7 @@ jobs:
 
   e2e:
     needs: [changes, e2e-build]
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
     runs-on: ubuntu-latest
     # HOW THIS NUMBER WAS PICKED, and what it is not. It is NOT a measured
     # runner wall clock: nobody has ever run this tier on a GitHub runner, so
@@ -1088,7 +1041,9 @@ jobs:
   # build and every shard are.
   e2e-deterministic:
     needs: [changes, e2e-build, e2e]
-    if: always() && needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    # Skipped, which the ruleset counts as passing, when `.rwx/ci.yml` runs
+    # these jobs instead; RWX's own check is then the one that must pass.
+    if: always() && needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
     runs-on: ubuntu-latest
     steps:
       - env:
@@ -1118,6 +1073,10 @@ jobs:
   # with `scripts/apply-branch-protection.sh`, not something a PR can do.
   cross-version:
     needs: changes
+    # Stays on GitHub Actions whatever `.github/ci-backend` says: its harness
+    # contains the builds in unprivileged bubblewrap namespaces, and inside an
+    # RWX task bwrap cannot set up the network namespace (measured 2026-10-22:
+    # `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`).
     if: needs.changes.outputs.binary == 'true'
     runs-on: ubuntu-latest
     # A cold build of one binary plus both directions' scenarios, each bounded
@@ -1287,7 +1246,7 @@ jobs:
   # runner with CC and AR unset is enough (verified).
   windows-cross-check:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -1461,7 +1420,14 @@ jobs:
   # `cargo nextest run` runs the same test-fast tier as the Linux `build` job.
   build-macos:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    # NOT on pull requests: macOS runs on pushes to `main` (and on a dispatch or
+    # a merge-queue run). It ran the same fast tier as the Linux `test` job and
+    # was the slowest required check of a PR (5-18 minutes). Measured over 545
+    # runs (2026-10-06..21) it failed where Linux passed 3% of the time, so a
+    # macOS-only defect now surfaces on `main` instead: `notify-main-red` opens
+    # an issue, the merging skill's post-merge watch (`merge-pr`) owns the fix,
+    # and `tag-release.yml` refuses to release a `main` this job left red.
+    if: github.event_name != 'pull_request' && needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
     runs-on: macos-latest
     # Line tables keep file:line in panics and backtraces and drop the rest of
     # the debug info, which is most of a test build's link time — the same
@@ -1543,7 +1509,7 @@ jobs:
   # `cargo audit` reads Cargo.lock, which a devbox-only PR cannot touch.
   security:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -1591,7 +1557,7 @@ jobs:
   # from-source release build of the whole crate.
   nix:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -1715,6 +1681,8 @@ jobs:
   # SCOPE: x86_64-linux only. The aarch64-darwin entries in devbox.lock stay
   # unvalidated; add a macos-latest leg if that gap starts to bite.
   devbox:
+    needs: changes
+    if: needs.changes.outputs.linux_backend != 'rwx'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

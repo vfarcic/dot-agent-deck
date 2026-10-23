@@ -82,7 +82,7 @@ function streamingFeed(backlog = "") {
   const listeners = new Set<(buffer: TerminalBuffer) => void>();
   const feed: TerminalFeed = {
     get: () => buffer,
-    subscribe: (_deckId, _agentId, listener) => {
+    subscribe: (_deckId, _agentId, _incarnation, listener) => {
       listeners.add(listener);
       return () => listeners.delete(listener);
     },
@@ -114,7 +114,7 @@ function mountTerminal(options: { backlog?: string; transcript?: string; readOnl
       onResize={() => {}}
     />,
   );
-  const terminal = getTerminal("deck-1", "agent-1");
+  const terminal = getTerminal("deck-1", "agent-1", undefined);
   if (!terminal) throw new Error("the viewport registered no terminal");
   /** Resolves once xterm has parsed everything written to it so far. */
   const parsed = () => new Promise<void>((resolve) => terminal.write("", resolve));

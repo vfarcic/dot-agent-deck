@@ -43,6 +43,10 @@ export const INBOX_WORDS = {
   notArmed: "this agent's deck integration has not connected yet; its messages wait until it does",
   refreshFailed: "the deck could not update this agent's deck integration: run dot-agent-deck hooks install --agent opencode to see why, then restart the agent",
   refreshFailedPi: "the deck could not update this agent's Pi extension: run dot-agent-deck orchestrator setup with the same HOME and PI_CODING_AGENT_DIR as the agent to see why, then restart the agent",
+  /** The agent's deck hooks run an older dot-agent-deck; followed by the command that fixes them. */
+  hooksTooOld: "this agent's deck hooks run a dot-agent-deck too old for its messages",
+  /** `hooksTooOld`'s fix when the deck names no command. */
+  hooksTooOldUpgrade: "upgrade the dot-agent-deck the hooks run, or run hooks install from the copy you want them to use, then restart the agent",
   receiptsDegraded: "messages may repeat: the deck cannot record message receipts for this agent",
   evidencePaused: "deck messages paused: {n} delivered messages still wait for proof that older copies cannot run; restart the agent to clear them",
 } as const;
@@ -97,6 +101,11 @@ export function inboxNotice(inbox: AgentInbox | undefined): string | undefined {
   if (inbox.integration === "not_armed") return INBOX_WORDS.notArmed;
   if (inbox.integration === "refresh_failed") return INBOX_WORDS.refreshFailed;
   if (inbox.integration === "refresh_failed_pi") return INBOX_WORDS.refreshFailedPi;
+  if (inbox.integration === "hooks_too_old") {
+    return inbox.integrationCommand
+      ? `${INBOX_WORDS.hooksTooOld}: run ${inbox.integrationCommand}, then restart the agent`
+      : `${INBOX_WORDS.hooksTooOld}: ${INBOX_WORDS.hooksTooOldUpgrade}`;
+  }
   if (inbox.evidencePaused !== undefined) return INBOX_WORDS.evidencePaused.replace("{n}", String(inbox.evidencePaused));
   if (uncertainCount(inbox) > outOfAttemptsCount(inbox)) return INBOX_WORDS.uncertainReason;
   if (outOfAttemptsCount(inbox) > 0) return INBOX_WORDS.outOfAttempts;

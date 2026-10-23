@@ -1738,6 +1738,30 @@ pub enum DaemonMessage {
     /// [`InboxWaitReply`] carrying `messages`.
     #[serde(rename = "inbox_fetch")]
     InboxFetch(InboxFetchRequest),
+    /// PRD #1666 part 2 §1.3: Claude's prompt hook commits the exact
+    /// attempts whose blocks a submitted prompt carried, after publishing
+    /// each one's `committed` receipt. Answered with an [`InboxWaitReply`].
+    #[serde(rename = "inbox_committed")]
+    InboxCommitted(InboxCommittedRequest),
+    /// PRD #1666 part 2 (wire audit W03–W05): a one-shot receiver asks whether
+    /// this daemon serves one-shot receipts, before it sends anything that
+    /// could take mail or commit it. Answered with an [`InboxWaitReply`]
+    /// carrying [`InboxWaitReply::one_shot_receipts`], on the same connection,
+    /// which then carries the receiver's request. An older daemon decodes it
+    /// as neither a `DaemonMessage` nor an [`AgentEvent`] and answers nothing,
+    /// so the receiver takes no mail ([`crate::inbox_oneshot::Connection::open_receipts`]).
+    #[serde(rename = "inbox_receipts")]
+    InboxReceipts(InboxReceiptsRequest),
+    /// PRD #1666 part 2: Claude's once-waiter on receipts. The request is an
+    /// `inbox_wait`'s, on a verb of its own that a 0.47.0 daemon cannot
+    /// decode, so no daemon that does not serve receipts can hand it mail on
+    /// legacy terms.
+    #[serde(rename = "inbox_receipt_wait")]
+    InboxReceiptWait(InboxWaitRequest),
+    /// PRD #1666 part 2: a hook's fetch as a one-shot receiver on receipts,
+    /// on a verb of its own for [`Self::InboxReceiptWait`]'s reason.
+    #[serde(rename = "inbox_receipt_fetch")]
+    InboxReceiptFetch(InboxFetchRequest),
     /// PRD #1666: list the caller's inbox (and with `all`, an orchestrator's
     /// scope). Answered with an [`InboxListReply`].
     #[serde(rename = "inbox_list")]
@@ -1795,6 +1819,10 @@ impl DaemonMessage {
             DaemonMessage::InboxWait(r) => &r.pane_id,
             DaemonMessage::InboxAnnounce(r) => &r.pane_id,
             DaemonMessage::InboxFetch(r) => &r.pane_id,
+            DaemonMessage::InboxCommitted(r) => &r.pane_id,
+            DaemonMessage::InboxReceipts(r) => &r.pane_id,
+            DaemonMessage::InboxReceiptWait(r) => &r.pane_id,
+            DaemonMessage::InboxReceiptFetch(r) => &r.pane_id,
             DaemonMessage::InboxList(r) => &r.pane_id,
             DaemonMessage::InboxPublish(r) => &r.pane_id,
             DaemonMessage::InboxOffer(r) => &r.pane_id,
@@ -1818,6 +1846,10 @@ impl DaemonMessage {
             DaemonMessage::InboxWait(r) => r.token.as_deref(),
             DaemonMessage::InboxAnnounce(r) => r.token.as_deref(),
             DaemonMessage::InboxFetch(r) => r.token.as_deref(),
+            DaemonMessage::InboxCommitted(r) => r.token.as_deref(),
+            DaemonMessage::InboxReceipts(r) => r.token.as_deref(),
+            DaemonMessage::InboxReceiptWait(r) => r.token.as_deref(),
+            DaemonMessage::InboxReceiptFetch(r) => r.token.as_deref(),
             DaemonMessage::InboxList(r) => r.token.as_deref(),
             DaemonMessage::InboxPublish(r) => r.token.as_deref(),
             DaemonMessage::InboxOffer(r) => r.token.as_deref(),
@@ -1835,6 +1867,10 @@ impl DaemonMessage {
             DaemonMessage::InboxWait(_)
             | DaemonMessage::InboxAnnounce(_)
             | DaemonMessage::InboxFetch(_)
+            | DaemonMessage::InboxCommitted(_)
+            | DaemonMessage::InboxReceipts(_)
+            | DaemonMessage::InboxReceiptWait(_)
+            | DaemonMessage::InboxReceiptFetch(_)
             | DaemonMessage::InboxList(_)
             | DaemonMessage::InboxPublish(_)
             | DaemonMessage::InboxOffer(_)
@@ -1859,6 +1895,10 @@ impl DaemonMessage {
             DaemonMessage::InboxWait(r) => r.agent_id.as_deref(),
             DaemonMessage::InboxAnnounce(r) => r.agent_id.as_deref(),
             DaemonMessage::InboxFetch(r) => r.agent_id.as_deref(),
+            DaemonMessage::InboxCommitted(r) => r.agent_id.as_deref(),
+            DaemonMessage::InboxReceipts(r) => r.agent_id.as_deref(),
+            DaemonMessage::InboxReceiptWait(r) => r.agent_id.as_deref(),
+            DaemonMessage::InboxReceiptFetch(r) => r.agent_id.as_deref(),
             DaemonMessage::InboxList(r) => r.agent_id.as_deref(),
             DaemonMessage::InboxPublish(r) => r.agent_id.as_deref(),
             DaemonMessage::InboxOffer(r) => r.agent_id.as_deref(),
@@ -1893,6 +1933,10 @@ impl DaemonMessage {
             DaemonMessage::InboxWait(_) => "inbox_wait",
             DaemonMessage::InboxAnnounce(_) => "inbox_announce",
             DaemonMessage::InboxFetch(_) => "inbox_fetch",
+            DaemonMessage::InboxCommitted(_) => "inbox_committed",
+            DaemonMessage::InboxReceipts(_) => "inbox_receipts",
+            DaemonMessage::InboxReceiptWait(_) => "inbox_receipt_wait",
+            DaemonMessage::InboxReceiptFetch(_) => "inbox_receipt_fetch",
             DaemonMessage::InboxList(_) => "inbox_list",
             DaemonMessage::InboxPublish(_) => "inbox_publish",
             DaemonMessage::InboxOffer(_) => "inbox_offer",
@@ -1956,6 +2000,10 @@ impl DaemonMessage {
             // learns nothing about what the pane holds.
             DaemonMessage::InboxWait(_)
             | DaemonMessage::InboxFetch(_)
+            | DaemonMessage::InboxCommitted(_)
+            | DaemonMessage::InboxReceipts(_)
+            | DaemonMessage::InboxReceiptWait(_)
+            | DaemonMessage::InboxReceiptFetch(_)
             | DaemonMessage::InboxList(_) => {
                 serde_json::to_string(&InboxWaitReply::refused(reason, message))
             }
@@ -2022,6 +2070,10 @@ impl DaemonMessage {
             | DaemonMessage::InboxWait(_)
             | DaemonMessage::InboxAnnounce(_)
             | DaemonMessage::InboxFetch(_)
+            | DaemonMessage::InboxCommitted(_)
+            | DaemonMessage::InboxReceipts(_)
+            | DaemonMessage::InboxReceiptWait(_)
+            | DaemonMessage::InboxReceiptFetch(_)
             | DaemonMessage::InboxList(_)
             | DaemonMessage::InboxPublish(_)
             | DaemonMessage::InboxOffer(_)
@@ -3397,6 +3449,11 @@ pub struct InboxWaitRequest {
     /// its `not_handed` resume answers are believed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub resumed: bool,
+    /// PRD #1666 part 2 §2.7: the one-shot receipt integration this binary
+    /// speaks ([`crate::inbox_hub::HOOK_INTEGRATION`]). A Claude once-waiter
+    /// without it, or below it, is refused before anything is issued to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_integration: Option<u32>,
 }
 
 /// PRD #1666 §2, §4: one attempt, by its identity. Every control on the
@@ -3532,6 +3589,10 @@ pub struct InboxRegistered {
     /// its component for three of them closes the stream (§4 "Dead adapter,
     /// live watcher").
     pub keepalive_ms: u64,
+    /// PRD #1666 part 2 §2.5: for a one-shot receiver, how long a `may`
+    /// approval stays usable, counted from when it asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_ttl_ms: Option<u64>,
 }
 
 /// PRD #1666 §5: caps for attempts a doorbell fetch issued to this
@@ -3543,6 +3604,17 @@ pub struct InboxIssued {
     pub e: u32,
     pub d: u64,
     pub caps: InboxAttemptCaps,
+}
+
+/// Payload of [`DaemonMessage::InboxReceipts`]: who asks. Admitted like
+/// every inbox verb, for the agent its token attests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxReceiptsRequest {
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 /// Payload of [`DaemonMessage::InboxAnnounce`].
@@ -3598,6 +3670,28 @@ pub struct InboxFetchRequest {
     /// possession.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rx: Option<u64>,
+    /// PRD #1666 part 2 §2.4, §2.7: the one-shot receipt integration of a
+    /// hook that fetches as a receiver of its own
+    /// ([`crate::inbox_hub::HOOK_INTEGRATION`]): the connection stays open
+    /// for its `may` and stage controls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_integration: Option<u32>,
+}
+
+/// PRD #1666 part 2 §1.3: payload of [`DaemonMessage::InboxCommitted`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxCommittedRequest {
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// The exact attempts a submitted prompt carried whole.
+    #[serde(default)]
+    pub attempts: Vec<InboxAttemptRef>,
+    /// Why a commit could not be recorded in the spool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded: Option<String>,
 }
 
 /// Payload of [`DaemonMessage::InboxList`].
@@ -3776,6 +3870,13 @@ pub struct InboxWaitReply {
     /// inbox stream protocol; not part of the TUI↔daemon attach contract.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub correctable: Vec<InboxCorrectable>,
+    /// PRD #1666 part 2: the answer to [`DaemonMessage::InboxReceipts`], the
+    /// one-shot receipt support this daemon serves
+    /// ([`crate::inbox_hub::ONE_SHOT_RECEIPTS`]). Additive and optional. Its
+    /// absence from the answer to that question does not establish support;
+    /// other lines (refusals, keepalives, batches) omit it from any daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub one_shot_receipts: Option<u32>,
 }
 
 impl InboxWaitReply {
@@ -4975,6 +5076,67 @@ mod tests {
     fn an_ack_line_never_decodes_as_an_agent_event() {
         let json = serde_json::to_string(&ack_message()).unwrap();
         assert!(serde_json::from_str::<AgentEvent>(&json).is_err());
+    }
+
+    /// PRD #1666 part 2 (wire audit W03–W05): every line a one-shot sends
+    /// that could take mail or commit it is a verb a 0.47.0 daemon does not
+    /// decode (its list copied from `v0.47.0`) and is no [`AgentEvent`]
+    /// either, so an older daemon logs it as malformed and answers nothing:
+    /// it can neither hand the one-shot mail on legacy terms nor ingest the
+    /// line as a status report.
+    #[test]
+    fn a_one_shots_receipt_lines_are_nothing_a_0_47_daemon_decodes() {
+        const RELEASED_0_47: &[&str] = &[
+            "delegate",
+            "work_done",
+            "get_seed",
+            "dispatch",
+            "list_targets",
+            "restart_role",
+            "spawn_role",
+            "ack",
+            "inbox_wait",
+            "inbox_announce",
+            "inbox_fetch",
+            "inbox_list",
+            "inbox_publish",
+            "inbox_offer",
+            "inbox_complete",
+            "inbox_release",
+            "question",
+        ];
+        let who = serde_json::json!({"pane_id":"7", "agent_id":"a", "token":"tok"});
+        let with = |verb: &str, extra: serde_json::Value| {
+            let mut line = who.clone();
+            line["message_type"] = serde_json::json!(verb);
+            for (key, value) in extra.as_object().unwrap() {
+                line[key] = value.clone();
+            }
+            let msg: DaemonMessage = serde_json::from_value(line).expect(verb);
+            serde_json::to_string(&msg).unwrap()
+        };
+        for line in [
+            with("inbox_receipts", serde_json::json!({})),
+            with(
+                "inbox_receipt_wait",
+                serde_json::json!({"component":"claude_waiter", "mode":"once",
+                    "hook_integration":1}),
+            ),
+            with(
+                "inbox_receipt_fetch",
+                serde_json::json!({"consumer":"doorbell_hook", "hook_integration":1}),
+            ),
+            with(
+                "inbox_committed",
+                serde_json::json!({"attempts":[{"id":"m-k3xzq2ab-0f3c9a71d2e4b850",
+                    "a":1, "e":1}]}),
+            ),
+        ] {
+            let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let verb = value["message_type"].as_str().unwrap();
+            assert!(!RELEASED_0_47.contains(&verb), "{line}");
+            assert!(serde_json::from_str::<AgentEvent>(&line).is_err(), "{line}");
+        }
     }
 
     /// Issue #1383: `ack` is attested by its pane like `work-done` and answers

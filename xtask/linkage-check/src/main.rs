@@ -94,9 +94,10 @@ mod affected_checks;
 mod build_gate;
 mod clean_tmp;
 /// PRD #1666: `/code-cleanup`'s instructions mode owns the `dot-ai-*` skills,
-/// which became project-owned when syncing from `dot-ai` stopped. Tests only,
-/// and Unix only: `pick-area.sh` is driven under `bash` against offline `git`
-/// and `gh` stand-ins.
+/// which became project-owned when syncing from `dot-ai` stopped. Issue #1819:
+/// its tool findings, off-limits paths, frequency guard and Renovate-read tool
+/// pins. Tests only, and Unix only: the skill's scripts are driven under `bash`
+/// against offline `git`, `gh`, `cargo` and `pnpm` stand-ins.
 #[cfg(all(test, unix))]
 mod code_cleanup_scope;
 /// Issue #801: a `changelog.d/<issue>.breaking.md` fragment and the
@@ -139,6 +140,11 @@ mod dispatch_base;
 /// only — the remedy is `gh aw compile`, not a hand-edit.
 #[cfg(test)]
 mod gh_aw_lock_consistency;
+/// Issue #1774: no gh-aw prompt body quotes the API proxy's credit-exceeded
+/// error, which gh-aw's conclusion job reads back from the agent's output as a
+/// credit failure. Tests only — the source is the workflow `.md` files.
+#[cfg(test)]
+mod gh_aw_prompt_body;
 /// Issue #1181: no `git` program literal in the root crate's production
 /// sources. Like `desktop_project_boundary` this carries a live rule — rule 13
 /// in [`RULES`] — as well as its own tests.

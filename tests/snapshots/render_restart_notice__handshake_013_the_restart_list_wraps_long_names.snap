@@ -1,0 +1,28 @@
+---
+source: tests/render_restart_notice.rs
+expression: shown
+---
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+ ┌ Restart notice ────────────────────────────────────────────────────────────┐ 
+ │  The deck restarted; these agents were stopped:                            │ 
+ │                                                                            │ 
+ │  nightly-dependency-upgrade-for-the-payments-service-and-its-workers--fir  │ 
+ │    st-alpha (integration-reviewer-of-release-candidates in                 │ 
+ │    quarterly-platform-upgrade-orchestration)                               │ 
+ │  nightly-dependency-upgrade-for-the-payments-service-and-its-workers-seco  │ 
+ │    nd-omega (integration-reviewer-of-release-candidates in                 │ 
+ │    quarterly-platform-upgrade-orchestration)                               │ 
+ │                                                                            │ 
+ │  [Dismiss c] [Close]                                                       │ 
+ │  j/k scroll · c dismiss · Esc to close                                     │ 
+ └────────────────────────────────────────────────────────────────────────────┘ 
+                                                                                
+The deck restarted; these agents were stopped: nightly-dependency-upgrade-for-th
+                                                          [Agents a] [Dismiss c]
+ COMMAND  [Command Mode Ctrl+D] [New Agent Ctrl+N] [Close Ctrl+W]               
+[Toggle Layout Ctrl+T] [Help ?] [Quit Ctrl+C] [Filter /] [Rename r] [Generate g]
+[Schedules s]

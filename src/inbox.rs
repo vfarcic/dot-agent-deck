@@ -1403,7 +1403,8 @@ impl Inbox {
             // PRD #1666 long-turn delivery: a message that ran out of
             // hand-overs while its agent was still holding it reached the agent
             // after all. The ack is the proof, so it is recorded; whoever was
-            // told it was undeliverable is corrected by the daemon. An offer
+            // told it was undeliverable can be corrected by the daemon while
+            // the hub retains its late-ack record. An offer
             // went back to its pool and was told "not taken", so it stays put.
             MessageState::Undeliverable {
                 reason: UndeliverableReason::MaxDeliver,

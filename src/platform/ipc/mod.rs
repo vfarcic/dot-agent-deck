@@ -55,6 +55,8 @@ mod windows;
 
 use crate::platform::transport::{AttachTransport, TransportReadHalf, TransportWriteHalf};
 
+#[cfg(all(unix, test))]
+pub(crate) use unix::tests::{QueueFull, SaturatedListener};
 #[cfg(unix)]
 pub use unix::{IpcClient, IpcListener, IpcReadHalf, IpcStream, IpcWriteHalf};
 #[cfg(windows)]

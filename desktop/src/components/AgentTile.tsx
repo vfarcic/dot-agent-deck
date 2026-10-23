@@ -234,7 +234,7 @@ export interface AgentTileProps {
   /** PRD #882 — the geometry the daemon has applied for this agent, if known. */
   appliedGeometry?: { rows: number; cols: number };
   onEvidenceSelect: (id: string) => void;
-  onRename?: (agentId: string, displayName: string) => Promise<void>;
+  onRename?: (agentId: string, displayName: string, incarnation?: string) => Promise<void>;
   /**
    * PRD #1105 M5 — enlarge this agent, supplied only by a parent that owns the
    * view. A capability rather than a `presentation` branch, for the reason
@@ -293,7 +293,7 @@ function InboxAttentionRow({ agent, item, onInboxAction }: {
     setBusy(true);
     try {
       const result = await onInboxAction(
-        { deckId: agent.daemonId, agentId: agent.id },
+        { deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation },
         { paneId, messageId: item.messageId, revision: item.revision },
         verb,
       );
@@ -354,12 +354,16 @@ export function AgentTile({
 }: AgentTileProps) {
   /* PRD #1401 — the badge opens the in-app browser where the shell offers one. */
   const openPullRequest = useContext(OpenPullRequest);
+  /* PRD #1666 part 2 (G-fix6): keystrokes and sizes carry the incarnation of
+     the record this tile renders, so they reach the session attached for that
+     process and never one attached for a restarted deck's agent of the same
+     id. */
   const handleInput = useCallback((data: string) => {
-    void onTerminalInput({ deckId: agent.daemonId, agentId: agent.id }, data);
-  }, [agent.daemonId, agent.id, onTerminalInput]);
+    void onTerminalInput({ deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation }, data);
+  }, [agent.daemonId, agent.id, agent.incarnation, onTerminalInput]);
   const handleResize = useCallback((cols: number, rows: number) => {
-    void onTerminalResize({ deckId: agent.daemonId, agentId: agent.id }, cols, rows);
-  }, [agent.daemonId, agent.id, onTerminalResize]);
+    void onTerminalResize({ deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation }, cols, rows);
+  }, [agent.daemonId, agent.id, agent.incarnation, onTerminalResize]);
   const agentEvidence = evidence.filter((item) => agent.handoffIds.includes(item.id) || item.agentId === agent.id);
   // Issue #1042: one derivation for the terminal's state, its read-only gate
   // and the sentence beside it, so the three cannot disagree the way the tile's
@@ -413,7 +417,9 @@ export function AgentTile({
   const readerSuppressed = overlay || Boolean(panePresent);
   const [renameDraft, setRenameDraft] = useState<string>();
   const [readerOpen, setReaderOpen] = useState(false);
-  useEffect(() => { setRenameDraft(undefined); setReaderOpen(false); }, [agent.id]);
+  /* A deck restart can hand this tile another agent under the same id (PRD
+     #1666 part 2): the draft goes with the agent it was opened on. */
+  useEffect(() => { setRenameDraft(undefined); setReaderOpen(false); }, [agent.id, agent.incarnation]);
   // Dismissed, not merely hidden: a Reader that came back when the pane closed
   // would answer the NEXT `Escape` instead of the deck, which is the same
   // surprise one step later.
@@ -423,7 +429,7 @@ export function AgentTile({
     const next = renameDraft?.trim();
     setRenameDraft(undefined);
     if (!onRename || !next || next === agent.displayName) return;
-    void onRename(agent.id, next);
+    void onRename(agent.id, next, agent.incarnation);
   };
 
   // The daemon's `error` is merged into `failed` for grouping; the card says
@@ -693,6 +699,10 @@ export function AgentTile({
                   /* The agent's OWN deck, never the selected one: the feed is keyed
                      by the composite identity because ids collide across decks. */
                   deckId={agent.daemonId}
+                  /* And its daemon process (PRD #1666 part 2, G-fix7): a
+                     restarted deck's agent with the same id has a feed and an
+                     xterm of its own. */
+                  incarnation={agent.incarnation}
                   label={agent.role}
                   transcript={agent.transcript}
                   terminalFeed={terminalFeed}

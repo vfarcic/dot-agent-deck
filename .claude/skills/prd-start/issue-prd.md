@@ -69,6 +69,8 @@ It prints `KEY=value` records; read one with `sed -n 's/^KEY=//p' | head -1`.
 
 The issue title is the PRD's title, prefixed `PRD: ` as the existing PRD issues are. Checkbox states are `[x]` done, `[ ]` pending, `[~]` deferred and `[!]` blocked. CLAUDE.md rule 10 applies: one line per prose paragraph.
 
+**Say what changes, not where in the code.** The body says what changes for the user and why. It carries no file paths, type or function names, code snippets or line numbers, with two exceptions: names the user sees (a CLI command or flag, a config key, a keybinding) and constraints the PRD exists to enforce (e.g. "no `PROTOCOL_VERSION` bump"). Decision records keep their rationale. Implementation notes, meaning what was built and where, go in dated `### PRD progress — YYYY-MM-DD` comments as history, not in the body as instructions. Code-level detail written before implementation can go stale before anyone implements it, and the agent that starts the PRD reads the code anyway, so a stale hint can cost more than it saves.
+
 **Keep the body to the plan.** GitHub refuses an issue body over 65,536 characters. Long evidence, measurements and design notes go in a comment that the body links to.
 
 ## Editing the body
@@ -77,15 +79,17 @@ Edit the newest body, and change only what you came to change. Fetch it with its
 
 ```bash
 mkdir -p .dot-agent-deck     # absent in a fresh checkout or a new worktree
-gh issue view <n> --json body --jq .body > .dot-agent-deck/prd-<n>-body.md
+gh issue view <n> --json body --template '{{.body}}' > .dot-agent-deck/prd-<n>-body.md
 gh issue view <n> --json updatedAt --jq .updatedAt     # note this value
 ```
+
+The body is read with `--template '{{.body}}'`, not `--jq .body`, because `--jq` appends a newline the stored body does not have: a fetched body would gain one on every write back, and the read-back below would report a difference after a successful write.
 
 Change that file with your file-editing tool. Then, **just before writing it back, read `updatedAt` again**: if it moved, someone else wrote to the issue meanwhile — discard your copy, fetch again, and re-apply your change. A comment moves it too, so this sometimes repeats work that needed no repeating; that is the cheaper error. Only when it has not moved:
 
 ```bash
 gh issue edit <n> --body-file .dot-agent-deck/prd-<n>-body.md
-gh issue view <n> --json body --jq .body | diff - .dot-agent-deck/prd-<n>-body.md && rm .dot-agent-deck/prd-<n>-body.md
+gh issue view <n> --json body --template '{{.body}}' | diff - .dot-agent-deck/prd-<n>-body.md && rm .dot-agent-deck/prd-<n>-body.md
 ```
 
 **This narrows the race and does not close it.** GitHub offers no conditional write for an issue body, so an edit landing between the last `updatedAt` read and `gh issue edit` is still lost, silently, and the read-back cannot tell — it confirms only that the body is now yours. That residual window is seconds wide where an unchecked fetch-edit-write is as wide as the editing session, and it is why everything append-only goes in comments: keep body edits to the plan itself, and rare. Never write the body with `--body "…"` or a heredoc: PRD text is full of backticks and `$`, which the shell rewrites before `gh` sees them. `.dot-agent-deck/` is ignored by git, so the scratch file never reaches a commit.

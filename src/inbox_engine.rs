@@ -43,8 +43,9 @@ use crate::event::{
 };
 use crate::inbox::{AckHow, AssignmentOwner, Consumer, MessageState, UndeliverableReason};
 use crate::inbox_attempts::{
-    AttemptModel, Effect, HandOverRefusal, LapseCheck, Limits, MessageState as Delivery,
-    ResumeAnswer, Rx, Slot, Stage, TurnView, UncertainReason, UndeliverableReason as Verdict,
+    AttemptModel, CommitTargetRefusal, Effect, HandOverRefusal, LapseCheck, Limits,
+    MessageState as Delivery, ResumeAnswer, Rx, Slot, Stage, TurnView, UncertainReason,
+    UndeliverableReason as Verdict,
 };
 use crate::inbox_display::{AttentionKind, IntegrationNotice};
 use crate::inbox_receipt::{EvidenceStore, GenerationSpool, RecordScanner};
@@ -109,14 +110,24 @@ pub(super) struct TurnClock {
     pub(super) seq: u64,
 }
 
-/// The receiver slot a component's stream registers in (§4).
+/// The receiver slot a component registers in (§4; part 2 §2.1): a stream
+/// for OpenCode and Pi, a once-waiter for Claude's `asyncRewake` waiter, a
+/// hook for Claude's prompt hook.
 pub(super) fn slot_for(component: InboxComponent) -> Option<Slot> {
     match component {
         InboxComponent::OpenCodePlugin => Some(Slot::OpencodeTui),
         InboxComponent::OpenCodeMini => Some(Slot::OpencodeServer),
         InboxComponent::PiExtension => Some(Slot::Pi),
+        InboxComponent::ClaudeWaiter => Some(Slot::OnceWaiter),
+        InboxComponent::ClaudeHooks => Some(Slot::Hook),
         _ => None,
     }
+}
+
+/// Whether `component` registers as a one-shot receiver (part 2 §2.4): one
+/// batch on one connection, then its stage reports, then it exits.
+pub(super) fn one_shot_component(component: InboxComponent) -> bool {
+    matches!(slot_for(component), Some(Slot::OnceWaiter | Slot::Hook))
 }
 
 fn slot_name(slot: Slot) -> &'static str {
@@ -140,6 +151,10 @@ pub(super) struct Floor {
     pub(super) cli_too_old: bool,
     /// A registration declared a missing or lower integration.
     pub(super) adapter_too_old: bool,
+    /// Part 2 §2.7: a one-shot receiver (a Claude hook or waiter) declared
+    /// no [`super::HOOK_INTEGRATION`], or a lower one: the agent's hooks run
+    /// an older dot-agent-deck.
+    pub(super) hooks_too_old: bool,
     /// The deck could not rewrite the generation's integration files as it
     /// started (`refresh_for_spawn`), so restarting does not update them:
     /// the notice in that integration's words.
@@ -152,6 +167,8 @@ impl Floor {
             Some(IntegrationNotice::CliTooOld)
         } else if let Some(notice) = self.refresh_failed.filter(|_| !self.registered) {
             Some(notice)
+        } else if self.hooks_too_old {
+            Some(IntegrationNotice::HooksTooOld)
         } else if self.adapter_too_old {
             Some(IntegrationNotice::AdapterTooOld)
         } else if !self.registered && self.arm_by.is_some_and(|by| now >= by) {
@@ -164,36 +181,116 @@ impl Floor {
     /// Incompatible: nothing is handed to the generation and its doorbell is
     /// silent. `not_armed` is readiness, not incompatibility.
     pub(super) fn blocks(&self) -> bool {
-        self.cli_too_old || self.adapter_too_old
+        self.cli_too_old || self.adapter_too_old || self.hooks_too_old
     }
 }
 
-/// One live receipt stream.
+/// What a receipt receiver's connection is for (part 2 §2.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LinkKind {
+    /// A receipt stream: pushed every hand-out its queue has room for.
+    Stream,
+    /// Claude's once-waiter: pushed exactly one batch, then spent.
+    Once { spent: bool },
+    /// A hook: issued what its own fetch asked for, never pushed anything.
+    Hook,
+}
+
+/// One live receipt receiver's connection.
 pub(super) struct Link {
     pub(super) conn_id: u64,
     pub(super) tx: mpsc::Sender<WaiterSignal>,
     pub(super) component: InboxComponent,
     pub(super) doorbell_only: bool,
+    pub(super) kind: LinkKind,
+}
+
+impl Link {
+    /// Whether [`dispatch`] may push a hand-out to it: an unspent once-waiter,
+    /// or a stream that takes pushed mail. A hook never.
+    fn takes_pushes(&self) -> bool {
+        match self.kind {
+            LinkKind::Stream => !self.doorbell_only,
+            LinkKind::Once { spent } => !spent,
+            LinkKind::Hook => false,
+        }
+    }
+}
+
+/// Part 2 §2.4: a once-waiter's batch, issued under the lock and held there
+/// until its caps files are written off it. `permit` is the room on the
+/// waiter's queue reserved at issue.
+pub(super) struct Staged {
+    pub(super) key: AgentKey,
+    pub(super) rx: Rx,
+    pub(super) conn_id: u64,
+    pub(super) permit: mpsc::OwnedPermit<WaiterSignal>,
+    pub(super) batch: Vec<InboxDelivery>,
+    pub(super) spool: Option<Arc<GenerationSpool>>,
+}
+
+/// An attempt whose spool files go once the lock is released, with how many
+/// times removing them has failed so far.
+pub(super) struct Removal {
+    pub(super) spool: Arc<GenerationSpool>,
+    pub(super) id: String,
+    pub(super) a: u32,
+    pub(super) e: u32,
+    pub(super) failures: u32,
+}
+
+/// How many times a removal is tried, on the clock's ticks, before the deck
+/// stops and logs it: its files then stay until the generation's whole spool
+/// directory goes at exit.
+pub(super) const REMOVAL_TRIES: u32 = 3;
+
+/// Queue the spool files of `id`'s attempt `(a, e)` for removal once the
+/// lock is released.
+fn remove_later(st: &mut HubState, spool: Arc<GenerationSpool>, id: String, a: u32, e: u32) {
+    st.receipts.removals.push(Removal {
+        spool,
+        id,
+        a,
+        e,
+        failures: 0,
+    });
 }
 
 /// The evidence a generation's attempts publish into its spool.
+///
+/// U1 (R2-fix3): the store and the scanner have a lock each. The scanner's
+/// is held across the spool's file IO, and is taken only off the hub's lock;
+/// the store's is held for no spool file IO (in-memory work, and the OS
+/// randomness issuing a cap draws), a scan taking it for each admission
+/// ([`crate::inbox_receipt::Admit`]), so the hub's lock, which takes the
+/// store's, does not wait on a stalled spool read.
 pub(super) struct Evidence {
-    pub(super) store: EvidenceStore,
-    pub(super) scanner: Option<RecordScanner>,
+    pub(super) store: Mutex<EvidenceStore>,
+    pub(super) scanner: Mutex<Option<RecordScanner>>,
+}
+
+impl Evidence {
+    pub(super) fn store(&self) -> std::sync::MutexGuard<'_, EvidenceStore> {
+        self.store.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 /// One agent generation's receipt-owned delivery.
 pub(super) struct Gen {
     pub(super) model: AttemptModel,
     pub(super) spool: Option<Arc<GenerationSpool>>,
-    pub(super) evidence: Arc<Mutex<Evidence>>,
+    pub(super) evidence: Arc<Evidence>,
     pub(super) links: HashMap<Rx, Link>,
     /// §3: the generation's receipts cannot be recorded; sticky until exit.
     pub(super) degraded: Option<String>,
     /// §7: hand-outs are paused for room in the evidence store.
     pub(super) paused: bool,
     /// Delegated tasks whose orchestrator was told their delivery is
-    /// uncertain (§6.6), so a later commit corrects it once.
+    /// uncertain (§6.6), so a later commit can correct it, at most once, while
+    /// the task's delegate watch remains. An id goes when the watch does
+    /// ([`forget_uncertain`]): a delegation with `--supersede` that retires it
+    /// ends the watch-based route, leaving a later commit only a retained
+    /// cancelled-task record to correct through, if the task has one.
     pub(super) uncertain_told: HashSet<String>,
 }
 
@@ -205,7 +302,14 @@ pub(super) struct Receipts {
     /// The card notices last broadcast per generation.
     pub(super) told: HashMap<AgentKey, InboxCardNotices>,
     /// Reclaimed attempts whose spool files go once the lock is released.
-    pub(super) removals: Vec<(Arc<GenerationSpool>, String, u32, u32)>,
+    pub(super) removals: Vec<Removal>,
+    /// Removals that failed, tried again on the clock's next tick.
+    pub(super) failed_removals: Vec<Removal>,
+    /// Part 2 §2.5: revoked one-shot attempts whose revoke markers are
+    /// written once the lock is released, with their generation.
+    pub(super) markers: Vec<(AgentKey, Arc<GenerationSpool>, String, u32, u32)>,
+    /// Part 2 §2.4: once batches waiting for their caps files.
+    pub(super) staged: Vec<Staged>,
     pub(super) arm_deadline: Duration,
     /// When the clock last read the spools ([`tick`]).
     pub(super) last_check: Option<Instant>,
@@ -223,6 +327,9 @@ impl Receipts {
             floors: HashMap::new(),
             told: HashMap::new(),
             removals: Vec::new(),
+            failed_removals: Vec::new(),
+            markers: Vec::new(),
+            staged: Vec::new(),
             arm_deadline,
             last_check: None,
             turns: HashMap::new(),
@@ -244,6 +351,16 @@ impl Receipts {
     /// The generation's floor blocks delivery (§11).
     pub(super) fn blocked(&self, key: &AgentKey) -> bool {
         self.floors.get(key).is_some_and(Floor::blocks)
+    }
+
+    /// When the next withheld attempt's staging runs out: the deadline
+    /// [`expire_staging`] keeps, which the clock waits for even while a tick
+    /// it started is still in spool IO (U1, R2-fix3).
+    pub(super) fn staging_due_at(&self) -> Option<Instant> {
+        self.gens
+            .values()
+            .filter_map(|generation| generation.model.staging_due_at())
+            .min()
     }
 
     /// The earliest instant [`tick`] has something to do for.
@@ -271,7 +388,7 @@ impl Receipts {
         // for the next ordinary step; at most once a second while one waits.
         let checking = self.gens.values().any(|generation| {
             !generation.model.lapse_candidates(now).is_empty()
-                || !generation.model.verify_candidates().is_empty()
+                || !generation.model.verify_candidates(now).is_empty()
         });
         let check = checking.then(|| {
             self.last_check
@@ -286,6 +403,26 @@ impl Receipts {
             .filter_map(|generation| generation.model.revoke_due_at())
             .min()
             .map(|due| due.max(now));
+        // C-1, C-4: a fenced one-shot attempt becomes a verify candidate
+        // once its approval and, for a once-waiter, the turn clock's
+        // possession have run out.
+        let verify = self
+            .gens
+            .values()
+            .filter_map(|generation| generation.model.verify_due_at(now))
+            .min();
+        // R2F-R01: a withheld attempt is released not handed when its
+        // staging runs out.
+        let staging = self.staging_due_at().map(|due| due.max(now));
+        // A removal that failed is tried again on the next tick.
+        let retry = (!self.failed_removals.is_empty()).then(|| now + step);
+        // C-3: a hook receiver is closed when its hold runs out.
+        let hold = self
+            .gens
+            .values()
+            .filter_map(|generation| generation.model.hold_due_at())
+            .min()
+            .map(|due| due.max(now));
         // PRD #1666 G3: a not-started attention falls due on its own instant.
         let not_started = self
             .gens
@@ -295,10 +432,20 @@ impl Receipts {
             })
             .min()
             .map(|due| due.max(now));
-        [open.then(|| now + step), arm, check, revoke, not_started]
-            .into_iter()
-            .flatten()
-            .min()
+        [
+            open.then(|| now + step),
+            arm,
+            check,
+            revoke,
+            verify,
+            hold,
+            staging,
+            retry,
+            not_started,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 }
 
@@ -329,6 +476,7 @@ pub(super) fn generation_mut<'a>(
     spool: Option<Result<Arc<GenerationSpool>, String>>,
 ) -> &'a mut Gen {
     let limits = st.receipts.limits;
+    let turn = st.receipts.turn_view(key);
     let missing = match &st.spool_error {
         Some(error) => format!("the receipt spool could not start: {error}"),
         None => "the deck has no receipt spool".to_string(),
@@ -348,13 +496,17 @@ pub(super) fn generation_mut<'a>(
                 None
             }
         });
+        // C-1: a once-waiter attempt's possession reads the turn clock, which
+        // may have run before the generation's first registration.
+        let mut model = AttemptModel::new(limits, 1);
+        model.turn(Instant::now(), turn);
         Gen {
-            model: AttemptModel::new(limits, 1),
+            model,
             spool,
-            evidence: Arc::new(Mutex::new(Evidence {
-                store: EvidenceStore::default(),
-                scanner,
-            })),
+            evidence: Arc::new(Evidence {
+                store: Mutex::new(EvidenceStore::default()),
+                scanner: Mutex::new(scanner),
+            }),
             links: HashMap::new(),
             degraded,
             paused: false,
@@ -363,8 +515,10 @@ pub(super) fn generation_mut<'a>(
     })
 }
 
-/// T8: a receipt stream registers for `key`. The slot's previous incarnation
-/// is retired; its open attempts wait for this registration's resume answer.
+/// T8: a receipt receiver registers for `key`. For a stream, the slot's
+/// previous incarnation is retired and its open attempts wait for this
+/// registration's resume answer; a once-waiter supersedes the previous one,
+/// and a hook supersedes nothing (C-2, C-3).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn register(
     st: &mut HubState,
@@ -381,8 +535,10 @@ pub(super) fn register(
     let floor = st.receipts.floors.entry(key.clone()).or_default();
     floor.registered = true;
     floor.adapter_too_old = false;
+    floor.hooks_too_old = false;
     floor.cli_too_old = false;
     floor.refresh_failed = None;
+    let grant_ttl = st.receipts.limits.grant_ttl();
     let generation = generation_mut(st, key, spool);
     let registration = generation.model.register(now, slot, resumed);
     // r8k R8G-03: commit authority only, for the new watcher to publish a
@@ -390,15 +546,12 @@ pub(super) fn register(
     // component sees the line. An attempt whose caps the store no longer
     // holds is left out: there is no authority to hand back.
     let correctable: Vec<InboxCorrectable> = {
-        let evidence = generation
-            .evidence
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let store = generation.evidence.store();
         registration
             .correctable
             .iter()
             .filter_map(|(id, a, e)| {
-                let caps = evidence.store.caps(id, *a, *e)?;
+                let caps = store.caps(id, *a, *e)?;
                 Some(InboxCorrectable {
                     id: id.clone(),
                     a: *a,
@@ -408,6 +561,11 @@ pub(super) fn register(
             })
             .collect()
     };
+    let kind = match slot {
+        Slot::OnceWaiter => LinkKind::Once { spent: false },
+        Slot::Hook => LinkKind::Hook,
+        _ => LinkKind::Stream,
+    };
     generation.links.insert(
         registration.rx,
         Link {
@@ -415,6 +573,7 @@ pub(super) fn register(
             tx,
             component,
             doorbell_only,
+            kind,
         },
     );
     info!(
@@ -432,6 +591,7 @@ pub(super) fn register(
             keepalive_ms: (st.receipts.limits.possess_ttl
                 / crate::inbox_attempts::KEEPALIVES_PER_POSSESS_TTL)
                 .as_millis() as u64,
+            grant_ttl_ms: (kind != LinkKind::Stream).then_some(grant_ttl.as_millis() as u64),
         }),
         resume: registration
             .resume
@@ -454,6 +614,18 @@ pub(super) fn refuse_adapter(st: &mut HubState, key: &AgentKey) {
         .adapter_too_old = true;
 }
 
+/// Part 2 §2.7: a one-shot receiver declared no [`super::HOOK_INTEGRATION`],
+/// or a lower one. Nothing was registered or issued; the generation's mail
+/// waits queued, its doorbell stays silent and its card names the command
+/// that updates the hooks.
+pub(super) fn refuse_hooks(st: &mut HubState, key: &AgentKey) {
+    st.receipts
+        .floors
+        .entry(key.clone())
+        .or_default()
+        .hooks_too_old = true;
+}
+
 /// The stream `rx` of `key` ended. It decides nothing at once (§4: a stream
 /// disconnect never requeues): the incarnation stays its slot's until the
 /// next registration of that slot retires it and asks it to resume what it
@@ -462,6 +634,9 @@ pub(super) fn refuse_adapter(st: &mut HubState, key: &AgentKey) {
 /// registration in its place for a while, the model retires it and fences
 /// what it held, so a Cancel can end those attempts and a message no
 /// receiver takes is `Uncertain` rather than waiting forever.
+///
+/// A one-shot receiver's connection ending is final at once (C-2): no
+/// control can come for it any more, so its open attempts are fenced.
 pub(super) fn closed(st: &mut HubState, key: &AgentKey, rx: Rx, conn_id: u64, now: Instant) {
     let Some(generation) = st.receipts.gens.get_mut(key) else {
         return;
@@ -470,9 +645,12 @@ pub(super) fn closed(st: &mut HubState, key: &AgentKey, rx: Rx, conn_id: u64, no
         .links
         .get(&rx)
         .is_some_and(|link| link.conn_id == conn_id)
+        && let Some(link) = generation.links.remove(&rx)
     {
-        generation.links.remove(&rx);
-        generation.model.stream_closed(now, rx);
+        match link.kind {
+            LinkKind::Stream => generation.model.stream_closed(now, rx),
+            LinkKind::Once { .. } | LinkKind::Hook => generation.model.connection_closed(now, rx),
+        }
     }
 }
 
@@ -521,7 +699,10 @@ pub(super) fn candidates(st: &HubState, key: &AgentKey) -> Vec<String> {
 }
 
 /// T1 for each candidate that fits `budget`, bound to `rx`. Returns the
-/// rendered hand-outs, each with its attempt and caps.
+/// rendered hand-outs, each with its attempt and caps. A `one_shot`
+/// receiver's blocks name their attempt in the opener (`delivery A.e`,
+/// part 2 §1.1), measured with it before issue.
+#[allow(clippy::too_many_arguments)]
 fn issue_to(
     st: &mut HubState,
     key: &AgentKey,
@@ -529,6 +710,7 @@ fn issue_to(
     ids: &[String],
     budget: Option<InboxBudget>,
     consumer: Consumer,
+    one_shot: bool,
     now: Instant,
 ) -> Vec<InboxDelivery> {
     let mut out = Vec::new();
@@ -549,8 +731,11 @@ fn issue_to(
             .model
             .delivery(id)
             .is_some_and(|d| d.repeat_scheduled());
+        let next = one_shot
+            .then(|| generation.model.next_attempt(id))
+            .flatten();
         let len = budget.map(|budget| {
-            let text = render_marked(&message, Some(budget), marked).text;
+            let text = render_marked(&message, Some(budget), marked, next).text;
             budget.measure(&text) + budget.measure(super::BLOCK_SEPARATOR)
         });
         if let (Some(budget), Some(len)) = (budget, len)
@@ -571,13 +756,7 @@ fn issue_to(
             }
         };
         generation.paused = false;
-        let caps = match generation
-            .evidence
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .store
-            .issue(id, issued.a, issued.e)
-        {
+        let caps = match generation.evidence.store().issue(id, issued.a, issued.e) {
             Ok(caps) => Some(InboxAttemptCaps {
                 handed: caps.handed.hex(),
                 commit: caps.commit.hex(),
@@ -595,7 +774,8 @@ fn issue_to(
         } else {
             st.inbox.count_receipt_repeat(id, &key.0, &key.1);
         }
-        let mut delivery = render_marked(&message, budget, issued.kind.marked());
+        let attempt = one_shot.then_some((issued.a, issued.e));
+        let mut delivery = render_marked(&message, budget, issued.kind.marked(), attempt);
         used += len.unwrap_or(0);
         delivery.attempt = Some(InboxDeliveryAttempt {
             a: issued.a,
@@ -614,6 +794,11 @@ fn issue_to(
 /// A generation whose floor blocks it (§11) has no receiver to hand to: a
 /// refused component never registers, and a valid registration clears the
 /// floor's verdicts.
+///
+/// Part 2 §2.4: a once-waiter is pushed one batch and is then spent. Its
+/// batch is not sent from here: it is staged ([`Staged`]) with the room
+/// reserved for it, so its caps files are written off the lock before it is
+/// released ([`release`]).
 pub(super) fn dispatch(st: &mut HubState, key: &AgentKey, now: Instant, out: &mut Outbox) {
     let Some(generation) = st.receipts.gens.get(key) else {
         return;
@@ -621,12 +806,13 @@ pub(super) fn dispatch(st: &mut HubState, key: &AgentKey, now: Instant, out: &mu
     let Some((rx, link)) = generation
         .links
         .iter()
-        .filter(|(rx, link)| !link.doorbell_only && generation.model.live(**rx))
+        .filter(|(rx, link)| link.takes_pushes() && generation.model.live(**rx))
         .max_by_key(|(_, link)| link.conn_id)
     else {
         return;
     };
     let (rx, conn_id, budget) = (*rx, link.conn_id, link.component.inline_budget());
+    let once = matches!(link.kind, LinkKind::Once { .. });
     // PR #1735 review 4307236310, auditor R9T-A02: nothing is issued unless
     // the stream's queue gives the hand-out's line its room first, under this
     // lock, since a line that does not fit is dropped after its attempts were
@@ -639,19 +825,335 @@ pub(super) fn dispatch(st: &mut HubState, key: &AgentKey, now: Instant, out: &mu
     if ids.is_empty() {
         return;
     }
-    let batch = issue_to(
-        st,
-        key,
-        rx,
-        &ids,
-        Some(budget),
-        Consumer::Stream { conn_id },
-        now,
-    );
+    let consumer = if once {
+        Consumer::Waiter { conn_id }
+    } else {
+        Consumer::Stream { conn_id }
+    };
+    let batch = issue_to(st, key, rx, &ids, Some(budget), consumer, once, now);
     if !batch.is_empty() {
-        out.push((permit, InboxWaitReply::messages(batch)));
+        if once {
+            spend(st, key, rx, conn_id, permit, batch, now);
+        } else {
+            out.push((permit, InboxWaitReply::messages(batch)));
+        }
     }
     apply(st, key, now, out);
+}
+
+/// A once-waiter was issued `batch`: it is spent, so it no longer counts as
+/// armed, and the batch waits for its caps files ([`release`]).
+fn spend(
+    st: &mut HubState,
+    key: &AgentKey,
+    rx: Rx,
+    conn_id: u64,
+    permit: mpsc::OwnedPermit<WaiterSignal>,
+    batch: Vec<InboxDelivery>,
+    now: Instant,
+) {
+    let Some(generation) = st.receipts.gens.get_mut(key) else {
+        return;
+    };
+    if let Some(link) = generation.links.get_mut(&rx) {
+        link.kind = LinkKind::Once { spent: true };
+    }
+    for delivery in &batch {
+        if let Some(at) = &delivery.attempt {
+            generation.model.withhold(now, &delivery.id, at.a, at.e);
+        }
+    }
+    let spool = generation.spool.clone();
+    forget_waiter(st, key, conn_id);
+    st.receipts.staged.push(Staged {
+        key: key.clone(),
+        rx,
+        conn_id,
+        permit,
+        batch,
+        spool,
+    });
+}
+
+/// Drop connection `conn_id` from `key`'s armed waiters.
+fn forget_waiter(st: &mut HubState, key: &AgentKey, conn_id: u64) {
+    if let Some(list) = st.waiters.get_mut(key) {
+        list.retain(|w| w.conn_id != conn_id);
+        if list.is_empty() {
+            st.waiters.remove(key);
+        }
+    }
+}
+
+/// What writing one staged attempt's caps file came to (part 2 §2.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum CapsWrite {
+    Written,
+    /// Not tried: before the write, the batch's generation or its waiter's
+    /// link was already gone ([`still_staged`]).
+    Skipped,
+    Failed(String),
+}
+
+/// R2-R02: whether `staged` is still worth its caps files, read under the
+/// lock just before they are written: its generation is the one that issued
+/// it (the same spool), its waiter's link is still there, and (R2F-R01) one
+/// of its attempts is still withheld, so a batch queued behind a stalled
+/// write that outran its staging meanwhile writes nothing. A batch that is
+/// not is released as not handed with no file written.
+pub(super) fn still_staged(st: &HubState, staged: &Staged) -> bool {
+    st.receipts.gens.get(&staged.key).is_some_and(|generation| {
+        same_spool(&generation.spool, &staged.spool)
+            && generation
+                .links
+                .get(&staged.rx)
+                .is_some_and(|link| link.conn_id == staged.conn_id)
+            && staged.batch.iter().any(|delivery| {
+                delivery
+                    .attempt
+                    .as_ref()
+                    .is_some_and(|at| generation.model.is_withheld(&delivery.id, at.a, at.e))
+            })
+    })
+}
+
+fn same_spool(a: &Option<Arc<GenerationSpool>>, b: &Option<Arc<GenerationSpool>>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// Part 2 §2.4: release a once batch whose caps files were written off the
+/// lock, `written` holding what each attempt's write came to. Each attempt
+/// is revalidated under this lock — its link is the one it was issued on and
+/// the deck would still approve its hand-over — before it goes. One that
+/// fails either check, or whose caps file was not written, is recorded not
+/// handed by the deck itself, which is true: no byte of it left the deck
+/// (R2-R01: that needs no live receiver). With nothing left to send, the
+/// waiter's connection is closed, so it exits with nothing and the doorbell
+/// covers the mail. Sending here queues the line; the waiter's connection
+/// task writes it afterwards, outside the lock.
+///
+/// R2-R02: until this runs, or until the clock applies its staging deadline
+/// (R2F-R01, [`expire_staging`]), every
+/// attempt of the batch is withheld, so no cleanup can reclaim it and remove
+/// its files while its caps file is being written. A batch whose generation
+/// exited meanwhile has no model left to reclaim it, and an attempt whose
+/// staging ran out may have been reclaimed, its removal run, before this
+/// write finished: the caps files written for either are queued for removal
+/// here, after the write.
+pub(super) fn release(
+    st: &mut HubState,
+    staged: Staged,
+    written: &[CapsWrite],
+    now: Instant,
+    out: &mut Outbox,
+) {
+    let Staged {
+        key,
+        rx,
+        conn_id,
+        permit,
+        batch,
+        spool,
+    } = staged;
+    let Some(generation) = st
+        .receipts
+        .gens
+        .get_mut(&key)
+        .filter(|generation| same_spool(&generation.spool, &spool))
+    else {
+        if let Some(spool) = spool {
+            for (delivery, write) in batch.iter().zip(written) {
+                if let (Some(at), CapsWrite::Written) = (&delivery.attempt, write) {
+                    remove_later(st, Arc::clone(&spool), delivery.id.clone(), at.a, at.e);
+                }
+            }
+        }
+        return;
+    };
+    let linked = generation
+        .links
+        .get(&rx)
+        .is_some_and(|link| link.conn_id == conn_id);
+    let mut going = Vec::new();
+    let mut held_back = Vec::new();
+    for (mut delivery, write) in batch.into_iter().zip(written) {
+        let Some(attempt) = delivery.attempt.as_mut() else {
+            continue;
+        };
+        let (a, e) = (attempt.a, attempt.e);
+        if let CapsWrite::Failed(error) = write {
+            generation
+                .degraded
+                .get_or_insert_with(|| format!("could not write a receipt caps file: {error}"));
+        }
+        let approved = linked
+            && generation
+                .model
+                .may_hand_over(&delivery.id, a, e, rx)
+                .is_ok();
+        if approved && *write == CapsWrite::Written {
+            // The caps stay in the deck and the caps file: the waiter reads
+            // its own from there.
+            attempt.caps = None;
+            going.push(delivery);
+        } else {
+            held_back.push((delivery.id, a, e, write.clone()));
+        }
+    }
+    for delivery in &going {
+        if let Some(at) = &delivery.attempt {
+            generation
+                .model
+                .released(now, &delivery.id, at.a, at.e, true);
+        }
+    }
+    let mut late = Vec::new();
+    for (id, a, e, write) in held_back.iter() {
+        generation.model.released(now, id, *a, *e, false);
+        if *write == CapsWrite::Written && generation.model.is_reclaimed(id, *a, *e) {
+            late.push((id.clone(), *a, *e));
+        }
+    }
+    if going.is_empty() {
+        permit.send(WaiterSignal::Close);
+    } else {
+        permit.send(WaiterSignal::Once(Box::new(InboxWaitReply::messages(
+            going,
+        ))));
+    }
+    if let Some(spool) = spool.as_ref() {
+        for (id, a, e) in late {
+            remove_later(st, Arc::clone(spool), id, a, e);
+        }
+    }
+    apply(st, &key, now, out);
+    if !held_back.is_empty() {
+        // What went back to the queue goes to whichever waiter is armed now.
+        dispatch(st, &key, now, out);
+    }
+}
+
+/// R2-R01: the deck's counted write of a one-shot's batch line to `rx` was
+/// accepted no byte up to its newline, so none of `attempts` was handed. The
+/// deck records that itself, whether or not `rx` is still live.
+pub(super) fn deck_not_handed(
+    st: &mut HubState,
+    key: &AgentKey,
+    rx: Rx,
+    attempts: &[InboxAttemptRef],
+    now: Instant,
+    out: &mut Outbox,
+) {
+    let Some(generation) = st.receipts.gens.get_mut(key) else {
+        return;
+    };
+    for at in attempts {
+        generation
+            .model
+            .deck_not_handed(now, &at.id, at.a, at.e, rx);
+    }
+    apply(st, key, now, out);
+    dispatch(st, key, now, out);
+}
+
+/// Part 2 §2.4: a hook receiver `rx`'s own fetch: the waiting mail that fits
+/// `budget` is issued to it, each block naming its attempt, with the caps it
+/// publishes its receipts with. With `named`, nothing is issued unless that
+/// message is still waiting, decided under the same lock.
+pub(super) fn hook_fetch(
+    st: &mut HubState,
+    key: &AgentKey,
+    rx: Rx,
+    named: Option<&str>,
+    budget: Option<InboxBudget>,
+    now: Instant,
+    out: &mut Outbox,
+) -> Vec<InboxDelivery> {
+    if !st
+        .receipts
+        .gens
+        .get(key)
+        .is_some_and(|generation| generation.model.live(rx))
+    {
+        return Vec::new();
+    }
+    let ids = candidates(st, key);
+    if let Some(named) = named
+        && !ids.iter().any(|id| id == named)
+    {
+        return Vec::new();
+    }
+    let batch = issue_to(st, key, rx, &ids, budget, Consumer::DoorbellHook, true, now);
+    apply(st, key, now, out);
+    batch
+}
+
+/// R2-A01: the attempts of an `inbox_committed` that may commit at all
+/// ([`AttemptModel::commit_admissible`]: released by the deck and not
+/// positively not handed), with the generation's evidence to verify each
+/// one's commit receipt against, off the lock.
+pub(super) fn commit_candidates(
+    st: &HubState,
+    key: &AgentKey,
+    attempts: &[InboxAttemptRef],
+) -> Option<(Vec<InboxAttemptRef>, Arc<Evidence>)> {
+    let generation = st.receipts.gens.get(key)?;
+    let admissible = attempts
+        .iter()
+        .take(crate::inbox_prompt::MAX_IDS)
+        .filter(|at| generation.model.commit_admissible(&at.id, at.a, at.e))
+        .cloned()
+        .collect();
+    Some((admissible, Arc::clone(&generation.evidence)))
+}
+
+/// Part 2 §1.3: Claude's prompt hook commits the exact one-shot attempts a
+/// submitted prompt carried whole, after publishing their `committed`
+/// receipts, on its own admitted connection. `verified` holds the attempts
+/// whose receipt the caller found in the spool on the attempt's own cap
+/// (R2-A01), or, for a generation the deck cannot read receipts of, every
+/// admissible one: that generation is degraded already. Whether the model
+/// still lets each one commit ([`AttemptModel::commit_admissible`]) is
+/// checked again here, under the lock; the receipt lookup is not repeated
+/// (`InboxHub::witnessed_commits` says why). `degraded` is why a receipt
+/// could not be published.
+pub(super) fn one_shot_committed(
+    st: &mut HubState,
+    key: &AgentKey,
+    verified: &[InboxAttemptRef],
+    degraded: Option<&str>,
+    now: Instant,
+    out: &mut Outbox,
+) -> usize {
+    let Some(generation) = st.receipts.gens.get_mut(key) else {
+        return 0;
+    };
+    if let Some(error) = degraded {
+        generation
+            .degraded
+            .get_or_insert_with(|| crate::untrusted_text::display_line(error, 200));
+    }
+    let mut applied = 0;
+    for at in verified.iter().take(crate::inbox_prompt::MAX_IDS) {
+        if generation.model.commit_admissible(&at.id, at.a, at.e)
+            && matches!(
+                generation
+                    .model
+                    .stage(now, &at.id, at.a, at.e, Stage::Committed, None),
+                crate::inbox_attempts::StageOutcome::Applied
+                    | crate::inbox_attempts::StageOutcome::Recorded
+            )
+        {
+            applied += 1;
+        }
+    }
+    apply(st, key, now, out);
+    dispatch(st, key, now, out);
+    applied
 }
 
 /// A doorbell substitution by the component holding incarnation `rx` (§4):
@@ -690,7 +1192,16 @@ pub(super) fn doorbell_fetch(
     let Some(permit) = room(&link.tx) else {
         return Ok(Vec::new());
     };
-    let mut batch = issue_to(st, key, rx, &ids, budget, Consumer::Stream { conn_id }, now);
+    let mut batch = issue_to(
+        st,
+        key,
+        rx,
+        &ids,
+        budget,
+        Consumer::Stream { conn_id },
+        false,
+        now,
+    );
     let issued: Vec<InboxIssued> = batch
         .iter_mut()
         .filter_map(|delivery| {
@@ -801,9 +1312,7 @@ pub(super) fn control(
             // handed the attempt's caps again; it never passes them on.
             let caps = generation
                 .evidence
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .store
+                .store()
                 .caps(&reply.id, reply.a, reply.e)
                 .map(|caps| InboxAttemptCaps {
                     handed: caps.handed.hex(),
@@ -849,25 +1358,35 @@ pub(super) fn control(
     dispatch(st, key, now, out);
 }
 
+/// What [`explicit_commit`] did with an agent's `ack <id>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ExplicitCommit {
+    /// An attempt of the current assignment was committed.
+    Committed,
+    /// Every attempt of the current assignment was positively not handed,
+    /// so the agent cannot have it: nothing changes (C-5).
+    Refused,
+    /// The model has no attempt to commit; the caller decides.
+    NoAttempt,
+}
+
 /// An explicit acknowledgement of a `Receipt`-owned message (`dot-agent-deck
 /// ack <id>`): its agent says it has the message, which settles it — rule 1
-/// needs one committed attempt of the current assignment, whichever it is.
-pub(super) fn explicit_commit(st: &mut HubState, key: &AgentKey, id: &str, now: Instant) -> bool {
+/// needs one committed attempt of the current assignment, the newest that
+/// may have reached the agent ([`AttemptModel::commit_target`]).
+pub(super) fn explicit_commit(
+    st: &mut HubState,
+    key: &AgentKey,
+    id: &str,
+    now: Instant,
+) -> ExplicitCommit {
     let Some(generation) = st.receipts.gens.get_mut(key) else {
-        return false;
+        return ExplicitCommit::NoAttempt;
     };
-    let Some(delivery) = generation.model.delivery(id) else {
-        return false;
-    };
-    let a = delivery.a;
-    let Some(e) = delivery
-        .attempts
-        .iter()
-        .filter(|at| at.a == a)
-        .map(|at| at.e)
-        .max()
-    else {
-        return false;
+    let (a, e) = match generation.model.commit_target(id) {
+        Ok(target) => target,
+        Err(CommitTargetRefusal::NotHanded) => return ExplicitCommit::Refused,
+        Err(CommitTargetRefusal::NoAttempt) => return ExplicitCommit::NoAttempt,
     };
     generation
         .model
@@ -875,7 +1394,7 @@ pub(super) fn explicit_commit(st: &mut HubState, key: &AgentKey, id: &str, now: 
     let mut out = Outbox::new();
     apply(st, key, now, &mut out);
     flush(out);
-    true
+    ExplicitCommit::Committed
 }
 
 /// Write `out`'s lines, each on the room [`send`] reserved for it under the
@@ -906,7 +1425,7 @@ pub(super) struct Checked {
 
 /// T2/T3, then T4/T8/held_long and G3's not-started attention, for every generation: `checked` holds what
 /// each generation's spool IO found. Every commit found is applied first, so
-/// a receipt published for any issued attempt settles (or corrects) before
+/// a receipt published for any issued attempt settles (or can correct) before
 /// a lapse can repeat anything; only the candidates a completed check
 /// cleared may then count toward an automatic repeat.
 pub(super) fn tick(
@@ -952,6 +1471,35 @@ pub(super) fn tick(
     }
 }
 
+/// U1 (R2-fix3): R2F-R01's staging deadline alone, for every generation:
+/// each withheld attempt whose staging ran out by `now` is released not
+/// handed ([`AttemptModel::expire_staging`]) and its verdict applied. This is
+/// the clock's own step, which [`tick`]'s spool IO does not hold up: it does
+/// no file IO, and the evidence store's lock it may take under the caller's
+/// is held for no spool file IO ([`Evidence`]). It dispatches nothing;
+/// issuing is left to the tick. Answers whether anything was released.
+pub(super) fn expire_staging(st: &mut HubState, now: Instant, out: &mut Outbox) -> bool {
+    let due: Vec<AgentKey> = st
+        .receipts
+        .gens
+        .iter()
+        .filter(|(_, generation)| {
+            generation
+                .model
+                .staging_due_at()
+                .is_some_and(|due| now >= due)
+        })
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in &due {
+        if let Some(generation) = st.receipts.gens.get_mut(key) {
+            generation.model.expire_staging(now);
+        }
+        apply(st, key, now, out);
+    }
+    !due.is_empty()
+}
+
 /// PRD #1666 G3: generation `key` reported a turn edge the registry accepted
 /// from its live owner, or kept for its reserved spawn, numbered `seen.seq`.
 /// A turn starting makes the clock busy; one under way ending makes it idle
@@ -968,7 +1516,7 @@ pub(super) fn note_turn(st: &mut HubState, key: &AgentKey, seen: TurnSeen, now: 
         return false;
     }
     clock.seq = seen.seq;
-    match seen.edge {
+    let changed = match seen.edge {
         TurnEdge::Started if !clock.busy => {
             clock.busy = true;
             true
@@ -979,13 +1527,21 @@ pub(super) fn note_turn(st: &mut HubState, key: &AgentKey, seen: TurnSeen, now: 
             true
         }
         _ => false,
+    };
+    // C-1: the model reads the same clock for once-waiter possession.
+    if changed {
+        let turn = st.receipts.turn_view(key);
+        if let Some(generation) = st.receipts.gens.get_mut(key) {
+            generation.model.turn(now, turn);
+        }
     }
+    changed
 }
 
 /// One generation's spool IO for the clock (§3).
 pub(super) struct Check {
     pub(super) key: AgentKey,
-    pub(super) evidence: Arc<Mutex<Evidence>>,
+    pub(super) evidence: Arc<Evidence>,
     /// The lapse candidates the spool lookup must clear.
     pub(super) candidates: Vec<LapseCheck>,
     /// The ended messages' fenced attempts the lookup must verify.
@@ -1001,7 +1557,7 @@ pub(super) fn lapse_checks(st: &HubState, now: Instant) -> Vec<Check> {
         .iter()
         .filter_map(|(key, generation)| {
             let candidates = generation.model.lapse_candidates(now);
-            let verify = generation.model.verify_candidates();
+            let verify = generation.model.verify_candidates(now);
             (!candidates.is_empty() || !verify.is_empty() || generation.model.watching_receipts())
                 .then(|| Check {
                     key: key.clone(),
@@ -1060,6 +1616,21 @@ pub(super) fn apply(st: &mut HubState, key: &AgentKey, now: Instant, out: &mut O
                 let Some(generation) = st.receipts.gens.get(key) else {
                     continue;
                 };
+                // Part 2 §2.5: a one-shot's fence also reads the attempt's
+                // revoke marker, written once the lock is released.
+                let one_shot = generation
+                    .model
+                    .delivery(&id)
+                    .and_then(|d| d.attempt(a, e))
+                    .is_some_and(|at| matches!(at.slot, Slot::OnceWaiter | Slot::Hook));
+                if one_shot && let Some(spool) = generation.spool.clone() {
+                    st.receipts
+                        .markers
+                        .push((key.clone(), spool, id.clone(), a, e));
+                }
+                let Some(generation) = st.receipts.gens.get(key) else {
+                    continue;
+                };
                 if let Some(link) = generation
                     .model
                     .attempt_rx(&id, a, e)
@@ -1080,6 +1651,14 @@ pub(super) fn apply(st: &mut HubState, key: &AgentKey, now: Instant, out: &mut O
             }
             Effect::WitnessViolation { id, a, e } => {
                 warn!(message_id = %id, a, e, "inbox: a commit contradicted a not-handed witness");
+            }
+            Effect::StagingLapsed { id, a, e } => {
+                warn!(message_id = %id, a, e, "inbox: a caps file write outlasted its staging; the attempt was not handed");
+                if let Some(generation) = st.receipts.gens.get_mut(key) {
+                    generation.degraded.get_or_insert_with(|| {
+                        "a receipt caps file write did not finish within the ack-wait".to_string()
+                    });
+                }
             }
             Effect::AlsoReachedOldWorker { id, a } => {
                 also_reached(st, key, &id, a);
@@ -1102,14 +1681,28 @@ pub(super) fn apply(st: &mut HubState, key: &AgentKey, now: Instant, out: &mut O
                 let Some(generation) = st.receipts.gens.get(key) else {
                     continue;
                 };
-                generation
-                    .evidence
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .store
-                    .forget(&id, a, e);
+                generation.evidence.store().forget(&id, a, e);
                 if let Some(spool) = generation.spool.clone() {
-                    st.receipts.removals.push((spool, id, a, e));
+                    remove_later(st, spool, id, a, e);
+                }
+            }
+            // C-2/C-3: a superseded once-waiter is told so and its
+            // connection closed; an expired hook's is closed. Dropping the
+            // link's sender ends its connection task even when the signal
+            // finds its queue full.
+            Effect::Close { rx } => {
+                let link = st
+                    .receipts
+                    .gens
+                    .get_mut(key)
+                    .and_then(|generation| generation.links.remove(&rx));
+                if let Some(link) = link {
+                    let signal = match link.kind {
+                        LinkKind::Once { .. } => WaiterSignal::Superseded,
+                        LinkKind::Stream | LinkKind::Hook => WaiterSignal::Close,
+                    };
+                    let _ = link.tx.try_send(signal);
+                    forget_waiter(st, key, link.conn_id);
                 }
             }
         }
@@ -1233,8 +1826,19 @@ fn uncertain_notice(st: &mut HubState, key: &AgentKey, id: &str) {
     ));
 }
 
+/// The delegate watch on `id` has ended, so no commit can correct its
+/// orchestrator through it: drop the record that it was told `id` is uncertain.
+pub(super) fn forget_uncertain(st: &mut HubState, id: &str) {
+    for generation in st.receipts.gens.values_mut() {
+        generation.uncertain_told.remove(id);
+    }
+}
+
 /// Rule 1's correction (§2): a sender told otherwise hears the message
-/// reached its agent after all.
+/// reached its agent after all, while the task's delegate watch or its
+/// cancelled-task record remains. A newer delegation that retires (supersedes)
+/// the watch ends the watch-based route; such a task is corrected only through
+/// a cancelled-task record still retained for it.
 fn delivered_after_all(st: &mut HubState, key: &AgentKey, id: &str, despite_cancel: bool) {
     let told = st
         .receipts
@@ -1242,7 +1846,7 @@ fn delivered_after_all(st: &mut HubState, key: &AgentKey, id: &str, despite_canc
         .get_mut(key)
         .is_some_and(|generation| generation.uncertain_told.remove(id));
     let Some(watch) = st.delegates.get(id) else {
-        if let Some((to, role)) = st.cancelled_tasks.remove(id) {
+        if let Some((to, role, _)) = st.cancelled_tasks.remove(id) {
             st.owed_notices.push((
                 to,
                 LATE_ACK_SUBJECT,
@@ -1265,7 +1869,8 @@ fn delivered_after_all(st: &mut HubState, key: &AgentKey, id: &str, despite_canc
 }
 
 /// T3: an earlier holder of an offer committed after it was reassigned — the
-/// task reached it too (§2), and its offerer is told.
+/// task reached it too (§2), and its offerer is told while the hub still
+/// holds the offer.
 fn also_reached(st: &mut HubState, key: &AgentKey, id: &str, a: u32) {
     warn!(message_id = %id, a, pane_id = %key.0, "inbox: a reassigned offer also reached its earlier holder");
     let Some(offer) = st.offers.get(id) else {
@@ -1286,8 +1891,14 @@ fn also_reached(st: &mut HubState, key: &AgentKey, id: &str, a: u32) {
 
 /// The card notices for `key` now (§6.5).
 pub(super) fn notices(st: &HubState, key: &AgentKey, now: Instant) -> InboxCardNotices {
+    let integration = st.receipts.floors.get(key).and_then(|f| f.notice(now));
     let mut notices = InboxCardNotices {
-        integration: st.receipts.floors.get(key).and_then(|f| f.notice(now)),
+        integration,
+        // Part 2 §2.7: composed by the deck from its own install path, never
+        // from anything a hook sent.
+        integration_command: (integration == Some(IntegrationNotice::HooksTooOld))
+            .then(|| st.hooks_remedy.clone())
+            .flatten(),
         ..InboxCardNotices::default()
     };
     let Some(generation) = st.receipts.gens.get(key) else {
@@ -1392,8 +2003,8 @@ pub(super) fn action(
         && let Some(watch) = st.delegates.get(id)
         && let Some(to) = watch.orchestrator.clone()
     {
-        st.cancelled_tasks
-            .insert(id.to_string(), (to, watch.role.clone()));
+        let role = watch.role.clone();
+        super::remember_cancelled_task(st, id, to, &role);
     }
     apply(st, key, now, out);
     dispatch(st, key, now, out);

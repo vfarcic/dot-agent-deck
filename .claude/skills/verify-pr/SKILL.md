@@ -84,7 +84,7 @@ Re-running on a PR that has been pushed to since: `setup.sh <n> --force`.
 
 **`WORKFLOWS_AWAITING_APPROVAL` from Phase 0 is non-zero.** GitHub withholds Actions runs on a fork PR from an outside contributor until a maintainer approves them, so the PR can look checked while every job that matters never ran. Do this now, before Phase 2, so CI runs alongside the local suite and its results are in hand by Phase 6.
 
-**Why this is not optional.** CI is not a duplicate of `checks.sh` — it is the only source for things the local run *cannot* produce: `build-macos` does a real `cargo build` + `clippy -D warnings` + `cargo nextest run` on the real OS (`build-windows` does the same on Windows when enabled — it is `if: false` until Windows ships, so it reports `skipped`), and `security` runs `cargo audit`. Locally, `windows-cross` is a type-check proxy that fails outright on machines without an MSVC cross-toolchain, and there is no macOS proxy at all. Measured on #334: `CI` and `Docs` sat at `action_required` on every head commit for two days, so a Linux-only local run was the sole verification of a PR that was otherwise reported as green.
+**Why this is not optional.** CI is not a duplicate of `checks.sh` — it is the only source for things the local run *cannot* produce, and `security` runs `cargo audit`. **macOS is not one of them on a PR any more:** `build-macos` runs on pushes to `main` (and on a dispatch), not on pull requests, so on a PR it reads `skipped`, which verifies nothing; macOS is checked by `main`'s run after the merge and by `tag-release.yml`'s green-`main` gate (docs/develop/rwx.md). `build-windows` is `if: false` until Windows ships, so it reports `skipped` too. Locally, `windows-cross` is a type-check proxy that fails outright on machines without an MSVC cross-toolchain, and there is no macOS proxy at all. Measured on #334: `CI` and `Docs` sat at `action_required` on every head commit for two days, so a Linux-only local run was the sole verification of a PR that was otherwise reported as green.
 
 **The safety bar here is higher than Phase 0's.** Phase 0 asks "is it safe to check this out on my machine?" Approving asks "is it safe to execute this in CI, where repository secrets live?" Two things follow:
 
@@ -130,10 +130,10 @@ bash .claude/skills/verify-pr/checks.sh --dir ../dot-agent-deck-pr-<n>
 
 Steps, cheapest first: `fmt`, `clippy` (both rule 2 — note clippy carries **both** e2e features, so it type-checks lane 2's files — the only step in this skill that compiles them, and CI-side the only thing that does, since no test reaching a real agent runs in any CI job), `build --release`, `test-fast` (rule 5's fast tier), `linkage-check` (rule 7), `windows-cross`, `audit`. It does not stop at the first failure — a review needs the whole picture. If the build fails, the test steps are marked `BLOCKED` rather than burning minutes restating it.
 
-**Lane 1 is CI's job, so READ its run rather than reproducing it.** The `e2e` step is **off by default** since issue #502: `ci.yml`'s `e2e-deterministic` job runs `cargo test-e2e` on every PR, so the signal already exists on the PR you are reviewing. Get it, and put it in the report as a row like any other gate:
+**Lane 1 is CI's job, so READ its run rather than reproducing it.** The `e2e` step is **off by default** since issue #502: `ci.yml`'s `e2e-deterministic` job runs `cargo test-e2e` on every PR, so the signal already exists on the PR you are reviewing. **When the PR's `.github/ci-backend` says `rwx`, that job reads `skipped` and the tier ran on RWX instead**, inside the `RWX: linux` status (its `e2e` tasks); read that one, with `rwx results <run-id>` from the link `gh pr checks` prints (docs/develop/rwx.md). Get it, and put it in the report as a row like any other gate:
 
 ```bash
-gh pr checks <n>                          # is e2e-deterministic green, red, or still running?
+gh pr checks <n>                          # is e2e-deterministic (or RWX: linux) green, red, or still running?
 gh run view <run-id> --log-failed         # what actually failed
 ```
 
@@ -246,8 +246,9 @@ Template:
 ## CI
 <per-job conclusions from `gh pr checks`, or "held for approval — released in Phase 1b" /
 "not approved, see blocking findings". Name the jobs the local run cannot replace:
-build-macos, security (cargo audit), and e2e-deterministic — lane 1
-is CI's job now, so quote its conclusion here rather than a local `e2e` row.
+security (cargo audit), and e2e-deterministic (or `RWX: linux` when the CI switch is on) —
+lane 1 is CI's job now, so quote its conclusion here rather than a local `e2e` row.
+`build-macos` does not run on pull requests; say so rather than reporting it as passed.
 State lane 2 explicitly: run by you with your own credentials (name the tests), or
 UNVERIFIED. Nothing in CI covers it.>
 
@@ -266,10 +267,10 @@ UNVERIFIED. Nothing in CI covers it.>
 ## NOT verified
 <skipped real-agent tests; the rule 12 cross-version test if it was not run;
 anything --no-e2e or --only skipped. Windows belongs here always while
-`build-windows` is `if: false` — a `skipped` conclusion verifies nothing, so never
-report it as verified by CI. macOS belongs here ONLY while its CI job has not gone
-green — once Phase 1b released the runs and build-macos / security passed, report
-them as verified by CI instead, and say so.>
+`build-windows` is `if: false`, and macOS belongs here always on a PR, since
+`build-macos` runs on `main`, not on pull requests: a `skipped` conclusion verifies
+nothing, so never report either as verified by CI. Say that macOS is checked by
+`main`'s run after the merge. `security` passing is reported as verified by CI.>
 ```
 
 ## Phase 7 — Close out

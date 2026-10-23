@@ -44,6 +44,8 @@ cargo xver --repo <this repository> --branch <head SHA> --previous <tag> \
 
 Two things happen before the harness starts: the job installs `bubblewrap` and sets `kernel.apparmor_restrict_unprivileged_userns=0`, since Ubuntu 24.04 confines the unprivileged user namespaces both of the harness's namespaces are; and it compares `PROTOCOL_VERSION` at the previous release with the pull request's head. When the constant moved, the job does not run the harness: the two builds refuse each other by design (the `PROTOCOL_VERSION` paragraph at the top of this page), and the job says so in a notice, and in a `<SHA>-protocol-refusal.md` evidence file, instead of reporting the refusal as a failing tell.
 
+**A known state, not fixed yet: tells 3 and 4 against `v0.47.x` (issue [#1755](https://github.com/vfarcic/dot-agent-deck/issues/1755)).** When both builds of a pairing are `v0.47.0` or later, both declare `1666-inbox-replaces-typed-delivery`: a delegate lands in the worker's inbox and work-done reaches the orchestrator the same way, while tell 3 still looks for the delegate typed into the worker's pane and tell 4 for the work-done line in the orchestrator's. `KNOWN_EFFECTS` has no entry for that break, so a same-protocol pairing with `v0.47.x` fails both tells and the job is red. PRD #1666 part 2 moves `PROTOCOL_VERSION` to 12, so its own job runs no harness (the paragraph above) and neither shows nor clears that failure; rewriting the two tells to verify inbox delivery, with the `KNOWN_EFFECTS` entries, is PRD #1666 part 3's work.
+
 The job tells three results apart, by the harness's exit status (issue #1596):
 
 - **pass** (exit 0): every tell held in both directions.

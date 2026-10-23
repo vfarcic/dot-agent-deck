@@ -761,3 +761,44 @@ fn pr_004_dashboard_badge_and_browser_shortcut() {
     common::wait_for_file_trimmed_eq(&fixture.scratch.path().join("browser-urls"), PR_URL, WAIT)
         .expect("o must open the selected PR URL through BROWSER");
 }
+
+/// Scenario: Start a synthetic agent on a branch pushed to the contributor's
+/// fork while `origin` is the upstream, with `gh` listing the pull request
+/// from that fork and a stranger's higher-numbered one from a same-named
+/// branch. The daemon serves the fork's own pull request as the agent's badge
+/// (issue #1779).
+#[spec("session/pr/006")]
+#[test]
+fn pr_006_a_pull_request_from_the_fork_the_branch_is_pushed_to_is_served() {
+    let fixture = Fixture::new("feat/x");
+    fixture.git(&[
+        "remote",
+        "add",
+        "fork",
+        "git@github.com:contributor/test-repo.git",
+    ]);
+    fixture.git(&["config", "branch.feat/x.pushRemote", "fork"]);
+    let from_fork = |number, owner: &str| {
+        let mut pr = pr_json(number, "feat/x", "OPEN", false, json!("REVIEW_REQUIRED"));
+        pr["isCrossRepository"] = json!(true);
+        pr["headRepository"] = json!({"id": "R_1", "name": "test-repo"});
+        pr["headRepositoryOwner"] = json!({"id": "U_1", "login": owner});
+        pr
+    };
+    fixture.set_reply(json!([
+        from_fork(9000, "stranger"),
+        from_fork(1234, "contributor")
+    ]));
+    let daemon = fixture.daemon();
+    fixture.start(&daemon);
+    expect_pr(
+        &daemon,
+        &PullRequestInfo {
+            number: 1234,
+            url: PR_URL.into(),
+            state: PullRequestState::Open,
+            review: Some(PullRequestReview::ReviewRequired),
+            checks: None,
+        },
+    );
+}

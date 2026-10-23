@@ -1,0 +1,7 @@
+## The TUI and the desktop app no longer use a replacement daemon they cannot read
+
+If the daemon was replaced while the TUI was open, the TUI reconnected to the new one without checking that the two speak the same attach protocol, so it could show a normal dashboard while it could not read what that daemon sent. Now, when the protocols differ, the TUI does not attach to that daemon, list its agents, start agents on it, or stop, rename or message its agents. A footer row says `⚠ Not attaching: daemon speaks attach protocol vN, but this binary speaks vM`, with the same two ways out as the refusal at startup, until a daemon on the TUI's own protocol answers again.
+
+The desktop app checks the same way when it lists a daemon's agents, follows their activity, starts an agent, opens an agent's terminal, or stops, renames, messages or answers one. A replacement daemon that the app would refuse when connecting, for another protocol or for a version that could make the app misread what it reports, is refused for each of these, and an agent terminal opened against it shows the refusal. **Connect anyway** still lets you use a daemon of the second kind until you quit the app. **Stop daemon** and **Replace daemon** still reach such a daemon, so that you can recover from it.
+
+See [Troubleshooting](https://agent-deck.devopstoolkit.ai/docs/troubleshooting.md#daemon-speaks-attach-protocol-vn-but-this-binary-speaks-vm).

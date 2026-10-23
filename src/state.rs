@@ -7,6 +7,7 @@ use tracing::warn;
 
 use crate::agent_pty::AgentPtyRegistry;
 use crate::config_validation::{escape_id_for_log, sanitize_role_name};
+use crate::daemon_client::Incarnation;
 pub use crate::event::BackgroundWork;
 use crate::event::{
     AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, DelegateSignal, EventType,
@@ -408,6 +409,22 @@ pub fn placeholder_session_id(pane_id: &str) -> String {
 /// `max_per_run` issue dispatches is single/low-double digits).
 const MAX_PENDING_ORCHESTRATION_SURFACES: usize = 64;
 
+/// PRD #1666 part 2 (G-fix7d): cap on [`AppState::replaced_processes`]. Each
+/// entry is one deck restart this client's event stream saw. Past 16 the oldest
+/// is forgotten, and a placeholder that arrives afterwards from that process is
+/// no longer recognised as stale on sight: it is held like one from a process
+/// the stream never named ([`AppState::held_placeholders`]), and is reported
+/// stale when the stream next opens.
+const MAX_REPLACED_PROCESSES: usize = 16;
+
+/// PRD #1666 part 2 (G-fix7e): cap on [`AppState::held_placeholders`], which
+/// holds one entry per pane and process from when its pane is started or
+/// attached until the stream next opens on a named process, or its pane is
+/// closed, forgotten or lost (G-fix7f). Past it the oldest is let go
+/// unresolved: it is neither drawn nor reported, and its pane keeps its local
+/// attachment.
+const MAX_HELD_PLACEHOLDERS: usize = 64;
+
 /// PRD #1223: cap on [`AppState::pending_pane_closures`], for the same reason
 /// and with the same drop-oldest policy as the surface queue above. Closures are
 /// drained all at once each frame, so this is only reached by a burst larger
@@ -437,6 +454,42 @@ pub struct PaneClosure {
     /// agent that was stopped, whatever its agent id says.
     pub queued_at: DateTime<Utc>,
 }
+
+/// PRD #1666 part 2 (G-fix7c): a card a deck restart took, queued for the TUI's
+/// render loop ([`AppState::pending_restart_drops`]) with what the notice names
+/// it by and the pane whose local attachment and tab slot go with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestartDroppedCard {
+    /// The card's key in [`AppState::sessions`], which the render loop's
+    /// display names are keyed by.
+    pub key: String,
+    /// G-fix7d: whether the card was in [`AppState::sessions`] under
+    /// [`Self::key`]. A stale placeholder never was
+    /// ([`AppState::insert_placeholder_session_learned`]), so its key may be a
+    /// live card's, whose name and selection must stay.
+    pub held: bool,
+    pub pane_id: Option<String>,
+    /// G-fix7d: the registry id of the card's agent, which with the pane and
+    /// the process tells one agent's cards from another's in the notice.
+    pub agent_id: Option<String>,
+    pub display_name: Option<String>,
+    pub agent_type: AgentType,
+    /// The daemon process the card was learned from, which the deck replaced.
+    pub incarnation: Incarnation,
+}
+
+/// PRD #1666 part 2 (G-fix7e): a placeholder card learned from a daemon process
+/// the event stream has not named, waiting for the stream to say whether that
+/// process is the one it comes from ([`AppState::held_placeholders`]).
+#[derive(Debug, Clone)]
+pub struct HeldPlaceholder {
+    pub pane_id: String,
+    pub cwd: Option<String>,
+    pub agent_type: Option<AgentType>,
+    pub agent_id: Option<String>,
+    pub learned_from: Incarnation,
+}
+
 /// Maximum number of first-prompt entries retained per session. The live-side
 /// cap in `apply_event` and the wire-boundary clamp in
 /// [`crate::daemon_client`] (which re-clamps a hostile/oversized daemon
@@ -845,6 +898,17 @@ pub struct SessionState {
     /// [`crate::event::PULL_REQUEST_REVISION_METADATA_KEY`]. Not an activity
     /// clock: it orders the pull request alone and moves nothing else.
     pub pull_request_revision: u64,
+    /// PRD #1666 part 2 (G-fix6): on a client, the daemon process this card was
+    /// learned from — the incarnation of the event stream whose frame created
+    /// it ([`AppState::stream_incarnation`]). Stamped once, when the card is
+    /// created, and never re-read from a later frame or snapshot: a restarted
+    /// daemon can hold an unrelated agent under this card's pane id, and a card
+    /// it updates is still the old process's card. Every action that turns the
+    /// card's pane id into a daemon request carries it
+    /// ([`SessionState::bound_pane`]). [`Incarnation::UNNAMED`] on the daemon,
+    /// and for a card learned while no named stream was open — which a gated
+    /// client sends nothing for.
+    pub incarnation: Incarnation,
 }
 
 /// Issue #1364: who raised a [`SessionStatus::WaitingForInput`] that came from
@@ -990,6 +1054,15 @@ fn release_subagent_wait(session: &mut SessionState, ended: &str) -> bool {
 }
 
 impl SessionState {
+    /// PRD #1666 part 2 (G-fix6): this card's pane id together with the daemon
+    /// process the card was learned from — what every action on the card hands
+    /// the pane controller. `None` for a card with no pane.
+    pub fn bound_pane(&self) -> Option<crate::pane::BoundPane> {
+        self.pane_id
+            .as_ref()
+            .map(|pane_id| crate::pane::BoundPane::new(pane_id.clone(), self.incarnation.clone()))
+    }
+
     /// PRD #162: build the wire [`SessionSnapshot`] from this live session.
     /// The snapshot's `agent_type` is the EVENT-DERIVED value, so a
     /// reconnecting TUI can override a `None` spawn-time
@@ -1548,6 +1621,17 @@ pub struct AppState {
     /// it. Forgotten with the pane, so it does not grow by one entry per pane
     /// id ever seen.
     pane_event_epochs: HashMap<String, u64>,
+    /// PRD #1666 part 2 (`inbox/doorbell/008`): per pane, what each recent
+    /// agent generation's OWN hooks have shown of its readiness for input,
+    /// newest generation first and at most [`MAX_READINESS_GENERATIONS`] of
+    /// them ([`Self::doorbell_readiness`]). Kept outside the bounded
+    /// [`SessionState::recent_events`] journal and outside any one card, so
+    /// neither shell-monitor frames pushing a native report out of the journal
+    /// nor `/clear` ending the card it arrived on forgets it, and keyed by the
+    /// generation the event names, so a predecessor's report, on a card a
+    /// successor's frames later reach, never speaks for that successor.
+    /// Forgotten with the pane.
+    pane_doorbell_ready: HashMap<String, Vec<GenerationReadiness>>,
     /// Remembers started_at per pane so a `/clear` restart keeps its position.
     pane_started_at: HashMap<String, DateTime<Utc>>,
     /// Issue #1507: per pane, the daemon registry id its card-surfacing
@@ -1590,6 +1674,13 @@ pub struct AppState {
     /// from `Hello` and replaced by each `HookBinaryNotice` broadcast. Drawn as
     /// one dashboard footer row while non-empty.
     pub hook_binary_notices: Vec<crate::hook_binary::HookBinaryNotice>,
+    /// PRD #1666 part 2 (`lifecycle/handshake/011`), a client's side: the
+    /// daemon now answering at this TUI's endpoint speaks another attach
+    /// protocol, found when the event subscriber reconnected
+    /// ([`crate::daemon_client::DaemonClient::check_protocol`]), so it has not
+    /// resubscribed. Drawn as a footer row on every view while set; cleared
+    /// once a reconnect finds a daemon on this binary's protocol.
+    pub protocol_refusal: Option<ProtocolRefusal>,
     /// Pane ids this process holds as its OWN: panes it registered itself
     /// ([`Self::register_pane`] — a TUI's own panes, the desktop fold's, the
     /// daemon's orchestration role panes), plus, in a process with no
@@ -1767,7 +1858,53 @@ pub struct AppState {
     /// the existing `open_orchestration_tab_with_existing_role_panes` machinery.
     /// Empty in the common case; bounded by `MAX_PENDING_ORCHESTRATION_SURFACES`
     /// (L1) so a flood can't grow it unbounded.
-    pub pending_orchestration_surfaces: Vec<OrchestrationSurface>,
+    ///
+    /// PRD #1666 part 2 (G-fix6): each with the daemon process whose stream
+    /// carried it, which every role pane's attach is bound to.
+    pub pending_orchestration_surfaces: Vec<(OrchestrationSurface, Incarnation)>,
+    /// PRD #1666 part 2 (G-fix6): the daemon process the event stream now
+    /// feeding this state comes from, from the `Hello` on its own connection —
+    /// set by the event subscriber when a subscription opens, before its
+    /// snapshot or first frame is applied, and [`Incarnation::UNNAMED`] while
+    /// none is open. Every card created from a frame is stamped with it
+    /// ([`SessionState::incarnation`]), and so is every queued orchestration
+    /// surface.
+    pub stream_incarnation: Incarnation,
+    /// PRD #1666 part 2 (G-fix7c): on a client, the cards a deck restart took,
+    /// waiting for the render loop to drop what the event subscriber cannot
+    /// reach — their local panes and orchestration tabs — and to name them in
+    /// one notice ([`crate::daemon_client::agents_stopped_by_restart_notice`]).
+    /// A card learned from a named daemon process that the deck has since
+    /// replaced is removed from [`Self::sessions`] as soon as this state learns
+    /// of the replacement ([`Self::learn_stream_incarnation`]): its agent is
+    /// gone, and an agent the new process lists under the same pane or agent id
+    /// is an unrelated one, which gets a card of its own. No stop, close or
+    /// unit cleanup is asked of either daemon for a dropped card. Drained by
+    /// [`Self::take_restart_drops`].
+    pub pending_restart_drops: Vec<RestartDroppedCard>,
+    /// PRD #1666 part 2 (G-fix7d): the named daemon process the event stream
+    /// last came from. Unlike [`Self::stream_incarnation`] it outlives the gap
+    /// between two subscriptions, so the next one can tell that the process
+    /// before the gap was replaced ([`Self::replaced_processes`]).
+    pub last_stream_process: Incarnation,
+    /// PRD #1666 part 2 (G-fix7d): the named daemon processes this state knows
+    /// the deck replaced: the stream's previous process, each time the stream
+    /// opens on another ([`Self::learn_stream_incarnation`]). G-fix7e: nothing
+    /// else adds to it — an attach answered by one process is no evidence that
+    /// another is older. A placeholder learned from one of them is stale: it
+    /// drops no card and is reported rather than drawn
+    /// ([`Self::insert_placeholder_session_learned`]). The oldest is forgotten
+    /// past [`MAX_REPLACED_PROCESSES`].
+    pub replaced_processes: Vec<String>,
+    /// PRD #1666 part 2 (G-fix7e): placeholders learned from a named process
+    /// the stream has neither named nor recorded as replaced — while no stream
+    /// is open, or while it comes from another process. Which of the two is
+    /// older only the stream can tell: when it next opens, a placeholder from
+    /// its process is drawn and every other one is stale
+    /// ([`Self::learn_stream_incarnation`]). One per pane and process; the
+    /// oldest is let go past [`MAX_HELD_PLACEHOLDERS`], and G-fix7f: each is let
+    /// go with its pane ([`Self::retire_held_placeholders`]).
+    pub held_placeholders: Vec<HeldPlaceholder>,
     /// Issue #717: dispatched worktrees a close LEFT ON DISK, waiting to be
     /// reported on the status line. Filled by the event subscriber (which has no
     /// `UiState`) from [`crate::event::BroadcastMsg::WorktreeKept`] and drained
@@ -1927,11 +2064,110 @@ pub struct AppState {
 
 pub type SharedState = Arc<RwLock<AppState>>;
 
+/// PRD #1666 part 2: the two attach protocols a reconnect found apart
+/// ([`AppState::protocol_refusal`]). `daemon` is `None` when the daemon's
+/// reply carried no `server_version`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtocolRefusal {
+    pub daemon: Option<u32>,
+    pub local: u32,
+}
+
 /// PRD #1666 hardening H3: what [`AppState::doorbell_admission`] grants — a
-/// pane fit for the doorbell, as of one event count.
+/// pane fit for the doorbell, as of one event count, and how far its
+/// generation has shown it is ready (part 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DoorbellAdmission {
     epoch: u64,
+    readiness: ReadinessLevel,
+}
+
+impl DoorbellAdmission {
+    /// How far the admitted generation's own hooks have shown it is ready.
+    pub fn readiness(&self) -> ReadinessLevel {
+        self.readiness
+    }
+
+    /// Whether `now`, asked again before a later step of the write this
+    /// admission was decided on, still grants it: the same event count, and
+    /// readiness no lower. A generation that shows more readiness while the
+    /// write is in flight (its own Idle arriving) does not stop it; any
+    /// change to what the pane's cards present does.
+    pub fn still_holds(&self, now: &DoorbellAdmission) -> bool {
+        now.epoch == self.epoch && now.readiness >= self.readiness
+    }
+}
+
+/// PRD #1666 part 2 (`inbox/doorbell/008`): how far an agent generation has
+/// shown, by its OWN reports, that it takes input — the readiness the doorbell
+/// needs, kept apart from the Idle a card presents. A placeholder card, the
+/// shell monitor's frames and a wrapper's boot report present Idle without
+/// establishing any of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ReadinessLevel {
+    /// Nothing from the generation's own hooks. Only an agent whose writer
+    /// recognises its empty composer on screen (Codex) may be rung, and only
+    /// while it does.
+    Unproven,
+    /// Its own `SessionStart`, from an agent that posts it before its prompt
+    /// is up (Claude Code): ready once the writer recognises that prompt on
+    /// screen ([`crate::agent_registry::AgentSpec::doorbell_ready_screen`]).
+    StartedOnScreen,
+    /// Its own Idle, or its own `SessionStart` from an agent with no ready
+    /// screen of its own to wait for.
+    Ready,
+}
+
+/// What one generation's own hooks have shown ([`AppState::pane_doorbell_ready`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GenerationReadiness {
+    agent_id: String,
+    /// The type its own report named, which says what its `SessionStart` is
+    /// worth.
+    agent_type: AgentType,
+    /// Its own Idle has arrived, not only its `SessionStart`.
+    idled: bool,
+}
+
+/// Recognises, in a pane's screen rows, what an agent shows when it is ready
+/// ([`crate::agent_registry::AgentSpec::doorbell_ready_screen`]).
+pub type ScreenRecogniser = fn(&[String]) -> bool;
+
+/// How many generations per pane [`AppState::pane_doorbell_ready`] keeps: the
+/// live one and the few before it whose late reports can still arrive.
+const MAX_READINESS_GENERATIONS: usize = 4;
+
+/// One generation's own report of readiness ([`readiness_report`]).
+struct ReadinessReport {
+    pane_id: String,
+    agent_id: String,
+    agent_type: AgentType,
+    idled: bool,
+}
+
+/// PRD #1666 part 2: what `event` shows of its generation's readiness, when it
+/// is one of that generation's own reports — not a wrapper's start or
+/// classified output, not a daemon-synthetic frame (the shell monitor's pair
+/// among them) — and shows it: a
+/// `SessionStart` or an Idle naming its pane and its generation.
+fn readiness_report(event: &AgentEvent) -> Option<ReadinessReport> {
+    let idled = match event.event_type {
+        EventType::Idle => true,
+        EventType::SessionStart => false,
+        _ => return None,
+    };
+    if event.is_wrapper_session_start()
+        || event.is_wrapper_output_classified()
+        || event.is_daemon_synthetic()
+    {
+        return None;
+    }
+    Some(ReadinessReport {
+        pane_id: event.pane_id.clone()?,
+        agent_id: event.agent_id.clone()?,
+        agent_type: event.agent_type.clone(),
+        idled,
+    })
 }
 
 /// Bytes of the human-readable half of a role slug that survive into the
@@ -6338,6 +6574,10 @@ fn card_inbox_of(event: &AgentEvent) -> Option<crate::inbox_display::CardInbox> 
         .metadata
         .get(crate::inbox_display::CARD_INBOX_DEGRADED_METADATA_KEY)
         .cloned();
+    inbox.integration_command = event
+        .metadata
+        .get(crate::inbox_display::CARD_INBOX_COMMAND_METADATA_KEY)
+        .cloned();
     Some(inbox)
 }
 
@@ -6374,6 +6614,12 @@ fn set_card_inbox(session: &mut SessionState, inbox: crate::inbox_display::CardI
         metadata.insert(
             crate::inbox_display::CARD_INBOX_DEGRADED_METADATA_KEY.to_string(),
             error.clone(),
+        );
+    }
+    if let Some(command) = &inbox.integration_command {
+        metadata.insert(
+            crate::inbox_display::CARD_INBOX_COMMAND_METADATA_KEY.to_string(),
+            command.clone(),
         );
     }
     session.recent_events.push_back(AgentEvent {
@@ -6605,6 +6851,7 @@ impl PaneInbox {
             not_started: count(|kind| kind == AttentionKind::NotStarted),
             held_long: count(|kind| kind == AttentionKind::HeldLong),
             integration: self.notices.integration,
+            integration_command: self.notices.integration_command.clone(),
             evidence_paused: self.notices.evidence_paused,
             receipts_degraded: self.notices.receipts_degraded.clone(),
         }
@@ -7157,12 +7404,74 @@ impl AppState {
     /// again right before each byte and get the SAME admission back only when
     /// nothing the doorbell reads has changed since the decision — not even a
     /// turn that started and ended in between.
+    ///
+    /// Part 2 (`inbox/doorbell/008`): the Idle a card presents is not the
+    /// generation's readiness. The admission carries that separately
+    /// ([`DoorbellAdmission::readiness`], from [`Self::doorbell_readiness`]),
+    /// and the doorbell and its writer withhold every byte from a generation
+    /// whose readiness is short of what its agent needs. It is read from the
+    /// generation's own reports alone, never from how long its card or
+    /// process has existed.
     pub fn doorbell_admission(&self, agent_id: &str, pane_id: &str) -> Option<DoorbellAdmission> {
         (self.agent_doorbell_idle(agent_id, pane_id)
             && self.pane_writable(pane_id) == Writable::Live)
             .then(|| DoorbellAdmission {
                 epoch: self.pane_event_epochs.get(pane_id).copied().unwrap_or(0),
+                readiness: self.doorbell_readiness(agent_id, pane_id).0,
             })
+    }
+
+    /// PRD #1666 part 2 (`inbox/doorbell/008`): how far generation `agent_id`
+    /// in `pane_id` has shown, by its own hooks, that it takes input, and, for
+    /// [`ReadinessLevel::StartedOnScreen`], the screen that completes it.
+    /// [`ReadinessLevel::Ready`] after its own Idle, or after its own
+    /// `SessionStart` when its agent has no ready screen to wait for;
+    /// [`ReadinessLevel::Unproven`] with neither, whatever its card presents.
+    pub fn doorbell_readiness(
+        &self,
+        agent_id: &str,
+        pane_id: &str,
+    ) -> (ReadinessLevel, Option<ScreenRecogniser>) {
+        let Some(generation) = self
+            .pane_doorbell_ready
+            .get(pane_id)
+            .and_then(|generations| generations.iter().find(|g| g.agent_id == agent_id))
+        else {
+            return (ReadinessLevel::Unproven, None);
+        };
+        if generation.idled {
+            return (ReadinessLevel::Ready, None);
+        }
+        match crate::agent_registry::spec(&generation.agent_type).doorbell_ready_screen {
+            Some(screen) => (ReadinessLevel::StartedOnScreen, Some(screen)),
+            None => (ReadinessLevel::Ready, None),
+        }
+    }
+
+    /// PRD #1666 part 2: fold one generation's own report of readiness
+    /// ([`readiness_report`]) into [`Self::pane_doorbell_ready`].
+    fn note_generation_readiness(&mut self, report: ReadinessReport) {
+        let generations = self.pane_doorbell_ready.entry(report.pane_id).or_default();
+        match generations
+            .iter_mut()
+            .find(|g| g.agent_id == report.agent_id)
+        {
+            Some(generation) => {
+                generation.idled |= report.idled;
+                generation.agent_type = report.agent_type;
+            }
+            None => {
+                generations.insert(
+                    0,
+                    GenerationReadiness {
+                        agent_id: report.agent_id,
+                        agent_type: report.agent_type,
+                        idled: report.idled,
+                    },
+                );
+                generations.truncate(MAX_READINESS_GENERATIONS);
+            }
+        }
     }
 
     pub fn agent_status(&self, agent_id: &str, pane_id: &str) -> Option<SessionStatus> {
@@ -7559,6 +7868,7 @@ impl AppState {
         self.untagged_status_panes.remove(pane_id);
         self.waiting_superseded_sessions.remove(pane_id);
         self.pane_event_epochs.remove(pane_id);
+        self.pane_doorbell_ready.remove(pane_id);
     }
 
     /// Issue #697: apply the daemon's announcement that it evicted the unproven
@@ -7785,24 +8095,252 @@ impl AppState {
         }
     }
 
+    /// PRD #1666 part 2 (G-fix7): the event stream feeding this state now comes
+    /// from the daemon process `incarnation` ([`Self::stream_incarnation`]).
+    /// G-fix7c: every card learned from another named process is dropped and
+    /// queued for the notice ([`Self::pending_restart_drops`]): the deck that
+    /// ran its agent was replaced, and an agent the new process lists under the
+    /// same pane or agent id is an unrelated one. Answers the panes those cards
+    /// were on, for [`Self::seed_successor_cards`].
+    ///
+    /// Cards learned from no named process are kept: a client draws them
+    /// before any stream is open — for a pane it started or attached itself,
+    /// whose own attach record binds it — and a gated client sends nothing for
+    /// one that has none.
+    ///
+    /// G-fix7d: the stream's previous named process — the one before a gap
+    /// included — is recorded as replaced ([`Self::replaced_processes`]), and a
+    /// process a stream opened on is live, so it is not.
+    ///
+    /// G-fix7e: each held placeholder ([`Self::held_placeholders`]) is settled
+    /// once a stream opens on a named process: drawn when it was learned from
+    /// that process, and otherwise stale — queued for the notice as
+    /// [`Self::insert_placeholder_session_learned`] queues one, without
+    /// recording its process as replaced.
+    pub fn learn_stream_incarnation(&mut self, incarnation: Incarnation) -> Vec<String> {
+        if let Some(process) = incarnation.as_deref() {
+            if let Some(previous) = self.last_stream_process.as_deref()
+                && previous != process
+            {
+                let previous = previous.to_string();
+                self.note_process_replaced(previous);
+            }
+            self.replaced_processes
+                .retain(|replaced| replaced != process);
+            self.last_stream_process = incarnation.clone();
+        }
+        self.stream_incarnation = incarnation;
+        let stream = self.stream_incarnation.clone();
+        let panes = self.drop_cards_replaced_by(&stream, None, None);
+        if !stream.is_unnamed() {
+            for held in std::mem::take(&mut self.held_placeholders) {
+                if held.learned_from.same_process(&stream) {
+                    self.draw_placeholder(
+                        held.pane_id,
+                        held.cwd,
+                        held.agent_type,
+                        held.agent_id,
+                        held.learned_from,
+                    );
+                } else {
+                    self.queue_stale_placeholder(held);
+                }
+            }
+        }
+        panes
+    }
+
+    /// PRD #1666 part 2 (G-fix7d): whether the deck is known to have replaced
+    /// the daemon process `process` ([`Self::replaced_processes`]). Never for
+    /// an unnamed one.
+    pub fn process_replaced(&self, process: &Incarnation) -> bool {
+        process
+            .as_deref()
+            .is_some_and(|process| self.replaced_processes.iter().any(|p| p == process))
+    }
+
+    fn note_process_replaced(&mut self, process: String) {
+        if self.replaced_processes.contains(&process) {
+            return;
+        }
+        if self.replaced_processes.len() >= MAX_REPLACED_PROCESSES {
+            self.replaced_processes.remove(0);
+        }
+        self.replaced_processes.push(process);
+    }
+
+    /// Drop every card learned from a named process other than `process` — on
+    /// `pane` only, or under `key` only, when either is given — queue each for
+    /// the render loop ([`Self::pending_restart_drops`]), and answer the panes
+    /// they were on. No stop, close or cleanup is asked of the daemon. Nothing
+    /// is dropped while `process` names none, or names one the deck is known
+    /// to have replaced: a late answer from a replaced process is no evidence
+    /// that anything newer is gone (G-fix7d). Only the stream's own process is
+    /// passed (G-fix7e), so a dropped card's process is the stream's earlier
+    /// one, which [`Self::learn_stream_incarnation`] records as replaced.
+    fn drop_cards_replaced_by(
+        &mut self,
+        process: &Incarnation,
+        pane: Option<&str>,
+        key: Option<&str>,
+    ) -> Vec<String> {
+        if self.agent_ownership.is_some() || process.is_unnamed() || self.process_replaced(process)
+        {
+            return Vec::new();
+        }
+        let mut replaced: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(id, card)| {
+                !card.incarnation.is_unnamed()
+                    && !card.incarnation.same_process(process)
+                    && (pane.is_none() && key.is_none()
+                        || pane.is_some_and(|pane| card.pane_id.as_deref() == Some(pane))
+                        || key.is_some_and(|key| id.as_str() == key))
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        // In key order, so the notice names them in an order that does not
+        // depend on the map's.
+        replaced.sort();
+        let mut panes = Vec::new();
+        for id in replaced {
+            let Some(card) = self.sessions.remove(&id) else {
+                continue;
+            };
+            self.forget_unproven_journal_count(&id);
+            panes.extend(card.pane_id.clone());
+            self.pending_restart_drops.push(RestartDroppedCard {
+                key: id,
+                held: true,
+                pane_id: card.pane_id,
+                agent_id: card.agent_id,
+                display_name: card.display_name,
+                agent_type: card.agent_type,
+                incarnation: card.incarnation,
+            });
+        }
+        panes
+    }
+
+    /// PRD #1666 part 2 (G-fix7c): drain the cards a deck restart took
+    /// ([`Self::pending_restart_drops`]) for the render loop.
+    pub fn take_restart_drops(&mut self) -> Vec<RestartDroppedCard> {
+        std::mem::take(&mut self.pending_restart_drops)
+    }
+
+    /// PRD #1666 part 2 (G-fix7): give the restarted deck's agent on each of
+    /// `panes` — whose cards [`Self::learn_stream_incarnation`] just dropped —
+    /// a card of its own from the stream's snapshot `records`, rather than
+    /// leaving the pane without one until that agent next reports. Only for a
+    /// pane this client manages that now has no card.
+    pub fn seed_successor_cards(
+        &mut self,
+        panes: &[String],
+        records: &[crate::agent_pty::AgentRecord],
+    ) {
+        for record in records {
+            let Some(pane_id) = record.pane_id_env.as_deref() else {
+                continue;
+            };
+            if !panes.iter().any(|pane| pane == pane_id)
+                || !self.managed_pane_ids.contains(pane_id)
+                || self
+                    .sessions
+                    .values()
+                    .any(|card| card.pane_id.as_deref() == Some(pane_id))
+            {
+                continue;
+            }
+            self.seed_hydrated_session(
+                pane_id.to_string(),
+                record.cwd.clone(),
+                record.agent_type.clone(),
+                Some(record.id.clone()),
+                record.live.as_ref(),
+            );
+        }
+    }
+
+    /// PRD #1666 part 2 (G-fix7f): give each agent the resync's snapshot
+    /// `records` lists on a pane with no card a card of its own, as the deck's
+    /// card-surfacing start would have drawn it had the stream been open when it
+    /// was broadcast. Without it an agent started while the stream was down —
+    /// across a deck restart, or a lagged stream — had no card until the TUI
+    /// restarted. An orchestration role's record is left alone: its tab is
+    /// built from the deck's surface, not from a listing.
+    ///
+    /// G-fix7g: its pane is admitted as that start would have admitted it
+    /// ([`Self::apply_event`]'s unmarked-start branch), so the agent's later
+    /// status reports reach the card and a later resync refreshes it. The card
+    /// keeps the stream's process: a report on a stream from another one drops
+    /// it instead ([`Self::drop_cards_replaced_by`]).
+    pub fn card_unseen_agents(&mut self, records: &[crate::agent_pty::AgentRecord]) {
+        if self.agent_ownership.is_some() {
+            return;
+        }
+        for record in records {
+            let Some(pane_id) = record.pane_id_env.as_deref() else {
+                continue;
+            };
+            if matches!(
+                record.tab_membership,
+                Some(crate::agent_pty::TabMembership::Orchestration { .. })
+            ) || self
+                .sessions
+                .values()
+                .any(|card| card.pane_id.as_deref() == Some(pane_id))
+            {
+                continue;
+            }
+            self.seed_hydrated_session(
+                pane_id.to_string(),
+                record.cwd.clone(),
+                record.agent_type.clone(),
+                Some(record.id.clone()),
+                record.live.as_ref(),
+            );
+            let name = record
+                .display_name
+                .as_deref()
+                .and_then(crate::untrusted_text::sanitize_display_name);
+            if let Some(card) = self
+                .sessions
+                .get_mut(&placeholder_session_id(pane_id))
+                .filter(|card| card.display_name.is_none())
+            {
+                card.display_name = name;
+            }
+            if let Ok(seq) = record.id.parse::<u64>() {
+                self.pane_surfaced_agent_seq
+                    .entry(pane_id.to_string())
+                    .or_insert(seq);
+            }
+            self.managed_pane_ids.insert(pane_id.to_string());
+        }
+    }
+
     /// PRD #120: record a daemon-spawned orchestration for the render loop to
     /// build into a live tab. Called from the event subscriber, which receives
     /// the [`BroadcastMsg::OrchestrationSurface`] but cannot touch the
     /// `TabManager` / pane controller (those live on the TUI render thread).
     pub fn queue_orchestration_surface(&mut self, surface: OrchestrationSurface) {
+        // PRD #1666 part 2 (G-fix6): the surface came on the stream open now.
+        let learned_from = self.stream_incarnation.clone();
         // PRD #120 L1: bound the queue. If it's already at the cap, drop the
         // OLDEST entry to make room — a flood can't grow it unbounded, and the
         // freshest dispatch is the one most worth surfacing. Log the drop so it
         // stays observable.
         if self.pending_orchestration_surfaces.len() >= MAX_PENDING_ORCHESTRATION_SURFACES {
-            let dropped = self.pending_orchestration_surfaces.remove(0);
+            let (dropped, _) = self.pending_orchestration_surfaces.remove(0);
             tracing::warn!(
                 orchestration = %dropped.name,
                 cap = MAX_PENDING_ORCHESTRATION_SURFACES,
                 "queue_orchestration_surface: pending queue at cap; dropping oldest surface"
             );
         }
-        self.pending_orchestration_surfaces.push(surface);
+        self.pending_orchestration_surfaces
+            .push((surface, learned_from));
     }
 
     /// Issue #717: record a worktree a close left on disk, for the render loop
@@ -7942,6 +8480,7 @@ impl AppState {
         // at 0 cannot satisfy an admission captured for the previous agent:
         // the doorbell's writer re-checks the agent that owns the pane.
         self.pane_event_epochs.remove(pane_id);
+        self.pane_doorbell_ready.remove(pane_id);
         if !self
             .sessions
             .values()
@@ -8022,6 +8561,94 @@ impl AppState {
         agent_type: Option<AgentType>,
         agent_id: Option<String>,
     ) -> String {
+        let learned_from = self.stream_incarnation.clone();
+        self.insert_placeholder_session_learned(pane_id, cwd, agent_type, agent_id, learned_from)
+    }
+
+    /// [`Self::insert_placeholder_session`] for a card learned from the daemon
+    /// process `learned_from` — the attach or start that produced a pane this
+    /// client started or attached itself (PRD #1666 part 2, G-fix7), rather
+    /// than the stream open now, which may still be the replaced process's.
+    ///
+    /// G-fix7e: on a client, only the event stream decides whether
+    /// `learned_from` is the process the deck runs now, so a placeholder never
+    /// drops a card and never records a process as replaced. One learned from
+    /// the stream's own process, or from no named process, is drawn. One
+    /// learned from a process the deck is known to have replaced
+    /// ([`Self::process_replaced`]) — an attach answered just before the
+    /// restart, whose card arrives after this state learned of it — is stale:
+    /// it is not drawn, and is queued for the render loop instead, which drops
+    /// the local attachment it came from and names its agent in the restart
+    /// notice. Any other one — while no stream is open, or while the stream
+    /// comes from another process — is held until the stream next opens
+    /// ([`Self::held_placeholders`]). The key is answered all the same; a stale
+    /// or held placeholder's is not in [`Self::sessions`].
+    pub fn insert_placeholder_session_learned(
+        &mut self,
+        pane_id: String,
+        cwd: Option<String>,
+        agent_type: Option<AgentType>,
+        agent_id: Option<String>,
+        learned_from: Incarnation,
+    ) -> String {
+        if self.agent_ownership.is_some()
+            || learned_from.is_unnamed()
+            || learned_from.same_process(&self.stream_incarnation)
+        {
+            return self.draw_placeholder(pane_id, cwd, agent_type, agent_id, learned_from);
+        }
+        let session_id = placeholder_session_id(&pane_id);
+        let held = HeldPlaceholder {
+            pane_id,
+            cwd,
+            agent_type,
+            agent_id,
+            learned_from,
+        };
+        if self.process_replaced(&held.learned_from) {
+            self.queue_stale_placeholder(held);
+            return session_id;
+        }
+        self.held_placeholders.retain(|other| {
+            other.pane_id != held.pane_id || !other.learned_from.same_process(&held.learned_from)
+        });
+        if self.held_placeholders.len() >= MAX_HELD_PLACEHOLDERS {
+            let dropped = self.held_placeholders.remove(0);
+            tracing::warn!(
+                pane_id = %dropped.pane_id,
+                cap = MAX_HELD_PLACEHOLDERS,
+                "insert_placeholder_session_learned: held placeholders at cap; letting the oldest go"
+            );
+        }
+        self.held_placeholders.push(held);
+        session_id
+    }
+
+    /// A placeholder learned from a process the deck replaced, for the render
+    /// loop to drop the local attachment it came from and to name its agent in
+    /// the restart notice ([`Self::pending_restart_drops`]).
+    fn queue_stale_placeholder(&mut self, held: HeldPlaceholder) {
+        self.pending_restart_drops.push(RestartDroppedCard {
+            key: placeholder_session_id(&held.pane_id),
+            held: false,
+            pane_id: Some(held.pane_id),
+            agent_id: held.agent_id,
+            display_name: None,
+            agent_type: held.agent_type.unwrap_or(AgentType::None),
+            incarnation: held.learned_from,
+        });
+    }
+
+    /// Draw the placeholder [`Self::insert_placeholder_session_learned`]
+    /// decided to draw.
+    fn draw_placeholder(
+        &mut self,
+        pane_id: String,
+        cwd: Option<String>,
+        agent_type: Option<AgentType>,
+        agent_id: Option<String>,
+        learned_from: Incarnation,
+    ) -> String {
         let session_id = placeholder_session_id(&pane_id);
         if agent_id.is_some()
             && let Some(existing) = self.sessions.iter().find_map(|(id, session)| {
@@ -8073,6 +8700,9 @@ impl AppState {
                 pending_question: None,
                 pull_request: None,
                 pull_request_revision: 0,
+                // G-fix6/G-fix7: the stream open now, or the attach that
+                // produced a pane this client started or attached itself.
+                incarnation: learned_from,
             },
         );
         if let Some((background, revision)) = held
@@ -8226,6 +8856,31 @@ impl AppState {
         agent_id: Option<String>,
         live: Option<&SessionSnapshot>,
     ) {
+        let learned_from = self.stream_incarnation.clone();
+        self.seed_hydrated_session_learned(pane_id, cwd, agent_type, agent_id, live, learned_from);
+    }
+
+    /// [`Self::seed_hydrated_session`] for a card learned from the daemon
+    /// process `learned_from` — the attach that produced it, at startup
+    /// hydration — rather than the stream open now (PR #1817 review
+    /// 4347247784). Startup hydration runs beside the first subscription, so
+    /// the stream may not have opened yet: the card is then drawn at once,
+    /// bound to its attach's process, and the stream's opening drops it if it
+    /// opens on another one ([`Self::learn_stream_incarnation`]). Bound to no
+    /// process, a later resync on the named stream would skip it. With a named
+    /// stream open it is [`Self::insert_placeholder_session_learned`]'s to
+    /// draw, hold or queue as stale; the snapshot and its hook generation then
+    /// reach only a card of this agent learned from `learned_from`, never a
+    /// successor's card that holds the key by now.
+    pub fn seed_hydrated_session_learned(
+        &mut self,
+        pane_id: String,
+        cwd: Option<String>,
+        agent_type: Option<AgentType>,
+        agent_id: Option<String>,
+        live: Option<&SessionSnapshot>,
+        learned_from: Incarnation,
+    ) {
         // The snapshot's event-derived agent_type wins; fall back to the
         // spawn-time value only when the snapshot has none (or is absent).
         let effective_agent_type = match live {
@@ -8240,9 +8895,36 @@ impl AppState {
         // Mint the placeholder exactly as today (PRD #110 agent_id,
         // started_at reuse, session_id), then overlay the live snapshot
         // fields when one is present.
-        let session_id =
-            self.insert_placeholder_session(pane_id.clone(), cwd, effective_agent_type, agent_id);
+        let session_id = if self.stream_incarnation.is_unnamed()
+            && !learned_from.is_unnamed()
+            && !self.process_replaced(&learned_from)
+        {
+            self.draw_placeholder(
+                pane_id.clone(),
+                cwd,
+                effective_agent_type,
+                agent_id.clone(),
+                learned_from.clone(),
+            )
+        } else {
+            self.insert_placeholder_session_learned(
+                pane_id.clone(),
+                cwd,
+                effective_agent_type,
+                agent_id.clone(),
+                learned_from.clone(),
+            )
+        };
         let Some(snap) = live else { return };
+        // PR #1817 review 4347247784: a stale or held placeholder's key is
+        // answered all the same, and may hold a successor's card by now. The
+        // snapshot, and the generation it carries, describe this attach's
+        // agent, so they reach only a card of that agent and process.
+        if !self.sessions.get(&session_id).is_some_and(|session| {
+            session.agent_id == agent_id && session.incarnation == learned_from
+        }) {
+            return;
+        }
         // The overlay below can push a live-target carrier onto the card's
         // journal outside the accounted path; recount it at the next pass.
         self.forget_unproven_journal_count(&session_id);
@@ -8441,6 +9123,15 @@ impl AppState {
                 .filter(|s| {
                     s.pane_id.as_deref() == Some(pane_id)
                         && s.agent_id.as_deref() == Some(record.id.as_str())
+                        // PRD #1666 part 2 (G-fix6): only a card learned from
+                        // the process that answered. A restarted daemon numbers
+                        // its agents again, so its record for this pane and id
+                        // can be an unrelated agent's; the old card is not
+                        // repainted as that agent. Unnamed on both sides is the
+                        // ungated client, whose stream names no process.
+                        && (s.incarnation.same_process(&self.stream_incarnation)
+                            || (s.incarnation.is_unnamed()
+                                && self.stream_incarnation.is_unnamed()))
                 })
                 .max_by(|a, b| {
                     a.last_activity
@@ -9438,6 +10129,7 @@ impl AppState {
         self.pane_surfaced_agent_seq.remove(pane_id);
         self.pane_inboxes.remove(pane_id);
         self.pane_event_epochs.remove(pane_id);
+        self.pane_doorbell_ready.remove(pane_id);
         self.pane_role_map.remove(pane_id);
         self.pane_cwd_map.remove(pane_id);
         self.orchestrator_pane_ids.remove(pane_id);
@@ -9491,7 +10183,20 @@ impl AppState {
             self.sessions.remove(&id);
             self.retire_removed_card_background(&id);
         }
+        // PRD #1666 part 2 (G-fix7f): and the cards still waiting to be drawn.
+        self.retire_held_placeholders(pane_id);
         n
+    }
+
+    /// PRD #1666 part 2 (G-fix7f): let go every placeholder held for `pane_id`
+    /// ([`Self::held_placeholders`]). Each was handed in by this client's own
+    /// attachment for that pane, so once the pane is closed, forgotten or lost
+    /// none of them has anything left to draw — and drawn when the stream next
+    /// opened on its process, it would bring back the card of an agent the user
+    /// closed, or name a dropped one in the restart notice a second time.
+    pub fn retire_held_placeholders(&mut self, pane_id: &str) {
+        self.held_placeholders
+            .retain(|held| held.pane_id != pane_id);
     }
 
     /// PRD #126 + #140: the **orchestration** cwd for `orchestrator_pane_id` —
@@ -11728,6 +12433,15 @@ impl AppState {
         mut event: AgentEvent,
         attested_agent: Option<&str>,
     ) -> AppliedEvent {
+        // PRD #1666 part 2 (G-fix7): a frame from the process the stream comes
+        // from never updates a card learned from another one. G-fix7c: such a
+        // card on the frame's pane or under its key is dropped first, so the
+        // restarted deck's agent gets a card of its own.
+        if self.agent_ownership.is_none() {
+            let stream = self.stream_incarnation.clone();
+            self.drop_cards_replaced_by(&stream, event.pane_id.as_deref(), None);
+            self.drop_cards_replaced_by(&stream, None, Some(&event.session_id));
+        }
         // PRD #1223: the daemon's pane-closed announcement is a statement ABOUT
         // a pane, not a producer's conversation ending, so none of the
         // `SessionEnd` machinery below applies to it — in particular its
@@ -13037,6 +13751,7 @@ impl AppState {
             .and_then(|pid| self.pane_started_at.get(pid))
             .copied();
 
+        let learned_from = self.stream_incarnation.clone();
         let session = self
             .sessions
             .entry(event.session_id.clone())
@@ -13071,6 +13786,8 @@ impl AppState {
                 pending_question: None,
                 pull_request: None,
                 pull_request_revision: 0,
+                // G-fix6: stamped once, from the stream this frame came on.
+                incarnation: learned_from,
             });
 
         // PRD #127 finding #2, reworked for PRD #284 sub-problem (d): seed the
@@ -13194,6 +13911,10 @@ impl AppState {
         // both are done with, just below.
         let provenance_pane = event.pane_id.clone();
         let provenance_untagged = event.agent_id.is_none();
+        // PRD #1666 part 2: the generation's own report of readiness, recorded
+        // once the `session` borrow is done. An outside card's frames speak for
+        // no deck generation.
+        let readiness = (!unproven).then(|| readiness_report(&event)).flatten();
 
         // Whether this frame ASSERTED a status, as opposed to leaving whatever
         // the session already had. Only an assertion may move the provenance
@@ -13314,6 +14035,9 @@ impl AppState {
         // frame. A frame that asserted nothing changes nothing here, so it can
         // neither launder an untagged status into a trusted one nor cast doubt
         // on a status it did not write.
+        if let Some(report) = readiness {
+            self.note_generation_readiness(report);
+        }
         if asserted_status && let Some(pane_id) = provenance_pane {
             if provenance_untagged {
                 self.untagged_status_panes.insert(pane_id);
@@ -18371,6 +19095,7 @@ mod tests {
                 pending_question: None,
                 pull_request: None,
                 pull_request_revision: 0,
+                incarnation: Default::default(),
             },
         );
 
@@ -19955,6 +20680,31 @@ mod tests {
         );
     }
 
+    /// Scenario: An agent's card is told its hooks run a dot-agent-deck too old for its messages, with the command the deck gives to fix them. The card's notice row names the hooks-too-old notice with that command, and still does after the card's journal has turned over.
+    #[test]
+    fn a_hooks_too_old_notice_carries_its_command_on_the_card() {
+        use crate::inbox_display::{IntegrationNotice::HooksTooOld, hooks_too_old_text};
+        let command = "/opt/deck/dot-agent-deck hooks install --agent claude-code";
+        let mut summary = held_summary(1, Some(HooksTooOld));
+        summary.notices.integration_command = Some(command.to_string());
+        let mut state = AppState::default();
+        state.apply_event(surfacing_start("pane-q", "agent-q", &summary));
+        let shown = || {
+            pane_card_inbox(&state, "pane-q")
+                .and_then(|inbox| inbox.notice_text())
+                .unwrap_or_default()
+        };
+        assert_eq!(shown(), hooks_too_old_text(Some(command)));
+        assert!(shown().contains(command), "{}", shown());
+        for secs in 0..(MAX_RECENT_EVENTS as i64 + 5) {
+            state.apply_event(quota_event(EventType::ToolStart, 10 + secs));
+        }
+        let shown = pane_card_inbox(&state, "pane-q")
+            .and_then(|inbox| inbox.notice_text())
+            .unwrap_or_default();
+        assert_eq!(shown, hooks_too_old_text(Some(command)));
+    }
+
     /// PRD #1666 §2.8 (reviewer R3fix5-02): a pane id reused by a new agent
     /// generation. Its surfacing start names the new agent (in its metadata,
     /// the start's own `agent_id` being `None`) with a clean inbox, so a late
@@ -20691,6 +21441,60 @@ mod tests {
             .collect();
         assert_eq!(cards.len(), 1, "one Codex pane keeps one card: {cards:#?}");
         cards[0].clone()
+    }
+
+    /// Scenario: Give a live pane a bare placeholder or only its own SessionStart, then age its session and pane timestamps by five seconds, one day and to the oldest representable startup without another agent signal. Aging must not change doorbell admission; the paired PTY pins require silence without own readiness, and an own Idle here must admit the pane at each age.
+    #[spec("inbox/doorbell/008")]
+    #[test]
+    fn doorbell_008_session_age_cannot_change_readiness() {
+        for session_start in [false, true] {
+            let now = Utc::now();
+            for old in [
+                now - chrono::TimeDelta::seconds(5),
+                now - chrono::TimeDelta::days(1),
+                DateTime::<Utc>::MIN_UTC,
+            ] {
+                let age_secs = (now - old).num_seconds();
+                let mut state = AppState::default();
+                state.register_pane("pane-x".into());
+                state.insert_placeholder_session(
+                    "pane-x".into(),
+                    None,
+                    Some(AgentType::ClaudeCode),
+                    Some("agent-x".into()),
+                );
+                let own_event = |kind| {
+                    let mut event = codex_status_frame(kind, false, 0);
+                    event.agent_type = AgentType::ClaudeCode;
+                    event.timestamp = Utc::now();
+                    event
+                };
+                if session_start {
+                    state.apply_event(own_event(EventType::SessionStart));
+                }
+                let fresh = state.doorbell_admission("agent-x", "pane-x").is_some();
+                // These are the actual wall-clock age sources, not the
+                // separate monotonic doorbell retry/stall decision clock.
+                for session in state.sessions.values_mut() {
+                    session.started_at = old;
+                    session.last_activity = old;
+                    for event in &mut session.recent_events {
+                        event.timestamp = old;
+                    }
+                }
+                state.pane_started_at.insert("pane-x".into(), old);
+                assert_eq!(
+                    state.doorbell_admission("agent-x", "pane-x").is_some(),
+                    fresh,
+                    "session age must not grant readiness: age={age_secs}s, SessionStart={session_start}"
+                );
+                state.apply_event(own_event(EventType::Idle));
+                assert!(
+                    state.doorbell_admission("agent-x", "pane-x").is_some(),
+                    "own Idle must admit the live pane at age={age_secs}s"
+                );
+            }
+        }
     }
 
     /// Scenario: a deck-launched Codex's native hooks start a session and

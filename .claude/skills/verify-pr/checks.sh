@@ -295,7 +295,7 @@ fi
 # docs/develop/e2e-lanes.md has the reasoning.
 
 if [ "$run_e2e" != true ]; then
-  skip e2e "not run locally — READ THE PR's e2e-deterministic CI run instead (gh pr checks <n>); pass --e2e to run it here"
+  skip e2e "not run locally — READ THE PR's e2e-deterministic CI run, or RWX: linux when .github/ci-backend says rwx, instead (gh pr checks <n>); pass --e2e to run it here"
 elif ! wanted e2e; then
   skip e2e "not in --only"
 elif [ "$build_ok" != true ]; then

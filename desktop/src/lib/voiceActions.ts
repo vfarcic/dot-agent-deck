@@ -120,6 +120,13 @@ export type AgentViewTarget = {
   deckId: string;
   agentId: string;
   from: "deck" | "overview";
+  /**
+   * PRD #1666 part 2 (G-fix6): the daemon process that listed the agent, from
+   * an opener that holds its record. Absent where only the ids are known (a
+   * row resolved by number); the shell then binds the view to the record
+   * listed when it is opened.
+   */
+  incarnation?: string;
 };
 
 /** One agent, named the way every caller here names one. */
@@ -339,14 +346,16 @@ export type VoiceActionContext = {
   closeSettings: () => void;
   /**
    * PR #1680 review — close the topmost of the app's overlays when it is one
-   * with no member of its own: the deck's command menu, its shortcut sheet, or
-   * a configuration sheet.
+   * with no member of its own: the deck's command menu, its shortcut sheet, a
+   * configuration sheet, or a confirmation or upgrade dialog (issue #1709).
+   * Answers the sentence saying why when it cannot close yet — an upgrade
+   * still running — and `undefined` (or nothing) when it closed.
    *
    * **Served by the SHELL, and only while such an overlay is on top**, read
    * from the fence's stack (`useInertBackground`) at dispatch time, for
    * {@link dismissVoiceOverlay}'s reason.
    */
-  closeOverlay: () => void;
+  closeOverlay: () => string | void;
   /**
    * Open the New agent dialog (PRD #1223), with `deckId` preselected when the
    * control that opened it belongs to one deck — a deck group's header.
@@ -584,7 +593,7 @@ export const VOICE_ACTIONS = {
          carries `agentLabel` as well, which belongs to the dictation row and
          not in a `DeckView` — a spread would put it in the app's view state,
          where nothing reads it and everything compares it. */
-      context.navigate({ kind: "agent", deckId: target.deckId, agentId: target.agentId, from: target.from });
+      context.navigate({ kind: "agent", deckId: target.deckId, agentId: target.agentId, from: target.from, ...("incarnation" in target ? { incarnation: target.incarnation } : {}) });
     },
   },
 
@@ -757,7 +766,11 @@ export const VOICE_ACTIONS = {
         return;
       }
       if (context.closeSettings) return context.closeSettings();
-      if (context.closeOverlay) return context.closeOverlay();
+      if (context.closeOverlay) {
+        const refused = context.closeOverlay();
+        if (typeof refused === "string") context.reportRefused(refused);
+        return;
+      }
       if (target.agentViewOpen) return context.closeAgentView();
       if (context.closeHostMetrics) return context.closeHostMetrics();
       context.reportNothingToClose();
@@ -1415,6 +1428,13 @@ export type VoiceDispatchTarget = AgentViewTarget & {
    * whose daemon reported no orchestration id is still a card (PRD #1223).
    */
   orchestrationAgentId?: string;
+  /**
+   * PRD #1666 part 2 (G-fix7) — the daemon process that listed
+   * {@link orchestrationAgentId} when the utterance was declared. A close
+   * confirms only the card whose member that process still lists; absent
+   * where the declaration did not list it.
+   */
+  orchestrationIncarnation?: string;
   /**
    * The words to type into the open agent's prompt, for the dictation row
    * (PRD #802 D6, rebuilt).

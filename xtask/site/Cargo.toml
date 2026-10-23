@@ -22,3 +22,9 @@ toml = "1.0"
 
 [dev-dependencies]
 tempfile = "3"
+
+# /code-cleanup's false positives for cargo-shear (issue #1819). `toml` is used
+# only by the `#[path]`-shared `src/published_docs.rs` (see `[dependencies]`),
+# which cargo-shear does not follow, so it reports the crate as unused.
+[package.metadata.cargo-shear]
+ignored = ["toml"]

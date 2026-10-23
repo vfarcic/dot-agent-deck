@@ -370,6 +370,23 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// unversioned hook socket is declared separately, as
 /// `1666-inbox-replaces-typed-delivery` in [`CONTRACT_BREAKS`].
 ///
+/// **11 → 12 (PRD #1666 part 2).** 11 shipped in `v0.47.0`, so part 2 cannot
+/// ride it. The bump is for one shape change on the attach wire: the agent
+/// card's integration notice gained the value `hooks_too_old`
+/// ([`crate::inbox_display::IntegrationNotice::HooksTooOld`]), a new value of
+/// a serialized enum that a 0.47.0 reader has no fallback for. It rides the
+/// `inbox` and `inbox-handover` broadcasts and the inbox summary on an agent
+/// record, so a 0.47.0 client would fail to decode the very event that tells
+/// it how to recover. The meanings that moved behind the unversioned hook
+/// socket are declared separately in [`CONTRACT_BREAKS`]:
+/// `1666-claude-one-shot-receipts` and
+/// `1666-explicit-ack-requires-handed-attempt`. The hook socket's own skew,
+/// a newer hook against an older daemon, is not something this number can
+/// refuse — a one-shot CLI runs no handshake — so it is closed on that socket:
+/// a one-shot asks `inbox_receipts` and sends its request only to a daemon
+/// that answers [`crate::inbox_hub::ONE_SHOT_RECEIPTS`], on verbs an older
+/// daemon cannot decode.
+///
 /// **PRD #1105 narrows the bump rule the paragraphs above restate, and
 /// contributes no bump of its own for [`AttachRequest::FocusGained`].** The 10
 /// is issue #1049's, for `StopDaemon`. `focus-gained` ships under that number
@@ -573,10 +590,18 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// The check is written at each site rather than shared, because it is one
 /// equality; the two are meant to stay the same rule, and a directional one was
 /// rejected for the reason `build_version_handshake`'s `ProtocolCheck` gives.
+/// PRD #1666 part 2 (`lifecycle/handshake/011`): both clients re-run that
+/// check when a daemon replaced mid-session is reached again. The TUI's event
+/// subscriber and its panes' auto-reattach ask
+/// [`crate::daemon_client::DaemonClient::check_protocol`] before they
+/// subscribe or attach, and a mismatch attaches nothing and shows a refusal
+/// naming both numbers; the desktop drops an endpoint's held handshake when a
+/// terminal stream or its event watcher's subscription ends, so the next
+/// attach classifies the daemon then answering.
 /// What it does **not** cover: the one-shot CLI subcommands (`delegate`,
 /// `work-done`, `agent-event`, `daemon status`, …), which send their request
-/// without that handshake, and a TUI whose daemon is replaced mid-session, whose
-/// reconnects do not re-run it.
+/// without that handshake, and the TUI's other requests (a listing, a resize,
+/// a start), which are sent on whatever answers without a check of their own.
 ///
 /// Before #491, [`crate::connect::probe_remote_protocol`] compared a remote's
 /// `server_version` against the laptop's and hard-failed on a difference, and
@@ -593,7 +618,7 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// deliberately not on. The bump is what makes a skew *nameable* — the number
 /// the handshake reports and `daemon hello` prints — and, at the two sites
 /// above, what makes it *refused*.
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// The attach-protocol version the daemon's `Hello` handler advertises as
 /// [`AttachResponse::server_version`]. [`PROTOCOL_VERSION`] in every shipped
@@ -1519,6 +1544,24 @@ pub const CONTRACT_BREAKS: &[&str] = &[
     // extension predate the inbox gets the doorbell instead of the typed task. Listed beside the bump for #1049's
     // reason: `changelog.d/1666.breaking.md` exists.
     "1666-inbox-replaces-typed-delivery",
+    // PRD #1666 part 2, beside the 11 -> 12 bump. Claude Code's once-waiter
+    // and prompt hook become one-shot receivers on receipts: each block is
+    // handed over on an attempt the deck issued, the waiter's block is
+    // committed by the exact attempt a later prompt carries, a hook's by
+    // writing it whole, and a lost one repeats marked or turns uncertain
+    // instead of being re-sent after the ack-wait. The receiver floor refuses
+    // an older hook (`hooks_too_old`), and a newer hook asks the daemon first
+    // and takes nothing from one that does not serve receipts. An older
+    // prompt hook beside a newer waiter still settles by the broad `ack <id>`,
+    // an accepted downgrade. A new entry rather than the one above, because
+    // both builds already carry that one.
+    "1666-claude-one-shot-receipts",
+    // PRD #1666 part 2. An explicit `ack <id>` used to settle the message's
+    // newest attempt; it now settles the newest attempt that may have reached
+    // the agent, and is refused (`unknown`) when every attempt is positively
+    // not handed. Same request, same reply type; what moved is which acks
+    // settle, for OpenCode and Pi as well as Claude Code.
+    "1666-explicit-ack-requires-handed-attempt",
 ];
 
 /// What comparing this build's [`CONTRACT_BREAKS`] against a peer's found.
@@ -3815,17 +3858,111 @@ pub struct AttachResponse {
 
 /// PRD #1487: this daemon process's identity for [`AttachResponse::instance_id`]
 /// — 16 bytes of OS randomness, hex-encoded, minted on first use and fixed for
-/// the life of the process (an `exec` into a successor mints a new one).
-/// `None` when OS randomness is unavailable, which a client reads as a daemon
-/// that does not say.
-pub fn daemon_instance_id() -> Option<&'static str> {
-    static ID: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+/// the life of the process. An `exec` into a successor mints a new random one;
+/// the kernel fallback below does not (G-fix7: it keeps its pid and start time
+/// across an `exec`).
+///
+/// PRD #1666 part 2 (G-fix6): when OS randomness is unavailable, the identity
+/// is the kernel's own name for this process ([`process_identity`]), and where
+/// there is none the process has no identity at all. The daemon checks this at
+/// startup ([`try_daemon_instance_id`]) and refuses to start without one, so a
+/// running daemon always names itself. This accessor is for code that runs
+/// after that check, or in a test, and panics in a process that has none.
+pub fn daemon_instance_id() -> &'static str {
+    try_daemon_instance_id()
+        .unwrap_or_else(|reason| panic!("this process has no daemon identity: {reason}"))
+}
+
+/// PRD #1666 part 2 (G-fix6): [`daemon_instance_id`], or why this process
+/// cannot have one — OS randomness failed, and so did the platform's process
+/// identity. Minted once; every call answers the same.
+pub fn try_daemon_instance_id() -> Result<&'static str, &'static str> {
+    static ID: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
     ID.get_or_init(|| {
         let mut bytes = [0u8; 16];
-        getrandom::fill(&mut bytes).ok()?;
-        Some(bytes.iter().map(|b| format!("{b:02x}")).collect())
+        mint_instance_id(
+            getrandom::fill(&mut bytes).ok().map(|()| bytes),
+            process_identity,
+        )
     })
-    .as_deref()
+    .as_ref()
+    .map(String::as_str)
+    .map_err(String::as_str)
+}
+
+/// [`try_daemon_instance_id`]'s choice: the random bytes hex-encoded when there
+/// are some, and `fallback` otherwise.
+fn mint_instance_id(
+    random: Option<[u8; 16]>,
+    fallback: impl FnOnce() -> Result<String, String>,
+) -> Result<String, String> {
+    match random {
+        Some(bytes) => Ok(bytes.iter().map(|b| format!("{b:02x}")).collect()),
+        None => fallback(),
+    }
+}
+
+/// PRD #1666 part 2 (G-fix6): this process's identity without randomness.
+///
+/// On Linux it is the kernel's boot id (`/proc/sys/kernel/random/boot_id`, new
+/// on every boot), this process's pid, and its start time in clock ticks since
+/// boot (field 22 of `/proc/self/stat`) — [`process_identity_of`]. It tells a
+/// daemon from a successor started as a new process in the same pid namespace:
+/// within a boot a live pid names one process, and a process given a recycled
+/// pid starts at a later tick unless the pid space wraps within one tick;
+/// across boots the boot id differs. No wall clock is read, so a clock step
+/// cannot repeat it.
+///
+/// G-fix7, what it does not tell apart: an `exec` keeps the pid and the start
+/// time, so a daemon that execs into a successor names the same identity; and
+/// two pid namespaces on one boot can hold equal local pids started at the
+/// same tick. The daemon does not re-exec itself; a daemon replaced across pid
+/// namespaces behind one socket is not covered by this fallback.
+///
+/// Elsewhere (macOS, Windows) this build reads no such source, and answers
+/// why. That is reached only when OS randomness itself has failed: the daemon
+/// then refuses to start rather than name itself with a value a successor
+/// could repeat, since the gated interactive clients, the TUI and the desktop
+/// app, would refuse to act on its unnamed agents anyway.
+fn process_identity() -> Result<String, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .map_err(|e| format!("OS randomness failed and the boot id is unreadable: {e}"))?;
+        let stat = std::fs::read_to_string("/proc/self/stat")
+            .map_err(|e| format!("OS randomness failed and /proc/self/stat is unreadable: {e}"))?;
+        process_identity_of(&boot_id, std::process::id(), &stat)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(
+            "OS randomness failed, and this platform offers this build no other \
+             process identity"
+                .to_string(),
+        )
+    }
+}
+
+/// [`process_identity`] from its inputs: the boot id, the pid, and the text of
+/// `/proc/<pid>/stat`, whose start time is the 20th field after the
+/// parenthesised command name (which may itself hold spaces and parentheses,
+/// so the fields are counted from its last `)`). The `boot-` prefix keeps it
+/// apart from the 32 hex characters of a random identity. Only Linux reads
+/// these inputs; the tests run it on every platform.
+#[cfg(any(target_os = "linux", test))]
+fn process_identity_of(boot_id: &str, pid: u32, stat: &str) -> Result<String, String> {
+    let boot_id = boot_id.trim();
+    if boot_id.is_empty() {
+        return Err("OS randomness failed and the boot id is empty".to_string());
+    }
+    let start_ticks = stat
+        .rsplit_once(')')
+        .and_then(|(_, fields)| fields.split_whitespace().nth(19))
+        .and_then(|ticks| ticks.parse::<u64>().ok())
+        .ok_or_else(|| {
+            "OS randomness failed and this process's start time is unreadable".to_string()
+        })?;
+    Ok(format!("boot-{boot_id}-pid-{pid}-start-{start_ticks}"))
 }
 
 /// Issue #1045: which spelling of the prepare verb a request used, or a client
@@ -4014,9 +4151,11 @@ impl AttachResponse {
 
     /// PRD #1487: name this daemon process on a handshake reply
     /// ([`Self::instance_id`]). Only the live daemon's `Hello` handler calls
-    /// it.
+    /// it. A process with no identity, which the daemon refuses to start as
+    /// ([`try_daemon_instance_id`]), names none, and a client then sends no
+    /// action aimed at an agent it listed.
     pub fn with_instance_id(mut self) -> Self {
-        self.instance_id = daemon_instance_id().map(str::to_string);
+        self.instance_id = try_daemon_instance_id().ok().map(str::to_string);
         self
     }
 }
@@ -5203,6 +5342,8 @@ async fn handle_connection(
 
     match req {
         AttachRequest::ListAgents => {
+            #[cfg(feature = "e2e")]
+            crate::doorbell::record_for_test("list-agents");
             let mut records = registry.agent_records();
             // PRD #162: enrich each registry record with the daemon's live,
             // event-derived session state so a reconnecting TUI restores the
@@ -5393,6 +5534,8 @@ async fn handle_connection(
             client_seeded_kind,
             remember_command,
         } => {
+            #[cfg(feature = "e2e")]
+            crate::doorbell::record_for_test("start-agent");
             // PRD #92 F1 followup hardening: refuse to start a new agent
             // while the registry's `shutting_down` latch is set. The
             // latch is flipped at the start of `shutdown_all_graceful`
@@ -6368,6 +6511,8 @@ async fn handle_connection(
             geometry_updates,
             client_id,
         } => {
+            #[cfg(feature = "e2e")]
+            crate::doorbell::record_for_test(&format!("attach-stream {id}"));
             // PRD #882: both axes or neither. A half-declared viewport is a
             // client bug, and guessing the missing axis would register a
             // constraint the client never asked for — which under a
@@ -6494,9 +6639,13 @@ async fn handle_connection(
             write_resp(&mut stream, &resp).await?
         }
         AttachRequest::SubscribeEvents => {
+            #[cfg(feature = "e2e")]
+            crate::doorbell::record_for_test("subscribe-events");
             handle_subscribe_events(stream, event_tx).await?;
         }
         AttachRequest::SubscribeEventsWithSnapshot => {
+            #[cfg(feature = "e2e")]
+            crate::doorbell::record_for_test("subscribe-events-with-snapshot");
             handle_subscribe_events_with_snapshot(stream, event_tx, &registry, &state).await?;
         }
         AttachRequest::SubscribeTurnReplies { id } => {
@@ -6642,6 +6791,8 @@ async fn handle_connection(
             write_resp(&mut stream, &resp).await?;
         }
         AttachRequest::RunNow { name } => {
+            #[cfg(feature = "e2e")]
+            crate::doorbell::record_for_test("run-now");
             // PRD #127 M1.5: fire the task now (the `schedule run-now` door).
             // Both started and skipped-still-running mean the task IS
             // registered → ok=true (so `wait_for_schedule_registered` and the
@@ -8484,6 +8635,13 @@ async fn handle_attach_stream(
                     enqueue_reject(&reject_tx, b"history-only");
                     continue;
                 }
+                // PRD #1666 part 2 (`inbox/doorbell/031`): counted in flight
+                // from before it waits for the writer until it is written or
+                // refused, so a doorbell holding the writer between its steps
+                // withholds the rest rather than typing ahead of it.
+                let _in_flight = registry.human_frame_arriving(&pane_id);
+                #[cfg(feature = "e2e")]
+                crate::doorbell::record_for_test(&format!("human-arrived {pane_id}"));
                 let w = writer.lock().await;
                 // PRD #20 R20-006 (finding #7): RE-VALIDATE under the held writer,
                 // immediately before writing. A close/respawn (registry removal),
@@ -11113,6 +11271,7 @@ mod tests {
             pending_question: None,
             pull_request: None,
             pull_request_revision: 0,
+            incarnation: Default::default(),
         };
         let snap = session.live_snapshot();
         assert_eq!(
@@ -12168,6 +12327,58 @@ mod tests {
         assert_eq!(serde_json::to_value(back).unwrap(), value);
     }
 
+    /// Scenario: a daemon that cannot read OS randomness names itself from the kernel's boot id, its pid and its start tick, so two processes, a recycled pid starting later, and a later boot are all told apart; a boot id or start time it cannot read gives it no identity, which the daemon refuses to start without.
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_instance_id_without_randomness_is_the_kernels_process_identity() {
+        let random = mint_instance_id(Some([0xab; 16]), || unreachable!()).unwrap();
+        assert_eq!(random, "ab".repeat(16));
+        // `/proc/<pid>/stat`: pid, `(comm)` with a space and a `)` in it, then
+        // fields 3.. with the start time (field 22) set to `ticks`.
+        let stat = |pid: u32, ticks: u64| {
+            let mut fields = vec!["S".to_string()];
+            fields.extend((4..=21).map(|n| n.to_string()));
+            fields.push(ticks.to_string());
+            fields.extend((23..=30).map(|n| n.to_string()));
+            format!("{pid} (dot agent) deck) {}", fields.join(" "))
+        };
+        let boot = "6a1f0c2e-1111-4222-8333-944455556666\n";
+        let id = |boot: &str, pid, ticks| {
+            mint_instance_id(None, || process_identity_of(boot, pid, &stat(pid, ticks))).unwrap()
+        };
+        let a = id(boot, 41, 1_000);
+        assert_eq!(
+            a,
+            "boot-6a1f0c2e-1111-4222-8333-944455556666-pid-41-start-1000"
+        );
+        assert_ne!(a, id(boot, 42, 1_000), "two live processes differ by pid");
+        assert_ne!(
+            a,
+            id(boot, 41, 2_000),
+            "a recycled pid starts at a later tick"
+        );
+        assert_ne!(
+            a,
+            id("0f0f0f0f-2222-4333-8444-955566667777", 41, 1_000),
+            "a later boot differs by boot id"
+        );
+        assert_ne!(
+            a.len(),
+            random.len(),
+            "never mistaken for a random identity"
+        );
+        assert!(process_identity_of(" \n", 41, &stat(41, 1_000)).is_err());
+        assert!(process_identity_of(boot, 41, "41 (deck) S 1 2").is_err());
+        assert!(process_identity_of(boot, 41, "garbled").is_err());
+        #[cfg(target_os = "linux")]
+        assert!(
+            process_identity()
+                .unwrap()
+                .contains(&format!("-pid-{}-start-", std::process::id())),
+            "this process reads its own identity"
+        );
+    }
+
     #[test]
     fn instance_id_is_additive_and_names_this_process() {
         let plain = serde_json::to_value(AttachResponse::hello(PROTOCOL_VERSION)).unwrap();
@@ -12184,9 +12395,8 @@ mod tests {
             .instance_id
             .clone()
             .expect("this process has an identity");
-        assert_eq!(id.len(), 32);
-        assert!(id.chars().all(|c| c.is_ascii_hexdigit()), "{id}");
-        assert_eq!(daemon_instance_id(), Some(id.as_str()));
+        assert!(!id.is_empty());
+        assert_eq!(daemon_instance_id(), id.as_str());
         let back: AttachResponse =
             serde_json::from_str(&serde_json::to_string(&live).unwrap()).unwrap();
         assert_eq!(back.instance_id, Some(id));

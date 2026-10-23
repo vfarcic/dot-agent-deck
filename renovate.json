@@ -55,10 +55,96 @@
     {
       "customType": "regex",
       "description": "The tauri-driver version the desktop-driver job installs (issue #953), written once as `TAURI_DRIVER_VERSION: <X.Y.Z>` in that job's `env:`. It is not duplicated in devbox.json — CI installs it with `cargo install --locked` from crates.io and devbox carries no copy — so scripts/check-pin-lockstep.sh has no second site to compare it with; `desktop/scripts/driver-test.sh` reads this same line for a local run rather than restating the number, which is what keeps local and CI on one driver. No automerge rule matches it, so a bump waits for a human, which is right for the component that decides whether the flake-prone tier can even start a session.",
-      "managerFilePatterns": ["/^\\.github/workflows/[^/]+\\.ya?ml$/"],
+      "managerFilePatterns": ["/^\\.github/workflows/[^/]+\\.ya?ml$/", "/^\\.rwx/[^/]+\\.ya?ml$/"],
       "matchStrings": ["TAURI_DRIVER_VERSION:\\s*(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
       "datasourceTemplate": "crate",
       "depNameTemplate": "tauri-driver"
+    },
+    {
+      "customType": "regex",
+      "description": "The RWX configs (`.rwx/ci.yml`, `.rwx/sandbox.yml`, docs/develop/rwx.md) are a third place the toolchain is pinned, in their own syntax, so the workflow managers above do not match them. This one reads `rust-lang/install`'s `rust-version: <X.Y.Z>`. Same datasource and package as the workflow and Cargo.toml managers (devbox, `rustc`), so the `Rust toolchain (devbox, workflows and rust-version)` group offers all of them one version. scripts/check-pin-lockstep.sh compares these sites with devbox.json (its `--rwx-sites` mode), and `renovate_reads_exactly_the_rwx_sites_the_guard_finds` in xtask/linkage-check/src/pin_lockstep.rs requires this regex to extract exactly the sites the guard reads.",
+      "managerFilePatterns": ["/^\\.rwx/[^/]+\\.ya?ml$/"],
+      "matchStrings": ["rust-version:\\s*(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
+      "datasourceTemplate": "devbox",
+      "depNameTemplate": "rustc"
+    },
+    {
+      "customType": "regex",
+      "description": "The RWX configs (`.rwx/ci.yml`, `.rwx/sandbox.yml`, docs/develop/rwx.md) are a third place the toolchain is pinned, in their own syntax, so the workflow managers above do not match them. This one reads rustup's `--default-toolchain <X.Y.Z>`, the toolchain the cross-compiling RWX tasks install. Grouped and guarded as the `rust-version:` manager above.",
+      "managerFilePatterns": ["/^\\.rwx/[^/]+\\.ya?ml$/"],
+      "matchStrings": ["--default-toolchain\\s+(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
+      "datasourceTemplate": "devbox",
+      "depNameTemplate": "rustc"
+    },
+    {
+      "customType": "regex",
+      "description": "The RWX configs (`.rwx/ci.yml`, `.rwx/sandbox.yml`, docs/develop/rwx.md) are a third place the toolchain is pinned, in their own syntax, so the workflow managers above do not match them. This one reads the nextest download URL (`get.nexte.st/<X.Y.Z>/linux`). Same datasource as the workflow nextest manager (crate), so both arrive as one cargo-nextest update.",
+      "managerFilePatterns": ["/^\\.rwx/[^/]+\\.ya?ml$/"],
+      "matchStrings": ["get\\.nexte\\.st/(?<currentValue>\\d+\\.\\d+\\.\\d+)/"],
+      "datasourceTemplate": "crate",
+      "depNameTemplate": "cargo-nextest"
+    },
+    {
+      "customType": "regex",
+      "description": "The RWX configs (`.rwx/ci.yml`, `.rwx/sandbox.yml`, docs/develop/rwx.md) are a third place the toolchain is pinned, in their own syntax, so the workflow managers above do not match them. This one reads `npm install -g pnpm@<X.Y.Z>`. Same datasource and package as the workflow pnpm manager (devbox, `pnpm`), so the `pnpm (devbox and workflows)` group carries it.",
+      "managerFilePatterns": ["/^\\.rwx/[^/]+\\.ya?ml$/"],
+      "matchStrings": ["pnpm@(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
+      "datasourceTemplate": "devbox",
+      "depNameTemplate": "pnpm"
+    },
+    {
+      "customType": "regex",
+      "description": "The RWX configs (`.rwx/ci.yml`, `.rwx/sandbox.yml`, docs/develop/rwx.md) are a third place the toolchain is pinned, in their own syntax, so the workflow managers above do not match them. This one reads the go-task release URL (`go-task/task/releases/download/v<X.Y.Z>/`). devbox.json pins go-task too, and scripts/check-pin-lockstep.sh compares the two; the workflows install a floating `3.x` through arduino/setup-task, which pins nothing. Same datasource and package as devbox.json's (devbox, `go-task`), grouped with it by the `go-task (devbox and RWX)` rule.",
+      "managerFilePatterns": ["/^\\.rwx/[^/]+\\.ya?ml$/"],
+      "matchStrings": ["go-task/task/releases/download/v(?<currentValue>\\d+\\.\\d+\\.\\d+)/"],
+      "datasourceTemplate": "devbox",
+      "depNameTemplate": "go-task"
+    },
+    {
+      "customType": "regex",
+      "description": "The RWX configs (`.rwx/ci.yml`, `.rwx/sandbox.yml`, docs/develop/rwx.md) are a third place the toolchain is pinned, in their own syntax, so the workflow managers above do not match them. This one reads `nodejs/install`'s `node-version: \"<X.Y.Z>\"` (the package needs an exact version). The workflows' `actions/setup-node` and devbox.json's `nodejs_24` follow major 24 rather than pin a release, so there is nothing to keep in lockstep; a new major is held by the `major` rule.",
+      "managerFilePatterns": ["/^\\.rwx/[^/]+\\.ya?ml$/"],
+      "matchStrings": ["node-version:\\s*\"(?<currentValue>\\d+\\.\\d+\\.\\d+)\""],
+      "datasourceTemplate": "node-version",
+      "depNameTemplate": "node"
+    },
+    {
+      "customType": "regex",
+      "description": "The RWX configs (`.rwx/ci.yml`, `.rwx/sandbox.yml`, docs/develop/rwx.md) are a third place the toolchain is pinned, in their own syntax, so the workflow managers above do not match them. This one reads the Nix release the `nix-install` task installs (`NIX_VERSION: <X.Y.Z>`). Nothing else in the repository pins Nix. The task checks the tarball against a pinned SHA-256, so a bump PR also needs that checksum updated (the `.sha256` beside the tarball on releases.nixos.org); it fails until then, which is the point.",
+      "managerFilePatterns": ["/^\\.rwx/[^/]+\\.ya?ml$/"],
+      "matchStrings": ["NIX_VERSION:\\s*(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
+      "datasourceTemplate": "github-tags",
+      "depNameTemplate": "NixOS/nix"
+    },
+    {
+      "customType": "regex",
+      "description": "The RWX configs (`.rwx/ci.yml`, `.rwx/sandbox.yml`, docs/develop/rwx.md) are a third place the toolchain is pinned, in their own syntax, so the workflow managers above do not match them. This one reads the devbox CLI version the `devbox` task installs (`DEVBOX_USE_VERSION: <X.Y.Z>`). The task checks the release tarball against a pinned SHA-256, so a bump PR also needs that checksum updated (the release's checksums.txt).",
+      "managerFilePatterns": ["/^\\.rwx/[^/]+\\.ya?ml$/"],
+      "matchStrings": ["DEVBOX_USE_VERSION:\\s*(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "jetify-com/devbox"
+    },
+    {
+      "customType": "regex",
+      "description": "The RWX configs (`.rwx/ci.yml`, docs/develop/rwx.md) install rustup-init for the cross-compiling tasks at `RUSTUP_VERSION: <X.Y.Z>`, checked against a pinned SHA-256, so a bump PR also needs that checksum updated (`rustup-init.sha256` beside the binary on static.rust-lang.org).",
+      "managerFilePatterns": ["/^\\.rwx/[^/]+\\.ya?ml$/"],
+      "matchStrings": ["RUSTUP_VERSION:\\s*(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
+      "datasourceTemplate": "github-tags",
+      "depNameTemplate": "rust-lang/rustup"
+    },
+    {
+      "customType": "regex",
+      "description": "The `cross` version the aarch64 builds install: release.yml's aarch64 leg, the aarch64-crossbuild-check.yml check that exists to predict it, and `.rwx/ci.yml`'s `aarch64-crossbuild` task (docs/develop/rwx.md). One manager over the three files, so one PR moves all of them and the check keeps predicting the release build.",
+      "managerFilePatterns": ["/^\\.github/workflows/aarch64-crossbuild-check\\.yml$/", "/^\\.github/workflows/release\\.yml$/", "/^\\.rwx/ci\\.yml$/"],
+      "matchStrings": ["cargo install cross --locked --version (?<currentValue>\\d+\\.\\d+\\.\\d+)"],
+      "datasourceTemplate": "crate",
+      "depNameTemplate": "cross"
+    },
+    {
+      "customType": "regex",
+      "description": "The static tools `/code-cleanup` picks its targets from (issue #1819): cargo-shear, cargo-mutants and knip, each pinned once in `.claude/skills/code-cleanup/find-targets.sh` as `<NAME>_VERSION=<X.Y.Z>` under a `# renovate: datasource=<datasource> depName=<package>` comment, which is where this manager reads the datasource and package from. The script refuses a cargo tool installed at any other version, naming the `cargo install --locked` command for the pin, and runs knip as `pnpm dlx knip@<pin>`, so a bump here is the whole upgrade. `code_cleanup_009_renovate_reads_every_tool_pin` in xtask/linkage-check/src/code_cleanup_scope.rs runs this matchString over the real script and requires it to extract every pin, so a pin written in another layout goes red there instead of silently rotting.",
+      "managerFilePatterns": ["/^\\.claude/skills/code-cleanup/find-targets\\.sh$/"],
+      "matchStrings": ["#\\s*renovate:\\s*datasource=(?<datasource>[a-z-]+)\\s+depName=(?<depName>[a-z0-9-]+)\\s*\\n[A-Z_]+_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)"]
     }
   ],
   "packageRules": [
@@ -195,6 +281,20 @@
       "automerge": false,
       "labels": ["dependencies", "devbox", "manual-review"],
       "description": "Issue #1478: the Rust toolchain moves in ONE PR — devbox.json's rustc, cargo, clippy and rustfmt, every workflow `toolchain:` pin, and Cargo.toml's workspace `rust-version`. All of them are read from the devbox datasource, so a version is offered only once nixhub carries it. The workflow and rust-version sites read package `rustc`; the four devbox packages each read their own nixhub entry, and those four carried identical version lists when checked on 2026-10-02. If they ever diverge (clippy indexed at a release rustc is not, say), the grouped PR carries a subset and scripts/check-pin-lockstep.sh fails it, which is the safe direction: it then waits for the lagging package rather than pinning one devbox cannot install. Because the PR touches Cargo.toml and the workflows as well as devbox.json, ci.yml's `changes` gate does not classify it as devbox-only, so the required build jobs run on it. Held for a human like the rest of the toolchain pins: a toolchain bump is where new deny-by-default rustc lints and clippy lints arrive. Placed after the `Devbox toolchain packages` rule so its groupName overrides that rule's `groupName: null`, and before the release.yml artifact-actions hold, which the release-workflow wiring guard requires to stay the last rule."
+    },
+    {
+      "matchManagers": ["devbox", "custom.regex"],
+      "matchPackageNames": ["go-task"],
+      "groupName": "go-task (devbox and RWX)",
+      "automerge": false,
+      "labels": ["dependencies", "devbox", "manual-review"],
+      "description": "go-task is pinned in devbox.json and in the RWX configs, and scripts/check-pin-lockstep.sh fails when they disagree, so the two halves move as one PR, held for a human like the other lockstep classes. Without this rule devbox.json's half would ride the automerging `Devbox packages` group alone and leave the RWX half behind."
+    },
+    {
+      "matchFileNames": [".rwx/**"],
+      "automerge": false,
+      "labels": ["dependencies", "manual-review"],
+      "description": "Every version in the RWX configs is held for a human: they install the CI toolchain (docs/develop/rwx.md), and a bump there changes what a pull request is built and tested with, which no RWX run before the merge has proven."
     },
     {
       "matchUpdateTypes": ["lockFileMaintenance"],

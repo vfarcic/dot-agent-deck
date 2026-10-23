@@ -101,6 +101,12 @@ reason = "Dismisses the status toast: a dismissal."
 [[site]]
 file = "desktop/src/App.tsx"
 handler = "onClick"
+code = "onDismissRestart"
+reason = "Dismisses the toast naming the agents a deck restart stopped: a dismissal."
+
+[[site]]
+file = "desktop/src/App.tsx"
+handler = "onClick"
 code = "onClose"
 reason = "Events drawer close X: a dismissal (the drawer's opening half is VOICE_ACTIONS.toggleEvidenceDrawer)."
 
@@ -681,7 +687,7 @@ reason = "Confirmation dialog Cancel: a dismissal, not a capability."
 [[site]]
 file = "desktop/src/components/ConfirmDialog.tsx"
 handler = "onClick"
-code = "() => { setBusy(true); void state.action().finally(onClose); }"
+code = "confirm"
 reason = "Confirmation dialog Confirm button: runs the destructive action the opener staged. Kept manual by design: voice raises the same confirmation (`stop_agent`, `close_orchestration`) and the user confirms it by hand."
 
 # --- desktop/src/components/DeckSelector.tsx ---
