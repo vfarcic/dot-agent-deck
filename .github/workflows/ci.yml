@@ -831,9 +831,10 @@ jobs:
   #
   # That is deliberately NOT the wider claim "no agent credential reaches this
   # repository's CI", which is false: the agent PR reviewer
-  # (`pr-review-batch.yml` calling `pr-review.lock.yml`) hands the repository
-  # secret ANTHROPIC_API_KEY to Claude Code on a runner and genuinely reaches a
-  # real agent. That is a separate feature with its own design — the
+  # (`pr-review-batch.yml` calling `pr-review.lock.yml`) puts the repository
+  # secret ANTHROPIC_API_KEY on a runner and genuinely reaches a real agent:
+  # Claude Code calls the API through the gh-aw firewall's proxy, which keeps
+  # the raw key out of the agent's environment but not off the runner. That is a separate feature with its own design — the
   # "automated reviewer" section of `docs/develop/governance.md` — started by a
   # schedule or a manual dispatch rather than by a pull request, and out of
   # scope for the e2e lanes. Do not cite it as precedent for putting a test key

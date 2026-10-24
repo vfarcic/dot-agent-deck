@@ -47,7 +47,7 @@ Lane 1 is not a required status check. The required set is still `build`, `build
 
 **What CI still does for lane 2.** Exactly one thing, and it is load-bearing: `cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings` in the `clippy` job (aggregated into the required `build` check) **type-checks** every one of them. That is the only CI-side coverage they have. CLAUDE.md rule 2 says the same thing, and [`lint-gate.md`](lint-gate.md) has the evidence at length, because "simplify the feature list" is a plausible-looking edit that silently removes a third of the tier from every gate.
 
-**The verification gap is an accepted trade, not an oversight.** Nothing can force a contributor to run lane 2. The only thing that could is CI, and CI has no credentials by design. So real-agent regressions surface when someone happens to run them, not on any schedule. That cost was weighed against holding an API key in a public repository's CI and judged the cheaper side.
+**The verification gap is an accepted trade, not an oversight.** Nothing can force a contributor to run lane 2. The only thing that could is CI, and CI has no test credentials by design. So real-agent regressions surface when someone happens to run them, not on any schedule. That cost was weighed against holding an API key in a public repository's CI and judged the cheaper side.
 
 ## Running lane 2
 
