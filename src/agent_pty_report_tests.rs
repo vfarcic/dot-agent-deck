@@ -1367,6 +1367,59 @@ async fn work_done_053_l_an_unavailable_tracker_before_a_failure_writes_nothing(
     std::mem::forget(Arc::try_unwrap(team).ok());
 }
 
+/// Scenario: (n) A task report attests and is held before admission, and the registry's record table is poisoned while the report state stays whole. Released, the report reads `deck_unavailable`; the task is still open rather than owned by a save that does not exist, and the claims, the reply room, the store's reservations and its files are as they were.
+#[spec("orchestration/work-done/053")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn work_done_053_n_a_poisoned_record_table_refuses_before_any_claim() {
+    let team = Arc::new(team("wd053n"));
+    let task = team.delegate("a task");
+    team.acknowledge();
+    let state = |team: &Team, task: &str| {
+        let hub = team.registry().inbox();
+        (
+            team.effects(),
+            hub.reserved_replies(),
+            hub.read_reports(|r| match r.tasks.lookup(task) {
+                crate::report_recovery::TaskLookup::Open(t) => format!("{:?}", t.state),
+                _ => "not open".to_string(),
+            })
+            .unwrap(),
+            team.deck
+                .store
+                .counts()
+                .map(|c| (c.reserved_bytes, c.reserved_slots)),
+        )
+    };
+    let before = state(&team, &task);
+    let (reached, release) = team
+        .registry()
+        .pause_at_for_test(crate::task_completion::PAUSE_ATTESTED);
+    let report = {
+        let team = Arc::clone(&team);
+        let task = task.clone();
+        tokio::spawn(async move { team.report_task(&task, "done").await })
+    };
+    reached.await.unwrap();
+    let registry = Arc::clone(team.registry());
+    let _ = std::thread::spawn(move || {
+        let _held = registry.inner.lock();
+        panic!("poison the record table (test)");
+    })
+    .join();
+    release.send(()).unwrap();
+    let answer = reply(
+        tokio::time::timeout(Duration::from_secs(10), report)
+            .await
+            .expect("answered")
+            .expect("the report did not unwind"),
+    );
+    assert_eq!(answer.code.as_deref(), Some(code::DECK_UNAVAILABLE));
+    assert_eq!(state(&team, &task), before, "nothing was claimed or reserved");
+    // Leaked on purpose: the registry's own teardown panics on a poisoned
+    // lock, the documented boundary.
+    std::mem::forget(Arc::try_unwrap(team).ok());
+}
+
 /// Scenario: (h) the after-section helpers run only after the answer is handed over. While a helper is held inside `after_section`, the reporting connection already reads `accepted`. A helper that panics there leaves the answer `accepted`, the supervisor logs the save task's panic, and the deck goes on taking reports.
 #[spec("orchestration/work-done/053")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
