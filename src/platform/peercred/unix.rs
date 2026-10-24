@@ -98,18 +98,25 @@ pub fn peer_is_same_user(stream: &IpcStream) -> Option<bool> {
 /// not compile.
 #[cfg(target_os = "linux")]
 pub fn peer_pid(stream: &IpcStream) -> std::io::Result<u32> {
+    peer_pid_raw(stream.as_raw_fd())
+}
+
+/// [`peer_pid`] on a raw connected socket: PRD #1666 part 3, round 5-wake,
+/// the wrapper identifying the daemon on a blocking `std` socket.
+#[cfg(target_os = "linux")]
+pub fn peer_pid_raw(fd: std::os::unix::io::RawFd) -> std::io::Result<u32> {
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
     // SAFETY: `cred` is a freshly-zeroed `libc::ucred` allocated on the
     // stack and outlives the syscall; `len` tracks its size by value.
     // `getsockopt` writes at most `len` bytes into the pointee, which is
-    // exactly the layout libc guarantees for `ucred`. The fd comes from
-    // `AsRawFd` so it's owned by the caller for the duration of this
-    // call. No unwinding can leak resources because there are no Drop
+    // exactly the layout libc guarantees for `ucred`. The fd is the
+    // caller's, open for the duration of this call (a bad one is reported
+    // by the return code, not by a write). No unwinding can leak resources because there are no Drop
     // types involved.
     let rc = unsafe {
         libc::getsockopt(
-            stream.as_raw_fd(),
+            fd,
             libc::SOL_SOCKET,
             libc::SO_PEERCRED,
             &mut cred as *mut _ as *mut libc::c_void,
@@ -129,6 +136,12 @@ pub fn peer_pid(stream: &IpcStream) -> std::io::Result<u32> {
 /// output.
 #[cfg(target_os = "macos")]
 pub fn peer_pid(stream: &IpcStream) -> std::io::Result<u32> {
+    peer_pid_raw(stream.as_raw_fd())
+}
+
+/// See the Linux variant.
+#[cfg(target_os = "macos")]
+pub fn peer_pid_raw(fd: std::os::unix::io::RawFd) -> std::io::Result<u32> {
     let mut pid: libc::pid_t = 0;
     let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
     // SAFETY: `pid` is a stack-allocated `pid_t` that outlives the call;
@@ -138,7 +151,7 @@ pub fn peer_pid(stream: &IpcStream) -> std::io::Result<u32> {
     // of this call.
     let rc = unsafe {
         libc::getsockopt(
-            stream.as_raw_fd(),
+            fd,
             libc::SOL_LOCAL,
             libc::LOCAL_PEERPID,
             &mut pid as *mut _ as *mut libc::c_void,

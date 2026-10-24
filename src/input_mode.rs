@@ -318,3 +318,469 @@ pub fn monotonic_ns() -> Option<u64> {
     let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     (rc == 0).then(|| ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64)
 }
+
+/// What one supervisory tick of [`InputModeWatch`] produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tick {
+    /// A report to send.
+    Report(ModeSample),
+    /// A sample taken; the bits did not change and no re-assertion is due.
+    Unchanged,
+    /// The two stamps were out of order or further apart than
+    /// [`MODE_MAX_AGE_NS`]: discarded, since it would arrive stale anyway.
+    WideSample(ModeSample),
+    /// A clock read failed: no sample.
+    ClockFailed,
+    /// The `tcgetattr` failed: no sample.
+    TermiosFailed,
+}
+
+/// The wrapper's producer (plan §1.3): on each supervisory tick, read the
+/// clock, the inner PTY's two bits, and the clock again, and report on every
+/// change of either bit and every [`MODE_REASSERT`] whatever the bits.
+/// `seq` is assigned when the sample is taken, so a higher one is newer.
+#[derive(Debug, Default)]
+pub struct InputModeWatch {
+    next_seq: u64,
+    /// The bits and first stamp of the last report produced.
+    reported: Option<(bool, bool, u64)>,
+}
+
+impl InputModeWatch {
+    /// One tick: `clock` is read before and after `bits`, which returns
+    /// `(icanon, echo)` from the inner master, or `None` when it fails.
+    pub fn tick(
+        &mut self,
+        clock: &mut impl FnMut() -> Option<u64>,
+        bits: impl FnOnce() -> Option<(bool, bool)>,
+    ) -> Tick {
+        let Some(sampled) = clock() else {
+            return Tick::ClockFailed;
+        };
+        let Some((icanon, echo)) = bits() else {
+            return Tick::TermiosFailed;
+        };
+        let Some(done) = clock() else {
+            return Tick::ClockFailed;
+        };
+        self.next_seq += 1;
+        let sample = ModeSample {
+            seq: self.next_seq,
+            icanon,
+            echo,
+            sampled_mono_ns: sampled,
+            sample_done_mono_ns: done,
+        };
+        if done < sampled || done - sampled > MODE_MAX_AGE_NS {
+            return Tick::WideSample(sample);
+        }
+        let due = match self.reported {
+            None => true,
+            Some((was_icanon, was_echo, at)) => {
+                was_icanon != icanon
+                    || was_echo != echo
+                    || sampled.saturating_sub(at) >= MODE_REASSERT.as_nanos() as u64
+            }
+        };
+        if !due {
+            return Tick::Unchanged;
+        }
+        self.reported = Some((icanon, echo, sampled));
+        Tick::Report(sample)
+    }
+}
+
+/// The daemon at the other end of one connection: the listening process's
+/// pid, from the connection's credentials, and its start time, from the
+/// process table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DaemonIdentity {
+    pub pid: u32,
+    pub start: u64,
+}
+
+/// Whether a daemon stores `input_mode` reports, as its probe answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    Supported,
+    Unsupported,
+}
+
+/// How many daemon identities [`VerdictCache`] remembers.
+pub const VERDICT_CACHE_LEN: usize = 8;
+
+/// The wrapper's verdicts per daemon identity, the least recently used
+/// evicted past [`VERDICT_CACHE_LEN`].
+#[derive(Debug, Default)]
+pub struct VerdictCache {
+    /// Least recently used first.
+    entries: Vec<(DaemonIdentity, Verdict)>,
+}
+
+impl VerdictCache {
+    /// `identity`'s verdict, marking it used.
+    pub fn get(&mut self, identity: DaemonIdentity) -> Option<Verdict> {
+        let at = self.entries.iter().position(|(id, _)| *id == identity)?;
+        let entry = self.entries.remove(at);
+        self.entries.push(entry);
+        Some(entry.1)
+    }
+
+    /// Record `verdict` for `identity`; the identity evicted to make room.
+    pub fn record(&mut self, identity: DaemonIdentity, verdict: Verdict) -> Option<DaemonIdentity> {
+        self.entries.retain(|(id, _)| *id != identity);
+        self.entries.push((identity, verdict));
+        (self.entries.len() > VERDICT_CACHE_LEN).then(|| self.entries.remove(0).0)
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// What one connection carried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Exchange {
+    /// The report was written, after a probe on this connection when
+    /// `probed`; the daemon's answer, when one came.
+    Sent { probed: bool, ack: Option<String> },
+    /// The daemon's verdict is Unsupported: no report written.
+    Withheld { probed: bool },
+    /// The connection ended (EOF, a reset, a failed write) before an
+    /// answer: no verdict recorded.
+    Ended { why: &'static str },
+    /// The daemon's identity could not be read: nothing written.
+    IdentityUnreadable,
+}
+
+/// The longest answer line [`exchange`] reads.
+const EXCHANGE_MAX_LINE: usize = 64 * 1024;
+
+/// One line from `conn`: `Ok(None)` at EOF before a newline, an error for a
+/// failed read or a timeout.
+fn read_line(conn: &mut impl std::io::Read) -> std::io::Result<Option<String>> {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match conn.read(&mut byte) {
+            Ok(0) => return Ok(None),
+            Ok(_) if byte[0] == b'\n' => {
+                return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
+            }
+            Ok(_) if line.len() >= EXCHANGE_MAX_LINE => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "answer line too long",
+                ));
+            }
+            Ok(_) => line.push(byte[0]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn write_line(conn: &mut impl std::io::Write, line: &str) -> std::io::Result<()> {
+    conn.write_all(format!("{line}\n").as_bytes())?;
+    conn.flush()
+}
+
+/// One connection's part of the carrier (plan §1.3), with the daemon at its
+/// other end already identified (`None`: unreadable). A cached verdict
+/// decides at once; otherwise one `probe` line asks, and the answer is
+/// recorded and decides, with the `report` line written on the same
+/// connection only for `input_mode_report: Some(1)`. A reply without it, a
+/// refusal, a malformed line and no answer within the connection's read
+/// timeout record Unsupported; a connection that ends records nothing.
+/// Returns what happened and the identity evicted to record a verdict.
+pub fn exchange<C: std::io::Read + std::io::Write>(
+    conn: &mut C,
+    identity: Option<DaemonIdentity>,
+    cache: &mut VerdictCache,
+    probe: &str,
+    report: &str,
+) -> (Exchange, Option<DaemonIdentity>) {
+    let Some(identity) = identity else {
+        return (Exchange::IdentityUnreadable, None);
+    };
+    let send = |conn: &mut C, probed| {
+        if write_line(conn, report).is_err() {
+            return Exchange::Ended {
+                why: "report_write_failed",
+            };
+        }
+        Exchange::Sent {
+            probed,
+            ack: read_line(conn).ok().flatten(),
+        }
+    };
+    match cache.get(identity) {
+        Some(Verdict::Supported) => return (send(conn, false), None),
+        Some(Verdict::Unsupported) => return (Exchange::Withheld { probed: false }, None),
+        None => {}
+    }
+    if write_line(conn, probe).is_err() {
+        return (
+            Exchange::Ended {
+                why: "probe_write_failed",
+            },
+            None,
+        );
+    }
+    let supported = match read_line(conn) {
+        Ok(Some(answer)) => {
+            serde_json::from_str::<crate::event::HookCapabilitiesReply>(answer.trim())
+                .ok()
+                .is_some_and(|reply| {
+                    reply.code.is_none() && reply.input_mode_report == Some(INPUT_MODE_REPORT)
+                })
+        }
+        Ok(None) => return (Exchange::Ended { why: "eof" }, None),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            false
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => false,
+        Err(_) => return (Exchange::Ended { why: "reset" }, None),
+    };
+    if supported {
+        let evicted = cache.record(identity, Verdict::Supported);
+        (send(conn, true), evicted)
+    } else {
+        let evicted = cache.record(identity, Verdict::Unsupported);
+        (Exchange::Withheld { probed: true }, evicted)
+    }
+}
+
+/// The two reads that identify the daemon at the other end of a connection,
+/// injectable for tests.
+#[cfg(unix)]
+pub struct IdentityLookups {
+    pub peer_pid: fn(&std::os::unix::net::UnixStream) -> Option<u32>,
+    pub started: fn(u32) -> Option<u64>,
+}
+
+#[cfg(unix)]
+impl IdentityLookups {
+    pub const PLATFORM: Self = Self {
+        peer_pid: |stream| {
+            use std::os::fd::AsRawFd;
+            crate::platform::peercred::peer_pid_raw(stream.as_raw_fd()).ok()
+        },
+        started: crate::platform::proc::process_start_of,
+    };
+
+    fn identify(&self, stream: &std::os::unix::net::UnixStream) -> Option<DaemonIdentity> {
+        let pid = (self.peer_pid)(stream)?;
+        let start = (self.started)(pid)?;
+        Some(DaemonIdentity { pid, start })
+    }
+}
+
+/// What the wrapper's sender reports for: its pane and the pane's token.
+#[derive(Debug, Clone)]
+pub struct ReportTarget {
+    pub socket: PathBuf,
+    pub pane_id: String,
+    pub token: Option<String>,
+}
+
+#[cfg(unix)]
+impl ReportTarget {
+    fn probe_line(&self) -> String {
+        serde_json::to_string(&crate::event::DaemonMessage::HookCapabilities(
+            crate::event::HookCapabilitiesRequest {
+                pane_id: self.pane_id.clone(),
+                token: self.token.clone(),
+            },
+        ))
+        .unwrap_or_default()
+    }
+
+    fn report_line(&self, sample: &ModeSample) -> String {
+        serde_json::to_string(&crate::event::DaemonMessage::InputMode(
+            crate::event::InputModeReport {
+                pane_id: self.pane_id.clone(),
+                token: self.token.clone(),
+                seq: sample.seq,
+                icanon: sample.icanon,
+                echo: sample.echo,
+                sampled_mono_ns: sample.sampled_mono_ns,
+                sample_done_mono_ns: sample.sample_done_mono_ns,
+            },
+        ))
+        .unwrap_or_default()
+    }
+
+    /// Connect, identify the daemon and carry `sample`, each read and write
+    /// bounded by [`MODE_SEND_TIMEOUT`]. `None` when no daemon answered the
+    /// connect.
+    pub fn send(
+        &self,
+        sample: &ModeSample,
+        cache: &mut VerdictCache,
+        lookups: &IdentityLookups,
+    ) -> Option<(Exchange, Option<DaemonIdentity>, Option<DaemonIdentity>)> {
+        let mut stream = std::os::unix::net::UnixStream::connect(&self.socket).ok()?;
+        let _ = stream.set_read_timeout(Some(MODE_SEND_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(MODE_SEND_TIMEOUT));
+        let identity = lookups.identify(&stream);
+        let (outcome, evicted) = exchange(
+            &mut stream,
+            identity,
+            cache,
+            &self.probe_line(),
+            &self.report_line(sample),
+        );
+        Some((outcome, identity, evicted))
+    }
+}
+
+/// The wrapper's sender thread with its latest-wins slot (the `LatestSend`
+/// pattern): the tick posts, the thread carries the newest sample waiting,
+/// dropping one already older than [`MODE_MAX_AGE_NS`] when its turn comes.
+#[cfg(unix)]
+pub struct ModeSender {
+    slot: std::sync::Mutex<Option<ModeSample>>,
+    ready: std::sync::Condvar,
+    closed: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(unix)]
+impl ModeSender {
+    pub fn spawn(target: ReportTarget, lookups: IdentityLookups) -> std::sync::Arc<Self> {
+        let sender = std::sync::Arc::new(Self {
+            slot: std::sync::Mutex::new(None),
+            ready: std::sync::Condvar::new(),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let worker = std::sync::Arc::clone(&sender);
+        std::thread::spawn(move || {
+            let mut cache = VerdictCache::default();
+            let mut unreadable_streak = 0u64;
+            while let Some(sample) = worker.next() {
+                let fresh = monotonic_ns().is_some_and(|now| {
+                    now.saturating_sub(sample.sampled_mono_ns) <= MODE_MAX_AGE_NS
+                });
+                if !fresh {
+                    tracing::debug!(
+                        seq = sample.seq,
+                        "wrap input mode: report stale at its turn, dropped"
+                    );
+                    continue;
+                }
+                let Some((outcome, identity, evicted)) = target.send(&sample, &mut cache, &lookups)
+                else {
+                    continue;
+                };
+                if let Some(evicted) = evicted {
+                    tracing::info!(
+                        pid = evicted.pid,
+                        start = evicted.start,
+                        "wrap input mode: daemon verdict evicted"
+                    );
+                }
+                match (&outcome, identity) {
+                    (Exchange::IdentityUnreadable, _) => {
+                        if unreadable_streak == 0 {
+                            tracing::info!(
+                                "wrap input mode: the daemon's identity could not be read; report withheld"
+                            );
+                        }
+                        unreadable_streak += 1;
+                        continue;
+                    }
+                    (Exchange::Sent { probed: true, .. }, Some(id)) => {
+                        tracing::info!(
+                            pid = id.pid,
+                            start = id.start,
+                            verdict = "supported",
+                            probed = true,
+                            "wrap input mode: daemon identity"
+                        );
+                    }
+                    (Exchange::Withheld { probed }, Some(id)) => {
+                        if *probed {
+                            tracing::info!(
+                                pid = id.pid,
+                                start = id.start,
+                                verdict = "unsupported",
+                                probed = true,
+                                "wrap input mode: daemon identity"
+                            );
+                        } else {
+                            tracing::debug!(
+                                pid = id.pid,
+                                seq = sample.seq,
+                                "wrap input mode: report withheld"
+                            );
+                        }
+                    }
+                    (Exchange::Ended { why }, Some(id)) => {
+                        tracing::info!(
+                            pid = id.pid,
+                            start = id.start,
+                            why,
+                            "wrap input mode: connection ended; no verdict recorded"
+                        );
+                    }
+                    _ => {}
+                }
+                if unreadable_streak > 0 {
+                    tracing::info!(
+                        streak = unreadable_streak,
+                        "wrap input mode: the daemon's identity is readable again"
+                    );
+                    unreadable_streak = 0;
+                }
+            }
+        });
+        sender
+    }
+
+    /// Wait for the next sample, or `None` once closed.
+    fn next(&self) -> Option<ModeSample> {
+        let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                return None;
+            }
+            if let Some(sample) = slot.take() {
+                return Some(sample);
+            }
+            slot = self.ready.wait(slot).unwrap_or_else(|p| p.into_inner());
+        }
+    }
+
+    /// Replace whatever is waiting with `sample`, unless closed.
+    pub fn post(&self, sample: ModeSample) {
+        let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        *slot = Some(sample);
+        drop(slot);
+        self.ready.notify_one();
+    }
+
+    /// Drop whatever is waiting and every later post; the thread ends.
+    pub fn close(&self) {
+        let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        *slot = None;
+        drop(slot);
+        self.ready.notify_one();
+    }
+}
+
+#[cfg(all(test, unix))]
+#[path = "input_mode_tests.rs"]
+mod tests;

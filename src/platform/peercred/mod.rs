@@ -26,7 +26,7 @@ mod unix;
 mod windows;
 
 #[cfg(unix)]
-pub use unix::{peer_is_same_user, peer_pid, peer_uid_raw};
+pub use unix::{peer_is_same_user, peer_pid, peer_pid_raw, peer_uid_raw};
 #[cfg(windows)]
 pub use windows::{peer_is_same_user, peer_pid};
 

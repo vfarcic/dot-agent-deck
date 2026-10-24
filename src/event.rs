@@ -906,6 +906,13 @@ pub const CLEAR_SESSION_START_METADATA_KEY: &str = "session_start_source";
 /// was caused by the user running `/clear`".
 pub const CLEAR_SESSION_START_METADATA_VALUE: &str = "clear";
 
+/// PRD #1666 part 3, round 5-wake (plan rev 2 §6): on the wrapper's final
+/// event, its Idle or Error at its child's exit, how the wrapped command
+/// ended: its exit code (`"0"`, `"2"`), `"signal:<n>"` for a signal, or
+/// `"unknown"` when the wait failed. Additive metadata, ignored by a daemon
+/// that does not read it.
+pub const WRAPPER_CHILD_EXIT_METADATA_KEY: &str = "wrapper_child_exit";
+
 /// Issue #714: `AgentEvent.metadata` key `dot-agent-deck wrap` stamps on every
 /// event its stdout line classifier emits (value
 /// [`WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE`]).

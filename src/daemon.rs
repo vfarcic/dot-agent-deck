@@ -15714,6 +15714,52 @@ mod hook_provenance_audit_tests {
         fd: Option<i32>,
         #[serde(default)]
         parent: Option<u32>,
+        /// Batch mode, for 052: reports `(seq, icanon, echo)` sent by this one
+        /// process, batch `k` once `gate/go-<k>` exists, each on its own
+        /// connection, its replies written to `gate/out-<k>.json`.
+        #[serde(default)]
+        batches: Vec<Vec<(u64, bool, bool)>>,
+        #[serde(default)]
+        gate: Option<std::path::PathBuf>,
+    }
+
+    /// A batch's result: the reporting process and the daemon's replies.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct ModeBatchOut {
+        pid: u32,
+        replies: Vec<String>,
+    }
+
+    /// Send one `input_mode` report on a connection of its own, stamped now,
+    /// and return the daemon's reply.
+    fn send_mode_report(helper: &ModeHelper, seq: u64, icanon: bool, echo: bool) -> String {
+        use std::io::{Read, Write};
+        let mut stream = std::os::unix::net::UnixStream::connect(&helper.sock).expect("connect");
+        let sampled = crate::input_mode::monotonic_ns().expect("the clock");
+        let done = crate::input_mode::monotonic_ns().expect("the clock");
+        let report = DaemonMessage::InputMode(crate::event::InputModeReport {
+            pane_id: helper.pane.clone(),
+            token: helper.token.clone(),
+            seq,
+            icanon,
+            echo,
+            sampled_mono_ns: sampled,
+            sample_done_mono_ns: done,
+        });
+        let line = serde_json::to_string(&report).unwrap();
+        stream.write_all(format!("{line}\n").as_bytes()).unwrap();
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut reply = String::new();
+        let _ = stream.read_to_string(&mut reply);
+        reply
+    }
+
+    /// Write `value` to `path` whole: a reader polling for `path` never sees
+    /// it half written.
+    fn write_whole(path: &std::path::Path, value: &impl serde::Serialize) {
+        let tmp = path.with_extension("part");
+        std::fs::write(&tmp, serde_json::to_vec(value).unwrap()).unwrap();
+        std::fs::rename(&tmp, path).unwrap();
     }
 
     /// A helper's result: the connecting process and the daemon's reply.
@@ -15741,6 +15787,30 @@ mod hook_provenance_audit_tests {
             return;
         };
         let helper: ModeHelper = serde_json::from_str(&helper).expect("the helper's spec");
+        if let Some(gate) = &helper.gate {
+            for (k, batch) in helper.batches.iter().enumerate() {
+                let deadline = std::time::Instant::now() + Duration::from_secs(60);
+                while !gate.join(format!("go-{k}")).exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "batch {k} never opened"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let replies = batch
+                    .iter()
+                    .map(|&(seq, icanon, echo)| send_mode_report(&helper, seq, icanon, echo))
+                    .collect();
+                write_whole(
+                    &gate.join(format!("out-{k}.json")),
+                    &ModeBatchOut {
+                        pid: std::process::id(),
+                        replies,
+                    },
+                );
+            }
+            return;
+        }
         let (mut stream, peer) = if helper.how == "handoff_child" {
             let parent = helper.parent.expect("the connecting process");
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -15806,13 +15876,7 @@ mod hook_provenance_audit_tests {
         stream.shutdown(std::net::Shutdown::Write).unwrap();
         let mut reply = String::new();
         let _ = stream.read_to_string(&mut reply);
-        let tmp = helper.out.with_extension("part");
-        std::fs::write(
-            &tmp,
-            serde_json::to_vec(&ModeHelperOut { pid: peer, reply }).unwrap(),
-        )
-        .unwrap();
-        std::fs::rename(&tmp, &helper.out).unwrap();
+        write_whole(&helper.out, &ModeHelperOut { pid: peer, reply });
     }
 
     /// 051's fixture: a deck on the real hook socket and the panes whose
@@ -15864,28 +15928,73 @@ mod hook_provenance_audit_tests {
                 how: how.to_string(),
                 fd: None,
                 parent: None,
+                batches: Vec::new(),
+                gate: None,
             };
+            self.start_helper(agent, &helper).await;
+            Self::wait_for(&out, &format!("helper {run} ({how})")).await
+        }
+
+        /// Type the command that starts `helper` into `agent`'s shell.
+        async fn start_helper(&self, agent: &str, helper: &ModeHelper) {
             let exe = std::env::current_exe().expect("the test binary");
             self.type_line(
                 agent,
                 &format!(
                     "{MODE_HELPER}='{}' '{}' --exact {MODE_HELPER_TEST} --nocapture --test-threads=1 >/dev/null 2>&1",
-                    serde_json::to_string(&helper).unwrap(),
+                    serde_json::to_string(helper).unwrap(),
                     exe.display()
                 ),
             )
             .await;
+        }
+
+        async fn wait_for<T: serde::de::DeserializeOwned>(out: &std::path::Path, what: &str) -> T {
             let deadline = std::time::Instant::now() + Duration::from_secs(30);
             loop {
-                if let Ok(bytes) = std::fs::read(&out) {
+                if let Ok(bytes) = std::fs::read(out) {
                     return serde_json::from_slice(&bytes).expect("the helper's result");
                 }
                 assert!(
                     std::time::Instant::now() < deadline,
-                    "helper {run} ({how}) never reported"
+                    "{what} never reported"
                 );
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
+        }
+
+        /// Start one helper from `agent`'s shell that sends `batches` as one
+        /// process, each batch when [`Self::open_batch`] opens it.
+        async fn start_batches(
+            &self,
+            agent: &str,
+            pane: &str,
+            token: &str,
+            batches: Vec<Vec<(u64, bool, bool)>>,
+        ) -> std::path::PathBuf {
+            let run = self.runs.fetch_add(1, Ordering::Relaxed);
+            let gate = self.dir.path().join(format!("gate-{run}"));
+            std::fs::create_dir(&gate).unwrap();
+            let helper = ModeHelper {
+                sock: self.deck.sock.clone(),
+                out: gate.join("unused.json"),
+                pane: pane.to_string(),
+                token: Some(token.to_string()),
+                seq: 0,
+                how: "plain".to_string(),
+                fd: None,
+                parent: None,
+                batches,
+                gate: Some(gate.clone()),
+            };
+            self.start_helper(agent, &helper).await;
+            gate
+        }
+
+        /// Let batch `k` go, and wait for its replies.
+        async fn open_batch(gate: &std::path::Path, k: usize) -> ModeBatchOut {
+            std::fs::write(gate.join(format!("go-{k}")), b"").unwrap();
+            Self::wait_for(&gate.join(format!("out-{k}.json")), &format!("batch {k}")).await
         }
     }
 
@@ -16055,6 +16164,104 @@ mod hook_provenance_audit_tests {
         assert_ne!(store.anchor(), old_anchor);
         assert!(store.anchor().is_some());
         deck.deck.handle.abort();
+        registry.shutdown_all();
+    }
+
+    /// Every broadcast waiting on `events`, counted and dropped.
+    fn broadcasts(events: &mut broadcast::Receiver<BroadcastMsg>) -> u64 {
+        let mut count = 0;
+        loop {
+            match events.try_recv() {
+                Ok(_) => count += 1,
+                Err(broadcast::error::TryRecvError::Lagged(missed)) => count += missed,
+                Err(_) => return count,
+            }
+        }
+    }
+
+    /// Scenario: A card is put through Working, Blocked, WaitingForInput and Idle on the real hook socket, and at each one a helper in the pane's session, one process throughout, sends reports that go raw, cooked, raw and raw again. Every report is accepted and stored, yet the card, its last activity and journal included, is exactly what it was before them, nothing is broadcast to attached clients, and the settle anchor is set by the first raw report and never moves.
+    #[spec("inbox/doorbell/052")]
+    #[tokio::test]
+    async fn doorbell_052_reports_move_nothing_but_the_mode_store() {
+        const PANE: &str = "pane-mode-quiet";
+        const SESSION: &str = "mode-quiet-card";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (agent, token) = mode_pane(&registry, PANE);
+        let mut deck = ModeDeck::start(registry.clone()).await;
+        let event = |kind: &str| line(SESSION, Some(PANE), Some(&agent), kind, Some(&token));
+        deck.deck.send(event("session_start")).await;
+        let statuses = [
+            ("tool_start", SessionStatus::Working),
+            ("quota_blocked", SessionStatus::Blocked),
+            ("waiting_for_input", SessionStatus::WaitingForInput),
+            ("idle", SessionStatus::Idle),
+        ];
+        let batch = |k: u64| {
+            let base = 1 + 4 * k;
+            vec![
+                (base, false, false),
+                (base + 1, true, true),
+                (base + 2, false, false),
+                (base + 3, false, false),
+            ]
+        };
+        let gate = deck
+            .start_batches(&agent, PANE, &token, (0..4).map(batch).collect())
+            .await;
+        let mut anchor = None;
+        for (k, (kind, status)) in statuses.into_iter().enumerate() {
+            deck.deck.send(event(kind)).await;
+            let card = deck.deck.card(SESSION).await.expect("the card");
+            assert_eq!(card.status, status, "precondition: {kind}");
+            let before = format!("{card:?}");
+            broadcasts(&mut deck.deck.events);
+            let out = ModeDeck::open_batch(&gate, k).await;
+            for reply in &out.replies {
+                let ack: crate::event::SignalAck = serde_json::from_str(reply.trim()).unwrap();
+                assert!(ack.accepted, "{kind}: {reply}");
+            }
+            let after = format!("{:?}", deck.deck.card(SESSION).await.unwrap());
+            assert_eq!(after, before, "{kind}: the card moved");
+            assert_eq!(broadcasts(&mut deck.deck.events), 0, "{kind}: a broadcast");
+            let store = registry.input_mode_store(&agent).unwrap();
+            assert_eq!(store.latest().map(|s| s.seq), Some(4 * k as u64 + 4));
+            assert_eq!(store.observer().map(|o| o.pid), Some(out.pid));
+            match k {
+                0 => anchor = store.anchor(),
+                _ => assert_eq!(store.anchor(), anchor, "{kind}: the anchor moved"),
+            }
+        }
+        assert!(anchor.is_some());
+        deck.deck.handle.abort();
+        registry.shutdown_all();
+    }
+
+    /// Scenario: A stand-in for an older wrapper reports a session start and an idle status for its pane on the real hook socket, and sends neither a capabilities probe nor any input-mode report. Each event is broadcast once and the card reads Idle, and the generation's input-mode store stays empty, so its evidence reads `input_mode_unverified`.
+    #[spec("inbox/doorbell/052")]
+    #[tokio::test]
+    async fn doorbell_052_an_older_wrapper_leaves_the_evidence_unverified() {
+        const PANE: &str = "pane-mode-older";
+        const SESSION: &str = "mode-older-card";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (agent, token) = mode_pane(&registry, PANE);
+        let mut deck = AuditDeck::start(registry.clone()).await;
+        for kind in ["session_start", "idle"] {
+            deck.send(line(SESSION, Some(PANE), Some(&agent), kind, Some(&token)))
+                .await;
+        }
+        assert_eq!(broadcasts(&mut deck.events), 2);
+        assert_eq!(
+            deck.card(SESSION).await.map(|card| card.status),
+            Some(SessionStatus::Idle)
+        );
+        let store = registry.input_mode_store(&agent).unwrap();
+        assert!(store.observer().is_none() && store.latest().is_none());
+        let now = crate::input_mode::monotonic_ns().unwrap();
+        assert_eq!(
+            store.usable(now).map_err(|clause| clause.as_str()),
+            Err("input_mode_unverified")
+        );
+        deck.handle.abort();
         registry.shutdown_all();
     }
 

@@ -316,14 +316,6 @@ impl Emitter {
         }
     }
 
-    /// Build an [`AgentEvent`] for `event_type` and send it to the daemon over
-    /// the existing raw-`AgentEvent` hook socket. Send failures are ignored so
-    /// the wrapper stays a transparent passthrough even with no daemon (the
-    /// "arbitrary commands as a basic fallback" success criterion).
-    fn emit(&self, event_type: EventType) {
-        self.emit_with_metadata(event_type, HashMap::new());
-    }
-
     /// PRD #225 M3: the fork-time `SessionStart` this wrapper emits the moment
     /// `cmd.spawn()` returns. Its ONLY job is to surface the dashboard card so a
     /// slow-booting agent isn't invisible — the child is typically just the
@@ -392,6 +384,10 @@ impl Emitter {
         });
     }
 
+    /// Build an [`AgentEvent`] for `event_type` and send it to the daemon over
+    /// the existing raw-`AgentEvent` hook socket. Send failures are ignored so
+    /// the wrapper stays a transparent passthrough even with no daemon (the
+    /// "arbitrary commands as a basic fallback" success criterion).
     fn emit_with_metadata(&self, event_type: EventType, metadata: HashMap<String, String>) {
         let event = self.build_event(event_type, metadata);
         if let Ok(json) = crate::event::agent_event_line(&event, self.token.as_deref()) {
@@ -2180,6 +2176,55 @@ impl InterfaceWatch {
     }
 }
 
+/// PRD #1666 part 3, round 5-wake (plan §1.3): one supervisory tick of the
+/// input-mode producer on the inner master, posting a report to `sender`;
+/// a failed read is logged once per streak.
+#[cfg(unix)]
+fn input_mode_tick(
+    watch: &mut crate::input_mode::InputModeWatch,
+    master_fd: RawFd,
+    sender: &crate::input_mode::ModeSender,
+    failures: &mut u64,
+) {
+    use crate::input_mode::Tick;
+    let mut clock = crate::input_mode::monotonic_ns;
+    let tick = watch.tick(&mut clock, || {
+        pty_lflag(master_fd).map(|lflag| (lflag & libc::ICANON != 0, lflag & libc::ECHO != 0))
+    });
+    let why = match tick {
+        Tick::Report(sample) => {
+            sender.post(sample);
+            None
+        }
+        Tick::Unchanged => None,
+        Tick::WideSample(sample) => {
+            tracing::info!(
+                seq = sample.seq,
+                gap_ns = sample
+                    .sample_done_mono_ns
+                    .wrapping_sub(sample.sampled_mono_ns),
+                "wrap input mode: sample discarded (wide_sample)"
+            );
+            None
+        }
+        Tick::ClockFailed => Some("clock"),
+        Tick::TermiosFailed => Some("tcgetattr"),
+    };
+    match why {
+        Some(why) => {
+            if *failures == 0 {
+                tracing::info!(why, "wrap input mode: no sample this tick");
+            }
+            *failures += 1;
+        }
+        None if *failures > 0 => {
+            tracing::info!(streak = *failures, "wrap input mode: sampling again");
+            *failures = 0;
+        }
+        None => {}
+    }
+}
+
 /// Read a pty's local-mode flags through `fd`, or `None` when it is not a
 /// terminal / the call fails.
 #[cfg(unix)]
@@ -2819,6 +2864,20 @@ fn run_wrap_pty(
     let mut quiet_output_idle = (emitter.agent_type == AgentType::Codex
         && emitter.prompt_reports_unavailable)
         .then(QuietOutputIdle::new);
+    // PRD #1666 part 3, round 5-wake (plan §1.3): only a wrapper inside a
+    // deck pane reports its input mode; a standalone wrap has nobody to tell.
+    let mode_sender = emitter.pane_id.clone().map(|pane_id| {
+        crate::input_mode::ModeSender::spawn(
+            crate::input_mode::ReportTarget {
+                socket: crate::endpoint_resolve::client_socket_path(),
+                pane_id,
+                token: emitter.token.clone(),
+            },
+            crate::input_mode::IdentityLookups::PLATFORM,
+        )
+    });
+    let mut mode_watch = crate::input_mode::InputModeWatch::default();
+    let mut mode_failures = 0u64;
     let status = loop {
         if let Some(size) = terminal_size(libc::STDIN_FILENO)
             .or_else(|| terminal_size(libc::STDOUT_FILENO))
@@ -2881,6 +2940,12 @@ fn run_wrap_pty(
             quiet.tick(&detector, &interface, emitter);
         }
 
+        // PRD #1666 part 3, round 5-wake (plan §1.3): the inner PTY's line
+        // discipline, for the daemon's input-mode evidence.
+        if let Some(sender) = &mode_sender {
+            input_mode_tick(&mut mode_watch, master_fd, sender, &mut mode_failures);
+        }
+
         // R20-001: the terminal output pump ended while the child is still alive
         // → the downstream terminal consumer closed; after a short settle window
         // terminate the group so the child can't block on a full inner PTY.
@@ -2902,6 +2967,10 @@ fn run_wrap_pty(
         }
         std::thread::sleep(Duration::from_millis(50));
     };
+
+    if let Some(sender) = &mode_sender {
+        sender.close();
+    }
 
     // R20-001 cleanup: the direct child exited (or was killed). Drain the
     // terminal-output tee with a BOUNDED wait instead of an unbounded join — a
@@ -2942,11 +3011,14 @@ fn run_wrap_pty(
     // finished pane. One already on the wire is stamped before this one and
     // the deck drops it as stale.
     emitter.close_classified();
-    emitter.emit(if success {
-        EventType::Idle
-    } else {
-        EventType::Error
-    });
+    emitter.emit_with_metadata(
+        if success {
+            EventType::Idle
+        } else {
+            EventType::Error
+        },
+        child_exit_metadata(status.as_ref()),
+    );
     ExitCode::from(code)
 }
 
@@ -3094,12 +3166,35 @@ fn run_wrap_pipe(
     // finished pane. One already on the wire is stamped before this one and
     // the deck drops it as stale.
     emitter.close_classified();
-    emitter.emit(if success {
-        EventType::Idle
-    } else {
-        EventType::Error
-    });
+    emitter.emit_with_metadata(
+        if success {
+            EventType::Idle
+        } else {
+            EventType::Error
+        },
+        child_exit_metadata(status.as_ref().ok()),
+    );
     ExitCode::from(code)
+}
+
+/// PRD #1666 part 3, round 5-wake (plan rev 2 §6): the final event's
+/// [`crate::event::WRAPPER_CHILD_EXIT_METADATA_KEY`], from the wrapped
+/// command's exit status (`None`: the wait failed).
+#[cfg(unix)]
+fn child_exit_metadata(status: Option<&std::process::ExitStatus>) -> HashMap<String, String> {
+    use std::os::unix::process::ExitStatusExt;
+    let ended = match status {
+        Some(status) => match (status.code(), status.signal()) {
+            (Some(code), _) => code.to_string(),
+            (None, Some(signal)) => format!("signal:{signal}"),
+            (None, None) => "unknown".to_string(),
+        },
+        None => "unknown".to_string(),
+    };
+    HashMap::from([(
+        crate::event::WRAPPER_CHILD_EXIT_METADATA_KEY.to_string(),
+        ended,
+    )])
 }
 
 /// Spawn a tee thread copying `reader` verbatim to the raw fd `out_fd` while
@@ -3900,5 +3995,25 @@ mod tests {
             before,
             "termios restored to the original on drop"
         );
+    }
+
+    /// PRD #1666 part 3, round 5-wake: the final event names how the wrapped
+    /// command ended, its code, a signal, or a failed wait.
+    #[cfg(unix)]
+    #[test]
+    fn the_final_event_carries_the_childs_exit() {
+        use std::os::unix::process::ExitStatusExt;
+        let ended = |status: Option<std::process::ExitStatus>| {
+            child_exit_metadata(status.as_ref())
+                .remove(crate::event::WRAPPER_CHILD_EXIT_METADATA_KEY)
+                .unwrap()
+        };
+        assert_eq!(ended(Some(std::process::ExitStatus::from_raw(0))), "0");
+        assert_eq!(ended(Some(std::process::ExitStatus::from_raw(2 << 8))), "2");
+        assert_eq!(
+            ended(Some(std::process::ExitStatus::from_raw(9))),
+            "signal:9"
+        );
+        assert_eq!(ended(None), "unknown");
     }
 }
