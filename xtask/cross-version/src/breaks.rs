@@ -1251,6 +1251,10 @@ mod tests {
         );
         assert!(md.contains("> failed: status"), "{md}");
         assert!(md.contains("reason=\"missing_token\""), "{md}");
+        // The introduction states the witness rule `explain` applies, the
+        // client's own output included, not a daemon-log-only rule.
+        assert!(md.contains("written while the operation ran"), "{md}");
+        assert!(md.contains("the client's own output in that pane"), "{md}");
     }
 
     /// Strip Rust's string-continuation escapes (`\` + newline + indentation)

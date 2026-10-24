@@ -487,11 +487,16 @@ impl Evidence {
             let _ = writeln!(
                 s,
                 "**Every tell was measured, and each one that failed failed exactly as a contract \
-                 break says it will**: a break the daemon's build declares in `CONTRACT_BREAKS` and \
-                 the client's build does not, with the refusal that break describes found in the \
-                 sandbox `deck.log`. CLAUDE.md rule 12 records a declared break as the outcome, not \
-                 as a regression. A failure no declared break accounts for would have made this \
-                 run FAIL (`xtask/cross-version/src/breaks.rs`).\n"
+                 break says it will**: a break one build declares in `CONTRACT_BREAKS` and the \
+                 other does not — the daemon's build, or the client's for a break whose client \
+                 refuses an older daemon — with that break's record found for the operation it \
+                 acts on, in that operation's pane: the daemon's refusal in the sandbox \
+                 `deck.log`, written while the operation ran, or, for a break the client declares \
+                 and refuses before sending the daemon anything, the client's own output in that \
+                 pane. Each explained tell below quotes the line it used. CLAUDE.md rule 12 \
+                 records a declared break as the outcome, not as a regression. A failure no \
+                 declared break accounts for would have made this run FAIL \
+                 (`xtask/cross-version/src/breaks.rs`).\n"
             );
         }
         if let Some(note) = &self.skip_build {
