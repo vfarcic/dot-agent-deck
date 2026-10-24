@@ -1134,7 +1134,9 @@ impl StoreLock<'_> {
 }
 
 /// A write's reserved room while the write runs: an unwind before the write's
-/// own accounting returns it, through `lock_in_drop`, which never panics.
+/// own accounting returns it, through `lock_in_drop`, which never panics. It
+/// does not record a file the write already created; the caller's `discard`
+/// removes one, and one it cannot remove stays uncharged.
 struct RoomOnUnwind<'a> {
     store: &'a RetainedStore,
     bytes: Option<u64>,

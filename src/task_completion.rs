@@ -869,7 +869,10 @@ async fn save(
         Err(join) => {
             error!(%join, "work-done: saving the report did not finish");
             // The write unwound: its room came back with it, and a file it
-            // may have created is removed.
+            // may have created is removed when it can be. A file that could
+            // not be removed here is not charged as an orphaned attempt, since
+            // the write never recorded it; no production panic source is known
+            // between its create and its accounting.
             store.discard(&ctx.spec.report_id);
             settle_failure(&registry, claim_id, "its save did not finish", handed);
             return;
