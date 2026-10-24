@@ -410,6 +410,18 @@ impl GhStub {
         std::fs::write(self.repo_dir(repo).join("state.json"), state.to_string()).unwrap();
     }
 
+    /// Add the writer's lifetime to a claim already seeded in the legacy format.
+    fn seed_claim_lifetime(&self, repo: &str, issue: u64, lifetime_hours: u64) {
+        let mut state = self.state(repo);
+        let body = state["comments"][issue.to_string()][0]["body"]
+            .as_str()
+            .expect("seeded claim body");
+        state["comments"][issue.to_string()][0]["body"] =
+            format!("{body}- Lifetime (hours): {lifetime_hours}\n").into();
+        std::fs::write(self.repo_dir(repo).join("state.json"), state.to_string())
+            .expect("seed the claim writer's lifetime");
+    }
+
     fn writes(&self) -> String {
         std::fs::read_to_string(self.dir.join("writes.jsonl")).unwrap_or_default()
     }
@@ -738,6 +750,7 @@ fn wait_for_claim_dispatch(daemon: &common::DaemonProc, stub: &GhStub, work: &Pa
 
 /// Scenario: Fire a gated schedule with a fresh collaborator claim on issue 7, an unclaimed sibling, and unaffiliated authors copying the collaborator's record onto issues 9 and 10.
 /// Only the collaborator's issue skips, identifying its actual GitHub login, while both copied claims permit dispatch.
+/// With an hourly schedule and a 3-hour reader TTL, a 24-hour-old collaborator claim stating a 168-hour lifetime still skips, while its legacy-format counterpart dispatches.
 #[spec("scheduler/dispatch/032")]
 #[test]
 fn dispatch_032_fresh_foreign_claim_skips_with_claimant() {
@@ -801,6 +814,47 @@ fn dispatch_032_fresh_foreign_claim_skips_with_claimant() {
             && !line.to_lowercase().contains("open pr")),
         "claimed skip must name schedule, machine and age with its own reason: {lines:?}"
     );
+    drop(daemon);
+
+    let (stub, _directory, work) = claim_fixture();
+    stub.set_issues("acme/widgets", &[7, 8]);
+    for issue in [7, 8] {
+        stub.seed_claim(
+            "acme/widgets",
+            issue,
+            99999,
+            "other-schedule",
+            "h1-1234567890abcdef",
+            24,
+        );
+    }
+    // Both claims outlive this reader's TTL, but issue 7's writer refreshes
+    // against its own longer lifetime; issue 8 models an older deck's format.
+    stub.seed_claim_lifetime("acme/widgets", 7, 168);
+    let foreign = stub.marker_comments("acme/widgets", 7);
+    let daemon = claim_daemon(&stub, &claim_task(&work, Some(true), 3, "0 * * * *"));
+    daemon.run_now("dispatch-task").unwrap();
+    wait_for_claim_dispatch(&daemon, &stub, &work, 8);
+    assert!(
+        !daemon.stderr_contains("claim_gating is OFF"),
+        "an hourly cron must keep gating enabled at a 3-hour reader TTL"
+    );
+    let lines = scheduler_messages(&daemon);
+    assert!(
+        lines.iter().any(|line| line.contains("#7")
+            && line.contains("skipping already-claimed")
+            && line.contains("other-schedule")
+            && line.contains("GitHub account claimant-99999")),
+        "a foreign claim within its writer's lifetime must skip despite exceeding the reader's TTL: {lines:?}"
+    );
+    assert!(
+        !derive_issue_paths(&work, "dispatch-task", 7)
+            .worktree_dir
+            .exists(),
+        "the still-live foreign claim must not create an issue-7 worktree"
+    );
+    assert_eq!(stub.marker_comments("acme/widgets", 7), foreign);
+    assert_eq!(count_orchestrators(&daemon), 1);
 }
 
 /// Scenario: Fire a gated schedule against a foreign claim and label event older than the TTL.

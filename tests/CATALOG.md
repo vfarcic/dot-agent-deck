@@ -7287,7 +7287,7 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 
 - **Layer:** L2 (headless daemon, offline stateful GitHub stub; lane 1).
 - **Agent:** synthetic `cat` orchestration.
-- **Asserts:** a fresh COLLABORATOR claim skips issue 7 with schedule, machine and actual GitHub login attribution; unclaimed issue 8 dispatches, as do issues 9 and 10 where NONE and CONTRIBUTOR authors copy and freshly edit the collaborator's full claim body.
+- **Asserts:** a fresh COLLABORATOR claim skips issue 7 with schedule, machine and actual GitHub login attribution; unclaimed issue 8 dispatches, as do issues 9 and 10 where NONE and CONTRIBUTOR authors copy and freshly edit the collaborator's full claim body. With an hourly cron and a 3-hour reader TTL, a 24-hour-old trusted claim stating a 168-hour lifetime skips and stays intact, while an equally old legacy-format claim without the lifetime dispatches; gating remains enabled.
 - **Does not assert:** real GitHub permissions or agent work.
 - **Platform coverage:** mac+linux.
 
