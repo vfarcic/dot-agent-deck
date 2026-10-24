@@ -1424,45 +1424,80 @@ async fn work_done_053_n_a_poisoned_record_table_refuses_before_any_claim() {
     std::mem::forget(Arc::try_unwrap(team).ok());
 }
 
-/// Scenario: (h) the after-section helpers run only after the answer is handed over. While a helper is held inside `after_section`, the reporting connection already reads `accepted`. A helper that panics there leaves the answer `accepted`, the supervisor logs the save task's panic, and the deck goes on taking reports.
+/// Scenario: (h) the after-section helpers run only after the answer is handed over, on the ordinary save and on both of the supervisor's settlements: a save task that panics after staging (rolled forward, `accepted`) and one that panics before (failed, `report_save_failed`). While a helper is held inside `after_section`, the reporting connection already reads its answer. A helper that panics there leaves the answer as it was, the panic is logged, and the deck goes on taking reports.
 #[spec("orchestration/work-done/053")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn work_done_053_h_the_helpers_run_after_the_handover() {
-    let team = Arc::new(team("wd053h"));
-    let task = team.delegate("a task");
-    let (reached, in_helper) = std::sync::mpsc::channel();
-    let (release, held) = std::sync::mpsc::channel::<()>();
-    *team.registry().inbox().after_section_hook.lock().unwrap() = Some(Box::new(move || {
-        let _ = reached.send(());
-        // Hands this worker's queued tasks to another thread while it waits,
-        // as a slow helper on the blocking pool would leave them runnable.
-        tokio::task::block_in_place(|| {
-            let _ = held.recv();
-        });
-    }));
-    let report = {
-        let team = Arc::clone(&team);
-        let task = task.clone();
-        tokio::spawn(async move { team.report_task(&task, "done").await })
-    };
-    tokio::task::spawn_blocking(move || in_helper.recv_timeout(Duration::from_secs(10)))
-        .await
-        .unwrap()
-        .expect("the helper is reached");
-    let answer = tokio::time::timeout(Duration::from_secs(5), report)
-        .await
-        .expect("answered while a helper is still running")
-        .unwrap();
-    accepted(answer);
-    release.send(()).unwrap();
+    use crate::task_completion::{FAULT_BEFORE_STAGE, FAULT_STAGED};
+    for seam in [None, Some(FAULT_STAGED), Some(FAULT_BEFORE_STAGE)] {
+        let label = seam.unwrap_or("save");
+        let team = Arc::new(team(&format!("wd053h-{label}")));
+        let failed = seam == Some(FAULT_BEFORE_STAGE);
+        // The answer this seam owes, and, for a failed save, the retry that
+        // takes the task so the next arm starts from no open task.
+        let owed = |team: &Arc<Team>, task: &str, answer: Completion| {
+            let team = Arc::clone(team);
+            let task = task.to_string();
+            async move {
+                if failed {
+                    assert_eq!(
+                        reply(answer).code.as_deref(),
+                        Some(code::REPORT_SAVE_FAILED),
+                        "{label}"
+                    );
+                    accepted(team.report_task(&task, "done").await);
+                } else {
+                    accepted(answer);
+                }
+            }
+        };
+        let inject = |team: &Team| {
+            if let Some(seam) = seam {
+                team.registry()
+                    .inject_fault_for_test(seam, TestFault::Panic("injected-053h"));
+            }
+        };
 
-    // A helper that panics.
-    let task = team.delegate("another task");
-    *team.registry().inbox().after_section_hook.lock().unwrap() =
-        Some(Box::new(|| std::panic::panic_any("injected-053h")));
-    accepted(team.report_task(&task, "done").await);
-    let task = team.delegate("a third task");
-    accepted(team.report_task(&task, "done").await);
+        // A helper that is held.
+        let task = team.delegate("a task");
+        let (reached, in_helper) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        *team.registry().inbox().after_section_hook.lock().unwrap() = Some(Box::new(move || {
+            let _ = reached.send(());
+            // Hands this worker's queued tasks to another thread while it
+            // waits, as a slow helper on the blocking pool would leave them
+            // runnable.
+            tokio::task::block_in_place(|| {
+                let _ = held.recv();
+            });
+        }));
+        inject(&team);
+        let report = {
+            let team = Arc::clone(&team);
+            let task = task.clone();
+            tokio::spawn(async move { team.report_task(&task, "done").await })
+        };
+        tokio::task::spawn_blocking(move || in_helper.recv_timeout(Duration::from_secs(10)))
+            .await
+            .unwrap()
+            .unwrap_or_else(|_| panic!("{label}: the helper is reached"));
+        let answer = tokio::time::timeout(Duration::from_secs(5), report)
+            .await
+            .unwrap_or_else(|_| panic!("{label}: answered while a helper is still running"))
+            .unwrap();
+        release.send(()).unwrap();
+        owed(&team, &task, answer).await;
+
+        // A helper that panics.
+        let task = team.delegate("another task");
+        *team.registry().inbox().after_section_hook.lock().unwrap() =
+            Some(Box::new(|| std::panic::panic_any("injected-053h")));
+        inject(&team);
+        let answer = team.report_task(&task, "done").await;
+        owed(&team, &task, answer).await;
+        let task = team.delegate("a third task");
+        accepted(team.report_task(&task, "done").await);
+    }
 }
 
 /// Scenario: (m) a worker exits owing task t, whose own commission arm is already gone, while a sibling arm, armed for another delegate, is still owed on the same pane. The exit's retirement is exact: it removes nothing for t's missing arm, and the sibling arm is still owed afterwards.
