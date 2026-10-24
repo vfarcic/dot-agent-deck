@@ -430,13 +430,10 @@ struct Declared<'a> {
 /// The lines of `log` that start inside `span` (all of them for `None`).
 fn lines_in(log: &str, span: Option<(u64, u64)>) -> impl Iterator<Item = &str> {
     let mut start = 0u64;
-    log.split_inclusive('\n').filter_map(move |line| {
+    log.split_inclusive('\n').filter(move |line| {
         let at = start;
         start += line.len() as u64;
-        match span {
-            Some((from, to)) if at < from || at >= to => None,
-            _ => Some(line),
-        }
+        span.is_none_or(|(from, to)| (from..to).contains(&at))
     })
 }
 
