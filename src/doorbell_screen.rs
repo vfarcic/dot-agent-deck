@@ -723,3 +723,15 @@ pub fn strict_withdrawal(
     }
     Ok(owned.chars().count())
 }
+
+/// The profile measured for an agent type, if any: what a generation's
+/// evidence state tracks from its spawn.
+pub fn profile_for_agent(
+    agent: Option<&crate::event::AgentType>,
+) -> Option<&'static ScreenProfile> {
+    match agent? {
+        crate::event::AgentType::Codex => Some(&CODEX_PROFILE),
+        crate::event::AgentType::ClaudeCode => Some(&CLAUDE_PROFILE),
+        _ => None,
+    }
+}

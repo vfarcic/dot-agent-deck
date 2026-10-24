@@ -574,6 +574,15 @@ pub fn wrap_launch_command(command: &str, agent_type: &AgentType, shell: &str) -
     )
 }
 
+/// PRD #1666 part 3, round 5-wake: whether the deck's child for `command` is
+/// its own wrapper — the command the deck wraps ([`wrap_launch_command`]), or
+/// one that already invokes `wrap`.
+pub fn launches_wrapper(command: &str, agent_type: &AgentType) -> bool {
+    let spec = crate::agent_registry::spec(agent_type);
+    spec.strategy == Some(crate::agent_registry::IntegrationStrategy::Wrapper)
+        || is_wrap_invocation(command, &deck_binary_for_wrap())
+}
+
 /// What the spawn seam runs for an agent's command, from [`wrap_launch_command`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchCommand {

@@ -8691,6 +8691,10 @@ async fn handle_attach_stream(
     loop {
         match read_frame(&mut rd).await {
             Ok(Some((KIND_STREAM_IN, bytes))) => {
+                // PRD #1666 part 3, round 5-wake (plan §2.1′): the frame is a
+                // human operation on this generation's input from here, before
+                // any await, until it is refused or its PTY job ends.
+                let mut ticket = registry.admit_ingress(&id);
                 // PRD #20 blocker-6: enforce liveness AUTHORITATIVELY here, not
                 // just in the UI. If the focused session became non-live (a
                 // wrapped Codex pane that declared `history-only`, or a
@@ -8719,6 +8723,9 @@ async fn handle_attach_stream(
                         payload_len = bytes.len(),
                         "STREAM_IN rejected — target agent has exited"
                     );
+                    if let Some(ticket) = ticket.take() {
+                        ticket.refuse("exited");
+                    }
                     enqueue_reject(&reject_tx, b"exited");
                     continue;
                 }
@@ -8742,14 +8749,16 @@ async fn handle_attach_stream(
                         payload_len = bytes.len(),
                         "STREAM_IN rejected — target is not live (history-only / view-only)"
                     );
+                    if let Some(ticket) = ticket.take() {
+                        ticket.refuse("history-only");
+                    }
                     enqueue_reject(&reject_tx, b"history-only");
                     continue;
                 }
-                // PRD #1666 part 2 (`inbox/doorbell/031`): counted in flight
-                // from before it waits for the writer until it is written or
-                // refused, so a doorbell holding the writer between its steps
+                // PRD #1666 part 2 (`inbox/doorbell/031`): the ticket admitted
+                // above keeps the frame outstanding while it waits for the
+                // writer, so a doorbell holding the writer between its steps
                 // withholds the rest rather than typing ahead of it.
-                let _in_flight = registry.human_frame_arriving(&pane_id);
                 #[cfg(feature = "e2e")]
                 crate::doorbell::record_for_test(&format!("human-arrived {pane_id}"));
                 let w = writer.lock().await;
@@ -8764,6 +8773,9 @@ async fn handle_attach_stream(
                 // typed frame and keep the stream open.
                 if exited.load(std::sync::atomic::Ordering::SeqCst) {
                     drop(w);
+                    if let Some(ticket) = ticket.take() {
+                        ticket.refuse("exited");
+                    }
                     enqueue_reject(&reject_tx, b"exited");
                     continue;
                 }
@@ -8777,11 +8789,17 @@ async fn handle_attach_stream(
                         Some(current) if current == id => {}
                         Some(_) => {
                             drop(w);
+                            if let Some(ticket) = ticket.take() {
+                                ticket.refuse("wrong-session");
+                            }
                             enqueue_reject(&reject_tx, b"wrong-session");
                             continue;
                         }
                         None => {
                             drop(w);
+                            if let Some(ticket) = ticket.take() {
+                                ticket.refuse("stale");
+                            }
                             enqueue_reject(&reject_tx, b"stale");
                             continue;
                         }
@@ -8799,6 +8817,9 @@ async fn handle_attach_stream(
                 };
                 if post_lock_writable != crate::event::Writable::Live {
                     drop(w);
+                    if let Some(ticket) = ticket.take() {
+                        ticket.refuse("history-only");
+                    }
                     enqueue_reject(&reject_tx, b"history-only");
                     continue;
                 }
@@ -8826,7 +8847,7 @@ async fn handle_attach_stream(
                 // Issue #525: awaited, not written inline — the PTY is written
                 // by the pane writer's own thread, so a pane whose agent has
                 // stopped reading holds this task, never a runtime worker.
-                if w.write_user(&bytes).await.is_err() {
+                if w.write_user_ticketed(&bytes, ticket.take()).await.is_err() {
                     break;
                 }
                 // PRD #127 M2.2: a STREAM_IN frame is a *user* keystroke —

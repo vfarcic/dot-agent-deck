@@ -2032,6 +2032,11 @@ struct AgentBusState {
     /// repaints the alternate one in place, and the TUI's cannot-scroll notice
     /// then calls the pane one with nothing to scroll.
     ring_start_modes: ReplayModes,
+    /// PRD #1666 part 3, round 5-wake (plan §2.2): whether the frame parsed
+    /// from this stream was drawn for the PTY's current geometry. Kept under
+    /// the same lock as the ring so a layout edge's ioctl and the bytes around
+    /// it are ordered.
+    evidence: crate::evidence_state::EvidenceState,
 }
 
 impl AgentBusState {
@@ -2060,6 +2065,16 @@ impl Default for AgentBus {
 
 impl AgentBus {
     pub fn new() -> Self {
+        Self::profiled(None, 24, 80)
+    }
+
+    /// A bus whose evidence state tracks `profile`'s screen from a spawn at
+    /// `rows` × `cols` (PRD #1666 part 3, round 5-wake).
+    pub fn profiled(
+        profile: Option<&'static crate::doorbell_screen::ScreenProfile>,
+        rows: u16,
+        cols: u16,
+    ) -> Self {
         let (tx, _rx0) = broadcast::channel(BROADCAST_CAPACITY);
         Self {
             tx,
@@ -2067,6 +2082,7 @@ impl AgentBus {
                 scrollback: VecDeque::new(),
                 live_modes: ReplayModes::default(),
                 ring_start_modes: ReplayModes::default(),
+                evidence: crate::evidence_state::EvidenceState::new(profile, rows, cols),
             }),
             #[cfg(test)]
             between_resize_and_clear: Mutex::new(None),
@@ -2088,6 +2104,14 @@ impl AgentBus {
     fn push(&self, data: Vec<u8>) {
         let arc = Arc::new(data);
         let mut state = self.state.lock().unwrap();
+        // PRD #1666 part 3, round 5-wake: a parser that starts at a redraw
+        // marker inside this push starts in the modes in force at the marker.
+        let modes_before = state.live_modes.clone();
+        let transition = state.evidence.push(&arc, |at| {
+            let mut modes = modes_before;
+            modes.feed(&arc[..at]);
+            modes.preamble()
+        });
         state.live_modes.feed(&arc);
         for &b in arc.iter() {
             state.scrollback.push_back(b);
@@ -2103,6 +2127,10 @@ impl AgentBus {
         // subscribers. `send` returns Err only when there are zero
         // receivers, which is fine — scrollback still has the bytes.
         let _ = self.tx.send(arc);
+        drop(state);
+        if let Some(transition) = transition {
+            log_evidence_transition(&transition, "output");
+        }
     }
 
     /// Atomically take the current scrollback snapshot and a receiver
@@ -2143,13 +2171,89 @@ impl AgentBus {
     /// A concurrent `subscribe` either sees the full pre-resize snapshot (and
     /// the live receiver picks up post-resize bytes) or sees an empty
     /// snapshot and the receiver picks up everything — no torn read.
-    fn resize_and_clear<E>(&self, resize: impl FnOnce() -> Result<(), E>) -> Result<(), E> {
+    fn resize_and_clear<E>(
+        &self,
+        rows: u16,
+        cols: u16,
+        resize: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), E> {
         let mut state = self.state.lock().unwrap();
         resize()?;
         #[cfg(test)]
         self.run_between_resize_and_clear();
         state.clear_ring();
+        let transition = state
+            .evidence
+            .edge(crate::evidence_state::EdgeReason::Resize, rows, cols);
+        let epoch = state.evidence.layout_epoch();
+        drop(state);
+        tracing::debug!(
+            target: "pane_layout",
+            edge = "resize",
+            rows,
+            cols,
+            ok = true,
+            layout_epoch = epoch,
+            "pane layout edge"
+        );
+        if let Some(transition) = transition {
+            log_evidence_transition(&transition, "resize");
+        }
         Ok(())
+    }
+
+    /// PRD #1666 part 3, round 5-wake (plan §2.2): run a repaint nudge's
+    /// ioctl to `rows` × `cols` under the lock `push` takes, so the edge is
+    /// recorded at its exact place in the stream. The ring is not cleared: an
+    /// attach replay keeps today's behaviour and `geometry_changes` keeps its
+    /// meaning. A failed restore leaves the width unknown until the next
+    /// successful resize.
+    fn resize_and_mark_edge<E>(
+        &self,
+        reason: crate::evidence_state::EdgeReason,
+        rows: u16,
+        cols: u16,
+        resize: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut state = self.state.lock().unwrap();
+        let result = resize();
+        let transition = match (&result, reason) {
+            (Ok(()), _) => state.evidence.edge(reason, rows, cols),
+            (Err(_), crate::evidence_state::EdgeReason::NudgeRestore) => {
+                state.evidence.geometry_unknown()
+            }
+            (Err(_), _) => None,
+        };
+        let epoch = state.evidence.layout_epoch();
+        drop(state);
+        tracing::debug!(
+            target: "pane_layout",
+            edge = reason.as_str(),
+            rows,
+            cols,
+            ok = result.is_ok(),
+            layout_epoch = epoch,
+            "pane layout edge"
+        );
+        if let Some(transition) = transition {
+            log_evidence_transition(&transition, reason.as_str());
+        }
+        result
+    }
+
+    /// The evidence state's status, layout epoch and stream position.
+    pub fn evidence(&self) -> (crate::evidence_state::EvidenceStatus, u64, u64) {
+        let state = self.state.lock().unwrap();
+        (
+            state.evidence.status(),
+            state.evidence.layout_epoch(),
+            state.evidence.out_seq(),
+        )
+    }
+
+    /// The current frame, read losslessly, while the evidence state is Clean.
+    pub fn clean_frame(&self) -> Option<crate::doorbell_screen::Grid> {
+        self.state.lock().unwrap().evidence.clean_frame()
     }
 
     /// The ring clear [`Self::resize_and_clear`] makes, without a resize.
@@ -2166,6 +2270,76 @@ impl AgentBus {
         self.tx.receiver_count()
     }
 }
+
+/// PRD #1666 part 3, round 5-wake: one `pane layout` line per change of a
+/// pane's evidence state.
+fn log_evidence_transition(transition: &crate::evidence_state::Transition, cause: &str) {
+    tracing::debug!(
+        target: "pane_layout",
+        cause,
+        from = transition.from.as_str(),
+        to = transition.to.as_str(),
+        layout_epoch = transition.layout_epoch,
+        out_seq = transition.out_seq,
+        marker_seq = transition.marker_seq,
+        "pane layout evidence"
+    );
+}
+
+/// How a pane's output stream ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadEnd {
+    Eof,
+    Error(std::io::ErrorKind),
+}
+
+/// What the deck started in the pane: its own wrapper around the agent's
+/// command, or the pane command itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildRole {
+    Wrapper,
+    PaneCommand,
+}
+
+/// PRD #1666 part 3, round 5-wake (plan rev 2 §6): what the deck observed
+/// ending a generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Termination {
+    /// The deck's own child (`role`) exited with `code`.
+    PaneCommandExited { code: u32, role: ChildRole },
+    /// The output stream ended and the child had not exited by the bound.
+    ConnectionEnded { read_end: ReadEnd },
+    /// The generation was removed and a successor holds its pane.
+    Replaced,
+    /// The generation was removed and nothing holds its pane.
+    Closed,
+}
+
+impl std::fmt::Display for Termination {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Termination::PaneCommandExited { code, role } => {
+                let role = match role {
+                    ChildRole::Wrapper => "wrapper",
+                    ChildRole::PaneCommand => "pane_command",
+                };
+                write!(
+                    f,
+                    "pane_command_exited code={code} child={role} reported_by=deck"
+                )
+            }
+            Termination::ConnectionEnded { read_end } => match read_end {
+                ReadEnd::Eof => write!(f, "connection_ended read_end=eof"),
+                ReadEnd::Error(kind) => write!(f, "connection_ended read_end={kind:?}"),
+            },
+            Termination::Replaced => write!(f, "replaced"),
+            Termination::Closed => write!(f, "closed"),
+        }
+    }
+}
+
+/// How long the reader polls for the deck's child after its stream ended.
+const TERMINATION_WAIT: Duration = Duration::from_millis(200);
 
 /// Reader-thread loop: pull bytes from the PTY master and publish them to
 /// the bus. Exits cleanly when the PTY returns EOF (the child was killed or
@@ -2256,13 +2430,21 @@ fn pump_reader(
     runtime_handle: Option<tokio::runtime::Handle>,
 ) {
     let mut buf = [0u8; 8192];
-    loop {
+    let read_end = loop {
         match reader.read(&mut buf) {
-            Ok(0) => break,
+            Ok(0) => break ReadEnd::Eof,
             Ok(n) => bus.push(buf[..n].to_vec()),
-            Err(_) => break,
+            // PRD #1666 part 3, round 5-wake: a read a signal interrupted is
+            // retried, not taken for the end of the stream.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => break ReadEnd::Error(e.kind()),
         }
-    }
+    };
+    // Whether the registry still held this generation when its output ended:
+    // read before any of the exit handling below, which can remove it.
+    let registered_at_eof = registry
+        .upgrade()
+        .is_some_and(|registry| registry.is_agent_still_registered(&agent_id));
     // Issue #868: must run regardless of whether `pane_id_env` is set — a
     // dashboard pane crashes just as much as an orchestration one, and the
     // block below (release/sweep/notify) only fires when a pane id exists.
@@ -2422,6 +2604,25 @@ fn pump_reader(
             }
         }
     }
+    // PRD #1666 part 3, round 5-wake (plan rev 2 §6): what the deck observed
+    // ending this generation, captured and logged. The deck observes its own
+    // child (the wrapper, or the pane command) and the stream, never the
+    // agent below them.
+    if let Some(registry) = registry.upgrade() {
+        let termination = registry.capture_termination(
+            &agent_id,
+            pane_id_env.as_deref(),
+            registered_at_eof,
+            read_end,
+        );
+        tracing::info!(
+            target: "pane_reader",
+            agent_id = %agent_id,
+            pane_id = pane_id_env.as_deref().unwrap_or("<none>"),
+            termination = %termination,
+            "pane reader ended"
+        );
+    }
 }
 
 /// Snapshot of the writer + bus needed to attach a streaming client.
@@ -2533,27 +2734,6 @@ pub enum DoorbellReady {
     Unproven,
 }
 
-/// A human attach frame in flight for a pane
-/// ([`AgentPtyRegistry::human_frame_arriving`]); dropping it ends that, and
-/// the pane's last one removes its count.
-#[must_use]
-pub struct HumanFrameInFlight {
-    counts: Arc<Mutex<HashMap<String, usize>>>,
-    pane_id_env: String,
-}
-
-impl Drop for HumanFrameInFlight {
-    fn drop(&mut self) {
-        let mut counts = self.counts.lock().unwrap();
-        if let Some(count) = counts.get_mut(&self.pane_id_env) {
-            *count -= 1;
-            if *count == 0 {
-                counts.remove(&self.pane_id_env);
-            }
-        }
-    }
-}
-
 /// PRD #20 R20-003/R20-006: the live target that currently owns a pane, resolved
 /// atomically for the identity-guarded send path. Bundles the shared writer with
 /// the identity/liveness needed to re-validate after the writer lock is acquired.
@@ -2662,6 +2842,12 @@ pub struct RunningAgent {
     /// synchronous and must not wait on a writer another task holds.
     pub pane_retired: Arc<AtomicBool>,
     pub bus: Arc<AgentBus>,
+    /// PRD #1666 part 3, round 5-wake: what the deck started in the pane.
+    pub child_role: ChildRole,
+    /// PRD #1666 part 3, round 5-wake (plan §2.1′): every human operation on
+    /// this generation's input, from arrival until its bytes are done with
+    /// the PTY. Closed when the generation retires.
+    pub ingress: Arc<crate::ingress_ledger::IngressLedger>,
     /// Value of [`DOT_AGENT_DECK_PANE_ID`] captured from the spawn-time env,
     /// if the caller supplied one. Echoed back to clients via the M2.x
     /// rehydration path so the TUI can re-bind a freshly-attached pane to
@@ -3967,12 +4153,25 @@ impl PaneWriter {
     /// reading holds it exactly as long as it would hold their keystrokes in a
     /// terminal. Errors as `write_all` would; the flush after it is a no-op on
     /// both PTY backends and its result is ignored, as it always was here.
+    #[cfg(test)]
     pub(crate) async fn write_user(&self, bytes: &[u8]) -> std::io::Result<()> {
+        self.write_user_ticketed(bytes, None).await
+    }
+
+    /// [`Self::write_user`] for a human operation admitted to the
+    /// generation's ledger: the job carrying the bytes takes `ticket` over and
+    /// settles it when it ends (PRD #1666 part 3, round 5-wake).
+    pub(crate) async fn write_user_ticketed(
+        &self,
+        bytes: &[u8],
+        ticket: Option<crate::ingress_ledger::TicketGuard>,
+    ) -> std::io::Result<()> {
         match self
             .pty
-            .run(
+            .run_ticketed(
                 PtyOp::WriteAll(bytes.to_vec(), ByteSource::User, true),
                 None,
+                ticket,
             )
             .await
         {
@@ -4003,10 +4202,11 @@ impl PaneWriter {
         bytes: &[u8],
         gate: AnswerGate,
         queued: impl FnOnce(),
+        ticket: Option<crate::ingress_ledger::TicketGuard>,
     ) -> std::io::Result<AnswerWrite> {
         match self
             .pty
-            .run_queued(PtyOp::Answer(bytes.to_vec(), gate), queued)
+            .run_queued(PtyOp::Answer(bytes.to_vec(), gate), queued, ticket)
             .await
         {
             PtyJobOutcome::Done(PtyJobDone { result: Err(e), .. })
@@ -4207,6 +4407,22 @@ struct PtyJob {
     /// decides whether a single byte of it is ever written.
     state: Arc<AtomicU8>,
     reply: PtyReply,
+    /// PRD #1666 part 3, round 5-wake (plan §2.1′): the human operation these
+    /// bytes belong to, settled by the thread when the job ends. The deck's
+    /// own writes carry none.
+    ticket: Option<crate::ingress_ledger::JobTicket>,
+}
+
+impl PtyOp {
+    /// How many bytes the job hands the PTY.
+    fn len(&self) -> usize {
+        match self {
+            PtyOp::Write(buf, _) | PtyOp::WriteAll(buf, _, _) | PtyOp::Answer(buf, _) => buf.len(),
+            PtyOp::Flush => 0,
+            #[cfg(test)]
+            PtyOp::Surrender(_) => 0,
+        }
+    }
 }
 
 /// Issue #525: jobs handed to the thread and not yet finished or withdrawn.
@@ -4247,6 +4463,19 @@ struct WithdrawUnlessAnswered<'a> {
     in_flight: &'a PtyInFlight,
     state: &'a AtomicU8,
     armed: bool,
+    /// The job's ticket, settled `Cancelled` when the job is taken back.
+    ticket: Option<crate::ingress_ledger::TicketHandle>,
+}
+
+impl WithdrawUnlessAnswered<'_> {
+    /// Take the job back if it has not started; `true` when it never will.
+    fn withdraw(&self) -> bool {
+        let withdrawn = self.in_flight.withdraw(self.state);
+        if withdrawn && let Some(ticket) = &self.ticket {
+            ticket.settle_cancelled();
+        }
+        withdrawn
+    }
 }
 
 impl Drop for WithdrawUnlessAnswered<'_> {
@@ -4254,7 +4483,7 @@ impl Drop for WithdrawUnlessAnswered<'_> {
         if self.armed {
             // A job the thread has already started is left to finish: its
             // bytes are going to the PTY.
-            self.in_flight.withdraw(self.state);
+            self.withdraw();
         }
     }
 }
@@ -4317,6 +4546,7 @@ impl PtyWriterThread {
                         // Withdrawn by a caller that stopped waiting.
                         continue;
                     }
+                    let len = job.op.len();
                     let done = match job.op {
                         PtyOp::Write(buf, source) => {
                             match write_once_recorded(inner.as_mut(), &buf, &recorder, source) {
@@ -4370,6 +4600,23 @@ impl PtyWriterThread {
                             return;
                         }
                     };
+                    // PRD #1666 part 3, round 5-wake: the human operation's
+                    // ticket settles with what the PTY took. A voice answer
+                    // superseded before its keys were written wrote nothing.
+                    if let Some(ticket) = job.ticket {
+                        let error = done.result.as_ref().err();
+                        if error.is_some_and(|e| {
+                            e.get_ref().is_some_and(|i| i.is::<AnswerSuperseded>())
+                        }) {
+                            ticket.settle_cancelled();
+                        } else {
+                            ticket.settle_written(
+                                len,
+                                done.accepted,
+                                error.map(std::io::Error::kind),
+                            );
+                        }
+                    }
                     // Answered BEFORE it counts as finished, so a caller whose
                     // bound runs out in between finds the answer rather than
                     // reporting a finished write as stalled.
@@ -4396,32 +4643,67 @@ impl PtyWriterThread {
     }
 
     fn submit(&self, op: PtyOp, reply: PtyReply) -> Option<Arc<AtomicU8>> {
+        self.submit_ticketed(op, reply, None)
+            .map(|(state, _)| state)
+    }
+
+    /// [`Self::submit`], carrying a human operation's ticket: its ownership
+    /// moves into the job, and the ledger's job mark with it, in one hold of
+    /// the ledger around the queueing (PRD #1666 part 3, round 5-wake).
+    fn submit_ticketed(
+        &self,
+        op: PtyOp,
+        reply: PtyReply,
+        ticket: Option<crate::ingress_ledger::TicketGuard>,
+    ) -> Option<(Arc<AtomicU8>, Option<crate::ingress_ledger::TicketHandle>)> {
         let state = Arc::new(AtomicU8::new(PTY_JOB_QUEUED));
         self.in_flight.count.fetch_add(1, Ordering::SeqCst);
-        let job = PtyJob {
-            op,
-            state: state.clone(),
-            reply,
+        let queue = |ticket: Option<crate::ingress_ledger::JobTicket>| {
+            let handle = ticket
+                .as_ref()
+                .map(crate::ingress_ledger::JobTicket::handle);
+            let job = PtyJob {
+                op,
+                state: state.clone(),
+                reply,
+                ticket,
+            };
+            if self.jobs.send(job).is_err() {
+                self.in_flight.leave();
+                return None;
+            }
+            Some((state.clone(), handle))
         };
-        if self.jobs.send(job).is_err() {
-            self.in_flight.leave();
-            return None;
+        match ticket {
+            Some(ticket) => ticket.into_job(|job| queue(Some(job))),
+            None => queue(None),
         }
-        Some(state)
     }
 
     /// Hand `op` to the thread and wait for it, at most `bound` when one is
     /// given. Dropping the returned future withdraws the job if it has not
     /// started.
     async fn run(&self, op: PtyOp, bound: Option<Duration>) -> PtyJobOutcome {
+        self.run_ticketed(op, bound, None).await
+    }
+
+    /// [`Self::run`] for a human operation's bytes, whose ticket the job
+    /// takes over.
+    async fn run_ticketed(
+        &self,
+        op: PtyOp,
+        bound: Option<Duration>,
+        ticket: Option<crate::ingress_ledger::TicketGuard>,
+    ) -> PtyJobOutcome {
         let (tx, mut rx) = oneshot::channel();
-        let Some(state) = self.submit(op, PtyReply::Async(tx)) else {
+        let Some((state, handle)) = self.submit_ticketed(op, PtyReply::Async(tx), ticket) else {
             return PtyJobOutcome::Gone;
         };
         let mut guard = WithdrawUnlessAnswered {
             in_flight: &self.in_flight,
             state: &state,
             armed: true,
+            ticket: handle,
         };
         let outcome = match bound {
             None => match (&mut rx).await {
@@ -4431,7 +4713,7 @@ impl PtyWriterThread {
             Some(bound) => match within_real_time(bound, &mut rx).await {
                 Some(Ok(done)) => PtyJobOutcome::Done(done),
                 Some(Err(_)) => PtyJobOutcome::Gone,
-                None if self.in_flight.withdraw(&state) => PtyJobOutcome::Withdrawn,
+                None if guard.withdraw() => PtyJobOutcome::Withdrawn,
                 // Started: it may have finished in the instant since the
                 // alarm rang, in which case its answer is the truth.
                 None => match rx.try_recv() {
@@ -4454,9 +4736,14 @@ impl PtyWriterThread {
     /// key re-checks its question on the thread ([`AnswerGate`], PRD #1631
     /// audit T1). A job still queued when the caller is dropped is withdrawn,
     /// as [`Self::run`]'s is, and so never written.
-    async fn run_queued(&self, op: PtyOp, queued: impl FnOnce()) -> PtyJobOutcome {
+    async fn run_queued(
+        &self,
+        op: PtyOp,
+        queued: impl FnOnce(),
+        ticket: Option<crate::ingress_ledger::TicketGuard>,
+    ) -> PtyJobOutcome {
         let (tx, rx) = oneshot::channel();
-        let Some(state) = self.submit(op, PtyReply::Async(tx)) else {
+        let Some((state, handle)) = self.submit_ticketed(op, PtyReply::Async(tx), ticket) else {
             queued();
             return PtyJobOutcome::Gone;
         };
@@ -4465,6 +4752,7 @@ impl PtyWriterThread {
             in_flight: &self.in_flight,
             state: &state,
             armed: true,
+            ticket: handle,
         };
         let outcome = match rx.await {
             Ok(done) => PtyJobOutcome::Done(done),
@@ -5593,14 +5881,6 @@ pub struct AgentPtyRegistry {
     /// is what makes the record atomic with respect to writer handoff (H1). See
     /// [`PaneInputState`].
     pane_input: Arc<Mutex<PaneInputState>>,
-    /// PRD #1666 part 2 (`inbox/doorbell/031`): per pane, the human attach
-    /// frames that have arrived and not yet finished with the pane's writer
-    /// ([`Self::human_frame_arriving`]). A frame counts from before it waits
-    /// for the writer, so a doorbell holding the writer between its steps sees
-    /// the keystroke queued behind it, which [`Self::draft_pending`] cannot
-    /// until the frame is written. A pane is in the map only while one of
-    /// its frames is in flight.
-    human_frames_in_flight: Arc<Mutex<HashMap<String, usize>>>,
     /// Issue #525: how long a guarded delivery waits on one PTY write before
     /// it stops waiting — [`PTY_WRITE_STALL_BOUND`], lowered by tests. In
     /// milliseconds so a test can change it through the `Arc` every caller
@@ -5610,6 +5890,10 @@ pub struct AgentPtyRegistry {
     /// ([`AgentPtyRegistry::nudge_repaint`]), each mapped to whether another
     /// was asked for while it ran.
     repaint_nudges: Mutex<HashMap<String, bool>>,
+    /// PRD #1666 part 3, round 5-wake: agents whose writer a doorbell
+    /// transaction holds ([`AgentPtyRegistry::doorbell_txn_begin`]), each
+    /// mapped to whether a repaint nudge was deferred meanwhile.
+    doorbell_txns: Mutex<HashMap<String, bool>>,
     /// PRD #1666 S8: how long a repaint nudge keeps the PTY one column
     /// narrower, in milliseconds ([`REPAINT_NUDGE_GAP`], or
     /// [`ENV_REPAINT_NUDGE_GAP_MS`]).
@@ -7722,9 +8006,9 @@ impl AgentPtyRegistry {
             shutting_down: AtomicBool::new(false),
             admission_frozen: AtomicBool::new(false),
             pane_input: Arc::new(Mutex::new(PaneInputState::default())),
-            human_frames_in_flight: Arc::default(),
             pty_write_stall_bound_ms: AtomicU64::new(PTY_WRITE_STALL_BOUND.as_millis() as u64),
             repaint_nudges: Mutex::new(HashMap::new()),
+            doorbell_txns: Mutex::new(HashMap::new()),
             repaint_nudge_gap_ms: AtomicU64::new(
                 std::env::var(ENV_REPAINT_NUDGE_GAP_MS)
                     .ok()
@@ -7859,16 +8143,25 @@ impl AgentPtyRegistry {
     where
         Fut: std::future::Future<Output = bool>,
     {
-        let target = self
-            .writer_target_for_agent(agent_id)
-            .ok_or("the agent is not running")?;
+        // PRD #1666 part 3, round 5-wake: a voice answer's keys are a human
+        // operation on the agent's input, admitted before any await.
+        let ticket = self.admit_ingress(agent_id);
+        let refuse = |ticket: Option<crate::ingress_ledger::TicketGuard>, why: &'static str| {
+            if let Some(ticket) = ticket {
+                ticket.refuse(why);
+            }
+            Err(why)
+        };
+        let Some(target) = self.writer_target_for_agent(agent_id) else {
+            return refuse(ticket, "the agent is not running");
+        };
         let writer = target.writer.lock().await;
         let lifecycle = self.question_answers.lock_lifecycle(pane_id).await;
         if target.exited.load(Ordering::SeqCst) {
-            return Err("the agent exited");
+            return refuse(ticket, "the agent exited");
         }
         if !revalidate().await {
-            return Err("the question changed before the keys were typed");
+            return refuse(ticket, "the question changed before the keys were typed");
         }
         self.question_answers
             .barrier("answer_keys:revalidated")
@@ -7877,7 +8170,7 @@ impl AgentPtyRegistry {
             .question_answers
             .answer_gate(pane_id, question_id, revision);
         match writer
-            .write_answer(keys, gate, move || drop(lifecycle))
+            .write_answer(keys, gate, move || drop(lifecycle), ticket)
             .await
         {
             Ok(AnswerWrite::Written(at)) => Ok(at),
@@ -9893,31 +10186,93 @@ impl AgentPtyRegistry {
         self.pane_input.lock().unwrap().draft_pending(pane_id_env)
     }
 
-    /// PRD #1666 part 2 (`inbox/doorbell/031`): a human attach frame for
-    /// `pane_id_env` has arrived and is about to wait for the pane's writer.
-    /// It counts as in flight until the returned guard drops, which the
-    /// caller does once the frame is written or refused.
-    pub fn human_frame_arriving(&self, pane_id_env: &str) -> HumanFrameInFlight {
-        *self
-            .human_frames_in_flight
-            .lock()
-            .unwrap()
-            .entry(pane_id_env.to_string())
-            .or_default() += 1;
-        HumanFrameInFlight {
-            counts: Arc::clone(&self.human_frames_in_flight),
-            pane_id_env: pane_id_env.to_string(),
+    /// PRD #1666 part 3, round 5-wake (plan §2.1′): admit one human operation
+    /// on `agent_id`'s input to its generation's ledger, before any await. The
+    /// returned guard owns the ticket until the operation's bytes are handed to
+    /// a PTY job; `None` when the generation is not in the registry.
+    pub fn admit_ingress(&self, agent_id: &str) -> Option<crate::ingress_ledger::TicketGuard> {
+        let inner = self.inner.lock();
+        inner
+            .agents
+            .get(agent_id)
+            .map(|agent| agent.ingress.admit())
+    }
+
+    /// `agent_id`'s ingress ledger, while it is in the registry.
+    pub fn ingress_ledger(
+        &self,
+        agent_id: &str,
+    ) -> Option<Arc<crate::ingress_ledger::IngressLedger>> {
+        let inner = self.inner.lock();
+        inner
+            .agents
+            .get(agent_id)
+            .map(|agent| Arc::clone(&agent.ingress))
+    }
+
+    /// PRD #1666 part 2 (`inbox/doorbell/031`): a human frame for the live
+    /// agent on `pane_id_env` has arrived: admitted to its generation's ledger
+    /// ([`Self::admit_ingress`]) until the returned guard, or the job it hands
+    /// its bytes to, settles it.
+    pub fn human_frame_arriving(
+        &self,
+        pane_id_env: &str,
+    ) -> Option<crate::ingress_ledger::TicketGuard> {
+        let agent_id = self.pane_current_agent_id(pane_id_env)?;
+        self.admit_ingress(&agent_id)
+    }
+
+    /// PRD #1666 part 3, round 5-wake (plan rev 2 §6): what ended
+    /// `agent_id`'s output. A generation the registry still held at its EOF
+    /// (`registered_at_eof`) ended on its own: its child's status, polled for
+    /// up to [`TERMINATION_WAIT`], or the stream's end when the child has not
+    /// exited by then. A removed one was replaced when a successor holds its
+    /// pane, and closed otherwise.
+    fn capture_termination(
+        &self,
+        agent_id: &str,
+        pane_id_env: Option<&str>,
+        registered_at_eof: bool,
+        read_end: ReadEnd,
+    ) -> Termination {
+        if registered_at_eof {
+            let deadline = Instant::now() + TERMINATION_WAIT;
+            loop {
+                let status = {
+                    let mut inner = self.inner.lock();
+                    inner
+                        .agents
+                        .get_mut(agent_id)
+                        .map(|agent| (agent.child.try_wait().ok().flatten(), agent.child_role))
+                };
+                match status {
+                    Some((Some(status), role)) => {
+                        return Termination::PaneCommandExited {
+                            code: status.exit_code(),
+                            role,
+                        };
+                    }
+                    Some((None, _)) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    _ => return Termination::ConnectionEnded { read_end },
+                }
+            }
+        }
+        match pane_id_env.and_then(|pane| self.pane_current_agent_id(pane)) {
+            Some(current) if current != agent_id => Termination::Replaced,
+            _ => Termination::Closed,
         }
     }
 
-    /// Whether a human attach frame for `pane_id_env` is in flight
-    /// ([`Self::human_frame_arriving`]): read by the doorbell under the pane's
-    /// writer, where an in-flight frame is one queued behind it.
+    /// Whether a human operation on the live agent of `pane_id_env` is
+    /// outstanding in its generation's ledger — arrived and not yet done with
+    /// the PTY: read by the doorbell under the pane's writer, where it is one
+    /// queued behind it.
     pub fn human_frame_in_flight(&self, pane_id_env: &str) -> bool {
-        self.human_frames_in_flight
-            .lock()
-            .unwrap()
-            .contains_key(pane_id_env)
+        self.pane_current_agent_id(pane_id_env)
+            .and_then(|agent_id| self.ingress_ledger(&agent_id))
+            .is_some_and(|ledger| ledger.any_outstanding())
     }
 
     /// PRD #1666: generation `agent_id` reported `edge` of a turn on
@@ -10906,6 +11261,8 @@ impl AgentPtyRegistry {
             for agent in inner.agents.values() {
                 if agent.pane_id_env.as_deref() == Some(claimed.as_str()) {
                     agent.pane_retired.store(true, Ordering::SeqCst);
+                    // PRD #1666 part 3, round 5-wake: the retired generation's ledger.
+                    agent.ingress.close();
                 }
             }
             self.forget_pane_input(claimed);
@@ -10993,6 +11350,20 @@ impl AgentPtyRegistry {
             self.pane_input.clone(),
             pane_retired.clone(),
         );
+        let child_role = match spawn_command.as_deref() {
+            Some(command)
+                if crate::wrap::launches_wrapper(
+                    command,
+                    &spawn_agent_type
+                        .clone()
+                        .or_else(|| AgentType::from_command(Some(command)))
+                        .unwrap_or(AgentType::None),
+                ) =>
+            {
+                ChildRole::Wrapper
+            }
+            _ => ChildRole::PaneCommand,
+        };
         let agent = RunningAgent {
             child,
             process_group,
@@ -11003,6 +11374,8 @@ impl AgentPtyRegistry {
             writer: Arc::new(AsyncMutex::new(pane_writer)),
             pane_retired,
             bus,
+            child_role,
+            ingress: crate::ingress_ledger::IngressLedger::new(),
             pane_id_env,
             display_name,
             cwd: cwd_stored,
@@ -11583,6 +11956,8 @@ impl AgentPtyRegistry {
                 .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?;
             // Before the pane-state lock below — see [`PaneWriter::retired`].
             agent.pane_retired.store(true, Ordering::SeqCst);
+            // PRD #1666 part 3, round 5-wake: the retired generation's ledger.
+            agent.ingress.close();
             if let Some(pane) = agent.pane_id_env.as_deref() {
                 let still_claimed = inner
                     .agents
@@ -11887,6 +12262,8 @@ impl AgentPtyRegistry {
             // old generation's writer is retired all the same, so a write it is
             // still finishing cannot record into the successor's input box.
             removed.pane_retired.store(true, Ordering::SeqCst);
+            // PRD #1666 part 3, round 5-wake: the retired generation's ledger.
+            removed.ingress.close();
             // Issue #1612: the pane keeps its working directory in use while it
             // has neither a record nor a reservation. Released with the ticket.
             let dirs = removed.rooted_dirs().collect();
@@ -11984,6 +12361,9 @@ impl AgentPtyRegistry {
             // starts `false` and takes the pane over in `spawn_agent`.
             pane_handed_over: _,
             pane_retired: _,
+            // Closed where the record was removed, above.
+            ingress: _,
+            child_role: _,
             // PRD #745 M11: deliberately dropped rather than carried over. The
             // fresh child is a fresh spawn, and `spawn_agent` stamps it — which
             // is what makes a restarted worker report its CURRENT iteration
@@ -13280,7 +13660,7 @@ impl AgentPtyRegistry {
         let master = &agent.master;
         agent
             .bus
-            .resize_and_clear(|| {
+            .resize_and_clear(rows, cols, || {
                 master.resize(PtySize {
                     rows,
                     cols,
@@ -13394,6 +13774,11 @@ impl AgentPtyRegistry {
     /// real resize during the gap wins. Coalesced per agent: a request while
     /// one runs schedules at most one more after it, one gap after its restore.
     pub fn nudge_repaint(self: &Arc<Self>, agent_id: &str) {
+        if let Some(deferred) = self.doorbell_txns.lock().unwrap().get_mut(agent_id) {
+            *deferred = true;
+            tracing::debug!(target: "pane_layout", agent_id, "pane layout nudge deferred");
+            return;
+        }
         if !self.nudge_begin(agent_id) {
             return;
         }
@@ -13465,14 +13850,24 @@ impl AgentPtyRegistry {
         if agent.pty_cols < 2 || agent.exited.load(Ordering::SeqCst) {
             return false;
         }
+        // PRD #1666 part 3, round 5-wake: under the bus lock, so the edge sits
+        // at its place in the stream (the registry lock, then the bus's).
+        let (rows, cols) = (agent.pty_rows, agent.pty_cols - 1);
         agent
-            .master
-            .resize(PtySize {
-                rows: agent.pty_rows,
-                cols: agent.pty_cols - 1,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
+            .bus
+            .resize_and_mark_edge(
+                crate::evidence_state::EdgeReason::NudgeShrink,
+                rows,
+                cols,
+                || {
+                    agent.master.resize(PtySize {
+                        rows,
+                        cols,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    })
+                },
+            )
             .is_ok()
     }
 
@@ -13480,12 +13875,40 @@ impl AgentPtyRegistry {
     fn nudge_restore(&self, agent_id: &str) {
         let inner = self.inner.lock();
         if let Some(agent) = inner.agents.get(agent_id) {
-            let _ = agent.master.resize(PtySize {
-                rows: agent.pty_rows,
-                cols: agent.pty_cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            });
+            let (rows, cols) = (agent.pty_rows, agent.pty_cols);
+            let _ = agent.bus.resize_and_mark_edge(
+                crate::evidence_state::EdgeReason::NudgeRestore,
+                rows,
+                cols,
+                || {
+                    agent.master.resize(PtySize {
+                        rows,
+                        cols,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    })
+                },
+            );
+        }
+    }
+
+    /// PRD #1666 part 3, round 5-wake (plan §2.2): a doorbell transaction now
+    /// holds `agent_id`'s writer. A repaint nudge asked for meanwhile waits
+    /// for [`Self::doorbell_txn_end`] instead of moving the layout under it.
+    pub fn doorbell_txn_begin(&self, agent_id: &str) {
+        self.doorbell_txns
+            .lock()
+            .unwrap()
+            .insert(agent_id.to_string(), false);
+    }
+
+    /// The transaction [`Self::doorbell_txn_begin`] marked has released the
+    /// writer: a nudge deferred meanwhile starts now.
+    pub fn doorbell_txn_end(self: &Arc<Self>, agent_id: &str) {
+        let deferred = self.doorbell_txns.lock().unwrap().remove(agent_id);
+        if deferred == Some(true) {
+            tracing::debug!(target: "pane_layout", agent_id, "pane layout deferred nudge starts");
+            self.nudge_repaint(agent_id);
         }
     }
 
@@ -14723,6 +15146,8 @@ impl AgentPtyRegistry {
                 writer: Arc::new(AsyncMutex::new(pane_writer)),
                 pane_retired,
                 bus: Arc::new(AgentBus::new()),
+                child_role: ChildRole::PaneCommand,
+                ingress: crate::ingress_ledger::IngressLedger::new(),
                 pane_id_env: pane_id_env.map(str::to_string),
                 display_name: None,
                 cwd: None,
@@ -16479,30 +16904,6 @@ mod tests {
                 "idle member {id} holds a PTY master"
             );
         }
-    }
-
-    /// Qodo on PR #1817 (finding 17): a pane's human-frame count is kept only
-    /// while a frame for it is in flight, so a long-lived daemon holds none for
-    /// the panes it has finished with.
-    #[test]
-    fn a_pane_with_no_human_frame_in_flight_holds_no_count() {
-        let registry = AgentPtyRegistry::new();
-        let first = registry.human_frame_arriving("pane-a");
-        let second = registry.human_frame_arriving("pane-a");
-        let other = registry.human_frame_arriving("pane-b");
-        drop(first);
-        assert!(
-            registry.human_frame_in_flight("pane-a"),
-            "one frame is left"
-        );
-        drop(second);
-        drop(other);
-        assert!(!registry.human_frame_in_flight("pane-a"));
-        assert!(!registry.human_frame_in_flight("pane-b"));
-        assert!(
-            registry.human_frames_in_flight.lock().unwrap().is_empty(),
-            "a pane with no frame in flight keeps its count"
-        );
     }
 
     /// Issue #714 (review): a blocked-worker notice task is cancellable only
@@ -21522,6 +21923,365 @@ mod spawn_tests {
             DoorbellWrite::Written,
             "the prompt the agent repainted for the resize must still be on screen for the doorbell"
         );
+        registry.shutdown_all();
+    }
+
+    /// A Claude Code frame at `cols`: the full-width rules around an empty
+    /// composer, preceded by Claude Code's full-redraw marker.
+    fn claude_frame(cols: u16) -> Vec<u8> {
+        let rule = "─".repeat(cols as usize);
+        format!("\x1b[2J\x1b[H\x1b[20;1H{rule}\x1b[21;1H❯\u{a0}\x1b[22;1H{rule}\x1b[23;3Hstatus\x1b[21;3H")
+            .into_bytes()
+    }
+
+    fn evidence(bus: &AgentBus) -> crate::evidence_state::EvidenceStatus {
+        bus.evidence().0
+    }
+
+    /// Scenario: Feed a Claude Code-profiled bus a frame, then move its layout the way a nudge does (shrink one column, restore) and the way a resize does, pushing the agent's bytes between and after the edges: frames drawn for the old width with and without the redraw marker, a marker split across two pushes, and a failed restore. The state is Clean only after a marker followed by a frame drawn for the width in force; bytes before the marker are never parsed, a redraw for the old width leaves it pending, a failed restore leaves the width unknown until the next resize, and an unprofiled bus tracks nothing.
+    #[spec("inbox/doorbell/044")]
+    #[test]
+    fn doorbell_044_layout_edges_order_the_evidence() {
+        use crate::evidence_state::{EdgeReason, EvidenceStatus};
+        let profile = Some(&crate::doorbell_screen::CLAUDE_PROFILE);
+        let bus = AgentBus::profiled(profile, 24, 80);
+        assert!(matches!(
+            evidence(&bus),
+            EvidenceStatus::Pending {
+                after_edge: None,
+                ..
+            }
+        ));
+        bus.push(claude_frame(80));
+        assert!(matches!(
+            evidence(&bus),
+            EvidenceStatus::Clean { since_seq: 0 }
+        ));
+        assert!(bus.clean_frame().is_some());
+
+        // A nudge: shrink, the agent's bytes for 79, restore.
+        bus.resize_and_mark_edge(EdgeReason::NudgeShrink, 24, 79, || Ok::<(), ()>(()))
+            .unwrap();
+        assert!(matches!(
+            evidence(&bus),
+            EvidenceStatus::Dirty {
+                reason: EdgeReason::NudgeShrink,
+                ..
+            }
+        ));
+        assert!(bus.clean_frame().is_none());
+        bus.resize_and_mark_edge(EdgeReason::NudgeRestore, 24, 80, || Ok::<(), ()>(()))
+            .unwrap();
+        // Bytes the agent wrote for the old width, without a marker: never parsed,
+        // even though their rules would be a witness at 80 if they were.
+        let mut old = claude_frame(80);
+        old.drain(..b"\x1b[2J\x1b[H".len());
+        bus.push(old);
+        assert!(matches!(evidence(&bus), EvidenceStatus::Dirty { .. }));
+        // A full redraw drawn for the shrunk width: pending, not Clean.
+        bus.push(claude_frame(79));
+        assert!(matches!(
+            evidence(&bus),
+            EvidenceStatus::Pending {
+                after_edge: Some(_),
+                ..
+            }
+        ));
+        // The redraw for the width in force, its marker split across pushes.
+        let frame = claude_frame(80);
+        bus.push(frame[..3].to_vec());
+        bus.push(frame[3..].to_vec());
+        assert!(matches!(evidence(&bus), EvidenceStatus::Clean { .. }));
+
+        // A real resize inside a nudge's gap: the geometry in force is the
+        // resize's, and only a frame drawn for it is a witness.
+        bus.resize_and_mark_edge(EdgeReason::NudgeShrink, 24, 79, || Ok::<(), ()>(()))
+            .unwrap();
+        bus.resize_and_clear(30, 100, || Ok::<(), ()>(())).unwrap();
+        bus.resize_and_mark_edge(EdgeReason::NudgeRestore, 30, 100, || Ok::<(), ()>(()))
+            .unwrap();
+        bus.push(claude_frame(80));
+        assert!(!matches!(evidence(&bus), EvidenceStatus::Clean { .. }));
+        bus.push(claude_frame(100));
+        assert!(matches!(evidence(&bus), EvidenceStatus::Clean { .. }));
+        let epoch = bus.evidence().1;
+
+        // A failed restore: the width is unknown until the next resize.
+        bus.resize_and_mark_edge(EdgeReason::NudgeShrink, 30, 99, || Ok::<(), ()>(()))
+            .unwrap();
+        let _ = bus.resize_and_mark_edge(EdgeReason::NudgeRestore, 30, 100, || Err(()));
+        assert!(matches!(
+            evidence(&bus),
+            EvidenceStatus::GeometryUnknown { .. }
+        ));
+        bus.push(claude_frame(100));
+        assert!(matches!(
+            evidence(&bus),
+            EvidenceStatus::GeometryUnknown { .. }
+        ));
+        bus.resize_and_clear(30, 100, || Ok::<(), ()>(())).unwrap();
+        bus.push(claude_frame(100));
+        assert!(matches!(evidence(&bus), EvidenceStatus::Clean { .. }));
+        assert_eq!(
+            bus.evidence().1,
+            epoch + 3,
+            "each edge moves the layout epoch"
+        );
+
+        // A failed shrink moves nothing.
+        let before = bus.evidence();
+        let _ = bus.resize_and_mark_edge(EdgeReason::NudgeShrink, 30, 99, || Err(()));
+        assert_eq!(bus.evidence().0, before.0);
+
+        // An unprofiled bus tracks nothing.
+        let plain = AgentBus::new();
+        plain.push(claude_frame(80));
+        plain
+            .resize_and_mark_edge(EdgeReason::NudgeShrink, 24, 79, || Ok::<(), ()>(()))
+            .unwrap();
+        assert_eq!(evidence(&plain), EvidenceStatus::Unprofiled);
+    }
+
+    /// Scenario: A doorbell transaction marks a `cat` pane's writer as held, and a repaint nudge is asked for meanwhile; then the transaction ends. The nudge does not start while the transaction holds the writer, and starts once it has ended.
+    #[spec("inbox/doorbell/044")]
+    #[tokio::test]
+    async fn doorbell_044_a_nudge_waits_for_the_doorbell_transaction() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (id, _) = ledger_pane(&registry, "pane-nudge-deferred");
+        registry.doorbell_txn_begin(&id);
+        registry.nudge_repaint(&id);
+        assert!(
+            !registry.repaint_nudges.lock().unwrap().contains_key(&id),
+            "a nudge started under the transaction"
+        );
+        registry.doorbell_txn_end(&id);
+        assert!(
+            registry.repaint_nudges.lock().unwrap().contains_key(&id),
+            "the deferred nudge did not start once the transaction ended"
+        );
+        // Without a transaction, a nudge starts at once.
+        let (other, _) = ledger_pane(&registry, "pane-nudge-free");
+        registry.nudge_repaint(&other);
+        assert!(registry.repaint_nudges.lock().unwrap().contains_key(&other));
+        registry.shutdown_all();
+    }
+
+    /// A `cat` pane for the ledger tests, its id and its ledger.
+    fn ledger_pane(
+        registry: &Arc<AgentPtyRegistry>,
+        pane: &str,
+    ) -> (String, Arc<crate::ingress_ledger::IngressLedger>) {
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    pane.to_string(),
+                )]),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the ledger's pane");
+        let ledger = registry
+            .ingress_ledger(&id)
+            .expect("the generation's ledger");
+        (id, ledger)
+    }
+
+    /// Wait (bounded) until `ledger` has settled `ticket`.
+    async fn settled_as(
+        ledger: &crate::ingress_ledger::IngressLedger,
+        ticket: u64,
+    ) -> crate::ingress_ledger::Settlement {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            if let Some((_, how)) = ledger.settled().into_iter().find(|(t, _)| *t == ticket) {
+                return how;
+            }
+            assert!(Instant::now() < deadline, "ticket {ticket} never settled");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Scenario: Admit human operations to a `cat` pane's ledger and end them every way they can end: refused, dropped by their caller, and written through the pane's writer; then let the deck write its own bytes. Each ticket settles once with its outcome, the watermark moves for every admission (so an operation already settled still shows), the job mark moves only when a ticket's bytes are queued for the PTY, and the deck's own bytes move neither.
+    #[spec("inbox/doorbell/035")]
+    #[tokio::test]
+    async fn doorbell_035_tickets_settle_once_and_marks_move_as_specified() {
+        use crate::ingress_ledger::Settlement;
+        const PANE: &str = "pane-ledger-marks";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (id, ledger) = ledger_pane(&registry, PANE);
+        // The deck's own bytes take no ticket and move no mark.
+        let deck = registry
+            .write_doorbell(PANE, &id, false, None, Some("DECKLINE"), || async { true })
+            .await;
+        assert_eq!(deck, DoorbellWrite::Written);
+        crate::test_pty_wait::wait_for_echo_bytes(&registry, &id, b"DECKLINE").await;
+        let w0 = ledger.marks();
+        assert_eq!((w0.watermark, w0.job_mark, w0.outstanding), (0, 0, 0));
+
+        let refused = registry.admit_ingress(&id).expect("admitted");
+        let refused_ticket = refused.ticket();
+        assert_eq!(ledger.marks().outstanding, 1);
+        assert!(
+            registry.human_frame_in_flight(PANE),
+            "an admitted frame is in flight"
+        );
+        refused.refuse("history-only");
+        assert_eq!(
+            settled_as(&ledger, refused_ticket).await,
+            Settlement::Refused("history-only")
+        );
+        let after_refusal = ledger.marks();
+        assert_eq!(after_refusal.outstanding, 0);
+        assert!(!registry.human_frame_in_flight(PANE));
+        // ABA: nothing outstanding, but the watermark says something arrived.
+        assert_eq!(after_refusal.watermark, w0.watermark + 1);
+        assert_eq!(after_refusal.job_mark, w0.job_mark);
+
+        let dropped = registry.admit_ingress(&id).expect("admitted");
+        let dropped_ticket = dropped.ticket();
+        drop(dropped);
+        assert_eq!(
+            settled_as(&ledger, dropped_ticket).await,
+            Settlement::Cancelled
+        );
+
+        let written = registry.admit_ingress(&id).expect("admitted");
+        let written_ticket = written.ticket();
+        let writer = registry.agent_writer(&id).expect("the pane's writer");
+        writer
+            .lock()
+            .await
+            .write_user_ticketed(b"typed", Some(written))
+            .await
+            .expect("the frame reaches the pane");
+        assert_eq!(
+            settled_as(&ledger, written_ticket).await,
+            Settlement::Written { bytes: 5 }
+        );
+        let after_write = ledger.marks();
+        assert_eq!(after_write.watermark, w0.watermark + 3);
+        assert_eq!(after_write.job_mark, w0.job_mark + 1, "one job queued");
+        assert_eq!(after_write.outstanding, 0);
+
+        // Two operations admitted together are two tickets.
+        let first = registry.admit_ingress(&id).expect("admitted");
+        let second = registry.admit_ingress(&id).expect("admitted");
+        assert_ne!(first.ticket(), second.ticket());
+        assert_eq!(ledger.marks().outstanding, 2);
+        drop(first);
+        drop(second);
+
+        registry.shutdown_all();
+    }
+
+    /// Scenario: A human frame's job is parked inside the PTY write and its caller is dropped; then a second frame is queued behind it and its caller is dropped too. The started frame keeps its ticket outstanding (so a doorbell admission would wait) until its bytes are written, and then settles as written; the queued one is taken back, settles as cancelled at once, and its bytes never reach the pane.
+    #[spec("inbox/doorbell/035")]
+    #[tokio::test]
+    async fn doorbell_035_a_started_job_keeps_its_ticket_and_a_withdrawn_one_cancels() {
+        use crate::ingress_ledger::Settlement;
+        const PANE: &str = "pane-ledger-jobs";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (id, ledger) = ledger_pane(&registry, PANE);
+        let writer = registry.agent_writer(&id).expect("the pane's writer");
+        let (reached, release) =
+            registry.pause_next_pty_write_for_test(PANE, PtyWritePause::BeforeWrite);
+        let started = registry.admit_ingress(&id).expect("admitted");
+        let started_ticket = started.ticket();
+        let first = tokio::spawn({
+            let writer = writer.clone();
+            async move {
+                let w = writer.lock().await;
+                let _ = w.write_user_ticketed(b"LATEFRAME", Some(started)).await;
+            }
+        });
+        tokio::task::spawn_blocking(move || reached.recv_timeout(Duration::from_secs(8)))
+            .await
+            .unwrap()
+            .expect("the first job reaches the PTY write");
+        first.abort();
+        let _ = first.await;
+        assert!(
+            ledger.any_outstanding(),
+            "a started job keeps its ticket after its caller is gone"
+        );
+        assert!(registry.human_frame_in_flight(PANE));
+
+        let queued = registry.admit_ingress(&id).expect("admitted");
+        let queued_ticket = queued.ticket();
+        let job_mark = ledger.marks().job_mark;
+        let second = tokio::spawn({
+            let writer = writer.clone();
+            async move {
+                let w = writer.lock().await;
+                let _ = w.write_user_ticketed(b"NEVERWRITTEN", Some(queued)).await;
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while ledger.marks().job_mark == job_mark {
+            assert!(Instant::now() < deadline, "the second job was never queued");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        second.abort();
+        let _ = second.await;
+        assert_eq!(
+            settled_as(&ledger, queued_ticket).await,
+            Settlement::Cancelled
+        );
+        assert!(
+            ledger.any_outstanding(),
+            "the started job is still outstanding"
+        );
+
+        release.send(()).expect("release the parked write");
+        assert_eq!(
+            settled_as(&ledger, started_ticket).await,
+            Settlement::Written { bytes: 9 }
+        );
+        assert!(!ledger.any_outstanding());
+        crate::test_pty_wait::wait_for_echo_bytes(&registry, &id, b"LATEFRAME").await;
+        let snapshot = registry.snapshot(&id).expect("pane snapshot");
+        assert!(
+            !String::from_utf8_lossy(&snapshot).contains("NEVERWRITTEN"),
+            "a withdrawn job's bytes reached the pane"
+        );
+        registry.shutdown_all();
+    }
+
+    /// Scenario: A ticket is outstanding when its generation is closed, and a successor is started on the same pane. The closed generation's ledger records the ticket as retired and stays closed; the successor's ledger starts empty and a frame admitted to it is its own.
+    #[spec("inbox/doorbell/035")]
+    #[tokio::test]
+    async fn doorbell_035_retirement_closes_the_ledger_and_touches_no_successor() {
+        use crate::ingress_ledger::Settlement;
+        const PANE: &str = "pane-ledger-retire";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (id, ledger) = ledger_pane(&registry, PANE);
+        let outstanding = registry.admit_ingress(&id).expect("admitted");
+        let ticket = outstanding.ticket();
+        registry.close_agent(&id).expect("close the generation");
+        assert!(ledger.is_closed());
+        assert_eq!(ledger.marks().outstanding, 0);
+        assert!(
+            ledger
+                .settled()
+                .iter()
+                .any(|(t, how)| *t == ticket && *how == Settlement::Retired)
+        );
+        drop(outstanding);
+        let (successor, fresh) = ledger_pane(&registry, PANE);
+        assert_ne!(successor, id);
+        assert_eq!(fresh.marks().watermark, 0);
+        assert!(!registry.human_frame_in_flight(PANE));
+        let theirs = registry
+            .human_frame_arriving(PANE)
+            .expect("the successor admits");
+        assert_eq!(fresh.marks().outstanding, 1);
+        assert_eq!(
+            ledger.marks().outstanding,
+            0,
+            "nothing reaches the closed ledger"
+        );
+        drop(theirs);
         registry.shutdown_all();
     }
 
