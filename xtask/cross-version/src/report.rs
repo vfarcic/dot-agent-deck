@@ -58,19 +58,17 @@ pub struct Tell {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failed_parts: Vec<String>,
     /// The pane a failed half measured, as the daemon itself named it — for
-    /// tell-4, whose `work-done` and `status` halves both run in the reviewer's
-    /// pane, that pane's id from the last readable `daemon status` rows.
-    /// `breaks.rs` requires a log line to name this pane before attributing
-    /// the failure to a declared break.
+    /// tell-4, the reviewer's pane id from the last readable `daemon status`
+    /// rows. A record of the run only: `breaks.rs` attributes a failure
+    /// through [`Self::part_ops`], never through this pane.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_pane: Option<String>,
     /// For a tell asserted in halves, the operations each half ran, each with
     /// its pane and the stretch of the sandbox `deck.log` it ran across. A half
     /// may run more than one: tell-4's `work-done` is reported from the
     /// reviewer's pane and fetched in the orchestrator's. A declared break
-    /// explains a half only through the operation it names (`breaks.rs`).
-    /// When a half records none here, `breaks.rs` falls back to
-    /// [`Self::subject_pane`] and the whole log.
+    /// explains a half only through the operation it names (`breaks.rs`), so
+    /// a half that records none here is not explained.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub part_ops: Vec<PartOp>,
     /// What the client CLI itself printed in a half's pane, as the capture
@@ -103,7 +101,8 @@ pub struct PartOp {
     /// just after it ended: a line the daemon wrote for it starts inside
     /// `[from, to)`. The daemon writes its log synchronously, before it
     /// answers, so a refusal of this operation is inside it. `None` when the
-    /// log's length could not be read.
+    /// log's length could not be read, and then no line of the log can be
+    /// tied to the operation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_span: Option<(u64, u64)>,
 }
@@ -120,19 +119,9 @@ impl PartOp {
 }
 
 impl Tell {
-    /// The operations `op` half `part` ran, as `(pane, log span)`: its own,
-    /// or — when the half recorded no operation at all — the tell's subject
-    /// pane over the whole log. A half that recorded other operations but not
-    /// `op` names none.
+    /// The operations `op` half `part` recorded, as `(pane, log span)`. A
+    /// half that recorded no `op` names none.
     pub fn ops_of(&self, part: &str, op: &str) -> Vec<(&str, Option<(u64, u64)>)> {
-        if !self.part_ops.iter().any(|o| o.part == part) {
-            return self
-                .subject_pane
-                .as_deref()
-                .map(|p| (p, None))
-                .into_iter()
-                .collect();
-        }
         self.part_ops
             .iter()
             .filter(|o| o.part == part && o.op == op)

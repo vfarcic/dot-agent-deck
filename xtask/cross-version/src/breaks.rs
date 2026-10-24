@@ -427,13 +427,13 @@ struct Declared<'a> {
     by_client: Vec<&'a String>,
 }
 
-/// The lines of `log` that start inside `span` (all of them for `None`).
-fn lines_in(log: &str, span: Option<(u64, u64)>) -> impl Iterator<Item = &str> {
+/// The lines of `log` that start inside `[from, to)`.
+fn lines_in(log: &str, (from, to): (u64, u64)) -> impl Iterator<Item = &str> {
     let mut start = 0u64;
     log.split_inclusive('\n').filter(move |line| {
         let at = start;
         start += line.len() as u64;
-        span.is_none_or(|(from, to)| (from..to).contains(&at))
+        (from..to).contains(&at)
     })
 }
 
@@ -478,8 +478,10 @@ fn explain_part(
         }
         let panes: Vec<&str> = ops.iter().map(|(pane, _)| *pane).collect();
         let witnessed = match effect.witness {
+            // An operation whose stretch of the log was not measured has no
+            // line the log can place inside it.
             Witness::DaemonLog => ops.iter().find_map(|(pane, span)| {
-                lines_in(deck_log, *span)
+                lines_in(deck_log, (*span)?)
                     .find(|l| {
                         effect.log_signature.iter().all(|sig| l.contains(sig))
                             && effect.pane_field.names(l, pane)
@@ -510,6 +512,15 @@ fn explain_part(
                 }),
         };
         let Some(witnessed) = witnessed else {
+            let unmeasured = ops.iter().filter(|(_, span)| span.is_none()).count();
+            if effect.witness == Witness::DaemonLog && unmeasured == ops.len() {
+                why_not.push(format!(
+                    "`{}` is declared, but the stretch of the log the `{}` ran across could not \
+                     be measured, so no refusal can be tied to it",
+                    effect.id, effect.op
+                ));
+                continue;
+            }
             let tokens: Vec<String> = panes.iter().map(|p| effect.pane_field.token(p)).collect();
             why_not.push(format!(
                 "`{}` is declared, but {} matching {:?} for {}",
@@ -567,6 +578,11 @@ mod tests {
     /// token taken out.
     const QUESTION_LINE: &str = r#"2026-10-23T09:12:01.000000Z  WARN dot_agent_deck::daemon: Malformed event: {"message_type":"hook_capabilities","pane_id":"3"} line_bytes=94"#;
 
+    /// The log span of an operation in a fixture that places no line in time:
+    /// the whole log, stated, unlike a span production could not measure
+    /// (`None`), which no line can be tied to.
+    const WHOLE_LOG: Option<(u64, u64)> = Some((0, u64::MAX));
+
     /// The branch's `daemon hello`, declaring the task-scoped break on top of
     /// [`BRANCH_HELLO`]'s list.
     fn task_scoped_hello() -> String {
@@ -601,7 +617,9 @@ mod tests {
             &[("work-done", false), ("status", true)],
             "work-done: the feedback line did NOT appear",
         );
-        ev.tells.last_mut().unwrap().subject_pane = Some(pane.to_string());
+        let t = ev.tells.last_mut().unwrap();
+        t.part_ops = vec![PartOp::new("work-done", "report", pane, WHOLE_LOG)];
+        t.subject_pane = Some(pane.to_string());
         ev
     }
 
@@ -699,7 +717,7 @@ mod tests {
 
     /// A run of `direction` in which `tell`'s halves held or failed as
     /// `parts`, each half running the operations `part_ops` names as
-    /// `(half, operation, pane)` over the whole log, with the
+    /// `(half, operation, pane)` over [`WHOLE_LOG`], with the
     /// client's `outputs` per half, the branch declaring the round's breaks
     /// when `declared`. Every other contract tell passed.
     fn run_of(
@@ -727,7 +745,7 @@ mod tests {
                 let t = ev.tells.last_mut().unwrap();
                 t.part_ops = part_ops
                     .iter()
-                    .map(|(h, op, p)| PartOp::new(h, op, p, None))
+                    .map(|(h, op, p)| PartOp::new(h, op, p, WHOLE_LOG))
                     .collect();
                 t.client_outputs = outputs
                     .iter()
@@ -922,6 +940,40 @@ mod tests {
         }
     }
 
+    /// Review U3-1: an operation the run recorded but whose stretch of the log
+    /// it could not measure cannot be tied to any line of it. Reverse, the
+    /// orchestrator's fetch is recorded on pane `1` with no span, and the only
+    /// refusal on `1` came before the report was sent: not explained.
+    #[test]
+    fn an_operation_without_a_measured_span_is_not_explained() {
+        let r = Direction::Reverse;
+        let (mut ev, log) = tell4_run(r, false, &[(At::BeforeReport, h5_line("1"))]);
+        let t = ev.tells.iter_mut().find(|t| t.id == "tell-4").unwrap();
+        for op in t.part_ops.iter_mut().filter(|o| o.op == "fetch") {
+            op.log_span = None;
+        }
+        explain(&mut ev, r, &log);
+        assert_eq!(ev.verdict(), RunVerdict::Fail);
+        assert!(
+            ev.steps.iter().any(|s| s.contains("could not be measured")),
+            "{:?}",
+            ev.steps
+        );
+    }
+
+    /// Review U3-1: nor is a half that recorded no operation at all, even with
+    /// its subject pane known and a refusal naming that pane in the log.
+    #[test]
+    fn a_half_that_recorded_no_operation_is_not_explained() {
+        let r = Direction::Reverse;
+        let (mut ev, _) = tell4_run(r, false, &[]);
+        let t = ev.tells.iter_mut().find(|t| t.id == "tell-4").unwrap();
+        t.part_ops.clear();
+        t.subject_pane = Some("1".to_string());
+        explain(&mut ev, r, &log_with(&h5_line("1")));
+        assert_eq!(ev.verdict(), RunVerdict::Fail);
+    }
+
     /// Forward, tell 4: the task-scoped break explains the half only with the
     /// REPORTER's unread capability question, sent after it typed `work-done`
     /// — not one naming the orchestrator's pane, not one from before the
@@ -1064,7 +1116,14 @@ mod tests {
             &[("work-done", work_done), (status_part, false)],
             "status: the status never changed",
         );
-        ev.tells.last_mut().unwrap().subject_pane = subject_pane.map(str::to_string);
+        let t = ev.tells.last_mut().unwrap();
+        // As production records it: the status half's operation exists only
+        // when `daemon status` named the reviewer's pane.
+        t.part_ops = subject_pane
+            .map(|p| PartOp::new(status_part, "status", p, WHOLE_LOG))
+            .into_iter()
+            .collect();
+        t.subject_pane = subject_pane.map(str::to_string);
         assert!(
             CONTRACT_TELLS
                 .iter()
