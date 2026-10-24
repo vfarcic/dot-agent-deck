@@ -153,6 +153,11 @@ fn logging_containment_001_explicitly_armed_wrapper_never_opens_an_outside_log()
 #[test]
 fn logging_containment_002_nextest_armed_wrapper_never_opens_an_outside_log() {
     let fixture = test_temp::tempdir().unwrap();
+    // Cargo creates this directory when it builds, but a test run from a
+    // nextest archive (CI's e2e shards) extracts `target/` without it, so it
+    // is created here; the path itself is the compile-time one either way.
+    std::fs::create_dir_all(env!("CARGO_TARGET_TMPDIR"))
+        .expect("create cargo's per-target scratch dir");
     let outside = tempfile::Builder::new()
         .prefix("deck-log-containment-")
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
