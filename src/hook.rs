@@ -2524,7 +2524,16 @@ fn arm_gated(
     deadline: std::time::Instant,
 ) -> std::io::Result<()> {
     match deadline.checked_duration_since(std::time::Instant::now()) {
-        Some(left) if !left.is_zero() => client.set_timeouts(left),
+        Some(left) if !left.is_zero() => match client.set_timeouts(left) {
+            // macOS refuses a socket option on a connection that can neither
+            // send nor receive any more (`EINVAL`), which is where a daemon
+            // that answered and closed leaves it. A read there returns what is
+            // buffered and then end of file, and a write fails, without
+            // blocking, so the deadline still holds.
+            #[cfg(target_os = "macos")]
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => Ok(()),
+            result => result,
+        },
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             "the wait is over",
