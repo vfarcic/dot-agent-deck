@@ -960,6 +960,73 @@ pub struct IssueDispatchConfig {
     /// default "all open issues up to `max_per_run`" listing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
+    /// PRD #421 Phase 3: the `claim_gating` / `claim_ttl_hours` keys, written
+    /// flat on the `[scheduled_tasks.issue_dispatch]` table.
+    #[serde(flatten)]
+    pub claim: ClaimGatingConfig,
+}
+
+/// PRD #421 M3.4: whether a live claim on GitHub stops an `issue_dispatch`
+/// task from dispatching an issue, and for how long a claim record stays live
+/// after its last edit. File-only keys of `[scheduled_tasks.issue_dispatch]`.
+/// The switch turns off the GATE only: the claim is written, and the owner's
+/// record refreshed, either way.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClaimGatingConfig {
+    /// `claim_gating`: honour other decks' live claims. Default `false`.
+    #[serde(rename = "claim_gating", default, skip_serializing_if = "is_false")]
+    pub gating: bool,
+    /// `claim_ttl_hours`: how long after its last edit a claim record stays
+    /// live. From 1 to [`crate::issue_dispatch::MAX_CLAIM_TTL_HOURS`] (checked
+    /// at load); default [`crate::issue_dispatch::DEFAULT_CLAIM_TTL_HOURS`].
+    /// The deck's claim records carry it, and other decks read them with it.
+    #[serde(
+        rename = "claim_ttl_hours",
+        default = "default_claim_ttl_hours",
+        skip_serializing_if = "is_default_claim_ttl_hours"
+    )]
+    pub ttl_hours: u32,
+    /// Why the load turned `gating` off although the file turns it on: the
+    /// TTL cannot be kept current by the task's cron (PRD #421 M3.1). Set at
+    /// load and never written back, so a CLI edit that rewrites the file keeps
+    /// the user's `claim_gating = true`.
+    #[serde(skip)]
+    pub gating_off: Option<String>,
+}
+
+impl Default for ClaimGatingConfig {
+    fn default() -> Self {
+        Self {
+            gating: false,
+            ttl_hours: default_claim_ttl_hours(),
+            gating_off: None,
+        }
+    }
+}
+
+impl ClaimGatingConfig {
+    /// Whether a fire should consult claims: switched on, and not turned off
+    /// at load.
+    pub fn gating_in_effect(&self) -> bool {
+        self.gating && self.gating_off.is_none()
+    }
+
+    /// The claim TTL as a duration.
+    pub fn ttl(&self) -> chrono::Duration {
+        chrono::Duration::hours(i64::from(self.ttl_hours))
+    }
+}
+
+fn default_claim_ttl_hours() -> u32 {
+    crate::issue_dispatch::DEFAULT_CLAIM_TTL_HOURS
+}
+
+fn is_default_claim_ttl_hours(hours: &u32) -> bool {
+    *hours == default_claim_ttl_hours()
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// One `[[scheduled_tasks]]` entry from the global
@@ -1180,7 +1247,10 @@ impl LoadedSchedules {
 /// malformed-entry path — the error is surfaced via the daemon's notification
 /// seam (PRD #126) and the entry is skipped, without blocking valid siblings or
 /// crashing the daemon.
-fn validate_task(task: ScheduledTask, index: usize) -> Result<ScheduledTask, ScheduleLoadError> {
+fn validate_task(
+    mut task: ScheduledTask,
+    index: usize,
+) -> Result<ScheduledTask, ScheduleLoadError> {
     // Issue #835: validate the `shape` STRING here, next to the issue-dispatch
     // slug check and for the same reason — it arrives from hand-edited TOML and
     // is re-read unattended by the daemon on every fire, so a typo must be a load
@@ -1230,6 +1300,27 @@ fn validate_task(task: ScheduledTask, index: usize) -> Result<ScheduledTask, Sch
                     task.name
                 ),
             });
+        }
+        if let Err(message) = crate::issue_dispatch::validate_claim_ttl_hours(disp.claim.ttl_hours)
+        {
+            return Err(ScheduleLoadError {
+                entry: Some(index),
+                message: format!("schedule {:?}: {message}", task.name),
+            });
+        }
+        // PRD #421 M3.1: a TTL the cron cannot keep current turns the GATE off
+        // rather than rejecting the task — dispatching, and writing the claim,
+        // carry on. The scheduler reports why on every (re)load.
+        if disp.claim.gating {
+            let gating_off = crate::issue_dispatch::check_claim_ttl_against_cron(
+                &task.cron,
+                disp.claim.ttl_hours,
+                &chrono::Local::now(),
+            )
+            .err();
+            if let Some(disp) = task.issue_dispatch.as_mut() {
+                disp.claim.gating_off = gating_off;
+            }
         }
         return Ok(expand_task(task));
     }
@@ -3320,6 +3411,164 @@ repo = "vfarcic/dot-ai"
         );
     }
 
+    /// One issue-dispatch task on `cron` with `claim_keys` appended to its
+    /// `[scheduled_tasks.issue_dispatch]` table.
+    fn issue_dispatch_toml(cron: &str, claim_keys: &str) -> String {
+        format!(
+            r#"
+[[scheduled_tasks]]
+name = "Issues vfarcic/dot-ai"
+cron = "{cron}"
+working_dir = "/work/space"
+prompt = "Work on issue {{{{issue_number}}}}"
+
+[scheduled_tasks.issue_dispatch]
+repo = "vfarcic/dot-ai"
+{claim_keys}
+"#
+        )
+    }
+
+    fn loaded_claim(toml_str: &str) -> ClaimGatingConfig {
+        let loaded = LoadedSchedules::parse(toml_str);
+        assert!(loaded.errors.is_empty(), "errors: {:?}", loaded.errors);
+        loaded.tasks[0]
+            .issue_dispatch
+            .as_ref()
+            .expect("issue-dispatch task")
+            .claim
+            .clone()
+    }
+
+    // PRD #421 M3.4 — the claim keys are optional: gating off, a week's TTL.
+    #[test]
+    fn issue_dispatch_claim_keys_default_to_gating_off_and_a_week() {
+        let claim = loaded_claim(&issue_dispatch_toml("0 9 * * MON-FRI", ""));
+        assert_eq!(claim, ClaimGatingConfig::default());
+        assert!(!claim.gating && claim.ttl_hours == 168 && claim.gating_off.is_none());
+        assert!(!claim.gating_in_effect());
+        assert_eq!(claim.ttl(), chrono::Duration::hours(168));
+    }
+
+    #[test]
+    fn issue_dispatch_claim_keys_are_read_from_the_issue_dispatch_table() {
+        let claim = loaded_claim(&issue_dispatch_toml(
+            "0 9 * * MON-FRI",
+            "claim_gating = true\nclaim_ttl_hours = 150",
+        ));
+        assert!(claim.gating && claim.ttl_hours == 150 && claim.gating_off.is_none());
+        assert!(claim.gating_in_effect());
+        let off = loaded_claim(&issue_dispatch_toml(
+            "0 9 * * *",
+            "claim_gating = false\nclaim_ttl_hours = 48",
+        ));
+        assert!(!off.gating_in_effect() && off.ttl_hours == 48);
+    }
+
+    // PRD #421 M3.4 — `claim_ttl_hours` is validated like the other keys: a
+    // value below 1 or above 2160 (90 days), or one that is not a non-negative
+    // integer, rejects the entry while its siblings still load.
+    #[test]
+    fn issue_dispatch_rejects_a_claim_ttl_outside_one_hour_to_ninety_days() {
+        assert!(
+            loaded_claim(&issue_dispatch_toml("0 9 * * *", "claim_ttl_hours = 2160")).ttl_hours
+                == 2160
+        );
+        for keys in [
+            "claim_ttl_hours = 0",
+            "claim_ttl_hours = 2161",
+            "claim_ttl_hours = -5",
+            "claim_ttl_hours = \"a week\"",
+            "claim_gating = \"yes\"",
+        ] {
+            let toml_str = format!(
+                "{}\n{}",
+                issue_dispatch_toml("0 9 * * *", keys),
+                r#"
+[[scheduled_tasks]]
+name = "sibling"
+cron = "0 9 * * *"
+working_dir = "/work/space"
+command = "claude"
+prompt = "go"
+"#
+            );
+            let loaded = LoadedSchedules::parse(&toml_str);
+            assert_eq!(loaded.errors.len(), 1, "{keys}: {:?}", loaded.errors);
+            assert_eq!(loaded.errors[0].entry, Some(0), "{keys}");
+            assert_eq!(
+                loaded
+                    .tasks
+                    .iter()
+                    .map(|t| t.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["sibling"],
+                "{keys}"
+            );
+        }
+    }
+
+    // PRD #421 M3.1 — a TTL the task's cron cannot keep current (the weekday
+    // cron's 72h weekend gap needs 145h) loads the task with gating turned
+    // OFF rather than rejecting it, and says why.
+    #[test]
+    fn issue_dispatch_turns_gating_off_when_the_ttl_cannot_cover_the_cron() {
+        let claim = loaded_claim(&issue_dispatch_toml(
+            "0 9 * * MON-FRI",
+            "claim_gating = true\nclaim_ttl_hours = 100",
+        ));
+        assert!(claim.gating, "the file's setting is kept");
+        assert!(!claim.gating_in_effect(), "but the gate is off");
+        let reason = claim.gating_off.expect("the reason is recorded");
+        assert!(
+            reason.contains("claim_ttl_hours = 100") && reason.contains("0 9 * * MON-FRI"),
+            "{reason}"
+        );
+        // Gating switched off needs no check, so records no reason.
+        let off = loaded_claim(&issue_dispatch_toml(
+            "0 9 * * MON-FRI",
+            "claim_ttl_hours = 100",
+        ));
+        assert_eq!(off.gating_off, None);
+    }
+
+    // PRD #421 M3.1 — the load-time "gating off" is never written back: a CLI
+    // edit that rewrites the file keeps the user's `claim_gating = true`, and
+    // keys left at their defaults stay out of the file.
+    #[test]
+    fn issue_dispatch_claim_keys_round_trip_without_the_load_time_verdict() {
+        let tasks = LoadedSchedules::parse(&issue_dispatch_toml(
+            "0 9 * * MON-FRI",
+            "claim_gating = true\nclaim_ttl_hours = 100",
+        ))
+        .tasks;
+        assert!(
+            tasks[0]
+                .issue_dispatch
+                .as_ref()
+                .unwrap()
+                .claim
+                .gating_off
+                .is_some()
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("schedules.toml");
+        crate::schedule_cli::write_atomic(&path, &tasks).expect("write schedules");
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("claim_gating = true") && written.contains("claim_ttl_hours = 100"),
+            "{written}"
+        );
+        let reloaded = LoadedSchedules::load_from(&path);
+        assert!(reloaded.errors.is_empty(), "errors: {:?}", reloaded.errors);
+        assert_eq!(reloaded.tasks, tasks);
+
+        let defaults = LoadedSchedules::parse(&issue_dispatch_toml("0 9 * * *", "")).tasks;
+        crate::schedule_cli::write_atomic(&path, &defaults).expect("write schedules");
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(!written.contains("claim_"), "{written}");
+    }
+
     // Issue #835 — a `shape` scalar round-trips through the file and is carried
     // on the loaded task. The field sits BEFORE `issue_dispatch` in the struct
     // precisely so it serializes ahead of any sub-table; this asserts the value
@@ -3479,6 +3728,7 @@ repo = "vfarcic/dot-ai"
                     max_per_run: 3,
                     label: None,
                     query: None,
+                    claim: Default::default(),
                 }),
             },
         ];
