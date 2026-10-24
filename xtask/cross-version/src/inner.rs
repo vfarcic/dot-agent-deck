@@ -1528,21 +1528,17 @@ fn with_attached_tui(
             shell_word(&cast.pane_cli)
         ),
     )?;
-    let (delivered, delivery_note) = judge_inbox_delivery(
+    let (delivery_halves, delivery_note) = inbox_delivery_halves(
         coder_fetch.out.as_deref(),
         listing.out.as_deref(),
         &delegate_sentinel,
         coder_pane,
         orchestrator_pane,
     );
-    ev.tell(
+    ev.tell_in_parts(
         "tell-3",
         "a delegate still routed",
-        if delivered {
-            Verdict::Pass
-        } else {
-            Verdict::Fail
-        },
+        &delivery_halves,
         format!(
             "delegated `{delegate_sentinel}` from the orchestrator pane to `{ROLE_CODER}` and \
              `{ROLE_REVIEWER}` with the {} CLI (`{}`), typed into the orchestrator's own PTY \
@@ -1558,6 +1554,15 @@ fn with_attached_tui(
             refusal_note(coder_fetch.refused, ROLE_CODER),
         ),
     );
+    // Each half names the pane it measured; the fetch's own output is what
+    // a client-declared break may cite (`breaks.rs`).
+    if let Some(t) = ev.tells.last_mut() {
+        t.part_panes = vec![
+            ("fetch".to_string(), coder_pane.to_string()),
+            ("listing".to_string(), orchestrator_pane.to_string()),
+        ];
+        t.client_outputs = client_output("fetch", coder_fetch.out.as_deref());
+    }
 
     // Hooks. `work-done` first, `agent-event` last: a bare `AgentEvent` makes
     // the daemon classify that pane's agent type as `Pi`, which routes prompt
@@ -1665,7 +1670,7 @@ fn with_attached_tui(
     // The status half is named `status` only when the daemon answered with
     // readable rows that never showed the change; a query that could not be
     // read is `status-query`, which no declared break explains (`breaks.rs`).
-    let (status_part, status_ok, status_note, reviewer_pane) = match &status_wait {
+    let (status_part, status_ok, status_note, status_pane) = match &status_wait {
         StatusWait::Satisfied(rows) => {
             let row = rows.iter().find(|r| r.role.contains(ROLE_REVIEWER));
             (
@@ -1717,7 +1722,18 @@ fn with_attached_tui(
         ),
     );
     if let Some(t) = ev.tells.last_mut() {
-        t.subject_pane = reviewer_pane;
+        // The `work-done` half was sent from the reviewer's pane and taken in
+        // the orchestrator's, so it names both; the status half names the
+        // reviewer's pane as `daemon status` reported it.
+        t.part_panes = vec![
+            ("work-done".to_string(), reviewer_pane.to_string()),
+            ("work-done".to_string(), orchestrator_pane.to_string()),
+        ];
+        if let Some(pane) = &status_pane {
+            t.part_panes.push((status_part.to_string(), pane.clone()));
+        }
+        t.client_outputs = client_output("work-done", orchestrator_fetch.out.as_deref());
+        t.subject_pane = status_pane;
     }
 
     // --- the branch-specific stimulus, reverse only --------------------------
@@ -3627,6 +3643,47 @@ pub(crate) fn judge_inbox_delivery(
     }
 }
 
+/// Tell 3's halves from its two captures, and the note judging them. `fetch`:
+/// whether `inbox fetch`, run in `expected_recipient`'s pane, was handed a
+/// message carrying `sentinel`. `listing`: whether the deck then lists that
+/// message acknowledged in that pane's inbox. The listing is judged only when
+/// the fetch took the message; otherwise it has nothing to show, and is no
+/// half of the tell.
+pub(crate) fn inbox_delivery_halves(
+    fetch: Option<&str>,
+    list: Option<&str>,
+    sentinel: &str,
+    expected_recipient: &str,
+    expected_listing_pane: &str,
+) -> (Vec<(&'static str, bool)>, String) {
+    let (delivered, note) = judge_inbox_delivery(
+        fetch,
+        list,
+        sentinel,
+        expected_recipient,
+        expected_listing_pane,
+    );
+    let fetched = fetch.is_some_and(|out| {
+        captured_pane(out) == Some(expected_recipient) && fetched_id(out, sentinel).is_some()
+    });
+    let halves = if fetched {
+        vec![("fetch", true), ("listing", delivered)]
+    } else {
+        vec![("fetch", false)]
+    };
+    (halves, note)
+}
+
+/// A capture's output as a tell half's client output, `(half, pane, output)`,
+/// with the pane the capture itself recorded; none when it recorded none.
+fn client_output(half: &str, out: Option<&str>) -> Vec<(String, String, String)> {
+    out.and_then(|out| {
+        captured_pane(out).map(|pane| (half.to_string(), pane.to_string(), out.to_string()))
+    })
+    .into_iter()
+    .collect()
+}
+
 /// The line a tell's detail ends with when the deck refused input typed into
 /// `role`'s pane.
 fn refusal_note(refused: bool, role: &str) -> String {
@@ -5032,6 +5089,44 @@ mod inbox_delivery_tests {
             "deliveries": 1, "age_ms": 1200,
         }]});
         format!("pane=1\n{reply}\nexit=0\n")
+    }
+
+    /// Scenario: Tell 3 in halves. A fetch that took the delegate and a listing that shows it acknowledged pass both halves; a listing that shows it unacknowledged fails only the listing half; a fetch that took nothing, or ran in another pane, fails the fetch half and leaves no listing half, since the listing has nothing to show.
+    #[test]
+    fn tell_3_is_judged_in_a_fetch_and_a_listing_half() {
+        let fetched = fetch_capture("2", &format!("{SENTINEL} list the files"));
+        let halves = |fetch: &str, list: &str| {
+            inbox_delivery_halves(Some(fetch), Some(list), SENTINEL, "2", "1").0
+        };
+        assert_eq!(
+            halves(&fetched, &list_capture("2", "acknowledged")),
+            vec![("fetch", true), ("listing", true)]
+        );
+        assert_eq!(
+            halves(&fetched, &list_capture("2", "fetched")),
+            vec![("fetch", true), ("listing", false)]
+        );
+        let refused = "pane=2\nError: Could not fetch messages\nexit=1\n";
+        assert_eq!(
+            halves(refused, &list_capture("2", "queued")),
+            vec![("fetch", false)]
+        );
+        assert_eq!(
+            halves(
+                &fetch_capture("5", &format!("{SENTINEL} list")),
+                &list_capture("2", "acknowledged")
+            ),
+            vec![("fetch", false)]
+        );
+        assert_eq!(
+            inbox_delivery_halves(None, None, SENTINEL, "2", "1").0,
+            vec![("fetch", false)]
+        );
+        assert_eq!(
+            client_output("fetch", Some(refused)),
+            vec![("fetch".to_string(), "2".to_string(), refused.to_string())]
+        );
+        assert!(client_output("fetch", Some("exit=1\n")).is_empty());
     }
 
     /// Scenario: The coder fetches its delegate and the orchestrator lists that exact message acknowledged in coder's inbox.

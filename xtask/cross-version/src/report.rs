@@ -64,12 +64,42 @@ pub struct Tell {
     /// the failure to a declared break.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_pane: Option<String>,
+    /// For a tell asserted in halves, the panes each half measured, as
+    /// `(half, pane)`. A half may name more than one: tell-4's `work-done` is
+    /// sent from the reviewer's pane and taken in the orchestrator's. When a
+    /// half names none here, `breaks.rs` falls back to [`Self::subject_pane`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub part_panes: Vec<(String, String)>,
+    /// What the client CLI itself printed in a half's pane, as the capture
+    /// recorded it with stderr folded in: `(half, pane, output)`, the pane
+    /// being the one the capture recorded. Only a CLIENT-declared break may
+    /// take its witness from here (`breaks.rs`); not written to the evidence
+    /// file, where an explanation quotes the line it used.
+    #[serde(skip)]
+    pub client_outputs: Vec<(String, String, String)>,
     /// Set on a FAILED tell when a contract break the two builds declare
     /// differently accounts for every half that failed, with the evidence
     /// (`breaks.rs`). Such a tell does not make the run FAIL: the run is a
     /// [`RunVerdict::DeclaredBreak`] instead, once everything else holds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declared_break: Option<BreakExplanation>,
+}
+
+impl Tell {
+    /// The panes half `part` measured: its own, or the tell's subject pane.
+    pub fn panes_of(&self, part: &str) -> Vec<&str> {
+        let own: Vec<&str> = self
+            .part_panes
+            .iter()
+            .filter(|(half, _)| half == part)
+            .map(|(_, pane)| pane.as_str())
+            .collect();
+        if own.is_empty() {
+            self.subject_pane.as_deref().into_iter().collect()
+        } else {
+            own
+        }
+    }
 }
 
 /// Why a failed tell is a declared break's intended outcome (`breaks.rs`).
@@ -223,6 +253,8 @@ impl Evidence {
             detail,
             failed_parts: Vec::new(),
             subject_pane: None,
+            part_panes: Vec::new(),
+            client_outputs: Vec::new(),
             declared_break: None,
         });
     }
@@ -771,6 +803,8 @@ mod tests {
             detail: "no ss(8) on this host".into(),
             failed_parts: Vec::new(),
             subject_pane: None,
+            part_panes: Vec::new(),
+            client_outputs: Vec::new(),
             declared_break: None,
         });
         assert!(e.missing_tells().is_empty(), "every tell was recorded");
@@ -789,6 +823,8 @@ mod tests {
             detail: "2 lines, expected 1".into(),
             failed_parts: Vec::new(),
             subject_pane: None,
+            part_panes: Vec::new(),
+            client_outputs: Vec::new(),
             declared_break: None,
         });
         assert!(!e.passed());
@@ -887,6 +923,8 @@ mod tests {
             detail: "first\nsecond".into(),
             failed_parts: Vec::new(),
             subject_pane: None,
+            part_panes: Vec::new(),
+            client_outputs: Vec::new(),
             declared_break: None,
         });
         let out = e.render();
