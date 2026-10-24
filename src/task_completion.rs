@@ -462,14 +462,20 @@ async fn transact(
                 // the reporting generation, never the pane's current
                 // occupant: a successor may hold the pane by now. A task's
                 // instance is its binding's (set by admission); otherwise the
-                // generation's pinned seat, or, for a generation spawned with
-                // no seat, the role map it was checked against.
+                // generation's pinned seat. Only a note from a generation
+                // spawned with no seat takes the role map's, which
+                // `note_recipient` checked against that generation; a
+                // terminal report's admission checked no snapshot, so with no
+                // seat it names none.
                 if !matches!(claimed.mode, ClaimMode::Task { .. }) {
-                    claimed.instance = match &attested {
-                        Some((_, facts)) if facts.seat.is_some() => {
-                            facts.seat.as_ref().map(|seat| seat.instance.clone())
-                        }
-                        _ => snap.instance.clone(),
+                    let seat = attested
+                        .as_ref()
+                        .and_then(|(_, facts)| facts.seat.as_ref())
+                        .map(|seat| seat.instance.clone());
+                    claimed.instance = match (&claimed.mode, seat) {
+                        (_, Some(instance)) => Some(instance),
+                        (ClaimMode::Uncorrelated, None) => snap.instance.clone(),
+                        (_, None) => None,
                     };
                 }
                 return supervise(
