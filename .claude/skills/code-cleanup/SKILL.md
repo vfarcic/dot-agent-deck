@@ -201,11 +201,12 @@ start a unit that owns it. Say in your report that this is what you did.
 PR: open it with the /pr-create skill, with the `cleanup` label (`--label cleanup`), a title of the
 form `refactor(<area>): ...`, `test(<area>): ...` or `docs(develop): ...`, and the body layout in
 the skill's "The PR body" section. Skip /pr-create's changelog-fragment step: no fragment. Answer
-and resolve every review thread: Greptile reviews once (fetch
-`gh api repos/<owner>/<repo>/pulls/<n>/comments --paginate` once its check-run completes); Qodo
-re-reviews every push and creates no check-run, so after your last push wait, bounded, for its
-summary comment to name your head SHA, and read that summary as well as the inline threads. Reply
-on each thread and resolve it. Bound every wait.
+and resolve every review thread: wait for the review apps with
+`.claude/skills/pr-create/wait-reviews.sh <n>`, again after your last push (Qodo re-reviews every
+push), then read `gh api repos/<owner>/<repo>/pulls/<n>/comments --paginate` and Qodo's "Code
+Review by Qodo" issue comment, which alone carries its informational findings. Reply on each
+thread and resolve it. The script bounds the wait; on REVIEWS=incomplete, report which review was
+not obtained and go on.
 
 FINISH:
 - code: take the PR to merged by the procedure in .claude/skills/issue-queue/SKILL.md, subsection
