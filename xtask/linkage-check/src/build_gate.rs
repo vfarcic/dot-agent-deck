@@ -882,6 +882,48 @@ fn cargo_config_routes_linux_links_through_the_gate() {
     }
 }
 
+/// Issues #864 / #927: split debug info halves `target/` and the peak link's
+/// memory on Linux. `unpacked` is not a value rustc accepts on Windows MSVC
+/// (`-Csplit-debuginfo=unpacked is unstable on this platform`), so the flag
+/// has to stay scoped to the Linux triple: moved into `[profile.dev]` or
+/// `[build]`, it would fail every Windows dev build.
+#[test]
+fn cargo_config_splits_debuginfo_for_the_linux_triple_only() {
+    let cfg: toml_edit::DocumentMut = fs::read_to_string(repo_root().join(".cargo/config.toml"))
+        .expect("read .cargo/config.toml")
+        .parse()
+        .expect(".cargo/config.toml parses");
+    let flags: Vec<&str> = cfg["target"]["x86_64-unknown-linux-gnu"]["rustflags"]
+        .as_array()
+        .expect("the Linux triple carries a rustflags array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        flags
+            .windows(2)
+            .any(|w| w == ["-C", "split-debuginfo=unpacked"]),
+        "the Linux triple's rustflags no longer split debug info: {flags:?}"
+    );
+    assert!(
+        cfg.get("build").and_then(|b| b.get("rustflags")).is_none(),
+        "`[build] rustflags` applies to every target, Windows included"
+    );
+
+    let manifest: toml_edit::DocumentMut = fs::read_to_string(repo_root().join("Cargo.toml"))
+        .expect("read Cargo.toml")
+        .parse()
+        .expect("Cargo.toml parses");
+    let profiles = manifest.get("profile").and_then(|p| p.as_table_like());
+    for (name, profile) in profiles.into_iter().flat_map(|p| p.iter()) {
+        assert!(
+            profile.get("split-debuginfo").is_none(),
+            "`[profile.{name}] split-debuginfo` applies on Windows too, where rustc \
+             refuses `unpacked`; keep it in .cargo/config.toml's Linux triple"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The mold seam (issue #906). `link-gate.sh` prepends `-fuse-ld=mold` to
 // rustc's argv when mold is on PATH, no explicit `DAD_LINKER` is set, and

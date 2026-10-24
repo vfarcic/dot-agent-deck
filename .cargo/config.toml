@@ -128,3 +128,21 @@ docs-screenshots = "run --quiet --package xtask-screenshots --"
 # and the degradation ladder are in `docs/develop/build-gate.md`.
 [target.x86_64-unknown-linux-gnu]
 linker = "./scripts/link-gate.sh"
+# Issues #864 / #927 — split debug info. rustc writes each object's DWARF to a
+# `.dwo` file beside it instead of into the object, so the linker no longer
+# copies the whole dependency graph's debug info into every one of the ~130
+# test binaries. Measured on the 16-core / 62 GiB dev box, one test build
+# (`cargo nextest run --workspace --no-run`): `target/` 37 GB -> 17 GB, and a
+# relink of every test binary peaks at 1.55 GiB per link instead of 3.0 GiB
+# (mean about 335 MiB instead of 607). The debug info is still there for a
+# debugger: checked with gdb, local variables print and a panic's backtrace
+# keeps file:line. That is why this and not `debug = "line-tables-only"`,
+# which saves about as much but leaves gdb no variables to show.
+#
+# HERE AND NOT IN `[profile.dev]`, because `unpacked` is a Linux and macOS
+# value: rustc refuses it on Windows MSVC, so a profile setting would break
+# every Windows MSVC dev build. macOS never reads this table, and `unpacked` is
+# already its dev default anyway. A `RUSTFLAGS` variable
+# replaces this table's `rustflags` entirely, so setting one opts out.
+# `docs/develop/build-gate.md` has the measurements.
+rustflags = ["-C", "split-debuginfo=unpacked"]
