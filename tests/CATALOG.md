@@ -4585,7 +4585,7 @@ without depending on the config struct API.
 - **Asserts:** Through the real EOF: a claimed task's 'worker exited' or 'not delivered' notice is withheld at the exit and posted once by the failure, never on success; a newer task's notice at the exit; a failure before the exit leaves the exit's own notice; a plain exit owes an unacknowledged task one 'not delivered' notice and an acknowledged one one 'worker exited' notice; a close owes no 'worker exited' notice and an unacknowledged task's close today's one undeliverable notice.
 - **Asserts (m):** a worker exits owing a task whose own commission arm is already gone, beside a sibling arm armed for another delegate: the exit retires exactly, and the sibling arm is still owed.
 - **Why it exists:** PRD #1666 part 3, round 5 (plan §6.6, D12 rule 4): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
-- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Does not assert:** (b) and (k), arms of the round's test plan (D-21) that are not written, are not shown equivalent to an arm that is, and remain verification debt; the EOF path's fallback for a task the ledger does not hold (mutant M53), named for round 6 and not driven here; a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
 - **Platform coverage:** mac+linux.
 
 ##### orchestration/work-done/046 — A waiting duplicate follows the first attempt.

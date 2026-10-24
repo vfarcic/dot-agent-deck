@@ -711,14 +711,14 @@ pub struct InboxHub {
     #[cfg(test)]
     hold_caps:
         std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
-    /// Test seam: the next fallback retry pass tells the first end once it
-    /// has taken the bodies out and before it writes them, and waits for the
-    /// second.
     /// Test seam: the next [`Self::after_section`] runs this first, inside
     /// the helpers, so a test can block or panic there.
     #[cfg(test)]
     #[allow(clippy::type_complexity)]
     pub(crate) after_section_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Test seam: the next fallback retry pass tells the first end once it
+    /// has taken each held body's reserved room out (the bodies stay in the
+    /// hub) and before it writes them, and waits for the second.
     #[cfg(test)]
     pub(crate) hold_fallback_retry:
         std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
