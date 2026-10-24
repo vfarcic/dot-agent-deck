@@ -36,10 +36,12 @@
 # The head is read again on every poll and once more before the verdict. When
 # it moves, the reviewers that review every push start over on the new head.
 # A GitHub read that fails after the first one is retried on the next poll;
-# the bound still applies.
+# the bound still applies. The read before the verdict is retried up to three
+# times, and if it still fails the script stops with ERROR= rather than give a
+# verdict about a head it could not confirm (Qodo's finding on PR #1882).
 #
 # Exit status is 0 whenever REVIEWS= was printed, and 2 with ERROR= on bad usage,
-# a malformed reviewers.json, or a pull request that cannot be read at all.
+# a malformed reviewers.json, or a pull request that cannot be read.
 #
 # REVIEWERS_FILE overrides the registry path and REVIEW_WAIT_POLL_SECS the poll
 # interval (default 30); both exist for the tests in
@@ -103,6 +105,17 @@ read_pr() {
     return 0
   fi
   return 1
+}
+
+# Read the PR again before a verdict, retrying a failed read; 1 when every
+# attempt failed.
+confirm_pr() {
+  local tries=1
+  until read_pr; do
+    [ "$tries" -lt 3 ] || return 1
+    tries=$((tries + 1))
+    sleep "$poll"
+  done
 }
 
 # Read one GitHub surface into $tmp/<name>.json as a flat array. A failed read
@@ -173,7 +186,8 @@ while :; do
 
   if [ "$waiting" = no ]; then
     # About to decide: make sure the verdict is about the head as it is now.
-    if read_pr && [ "$new_head" != "$head" ]; then :; else break; fi
+    confirm_pr || die "cannot read pull request #$pr to confirm its head before the verdict"
+    [ "$new_head" != "$head" ] || break
   else
     sleep "$poll"
     read_pr || continue

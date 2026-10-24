@@ -55,16 +55,18 @@ fn tools_present() -> bool {
     false
 }
 
-/// An offline `gh`. Each surface the script reads answers from
-/// `$REVIEW_STUB/<surface>.<call>.json` when that file exists, else from
-/// `<surface>.json`, and fails when neither does — so a test can change the
-/// answer between polls, or make a read fail.
+/// An offline `gh`. Each surface the script reads fails on its `<call>`th read
+/// when `$REVIEW_STUB/<surface>.<call>.fail` exists, and otherwise answers from
+/// `<surface>.<call>.json` when that file exists, else from `<surface>.json`,
+/// failing when neither does — so a test can change the answer between polls,
+/// or make a read fail.
 const GH_STUB: &str = r#"#!/usr/bin/env bash
 answer() {
   local n
   n=$(( $(cat "$REVIEW_STUB/$1.count" 2>/dev/null || echo 0) + 1 ))
   echo "$n" >"$REVIEW_STUB/$1.count"
-  if [ -f "$REVIEW_STUB/$1.$n.json" ]; then cat "$REVIEW_STUB/$1.$n.json"
+  if [ -f "$REVIEW_STUB/$1.$n.fail" ]; then echo "HTTP 502" >&2; exit 1
+  elif [ -f "$REVIEW_STUB/$1.$n.json" ]; then cat "$REVIEW_STUB/$1.$n.json"
   elif [ -f "$REVIEW_STUB/$1.json" ]; then cat "$REVIEW_STUB/$1.json"
   else echo "HTTP 502" >&2; exit 1
   fi
@@ -112,6 +114,11 @@ impl Sandbox {
     fn pr_on(&self, call: u32, head: &str) {
         let at = iso_minutes_ago(1);
         self.answer_on("pr", call, &json!({"headRefOid": head, "createdAt": at}));
+    }
+
+    /// Make a surface's `call`th read fail.
+    fn fail_on(&self, surface: &str, call: u32) {
+        fs::write(self.stub.join(format!("{surface}.{call}.fail")), "").unwrap();
     }
 
     /// How many times the script read a surface.
@@ -352,6 +359,57 @@ fn review_wait_006_a_push_during_the_wait_moves_the_verdict_to_the_new_head() {
         3,
         "Qodo's review of the old head must not end the wait for the new one"
     );
+}
+
+/// Qodo's finding on PR #1882's fix: a failed read just before the verdict was
+/// taken as "the head has not moved".
+#[test]
+fn review_wait_010_a_failed_read_before_the_verdict_is_retried_not_trusted() {
+    if !tools_present() {
+        return;
+    }
+    let sb = Sandbox::new(1);
+    // The wait starts on OLD, already reviewed. The read before the verdict
+    // fails, the retry finds HEAD, and Qodo reviews HEAD on the third read.
+    sb.pr_on(1, OLD);
+    sb.fail_on("pr", 2);
+    sb.answer_on(
+        "comments",
+        1,
+        &json!([qodo_comment(OLD), greptile_comment()]),
+    );
+    sb.answer_on(
+        "comments",
+        2,
+        &json!([qodo_comment(OLD), greptile_comment()]),
+    );
+    sb.answer("comments", &json!([qodo_comment(HEAD), greptile_comment()]));
+    let out = sb.run(&["42"]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains(&format!("HEAD={HEAD}")), "{text}");
+    assert!(text.ends_with("REVIEWS=complete\n"), "{text}");
+    assert_eq!(sb.reads("comments"), 3, "{text}");
+}
+
+#[test]
+fn review_wait_011_a_head_that_cannot_be_confirmed_gets_no_verdict() {
+    if !tools_present() {
+        return;
+    }
+    let sb = Sandbox::new(1);
+    sb.answer("comments", &json!([qodo_comment(HEAD), greptile_comment()]));
+    for call in 2..=4 {
+        sb.fail_on("pr", call);
+    }
+    let out = sb.run(&["42"]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(
+        text.contains("ERROR=cannot read pull request #42"),
+        "{text}"
+    );
+    assert!(!text.contains("REVIEWS="), "{text}");
 }
 
 /// Greptile's finding on PR #1882: a check-run was matched by name alone.
