@@ -42,6 +42,10 @@ pub mod dispatch;
 pub mod dispatch_return;
 // PRD #1666 S4: the fixed one-line doorbell for an agent with no armed inbox component.
 pub mod doorbell;
+// PRD #1666 part 3 round 5-wake: which agent releases the doorbell may type into.
+pub mod doorbell_activation;
+// PRD #1666 part 3 round 5-wake: an agent's screen read losslessly, and the measured recognisers.
+pub mod doorbell_screen;
 // PRD #1589: the record of dispatched units the `close` verb is authorized from.
 pub mod dispatched_units;
 // Issue #544: the per-pane unsent-draft bit the doorbell reads before it writes.
@@ -129,6 +133,8 @@ pub mod pull_request_info;
 pub mod question;
 pub mod quota_block;
 pub mod quota_signals;
+// PRD #1666 part 3 round 5-wake: an agent's release, read off its start-up header.
+pub mod release_scanner;
 pub mod remote;
 pub mod remote_daemon;
 pub mod remote_doctor;

@@ -9,3 +9,8 @@
 * text=auto eol=lf
 
 .github/workflows/*.lock.yml linguist-generated=true
+
+# PRD #1666 part 3 round 5-wake: raw terminal captures. Their CR LF pairs and
+# escape bytes are the data a test replays, byte offsets included, so git
+# never converts them.
+tests/fixtures/**/*.bin binary

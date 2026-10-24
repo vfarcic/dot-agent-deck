@@ -1,0 +1,725 @@
+//! PRD #1666 part 3, round 5-wake: what an agent's screen shows, read
+//! losslessly, and the measured recognisers the doorbell's admission asks.
+//!
+//! [`crate::pane_screen_text`] reduces a screen to trimmed, collapsed text rows,
+//! which is right for a notice and wrong for a proof: it drops the dim
+//! attribute that separates Codex's placeholder from typed text, collapses the
+//! spaces inside a line, and loses where a row's text ends. [`Grid`] keeps every
+//! cell of the screen with the attributes the profiles read, each row's
+//! soft-wrap flag, the cursor, and the stream position it was taken at.
+//!
+//! The recognisers below each answer one question about one agent's screen,
+//! from shapes measured on real launches (M1, M2): the empty ready composer,
+//! the placeholder an agent draws while its input is empty, the deck's
+//! own line held exactly in the composer, the dialogs that can open after the
+//! agent is ready, and the rows that tie a redraw to the terminal width. None
+//! of them authenticates a screen: a process that controls what the pane
+//! draws can draw any of these frames.
+
+/// One cell of the screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GridCell {
+    /// The cell's text; empty for a cell nothing was written to, and for the
+    /// second half of a wide character.
+    pub text: String,
+    pub bold: bool,
+    pub dim: bool,
+    pub inverse: bool,
+    pub fg: vt100::Color,
+    pub bg: vt100::Color,
+}
+
+impl GridCell {
+    /// The cell's text, with an empty cell read as a blank.
+    pub fn shown(&self) -> &str {
+        if self.text.is_empty() {
+            " "
+        } else {
+            &self.text
+        }
+    }
+
+    /// Whether nothing visible is drawn in the cell.
+    pub fn blank(&self) -> bool {
+        self.text.trim().is_empty() && self.bg == vt100::Color::Default && !self.inverse
+    }
+}
+
+/// A screen, cell by cell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Grid {
+    pub rows: u16,
+    pub cols: u16,
+    pub cells: Vec<Vec<GridCell>>,
+    /// Whether each row continues on the next (the agent's text ran past the
+    /// right edge rather than ending with a line feed).
+    pub wrapped: Vec<bool>,
+    /// The cursor's row and column.
+    pub cursor: (u16, u16),
+    pub cursor_hidden: bool,
+    pub alternate_screen: bool,
+    /// How many bytes of the stream the screen was parsed from.
+    pub out_seq: u64,
+}
+
+impl Grid {
+    /// Read `screen` cell by cell.
+    pub fn of(screen: &vt100::Screen, out_seq: u64) -> Self {
+        let (rows, cols) = crate::vt_grid::size(screen);
+        let mut cells = Vec::with_capacity(rows as usize);
+        let mut wrapped = Vec::with_capacity(rows as usize);
+        for r in 0..rows {
+            let mut row = Vec::with_capacity(cols as usize);
+            for c in 0..cols {
+                let cell = screen.cell(r, c);
+                row.push(match cell {
+                    Some(cell) => GridCell {
+                        text: if cell.is_wide_continuation() {
+                            String::new()
+                        } else {
+                            cell.contents().to_string()
+                        },
+                        bold: cell.bold(),
+                        dim: cell.dim(),
+                        inverse: cell.inverse(),
+                        fg: cell.fgcolor(),
+                        bg: cell.bgcolor(),
+                    },
+                    None => GridCell {
+                        text: String::new(),
+                        bold: false,
+                        dim: false,
+                        inverse: false,
+                        fg: vt100::Color::Default,
+                        bg: vt100::Color::Default,
+                    },
+                });
+            }
+            cells.push(row);
+            wrapped.push(screen.row_wrapped(r));
+        }
+        Self {
+            rows,
+            cols,
+            cells,
+            wrapped,
+            cursor: screen.cursor_position(),
+            cursor_hidden: screen.hide_cursor(),
+            alternate_screen: screen.alternate_screen(),
+            out_seq,
+        }
+    }
+
+    /// Parse `bytes` from a fresh terminal at `rows` × `cols` and read the
+    /// result: how a recorded trace becomes a fixture screen.
+    pub fn parse(bytes: &[u8], rows: u16, cols: u16) -> Self {
+        let mut parser = crate::vt_grid::parser(rows, cols, 0);
+        parser.process(bytes);
+        Self::of(parser.screen(), bytes.len() as u64)
+    }
+
+    pub fn cell(&self, row: u16, col: u16) -> Option<&GridCell> {
+        self.cells.get(row as usize)?.get(col as usize)
+    }
+
+    /// Row `row` as drawn, every cell included: untouched cells as blanks,
+    /// nothing trimmed.
+    pub fn row_text(&self, row: u16) -> String {
+        self.cells
+            .get(row as usize)
+            .map(|cells| cells.iter().map(GridCell::shown).collect())
+            .unwrap_or_default()
+    }
+
+    /// The text of `len` cells of `row` from `col`.
+    pub fn span_text(&self, row: u16, col: u16, len: u16) -> String {
+        (col..col.saturating_add(len))
+            .filter_map(|c| self.cell(row, c))
+            .map(GridCell::shown)
+            .collect()
+    }
+
+    /// The column just past the last non-blank cell of `row` (0 for a blank
+    /// row).
+    pub fn row_extent(&self, row: u16) -> u16 {
+        self.cells
+            .get(row as usize)
+            .and_then(|cells| cells.iter().rposition(|c| !c.blank()))
+            .map(|i| i as u16 + 1)
+            .unwrap_or(0)
+    }
+
+    /// Whether every cell of `row` from `col` on is blank.
+    pub fn blank_from(&self, row: u16, col: u16) -> bool {
+        self.cells
+            .get(row as usize)
+            .is_some_and(|cells| cells.iter().skip(col as usize).all(GridCell::blank))
+    }
+
+    /// The last row with anything visible on it.
+    pub fn last_drawn_row(&self) -> Option<u16> {
+        (0..self.rows).rev().find(|&r| self.row_extent(r) > 0)
+    }
+}
+
+impl Grid {
+    /// The column just past the last cell anything was written to on `row`,
+    /// written blanks included: a row an agent pads to the edge reaches
+    /// [`Grid::cols`], while erased cells hold nothing.
+    pub fn written_extent(&self, row: u16) -> u16 {
+        self.cells
+            .get(row as usize)
+            .and_then(|cells| cells.iter().rposition(|c| !c.text.is_empty()))
+            .map(|i| i as u16 + 1)
+            .unwrap_or(0)
+    }
+
+    /// The text of `row` from `col`, trailing blanks removed.
+    pub fn text_from(&self, row: u16, col: u16) -> String {
+        let text: String = self
+            .cells
+            .get(row as usize)
+            .map(|cells| {
+                cells
+                    .iter()
+                    .skip(col as usize)
+                    .map(GridCell::shown)
+                    .collect()
+            })
+            .unwrap_or_default();
+        text.trim_end().to_string()
+    }
+}
+
+/// A dialog a recogniser found on the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialog {
+    /// One of the release's measured post-ready dialogs, by the name the
+    /// key-effect measurements use (`update`, `trust`, `hooks`): the markers
+    /// an inherited release's tripwire is to be set by (plan §4.6).
+    Measured(&'static str),
+    /// A screen with the dialog shape the profile knows (a highlighted
+    /// numbered choice) but a title it does not.
+    Unrecognised,
+}
+
+/// What the composer holds, against the line the deck typed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComposerText {
+    /// Nothing typed: blank, or the agent's placeholder (`placeholder`).
+    Empty { placeholder: bool },
+    /// Exactly the line, with the cursor right after it.
+    Exact,
+    /// A strict prefix of the line, cursor at its end: still arriving.
+    Prefix { chars: usize },
+    /// Anything else, the line with the cursor elsewhere included.
+    Other,
+}
+
+/// The composer a profile located.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Composer {
+    /// The row holding the prompt glyph.
+    pub prompt_row: u16,
+    /// The last row the composer's text reaches.
+    pub last_row: u16,
+    /// The composer's text, its rows joined by the profile's wrap rule.
+    pub text: String,
+    /// Every visible cell of the text is drawn dim (the placeholder style).
+    pub dim: bool,
+    /// The cursor sits right after the text.
+    pub cursor_at_end: bool,
+}
+
+/// The measured screen of one agent, across the releases its record lists.
+pub struct ScreenProfile {
+    pub id: &'static str,
+    /// The composer, wherever it is drawn, or `None` when the screen shows
+    /// none (a dialog, another screen).
+    pub composer: fn(&Grid) -> Option<Composer>,
+    /// The ready screen: the composer, plus whatever the agent draws only
+    /// while it waits for input.
+    pub ready: fn(&Grid) -> bool,
+    /// Whether a dim text in the composer is the agent's placeholder, which it
+    /// showed while its input was empty and never over typed text in the
+    /// measurements.
+    pub placeholder: fn(&str) -> bool,
+    pub dialog: fn(&Grid) -> Option<Dialog>,
+    /// Whether the transcript shows `line` as a submitted user message.
+    pub transcript_user_line: fn(&Grid, &str) -> bool,
+    /// The bytes the agent writes first when it redraws its whole screen
+    /// after a resize.
+    pub redraw_marker: &'static [u8],
+    /// Whether a frame ties itself to the terminal's width.
+    pub width_witness: fn(&Grid) -> bool,
+    /// The narrowest pane the measurements cover; a narrower one refuses.
+    pub min_cols: u16,
+}
+
+impl ScreenProfile {
+    /// The composer's content against `line`.
+    pub fn holds(&self, grid: &Grid, line: &str) -> Option<ComposerText> {
+        let composer = (self.composer)(grid)?;
+        if composer.text.is_empty() || (composer.dim && (self.placeholder)(&composer.text)) {
+            return Some(ComposerText::Empty {
+                placeholder: !composer.text.is_empty(),
+            });
+        }
+        if composer.dim {
+            return Some(ComposerText::Other);
+        }
+        if !composer.cursor_at_end {
+            return Some(ComposerText::Other);
+        }
+        if composer.text == line {
+            return Some(ComposerText::Exact);
+        }
+        if line.starts_with(&composer.text) {
+            return Some(ComposerText::Prefix {
+                chars: composer.text.chars().count(),
+            });
+        }
+        Some(ComposerText::Other)
+    }
+
+    /// The empty ready composer, with no dialog over it: what the doorbell
+    /// needs before it types (step 2).
+    pub fn empty_and_ready(&self, grid: &Grid) -> bool {
+        grid.cols >= self.min_cols
+            && (self.dialog)(grid).is_none()
+            && (self.ready)(grid)
+            && matches!(self.holds(grid, "\u{0}"), Some(ComposerText::Empty { .. }))
+    }
+
+    /// The agent's placeholder in the composer: drawn while its input is
+    /// empty, so it confirms a withdrawal where a blank composer cannot.
+    pub fn placeholder_empty(&self, grid: &Grid) -> bool {
+        matches!(
+            self.holds(grid, "\u{0}"),
+            Some(ComposerText::Empty { placeholder: true })
+        )
+    }
+}
+
+/// Where the first `needle` sits in `bytes`.
+pub fn find_marker(bytes: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    bytes.windows(needle.len()).position(|w| w == needle)
+}
+
+// ---------------------------------------------------------------------------
+// Codex (measured on 0.160.0 and 0.164.0, M2, 2026-10-24)
+// ---------------------------------------------------------------------------
+
+/// Codex's composer indent: text starts two cells in, after `› `.
+const CODEX_INDENT: u16 = 2;
+
+/// The texts Codex shows, dim, in an empty composer.
+fn codex_placeholder(text: &str) -> bool {
+    matches!(
+        text,
+        "Ask Codex to do anything" | "Ask a follow-up question"
+    )
+}
+
+fn codex_glyph(grid: &Grid, row: u16) -> Option<&GridCell> {
+    grid.cell(row, 0).filter(|c| c.text == "›")
+}
+
+/// A numbered choice after the glyph: `› 1. …`.
+fn codex_numbered(grid: &Grid, row: u16) -> bool {
+    let text = grid.text_from(row, CODEX_INDENT);
+    let digits = text.chars().take_while(char::is_ascii_digit).count();
+    digits > 0 && text[digits..].starts_with('.')
+}
+
+/// The composer: the lowest row whose first cell is a bold `›` that is
+/// neither dim (a submitted message in the transcript, whose glyph Codex
+/// draws dim) nor inverse (a dialog's highlighted choice), with its text from column 2 and the rows
+/// below it at the same indent until a blank row, joined at single spaces
+/// (Codex wraps the line at word boundaries).
+fn codex_composer(grid: &Grid) -> Option<Composer> {
+    let prompt_row = (0..grid.rows).rev().find(|&r| {
+        codex_glyph(grid, r).is_some_and(|c| c.bold && !c.dim && !c.inverse)
+            && !codex_numbered(grid, r)
+    })?;
+    let mut text = grid.text_from(prompt_row, CODEX_INDENT);
+    let mut last_row = prompt_row;
+    let mut row = prompt_row + 1;
+    while row < grid.rows {
+        let next = grid.text_from(row, CODEX_INDENT);
+        if next.is_empty() || !grid.text_from(row, 0).starts_with("  ") {
+            break;
+        }
+        // A row below the composer that is not its continuation: the model
+        // line and the footer sit after a blank row.
+        text.push(' ');
+        text.push_str(next.trim_start());
+        last_row = row;
+        row += 1;
+    }
+    let mut dim = true;
+    let mut any = false;
+    for r in prompt_row..=last_row {
+        let from = if r == prompt_row { CODEX_INDENT } else { 0 };
+        for cell in grid.cells[r as usize].iter().skip(from as usize) {
+            if !cell.text.trim().is_empty() {
+                any = true;
+                dim &= cell.dim;
+            }
+        }
+    }
+    let end_col = if last_row == prompt_row {
+        CODEX_INDENT + grid.text_from(prompt_row, CODEX_INDENT).chars().count() as u16
+    } else {
+        grid.text_from(last_row, 0).chars().count() as u16
+    };
+    let cursor_at_end = if text.is_empty() || (any && dim) {
+        grid.cursor == (prompt_row, CODEX_INDENT)
+    } else {
+        grid.cursor == (last_row, end_col)
+    };
+    Some(Composer {
+        prompt_row,
+        last_row,
+        text,
+        dim: any && dim,
+        cursor_at_end,
+    })
+}
+
+/// The ready screen: the composer, and `? for shortcuts` on the last drawn
+/// row, which Codex hid while its composer held text in the measurements.
+fn codex_ready(grid: &Grid) -> bool {
+    let Some(composer) = codex_composer(grid) else {
+        return false;
+    };
+    let Some(footer) = grid.last_drawn_row() else {
+        return false;
+    };
+    let footer_text = grid.text_from(footer, 0);
+    let footer_text = footer_text.trim_start();
+    footer > composer.last_row
+        && (footer_text.starts_with("? for shortcuts") || footer_text.contains("· ? for shortcuts"))
+}
+
+/// Codex's dialogs (update, folder trust, hooks review, measured): a bold
+/// title at row 1, column 2, and a highlighted choice — `›` at column 0,
+/// bold and inverse, then `N.` — drawn to the right edge. Text that merely
+/// mentions a dialog's words in the transcript has neither.
+fn codex_dialog(grid: &Grid) -> Option<Dialog> {
+    let choice = (0..grid.rows).any(|r| {
+        codex_glyph(grid, r).is_some_and(|c| c.inverse && c.bold)
+            && codex_numbered(grid, r)
+            && grid.written_extent(r) == grid.cols
+    });
+    if !choice {
+        return None;
+    }
+    let title_bold = grid.cell(1, 2).is_some_and(|c| c.bold);
+    let title = grid.text_from(1, 2);
+    Some(match title.as_str() {
+        t if title_bold && t.starts_with("Update available") => Dialog::Measured("update"),
+        "Folder access" if title_bold => Dialog::Measured("trust"),
+        "Hooks need review" if title_bold => Dialog::Measured("hooks"),
+        _ => Dialog::Unrecognised,
+    })
+}
+
+/// A submitted user message in Codex's transcript: `›` at column 0 drawn
+/// dim (Codex writes it bold then dim, which leaves it dim; the composer's
+/// glyph is bold and not dim), its text from column 2 with continuation
+/// rows at the same indent, above the composer.
+fn codex_transcript_user_line(grid: &Grid, line: &str) -> bool {
+    let composer_row = codex_composer(grid)
+        .map(|c| c.prompt_row)
+        .unwrap_or(grid.rows);
+    (0..composer_row).any(|r| {
+        if !codex_glyph(grid, r).is_some_and(|c| c.dim && !c.inverse) {
+            return false;
+        }
+        let mut text = grid.text_from(r, CODEX_INDENT);
+        let mut row = r + 1;
+        while row < composer_row {
+            let next = grid.text_from(row, 0);
+            if next.trim().is_empty() || !next.starts_with("  ") {
+                break;
+            }
+            text.push(' ');
+            text.push_str(next.trim());
+            row += 1;
+        }
+        text == line
+    })
+}
+
+/// Whether a frame ties itself to the width it was drawn at: a row written
+/// to the right edge (a dialog's highlighted choice, the dim rule Codex pads
+/// under a finished turn), or, before the first prompt, Codex's logo centred
+/// with its top row starting at column `cols / 2 - 5` (measured at eleven
+/// widths from 90 to 200 on 0.160.0 and 0.164.0). A frame drawn for another
+/// width puts neither where this width needs it.
+fn codex_width_witness(grid: &Grid) -> bool {
+    if (0..grid.rows).any(|r| grid.written_extent(r) == grid.cols) {
+        return true;
+    }
+    let braille = |c: &GridCell| {
+        c.text
+            .chars()
+            .next()
+            .is_some_and(|ch| ('\u{2800}'..='\u{28ff}').contains(&ch))
+    };
+    let Some(top) = (0..grid.rows).find(|&r| grid.cells[r as usize].iter().any(braille)) else {
+        return false;
+    };
+    let first = grid.cells[top as usize]
+        .iter()
+        .position(braille)
+        .unwrap_or(0);
+    (grid.cols / 2).checked_sub(5) == Some(first as u16)
+}
+
+/// Codex 0.160.0 and 0.164.0: alternate screen; after a resize Codex waits
+/// about two seconds, then redraws the whole screen at the new width
+/// (`ESC[?2026h ESC[1;1H ESC[J`; after each of 10 resizes and 10 nudges on
+/// each release, before and after a first prompt).
+pub static CODEX_PROFILE: ScreenProfile = ScreenProfile {
+    id: "codex-2026-10",
+    composer: codex_composer,
+    ready: codex_ready,
+    placeholder: codex_placeholder,
+    dialog: codex_dialog,
+    transcript_user_line: codex_transcript_user_line,
+    redraw_marker: b"\x1b[?2026h\x1b[1;1H\x1b[J",
+    width_witness: codex_width_witness,
+    min_cols: 80,
+};
+
+// ---------------------------------------------------------------------------
+// Claude Code (measured on 2.1.310, M1, 2026-10-24)
+// ---------------------------------------------------------------------------
+
+/// Claude Code's composer indent: text starts two cells in, after `❯` and a
+/// no-break space.
+const CLAUDE_INDENT: u16 = 2;
+
+/// A rule Claude Code draws across the whole width above and below its
+/// composer.
+fn claude_rule(grid: &Grid, row: u16) -> bool {
+    grid.written_extent(row) == grid.cols
+        && grid
+            .cells
+            .get(row as usize)
+            .is_some_and(|cells| cells.iter().all(|c| c.text == "─"))
+}
+
+/// The composer: `❯` at column 0 on the row below a full-width rule, its text
+/// from column 2 and the rows below it at the same indent up to the next
+/// full-width rule, joined at single spaces (Claude Code wraps at word
+/// boundaries). A user message in the transcript is painted on a background
+/// colour; the composer's glyph is not.
+fn claude_composer(grid: &Grid) -> Option<Composer> {
+    let prompt_row = (1..grid.rows).rev().find(|&r| {
+        grid.cell(r, 0)
+            .is_some_and(|c| c.text == "❯" && c.bg == vt100::Color::Default)
+            && claude_rule(grid, r - 1)
+    })?;
+    let close = (prompt_row + 1..grid.rows).find(|&r| claude_rule(grid, r))?;
+    let mut text = grid.text_from(prompt_row, CLAUDE_INDENT);
+    let mut last_row = prompt_row;
+    for row in prompt_row + 1..close {
+        let next = grid.text_from(row, 0);
+        if next.trim().is_empty() {
+            break;
+        }
+        text.push(' ');
+        text.push_str(next.trim());
+        last_row = row;
+    }
+    let mut dim = true;
+    let mut any = false;
+    for r in prompt_row..=last_row {
+        let from = if r == prompt_row { CLAUDE_INDENT } else { 0 };
+        for cell in grid.cells[r as usize].iter().skip(from as usize) {
+            if !cell.text.trim().is_empty() {
+                any = true;
+                dim &= cell.dim;
+            }
+        }
+    }
+    let end_col = if last_row == prompt_row {
+        CLAUDE_INDENT + grid.text_from(prompt_row, CLAUDE_INDENT).chars().count() as u16
+    } else {
+        grid.text_from(last_row, 0).chars().count() as u16
+    };
+    let cursor_at_end = if text.is_empty() || (any && dim) {
+        grid.cursor == (prompt_row, CLAUDE_INDENT)
+    } else {
+        grid.cursor == (last_row, end_col)
+    };
+    Some(Composer {
+        prompt_row,
+        last_row,
+        text,
+        dim: any && dim,
+        cursor_at_end,
+    })
+}
+
+/// The ready screen: the composer framed by two full-width rules with a
+/// status row under the lower one.
+fn claude_ready(grid: &Grid) -> bool {
+    let Some(composer) = claude_composer(grid) else {
+        return false;
+    };
+    let Some(close) = (composer.last_row + 1..grid.rows).find(|&r| claude_rule(grid, r)) else {
+        return false;
+    };
+    (close + 1..grid.rows).any(|r| grid.row_extent(r) > 0)
+}
+
+/// Claude Code's dialogs show their choices as `❯ 1. …`; none was seen after
+/// readiness in M1's launches, so any such screen is unrecognised.
+fn claude_dialog(grid: &Grid) -> Option<Dialog> {
+    (0..grid.rows)
+        .any(|r| {
+            let text = grid.text_from(r, 0);
+            let text = text.trim_start();
+            text.strip_prefix('❯').is_some_and(|rest| {
+                let rest = rest.trim_start_matches([' ', '\u{a0}']);
+                let digits = rest.chars().take_while(char::is_ascii_digit).count();
+                digits > 0 && rest[digits..].starts_with('.')
+            })
+        })
+        .then_some(Dialog::Unrecognised)
+}
+
+/// A user message in Claude Code's transcript: `❯` at column 0 on a row
+/// painted background colour 237, its text from column 2 with continuation
+/// rows on the same background.
+fn claude_transcript_user_line(grid: &Grid, line: &str) -> bool {
+    let user_bg = vt100::Color::Idx(237);
+    (0..grid.rows).any(|r| {
+        if !grid
+            .cell(r, 0)
+            .is_some_and(|c| c.text == "❯" && c.bg == user_bg)
+        {
+            return false;
+        }
+        let mut text = grid.text_from(r, CLAUDE_INDENT);
+        let mut row = r + 1;
+        while row < grid.rows && grid.cell(row, 0).is_some_and(|c| c.bg == user_bg) {
+            let next = grid.text_from(row, 0);
+            if next.trim().is_empty() {
+                break;
+            }
+            text.push(' ');
+            text.push_str(next.trim());
+            row += 1;
+        }
+        text == line
+    })
+}
+
+/// A full-width rule tied to the width the agent drew at.
+fn claude_width_witness(grid: &Grid) -> bool {
+    (0..grid.rows).any(|r| claude_rule(grid, r))
+}
+
+/// The suggestion Claude Code shows, dim, in an empty composer: `Try "…"`,
+/// with a different suggestion on each launch.
+fn claude_placeholder(text: &str) -> bool {
+    text.starts_with("Try \"") && text.ends_with('"')
+}
+
+/// Claude Code 2.1.310: alternate screen, a full redraw (`ESC[2J ESC[H`)
+/// within 9 ms of each of the 10 resizes and 10 nudges measured.
+pub static CLAUDE_PROFILE: ScreenProfile = ScreenProfile {
+    id: "claude-code-2026-10",
+    composer: claude_composer,
+    ready: claude_ready,
+    placeholder: claude_placeholder,
+    dialog: claude_dialog,
+    transcript_user_line: claude_transcript_user_line,
+    redraw_marker: b"\x1b[2J\x1b[H",
+    width_witness: claude_width_witness,
+    min_cols: 80,
+};
+
+/// The profile a record names.
+pub fn profile(id: &str) -> Option<&'static ScreenProfile> {
+    [&CODEX_PROFILE, &CLAUDE_PROFILE]
+        .into_iter()
+        .find(|p| p.id == id)
+}
+
+/// Why the strict recogniser refuses to withdraw the deck's text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WithdrawalRefusal {
+    /// The pane is narrower than the profile's measurements cover.
+    Narrow,
+    /// A dialog is on screen: deletes would go to it.
+    Dialog,
+    /// No composer is on screen.
+    NotComposer,
+    /// The owned text does not begin with a whole ring token, so the deck
+    /// cannot tell its own text from anyone else's.
+    NoWholeToken,
+    /// The composer holds something other than exactly the owned text.
+    NotOwnedText,
+    /// The cursor is not right after the owned text.
+    CursorElsewhere,
+    /// Part of the composer is highlighted (a selection).
+    Selection,
+}
+
+/// The length of a ring token's visible head, `(` + six letters + `)`.
+pub const TOKEN_HEAD_CHARS: usize = 8;
+
+/// Whether the deck may delete `owned`, the text it wrote and the agent
+/// accepted (all of its line, or after a partial write exactly its accepted
+/// prefix), from this frame: the composer holds exactly `owned`, starting
+/// with a whole token, with the cursor right after it, nothing highlighted
+/// and no dialog on screen. Returns the number of delete keys to send, one per
+/// character. Called on a fresh frame immediately before the deletes; the
+/// deletes still go to whatever owns the input when they arrive.
+pub fn strict_withdrawal(
+    profile: &ScreenProfile,
+    grid: &Grid,
+    owned: &str,
+) -> Result<usize, WithdrawalRefusal> {
+    if grid.cols < profile.min_cols {
+        return Err(WithdrawalRefusal::Narrow);
+    }
+    if (profile.dialog)(grid).is_some() {
+        return Err(WithdrawalRefusal::Dialog);
+    }
+    let head: Vec<char> = owned.chars().take(TOKEN_HEAD_CHARS).collect();
+    let whole_token = head.len() == TOKEN_HEAD_CHARS
+        && head[0] == '('
+        && head[TOKEN_HEAD_CHARS - 1] == ')'
+        && head[1..TOKEN_HEAD_CHARS - 1]
+            .iter()
+            .all(char::is_ascii_lowercase);
+    if !whole_token {
+        return Err(WithdrawalRefusal::NoWholeToken);
+    }
+    let composer = (profile.composer)(grid).ok_or(WithdrawalRefusal::NotComposer)?;
+    if composer.dim || composer.text != owned {
+        return Err(WithdrawalRefusal::NotOwnedText);
+    }
+    if !composer.cursor_at_end {
+        return Err(WithdrawalRefusal::CursorElsewhere);
+    }
+    let highlighted = (composer.prompt_row..=composer.last_row).any(|r| {
+        grid.cells[r as usize]
+            .iter()
+            .any(|c| c.inverse && !c.text.trim().is_empty())
+    });
+    if highlighted {
+        return Err(WithdrawalRefusal::Selection);
+    }
+    Ok(owned.chars().count())
+}
