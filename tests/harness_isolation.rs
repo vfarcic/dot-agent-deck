@@ -612,7 +612,7 @@ fn a_discard_that_cannot_delete_a_stale_artifact_fails_the_run() {
 /// Scenario: Read the harness source and assert that `TuiDeck::try_launch_inner`
 /// discards the previous recording, that it does so before it spawns anything,
 /// and that the artifact list the discard walks still names every file
-/// `dump_recordings` writes.
+/// the locked recording writer writes.
 ///
 /// A source guard rather than an observation, because observing it needs a real
 /// PTY launch and this file is in the fast tier — the launch path itself is
@@ -647,8 +647,8 @@ fn tui_deck_launch_discards_the_previous_recording_before_it_spawns() {
     // The dump and the discard must agree on the file names, or the discard
     // silently stops covering whatever the dump added.
     let dump = source
-        .split_once("fn dump_recordings(")
-        .expect("dump_recordings must exist")
+        .split_once("fn dump_recording_files(")
+        .expect("dump_recording_files must exist")
         .1;
     let dump = dump.split_once("\n    fn ").map_or(dump, |(head, _)| head);
     for name in RECORDING_ARTIFACTS {
@@ -668,13 +668,13 @@ fn tui_deck_launch_discards_the_previous_recording_before_it_spawns() {
     }
     assert!(
         !written.is_empty(),
-        "found no `dir.join(\"…\")` artifact writes in dump_recordings — this \
+        "found no `dir.join(\"…\")` artifact writes in dump_recording_files — this \
          guard has stopped guarding anything"
     );
     for name in &written {
         assert!(
             RECORDING_ARTIFACTS.contains(&name.as_str()),
-            "dump_recordings writes `{name}`, which the launch-time discard does \
+            "dump_recording_files writes `{name}`, which the launch-time discard does \
              not remove — add it to RECORDING_ARTIFACTS in tests/common/mod.rs, \
              or an interrupted run leaves it behind (PR #805 audit blocker 3)"
         );

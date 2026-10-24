@@ -63,6 +63,585 @@ use std::time::Duration;
 
 use crate::common::*;
 
+/// Scenario: A failed run leaves a cast, grid, fixture, logs and provenance.
+/// Starting and completing a passing rerun clears the current files but keeps
+/// the failed run's original artifacts together in a separate archive.
+#[test]
+fn recording_retention_preserves_failed_evidence_across_passing_reruns() {
+    let root = harness_tempdir().unwrap();
+    let dir = root.path();
+    let artifacts = [
+        "full-stream.cast",
+        "final-grid.txt",
+        "final-grid.svg",
+        "fixture.toml",
+        "daemon.log",
+        "deck.log",
+    ];
+    for name in artifacts {
+        std::fs::write(dir.join(name), format!("failed {name}")).unwrap();
+    }
+    let failed = serde_json::json!({"outcome":"failed", "recorded_at_unix": 1}).to_string();
+    std::fs::write(dir.join("provenance.json"), &failed).unwrap();
+    std::fs::write(dir.join("test.md"), "paired doc").unwrap();
+    discard_recording_dir(dir);
+    for name in artifacts {
+        assert!(!dir.join(name).exists(), "latest files must be invalidated");
+        std::fs::write(dir.join(name), format!("passed {name}")).unwrap();
+    }
+    std::fs::write(dir.join("provenance.json"), r#"{"outcome":"passed"}"#).unwrap();
+    discard_recording_dir(dir);
+    let archives: Vec<_> = std::fs::read_dir(dir.join("runs"))
+        .expect("a failed recording must survive a passing rerun under runs/")
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    let archive = archives
+        .iter()
+        .find(|path| std::fs::read_to_string(path.join("provenance.json")).unwrap() == failed)
+        .expect("the failed run's provenance must survive the passing rerun");
+    for name in artifacts {
+        assert_eq!(
+            std::fs::read_to_string(archive.join(name)).unwrap(),
+            format!("failed {name}")
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(dir.join("test.md")).unwrap(),
+        "paired doc"
+    );
+}
+
+/// Scenario: Retain recent failures while trimming a mix of successful and
+/// expired failed recordings to the count cap, oldest first. Once their
+/// protection expires, those failures become eligible for the same pruning.
+#[test]
+fn recording_retention_prunes_oldest_runs_and_protects_recent_failures() {
+    let root = harness_tempdir().unwrap();
+    let runs = root.path().join("runs");
+    let plant = |time: u64, outcome: &str| {
+        let dir = runs.join(format!("run-{time:020}-fixture"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("provenance.json"),
+            serde_json::json!({
+                "outcome": outcome, "recorded_at_unix": time
+            })
+            .to_string(),
+        )
+        .unwrap();
+        dir
+    };
+    let oldest_pass = plant(1, "passed");
+    let expired_failure = plant(2, "failed");
+    let newest_pass = plant(999, "passed");
+    let recent_failures = [
+        plant(990, "failed"),
+        plant(991, "failed"),
+        plant(992, "failed"),
+    ];
+    recording_evidence::prune_recordings(root.path(), 1000, 2, 100).unwrap();
+    assert!(!oldest_pass.exists());
+    assert!(!expired_failure.exists());
+    assert!(
+        !newest_pass.exists(),
+        "protected failures may exceed the soft cap"
+    );
+    assert!(recent_failures.iter().all(|path| path.exists()));
+    recording_evidence::prune_recordings(root.path(), 1090, 2, 100).unwrap();
+    assert!(
+        !recent_failures[0].exists(),
+        "failure expires exactly at the protection boundary"
+    );
+    assert!(recent_failures[1..].iter().all(|path| path.exists()));
+    recording_evidence::prune_recordings(root.path(), 2000, 1, 100).unwrap();
+    assert!(
+        !recent_failures[1].exists(),
+        "eligible runs are pruned oldest first"
+    );
+    assert!(recent_failures[2].exists());
+}
+
+/// Scenario: An interrupted recording has no usable provenance, and another
+/// failed recording has a timestamp ahead of the clock. Both stay protected
+/// rather than being mistaken for disposable successful runs.
+#[test]
+fn recording_retention_protects_incomplete_and_future_dated_failures() {
+    let root = harness_tempdir().unwrap();
+    for name in [
+        "run-00000000000000001000-incomplete",
+        "run-00000000000000002000-future",
+    ] {
+        std::fs::create_dir_all(root.path().join("runs").join(name)).unwrap();
+    }
+    recording_evidence::prune_recordings(root.path(), 1000, 0, 100).unwrap();
+    assert_eq!(
+        std::fs::read_dir(root.path().join("runs")).unwrap().count(),
+        2
+    );
+}
+
+/// Scenario: An archive directory or session transcript points outside its
+/// sandbox through a symlink. Pruning refuses that archive, and metadata
+/// collection ignores linked transcripts and linked ancestors without reading outside metadata.
+#[cfg(unix)]
+#[test]
+fn recording_evidence_does_not_follow_archive_or_transcript_symlinks() {
+    let root = harness_tempdir().unwrap();
+    let outside = harness_tempdir().unwrap();
+    let preserved = outside.path().join("run-00000000000000000001-old");
+    std::fs::create_dir(&preserved).unwrap();
+    std::os::unix::fs::symlink(outside.path(), root.path().join("runs")).unwrap();
+    assert!(recording_evidence::prune_recordings(root.path(), 1000, 0, 0).is_err());
+    assert!(preserved.exists());
+    let projects = root.path().join(".claude/projects");
+    std::fs::create_dir_all(&projects).unwrap();
+    let transcript = outside.path().join("host.jsonl");
+    std::fs::write(&transcript, "{\"permissionMode\":\"auto\"}\n").unwrap();
+    std::os::unix::fs::symlink(transcript, projects.join("linked.jsonl")).unwrap();
+    assert!(recording_evidence::claude_session_provenance(root.path()).is_empty());
+    std::fs::remove_dir_all(root.path().join(".claude")).unwrap();
+    let outside_projects = outside.path().join("projects");
+    std::fs::create_dir_all(&outside_projects).unwrap();
+    std::fs::write(
+        outside_projects.join("host.jsonl"),
+        "{\"sessionId\":\"outside-host-session\",\"permissionMode\":\"auto\"}\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(outside.path(), root.path().join(".claude")).unwrap();
+    assert!(
+        recording_evidence::claude_session_provenance(root.path()).is_empty(),
+        "a linked .claude ancestor must not import outside session metadata"
+    );
+    std::fs::remove_file(root.path().join(".claude")).unwrap();
+    std::fs::create_dir(root.path().join(".claude")).unwrap();
+    std::os::unix::fs::symlink(&outside_projects, &projects).unwrap();
+    assert!(recording_evidence::claude_session_provenance(root.path()).is_empty());
+}
+
+/// Scenario: A publisher holds the per-test recording lock while another launch tries to discard its files.
+/// The discard must wait until publication finishes, then preserve the complete evidence in one archive.
+#[test]
+fn recording_retention_waits_for_an_active_publisher() {
+    let root = harness_tempdir().unwrap();
+    let lock = std::fs::File::create(root.path().join(".recording.lock")).unwrap();
+    lock.lock().unwrap();
+    std::fs::write(root.path().join("final-grid.txt"), "failed grid").unwrap();
+    let dir = root.path().to_owned();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        sender.send("started").unwrap();
+        discard_recording_dir(&dir);
+        sender.send("discarded").unwrap();
+    });
+    assert_eq!(receiver.recv().unwrap(), "started");
+    let completed_while_locked = receiver.recv_timeout(Duration::from_millis(100)).is_ok();
+    let grid_survived = root.path().join("final-grid.txt").exists();
+    lock.unlock().unwrap();
+    worker.join().unwrap();
+    assert!(
+        !completed_while_locked && grid_survived,
+        "discard cleared a recording while its publisher still held the per-test lock"
+    );
+    let runs: Vec<_> = std::fs::read_dir(root.path().join("runs"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(runs[0].join("final-grid.txt")).unwrap(),
+        "failed grid"
+    );
+}
+
+/// Scenario: Retention encounters an abandoned old pending archive, a recent pending archive and an old one with a live writer lock.
+/// It reaps only the abandoned copy, then reaps the old live copy once its writer releases the lock.
+#[cfg(unix)]
+#[test]
+fn recording_retention_reaps_stale_pending_copies_without_touching_live_writers() {
+    let root = harness_tempdir().unwrap();
+    let runs = root.path().join("runs");
+    let old = runs.join(".pending-abandoned");
+    let live = runs.join(".pending-live");
+    let recent = runs.join(".pending-recent");
+    for path in [&old, &live, &recent] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    let live_lock = std::fs::File::create(live.join(".writer.lock")).unwrap();
+    live_lock.lock().unwrap();
+    let epoch = std::time::SystemTime::UNIX_EPOCH;
+    for path in [&old, &live] {
+        std::fs::File::open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(epoch))
+            .unwrap();
+    }
+    recording_evidence::prune_recordings(root.path(), 100_000, 0, 100).unwrap();
+    assert!(!old.exists(), "stale pending evidence was never reclaimed");
+    assert!(
+        live.exists(),
+        "a pending copy with a live writer must survive"
+    );
+    assert!(recent.exists());
+    live_lock.unlock().unwrap();
+    recording_evidence::prune_recordings(root.path(), 100_000, 0, 100).unwrap();
+    assert!(!live.exists());
+    assert!(recent.exists());
+}
+
+/// Scenario: Concurrent launch attempts archive the same completed failure while concurrent pruners trim old successful runs.
+/// Every operation succeeds and exactly one complete copy of the failure survives.
+#[test]
+fn recording_retention_concurrent_discards_and_pruners_preserve_one_complete_failure() {
+    let root = harness_tempdir().unwrap();
+    std::fs::write(root.path().join("final-grid.txt"), vec![b'x'; 1024 * 1024]).unwrap();
+    std::fs::write(
+        root.path().join("provenance.json"),
+        r#"{"outcome":"failed"}"#,
+    )
+    .unwrap();
+    for n in 0..20 {
+        let run = root.path().join("runs").join(format!("run-{n:020}-passed"));
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join("provenance.json"), r#"{"outcome":"passed"}"#).unwrap();
+    }
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+    let workers: Vec<_> = (0..16)
+        .map(|n| {
+            let dir = root.path().to_owned();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                if n % 2 == 0 {
+                    discard_recording_dir(&dir);
+                } else {
+                    recording_evidence::prune_recordings(&dir, 1000, 1, u64::MAX).unwrap();
+                }
+            })
+        })
+        .collect();
+    let successes: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().is_ok())
+        .collect();
+    assert!(
+        successes.iter().all(|ok| *ok),
+        "concurrent archive/clear/prune aborted a launch"
+    );
+    let failures: Vec<_> = std::fs::read_dir(root.path().join("runs"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            std::fs::read_to_string(p.join("provenance.json")).is_ok_and(|s| s.contains("failed"))
+        })
+        .collect();
+    assert_eq!(
+        failures.len(),
+        1,
+        "one completed failure must be archived exactly once"
+    );
+    assert_eq!(
+        std::fs::metadata(failures[0].join("final-grid.txt"))
+            .unwrap()
+            .len(),
+        1024 * 1024
+    );
+}
+
+/// Scenario: An old archive cannot be removed, but the current failure can still be archived.
+/// Two launch attempts clear the current files after preserving them once, despite the retention error.
+#[cfg(unix)]
+#[test]
+fn recording_retention_prune_errors_do_not_republish_the_same_failure() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = harness_tempdir().unwrap();
+    let runs = root.path().join("runs");
+    let mut old_dirs = Vec::new();
+    for n in 0..11 {
+        let run = runs.join(format!("run-{n:020}-passed"));
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join("provenance.json"), r#"{"outcome":"passed"}"#).unwrap();
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o500)).unwrap();
+        old_dirs.push(run);
+    }
+    std::fs::write(root.path().join("final-grid.txt"), "original failure").unwrap();
+    std::fs::write(
+        root.path().join("provenance.json"),
+        r#"{"outcome":"failed"}"#,
+    )
+    .unwrap();
+    let attempts: Vec<_> = (0..2)
+        .map(|_| std::panic::catch_unwind(|| discard_recording_dir(root.path())).is_ok())
+        .collect();
+    for run in old_dirs {
+        if run.exists() {
+            std::fs::set_permissions(run, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+    let failures = std::fs::read_dir(&runs)
+        .unwrap()
+        .filter(|entry| {
+            std::fs::read_to_string(entry.as_ref().unwrap().path().join("provenance.json"))
+                .is_ok_and(|s| s.contains("failed"))
+        })
+        .count();
+    assert!(
+        attempts.iter().all(|ok| *ok),
+        "retention cleanup errors must not abort an already archived launch"
+    );
+    assert_eq!(
+        failures, 1,
+        "retrying retention must not republish the same failure"
+    );
+    assert!(!root.path().join("provenance.json").exists());
+}
+
+/// Scenario: Claude's settings request auto mode, but the session transcript
+/// reports default and then acceptEdits, an actual model and a version, with or without a final newline.
+/// Provenance keeps the latest complete observation, marks a partial tail, and ignores settings.
+#[test]
+fn recording_provenance_carries_observed_claude_mode_version_and_model() {
+    let home = harness_tempdir().unwrap();
+    let project = home.path().join(".claude/projects/fixture");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        home.path().join(".claude/settings.json"),
+        r#"{"permissions":{"defaultMode":"auto"}}"#,
+    )
+    .unwrap();
+    std::fs::write(project.join("session.jsonl"), concat!(
+        "{\"type\":\"user\",\"sessionId\":\"fixture-session\",\"permissionMode\":\"default\",\"version\":\"2.1.309\"}\n",
+        "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-haiku-4-5-20251001\",\"content\":\"private transcript text\"}}\n",
+        "{\"type\":\"user\",\"permissionMode\":\"acceptEdits\"}\n",
+        "{partial final record"
+    )).unwrap();
+    let sessions = recording_evidence::claude_session_provenance(home.path());
+    assert_eq!(sessions.len(), 1);
+    let session = &sessions[0];
+    assert_eq!(session["session_id"], "fixture-session");
+    assert_eq!(session["permissionMode"], "acceptEdits");
+    assert_eq!(
+        session["permission_modes"],
+        serde_json::json!(["default", "acceptEdits"])
+    );
+    assert_eq!(session["version"], "2.1.309");
+    assert_eq!(session["model"], "claude-haiku-4-5-20251001");
+    assert_eq!(
+        session["models"],
+        serde_json::json!(["claude-haiku-4-5-20251001"])
+    );
+    assert!(
+        !serde_json::to_string(&sessions)
+            .unwrap()
+            .contains("private transcript text")
+    );
+    for prefix in ["{\"permissionMode\":\"default\"}\n", ""] {
+        for ending in ["\n", ""] {
+            std::fs::write(
+                project.join("session.jsonl"),
+                format!(
+                    "{prefix}{{\"sessionId\":\"final-session\",\"permissionMode\":\"auto\",\"version\":\"final-version\",\"message\":{{\"model\":\"final-model\"}}}}{ending}"
+                ),
+            )
+            .unwrap();
+            let observed = recording_evidence::claude_session_provenance(home.path());
+            let final_session = &observed[0];
+            assert_eq!(
+                final_session["permissionMode"], "auto",
+                "latest complete record must survive EOF: prefix={prefix:?}, ending={ending:?}"
+            );
+            assert_eq!(final_session["session_id"], "final-session");
+            assert_eq!(final_session["version"], "final-version");
+            assert_eq!(final_session["model"], "final-model");
+            let modes = if prefix.is_empty() {
+                serde_json::json!(["auto"])
+            } else {
+                serde_json::json!(["default", "auto"])
+            };
+            assert_eq!(final_session["permission_modes"], modes);
+            assert_eq!(final_session["models"], serde_json::json!(["final-model"]));
+            assert_eq!(final_session["truncated"], false);
+        }
+    }
+    assert_eq!(
+        session["truncated"], true,
+        "a partial final record must mark the preserved observations incomplete"
+    );
+    std::fs::write(project.join("session.jsonl"), "{\"type\":\"system\"}\n").unwrap();
+    let unknown = recording_evidence::claude_session_provenance(home.path());
+    assert!(
+        unknown[0]["permissionMode"].is_null(),
+        "missing mode is unknown, not the configured auto default"
+    );
+    assert!(unknown[0]["version"].is_null());
+    assert_eq!(unknown[0]["models"], serde_json::json!([]));
+}
+
+/// Scenario: A sandbox has more transcripts than the collection cap, including one newest active session.
+/// Provenance keeps the newest session first and marks the omitted sessions explicitly.
+#[test]
+fn recording_provenance_selects_newest_sessions_and_reports_the_file_cap() {
+    let home = harness_tempdir().unwrap();
+    let project = home.path().join(".claude/projects/fixture");
+    std::fs::create_dir_all(&project).unwrap();
+    for n in 0..257 {
+        let path = project.join(format!("session-{n:03}.jsonl"));
+        std::fs::write(&path, format!("{{\"sessionId\":\"session-{n}\"}}\n")).unwrap();
+        let modified = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(n);
+        std::fs::File::open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+    }
+    let sessions = recording_evidence::claude_session_provenance(home.path());
+    assert_eq!(sessions.len(), 256);
+    assert_eq!(
+        sessions[0]["session_id"], "session-256",
+        "the current session must survive the file cap"
+    );
+    assert!(
+        sessions
+            .iter()
+            .all(|session| session["collection_truncated"] == true)
+    );
+}
+
+/// Scenario: Transcript collection encounters an oversized JSONL record followed by a normal mode observation, then an I/O failure.
+/// It skips the oversized record, preserves the later observation and explicitly marks the incomplete read.
+#[test]
+fn recording_provenance_bounds_records_and_marks_partial_read_errors() {
+    use std::io::Read;
+    let mut bytes = format!(
+        "{{\"permissionMode\":\"auto\",\"content\":\"{}\"}}\n",
+        "x".repeat(128 * 1024)
+    )
+    .into_bytes();
+    bytes.extend_from_slice(b"{\"permissionMode\":\"default\"}\n");
+    struct FailsAtEnd(std::io::Cursor<Vec<u8>>);
+    impl Read for FailsAtEnd {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.0.read(output)?;
+            if n == 0 {
+                Err(std::io::Error::other("injected transcript read failure"))
+            } else {
+                Ok(n)
+            }
+        }
+    }
+    let mut result = serde_json::json!({"permission_modes": [], "models": []});
+    recording_evidence::collect_session_records(
+        std::io::BufReader::new(FailsAtEnd(std::io::Cursor::new(bytes))),
+        false,
+        &mut result,
+    );
+    assert_eq!(result["permission_modes"], serde_json::json!(["default"]));
+    assert_eq!(result["permissionMode"], "default");
+    assert_eq!(result["truncated"], true);
+    assert!(
+        result["read_error"].is_string(),
+        "read errors must not look like a complete transcript: {result}"
+    );
+}
+
+/// Scenario: A transcript grows after the collector snapshots its length.
+/// Collection stops at the original end offset and cannot observe a later mode appended to the file, or mistake a skipped first tail fragment for a complete record.
+#[test]
+fn recording_provenance_tail_stops_at_the_snapshot_even_if_the_file_grows() {
+    let snapshot = b"{\"permissionMode\":\"default\"}\n";
+    let mut growing = snapshot.to_vec();
+    growing.extend_from_slice(b"{\"permissionMode\":\"auto\"}\n");
+    let mut result = serde_json::json!({"permission_modes": [], "models": []});
+    recording_evidence::collect_session_tail(
+        std::io::Cursor::new(growing),
+        snapshot.len() as u64,
+        1024,
+        &mut result,
+    );
+    assert_eq!(result["permission_modes"], serde_json::json!(["default"]));
+    assert_eq!(result["permissionMode"], "default");
+    let snapshot = b"ignored-prefix{\"permissionMode\":\"auto\"}";
+    let mut result = serde_json::json!({"permission_modes": [], "models": []});
+    recording_evidence::collect_session_tail(
+        std::io::Cursor::new(snapshot),
+        snapshot.len() as u64,
+        b"{\"permissionMode\":\"auto\"}".len() as u64,
+        &mut result,
+    );
+    assert_eq!(result["permission_modes"], serde_json::json!([]));
+    assert!(result["permissionMode"].is_null());
+    assert_eq!(result["truncated"], true);
+}
+
+/// Scenario: A custom log points outside the sandbox, escapes with parent components or uses a symlink to an outside file.
+/// Collection rejects those sources while retaining an ordinary log from the sandbox.
+#[cfg(unix)]
+#[test]
+fn recording_evidence_confines_custom_logs_to_the_sandbox() {
+    let root = harness_tempdir().unwrap();
+    let normal = root.path().join("deck.log");
+    std::fs::write(&normal, "sandbox log").unwrap();
+    assert_eq!(
+        recording_evidence::sandbox_log(&normal).unwrap().unwrap(),
+        b"sandbox log"
+    );
+    let host = Path::new("/etc/hosts");
+    assert!(recording_evidence::sandbox_log(host).unwrap().is_none());
+    let link = root.path().join("linked.log");
+    std::os::unix::fs::symlink(host, &link).unwrap();
+    assert!(recording_evidence::sandbox_log(&link).unwrap().is_none());
+    let escape = root.path().join("../../../../etc/hosts");
+    assert!(recording_evidence::sandbox_log(&escape).unwrap().is_none());
+}
+
+/// Scenario: Concurrent publishers and discarders share a test's recording directory.
+/// Every archived failure keeps its own grid and provenance together, including the final flat recording.
+#[test]
+fn recording_retention_concurrent_publications_never_mix_or_lose_failures() {
+    let root = harness_tempdir().unwrap();
+    let workers: Vec<_> = (0..16)
+        .map(|n| {
+            let dir = root.path().to_owned();
+            std::thread::spawn(move || {
+                if n % 2 == 0 {
+                    discard_recording_dir(&dir);
+                }
+                recording_evidence::publish_recording(&dir, || {
+                    std::fs::write(dir.join("final-grid.txt"), n.to_string())?;
+                    std::thread::yield_now();
+                    std::fs::write(
+                        dir.join("provenance.json"),
+                        serde_json::json!({"outcome":"failed", "session":n}).to_string(),
+                    )
+                })
+                .unwrap();
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    discard_recording_dir(root.path());
+    let mut ids = Vec::new();
+    for run in std::fs::read_dir(root.path().join("runs")).unwrap() {
+        let run = run.unwrap().path();
+        let grid = std::fs::read_to_string(run.join("final-grid.txt")).unwrap();
+        let provenance: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(run.join("provenance.json")).unwrap()).unwrap();
+        assert_eq!(
+            grid.parse::<u64>().unwrap(),
+            provenance["session"].as_u64().unwrap(),
+            "archive mixed two different runs"
+        );
+        ids.push(grid);
+    }
+    ids.sort();
+    ids.dedup();
+    assert_eq!(
+        ids.len(),
+        16,
+        "a concurrent publication lost failed evidence"
+    );
+}
+
 // -----------------------------------------------------------------------
 // Issue #322 — harness temp-root containment and cleanup
 // -----------------------------------------------------------------------

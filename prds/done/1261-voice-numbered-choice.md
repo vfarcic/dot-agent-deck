@@ -1,6 +1,6 @@
 # PRD #1261: Offer a numbered choice when a voice command names several things
 
-**Status**: Complete — M1, M2 and M3 implemented; this PRD delivers value ambiguity only. D1 (action ambiguity) is **not done** and **moved to [PRD #1184](../1184-voice-command-chains.md)** as a dependent follow-up. Written 2026-09-29 on branch `agent/dispatch-voice-interaction-modes`, together with [PRD #1260](1260-voice-sticky-dictation-mode.md) and [PRD #1184](../1184-voice-command-chains.md).
+**Status**: Complete — M1, M2 and M3 implemented; this PRD delivers value ambiguity only. D1 (action ambiguity) is **not done** and **moved to [PRD #1184](https://github.com/vfarcic/dot-agent-deck/issues/1184)** as a dependent follow-up. Written 2026-09-29 on branch `agent/dispatch-voice-interaction-modes`, together with [PRD #1260](1260-voice-sticky-dictation-mode.md) and [PRD #1184](https://github.com/vfarcic/dot-agent-deck/issues/1184).
 **Priority**: Medium
 **Created**: 2026-09-29
 **Issue**: [#1261](https://github.com/vfarcic/dot-agent-deck/issues/1261)
@@ -37,7 +37,7 @@ When a **required** param is ambiguous, the panel shows the candidates as a **nu
 
 ### Action ambiguity: deferred, and why
 
-The pipeline does not detect it. The Commands backend returns **one** action (`IntentAnswer { action, params }` in `voice/resolver.rs`), so there is no outcome that says two rows fit; "close the agent" is settled before the app sees it, by vocabulary and instructions — `close` claims the phrase, `stop_agent`'s `heard_as` has no "close", and `TOOL_INSTRUCTIONS` says a view-or-stop reading means the view (`voice-first-design.md` §5, "An ambiguous reading resolves to the non-destructive action"). Detecting it would need the backend to return several candidate actions, which is the response-schema change [PRD #1184](../1184-voice-command-chains.md) makes for chains. So action ambiguity is deferred to after #1184's schema lands (D1 below), and when it is revisited the rule is already written: the non-destructive reading is **option 1**, and the destructive option still ends at D5.
+The pipeline does not detect it. The Commands backend returns **one** action (`IntentAnswer { action, params }` in `voice/resolver.rs`), so there is no outcome that says two rows fit; "close the agent" is settled before the app sees it, by vocabulary and instructions — `close` claims the phrase, `stop_agent`'s `heard_as` has no "close", and `TOOL_INSTRUCTIONS` says a view-or-stop reading means the view (`voice-first-design.md` §5, "An ambiguous reading resolves to the non-destructive action"). Detecting it would need the backend to return several candidate actions, which is the response-schema change [PRD #1184](https://github.com/vfarcic/dot-agent-deck/issues/1184) makes for chains. So action ambiguity is deferred to after #1184's schema lands (D1 below), and when it is revisited the rule is already written: the non-destructive reading is **option 1**, and the destructive option still ends at D5.
 
 ## Technical Approach
 
@@ -246,7 +246,7 @@ Written from issue #1261 by a dispatched unit, alongside PRDs #1260 and #1184, a
 
 ### 2026-09-30 — Closed; D1 moved to PRD #1184
 
-Everything but D1 is built and ships in the PR that closes #1261. D1 needs the multi-action response schema that PRD #1184 would introduce, and #1184's M1 measured NO-GO (not now), so D1 moved into [PRD #1184](../1184-voice-command-chains.md) as a dependent follow-up rather than staying open here.
+Everything but D1 is built and ships in the PR that closes #1261. D1 needs the multi-action response schema that PRD #1184 would introduce, and #1184's M1 measured NO-GO (not now), so D1 moved into [PRD #1184](https://github.com/vfarcic/dot-agent-deck/issues/1184) as a dependent follow-up rather than staying open here.
 
 ### 2026-10-01 — PR #1451 round 3, change 2: the numbered choice becomes a dialog
 

@@ -1,6 +1,6 @@
 # PRD #1260: A sticky dictation mode for desktop voice ("type on" / "type off")
 
-**Status**: Complete — M2 and M3 done on branch `agent/dispatch-voice-interaction-modes` (2026-09-29). M1's measurement was not taken (no microphone) and **moved to [#1450](https://github.com/vfarcic/dot-agent-deck/issues/1450)**; the overlapped capture cycle it was to decide was built in PR #1451 on the maintainer's decision after the 2026-10-01 hand test (Work Log). Written 2026-09-29 on branch `agent/dispatch-voice-interaction-modes`, together with [PRD #1261](1261-voice-numbered-choice.md) and [PRD #1184](../1184-voice-command-chains.md), because the three share one voice panel state model (below).
+**Status**: Complete — M2 and M3 done on branch `agent/dispatch-voice-interaction-modes` (2026-09-29). M1's measurement was not taken (no microphone) and **moved to [#1450](https://github.com/vfarcic/dot-agent-deck/issues/1450)**; the overlapped capture cycle it was to decide was built in PR #1451 on the maintainer's decision after the 2026-10-01 hand test (Work Log). Written 2026-09-29 on branch `agent/dispatch-voice-interaction-modes`, together with [PRD #1261](1261-voice-numbered-choice.md) and [PRD #1184](https://github.com/vfarcic/dot-agent-deck/issues/1184), because the three share one voice panel state model (below).
 **Priority**: Medium
 **Created**: 2026-09-29
 **Issue**: [#1260](https://github.com/vfarcic/dot-agent-deck/issues/1260)
@@ -42,7 +42,7 @@ This section is the one state model for #1260, #1261 and #1184. The other two PR
 | D5 confirmation | a stop or orchestration close is waiting to be answered by hand | #802 D5, #1223 | as today: the confirmation is answered by clicking; a second spoken stop is refused (`CONFIRMATION_ALREADY_OPEN`) |
 | the existing pending answers | the New agent dialog's form and directory browser, and a pending dictation send (`Pending` + countdown in `VoiceControlPanel.tsx`) | #802, #1223 | as today |
 
-**A chain in progress ([#1184](../1184-voice-command-chains.md)) is not a state of its own.** A chain that has to stop for the user stops by entering `AwaitingChoice` or by ending at the D5 confirmation, with any remaining steps held by that state. That keeps the number of things the panel can be waiting for fixed at the rows above.
+**A chain in progress ([#1184](https://github.com/vfarcic/dot-agent-deck/issues/1184)) is not a state of its own.** A chain that has to stop for the user stops by entering `AwaitingChoice` or by ending at the D5 confirmation, with any remaining steps held by that state. That keeps the number of things the panel can be waiting for fixed at the rows above.
 
 **Where each state lives.** `Dictating` and `AwaitingChoice` are held by the voice panel (`VoiceControlPanel.tsx`), in a ref mirrored into state for the reason `Pending` already is (the poll reads it between awaits). The D5 confirmation is held where it is today, by the overview (`AgentOverview.tsx`'s `confirm`); the panel does not own it and learns of it only through what the host declares. The Rust side stays stateless per utterance — `handle_utterance` keeps no memory between utterances (`docs/develop/voice-first-design.md` §2) — so whatever a state needs Rust to know travels in the declaration made with each utterance, the way the New agent dialog's state already does.
 
@@ -68,7 +68,7 @@ This section is the one state model for #1260, #1261 and #1184. The other two PR
 
 ### Out of Scope
 
-- The numbered choice ([#1261](1261-voice-numbered-choice.md)) and chains ([#1184](../1184-voice-command-chains.md)), except where this PRD's state model constrains them.
+- The numbered choice ([#1261](1261-voice-numbered-choice.md)) and chains ([#1184](https://github.com/vfarcic/dot-agent-deck/issues/1184)), except where this PRD's state model constrains them.
 - Changing one-shot dictation. "type run the tests" in `Idle` keeps working exactly as today, countdown included.
 - A keyboard shortcut of its own for the mode (Technical Approach, "Non-voice exits", says why).
 - Any daemon or TUI↔daemon protocol change. Everything here is inside the desktop binary, between its Rust side and its webview (see "Contract").

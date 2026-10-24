@@ -117,7 +117,7 @@ The full effort is split across three PRDs so each is an independently shippable
 
 - **#42 (this PRD) — Foundation**: M1 + M2 + M8. The `platform/` seam, `libc` gating, the IPC abstraction (the single biggest category, 8 files), and the `windows-latest` CI job that proves the Windows branches compile and pass tests.
 - **[#163](163-windows-platform-backends.md) — Process, path & filesystem backends**: M3–M7 (paths/shell, detach/lock, peer-PID/lifecycle, fsperm, clipboard).
-- **[#164](../164-windows-release-e2e-docs.md) — Release, e2e & docs**: M9–M11 (`.exe`/Scoop, interactive e2e on a Windows VM, README/platform docs).
+- **[#164](https://github.com/vfarcic/dot-agent-deck/issues/164) — Release, e2e & docs**: M9–M11 (`.exe`/Scoop, interactive e2e on a Windows VM, README/platform docs).
 
 ## Milestones (this PRD — Foundation)
 
