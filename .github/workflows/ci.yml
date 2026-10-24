@@ -329,7 +329,8 @@ jobs:
     # room for all of it while capping a wedged browser at a fraction of the
     # 6-hour runner default. Re-tune downward once honest runs exist; do not
     # raise it to paper over a hang.
-    # On 2026-10-22 browser/apt downloads took 14–20 minutes, exhausting that
+    # On 2026-10-22 the apt downloads of `--with-deps` took 14–20 minutes (the
+    # browser download stayed at seconds; see the install step), exhausting that
     # budget, so allow 25 minutes for install, 15 for the suite (observed 8–12)
     # and 5 for setup/reporting, with separate step limits bounding a hung suite.
     timeout-minutes: 45
@@ -357,25 +358,59 @@ jobs:
       # downloaded (Chromium 187, its headless shell 114, WebKit 95, ffmpeg 2),
       # unpacking to 927 MB, in ~50s.
       #
-      # Deliberately NOT wrapped in `actions/cache`, for two reasons, and the
-      # second is the one a future "let's just cache this to speed CI up" PR
-      # has to argue against. Cost is the weaker one: the repository's cache
-      # budget is shared, and `Swatinem/rust-cache` in four other jobs is what
-      # actually keeps CI fast; adding a several-hundred-megabyte entry here to
-      # save part of a one-minute download risks evicting those.
+      # Deliberately NOT wrapped in `actions/cache`, and since issue #1833 the
+      # reason is cost against benefit, measured. Every slow or timed-out
+      # attempt of this job on `main` on 2026-10-22 and 2026-10-23 (14 of them,
+      # run 39996955663 among them) spent its time in the APT half of
+      # `--with-deps` — 119 MB of .debs from the runner's Ubuntu mirror, at
+      # 85–203 kB/s where the fetch finished — and the ten that hit a time limit
+      # never reached the browser download. The CDN download of the browsers
+      # took 9–12 s in each of the four that did, as in the healthy rerun of
+      # 39996955663. So a browser cache saves at most those seconds, less the
+      # restore of its own several-hundred-megabyte entry, and would have
+      # prevented none of those timeouts. Against that, the repository's cache
+      # is capped at 10 GB and `main`'s set already fills ~9 GB of it (the note
+      # above `jobs:`, issue #1743), so a browser entry of several hundred MB
+      # makes evicting `main`'s Rust caches — what actually keeps CI fast —
+      # more likely. What the timeouts needed was a cache of the apt .debs,
+      # which the steps below add (issue #1864).
       #
-      # The security property is the stronger one. A GitHub Actions cache entry
-      # is writable by a workflow run on ANY branch, so a cached browser
-      # payload keyed by Playwright version would be a cross-branch poisoning
-      # target: a malicious or compromised branch could populate or overwrite
-      # that entry, and a later trusted run would restore those binaries and
-      # then EXECUTE them. Re-downloading from the pinned CDN on every run
-      # removes that write surface entirely. Note what it does NOT do: it does
-      # not make the download independently verified. The pin is a browser
-      # revision number resolved from the lockfile, not a hash of the archive
-      # bytes, so what arrives is trusted on TLS and CDN trust alone. Losing a
-      # cross-branch write path is the whole of what a cache would cost here,
-      # and a speed argument alone does not settle it.
+      # Security does NOT decide it. An earlier version of this note said it
+      # did, on the premise that a run on any branch can write an entry a
+      # trusted run restores; GitHub's cache scoping makes that false:
+      #
+      #   * A `pull_request` run saves under its PR's merge ref, restored by
+      #     that PR's later runs alone. A push to another branch, or a
+      #     `workflow_dispatch` of one, saves under that branch, restored by its
+      #     own later runs and by PRs that target it as their base. A run
+      #     restores from its own ref, its PR's base and the default branch, so
+      #     neither reaches `main` or a sibling branch.
+      #   * `main`'s scope, which every run can restore from, is writable by any
+      #     run on `main`'s ref in any workflow: this file's pushes, and also
+      #     event-triggered workflows such as the issue labeler (`issues`). So
+      #     "saved only from `main`" bounds the writers to code running on the
+      #     default branch, not to this job.
+      #   * A key cannot be overwritten within a scope, but that does not pin the
+      #     content: the first writer of a key owns it (a future Playwright
+      #     version's key included), and once size pressure evicts an entry its
+      #     key can be written again.
+      #   * The Rust caches already carry that exposure: they restore compiled
+      #     dependency artifacts from `main`'s scope, proc-macro libraries that
+      #     rustc loads and runs among them. A browser cache saved only from
+      #     `main` would be another instance of an accepted risk, not a new kind.
+      #
+      # Not caching does not make the download verified either. The pin is a
+      # browser revision resolved from the lockfile, not a hash of the archive
+      # bytes, and nothing in this job checks one, so each run trusts TLS and
+      # the CDN; a cache would swap that for trust in the `main` run that saved
+      # the entry. That is where it differs from the .deb cache below, whose
+      # files are checked against Ubuntu's signed index on every restore:
+      # Playwright publishes no hash a restored browser could be checked
+      # against (its `browsers.json` lists revisions only, at 1.64.1). What
+      # would reverse the decision is the timing: if the
+      # browser download becomes the slow part, a cache restored everywhere and
+      # saved only from `main` (gated like the Rust caches' `save-if`) is
+      # acceptable on the reasoning above.
       #
       # `--with-deps` is for WebKit, not for Chromium: WebKit needs a GTK4 and
       # GStreamer runtime that the runner image does not carry in full. It runs
