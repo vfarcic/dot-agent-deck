@@ -368,9 +368,8 @@ jobs:
       # took 9–12 s in each of the four that did, as in the healthy rerun of
       # 39996955663. So a browser cache saves at most those seconds, less the
       # restore of its own several-hundred-megabyte entry, and would have
-      # prevented none of those timeouts; issue #1864 tracks the apt step,
-      # which is what they need.
-      # Against that, the repository's cache is capped at 10 GB and `main`'s
+      # prevented none of those timeouts. What they needed was a cache of the
+      # apt .debs, which the steps below add (issue #1864). Against that, the repository's cache is capped at 10 GB and `main`'s
       # set already fills ~9 GB of it (the note above `jobs:`, issue #1743), so
       # an entry this size makes evicting `main`'s Rust caches — what actually
       # keeps CI fast — more likely.
@@ -403,7 +402,11 @@ jobs:
       # browser revision resolved from the lockfile, not a hash of the archive
       # bytes, and nothing in this job checks one, so each run trusts TLS and
       # the CDN; a cache would swap that for trust in the `main` run that saved
-      # the entry. What would reverse the decision is the timing: if the
+      # the entry. That is where it differs from the .deb cache below, whose
+      # files are checked against Ubuntu's signed index on every restore:
+      # Playwright publishes no hash a restored browser could be checked
+      # against (its `browsers.json` lists revisions only, at 1.64.1). What
+      # would reverse the decision is the timing: if the
       # browser download becomes the slow part, a cache restored everywhere and
       # saved only from `main` (gated like the Rust caches' `save-if`) is
       # acceptable on the reasoning above.
