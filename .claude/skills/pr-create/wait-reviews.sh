@@ -6,9 +6,9 @@
 # Usage: wait-reviews.sh [--no-wait] <pr-number>
 #
 # Run it from inside the repository checkout: `gh` resolves {owner}/{repo} from
-# the git remote. It prints one KEY=value record per line:
+# the git remote. It prints one KEY=value record per line, once it has decided:
 #
-#   HEAD=<sha>                 the head commit it waited on
+#   HEAD=<sha>                 the head commit the verdict is about
 #   DONE=<name> <url>          that reviewer has finished; <url> is its evidence
 #   TIMED_OUT=<name> <n>m      no finished review within that reviewer's bound
 #   PENDING=<name>             --no-wait only: not finished yet, bound not spent
@@ -22,10 +22,21 @@
 # (`gh api repos/{owner}/{repo}/pulls/<n>/comments --paginate`), which this
 # script does not do.
 #
-# Each reviewer's bound is counted from the later of the PR's creation and the
-# head commit's committer date, so calling the script again after a wait that
-# already ran does not start the clock over. A GitHub read that fails is retried
-# on the next poll; the bound still applies.
+# Two kinds of reviewer, told apart by their signal:
+#
+#   - one that reviews EVERY PUSH: a `comment` signal with `names_head`, or a
+#     `check_run` or `review` signal, all of which are tied to the head. Its
+#     bound starts when this script starts, and again whenever the head moves,
+#     because a push is what it reviews. A commit's own date says nothing about
+#     when it was pushed or when a review was asked for.
+#   - one that reviews ONCE, when the PR opens: a `comment` signal without
+#     `names_head`. Its bound counts from the PR's creation, so a later push
+#     never buys it another wait; there is no review left to come.
+#
+# The head is read again on every poll and once more before the verdict. When
+# it moves, the reviewers that review every push start over on the new head.
+# A GitHub read that fails after the first one is retried on the next poll;
+# the bound still applies.
 #
 # Exit status is 0 whenever REVIEWS= was printed, and 2 with ERROR= on bad usage,
 # a malformed reviewers.json, or a pull request that cannot be read at all.
@@ -65,7 +76,8 @@ bad=$(jq -r '
       or ((.timeout_minutes | type) != "number") or .timeout_minutes <= 0
       or (.signal.kind as $k | ["comment", "check_run", "review"] | index($k) | not)
       or (.signal.kind == "comment" and ((.signal.contains | type) != "string" or .signal.contains == ""))
-      or (.signal.kind == "check_run" and ((.signal.name | type) != "string" or .signal.name == ""))
+      or (.signal.kind == "check_run" and ((.signal.name | type) != "string" or .signal.name == ""
+                                           or (.signal.app | type) != "string" or .signal.app == ""))
     )
   | (.name // "an unnamed entry")' "$registry" 2>/dev/null) || die "$registry is not valid JSON"
 [ -z "$bad" ] || die "malformed reviewer in $registry: $(printf '%s' "$bad" | head -1)"
@@ -73,17 +85,25 @@ bad=$(jq -r '
 tmp=$(mktemp -d) || die "mktemp failed"
 trap 'rm -rf "$tmp"' EXIT
 
-gh pr view "$pr" --json headRefOid,createdAt,commits >"$tmp/pr.json" 2>/dev/null ||
-  die "cannot read pull request #$pr"
-head=$(jq -r '.headRefOid // empty' "$tmp/pr.json")
-[ -n "$head" ] || die "pull request #$pr has no head commit"
-start=$(jq -r '[.createdAt, (.commits[-1].committedDate // .createdAt)] | map(fromdateiso8601) | max' "$tmp/pr.json" 2>/dev/null) ||
-  die "cannot read the PR's creation or head commit time"
-echo "HEAD=$head"
-
 count=$(jq '.reviewers | length' "$registry")
-pending=$(seq 0 $((count - 1)) | tr '\n' ' ')
-timed_out=0
+names=()
+once=()
+minutes=()
+for ((i = 0; i < count; i++)); do
+  names[i]=$(jq -r --argjson i "$i" '.reviewers[$i].name' "$registry")
+  once[i]=$(jq -r --argjson i "$i" '.reviewers[$i].signal | if .kind == "comment" and ((.names_head // false) | not) then "yes" else "no" end' "$registry")
+  minutes[i]=$(jq -r --argjson i "$i" '.reviewers[$i].timeout_minutes' "$registry")
+done
+
+# Read the PR's head and creation time. Only the first read may end the script.
+read_pr() {
+  if gh pr view "$pr" --json headRefOid,createdAt >"$tmp/pr.json" 2>/dev/null &&
+    new_head=$(jq -re '.headRefOid' "$tmp/pr.json" 2>/dev/null) &&
+    new_created=$(jq -re '.createdAt | fromdateiso8601' "$tmp/pr.json" 2>/dev/null); then
+    return 0
+  fi
+  return 1
+}
 
 # Read one GitHub surface into $tmp/<name>.json as a flat array. A failed read
 # leaves an empty array, so that reviewer stays unfinished until the next poll.
@@ -98,8 +118,18 @@ fetch() {
   echo '[]' >"$tmp/$name.json"
 }
 
+read_pr || die "cannot read pull request #$pr"
+head="$new_head"
+created="$new_created"
+head_since=$(date +%s)
+status=()
+evidence=()
+for ((i = 0; i < count; i++)); do status[i]=pending; done
+
 while :; do
-  kinds=$(for i in $pending; do jq -r --argjson i "$i" '.reviewers[$i].signal.kind' "$registry"; done | sort -u)
+  kinds=$(for ((i = 0; i < count; i++)); do
+    [ "${status[i]}" = pending ] && jq -r --argjson i "$i" '.reviewers[$i].signal.kind' "$registry"
+  done | sort -u)
   echo '[]' >"$tmp/comments.json"
   echo '[]' >"$tmp/checks.json"
   echo '[]' >"$tmp/reviews.json"
@@ -108,10 +138,10 @@ while :; do
   case "$kinds" in *review*) fetch reviews 'add // []' api "repos/{owner}/{repo}/pulls/$pr/reviews" --paginate ;; esac
 
   now=$(date +%s)
-  still=""
-  for i in $pending; do
-    name=$(jq -r --argjson i "$i" '.reviewers[$i].name' "$registry")
-    evidence=$(jq -r -n --argjson i "$i" --arg head "$head" \
+  waiting=no
+  for ((i = 0; i < count; i++)); do
+    [ "${status[i]}" = pending ] || continue
+    found=$(jq -r -n --argjson i "$i" --arg head "$head" \
       --slurpfile reg "$registry" --slurpfile c "$tmp/comments.json" \
       --slurpfile k "$tmp/checks.json" --slurpfile v "$tmp/reviews.json" '
       ($reg[0].reviewers[$i]) as $r
@@ -122,33 +152,54 @@ while :; do
              | select((.body // "") | contains($s.contains))
              | select(($s.names_head // false | not) or ((.body // "") | contains($head))) ]
          elif $s.kind == "check_run" then
-           [ $k[0][] | select(.name == $s.name and .status == "completed") ]
+           [ $k[0][] | select(.name == $s.name and .app.slug == $s.app and .status == "completed") ]
          else
            [ $v[0][] | select(.user.login == $r.login and .state != "PENDING" and .commit_id == $head) ]
          end)
       | if length == 0 then "" else (.[0].html_url // "(no url)") end')
-    if [ -n "$evidence" ]; then
-      echo "DONE=$name $evidence"
+    if [ -n "$found" ]; then
+      status[i]=done
+      evidence[i]="$found"
       continue
     fi
-    minutes=$(jq -r --argjson i "$i" '.reviewers[$i].timeout_minutes' "$registry")
-    deadline=$(jq -n --argjson s "$start" --argjson m "$minutes" '$s + $m * 60 | floor')
+    if [ "${once[i]}" = yes ]; then since="$created"; else since="$head_since"; fi
+    deadline=$(jq -n --argjson s "$since" --argjson m "${minutes[i]}" '$s + $m * 60 | floor')
     if [ "$now" -ge "$deadline" ]; then
-      echo "TIMED_OUT=$name ${minutes}m"
-      timed_out=1
-    elif [ "$wait_for_it" = no ]; then
-      echo "PENDING=$name"
-      timed_out=1
-    else
-      still="$still $i"
+      status[i]=timed_out
+    elif [ "$wait_for_it" = yes ]; then
+      waiting=yes
     fi
   done
-  pending="$still"
-  [ -n "${pending// /}" ] || break
-  sleep "$poll"
+
+  if [ "$waiting" = no ]; then
+    # About to decide: make sure the verdict is about the head as it is now.
+    if read_pr && [ "$new_head" != "$head" ]; then :; else break; fi
+  else
+    sleep "$poll"
+    read_pr || continue
+    [ "$new_head" != "$head" ] || continue
+  fi
+
+  # The head moved: what reviews every push starts over on the new one.
+  echo "wait-reviews: the head moved from $head to $new_head; waiting again for the new head" >&2
+  head="$new_head"
+  head_since=$(date +%s)
+  for ((i = 0; i < count; i++)); do
+    [ "${once[i]}" = yes ] && [ "${status[i]}" = done ] && continue
+    status[i]=pending
+  done
 done
 
-if [ "$timed_out" -eq 0 ]; then
+echo "HEAD=$head"
+incomplete=0
+for ((i = 0; i < count; i++)); do
+  case "${status[i]}" in
+    done) echo "DONE=${names[i]} ${evidence[i]}" ;;
+    timed_out) echo "TIMED_OUT=${names[i]} ${minutes[i]}m"; incomplete=1 ;;
+    *) echo "PENDING=${names[i]}"; incomplete=1 ;;
+  esac
+done
+if [ "$incomplete" -eq 0 ]; then
   echo "REVIEWS=complete"
 else
   echo "REVIEWS=incomplete"

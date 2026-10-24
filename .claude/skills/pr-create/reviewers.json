@@ -1,19 +1,27 @@
 {
-  "about": "The automated review apps whose reviews pr-create, issue-queue, prd-queue, land-prs, code-cleanup, verify-pr and the orchestrator in .dot-agent-deck.toml wait for, read by wait-reviews.sh beside this file (issue #1256). Adding, dropping or replacing a reviewer is an edit here, not in those skills. Each entry says how to tell that the app has finished reviewing a pull request: `comment` is an issue comment by `login` whose body contains `contains`, and with `names_head` it must also contain the head commit's SHA, so it counts only for that push; `check_run` is a completed check-run of that name on the head; `review` is a submitted PR review by `login` whose commit_id is the head. `timeout_minutes` is how long to wait, counted from the later of the PR's creation and the head commit's committer date. docs/develop/governance.md, 'The automated reviewer', has the measurements behind each entry.",
+  "about": "The automated review apps whose reviews pr-create, issue-queue, prd-queue, land-prs, code-cleanup, verify-pr and the orchestrator in .dot-agent-deck.toml wait for, read by wait-reviews.sh beside this file (issue #1256). Adding, dropping or replacing a reviewer is an edit here, not in those skills. Each entry says how to tell that the app has finished reviewing a pull request: `comment` is an issue comment by `login` whose body contains `contains`, and with `names_head` it must also contain the head commit's SHA; `check_run` is a completed check-run named `name` on the head, created by the GitHub App whose slug is `app`; `review` is a submitted PR review by `login` whose commit_id is the head. A `comment` without `names_head` marks an app that reviews once, when the PR opens: its `timeout_minutes` counts from the PR's creation. Every other signal marks an app that reviews every push: its `timeout_minutes` counts from when wait-reviews.sh starts, and again whenever the head moves. docs/develop/governance.md, 'The automated reviewer', has the measurements behind each entry.",
   "reviewers": [
     {
       "name": "Qodo",
       "login": "qodo-code-review[bot]",
-      "signal": { "kind": "comment", "contains": "Code Review by Qodo", "names_head": true },
+      "signal": {
+        "kind": "comment",
+        "contains": "Code Review by Qodo",
+        "names_head": true
+      },
       "timeout_minutes": 20,
-      "note": "Reviews every push and creates no check-run. It edits its one 'Code Review by Qodo' comment in place, and the body ends with <!-- https://github.com/<repo>/commit/<sha> --> naming the commit it reviewed. Over 45 PRs (#1756-#1856) the review landed a median 150 s after the PR opened and at most 1008 s, so 20 minutes covers every case seen."
+      "note": "Reviews every push and creates no check-run. It edits its one 'Code Review by Qodo' comment in place, and the body ends with <!-- https://github.com/<repo>/commit/<sha> --> naming the commit it reviewed. Over 45 PRs (#1756-#1856) the review landed a median 150 s after the PR opened and at most 1008 s, and its reviews of later pushes at most 869 s after the push, so 20 minutes covers every case seen."
     },
     {
       "name": "Greptile",
       "login": "greptile-apps[bot]",
-      "signal": { "kind": "comment", "contains": "<!-- greptile_summary -->", "names_head": false },
+      "signal": {
+        "kind": "comment",
+        "contains": "<!-- greptile_summary -->",
+        "names_head": false
+      },
       "timeout_minutes": 15,
-      "note": "Reviews once, when the PR opens (greptile.json sets triggerOnUpdates: false), so one summary comment means it is done for the whole PR; a later push gets no review to wait for. The comment is posted when the review completes, seconds before its 'Greptile Review' check-run, which sits on the opening commit rather than the head. Over the same 45 PRs it landed within 463 s. An exhausted monthly quota produces no comment and no check-run, so expect a timeout then."
+      "note": "Reviews once, when the PR opens (greptile.json sets triggerOnUpdates: false), so one summary comment means it is done for the whole PR; a later push gets no review to wait for. The comment is posted when the review completes, seconds before its 'Greptile Review' check-run, which sits on the opening commit rather than the head. Over the same 45 PRs it landed within 463 s of the PR opening, so the 15 minutes count from then. An exhausted monthly quota produces no comment and no check-run, so expect a timeout then."
     }
   ]
 }

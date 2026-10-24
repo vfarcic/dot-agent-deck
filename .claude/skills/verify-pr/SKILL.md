@@ -54,7 +54,7 @@ The gate also reports `INCOMPLETE_FILE_LIST` when fewer files came back than `PR
 
 **`WORKFLOWS_AWAITING_APPROVAL`** — non-zero means GitHub is holding this PR's CI runs pending maintainer approval, so no real CI job has run. The scan lists each held run's id. Phase 1b decides whether releasing them is safe and, if so, releases them.
 
-**`REVIEWS_AT_HEAD`** — `complete` means every review app in `.claude/skills/pr-create/reviewers.json` has finished on the head (`REVIEWS_FINISHED` names them). `incomplete` lists the rest in `REVIEWS_NOT_FINISHED`: a review still running, or an app that produced nothing within its bound, such as Greptile out of quota. The scan does not wait; to wait, run `.claude/skills/pr-create/wait-reviews.sh <n>` (issue #1256). Either way, say in the report which apps' reviews you read, because the findings you list under "Already covered" are only as complete as the reviews that finished.
+**`REVIEWS_AT_HEAD`** — `complete` means every review app in `.claude/skills/pr-create/reviewers.json` has finished on the head (`REVIEWS_FINISHED` names them). `incomplete` lists the rest in `REVIEWS_NOT_FINISHED`: a review still running, or an app that produced nothing within its bound, such as Greptile out of quota. `unknown`, with all three lists `unknown`, means the status could not be read, and `REVIEWS_ERROR` says why; treat it as not knowing, never as "no app has finished". The scan does not wait; to wait, run `.claude/skills/pr-create/wait-reviews.sh <n>` (issue #1256). Either way, say in the report which apps' reviews you read, because the findings you list under "Already covered" are only as complete as the reviews that finished.
 
 Then read what the existing reviewers already found, per rule 8:
 

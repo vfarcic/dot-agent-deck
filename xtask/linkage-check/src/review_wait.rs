@@ -86,8 +86,7 @@ struct Sandbox {
 }
 
 impl Sandbox {
-    /// A pull request whose head is `HEAD`, opened `age_minutes` ago with its
-    /// head committed then too.
+    /// A pull request whose head is `HEAD`, opened `age_minutes` ago.
     fn new(age_minutes: i64) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let bin = dir.path().join("bin");
@@ -104,11 +103,22 @@ impl Sandbox {
             stub,
             registry: None,
         };
-        sb.answer(
-            "pr",
-            &json!({"headRefOid": HEAD, "createdAt": at, "commits": [{"oid": HEAD, "committedDate": at}]}),
-        );
+        sb.answer("pr", &json!({"headRefOid": HEAD, "createdAt": at}));
         sb
+    }
+
+    /// The PR as `gh pr view` answers on its `call`th read only, with `head`
+    /// as its head commit.
+    fn pr_on(&self, call: u32, head: &str) {
+        let at = iso_minutes_ago(1);
+        self.answer_on("pr", call, &json!({"headRefOid": head, "createdAt": at}));
+    }
+
+    /// How many times the script read a surface.
+    fn reads(&self, surface: &str) -> u32 {
+        fs::read_to_string(self.stub.join(format!("{surface}.count")))
+            .map(|s| s.trim().parse().unwrap_or(0))
+            .unwrap_or(0)
     }
 
     /// What `gh` answers for a surface: `pr`, `comments`, `checks` or `reviews`.
@@ -186,6 +196,22 @@ fn greptile_comment() -> Value {
     })
 }
 
+/// The real `reviewers.json` with every bound cut to nothing, so a test about
+/// what does NOT count decides at once instead of waiting out 20 minutes.
+fn real_registry_without_bounds() -> Value {
+    let mut registry = real_registry();
+    for r in registry["reviewers"].as_array_mut().unwrap() {
+        r["timeout_minutes"] = json!(0.001);
+    }
+    registry
+}
+
+fn real_registry() -> Value {
+    let text = fs::read_to_string(repo_root().join(".claude/skills/pr-create/reviewers.json"))
+        .expect("read reviewers.json");
+    serde_json::from_str(&text).expect("reviewers.json is JSON")
+}
+
 #[test]
 fn review_wait_001_both_reviewers_finished_on_the_head_is_complete() {
     if !tools_present() {
@@ -213,9 +239,7 @@ fn review_wait_002_a_qodo_review_of_an_older_commit_does_not_count() {
     if !tools_present() {
         return;
     }
-    // Opened an hour ago, so every bound has run out and the script decides at
-    // once: Greptile's one review covers the PR, Qodo's names an older push.
-    let sb = Sandbox::new(60);
+    let sb = Sandbox::new(5).with_registry(&real_registry_without_bounds());
     sb.answer("comments", &json!([qodo_comment(OLD), greptile_comment()]));
     let out = sb.run(&["42"]);
     let text = stdout(&out);
@@ -223,7 +247,7 @@ fn review_wait_002_a_qodo_review_of_an_older_commit_does_not_count() {
         out.status.success(),
         "a timeout is a result, not a failure:\n{text}"
     );
-    assert!(text.contains("TIMED_OUT=Qodo 20m"), "{text}");
+    assert!(text.contains("TIMED_OUT=Qodo"), "{text}");
     assert!(text.contains("DONE=Greptile"), "{text}");
     assert!(text.ends_with("REVIEWS=incomplete\n"), "{text}");
 }
@@ -233,28 +257,38 @@ fn review_wait_003_another_account_cannot_stand_in_for_a_reviewer() {
     if !tools_present() {
         return;
     }
-    let sb = Sandbox::new(60);
+    let sb = Sandbox::new(5).with_registry(&real_registry_without_bounds());
     let mut forged = qodo_comment(HEAD);
     forged["user"]["login"] = json!("someone-else");
     sb.answer("comments", &json!([forged]));
     let text = stdout(&sb.run(&["42"]));
     assert!(text.contains("TIMED_OUT=Qodo"), "{text}");
-    assert!(text.contains("TIMED_OUT=Greptile 15m"), "{text}");
+    assert!(text.contains("TIMED_OUT=Greptile"), "{text}");
     assert!(!text.contains("DONE="), "{text}");
 }
 
+/// Greptile's finding on PR #1882: a bound counted from the head commit's date
+/// ran out at once for an old commit pushed late. And Qodo's: a bound counted
+/// from the head gave a once-at-open reviewer a fresh wait on every push.
 #[test]
-fn review_wait_004_no_wait_reports_unfinished_reviewers_as_pending() {
+fn review_wait_004_each_bound_counts_from_what_that_reviewer_reviews() {
     if !tools_present() {
         return;
     }
-    let sb = Sandbox::new(1);
-    sb.answer("comments", &json!([greptile_comment()]));
+    // Opened an hour ago, no review from either app yet.
+    let sb = Sandbox::new(60);
+    sb.answer("comments", &json!([]));
     let out = sb.run(&["--no-wait", "42"]);
     let text = stdout(&out);
     assert!(out.status.success(), "{text}");
-    assert!(text.contains("PENDING=Qodo"), "{text}");
-    assert!(text.contains("DONE=Greptile"), "{text}");
+    assert!(
+        text.contains("PENDING=Qodo"),
+        "Qodo reviews every push, so its bound starts with the wait, however old the PR is:\n{text}"
+    );
+    assert!(
+        text.contains("TIMED_OUT=Greptile 15m"),
+        "Greptile reviews once, so its bound counts from the PR opening an hour ago:\n{text}"
+    );
     assert!(text.ends_with("REVIEWS=incomplete\n"), "{text}");
 }
 
@@ -280,23 +314,68 @@ fn review_wait_005_it_waits_until_the_review_lands_and_survives_a_failed_read() 
     assert!(text.ends_with("REVIEWS=complete\n"), "{text}");
 }
 
+/// Qodo's finding on PR #1882: a push during the wait used to leave the verdict
+/// about the head the wait started on.
 #[test]
-fn review_wait_006_check_run_and_review_signals_key_on_the_head() {
+fn review_wait_006_a_push_during_the_wait_moves_the_verdict_to_the_new_head() {
     if !tools_present() {
         return;
     }
-    let sb = Sandbox::new(60).with_registry(&json!({"reviewers": [
-        {"name": "Checker", "login": "checker[bot]", "timeout_minutes": 5,
-         "signal": {"kind": "check_run", "name": "Checker Review"}},
-        {"name": "Reviewer", "login": "reviewer[bot]", "timeout_minutes": 5,
+    let sb = Sandbox::new(1);
+    // The wait starts on OLD, which Qodo has already reviewed; by the time it
+    // checks before deciding, HEAD has been pushed. Qodo reviews HEAD on the
+    // third read of the comments.
+    sb.pr_on(1, OLD);
+    sb.answer_on(
+        "comments",
+        1,
+        &json!([qodo_comment(OLD), greptile_comment()]),
+    );
+    sb.answer_on(
+        "comments",
+        2,
+        &json!([qodo_comment(OLD), greptile_comment()]),
+    );
+    sb.answer("comments", &json!([qodo_comment(HEAD), greptile_comment()]));
+    let out = sb.run(&["42"]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains(&format!("HEAD={HEAD}")), "{text}");
+    assert!(
+        !text.contains(OLD),
+        "the verdict is about the new head:\n{text}"
+    );
+    assert!(text.contains("DONE=Qodo"), "{text}");
+    assert!(text.ends_with("REVIEWS=complete\n"), "{text}");
+    assert_eq!(
+        sb.reads("comments"),
+        3,
+        "Qodo's review of the old head must not end the wait for the new one"
+    );
+}
+
+/// Greptile's finding on PR #1882: a check-run was matched by name alone.
+#[test]
+fn review_wait_007_check_run_and_review_signals_key_on_the_head_and_the_app() {
+    if !tools_present() {
+        return;
+    }
+    let sb = Sandbox::new(5).with_registry(&json!({"reviewers": [
+        {"name": "Checker", "login": "checker[bot]", "timeout_minutes": 0.001,
+         "signal": {"kind": "check_run", "name": "Checker Review", "app": "checker"}},
+        {"name": "Copycat", "login": "copycat[bot]", "timeout_minutes": 0.001,
+         "signal": {"kind": "check_run", "name": "Copycat Review", "app": "copycat"}},
+        {"name": "Reviewer", "login": "reviewer[bot]", "timeout_minutes": 0.001,
          "signal": {"kind": "review"}},
-        {"name": "Stale", "login": "stale[bot]", "timeout_minutes": 5,
+        {"name": "Stale", "login": "stale[bot]", "timeout_minutes": 0.001,
          "signal": {"kind": "review"}},
     ]}));
     sb.answer(
         "checks",
         &json!({"check_runs": [
-            {"name": "Checker Review", "status": "completed", "html_url": "https://example.test/check"}
+            {"name": "Checker Review", "status": "completed", "app": {"slug": "checker"},
+             "html_url": "https://example.test/check"},
+            {"name": "Copycat Review", "status": "completed", "app": {"slug": "someone-else"}}
         ]}),
     );
     sb.answer(
@@ -314,36 +393,48 @@ fn review_wait_006_check_run_and_review_signals_key_on_the_head() {
         "{text}"
     );
     assert!(
+        text.contains("TIMED_OUT=Copycat"),
+        "a same-named check from another app is not that app's review:\n{text}"
+    );
+    assert!(
         text.contains("DONE=Reviewer https://example.test/review"),
         "{text}"
     );
     assert!(
-        text.contains("TIMED_OUT=Stale 5m"),
+        text.contains("TIMED_OUT=Stale"),
         "an older commit's review and an unsubmitted one are not a review of the head:\n{text}"
     );
 }
 
 #[test]
-fn review_wait_007_a_malformed_registry_is_an_error_not_a_verdict() {
+fn review_wait_008_a_malformed_registry_is_an_error_not_a_verdict() {
     if !tools_present() {
         return;
     }
-    let sb = Sandbox::new(1).with_registry(&json!({"reviewers": [
-        {"name": "Typo", "login": "typo[bot]", "timeout_minutes": 5,
-         "signal": {"kind": "coment", "contains": "x"}},
-    ]}));
-    let out = sb.run(&["42"]);
-    let text = stdout(&out);
-    assert_eq!(out.status.code(), Some(2), "{text}");
-    assert!(text.contains("ERROR=malformed reviewer"), "{text}");
-    assert!(!text.contains("REVIEWS="), "{text}");
+    for (what, entry) in [
+        (
+            "an unknown signal",
+            json!({"name": "Typo", "login": "typo[bot]", "timeout_minutes": 5,
+                   "signal": {"kind": "coment", "contains": "x"}}),
+        ),
+        (
+            "a check-run with no app",
+            json!({"name": "Anyone", "login": "anyone[bot]", "timeout_minutes": 5,
+                   "signal": {"kind": "check_run", "name": "Review"}}),
+        ),
+    ] {
+        let sb = Sandbox::new(1).with_registry(&json!({ "reviewers": [entry] }));
+        let out = sb.run(&["42"]);
+        let text = stdout(&out);
+        assert_eq!(out.status.code(), Some(2), "{what}:\n{text}");
+        assert!(text.contains("ERROR=malformed reviewer"), "{what}:\n{text}");
+        assert!(!text.contains("REVIEWS="), "{what}:\n{text}");
+    }
 }
 
 #[test]
-fn review_wait_008_the_real_registry_names_qodo_and_greptile_with_their_signals() {
-    let text = fs::read_to_string(repo_root().join(".claude/skills/pr-create/reviewers.json"))
-        .expect("read reviewers.json");
-    let registry: Value = serde_json::from_str(&text).expect("reviewers.json is JSON");
+fn review_wait_009_the_real_registry_names_qodo_and_greptile_with_their_signals() {
+    let registry = real_registry();
     let entries = registry["reviewers"].as_array().expect("a reviewers list");
     let find = |login: &str| {
         entries
@@ -359,6 +450,10 @@ fn review_wait_008_the_real_registry_names_qodo_and_greptile_with_their_signals(
     );
     let greptile = find("greptile-apps[bot]");
     assert_eq!(greptile["signal"]["kind"], "comment");
+    assert_ne!(
+        greptile["signal"]["names_head"], true,
+        "Greptile reviews once, when the PR opens, so its one comment covers the PR"
+    );
     for r in entries {
         assert!(
             r["note"].as_str().is_some_and(|n| !n.is_empty()),
