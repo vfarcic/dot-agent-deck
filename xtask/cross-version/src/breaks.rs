@@ -673,16 +673,22 @@ mod tests {
         )
     }
 
+    /// `CLI_RECEIPTS_UNSUPPORTED` (`src/inbox_cli.rs`), whole: what the
+    /// branch CLI prints when the daemon does not confirm receipts.
+    /// `every_known_effect_is_pinned_to_the_source` holds the constant to
+    /// exactly this text.
+    const H4_TEXT: &str = "Could not fetch messages: the deck daemon did not confirm that it \
+        can hand them to this `dot-agent-deck inbox fetch`, so no message was taken and they \
+        stay waiting. The daemon most likely runs an older dot-agent-deck than this command. \
+        Restart the deck daemon on this release (see \"Recycling the daemon\" in \
+        `dot-agent-deck docs troubleshooting`), or run `inbox fetch` with the dot-agent-deck \
+        the daemon runs.";
+
     /// What the branch CLI's `inbox fetch` captured in pane `pane` against a
     /// daemon that does not serve receipts: the capture's pane line, the
     /// CLI's stderr, its exit status.
     fn h4_capture(pane: &str) -> String {
-        format!(
-            "pane={pane}\nError: {}\nexit=1\n",
-            "Could not fetch messages: the deck daemon did not confirm that it can hand them \
-             to this `dot-agent-deck inbox fetch`, so no message was taken and they stay \
-             waiting."
-        )
+        format!("pane={pane}\nError: {H4_TEXT}\nexit=1\n")
     }
 
     /// The branch's `daemon hello`, declaring the round's other two breaks
@@ -1270,6 +1276,50 @@ mod tests {
         })
     }
 
+    /// The value of the one string literal a `const` declaration opening
+    /// with `open` binds, from its opening quote to its closing one followed
+    /// by `;`, escapes read: `None` when `open` is absent or not followed by
+    /// exactly that. Nothing past the declaration's own `;` is read.
+    fn const_literal(src: &str, open: &str) -> Option<String> {
+        let rest = src[src.find(open)? + open.len()..].trim_start();
+        let mut chars = rest.strip_prefix('"')?.chars();
+        let mut value = String::new();
+        loop {
+            match chars.next()? {
+                '\\' => match chars.next()? {
+                    'n' => value.push('\n'),
+                    c @ ('"' | '\\') => value.push(c),
+                    _ => return None,
+                },
+                '"' => break,
+                c => value.push(c),
+            }
+        }
+        chars
+            .as_str()
+            .trim_start()
+            .starts_with(';')
+            .then_some(value)
+    }
+
+    #[test]
+    fn a_constant_is_read_to_its_own_end_and_no_further() {
+        let src = "pub const A: &str = \"one \\\"two\\\" three\";\npub const B: &str = \"four\";";
+        assert_eq!(
+            const_literal(src, "pub const A: &str =").as_deref(),
+            Some("one \"two\" three")
+        );
+        assert_eq!(
+            const_literal(src, "pub const B: &str =").as_deref(),
+            Some("four")
+        );
+        assert_eq!(
+            const_literal("pub const A: &str = f(\"x\");", "pub const A: &str ="),
+            None
+        );
+        assert_eq!(const_literal(src, "pub const C: &str ="), None);
+    }
+
     #[test]
     fn a_pin_spread_across_two_log_calls_does_not_hold() {
         let src = "warn!(verb = \"agent_event\", \"refused a status event\");\n\
@@ -1329,15 +1379,28 @@ mod tests {
                  pane field",
                 effect.id
             );
-            let open = match effect.witness {
-                Witness::DaemonLog => "warn!(",
-                Witness::ClientOutput => effect.client_text,
-            };
-            assert!(
-                one_call_contains(&source(site_file), open, site),
-                "`{}`: no single `{open}…` in {site_file} contains all of {site:?}",
-                effect.id
-            );
+            match effect.witness {
+                Witness::DaemonLog => assert!(
+                    one_call_contains(&source(site_file), "warn!(", site),
+                    "`{}`: no single `warn!(…` in {site_file} contains all of {site:?}",
+                    effect.id
+                ),
+                Witness::ClientOutput => {
+                    let value = const_literal(&source(site_file), effect.client_text)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "`{}`: {site_file} declares no `{} \"…\";`",
+                                effect.id, effect.client_text
+                            )
+                        });
+                    assert!(
+                        site.iter().all(|t| value.contains(t))
+                            && effect.log_signature.iter().all(|t| value.contains(t)),
+                        "`{}`: the constant {value:?} does not contain all of {site:?}",
+                        effect.id
+                    );
+                }
+            }
             for (file, text) in effect.source_pins {
                 assert!(
                     source(file).contains(text),
@@ -1365,8 +1428,15 @@ mod tests {
                 effect.id
             );
         }
-        // The client's line is the constant the CLI prints, whole.
-        assert!(h4.contains(&format!("{} ", KNOWN_EFFECTS[4].log_signature[0])));
+        // The client's line is the constant the CLI prints, exactly.
+        assert_eq!(
+            const_literal(&source("src/inbox_cli.rs"), KNOWN_EFFECTS[4].client_text).as_deref(),
+            Some(H4_TEXT)
+        );
+        assert_eq!(
+            h4.lines().nth(1),
+            Some(format!("Error: {H4_TEXT}").as_str())
+        );
         assert_eq!(KNOWN_EFFECTS.len(), 5);
     }
 }
