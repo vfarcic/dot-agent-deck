@@ -95,6 +95,52 @@ pub(crate) fn config_write_allowed(dest: &Path) -> bool {
     check_config_write(dest).is_ok()
 }
 
+/// Whether the deck's file logger may open `log` (issues #1791, #1796): always
+/// when containment is unarmed; in a test process only when `log` resolves
+/// inside an owned root and is not the deck's default debug log, which sits in
+/// the OS temp dir — itself a default root — and is shared by every deck on the
+/// machine that runs with `DOT_AGENT_DECK_LOG=1`.
+///
+/// Why: a test run inherits `DOT_AGENT_DECK_LOG` from the shell that started
+/// it — a developer's, or the deck pane's the tests were started in — and every
+/// deck binary a test spawned without clearing its environment appended to that
+/// real `deck.log`, where its lines read as the production daemon's own. A
+/// user's process is not armed, and gets its log unchanged.
+///
+/// Says nothing when it refuses: it is asked before a logger exists, and the
+/// processes asking include the wrapper, whose stderr is an agent's terminal.
+pub fn log_write_allowed(log: &Path) -> bool {
+    match armed_roots() {
+        Ok(None) => true,
+        Ok(Some(roots)) => check_within_roots(log, &roots).is_ok() && !is_default_debug_log(log),
+        Err(_) => false,
+    }
+}
+
+/// Whether `log` names the same file as the default debug log.
+fn is_default_debug_log(log: &Path) -> bool {
+    same_log(log, &crate::platform::paths::default_debug_log_path())
+}
+
+/// Whether `log` and `other` name one file: the same resolved path, or, where
+/// both exist, the same file identity — so a hard link to `other` inside an
+/// owned root counts as `other` (PR #1857 review). An `other` that cannot be
+/// resolved is compared as spelled.
+fn same_log(log: &Path, other: &Path) -> bool {
+    let resolved_other = resolve_for_containment(other).unwrap_or_else(|_| other.to_path_buf());
+    if resolve_for_containment(log).is_ok_and(|log| log == resolved_other) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(a), Ok(b)) = (std::fs::metadata(log), std::fs::metadata(other)) {
+            return (a.dev(), a.ino()) == (b.dev(), b.ino());
+        }
+    }
+    false
+}
+
 /// [`ensure_config_write_allowed`] without the log line.
 fn check_config_write(dest: &Path) -> io::Result<()> {
     let Some(roots) = armed_roots()? else {
@@ -300,6 +346,50 @@ fn resolve_for_containment(dest: &Path) -> io::Result<PathBuf> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// Scenario: in this unit-test process, which is a test process by
+    /// construction, a log in a test scratch directory may be opened, while a
+    /// log outside every owned root and the deck's default debug log are
+    /// refused — and deciding creates nothing.
+    #[test]
+    fn a_test_process_opens_only_a_log_it_owns() {
+        let fixture = crate::test_temp::tempdir().unwrap();
+        let owned = fixture.path().join("deck.log");
+        assert!(
+            log_write_allowed(&owned),
+            "a scratch-dir log is the test's own"
+        );
+        assert!(
+            !log_write_allowed(Path::new("/deck.log")),
+            "outside every root"
+        );
+        assert!(
+            !log_write_allowed(&crate::platform::paths::default_debug_log_path()),
+            "the default debug log is shared by every deck on the machine"
+        );
+        assert!(!owned.exists(), "deciding the path must not create the log");
+    }
+
+    /// Scenario: a stand-in for the shared debug log exists in one directory;
+    /// a hard link to it in another directory is the same log, and so is a
+    /// symlink to it, while a separate file and a missing path are not.
+    #[test]
+    fn a_hard_link_to_the_shared_log_is_the_shared_log() {
+        let fixture = crate::test_temp::tempdir().unwrap();
+        let root = std::fs::canonicalize(fixture.path()).unwrap();
+        std::fs::create_dir_all(root.join("shared")).unwrap();
+        std::fs::create_dir_all(root.join("owned")).unwrap();
+        let shared = root.join("shared/dot-agent-deck.log");
+        std::fs::write(&shared, b"").unwrap();
+        std::fs::hard_link(&shared, root.join("owned/linked.log")).unwrap();
+        std::os::unix::fs::symlink(&shared, root.join("owned/symlinked.log")).unwrap();
+        std::fs::write(root.join("owned/own.log"), b"").unwrap();
+
+        assert!(same_log(&root.join("owned/linked.log"), &shared));
+        assert!(same_log(&root.join("owned/symlinked.log"), &shared));
+        assert!(!same_log(&root.join("owned/own.log"), &shared));
+        assert!(!same_log(&root.join("owned/missing.log"), &shared));
+    }
 
     /// The lib's unit tests are armed by `cfg(test)` alone, and resolve a path
     /// through a symlink and `..` the way the kernel does.
