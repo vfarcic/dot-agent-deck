@@ -2423,11 +2423,12 @@ pub enum Gated {
     Reply(String),
 }
 
-/// How long [`send_gated`] waits for the answer to its question.
+/// How long [`send_gated`] waits, in all, to connect, ask its question and
+/// read the whole answer.
 pub const GATED_QUESTION_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
-/// How long [`send_gated`] waits for the answer to its mutation: the daemon
-/// answers once the report is kept, after a bounded wait on any earlier
-/// report of the same task.
+/// How long [`send_gated`] waits, in all, to write its mutation and read the
+/// whole answer: the daemon answers once the report is kept, after a bounded
+/// wait on any earlier report of the same task.
 pub const GATED_REPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// The longest line [`send_gated`] reads.
@@ -2464,12 +2465,15 @@ pub fn send_gated_at(
     reply_wait: std::time::Duration,
 ) -> Gated {
     let not_confirmed = |why| Gated::NotConfirmed { refusal: None, why };
+    // Each wait bounds its whole exchange, not each read: a peer that sends a
+    // byte at a time cannot stretch it.
+    let question_deadline = std::time::Instant::now() + question_wait;
     let Ok(mut client) = crate::platform::ipc::IpcClient::connect_timeout(path, question_wait)
     else {
         return not_confirmed("no daemon answered");
     };
-    if client.set_timeouts(question_wait).is_err() {
-        return not_confirmed("the connection could not be bounded");
+    if arm_gated(&client, question_deadline).is_err() {
+        return not_confirmed("no answer within the wait");
     }
     if client
         .write_all(format!("{question}\n").as_bytes())
@@ -2478,7 +2482,7 @@ pub fn send_gated_at(
     {
         return not_confirmed("the question could not be sent");
     }
-    let answer = match read_gated_line(&mut client) {
+    let answer = match read_gated_line(&mut client, question_deadline) {
         Ok(Some(line)) => line,
         Ok(None) => return not_confirmed("the daemon closed the connection unanswered"),
         Err(_) => return not_confirmed("no answer within the wait"),
@@ -2489,7 +2493,8 @@ pub fn send_gated_at(
             why: "the daemon did not confirm the verb",
         };
     }
-    if client.set_timeouts(reply_wait).is_err() {
+    let reply_deadline = std::time::Instant::now() + reply_wait;
+    if arm_gated(&client, reply_deadline).is_err() {
         return not_confirmed("the connection could not be bounded");
     }
     if client
@@ -2499,20 +2504,40 @@ pub fn send_gated_at(
     {
         return Gated::Unconfirmed("the report could not be written whole");
     }
-    match read_gated_line(&mut client) {
+    match read_gated_line(&mut client, reply_deadline) {
         Ok(Some(line)) => Gated::Reply(line),
         Ok(None) => Gated::Unconfirmed("the daemon closed the connection with no answer"),
         Err(_) => Gated::Unconfirmed("no answer within the wait"),
     }
 }
 
-/// One line, at most [`GATED_MAX_LINE`] bytes: `Ok(None)` at a clean end of
-/// the connection, an error for a read failure, a deadline or an over-long
-/// line.
-fn read_gated_line(client: &mut impl std::io::Read) -> std::io::Result<Option<String>> {
+/// Bound `client`'s next read and write by what is left until `deadline`; an
+/// error once it has passed.
+fn arm_gated(
+    client: &crate::platform::ipc::IpcClient,
+    deadline: std::time::Instant,
+) -> std::io::Result<()> {
+    match deadline.checked_duration_since(std::time::Instant::now()) {
+        Some(left) if !left.is_zero() => client.set_timeouts(left),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "the wait is over",
+        )),
+    }
+}
+
+/// One line, at most [`GATED_MAX_LINE`] bytes, read by `deadline`: `Ok(None)`
+/// at a clean end of the connection, an error for a read failure, the
+/// deadline or an over-long line. Each read is bounded by what is left of the
+/// deadline, so the whole line is.
+fn read_gated_line(
+    client: &mut crate::platform::ipc::IpcClient,
+    deadline: std::time::Instant,
+) -> std::io::Result<Option<String>> {
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
     loop {
+        arm_gated(client, deadline)?;
         match client.read(&mut byte)? {
             0 if line.is_empty() => return Ok(None),
             0 => {
@@ -7126,6 +7151,11 @@ mod gated_send_tests {
         Confirm(Option<&'static str>),
         /// Confirm, read part of the mutation, then reset the connection.
         ConfirmThenCut,
+        /// Write the confirmation one byte at a time, this far apart.
+        DripConfirm(Duration),
+        /// Confirm, read the mutation, then write `reply` one byte at a time,
+        /// this far apart.
+        ConfirmThenDrip(&'static str, Duration),
     }
 
     const CONFIRMED: &str = r#"{"task_scoped_completion":1}"#;
@@ -7186,6 +7216,31 @@ mod gated_send_tests {
                         let _ = std::io::Read::read(&mut reader, &mut first);
                         let _ = stream.shutdown(std::net::Shutdown::Both);
                     }
+                    Script::DripConfirm(every) => {
+                        for byte in format!("{CONFIRMED}\n").bytes() {
+                            std::thread::sleep(every);
+                            if stream.write_all(&[byte]).is_err() {
+                                break;
+                            }
+                        }
+                        let mut more = String::new();
+                        if reader.read_line(&mut more).unwrap_or(0) > 0 {
+                            record(&more);
+                        }
+                    }
+                    Script::ConfirmThenDrip(reply, every) => {
+                        writeln!(stream, "{CONFIRMED}").unwrap();
+                        let mut mutation = String::new();
+                        if reader.read_line(&mut mutation).unwrap_or(0) > 0 {
+                            record(&mutation);
+                        }
+                        for byte in format!("{reply}\n").bytes() {
+                            std::thread::sleep(every);
+                            if stream.write_all(&[byte]).is_err() {
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         });
@@ -7225,6 +7280,37 @@ mod gated_send_tests {
         let stub = stub(Script::Silent);
         assert!(matches!(send(&stub), Gated::NotConfirmed { .. }));
         assert_eq!(mutations(&stub), 0);
+    }
+
+    /// Scenario: A daemon that answers the capabilities question one byte at a time, each byte well inside the wait but the whole answer far past it, gets no report: the question's wait bounds the whole answer, not each read, so the sender says the daemon did not confirm within about the wait, and the stub never reads a mutation.
+    #[spec("inbox/protocol/024")]
+    #[test]
+    fn protocol_024_a_dripped_answer_is_bounded_by_the_whole_wait() {
+        let stub = stub(Script::DripConfirm(Duration::from_millis(60)));
+        let started = std::time::Instant::now();
+        assert!(matches!(send(&stub), Gated::NotConfirmed { .. }));
+        assert!(
+            started.elapsed() < Duration::from_millis(1000),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(mutations(&stub), 0);
+    }
+
+    /// Scenario: A daemon that confirms, reads the report, and then drips its answer one byte at a time past the reply's wait: the sender stops at the wait and says the result is unconfirmed, having sent the report once.
+    #[spec("inbox/protocol/028")]
+    #[test]
+    fn protocol_028_a_dripped_reply_is_bounded_by_the_whole_wait() {
+        let reply = r#"{"disposition":"uncorrelated","destination":"inbox","report_id":"0123456789abcdef0123456789abcdef"}"#;
+        let stub = stub(Script::ConfirmThenDrip(reply, Duration::from_millis(30)));
+        let started = std::time::Instant::now();
+        assert!(matches!(send(&stub), Gated::Unconfirmed(_)));
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(mutations(&stub), 1);
     }
 
     /// Scenario: A daemon that answers the question with something else — an empty object, a legacy acknowledgement, a refusal with no capability — gets no report.
@@ -7317,14 +7403,15 @@ mod gated_send_tests {
             reply.disposition,
             crate::event::WorkDoneDisposition::Unknown
         );
-        for task in [Some("m-1"), None] {
-            let answer = crate::work_done_text::cli_answer(&reply, task, false);
+        for (task, terminal) in [(Some("m-1"), false), (None, true), (None, false)] {
+            let answer = crate::work_done_text::cli_answer(&reply, task, terminal);
             assert!(!answer.success);
             assert_eq!(
                 answer.stderr,
-                Some(crate::work_done_text::unconfirmed(task)),
-                "{task:?}"
+                Some(crate::work_done_text::unconfirmed(task, terminal)),
+                "{task:?} {terminal}"
             );
         }
+        assert!(!crate::work_done_text::unconfirmed(None, true).contains("note"));
     }
 }

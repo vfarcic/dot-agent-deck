@@ -9344,6 +9344,7 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 - **Layer:** fast unit (`src/hook.rs`; the real sender against a scripted daemon socket).
 - **Agent:** none.
 - **Asserts:** No answer within the wait: not confirmed, and no mutation is read.
+- **Asserts (round 5 fixes, auditor U3-6):** a confirmation dripped a byte at a time, each byte inside the wait, is cut at the question's whole wait: not confirmed in well under the drip's total, and no mutation read.
 - **Why it exists:** PRD #1666 part 3, round 5 (plan D1): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
 - **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
 - **Platform coverage:** mac+linux.
@@ -9376,6 +9377,7 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 - **Layer:** fast unit (`src/hook.rs`; the real sender against a scripted daemon socket).
 - **Agent:** none.
 - **Asserts:** The daemon closes after the report: unconfirmed, sent once.
+- **Asserts (round 5 fixes, auditor U3-6):** a reply dripped a byte at a time past the reply's wait reads unconfirmed at about that wait, with the report sent once.
 - **Why it exists:** PRD #1666 part 3, round 5 (plan D1): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
 - **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
 - **Platform coverage:** mac+linux.

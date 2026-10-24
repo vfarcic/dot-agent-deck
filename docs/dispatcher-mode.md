@@ -128,7 +128,7 @@ The report waits in the dispatcher's inbox while its agent is running. If that a
 
 The deck keeps a copy of every unit's report, and of every dispatch's start and failure message, in its saved-results directory, `retained-reports/` under the deck's state directory, so one that could not reach the dispatcher is not lost with it. It is kept for 24 hours after the dispatcher acknowledged it, and for 7 days after it could not be delivered. A restarted deck keeps the files the previous one left until those times are up, and one that was still waiting for its dispatcher for 7 days from the restart. [Saved results and reports](troubleshooting.md#saved-results-and-reports) says where the directory is. If the deck cannot write a result to disk, the message the dispatcher receives says it is held in memory until the deck restarts, and the deck keeps trying to save it.
 
-The unit's work is not affected: it is still committed on the unit's branch, and its directory is still on disk. Only the summary is lost; open the unit's card or tab, or its directory.
+The unit's work is not affected: it is still committed on the unit's branch, and its directory is still on disk. When the dispatcher did not get the report, read the saved copy, or open the unit's card or tab, or its directory.
 
 Detaching the TUI or closing the desktop app does not close the dispatcher pane, which keeps running in the daemon, so a report that arrives while you are away is waiting in it when you come back.
 

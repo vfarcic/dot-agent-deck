@@ -1230,14 +1230,14 @@ fn run_work_done(pane_id: String, report: String, done: bool, task_id: Option<St
             return ExitCode::FAILURE;
         }
         Gated::Unconfirmed(why) => {
-            eprintln!("{}", text::unconfirmed(task_id.as_deref()));
+            eprintln!("{}", text::unconfirmed(task_id.as_deref(), done));
             eprintln!("({why})");
             return ExitCode::FAILURE;
         }
         Gated::Reply(line) => line,
     };
     let Ok(reply) = serde_json::from_str::<WorkDoneTaskReply>(reply.trim()) else {
-        eprintln!("{}", text::unconfirmed(task_id.as_deref()));
+        eprintln!("{}", text::unconfirmed(task_id.as_deref(), done));
         eprintln!("(the daemon's answer could not be read)");
         return ExitCode::FAILURE;
     };

@@ -131,9 +131,12 @@ pub fn deck_unavailable(dir: &str) -> String {
         "{NOTHING}: the deck daemon hit an internal error and has stopped taking reports (its \
          log has the details). This attempt saved nothing new. The daemon does not recover from \
          this by itself: restart it to take reports again (dot-agent-deck daemon stop, then start \
-         the deck; stopping the daemon also stops the agents it runs). Reports it already saved \
-         stay in {dir}; after the restart they are kept there, but not delivered or listed. A \
-         restart also loses any dispatch result the deck holds only in memory."
+         the deck; stopping the daemon also stops the agents it runs). dot-agent-deck daemon \
+         stop refuses while orchestration roles are live, and forcing it leaves those \
+         orchestrations unable to delegate: read 'The deck stopped taking reports or \
+         dispatches' in dot-agent-deck docs troubleshooting first. Reports it already saved stay \
+         in {dir}; after the restart they are kept there, but not delivered or listed. A restart \
+         also loses any dispatch result the deck holds only in memory."
     )
 }
 
@@ -235,15 +238,22 @@ pub const NOT_CONFIRMED: &str = "Error: this deck daemon did not confirm it supp
      work-done reports; nothing was reported. Restart the deck daemon on this release, or run \
      work-done with the dot-agent-deck the daemon runs.";
 
-/// What the CLI says when the report was sent and its outcome is unknown.
-pub fn unconfirmed(task_id: Option<&str>) -> String {
-    match task_id {
-        Some(_) => "The report may have been accepted; its result is unconfirmed. Run the same \
-                    command again: a repeat of the same --task-id is answered with its first \
-                    result while the deck still remembers the task, and is not reported twice."
+/// What the CLI says when the report was sent and its outcome is unknown:
+/// for a task (`task_id`), a unit's terminal report (`terminal`), or a note.
+pub fn unconfirmed(task_id: Option<&str>, terminal: bool) -> String {
+    match (task_id, terminal) {
+        (Some(_), _) => "The report may have been accepted; its result is unconfirmed. Run the \
+                         same command again: a repeat of the same --task-id is answered with its \
+                         first result while the deck still remembers the task, and is not \
+                         reported twice."
             .to_string(),
-        None => "The report may have been accepted; its result is unconfirmed. Check with the \
-                 orchestrator before repeating: a repeat would be a second note."
+        (None, true) => "The report may have been accepted; its result is unconfirmed. Run the \
+                         same command again: a repeat of this unit's report is answered with its \
+                         first result while the deck still remembers the unit, and is not \
+                         reported twice."
+            .to_string(),
+        (None, false) => "The report may have been accepted; its result is unconfirmed. Check \
+                          with the orchestrator before repeating: a repeat would be a second note."
             .to_string(),
     }
 }
@@ -310,6 +320,6 @@ pub fn cli_answer(reply: &WorkDoneTaskReply, task_id: Option<&str>, terminal: bo
                 reply.message.clone().unwrap_or_else(|| NOTHING.to_string())
             ))
         }
-        WorkDoneDisposition::Unknown => err(unconfirmed(task_id)),
+        WorkDoneDisposition::Unknown => err(unconfirmed(task_id, terminal)),
     }
 }

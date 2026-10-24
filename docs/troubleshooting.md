@@ -509,7 +509,7 @@ Treat `--force` at that point as abandoning those runs.
 
 ### `work-done` is refused, pending or unconfirmed
 
-`work-done` prints why when it reports nothing, and in each case nothing was reported or changed:
+`work-done` prints why when it did not report, or when it cannot tell whether it did. A refusal or a pending answer reports nothing and changes nothing; an unconfirmed answer means the report may have been accepted:
 
 | Message | What happened | What to do |
 |---|---|---|
@@ -520,8 +520,8 @@ Treat `--force` at that point as abandoning those runs.
 | `Error: nothing new was reported: an earlier work-done for this task is still being saved. …` | The same report is still being saved, or this agent has another report in progress. | Run the same command again in a moment; it is answered with that report's result. |
 | `Error: nothing was reported: the deck cannot keep this report: its saved-results store is full …` | See [Saved results and reports](#saved-results-and-reports). | Remove saved files you no longer need. |
 | `Error: nothing was reported: the deck could not save this report (…)` | Writing the report's file failed. | Fix what the message names, then run the same command again. |
-| `The report may have been accepted; its result is unconfirmed.` | The report was sent and no answer came back. | With `--task-id`, run the same command again: a repeat is answered with the first result and is not reported twice. Without it, check with the orchestrator first: a repeat would be a second note. |
-| `Error: nothing was reported: the deck daemon hit an internal error and has stopped taking reports …` | See [The deck stopped taking reports or dispatches](#the-deck-stopped-taking-reports-or-dispatches). | Restart the deck daemon. |
+| `The report may have been accepted; its result is unconfirmed.` | The report was sent and no answer came back. | With `--task-id` or `--done`, run the same command again: a repeat is answered with the first result and is not reported twice. With neither, check with the orchestrator first: a repeat would be a second note. |
+| `Error: nothing was reported: the deck daemon hit an internal error and has stopped taking reports …` | See [The deck stopped taking reports or dispatches](#the-deck-stopped-taking-reports-or-dispatches). | Restart the deck daemon, after reading what a restart costs there: `daemon stop` refuses while orchestration roles are live. |
 
 A `work-done` without `--task-id` is not refused for want of one: it reaches the orchestrator as a note that completes no task, and the worker still owes the report for its task.
 
@@ -529,9 +529,9 @@ A `work-done` without `--task-id` is not refused for want of one: it reaches the
 
 The deck saves every worker report it accepts, and the start and failure message of every dispatch, as a file, so none is lost when the agent that should read it has gone: a report whose orchestrator or dispatcher is no longer running is kept there instead of being handed to whoever took over its pane. The files are under `retained-reports/` in the deck's state directory (`$XDG_STATE_HOME/dot-agent-deck`, else `~/.local/state/dot-agent-deck`, or `DOT_AGENT_DECK_STATE_DIR` when it is set), one folder per deck daemon run under `retained-reports/files/`. The directory and its files are readable by your user only; another program running as you, any of your agents included, can still read and write them. How well a saved file survives a power loss depends on the filesystem.
 
-The deck removes a file 24 hours after its recipient acknowledged the message, and 7 days after the message could not be delivered. It keeps at most 256 MiB and 4096 files per daemon run; [Daemon behaviour](configuration.md#daemon-behaviour) has the settings that change those limits. When either limit is reached, `dispatch` is refused with `the deck cannot keep this dispatch's result: its saved-results store is full (<dir>)` or `… holds the most reports it keeps (<n> files, <dir>)`, and nothing is started; `work-done` is refused the same way, and nothing is reported. Remove files you no longer need from the named directory: the deck counts them again at its next hourly cleanup and at its next start.
+The deck removes a file 24 hours after its recipient acknowledged the message, and 7 days after the message could not be delivered. It keeps at most 256 MiB and 4096 files per daemon run, and the files a restarted daemon keeps from an earlier run count toward the 256 MiB but not toward the 4096; [Daemon behaviour](configuration.md#daemon-behaviour) has the settings that change those limits. When either limit is reached, `dispatch` is refused with `the deck cannot keep this dispatch's result: its saved-results store is full (<dir>)` or `… holds the most reports it keeps (<n> files, <dir>)`, and nothing is started; `work-done` is refused the same way, and nothing is reported. Remove files you no longer need from the named directory: the deck counts them again at its next hourly cleanup and at its next start.
 
-When the deck cannot write a file, it holds the message in memory, says so in the message itself (`The deck could not save this result to disk; it is held in memory until the deck restarts.`) and tries to save it again. A deck restart loses a message held only in memory.
+When the deck cannot write a dispatch's start or failure message to a file, it holds that message in memory, says so in the message itself (`The deck could not save this result to disk; it is held in memory until the deck restarts.`) and tries to save it again. A deck restart loses a message held only in memory. A worker's report whose file cannot be written is refused instead, so `work-done` says nothing was reported.
 
 ### The deck stopped taking reports or dispatches
 
