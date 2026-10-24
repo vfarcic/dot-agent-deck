@@ -909,18 +909,36 @@ fn cargo_config_splits_debuginfo_for_the_linux_triple_only() {
         cfg.get("build").and_then(|b| b.get("rustflags")).is_none(),
         "`[build] rustflags` applies to every target, Windows included"
     );
+    // Any other `[target.<triple-or-cfg>]` table could match a Windows target.
+    let targets = cfg.get("target").and_then(|t| t.as_table_like());
+    for (key, table) in targets.into_iter().flat_map(|t| t.iter()) {
+        if key == "x86_64-unknown-linux-gnu" {
+            continue;
+        }
+        let flags = table
+            .get("rustflags")
+            .map(|f| f.to_string())
+            .unwrap_or_default();
+        assert!(
+            !flags.contains("split-debuginfo"),
+            "`[target.{key}] rustflags` splits debug info outside the Linux triple: {flags}"
+        );
+    }
 
+    // A profile can set it in either file, and a profile applies to every target.
     let manifest: toml_edit::DocumentMut = fs::read_to_string(repo_root().join("Cargo.toml"))
         .expect("read Cargo.toml")
         .parse()
         .expect("Cargo.toml parses");
-    let profiles = manifest.get("profile").and_then(|p| p.as_table_like());
-    for (name, profile) in profiles.into_iter().flat_map(|p| p.iter()) {
-        assert!(
-            profile.get("split-debuginfo").is_none(),
-            "`[profile.{name}] split-debuginfo` applies on Windows too, where rustc \
-             refuses `unpacked`; keep it in .cargo/config.toml's Linux triple"
-        );
+    for (file, doc) in [("Cargo.toml", &manifest), (".cargo/config.toml", &cfg)] {
+        let profiles = doc.get("profile").and_then(|p| p.as_table_like());
+        for (name, profile) in profiles.into_iter().flat_map(|p| p.iter()) {
+            assert!(
+                profile.get("split-debuginfo").is_none(),
+                "{file}'s `[profile.{name}] split-debuginfo` applies on Windows too, where \
+                 rustc refuses `unpacked`; keep it in .cargo/config.toml's Linux triple"
+            );
+        }
     }
 }
 
