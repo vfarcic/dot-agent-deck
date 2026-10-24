@@ -865,11 +865,27 @@ impl Fixture {
     /// A `PATH` holding only a stand-in `codex`, so Codex counts as installed
     /// and its hooks go to `<home>/.codex`. Its app server answers the deck's
     /// trust exchange with no hooks listed, as a Codex with nothing to trust
-    /// yet does.
+    /// yet does. A shell script rather than Python: on macOS runners an
+    /// interpreter's cold start took most of the deck's 5-second `hooks/list`
+    /// wait, and on some runs all of it. Shell built-ins only: this `PATH`
+    /// holds nothing else.
     fn codex_path(&self) -> PathBuf {
         self.codex_stand_in(
             "codexbin",
-            "#!/usr/bin/python3\nimport json, sys\nif 'app-server' in sys.argv:\n    for line in sys.stdin:\n        req = json.loads(line)\n        if 'id' not in req: continue\n        result = {'userAgent':'refresh-fixture'} if req['method'] == 'initialize' else {'hooks':[]}\n        print(json.dumps({'id':req['id'],'result':result}), flush=True)\n",
+            r##"#!/bin/sh
+case " $* " in *" app-server "*) ;; *) exit 0 ;; esac
+while IFS= read -r line; do
+    rest=${line#*'"id":'}
+    [ "$rest" != "$line" ] || continue
+    id=${rest%%[!0-9]*}
+    [ -n "$id" ] || continue
+    case "$line" in
+        *'"method":"initialize"'*) result='{"userAgent":"refresh-fixture"}' ;;
+        *) result='{"hooks":[]}' ;;
+    esac
+    printf '{"id":%s,"result":%s}\n' "$id" "$result"
+done
+"##,
         )
     }
 
