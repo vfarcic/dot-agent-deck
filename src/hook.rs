@@ -495,6 +495,7 @@ fn codex_inbox_hooks(
                 component: crate::event::InboxComponent::CodexHooks,
                 consumer: crate::event::InboxFetchConsumer::TurnEndHook,
                 rung: None,
+                ring: None,
                 envelope: &crate::inbox_prompt::Envelope::Block,
                 framing,
             },
@@ -540,12 +541,14 @@ pub fn deck_prompt_submit(
         let envelope = crate::inbox_prompt::Envelope::Context {
             hook_event_name: "UserPromptSubmit".to_string(),
         };
+        let ring = crate::inbox_prompt::ring_of(prompt);
         let injection = ids.rung.first().and_then(|rung| {
             crate::inbox_prompt::one_shot_injection(
                 crate::inbox_prompt::HookHandOver {
                     component,
                     consumer: crate::event::InboxFetchConsumer::DoorbellHook,
                     rung: Some(rung),
+                    ring: ring.as_ref(),
                     envelope: &envelope,
                     framing,
                 },

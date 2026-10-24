@@ -3723,6 +3723,20 @@ pub struct InboxAnnounceRequest {
     pub pid: Option<u32>,
 }
 
+/// PRD #1666 part 3, round 5-wake (plan §1.4): what a prompt carrying a ring's
+/// doorbell line looked like.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptShape {
+    /// The whole prompt, trimmed, is exactly the one token-led line.
+    Exact,
+    /// The prompt holds the token-led line among other text.
+    WithOtherText,
+    /// A shape this build does not know.
+    #[serde(other)]
+    Unknown,
+}
+
 /// Payload of [`DaemonMessage::InboxFetch`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InboxFetchRequest {
@@ -3751,6 +3765,16 @@ pub struct InboxFetchRequest {
     /// the caller, decided under the inbox's lock with the fetch itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doorbell: Option<String>,
+    /// PRD #1666 part 3, round 5-wake (plan §1.4): the ring token at the head
+    /// of the doorbell line the submitted prompt carried — evidence that this
+    /// ring's line was submitted, reported whether or not the fetch grants
+    /// anything. Additive: an older daemon ignores it, an older hook sends
+    /// none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doorbell_ring: Option<String>,
+    /// The shape of the prompt that carried [`Self::doorbell_ring`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doorbell_prompt: Option<PromptShape>,
     /// PRD #1666 §11: the integration of the component that runs the fetch
     /// (OpenCode's doorbell substitution), as on [`InboxWaitRequest`].
     #[serde(default, skip_serializing_if = "Option::is_none")]

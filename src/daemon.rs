@@ -6278,6 +6278,23 @@ async fn run_hook_loop_with_limits(
                                     let Some(agent_id) = attested_agent else {
                                         continue;
                                     };
+                                    // PRD #1666 part 3, round 5-wake (plan
+                                    // §1.4): a prompt hook's ring evidence,
+                                    // handed on whether or not the fetch
+                                    // grants anything.
+                                    if let Some(token) = req.doorbell_ring.as_deref() {
+                                        pty_registry.note_doorbell_evidence(
+                                            crate::agent_pty::RingEvidence {
+                                                pane_id: req.pane_id.clone(),
+                                                agent_id: agent_id.clone(),
+                                                message_id: req.doorbell.clone(),
+                                                token: token.to_string(),
+                                                shape: req
+                                                    .doorbell_prompt
+                                                    .unwrap_or(crate::event::PromptShape::Unknown),
+                                            },
+                                        );
+                                    }
                                     // Part 2 §2.4, §2.7: a hook's fetch is a
                                     // one-shot receiver of its own, held on
                                     // this connection for its controls; below
@@ -15514,6 +15531,81 @@ mod hook_provenance_audit_tests {
              authoritative, not its own registration of the pane"
         );
         deck.stop().await;
+    }
+
+    /// Scenario: A generation's prompt hook sends doorbell fetches to the daemon's real hook socket while a doorbell transaction listens on the pane: one carrying a ring token for a message that is not queued, one from an older hook with no ring, and one carrying a ring but attested by another pane's token. Only the first reaches the pane's evidence channel, with the generation, message, token and shape, although its fetch granted nothing.
+    #[spec("inbox/doorbell/046")]
+    #[tokio::test]
+    async fn doorbell_046_a_hooks_ring_evidence_reaches_the_panes_channel() {
+        use crate::event::PromptShape;
+        const PANE: &str = "pane-ring-evidence";
+        const OTHER: &str = "pane-ring-other";
+        const MESSAGE: &str = "m-abcdefgh-0123456789abcdef";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent = spawn(&registry, Some(PANE), "/bin/cat");
+        let token = registry
+            .hook_token_of(&agent)
+            .expect("the generation's token");
+        let other = spawn(&registry, Some(OTHER), "/bin/cat");
+        let other_token = registry.hook_token_of(&other).expect("the other token");
+        let mut evidence = registry.subscribe_doorbell_evidence(PANE);
+        let deck = AuditDeck::start(registry.clone()).await;
+        let fetch = |token: &str, agent: &str, ring: Option<&str>| {
+            let mut line = serde_json::json!({
+                "message_type": "inbox_fetch", "pane_id": PANE, "agent_id": agent,
+                "token": token, "consumer": "doorbell_hook", "doorbell": MESSAGE,
+                "max_chars": 4096
+            });
+            if let Some(ring) = ring {
+                line["doorbell_ring"] = ring.into();
+                line["doorbell_prompt"] = "exact".into();
+            }
+            line
+        };
+        // A fetch is answered (here refused: these stand-ins run no deck
+        // hooks); the evidence is handed on before its answer either way.
+        let ask = |payload: serde_json::Value| {
+            let deck = &deck;
+            async move {
+                use tokio::io::AsyncBufReadExt;
+                let stream = deck.open(payload).await;
+                let mut reply = String::new();
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    tokio::io::BufReader::new(stream).read_line(&mut reply),
+                )
+                .await;
+            }
+        };
+        ask(fetch(&token, &agent, Some("abcdfg"))).await;
+        let got = tokio::time::timeout(Duration::from_secs(5), evidence.recv())
+            .await
+            .expect("the evidence arrives")
+            .expect("the channel is open");
+        assert_eq!(
+            got,
+            crate::agent_pty::RingEvidence {
+                pane_id: PANE.to_string(),
+                agent_id: agent.clone(),
+                message_id: Some(MESSAGE.to_string()),
+                token: "abcdfg".to_string(),
+                shape: PromptShape::Exact,
+            }
+        );
+        ask(fetch(&token, &agent, None)).await;
+        ask(fetch(&other_token, &other, Some("zzzzzz"))).await;
+        // A later report from the generation is the next thing on the channel.
+        ask(fetch(&token, &agent, Some("bcdfgi"))).await;
+        let next = tokio::time::timeout(Duration::from_secs(5), evidence.recv())
+            .await
+            .expect("the evidence arrives")
+            .expect("the channel is open");
+        assert_eq!(
+            next.token, "bcdfgi",
+            "no evidence came from the older hook or the other pane"
+        );
+        deck.handle.abort();
+        registry.shutdown_all();
     }
 
     /// Scenario: A generation is spawned, and status events reach the daemon's real hook socket: one carrying no prompt, then a prompt with no hook token, then a prompt attested by the generation's own token. Only the attested prompt closes the generation's header window, at the first prompt; the others leave its scanner reading.

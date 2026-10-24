@@ -5481,6 +5481,7 @@ fn codex_hand_overs() -> Vec<(
                     component: InboxComponent::CodexHooks,
                     consumer,
                     rung: None,
+                    ring: None,
                     envelope: &envelope,
                     framing: AGENT_FRAMING,
                 },

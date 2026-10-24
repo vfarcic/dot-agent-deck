@@ -2390,6 +2390,22 @@ fn log_evidence_transition(transition: &crate::evidence_state::Transition, cause
     );
 }
 
+/// PRD #1666 part 3, round 5-wake (plan §1.4): a prompt hook's report that
+/// the prompt it saw carried a ring's token-led doorbell line, from the
+/// generation its hook token attests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RingEvidence {
+    pub pane_id: String,
+    pub agent_id: String,
+    /// The message the line named, as the hook's doorbell fetch names it.
+    pub message_id: Option<String>,
+    pub token: String,
+    pub shape: crate::event::PromptShape,
+}
+
+/// How many ring evidence reports a pane's channel holds for a slow reader.
+const RING_EVIDENCE_CAPACITY: usize = 16;
+
 /// How a pane's output stream ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadEnd {
@@ -6000,6 +6016,9 @@ pub struct AgentPtyRegistry {
     /// transaction holds ([`AgentPtyRegistry::doorbell_txn_begin`]), each
     /// mapped to whether a repaint nudge was deferred meanwhile.
     doorbell_txns: Mutex<HashMap<String, bool>>,
+    /// PRD #1666 part 3, round 5-wake (plan §2.3): per pane, the channel a
+    /// prompt hook's ring evidence reaches a waiting doorbell transaction on.
+    doorbell_evidence: Mutex<HashMap<String, broadcast::Sender<RingEvidence>>>,
     /// PRD #1666 S8: how long a repaint nudge keeps the PTY one column
     /// narrower, in milliseconds ([`REPAINT_NUDGE_GAP`], or
     /// [`ENV_REPAINT_NUDGE_GAP_MS`]).
@@ -8115,6 +8134,7 @@ impl AgentPtyRegistry {
             pty_write_stall_bound_ms: AtomicU64::new(PTY_WRITE_STALL_BOUND.as_millis() as u64),
             repaint_nudges: Mutex::new(HashMap::new()),
             doorbell_txns: Mutex::new(HashMap::new()),
+            doorbell_evidence: Mutex::new(HashMap::new()),
             repaint_nudge_gap_ms: AtomicU64::new(
                 std::env::var(ENV_REPAINT_NUDGE_GAP_MS)
                     .ok()
@@ -10330,6 +10350,38 @@ impl AgentPtyRegistry {
     )> {
         let inner = self.inner.lock();
         inner.agents.get(agent_id).map(|agent| agent.bus.release())
+    }
+
+    /// PRD #1666 part 3, round 5-wake (plan §2.3): subscribe to `pane_id`'s
+    /// ring evidence; a doorbell transaction waits on it for its token.
+    pub fn subscribe_doorbell_evidence(&self, pane_id: &str) -> broadcast::Receiver<RingEvidence> {
+        self.doorbell_evidence
+            .lock()
+            .unwrap()
+            .entry(pane_id.to_string())
+            .or_insert_with(|| broadcast::channel(RING_EVIDENCE_CAPACITY).0)
+            .subscribe()
+    }
+
+    /// A prompt hook reported `evidence`: handed to whoever waits on its
+    /// pane, and logged.
+    pub fn note_doorbell_evidence(&self, evidence: RingEvidence) {
+        tracing::info!(
+            target: "doorbell",
+            pane_id = %evidence.pane_id,
+            agent_id = %evidence.agent_id,
+            message_id = evidence.message_id.as_deref().unwrap_or("<none>"),
+            shape = ?evidence.shape,
+            "doorbell evidence"
+        );
+        let mut channels = self.doorbell_evidence.lock().unwrap();
+        if let Some(tx) = channels.get(&evidence.pane_id) {
+            if tx.receiver_count() == 0 {
+                channels.remove(&evidence.pane_id);
+            } else {
+                let _ = tx.send(evidence);
+            }
+        }
     }
 
     /// `agent_id`'s ingress ledger, while it is in the registry.

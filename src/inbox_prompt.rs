@@ -93,6 +93,49 @@ static DOORBELL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!("{prefix} {ID_PATTERN}{suffix}")).expect("the doorbell pattern is valid")
 });
 
+/// PRD #1666 part 3, round 5-wake (plan §1.2): a token-led doorbell line,
+/// `(token) dot-agent-deck: message <id> waiting, run: dot-agent-deck inbox
+/// fetch`, the token six lowercase letters.
+static RING: LazyLock<Regex> = LazyLock::new(|| {
+    let prefix = regex::escape(crate::doorbell::LINE_PREFIX);
+    let suffix = regex::escape(crate::doorbell::LINE_SUFFIX);
+    Regex::new(&format!(r"\(([a-z]{{6}})\){prefix}{ID_PATTERN}{suffix}"))
+        .expect("the ring pattern is valid")
+});
+
+/// The ring a prompt carried: its token, the message its line named, and the
+/// prompt's shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ring {
+    pub token: String,
+    pub id: String,
+    pub shape: crate::event::PromptShape,
+}
+
+/// The first token-led doorbell line in `prompt`, if any. The shape is
+/// `Exact` only when the whole prompt, trimmed, equals that one line; an
+/// untokened line (an older deck's) is no ring.
+pub fn ring_of(prompt: &str) -> Option<Ring> {
+    if !prompt.contains("dot-agent-deck") {
+        return None;
+    }
+    let capture = RING.captures(prompt)?;
+    let id = capture[2].to_string();
+    if !crate::inbox::is_valid_message_id(&id) {
+        return None;
+    }
+    let shape = if prompt.trim() == &capture[0] {
+        crate::event::PromptShape::Exact
+    } else {
+        crate::event::PromptShape::WithOtherText
+    };
+    Some(Ring {
+        token: capture[1].to_string(),
+        id,
+        shape,
+    })
+}
+
 /// The deck message ids a prompt carries.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct DeckPromptIds {
@@ -209,6 +252,8 @@ fn hand_over_request(
         max_bytes,
         ack: false,
         doorbell: rung.map(str::to_string),
+        doorbell_ring: None,
+        doorbell_prompt: None,
         adapter_integration: None,
         rx: None,
         hook_integration: None,
@@ -261,6 +306,9 @@ pub struct HookHandOver<'a> {
     pub consumer: InboxFetchConsumer,
     /// The message the doorbell named; none for a turn-end hand-over.
     pub rung: Option<&'a str>,
+    /// PRD #1666 part 3, round 5-wake: the ring token on that message's line,
+    /// reported as the deck's evidence the line was submitted.
+    pub ring: Option<&'a Ring>,
     pub envelope: &'a Envelope,
     /// What heads the hand-over, inside the envelope.
     pub framing: &'a str,
@@ -405,6 +453,12 @@ pub fn one_shot_request(
         agent_id,
         token,
     );
+    if let (Some(ring), Some(rung)) = (hand.ring, hand.rung)
+        && ring.id == rung
+    {
+        request.doorbell_ring = Some(ring.token.clone());
+        request.doorbell_prompt = Some(ring.shape);
+    }
     if let InboxBudget::Bytes(limit) = budget {
         let rest = json_room(limit, hand.envelope, hand.framing);
         request.max_chars = Some(rest);

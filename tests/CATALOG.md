@@ -9846,6 +9846,13 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** the admission reading the state, or the transaction cases (an edge during echo or withdrawal), which arrive with the transaction.
 - **Platform coverage:** mac+linux.
 
+##### inbox/doorbell/046 — A prompt hook reports the ring token its prompt carried, and the daemon hands it to the pane.
+- **Layer:** Fast (`tests/doorbell_ring_evidence.rs`, pure, over real UserPromptSubmit payloads; `src/daemon.rs`, `hook_provenance_audit_tests`, the real hook socket).
+- **Agent:** none at test time; the payloads are Claude Code 2.1.310's and Codex 0.164.0's and 0.160.0's, captured with the token-led line submitted.
+- **Asserts:** the token-led doorbell line is read off each agent's real prompt payload with its token and message, `exact` only when the whole prompt (whitespace aside) is that one line and `with_other_text` when it is among other text; an older deck's untokened line, a malformed token and an invalid message id are no ring. The hook's doorbell fetch carries the ring's token and shape only for the message the line named, and without a ring its wire is an older hook's; an unknown shape decodes as unknown. Through the real hook socket, a fetch carrying a ring reaches the pane's evidence channel with the generation its token attests, the message, the token and the shape, although its fetch granted nothing; a fetch from an older hook with no ring and one attested to another pane put nothing on the channel.
+- **Does not assert:** a transaction matching the token to its attempt, or the latch's late-evidence cases (the transaction's commits).
+- **Platform coverage:** mac+linux.
+
 ##### inbox/doorbell/053 — The activation table decides each release from its record, rule by rule.
 - **Layer:** Fast (`tests/doorbell_activation_table.rs`), pure (`src/doorbell_activation.rs`).
 - **Agent:** none.
