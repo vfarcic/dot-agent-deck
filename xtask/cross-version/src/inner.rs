@@ -2001,8 +2001,9 @@ fn with_attached_tui(
     }
 
     let deck_log = std::fs::read_to_string(&sb.log).unwrap_or_default();
-    // A failed tell that a break declared by the daemon's build, and not the
-    // client's, accounts for is that break's intended outcome (issue #1596).
+    // A failed tell that a break declared by one build and not the other
+    // accounts for, witnessed in this log or in the client's own output, is
+    // that break's intended outcome (issue #1596).
     crate::breaks::explain(ev, plan.direction, &deck_log);
     ev.excerpt("sandbox deck.log (tail)", tail(&deck_log, 80));
     Ok(())
@@ -3856,8 +3857,11 @@ pub fn compare_hellos(old_raw: &str, new_raw: &str) -> Result<Vec<String>, Strin
             "CONTRACT_BREAKS differ: old {obr:?}, branch {nbr:?}. The desktop's \
              `classify_handshake` refuses across any difference in that list, so a new app would \
              refuse this older daemon outright — a surface this harness does not exercise. A tell \
-             that fails the way one of these breaks says it will, with the daemon's refusal \
-             logged, is reported as a DECLARED BREAK rather than a FAIL (`breaks.rs`)"
+             that fails the way one of these breaks says it will, with that break's record found \
+             for the operation it acts on, in that operation's pane — the daemon's refusal in the \
+             sandbox `deck.log`, written while the operation ran, or, for a break the client \
+             declares and refuses before sending the daemon anything, the client's own output in \
+             that pane — is reported as a DECLARED BREAK rather than a FAIL (`breaks.rs`)"
         )
     });
     Ok(notes)
@@ -4111,6 +4115,18 @@ mod tests {
             notes.iter().any(|n| n.contains("classify_handshake")),
             "{notes:?}"
         );
+        // Review U3-3: the note states the witness rule `breaks.rs` applies,
+        // the client's own output included, not a daemon-log-only one.
+        let note = notes
+            .iter()
+            .find(|n| n.contains("CONTRACT_BREAKS differ"))
+            .expect("the differ note");
+        assert!(note.contains("written while the operation ran"), "{note}");
+        assert!(
+            note.contains("the client's own output in that pane"),
+            "{note}"
+        );
+        assert!(!note.contains("with the daemon's refusal logged"), "{note}");
     }
 
     #[test]
