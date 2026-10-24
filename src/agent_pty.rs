@@ -9794,27 +9794,13 @@ impl AgentPtyRegistry {
     /// `std::thread` with no async context of its own — see that function's
     /// doc comment for why the handle can be absent and what happens then.
     ///
-    /// A worker that calls `work-done` and then exits immediately races this
-    /// path against the hook-socket `work-done` message: the two have no
-    /// ordering guarantee between them, so if the PTY's EOF is observed
-    /// first, this notice can fire right before the genuine `work-done`
-    /// arrives and finds no record left to retire. The window is small — the
-    /// socket write completes before the process exits in the normal case —
-    /// so this is accepted as low-probability rather than fixed with an
-    /// added delivery delay.
-    ///
-    /// Issue #708 raised what losing that race costs — a submitted report is a
-    /// turn the orchestrator may act on, where an unsubmitted one was a line in
-    /// its scrollback — so it now narrows the race rather than only naming it.
-    /// A racing `work-done` finds no `OutstandingDelegation` (this sweep took
-    /// it) and goes on to retire the worker's COMMISSION
-    /// (`AppState::handle_work_done`'s order: silence watch, delegation,
-    /// commission), so the check at the top refuses once
-    /// [`Self::owes_delegation_commission`] says nothing is owed any more. That
-    /// closes everything up to the post; a `work-done` processed after it still
-    /// arrives as a message of its own, credited as
-    /// solicited because the commission was standing, and the report's wording
-    /// tells the orchestrator to trust that completion over this report.
+    /// PRD #1666 part 3, round 5 (plan D12 rule 4): a delegated task's exit
+    /// notice is decided by the hub's task ledger, at the exit, from the task
+    /// itself, and a worker's report names the task it completes. This is the
+    /// fallback for a tracker record that names no ledger task, which no
+    /// `work-done` can credit, so it has no report to race. Issue #708's race
+    /// between this notice and a report that names no task is gone with the
+    /// crediting it described.
     ///
     /// Returns what it did so a test can drive this exact call site; the one
     /// production caller ignores it.

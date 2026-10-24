@@ -1082,9 +1082,11 @@ pub struct ReportState {
     pub fallback: FallbackBodies,
     pub tasks: TaskLedger,
     pub claims: ClaimTable,
-    /// Tasks a worker's exit walk decided (D12 rule 4), until the exit's
-    /// `AgentExited` event for each is settled: `settle_delegate` posts no
-    /// notice of its own for them.
+    /// Tasks a worker's exit walk decided (D12 rule 4) whose message was
+    /// still live, until the exit's `AgentExited` event for each is settled:
+    /// `settle_delegate` posts no notice of its own for them. An acknowledged
+    /// or ended task's message gets no such event, so the walk never records
+    /// one, and each entry is removed by the event that follows it.
     pub exit_walked: HashSet<String>,
     /// This run of the daemon, as `DeckOutcomes` names it.
     pub incarnation: String,

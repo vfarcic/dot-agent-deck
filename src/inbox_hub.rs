@@ -1551,38 +1551,6 @@ impl InboxHub {
         retired
     }
 
-    /// PRD #1666 part 3, round 5 (plan D12 rule 4): the fallback producer of
-    /// an exit notice, for a tracker record or commission arm that names no
-    /// ledger task (`task_ids` empty), or names tasks the ledger may already
-    /// have settled. Withheld when every named task is being reported, dropped
-    /// when every named task was reported (both answer `Ok(None)`), and posted
-    /// otherwise.
-    pub fn post_exit_notice(
-        &self,
-        to: Recipient,
-        subject: &'static str,
-        body: String,
-        task_ids: &[String],
-    ) -> Result<Option<MessageId>, PostError> {
-        use crate::report_recovery::{TaskLookup, TaskState, Tombstone};
-        if !task_ids.is_empty() {
-            let decided = self.lock().guarded_read(|reports| {
-                let looked: Vec<_> = task_ids.iter().map(|id| reports.tasks.lookup(id)).collect();
-                let reporting = looked.iter().all(|l| {
-                    matches!(l, TaskLookup::Open(task) if matches!(task.state, TaskState::Reporting { .. }))
-                });
-                let reported = looked
-                    .iter()
-                    .all(|l| matches!(l, TaskLookup::Settled(settled) if matches!(settled.tombstone, Tombstone::Reported { .. })));
-                reporting || reported
-            });
-            if decided == Ok(true) {
-                return Ok(None);
-            }
-        }
-        self.post_notice(to, subject, body).map(Some)
-    }
-
     /// Retire, as superseded, each watched task to `pane_id` whose live message
     /// `retire` selects, and drop the watch of any already terminal.
     fn retire_delegates_to(&self, pane_id: &str, retire: impl Fn(&Message) -> bool) -> usize {
@@ -4376,7 +4344,12 @@ fn walk_exited_tasks(
         if let TaskState::Reporting { claim_id } = task.state {
             task.exit_walked = true;
             let task = task.clone();
-            reports.exit_walked.insert(id.clone());
+            // Only a message still live gets the exit's `AgentExited` event,
+            // which removes this entry; an acknowledged or ended one gets
+            // none, so it is not recorded.
+            if task.delivery == TaskDelivery::Live {
+                reports.exit_walked.insert(id.clone());
+            }
             debt.push(task_debt(&task));
             if let Some(claim) = reports.claims.get_mut(claim_id) {
                 claim.worker_gone.get_or_insert(match kind {
@@ -4417,7 +4390,9 @@ fn walk_exited_tasks(
         let Some(task) = reports.tasks.settle(&id, Tombstone::Closed) else {
             continue;
         };
-        reports.exit_walked.insert(id.clone());
+        if task.delivery == TaskDelivery::Live {
+            reports.exit_walked.insert(id.clone());
+        }
         debt.push(task_debt(&task));
         let Some(orchestrator) = task.binding.orchestrator.clone() else {
             continue;

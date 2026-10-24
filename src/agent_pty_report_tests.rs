@@ -1063,18 +1063,18 @@ async fn work_done_045_a_save_failure_after_the_workers_exit() {
     );
 }
 
-/// Scenario: Plain exits with no claim, through the real EOF, counting the orchestrator's notices by subject and task id: (i) an unacknowledged task gets one "not delivered" notice; (j) an acknowledged task one "worker exited" notice and no undeliverable notice; (l) an explicit close of the worker gets no "worker exited" notice, and an unacknowledged task's close gets the one undeliverable notice today's code gives.
+/// Scenario: Plain exits with no claim, through the real EOF, counting the orchestrator's notices by subject and task id: (i) an unacknowledged task gets one "not delivered" notice; (j) an acknowledged task one "worker exited" notice and no undeliverable notice; (l) an explicit close of the worker gets no "worker exited" notice, and an unacknowledged task's close gets the one undeliverable notice today's code gives. Neither (i) nor (j) leaves a walked-task entry behind.
 #[spec("orchestration/work-done/045")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn work_done_045_plain_exits_owe_what_their_tasks_owe() {
     // (i)
-    let team = team("wd045i");
-    let t = team.delegate("unacknowledged");
-    team.worker_exits().await;
+    let team_i = team("wd045i");
+    let t = team_i.delegate("unacknowledged");
+    team_i.worker_exits().await;
     assert_eq!(
         (
-            team.notices_naming(UNDELIVERED, &t),
-            team.notices_naming(EXITED, &t)
+            team_i.notices_naming(UNDELIVERED, &t),
+            team_i.notices_naming(EXITED, &t)
         ),
         (1, 0)
     );
@@ -1090,6 +1090,17 @@ async fn work_done_045_plain_exits_owe_what_their_tasks_owe() {
         ),
         (0, 1)
     );
+    // Neither exit leaves a walked-task entry behind: (i)'s is removed by its
+    // message's exit event, and (j)'s acknowledged message gets none.
+    for team in [&team_i, &team] {
+        eventually("no walked-task entry is left", || {
+            team.registry()
+                .inbox()
+                .read_reports(|r| r.exit_walked.is_empty())
+                .unwrap()
+        })
+        .await;
+    }
     // (l) an explicit close.
     for acknowledged in [true, false] {
         let team = super::report_tests::team(&format!("wd045l-{acknowledged}"));

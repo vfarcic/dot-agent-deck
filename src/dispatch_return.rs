@@ -11,8 +11,10 @@
 //! This module is the retention half. It is deliberately pure data: no locks, no
 //! I/O and no registry access, so the eviction rules can be asserted directly
 //! rather than through PTYs. [`crate::agent_pty::AgentPtyRegistry`] owns one
-//! behind its own mutex, and [`crate::state::AppState::handle_work_done`]
-//! resolves through it.
+//! behind its own mutex (R2). Since PRD #1666 part 3, round 5, a terminal
+//! `work-done --done` is admitted against it (`install_terminal_claim`, which
+//! requires the route's unit generation to be the attested reporter) and its
+//! commit takes the route by unit id ([`DispatchReturns::take_for_unit`]).
 
 use std::collections::HashMap;
 
@@ -50,24 +52,19 @@ pub struct DispatchCaller {
 /// completion inside a dispatched orchestration can never match: the workers'
 /// panes are not keys.
 ///
-/// Entries are evicted on four transitions: the report is delivered
-/// ([`Self::take`]), either pane is deliberately closed ([`Self::evict_pane`],
-/// from `begin_pane_close`), and either pane's process dies on its own
-/// ([`Self::evict_exited`], from the PTY-EOF sweep).
+/// PRD #1666 part 3, round 5 (plan D7): an entry is removed by its UNIT side
+/// only — the unit's report is committed ([`Self::take_for_unit`]), the unit's
+/// pane is deliberately closed ([`Self::evict_pane`], from `begin_pane_close`),
+/// or the unit's current generation exits ([`Self::evict_exited`], from the
+/// PTY-EOF sweep) — and each of the last two records the unit's end. The
+/// CALLER side never removes it: a caller that is closed, exits or is
+/// replaced by a respawn marks it `orphaned` ([`Self::orphan_caller`],
+/// [`Self::orphan_caller_pane`]), and the unit's result then goes to
+/// recovery instead of being lost.
 ///
 /// **That is the set of transitions covered, not a claim that nothing can
-/// linger** (PRD #220 Phase 2 review, finding A5 — the earlier wording said "all
-/// three ways an entry can stop being deliverable", which was wider than the code
-/// has ever guaranteed). Two residuals are known and accepted, one per side of an
-/// entry. On the CALLER side: an agent replaced on a still-open pane — a respawn
-/// — leaves an entry whose recipient can no longer be written to, since delivery
-/// is identity-gated against the agent id captured at dispatch time. It is not
-/// leaked, only deferred: it goes when the unit completes (delivery is attempted,
-/// refused, and the entry evicted regardless) or when either pane finally closes
-/// or exits. The cost is one map entry held until then, and the report itself is
-/// lost either way, because the agent that asked for it is gone. The UNIT side's
-/// mirror image, and why it is the cheap direction to fail in, is on
-/// [`Self::evict_exited`].
+/// linger** (PRD #220 Phase 2 review, finding A5). The residual known and
+/// accepted is on the unit side, on [`Self::evict_exited`].
 #[derive(Debug, Default)]
 pub struct DispatchReturns {
     by_unit_pane: HashMap<String, RetainedReturn>,
@@ -78,9 +75,9 @@ pub struct DispatchReturns {
 ///
 /// The unit half exists so the EOF sweep can tell a dispatched unit's own exit
 /// from the exit of whatever ELSE has held its pane id (PR #1081 review, Greptile
-/// finding 1) — see [`DispatchReturns::evict_exited`], which is the only thing
-/// that reads it. Delivery does not: a terminal `work-done` carries a pane id and
-/// no agent identity, so [`DispatchReturns::take`] stays keyed by pane alone.
+/// finding 1) — see [`DispatchReturns::evict_exited`]. Since PRD #1666 part 3,
+/// round 5, a terminal report's admission reads it too: the route is claimed
+/// only by the attested generation it names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetainedReturn {
     /// The registry agent id occupying the unit's TERMINAL pane when the dispatch
@@ -316,18 +313,15 @@ impl DispatchReturns {
     /// that a completion stops being something nobody hears about.
     ///
     /// The residual left is the cheap direction: an entry whose `unit_agent_id`
-    /// will never be seen exiting lingers until the unit completes or either pane
+    /// will never be seen exiting lingers until the unit completes or its pane
     /// closes. Bounded memory, cleaned up by [`Self::evict_pane`] and by daemon
-    /// death. It does not widen who can be WRITTEN to — delivery is identity-gated
-    /// against the caller — but it does leave the entry answerable by whoever
-    /// holds the unit pane at completion, which is the pre-existing hook-socket
-    /// provenance question tracked as issue #1077 rather than anything this
-    /// eviction decides.
+    /// death. It does not widen who can claim it: a terminal report's
+    /// admission requires the attested reporter to be the generation the route
+    /// names (PRD #1666 part 3, round 5).
     ///
-    /// An in-place respawn does not reach here at all: `respawn_agent_for_pane`
-    /// removes the registry record before starting the replacement, so
-    /// `pump_reader`'s `is_agent_still_registered` gate is already `false` when the
-    /// predecessor's EOF lands.
+    /// An in-place respawn retargets the route to its successor
+    /// ([`Self::retarget`]), so the predecessor's late EOF no longer matches
+    /// it here.
     ///
     /// PRD #1666 part 3, round 5 (plan D7): only the UNIT half is evicted now,
     /// matched by pane and the route's CURRENT generation, and it is returned
