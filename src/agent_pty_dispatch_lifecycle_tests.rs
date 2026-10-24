@@ -694,6 +694,209 @@ async fn return_024_fallback_slots_hold_results_and_word_their_refusals_apart() 
     );
 }
 
+/// A dispatch result whose file cannot be written, held in memory and posted
+/// to `caller` (`gone` for a caller that is not running). Answers its report
+/// id.
+async fn held_result(deck: &Deck, caller_pane: &str, caller_agent: &str, name: &str) -> String {
+    deck.store.fail_writes_for_test(true);
+    let room = crate::dispatch_return::admit_dispatch_result(&deck.registry).unwrap();
+    let record = crate::dispatch_return::retain_dispatch_result(
+        &deck.registry,
+        room,
+        caller_pane,
+        caller_agent,
+        name,
+        &format!("held result {name}"),
+        true,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(record.storage, OutcomeStorage::Memory);
+    let reply = deck.registry.inbox().reserve_reply().unwrap();
+    crate::dispatch_return::post_dispatch_result(
+        &deck.registry,
+        reply,
+        caller_pane,
+        caller_agent,
+        name,
+        true,
+        &format!("held result {name}"),
+        Some(record.clone()),
+    );
+    record.report_id
+}
+
+fn held_bodies(deck: &Deck) -> usize {
+    deck.registry
+        .inbox()
+        .read_reports(|r| r.fallback.len())
+        .unwrap()
+}
+
+/// Scenario: A dispatch result whose file cannot be written is held in memory, and keeps the lifetime a saved file would have on every path. Its caller already gone, it enters recovery at once: with the disk still broken it is held after six days and released, room and slot, after seven. Acknowledged, or set aside, and then saved by a retry, its file is acknowledged or recovered rather than pinned, a restart would adopt it as such, and the sweep removes it 24 hours or seven days after that event, not after the retry. Acknowledged, or its caller exiting, while a retry is writing it, the same. Acknowledged and retried with the disk still broken, it is released after 24 hours.
+#[spec("dispatch/return/024")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn return_024_a_held_result_keeps_its_lifetime_on_every_path() {
+    use crate::retained_store::{AdoptedState, Now, OwnState, parse_adopted_name};
+    const HOUR: Duration = Duration::from_secs(60 * 60);
+    const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+    let adopted_letter = |deck: &Deck, id: &str| -> Vec<char> {
+        super::report_tests::adopted_after_restart(deck)
+            .iter()
+            .filter_map(|name| parse_adopted_name(name))
+            .filter(|(report, _, _)| *report == id)
+            .map(|(_, _, state)| state.letter())
+            .collect()
+    };
+
+    // The caller is gone, and the disk stays broken.
+    let deck = self::deck();
+    let baseline = deck.store.counts().unwrap();
+    let start = Now::current();
+    let _id = held_result(&deck, "l024a-caller", "gone", "l024a").await;
+    assert_eq!(rows(&deck).len(), 1, "set aside at once");
+    deck.registry
+        .inbox()
+        .retry_fallback_bodies_at(&deck.store, start.plus(DAY * 6));
+    assert_eq!(held_bodies(&deck), 1, "held after six days");
+    deck.registry
+        .inbox()
+        .retry_fallback_bodies_at(&deck.store, start.plus(DAY * 7 + HOUR));
+    assert_eq!(held_bodies(&deck), 0, "released after seven");
+    assert_eq!(deck.store.counts().unwrap(), baseline, "its room and slot");
+
+    // Acknowledged, or set aside, then saved by a retry.
+    for acknowledged in [true, false] {
+        let deck = self::deck();
+        let baseline = deck.store.counts().unwrap();
+        let (pane, agent) = if acknowledged {
+            ("l024b-caller", spawn_cat(&deck.registry, "l024b-caller"))
+        } else {
+            ("l024c-caller", "gone".to_string())
+        };
+        let id = held_result(&deck, pane, &agent, "l024b").await;
+        let event = Now::current();
+        if acknowledged {
+            deck.registry.inbox().test_take_acked(pane, &agent);
+        }
+        deck.store.fail_writes_for_test(false);
+        deck.registry
+            .inbox()
+            .retry_fallback_bodies_at(&deck.store, event.plus(HOUR));
+        assert_eq!(held_bodies(&deck), 0, "saved");
+        let (letter, retention) = if acknowledged {
+            assert!(matches!(
+                deck.store.own_state(&id),
+                Some(OwnState::Acknowledged(_))
+            ));
+            (AdoptedState::Acknowledged.letter(), DAY)
+        } else {
+            assert!(matches!(
+                deck.store.own_state(&id),
+                Some(OwnState::Recovered(_))
+            ));
+            (AdoptedState::Recovered.letter(), DAY * 7)
+        };
+        assert_eq!(adopted_letter(&deck, &id), vec![letter]);
+        deck.store.sweep(event.plus(retention - HOUR));
+        assert_eq!(deck.store.counts().unwrap().own_files, 1, "kept until then");
+        deck.store.sweep(event.plus(retention + HOUR));
+        assert_eq!(
+            deck.store.counts().unwrap(),
+            baseline,
+            "removed {retention:?} after the event, not after the retry"
+        );
+    }
+
+    // Acknowledged, or the caller exiting, while a retry is writing it.
+    for exits in [false, true] {
+        let deck = self::deck();
+        let pane = format!("l024d{}-caller", u8::from(exits));
+        let agent = spawn_cat(&deck.registry, &pane);
+        let id = held_result(&deck, &pane, &agent, "l024d").await;
+        deck.store.fail_writes_for_test(false);
+        let (reached, held) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        *deck.registry.inbox().hold_fallback_retry.lock().unwrap() = Some((reached, wait));
+        let retry = {
+            let registry = Arc::clone(&deck.registry);
+            let store = Arc::clone(&deck.store);
+            tokio::task::spawn_blocking(move || {
+                registry.inbox().retry_fallback_bodies(&store);
+            })
+        };
+        tokio::task::spawn_blocking(move || held.recv().unwrap())
+            .await
+            .unwrap();
+        if exits {
+            kill_child(&deck.registry, &agent);
+            eventually("the result is set aside", || rows(&deck).len() == 1).await;
+        } else {
+            deck.registry.inbox().test_take_acked(&pane, &agent);
+        }
+        release.send(()).unwrap();
+        retry.await.unwrap();
+        let state = deck.store.own_state(&id);
+        if exits {
+            assert!(matches!(state, Some(OwnState::Recovered(_))), "{state:?}");
+        } else {
+            assert!(
+                matches!(state, Some(OwnState::Acknowledged(_))),
+                "{state:?}"
+            );
+        }
+    }
+
+    // Acknowledged, and the disk stays broken.
+    let deck = self::deck();
+    let baseline = deck.store.counts().unwrap();
+    let agent = spawn_cat(&deck.registry, "l024e-caller");
+    let _id = held_result(&deck, "l024e-caller", &agent, "l024e").await;
+    let event = Now::current();
+    deck.registry
+        .inbox()
+        .test_take_acked("l024e-caller", &agent);
+    deck.registry
+        .inbox()
+        .retry_fallback_bodies_at(&deck.store, event.plus(HOUR));
+    assert_eq!(held_bodies(&deck), 1);
+    deck.registry
+        .inbox()
+        .retry_fallback_bodies_at(&deck.store, event.plus(DAY + HOUR));
+    assert_eq!(held_bodies(&deck), 0);
+    assert_eq!(deck.store.counts().unwrap(), baseline);
+}
+
+/// Scenario: A held dispatch result is handed to its live caller once, the only hand-over it gets, and that hand-over is reported not handed: it is set aside, and its seven days start. The caller's commit then acknowledges it late, which starts 24 hours instead: with the disk still broken, the body is released a day after that acknowledgement, not seven.
+#[spec("dispatch/return/024")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn return_024_a_late_acknowledgement_shortens_a_held_results_lifetime() {
+    use crate::retained_store::Now;
+    // SAFETY: a nextest process runs one test.
+    unsafe { std::env::set_var(crate::inbox::ENV_MAX_DELIVER, "1") };
+    let deck = deck();
+    let baseline = deck.store.counts().unwrap();
+    let agent = spawn_cat(&deck.registry, "l024f-caller");
+    let _id = held_result(&deck, "l024f-caller", &agent, "l024f").await;
+    let hub = deck.registry.inbox();
+    let hook = hub.test_hook_fetch("l024f-caller", &agent, None);
+    let id = hook.ids().into_iter().next().expect("handed over once");
+    hub.test_hook_not_handed(&hook);
+    assert_eq!(rows(&deck).len(), 1, "out of hand-overs, it is set aside");
+    // The caller's commit says it got it after all.
+    let late = Now::current();
+    hub.test_hook_committed(&hook, &[id.as_str()]);
+    hub.test_hook_close(hook);
+    assert_eq!(
+        rows(&deck)[0].delivery,
+        crate::report_recovery::OutcomeDelivery::AcknowledgedLate
+    );
+    hub.retry_fallback_bodies_at(&deck.store, late.plus(Duration::from_secs(25 * 60 * 60)));
+    assert_eq!(held_bodies(&deck), 0, "released a day after the late ack");
+    assert_eq!(deck.store.counts().unwrap(), baseline);
+}
+
 /// [`dispatch_single`] as a task, so a test can pause it.
 fn dispatch_single_task(
     deck: &Deck,

@@ -711,6 +711,12 @@ pub struct InboxHub {
     #[cfg(test)]
     hold_caps:
         std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    /// Test seam: the next fallback retry pass tells the first end once it
+    /// has taken the bodies out and before it writes them, and waits for the
+    /// second.
+    #[cfg(test)]
+    pub(crate) hold_fallback_retry:
+        std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 /// [`InboxHub::request_tick`]'s state.
@@ -858,6 +864,8 @@ impl InboxHub {
             fallback_retry_pass: std::sync::Mutex::new(()),
             #[cfg(test)]
             hold_caps: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            hold_fallback_retry: std::sync::Mutex::new(None),
         }
     }
 
@@ -4573,13 +4581,16 @@ fn settle_accepted_report(
                 if let Some(report) = entry.report_id.as_deref() {
                     store.acknowledged(report, now);
                     if let Some(body) = reports.fallback.get_mut(report) {
-                        body.expires = Some(now.mono + crate::retained_store::ACK_RETENTION);
+                        body.lifetime.acknowledge(now);
                     }
                 }
             } else if let Some(report) = reports.outcomes.acknowledged_late(id)
                 && let Some(report) = report.as_deref()
             {
                 store.acknowledged(report, now);
+                if let Some(body) = reports.fallback.get_mut(report) {
+                    body.lifetime.acknowledge(now);
+                }
             }
         }
         StateName::Undeliverable => {
@@ -4609,10 +4620,8 @@ fn settle_accepted_report(
             }
             if let Some(report) = report.as_deref() {
                 store.recovered(report, now);
-                if let Some(body) = reports.fallback.get_mut(report)
-                    && body.expires.is_none()
-                {
-                    body.expires = Some(now.mono + crate::retained_store::RECOVERY_RETENTION);
+                if let Some(body) = reports.fallback.get_mut(report) {
+                    body.lifetime.recover(now);
                 }
             }
         }

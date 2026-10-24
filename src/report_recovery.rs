@@ -648,11 +648,14 @@ pub struct FallbackBody {
     /// The whole file the deck would have written.
     pub contents: Vec<u8>,
     pub held_since: Instant,
-    /// Its retained room, for the retry.
-    pub held: crate::retained_store::HeldResult,
-    /// When its lifetime ends: 24 hours after its message was acknowledged,
-    /// or 7 days after it was set aside; `None` while it is referenced.
-    pub expires: Option<Instant>,
+    /// Its retained room, for the retry; `None` while a retry pass has it
+    /// out, writing the body. The body stays here meanwhile, so an event that
+    /// arrives during the write still finds it.
+    pub held: Option<crate::retained_store::HeldResult>,
+    /// Where it is in its lifetime: it ends 24 hours after its message was
+    /// acknowledged, or 7 days after it was set aside. A retry that saves it
+    /// hands this to the file, start time and all.
+    pub lifetime: crate::retained_store::Lifetime,
 }
 
 pub type FallbackBodies = HashMap<String, FallbackBody>;

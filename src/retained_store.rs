@@ -126,6 +126,41 @@ impl Now {
     }
 }
 
+/// Where a retained report, or a dispatch result held in memory in its place,
+/// is in its lifetime (D3), with when that started. The rules are the own
+/// file's: an acknowledgement starts 24 hours from any state; recovery starts
+/// seven days only from `Referenced`.
+#[derive(Debug, Clone, Copy)]
+pub enum Lifetime {
+    /// Referenced by a claim, a ledger entry or a listed row: kept.
+    Referenced,
+    Acknowledged(Now),
+    Recovered(Now),
+}
+
+impl Lifetime {
+    /// Its message was acknowledged at `now`.
+    pub fn acknowledge(&mut self, now: Now) {
+        *self = Lifetime::Acknowledged(now);
+    }
+
+    /// It entered recovery at `now`, if it was still referenced.
+    pub fn recover(&mut self, now: Now) {
+        if matches!(self, Lifetime::Referenced) {
+            *self = Lifetime::Recovered(now);
+        }
+    }
+
+    /// When it ends, or `None` while it is referenced.
+    pub fn ends(&self) -> Option<Instant> {
+        match self {
+            Lifetime::Referenced => None,
+            Lifetime::Acknowledged(at) => Some(at.mono + ACK_RETENTION),
+            Lifetime::Recovered(at) => Some(at.mono + RECOVERY_RETENTION),
+        }
+    }
+}
+
 fn secs(d: Duration) -> i64 {
     i64::try_from(d.as_secs()).unwrap_or(i64::MAX)
 }
@@ -1045,6 +1080,22 @@ impl StoreLock<'_> {
         });
     }
 
+    /// See [`RetainedStore::continue_lifetime`].
+    pub fn continue_lifetime(&mut self, report_id: &str, lifetime: Lifetime) {
+        let (state, since) = match lifetime {
+            Lifetime::Referenced => return,
+            Lifetime::Acknowledged(at) => (OwnState::Acknowledged(at.wall), at.mono),
+            Lifetime::Recovered(at) => (OwnState::Recovered(at.wall), at.mono),
+        };
+        if let Some(file) = self.st.own.get_mut(&own_name(report_id))
+            && file.state != OwnState::OrphanUnlink
+        {
+            file.state = state;
+            file.since = Some(since);
+            self.st.revision += 1;
+        }
+    }
+
     /// See [`RetainedStore::reserve`].
     pub fn reserve(&mut self, bytes: u64) -> Result<Reservation, StoreRefusal> {
         self.store.refuse_unusable()?;
@@ -1458,6 +1509,15 @@ impl RetainedStore {
     pub fn recovered(&self, report_id: &str, now: Now) {
         if let Ok(mut held) = self.lock() {
             held.recovered(report_id, now);
+        }
+    }
+
+    /// A held result that a retry just saved as `report_id`'s own file takes
+    /// the lifetime its body had in memory, from when that started, so a
+    /// retry never renews it.
+    pub fn continue_lifetime(&self, report_id: &str, lifetime: Lifetime) {
+        if let Ok(mut held) = self.lock() {
+            held.continue_lifetime(report_id, lifetime);
         }
     }
 

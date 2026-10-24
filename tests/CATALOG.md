@@ -5384,8 +5384,9 @@ without depending on the config struct API.
 - **Layer:** fast unit, in-crate (`src/agent_pty_dispatch_lifecycle_tests.rs`; the real registry, inbox hub and retained store, with `cat` stand-ins for every agent and the daemon's live check installed).
 - **Agent:** none: `cat` stand-ins.
 - **Asserts:** with two slots and every write failing: two results are held in memory under their report ids with rows reading `storage: memory`, and a third dispatch is refused with the unsaved-results sentence and no in-flight clause; a retry with writes working saves both (rows read `artifact`) and a new dispatch is admitted; with no failure, two in-flight dispatches make a third refused with the in-flight sentence, which mentions no disk and no restart; one in flight and one held name both causes.
-- **Why it exists:** reviewer R14, U3-1: the fallback never overflows or replaces a body, and healthy load is never reported as a disk failure.
-- **Does not assert:** the hourly retry's timing; a body's 24-hour or 7-day expiry.
+- **Asserts (lifetimes):** a held result keeps an artifact's lifetime on every path, with the retry's clock moved forward: a caller already gone sets it aside at once, and with the disk still broken it is held after six days and released, room and slot, after seven; acknowledged or set aside and then saved by a retry, its file is acknowledged or recovered (and adopted as such after a restart), and the sweep removes it 24 hours or seven days after the event, not after the retry; acknowledged, or its caller exiting, while a retry is writing it, the same; acknowledged with the disk still broken, released after 24 hours; set aside after its only hand-over and then acknowledged late by the caller's commit, released 24 hours after that acknowledgement.
+- **Why it exists:** reviewer R14, U3-1: the fallback never overflows or replaces a body, and healthy load is never reported as a disk failure. Reviewer R29, auditor U2-1 (round 5 fixes): a held body lost its lifetime when it was set aside at once, when a retry saved it, and when an event landed during the retry's write.
+- **Does not assert:** the hourly retry's timing; a result held across a daemon restart (it is lost, as documented).
 - **Platform coverage:** mac+linux.
 
 ##### dispatch/return/025 — A close against the unit mark.

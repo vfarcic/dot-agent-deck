@@ -100,6 +100,7 @@ impl InboxHub {
     /// A report or dispatch result whose post was refused, or whose
     /// recipient is gone: a recovery row now, and its file's seven days start.
     pub(crate) fn set_aside(&self, entry: AcceptedReport, cause: OutcomeCause) {
+        let now = crate::retained_store::Now::current();
         let mut st = self.lock();
         let store = st.retained.clone();
         let report = entry.report_id.clone();
@@ -113,13 +114,20 @@ impl InboxHub {
                     None,
                 );
             }
+            // A result held in memory starts its seven days too.
+            if let Some(body) = report
+                .as_deref()
+                .and_then(|report| reports.fallback.get_mut(report))
+            {
+                body.lifetime.recover(now);
+            }
         });
         if set.is_err() {
             st.log_torn_once("a refused result");
         }
         drop(st);
         if let (Some(store), Some(report)) = (store, report) {
-            store.recovered(&report, crate::retained_store::Now::current());
+            store.recovered(&report, now);
         }
     }
 
@@ -142,8 +150,8 @@ impl InboxHub {
                     crate::report_recovery::FallbackBody {
                         contents,
                         held_since: Instant::now(),
-                        held,
-                        expires: None,
+                        held: Some(held),
+                        lifetime: crate::retained_store::Lifetime::Referenced,
                     },
                 );
             }
@@ -160,53 +168,77 @@ impl InboxHub {
     }
 
     /// Retry saving every held dispatch result, and end those whose lifetime
-    /// is over (§3.2): taken out under the lock, written off it, the saved
-    /// ones' rows and ledger entries moved to `artifact`, the rest put back.
+    /// is over (§3.2). Each body's room is taken out under the lock and the
+    /// body written off it; the body itself stays held meanwhile, so an
+    /// acknowledgement or a recipient's exit during the write still settles
+    /// its lifetime. A saved body's file then takes that lifetime, and its
+    /// rows and ledger entries move to `artifact`; the rest get their room
+    /// back.
     pub(crate) fn retry_fallback_bodies(&self, store: &crate::retained_store::RetainedStore) {
+        self.retry_fallback_bodies_at(store, crate::retained_store::Now::current());
+    }
+
+    /// [`Self::retry_fallback_bodies`] at `now`, which a test moves forward.
+    pub(crate) fn retry_fallback_bodies_at(
+        &self,
+        store: &crate::retained_store::RetainedStore,
+        now: crate::retained_store::Now,
+    ) {
         let _pass = self
             .fallback_retry_pass
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        let now = crate::retained_store::Now::current();
         let taken = {
             let mut st = self.lock();
-            st.guarded_section(|_, reports| std::mem::take(&mut reports.fallback))
+            st.guarded_section(|_, reports| {
+                let mut ended = Vec::new();
+                let mut writes = Vec::new();
+                let ids: Vec<String> = reports.fallback.keys().cloned().collect();
+                for id in ids {
+                    let Some(body) = reports.fallback.get_mut(&id) else {
+                        continue;
+                    };
+                    if body.lifetime.ends().is_some_and(|at| now.mono >= at) {
+                        if let Some(body) = reports.fallback.remove(&id)
+                            && let Some(held) = body.held
+                        {
+                            ended.push(held);
+                        }
+                    } else if let Some(held) = body.held.take() {
+                        writes.push((id, body.contents.clone(), held));
+                    }
+                }
+                (ended, writes)
+            })
         };
-        let Ok(taken) = taken else {
+        let Ok((ended, writes)) = taken else {
             return;
         };
-        let mut kept = HashMap::new();
+        for held in ended {
+            store.end_held(held);
+        }
+        #[cfg(test)]
+        if let Some((reached, release)) = self.hold_fallback_retry.lock().unwrap().take() {
+            let _ = reached.send(());
+            let _ = release.recv();
+        }
         let mut saved = Vec::new();
-        for (report_id, body) in taken {
-            if body.expires.is_some_and(|at| now.mono >= at) {
-                store.end_held(body.held);
-                continue;
-            }
-            let crate::report_recovery::FallbackBody {
-                contents,
-                held_since,
-                held,
-                expires,
-            } = body;
+        let mut unsaved = Vec::new();
+        for (report_id, contents, held) in writes {
             match store.retry_held(held, &report_id, &contents, now) {
                 Ok(()) => saved.push(report_id),
-                Err(held) => {
-                    kept.insert(
-                        report_id,
-                        crate::report_recovery::FallbackBody {
-                            contents,
-                            held_since,
-                            held,
-                            expires,
-                        },
-                    );
-                }
+                Err(held) => unsaved.push((report_id, held)),
             }
         }
         let mut st = self.lock();
+        let mut unsaved = Some(unsaved);
         let restored = st.guarded_section(|_, reports| {
-            reports.fallback.extend(kept);
             for report_id in &saved {
+                // Under the hub's lock, so an event cannot land between the
+                // body leaving and its file taking the body's lifetime.
+                if let Some(body) = reports.fallback.remove(report_id) {
+                    store.continue_lifetime(report_id, body.lifetime);
+                }
                 reports.outcomes.saved(report_id);
                 for entry in reports.accepted.values_mut() {
                     if entry.report_id.as_deref() == Some(report_id.as_str()) {
@@ -214,9 +246,31 @@ impl InboxHub {
                     }
                 }
             }
+            let mut stray = Vec::new();
+            for (report_id, held) in unsaved.take().into_iter().flatten() {
+                match reports.fallback.get_mut(&report_id) {
+                    Some(body) => body.held = Some(held),
+                    None => stray.push(held),
+                }
+            }
+            stray
         });
-        if restored.is_err() {
-            st.log_torn_once("a fallback retry");
+        let stray = match restored {
+            Ok(stray) => stray,
+            Err(_) => {
+                st.log_torn_once("a fallback retry");
+                // The bodies went with the torn state: their room comes back.
+                unsaved
+                    .take()
+                    .into_iter()
+                    .flatten()
+                    .map(|(_, held)| held)
+                    .collect()
+            }
+        };
+        drop(st);
+        for held in stray {
+            store.end_held(held);
         }
     }
 
