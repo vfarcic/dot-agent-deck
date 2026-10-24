@@ -225,6 +225,12 @@ mod release_workflow_wiring;
 #[cfg(test)]
 mod renovate_lock_file_maintenance;
 mod repo_state;
+/// Issue #1256: when the automated review apps have finished, which
+/// `.claude/skills/pr-create/wait-reviews.sh` decides from `reviewers.json`
+/// for every skill that waits on a review. Tests only, and Unix only: the
+/// script is driven under `bash` against an offline `gh` stand-in.
+#[cfg(all(test, unix))]
+mod review_wait;
 /// Issue #906: `scripts/sample-attribution.sh`'s worktree-attribution rule, the
 /// prefix test that decides which worktree a toolchain process is building for.
 /// Tests only — the rule lives in the script, no CI job runs it, and both ways
