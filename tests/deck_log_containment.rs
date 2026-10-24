@@ -153,6 +153,10 @@ fn logging_containment_001_explicitly_armed_wrapper_never_opens_an_outside_log()
 #[test]
 fn logging_containment_002_nextest_armed_wrapper_never_opens_an_outside_log() {
     let fixture = test_temp::tempdir().unwrap();
+    // Cargo creates this at build time, but a shard that runs the tests from a
+    // nextest archive on another machine never built anything, so it is absent
+    // there (main's CI run for #1857).
+    std::fs::create_dir_all(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let outside = tempfile::Builder::new()
         .prefix("deck-log-containment-")
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
