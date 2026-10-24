@@ -6891,9 +6891,55 @@ async fn run_hook_loop_with_limits(
                                         task_scoped_completion: Some(
                                             crate::event::TASK_SCOPED_COMPLETION,
                                         ),
+                                        // PRD #1666 part 3, round 5-wake:
+                                        // `input_mode` reports are stored.
+                                        input_mode_report: Some(
+                                            crate::input_mode::INPUT_MODE_REPORT,
+                                        ),
                                         ..Default::default()
                                     };
                                     if let Ok(json) = serde_json::to_string(&reply) {
+                                        let line = format!("{json}\n");
+                                        let _ = write_half.write_all(line.as_bytes()).await;
+                                        let _ = write_half.flush().await;
+                                    }
+                                }
+                                DaemonMessage::InputMode(report) => {
+                                    // PRD #1666 part 3, round 5-wake (plan
+                                    // §1.3): the generation's input-mode
+                                    // store, and nothing else.
+                                    let verdict = match (attested_agent.as_deref(), peer_pid) {
+                                        (Some(agent_id), Some(peer)) => match peer.started {
+                                            Some(start) => pty_registry
+                                                .accept_input_mode(
+                                                    agent_id,
+                                                    crate::input_mode::Observer {
+                                                        pid: peer.pid,
+                                                        start,
+                                                    },
+                                                    crate::input_mode::ModeSample {
+                                                        seq: report.seq,
+                                                        icanon: report.icanon,
+                                                        echo: report.echo,
+                                                        sampled_mono_ns: report.sampled_mono_ns,
+                                                        sample_done_mono_ns: report
+                                                            .sample_done_mono_ns,
+                                                    },
+                                                )
+                                                .map(|_| ()),
+                                            None => Err("peer_start_unreadable"),
+                                        },
+                                        (None, _) => Err("unattested"),
+                                        (_, None) => Err("peer_unreadable"),
+                                    };
+                                    let ack = match verdict {
+                                        Ok(()) => crate::event::SignalAck::accepted(),
+                                        Err(code) => crate::event::SignalAck::refused(
+                                            code,
+                                            "the input-mode report was not stored",
+                                        ),
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&ack) {
                                         let line = format!("{json}\n");
                                         let _ = write_half.write_all(line.as_bytes()).await;
                                         let _ = write_half.flush().await;
@@ -15640,6 +15686,375 @@ mod hook_provenance_audit_tests {
         assert!(!alive);
         assert_eq!(closed, Some(WindowClose::FirstPrompt));
         deck.handle.abort();
+        registry.shutdown_all();
+    }
+
+    /// PRD #1666 part 3, round 5-wake: the variable that turns this test
+    /// binary into 051's helper process, with its [`ModeHelper`] as JSON.
+    const MODE_HELPER: &str = "DAD_TEST_INPUT_MODE_HELPER";
+    const MODE_HELPER_TEST: &str = "daemon::hook_provenance_audit_tests::input_mode_helper_process";
+
+    /// A pane's child for 051: a shell that runs each line typed into its PTY,
+    /// so every helper it starts is in the pane's session.
+    const MODE_SHELL: &str = "while read -r line; do eval \"$line\"; done";
+
+    /// What one 051 helper process sends, and how.
+    #[derive(Clone, serde::Serialize, serde::Deserialize)]
+    struct ModeHelper {
+        sock: std::path::PathBuf,
+        out: std::path::PathBuf,
+        pane: String,
+        token: Option<String>,
+        seq: u64,
+        /// `plain`; `setsid` (from a session of its own, a nested wrapper's
+        /// position); `handoff` (connect, hand the connection to a child and
+        /// exit, so the peer is gone when its line is read); `handoff_child`.
+        how: String,
+        #[serde(default)]
+        fd: Option<i32>,
+        #[serde(default)]
+        parent: Option<u32>,
+    }
+
+    /// A helper's result: the connecting process and the daemon's reply.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct ModeHelperOut {
+        pid: u32,
+        reply: String,
+    }
+
+    impl ModeHelperOut {
+        fn ack(&self) -> crate::event::SignalAck {
+            serde_json::from_str(self.reply.trim()).expect("one ack line")
+        }
+    }
+
+    /// Not a check of its own: without [`MODE_HELPER`] it returns at once.
+    /// 051 starts this test binary inside a pane's session with it set, and
+    /// this process sends one `input_mode` report, both bits clear, stamped
+    /// from its own clock.
+    #[test]
+    fn input_mode_helper_process() {
+        use std::io::{Read, Write};
+        use std::os::fd::{FromRawFd, IntoRawFd};
+        let Ok(helper) = std::env::var(MODE_HELPER) else {
+            return;
+        };
+        let helper: ModeHelper = serde_json::from_str(&helper).expect("the helper's spec");
+        let (mut stream, peer) = if helper.how == "handoff_child" {
+            let parent = helper.parent.expect("the connecting process");
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            // SAFETY: signal 0 only checks that the pid exists.
+            while unsafe { libc::kill(parent as libc::pid_t, 0) } == 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the connecting process stayed"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // SAFETY: the parent cleared close-on-exec on this connected
+            // socket for this process, and nothing else here owns it.
+            let stream =
+                unsafe { std::os::unix::net::UnixStream::from_raw_fd(helper.fd.expect("fd")) };
+            (stream, parent)
+        } else {
+            if helper.how == "setsid" {
+                // SAFETY: no arguments; this process is not a group leader.
+                assert_ne!(unsafe { libc::setsid() }, -1, "a session of its own");
+            }
+            let stream = std::os::unix::net::UnixStream::connect(&helper.sock).expect("connect");
+            if helper.how == "handoff" {
+                let fd = stream.into_raw_fd();
+                // SAFETY: clears close-on-exec on a descriptor this process owns.
+                assert_ne!(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }, -1);
+                let child = ModeHelper {
+                    how: "handoff_child".to_string(),
+                    fd: Some(fd),
+                    parent: Some(std::process::id()),
+                    ..helper
+                };
+                std::process::Command::new(std::env::current_exe().expect("the test binary"))
+                    .args([
+                        "--exact",
+                        MODE_HELPER_TEST,
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env(MODE_HELPER, serde_json::to_string(&child).unwrap())
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect("hand the connection on");
+                std::process::exit(0);
+            }
+            (stream, std::process::id())
+        };
+        let sampled = crate::input_mode::monotonic_ns().expect("the clock");
+        let done = crate::input_mode::monotonic_ns().expect("the clock");
+        let report = DaemonMessage::InputMode(crate::event::InputModeReport {
+            pane_id: helper.pane.clone(),
+            token: helper.token.clone(),
+            seq: helper.seq,
+            icanon: false,
+            echo: false,
+            sampled_mono_ns: sampled,
+            sample_done_mono_ns: done,
+        });
+        let line = serde_json::to_string(&report).unwrap();
+        stream.write_all(format!("{line}\n").as_bytes()).unwrap();
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut reply = String::new();
+        let _ = stream.read_to_string(&mut reply);
+        let tmp = helper.out.with_extension("part");
+        std::fs::write(
+            &tmp,
+            serde_json::to_vec(&ModeHelperOut { pid: peer, reply }).unwrap(),
+        )
+        .unwrap();
+        std::fs::rename(&tmp, &helper.out).unwrap();
+    }
+
+    /// 051's fixture: a deck on the real hook socket and the panes whose
+    /// shells start the helpers.
+    struct ModeDeck {
+        deck: AuditDeck,
+        dir: tempfile::TempDir,
+        runs: std::sync::atomic::AtomicU32,
+    }
+
+    impl ModeDeck {
+        async fn start(registry: Arc<AgentPtyRegistry>) -> Self {
+            Self {
+                deck: AuditDeck::start(registry).await,
+                dir: tempfile::tempdir().unwrap(),
+                runs: std::sync::atomic::AtomicU32::new(0),
+            }
+        }
+
+        /// Type `line` into `agent`'s shell.
+        async fn type_line(&self, agent: &str, line: &str) {
+            let writer = self.deck.registry.agent_writer(agent).expect("writer");
+            writer
+                .lock()
+                .await
+                .write_user(format!("{line}\n").as_bytes())
+                .await
+                .expect("type into the pane's shell");
+        }
+
+        /// Start a helper from `agent`'s shell, sending for `pane` with
+        /// `token`, and wait for its result.
+        async fn report(
+            &self,
+            agent: &str,
+            pane: &str,
+            token: Option<&str>,
+            seq: u64,
+            how: &str,
+        ) -> ModeHelperOut {
+            let run = self.runs.fetch_add(1, Ordering::Relaxed);
+            let out = self.dir.path().join(format!("helper-{run}.json"));
+            let helper = ModeHelper {
+                sock: self.deck.sock.clone(),
+                out: out.clone(),
+                pane: pane.to_string(),
+                token: token.map(str::to_string),
+                seq,
+                how: how.to_string(),
+                fd: None,
+                parent: None,
+            };
+            let exe = std::env::current_exe().expect("the test binary");
+            self.type_line(
+                agent,
+                &format!(
+                    "{MODE_HELPER}='{}' '{}' --exact {MODE_HELPER_TEST} --nocapture --test-threads=1 >/dev/null 2>&1",
+                    serde_json::to_string(&helper).unwrap(),
+                    exe.display()
+                ),
+            )
+            .await;
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                if let Ok(bytes) = std::fs::read(&out) {
+                    return serde_json::from_slice(&bytes).expect("the helper's result");
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "helper {run} ({how}) never reported"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+
+    fn mode_pane(registry: &Arc<AgentPtyRegistry>, pane: &str) -> (String, String) {
+        let agent = spawn(registry, Some(pane), MODE_SHELL);
+        let token = registry
+            .hook_token_of(&agent)
+            .expect("the generation's token");
+        (agent, token)
+    }
+
+    /// Scenario: A pane's shell starts a helper process that reports both bits clear on the daemon's real hook socket with the generation's token, then a second helper in the same session reports. The first binds the generation's evidence to itself and sets the settle anchor; the second is refused as `input_mode_conflict`, the store records the conflict naming both processes, and from then on the evidence reads `input_mode_conflict`, so the first helper's next report is refused too.
+    #[spec("inbox/doorbell/051")]
+    #[tokio::test]
+    async fn doorbell_051_a_second_reporter_in_the_session_is_a_conflict() {
+        use crate::input_mode::ModeClause;
+        const PANE: &str = "pane-mode-conflict";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (agent, token) = mode_pane(&registry, PANE);
+        let deck = ModeDeck::start(registry.clone()).await;
+        let first = deck.report(&agent, PANE, Some(&token), 1, "plain").await;
+        assert!(first.ack().accepted, "the first helper: {}", first.reply);
+        let store = registry.input_mode_store(&agent).unwrap();
+        let bound = store.observer().expect("bound");
+        assert_eq!(bound.pid, first.pid);
+        assert!(store.anchor().is_some(), "both bits clear set the anchor");
+        let second = deck.report(&agent, PANE, Some(&token), 2, "plain").await;
+        let ack = second.ack();
+        assert!(!ack.accepted);
+        assert_eq!(ack.reason.as_deref(), Some("input_mode_conflict"));
+        let store = registry.input_mode_store(&agent).unwrap();
+        let (a, b) = store.conflict().expect("the conflict is recorded");
+        assert_eq!((a.pid, b.pid), (first.pid, second.pid));
+        assert_eq!(store.sticky(), Some(ModeClause::Conflict));
+        let now = crate::input_mode::monotonic_ns().unwrap();
+        assert_eq!(store.usable(now), Err(ModeClause::Conflict));
+        assert_eq!(
+            store.usable(now).unwrap_err().as_str(),
+            "input_mode_conflict"
+        );
+        let again = deck.report(&agent, PANE, Some(&token), 3, "plain").await;
+        assert_eq!(again.ack().reason.as_deref(), Some("input_mode_conflict"));
+        assert_eq!(
+            registry
+                .input_mode_store(&agent)
+                .unwrap()
+                .latest()
+                .unwrap()
+                .seq,
+            1
+        );
+        deck.deck.handle.abort();
+        registry.shutdown_all();
+    }
+
+    /// Scenario: A pane's shell first prints a line shaped exactly like an `input_mode` report into the pane's output, then starts helpers that report on the real hook socket from a session of their own, with no token, with another pane's token, and by connecting and exiting before their line is read. Each is refused and the generation's evidence stays empty; a helper reporting properly afterwards is accepted and binds, so the refusals were not the fixture's.
+    #[spec("inbox/doorbell/051")]
+    #[tokio::test]
+    async fn doorbell_051_reports_from_outside_the_generation_are_refused() {
+        const PANE: &str = "pane-mode-outside";
+        const OTHER: &str = "pane-mode-other";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (agent, token) = mode_pane(&registry, PANE);
+        let (_other, other_token) = mode_pane(&registry, OTHER);
+        let deck = ModeDeck::start(registry.clone()).await;
+        let shaped =
+            serde_json::to_string(&DaemonMessage::InputMode(crate::event::InputModeReport {
+                pane_id: PANE.to_string(),
+                token: Some(token.clone()),
+                seq: 1,
+                icanon: false,
+                echo: false,
+                sampled_mono_ns: 1,
+                sample_done_mono_ns: 2,
+            }))
+            .unwrap();
+        deck.type_line(&agent, &format!("printf '%s\\n' '{shaped}'"))
+            .await;
+        let empty = |what: &str| {
+            let store = registry.input_mode_store(&agent).unwrap();
+            assert!(
+                store.observer().is_none() && store.latest().is_none() && store.sticky().is_none(),
+                "{what} changed the store: {store:?}"
+            );
+        };
+        // The shell runs one line at a time, so this helper's result also
+        // means the printed line has gone out.
+        let nested = deck.report(&agent, PANE, Some(&token), 2, "setsid").await;
+        assert_ne!(nested.pid, 0);
+        let ack = nested.ack();
+        assert!(!ack.accepted);
+        assert_eq!(ack.reason.as_deref(), Some("peer_session"));
+        empty("a report-shaped line in the pane's output, or another session");
+        let untokened = deck.report(&agent, PANE, None, 3, "plain").await;
+        assert!(!untokened.ack().accepted, "{}", untokened.reply);
+        empty("a report with no token");
+        let wrong = deck
+            .report(&agent, PANE, Some(&other_token), 4, "plain")
+            .await;
+        assert!(!wrong.ack().accepted, "{}", wrong.reply);
+        empty("another pane's token");
+        let gone = deck.report(&agent, PANE, Some(&token), 5, "handoff").await;
+        assert!(!gone.ack().accepted, "{}", gone.reply);
+        empty("a peer that exited before its line was read");
+        let proper = deck.report(&agent, PANE, Some(&token), 6, "plain").await;
+        assert!(proper.ack().accepted, "the control: {}", proper.reply);
+        let store = registry.input_mode_store(&agent).unwrap();
+        assert_eq!(store.observer().map(|o| o.pid), Some(proper.pid));
+        assert_eq!(store.latest().map(|s| s.seq), Some(6));
+        deck.deck.handle.abort();
+        registry.shutdown_all();
+    }
+
+    /// Scenario: A pane's shell draws a Codex start-up header and a helper in its session binds the generation's evidence; then the pane is restarted. The new generation starts with an empty store and no release latched; a helper in the new session reporting with the old generation's token is refused and leaves it empty; a helper reporting with the new token binds it to itself, with its own anchor.
+    #[spec("inbox/doorbell/051")]
+    #[tokio::test]
+    async fn doorbell_051_a_respawned_generation_starts_its_evidence_afresh() {
+        use crate::release_scanner::ScanLatch;
+        const PANE: &str = "pane-mode-respawn";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (old, old_token) = mode_pane(&registry, PANE);
+        let deck = ModeDeck::start(registry.clone()).await;
+        let header = deck.dir.path().join("header.bin");
+        std::fs::write(
+            &header,
+            "\x1b[2;3H>_ \x1b[1mOpenAI Codex\x1b[22m\x1b[2m (v0.164.0)\x1b[22m\r\n",
+        )
+        .unwrap();
+        deck.type_line(&old, &format!("cat '{}'", header.display()))
+            .await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !matches!(
+            registry.release_capture(&old).unwrap().0,
+            ScanLatch::Latched { .. }
+        ) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the header never latched"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let bound = deck.report(&old, PANE, Some(&old_token), 1, "plain").await;
+        assert!(bound.ack().accepted, "{}", bound.reply);
+        let old_anchor = registry.input_mode_store(&old).unwrap().anchor();
+        assert!(old_anchor.is_some());
+
+        let new = registry
+            .respawn_agent_for_pane(PANE, MODE_SHELL)
+            .await
+            .expect("restart the pane");
+        assert_ne!(new, old);
+        let token = registry.hook_token_of(&new).expect("the new token");
+        let store = registry.input_mode_store(&new).unwrap();
+        assert!(store.observer().is_none() && store.anchor().is_none());
+        assert_eq!(
+            registry.release_capture(&new).unwrap().0,
+            ScanLatch::Pending
+        );
+        let stale = deck.report(&new, PANE, Some(&old_token), 2, "plain").await;
+        assert!(!stale.ack().accepted, "{}", stale.reply);
+        let store = registry.input_mode_store(&new).unwrap();
+        assert!(store.observer().is_none() && store.latest().is_none());
+        let fresh = deck.report(&new, PANE, Some(&token), 1, "plain").await;
+        assert!(fresh.ack().accepted, "{}", fresh.reply);
+        let store = registry.input_mode_store(&new).unwrap();
+        assert_eq!(store.observer().map(|o| o.pid), Some(fresh.pid));
+        assert_ne!(store.anchor(), old_anchor);
+        assert!(store.anchor().is_some());
+        deck.deck.handle.abort();
         registry.shutdown_all();
     }
 

@@ -2403,6 +2403,38 @@ pub struct RingEvidence {
     pub shape: crate::event::PromptShape,
 }
 
+/// PRD #1666 part 3, round 5-wake: the process-table and clock reads
+/// [`AgentPtyRegistry::accept_input_mode`] makes, injectable so a test can
+/// stand in a reused pid, another session or another time namespace.
+pub struct InputModeLookups {
+    pub session_of: fn(u32) -> Option<u32>,
+    pub started: fn(u32) -> Option<u64>,
+    pub own_namespace: fn() -> crate::input_mode::NamespaceRead,
+    pub namespace_of: fn(u32) -> crate::input_mode::NamespaceRead,
+    pub now: fn() -> Option<u64>,
+}
+
+impl InputModeLookups {
+    /// This platform's: Linux reads time namespaces; macOS has none, so both
+    /// reads answer "absent" and the check passes.
+    pub const PLATFORM: Self = Self {
+        session_of: crate::platform::proc::session_of,
+        started: crate::platform::proc::process_start_of,
+        #[cfg(target_os = "linux")]
+        own_namespace: || crate::input_mode::own_time_namespace().clone(),
+        #[cfg(not(target_os = "linux"))]
+        own_namespace: || crate::input_mode::NamespaceRead::NotFound,
+        #[cfg(target_os = "linux")]
+        namespace_of: |pid| crate::input_mode::read_time_namespace(Some(pid)),
+        #[cfg(not(target_os = "linux"))]
+        namespace_of: |_| crate::input_mode::NamespaceRead::NotFound,
+        #[cfg(unix)]
+        now: crate::input_mode::monotonic_ns,
+        #[cfg(not(unix))]
+        now: || None,
+    };
+}
+
 /// How many ring evidence reports a pane's channel holds for a slow reader.
 const RING_EVIDENCE_CAPACITY: usize = 16;
 
@@ -2966,6 +2998,9 @@ pub struct RunningAgent {
     pub bus: Arc<AgentBus>,
     /// PRD #1666 part 3, round 5-wake: what the deck started in the pane.
     pub child_role: ChildRole,
+    /// PRD #1666 part 3, round 5-wake (plan §1.3): the generation's
+    /// input-mode evidence, from its wrapper's reports.
+    pub input_mode: Arc<Mutex<crate::input_mode::InputModeStore>>,
     /// PRD #1666 part 3, round 5-wake (plan §2.1′): every human operation on
     /// this generation's input, from arrival until its bytes are done with
     /// the PTY. Closed when the generation retires.
@@ -10352,6 +10387,94 @@ impl AgentPtyRegistry {
         inner.agents.get(agent_id).map(|agent| agent.bus.release())
     }
 
+    /// PRD #1666 part 3, round 5-wake (plan §1.3): store a wrapper's input-mode
+    /// sample for `agent_id`, the generation the report's token attests, from
+    /// `peer`, the process at the other end of the connection. Accepted only
+    /// from a peer in the session the generation's PTY child leads (the
+    /// wrapper's; the agent and anything it starts are in sessions of their
+    /// own), on the daemon's clock (Linux: the same time namespace), and then
+    /// as [`crate::input_mode::InputModeStore::accept`] decides.
+    pub fn accept_input_mode(
+        &self,
+        agent_id: &str,
+        peer: crate::input_mode::Observer,
+        sample: crate::input_mode::ModeSample,
+    ) -> Result<crate::input_mode::Stored, &'static str> {
+        self.accept_input_mode_with(agent_id, peer, sample, &InputModeLookups::PLATFORM)
+    }
+
+    /// [`Self::accept_input_mode`] with the process lookups injected.
+    pub(crate) fn accept_input_mode_with(
+        &self,
+        agent_id: &str,
+        peer: crate::input_mode::Observer,
+        sample: crate::input_mode::ModeSample,
+        lookups: &InputModeLookups,
+    ) -> Result<crate::input_mode::Stored, &'static str> {
+        let (leader, store) = {
+            let inner = self.inner.lock();
+            let agent = inner.agents.get(agent_id).ok_or("unknown_generation")?;
+            (agent.child.process_id(), Arc::clone(&agent.input_mode))
+        };
+        let leader = leader.ok_or("peer_session")?;
+        if (lookups.session_of)(peer.pid) != Some(leader) {
+            tracing::debug!(target: "pane_input_mode", agent_id, peer = peer.pid, "pane input mode refused: peer_session");
+            return Err("peer_session");
+        }
+        if (lookups.started)(peer.pid) != Some(peer.start) {
+            return Err("peer_gone");
+        }
+        if let Err(clause) = crate::input_mode::namespace_verdict(
+            &(lookups.own_namespace)(),
+            &(lookups.namespace_of)(peer.pid),
+        ) {
+            store.lock().unwrap().hold(clause);
+            tracing::info!(target: "pane_input_mode", agent_id, peer = peer.pid, refusal = clause.as_str(), "pane input mode refused");
+            return Err(clause.as_str());
+        }
+        let now = (lookups.now)().ok_or("clock_unreadable")?;
+        let mut store = store.lock().unwrap();
+        let first_anchor = store.anchor().is_none();
+        let stored = store.accept(peer, sample, now).map_err(|refusal| {
+            tracing::info!(
+                target: "pane_input_mode",
+                agent_id,
+                peer = peer.pid,
+                peer_start = peer.start,
+                refusal = refusal.code(),
+                conflict = ?store.conflict(),
+                "pane input mode refused"
+            );
+            refusal.code()
+        })?;
+        if first_anchor && let Some(anchor) = store.anchor() {
+            tracing::info!(target: "pane_input_mode", agent_id, anchor, "pane input mode settle anchor");
+        }
+        tracing::debug!(
+            target: "pane_input_mode",
+            agent_id,
+            observer = peer.pid,
+            observer_start = peer.start,
+            seq = sample.seq,
+            icanon = sample.icanon,
+            echo = sample.echo,
+            stored = ?stored,
+            duplicates = store.duplicates,
+            regressions = store.regressions,
+            "pane input mode"
+        );
+        Ok(stored)
+    }
+
+    /// `agent_id`'s input-mode evidence, while it is in the registry.
+    pub fn input_mode_store(&self, agent_id: &str) -> Option<crate::input_mode::InputModeStore> {
+        let inner = self.inner.lock();
+        inner
+            .agents
+            .get(agent_id)
+            .map(|agent| agent.input_mode.lock().unwrap().clone())
+    }
+
     /// PRD #1666 part 3, round 5-wake (plan §2.3): subscribe to `pane_id`'s
     /// ring evidence; a doorbell transaction waits on it for its token.
     pub fn subscribe_doorbell_evidence(&self, pane_id: &str) -> broadcast::Receiver<RingEvidence> {
@@ -11572,6 +11695,7 @@ impl AgentPtyRegistry {
             pane_retired,
             bus,
             child_role,
+            input_mode: Arc::default(),
             ingress: crate::ingress_ledger::IngressLedger::new(),
             pane_id_env,
             display_name,
@@ -12567,6 +12691,8 @@ impl AgentPtyRegistry {
             // Closed where the record was removed, above.
             ingress: _,
             child_role: _,
+            // The replacement's evidence starts empty.
+            input_mode: _,
             // PRD #745 M11: deliberately dropped rather than carried over. The
             // fresh child is a fresh spawn, and `spawn_agent` stamps it — which
             // is what makes a restarted worker report its CURRENT iteration
@@ -15350,6 +15476,7 @@ impl AgentPtyRegistry {
                 pane_retired,
                 bus: Arc::new(AgentBus::new()),
                 child_role: ChildRole::PaneCommand,
+                input_mode: Arc::default(),
                 ingress: crate::ingress_ledger::IngressLedger::new(),
                 pane_id_env: pane_id_env.map(str::to_string),
                 display_name: None,
@@ -22609,6 +22736,214 @@ mod spawn_tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(ended_bus.release().1, Some(WindowClose::AgentExit));
+        registry.shutdown_all();
+    }
+
+    /// 051's injected process table: what each lookup answers, per test thread.
+    #[derive(Clone)]
+    struct FakeProcs {
+        session: Option<u32>,
+        started: Option<u64>,
+        own: crate::input_mode::NamespaceRead,
+        peer: crate::input_mode::NamespaceRead,
+    }
+
+    thread_local! {
+        static FAKE_PROCS: std::cell::RefCell<Option<FakeProcs>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    fn fake() -> FakeProcs {
+        FAKE_PROCS.with(|f| f.borrow().clone().expect("fake process table set"))
+    }
+
+    const FAKE_LOOKUPS: InputModeLookups = InputModeLookups {
+        session_of: |_| fake().session,
+        started: |_| fake().started,
+        own_namespace: || fake().own,
+        namespace_of: |_| fake().peer,
+        now: crate::input_mode::monotonic_ns,
+    };
+
+    /// A `cat` generation for 051's unit cases, and its session leader.
+    fn mode_generation(registry: &Arc<AgentPtyRegistry>, pane: &str) -> (String, u32) {
+        let (id, _) = ledger_pane(registry, pane);
+        let leader = registry.inner.lock().agents[&id]
+            .child
+            .process_id()
+            .expect("the child's pid");
+        (id, leader)
+    }
+
+    fn fresh_raw(seq: u64) -> crate::input_mode::ModeSample {
+        let at = crate::input_mode::monotonic_ns().unwrap();
+        crate::input_mode::ModeSample {
+            seq,
+            icanon: false,
+            echo: false,
+            sampled_mono_ns: at,
+            sample_done_mono_ns: at + 1,
+        }
+    }
+
+    fn set_fake(procs: FakeProcs) {
+        FAKE_PROCS.with(|f| *f.borrow_mut() = Some(procs));
+    }
+
+    /// Scenario: With the process table injected, a report binds a generation to a process, and then the same pid reports with a different start time, as a reused pid would; on another generation, the reporting process's start time cannot be read. The reused pid is a second observer, so the generation is held as `input_mode_conflict` and never treated as the bound process; the unreadable start time is refused and stores nothing.
+    #[spec("inbox/doorbell/051")]
+    #[tokio::test]
+    async fn doorbell_051_an_observer_is_its_pid_and_start_time() {
+        use crate::input_mode::{ModeClause, NamespaceRead, Observer};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (id, leader) = mode_generation(&registry, "pane-mode-reuse");
+        let first = Observer {
+            pid: 4242,
+            start: 100,
+        };
+        let procs = FakeProcs {
+            session: Some(leader),
+            started: Some(100),
+            own: NamespaceRead::NotFound,
+            peer: NamespaceRead::NotFound,
+        };
+        set_fake(procs.clone());
+        assert!(
+            registry
+                .accept_input_mode_with(&id, first, fresh_raw(1), &FAKE_LOOKUPS)
+                .is_ok()
+        );
+        let reused = Observer {
+            pid: 4242,
+            start: 200,
+        };
+        set_fake(FakeProcs {
+            started: Some(200),
+            ..procs.clone()
+        });
+        assert_eq!(
+            registry.accept_input_mode_with(&id, reused, fresh_raw(2), &FAKE_LOOKUPS),
+            Err("input_mode_conflict")
+        );
+        let store = registry.input_mode_store(&id).unwrap();
+        assert_eq!(store.conflict(), Some((first, reused)));
+        assert_eq!(store.sticky(), Some(ModeClause::Conflict));
+        assert_eq!(store.latest().map(|s| s.seq), Some(1));
+
+        let (other, leader) = mode_generation(&registry, "pane-mode-unreadable");
+        set_fake(FakeProcs {
+            session: Some(leader),
+            started: None,
+            ..procs
+        });
+        assert!(
+            registry
+                .accept_input_mode_with(&other, first, fresh_raw(1), &FAKE_LOOKUPS)
+                .is_err()
+        );
+        let store = registry.input_mode_store(&other).unwrap();
+        assert!(store.observer().is_none() && store.latest().is_none());
+        registry.shutdown_all();
+    }
+
+    /// Scenario: With the time-namespace links injected, reports reach fresh generations from a peer in another namespace, with no namespaces on either side, with the daemon's own link unreadable, and with the daemon's link present while the peer's read fails with no such file, no such process and permission denied. Only the no-namespaces case is stored; another namespace and each failed peer read are refused as `clock_namespace`, an unreadable own link refuses every report as `clock_namespace_unreadable`, and a generation refused for its clock stays refused when a later report's namespace matches.
+    #[spec("inbox/doorbell/051")]
+    #[tokio::test]
+    async fn doorbell_051_a_peer_must_share_the_daemons_clock() {
+        use crate::input_mode::{ModeClause, NamespaceRead, Observer};
+        let peer = Observer {
+            pid: 4242,
+            start: 100,
+        };
+        let link = |n: &str| NamespaceRead::Link(std::path::PathBuf::from(format!("time:[{n}]")));
+        let os = |code| NamespaceRead::of(Err(std::io::Error::from_raw_os_error(code)));
+        assert_eq!(os(libc::ENOENT), NamespaceRead::NotFound);
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let cases = [
+            (
+                "another namespace",
+                link("1"),
+                link("2"),
+                Err("clock_namespace"),
+            ),
+            (
+                "no namespaces",
+                NamespaceRead::NotFound,
+                NamespaceRead::NotFound,
+                Ok(()),
+            ),
+            ("the same namespace", link("1"), link("1"), Ok(())),
+            (
+                "own link unreadable",
+                os(libc::EACCES),
+                NamespaceRead::NotFound,
+                Err("clock_namespace_unreadable"),
+            ),
+            (
+                "own link unreadable, peer's present",
+                os(libc::EACCES),
+                link("1"),
+                Err("clock_namespace_unreadable"),
+            ),
+            (
+                "peer's link absent",
+                link("1"),
+                os(libc::ENOENT),
+                Err("clock_namespace"),
+            ),
+            (
+                "peer gone",
+                link("1"),
+                os(libc::ESRCH),
+                Err("clock_namespace"),
+            ),
+            (
+                "peer's link denied",
+                link("1"),
+                os(libc::EACCES),
+                Err("clock_namespace"),
+            ),
+        ];
+        for (i, (what, own, peer_ns, want)) in cases.into_iter().enumerate() {
+            let (id, leader) = mode_generation(&registry, &format!("pane-mode-ns-{i}"));
+            set_fake(FakeProcs {
+                session: Some(leader),
+                started: Some(100),
+                own: own.clone(),
+                peer: peer_ns,
+            });
+            let got = registry
+                .accept_input_mode_with(&id, peer, fresh_raw(1), &FAKE_LOOKUPS)
+                .map(|_| ());
+            assert_eq!(got, want, "{what}");
+            let store = registry.input_mode_store(&id).unwrap();
+            match want {
+                Ok(()) => assert_eq!(store.observer(), Some(peer), "{what}"),
+                Err(clause) => {
+                    assert!(store.latest().is_none(), "{what}");
+                    assert_eq!(
+                        store.sticky().map(ModeClause::as_str),
+                        Some(clause),
+                        "{what}"
+                    );
+                    // Held for the generation: a matching namespace later
+                    // does not lift it.
+                    set_fake(FakeProcs {
+                        session: Some(leader),
+                        started: Some(100),
+                        own: NamespaceRead::NotFound,
+                        peer: NamespaceRead::NotFound,
+                    });
+                    assert_eq!(
+                        registry
+                            .accept_input_mode_with(&id, peer, fresh_raw(2), &FAKE_LOOKUPS)
+                            .map(|_| ()),
+                        Err(clause),
+                        "{what}: held"
+                    );
+                }
+            }
+        }
         registry.shutdown_all();
     }
 

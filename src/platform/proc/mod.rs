@@ -162,6 +162,21 @@ pub use windows::{
     terminate_child_with_grace_and_wait, terminate_pid,
 };
 
+/// PRD #1666 part 3, round 5-wake (plan §1.3): the session process `pid`
+/// belongs to (`getsid(2)`), or `None` when it cannot be read (no such
+/// process, or a platform without sessions).
+#[cfg(unix)]
+pub fn session_of(pid: u32) -> Option<u32> {
+    let pid = i32::try_from(pid).ok()?;
+    // SAFETY: `getsid(2)` has no side effects and only reads the process table.
+    let sid = unsafe { libc::getsid(pid) };
+    u32::try_from(sid).ok()
+}
+#[cfg(windows)]
+pub fn session_of(_pid: u32) -> Option<u32> {
+    None
+}
+
 /// R2-fix4 (U2): the parent a placement walk follows ([`ancestry_with`]).
 /// [`parent_pid_of`] itself on Unix; on Windows `None`, not `Some(0)`, for a
 /// recorded parent that cannot be opened or whose pid was reused.

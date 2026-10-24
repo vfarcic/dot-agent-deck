@@ -9853,6 +9853,20 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** a transaction matching the token to its attempt, or the latch's late-evidence cases (the transaction's commits).
 - **Platform coverage:** mac+linux.
 
+##### inbox/doorbell/048 — A generation's input-mode evidence counts only a fresh sample, from its one observer, with both bits clear.
+- **Layer:** Fast (`tests/doorbell_input_mode_store.rs`), pure (`src/input_mode.rs`).
+- **Agent:** none.
+- **Asserts:** only a sample with canonical input and echo both off is usable, either bit set reading `input_mode_cooked` and no report at all `input_mode_unverified`; a sample counts for the age bound from the stamp taken before its read, however recently it arrived and however recent the stamp after the read, and reads `input_mode_stale` past it; a newer cooked sample delivered behind an older raw one wins once stored; a repeated or lower sequence number is counted and refreshes nothing; a sample whose stamps are out of order or further apart than the bound is refused as `wide_sample` and binds nobody; a stamp later than the daemon's clock is a clock mismatch that holds the generation as `clock_namespace`; the settle anchor is the first raw sample's after-read stamp, set once; a second observer is a conflict naming both and holds the generation as `input_mode_conflict`, refusing even the bound observer afterwards.
+- **Does not assert:** an admission or a transaction reading the evidence (`Unresolved(mode_changed)`), which arrives with activation.
+- **Platform coverage:** mac+linux.
+
+##### inbox/doorbell/051 — Only the generation's own wrapper, on the daemon's clock, may report its input mode.
+- **Layer:** Fast (`src/daemon.rs`, `hook_provenance_audit_tests`, the real hook socket with helper processes started from a pane's shell; `src/agent_pty.rs`, `spawn_tests`, a real `cat` generation with the process table and time-namespace links injected).
+- **Agent:** none (a shell in the pane and helper processes that each send one report).
+- **Asserts:** the first helper in the pane's session to report with the generation's token binds its evidence and sets the settle anchor; a second helper in that session is refused as `input_mode_conflict`, the store records both and holds the conflict, refusing the first helper's next report too. A line shaped like a report printed in the pane's output, a helper in a session of its own, a report with no token, one with another pane's token and one whose process exited before its line was read each leave the store empty, and a proper report afterwards binds. After a restart the new generation starts with an empty store and no release latched, the old generation's token is refused, and a helper in the new session binds it with its own anchor. A reused pid with another start time is a second observer, never the bound one; an unreadable start time stores nothing. A peer in another time namespace, or whose namespace link cannot be read while the daemon's exists, is refused as `clock_namespace`; with no namespaces on either side a report is stored; an unreadable own link refuses every report as `clock_namespace_unreadable`; and a generation refused for its clock stays refused.
+- **Does not assert:** the card's `cannot_type` or typed bytes for a held generation (activation), or the wrapper's sending side (`inbox/doorbell/052`, `054`).
+- **Platform coverage:** mac+linux (the time-namespace cases run on both through injected links; the real links are read on Linux only).
+
 ##### inbox/doorbell/053 — The activation table decides each release from its record, rule by rule.
 - **Layer:** Fast (`tests/doorbell_activation_table.rs`), pure (`src/doorbell_activation.rs`).
 - **Agent:** none.

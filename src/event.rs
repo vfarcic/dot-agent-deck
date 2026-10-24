@@ -1662,6 +1662,13 @@ pub enum DaemonMessage {
     /// connection, which then carries the mutation.
     #[serde(rename = "hook_capabilities")]
     HookCapabilities(HookCapabilitiesRequest),
+    /// PRD #1666 part 3, round 5-wake (plan §1.3): a wrapper's sample of its
+    /// agent's line discipline, sent only on a connection whose daemon
+    /// answered `input_mode_report` on that same connection. The daemon
+    /// stores it in the generation's input-mode evidence and nothing else, and
+    /// answers one [`SignalAck`].
+    #[serde(rename = "input_mode")]
+    InputMode(InputModeReport),
     /// PRD #1666 part 3, round 5 (plan D1): a task-scoped `work-done`,
     /// answered with a [`WorkDoneTaskReply`] once the deck kept the report.
     #[serde(rename = "work_done_task")]
@@ -1822,6 +1829,7 @@ impl DaemonMessage {
             DaemonMessage::Delegate(s) => &s.pane_id,
             DaemonMessage::WorkDone(s) => &s.pane_id,
             DaemonMessage::HookCapabilities(r) => &r.pane_id,
+            DaemonMessage::InputMode(r) => &r.pane_id,
             DaemonMessage::WorkDoneTask(r) => &r.pane_id,
             DaemonMessage::GetSeed(r) => &r.pane_id,
             DaemonMessage::Dispatch(s) => &s.pane_id,
@@ -1851,6 +1859,7 @@ impl DaemonMessage {
             DaemonMessage::Delegate(s) => s.token.as_deref(),
             DaemonMessage::WorkDone(s) => s.token.as_deref(),
             DaemonMessage::HookCapabilities(r) => r.token.as_deref(),
+            DaemonMessage::InputMode(r) => r.token.as_deref(),
             DaemonMessage::WorkDoneTask(r) => r.token.as_deref(),
             DaemonMessage::GetSeed(r) => r.token.as_deref(),
             DaemonMessage::Dispatch(s) => s.token.as_deref(),
@@ -1891,6 +1900,7 @@ impl DaemonMessage {
             | DaemonMessage::InboxOffer(_)
             | DaemonMessage::InboxComplete(_)
             | DaemonMessage::InboxRelease(_)
+            | DaemonMessage::InputMode(_)
             | DaemonMessage::Ack(_) => true,
             DaemonMessage::Delegate(_)
             | DaemonMessage::WorkDone(_)
@@ -1932,6 +1942,7 @@ impl DaemonMessage {
             | DaemonMessage::RestartRole(_)
             | DaemonMessage::SpawnRole(_)
             | DaemonMessage::Ack(_)
+            | DaemonMessage::InputMode(_)
             | DaemonMessage::Question(_) => None,
         };
         claimed.filter(|id| !id.is_empty())
@@ -1944,6 +1955,7 @@ impl DaemonMessage {
             DaemonMessage::Delegate(_) => "delegate",
             DaemonMessage::WorkDone(_) => "work_done",
             DaemonMessage::HookCapabilities(_) => "hook_capabilities",
+            DaemonMessage::InputMode(_) => "input_mode",
             DaemonMessage::WorkDoneTask(_) => "work_done_task",
             DaemonMessage::GetSeed(_) => "get_seed",
             DaemonMessage::Dispatch(_) => "dispatch",
@@ -2012,6 +2024,7 @@ impl DaemonMessage {
             // the sender withholds its mutation and says why.
             DaemonMessage::HookCapabilities(_) => serde_json::to_string(&HookCapabilitiesReply {
                 task_scoped_completion: None,
+                input_mode_report: None,
                 code: Some(reason.to_string()),
                 message: Some(message.to_string()),
             }),
@@ -2021,6 +2034,7 @@ impl DaemonMessage {
             DaemonMessage::WorkDone(_)
             | DaemonMessage::Dispatch(_)
             | DaemonMessage::Ack(_)
+            | DaemonMessage::InputMode(_)
             | DaemonMessage::InboxAnnounce(_) => {
                 serde_json::to_string(&SignalAck::refused(reason, message))
             }
@@ -2089,6 +2103,7 @@ impl DaemonMessage {
             DaemonMessage::Dispatch(_) => serde_json::to_string(&SignalAck::accepted()).ok(),
             DaemonMessage::WorkDone(_)
             | DaemonMessage::HookCapabilities(_)
+            | DaemonMessage::InputMode(_)
             | DaemonMessage::WorkDoneTask(_)
             | DaemonMessage::Delegate(_)
             | DaemonMessage::RestartRole(_)
@@ -4211,6 +4226,21 @@ pub struct HookCapabilitiesRequest {
     pub token: Option<String>,
 }
 
+/// PRD #1666 part 3, round 5-wake (plan §1.3): a wrapper's sample of the line
+/// discipline of the PTY its agent reads. None of an `AgentEvent`'s required
+/// fields, so a daemon that does not know the verb cannot take it for one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputModeReport {
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    pub seq: u64,
+    pub icanon: bool,
+    pub echo: bool,
+    pub sampled_mono_ns: u64,
+    pub sample_done_mono_ns: u64,
+}
+
 /// The answer to a [`HookCapabilitiesRequest`]. Additive: a field a sender
 /// does not know is ignored, and one it needs but is absent reads as "not
 /// served".
@@ -4218,6 +4248,12 @@ pub struct HookCapabilitiesRequest {
 pub struct HookCapabilitiesReply {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_scoped_completion: Option<u32>,
+    /// PRD #1666 part 3, round 5-wake (plan §1.3): this daemon stores
+    /// `input_mode` reports ([`crate::input_mode::INPUT_MODE_REPORT`]). A
+    /// wrapper sends them only to a daemon that answered this on the same
+    /// connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_mode_report: Option<u32>,
     /// On a refusal (the provenance gate), its stable code and sentence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
