@@ -86,8 +86,7 @@ mod tests {
     /// did not match — `build-windows` runs `cargo nextest run --workspace`, so
     /// this was load bearing rather than theoretical. The root `.gitattributes`
     /// now checks text out with LF everywhere; the normalisation stays as
-    /// defense in depth, for a clone made before that attribute landed, as
-    /// `issue_labeler_memory.rs` and `issue_labeler_policy.rs` keep theirs.
+    /// defense in depth, for a clone made before that attribute landed.
     fn read_lf(path: &Path) -> String {
         std::fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))

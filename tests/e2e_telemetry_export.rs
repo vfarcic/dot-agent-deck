@@ -415,7 +415,7 @@ fn telemetry_otlp_002_exports_run_and_status_intervals() {
             assert_eq!(attribute(resource, "service.name"), "dot-agent-deck");
             assert!(!attribute(resource, "service.version").is_empty());
             assert!(!attribute(resource, "host.name").is_empty());
-            assert_eq!(attribute(resource, "deck.telemetry.schema_version"), "1");
+            assert_eq!(attribute(resource, "deck.telemetry.schema_version"), "2");
         }
     }
 }
@@ -1019,7 +1019,7 @@ fn telemetry_otlp_012_daemon_shutdown_flushes_open_run() {
     );
 }
 
-/// Scenario: Send shell-tool start/end hooks for ordinary, wrapped, sandboxed and private commands to a stand-in pane, including assignments whose values hold a path, comments, command substitutions and variable expansions before the program, and shell reserved words or `eval` whose operand is a sentinel, in both the shell-split and Codex's joined-argv form, plus a non-shell tool. Close the pane and inspect completed operation spans: plain commands carry safe program/word metadata, commands with other shell syntax before their first word, or shell grammar as their program, carry neither, and no request body holds a sentinel, private or raw command text, alongside parent identity, duration and count.
+/// Scenario: Send shell-tool start/end hooks for ordinary, chained, wrapped, sandboxed and private commands to a stand-in pane, including assignments whose values hold a path, comments, command substitutions and variable expansions before the program, and shell reserved words or `eval` whose operand is a sentinel, in both the shell-split and Codex's joined-argv form, plus a non-shell tool. Close the pane and inspect completed operation spans: plain commands carry safe program/word metadata, a chain names each command up to the first that declines and a listed wrapper names the command it runs, commands with other shell syntax before their first word, or shell grammar as their program, carry neither, and no request body holds a sentinel, private or raw command text, alongside parent identity, duration and count.
 #[spec("telemetry/otlp/014")]
 #[test]
 fn telemetry_otlp_014_shell_operations_classify_without_content() {
@@ -1127,15 +1127,113 @@ fn telemetry_otlp_014_shell_operations_classify_without_content() {
             "",
         ),
     ];
+    // Chained and wrapped lines: (command, program, word, commands, wrapped
+    // program, wrapped word).
+    let described_cases = [
+        (
+            "cargo fmt && cargo xtask affected-checks --run",
+            "cargo",
+            "fmt",
+            "cargo fmt,cargo xtask",
+            "",
+            "",
+        ),
+        (
+            "cd /tmp/x && cargo test 2>&1 | tail -n 5",
+            "cargo",
+            "test",
+            "cargo test,tail",
+            "",
+            "",
+        ),
+        (
+            "make ci && git commit -m 'PRIVATE_MESSAGE_1741; hunter2 run' && git push",
+            "make",
+            "ci",
+            "make ci,git commit,git push",
+            "",
+            "",
+        ),
+        (
+            "make ci && X=$(cat /x/sentinelvalue1741) cargo test && git push",
+            "make",
+            "ci",
+            "make ci",
+            "",
+            "",
+        ),
+        (
+            "timeout 600 cargo test",
+            "timeout",
+            "600",
+            "timeout 600",
+            "cargo",
+            "test",
+        ),
+        (
+            "kubectl exec PRIVATE_POD_1741 -- cat /x/sentinelvalue1741",
+            "kubectl",
+            "exec",
+            "kubectl exec",
+            "cat",
+            "",
+        ),
+        (
+            "rwx sandbox exec -- cargo build",
+            "rwx",
+            "sandbox",
+            "rwx sandbox",
+            "",
+            "",
+        ),
+    ];
+    let one_command = |program: &str, word: &str| match (program, word) {
+        ("", _) => String::new(),
+        (program, "") => program.to_string(),
+        (program, word) => format!("{program} {word}"),
+    };
     let all_cases: Vec<_> = cases
         .iter()
-        .map(|case| ("Bash", case))
-        .chain(joined_cases.iter().map(|case| ("shell", case)))
+        .map(|&(command, program, word)| {
+            (
+                "Bash",
+                command,
+                program,
+                word,
+                one_command(program, word),
+                "",
+                "",
+            )
+        })
+        .chain(joined_cases.iter().map(|&(command, program, word)| {
+            (
+                "shell",
+                command,
+                program,
+                word,
+                one_command(program, word),
+                "",
+                "",
+            )
+        }))
+        .chain(described_cases.iter().map(
+            |&(command, program, word, commands, wrapped_program, wrapped_word)| {
+                (
+                    "Bash",
+                    command,
+                    program,
+                    word,
+                    commands.to_string(),
+                    wrapped_program,
+                    wrapped_word,
+                )
+            },
+        ))
         .collect();
     for (tool, command) in std::iter::once(("Read", "PRIVATE_NON_SHELL_1741")).chain(
         all_cases
             .iter()
-            .map(|(tool, (command, ..))| (*tool, *command)),
+            .map(|(tool, command, ..)| (*tool, *command)),
     ) {
         for (kind, expected) in [
             ("tool_start", EventType::ToolStart),
@@ -1176,18 +1274,37 @@ fn telemetry_otlp_014_shell_operations_classify_without_content() {
             (
                 attribute(span, "deck.operation.program"),
                 attribute(span, "deck.operation.word"),
+                attribute(span, "deck.operation.commands"),
+                attribute(span, "deck.operation.wrapped.program"),
+                attribute(span, "deck.operation.wrapped.word"),
             )
         })
         .collect();
     let mut expected: Vec<_> = all_cases
         .iter()
-        .map(|(_, (_, program, word))| (program.to_string(), word.to_string()))
+        .map(
+            |(_, _, program, word, commands, wrapped_program, wrapped_word)| {
+                (
+                    program.to_string(),
+                    word.to_string(),
+                    commands.clone(),
+                    wrapped_program.to_string(),
+                    wrapped_word.to_string(),
+                )
+            },
+        )
         .collect();
     actual.sort();
     expected.sort();
     assert_eq!(actual, expected, "operation classification");
     for operation in &operations {
-        for key in ["deck.operation.program", "deck.operation.word"] {
+        for key in [
+            "deck.operation.program",
+            "deck.operation.word",
+            "deck.operation.commands",
+            "deck.operation.wrapped.program",
+            "deck.operation.wrapped.word",
+        ] {
             if attribute(operation, key).is_empty() {
                 assert!(
                     !operation["attributes"]
@@ -1224,10 +1341,11 @@ fn telemetry_otlp_014_shell_operations_classify_without_content() {
             "/tmp/x",
             "Weird Name",
             "sentinelvalue",
+            "hunter2",
         ] {
             assert!(!body.contains(secret), "operation content leaked: {secret}");
         }
-        for (_, (command, ..)) in &all_cases {
+        for (_, command, ..) in &all_cases {
             assert!(!body.contains(command), "raw command leaked: {command}");
         }
     }

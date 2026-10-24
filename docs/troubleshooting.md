@@ -311,6 +311,8 @@ codex --sandbox workspace-write --ask-for-approval never -c "sandbox_workspace_w
 
 The `-c "sandbox_workspace_write.network_access=true"` override is the part that matters. See [Orchestration](orchestration.md) for role definitions.
 
+If a Codex role sits at Codex's "a new version is available" prompt and never takes its task, add `-c check_for_update_on_startup=false` to its `command` in `.dot-agent-deck.toml` (the terminal UI and the desktop app both start the role from that `command`), which stops Codex asking at startup. Upgrade Codex yourself instead, for example with `npm install -g @openai/codex@latest`.
+
 ### Manual Management
 
 `hooks install` and `hooks uninstall` take `--agent` with one of `claude-code` (the default), `opencode`, `codex` or `devin`:

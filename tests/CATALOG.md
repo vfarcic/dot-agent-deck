@@ -14,7 +14,7 @@ This is the authoritative list of test cases the harness must cover. IDs are sta
 
 Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows once the harness's Windows path is ready per Decision 4); **mac+linux+windows** = portable from day one.
 
-Tier vocabulary (issue #502, CLAUDE.md rule 5): L1 tests run in the fast tier, `cargo test-fast`. L2 tests are split by whether they reach a **real agent** — **lane 1** is the credential-free `tests/e2e_*.rs` files, `cargo test-e2e`, which CI runs on every PR; **lane-2** entries below are in a file gated `#![cfg(all(feature = "e2e", feature = "e2e-live"))]`, run by `cargo test-e2e-live`, which **runs on a developer's machine and nowhere in CI** — no e2e test reaches a real agent on a runner, and no test credential is registered on this repository (the separately credentialed Codex issue-labeler is out of scope; see [`docs/develop/issue-labeling.md`](../docs/develop/issue-labeling.md)). Lane 2 is where the real-agent tests live and it is flaky-tolerant. Nothing here is a "pre-PR" tier any more — that obligation was removed with #502 — but this catalog is how you find the tests that cover what you changed, which rule 5 still requires you to run and to name. See [`docs/develop/e2e-lanes.md`](../docs/develop/e2e-lanes.md), and note that a lane-2 test whose preflight cannot be satisfied SKIPS and is counted as a pass.
+Tier vocabulary (issue #502, CLAUDE.md rule 5): L1 tests run in the fast tier, `cargo test-fast`. L2 tests are split by whether they reach a **real agent** — **lane 1** is the credential-free `tests/e2e_*.rs` files, `cargo test-e2e`, which CI runs on every PR; **lane-2** entries below are in a file gated `#![cfg(all(feature = "e2e", feature = "e2e-live"))]`, run by `cargo test-e2e-live`, which **runs on a developer's machine and nowhere in CI** — no e2e test reaches a real agent on a runner, and no test credential is registered on this repository (the separately credentialed agent PR reviewer is out of scope; see [`docs/develop/governance.md`](../docs/develop/governance.md#the-automated-reviewer)). Lane 2 is where the real-agent tests live and it is flaky-tolerant. Nothing here is a "pre-PR" tier any more — that obligation was removed with #502 — but this catalog is how you find the tests that cover what you changed, which rule 5 still requires you to run and to name. See [`docs/develop/e2e-lanes.md`](../docs/develop/e2e-lanes.md), and note that a lane-2 test whose preflight cannot be satisfied SKIPS and is counted as a pass.
 
 Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> — <headline>` line opts that test into the PRD #180 demo reel (`.claude/skills/demo-reel-adapter`). Eligibility is **opt-in** — the default (no marker) is *not* eligible even for a PTY-attached test that records a cast. Mark a test only if it validates the feature **as a user actually runs and sees it** — a real agent genuinely spinning up (spawn → agent → work) — never a synthetic/stand-in test (`cat`, scripted echo, recorder stubs, terminal-probe, or synthesized hook events). The adapter includes a marked test in the reel only when it *also* has a cast and its source changed on the branch.
 
@@ -116,7 +116,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### telemetry/otlp/014 — Shell operation metadata classifies safe command shapes without exporting content.
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
 - **Agent:** shell/cat stand-in with synthetic shell-tool and Read hooks.
-- **Asserts:** program/word classification of plain commands, assignments/prefixes/segments, program shape filtering and conditional word filtering, the word deny-list, first-line handling, neither program nor word for comments, command substitutions and variable expansions before the first word, or a shell reserved word or `eval` as the program, on both the Bash and Codex `shell` paths, child identity/duration/count and absence of sentinel, private and raw command text from captured bodies.
+- **Asserts:** program/word classification of plain commands, assignments/prefixes/segments, the commands of a chained line up to the first that declines, the command a listed wrapper runs and no wrapped command for an unlisted one, program shape filtering and conditional word filtering, the word deny-list, first-line handling, neither program nor word for comments, command substitutions and variable expansions before the first word, or a shell reserved word or `eval` as the program, on both the Bash and Codex `shell` paths, child identity/duration/count and absence of sentinel, private and raw command text from captured bodies.
 - **Does not assert:** native hook availability for each agent or nested shell grammar.
 - **Platform coverage:** mac+linux.
 
@@ -2585,6 +2585,24 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Agent:** none — the pane runs a byte recorder (`stty raw -echo; exec cat -u > keys.log`), because the subject is the bytes the deck forwards, not what an agent does with them. What each of the five supported agents does with those bytes was measured by hand and is in `docs/develop/desktop-gui.md` ("Keys in an agent's terminal").
 - **Asserts:** writing to the deck's PTY the encoding a terminal emits for each key — CSI u for Ctrl+Backspace and the Super/Cmd chords, the xterm modifier form for the rest — the recorder receives ETB for Ctrl+Backspace, `ESC d` for Ctrl+Delete and Alt/Option+Delete, `ESC[1;3D` / `ESC[1;3C` for Alt/Option+Left/Right, and SOH / ENQ / NAK for Super/Cmd+Left / Right / Backspace, which is what the desktop sends; and, unchanged, Home, End, Ctrl+Left/Right, Alt+Backspace, Shift+Enter, Ctrl+Enter, Ctrl+/, the bytes a macOS terminal sends for Option+Left/Right (`ESC b` / `ESC f`) and the readline bytes a terminal set up for macOS text editing sends (Ctrl+A, Ctrl+E, Ctrl+U, Ctrl+W, `ESC d`), a legacy terminal's BS, and a bracketed paste's text; BS for Ctrl+Shift+Backspace and `ESC BS` for Ctrl+Alt+Backspace (both CSI u), and Shift+Delete and Home/End with Ctrl, Shift or Alt in their modifier form (`ESC[3;2~`, `ESC[1;5H`…). Then the pane's program turns application cursor mode on (`ESC[?1h`, on a file the test creates): Up, Down, Right, Left, Home and End arrive as `ESC O A`…`ESC O F` whether the terminal typed the CSI or the SS3 form, while Shift+Up, Ctrl+Left, Alt+Right, Ctrl+End and Delete keep their ordinary bytes; after `ESC[?1l` the cursor keys are back to the CSI form. A phase starts only once the recorder has the previous phase's marker, so no key straddles a mode change. The deck must still be in the pane afterwards, so none of those keys was taken by a deck shortcut.
 - **Does not assert:** what a real terminal emits for a physical key (the sequences are injected already encoded, and a terminal may keep a chord, Cmd above all, for itself); what an agent does with the bytes; application cursor mode in a pane other than the focused one, or across a reattach; the desktop side, which is `desktop/src/components/TerminalViewport.keys.test.tsx` and `desktop/e2e/agent-terminal-input.spec.ts`.
+- **Platform coverage:** mac+linux.
+
+### Deck log containment (issues #1791, #1796)
+
+#### logging/containment
+
+##### logging/containment/001 — An explicitly armed test process never opens a deck.log outside its owned root.
+- **Layer:** fast tier (`tests/deck_log_containment.rs`): the real binary's `wrap --agent codex -- /bin/true` with a cleared environment, the containment marker and an explicit owned root.
+- **Agent:** none (`/bin/true` stands in for the wrapped child; `CODEX_HOME` outside the root makes the automatic install log a containment refusal).
+- **Asserts:** with `DOT_AGENT_DECK_LOG` naming a file in a separate directory standing in for the developer's state dir, that file is never created; with the log inside the owned root, the same run writes the refusal there, so the absence is the logger refusing the path and not a run with nothing to log.
+- **Does not assert:** a log inherited from the shell that lies inside an owned root (the temp dir included), which the binary cannot tell apart from a log a test chose; the default debug log, which a test cannot write without touching the shared file (the `config_write_guard` unit test `a_test_process_opens_only_a_log_it_owns` pins its refusal).
+- **Platform coverage:** mac+linux.
+
+##### logging/containment/002 — A process armed only by nextest's environment never opens a deck.log outside every test scratch root.
+- **Layer:** fast tier (`tests/deck_log_containment.rs`): the same wrapper run, armed only by `NEXTEST` and `NEXTEST_RUN_ID`, the way a binary spawned without a cleared environment inherits them.
+- **Agent:** none (`/bin/true`).
+- **Asserts:** a log in cargo's target tmp dir (checked to be outside the private base; the child is handed its own temp dir, so the system one is not among its roots) is never created; a log in the child's temp dir receives the refused install's line.
+- **Does not assert:** that the test runner itself scrubs `DOT_AGENT_DECK_LOG` before `main`; a deck started with a cleared environment and no containment variables, which is not a test process to the binary.
 - **Platform coverage:** mac+linux.
 
 ### Hook delivery
@@ -11738,6 +11756,19 @@ Manual merge gate: opt in with `DOT_AGENT_DECK_INBOX_LOAD_TEST=1` only when sche
 - **Asserts:** 20 messages across genuine spawn seed, idle and a sleep-tool turn are acknowledged and acted on, and the actual inbox list CLI lists each as acknowledged, within a 300-second agent window; a message left queued fails it (until 2026-10-14 a queued message passed, so a run with nothing acknowledged was green). Three busy-loop processes per available CPU run throughout and are killed/reaped using captured children in Drop; PSI load context is emitted on success and failure; vt100 bottom rows contain no stranded doorbell line or message opener after settling.
 - **Does not assert:** Persistence across daemon restart, exact model prose, or load-test execution in normal verification; only the scheduled opt-in run exercises the loaded scenario.
 - **Platform coverage:** mac+linux, local credentials only; never CI.
+
+## Desktop native driver scenarios
+
+These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[spec]` scanner, and run in CI's advisory `desktop-driver` job. `docs/develop/desktop-gui.md` ("The driver tier") describes the harness.
+
+##### desktop/fleet/001 — All Decks shows two real daemons apart, and one stopping is that deck's problem alone.
+
+- **Test:** `desktop/driver/fleet.test.ts`, `fleet_001`.
+- **Layer:** native Tauri/WebKitGTK driver (`tauri-driver` and `WebKitWebDriver` under Xvfb) against two real `daemon serve` processes. The second is reached as a remote deck through the app's own `ssh -N -L` tunnel to a loopback `sshd` the harness runs; the window runs under `nss_wrapper` so the app's strict host-key check reads the sandbox's `known_hosts`.
+- **Agent:** none; one `bash --noprofile --norc` per daemon, started over its attach socket. No credential.
+- **Asserts:** both daemons give their agent the same id (required, not assumed); with All Decks selected the window shows two connected sections, each holding only its own deck's row, with both lamps connected and the deck counter at `2/2`; after the far daemon is stopped, its section stays, reads disconnected with a disconnected lamp and lists no agents, while the local deck keeps exactly its own row and its connected lamp, and the counter reads `1/2`.
+- **Does not assert:** three or more decks, a deck waiting to report, an unconfigured deck-list row, a deck coming back, New agent or a pane on the far deck, or a far deck on another machine; the far deck shares this machine's filesystem, so it says nothing about a window rendering a far host's paths.
+- **Platform coverage:** Linux WebKitGTK only. Needs a system `sshd` (`DAD_DRIVER_SSHD`) and `libnss_wrapper.so` (`DAD_DRIVER_NSS_WRAPPER`); the scenario fails naming whichever is missing.
 
 ## Desktop native network scenarios
 
