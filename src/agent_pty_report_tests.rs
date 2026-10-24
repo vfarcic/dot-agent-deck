@@ -1164,6 +1164,140 @@ async fn work_done_053_a_panicking_save_task_is_settled_by_its_supervisor() {
     assert_eq!(note.destination, Some(Destination::Inbox));
 }
 
+/// The store's own files, by name.
+pub(super) fn store_files(store: &crate::retained_store::RetainedStore) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(store.dir())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|file| file.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// What a restart of `deck` would adopt: its retained tree copied, lock files
+/// unheld, into a fresh state directory that a new store opens. Answers the
+/// new run's adopted names; the copy is removed on return.
+pub(super) fn adopted_after_restart(deck: &Deck) -> Vec<String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    fn copy(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir(to).unwrap();
+        std::fs::set_permissions(to, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).unwrap();
+            }
+        }
+    }
+    deck.store.flush_inventory().unwrap();
+    let root = crate::test_temp::tempdir().unwrap();
+    let state = root.path().join("state");
+    std::fs::create_dir(&state).unwrap();
+    copy(
+        &deck.root.path().join("state").join("retained-reports"),
+        &state.join("retained-reports"),
+    );
+    let next = crate::retained_store::RetainedStore::open(
+        &state,
+        crate::retained_store::StoreConfig::default(),
+        crate::retained_store::Now::current(),
+    );
+    store_files(&next)
+}
+
+/// Scenario: (a) in full: a save task panics before its write, or after its report's file was written and before staging. The connection reads `report_save_failed`, and the attempt leaves nothing: the store's files, bytes, reservations and slots are what they were before the report. A retry is accepted, and a restart adopts exactly the retry's report. When the attempt's file cannot be removed, it stays charged as an orphaned attempt, and a restart adopts it as orphaned, never as a report. A write that unwinds returns its room once.
+#[spec("orchestration/work-done/053")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn work_done_053_a_a_failed_attempt_leaves_no_report_behind() {
+    use crate::retained_store::{AdoptedState, OwnState, parse_adopted_name, parse_own_name};
+    use crate::task_completion::{FAULT_BEFORE_STAGE, FAULT_BEFORE_WRITE};
+    for (seam, unlink_fails) in [
+        (FAULT_BEFORE_WRITE, false),
+        (FAULT_BEFORE_STAGE, false),
+        (FAULT_BEFORE_STAGE, true),
+    ] {
+        let team = team(&format!("wd053a-{seam}-{}", u8::from(unlink_fails)));
+        let task = team.delegate("a task");
+        let store = Arc::clone(&team.deck.store);
+        let counts_before = store.counts().unwrap();
+        let files_before = store_files(&store);
+        team.registry()
+            .inject_fault_for_test(seam, TestFault::Panic("injected-053a"));
+        store.fail_unlinks_for_test(unlink_fails);
+        let refusal = refused_with(
+            team.report_task(&task, "done").await,
+            code::REPORT_SAVE_FAILED,
+        );
+        assert!(
+            refusal
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("saved nothing new")),
+            "{refusal:?}"
+        );
+        let after = store.counts().unwrap();
+        let attempt: Vec<String> = store_files(&store)
+            .into_iter()
+            .filter(|name| !files_before.contains(name))
+            .collect();
+        assert_eq!(after.reserved_bytes, counts_before.reserved_bytes);
+        assert_eq!(after.reserved_slots, counts_before.reserved_slots);
+        if unlink_fails {
+            assert_eq!(attempt.len(), 1, "the attempt's file could not go");
+            let id = parse_own_name(&attempt[0]).unwrap();
+            assert_eq!(store.own_state(id), Some(OwnState::OrphanUnlink));
+            assert_eq!(after.own_files, counts_before.own_files + 1);
+            store.fail_unlinks_for_test(false);
+        } else {
+            assert_eq!(attempt, Vec::<String>::new(), "no report artifact");
+            assert_eq!(after, counts_before, "the room, bytes and slot came back");
+        }
+        assert_eq!(
+            team.registry().inbox().open_tasks_of(&team.worker_pane),
+            vec![task.clone()]
+        );
+        assert_eq!(team.effects().claims, 0);
+        let retry = accepted(team.report_task(&task, "done").await);
+        let retry_id = retry.report_id.clone().unwrap();
+        let mut adopted: Vec<(String, char)> = adopted_after_restart(&team.deck)
+            .iter()
+            .map(|name| {
+                let (id, _, state) = parse_adopted_name(name).unwrap();
+                (id.to_string(), state.letter())
+            })
+            .collect();
+        adopted.sort();
+        let mut expected = vec![(retry_id, AdoptedState::Pinned.letter())];
+        if unlink_fails {
+            let id = parse_own_name(&attempt[0]).unwrap().to_string();
+            expected.push((id, AdoptedState::Orphaned.letter()));
+            expected.sort();
+        }
+        assert_eq!(adopted, expected, "exactly the retry's report");
+    }
+    // A write that unwinds (here its debug check of the report id) returns
+    // its room once.
+    let deck = deck();
+    let before = deck.store.counts().unwrap();
+    let room = deck.store.reserve(64).unwrap();
+    let store = Arc::clone(&deck.store);
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = store.write(
+            room,
+            "not a report id",
+            b"x",
+            crate::retained_store::Now::current(),
+        );
+    }));
+    assert!(unwound.is_err(), "the write's debug check fires");
+    assert_eq!(deck.store.counts().unwrap(), before);
+}
+
 /// Scenario: (d) the commit panics inside its section, after the report's post and before its tombstone. The supervisor's task ends without panicking, the reporting connection reads no answer (unconfirmed), the report state stays torn, the inserted message is the only one, the report's file is on disk, and a repeat is refused `deck_unavailable`. (g) a failure asked for a staged claim refuses and changes nothing.
 #[spec("orchestration/work-done/053")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

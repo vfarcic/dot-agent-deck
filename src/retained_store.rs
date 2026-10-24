@@ -1082,6 +1082,26 @@ impl StoreLock<'_> {
     }
 }
 
+/// A write's reserved room while the write runs: an unwind before the write's
+/// own accounting returns it, through `lock_in_drop`, which never panics.
+struct RoomOnUnwind<'a> {
+    store: &'a RetainedStore,
+    bytes: Option<u64>,
+}
+
+impl Drop for RoomOnUnwind<'_> {
+    fn drop(&mut self) {
+        if let Some(bytes) = self.bytes.take()
+            && let Some(mut st) = self
+                .store
+                .state
+                .lock_in_drop(crate::lock_rank::OnPoison::Skip)
+        {
+            st.release(bytes);
+        }
+    }
+}
+
 /// Whether `error` says the platform or filesystem has no no-replace rename.
 fn unsupported_rename(error: &io::Error) -> bool {
     #[cfg(unix)]
@@ -1227,6 +1247,13 @@ impl RetainedStore {
         self.seams.fail_all_writes.store(fail, Ordering::SeqCst);
     }
 
+    /// Test seam: every removal fails, as a broken disk would, until it is
+    /// switched off.
+    #[cfg(test)]
+    pub(crate) fn fail_unlinks_for_test(&self, fail: bool) {
+        self.seams.fail_unlink.store(fail, Ordering::SeqCst);
+    }
+
     /// Whether a thread panicked holding the store's state.
     pub fn is_poisoned(&self) -> bool {
         self.state.is_poisoned()
@@ -1313,6 +1340,11 @@ impl RetainedStore {
             self.release(reservation);
             return Err(WriteFailure::Unusable);
         };
+        // Until the accounting below runs, an unwind returns the room, once.
+        let mut room = RoomOnUnwind {
+            store: self,
+            bytes: Some(reservation.bytes),
+        };
         debug_assert!(valid_report_id(report_id), "an invalid report id");
         debug_assert!(
             contents.len() as u64 <= reservation.bytes,
@@ -1333,6 +1365,7 @@ impl RetainedStore {
             file.sync_all()?;
             self.sync(&dirs.mine, "mine")
         })();
+        room.bytes = None;
         match written {
             Ok(()) => {
                 if let Ok(mut st) = self.state.try_lock() {
@@ -1354,7 +1387,9 @@ impl RetainedStore {
                 Ok(())
             }
             Err(error) => {
+                room.bytes = Some(reservation.bytes);
                 let removed = !created || self.unlink(&dirs.mine, &name).is_ok();
+                room.bytes = None;
                 let Ok(mut st) = self.state.try_lock() else {
                     return Err(WriteFailure::Io(error.to_string()));
                 };
@@ -1379,8 +1414,17 @@ impl RetainedStore {
         }
     }
 
+    /// A reservation dropped unused from a destructor or an unwind: its room
+    /// is returned through `lock_in_drop`, which never panics.
+    pub fn release_in_drop(&self, reservation: Reservation) {
+        if let Some(mut st) = self.state.lock_in_drop(crate::lock_rank::OnPoison::Skip) {
+            st.release(reservation.bytes);
+        }
+    }
+
     /// Remove `report_id`'s own file, written and not published (its save
-    /// failed after the write), and give its room back. When the removal
+    /// failed after the write, or its save task stopped before staging it),
+    /// and give its room back. A name with no file is left alone. When the removal
     /// fails, the file stays charged as an orphan whose removal the sweep
     /// retries, as a failed write's does.
     pub fn discard(&self, report_id: &str) {
@@ -1388,7 +1432,10 @@ impl RetainedStore {
             return;
         };
         let name = own_name(report_id);
-        let removed = self.unlink(&dirs.mine, &name).is_ok();
+        let removed = match self.unlink(&dirs.mine, &name) {
+            Ok(()) => true,
+            Err(error) => error.kind() == io::ErrorKind::NotFound,
+        };
         if let Ok(mut st) = self.state.try_lock() {
             if removed {
                 st.drop_own(&name);

@@ -67,6 +67,8 @@ pub(crate) const PAUSE_ACKED: &str = "work-done-acked";
 
 /// Test fault: `Fail` makes the report's save fail.
 pub(crate) const FAULT_FAIL_SAVE: &str = "work-done-fail-save";
+/// Test fault: a panic in the save task after its claim and before the write.
+pub(crate) const FAULT_BEFORE_WRITE: &str = "work-done-before-write";
 /// Test fault: a panic in the save task after the save and before staging.
 pub(crate) const FAULT_BEFORE_STAGE: &str = "work-done-before-stage";
 /// Test fault: a panic after staging and before the unit mark.
@@ -612,6 +614,12 @@ async fn recover(
         },
         Some(ClaimPhase::Admitted | ClaimPhase::Saving) => match registry.fail_claim(claim_id) {
             (FailOutcome::Failed { .. }, after) => {
+                // The attempt may have written its file before it stopped:
+                // nothing will publish it, so it goes, or stays charged as an
+                // orphaned attempt when it cannot be removed. Never a report.
+                if let Some(store) = registry.inbox().retained_store() {
+                    store.discard(report_id);
+                }
                 if let Some(after) = after {
                     registry.inbox().after_section(after);
                 }
@@ -691,6 +699,12 @@ async fn save(
         );
         return;
     };
+    // Returned to the store if this task unwinds before the write takes it.
+    let mut room = Room {
+        store: Arc::clone(&store),
+        reservation: Some(claimed.reservation),
+    };
+    let _ = registry.fault_point(FAULT_BEFORE_WRITE);
     // The retained file.
     let (task_id, unit_id) = match &claimed.mode {
         ClaimMode::Task { task_id } => (Some(task_id.clone()), None),
@@ -730,7 +744,9 @@ async fn save(
         truncated: Vec::new(),
     };
     let contents = crate::retained_store::compose_file(&envelope, &ctx.framed);
-    let reservation = claimed.reservation;
+    let Some(reservation) = room.reservation.take() else {
+        return;
+    };
     if contents.len() as u64 > reservation.bytes() {
         store.release(reservation);
         settle_failure(
@@ -785,6 +801,9 @@ async fn save(
         }
         Err(join) => {
             error!(%join, "work-done: saving the report did not finish");
+            // The write unwound: its room came back with it, and a file it
+            // may have created is removed.
+            store.discard(&ctx.spec.report_id);
             settle_failure(&registry, claim_id, "its save did not finish", handed);
             return;
         }
@@ -852,6 +871,21 @@ async fn save(
     let _ = registry.fault_point(FAULT_AFTER_HANDOVER);
     if let Some(after) = after {
         registry.inbox().after_section(after);
+    }
+}
+
+/// A claim's reserved room until its write takes it. Dropped untaken, as
+/// when the save task unwinds first, the room goes back to the store, once.
+struct Room {
+    store: Arc<crate::retained_store::RetainedStore>,
+    reservation: Option<crate::retained_store::Reservation>,
+}
+
+impl Drop for Room {
+    fn drop(&mut self) {
+        if let Some(reservation) = self.reservation.take() {
+            self.store.release_in_drop(reservation);
+        }
     }
 }
 
