@@ -2465,20 +2465,19 @@ pub fn send_gated_at(
     reply_wait: std::time::Duration,
 ) -> Gated {
     let not_confirmed = |why| Gated::NotConfirmed { refusal: None, why };
-    // Each wait bounds its whole exchange, not each read: a peer that sends a
-    // byte at a time cannot stretch it.
+    // Each wait bounds its whole exchange, not each read or write: a peer
+    // that sends or takes a byte at a time cannot stretch it.
     let question_deadline = std::time::Instant::now() + question_wait;
     let Ok(mut client) = crate::platform::ipc::IpcClient::connect_timeout(path, question_wait)
     else {
         return not_confirmed("no daemon answered");
     };
-    if arm_gated(&client, question_deadline).is_err() {
-        return not_confirmed("no answer within the wait");
-    }
-    if client
-        .write_all(format!("{question}\n").as_bytes())
-        .and_then(|()| client.flush())
-        .is_err()
+    if write_gated(
+        &mut client,
+        format!("{question}\n").as_bytes(),
+        question_deadline,
+    )
+    .is_err()
     {
         return not_confirmed("the question could not be sent");
     }
@@ -2497,10 +2496,12 @@ pub fn send_gated_at(
     if arm_gated(&client, reply_deadline).is_err() {
         return not_confirmed("the connection could not be bounded");
     }
-    if client
-        .write_all(format!("{mutation}\n").as_bytes())
-        .and_then(|()| client.flush())
-        .is_err()
+    if write_gated(
+        &mut client,
+        format!("{mutation}\n").as_bytes(),
+        reply_deadline,
+    )
+    .is_err()
     {
         return Gated::Unconfirmed("the report could not be written whole");
     }
@@ -2524,6 +2525,40 @@ fn arm_gated(
             "the wait is over",
         )),
     }
+}
+
+/// The most [`write_gated`] hands one write call. A blocking write to a
+/// local socket keeps waiting for room for as long as its peer makes some,
+/// each wait getting the socket's whole timeout again, so one large write
+/// could outlast any deadline; a small one returns, and the deadline is
+/// checked again before the next.
+const GATED_WRITE_CHUNK: usize = 16 * 1024;
+
+/// Write all of `bytes` by `deadline`, then flush: an error for a write
+/// failure or the deadline. The deadline is checked before each write of at
+/// most [`GATED_WRITE_CHUNK`] bytes, which gets what is left of it, so a peer
+/// that drains a little at a time cannot stretch the whole write past it by
+/// more than one such write.
+fn write_gated(
+    client: &mut crate::platform::ipc::IpcClient,
+    mut bytes: &[u8],
+    deadline: std::time::Instant,
+) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        arm_gated(client, deadline)?;
+        match client.write(&bytes[..bytes.len().min(GATED_WRITE_CHUNK)]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "the connection took nothing",
+                ));
+            }
+            Ok(n) => bytes = &bytes[n..],
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    client.flush()
 }
 
 /// One line, at most [`GATED_MAX_LINE`] bytes, read by `deadline`: `Ok(None)`
