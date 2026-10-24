@@ -368,11 +368,12 @@ jobs:
       # took 9–12 s in each of the four that did, as in the healthy rerun of
       # 39996955663. So a browser cache saves at most those seconds, less the
       # restore of its own several-hundred-megabyte entry, and would have
-      # prevented none of those timeouts. What they needed was a cache of the
-      # apt .debs, which the steps below add (issue #1864). Against that, the repository's cache is capped at 10 GB and `main`'s
-      # set already fills ~9 GB of it (the note above `jobs:`, issue #1743), so
-      # an entry this size makes evicting `main`'s Rust caches — what actually
-      # keeps CI fast — more likely.
+      # prevented none of those timeouts. Against that, the repository's cache
+      # is capped at 10 GB and `main`'s set already fills ~9 GB of it (the note
+      # above `jobs:`, issue #1743), so a browser entry of several hundred MB
+      # makes evicting `main`'s Rust caches — what actually keeps CI fast —
+      # more likely. What the timeouts needed was a cache of the apt .debs,
+      # which the steps below add (issue #1864).
       #
       # Security does NOT decide it. An earlier version of this note said it
       # did, on the premise that a run on any branch can write an entry a
