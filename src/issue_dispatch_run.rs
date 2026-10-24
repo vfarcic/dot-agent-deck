@@ -16,7 +16,11 @@
 //!      ignore `--limit`.
 //!   3. **M2.2** — for each issue, decide dispatch-vs-skip from the two
 //!      idempotency signals (per-issue worktree already on disk; an open PR whose
-//!      head is `agent/issue-<n>`) via [`crate::issue_dispatch::dispatch_decision`].
+//!      head is `agent/issue-<n>`) and, with `claim_gating` in effect, another
+//!      deck's live claim on GitHub (PRD #421 Phase 3, read only when the first
+//!      two leave the issue open) via [`crate::issue_dispatch::dispatch_decision`].
+//!      A skip because the worktree exists also refreshes this deck's own claim
+//!      record once it is half a TTL old.
 //!   4. **M2.2 / M2.3** — on dispatch, create the per-issue worktree on
 //!      `agent/issue-<n>` (creating the branch with `-b`, or attaching a branch
 //!      left behind by an earlier closed-without-PR run — B1) and [`spawn`] one
@@ -55,7 +59,7 @@ use crate::agent_pty::{AgentPtyRegistry, AgentRecord, TabMembership};
 use crate::config::IssueDispatchConfig;
 use crate::event::BroadcastMsg;
 use crate::issue_dispatch::{
-    DispatchDecision, derive_issue_paths, dispatch_decision, issue_list_argv,
+    Claimant, DispatchDecision, SkipCause, derive_issue_paths, dispatch_decision, issue_list_argv,
     pr_list_for_issue_argv, substitute_issue_number,
 };
 use crate::scheduler::{Notifier, NotifyEvent};
@@ -559,7 +563,9 @@ pub async fn run_issue_dispatch(
     // PRD #421 M2.6(a) — the claim label is provisioned just in time: once per
     // run, plus at most one re-attempt when a later label add fails while it has
     // not succeeded, and only in a run that is about to write a claim, so a fire
-    // that dispatches nothing makes no GitHub write at all (#483).
+    // that dispatches nothing provisions no label (#483). Such a fire can still
+    // read claims, and edit this deck's own record from a worktree skip
+    // (PRD #421 M3.1).
     let mut claim_run = ClaimRun::new(&local_hostname());
 
     for issue in issues.into_iter().take(cfg.max_per_run) {
@@ -578,6 +584,7 @@ pub async fn run_issue_dispatch(
                 notifier,
                 event_tx,
                 state,
+                &mut claim_run,
             )
             .await
             {
@@ -585,13 +592,14 @@ pub async fn run_issue_dispatch(
                 // The claim is written before the success is surfaced, so
                 // "dispatched" is the issue's last word in this run: nothing
                 // writes to GitHub for it after that line.
-                Ok(IssueOutcome::Dispatched) => {
-                    claim_issue(task_name, &cfg.repo, issue, &mut claim_run, notifier).await;
+                Ok(IssueOutcome::Dispatched { claims_unchecked }) => {
+                    claim_issue(task_name, cfg, issue, &mut claim_run, notifier).await;
                     // M1.3 — surface the per-issue dispatch success.
                     notifier.notify(NotifyEvent::IssueDispatched {
                         task: task_name.to_string(),
                         repo: cfg.repo.clone(),
                         issue,
+                        claims_unchecked,
                     });
                     break;
                 }
@@ -866,14 +874,15 @@ async fn abandoned_generation_if_unused(
 }
 
 /// What [`dispatch_one_issue`] did with an issue it did not fail on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum IssueOutcome {
     /// Skipped as already claimed (the skip is surfaced there).
     Handled,
     /// An agent was spawned for the issue, so the caller claims it on GitHub
     /// (PRD #421 M2.2) — never on any other outcome — and surfaces the
-    /// dispatch.
-    Dispatched,
+    /// dispatch. `claims_unchecked` is why claim gating could not read the
+    /// issue's claims, which the dispatch line reports.
+    Dispatched { claims_unchecked: Option<String> },
     /// PRD #1487 re-check, reviewer R3: refused because the daemon is
     /// restarting. The issue's worktree was removed again, so the slot stays
     /// open for the next attempt — this daemon's, if the restart is called
@@ -903,15 +912,17 @@ async fn dispatch_one_issue(
     // the daemon's delegate-routing maps — see
     // `crate::state::AppState::register_orchestration_role`.
     state: Option<&crate::state::SharedState>,
+    claim_run: &mut ClaimRun,
 ) -> Result<IssueOutcome, String> {
     let paths = derive_issue_paths(workspace, task_name, issue);
 
-    let notify_skip = || {
+    let notify_skip = |cause: SkipCause| {
         notifier.notify(NotifyEvent::IssueDispatchSkipped {
             task: task_name.to_string(),
             repo: cfg.repo.clone(),
             issue,
             branch: paths.branch.clone(),
+            cause,
         });
     };
 
@@ -945,7 +956,8 @@ async fn dispatch_one_issue(
         .await
         {
             Reclaim::NotAbandoned => {
-                notify_skip();
+                refresh_claim_on_worktree_skip(task_name, cfg, issue, claim_run).await;
+                notify_skip(SkipCause::WorktreeExists);
                 return Ok(IssueOutcome::Handled);
             }
             Reclaim::Failed(message) => return Err(message),
@@ -954,7 +966,8 @@ async fn dispatch_one_issue(
             }
         }
         if worktree_exists {
-            notify_skip();
+            refresh_claim_on_worktree_skip(task_name, cfg, issue, claim_run).await;
+            notify_skip(SkipCause::WorktreeExists);
             return Ok(IssueOutcome::Handled);
         }
     }
@@ -963,8 +976,33 @@ async fn dispatch_one_issue(
     // head is `agent/issue-<n>`. A `gh` failure here is a genuine per-issue
     // error (e.g. the stub's simulated API error) and propagates via `?`.
     let open_pr = issue_has_open_pr(&cfg.repo, issue).await?;
-    if dispatch_decision(worktree_exists, open_pr) == DispatchDecision::Skip {
-        notify_skip();
+
+    // TERTIARY (PRD #421 M3.2) — reached only when neither local signal
+    // skipped, so a GitHub failure here can never turn a clean skip into a
+    // failure: another deck's live claim. Read only with gating in effect,
+    // and a claim that cannot be read dispatches (fail toward a duplicate,
+    // never a wedge), which the dispatch line then says.
+    let mut claims_unchecked = None;
+    let claimant = if !open_pr && cfg.claim.gating_in_effect() {
+        match live_claim(task_name, &cfg.repo, issue, cfg.claim.ttl(), claim_run).await {
+            Ok(claimant) => claimant,
+            Err(error) => {
+                tracing::warn!(
+                    task = task_name,
+                    repo = cfg.repo,
+                    issue,
+                    error = %error,
+                    "issue-dispatch: the issue's claims could not be read; dispatching without them"
+                );
+                claims_unchecked = Some(error);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if let DispatchDecision::Skip(cause) = dispatch_decision(worktree_exists, open_pr, claimant) {
+        notify_skip(cause);
         return Ok(IssueOutcome::Handled);
     }
 
@@ -988,12 +1026,7 @@ async fn dispatch_one_issue(
         // skip alongside `AlreadyClaimed` so the match stays exhaustive if that
         // ever changes.
         WorktreeCreation::AlreadyClaimed | WorktreeCreation::BranchExists => {
-            notifier.notify(NotifyEvent::IssueDispatchSkipped {
-                task: task_name.to_string(),
-                repo: cfg.repo.clone(),
-                issue,
-                branch: paths.branch.clone(),
-            });
+            notify_skip(SkipCause::ConcurrentCreator);
             return Ok(IssueOutcome::Handled);
         }
     }
@@ -1049,7 +1082,141 @@ async fn dispatch_one_issue(
     }
 
     // M1.3 — the caller claims the issue and then surfaces the success.
-    Ok(IssueOutcome::Dispatched)
+    Ok(IssueOutcome::Dispatched { claims_unchecked })
+}
+
+/// PRD #421 M3.2 — the claimant whose record on `issue` is live, read from
+/// GitHub now: `None` when the issue does not carry [`CLAIM_LABEL`]
+/// (removing it by hand releases the claim) or no record on it is live. This
+/// deck's own records count as dead here — the worktree and open-PR checks,
+/// which skip before this runs, are their evidence — so a record gates here
+/// only when it is foreign, written by the repository's owner, a member or a
+/// collaborator, and edited within `ttl` of GitHub's clock ([`ClaimRun::now`]).
+/// Each read draws on the run's claim budget, and
+/// any failure, the budget running out included, is an `Err` the caller
+/// dispatches on.
+///
+/// [`CLAIM_LABEL`]: crate::issue_dispatch::CLAIM_LABEL
+async fn live_claim(
+    task_name: &str,
+    repo: &str,
+    issue: u64,
+    ttl: chrono::Duration,
+    run: &mut ClaimRun,
+) -> Result<Option<Claimant>, String> {
+    let label = run.claim_label(repo, issue).await?;
+    if !label.present {
+        return Ok(None);
+    }
+    let records = run.claim_records(repo, issue).await?;
+    if records.is_empty() {
+        return Ok(None);
+    }
+    let me = crate::issue_dispatch::ClaimIdentity {
+        user_id: run.account().await?,
+        task: task_name,
+        host_id: &run.host_id,
+    };
+    Ok(crate::issue_dispatch::live_claimant(
+        &records,
+        &me,
+        false,
+        label.added_at,
+        run.now(),
+        ttl,
+    ))
+}
+
+/// PRD #421 M3.1 — the owner's refresh, taken from the skip its own worktree
+/// causes: when this deck has a record on `issue` whose clock — its
+/// `updated_at` on GitHub, floored by when the label was first added — is at
+/// least half the TTL old, edit it with a new claim time, so the record stays
+/// live for as long as the work does. Runs whether or not gating is on (the
+/// switch turns off the gate, not the claim), never creates a record, and is
+/// best-effort: a failure is logged and the issue is skipped all the same.
+async fn refresh_claim_on_worktree_skip(
+    task_name: &str,
+    cfg: &IssueDispatchConfig,
+    issue: u64,
+    run: &mut ClaimRun,
+) {
+    match refresh_own_claim(task_name, &cfg.repo, issue, cfg.claim.ttl_hours, run).await {
+        Ok(Some(comment_id)) => tracing::info!(
+            task = task_name,
+            repo = cfg.repo,
+            issue,
+            comment_id,
+            "issue-dispatch: claim record refreshed"
+        ),
+        Ok(None) => {}
+        Err(error) => tracing::warn!(
+            task = task_name,
+            repo = cfg.repo,
+            issue,
+            error = %error,
+            "issue-dispatch: could not refresh the claim record"
+        ),
+    }
+}
+
+/// [`refresh_claim_on_worktree_skip`]'s work: `Ok(Some(id))` when the record
+/// `id` was edited, `Ok(None)` when there is no own record or it is not due.
+/// A record stating a lifetime other than `ttl_hours` is due whatever its age
+/// ([`claim_record_ttl_outdated`]), and every edit writes `ttl_hours` into it.
+///
+/// [`claim_record_ttl_outdated`]: crate::issue_dispatch::claim_record_ttl_outdated
+async fn refresh_own_claim(
+    task_name: &str,
+    repo: &str,
+    issue: u64,
+    ttl_hours: u32,
+    run: &mut ClaimRun,
+) -> Result<Option<u64>, String> {
+    use crate::issue_dispatch::{
+        ClaimIdentity, claim_record_ttl_outdated, claim_refresh_due, edit_claim_record_argv,
+        next_claim_time, render_claim_record_with_ttl,
+    };
+    let ttl = chrono::Duration::hours(i64::from(ttl_hours));
+    let records = run.claim_records(repo, issue).await?;
+    if records.is_empty() {
+        return Ok(None);
+    }
+    let user_id = run.account().await?;
+    let me = ClaimIdentity {
+        user_id,
+        task: task_name,
+        host_id: &run.host_id,
+    };
+    let Some(own) = records.into_iter().find(|found| found.is_own(&me)) else {
+        return Ok(None);
+    };
+    let now = run.now();
+    // The label floor can only make the record younger, so the events are
+    // read only when the record's own clock already says a refresh is due.
+    if !claim_record_ttl_outdated(&own.record, ttl_hours) {
+        if !claim_refresh_due(now, own.updated_at, ttl) {
+            return Ok(None);
+        }
+        let label = run.claim_label(repo, issue).await?;
+        if !claim_refresh_due(now, own.updated_at.max(label.added_at), ttl) {
+            return Ok(None);
+        }
+    }
+    // A new claim time, so the edit changes the body: GitHub leaves
+    // `updated_at` alone on an edit that repeats it.
+    let body = render_claim_record_with_ttl(
+        task_name,
+        &run.host_id,
+        next_claim_time(now, own.record.claimed_at),
+        ttl_hours,
+    );
+    run.call(
+        &edit_claim_record_argv(repo, own.comment_id, &body),
+        "refreshing the claim comment",
+        CLAIM_CALL_MAX_BYTES,
+    )
+    .await?;
+    Ok(Some(own.comment_id))
 }
 
 /// S5: resolve the task's `working_dir` to an ABSOLUTE workspace root. The
@@ -1382,10 +1549,10 @@ const CLAIM_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// integer is ignored.
 const CLAIM_CALL_TIMEOUT_ENV: &str = "DOT_AGENT_DECK_ISSUE_CLAIM_TIMEOUT_MS";
 
-/// The most `gh api --paginate` may print for one issue's comments before the
-/// call is killed (PRD #421 amendment item 10). Far above what a typical issue's
-/// comments print, and low enough that a runaway listing's captured output
-/// stays bounded in the daemon's memory.
+/// The most `gh api --paginate` may print for one issue's comments, or its
+/// events, before the call is killed (PRD #421 amendment item 10). Far above
+/// what a typical issue's comments print, and low enough that a runaway
+/// listing's captured output stays bounded in the daemon's memory.
 const CLAIM_COMMENTS_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 /// The most any other claim call may print on stdout before it is killed. What
@@ -1459,11 +1626,23 @@ impl ClaimBudget {
     }
 }
 
+/// This machine's clock `local_now` moved onto GitHub's by `offset` (GitHub's
+/// clock minus this machine's, measured once per run), or left as it is when
+/// no offset was measured.
+fn clock_now(
+    local_now: chrono::DateTime<chrono::Utc>,
+    offset: Option<chrono::Duration>,
+) -> chrono::DateTime<chrono::Utc> {
+    offset.map_or(local_now, |offset| local_now + offset)
+}
+
 /// What the claims of one run share: the machine id the records name, the
 /// time budget every claim call draws from, and two lookups — the label
 /// provisioning (PRD #421 M2.6(a)) and the signed-in account (amendment item
-/// 6). Each is made lazily, on the first claim that needs it, so a run that
-/// dispatches nothing makes no claim call at all. Provisioning is attempted
+/// 6), which also yields the offset between GitHub's clock and this machine's
+/// (PRD #421 M3.1). Each is made lazily, on the first claim call that needs
+/// it, so a run that neither dispatches nor reads or refreshes a claim makes
+/// no claim call. Provisioning is attempted
 /// once per run, plus at most one re-attempt when a later label add fails while
 /// provisioning has not succeeded ([`ClaimRun::should_reprovision`], amendment
 /// item 14); its outcome otherwise stands for the rest of the run. Only a
@@ -1475,6 +1654,10 @@ struct ClaimRun {
     provisioned: Option<Result<(), String>>,
     reprovisioned: bool,
     account: Option<u64>,
+    /// GitHub's clock minus this machine's, from the account lookup's `Date`;
+    /// `None` until a lookup carried a readable one, and then the local clock
+    /// stands in.
+    clock_offset: Option<chrono::Duration>,
 }
 
 impl ClaimRun {
@@ -1499,6 +1682,7 @@ impl ClaimRun {
             provisioned: None,
             reprovisioned: false,
             account: None,
+            clock_offset: None,
         }
     }
 
@@ -1516,6 +1700,86 @@ impl ClaimRun {
         if let Ok(id) = lookup {
             self.account = Some(*id);
         }
+    }
+
+    /// The id of the account `gh` is signed in with, looked up on first need
+    /// and kept for the rest of the run once a lookup succeeds. The lookup that
+    /// succeeds also sets the run's clock ([`ClaimRun::now`]) from GitHub's
+    /// `Date`, logging once when it has none.
+    async fn account(&mut self) -> Result<u64, String> {
+        use crate::issue_dispatch::{
+            authenticated_user_argv, parse_authenticated_user, sanitize_claim_error,
+        };
+        if let Some(id) = self.account {
+            return Ok(id);
+        }
+        let lookup = self
+            .call(
+                &authenticated_user_argv(),
+                "looking up the signed-in GitHub account",
+                CLAIM_CALL_MAX_BYTES,
+            )
+            .await
+            .and_then(|output| {
+                parse_authenticated_user(&output).map_err(|e| sanitize_claim_error(&e))
+            });
+        let local_now = chrono::Utc::now();
+        if let Ok(user) = &lookup {
+            self.clock_offset = user
+                .server_date
+                .map(|server| server.signed_duration_since(local_now));
+            if self.clock_offset.is_none() {
+                tracing::warn!(
+                    "issue-dispatch: GitHub's answer to the account lookup carried no readable \
+                     Date header; claim ages in this run use this machine's clock"
+                );
+            }
+        }
+        let lookup = lookup.map(|user| user.id);
+        self.remember_account(&lookup);
+        lookup
+    }
+
+    /// Now on GitHub's clock — this machine's clock moved by the offset the
+    /// account lookup measured — which is what every claim record's times are
+    /// on. This machine's clock when no offset was measured.
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        clock_now(chrono::Utc::now(), self.clock_offset)
+    }
+
+    /// Every claim record on `issue`, whoever wrote it (PRD #421 M3.2).
+    async fn claim_records(
+        &mut self,
+        repo: &str,
+        issue: u64,
+    ) -> Result<Vec<crate::issue_dispatch::IssueClaimRecord>, String> {
+        let comments = self
+            .call(
+                &crate::issue_dispatch::issue_comments_argv(repo, issue),
+                "reading the issue's comments",
+                CLAIM_COMMENTS_MAX_BYTES,
+            )
+            .await?;
+        crate::issue_dispatch::parse_issue_claim_records(&comments)
+            .map_err(|e| crate::issue_dispatch::sanitize_claim_error(&e))
+    }
+
+    /// Whether `issue` carries the claim label and when it was first added,
+    /// from its events (PRD #421 M3.1).
+    async fn claim_label(
+        &mut self,
+        repo: &str,
+        issue: u64,
+    ) -> Result<crate::issue_dispatch::ClaimLabelState, String> {
+        let events = self
+            .call(
+                &crate::issue_dispatch::issue_events_argv(repo, issue),
+                "reading the issue's events",
+                CLAIM_COMMENTS_MAX_BYTES,
+            )
+            .await?;
+        crate::issue_dispatch::parse_claim_label_state(&events)
+            .map_err(|e| crate::issue_dispatch::sanitize_claim_error(&e))
     }
 
     /// One claim call within the run's budget ([`gh_claim_call`]), or the
@@ -1597,11 +1861,12 @@ impl ClaimRun {
 /// provisioned once more and the add retried ([`ClaimRun::should_reprovision`]).
 async fn claim_issue(
     task_name: &str,
-    repo: &str,
+    cfg: &IssueDispatchConfig,
     issue: u64,
     run: &mut ClaimRun,
     notifier: &dyn Notifier,
 ) {
+    let repo = cfg.repo.as_str();
     if run.budget.is_spent() {
         let skipped = format!("the claim was skipped: {CLAIM_BUDGET_SPENT}");
         tracing::warn!(
@@ -1643,7 +1908,9 @@ async fn claim_issue(
         );
     }
 
-    let record_error = write_claim_record(task_name, repo, issue, run).await.err();
+    let record_error = write_claim_record(task_name, repo, issue, cfg.claim.ttl_hours, run)
+        .await
+        .err();
 
     if label_error.is_some() || record_error.is_some() {
         tracing::warn!(
@@ -1669,34 +1936,20 @@ async fn claim_issue(
 /// `gh` is signed in with — and edit it if there is one, so a re-claim never
 /// appends a second record. If the account or the comments cannot be read,
 /// nothing is posted: a blind post is how a duplicate record would appear.
+/// The record states `ttl_hours`, the task's `claim_ttl_hours`, as its
+/// lifetime.
 async fn write_claim_record(
     task_name: &str,
     repo: &str,
     issue: u64,
+    ttl_hours: u32,
     run: &mut ClaimRun,
 ) -> Result<(), String> {
     use crate::issue_dispatch::{
-        authenticated_user_argv, create_claim_record_argv, edit_claim_record_argv,
-        find_own_claim_record, issue_comments_argv, next_claim_time, parse_authenticated_user_id,
-        render_claim_record, sanitize_claim_error,
+        create_claim_record_argv, edit_claim_record_argv, find_own_claim_record,
+        issue_comments_argv, next_claim_time, render_claim_record_with_ttl, sanitize_claim_error,
     };
-    let user_id = match run.account {
-        Some(id) => id,
-        None => {
-            let lookup = run
-                .call(
-                    &authenticated_user_argv(),
-                    "looking up the signed-in GitHub account",
-                    CLAIM_CALL_MAX_BYTES,
-                )
-                .await
-                .and_then(|json| {
-                    parse_authenticated_user_id(&json).map_err(|e| sanitize_claim_error(&e))
-                });
-            run.remember_account(&lookup);
-            lookup?
-        }
-    };
+    let user_id = run.account().await?;
     let comments = run
         .call(
             &issue_comments_argv(repo, issue),
@@ -1706,11 +1959,8 @@ async fn write_claim_record(
         .await?;
     let own = find_own_claim_record(&comments, task_name, &run.host_id, user_id)
         .map_err(|e| sanitize_claim_error(&e))?;
-    let claimed_at = next_claim_time(
-        chrono::Utc::now(),
-        own.as_ref().and_then(|record| record.claimed_at),
-    );
-    let body = render_claim_record(task_name, &run.host_id, claimed_at);
+    let claimed_at = next_claim_time(run.now(), own.as_ref().and_then(|record| record.claimed_at));
+    let body = render_claim_record_with_ttl(task_name, &run.host_id, claimed_at, ttl_hours);
     match own {
         Some(record) => {
             let id = record.id;
@@ -3381,6 +3631,92 @@ mod tests {
         assert_eq!(run.account, Some(54321));
     }
 
+    /// Scenario: PRD #421 M3.1 — a run ages claim records on GitHub's clock,
+    /// read from the account lookup's `Date`, so a machine whose clock is an
+    /// hour fast or slow reaches the same decisions as one in step with
+    /// GitHub; without a `Date` the local clock stands in.
+    #[test]
+    fn claim_decisions_use_githubs_clock_whatever_the_local_clock_says() {
+        use crate::issue_dispatch::{
+            ClaimIdentity, IssueClaimRecord, claim_refresh_due, live_claimant,
+            parse_authenticated_user, parse_issue_claim_records, render_claim_record,
+        };
+        let github = |rfc3339: &str| {
+            chrono::DateTime::parse_from_rfc3339(rfc3339)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        let server_now = github("2026-10-23T12:00:00Z");
+        let lookup = parse_authenticated_user(
+            "HTTP/2.0 200 OK\nDate: Fri, 23 Oct 2026 12:00:00 GMT\r\n\r\n{\"id\":1}",
+        )
+        .unwrap();
+        let ttl = chrono::Duration::hours(1);
+        let me = ClaimIdentity {
+            user_id: 1,
+            task: "mine",
+            host_id: "h1-aaaa",
+        };
+        let record = |user: u64, task: &str, updated_at: &str| -> IssueClaimRecord {
+            let json = serde_json::json!([{
+                "id": 9, "user": {"id": user, "login": "teammate"},
+                "author_association": "COLLABORATOR",
+                "body": render_claim_record(task, "h1-aaaa", server_now),
+                "updated_at": updated_at,
+            }]);
+            parse_issue_claim_records(&json.to_string())
+                .unwrap()
+                .remove(0)
+        };
+        // A foreign record edited 50 minutes ago on GitHub's clock is live
+        // under a one-hour TTL; the deck's own record, edited just now, is
+        // not due for a refresh.
+        let foreign = record(2, "theirs", "2026-10-23T11:10:00Z");
+        let own = record(1, "mine", "2026-10-23T12:00:00Z");
+        for skew in [
+            chrono::Duration::zero(),
+            chrono::Duration::hours(1),
+            -chrono::Duration::hours(1),
+        ] {
+            let local_now = server_now + skew;
+            let offset = lookup
+                .server_date
+                .map(|server| server.signed_duration_since(local_now));
+            let now = clock_now(local_now, offset);
+            assert_eq!(now, server_now, "skew {skew}");
+            assert!(
+                live_claimant(std::slice::from_ref(&foreign), &me, false, None, now, ttl).is_some(),
+                "skew {skew}"
+            );
+            assert!(!claim_refresh_due(now, own.updated_at, ttl), "skew {skew}");
+        }
+        // What the local clock alone would decide: an hour fast reads the
+        // live foreign record as expired and edits the fresh own record on
+        // every fire; an hour slow reads the foreign record as dated ahead.
+        let fast = clock_now(server_now + chrono::Duration::hours(1), None);
+        assert!(
+            live_claimant(std::slice::from_ref(&foreign), &me, false, None, fast, ttl).is_none()
+        );
+        assert!(claim_refresh_due(fast, own.updated_at, ttl));
+        let slow = clock_now(server_now - chrono::Duration::hours(1), None);
+        assert!(
+            live_claimant(std::slice::from_ref(&foreign), &me, false, None, slow, ttl).is_none()
+        );
+    }
+
+    /// Scenario: PRD #421 M3.1 — a run starts on this machine's clock and
+    /// moves onto GitHub's only once the account lookup measured an offset.
+    #[test]
+    fn a_claim_run_uses_the_local_clock_until_an_offset_is_measured() {
+        let mut run = claim_run_with(Duration::from_secs(120));
+        let before = chrono::Utc::now();
+        let now = run.now();
+        assert!(now >= before && now <= chrono::Utc::now());
+        run.clock_offset = Some(chrono::Duration::hours(-3));
+        let now = run.now();
+        assert!(now < chrono::Utc::now() - chrono::Duration::minutes(170));
+    }
+
     /// Scenario: PRD #421 amendment item 12 — once the budget is spent, a
     /// claim call is reported as skipped for the budget without running `gh`.
     #[tokio::test]
@@ -3821,7 +4157,7 @@ mod tests {
         );
         assert_eq!(take_worktree(&reg, &wt), None, "and its record dropped");
         assert_eq!(
-            dispatch_decision(wt.exists(), false),
+            dispatch_decision(wt.exists(), false, None),
             DispatchDecision::Dispatch,
             "so the next fire dispatches the issue"
         );
@@ -3981,7 +4317,7 @@ mod tests {
         );
         assert!(!wt.exists(), "the retry removed the leftover");
         assert_eq!(
-            dispatch_decision(wt.exists(), false),
+            dispatch_decision(wt.exists(), false, None),
             DispatchDecision::Dispatch,
             "so the issue is dispatched rather than skipped as claimed"
         );
