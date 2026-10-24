@@ -134,6 +134,9 @@ mod devbox_gtk_origin;
 /// repository files, which no compile step reads.
 #[cfg(test)]
 mod dispatch_base;
+/// Issue #1850: the OpenTelemetry spans `affected-checks --run` sends, off
+/// unless the standard `OTEL_*` variables turn them on.
+mod gate_telemetry;
 /// Issues #1774 and #1808: no gh-aw workflow source quotes the API proxy's
 /// credit-exceeded error, frontmatter included, because gh-aw's conclusion job
 /// reads it back from the agent's output as a credit failure. Tests only — the
