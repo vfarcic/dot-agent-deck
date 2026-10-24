@@ -4583,6 +4583,7 @@ without depending on the config struct API.
 - **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
 - **Agent:** none.
 - **Asserts:** Through the real EOF: a claimed task's 'worker exited' or 'not delivered' notice is withheld at the exit and posted once by the failure, never on success; a newer task's notice at the exit; a failure before the exit leaves the exit's own notice; a plain exit owes an unacknowledged task one 'not delivered' notice and an acknowledged one one 'worker exited' notice; a close owes no 'worker exited' notice and an unacknowledged task's close today's one undeliverable notice.
+- **Asserts (m):** a worker exits owing a task whose own commission arm is already gone, beside a sibling arm armed for another delegate: the exit retires exactly, and the sibling arm is still owed.
 - **Why it exists:** PRD #1666 part 3, round 5 (plan §6.6, D12 rule 4): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
 - **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
 - **Platform coverage:** mac+linux.
@@ -4607,6 +4608,7 @@ without depending on the config struct API.
 - **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
 - **Agent:** none.
 - **Asserts:** A note paused while the orchestrator is replaced is kept in recovery and the successor gets nothing; a note from a pane now in another instance is refused `not_a_worker`, and nothing is sent.
+- **Asserts (d):** a real seated worker's note, held before the role map while it exits and another instance's generation takes its pane (that instance's orchestrator running), is refused `not_a_worker`; neither orchestrator's inbox gets it, and nothing is saved or listed.
 - **Why it exists:** PRD #1666 part 3, round 5 (plan §6.6, §2 step 1): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
 - **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
 - **Platform coverage:** mac+linux.
@@ -4647,6 +4649,7 @@ without depending on the config struct API.
 - **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins); `src/agent_pty_terminal_tests.rs` for (j).
 - **Agent:** none.
 - **Asserts:** Before staging `report_save_failed`; after staging, after the mark, after the commit and in the helpers `accepted`; a note panicking before the handover `uncorrelated`; a panic inside the commit after the post: unconfirmed, the state torn, the one inserted message, the file kept, a repeat `deck_unavailable`; a failure asked for a staged claim refuses; the store unavailable before the commit: unconfirmed, nothing written, a repeat `deck_unavailable`.
+- **Asserts (round 5 fixes):** (a) in full: a panic before the write or after it and before staging leaves the store's files, bytes, reservations and slots as before the report, a retry is accepted and a restart adopts exactly it; a failed removal leaves an orphaned attempt, adopted `o`; a write that unwinds returns its room once. (h) while a helper is held inside the after-section helpers the connection already reads `accepted`, and a helper panic leaves it `accepted`. (j) the whole state (reply room, claim, unit entry, ledger, rows, caller inbox, routes, files, mark) is unchanged around the unavailable store. (k) poisoned routes with whole report state: `deck_unavailable`, no task panic, nothing consumed. (l) a save failure with the delegation tracker poisoned writes nothing and reads unconfirmed.
 - **Why it exists:** PRD #1666 part 3, round 5 (plan §6.6, D12 rule 11, D15): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
 - **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
 - **Platform coverage:** mac+linux.
@@ -4665,6 +4668,14 @@ without depending on the config struct API.
 - **Asserts:** A's task report, held before it reads the role map while A exits with its cleanup held and B takes A's pane in another directory and instance, is accepted for A's task; B's `work-done-coder.md` is unchanged, A's copy is in A's directory, and the retained report's envelope names A's instance and A; the same when A's record is removed while the save is paused.
 - **Why it exists:** PRD #1666 part 3, round 5 fixes (auditor U2-4, reviewer U3-2): the save took the convenience copy's directory and the artifact's instance from the pane's current occupant.
 - **Does not assert:** a real agent; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/059 — A report's broadcast notices carry its provenance.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub and its broadcast channel, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** every `InboxNotice` the hub broadcasts for an accepted task report's message (queued, handed over, handed back, handed over again, acknowledged) carries `provenance: task` with the task id, the report id and the worker's agent id; a deck notice posted beside it carries none.
+- **Why it exists:** PRD #1666 part 3, round 5 fixes (reviewer R30, auditor U3-2, mutant M28): the broadcast's provenance was asserted only on notices a test built itself.
+- **Does not assert:** the `returned` notice an offer moving between generations broadcasts (this schedule hands it to one generation); a client reading it.
 - **Platform coverage:** mac+linux.
 
 ##### orchestration/work-done/056 — A destructor armed across a dispatch or a respawn does not abort the daemon when it drops during an unwind.
@@ -5401,16 +5412,18 @@ without depending on the config struct API.
 - **Layer:** fast unit, in-crate (`src/agent_pty_replacement_tests.rs`; the real registry, inbox hub and retained store, `cat` stand-ins, named pauses and fault points; the arms marked "child process" re-execute the test binary so an abort reads as `SIGABRT`).
 - **Agent:** none: `cat` stand-ins.
 - **Asserts:** publish: the route compare-and-sets to B, (P, B) is indexed and B carries the unit pinned, and B's exit ends the unit once (one notice, or one row for an orphaned caller), for a single unit and an orchestration unit; a predecessor's held EOF ends nothing; B killed while the window is paused waits for the publication, then ends the unit once; (f1) a failed spawn ends the unit `RespawnFailed`, its route, publication and leaf unit gone, one notice, nothing closed; (f2), (f3), (f2') a panic after the spawn, before the publish section, or inside the spawn after B is published aborts with B taken from the reserved slot, indexed and closed by its id, the injected payload resumed; (f2s) an exited record on the pane is never indexed or closed; (f7) a competing start makes the reservation refuse, the unit end, and the competitor untouched; (f8) a pane reused after B exited leaves the new occupant untouched while B is closed by id; (f6) a respawn cancelled before `begin` installs nothing; (g) a close during the window ends the unit once and keeps the publication, closed, until publish removes it, resurrecting no route; child process: (f4) a panic inside publish leaves the routes poisoned, the state torn, the route moved by the compare-and-set, the leaf on B, B running, nothing posted or closed, and the inbox still working; (f4') a state torn by another thread with healthy routes makes the abort write nothing; (f4'') an unrelated hub panic leaves the abort working; (f5a) a dropped latch makes B's reader abort; (f5b) a panicking abort leaves B's reader to find what it left. Reports during a replacement (`src/agent_pty_terminal_tests.rs`): (e1) the successor's terminal report before its publish reads `report_pending` and nothing is saved; after it, it is accepted to the original caller once; (e3) a directly started orchestration's orchestrator answers `destination: none` before and after its own respawn.
+- **Asserts (e2, `src/agent_pty_terminal_tests.rs`):** a predecessor A's terminal report held before the routes across a respawn of its pane, for a single and an orchestration unit: released while the replacement is being published, `report_pending`; held again and released after the publish, `task_closed` with the replaced wording; neither consumes a claim, file, mark or post; B's report is then accepted once.
 - **Why it exists:** reviewer R17, R20, R25, R27, auditor U2-1, U3-2: the respawn moves a unit's terminal generation, and its EOF, reports and failure paths must agree on one unit.
-- **Does not assert:** the arms that send a terminal `work-done` (they arrive with task-scoped completion); the torn report state's contents after a panic, which are discarded with it (only the routes, records and leaf are read).
+- **Does not assert:** (c), (f-claim) and (g)'s terminal reports, which are not written; the torn report state's contents after a panic, which are discarded with it (only the routes, records and leaf are read).
 - **Platform coverage:** mac+linux.
 
 ##### dispatch/return/027 — A unit that ends before its route is registered is recorded ended, and an instance's contradictory origin is pinned as a conflict.
 - **Layer:** fast unit, in-crate (`src/agent_pty_dispatch_lifecycle_tests.rs`; the real registry, inbox hub and retained store, with `cat` stand-ins for every agent and the daemon's live check installed).
 - **Agent:** none: `cat` stand-ins.
 - **Asserts:** (e) the terminal generation exiting, and (f) its pane being marked closing, while the dispatch is paused before registration: registration records `Ended { Exited }` or `Ended { Closed }`, inserts no route, indexes the generation, and tells the live caller once; (i) a second role of a dispatched instance spawned with origin `Direct` has its origin pinned as `Conflict`. Reports (`src/agent_pty_terminal_tests.rs`): (a), (b) a terminal report paused before the routes and released after the unit's close or exit reads `task_closed`, one `dispatch ended`; (c) one sent while the dispatch is paused before registration reads `report_pending`, and the next after registration is accepted once; (g) one released after its unit was closed and evicted reads `unknown_task`, forgotten wording, with nothing saved or ended twice; (i) an orchestrator whose origin is `Conflict` reads `incompatible_mode`.
+- **Asserts (c, orchestration; h):** an orchestrator's terminal report while its dispatch is paused before registration reads `report_pending`, never `destination: none`, and nothing is saved, claimed or posted; registered, it is accepted to the caller once. (h) for both kinds, G's report attests with no unit and is held before the role map while the dispatch registers U, U is closed and evicted, and a directly started orchestrator takes G's pane: released, the report reads that role map (a probe records it) and is refused `unknown_task` (orchestration) or `incompatible_mode` (single), never `destination: none`, with nothing saved, claimed, marked or posted, one `dispatch ended` and nothing for the successor; the successor's own report reads `destination: none`.
 - **Why it exists:** reviewer R16, auditor U3-3, U3-4: every order of exit, close and registration is covered.
-- **Does not assert:** the terminal reports these generations then send (they arrive with task-scoped completion).
+- **Does not assert:** (c') as a separate arm; (d), whose directly started orchestrator is `dispatch/return/026` (e3)'s; a real agent.
 - **Platform coverage:** mac+linux.
 
 ##### dispatch/return/028 — A unit's entry and index outlive no generation that can still attest, and no shorter.

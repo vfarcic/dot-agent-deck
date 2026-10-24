@@ -1301,6 +1301,336 @@ async fn work_done_058_a_delayed_task_report_never_uses_its_successors_pane() {
     }
 }
 
+/// Scenario: A task report's save fails while the delegation tracker's lock is poisoned: the failure writes nothing before it finds the tracker unavailable, so the connection reads no answer and the claim, the task, its delivery watch, the reply room, the orchestrator's inbox, the rows and the store's reservations are as they were.
+#[spec("orchestration/work-done/053")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn work_done_053_l_an_unavailable_tracker_before_a_failure_writes_nothing() {
+    let team = Arc::new(team("wd053l"));
+    let task = team.delegate("a task");
+    let (reached, release) = team
+        .registry()
+        .pause_at_for_test(crate::task_completion::PAUSE_SAVED);
+    let report = {
+        let team = Arc::clone(&team);
+        let task = task.clone();
+        tokio::spawn(async move { team.report_task(&task, "done").await })
+    };
+    reached.await.unwrap();
+    let state = |team: &Team| {
+        let hub = team.registry().inbox();
+        (
+            hub.reserved_replies(),
+            hub.read_reports(|r| {
+                r.claims
+                    .iter()
+                    .map(|c| format!("{:?} {} {}", c.phase, c.room, c.reserved_bytes))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap(),
+            hub.open_tasks_of(&team.worker_pane),
+            hub.watched_tasks_for_test(),
+            team.orch_subjects(),
+            rows(&team.deck).len(),
+            team.deck
+                .store
+                .counts()
+                .map(|c| (c.reserved_bytes, c.reserved_slots)),
+        )
+    };
+    let before = state(&team);
+    let registry = Arc::clone(team.registry());
+    let _ = std::thread::spawn(move || {
+        let _held = registry.delegations.lock();
+        panic!("poison the delegation tracker (test)");
+    })
+    .join();
+    team.registry()
+        .inject_fault_for_test(crate::task_completion::FAULT_FAIL_SAVE, TestFault::Fail);
+    release.send(()).unwrap();
+    assert_eq!(report.await.unwrap(), Completion::Unconfirmed);
+    let after = state(&team);
+    assert_eq!(after, before, "the failure wrote nothing");
+    assert_eq!(before.1.len(), 1, "the claim stays where it was");
+    // Leaked on purpose: the registry's own teardown panics on a poisoned
+    // lock, the documented boundary.
+    std::mem::forget(Arc::try_unwrap(team).ok());
+}
+
+/// Scenario: (h) the after-section helpers run only after the answer is handed over. While a helper is held inside `after_section`, the reporting connection already reads `accepted`. A helper that panics there leaves the answer `accepted`, the supervisor logs the save task's panic, and the deck goes on taking reports.
+#[spec("orchestration/work-done/053")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn work_done_053_h_the_helpers_run_after_the_handover() {
+    let team = Arc::new(team("wd053h"));
+    let task = team.delegate("a task");
+    let (reached, in_helper) = std::sync::mpsc::channel();
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    *team.registry().inbox().after_section_hook.lock().unwrap() = Some(Box::new(move || {
+        let _ = reached.send(());
+        // Hands this worker's queued tasks to another thread while it waits,
+        // as a slow helper on the blocking pool would leave them runnable.
+        tokio::task::block_in_place(|| {
+            let _ = held.recv();
+        });
+    }));
+    let report = {
+        let team = Arc::clone(&team);
+        let task = task.clone();
+        tokio::spawn(async move { team.report_task(&task, "done").await })
+    };
+    tokio::task::spawn_blocking(move || in_helper.recv_timeout(Duration::from_secs(10)))
+        .await
+        .unwrap()
+        .expect("the helper is reached");
+    let answer = tokio::time::timeout(Duration::from_secs(5), report)
+        .await
+        .expect("answered while a helper is still running")
+        .unwrap();
+    accepted(answer);
+    release.send(()).unwrap();
+
+    // A helper that panics.
+    let task = team.delegate("another task");
+    *team.registry().inbox().after_section_hook.lock().unwrap() =
+        Some(Box::new(|| std::panic::panic_any("injected-053h")));
+    accepted(team.report_task(&task, "done").await);
+    let task = team.delegate("a third task");
+    accepted(team.report_task(&task, "done").await);
+}
+
+/// Scenario: (m) a worker exits owing task t, whose own commission arm is already gone, while a sibling arm, armed for another delegate, is still owed on the same pane. The exit's retirement is exact: it removes nothing for t's missing arm, and the sibling arm is still owed afterwards.
+#[spec("orchestration/work-done/045")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn work_done_045_m_an_exit_never_retires_a_sibling_arm() {
+    let team = team("wd045m");
+    let _task = team.delegate("t");
+    team.acknowledge();
+    let own = team
+        .registry()
+        .commission_arm_ids_for_test(&team.worker_pane);
+    assert_eq!(own.len(), 1, "t's own arm");
+    assert!(
+        team.registry()
+            .delegations
+            .lock()
+            .remove_arm_exact(&team.worker_pane, own[0]),
+        "t's arm is gone before the exit"
+    );
+    let sibling = match team.registry().arm_delegation_commission(
+        &team.worker_pane,
+        &team.orch_pane,
+        Some(&team.orch),
+        false,
+    ) {
+        CommissionArm::Armed { in_flight, .. } => in_flight.arm_id(),
+        _ => panic!("a sibling arm"),
+    };
+    assert_eq!(
+        team.registry()
+            .commission_arm_ids_for_test(&team.worker_pane),
+        vec![sibling]
+    );
+    kill_child(team.registry(), &team.worker);
+    eventually("the exit walks t", || {
+        team.registry()
+            .inbox()
+            .open_tasks_of(&team.worker_pane)
+            .is_empty()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        team.registry()
+            .commission_arm_ids_for_test(&team.worker_pane),
+        vec![sibling],
+        "the sibling arm is still owed"
+    );
+}
+
+/// Scenario: A client subscribes to the deck's broadcast. A worker's task report is accepted, and every notice the hub broadcasts for the report's message — when it is posted, handed over and acknowledged — carries the report's provenance, naming the task, the report id and the worker, including a hand-over that came back; a deck notice posted beside it carries none.
+#[spec("orchestration/work-done/059")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn work_done_059_a_reports_broadcast_notices_carry_its_provenance() {
+    use crate::report_recovery::ReportProvenance;
+    let team = team("wd059");
+    let (tx, mut rx) = tokio::sync::broadcast::channel(256);
+    team.registry().inbox().set_broadcast(tx);
+    let task = team.delegate("a task");
+    let report = accepted(team.report_task(&task, "done").await);
+    let report_id = report.report_id.clone().unwrap();
+    let message = team
+        .registry()
+        .inbox()
+        .list(&team.orch_pane)
+        .into_iter()
+        .find(|m| m.subject == format!("coder completed task {task}"))
+        .expect("the report's message")
+        .id
+        .to_string();
+    team.registry()
+        .inbox()
+        .post_direct(
+            Recipient::bound(&team.orch_pane, &team.orch),
+            Content::from_deck("notice", "a deck notice", "not a report"),
+        )
+        .unwrap();
+    // One hand-over that comes back, then one that is acknowledged.
+    let hub = team.registry().inbox();
+    let hook = hub.test_hook_fetch(&team.orch_pane, &team.orch, None);
+    hub.test_hook_not_handed(&hook);
+    hub.test_hook_close(hook);
+    hub.test_take_acked(&team.orch_pane, &team.orch);
+    let mut states = Vec::new();
+    let mut returned = 0;
+    let mut other = 0;
+    while let Ok(msg) = rx.try_recv() {
+        let crate::event::BroadcastMsg::Inbox(notice) = msg else {
+            continue;
+        };
+        if notice.message_id == message {
+            match &notice.provenance {
+                Some(ReportProvenance::Task {
+                    task_id,
+                    report_id: id,
+                    producer,
+                }) => {
+                    assert_eq!(task_id, &task);
+                    assert_eq!(id, &report_id);
+                    assert_eq!(producer.agent_id, team.worker);
+                }
+                other => panic!("the report's notice carries {other:?}"),
+            }
+            states.push(notice.state);
+            returned += usize::from(notice.returned);
+        } else if notice.pane_id == team.orch_pane && notice.subject == "a deck notice" {
+            assert_eq!(notice.provenance, None);
+            other += 1;
+        }
+    }
+    assert!(states.contains(&StateName::Queued), "{states:?}");
+    assert!(states.contains(&StateName::Fetched), "{states:?}");
+    assert!(states.contains(&StateName::Acknowledged), "{states:?}");
+    assert!(other > 0, "the deck notice was broadcast too");
+    // An offer that leaves its holder for another generation is broadcast
+    // with `returned`; this schedule hands it to one generation only.
+    assert_eq!(returned, 0);
+}
+
+/// Scenario: (d) a delayed note across pane reuse into another orchestration: worker A, spawned into the team's instance, sends a note that attests and is held before it reads the role map. A exits, B starts on A's pane in another instance, and that instance's orchestrator is running; the role map now puts the pane in the other instance. Released, the note is refused as from a pane that now belongs to another orchestration: neither orchestrator's inbox gets it, and nothing is saved or listed.
+#[spec("orchestration/work-done/048")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn work_done_048_d_a_delayed_note_never_crosses_into_another_instance() {
+    let mut team = team("wd048d");
+    let registry = Arc::clone(team.registry());
+    let seated = move |pane: &str, instance: &str, orchestrator: bool| {
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+                tab_membership: Some(TabMembership::Orchestration {
+                    name: "team".to_string(),
+                    role_index: usize::from(!orchestrator),
+                    role_name: if orchestrator {
+                        "orchestrator"
+                    } else {
+                        "coder"
+                    }
+                    .to_string(),
+                    is_start_role: orchestrator,
+                    orchestration_cwd: None,
+                    display_title: None,
+                    orchestration_id: Some(instance.to_string()),
+                }),
+                origin: Some(crate::hook_provenance::InstanceOrigin::Direct),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn a seated cat")
+    };
+    let _ = team.registry().close_agent(&team.worker);
+    let a = seated(&team.worker_pane, &team.instance, false);
+    team.worker = a.clone();
+    let provenance = team.attested(&a);
+    assert!(
+        matches!(&provenance, Provenance::Attested { facts, .. }
+            if facts.seat.as_ref().is_some_and(|seat| seat.instance == team.instance)),
+        "A is seated in the team's instance"
+    );
+    let state = Arc::new(tokio::sync::RwLock::new(team.state.clone()));
+    let (reached, release) = team
+        .registry()
+        .pause_at_for_test(crate::task_completion::PAUSE_ATTESTED);
+    let note = {
+        let registry = Arc::clone(team.registry());
+        let state = Arc::clone(&state);
+        let pane = team.worker_pane.clone();
+        tokio::spawn(async move {
+            crate::task_completion::complete(
+                &state,
+                &registry,
+                CompletionRequest {
+                    pane_id: pane,
+                    mode: WorkDoneMode::Uncorrelated,
+                    report: "A-048D-NOTE".to_string(),
+                },
+                &provenance,
+            )
+            .await
+        })
+    };
+    reached.await.unwrap();
+    kill_child(team.registry(), &a);
+    let other = "wd048d-other-instance";
+    let orch2_pane = "wd048d-orch2";
+    let orch2 = seated(orch2_pane, other, true);
+    let mut b = None;
+    eventually("B starts on A's pane", || {
+        b = team
+            .registry()
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), team.worker_pane.clone())],
+                ..SpawnOptions::default()
+            })
+            .ok();
+        b.is_some()
+    })
+    .await;
+    {
+        let mut st = state.write().await;
+        let identity = OrchestrationIdentity {
+            id: other.to_string(),
+            name: "other".to_string(),
+        };
+        st.pane_orchestration_map
+            .insert(team.worker_pane.clone(), identity.clone());
+        st.pane_orchestration_map
+            .insert(orch2_pane.to_string(), identity);
+        st.pane_role_map
+            .insert(orch2_pane.to_string(), "orchestrator".to_string());
+        st.orchestrator_pane_ids.insert(orch2_pane.to_string());
+    }
+    release.send(()).unwrap();
+    refused_with(note.await.unwrap(), code::NOT_A_WORKER);
+    let holds_note = |pane: &str| {
+        team.registry()
+            .inbox()
+            .rendered(pane)
+            .into_iter()
+            .any(|delivery| delivery.text.contains("A-048D-NOTE"))
+    };
+    assert!(
+        !holds_note(orch2_pane),
+        "not the other instance's orchestrator"
+    );
+    assert!(
+        !holds_note(&team.orch_pane),
+        "not the team's orchestrator either"
+    );
+    assert!(team.registry().inbox().list(orch2_pane).is_empty());
+    assert_eq!(store_files(&team.deck.store).len(), 0);
+    assert!(rows(&team.deck).is_empty());
+    let _ = (orch2, b);
+}
+
 /// The store's own files, by name.
 pub(super) fn store_files(store: &crate::retained_store::RetainedStore) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(store.dir())

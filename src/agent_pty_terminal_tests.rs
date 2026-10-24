@@ -570,7 +570,7 @@ async fn return_026_e1_e3_reports_during_a_replacement() {
     assert!(rows(&deck).is_empty());
 }
 
-/// Scenario: (a) a terminal report paused after its snapshot, released after the unit was closed: `task_closed`, never `incompatible_mode` and never `destination: none`, for a single and an orchestration unit. (c) the dispatch paused before registering its unit: the terminal generation's report reads `report_pending`; released and registered, the next report is accepted. (d) the orchestrator of a directly started orchestration: `destination: none`, nothing saved.
+/// Scenario: (a) a terminal report paused after its snapshot, released after the unit was closed: `task_closed`, never `incompatible_mode` and never `destination: none`, for a single and an orchestration unit. (c) the dispatch paused before registering its unit: the terminal generation's report reads `report_pending`; released and registered, the next report is accepted.
 #[spec("dispatch/return/027")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn return_027_a_c_d_a_unit_that_ends_or_registers_around_its_report() {
@@ -638,6 +638,368 @@ async fn return_027_a_c_d_a_unit_that_ends_or_registers_around_its_report() {
             .count(),
         1
     );
+}
+
+/// Scenario: (c) for an orchestration: the dispatch is paused after its roles are spawned and before its unit is registered, so an `Instance` publication covers its orchestrator. The orchestrator's terminal report reads `report_pending`, never `destination: none`, and nothing is saved, claimed or posted; released and registered, its report is accepted to the caller once.
+#[spec("dispatch/return/027")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn return_027_c_an_orchestrators_report_during_registration_is_pending() {
+    let deck = Arc::new(deck());
+    let caller = spawn_cat(&deck.registry, "r027co-caller");
+    let (reached, release) = deck.registry.pause_at_for_test("dispatch-publication");
+    let dispatch = {
+        let deck = Arc::clone(&deck);
+        let caller = caller.clone();
+        tokio::spawn(async move {
+            dispatch_orchestration(&deck, "r027co", "r027co-caller", &caller).await
+        })
+    };
+    reached.await.unwrap();
+    let (pane, orchestrator) = deck
+        .registry
+        .live_pane_agents()
+        .into_iter()
+        .find(|(_, agent)| {
+            deck.registry
+                .attest_facts(agent)
+                .and_then(|facts| facts.seat)
+                .is_some_and(|seat| seat.is_orchestrator)
+        })
+        .expect("the orchestrator is spawned");
+    let terminal = |deck: Arc<Deck>, pane: String, agent: String| async move {
+        crate::task_completion::complete_with_state(
+            &AppState::default(),
+            &deck.registry,
+            CompletionRequest {
+                pane_id: pane,
+                mode: WorkDoneMode::Terminal,
+                report: "orchestration done".to_string(),
+            },
+            &Provenance::Attested {
+                facts: deck.registry.attest_facts(&agent).unwrap_or_default(),
+                agent_id: agent,
+            },
+        )
+        .await
+    };
+    let pending = refused_with(
+        terminal(Arc::clone(&deck), pane.clone(), orchestrator.clone()).await,
+        code::REPORT_PENDING,
+    );
+    assert_eq!(pending.destination, None);
+    assert_eq!(super::report_tests::store_files(&deck.store).len(), 0);
+    assert_eq!(
+        deck.registry
+            .inbox()
+            .read_reports(|r| r.claims.len())
+            .unwrap(),
+        0
+    );
+    assert!(inbox_of(&deck, "r027co-caller").is_empty());
+    release.send(()).unwrap();
+    dispatch.await.unwrap();
+    let answer = accepted(terminal(Arc::clone(&deck), pane, orchestrator).await);
+    assert_eq!(answer.destination, Some(Destination::Inbox));
+    assert_eq!(
+        inbox_of(&deck, "r027co-caller")
+            .iter()
+            .filter(|(s, _)| s == "dispatch completed")
+            .count(),
+        1
+    );
+}
+
+/// Scenario: (e2) a delayed predecessor, for a single and an orchestration unit: A's terminal report attests and is held before it reads the routes, and A's pane is respawned to B. Released while the replacement is still being published, it reads `report_pending`; a second held request from A, released after the publish, reads `task_closed` with the replaced wording. Neither consumes anything: no claim, file, mark or post. B then reports and is accepted once.
+#[spec("dispatch/return/026")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn return_026_e2_a_delayed_predecessor_is_refused() {
+    for orchestration in [false, true] {
+        let unit = Arc::new(unit(&format!("r026e2-{orchestration}"), orchestration).await);
+        let a = unit.agent().to_string();
+        let facts_a = unit.facts(&a);
+        let held_a = |unit: &Arc<Unit>| {
+            let (reached, release) = unit
+                .registry()
+                .pause_at_for_test(crate::task_completion::PAUSE_TERMINAL_RESOLVED);
+            let report = {
+                let unit = Arc::clone(unit);
+                let (a, facts) = (a.clone(), facts_a.clone());
+                tokio::spawn(async move { unit.report_from(&unit.pane, &a, facts, "A done").await })
+            };
+            (reached, release, report)
+        };
+        let nothing_consumed = |unit: &Unit| {
+            assert_eq!(
+                unit.registry()
+                    .inbox()
+                    .read_reports(|r| r.claims.len())
+                    .unwrap(),
+                0
+            );
+            assert_eq!(super::report_tests::store_files(&unit.deck.store).len(), 0);
+            assert_eq!(unit.completed(), 0);
+            assert!(
+                unit.registry()
+                    .dispatched_units()
+                    .get(&unit.unit_id())
+                    .is_some_and(|u| u.completed_at_ms.is_none())
+            );
+        };
+        let (reached, release, during) = held_a(&unit);
+        reached.await.unwrap();
+        let (published, publish) = unit
+            .registry()
+            .pause_at_sync_for_test(PAUSE_RESPAWN_BEFORE_PUBLISH);
+        let respawn = {
+            let unit = Arc::clone(&unit);
+            tokio::spawn(async move {
+                unit.registry()
+                    .respawn_agent_for_pane(&unit.pane, "cat")
+                    .await
+            })
+        };
+        tokio::task::spawn_blocking(move || published.recv_timeout(Duration::from_secs(10)))
+            .await
+            .unwrap()
+            .unwrap();
+        release.send(()).unwrap();
+        refused_with(during.await.unwrap(), code::REPORT_PENDING);
+        nothing_consumed(&unit);
+
+        let (reached, release, after) = held_a(&unit);
+        reached.await.unwrap();
+        publish.send(()).unwrap();
+        respawn.await.unwrap().unwrap();
+        release.send(()).unwrap();
+        let refusal = refused_with(after.await.unwrap(), code::TASK_CLOSED);
+        assert!(
+            refusal
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("replaced by a restart")),
+            "{refusal:?}"
+        );
+        nothing_consumed(&unit);
+
+        let b = unit.registry().pane_current_agent_id(unit.pane()).unwrap();
+        assert_ne!(b, a);
+        accepted(
+            unit.report_from(unit.pane(), &b, unit.facts(&b), "B done")
+                .await,
+        );
+        assert_eq!(unit.completed(), 1);
+    }
+}
+
+/// Scenario: (h) the R24 schedule with a delayed request, for a single and an orchestration unit. The dispatch is paused before its unit is registered, so its terminal generation G is spawned and attests with no unit. G's terminal report attests and is held before it reads the role map. The dispatch is released and registers U; U is closed and ends, with one `dispatch ended`; U's entry and index are evicted; and a directly started orchestration's orchestrator takes G's pane, so the role map now names a direct orchestrator there. Released, G's report reads that role map (the probe shows it) and is refused — `unknown_task` for the orchestration, `incompatible_mode` for the single unit — never `destination: none`: nothing is saved, claimed, marked or posted, no second `dispatch ended` is sent and the successor's inbox stays empty. The direct successor's own report then reads `destination: none`.
+#[spec("dispatch/return/027")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn return_027_h_a_delayed_report_across_registration_eviction_and_pane_reuse() {
+    // SAFETY: a nextest process runs one test.
+    unsafe { std::env::set_var(crate::report_recovery::ENV_TOMBSTONES_MAX, "1") };
+    for orchestration in [false, true] {
+        let tag = format!("r027h{}", u8::from(orchestration));
+        let caller_pane = format!("{tag}-caller");
+        let deck = Arc::new(deck());
+        let caller = spawn_cat(&deck.registry, &caller_pane);
+        let (reached, release_dispatch) = deck.registry.pause_at_for_test("dispatch-publication");
+        let dispatch = {
+            let (deck, tag, caller_pane, caller) = (
+                Arc::clone(&deck),
+                tag.clone(),
+                caller_pane.clone(),
+                caller.clone(),
+            );
+            tokio::spawn(async move {
+                if orchestration {
+                    dispatch_orchestration(&deck, &tag, &caller_pane, &caller).await
+                } else {
+                    dispatch_single(&deck, &tag, &caller_pane, &caller).await
+                }
+            })
+        };
+        reached.await.unwrap();
+        // G: the single unit's agent, or the orchestration's orchestrator.
+        let (pane, g) = deck
+            .registry
+            .live_pane_agents()
+            .into_iter()
+            .find(|(pane, agent)| {
+                pane.starts_with(&format!("sched-dispatch-{tag}"))
+                    && (!orchestration
+                        || deck
+                            .registry
+                            .attest_facts(agent)
+                            .and_then(|facts| facts.seat)
+                            .is_some_and(|seat| seat.is_orchestrator))
+            })
+            .expect("G is spawned");
+        let facts = deck.registry.attest_facts(&g).unwrap();
+        assert_eq!(facts.unit, None, "G attests with no unit");
+        let state = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let (attested, release_report) = deck
+            .registry
+            .pause_at_for_test(crate::task_completion::PAUSE_ATTESTED);
+        let report = {
+            let (deck, state, pane, g) = (
+                Arc::clone(&deck),
+                Arc::clone(&state),
+                pane.clone(),
+                g.clone(),
+            );
+            tokio::spawn(async move {
+                crate::task_completion::complete(
+                    &state,
+                    &deck.registry,
+                    CompletionRequest {
+                        pane_id: pane,
+                        mode: WorkDoneMode::Terminal,
+                        report: "G done".to_string(),
+                    },
+                    &Provenance::Attested { agent_id: g, facts },
+                )
+                .await
+            })
+        };
+        attested.await.unwrap();
+        release_dispatch.send(()).unwrap();
+        let handle = dispatch.await.unwrap();
+        let unit_id = handle.unit_id.clone().unwrap();
+        // U is closed, and ends.
+        drop(deck.registry.begin_pane_close(&pane));
+        let _ = deck.registry.close_agent(&g);
+        drop(deck.registry.finish_pane_close(&pane, true));
+        eventually("U ends", || {
+            inbox_of(&deck, &caller_pane)
+                .iter()
+                .any(|(s, _)| s == "dispatch ended")
+        })
+        .await;
+        // U's entry and index are evicted.
+        let others: Vec<(String, String, String)> = (0..32)
+            .map(|n| {
+                (
+                    format!("{tag}-p{n}"),
+                    format!("gone-{n}"),
+                    format!("u-{tag}-{n}"),
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, &str, &str)> = others
+            .iter()
+            .map(|(p, a, u)| (p.as_str(), a.as_str(), u.as_str()))
+            .collect();
+        deck.registry
+            .inbox()
+            .insert_ended_units_for_test(deck.registry.as_ref(), &refs);
+        assert!(unit_entry(&deck, &unit_id).is_none(), "U is evicted");
+        // A direct orchestration's orchestrator takes G's pane.
+        let direct_instance = format!("{tag}-direct");
+        let successor = deck
+            .registry
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.clone())],
+                tab_membership: Some(TabMembership::Orchestration {
+                    name: "direct".to_string(),
+                    role_index: 0,
+                    role_name: "orchestrator".to_string(),
+                    is_start_role: true,
+                    orchestration_cwd: None,
+                    display_title: None,
+                    orchestration_id: Some(direct_instance.clone()),
+                }),
+                origin: Some(InstanceOrigin::Direct),
+                ..SpawnOptions::default()
+            })
+            .expect("the direct orchestrator takes the pane");
+        {
+            let mut st = state.write().await;
+            st.pane_role_map
+                .insert(pane.clone(), "orchestrator".to_string());
+            st.orchestrator_pane_ids.insert(pane.clone());
+            st.pane_orchestration_map.insert(
+                pane.clone(),
+                crate::state::OrchestrationIdentity {
+                    id: direct_instance.clone(),
+                    name: "direct".to_string(),
+                },
+            );
+        }
+        release_report.send(()).unwrap();
+        let answer = report.await.unwrap();
+        let seen = crate::task_completion::snapshot_probe::seen(&pane).unwrap();
+        assert!(
+            seen.contains("is_orchestrator: true") && seen.contains(&direct_instance),
+            "the report read the direct successor's role map: {seen}"
+        );
+        let refusal = refused_with(
+            answer,
+            if orchestration {
+                code::UNKNOWN_TASK
+            } else {
+                code::INCOMPATIBLE_MODE
+            },
+        );
+        assert_ne!(refusal.destination, Some(Destination::None));
+        assert_eq!(super::report_tests::store_files(&deck.store).len(), 0);
+        assert_eq!(
+            deck.registry
+                .inbox()
+                .read_reports(|r| r.claims.len())
+                .unwrap(),
+            0
+        );
+        let caller_inbox = inbox_of(&deck, &caller_pane);
+        assert_eq!(
+            caller_inbox
+                .iter()
+                .filter(|(s, _)| s == "dispatch ended")
+                .count(),
+            1,
+            "no second dispatch ended"
+        );
+        assert!(!caller_inbox.iter().any(|(s, _)| s == "dispatch completed"));
+        assert!(
+            deck.registry
+                .dispatched_units()
+                .get(&unit_id)
+                .is_none_or(|u| u.completed_at_ms.is_none()),
+            "no mark"
+        );
+        let for_successor: Vec<String> = deck
+            .registry
+            .inbox()
+            .list(&pane)
+            .into_iter()
+            .filter(|m| {
+                m.recipient.as_ref().and_then(|r| r.agent_id.as_deref()) == Some(successor.as_str())
+            })
+            .map(|m| m.subject)
+            .collect();
+        assert!(
+            for_successor.is_empty(),
+            "nothing for the successor: {for_successor:?}"
+        );
+        // The direct successor's own report.
+        let none = accepted(
+            crate::task_completion::complete_with_state(
+                &AppState::default(),
+                &deck.registry,
+                CompletionRequest {
+                    pane_id: pane.clone(),
+                    mode: WorkDoneMode::Terminal,
+                    report: "direct done".to_string(),
+                },
+                &Provenance::Attested {
+                    facts: deck.registry.attest_facts(&successor).unwrap(),
+                    agent_id: successor.clone(),
+                },
+            )
+            .await,
+        );
+        assert_eq!(none.destination, Some(Destination::None));
+    }
 }
 
 /// Scenario: (i) an orchestrator seat whose instance's generations disagree on how it started reports terminal with no unit evidence: refused `incompatible_mode`, never `destination: none`.
@@ -729,20 +1091,92 @@ async fn work_done_053_j_an_unavailable_store_before_the_commit_writes_nothing()
     let unit = Arc::new(unit("wd053j", false).await);
     let (report, release) =
         paused_report(&unit, crate::task_completion::PAUSE_MARKED, "done").await;
+    // Everything the commit could change, read whole before and after.
+    let state = |unit: &Unit| {
+        let hub = unit.registry().inbox();
+        (
+            hub.reserved_replies(),
+            hub.read_reports(|r| {
+                (
+                    r.claims.len(),
+                    r.claims
+                        .iter()
+                        .map(|c| {
+                            format!(
+                                "{:?} {} {:?} {} {}",
+                                c.phase,
+                                c.prepared.is_some(),
+                                c.unit_mark,
+                                c.room,
+                                c.reserved_bytes
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    format!("{:?}", r.units.get(&unit.unit_id())),
+                    r.accepted.len(),
+                    r.outcomes.rows().len(),
+                )
+            })
+            .unwrap(),
+            inbox_of(&unit.deck, &unit.caller_pane),
+            unit.route_count(),
+            super::report_tests::store_files(&unit.deck.store),
+            unit.registry()
+                .dispatched_units()
+                .get(&unit.unit_id())
+                .map(|u| u.completed_at_ms),
+        )
+    };
+    let before = state(&unit);
     unit.deck.store.poison_for_test();
     release.send(()).unwrap();
     assert_eq!(report.await.unwrap(), Completion::Unconfirmed);
     assert_eq!(unit.completed(), 0);
+    assert_eq!(state(&unit), before, "the commit wrote nothing");
+    assert_eq!(before.1.0, 1, "the claim stays where it was");
+    refused_with(unit.report("done").await, code::DECK_UNAVAILABLE);
+    std::mem::forget(Arc::try_unwrap(unit).ok());
+}
+
+/// Scenario: The routes' lock is poisoned by a panic on another thread while the deck's report state stays whole. The unit's terminal report is answered `deck_unavailable` on its own connection, with no panic in the reporting task, and nothing is claimed, saved, marked or posted.
+#[spec("orchestration/work-done/053")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn work_done_053_k_poisoned_routes_refuse_a_terminal_report() {
+    let unit = Arc::new(unit("wd053k", false).await);
+    let registry = Arc::clone(unit.registry());
+    let _ = std::thread::spawn(move || {
+        let _held = registry.dispatch_returns.lock();
+        panic!("poison the routes (test)");
+    })
+    .join();
+    assert!(unit.registry().dispatch_returns.is_poisoned());
+    assert!(
+        !unit.registry().inbox().reports_torn(),
+        "the state is whole"
+    );
+    let report = {
+        let unit = Arc::clone(&unit);
+        tokio::spawn(async move { unit.report("done").await })
+    };
+    let answer = report.await.expect("the reporting task does not panic");
+    refused_with(answer, code::DECK_UNAVAILABLE);
     assert_eq!(
         unit.registry()
             .inbox()
             .read_reports(|r| r.claims.len())
             .unwrap(),
-        1,
-        "the claim stays where it was"
+        0
     );
-    assert_eq!(std::fs::read_dir(unit.deck.store.dir()).unwrap().count(), 1);
-    refused_with(unit.report("done").await, code::DECK_UNAVAILABLE);
+    assert_eq!(super::report_tests::store_files(&unit.deck.store).len(), 0);
+    assert_eq!(unit.completed(), 0);
+    assert!(
+        unit.registry()
+            .dispatched_units()
+            .get(&unit.unit_id())
+            .is_some_and(|u| u.completed_at_ms.is_none())
+    );
+    // Leaked on purpose: the registry's own teardown panics on a poisoned
+    // lock, the documented boundary.
     std::mem::forget(Arc::try_unwrap(unit).ok());
 }
 

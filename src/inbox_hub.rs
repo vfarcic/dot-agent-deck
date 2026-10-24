@@ -714,6 +714,11 @@ pub struct InboxHub {
     /// Test seam: the next fallback retry pass tells the first end once it
     /// has taken the bodies out and before it writes them, and waits for the
     /// second.
+    /// Test seam: the next [`Self::after_section`] runs this first, inside
+    /// the helpers, so a test can block or panic there.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub(crate) after_section_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     pub(crate) hold_fallback_retry:
         std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
@@ -864,6 +869,8 @@ impl InboxHub {
             fallback_retry_pass: std::sync::Mutex::new(()),
             #[cfg(test)]
             hold_caps: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            after_section_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
             hold_fallback_retry: std::sync::Mutex::new(None),
         }

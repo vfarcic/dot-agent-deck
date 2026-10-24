@@ -49,6 +49,10 @@ impl InboxHub {
     /// Run what a section owes: wake the recipients of what it posted and
     /// post the notices it queued. Called with no ranked lock held.
     pub(crate) fn after_section(&self, after: AfterSection) {
+        #[cfg(test)]
+        if let Some(hook) = self.after_section_hook.lock().unwrap().take() {
+            hook();
+        }
         for to in after.wakes {
             match &to.agent_id {
                 Some(agent) => self.dispatch_agent(&to.pane_id, agent),

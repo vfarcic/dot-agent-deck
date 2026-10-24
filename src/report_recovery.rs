@@ -1035,6 +1035,12 @@ impl ClaimTable {
         self.claims.get_mut(&claim_id)
     }
 
+    /// Every claim, for a test's whole-state reads.
+    #[cfg(test)]
+    pub fn iter(&self) -> impl Iterator<Item = &Claim> {
+        self.claims.values()
+    }
+
     pub fn remove(&mut self, claim_id: u64) -> Option<Claim> {
         let claim = self.claims.remove(&claim_id)?;
         let key = (claim.worker_pane.clone(), claim.worker_agent.clone());

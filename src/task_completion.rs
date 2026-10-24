@@ -334,6 +334,8 @@ async fn transact(
     provenance: &Provenance,
     snap: Snapshot,
 ) -> Completion {
+    #[cfg(test)]
+    snapshot_probe::record(&request.pane_id, &snap);
     let attested = match provenance {
         Provenance::Attested { agent_id, facts } => Some((agent_id.clone(), facts.clone())),
         _ => None,
@@ -932,6 +934,31 @@ fn settle_failure(
     let _ = handed.send(completion);
     if let Some(after) = after {
         registry.inbox().after_section(after);
+    }
+}
+
+/// Test probe: the role-map snapshot each pane's last report read, so a
+/// test can show the schedule it built is the one the transaction saw.
+#[cfg(test)]
+pub(crate) mod snapshot_probe {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    static SEEN: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+
+    pub(super) fn record(pane_id: &str, snap: &super::Snapshot) {
+        SEEN.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_or_insert_with(HashMap::new)
+            .insert(pane_id.to_string(), format!("{snap:?}"));
+    }
+
+    /// The snapshot `pane_id`'s last report read, as its `Debug` text.
+    pub(crate) fn seen(pane_id: &str) -> Option<String> {
+        SEEN.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .and_then(|seen| seen.get(pane_id).cloned())
     }
 }
 
