@@ -90,6 +90,26 @@ def touches_denied(repo, number):
     return sorted(denied, key=deny_sort_key)
 
 
+def vote_note(author_may_vote, denied):
+    """The selection log's note on what the vote job will do with a verdict.
+
+    Issue #1629: this used to read "verdict only" for a deny-listed pull request,
+    which stopped being true with #998 -- the vote job votes on one, with a
+    `needs-human-eye` marker, unless auto-merge is armed. #1606 was approved that
+    way while its selection line said "verdict only", which read as a vote that
+    should have been withheld. Only an author outside VOTE_AUTHORS gets a verdict
+    and no vote.
+    """
+    if not author_may_vote:
+        return "  (verdict only: author not in VOTE_AUTHORS)"
+    if denied:
+        return (
+            "  (sensitive path: votes with a needs-human-eye marker unless auto-merge "
+            f"is armed: {denied[:5]})"
+        )
+    return ""
+
+
 def main():
     repo = env("REPO")
     only_pr = env("ONLY_PR")
@@ -153,6 +173,8 @@ def main():
     # Advisory reds, per selected pull request. Kept out of `items` on purpose:
     # that list becomes the review job's matrix payload, and this is for the log.
     advisories = {}
+    # What the vote job will do with each selected pull request, for the log.
+    vote_notes = {}
     for pr in prs:
         number, sha = pr["number"], pr["headRefOid"]
         author = pr["author"]["login"]
@@ -279,6 +301,7 @@ def main():
             # limit rather than a lost reason.
             "denied_paths": denied[:5],
         })
+        vote_notes[number] = vote_note(author in vote_authors, denied)
         if mode == "review":
             # Only the review job reads it; the vote job recomputes coverage.
             items[-1]["independent_review"] = describe_independent_review(evidence)
@@ -288,8 +311,7 @@ def main():
     for number, why in skipped:
         print(f"skip #{number}: {why}")
     for item in items:
-        note = "" if item["vote_allowed"] else f"  (verdict only: {item['denied_paths'] or 'author not in VOTE_AUTHORS'})"
-        print(f"review #{item['number']} @ {item['sha'][:8]}{note}")
+        print(f"review #{item['number']} @ {item['sha'][:8]}{vote_notes[item['number']]}")
         # Said out loud rather than swallowed: "selected anyway" is a different
         # statement from "nothing was red", and the reader should not have to
         # open the pull request to tell them apart.

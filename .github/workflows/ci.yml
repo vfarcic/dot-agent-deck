@@ -380,8 +380,108 @@ jobs:
       # `--with-deps` is for WebKit, not for Chromium: WebKit needs a GTK4 and
       # GStreamer runtime that the runner image does not carry in full. It runs
       # apt, so it is the slowest step here.
+      #
+      # Issue #1864 — the .debs that apt installs are cached, and the index is
+      # not. In the 14 slow or timed-out attempts of this job on `main` on
+      # 2026-10-22 and 2026-10-23, the .deb fetch (119 MB, 189 packages) ran at
+      # 85–203 kB/s in the four that finished it and never finished in the
+      # other ten, while `apt-get update` fetched its 8–12.5 MB of indexes from
+      # the same mirror in about a second in 13 of them (6 s in the other). So
+      # the steps below keep the fast half and skip the slow one: a warm cache
+      # leaves apt only the packages Ubuntu has updated since the entry was
+      # saved.
+      #
+      # apt does NOT verify a .deb that is already in its archive directory: it
+      # checks the size and hands the file to dpkg. In an `ubuntu:24.04`
+      # container a same-size tampered .deb went straight to "Preparing to
+      # unpack", with no "Hash Sum mismatch", and failed only because zstd's
+      # own checksum caught random corruption. A crafted .deb would pass that
+      # check. So the restore step hands apt only the cached files whose SHA-256
+      # matches the one in the index this job has just fetched and apt has
+      # checked against Ubuntu's signature, and drops every other file. apt
+      # fetches the dropped packages from the mirror again, so a bad cache entry
+      # costs time and nothing else. The trust root is the same as an uncached
+      # install, Ubuntu's archive key.
+      #
+      # Saved only from `main`, the rule the Rust caches follow (the note above
+      # `jobs:`, issue #1743): ~119 MB of a budget that `main` already nearly
+      # fills. Each key covers one runner image version and one Playwright
+      # version. A new image restores the previous image's entry by prefix and
+      # fetches only what changed. Rejected alternatives: a retry, because the
+      # slow attempts did not recover (one averaged 85 kB/s over 23 minutes, and
+      # in the three traced file by file the rate fell rather than rose), so a
+      # retry on the same runner would most likely repeat it; Playwright's
+      # container image, which would move the trust to that image and need
+      # another pin kept in lockstep with `@playwright/test`. `.rwx/ci.yml`'s
+      # copy of this job has no cache because it has not needed one: in the 57
+      # RWX runs of that task on those two days it took 407–441 s, and the two
+      # whose logs were read fetched its .debs (195 MB on that image) in 1–2 s.
+      - name: Compute the .deb cache key
+        id: debs-key
+        run: |
+          playwright=$(node -p 'require("./node_modules/@playwright/test/package.json").version')
+          echo "prefix=playwright-debs-${ImageOS:-unknown}-" >> "$GITHUB_OUTPUT"
+          echo "key=playwright-debs-${ImageOS:-unknown}-${ImageVersion:-unknown}-${playwright}" >> "$GITHUB_OUTPUT"
+      - id: debs
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/playwright-debs
+          key: ${{ steps.debs-key.outputs.key }}
+          restore-keys: ${{ steps.debs-key.outputs.prefix }}
+      # The file name is `<package>_<version>_<arch>.deb` with an epoch's `:`
+      # written as `%3a`, which `apt-cache show <package>=<version>` takes back.
+      # A file the index does not list, or lists with another hash, is dropped.
+      - name: Hand apt the cached .debs whose hash the signed index carries
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/playwright-debs"
+          shopt -s nullglob
+          debs=("$dir"/*.deb)
+          if [ "${#debs[@]}" -eq 0 ]; then
+            echo "No cached .debs: apt fetches every one from the mirror."
+            exit 0
+          fi
+          sudo apt-get update -qq
+          kept=0
+          dropped=0
+          for deb in "${debs[@]}"; do
+            IFS=_ read -r pkg ver _ <<< "$(basename "$deb" .deb)"
+            signed=$(apt-cache show "$pkg=${ver//%3a/:}" 2>/dev/null | sed -n 's/^SHA256: //p' || true)
+            if grep -qxF "$(sha256sum "$deb" | cut -d' ' -f1)" <<< "$signed"; then
+              sudo cp "$deb" /var/cache/apt/archives/
+              kept=$((kept + 1))
+            else
+              echo "Dropped $(basename "$deb"): no entry in the signed index carries its SHA-256."
+              dropped=$((dropped + 1))
+            fi
+          done
+          echo "Handed apt $kept cached .debs; dropped $dropped."
       - run: pnpm exec playwright install --with-deps chromium webkit
         timeout-minutes: 25
+      # Rebuilt from what this run installed, so a package nothing installs any
+      # more, a version Ubuntu has replaced or a dropped file is not saved
+      # again. It runs on every ref, so a branch's run shows what `main` would
+      # save; only the save itself is limited to `main`.
+      - name: Collect the .debs this run installed
+        if: steps.debs.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/playwright-debs"
+          rm -rf "$dir"
+          mkdir -p "$dir"
+          shopt -s nullglob
+          for deb in /var/cache/apt/archives/*.deb; do
+            IFS=_ read -r pkg ver _ <<< "$(basename "$deb" .deb)"
+            if [ "$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || true)" = "${ver//%3a/:}" ]; then
+              cp "$deb" "$dir/"
+            fi
+          done
+          echo "Collected $(find "$dir" -name '*.deb' | wc -l) .debs, $(du -sh "$dir" | cut -f1)."
+      - if: steps.debs.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/playwright-debs
+          key: ${{ steps.debs-key.outputs.key }}
       # Playwright transpiles specs without type-checking them, so a type error
       # under `desktop/e2e` would run happily and could pass. This is the gate
       # that makes it an error, and it is fast enough to run before the browsers
@@ -681,7 +781,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
-      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
         with:
           tool: cargo-nextest@0.9.146
       # The Pi extension's Node suites run from the fast tier
@@ -895,7 +995,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
-      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
         with:
           tool: cargo-nextest@0.9.146
       # The same Linux deps `clippy` installs, for the same reason: the archive
@@ -968,7 +1068,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: 1.99.0
-      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
         with:
           tool: cargo-nextest@0.9.146
       # The desktop crate's test binaries link these libraries at run time.
@@ -1373,7 +1473,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
-      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
         with:
           tool: cargo-nextest@0.9.146
       - run: cargo build
@@ -1455,7 +1555,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
-      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
         with:
           tool: cargo-nextest@0.9.146
       - run: cargo build

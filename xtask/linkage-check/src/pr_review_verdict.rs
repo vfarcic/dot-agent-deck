@@ -1469,3 +1469,43 @@ assert 'items=[]' in open(out.name).read()
         ));
     }
 }
+
+/// Issue #1629: the selector's log called a deny-listed pull request "verdict
+/// only", but since #998 the vote job votes on one with a `needs-human-eye`
+/// marker unless auto-merge is armed -- #1606 was approved exactly that way, and
+/// the label made it read as a vote that should have been withheld. Only an
+/// author outside VOTE_AUTHORS is genuinely verdict only.
+#[test]
+fn a_deny_listed_pull_request_is_not_logged_as_verdict_only() {
+    for (author, vote_authors, expect, refuse) in [
+        (
+            "app/renovate",
+            "app/renovate",
+            "needs-human-eye",
+            "verdict only",
+        ),
+        ("app/renovate", "vfarcic", "verdict only", "needs-human-eye"),
+    ] {
+        assert_py_ok(&format!(
+            r#"import os, io, tempfile, contextlib
+import pr_review_select as sel
+sel.gh_json = lambda *a: [{{'number': 7, 'author': {{'login': {author:?}}}, 'isDraft': False,
+    'headRefOid': SHA, 'headRepositoryOwner': {{'login': 'o'}}, 'reviewDecision': ''}}]
+sel.check_status = lambda repo, sha: (True, 'green', [])
+sel.unresolved_threads = lambda repo, n: 0
+sel.latest_verdict = lambda repo, n: None
+sel.pr_comments = sel.pr_review_comments = sel.pr_reviews = lambda repo, n: []
+sel.touches_denied = lambda repo, n: ['.github/workflows/release.yml']
+out = tempfile.NamedTemporaryFile('r', delete=False)
+os.environ.update({{'REPO': 'o/r', 'SELECT_MODE': 'review', 'REVIEW_AUTHORS': {author:?},
+                   'VOTE_AUTHORS': {vote_authors:?}, 'GITHUB_OUTPUT': out.name}})
+log = io.StringIO()
+with contextlib.redirect_stdout(log):
+    sel.main()
+line = [l for l in log.getvalue().splitlines() if l.startswith('review #7')][0]
+assert {expect:?} in line, line
+assert {refuse:?} not in line, line
+"#
+        ));
+    }
+}
