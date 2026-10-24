@@ -970,7 +970,29 @@ mod tests {
         let t = ev.tells.iter_mut().find(|t| t.id == "tell-4").unwrap();
         t.part_ops.clear();
         t.subject_pane = Some("1".to_string());
+        assert!(t.ops_of("work-done", "fetch").is_empty());
         explain(&mut ev, r, &log_with(&h5_line("1")));
+        assert_eq!(ev.verdict(), RunVerdict::Fail);
+    }
+
+    /// Review U3-1, the client's witness: forward, tell 3's fetch half recorded
+    /// no operation, yet its subject pane `2` is known and the client printed
+    /// H4's line in that pane. A client-output witness reads no log span, so
+    /// only the absence of a recorded operation keeps this unexplained.
+    #[test]
+    fn a_half_that_recorded_no_operation_is_not_explained_by_the_clients_output() {
+        let mut ev = run_of(
+            Direction::Forward,
+            true,
+            "tell-3",
+            &[("fetch", false)],
+            &[],
+            &[("fetch", "2", h4_capture("2"))],
+        );
+        let t = ev.tells.iter_mut().find(|t| t.id == "tell-3").unwrap();
+        t.subject_pane = Some("2".to_string());
+        assert!(t.ops_of("fetch", "fetch").is_empty());
+        explain(&mut ev, Direction::Forward, &deck_log(false));
         assert_eq!(ev.verdict(), RunVerdict::Fail);
     }
 
