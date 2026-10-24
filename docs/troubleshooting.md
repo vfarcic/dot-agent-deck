@@ -509,7 +509,7 @@ Treat `--force` at that point as abandoning those runs.
 
 ### `work-done` is refused, pending or unconfirmed
 
-`work-done` prints why when it did not report, or when it cannot tell whether it did. A refusal or a pending answer reports nothing and changes nothing; an unconfirmed answer means the report may have been accepted:
+`work-done` prints why when it did not report, or when it cannot tell whether it did. A refusal or a pending answer means the deck accepted no new report from that attempt; an unconfirmed answer means the report may have been accepted:
 
 | Message | What happened | What to do |
 |---|---|---|
