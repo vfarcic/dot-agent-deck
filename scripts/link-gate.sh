@@ -56,7 +56,13 @@ linker="${DAD_LINKER:-cc}"
 # MOLD (issue #906). This workspace links ~130 test binaries, each statically
 # pulling the whole dependency graph's debug info, and issue #863 measured that
 # as an I/O and memory bound with the CPU idle. mold links the same objects with
-# far less of both.
+# far less I/O and time, though each link holds more memory than GNU ld, not
+# less (docs/develop/build-gate.md has the numbers).
+#
+# PREPENDED, so a `-fuse-ld` rustc passes itself wins: an official toolchain
+# (1.90 or later) passes `-fuse-ld=lld` for its bundled rust-lld, which is what
+# CI links with. mold therefore applies where rustc passes no `-fuse-ld` of its
+# own, as the nixpkgs rustc in a devbox shell (which ships no rust-lld) does.
 #
 # DETECTED HERE RATHER THAN SET IN RUSTFLAGS, and the difference is a failure
 # mode, not a preference. `-C link-arg=-fuse-ld=mold` in `.cargo/config.toml`
