@@ -55,7 +55,7 @@ The default is derived from the machine rather than pinned to the box this was m
 
 On a 4-core / 16 GiB CI runner the clamp resolves to 4 slots against cargo's own default `-j 4`, so the gate should be inert there and CI keeps building at full width — though that is arithmetic on a runner spec rather than a measurement, and a larger runner or a changed default moves it. `DAD_LINK_JOBS=0` in the job is the lever if it ever bites.
 
-Override it with `DAD_LINK_JOBS=N`. The right value is a memory budget: multiply the slots by ~700 MB and leave room for the agents.
+Override it with `DAD_LINK_JOBS=N`. The right value is a memory budget: multiply the slots by ~700 MB and leave room for the agents, remembering that the desktop crate's links reach about 3 GiB under mold ([below](#what-mold-costs-in-memory)).
 
 ## What it costs, and what it buys
 
@@ -107,9 +107,32 @@ Waiters scan slots from a random offset and, when all are busy, block on a rando
 
 `DAD_LINKER` exists because the `linker` key in `.cargo/config.toml` overrides a `linker` set in a personal `~/.cargo/config.toml` — repository config beats `$CARGO_HOME` config — so anyone who had chosen their own linker driver needs it back.
 
-`DAD_NO_MOLD` exists because `link-gate.sh` prepends `-fuse-ld=mold` to rustc's argv when mold is on `PATH` (issue #906) — mold links this workspace's ~130 test binaries with far less I/O and memory, which is the bound #863 measured. **Detected at run time rather than set in `RUSTFLAGS`**, and that is a failure mode rather than a preference: `-C link-arg=-fuse-ld=mold` in `.cargo/config.toml` would hard-fail every build on a host without mold with `cannot find -fuse-ld=mold`, including a plain `cargo build` outside a devbox shell. Detection keeps a mold-less host building exactly as before, which is the same contract every other rung of the gate honours — degrade to working, never fail for a reason the gate invented. `devbox.json` pins mold so a devbox shell and CI share the linker.
+`DAD_NO_MOLD` exists because `link-gate.sh` prepends `-fuse-ld=mold` to rustc's argv when mold is on `PATH` (issue #906) — mold links this workspace's ~130 test binaries with far less I/O and in much less time (PR #926 measured 2.2× faster and 4.8× less I/O), though not with less memory ([below](#what-mold-costs-in-memory)). **Detected at run time rather than set in `RUSTFLAGS`**, and that is a failure mode rather than a preference: `-C link-arg=-fuse-ld=mold` in `.cargo/config.toml` would hard-fail every build on a host without mold with `cannot find -fuse-ld=mold`, including a plain `cargo build` outside a devbox shell. Detection keeps a mold-less host building exactly as before, which is the same contract every other rung of the gate honours — degrade to working, never fail for a reason the gate invented. `devbox.json` pins mold for a devbox shell; CI links with rust-lld instead ([below](#which-linker-each-environment-uses)).
 
 The flag is **prepended**, not appended, because `-fuse-ld=` is last-wins: appending would silently override a `-fuse-ld` rustc itself passed instead of deferring to it. All of that is pinned by tests in `xtask/linkage-check/src/build_gate.rs`, which build a `PATH` holding only the tools the scripts use and so decide mold's presence themselves — the ambient `PATH` would otherwise assert the opposite condition inside a devbox shell than outside one.
+
+### Which linker each environment uses
+
+The prepended flag means mold applies only where rustc chooses no linker of its own, and that is not the same everywhere:
+
+| where | toolchain | links with | why |
+| --- | --- | --- | --- |
+| a devbox shell | nixpkgs `rustc`, which ships no `rust-lld` (its `lib/rustlib/x86_64-unknown-linux-gnu/bin` holds only `rust-objcopy`) | **mold** | rustc passes no `-fuse-ld`, so the flag `link-gate.sh` prepends decides |
+| CI: GitHub Actions and RWX | the official 1.99.0 toolchain (`dtolnay/rust-toolchain`, `rust-lang/install`), which bundles `rust-lld` | **rust-lld** | since Rust 1.90 rustc links `x86_64-unknown-linux-gnu` with its bundled LLD and passes `-fuse-ld=lld` itself, which wins over the prepended flag |
+| any other host | whatever its `rustc` ships | rust-lld with an official toolchain of 1.90 or later, otherwise mold where it is on `PATH`, otherwise the system `ld` | the same two rules |
+
+Measured on RWX on 2026-10-23 (issue #906): a default `cargo build` with that toolchain records `Linker: LLD 23.1.1` in its binary's `.comment` section, and an RWX run of `.rwx/ci.yml`'s `test` task with mold installed on `PATH` produced a `dot-agent-deck` whose `.comment` named no mold. GitHub Actions installs the same official toolchain through rustup, so the same default applies there; that half is inferred, not measured. So CI has had a fast linker without any CI change, and installing mold there would change nothing while rustc picks LLD. `readelf -p .comment <binary>` shows which linker produced a binary.
+
+### What mold costs in memory
+
+mold is faster than the system `ld` and also holds **more** memory per link, not less, so it is no reason to raise the slot count. Measured on 2026-10-23 in one worktree on the 16-core / 62 GiB dev box, relinking every test binary after touching `src/lib.rs`, each link run under `/usr/bin/time` with mold's `--no-fork` so its working process is the one counted:
+
+| | links | summed link wall time | mean peak RSS | p90 | largest (a `dot-agent-deck-desktop` binary) |
+| --- | --- | --- | --- | --- | --- |
+| mold 3.0.0 | 257 | 311 s | 606 MiB | 1360 MiB | 3052 MiB in 10.6 s |
+| GNU ld 2.46, BFD (`DAD_NO_MOLD=1`) | 256 | 1110 s | 330 MiB | 754 MiB | 1906 MiB in 34.6 s |
+
+The box was shared with other dispatched units throughout (load average 23–47 during the mold build, 47–20 during the `ld` one), so treat the time ratio (about 3.6×) as approximate. Peak RSS depends far less on load. mold maps its input files, so part of that resident memory is file-backed page cache the kernel can reclaim, not all of it anonymous memory. The 4 GiB-per-slot budget still covers the largest link measured, so it stands as it is.
 
 ## Platform scope
 
