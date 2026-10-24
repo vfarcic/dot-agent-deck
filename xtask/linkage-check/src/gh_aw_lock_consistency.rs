@@ -32,11 +32,16 @@
 //!
 //! Two traps when regenerating, both hit while writing this:
 //!
-//! 1. **Compile per workflow, never bare.** `gh aw compile <name>` preserves
-//!    `GH_AW_ACTION_FAILURE_ISSUE_EXPIRES_HOURS: "168"`; bare `gh aw compile`
-//!    rewrites it to `"0"` in every lock. Same CLI, same sources — reproduced
-//!    on v0.86.2. A bare recompile therefore smuggles a behaviour change into
-//!    what looks like a pin-only diff.
+//! 1. **Compile bare, so the maintenance workflow is regenerated too.**
+//!    `.github/workflows/aw.json` sets `maintenance.action_failure_issue_expires`
+//!    (issue #1775), which makes a bare `gh aw compile` generate
+//!    `agentics-maintenance.yml`, whose daily `close-expired-issues` job closes
+//!    each failure report gh-aw files once its `gh-aw-expires` marker passes.
+//!    A per-workflow `gh aw compile <name>` leaves that file alone, so after a
+//!    CLI upgrade it keeps pinning the old actions. Without the `aw.json`
+//!    opt-in, a bare compile writes `GH_AW_ACTION_FAILURE_ISSUE_EXPIRES_HOURS:
+//!    "0"` into every lock instead (reproduced on v0.86.2), and failure reports
+//!    are filed with no expiry at all.
 //! 2. **The CLI version is not pinned by this repo.** Nothing in `devbox.json`
 //!    or `scripts/` fixes it, so whoever recompiles decides which version the
 //!    locks are generated at. Check `gh aw --version` first, and say which
@@ -128,9 +133,9 @@ fn short(sha: &str) -> &str {
     &sha[..8.min(sha.len())]
 }
 
-const REMEDY: &str = "Fix: regenerate with `gh aw compile <workflow-name>` (never bare — see the \
-                      module docs) at the `gh aw` version you intend; do not hand-edit the pins \
-                      into agreement, because the generated body has to change too.";
+const REMEDY: &str = "Fix: regenerate with a bare `gh aw compile` (see the module docs) at the \
+                      `gh aw` version you intend; do not hand-edit the pins into agreement, \
+                      because the generated body has to change too.";
 
 /// Every consistency problem in one lock file's text.
 ///
@@ -205,6 +210,167 @@ fn problems_in(label: &str, text: &str) -> Vec<String> {
     }
 
     problems
+}
+
+const MAINTENANCE: &str = "agentics-maintenance.yml";
+const EXPIRES_KEY: &str = "GH_AW_ACTION_FAILURE_ISSUE_EXPIRES_HOURS:";
+const MAINTENANCE_REMEDY: &str = "Fix: keep `maintenance.action_failure_issue_expires` in \
+                                  `.github/workflows/aw.json` and regenerate with a bare \
+                                  `gh aw compile` (see the module docs), which rewrites the locks \
+                                  and agentics-maintenance.yml together.";
+
+/// Every way a failure report could be filed without anything to close it
+/// (issue #1775), or the maintenance workflow could run actions from a
+/// different gh-aw release than the locks it serves.
+///
+/// `locks` is `(label, text)` per lock; `maintenance` is the text of
+/// `agentics-maintenance.yml`, `None` when the file does not exist. Pure for
+/// the same reason as `problems_in`: the synthetic tests drive each shape.
+fn maintenance_problems(locks: &[(String, String)], maintenance: Option<&str>) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut expiring = Vec::new();
+    let mut setup_shas: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+
+    for (label, text) in locks {
+        if let Some((sha, _)) = manifest_pins(text).get("github/gh-aw-actions/setup") {
+            setup_shas.entry(sha.clone()).or_default().push(label);
+        }
+        let Some(start) = text.find(EXPIRES_KEY).map(|i| i + EXPIRES_KEY.len()) else {
+            continue; // no conclusion job, so no failure reports
+        };
+        // The key decides whether the lock files reports; the value is read
+        // whatever its YAML quoting, and one that does not parse is a problem,
+        // never a skip (Greptile, PR #1866).
+        let line = &text[start..text[start..].find('\n').map_or(text.len(), |i| start + i)];
+        let value = line.split(" #").next().unwrap_or("").trim();
+        let hours = value.trim_matches(|c| c == '"' || c == '\'');
+        match hours.parse::<u32>() {
+            Ok(h) if h > 0 => expiring.push(label.as_str()),
+            _ => problems.push(format!(
+                "{label}: GH_AW_ACTION_FAILURE_ISSUE_EXPIRES_HOURS is \"{hours}\", not a positive \
+                 number of hours, so any failure report it files carries no expiry this guard \
+                 can vouch for and stays open until stale.yml reaches it. \
+                 That is what a compile without the aw.json opt-in writes. {MAINTENANCE_REMEDY}"
+            )),
+        }
+    }
+
+    if expiring.is_empty() {
+        return problems;
+    }
+    let Some(maintenance) = maintenance else {
+        problems.push(format!(
+            "{} set a failure-report expiry, but there is no {MAINTENANCE}, so nothing closes a \
+             report when it passes. {MAINTENANCE_REMEDY}",
+            expiring.join(", ")
+        ));
+        return problems;
+    };
+    if let Some(why) = closer_gap(maintenance) {
+        problems.push(format!(
+            "{MAINTENANCE} {why}, so the failure-report expiry {} set is never acted on. \
+             {MAINTENANCE_REMEDY}",
+            expiring.join(", ")
+        ));
+    }
+
+    if setup_shas.len() > 1 {
+        let detail: Vec<String> = setup_shas
+            .iter()
+            .map(|(sha, labels)| format!("{} in {}", short(sha), labels.join(", ")))
+            .collect();
+        problems.push(format!(
+            "the locks were compiled by different gh-aw releases ({}), so {MAINTENANCE} cannot \
+             agree with all of them. {MAINTENANCE_REMEDY}",
+            detail.join("; ")
+        ));
+    } else if let Some(want) = setup_shas.keys().next() {
+        // Every reference, not only the SHA-pinned ones `used_pins` returns: a
+        // tag or branch in place of the SHA must fail too (Qodo, PR #1866).
+        for (n, line) in maintenance.lines().enumerate() {
+            let trimmed = line.trim();
+            let trimmed = trimmed.strip_prefix("- ").unwrap_or(trimmed);
+            let Some(after) = trimmed.strip_prefix("uses: ") else {
+                continue;
+            };
+            let reference = after.split_whitespace().next().unwrap_or("");
+            let Some((repo, pinned)) = reference.rsplit_once('@') else {
+                continue;
+            };
+            if repo.starts_with("github/gh-aw-actions/") && pinned != want {
+                problems.push(format!(
+                    "{MAINTENANCE}:{}: {repo} is pinned to {pinned} but the locks run \
+                     github/gh-aw-actions/setup at {}. A per-workflow compile, a bot bump or a \
+                     hand edit moved one side only. {MAINTENANCE_REMEDY}",
+                    n + 1,
+                    short(want),
+                ));
+            }
+        }
+    }
+
+    problems
+}
+
+/// Why the maintenance workflow's `close-expired-issues` job would not run on
+/// its schedule, or `None` when it would. The trigger, the job, its script and
+/// its condition are checked together, so a closer kept in the file but
+/// restricted to a manual dispatch fails (Qodo, PR #1866).
+fn closer_gap(maintenance: &str) -> Option<&'static str> {
+    let Some((triggers, jobs)) = maintenance.split_once("\njobs:\n") else {
+        return Some("has no `jobs:` section");
+    };
+    if !triggers.lines().any(|l| l.trim() == "schedule:") {
+        return Some("has no schedule trigger");
+    }
+    let jobs = format!("\n{jobs}");
+    let Some(start) = jobs.find("\n  close-expired-issues:\n") else {
+        return Some("has no close-expired-issues job");
+    };
+    let body = &jobs[start + "\n  close-expired-issues:\n".len()..];
+    // The job ends at the next line indented exactly two spaces: the next job.
+    let end = body
+        .lines()
+        .position(|l| l.starts_with("  ") && !l.starts_with("   "))
+        .map_or(body.len(), |i| {
+            body.lines().take(i).map(|l| l.len() + 1).sum()
+        });
+    let job = &body[..end];
+    if !job.contains("close_expired_issues.cjs") {
+        return Some("has a close-expired-issues job that does not run close_expired_issues.cjs");
+    }
+    let condition = job.lines().find(|l| l.starts_with("    if:")).unwrap_or("");
+    let restricted = condition
+        .split("github.event_name == '")
+        .skip(1)
+        .any(|rest| !rest.starts_with("schedule'"));
+    if restricted {
+        return Some("restricts its close-expired-issues job to events other than the schedule");
+    }
+    None
+}
+
+/// Every failure report the locks file has something that closes it on its
+/// expiry, running the same gh-aw release as the locks (issue #1775).
+#[test]
+fn failure_report_expiry_has_a_closer() {
+    let locks: Vec<(String, String)> = lock_files()
+        .iter()
+        .map(|path| {
+            let text = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            (path.display().to_string(), text)
+        })
+        .collect();
+    let maintenance_path = repo_root().join(".github/workflows").join(MAINTENANCE);
+    let maintenance = std::fs::read_to_string(&maintenance_path).ok();
+
+    let problems = maintenance_problems(&locks, maintenance.as_deref());
+    assert!(
+        problems.is_empty(),
+        "gh-aw failure reports are not closed on their expiry:\n  {}",
+        problems.join("\n  ")
+    );
 }
 
 /// The real files must be internally consistent.
@@ -318,5 +484,153 @@ mod synthetic {
     #[test]
     fn a_file_with_no_pins_is_ignored() {
         assert!(problems_in("t", "jobs:\n  build:\n    runs-on: ubuntu-latest\n").is_empty());
+    }
+}
+
+/// `maintenance_problems` on constructed input, one test per shape, so the
+/// real-file test above cannot pass vacuously.
+#[cfg(test)]
+mod maintenance_synthetic {
+    use super::maintenance_problems;
+
+    const SHA_A: &str = "6aab9e5b5c91c615506061f09bedd81a23babe3c";
+    const SHA_B: &str = "af9516b9001c6aa6d4817b7484de4bb017ebb27f";
+
+    fn lock(setup_sha: &str, hours: &str) -> (String, String) {
+        (
+            "l.lock.yml".to_string(),
+            format!(
+                "# gh-aw-manifest: {{\"version\":1,\"actions\":[{{\"repo\":\"github/gh-aw-actions/setup\",\"sha\":\"{setup_sha}\",\"version\":\"v0\"}}]}}\njobs:\n  conclusion:\n    env:\n      GH_AW_ACTION_FAILURE_ISSUE_EXPIRES_HOURS: \"{hours}\"\n"
+            ),
+        )
+    }
+
+    fn maintenance(sha: &str) -> String {
+        format!(
+            "on:\n  schedule:\n    - cron: \"37 0 * * *\"\njobs:\n  close-expired-issues:\n    steps:\n      - uses: github/gh-aw-actions/setup@{sha} # v0\n      - run: require('close_expired_issues.cjs')\n      - uses: github/gh-aw-actions/setup-cli@{sha} # v0\n  manual-only:\n    if: ${{{{ github.event_name == 'workflow_dispatch' }}}}\n"
+        )
+    }
+
+    #[test]
+    fn expiring_locks_with_a_matching_maintenance_workflow_pass() {
+        let p = maintenance_problems(&[lock(SHA_A, "168")], Some(&maintenance(SHA_A)));
+        assert!(p.is_empty(), "{p:?}");
+    }
+
+    /// The #1775 shape: reports carry an expiry and nothing acts on it.
+    #[test]
+    fn an_expiry_with_no_maintenance_workflow_is_caught() {
+        let p = maintenance_problems(&[lock(SHA_A, "168")], None);
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(p[0].contains("nothing closes"), "{}", p[0]);
+    }
+
+    /// What a compile without the aw.json opt-in writes.
+    #[test]
+    fn a_zero_expiry_is_caught() {
+        let p = maintenance_problems(&[lock(SHA_A, "0")], Some(&maintenance(SHA_A)));
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(p[0].contains("no expiry"), "{}", p[0]);
+    }
+
+    #[test]
+    fn a_maintenance_workflow_without_the_issue_closer_is_caught() {
+        let text = maintenance(SHA_A).replace("close_expired_issues.cjs", "other.cjs");
+        let p = maintenance_problems(&[lock(SHA_A, "168")], Some(&text));
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(
+            p[0].contains("does not run close_expired_issues.cjs"),
+            "{}",
+            p[0]
+        );
+    }
+
+    /// The closer kept in the file but no longer run by the schedule.
+    #[test]
+    fn a_closer_restricted_to_manual_dispatch_is_caught() {
+        let text = maintenance(SHA_A).replace(
+            "  close-expired-issues:\n",
+            "  close-expired-issues:\n    if: ${{ github.event_name == 'workflow_dispatch' }}\n",
+        );
+        let p = maintenance_problems(&[lock(SHA_A, "168")], Some(&text));
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(
+            p[0].contains("restricts its close-expired-issues job"),
+            "{}",
+            p[0]
+        );
+    }
+
+    /// The script present only in another job does not count as the closer.
+    #[test]
+    fn the_closer_script_in_another_job_is_caught() {
+        let text = maintenance(SHA_A).replace("close-expired-issues:", "something-else:");
+        let p = maintenance_problems(&[lock(SHA_A, "168")], Some(&text));
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(p[0].contains("has no close-expired-issues job"), "{}", p[0]);
+    }
+
+    #[test]
+    fn a_maintenance_workflow_with_no_schedule_is_caught() {
+        let text = maintenance(SHA_A).replace("  schedule:\n", "  workflow_dispatch:\n");
+        let p = maintenance_problems(&[lock(SHA_A, "168")], Some(&text));
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(p[0].contains("has no schedule trigger"), "{}", p[0]);
+    }
+
+    /// A tag in place of the SHA is not skipped as "not a pin".
+    #[test]
+    fn a_gh_aw_action_on_a_tag_is_caught() {
+        let text = maintenance(SHA_A).replace(&format!("setup-cli@{SHA_A}"), "setup-cli@v0.86.2");
+        let p = maintenance_problems(&[lock(SHA_A, "168")], Some(&text));
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(p[0].contains("is pinned to v0.86.2"), "{}", p[0]);
+    }
+
+    /// A per-workflow recompile at a new CLI leaves the maintenance file behind.
+    #[test]
+    fn a_maintenance_workflow_on_another_gh_aw_release_is_caught() {
+        let p = maintenance_problems(&[lock(SHA_B, "168")], Some(&maintenance(SHA_A)));
+        assert_eq!(p.len(), 2, "one per gh-aw-actions pin: {p:?}");
+        assert!(p.iter().all(|m| m.contains("the locks run")), "{p:?}");
+    }
+
+    #[test]
+    fn locks_from_different_gh_aw_releases_are_caught() {
+        let p = maintenance_problems(
+            &[lock(SHA_A, "168"), lock(SHA_B, "168")],
+            Some(&maintenance(SHA_A)),
+        );
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(p[0].contains("different gh-aw releases"), "{}", p[0]);
+    }
+
+    /// YAML's other spellings of the value are read, not skipped: a guard that
+    /// missed them would pass with the maintenance workflow gone.
+    #[test]
+    fn single_quoted_and_unquoted_expiries_are_read() {
+        for value in ["'168'", "168", "168 # hours"] {
+            let (label, text) = lock(SHA_A, "168");
+            let text = text.replace("\"168\"", value);
+            let p = maintenance_problems(&[(label, text)], None);
+            assert_eq!(p.len(), 1, "{value}: {p:?}");
+            assert!(p[0].contains("nothing closes"), "{value}: {}", p[0]);
+        }
+    }
+
+    /// An unreadable value is reported rather than taken as "files no reports".
+    #[test]
+    fn an_unreadable_expiry_is_caught() {
+        let p = maintenance_problems(&[lock(SHA_A, "${{ vars.X }}")], None);
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(p[0].contains("no expiry"), "{}", p[0]);
+    }
+
+    /// A lock with no conclusion job files no reports, so it needs no closer.
+    #[test]
+    fn locks_without_failure_reporting_need_no_maintenance_workflow() {
+        let text = "jobs:\n  agent:\n    runs-on: ubuntu-latest\n".to_string();
+        let p = maintenance_problems(&[("l.lock.yml".to_string(), text)], None);
+        assert!(p.is_empty(), "{p:?}");
     }
 }

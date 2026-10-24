@@ -354,7 +354,8 @@ tasks:
       CARGO_INCREMENTAL: "0"
     run: |
       sudo apt-get update
-      sudo apt-get install -y webkit2gtk-driver xvfb xclip xdotool
+      # openssh-server and libnss-wrapper: fleet_001's far deck (issue #1356).
+      sudo apt-get install -y webkit2gtk-driver xvfb xclip xdotool openssh-server libnss-wrapper
       cargo install tauri-driver --locked --version "$TAURI_DRIVER_VERSION"
       # `cargo install` puts it in Cargo's bin dir, which is not on PATH here.
       export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
