@@ -53,7 +53,7 @@ CARGO_SHEAR_VERSION=1.14.0
 # renovate: datasource=crate depName=cargo-mutants
 CARGO_MUTANTS_VERSION=27.1.0
 # renovate: datasource=npm depName=knip
-KNIP_VERSION=6.42.1
+KNIP_VERSION=6.43.0
 
 die() { echo "ERROR=$*"; exit 1; }
 
