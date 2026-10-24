@@ -42,7 +42,7 @@ use crate::event::{
 };
 use crate::hook_provenance::{AttestFacts, Provenance};
 use crate::inbox::Recipient;
-use crate::inbox_hub::{Admission, ClaimSpec, Claimed, CommitOutcome, FailOutcome};
+use crate::inbox_hub::{Admission, AfterSection, ClaimSpec, Claimed, CommitOutcome, FailOutcome};
 use crate::report_recovery::{ClaimMode, ClaimPhase, ClaimState, Destination, UnitMark};
 use crate::state::AppState;
 use crate::work_done_text::{self as text, code};
@@ -611,7 +611,7 @@ async fn supervise(
             let _ = to_connection.send(completion);
             return;
         }
-        if let Some(completion) = recover(
+        let (completion, after) = recover(
             &registry,
             claim_id,
             &mode,
@@ -620,17 +620,32 @@ async fn supervise(
             recipient_pane.as_deref(),
             unit_id.as_deref(),
         )
-        .await
-        {
-            let _ = to_connection.send(completion);
+        .await;
+        // The settled answer is handed over first (D12 rule 11), or the
+        // oneshot dropped with no value, which reads unconfirmed; only then
+        // what the settlement owes runs, in a task of its own so a helper
+        // that panics is logged rather than taking the supervisor with it.
+        match completion {
+            Some(completion) => {
+                let _ = to_connection.send(completion);
+            }
+            None => drop(to_connection),
         }
-        // Otherwise the oneshot is dropped with no value: unconfirmed.
+        if let Some(after) = after {
+            let inbox = Arc::clone(&registry);
+            if let Err(join) = tokio::spawn(async move { inbox.inbox().after_section(after) }).await
+            {
+                error!(%join, report_id = %report_id, "work-done: a settled report's after-section helpers panicked after its result was handed over");
+            }
+        }
     });
     from_supervisor.await.unwrap_or(Completion::Unconfirmed)
 }
 
 /// The supervisor's settlement of a save task that ended without a result
-/// (D12 rule 11). `None` answers nothing: the connection reads unconfirmed.
+/// (D12 rule 11): its answer, and what the settlement owes once that answer
+/// is handed over. A `None` answer answers nothing: the connection reads
+/// unconfirmed.
 async fn recover(
     registry: &Arc<AgentPtyRegistry>,
     claim_id: u64,
@@ -639,7 +654,7 @@ async fn recover(
     message_id: &str,
     recipient_pane: Option<&str>,
     unit_id: Option<&str>,
-) -> Option<Completion> {
+) -> (Option<Completion>, Option<AfterSection>) {
     let file = format!("r-{report_id}.md");
     let phase = match registry.inbox().claim_phase(claim_id) {
         Ok(phase) => phase,
@@ -650,7 +665,7 @@ async fn recover(
                 "work-done: a report's save task ended and the deck's report state is torn; its \
                  result is unconfirmed, and the report is kept in its file"
             );
-            return None;
+            return (None, None);
         }
     };
     match phase {
@@ -658,8 +673,8 @@ async fn recover(
             .inbox()
             .committed_answer(mode, report_id, message_id, recipient_pane)
         {
-            Ok(Some(reply)) => Some(Completion::Reply(reply)),
-            _ => None,
+            Ok(Some(reply)) => (Some(Completion::Reply(reply)), None),
+            _ => (None, None),
         },
         Some(ClaimPhase::Admitted | ClaimPhase::Saving) => match registry.fail_claim(claim_id) {
             (FailOutcome::Failed { .. }, after) => {
@@ -669,15 +684,15 @@ async fn recover(
                 if let Some(store) = registry.inbox().retained_store() {
                     store.discard(report_id);
                 }
-                if let Some(after) = after {
-                    registry.inbox().after_section(after);
-                }
-                Some(Completion::refused(
-                    code::REPORT_SAVE_FAILED,
-                    text::save_failed("the deck's save of it stopped"),
-                ))
+                (
+                    Some(Completion::refused(
+                        code::REPORT_SAVE_FAILED,
+                        text::save_failed("the deck's save of it stopped"),
+                    )),
+                    after,
+                )
             }
-            _ => None,
+            _ => (None, None),
         },
         Some(ClaimPhase::Staged | ClaimPhase::Marked) => {
             if let Some(unit_id) = unit_id {
@@ -687,10 +702,7 @@ async fn recover(
                 let _ = registry.inbox().note_claim_marked(claim_id, mark);
             }
             let (outcome, after) = registry.commit_claim(claim_id, unit_id.is_some());
-            if let Some(after) = after {
-                registry.inbox().after_section(after);
-            }
-            committed(outcome, mode)
+            (committed(outcome, mode), after)
         }
         Some(ClaimPhase::Applying) => {
             error!(
@@ -699,7 +711,7 @@ async fn recover(
                 "work-done: a report's commit was interrupted; its result is unconfirmed, and the \
                  report is kept in its file"
             );
-            None
+            (None, None)
         }
     }
 }
