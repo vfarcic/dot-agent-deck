@@ -9378,7 +9378,7 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 - **Agent:** none.
 - **Asserts:** The daemon closes after the report: unconfirmed, sent once.
 - **Asserts (round 5 fixes, auditor U3-6):** a reply dripped a byte at a time past the reply's wait reads unconfirmed at about that wait, with the report sent once.
-- **Asserts (round 5 second fix pass, reviewer U3-3, auditor U3-1):** an 8 MiB report the daemon drains 4 KiB every 20 ms, about 40 s in all, reads unconfirmed well inside 2 s of a 500 ms reply wait: the wait bounds the write as well as the read.
+- **Asserts (round 5 second fix pass, reviewer U3-3, auditor U3-1):** an 8 MiB report the daemon drains 4 KiB every 20 ms, about 40 s in all, reads unconfirmed well inside 2 s of a 500 ms reply wait: the reply's deadline is checked between writes of at most 16 KiB, so the sender gives up at the first check after it rather than once the daemon has drained the whole report. The one write under way when the deadline passes may still run past it; this schedule measures that overrun within the 2 s ceiling, not a bound for every socket buffer or drain rate.
 - **Why it exists:** PRD #1666 part 3, round 5 (plan D1): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
 - **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
 - **Platform coverage:** mac+linux.

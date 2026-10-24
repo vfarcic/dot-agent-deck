@@ -2424,11 +2424,13 @@ pub enum Gated {
 }
 
 /// How long [`send_gated`] waits, in all, to connect, ask its question and
-/// read the whole answer.
+/// read the whole answer; the one write under way when it ends may run past
+/// it ([`write_gated`]).
 pub const GATED_QUESTION_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// How long [`send_gated`] waits, in all, to write its mutation and read the
 /// whole answer: the daemon answers once the report is kept, after a bounded
-/// wait on any earlier report of the same task.
+/// wait on any earlier report of the same task. The one write under way when
+/// it ends may run past it ([`write_gated`]).
 pub const GATED_REPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// The longest line [`send_gated`] reads.
@@ -2465,8 +2467,11 @@ pub fn send_gated_at(
     reply_wait: std::time::Duration,
 ) -> Gated {
     let not_confirmed = |why| Gated::NotConfirmed { refusal: None, why };
-    // Each wait bounds its whole exchange, not each read or write: a peer
-    // that sends or takes a byte at a time cannot stretch it.
+    // Each wait is a deadline for its whole exchange, not a timeout per read
+    // or write: it is checked before every read and before every write of at
+    // most `GATED_WRITE_CHUNK` bytes, so a peer that sends or takes a byte at
+    // a time stretches the exchange past it by no more than the one write
+    // under way when it passes (`write_gated`).
     let question_deadline = std::time::Instant::now() + question_wait;
     let Ok(mut client) = crate::platform::ipc::IpcClient::connect_timeout(path, question_wait)
     else {
@@ -2537,8 +2542,11 @@ const GATED_WRITE_CHUNK: usize = 16 * 1024;
 /// Write all of `bytes` by `deadline`, then flush: an error for a write
 /// failure or the deadline. The deadline is checked before each write of at
 /// most [`GATED_WRITE_CHUNK`] bytes, which gets what is left of it, so a peer
-/// that drains a little at a time cannot stretch the whole write past it by
-/// more than one such write.
+/// that drains a little at a time stretches the whole write past it by no
+/// more than the one write under way when it passes. How long that one write
+/// takes is the platform socket's and the peer's to decide, not this
+/// function's: a strict bound would need a nonblocking write, which
+/// `IpcClient` does not offer.
 fn write_gated(
     client: &mut crate::platform::ipc::IpcClient,
     mut bytes: &[u8],
@@ -7362,7 +7370,7 @@ mod gated_send_tests {
         assert_eq!(mutations(&stub), 1);
     }
 
-    /// Scenario: A daemon that confirms, then takes a large report a few kilobytes at a time, each read well inside the reply's wait but the whole report far past it: the reply's wait bounds the whole write as well as the read, so the sender stops at about the wait and says the result is unconfirmed.
+    /// Scenario: A daemon that confirms, then takes a large report a few kilobytes at a time, each read well inside the reply's wait but the whole report far past it: the sender checks the reply's deadline between small writes, so it stops soon after the wait rather than when the report is drained, and says the result is unconfirmed.
     #[spec("inbox/protocol/028")]
     #[test]
     fn protocol_028_a_slowly_drained_report_is_bounded_by_the_whole_wait() {
