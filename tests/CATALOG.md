@@ -2587,6 +2587,24 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** what a real terminal emits for a physical key (the sequences are injected already encoded, and a terminal may keep a chord, Cmd above all, for itself); what an agent does with the bytes; application cursor mode in a pane other than the focused one, or across a reattach; the desktop side, which is `desktop/src/components/TerminalViewport.keys.test.tsx` and `desktop/e2e/agent-terminal-input.spec.ts`.
 - **Platform coverage:** mac+linux.
 
+### Deck log containment (issues #1791, #1796)
+
+#### logging/containment
+
+##### logging/containment/001 — An explicitly armed test process never opens a deck.log outside its owned root.
+- **Layer:** fast tier (`tests/deck_log_containment.rs`): the real binary's `wrap --agent codex -- /bin/true` with a cleared environment, the containment marker and an explicit owned root.
+- **Agent:** none (`/bin/true` stands in for the wrapped child; `CODEX_HOME` outside the root makes the automatic install log a containment refusal).
+- **Asserts:** with `DOT_AGENT_DECK_LOG` naming a file in a separate directory standing in for the developer's state dir, that file is never created; with the log inside the owned root, the same run writes the refusal there, so the absence is the logger refusing the path and not a run with nothing to log.
+- **Does not assert:** a log inherited from the shell that lies inside an owned root (the temp dir included), which the binary cannot tell apart from a log a test chose; the default debug log, which a test cannot write without touching the shared file (the `config_write_guard` unit test `a_test_process_opens_only_a_log_it_owns` pins its refusal).
+- **Platform coverage:** mac+linux.
+
+##### logging/containment/002 — A process armed only by nextest's environment never opens a deck.log outside every test scratch root.
+- **Layer:** fast tier (`tests/deck_log_containment.rs`): the same wrapper run, armed only by `NEXTEST` and `NEXTEST_RUN_ID`, the way a binary spawned without a cleared environment inherits them.
+- **Agent:** none (`/bin/true`).
+- **Asserts:** a log in cargo's target tmp dir (checked to be outside the private base; the child is handed its own temp dir, so the system one is not among its roots) is never created; a log in the child's temp dir receives the refused install's line.
+- **Does not assert:** that the test runner itself scrubs `DOT_AGENT_DECK_LOG` before `main`; a deck started with a cleared environment and no containment variables, which is not a test process to the binary.
+- **Platform coverage:** mac+linux.
+
 ### Hook delivery
 
 #### hooks/delivery

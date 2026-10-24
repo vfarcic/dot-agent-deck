@@ -2608,6 +2608,11 @@ fn init_logging_from_env() {
         } else {
             std::path::PathBuf::from(log_val)
         };
+        // Issues #1791, #1796: a test process does not open an inherited log
+        // that is not its own; see `config_write_guard::log_write_allowed`.
+        if !dot_agent_deck::config_write_guard::log_write_allowed(&log_path) {
+            return;
+        }
         match std::fs::OpenOptions::new()
             .create(true)
             .append(true)
