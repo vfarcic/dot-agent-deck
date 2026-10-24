@@ -784,6 +784,134 @@ mod tests {
         );
     }
 
+    /// Where, in the run's order, a line of the daemon's log was written
+    /// relative to tell-4's `work-done` half.
+    #[derive(Clone, Copy, Debug)]
+    enum At {
+        /// Before the reviewer reported: its own fetch of the delegate.
+        BeforeReport,
+        /// After the reviewer typed `work-done`, before the orchestrator's
+        /// fetch.
+        Report,
+        /// During the orchestrator's fetch of the report.
+        Fetch,
+        /// During the orchestrator's listing.
+        Listing,
+    }
+
+    /// Tell-4 as production records it: the reviewer (pane `3`) reports, the
+    /// orchestrator (pane `1`) fetches and lists; the `work-done` half failed
+    /// and the status half held. `fetched` when the orchestrator's fetch handed
+    /// the report over, so only its listing failed. Each line of `lines` is
+    /// written to the log at its place in the run. Returns the run and its log.
+    fn tell4_run(
+        direction: Direction,
+        fetched: bool,
+        lines: &[(At, String)],
+    ) -> (Evidence, String) {
+        let _ = fetched;
+        let mut log = deck_log(false);
+        for (at, line) in lines {
+            let _ = at;
+            log.push_str(line);
+            log.push('\n');
+        }
+        let ev = run_of(
+            direction,
+            true,
+            "tell-4",
+            &[("work-done", false), ("status", true)],
+            &[("work-done", "3"), ("work-done", "1")],
+            &[],
+        );
+        (ev, log)
+    }
+
+    fn explained(direction: Direction, fetched: bool, lines: &[(At, String)]) -> RunVerdict {
+        let (mut ev, log) = tell4_run(direction, fetched, lines);
+        explain(&mut ev, direction, &log);
+        ev.verdict()
+    }
+
+    /// Reverse, tell 4 (review R31 / U2-2): H5 explains the orchestrator's
+    /// failed fetch of the report only with a refusal of THAT fetch. The
+    /// reviewer's own earlier fetch of its delegate, refused on pane `3`, is a
+    /// different operation and explains nothing — nor does a refusal on the
+    /// orchestrator's pane from before the report was sent, nor any refusal
+    /// once the fetch handed the report over and only the listing failed.
+    #[test]
+    fn h5_explains_tell_4_only_with_the_orchestrators_own_fetch() {
+        let r = Direction::Reverse;
+        let v = explained(r, false, &[(At::Fetch, h5_line("1"))]);
+        assert!(is_declared_break(&v), "{}", v.label());
+        let v = explained(
+            r,
+            false,
+            &[(At::BeforeReport, h5_line("3")), (At::Fetch, h5_line("1"))],
+        );
+        assert!(is_declared_break(&v), "{}", v.label());
+        for (fetched, lines, why) in [
+            (
+                false,
+                vec![(At::BeforeReport, h5_line("3"))],
+                "only the reviewer's earlier refusal",
+            ),
+            (
+                false,
+                vec![(At::Fetch, h5_line("3"))],
+                "a refusal on the reporter's pane during the fetch",
+            ),
+            (
+                false,
+                vec![(At::BeforeReport, h5_line("1"))],
+                "an earlier refusal on the orchestrator's pane",
+            ),
+            (
+                false,
+                vec![(At::Listing, h5_line("1"))],
+                "a refusal after the fetch ended",
+            ),
+            (
+                true,
+                vec![(At::Fetch, h5_line("1"))],
+                "the fetch handed the report over; only the listing failed",
+            ),
+        ] {
+            assert_eq!(explained(r, fetched, &lines), RunVerdict::Fail, "{why}");
+        }
+    }
+
+    /// Forward, tell 4: the task-scoped break explains the half only with the
+    /// REPORTER's unread capability question, sent after it typed `work-done`
+    /// — not one naming the orchestrator's pane, not one from before the
+    /// report, and not when the report was fetched and only the listing failed.
+    #[test]
+    fn the_task_scoped_break_explains_tell_4_only_with_the_reporters_question() {
+        let f = Direction::Forward;
+        let v = explained(f, false, &[(At::Report, QUESTION_LINE.to_string())]);
+        assert!(is_declared_break(&v), "{}", v.label());
+        let on_orchestrator = QUESTION_LINE.replace(r#""pane_id":"3""#, r#""pane_id":"1""#);
+        for (fetched, lines, why) in [
+            (
+                false,
+                vec![(At::Report, on_orchestrator)],
+                "the question on the orchestrator's pane",
+            ),
+            (
+                false,
+                vec![(At::BeforeReport, QUESTION_LINE.to_string())],
+                "a question from before the report",
+            ),
+            (
+                true,
+                vec![(At::Report, QUESTION_LINE.to_string())],
+                "the report was fetched; only the listing failed",
+            ),
+        ] {
+            assert_eq!(explained(f, fetched, &lines), RunVerdict::Fail, "{why}");
+        }
+    }
+
     /// Forward, tell 3: the branch CLI's fetch in the coder's pane `2` read
     /// that the old daemon does not serve receipts, took nothing and said so;
     /// the old daemon logged nothing. The CLIENT declares the break, so its own
