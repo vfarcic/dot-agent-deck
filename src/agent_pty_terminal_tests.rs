@@ -1002,6 +1002,100 @@ async fn return_027_h_a_delayed_report_across_registration_eviction_and_pane_reu
     }
 }
 
+/// Scenario: (j) a single unit's agent A, spawned with no orchestration seat, sends its terminal report, which attests and is held before it reads the role map. A exits with its exit cleanup held, so its route stays; B starts on A's pane as a member of another orchestration instance, and the role map now names that instance there. Released, A's report is accepted for A's unit, and the retained report names no instance: never B's.
+#[spec("dispatch/return/027")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn return_027_j_a_seatless_terminal_report_never_takes_its_successors_instance() {
+    let unit = unit("r027j", false).await;
+    let a = unit.agent().to_string();
+    let pane = unit.pane().to_string();
+    let facts = unit.facts(&a);
+    assert!(facts.seat.is_none(), "A has no orchestration seat");
+    let state = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+    let held = unit.registry().hold_exit_cleanup_for_test(&a);
+    let (attested, release) = unit
+        .registry()
+        .pause_at_for_test(crate::task_completion::PAUSE_ATTESTED);
+    let report = {
+        let (registry, state, pane, a) = (
+            Arc::clone(unit.registry()),
+            Arc::clone(&state),
+            pane.clone(),
+            a.clone(),
+        );
+        tokio::spawn(async move {
+            crate::task_completion::complete(
+                &state,
+                &registry,
+                CompletionRequest {
+                    pane_id: pane,
+                    mode: WorkDoneMode::Terminal,
+                    report: "A-027J-REPORT".to_string(),
+                },
+                &Provenance::Attested { agent_id: a, facts },
+            )
+            .await
+        })
+    };
+    attested.await.unwrap();
+    kill_child(unit.registry(), &a);
+    let successor_instance = "r027j-successor-instance".to_string();
+    let mut b = None;
+    eventually("B starts on A's pane", || {
+        b = unit
+            .registry()
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.clone())],
+                tab_membership: Some(TabMembership::Orchestration {
+                    name: "other".to_string(),
+                    role_index: 1,
+                    role_name: "coder".to_string(),
+                    is_start_role: false,
+                    orchestration_cwd: None,
+                    display_title: None,
+                    orchestration_id: Some(successor_instance.clone()),
+                }),
+                origin: Some(InstanceOrigin::Direct),
+                ..SpawnOptions::default()
+            })
+            .ok();
+        b.is_some()
+    })
+    .await;
+    {
+        let mut st = state.write().await;
+        st.pane_role_map.insert(pane.clone(), "coder".to_string());
+        st.pane_orchestration_map.insert(
+            pane.clone(),
+            crate::state::OrchestrationIdentity {
+                id: successor_instance.clone(),
+                name: "other".to_string(),
+            },
+        );
+    }
+    release.send(()).unwrap();
+    let answer = accepted(report.await.unwrap());
+    let seen = crate::task_completion::snapshot_probe::seen(&pane).unwrap();
+    assert!(
+        seen.contains(&successor_instance),
+        "the report read the successor's role map: {seen}"
+    );
+    let file = std::fs::File::open(
+        unit.deck
+            .store
+            .dir()
+            .join(crate::retained_store::own_name(&answer.report_id.unwrap())),
+    )
+    .unwrap();
+    let envelope = crate::retained_store::read_attribution(file).expect("an envelope");
+    assert_eq!(envelope.instance, None, "never the successor's instance");
+    assert_eq!(envelope.producer_agent_id, a);
+    assert_eq!(unit.completed(), 1);
+    drop(held);
+    let _ = unit.registry().close_agent(b.as_deref().unwrap());
+}
+
 /// Scenario: (i) an orchestrator seat whose instance's generations disagree on how it started reports terminal with no unit evidence: refused `incompatible_mode`, never `destination: none`.
 #[spec("dispatch/return/027")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
