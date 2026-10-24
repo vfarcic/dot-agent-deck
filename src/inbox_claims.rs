@@ -53,6 +53,10 @@ pub(crate) struct Claimed {
     pub mode: ClaimMode,
     /// The dispatched unit's name, for a terminal claim.
     pub unit_name: Option<String>,
+    /// The orchestration instance the report is attributed to: a task's own
+    /// binding, never the pane's current occupant. Admission sets it for a
+    /// task; the transaction sets it from the attested facts otherwise.
+    pub instance: Option<String>,
 }
 
 /// What every admission needs about the report.
@@ -206,6 +210,7 @@ fn install(
         role,
         mode,
         unit_name,
+        instance: None,
     }
 }
 
@@ -322,12 +327,13 @@ impl InboxHub {
                     }
                     let recipient = binding.orchestrator.clone();
                     let role = Some(binding.role.clone());
+                    let instance = binding.instance.clone();
                     let debt = (binding.arm_id, binding.seq);
                     let reservation = match reserve_room(st, &store, spec.file_bytes) {
                         Ok(reservation) => reservation,
                         Err(reply) => return Admission::Answer(reply),
                     };
-                    let claimed = install(
+                    let mut claimed = install(
                         reports,
                         spec,
                         ClaimMode::Task {
@@ -340,6 +346,7 @@ impl InboxHub {
                         &message_id,
                         reservation,
                     );
+                    claimed.instance = instance;
                     if let Some(task) = reports.tasks.open_task_mut(task_id) {
                         task.state = TaskState::Reporting {
                             claim_id: claimed.claim_id,

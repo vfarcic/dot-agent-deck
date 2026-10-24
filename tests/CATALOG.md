@@ -4659,6 +4659,14 @@ without depending on the config struct API.
 - **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
 - **Platform coverage:** mac+linux.
 
+##### orchestration/work-done/058 — A delayed task report never writes to, or names, its worker's successor.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** A's task report, held before it reads the role map while A exits with its cleanup held and B takes A's pane in another directory and instance, is accepted for A's task; B's `work-done-coder.md` is unchanged, A's copy is in A's directory, and the retained report's envelope names A's instance and A; the same when A's record is removed while the save is paused.
+- **Why it exists:** PRD #1666 part 3, round 5 fixes (auditor U2-4, reviewer U3-2): the save took the convenience copy's directory and the artifact's instance from the pane's current occupant.
+- **Does not assert:** a real agent; the desktop app.
+- **Platform coverage:** mac+linux.
+
 ##### orchestration/work-done/056 — A destructor armed across a dispatch or a respawn does not abort the daemon when it drops during an unwind.
 - **Layer:** fast unit, one child process per case (`src/agent_pty_unwind_tests.rs`; the outer test re-executes its own binary filtered to itself, so an abort reads as a failed status, `SIGABRT`, instead of a hung runner).
 - **Agent:** none.

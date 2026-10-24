@@ -198,7 +198,6 @@ struct Snapshot {
     instance: Option<String>,
     is_orchestrator: bool,
     orchestrator_pane: Option<String>,
-    cwd: Option<String>,
 }
 
 async fn snapshot(state: &RwLock<AppState>, pane_id: &str) -> Snapshot {
@@ -215,7 +214,6 @@ impl Snapshot {
                 .map(|identity| identity.id.clone()),
             is_orchestrator: state.orchestrator_pane_ids.contains(pane_id),
             orchestrator_pane: state.orchestrator_for_worker(pane_id),
-            cwd: state.pane_cwd_map.get(pane_id).cloned(),
         }
     }
 }
@@ -437,7 +435,24 @@ async fn transact(
                 // Admitted again: the first report's result, or a fresh claim.
                 continue;
             }
-            Admission::Claimed(claimed) => {
+            Admission::Claimed(mut claimed) => {
+                // The report's attribution and its convenience copies follow
+                // the reporting generation, never the pane's current
+                // occupant: a successor may hold the pane by now. A task's
+                // instance is its binding's (set by admission); otherwise the
+                // generation's pinned seat, or, for a generation spawned with
+                // no seat, the role map it was checked against.
+                if !matches!(claimed.mode, ClaimMode::Task { .. }) {
+                    claimed.instance = match &attested {
+                        Some((_, facts)) if facts.seat.is_some() => {
+                            facts.seat.as_ref().map(|seat| seat.instance.clone())
+                        }
+                        _ => snap.instance.clone(),
+                    };
+                }
+                let cwd = registry
+                    .agent_record_any(&worker_agent)
+                    .and_then(|record| record.cwd);
                 return supervise(
                     Arc::clone(registry),
                     claimed,
@@ -445,7 +460,8 @@ async fn transact(
                         spec: spec.clone(),
                         report: request.report.clone(),
                         framed,
-                        snap,
+                        role: snap.role.clone(),
+                        cwd,
                         worker_agent,
                     },
                 )
@@ -527,7 +543,12 @@ struct SaveContext {
     spec: ClaimSpec,
     report: String,
     framed: String,
-    snap: Snapshot,
+    /// The role map's role for a note, which carries no binding.
+    role: Option<String>,
+    /// The reporting generation's own working directory, from its record,
+    /// where the convenience copies go; `None` when the record had none or
+    /// was gone, and then no copy is written.
+    cwd: Option<String>,
     worker_agent: String,
 }
 
@@ -738,10 +759,10 @@ async fn save(
             .as_ref()
             .and_then(|to| to.agent_id.clone())
             .unwrap_or_default(),
-        instance: ctx.snap.instance.clone(),
+        instance: claimed.instance.clone(),
         producer_supplied: crate::retained_store::ProducerSupplied {
             unit_name: claimed.unit_name.clone(),
-            role: claimed.role.clone().or_else(|| ctx.snap.role.clone()),
+            role: claimed.role.clone().or_else(|| ctx.role.clone()),
             producer_pane_id: ctx.spec.worker_pane.clone(),
             recipient_pane_id: claimed
                 .recipient
@@ -822,22 +843,16 @@ async fn save(
     let post = match &claimed.mode {
         ClaimMode::Task { task_id } => crate::state::ReportPost::Task {
             task_id: task_id.clone(),
-            role: claimed
-                .role
-                .clone()
-                .or_else(|| ctx.snap.role.clone())
-                .unwrap_or_else(|| "worker".to_string()),
-            cwd: ctx.snap.cwd.clone(),
+            role: claimed.role.clone().unwrap_or_else(|| "worker".to_string()),
+            cwd: ctx.cwd.clone(),
         },
         ClaimMode::Uncorrelated => crate::state::ReportPost::Note {
-            role: ctx.snap.role.clone(),
-            cwd: ctx.snap.cwd.clone(),
+            role: ctx.role.clone(),
+            cwd: ctx.cwd.clone(),
         },
         ClaimMode::Terminal { .. } => crate::state::ReportPost::Terminal {
             unit_name: claimed.unit_name.clone().unwrap_or_default(),
-            unit_cwd: registry
-                .agent_record_any(&ctx.worker_agent)
-                .and_then(|record| record.cwd),
+            unit_cwd: ctx.cwd.clone(),
         },
     };
     let content = crate::state::compose_report_post(

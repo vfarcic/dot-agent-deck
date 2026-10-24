@@ -1164,6 +1164,143 @@ async fn work_done_053_a_panicking_save_task_is_settled_by_its_supervisor() {
     assert_eq!(note.destination, Some(Destination::Inbox));
 }
 
+/// Scenario: Worker A, started in its own directory, acknowledges task t and reports it; the report attests and is held before it reads the role map. A exits with its exit cleanup held, so t stays open, and B starts on A's pane in another directory and another orchestration instance; the role map now describes B, and B's own `work-done-coder.md`, a report the deck filed and would replace, is on disk. Released, A's report is accepted for t; B's file is unchanged, A's copy lands in A's directory, and the retained report names A's instance and A as its producer. Run again with A's record removed while the save is paused after admission: the same.
+#[spec("orchestration/work-done/058")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn work_done_058_a_delayed_task_report_never_uses_its_successors_pane() {
+    for remove_record in [false, true] {
+        let mut team = team(&format!("wd058-{}", u8::from(remove_record)));
+        let dir_a = crate::test_temp::tempdir().unwrap();
+        let dir_b = crate::test_temp::tempdir().unwrap();
+        let path = |dir: &tempfile::TempDir| {
+            dir.path()
+                .join(".dot-agent-deck")
+                .join("work-done-coder.md")
+        };
+        // A, in its own directory, replaces the fixture's worker.
+        let _ = team.registry().close_agent(&team.worker);
+        let spawn_in = {
+            let registry = Arc::clone(team.registry());
+            let pane = team.worker_pane.clone();
+            move |dir: &tempfile::TempDir| {
+                registry.spawn_agent(SpawnOptions {
+                    command: Some("cat"),
+                    cwd: Some(dir.path().to_str().unwrap()),
+                    env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.clone())],
+                    ..SpawnOptions::default()
+                })
+            }
+        };
+        let a = spawn_in(&dir_a).expect("A");
+        team.worker = a.clone();
+        team.state.pane_cwd_map.insert(
+            team.worker_pane.clone(),
+            dir_a.path().to_string_lossy().into_owned(),
+        );
+        let task = team.delegate("A's task");
+        team.acknowledge();
+        let state = Arc::new(tokio::sync::RwLock::new(team.state.clone()));
+        let provenance = team.attested(&a);
+        let held = team.registry().hold_exit_cleanup_for_test(&a);
+        let (reached, release) = team
+            .registry()
+            .pause_at_for_test(crate::task_completion::PAUSE_ATTESTED);
+        let report = {
+            let registry = Arc::clone(team.registry());
+            let state = Arc::clone(&state);
+            let pane = team.worker_pane.clone();
+            let task = task.clone();
+            tokio::spawn(async move {
+                crate::task_completion::complete(
+                    &state,
+                    &registry,
+                    CompletionRequest {
+                        pane_id: pane,
+                        mode: WorkDoneMode::Task { task_id: task },
+                        report: "A-058-REPORT".to_string(),
+                    },
+                    &provenance,
+                )
+                .await
+            })
+        };
+        reached.await.unwrap();
+        // A exits; its cleanup, the task-ledger walk included, is held.
+        kill_child(team.registry(), &a);
+        let mut b = None;
+        eventually("B starts on A's pane", || {
+            b = spawn_in(&dir_b).ok();
+            b.is_some()
+        })
+        .await;
+        {
+            let mut st = state.write().await;
+            st.pane_cwd_map.insert(
+                team.worker_pane.clone(),
+                dir_b.path().to_string_lossy().into_owned(),
+            );
+            st.pane_orchestration_map.insert(
+                team.worker_pane.clone(),
+                OrchestrationIdentity {
+                    id: "wd058-successor-instance".to_string(),
+                    name: "other".to_string(),
+                },
+            );
+        }
+        // B's earlier report, as the deck files one: the deck replaces it.
+        let b_report = crate::state::frame_untrusted_report_for_file("B-058-SENTINEL");
+        std::fs::create_dir_all(path(&dir_b).parent().unwrap()).unwrap();
+        std::fs::write(path(&dir_b), &b_report).unwrap();
+        let saved = remove_record.then(|| {
+            team.registry()
+                .pause_at_for_test(crate::task_completion::PAUSE_SAVED)
+        });
+        release.send(()).unwrap();
+        if let Some((saved, go)) = saved {
+            saved.await.unwrap();
+            let _ = team.registry().close_agent(&a);
+            assert!(
+                team.registry().agent_record_any(&a).is_none(),
+                "A's record is gone"
+            );
+            go.send(()).unwrap();
+        }
+        let answer = accepted(report.await.unwrap());
+        assert_eq!(answer.task_id.as_deref(), Some(task.as_str()));
+        assert_eq!(
+            std::fs::read_to_string(path(&dir_b)).unwrap(),
+            b_report,
+            "B's file is untouched"
+        );
+        assert_eq!(
+            std::fs::read_dir(path(&dir_b).parent().unwrap())
+                .unwrap()
+                .count(),
+            1,
+            "nothing else in B's directory"
+        );
+        assert!(
+            std::fs::read_to_string(path(&dir_a))
+                .unwrap()
+                .contains("A-058-REPORT"),
+            "A's copy is in A's directory"
+        );
+        let report_id = answer.report_id.unwrap();
+        let file = std::fs::File::open(
+            team.deck
+                .store
+                .dir()
+                .join(crate::retained_store::own_name(&report_id)),
+        )
+        .unwrap();
+        let envelope = crate::retained_store::read_attribution(file).expect("an envelope");
+        assert_eq!(envelope.instance.as_deref(), Some(team.instance.as_str()));
+        assert_eq!(envelope.producer_agent_id, a);
+        drop(held);
+        let _ = team.registry().close_agent(b.as_deref().unwrap());
+    }
+}
+
 /// The store's own files, by name.
 pub(super) fn store_files(store: &crate::retained_store::RetainedStore) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(store.dir())
