@@ -142,7 +142,7 @@ fn rejects_a_verdict_pasted_by_a_maintainer() {
 #[test]
 fn rejects_a_bot_comment_from_a_different_workflow() {
     assert_py_ok(
-        "other = '\\n<!-- gh-aw-agentic-workflow: labeler, workflow_id: issue-labeler -->'\n\
+        "other = '\\n<!-- gh-aw-agentic-workflow: other, workflow_id: another-workflow -->'\n\
          assert not _is_trusted_verdict_comment(comment('github-actions[bot]', BLOCK + other))",
     );
 }

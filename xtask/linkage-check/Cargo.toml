@@ -54,8 +54,8 @@ libc = "0.2"
 
 [dev-dependencies]
 # Already a root-package dependency at the same version, so this pulls no new
-# crate into Cargo.lock. Used by `issue_labeler_policy` to read back the
-# `label-policy.json` the labeler's setup step writes.
+# crate into Cargo.lock. Used by the tests that read or build JSON, such as
+# `renovate.json` (`pin_lockstep`, `renovate_lock_file_maintenance`).
 serde_json = "1"
 tempfile = "3"
 # Already a root-package dependency at the same pinned version, so this pulls

@@ -156,7 +156,7 @@ pub(crate) const TEXT_CLASSES: &[TextClass] = &[
     TextClass {
         name: "GitHub configuration",
         read_by: "read by xtask/linkage-check (pin_lockstep, release_workflow_wiring, \
-                  gh_aw_lock_consistency, pr_review_verdict, the issue-labeler tests)",
+                  gh_aw_lock_consistency, pr_review_verdict)",
         patterns: &[Pattern::Under(".github/")],
         root_tests: &[],
         root_lib_modules: &[],
