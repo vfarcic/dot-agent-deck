@@ -10428,23 +10428,36 @@ impl AgentPtyRegistry {
             &(lookups.own_namespace)(),
             &(lookups.namespace_of)(peer.pid),
         ) {
-            store.lock().unwrap().hold(clause);
-            tracing::info!(target: "pane_input_mode", agent_id, peer = peer.pid, refusal = clause.as_str(), "pane input mode refused");
+            let mut store = store.lock().unwrap();
+            // Logged once, when it first holds the generation; every later
+            // report is refused the same way, about once a second.
+            if store.sticky().is_none() {
+                tracing::info!(target: "pane_input_mode", agent_id, peer = peer.pid, refusal = clause.as_str(), "pane input mode refused");
+            } else {
+                tracing::debug!(target: "pane_input_mode", agent_id, peer = peer.pid, refusal = clause.as_str(), "pane input mode refused");
+            }
+            store.hold(clause);
             return Err(clause.as_str());
         }
         let now = (lookups.now)().ok_or("clock_unreadable")?;
         let mut store = store.lock().unwrap();
         let first_anchor = store.anchor().is_none();
         let stored = store.accept(peer, sample, now).map_err(|refusal| {
-            tracing::info!(
-                target: "pane_input_mode",
-                agent_id,
-                peer = peer.pid,
-                peer_start = peer.start,
-                refusal = refusal.code(),
-                conflict = ?store.conflict(),
-                "pane input mode refused"
-            );
+            // A generation already held refuses every later report the same
+            // way: logged when it was first held, not again.
+            if matches!(refusal, crate::input_mode::Refusal::Held(_)) {
+                tracing::debug!(target: "pane_input_mode", agent_id, peer = peer.pid, refusal = refusal.code(), "pane input mode refused");
+            } else {
+                tracing::info!(
+                    target: "pane_input_mode",
+                    agent_id,
+                    peer = peer.pid,
+                    peer_start = peer.start,
+                    refusal = refusal.code(),
+                    conflict = ?store.conflict(),
+                    "pane input mode refused"
+                );
+            }
             refusal.code()
         })?;
         if first_anchor && let Some(anchor) = store.anchor() {
