@@ -7373,7 +7373,7 @@ mod gated_send_tests {
     /// Scenario: A daemon that confirms, then takes a large report a few kilobytes at a time, each read well inside the reply's wait but the whole report far past it: the sender checks the reply's deadline between small writes, so it stops soon after the wait rather than when the report is drained, and says the result is unconfirmed.
     #[spec("inbox/protocol/028")]
     #[test]
-    fn protocol_028_a_slowly_drained_report_is_bounded_by_the_whole_wait() {
+    fn protocol_028_a_slowly_drained_report_gives_up_long_before_it_drains() {
         let stub = stub(Script::ConfirmThenDrain(4096, Duration::from_millis(20)));
         // At 4 KiB every 20 ms the report takes about 40 s to drain.
         let mutation = format!(
