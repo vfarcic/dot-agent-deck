@@ -2012,6 +2012,8 @@ const GEOMETRY_BROADCAST_CAPACITY: usize = 16;
 pub struct AgentBus {
     tx: broadcast::Sender<Arc<Vec<u8>>>,
     state: Mutex<AgentBusState>,
+    /// The generation the bus carries, for its log lines.
+    label: String,
     /// Test hook run once by the next resize between its ioctl and its ring
     /// clear (`inbox/doorbell/034`).
     #[cfg(test)]
@@ -2037,6 +2039,9 @@ struct AgentBusState {
     /// the same lock as the ring so a layout edge's ioctl and the bytes around
     /// it are ordered.
     evidence: crate::evidence_state::EvidenceState,
+    /// PRD #1666 part 3, round 5-wake (plan §4.6): the generation's release,
+    /// read off its start-up header by a scanner fed every byte of the window.
+    release: crate::release_scanner::ReleaseCapture,
 }
 
 impl AgentBusState {
@@ -2068,6 +2073,19 @@ impl AgentBus {
         Self::profiled(None, 24, 80)
     }
 
+    /// [`Self::profiled`] for generation `agent_id`, named in its log lines.
+    pub fn for_generation(
+        agent_id: &str,
+        profile: Option<&'static crate::doorbell_screen::ScreenProfile>,
+        rows: u16,
+        cols: u16,
+    ) -> Self {
+        Self {
+            label: agent_id.to_string(),
+            ..Self::profiled(profile, rows, cols)
+        }
+    }
+
     /// A bus whose evidence state tracks `profile`'s screen from a spawn at
     /// `rows` × `cols` (PRD #1666 part 3, round 5-wake).
     pub fn profiled(
@@ -2083,7 +2101,9 @@ impl AgentBus {
                 live_modes: ReplayModes::default(),
                 ring_start_modes: ReplayModes::default(),
                 evidence: crate::evidence_state::EvidenceState::new(profile, rows, cols),
+                release: crate::release_scanner::ReleaseCapture::start(rows, cols),
             }),
+            label: String::new(),
             #[cfg(test)]
             between_resize_and_clear: Mutex::new(None),
         }
@@ -2112,6 +2132,7 @@ impl AgentBus {
             modes.feed(&arc[..at]);
             modes.preamble()
         });
+        let release = state.release.push(&arc);
         state.live_modes.feed(&arc);
         for &b in arc.iter() {
             state.scrollback.push_back(b);
@@ -2131,6 +2152,78 @@ impl AgentBus {
         if let Some(transition) = transition {
             log_evidence_transition(&transition, "output");
         }
+        for event in release {
+            self.log_release(&event);
+        }
+    }
+
+    /// One `pane release` line.
+    fn log_release(&self, event: &crate::release_scanner::CaptureEvent) {
+        use crate::release_scanner::{CaptureEvent, ScanLatch, WindowClose};
+        let (latch, close) = match event {
+            CaptureEvent::Latched(latch) => (latch, None),
+            CaptureEvent::Closed { reason, latch } => (latch, Some(*reason)),
+        };
+        let close_words = close.map(WindowClose::as_str);
+        match latch {
+            ScanLatch::Latched { agent, release, at } => tracing::info!(
+                target: "pane_release",
+                agent_id = %self.label,
+                agent = ?agent,
+                release = %release,
+                header_completed_at = at,
+                close = close_words,
+                "pane release"
+            ),
+            ScanLatch::Conflict { first, second, at } => tracing::info!(
+                target: "pane_release",
+                agent_id = %self.label,
+                release = "release_conflict",
+                first = %first.1,
+                second = %second.1,
+                at,
+                close = close_words,
+                "pane release"
+            ),
+            ScanLatch::Pending => tracing::info!(
+                target: "pane_release",
+                agent_id = %self.label,
+                release = if close == Some(WindowClose::Geometry) {
+                    "scanner_geometry"
+                } else {
+                    "unknown_release"
+                },
+                close = close_words,
+                "pane release"
+            ),
+        }
+    }
+
+    /// Close the generation's header window (PRD #1666 part 3, round
+    /// 5-wake): under the lock `push` takes, so each push is fed wholly
+    /// before or wholly after the close.
+    pub fn close_release(&self, reason: crate::release_scanner::WindowClose) {
+        let event = self.state.lock().unwrap().release.close(reason);
+        if let Some(event) = event {
+            self.log_release(&event);
+        }
+    }
+
+    /// The generation's release capture: its latch, why its window closed,
+    /// and whether its scanner is still alive.
+    pub fn release(
+        &self,
+    ) -> (
+        crate::release_scanner::ScanLatch,
+        Option<crate::release_scanner::WindowClose>,
+        bool,
+    ) {
+        let state = self.state.lock().unwrap();
+        (
+            state.release.latch().clone(),
+            state.release.closed(),
+            state.release.scanner_alive(),
+        )
     }
 
     /// Atomically take the current scrollback snapshot and a receiver
@@ -2185,8 +2278,12 @@ impl AgentBus {
         let transition = state
             .evidence
             .edge(crate::evidence_state::EdgeReason::Resize, rows, cols);
+        let release = state.release.resize(rows, cols);
         let epoch = state.evidence.layout_epoch();
         drop(state);
+        if let Some(event) = release {
+            self.log_release(&event);
+        }
         tracing::debug!(
             target: "pane_layout",
             edge = "resize",
@@ -2224,8 +2321,15 @@ impl AgentBus {
             }
             (Err(_), _) => None,
         };
+        let release = match &result {
+            Ok(()) => state.release.resize(rows, cols),
+            Err(_) => None,
+        };
         let epoch = state.evidence.layout_epoch();
         drop(state);
+        if let Some(event) = release {
+            self.log_release(&event);
+        }
         tracing::debug!(
             target: "pane_layout",
             edge = reason.as_str(),
@@ -2440,6 +2544,8 @@ fn pump_reader(
             Err(e) => break ReadEnd::Error(e.kind()),
         }
     };
+    // PRD #1666 part 3, round 5-wake: the header window ends with the stream.
+    bus.close_release(crate::release_scanner::WindowClose::AgentExit);
     // Whether the registry still held this generation when its output ended:
     // read before any of the exit handling below, which can remove it.
     let registered_at_eof = registry
@@ -10198,6 +10304,34 @@ impl AgentPtyRegistry {
             .map(|agent| agent.ingress.admit())
     }
 
+    /// PRD #1666 part 3, round 5-wake (plan §4.6): `agent_id`'s first
+    /// `UserPromptSubmit` closes its header window.
+    pub fn close_release_window(&self, agent_id: &str) {
+        let bus = {
+            let inner = self.inner.lock();
+            inner
+                .agents
+                .get(agent_id)
+                .map(|agent| Arc::clone(&agent.bus))
+        };
+        if let Some(bus) = bus {
+            bus.close_release(crate::release_scanner::WindowClose::FirstPrompt);
+        }
+    }
+
+    /// `agent_id`'s release capture ([`AgentBus::release`]).
+    pub fn release_capture(
+        &self,
+        agent_id: &str,
+    ) -> Option<(
+        crate::release_scanner::ScanLatch,
+        Option<crate::release_scanner::WindowClose>,
+        bool,
+    )> {
+        let inner = self.inner.lock();
+        inner.agents.get(agent_id).map(|agent| agent.bus.release())
+    }
+
     /// `agent_id`'s ingress ledger, while it is in the registry.
     pub fn ingress_ledger(
         &self,
@@ -11263,6 +11397,9 @@ impl AgentPtyRegistry {
                     agent.pane_retired.store(true, Ordering::SeqCst);
                     // PRD #1666 part 3, round 5-wake: the retired generation's ledger.
                     agent.ingress.close();
+                    agent
+                        .bus
+                        .close_release(crate::release_scanner::WindowClose::Retired);
                 }
             }
             self.forget_pane_input(claimed);
@@ -11295,7 +11432,15 @@ impl AgentPtyRegistry {
             process_group,
         } = pty;
 
-        let bus = Arc::new(AgentBus::new());
+        // PRD #1666 part 3, round 5-wake: the evidence state tracks the spawn
+        // type's measured screen, and the release scanner reads the header,
+        // from the generation's first byte.
+        let bus = Arc::new(AgentBus::for_generation(
+            &preallocated_id,
+            crate::doorbell_screen::profile_for_agent(spawn_agent_type.as_ref()),
+            captured_rows,
+            captured_cols,
+        ));
         let bus_for_thread = bus.clone();
         let exited = Arc::new(AtomicBool::new(false));
         let exited_for_thread = exited.clone();
@@ -11958,6 +12103,9 @@ impl AgentPtyRegistry {
             agent.pane_retired.store(true, Ordering::SeqCst);
             // PRD #1666 part 3, round 5-wake: the retired generation's ledger.
             agent.ingress.close();
+            agent
+                .bus
+                .close_release(crate::release_scanner::WindowClose::Retired);
             if let Some(pane) = agent.pane_id_env.as_deref() {
                 let still_claimed = inner
                     .agents
@@ -12264,6 +12412,9 @@ impl AgentPtyRegistry {
             removed.pane_retired.store(true, Ordering::SeqCst);
             // PRD #1666 part 3, round 5-wake: the retired generation's ledger.
             removed.ingress.close();
+            removed
+                .bus
+                .close_release(crate::release_scanner::WindowClose::Retired);
             // Issue #1612: the pane keeps its working directory in use while it
             // has neither a record nor a reservation. Released with the ticket.
             let dirs = removed.rooted_dirs().collect();
@@ -22063,6 +22214,349 @@ mod spawn_tests {
         let (other, _) = ledger_pane(&registry, "pane-nudge-free");
         registry.nudge_repaint(&other);
         assert!(registry.repaint_nudges.lock().unwrap().contains_key(&other));
+        registry.shutdown_all();
+    }
+
+    /// Codex's start-up header for `version`, drawn the way Codex 0.164.0
+    /// draws it: `OpenAI` at row 1, column 5.
+    fn codex_header(version: &str) -> Vec<u8> {
+        format!("\x1b[2;3H>_ \x1b[1mOpenAI Codex\x1b[22m\x1b[2m (v{version})\x1b[22m").into_bytes()
+    }
+
+    fn latch(bus: &AgentBus) -> crate::release_scanner::ScanLatch {
+        bus.release().0
+    }
+
+    fn latched_release(bus: &AgentBus) -> Option<semver::Version> {
+        match latch(bus) {
+            crate::release_scanner::ScanLatch::Latched { release, .. } => Some(release),
+            _ => None,
+        }
+    }
+
+    const V164: semver::Version = semver::Version::new(0, 164, 0);
+
+    /// Scenario: Feed a generation's bus its start-up header and then 200 lines that scroll it away, header-like text in another shape, a header after the window closed at the first prompt, two different headers, and a header overwritten in place. The release latches when the header is drawn and stays latched after it scrolls away; another shape latches nothing; nothing after the window's close counts; two headers are a conflict; a header redrawn in place over another is read as drawn.
+    #[spec("inbox/doorbell/055")]
+    #[test]
+    fn doorbell_055_the_latch_reads_the_header_once_and_keeps_it() {
+        use crate::release_scanner::{ScanLatch, WindowClose};
+        // (a) drawn, then scrolled away.
+        let bus = AgentBus::for_generation("g-a", None, 24, 80);
+        bus.push(codex_header("0.164.0"));
+        bus.push(b"\x1b[24;1H".to_vec());
+        bus.push(b"line\r\n".repeat(200));
+        assert_eq!(latched_release(&bus), Some(V164));
+        // (e) another shape.
+        let bus = AgentBus::for_generation("g-e", None, 24, 80);
+        bus.push(b"\x1b[2;6HOpenAI Codex v0.164.0\r\n".to_vec());
+        assert_eq!(latch(&bus), ScanLatch::Pending);
+        // (b), (f) the window closed at the first prompt: unseen, and a
+        // header after it is ignored.
+        bus.close_release(WindowClose::FirstPrompt);
+        bus.push(codex_header("0.164.0"));
+        let (seen, closed, alive) = bus.release();
+        assert_eq!(seen, ScanLatch::Pending);
+        assert_eq!(closed, Some(WindowClose::FirstPrompt));
+        assert!(!alive, "the scanner is dropped at the window's close");
+        // (f) a header starting past the byte limit is ignored.
+        let bus = AgentBus::for_generation("g-f", None, 24, 80);
+        bus.push(vec![
+            b'x';
+            crate::release_scanner::RELEASE_WINDOW_BYTES as usize
+                - 4
+        ]);
+        bus.push(codex_header("0.164.0"));
+        let (seen, closed, _) = bus.release();
+        assert_eq!(seen, ScanLatch::Pending);
+        assert_eq!(closed, Some(WindowClose::ByteLimit));
+        // (g) two different headers inside the window.
+        let bus = AgentBus::for_generation("g-g", None, 24, 80);
+        bus.push(codex_header("0.164.0"));
+        bus.push(codex_header("0.165.0"));
+        assert!(matches!(latch(&bus), ScanLatch::Conflict { .. }));
+        // (j) a header overwritten in place after a carriage return.
+        let bus = AgentBus::for_generation("g-j", None, 24, 80);
+        let mut bytes = b"\x1b[2;6HOpenAI Codex (vX.Y.Z)\r".to_vec();
+        bytes.extend(codex_header("0.164.0"));
+        bus.push(bytes);
+        assert_eq!(latched_release(&bus), Some(V164));
+    }
+
+    /// Scenario: Push one raw trace — a complete header, then an erase-display and a redraw that leaves only a composer — as one push, split right after the header, inside the header's escape sequences, inside a multibyte glyph, and one byte per push; then the same with two different headers and a redraw. Every split latches the same release, though the screen after the single push holds no header, and every split of the second trace is a conflict.
+    #[spec("inbox/doorbell/055")]
+    #[test]
+    fn doorbell_055_the_latch_is_independent_of_how_the_bytes_were_split() {
+        use crate::release_scanner::ScanLatch;
+        let mut trace = codex_header("0.164.0");
+        let header_end = trace.len();
+        trace.extend("\x1b[2J\x1b[H\x1b[20;1H› Ask Codex to do anything ✓".as_bytes());
+        let glyph = trace.len() - 2;
+        let escape = 4;
+        let splits: Vec<Vec<usize>> = vec![
+            vec![],
+            vec![header_end],
+            vec![escape],
+            vec![glyph],
+            (1..trace.len()).collect(),
+        ];
+        let latch_with = |trace: &[u8], cuts: &[usize]| {
+            let bus = AgentBus::for_generation("g-h", None, 24, 80);
+            let mut from = 0;
+            for &cut in cuts.iter().chain(std::iter::once(&trace.len())) {
+                bus.push(trace[from..cut].to_vec());
+                from = cut;
+            }
+            latch(&bus)
+        };
+        // The header completes with its `)`.
+        let closing = trace.iter().position(|&b| b == b')').unwrap() as u64 + 1;
+        for cuts in &splits {
+            assert_eq!(
+                latch_with(&trace, cuts),
+                ScanLatch::Latched {
+                    agent: AgentType::Codex,
+                    release: V164,
+                    at: closing
+                },
+                "{cuts:?}"
+            );
+        }
+        // The screen after the single push no longer shows the header.
+        let shown = crate::doorbell_screen::Grid::parse(&trace, 24, 80);
+        assert!(!shown.row_text(1).contains("OpenAI Codex"));
+        let mut two = codex_header("0.164.0");
+        two.extend(codex_header("0.165.0"));
+        two.extend(b"\x1b[2J\x1b[H".to_vec());
+        for cuts in [
+            vec![],
+            vec![10],
+            vec![30],
+            (1..two.len()).collect::<Vec<_>>(),
+        ] {
+            assert!(
+                matches!(latch_with(&two, &cuts), ScanLatch::Conflict { .. }),
+                "{cuts:?}"
+            );
+        }
+    }
+
+    /// Scenario: Replay commit 1's recorded launches of Codex 0.164.0, 0.160.0 and Claude Code 2.1.310 through a generation's bus at pseudo-random splits. Each latches exactly what feeding the bytes one at a time latches.
+    #[spec("inbox/doorbell/055")]
+    #[test]
+    fn doorbell_055_recorded_launches_latch_at_any_split() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        for stem in [
+            "codex-inbox/r5wake/codex-0.164.0-deck-tester-fresh-46x130",
+            "codex-inbox/r5wake/codex-0.160.0-deck-tester-respawn-46x130",
+            "codex-inbox/r5wake/codex-0.164.0-start-update-50x200",
+            "claude-inbox/r5wake/claude-2.1.310-start-50x200",
+        ] {
+            let bytes = std::fs::read(base.join(format!("{stem}.bin"))).unwrap();
+            let index: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(base.join(format!("{stem}.json"))).unwrap())
+                    .unwrap();
+            let (rows, cols) = (
+                index["rows"].as_u64().unwrap() as u16,
+                index["cols"].as_u64().unwrap() as u16,
+            );
+            let reference =
+                crate::release_scanner::latch_byte_at_a_time(&bytes, rows, cols).unwrap();
+            assert!(matches!(
+                reference,
+                crate::release_scanner::ScanLatch::Latched { .. }
+            ));
+            let mut seed: u64 = 0x5eed_0055;
+            for _ in 0..6 {
+                let bus = AgentBus::for_generation("g-k", None, rows, cols);
+                let mut pos = 0;
+                while pos < bytes.len() {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let end = (pos + 1 + (seed >> 33) as usize % 900).min(bytes.len());
+                    bus.push(bytes[pos..end].to_vec());
+                    pos = end;
+                }
+                assert_eq!(latch(&bus), reference, "{stem}");
+            }
+        }
+    }
+
+    /// Scenario: Feed a Codex-profiled bus its header before any width witness, then across layout edges: a header before the state was ever Clean, a header followed by an edge that leaves the state Dirty, and a header drawn while Dirty after an edge at the new width. Each latches, whatever the evidence state.
+    #[spec("inbox/doorbell/055")]
+    #[test]
+    fn doorbell_055_the_latch_does_not_wait_for_clean_evidence() {
+        use crate::evidence_state::{EdgeReason, EvidenceStatus};
+        let profile = Some(&crate::doorbell_screen::CODEX_PROFILE);
+        // (l) never Clean.
+        let bus = AgentBus::for_generation("g-l", profile, 24, 80);
+        bus.push(codex_header("0.164.0"));
+        assert!(!matches!(bus.evidence().0, EvidenceStatus::Clean { .. }));
+        assert_eq!(latched_release(&bus), Some(V164));
+        // (m) the header, then an edge that leaves the state Dirty.
+        bus.resize_and_mark_edge(EdgeReason::NudgeShrink, 24, 79, || Ok::<(), ()>(()))
+            .unwrap();
+        assert!(matches!(bus.evidence().0, EvidenceStatus::Dirty { .. }));
+        assert_eq!(latched_release(&bus), Some(V164));
+        // A header drawn while Dirty after an edge, at the new width.
+        let bus = AgentBus::for_generation("g-m", profile, 24, 80);
+        bus.resize_and_clear(30, 100, || Ok::<(), ()>(())).unwrap();
+        assert!(matches!(bus.evidence().0, EvidenceStatus::Dirty { .. }));
+        bus.push(codex_header("0.164.0"));
+        assert_eq!(latched_release(&bus), Some(V164));
+    }
+
+    /// Scenario: Feed headers through the operations the scanner's argument covers: painted right to left one character per cursor move, printed and then moved by scroll-up, insert-line and reverse-index with the cursor left elsewhere, a header-like row completed by erasing a disqualifying cell, and a header whose last digit a repeat writes across a wrap. The painted header latches at its last character, the moved one latches once at its print and a non-matching row moved the same way latches nothing, the erase completes a match, and the repeat leaves the release unseen.
+    #[spec("inbox/doorbell/055")]
+    #[test]
+    fn doorbell_055_operations_on_the_cursors_row() {
+        use crate::release_scanner::ScanLatch;
+        // (n) right to left, one CUP per character.
+        let text = "OpenAI Codex (v0.164.0)";
+        let mut painted = Vec::new();
+        for (i, c) in text.char_indices().rev() {
+            painted.extend(format!("\x1b[2;{}H{c}", 6 + i).into_bytes());
+        }
+        let bus = AgentBus::for_generation("g-n", None, 24, 80);
+        bus.push(painted.clone());
+        assert!(matches!(
+            latch(&bus),
+            ScanLatch::Latched { at, .. } if at == painted.len() as u64
+        ));
+        // (o) printed, then moved; and a non-matching row moved the same way.
+        let bus = AgentBus::for_generation("g-o", None, 24, 80);
+        bus.push(codex_header("0.164.0"));
+        let at = match latch(&bus) {
+            ScanLatch::Latched { at, .. } => at,
+            other => panic!("{other:?}"),
+        };
+        bus.push(b"\x1b[10;1H\x1b[S\x1b[5;1H\x1b[L\x1b[1;1H\x1bM\x1b[12;1H".to_vec());
+        assert!(matches!(latch(&bus), ScanLatch::Latched { at: same, .. } if same == at));
+        let bus = AgentBus::for_generation("g-o2", None, 24, 80);
+        bus.push(b"\x1b[4;6HOpenAI Codex (v0.164.0)\x1b[10;1H".to_vec());
+        bus.push(b"\x1b[1;1H\x1bM\x1b[1;1H\x1bM\x1b[3;1H\x1b[S\x1b[S\x1b[12;1H".to_vec());
+        assert_eq!(latch(&bus), ScanLatch::Pending);
+        // (p) an erase completes the match: the blank inside the span.
+        let bus = AgentBus::for_generation("g-p", None, 24, 80);
+        bus.push(b"\x1b[2;6HOpenAIXCodex (v0.164.0)".to_vec());
+        assert_eq!(latch(&bus), ScanLatch::Pending);
+        bus.push(b"\x1b[2;12H\x1b[1X\x1b[10;1H".to_vec());
+        assert_eq!(latched_release(&bus), Some(V164));
+        // (q) the residual: a repeat that writes the last digit across a wrap.
+        // With the measured shapes a repeat cannot complete a header (Codex's
+        // ends in `)`, Claude Code's needs a blank after its version on the
+        // same row), so this stays unseen.
+        let bus = AgentBus::for_generation("g-q", None, 24, 31);
+        bus.push(b"\x1b[2;12HClaude Code v2.1.31\x1b[2b\x1b[10;1H".to_vec());
+        assert_eq!(latch(&bus), ScanLatch::Pending);
+    }
+
+    /// Scenario: Start a generation larger than the scanner's cell budget, and resize latched and unlatched generations over it. An oversized start has no scanner and reads as scanner_geometry; a resize over the budget drops the scanner and keeps a latch already made, and leaves an unlatched generation scanner_geometry; the scanner keeps no scrollback.
+    #[spec("inbox/doorbell/055")]
+    #[test]
+    fn doorbell_055_the_scanner_stays_within_its_cell_budget() {
+        use crate::doorbell_activation::LatchedRelease;
+        use crate::release_scanner::{ReleaseCapture, WindowClose};
+        let big = ReleaseCapture::start(1024, 1024);
+        assert!(!big.scanner_alive());
+        assert_eq!(
+            big.latched_for(&AgentType::Codex),
+            LatchedRelease::ScannerGeometry
+        );
+        let fits = ReleaseCapture::start(512, 512);
+        assert!(fits.scanner_alive());
+        assert_eq!(fits.scanner_scrollback(), Some(0));
+        let bus = AgentBus::for_generation("g-r", None, 24, 80);
+        bus.push(codex_header("0.164.0"));
+        bus.resize_and_clear(1024, 1024, || Ok::<(), ()>(()))
+            .unwrap();
+        let (seen, closed, alive) = bus.release();
+        assert!(!alive);
+        assert_eq!(closed, Some(WindowClose::Geometry));
+        assert!(matches!(
+            seen,
+            crate::release_scanner::ScanLatch::Latched { .. }
+        ));
+        let bus = AgentBus::for_generation("g-r2", None, 24, 80);
+        bus.resize_and_clear(1024, 1024, || Ok::<(), ()>(()))
+            .unwrap();
+        let state = bus.state.lock().unwrap();
+        assert_eq!(
+            state.release.latched_for(&AgentType::Codex),
+            LatchedRelease::ScannerGeometry
+        );
+    }
+
+    /// Scenario: Latch a `cat` generation's release, attach to it and detach, start the window's first-prompt close through the registry, restart the pane, close a generation, and let a generation's PTY reach its end. Attaching changes nothing; the respawned generation starts with an empty latch and reads as unseen with no header of its own; closing or retiring a generation and its reader's end each drop its scanner.
+    #[spec("inbox/doorbell/055")]
+    #[tokio::test]
+    async fn doorbell_055_the_latch_lives_with_its_generation() {
+        use crate::doorbell_activation::LatchedRelease;
+        use crate::release_scanner::{ScanLatch, WindowClose};
+        const PANE: &str = "pane-release-latch";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (id, _) = ledger_pane(&registry, PANE);
+        let bus = registry.inner.lock().agents[&id].bus.clone();
+        bus.push(codex_header("0.164.0"));
+        let latched = latch(&bus);
+        assert!(matches!(latched, ScanLatch::Latched { .. }));
+        // (d) attach, detach, reattach.
+        let (_, rx) = bus.subscribe();
+        drop(rx);
+        let (_, rx) = bus.subscribe();
+        assert_eq!(latch(&bus), latched);
+        drop(rx);
+        // The first prompt closes the window; the latch stays.
+        registry.close_release_window(&id);
+        let (seen, closed, alive) = registry.release_capture(&id).unwrap();
+        assert_eq!(seen, latched);
+        assert_eq!(closed, Some(WindowClose::FirstPrompt));
+        assert!(!alive);
+        // (c) respawn: the successor starts empty, unseen without a header.
+        let successor = registry
+            .respawn_agent_for_pane(PANE, "/bin/cat")
+            .await
+            .expect("respawn the pane");
+        assert_ne!(successor, id);
+        let (seen, closed, alive) = registry.release_capture(&successor).unwrap();
+        assert_eq!(seen, ScanLatch::Pending);
+        assert_eq!(closed, None);
+        assert!(alive);
+        let successor_bus = registry.inner.lock().agents[&successor].bus.clone();
+        successor_bus.close_release(WindowClose::FirstPrompt);
+        assert_eq!(
+            successor_bus
+                .state
+                .lock()
+                .unwrap()
+                .release
+                .latched_for(&AgentType::Codex),
+            LatchedRelease::Unseen
+        );
+        // Retirement drops the scanner.
+        let (other, _) = ledger_pane(&registry, "pane-release-close");
+        let other_bus = registry.inner.lock().agents[&other].bus.clone();
+        registry.close_agent(&other).expect("close");
+        let (_, closed, alive) = other_bus.release();
+        assert!(!alive);
+        assert_eq!(closed, Some(WindowClose::Retired));
+        // The reader's end drops it.
+        let (ended, _) = ledger_pane(&registry, "pane-release-exit");
+        let ended_bus = registry.inner.lock().agents[&ended].bus.clone();
+        let writer = registry.agent_writer(&ended).expect("writer");
+        writer
+            .lock()
+            .await
+            .write_user(b"\x04")
+            .await
+            .expect("EOF to cat");
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while ended_bus.release().2 {
+            assert!(Instant::now() < deadline, "the reader never ended");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(ended_bus.release().1, Some(WindowClose::AgentExit));
         registry.shutdown_all();
     }
 

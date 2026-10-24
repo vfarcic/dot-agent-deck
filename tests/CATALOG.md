@@ -9853,6 +9853,13 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** the production build's stub (it reads no variable; it is compiled by the bare-clippy jobs, not run here), or where admission consults the table (activation).
 - **Platform coverage:** mac+linux.
 
+##### inbox/doorbell/055 — A generation's release is latched from its start-up header, whatever the evidence state and however the bytes were split.
+- **Layer:** Fast (`src/agent_pty.rs`, `spawn_tests`, the real bus `push` and resize paths, a real `cat` registry agent; `src/daemon.rs`, `hook_provenance_audit_tests`, the real hook socket).
+- **Agent:** none (`cat`, synthesized headers, and commit 1's recorded Codex and Claude Code launches).
+- **Asserts:** a header drawn and then scrolled away 200 lines stays latched; header-like text in another shape latches nothing; once the window has closed at the first prompt, or at its byte limit, a later header is ignored and the release reads as unseen with the close reason; two different headers are a conflict; a header overwritten in place after a carriage return latches. One trace whose single push leaves no header on screen latches the same release split after the header, inside its escape sequences, inside a multibyte glyph and one byte per push, and two headers with a redraw are a conflict under every split; commit 1's recorded launches latch through the bus at pseudo-random splits exactly as one byte at a time. A header before any Clean frame, before a layout edge that leaves the state Dirty, and drawn while Dirty after an edge all latch. A header painted right to left latches at its last character; one moved by scroll-up, insert-line and reverse-index latches once, at its print, and a non-matching row moved the same way latches nothing; an erase that removes a disqualifying cell inside the span completes the match; a repeat writing a version's last digit across a wrap leaves it unseen. A spawn over the scanner's cell budget has no scanner and reads as `scanner_geometry`; a resize over the budget drops the scanner, keeping a latch already made; the scanner keeps no scrollback. Attaching and detaching leave the latch alone; a respawned generation starts empty and reads as unseen with no header of its own; the window's close at the first prompt, a generation's retirement and its PTY reader's end each drop the scanner; only a prompt attested to the generation by its hook token closes its window, through the real hook socket.
+- **Does not assert:** an admission using the latch, or the `cannot_type` and controller-notice halves (activation).
+- **Platform coverage:** mac+linux.
+
 #### inbox/boundary
 
 ##### inbox/boundary/001 — No ack-wait redelivers a receipt hand-out.

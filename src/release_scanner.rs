@@ -294,6 +294,11 @@ impl ReleaseScanner {
     pub fn fed(&self) -> u64 {
         self.fed
     }
+
+    /// The rows of scrollback the parser keeps: none.
+    pub fn scrollback_capacity(&self) -> usize {
+        self.parser.screen().scrollback_capacity()
+    }
 }
 
 /// The reference the scanner must equal: `trace` fed one byte per call at
@@ -304,4 +309,159 @@ pub fn latch_byte_at_a_time(trace: &[u8], rows: u16, cols: u16) -> Option<ScanLa
         scanner.feed(std::slice::from_ref(byte));
     }
     Some(scanner.latch().clone())
+}
+
+/// How many bytes of a generation's output the header window covers.
+pub const RELEASE_WINDOW_BYTES: u64 = 262_144;
+
+/// Why a generation's header window closed, in the words the `pane release`
+/// log line uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowClose {
+    /// The generation's first `UserPromptSubmit` hook.
+    FirstPrompt,
+    /// [`RELEASE_WINDOW_BYTES`] fed.
+    ByteLimit,
+    /// The PTY reader ended.
+    AgentExit,
+    /// The generation was retired.
+    Retired,
+    /// The pane's geometry went over [`SCANNER_CELLS_MAX`].
+    Geometry,
+}
+
+impl WindowClose {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WindowClose::FirstPrompt => "closed at first prompt",
+            WindowClose::ByteLimit => "closed at byte limit",
+            WindowClose::AgentExit => "closed at agent exit",
+            WindowClose::Retired => "closed at retirement",
+            WindowClose::Geometry => "scanner dropped: geometry over budget",
+        }
+    }
+}
+
+/// A change to a generation's release capture, for the `pane release` line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaptureEvent {
+    Latched(ScanLatch),
+    Closed {
+        reason: WindowClose,
+        latch: ScanLatch,
+    },
+}
+
+/// A generation's release, latched from its start-up header, and the scanner
+/// that reads it while the header window is open (plan §4.6). The latch lives
+/// as long as the generation; the scanner is dropped at the first of the
+/// window's close (first prompt, byte limit), the generation's retirement,
+/// the end of its PTY reader, or a geometry over [`SCANNER_CELLS_MAX`].
+pub struct ReleaseCapture {
+    scanner: Option<ReleaseScanner>,
+    latch: ScanLatch,
+    closed: Option<WindowClose>,
+}
+
+impl std::fmt::Debug for ReleaseCapture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReleaseCapture")
+            .field("scanner", &self.scanner.is_some())
+            .field("latch", &self.latch)
+            .field("closed", &self.closed)
+            .finish()
+    }
+}
+
+impl ReleaseCapture {
+    /// A capture for a generation spawned at `rows` × `cols`.
+    pub fn start(rows: u16, cols: u16) -> Self {
+        match ReleaseScanner::new(rows, cols, HEADER_RECOGNISERS) {
+            Ok(scanner) => Self {
+                scanner: Some(scanner),
+                latch: ScanLatch::Pending,
+                closed: None,
+            },
+            Err(_) => Self {
+                scanner: None,
+                latch: ScanLatch::Pending,
+                closed: Some(WindowClose::Geometry),
+            },
+        }
+    }
+
+    /// Bytes the agent wrote, in stream order: fed to the scanner up to the
+    /// window's byte limit.
+    pub fn push(&mut self, bytes: &[u8]) -> Vec<CaptureEvent> {
+        let mut events = Vec::new();
+        let Some(scanner) = &mut self.scanner else {
+            return events;
+        };
+        let room = RELEASE_WINDOW_BYTES.saturating_sub(scanner.fed()) as usize;
+        let take = room.min(bytes.len());
+        if scanner.feed(&bytes[..take]) {
+            self.latch = scanner.latch().clone();
+            events.push(CaptureEvent::Latched(self.latch.clone()));
+        }
+        if scanner.fed() >= RELEASE_WINDOW_BYTES {
+            events.extend(self.close(WindowClose::ByteLimit));
+        }
+        events
+    }
+
+    /// A layout edge to `rows` × `cols` at this place in the stream.
+    pub fn resize(&mut self, rows: u16, cols: u16) -> Option<CaptureEvent> {
+        let scanner = self.scanner.as_mut()?;
+        if scanner.resize(rows, cols).is_err() {
+            return self.close(WindowClose::Geometry);
+        }
+        None
+    }
+
+    /// Close the window: the scanner is dropped; the latch stays.
+    pub fn close(&mut self, reason: WindowClose) -> Option<CaptureEvent> {
+        self.scanner.take()?;
+        self.closed = Some(reason);
+        Some(CaptureEvent::Closed {
+            reason,
+            latch: self.latch.clone(),
+        })
+    }
+
+    pub fn latch(&self) -> &ScanLatch {
+        &self.latch
+    }
+
+    pub fn closed(&self) -> Option<WindowClose> {
+        self.closed
+    }
+
+    pub fn scanner_alive(&self) -> bool {
+        self.scanner.is_some()
+    }
+
+    /// The live scanner's scrollback rows, while it is alive.
+    pub fn scanner_scrollback(&self) -> Option<usize> {
+        self.scanner
+            .as_ref()
+            .map(ReleaseScanner::scrollback_capacity)
+    }
+
+    /// The generation's release for the activation table, as `agent`'s: a
+    /// header of another agent is no release of this one.
+    pub fn latched_for(&self, agent: &AgentType) -> crate::doorbell_activation::LatchedRelease {
+        use crate::doorbell_activation::LatchedRelease;
+        match &self.latch {
+            ScanLatch::Latched {
+                agent: seen,
+                release,
+                ..
+            } if seen == agent => LatchedRelease::Known(release.clone()),
+            ScanLatch::Conflict { .. } => LatchedRelease::Conflict,
+            ScanLatch::Pending if self.closed == Some(WindowClose::Geometry) => {
+                LatchedRelease::ScannerGeometry
+            }
+            _ => LatchedRelease::Unseen,
+        }
+    }
 }

@@ -1845,6 +1845,13 @@ async fn ingest_hook_event(
             )
         })
     };
+    // PRD #1666 part 3, round 5-wake (plan §4.6): the generation's first
+    // `UserPromptSubmit`, attested to it, closes its header window.
+    if event.user_prompt.is_some()
+        && let Some(owner) = attested_agent.as_deref()
+    {
+        registry.close_release_window(owner);
+    }
     let event_type = event.event_type.clone();
     let claimed_pane = event.pane_id.clone();
     let ingested = ingest_event_unless(
@@ -15507,6 +15514,41 @@ mod hook_provenance_audit_tests {
              authoritative, not its own registration of the pane"
         );
         deck.stop().await;
+    }
+
+    /// Scenario: A generation is spawned, and status events reach the daemon's real hook socket: one carrying no prompt, then a prompt with no hook token, then a prompt attested by the generation's own token. Only the attested prompt closes the generation's header window, at the first prompt; the others leave its scanner reading.
+    #[spec("inbox/doorbell/055")]
+    #[tokio::test]
+    async fn doorbell_055_an_attested_prompt_closes_the_header_window() {
+        use crate::release_scanner::WindowClose;
+        const PANE: &str = "pane-release-prompt";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent = spawn(&registry, Some(PANE), "/bin/cat");
+        let token = registry
+            .hook_token_of(&agent)
+            .expect("the generation's token");
+        let deck = AuditDeck::start(registry.clone()).await;
+        let status = |prompt: Option<&str>, token: Option<&str>| {
+            let mut payload = line(PANE, Some(PANE), Some(&agent), "thinking", token);
+            if let Some(prompt) = prompt {
+                payload["user_prompt"] = prompt.into();
+            }
+            payload
+        };
+        let open = |registry: &AgentPtyRegistry| registry.release_capture(&agent).unwrap();
+        deck.send(status(None, Some(&token))).await;
+        assert!(
+            open(&registry).2,
+            "a status event with no prompt left the window open"
+        );
+        deck.send(status(Some("hello"), None)).await;
+        assert!(open(&registry).2, "an unattested prompt closed the window");
+        deck.send(status(Some("hello"), Some(&token))).await;
+        let (_, closed, alive) = open(&registry);
+        assert!(!alive);
+        assert_eq!(closed, Some(WindowClose::FirstPrompt));
+        deck.handle.abort();
+        registry.shutdown_all();
     }
 
     fn assert_bounded(state: &AppState, what: &str) {
