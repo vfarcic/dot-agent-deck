@@ -7156,6 +7156,9 @@ mod gated_send_tests {
         /// Confirm, read the mutation, then write `reply` one byte at a time,
         /// this far apart.
         ConfirmThenDrip(&'static str, Duration),
+        /// Confirm, then read the mutation at most this many bytes at a time,
+        /// this far apart, and never answer.
+        ConfirmThenDrain(usize, Duration),
     }
 
     const CONFIRMED: &str = r#"{"task_scoped_completion":1}"#;
@@ -7241,6 +7244,17 @@ mod gated_send_tests {
                             }
                         }
                     }
+                    Script::ConfirmThenDrain(chunk, every) => {
+                        writeln!(stream, "{CONFIRMED}").unwrap();
+                        let mut buf = vec![0u8; chunk];
+                        loop {
+                            std::thread::sleep(every);
+                            match std::io::Read::read(&mut reader, &mut buf) {
+                                Ok(0) | Err(_) => break,
+                                Ok(_) => {}
+                            }
+                        }
+                    }
                 }
             }
         });
@@ -7311,6 +7325,33 @@ mod gated_send_tests {
             started.elapsed()
         );
         assert_eq!(mutations(&stub), 1);
+    }
+
+    /// Scenario: A daemon that confirms, then takes a large report a few kilobytes at a time, each read well inside the reply's wait but the whole report far past it: the reply's wait bounds the whole write as well as the read, so the sender stops at about the wait and says the result is unconfirmed.
+    #[spec("inbox/protocol/028")]
+    #[test]
+    fn protocol_028_a_slowly_drained_report_is_bounded_by_the_whole_wait() {
+        let stub = stub(Script::ConfirmThenDrain(4096, Duration::from_millis(20)));
+        // At 4 KiB every 20 ms the report takes about 40 s to drain.
+        let mutation = format!(
+            r#"{{"message_type":"work_done_task","pane_id":"p","mode":{{"kind":"uncorrelated"}},"report":"{}","timestamp":"2026-01-01T00:00:00Z"}}"#,
+            "x".repeat(8 * 1024 * 1024)
+        );
+        let started = std::time::Instant::now();
+        let sent = send_gated_at(
+            &stub.path,
+            r#"{"message_type":"hook_capabilities","pane_id":"p"}"#,
+            &mutation,
+            confirms_task_scoped_completion,
+            Duration::from_millis(300),
+            Duration::from_millis(500),
+        );
+        assert!(matches!(sent, Gated::Unconfirmed(_)), "{sent:?}");
+        assert!(
+            started.elapsed() < Duration::from_millis(2000),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     /// Scenario: A daemon that answers the question with something else — an empty object, a legacy acknowledgement, a refusal with no capability — gets no report.
