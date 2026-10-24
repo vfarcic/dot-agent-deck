@@ -763,9 +763,9 @@ jobs:
       #
       # THAT FLAG NOW CARRIES THE WHOLE WEIGHT. Lane 2 does not run in CI at
       # all — no e2e test reaches a real agent there, so no TEST credential is
-      # registered on this repository (the separately credentialed Codex
-      # issue-labeler is out of scope; see the e2e-deterministic job's comment
-      # and docs/develop/issue-labeling.md) — which makes this step the ONLY
+      # registered on this repository (the separately credentialed agent PR
+      # reviewer is out of scope; see the e2e-deterministic job's comment) —
+      # which makes this step the ONLY
       # thing in CI that compiles the lane-2 files. Drop `e2e-live` from this
       # line and they go back to being checked by nothing until a developer
       # runs them.
@@ -969,12 +969,15 @@ jobs:
   # replacement for it.
   #
   # That is deliberately NOT the wider claim "no agent credential reaches this
-  # repository's CI", which is false: the Codex issue-labeler
-  # (`issue-labeler.md`, `issue-labeler.lock.yml`, `issue-labeler-batch.yml`)
-  # passes the repository secret OPENAI_API_KEY into a `codex exec` step and
-  # genuinely reaches a real agent. That is a separate feature with its own
-  # threat model — `docs/develop/issue-labeling.md` — and out of scope for the
-  # e2e lanes. Do not cite it as precedent for putting a test key here.
+  # repository's CI", which is false: the agent PR reviewer
+  # (`pr-review-batch.yml` calling `pr-review.lock.yml`) puts the repository
+  # secret ANTHROPIC_API_KEY on a runner and genuinely reaches a real agent:
+  # Claude Code calls the API through the gh-aw firewall's proxy, which keeps
+  # the raw key out of the agent's environment but not off the runner. That is a separate feature with its own design — the
+  # "automated reviewer" section of `docs/develop/governance.md` — started by a
+  # schedule or a manual dispatch rather than by a pull request, and out of
+  # scope for the e2e lanes. Do not cite it as precedent for putting a test key
+  # here.
   #
   # NO AGENT CLI is installed either, and that is deliberate rather than merely
   # unnecessary. `scheduler/cli/002` in tests/e2e_scheduler_cli.rs writes a
