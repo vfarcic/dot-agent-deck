@@ -19,7 +19,7 @@ use crate::isolation::{self, Plan};
 use crate::outer::epoch_secs;
 use crate::proc::{self, Identity, Mismatch, SandboxProcess, Terminated};
 use crate::pty;
-use crate::report::{Evidence, RunVerdict, Verdict};
+use crate::report::{Evidence, PartOp, RunVerdict, Verdict};
 use crate::sandbox::{self, Direction, EndpointMatrix, EndpointMode, Sandbox};
 use crate::{ctl, probes};
 
@@ -678,6 +678,18 @@ pub(crate) fn wait_for_status(
         StatusWait::Satisfied(rows) => Ok(rows),
         StatusWait::Unsatisfied(_, why) | StatusWait::Failing(why) => Err(why),
     })
+}
+
+/// The length of `path` in bytes, which marks where an operation begins or
+/// ends in the daemon's append-only log ([`crate::report::PartOp::log_span`]);
+/// `None` when it cannot be read.
+pub(crate) fn log_len(path: &Path) -> Option<u64> {
+    std::fs::metadata(path).ok().map(|m| m.len())
+}
+
+/// The span of the daemon's log between two [`log_len`] readings.
+fn span(from: Option<u64>, to: Option<u64>) -> Option<(u64, u64)> {
+    Some((from?, to?))
 }
 
 pub(crate) fn count_in_file(path: &Path, needle: &str) -> usize {
@@ -1508,6 +1520,7 @@ fn with_attached_tui(
     // listing, read from a different pane, must then show that very message
     // acknowledged. The sentinel is checked in what the deck HANDED the worker;
     // judgement reads parsed fetch JSON, rather than terminal echo.
+    let fetch_from = log_len(&sb.log);
     let coder_fetch = fetch_in_pane(
         g,
         tui,
@@ -1516,6 +1529,7 @@ fn with_attached_tui(
         (ROLE_CODER, coder_pane),
         &delegate_sentinel,
     )?;
+    let listing_from = log_len(&sb.log);
     let listing = capture_in_pane(
         g,
         tui,
@@ -1528,6 +1542,7 @@ fn with_attached_tui(
             shell_word(&cast.pane_cli)
         ),
     )?;
+    let listing_to = log_len(&sb.log);
     let (delivery_halves, delivery_note) = inbox_delivery_halves(
         coder_fetch.out.as_deref(),
         listing.out.as_deref(),
@@ -1554,12 +1569,18 @@ fn with_attached_tui(
             refusal_note(coder_fetch.refused, ROLE_CODER),
         ),
     );
-    // Each half names the pane it measured; the fetch's own output is what
-    // a client-declared break may cite (`breaks.rs`).
+    // Each half names the operation it ran, its pane and its stretch of the
+    // log; the fetch's own output is what a client-declared break may cite
+    // (`breaks.rs`).
     if let Some(t) = ev.tells.last_mut() {
-        t.part_panes = vec![
-            ("fetch".to_string(), coder_pane.to_string()),
-            ("listing".to_string(), orchestrator_pane.to_string()),
+        t.part_ops = vec![
+            PartOp::new("fetch", "fetch", coder_pane, span(fetch_from, listing_from)),
+            PartOp::new(
+                "listing",
+                "listing",
+                orchestrator_pane,
+                span(listing_from, listing_to),
+            ),
         ];
         t.client_outputs = client_output("fetch", coder_fetch.out.as_deref());
     }
@@ -1604,6 +1625,7 @@ fn with_attached_tui(
         &plan.env,
         ev,
     )?;
+    let report_from = log_len(&sb.log);
     type_into_pane(
         tui,
         &format!(
@@ -1615,6 +1637,7 @@ fn with_attached_tui(
     // The report goes to the orchestrator's inbox; the orchestrator takes it
     // and its own listing must show it acknowledged — tell 3's evidence, for
     // the report travelling the other way.
+    let report_fetch_from = log_len(&sb.log);
     let orchestrator_fetch = fetch_in_pane(
         g,
         tui,
@@ -1623,6 +1646,7 @@ fn with_attached_tui(
         (ROLE_ORCHESTRATOR, orchestrator_pane),
         &work_done_sentinel,
     )?;
+    let report_listing_from = log_len(&sb.log);
     let orchestrator_listing = capture_in_pane(
         g,
         tui,
@@ -1635,6 +1659,11 @@ fn with_attached_tui(
             shell_word(&cast.pane_cli)
         ),
     )?;
+    let report_listing_to = log_len(&sb.log);
+    let report_fetched = orchestrator_fetch.out.as_deref().is_some_and(|out| {
+        captured_pane(out) == Some(orchestrator_pane)
+            && fetched_id(out, &work_done_sentinel).is_some()
+    });
     let (work_done_arrived, work_done_note) = judge_inbox_delivery(
         orchestrator_fetch.out.as_deref(),
         orchestrator_listing.out.as_deref(),
@@ -1649,6 +1678,7 @@ fn with_attached_tui(
         &plan.env,
         ev,
     )?;
+    let status_from = log_len(&sb.log);
     type_into_pane(
         tui,
         &format!("{} agent-event --type running", shell_word(&cast.pane_cli)),
@@ -1667,6 +1697,7 @@ fn with_attached_tui(
             })
         },
     )?;
+    let status_to = log_len(&sb.log);
     // The status half is named `status` only when the daemon answered with
     // readable rows that never showed the change; a query that could not be
     // read is `status-query`, which no declared break explains (`breaks.rs`).
@@ -1722,15 +1753,43 @@ fn with_attached_tui(
         ),
     );
     if let Some(t) = ev.tells.last_mut() {
-        // The `work-done` half was sent from the reviewer's pane and taken in
-        // the orchestrator's, so it names both; the status half names the
-        // reviewer's pane as `daemon status` reported it.
-        t.part_panes = vec![
-            ("work-done".to_string(), reviewer_pane.to_string()),
-            ("work-done".to_string(), orchestrator_pane.to_string()),
-        ];
+        // The `work-done` half was reported from the reviewer's pane and
+        // fetched and listed in the orchestrator's: three operations, each
+        // with its pane and its stretch of the log, so a break explains it
+        // only through the operation it acts on (`breaks.rs`). The report
+        // runs until the half was measured, since the CLI typed into the pane
+        // sends it while the harness has already moved on to the fetch. A
+        // fetch that handed the report over leaves only the listing to have
+        // failed, so the report and the fetch are not recorded then. The
+        // status half names the reviewer's pane as `daemon status` reported
+        // it.
+        if !report_fetched {
+            t.part_ops.push(PartOp::new(
+                "work-done",
+                "report",
+                reviewer_pane,
+                span(report_from, report_listing_to),
+            ));
+            t.part_ops.push(PartOp::new(
+                "work-done",
+                "fetch",
+                orchestrator_pane,
+                span(report_fetch_from, report_listing_from),
+            ));
+        }
+        t.part_ops.push(PartOp::new(
+            "work-done",
+            "listing",
+            orchestrator_pane,
+            span(report_listing_from, report_listing_to),
+        ));
         if let Some(pane) = &status_pane {
-            t.part_panes.push((status_part.to_string(), pane.clone()));
+            t.part_ops.push(PartOp::new(
+                status_part,
+                "status",
+                pane,
+                span(status_from, status_to),
+            ));
         }
         t.client_outputs = client_output("work-done", orchestrator_fetch.out.as_deref());
         t.subject_pane = status_pane;

@@ -22,8 +22,15 @@
 //!   PRD #1666 part 3's task-scoped `work-done` also the CLIENT's build, whose
 //!   CLI asks an older daemon a question that daemon cannot read;
 //! * its witness, in this run, carries every piece of the effect's signature
-//!   and names a pane the failed half measured
-//!   ([`crate::report::Tell::panes_of`]). The witness is one line of the
+//!   and comes from the operation of the failed half the effect names
+//!   ([`KnownEffect::op`], [`crate::report::Tell::ops_of`]): it names that
+//!   operation's pane and, in the daemon's log, starts inside the stretch of
+//!   the log written while that operation ran. A half that ran several
+//!   operations in different panes — tell-4's `work-done` is reported from
+//!   the reviewer's pane and fetched in the orchestrator's — is explained
+//!   only by the one the break acts on, so a refusal of the reviewer's
+//!   earlier fetch of its delegate cannot explain the orchestrator's failed
+//!   fetch of the report. The witness is one line of the
 //!   sandbox `deck.log` — the daemon logged that pane's message the way the
 //!   break says it will — except for a CLIENT-declared effect whose client
 //!   refuses before it sends anything the daemon could log: such an effect
@@ -41,7 +48,7 @@
 //! a tell sees fails the run until its effect is added below, which is the
 //! point: the entry is the reviewed statement that this failure is that break.
 
-use crate::report::{BreakExplanation, Evidence, Verdict};
+use crate::report::{BreakExplanation, Evidence, Tell, Verdict};
 use crate::sandbox::Direction;
 
 /// A failure a declared break is known to cause, and the daemon's own record
@@ -53,6 +60,13 @@ pub struct KnownEffect {
     pub tell: &'static str,
     /// The half of that tell it fails ([`crate::report::Tell::failed_parts`]).
     pub part: &'static str,
+    /// The operation of that half it fails ([`crate::report::PartOp::op`]):
+    /// its witness must name that operation's pane and, for the daemon's log,
+    /// start inside that operation's stretch of it. A half runs several, in
+    /// different panes — tell-4's `work-done` is the reviewer's `report` and
+    /// the orchestrator's `fetch` — and a refusal of one of them says nothing
+    /// about another.
+    pub op: &'static str,
     /// Which build must declare the break, the other one not.
     pub declared_by: Declarer,
     /// Where the run's record of the break is.
@@ -60,8 +74,8 @@ pub struct KnownEffect {
     /// Substrings that must all appear on ONE line of the witness: the
     /// daemon's refusal in its own words, or the client's.
     pub log_signature: &'static [&'static str],
-    /// How that line names the message's pane; the pane must be one the
-    /// failed half measured ([`crate::report::Tell::panes_of`]).
+    /// How that line names the message's pane; the pane must be the one
+    /// [`Self::op`] ran in ([`crate::report::Tell::ops_of`]).
     pub pane_field: PaneField,
     /// The one call that writes the line, as `(source file, texts)`: every
     /// text must appear inside the SAME `warn!(…);` call there — its message
@@ -200,6 +214,7 @@ pub const KNOWN_EFFECTS: &[KnownEffect] = &[
         id: "318-hook-event-capability-token",
         tell: "tell-4",
         part: "status",
+        op: "status",
         declared_by: Declarer::Daemon,
         witness: Witness::DaemonLog,
         log_signature: &[
@@ -236,6 +251,7 @@ pub const KNOWN_EFFECTS: &[KnownEffect] = &[
         id: TASK_SCOPED_COMPLETION,
         tell: "tell-4",
         part: "work-done",
+        op: "report",
         declared_by: Declarer::Client,
         witness: Witness::DaemonLog,
         log_signature: &["Malformed event:", "\"message_type\":\"hook_capabilities\""],
@@ -267,6 +283,7 @@ pub const KNOWN_EFFECTS: &[KnownEffect] = &[
         id: LEGACY_FETCH_WITHDRAWN,
         tell: "tell-3",
         part: "fetch",
+        op: "fetch",
         declared_by: Declarer::Daemon,
         witness: Witness::DaemonLog,
         log_signature: H5_SIGNATURE,
@@ -279,11 +296,14 @@ pub const KNOWN_EFFECTS: &[KnownEffect] = &[
     // Reverse, tell 4: the old CLI's report is delivered as a note, which
     // the orchestrator's old `inbox fetch` then cannot take, for the same
     // reason. The note being delivered is not a failure, so it is not an
-    // effect; the refused fetch, in the orchestrator's pane, is.
+    // effect; the refused fetch, in the orchestrator's pane, is — and only a
+    // refusal of THAT fetch: the reviewer's own earlier fetch of its delegate
+    // is refused the same way, on its own pane, before it reports.
     KnownEffect {
         id: LEGACY_FETCH_WITHDRAWN,
         tell: "tell-4",
         part: "work-done",
+        op: "fetch",
         declared_by: Declarer::Daemon,
         witness: Witness::DaemonLog,
         log_signature: H5_SIGNATURE,
@@ -301,6 +321,7 @@ pub const KNOWN_EFFECTS: &[KnownEffect] = &[
         id: ONE_SHOT_RECEIPTS,
         tell: "tell-3",
         part: "fetch",
+        op: "fetch",
         declared_by: Declarer::Client,
         witness: Witness::ClientOutput,
         log_signature: &[
@@ -376,20 +397,7 @@ pub fn explain(ev: &mut Evidence, direction: Direction, deck_log: &str) {
         let mut explained = Vec::new();
         let mut unexplained = Vec::new();
         for part in &tell.failed_parts {
-            let outputs: Vec<(&str, &str)> = tell
-                .client_outputs
-                .iter()
-                .filter(|(half, _, _)| half == part)
-                .map(|(_, pane, out)| (pane.as_str(), out.as_str()))
-                .collect();
-            match explain_part(
-                &tell.id,
-                part,
-                &tell.panes_of(part),
-                &outputs,
-                &declared,
-                deck_log,
-            ) {
+            match explain_part(tell, part, &declared, deck_log) {
                 Ok(why) => explained.push(why),
                 Err(why) => unexplained.push(format!("`{part}`: {why}")),
             }
@@ -419,21 +427,30 @@ struct Declared<'a> {
     by_client: Vec<&'a String>,
 }
 
+/// The lines of `log` that start inside `span` (all of them for `None`).
+fn lines_in(log: &str, span: Option<(u64, u64)>) -> impl Iterator<Item = &str> {
+    let mut start = 0u64;
+    log.split_inclusive('\n').filter_map(move |line| {
+        let at = start;
+        start += line.len() as u64;
+        match span {
+            Some((from, to)) if at < from || at >= to => None,
+            _ => Some(line),
+        }
+    })
+}
+
 /// Whether a declared break explains one failed half of one tell: `Ok` with
-/// the explanation's summary and detail, or `Err` with why not. `panes` are
-/// the panes the half measured, and `outputs` what the client printed in
-/// them, as `(pane, output)`.
+/// the explanation's summary and detail, or `Err` with why not.
 fn explain_part(
-    tell: &str,
+    tell: &Tell,
     part: &str,
-    panes: &[&str],
-    outputs: &[(&str, &str)],
     declared: &Declared<'_>,
     deck_log: &str,
 ) -> Result<(String, String), String> {
     let candidates: Vec<&KnownEffect> = KNOWN_EFFECTS
         .iter()
-        .filter(|e| e.tell == tell && e.part == part)
+        .filter(|e| e.tell == tell.id && e.part == part)
         .collect();
     if candidates.is_empty() {
         return Err("no declared break is known to fail it".to_string());
@@ -453,22 +470,25 @@ fn explain_part(
             ));
             continue;
         }
-        if panes.is_empty() {
+        let ops = tell.ops_of(part, effect.op);
+        if ops.is_empty() {
             why_not.push(format!(
-                "`{}` is declared, but the run did not record which pane the failed half \
-                 measured, so no refusal can be tied to it",
-                effect.id
+                "`{}` is declared, but the run recorded no `{}` the failed half ran, or not its \
+                 pane, so no refusal can be tied to it",
+                effect.id, effect.op
             ));
             continue;
         }
+        let panes: Vec<&str> = ops.iter().map(|(pane, _)| *pane).collect();
         let witnessed = match effect.witness {
-            Witness::DaemonLog => deck_log
-                .lines()
-                .find(|l| {
-                    effect.log_signature.iter().all(|sig| l.contains(sig))
-                        && panes.iter().any(|pane| effect.pane_field.names(l, pane))
-                })
-                .map(|line| format!("the daemon logged: `{}`", line.trim())),
+            Witness::DaemonLog => ops.iter().find_map(|(pane, span)| {
+                lines_in(deck_log, *span)
+                    .find(|l| {
+                        effect.log_signature.iter().all(|sig| l.contains(sig))
+                            && effect.pane_field.names(l, pane)
+                    })
+                    .map(|line| format!("the daemon logged: `{}`", line.trim()))
+            }),
             // The client's own words stand in for the daemon's log only for a
             // break the CLIENT declares: a daemon's refusal is the daemon's to
             // record.
@@ -480,10 +500,11 @@ fn explain_part(
                 ));
                 continue;
             }
-            Witness::ClientOutput => outputs
+            Witness::ClientOutput => tell
+                .client_outputs
                 .iter()
-                .filter(|(pane, _)| panes.contains(pane))
-                .find_map(|(pane, out)| {
+                .filter(|(half, pane, _)| half == part && panes.contains(&pane.as_str()))
+                .find_map(|(_, pane, out)| {
                     out.lines()
                         .find(|l| effect.log_signature.iter().all(|sig| l.contains(sig)))
                         .map(|line| {
@@ -497,7 +518,7 @@ fn explain_part(
                 "`{}` is declared, but {} matching {:?} for {}",
                 effect.id,
                 match effect.witness {
-                    Witness::DaemonLog => "the daemon logged no refusal",
+                    Witness::DaemonLog => "during that operation the daemon logged no refusal",
                     Witness::ClientOutput => "the client printed no line",
                 },
                 effect.log_signature,
@@ -527,7 +548,7 @@ fn explain_part(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::report::{CONTRACT_TELLS, ROLE_SET_TELL, RunVerdict, Verdict};
+    use crate::report::{CONTRACT_TELLS, PartOp, ROLE_SET_TELL, RunVerdict, Verdict};
 
     /// `daemon hello` of v0.45.1, as the PR #1595 run recorded it.
     const V0451_HELLO: &str = r#"{"ok":true,"server_version":10,"build_version":"0.45.1-g4a332587","daemon_version":"0.45.1","contract_breaks":["617-pane-write-agent-binding","1049-stop-daemon-verb","1077-hook-capability-token","1105-focused-client-terminal-size","580-delegate-refuses-busy-worker","555-orchestration-title-uniqueness","708-worker-failure-reports-submitted","1233-prepare-refuses-ambiguous-orchestration","1337-respawn-failure-report-submitted","505-unsolicited-work-done-label-reworded"]}"#;
@@ -674,7 +695,8 @@ mod tests {
     }
 
     /// A run of `direction` in which `tell`'s halves held or failed as
-    /// `parts`, each half measuring the panes `part_panes` names, with the
+    /// `parts`, each half running the operations `part_ops` names as
+    /// `(half, operation, pane)` over the whole log, with the
     /// client's `outputs` per half, the branch declaring the round's breaks
     /// when `declared`. Every other contract tell passed.
     fn run_of(
@@ -682,7 +704,7 @@ mod tests {
         declared: bool,
         tell: &str,
         parts: &[(&str, bool)],
-        part_panes: &[(&str, &str)],
+        part_ops: &[(&str, &str, &str)],
         outputs: &[(&str, &str, String)],
     ) -> Evidence {
         let mut ev = Evidence {
@@ -700,9 +722,9 @@ mod tests {
             if id == tell {
                 ev.tell_in_parts(id, "t", parts, "measured");
                 let t = ev.tells.last_mut().unwrap();
-                t.part_panes = part_panes
+                t.part_ops = part_ops
                     .iter()
-                    .map(|(h, p)| (h.to_string(), p.to_string()))
+                    .map(|(h, op, p)| PartOp::new(h, op, p, None))
                     .collect();
                 t.client_outputs = outputs
                     .iter()
@@ -726,7 +748,7 @@ mod tests {
                 declared,
                 "tell-3",
                 &[("fetch", false)],
-                &[("fetch", "2")],
+                &[("fetch", "fetch", "2")],
                 &[],
             )
         };
@@ -748,23 +770,23 @@ mod tests {
 
     /// Reverse, tell 4: the old CLI's report reached the orchestrator's inbox
     /// as a note, and the orchestrator's old fetch in pane `1` was refused.
-    /// The work-done half measured the reviewer's pane `3` and the
-    /// orchestrator's `1`; the refusal names `1`. A DECLARED BREAK; the note
-    /// alone is not, nor a refusal for the reviewer's own fetch on `3` when
-    /// the half recorded only the reviewer's pane.
+    /// The work-done half ran the reviewer's report on pane `3` and the
+    /// orchestrator's fetch on `1`; the refusal names `1`. A DECLARED BREAK;
+    /// the note alone is not, nor a refusal on `1` when the half recorded no
+    /// fetch.
     #[test]
     fn a_refused_legacy_fetch_is_h5_in_reverse_on_tell_4() {
-        let run = |panes: &[(&str, &str)]| {
+        let run = |ops: &[(&str, &str, &str)]| {
             run_of(
                 Direction::Reverse,
                 true,
                 "tell-4",
                 &[("work-done", false), ("status", true)],
-                panes,
+                ops,
                 &[],
             )
         };
-        let both = [("work-done", "3"), ("work-done", "1")];
+        let both = [("work-done", "report", "3"), ("work-done", "fetch", "1")];
         let mut ev = run(&both);
         explain(
             &mut ev,
@@ -775,7 +797,7 @@ mod tests {
         let mut ev = run(&both);
         explain(&mut ev, Direction::Reverse, &log_with(NOTE_LINE));
         assert_eq!(ev.verdict(), RunVerdict::Fail, "the note alone");
-        let mut ev = run(&[("work-done", "3")]);
+        let mut ev = run(&[("work-done", "report", "3")]);
         explain(&mut ev, Direction::Reverse, &log_with(&h5_line("1")));
         assert_eq!(
             ev.verdict(),
@@ -786,7 +808,7 @@ mod tests {
 
     /// Where, in the run's order, a line of the daemon's log was written
     /// relative to tell-4's `work-done` half.
-    #[derive(Clone, Copy, Debug)]
+    #[derive(Clone, Copy, Debug, PartialEq)]
     enum At {
         /// Before the reviewer reported: its own fetch of the delegate.
         BeforeReport,
@@ -809,21 +831,37 @@ mod tests {
         fetched: bool,
         lines: &[(At, String)],
     ) -> (Evidence, String) {
-        let _ = fetched;
         let mut log = deck_log(false);
-        for (at, line) in lines {
-            let _ = at;
-            log.push_str(line);
-            log.push('\n');
+        // Where each place in the run begins in the log, and where it ends.
+        let mut begins = Vec::new();
+        for at in [At::BeforeReport, At::Report, At::Fetch, At::Listing] {
+            begins.push(log.len() as u64);
+            for (_, line) in lines.iter().filter(|(a, _)| *a == at) {
+                log.push_str(line);
+                log.push('\n');
+            }
         }
-        let ev = run_of(
+        let end = log.len() as u64;
+        let (report, fetch, listing) = ((begins[1], end), (begins[2], begins[3]), (begins[3], end));
+        let mut ev = run_of(
             direction,
             true,
             "tell-4",
             &[("work-done", false), ("status", true)],
-            &[("work-done", "3"), ("work-done", "1")],
+            &[],
             &[],
         );
+        let t = ev.tells.iter_mut().find(|t| t.id == "tell-4").unwrap();
+        // As production records it: a fetch that handed the report over leaves
+        // only the listing to have failed.
+        if !fetched {
+            t.part_ops
+                .push(PartOp::new("work-done", "report", "3", Some(report)));
+            t.part_ops
+                .push(PartOp::new("work-done", "fetch", "1", Some(fetch)));
+        }
+        t.part_ops
+            .push(PartOp::new("work-done", "listing", "1", Some(listing)));
         (ev, log)
     }
 
@@ -926,7 +964,7 @@ mod tests {
                 declared,
                 "tell-3",
                 &[("fetch", false)],
-                &[("fetch", "2")],
+                &[("fetch", "fetch", "2")],
                 outputs,
             )
         };

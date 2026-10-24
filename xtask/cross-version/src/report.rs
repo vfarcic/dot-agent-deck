@@ -64,12 +64,15 @@ pub struct Tell {
     /// the failure to a declared break.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_pane: Option<String>,
-    /// For a tell asserted in halves, the panes each half measured, as
-    /// `(half, pane)`. A half may name more than one: tell-4's `work-done` is
-    /// sent from the reviewer's pane and taken in the orchestrator's. When a
-    /// half names none here, `breaks.rs` falls back to [`Self::subject_pane`].
+    /// For a tell asserted in halves, the operations each half ran, each with
+    /// its pane and the stretch of the sandbox `deck.log` it ran across. A half
+    /// may run more than one: tell-4's `work-done` is reported from the
+    /// reviewer's pane and fetched in the orchestrator's. A declared break
+    /// explains a half only through the operation it names (`breaks.rs`).
+    /// When a half records none here, `breaks.rs` falls back to
+    /// [`Self::subject_pane`] and the whole log.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub part_panes: Vec<(String, String)>,
+    pub part_ops: Vec<PartOp>,
     /// What the client CLI itself printed in a half's pane, as the capture
     /// recorded it with stderr folded in: `(half, pane, output)`, the pane
     /// being the one the capture recorded. Only a CLIENT-declared break may
@@ -85,20 +88,56 @@ pub struct Tell {
     pub declared_break: Option<BreakExplanation>,
 }
 
-impl Tell {
-    /// The panes half `part` measured: its own, or the tell's subject pane.
-    pub fn panes_of(&self, part: &str) -> Vec<&str> {
-        let own: Vec<&str> = self
-            .part_panes
-            .iter()
-            .filter(|(half, _)| half == part)
-            .map(|(_, pane)| pane.as_str())
-            .collect();
-        if own.is_empty() {
-            self.subject_pane.as_deref().into_iter().collect()
-        } else {
-            own
+/// One operation a tell's half ran: what it was, in which pane, and where in
+/// the sandbox `deck.log` the daemon's record of it can be.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartOp {
+    /// The half it belongs to ([`Tell::failed_parts`]).
+    pub part: String,
+    /// What it was: `fetch`, `listing`, `report`, `status`. A known effect
+    /// names the one it explains (`breaks.rs`).
+    pub op: String,
+    /// The pane it ran in.
+    pub pane: String,
+    /// The `deck.log` length in bytes just before the operation began and
+    /// just after it ended: a line the daemon wrote for it starts inside
+    /// `[from, to)`. The daemon writes its log synchronously, before it
+    /// answers, so a refusal of this operation is inside it. `None` when the
+    /// log's length could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_span: Option<(u64, u64)>,
+}
+
+impl PartOp {
+    pub fn new(part: &str, op: &str, pane: &str, log_span: Option<(u64, u64)>) -> Self {
+        PartOp {
+            part: part.to_string(),
+            op: op.to_string(),
+            pane: pane.to_string(),
+            log_span,
         }
+    }
+}
+
+impl Tell {
+    /// The operations `op` half `part` ran, as `(pane, log span)`: its own,
+    /// or — when the half recorded no operation at all — the tell's subject
+    /// pane over the whole log. A half that recorded other operations but not
+    /// `op` names none.
+    pub fn ops_of(&self, part: &str, op: &str) -> Vec<(&str, Option<(u64, u64)>)> {
+        if !self.part_ops.iter().any(|o| o.part == part) {
+            return self
+                .subject_pane
+                .as_deref()
+                .map(|p| (p, None))
+                .into_iter()
+                .collect();
+        }
+        self.part_ops
+            .iter()
+            .filter(|o| o.part == part && o.op == op)
+            .map(|o| (o.pane.as_str(), o.log_span))
+            .collect()
     }
 }
 
@@ -253,7 +292,7 @@ impl Evidence {
             detail,
             failed_parts: Vec::new(),
             subject_pane: None,
-            part_panes: Vec::new(),
+            part_ops: Vec::new(),
             client_outputs: Vec::new(),
             declared_break: None,
         });
@@ -803,7 +842,7 @@ mod tests {
             detail: "no ss(8) on this host".into(),
             failed_parts: Vec::new(),
             subject_pane: None,
-            part_panes: Vec::new(),
+            part_ops: Vec::new(),
             client_outputs: Vec::new(),
             declared_break: None,
         });
@@ -823,7 +862,7 @@ mod tests {
             detail: "2 lines, expected 1".into(),
             failed_parts: Vec::new(),
             subject_pane: None,
-            part_panes: Vec::new(),
+            part_ops: Vec::new(),
             client_outputs: Vec::new(),
             declared_break: None,
         });
@@ -923,7 +962,7 @@ mod tests {
             detail: "first\nsecond".into(),
             failed_parts: Vec::new(),
             subject_pane: None,
-            part_panes: Vec::new(),
+            part_ops: Vec::new(),
             client_outputs: Vec::new(),
             declared_break: None,
         });
