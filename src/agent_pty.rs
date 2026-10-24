@@ -2888,6 +2888,27 @@ pub enum DoorbellReady {
     Unproven,
 }
 
+/// A human attach frame in flight for a pane
+/// ([`AgentPtyRegistry::human_frame_arriving`]); dropping it ends that, and
+/// the pane's last one removes its count.
+#[must_use]
+pub struct HumanFrameInFlight {
+    counts: Arc<Mutex<HashMap<String, usize>>>,
+    pane_id_env: String,
+}
+
+impl Drop for HumanFrameInFlight {
+    fn drop(&mut self) {
+        let mut counts = self.counts.lock().unwrap();
+        if let Some(count) = counts.get_mut(&self.pane_id_env) {
+            *count -= 1;
+            if *count == 0 {
+                counts.remove(&self.pane_id_env);
+            }
+        }
+    }
+}
+
 /// PRD #20 R20-003/R20-006: the live target that currently owns a pane, resolved
 /// atomically for the identity-guarded send path. Bundles the shared writer with
 /// the identity/liveness needed to re-validate after the writer lock is acquired.
@@ -6038,6 +6059,19 @@ pub struct AgentPtyRegistry {
     /// is what makes the record atomic with respect to writer handoff (H1). See
     /// [`PaneInputState`].
     pane_input: Arc<Mutex<PaneInputState>>,
+    /// PRD #1666 part 2 (`inbox/doorbell/031`): per pane, the human attach
+    /// frames that have arrived and not yet finished with the pane's writer
+    /// ([`Self::human_frame_arriving`]). A frame counts from before it waits
+    /// for the writer, so a doorbell holding the writer between its steps sees
+    /// the keystroke queued behind it, which [`Self::draft_pending`] cannot
+    /// until the frame is written. A pane is in the map only while one of
+    /// its frames is in flight.
+    ///
+    /// PRD #1666 part 3, round 5-wake: still the doorbell's live input until
+    /// commit 6 switches it to the generation's ingress ledger
+    /// ([`Self::ingress_ledger`]), which is filled beside it and read by
+    /// nothing in production yet.
+    human_frames_in_flight: Arc<Mutex<HashMap<String, usize>>>,
     /// Issue #525: how long a guarded delivery waits on one PTY write before
     /// it stops waiting — [`PTY_WRITE_STALL_BOUND`], lowered by tests. In
     /// milliseconds so a test can change it through the `Arc` every caller
@@ -8166,6 +8200,7 @@ impl AgentPtyRegistry {
             shutting_down: AtomicBool::new(false),
             admission_frozen: AtomicBool::new(false),
             pane_input: Arc::new(Mutex::new(PaneInputState::default())),
+            human_frames_in_flight: Arc::default(),
             pty_write_stall_bound_ms: AtomicU64::new(PTY_WRITE_STALL_BOUND.as_millis() as u64),
             repaint_nudges: Mutex::new(HashMap::new()),
             doorbell_txns: Mutex::new(HashMap::new()),
@@ -10532,16 +10567,21 @@ impl AgentPtyRegistry {
             .map(|agent| Arc::clone(&agent.ingress))
     }
 
-    /// PRD #1666 part 2 (`inbox/doorbell/031`): a human frame for the live
-    /// agent on `pane_id_env` has arrived: admitted to its generation's ledger
-    /// ([`Self::admit_ingress`]) until the returned guard, or the job it hands
-    /// its bytes to, settles it.
-    pub fn human_frame_arriving(
-        &self,
-        pane_id_env: &str,
-    ) -> Option<crate::ingress_ledger::TicketGuard> {
-        let agent_id = self.pane_current_agent_id(pane_id_env)?;
-        self.admit_ingress(&agent_id)
+    /// PRD #1666 part 2 (`inbox/doorbell/031`): a human attach frame for
+    /// `pane_id_env` has arrived and is about to wait for the pane's writer.
+    /// It counts as in flight until the returned guard drops, which the
+    /// caller does once the frame is written or refused.
+    pub fn human_frame_arriving(&self, pane_id_env: &str) -> HumanFrameInFlight {
+        *self
+            .human_frames_in_flight
+            .lock()
+            .unwrap()
+            .entry(pane_id_env.to_string())
+            .or_default() += 1;
+        HumanFrameInFlight {
+            counts: Arc::clone(&self.human_frames_in_flight),
+            pane_id_env: pane_id_env.to_string(),
+        }
     }
 
     /// PRD #1666 part 3, round 5-wake (plan rev 2 §6): what ended
@@ -10587,14 +10627,14 @@ impl AgentPtyRegistry {
         }
     }
 
-    /// Whether a human operation on the live agent of `pane_id_env` is
-    /// outstanding in its generation's ledger — arrived and not yet done with
-    /// the PTY: read by the doorbell under the pane's writer, where it is one
-    /// queued behind it.
+    /// Whether a human attach frame for `pane_id_env` is in flight
+    /// ([`Self::human_frame_arriving`]): read by the doorbell under the pane's
+    /// writer, where an in-flight frame is one queued behind it.
     pub fn human_frame_in_flight(&self, pane_id_env: &str) -> bool {
-        self.pane_current_agent_id(pane_id_env)
-            .and_then(|agent_id| self.ingress_ledger(&agent_id))
-            .is_some_and(|ledger| ledger.any_outstanding())
+        self.human_frames_in_flight
+            .lock()
+            .unwrap()
+            .contains_key(pane_id_env)
     }
 
     /// PRD #1666: generation `agent_id` reported `edge` of a turn on
@@ -23016,10 +23056,7 @@ mod spawn_tests {
         let refused = registry.admit_ingress(&id).expect("admitted");
         let refused_ticket = refused.ticket();
         assert_eq!(ledger.marks().outstanding, 1);
-        assert!(
-            registry.human_frame_in_flight(PANE),
-            "an admitted frame is in flight"
-        );
+        assert!(ledger.any_outstanding(), "an admitted frame is outstanding");
         refused.refuse("history-only");
         assert_eq!(
             settled_as(&ledger, refused_ticket).await,
@@ -23027,7 +23064,7 @@ mod spawn_tests {
         );
         let after_refusal = ledger.marks();
         assert_eq!(after_refusal.outstanding, 0);
-        assert!(!registry.human_frame_in_flight(PANE));
+        assert!(!ledger.any_outstanding());
         // ABA: nothing outstanding, but the watermark says something arrived.
         assert_eq!(after_refusal.watermark, w0.watermark + 1);
         assert_eq!(after_refusal.job_mark, w0.job_mark);
@@ -23099,7 +23136,6 @@ mod spawn_tests {
             ledger.any_outstanding(),
             "a started job keeps its ticket after its caller is gone"
         );
-        assert!(registry.human_frame_in_flight(PANE));
 
         let queued = registry.admit_ingress(&id).expect("admitted");
         let queued_ticket = queued.ticket();
@@ -23142,7 +23178,7 @@ mod spawn_tests {
         registry.shutdown_all();
     }
 
-    /// Scenario: A ticket is outstanding when its generation is closed, and a successor is started on the same pane. The closed generation's ledger records the ticket as retired and stays closed; the successor's ledger starts empty and a frame admitted to it is its own.
+    /// Scenario: A ticket is outstanding when its generation is closed, its guard is dropped afterwards, and a successor is started on the same pane. The closed generation's ledger records the ticket as retired, leaves nothing outstanding and stays closed; its log then records the guard's end as well; the successor's ledger starts empty and a frame admitted to it is its own.
     #[spec("inbox/doorbell/035")]
     #[tokio::test]
     async fn doorbell_035_retirement_closes_the_ledger_and_touches_no_successor() {
@@ -23162,12 +23198,23 @@ mod spawn_tests {
                 .any(|(t, how)| *t == ticket && *how == Settlement::Retired)
         );
         drop(outstanding);
+        assert_eq!(ledger.marks().outstanding, 0);
+        assert_eq!(
+            ledger
+                .settled()
+                .into_iter()
+                .filter(|(t, _)| *t == ticket)
+                .map(|(_, how)| how)
+                .collect::<Vec<_>>(),
+            vec![Settlement::Retired, Settlement::Cancelled],
+            "the log records the retirement and then the guard's end"
+        );
         let (successor, fresh) = ledger_pane(&registry, PANE);
         assert_ne!(successor, id);
         assert_eq!(fresh.marks().watermark, 0);
-        assert!(!registry.human_frame_in_flight(PANE));
+        assert!(!fresh.any_outstanding());
         let theirs = registry
-            .human_frame_arriving(PANE)
+            .admit_ingress(&successor)
             .expect("the successor admits");
         assert_eq!(fresh.marks().outstanding, 1);
         assert_eq!(
@@ -23176,6 +23223,90 @@ mod spawn_tests {
             "nothing reaches the closed ledger"
         );
         drop(theirs);
+        registry.shutdown_all();
+    }
+
+    /// Scenario: A voice answer's ticket is admitted to a `cat` pane's generation and held while a doorbell is written; then an attach frame's job is parked inside the PTY write and its caller, which took the pane's frame count as the attach handler does, is dropped. The ledger keeps each outstanding, yet the doorbell's live input is still the caller-lifetime count: the doorbell is typed whole beside the voice ticket, and nothing reads in flight once the attach caller is gone.
+    #[spec("inbox/doorbell/035")]
+    #[tokio::test]
+    async fn doorbell_035_the_ledger_is_not_the_doorbells_input_yet() {
+        const PANE: &str = "pane-ledger-shadow";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (id, ledger) = ledger_pane(&registry, PANE);
+
+        let voice = registry
+            .admit_ingress(&id)
+            .expect("a voice answer's ticket");
+        assert!(ledger.any_outstanding());
+        assert!(!registry.human_frame_in_flight(PANE));
+        let outcome = registry
+            .write_doorbell(PANE, &id, false, None, Some("SHADOWBELL"), || async {
+                true
+            })
+            .await;
+        assert_eq!(
+            outcome,
+            DoorbellWrite::Written,
+            "an outstanding voice ticket does not hold the doorbell yet"
+        );
+        crate::test_pty_wait::wait_for_echo_bytes(&registry, &id, b"SHADOWBELL").await;
+        drop(voice);
+
+        let writer = registry.agent_writer(&id).expect("the pane's writer");
+        let (reached, release) =
+            registry.pause_next_pty_write_for_test(PANE, PtyWritePause::BeforeWrite);
+        let ticket = registry.admit_ingress(&id).expect("admitted");
+        let attach = tokio::spawn({
+            let registry = Arc::clone(&registry);
+            let writer = writer.clone();
+            async move {
+                let _in_flight = registry.human_frame_arriving(PANE);
+                let w = writer.lock().await;
+                let _ = w.write_user_ticketed(b"ATTACHFRAME", Some(ticket)).await;
+            }
+        });
+        tokio::task::spawn_blocking(move || reached.recv_timeout(Duration::from_secs(8)))
+            .await
+            .unwrap()
+            .expect("the attach job reaches the PTY write");
+        assert!(
+            registry.human_frame_in_flight(PANE),
+            "while its caller lives"
+        );
+        attach.abort();
+        let _ = attach.await;
+        assert!(ledger.any_outstanding(), "the started job keeps its ticket");
+        assert!(
+            !registry.human_frame_in_flight(PANE),
+            "the doorbell's input ends with the attach caller, as before the ledger"
+        );
+        release.send(()).expect("release the parked write");
+        crate::test_pty_wait::wait_for_echo_bytes(&registry, &id, b"ATTACHFRAME").await;
+        registry.shutdown_all();
+    }
+
+    /// Qodo on PR #1817 (finding 17): a pane's human-frame count is kept only
+    /// while a frame for it is in flight, so a long-lived daemon holds none for
+    /// the panes it has finished with.
+    #[test]
+    fn a_pane_with_no_human_frame_in_flight_holds_no_count() {
+        let registry = AgentPtyRegistry::new();
+        let first = registry.human_frame_arriving("pane-a");
+        let second = registry.human_frame_arriving("pane-a");
+        let other = registry.human_frame_arriving("pane-b");
+        drop(first);
+        assert!(
+            registry.human_frame_in_flight("pane-a"),
+            "one frame is left"
+        );
+        drop(second);
+        drop(other);
+        assert!(!registry.human_frame_in_flight("pane-a"));
+        assert!(!registry.human_frame_in_flight("pane-b"));
+        assert!(
+            registry.human_frames_in_flight.lock().unwrap().is_empty(),
+            "a pane with no frame in flight keeps its count"
+        );
         registry.shutdown_all();
     }
 

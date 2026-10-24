@@ -8,7 +8,8 @@
 //! case), and it stopped counting a frame when its caller stopped waiting,
 //! while the PTY job carrying its bytes could still be running. So each
 //! operation takes a **ticket** from its generation's ledger when it arrives,
-//! before any await, and the ticket is settled exactly once:
+//! before any await, and the ticket leaves the outstanding set exactly once,
+//! when it is settled:
 //!
 //! - until the operation hands its bytes to a PTY job, a caller-side
 //!   [`TicketGuard`] owns it: dropping the guard settles `Cancelled`, and a
@@ -27,9 +28,14 @@
 //! queued for the PTY. The deck's own writes take no ticket and move neither.
 //!
 //! The ledger belongs to one generation (agent id). When the generation is
-//! retired its ledger is closed: what was outstanding is marked `Retired` for
-//! the log, a job that ends later settles into the closed ledger, and nothing
-//! in a successor's ledger moves.
+//! retired its ledger is closed: what was outstanding leaves the outstanding
+//! set and is recorded `Retired`, and nothing in a successor's ledger moves.
+//!
+//! The history ([`IngressLedger::settled`]) is a log, not the outstanding
+//! set: it records each settlement as it happens, so a ticket retired while
+//! outstanding is recorded twice, `Retired` and then however its guard or
+//! job ended, and a ticket admitted to a closed ledger, never outstanding,
+//! is recorded once, when it ends.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -123,7 +129,9 @@ impl IngressLedger {
         self.inner.lock().unwrap().closed
     }
 
-    /// The most recent settlements, oldest first.
+    /// The most recent settlements, oldest first: a log in which a ticket
+    /// retired while outstanding appears again when it ends (see the module
+    /// documentation).
     pub fn settled(&self) -> Vec<(u64, Settlement)> {
         self.inner.lock().unwrap().settled.clone()
     }

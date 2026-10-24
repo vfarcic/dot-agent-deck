@@ -8755,10 +8755,14 @@ async fn handle_attach_stream(
                     enqueue_reject(&reject_tx, b"history-only");
                     continue;
                 }
-                // PRD #1666 part 2 (`inbox/doorbell/031`): the ticket admitted
-                // above keeps the frame outstanding while it waits for the
-                // writer, so a doorbell holding the writer between its steps
-                // withholds the rest rather than typing ahead of it.
+                // PRD #1666 part 2 (`inbox/doorbell/031`): counted in flight
+                // from before it waits for the writer until it is written or
+                // refused, so a doorbell holding the writer between its steps
+                // withholds the rest rather than typing ahead of it. Part 3
+                // round 5-wake: the ticket admitted above is the ledger's
+                // record of the same frame, read by nothing that admits or
+                // types until commit 6 switches the doorbell to it.
+                let _in_flight = registry.human_frame_arriving(&pane_id);
                 #[cfg(feature = "e2e")]
                 crate::doorbell::record_for_test(&format!("human-arrived {pane_id}"));
                 let w = writer.lock().await;
