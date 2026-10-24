@@ -2,6 +2,8 @@
 
 How the deck's OpenTelemetry export (PRD #1741) decides two things the user page, [`docs/telemetry.md`](../telemetry.md), describes only by their result: what an `agent.operation` span says about a shell command, and which `codex` or `devin` the `PATH` shim adds to.
 
+What each agent can report beyond these spans (tokens, cost, quota, outcomes), and the record and outcome taxonomy PRD #633 proposes from real runs, are in [Execution accounting](execution-accounting.md).
+
 ## From a command line to `deck.operation.program` and `deck.operation.word`
 
 The classifier is `src/telemetry/operation.rs`. It does not parse shell syntax: it reads words that an allow-list matches, and any other word it reads declines the command, so the span carries neither program nor word. It reads the first line of the command, split on `&&`, `||`, `;` and `|` (`segments`) and into words on spaces and tabs only. The first segment that does more than set up the next is the one described: a segment running `cd`, `export`, `source`, `.`, `set` or `true` (`SETUP_PROGRAMS`) is skipped, and in front of the program so are `NAME=value` assignments and an `env`, `sudo`, `command`, `time` or `nice`, with the options each knows (`Options`) and their values (`time -f %e cargo test` is `cargo test`).
