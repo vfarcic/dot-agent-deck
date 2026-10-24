@@ -360,6 +360,26 @@ async fn transact(
             + framed.len()
             + 4) as u64,
     };
+    // The reporting generation's own directory, for the report's convenience
+    // copy: a successor may hold the pane by now, so never the pane's current
+    // one. Read before anything is admitted, through the fallible form (plan
+    // D15): a poisoned record table refuses here, while nothing is claimed or
+    // reserved, rather than unwinding with a claim no supervisor owns.
+    let cwd = match registry.agent_cwd_checked(&worker_agent) {
+        Ok(cwd) => cwd,
+        Err(_) => {
+            error!(
+                pane_id = %escape_id_for_log(&request.pane_id),
+                "work-done: the registry's record table is poisoned; the report was not taken"
+            );
+            let dir = registry
+                .inbox()
+                .retained_store()
+                .map(|store| store.dir().display().to_string())
+                .unwrap_or_default();
+            return Completion::refused(code::DECK_UNAVAILABLE, text::deck_unavailable(&dir));
+        }
+    };
     let deadline = tokio::time::Instant::now() + claim_wait();
     loop {
         let admission = match &request.mode {
@@ -452,9 +472,6 @@ async fn transact(
                         _ => snap.instance.clone(),
                     };
                 }
-                let cwd = registry
-                    .agent_record_any(&worker_agent)
-                    .and_then(|record| record.cwd);
                 return supervise(
                     Arc::clone(registry),
                     claimed,
@@ -463,7 +480,7 @@ async fn transact(
                         report: request.report.clone(),
                         framed,
                         role: snap.role.clone(),
-                        cwd,
+                        cwd: cwd.clone(),
                         worker_agent,
                     },
                 )

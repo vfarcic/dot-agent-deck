@@ -1414,7 +1414,11 @@ async fn work_done_053_n_a_poisoned_record_table_refuses_before_any_claim() {
             .expect("the report did not unwind"),
     );
     assert_eq!(answer.code.as_deref(), Some(code::DECK_UNAVAILABLE));
-    assert_eq!(state(&team, &task), before, "nothing was claimed or reserved");
+    assert_eq!(
+        state(&team, &task),
+        before,
+        "nothing was claimed or reserved"
+    );
     // Leaked on purpose: the registry's own teardown panics on a poisoned
     // lock, the documented boundary.
     std::mem::forget(Arc::try_unwrap(team).ok());

@@ -13918,6 +13918,20 @@ impl AgentPtyRegistry {
             .map(|agent| Self::cleanup_record(id, agent))
     }
 
+    /// PRD #1666 part 3, round 5: the working directory agent `id` was
+    /// started in, INCLUDING one whose child has already exited — the
+    /// reporting generation's own directory, for a report's convenience copy.
+    /// `Ok(None)` when no record or no directory is kept for it; `Err` when the
+    /// record table is poisoned, answered rather than panicking (plan D15) so
+    /// a report can refuse before it has claimed or reserved anything.
+    pub fn agent_cwd_checked(
+        &self,
+        id: &str,
+    ) -> Result<Option<String>, crate::lock_rank::Unavailable> {
+        let inner = self.inner.try_lock()?;
+        Ok(inner.agents.get(id).and_then(|agent| agent.cwd.clone()))
+    }
+
     /// PRD #1589: every record, INCLUDING exited ones, each with whether its
     /// child has exited — the membership a close enumerates, under one
     /// acquisition. A close has to see a dead role as well as a live one: it is
