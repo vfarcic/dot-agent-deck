@@ -166,13 +166,22 @@ impl Completion {
         Completion::Reply(WorkDoneTaskReply::refused(code, &message))
     }
 
-    /// The legacy `work_done` verb's answer: a [`SignalAck`], or no line.
+    /// The legacy `work_done` verb's answer: a [`SignalAck`], or no line. A
+    /// repeat with a different body is refused: the acknowledgement has no
+    /// `differs`, and that body was neither saved nor delivered.
     pub fn to_signal_ack(&self) -> Option<SignalAck> {
         match self {
             Completion::Reply(reply) => Some(match reply.disposition {
                 WorkDoneDisposition::Refused => SignalAck::refused(
                     reply.code.as_deref().unwrap_or("refused"),
                     reply.message.as_deref().unwrap_or_default(),
+                ),
+                WorkDoneDisposition::AlreadyAccepted if reply.differs => SignalAck::refused(
+                    code::REPORT_DIFFERS,
+                    &match reply.task_id.as_deref() {
+                        Some(task_id) => text::task_differs(task_id),
+                        None => text::unit_differs(),
+                    },
                 ),
                 _ => SignalAck::accepted(),
             }),

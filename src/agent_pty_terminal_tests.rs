@@ -261,6 +261,69 @@ async fn return_019_a_differing_terminal_repeat_is_not_delivered() {
     assert_eq!(unit.completed(), 1);
 }
 
+/// Scenario: An older dot-agent-deck's `work-done --done`, through the legacy verb's adapter: the unit's first report is acknowledged and delivered. The same body again is acknowledged and changes nothing. A different body is refused, saying the first report stands and this one was not delivered, and it changes nothing: the caller still holds only the first report, and no file is saved.
+#[spec("dispatch/return/019")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn return_019_the_legacy_verb_refuses_a_differing_repeat() {
+    let unit = unit("r019l", false).await;
+    let legacy = |body: &str| {
+        let provenance = Provenance::Attested {
+            agent_id: unit.agent().to_string(),
+            facts: unit.facts(unit.agent()),
+        };
+        let signal = crate::event::WorkDoneSignal {
+            pane_id: unit.pane().to_string(),
+            task: body.to_string(),
+            done: true,
+            timestamp: chrono::Utc::now(),
+            token: None,
+        };
+        let registry = Arc::clone(unit.registry());
+        async move {
+            let state = tokio::sync::RwLock::new(AppState::default());
+            crate::task_completion::complete_legacy(&state, &registry, signal, &provenance)
+                .await
+                .to_signal_ack()
+                .expect("an answer")
+        }
+    };
+    let delivered = |needle: &str| {
+        unit.registry()
+            .inbox()
+            .rendered(&unit.caller_pane)
+            .into_iter()
+            .filter(|delivery| delivery.text.contains(needle))
+            .count()
+    };
+    let first = legacy("LEGACY-019-FIRST").await;
+    assert!(first.accepted, "{first:?}");
+    assert_eq!(unit.completed(), 1);
+    assert_eq!(delivered("LEGACY-019-FIRST"), 1);
+    let files = super::report_tests::store_files(&unit.deck.store);
+    let caller = inbox_of(&unit.deck, &unit.caller_pane);
+
+    let same = legacy("LEGACY-019-FIRST").await;
+    assert!(same.accepted, "an identical repeat succeeds: {same:?}");
+    let differs = legacy("LEGACY-019-SECOND").await;
+    assert!(
+        !differs.accepted,
+        "a differing repeat is refused: {differs:?}"
+    );
+    assert_eq!(differs.reason.as_deref(), Some(code::REPORT_DIFFERS));
+    assert!(
+        differs
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("NOT delivered") && e.contains("first one stands")),
+        "{differs:?}"
+    );
+    assert_eq!(inbox_of(&unit.deck, &unit.caller_pane), caller);
+    assert_eq!(delivered("LEGACY-019-SECOND"), 0);
+    assert_eq!(delivered("LEGACY-019-FIRST"), 1);
+    assert_eq!(super::report_tests::store_files(&unit.deck.store), files);
+    assert_eq!(unit.completed(), 1);
+}
+
 /// Scenario: A terminal report is paused after its role-map snapshot and before it takes the routes; the unit's agent exits, and in a second run the unit is closed. Released, it is refused `task_closed` with the ended wording; exactly one `dispatch ended` is posted; no claim, no saved report and no mark are left.
 #[spec("dispatch/return/020")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

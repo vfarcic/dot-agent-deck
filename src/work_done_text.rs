@@ -21,6 +21,10 @@ pub mod code {
     pub const REPORT_SAVE_FAILED: &str = "report_save_failed";
     pub const DECK_FULL: &str = "deck_full";
     pub const UNSUPPORTED_MODE: &str = "unsupported_mode";
+    /// Not a refusal on the task-scoped verb, which answers
+    /// `already_accepted` with `differs`: the legacy verb's acknowledgement
+    /// has no such field, so it refuses a differing repeat with this code.
+    pub const REPORT_DIFFERS: &str = "report_differs";
 }
 
 const NOTHING: &str = "nothing was reported";
@@ -210,6 +214,22 @@ pub fn unsupported_mode() -> String {
     )
 }
 
+/// A repeat of task `task_id`'s report with a different body.
+pub fn task_differs(task_id: &str) -> String {
+    format!(
+        "Task {task_id} was already reported; this different report was NOT delivered. To tell \
+         the orchestrator more, run work-done without --task-id: that is delivered as a note \
+         that completes no task."
+    )
+}
+
+/// A repeat of a unit's terminal report with a different body.
+pub fn unit_differs() -> String {
+    "This unit already reported that it finished; this different report was NOT delivered, and \
+     the first one stands."
+        .to_string()
+}
+
 /// The CLI's line when the daemon did not confirm task-scoped completion.
 pub const NOT_CONFIRMED: &str = "Error: this deck daemon did not confirm it supports task \
      work-done reports; nothing was reported. Restart the deck daemon on this release, or run \
@@ -270,19 +290,11 @@ pub fn cli_answer(reply: &WorkDoneTaskReply, task_id: Option<&str>, terminal: bo
             (Some(id), false) => ok(format!(
                 "Task {id} was already reported; nothing new was sent."
             )),
-            (Some(id), true) => err(format!(
-                "Task {id} was already reported; this different report was NOT delivered. To \
-                 tell the orchestrator more, run work-done without --task-id: that is delivered \
-                 as a note that completes no task."
-            )),
+            (Some(id), true) => err(task_differs(id)),
             (None, false) => ok("This unit was already reported complete; nothing new was \
                  sent."
                 .to_string()),
-            (None, true) => err(
-                "This unit already reported that it finished; this different \
-                 report was NOT delivered, and the first one stands."
-                    .to_string(),
-            ),
+            (None, true) => err(unit_differs()),
         },
         WorkDoneDisposition::Uncorrelated if recovered => ok("Sent as a note that completes no \
              task. Its orchestrator is no longer running, so the deck saved it in Deck notices."
