@@ -49,9 +49,9 @@ network:
 # credit cap." That was false for as long as it has been written, and it cost a
 # review. gh-aw's firewall api-proxy applies `maxAiCredits` to EVERY run from
 # `vars.GH_AW_DEFAULT_MAX_AI_CREDITS || '1000'` — declaring nothing here does not
-# mean uncapped, it means 1000. On 2026-09-13 the #1035 leg died at
-# `403 Maximum AI credits exceeded (1011.080265 / 1000)` after eight minutes, on
-# the largest open pull request, having produced no verdict at all.
+# mean uncapped, it means 1000. On 2026-09-13 the #1035 leg died on the API
+# proxy's 403 at 1011.080265 of 1000 credits after eight minutes, on the
+# largest open pull request, having produced no verdict at all.
 #
 # The original argument was right and is why the number below is the ceiling
 # rather than a guess: a cap does not prevent spend, it WASTES it — the tokens
@@ -111,15 +111,20 @@ network:
 # than a shallow one. Telling it less than it has only wastes headroom. So the
 # number in the prompt must never exceed what is certainly enforced.
 #
-# KEEP THE PROXY'S ERROR TEXT OUT OF THE PROMPT BODY (issue #1774). gh-aw's
-# conclusion job scans the tail of the agent's stdio log for
-# /maximum ai credits exceeded/i (`MAX_AI_CREDITS_EXCEEDED_STDIO_RE` in gh-aw's
-# actions/setup/js/ai_credits_context.cjs, v0.86.2) and, on a match, files an
-# "exceeded max AI credits" failure. The body used to quote that error, so an
-# agent that echoed its own instructions turned a successful review into a
-# false credit failure (#1131, #1219, #1613). Describe the limit in other words
-# below the closing `---`. These comments are frontmatter, which the runtime
-# import strips before the prompt is built, so the quotes up here are safe.
+# KEEP THE PROXY'S ERROR TEXT OUT OF THIS WHOLE FILE (issues #1774, #1808).
+# gh-aw's conclusion job scans the tail of the agent's stdio log with
+# `MAX_AI_CREDITS_EXCEEDED_STDIO_RE` (actions/setup/js/ai_credits_context.cjs,
+# v0.86.2), which matches the proxy's 403 message verbatim, and on a match
+# files an "exceeded max AI credits" failure. The body used to quote that
+# message, so an agent that echoed its own instructions turned a successful
+# review into a false credit failure (#1131, #1219, #1613). Quoting it up here
+# in the frontmatter is NOT safe either, although the runtime import strips the
+# frontmatter before the prompt is built: the agent can still read this file,
+# and a tool result lands in the same stdio log. The run behind #1808 reviewed
+# a pull request that touched this file, grepped it for the message, printed a
+# frontmatter line quoting it, and was reported as over budget at 115 of 10000
+# credits. So name the message only as the regex's identifier, here and in the
+# body. `xtask/linkage-check`'s gh_aw_credit_error_text test enforces that.
 #
 # `timeout-minutes` is raised because it is a GitHub Actions timeout: enforced
 # by the runner, subject to no clamp, and verifiable from the workflow file.
