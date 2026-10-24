@@ -90,13 +90,15 @@ After editing either Markdown source, regenerate and validate both locks with th
 gh aw compile issue-labeler issue-labeler-preview --validate --strict --approve
 ```
 
+A per-workflow compile leaves `.github/workflows/agentics-maintenance.yml` alone. That file is gh-aw's maintenance workflow: `.github/workflows/aw.json` opts into it by setting `maintenance.action_failure_issue_expires` (issue #1775), and its daily `close-expired-issues` job closes each failure report gh-aw files once the `gh-aw-expires` marker in the report passes; `aw.json` sets that expiry to 168 hours. Only a bare `gh aw compile` regenerates it, so when a compile moves the `gh aw` version, run a bare `gh aw compile` as well, which rewrites every lock and the maintenance workflow together. `failure_report_expiry_has_a_closer` in `xtask/linkage-check/src/gh_aw_lock_consistency.rs` fails `cargo test-fast` when a lock's failure-report expiry is `0`, when the maintenance workflow or its issue-closing job is missing, or when it pins a different gh-aw release from the locks.
+
 Then run the additional workflow checks and normal repository gates:
 
 ```sh
 gh aw compile issue-labeler issue-labeler-preview --validate --strict --no-emit
 cargo test-fast
 cargo fmt --check
-cargo clippy --workspace --all-targets --features e2e -- -D warnings
+cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings
 ```
 
 The Codex engine uses `gpt-5-mini` and reads the repository Actions secret `OPENAI_API_KEY`. GitHub reads use `gh-aw`'s `gh-proxy` mode with the agent job's read-only token; labels and memory are written later by separate compiler-generated jobs. Threat detection is fail-closed, so detected prompt injection or a detector failure blocks both safe outputs and memory persistence. Rotate or replace the OpenAI secret through GitHub's secret interface; never place its value in source, workflow inputs, logs, or model-visible environment variables. The checked-in `.env.vals.yaml` entry is only a local `vals` reference to the external secret.
