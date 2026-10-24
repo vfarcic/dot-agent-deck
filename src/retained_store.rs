@@ -1174,6 +1174,18 @@ fn exists_error(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::AlreadyExists
 }
 
+/// The error the test seams inject for a failed unlink or sync: `EIO` on
+/// Unix; `libc` is a Unix-only dependency, so elsewhere an error of its own.
+#[cfg(all(test, unix))]
+fn injected_io_error() -> io::Error {
+    io::Error::from_raw_os_error(libc::EIO)
+}
+
+#[cfg(all(test, not(unix)))]
+fn injected_io_error() -> io::Error {
+    io::Error::other("injected I/O error")
+}
+
 impl RetainedStore {
     /// Open this run's store under `state_dir` (an absolute path), take over
     /// every ended run's files, and sweep once. Never fails: a directory that
@@ -2076,7 +2088,7 @@ impl RetainedStore {
     fn unlink(&self, dir: &TrustedDir, name: &str) -> io::Result<()> {
         #[cfg(test)]
         if self.seams.fail_unlink.load(Ordering::SeqCst) {
-            return Err(io::Error::from_raw_os_error(libc::EIO));
+            return Err(injected_io_error());
         }
         dir.remove_file(name)
     }
@@ -2098,7 +2110,7 @@ impl RetainedStore {
     fn sync(&self, dir: &TrustedDir, _which: &str) -> io::Result<()> {
         #[cfg(test)]
         if self.seams.sync_fails(_which) {
-            return Err(io::Error::from_raw_os_error(libc::EIO));
+            return Err(injected_io_error());
         }
         dir.sync()
     }
