@@ -7,8 +7,12 @@
 use tracing_subscriber::EnvFilter;
 
 /// The crate-level verbosity the deck applies when the user has not asked for
-/// something else.
-const CRATE_DEFAULT: &str = "dot_agent_deck=info";
+/// something else. Three subsystems log under targets of their own rather
+/// than the crate's module paths, and the user troubleshooting page sends
+/// readers to their info lines (`doorbell off`, `doorbell attempt`,
+/// `pane release`, `pane input mode refused`), so they are named here too.
+const CRATE_DEFAULT: &str =
+    "dot_agent_deck=info,doorbell=info,pane_release=info,pane_input_mode=info";
 
 /// The verbosity everything *else* — dependency crates — is held to. This
 /// restates the default directive [`EnvFilter::from_default_env`] installs when

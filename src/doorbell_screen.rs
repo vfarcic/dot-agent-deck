@@ -800,7 +800,8 @@ const STANDIN_COMPOSER: &str = "COMPOSER: ";
 #[cfg(feature = "e2e")]
 const STANDIN_SUBMITTED: &str = "SUBMITTED:";
 
-/// The stand-in's composer: the row that starts `COMPOSER: `.
+/// The stand-in's composer: the row that starts `COMPOSER: `, and the rows
+/// it wraps onto when the line is wider than the terminal.
 #[cfg(feature = "e2e")]
 fn standin_composer(grid: &Grid) -> Option<Composer> {
     let indent = STANDIN_COMPOSER.chars().count() as u16;
@@ -808,15 +809,40 @@ fn standin_composer(grid: &Grid) -> Option<Composer> {
         grid.text_from(r, 0)
             .starts_with(STANDIN_COMPOSER.trim_end())
     })?;
-    let text = grid.text_from(row, indent);
-    let cells = &grid.cells[row as usize][indent as usize..];
-    let shown: Vec<&GridCell> = cells.iter().filter(|c| !c.text.trim().is_empty()).collect();
+    let mut last_row = row;
+    while grid
+        .wrapped
+        .get(last_row as usize)
+        .copied()
+        .unwrap_or(false)
+        && last_row + 1 < grid.rows
+    {
+        last_row += 1;
+    }
+    let mut text = String::new();
+    let mut shown: Vec<&GridCell> = Vec::new();
+    for r in row..=last_row {
+        let from = if r == row { indent } else { 0 };
+        let cells = &grid.cells[r as usize][from as usize..];
+        // A wrapped row is drawn to the edge; only the last may end early.
+        let piece = if r < last_row {
+            cells.iter().map(GridCell::shown).collect::<String>()
+        } else {
+            grid.text_from(r, from)
+        };
+        text.push_str(&piece);
+        shown.extend(cells.iter().filter(|c| !c.text.trim().is_empty()));
+    }
     let dim = !shown.is_empty() && shown.iter().all(|c| c.dim);
-    let end = indent + text.chars().count() as u16;
+    let end_col = if last_row == row {
+        indent + text.chars().count() as u16
+    } else {
+        grid.text_from(last_row, 0).chars().count() as u16
+    };
     Some(Composer {
         prompt_row: row,
-        last_row: row,
-        cursor_at_end: grid.cursor == (row, end),
+        last_row,
+        cursor_at_end: grid.cursor == (last_row, end_col),
         text,
         dim,
     })
@@ -837,11 +863,22 @@ fn standin_dialog(_grid: &Grid) -> Option<Dialog> {
     None
 }
 
+/// A `SUBMITTED:` row holding `line`, with the rows it wraps onto when the
+/// line is wider than the terminal.
 #[cfg(feature = "e2e")]
 fn standin_transcript_user_line(grid: &Grid, line: &str) -> bool {
     (0..grid.rows).any(|r| {
-        grid.text_from(r, 0)
-            .strip_prefix(STANDIN_SUBMITTED)
+        if !grid.text_from(r, 0).starts_with(STANDIN_SUBMITTED) {
+            return false;
+        }
+        let mut text = String::new();
+        let mut row = r;
+        while grid.wrapped.get(row as usize).copied().unwrap_or(false) && row + 1 < grid.rows {
+            text.extend(grid.cells[row as usize].iter().map(GridCell::shown));
+            row += 1;
+        }
+        text.push_str(&grid.text_from(row, 0));
+        text.strip_prefix(STANDIN_SUBMITTED)
             .is_some_and(|text| text == line)
     })
 }
@@ -871,32 +908,61 @@ pub static STANDIN_PROFILE: ScreenProfile = ScreenProfile {
     transcript_user_line: standin_transcript_user_line,
     redraw_marker: b"\x1b[2J\x1b[H",
     width_witness: standin_width_witness,
-    min_cols: 120,
+    min_cols: 40,
 };
 
 /// The stand-in's executable when a pane's spawn selects the stand-in
 /// profile: the selector says `standin`, the binary variable names an
-/// absolute path, and the pane's command names that path. Anything less
-/// selects nothing.
+/// absolute path, and the pane's command names that path. Each variable is
+/// read from the pane's environment, or else from an assignment in the
+/// command itself (an orchestration role's pane carries no start request's
+/// environment). Anything less selects nothing.
 #[cfg(feature = "e2e")]
 pub fn standin_selected(
     env: &[(String, String)],
     command: Option<&str>,
 ) -> Option<std::path::PathBuf> {
-    let value = |name: &str| {
-        env.iter()
-            .rev()
-            .find(|(k, _)| k == name)
-            .map(|(_, v)| v.as_str())
+    let command = command?;
+    let value = |name: &str| -> Option<String> {
+        if let Some((_, v)) = env.iter().rev().find(|(k, _)| k == name) {
+            return Some(v.clone());
+        }
+        let at = command.find(&format!("{name}="))? + name.len() + 1;
+        let rest = &command[at..];
+        let raw = match rest.strip_prefix('\'') {
+            Some(quoted) => quoted.split('\'').next()?,
+            None => rest.split(|c: char| c.is_whitespace() || c == ';').next()?,
+        };
+        Some(raw.to_string())
     };
-    if value(STANDIN_SELECTOR_ENV) != Some("standin") {
+    if value(STANDIN_SELECTOR_ENV).as_deref() != Some("standin") {
         return None;
     }
     let binary = std::path::PathBuf::from(value(STANDIN_BINARY_ENV)?);
-    if !binary.is_absolute() || !command?.contains(binary.to_str()?) {
+    if !binary.is_absolute() || !command.contains(binary.to_str()?) {
         return None;
     }
     Some(binary)
+}
+
+/// The stand-in the daemon's own environment selects, for panes a test
+/// cannot give the selector to (an agent the TUI spawns from its configured
+/// command): the selector says `standin` and the binary variable names an
+/// absolute path. Nothing in the pane's command is checked, so a pane in such
+/// a daemon types under the stand-in's profile only while its process runs
+/// that path ([`standin_running`], asked at every attempt).
+#[cfg(feature = "e2e")]
+pub fn standin_from_daemon_env() -> Option<std::path::PathBuf> {
+    standin_from(|name| std::env::var(name).ok())
+}
+
+#[cfg(feature = "e2e")]
+fn standin_from(lookup: impl Fn(&str) -> Option<String>) -> Option<std::path::PathBuf> {
+    if lookup(STANDIN_SELECTOR_ENV).as_deref() != Some("standin") {
+        return None;
+    }
+    let binary = std::path::PathBuf::from(lookup(STANDIN_BINARY_ENV)?);
+    binary.is_absolute().then_some(binary)
 }
 
 /// Whether process `pid` runs `binary`: one of its arguments is that path,
@@ -1162,6 +1228,43 @@ mod standin_tests {
         );
     }
 
+    #[test]
+    fn the_daemons_environment_selects_the_standin_with_an_absolute_path() {
+        let lookup = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        assert_eq!(
+            standin_from(lookup(&[
+                (STANDIN_SELECTOR_ENV, "standin"),
+                (STANDIN_BINARY_ENV, "/home/t/recorder.py"),
+            ])),
+            Some(std::path::PathBuf::from("/home/t/recorder.py"))
+        );
+        assert_eq!(
+            standin_from(lookup(&[(STANDIN_BINARY_ENV, "/home/t/recorder.py")])),
+            None,
+            "no selector"
+        );
+        assert_eq!(
+            standin_from(lookup(&[(STANDIN_SELECTOR_ENV, "standin")])),
+            None,
+            "a missing path"
+        );
+        assert_eq!(
+            standin_from(lookup(&[
+                (STANDIN_SELECTOR_ENV, "standin"),
+                (STANDIN_BINARY_ENV, "recorder.py"),
+            ])),
+            None,
+            "a relative path"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn the_standin_is_recognised_only_in_a_process_running_its_path() {
@@ -1197,6 +1300,14 @@ mod standin_tests {
         let f = frame(p, &submitted, 0, true, Some(line));
         assert_eq!(f.user_cells, vec![line.to_string()]);
         assert!(f.empty_and_ready());
+        // At a width the submitted row wraps at, it is read through its wrap.
+        let narrow = Grid::parse(
+            &standin_frame(80, &format!("SUBMITTED:{line}"), None),
+            45,
+            80,
+        );
+        let f = frame(p, &narrow, 0, true, Some(line));
+        assert_eq!(f.user_cells, vec![line.to_string()]);
         // Its width witness: the W row as wide as the terminal, in one run.
         let mut parser = crate::vt_grid::parser(45, 160, 0);
         parser.process(&standin_frame(160, "", None));

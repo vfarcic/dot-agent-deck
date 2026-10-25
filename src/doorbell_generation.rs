@@ -57,7 +57,10 @@ impl Tripwires {
 /// The verdict for a generation of `agent` whose header latched `latch`
 /// (plan §4.6): `records` with the e2e build's Claude Code exclusion applied,
 /// then the activation table. With no effective agent type there is no
-/// profile to type under.
+/// profile to type under, and an agent type no record measures is
+/// `unmeasured_release` whatever its start-up screen showed: the deck reads
+/// no release from a screen it has no record of, so `unknown_release` would
+/// send the user after a start-up screen that was never the cause.
 pub fn generation_activation<'a>(
     records: &[ReleaseRecord<'a>],
     agent: Option<&AgentType>,
@@ -68,6 +71,9 @@ pub fn generation_activation<'a>(
         return Activation::NoGo(NoGo::UnmeasuredRelease);
     };
     let records = without_unrecorded_claude(records, &unrecorded_claude_releases());
+    if !records.iter().any(|record| record.agent == *agent) {
+        return Activation::NoGo(NoGo::UnmeasuredRelease);
+    }
     activation(&records, agent, latch, tripwires)
 }
 
@@ -104,6 +110,10 @@ pub struct GenerationDoorbell {
     /// selected for this generation.
     #[cfg(feature = "e2e")]
     standin: Option<std::path::PathBuf>,
+    /// What to do when a move outside a transaction (the hook arm's
+    /// evidence, the user's own clear) changed the cell: the registry asks
+    /// for the generation's re-projection.
+    on_moved: OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl std::fmt::Debug for GenerationDoorbell {
@@ -132,6 +142,19 @@ impl GenerationDoorbell {
             first_admitted: AtomicBool::new(false),
             #[cfg(feature = "e2e")]
             standin: None,
+            on_moved: OnceLock::new(),
+        }
+    }
+
+    /// Call `moved` whenever the hook arm's evidence or the user's own clear
+    /// moves the cell. Set once.
+    pub fn on_moved(&self, moved: impl Fn() + Send + Sync + 'static) {
+        let _ = self.on_moved.set(Box::new(moved));
+    }
+
+    fn moved(&self) {
+        if let Some(moved) = self.on_moved.get() {
+            moved();
         }
     }
 
@@ -187,14 +210,18 @@ impl GenerationDoorbell {
     /// moved.
     pub fn evidence(&self, token: &str, exact: bool) -> Option<Latch> {
         let token = RingToken::parse(token)?;
-        crate::doorbell_txn::hook_evidence(&self.cell, &self.ring, token, exact)
+        let moved = crate::doorbell_txn::hook_evidence(&self.cell, &self.ring, token, exact)?;
+        self.moved();
+        Some(moved)
     }
 
     /// The user's own submit or clear, read from their bytes: a suspended
     /// attempt is resolved as the user's. `Some` with the cell's state when
     /// it moved.
     pub fn user_cleared(&self) -> Option<Latch> {
-        self.cell.user_cleared().ok().map(|_| self.cell.load())
+        self.cell.user_cleared().ok()?;
+        self.moved();
+        Some(self.cell.load())
     }
 
     /// The generation retired: its cell refuses every later move.
@@ -264,7 +291,7 @@ impl GenerationDoorbell {
         settle: std::time::Duration,
         now_ns: u64,
     ) -> bool {
-        if self.first_admitted.load(Ordering::Acquire) {
+        if self.first_admitted.load(Ordering::Acquire) || settle.is_zero() {
             return false;
         }
         match self.settle_anchor(store_anchor) {
@@ -418,6 +445,33 @@ mod tests {
                 &[]
             )),
             None
+        );
+    }
+
+    #[test]
+    fn an_agent_type_no_record_measures_is_unmeasured_whatever_its_latch() {
+        let records = &crate::doorbell_activation::RELEASE_RECORDS;
+        for agent in [AgentType::OpenCode, AgentType::Pi, AgentType::Devin] {
+            for latch in [
+                LatchedRelease::Unseen,
+                LatchedRelease::Known(Version::new(1, 0, 0)),
+            ] {
+                assert_eq!(
+                    refused_clause(&generation_activation(records, Some(&agent), &latch, &[])),
+                    Some("unmeasured_release"),
+                    "{agent:?} {latch:?}"
+                );
+            }
+        }
+        // An agent type with records still reads an unseen header as such.
+        assert_eq!(
+            refused_clause(&generation_activation(
+                records,
+                Some(&AgentType::ClaudeCode),
+                &LatchedRelease::Unseen,
+                &[]
+            )),
+            Some("unknown_release")
         );
     }
 }

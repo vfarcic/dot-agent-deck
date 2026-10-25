@@ -353,7 +353,7 @@ fn spawn_003_command_is_honored() {
     );
 }
 
-/// Scenario: Fire a single scheduled task without a SessionStart hook. One agent and one bound inbox message appear; the pane fetches the prompt through its fixed doorbell rather than receiving prompt bytes on stdin.
+/// Scenario: Fire a single scheduled task without a SessionStart hook. One agent and one bound inbox message appear; the pane fetches the prompt through its token-led doorbell rather than receiving prompt bytes on stdin.
 #[spec("scheduler/spawn/004")]
 #[test]
 #[cfg(unix)]

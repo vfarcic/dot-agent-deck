@@ -528,6 +528,13 @@ struct HubState {
     /// ([`InboxHub::set_typed_fallback`]); read by [`wake_of`], so the
     /// status's WAKE and the overdue notice agree.
     typed_refused: HashMap<AgentKey, &'static str>,
+    /// PRD #1666 part 3, round 5-wake (plan §3.4′, §5.1 row 1): a generation
+    /// whose doorbell is suspended on an attempt, with the reason its card
+    /// shows at once (`uncertain_input`, or `dialog_during_ring`). Written
+    /// only by the doorbell's re-projection publisher, from the generation's
+    /// latch cell as it is when the request runs; it takes precedence over
+    /// the doorbell's episode reason ([`InboxHub::set_wake_hold`]).
+    wake_suspension: HashMap<AgentKey, crate::inbox_display::WakeHold>,
     /// PRD #1666 part 3, round 5-wake (plan §5): why the doorbell holds for
     /// an agent generation's waiting messages, with the message the hold was
     /// last told against ([`InboxHub::set_wake_hold`]).
@@ -844,6 +851,7 @@ impl InboxHub {
                 owed_retry_at: None,
                 wake_stalled: HashMap::new(),
                 typed_refused: HashMap::new(),
+                wake_suspension: HashMap::new(),
                 wake_hold: HashMap::new(),
                 live_agent: None,
                 offers: HashMap::new(),
@@ -1883,7 +1891,7 @@ impl InboxHub {
             // PRD #1666 part 3, round 5-wake (plan §5.3): why the doorbell
             // holds, as it stands when the notice is composed. The notice is
             // composed once, so a later change is not sent.
-            let hold = st.wake_hold.get(&key).map(|(hold, _)| *hold);
+            let hold = shown_hold(st, &key);
             let body = compose_undelivered_notice(
                 &id,
                 &watch.role,
@@ -2076,7 +2084,8 @@ impl InboxHub {
         let stall = st.wake_stalled.remove(&key);
         let hold = st.wake_hold.remove(&key).map(|(_, id)| id);
         st.typed_refused.remove(&key);
-        if let Some(id) = stall.or(hold) {
+        let suspended = st.wake_suspension.remove(&key).is_some();
+        if let Some(id) = stall.or(hold).or_else(|| suspended.then(String::new)) {
             broadcast_wake(&st, pane_id, agent_id, &id);
         }
         drain_events(&mut st);
@@ -2135,15 +2144,72 @@ impl InboxHub {
         refused: Option<&'static str>,
     ) -> bool {
         let mut st = self.state.lock();
+        apply_typed_fallback(&mut st, pane_id, agent_id, refused)
+    }
+
+    /// Test seam: what the re-projection publisher last wrote for
+    /// `agent_id` in `pane_id`, the suspension shown and the typed-fallback
+    /// refusal.
+    #[cfg(test)]
+    pub(crate) fn wake_projection_for_test(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+    ) -> (Option<crate::inbox_display::WakeHold>, Option<&'static str>) {
+        let st = self.lock();
         let key = (pane_id.to_string(), agent_id.to_string());
-        let changed = match refused {
-            Some(clause) => st.typed_refused.insert(key, clause) != Some(clause),
-            None => st.typed_refused.remove(&key).is_some(),
-        };
-        if changed {
-            debug!(pane_id, agent_id, ?refused, "inbox: typed fallback");
+        (
+            st.wake_suspension.get(&key).copied(),
+            st.typed_refused.get(&key).copied(),
+        )
+    }
+
+    /// The re-projection publisher's write (plan §3.4′): [`Self::set_wake_suspension`]
+    /// and [`Self::set_typed_fallback`] for `agent_id` in `pane_id`, under one
+    /// hold of the hub, and only while `current` says, asked under that hold,
+    /// that the generation is still the pane's live one. A generation's exit
+    /// marks it no longer current before its hub entries go, and both happen
+    /// on the hub's side of this check, so a request that read its inputs
+    /// before the exit and writes after it puts back no entry for the retired
+    /// generation. `current` may take the registry's record table, which
+    /// ranks inside the hub. Returns whether the suspension and whether the
+    /// refusal changed.
+    pub fn set_wake_projection(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        shown: Option<crate::inbox_display::WakeHold>,
+        refused: Option<&'static str>,
+        current: impl FnOnce() -> bool,
+    ) -> (bool, bool) {
+        let mut st = self.lock();
+        if !current() {
+            debug!(
+                pane_id,
+                agent_id, "inbox: wake projection for a retired generation dropped"
+            );
+            return (false, false);
         }
-        changed
+        let shown = apply_wake_suspension(&mut st, pane_id, agent_id, shown);
+        let refused = apply_typed_fallback(&mut st, pane_id, agent_id, refused);
+        (shown, refused)
+    }
+
+    /// PRD #1666 part 3, round 5-wake (plan §3.4′, §5.1 row 1): the card's
+    /// reason for a suspended doorbell, `shown`, or none: what the
+    /// re-projection publisher read from `agent_id`'s latch cell when its
+    /// request ran. It shows at once, with or without mail, ahead of the
+    /// episode's reason, and is broadcast in a wake update whenever it
+    /// changes. Only the publisher calls this, with no other lock held. The
+    /// entry goes when the agent exits. Returns whether it changed.
+    pub fn set_wake_suspension(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        shown: Option<crate::inbox_display::WakeHold>,
+    ) -> bool {
+        let mut st = self.lock();
+        apply_wake_suspension(&mut st, pane_id, agent_id, shown)
     }
 
     /// PRD #1666 part 3, round 5-wake (plan §5): the doorbell's account of
@@ -2691,6 +2757,15 @@ impl InboxHub {
 }
 
 /// [`InboxHub::summary`], under a lock the caller holds.
+/// The reason a generation's card shows for its doorbell: a suspension
+/// first ([`InboxHub::set_wake_suspension`]), then the episode's reason.
+fn shown_hold(st: &HubState, key: &AgentKey) -> Option<crate::inbox_display::WakeHold> {
+    st.wake_suspension
+        .get(key)
+        .copied()
+        .or_else(|| st.wake_hold.get(key).map(|(hold, _)| *hold))
+}
+
 /// PRD #1666 part 3, round 5-wake (Q16): the one choice of a generation's
 /// wake path, for both its summary and the overdue notice. In order: an armed
 /// waiter is native; a turn-end announcement is turn-end; a generation the
@@ -2723,7 +2798,7 @@ fn summary_of(st: &HubState, pane_id: &str, agent_id: &str) -> InboxSummary {
         wake: WakePath::Doorbell,
         component: None,
         wake_stalled: st.wake_stalled.contains_key(&key),
-        wake_hold: st.wake_hold.get(&key).map(|(hold, _)| *hold),
+        wake_hold: shown_hold(st, &key),
         notices: engine::notices(st, &key, now),
     };
     let mut last_acked: Option<Instant> = None;
@@ -4864,6 +4939,50 @@ fn consume_events(st: &mut HubState, events: Vec<InboxEvent>, verdicts: &TaskVer
     st.cancelled_handed.clear();
 }
 
+/// [`InboxHub::set_wake_suspension`] under the hub's hold.
+fn apply_wake_suspension(
+    st: &mut HubState,
+    pane_id: &str,
+    agent_id: &str,
+    shown: Option<crate::inbox_display::WakeHold>,
+) -> bool {
+    let key = (pane_id.to_string(), agent_id.to_string());
+    let before = st.wake_suspension.get(&key).copied();
+    if before == shown {
+        return false;
+    }
+    match shown {
+        Some(hold) => st.wake_suspension.insert(key.clone(), hold),
+        None => st.wake_suspension.remove(&key),
+    };
+    let id = queued_for(&st.inbox, pane_id, agent_id)
+        .next()
+        .map(|m| m.id.to_string())
+        .or_else(|| st.wake_hold.get(&key).map(|(_, id)| id.clone()))
+        .unwrap_or_default();
+    info!(pane_id, agent_id, ?before, now = ?shown, "inbox: wake suspension");
+    broadcast_wake(st, pane_id, agent_id, &id);
+    true
+}
+
+/// [`InboxHub::set_typed_fallback`] under the hub's hold.
+fn apply_typed_fallback(
+    st: &mut HubState,
+    pane_id: &str,
+    agent_id: &str,
+    refused: Option<&'static str>,
+) -> bool {
+    let key = (pane_id.to_string(), agent_id.to_string());
+    let changed = match refused {
+        Some(clause) => st.typed_refused.insert(key, clause) != Some(clause),
+        None => st.typed_refused.remove(&key).is_some(),
+    };
+    if changed {
+        debug!(pane_id, agent_id, ?refused, "inbox: typed fallback");
+    }
+    changed
+}
+
 /// PR #1735 fifth review (B-03, B-04): tell attached clients `agent_id`'s
 /// wake stall in `pane_id` and, since PRD #1666 part 3's round 5-wake, why the
 /// doorbell holds for it, both as they stand now, in a notice that names `id`,
@@ -4876,7 +4995,7 @@ fn broadcast_wake(st: &HubState, pane_id: &str, agent_id: &str, id: &str) {
     };
     let key = (pane_id.to_string(), agent_id.to_string());
     let stalled = st.wake_stalled.contains_key(&key);
-    let hold = st.wake_hold.get(&key).map(|(hold, _)| *hold);
+    let hold = shown_hold(st, &key);
     let message = st.inbox.get(id, pane_id);
     let _ = tx.send(BroadcastMsg::Inbox(InboxNotice {
         pane_id: pane_id.to_string(),

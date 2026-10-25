@@ -120,6 +120,14 @@ impl IngressLedger {
         }
     }
 
+    /// The ledger's lock by `try_lock`, for the doorbell's final seam (plan
+    /// §2.4): held across the seam's checks and its enqueue, so no human
+    /// operation is admitted between the check of the watermark and the
+    /// deck's job. `None` when it is contended.
+    pub fn try_hold(&self) -> Option<LedgerHold<'_>> {
+        self.inner.try_lock().ok().map(|inner| LedgerHold { inner })
+    }
+
     /// Whether any human operation is outstanding.
     pub fn any_outstanding(&self) -> bool {
         !self.inner.lock().unwrap().outstanding.is_empty()
@@ -195,6 +203,21 @@ fn push_settled(inner: &mut LedgerInner, ticket: u64, how: Settlement) {
     if inner.settled.len() > SETTLED_KEPT {
         let excess = inner.settled.len() - SETTLED_KEPT;
         inner.settled.drain(..excess);
+    }
+}
+
+/// A hold of a ledger's lock ([`IngressLedger::try_hold`]).
+pub struct LedgerHold<'a> {
+    inner: std::sync::MutexGuard<'a, LedgerInner>,
+}
+
+impl LedgerHold<'_> {
+    pub fn marks(&self) -> LedgerMarks {
+        LedgerMarks {
+            watermark: self.inner.watermark,
+            job_mark: self.inner.job_mark,
+            outstanding: self.inner.outstanding.len(),
+        }
     }
 }
 

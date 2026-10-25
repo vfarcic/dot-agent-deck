@@ -18,7 +18,7 @@ use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast, oneshot};
 
 use crate::event::{AgentType, OrchestrationSurface};
-use crate::pane_input::{PaneInputError, SUBMIT_DELAY, encode_pane_payload};
+use crate::pane_input::PaneInputError;
 use crate::state::Ownership;
 use crate::terminal_modes::ReplayModes;
 
@@ -2033,6 +2033,9 @@ struct PushCost {
     /// The release scanner's wall and CPU nanoseconds, while its window was
     /// open.
     scanner: Option<(u64, u64)>,
+    /// The generation's release latch changed, or its window closed: its
+    /// re-projection is due (plan §3.4′).
+    latch_changed: bool,
 }
 
 struct AgentBusState {
@@ -2148,7 +2151,9 @@ impl AgentBus {
     /// Append bytes to scrollback and publish to subscribers. Held under the
     /// same lock that subscribers use to take their initial snapshot, so a
     /// concurrent `subscribe` can never split a write between snapshot and
-    /// live receiver.
+    /// live receiver. The PTY reader pushes through [`Self::push_timed`],
+    /// which also says whether the release latch moved.
+    #[cfg(test)]
     fn push(&self, data: Vec<u8>) {
         self.push_timed(data);
     }
@@ -2192,6 +2197,7 @@ impl AgentBus {
         if let Some(transition) = transition {
             log_evidence_transition(&transition, "output");
         }
+        let latch_changed = !release.is_empty();
         for event in release {
             self.log_release(&event);
         }
@@ -2199,6 +2205,7 @@ impl AgentBus {
             hold_ns,
             evidence_ns,
             scanner,
+            latch_changed,
         }
     }
 
@@ -2668,7 +2675,16 @@ fn pump_reader(
     let read_end = loop {
         match reader.read(&mut buf) {
             Ok(0) => break ReadEnd::Eof,
-            Ok(n) => bus.push(buf[..n].to_vec()),
+            Ok(n) => {
+                // PRD #1666 part 3, round 5-wake: a latch that changed is
+                // re-projected, after the push released the bus lock.
+                if bus.push_timed(buf[..n].to_vec()).latch_changed
+                    && let (Some(registry), Some(pane)) =
+                        (registry.upgrade(), pane_id_env.as_deref())
+                {
+                    registry.request_reprojection(pane, &agent_id);
+                }
+            }
             // PRD #1666 part 3, round 5-wake: a read a signal interrupted is
             // retried, not taken for the end of the stream.
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -2918,80 +2934,6 @@ pub(crate) enum ExitedNotice {
     Refused,
 }
 
-/// PRD #1666 S4: what [`AgentPtyRegistry::write_doorbell`] did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DoorbellWrite {
-    /// Every byte went in.
-    Written,
-    /// Only the pre-ring CR went in: it submitted the doorbell's own earlier
-    /// line, found unsubmitted in a gated composer, and the new line was not
-    /// typed on top of it.
-    Flushed,
-    /// The user has an unsent draft in the pane; nothing was written.
-    DraftPending,
-    /// The pane is gone or now belongs to another agent; nothing was written.
-    NotOwner,
-    /// The pane's PTY is not taking input; nothing was written.
-    NotReading,
-    /// PRD #1666 S7: the agent has not reported through its own hooks yet and
-    /// its composer is not on screen, so whatever is there — a start dialog,
-    /// known or not — gets no byte; nothing was written. Part 2: likewise a
-    /// generation not yet ready ([`DoorbellReady`]) whose ready screen is not
-    /// on screen, or that has no screen the writer could recognise.
-    NoComposer,
-    /// PRD #1666 hardening H3: between the doorbell's decision and the write
-    /// the pane stopped being fit for it — a status changed, a dialog opened,
-    /// a native component armed, the message a ring names left the queue, or
-    /// a human frame arrived; nothing was written.
-    NotAdmitted,
-    /// PRD #1666 part 2 (`inbox/doorbell/031`): the pane stopped being fit for
-    /// the write after some of its steps went in (the same reasons as
-    /// [`DoorbellWrite::NotAdmitted`]), so the rest were withheld.
-    /// `steps_written` steps went in, in order; `line_typed` says whether the
-    /// ring's line was among them (its submit CR was then not).
-    Cancelled { steps_written: u8, line_typed: bool },
-    /// A write failed part-way or could not be encoded.
-    Failed,
-}
-
-/// PRD #1666 part 2 (`inbox/doorbell/008`): what the doorbell's generation
-/// has shown of its readiness ([`crate::state::AppState::doorbell_readiness`]),
-/// as far as [`AgentPtyRegistry::write_doorbell`] still has to check it on
-/// screen.
-#[derive(Debug, Clone, Copy)]
-pub enum DoorbellReady {
-    /// Its own hooks showed it ready: nothing more to check.
-    Ready,
-    /// Its own `SessionStart` only, from an agent whose prompt comes up later:
-    /// written to only while this recognises that prompt on screen.
-    Screen(fn(&[String]) -> bool),
-    /// Nothing from its own hooks: written to only through the agent's
-    /// composer gate ([`crate::agent_registry::AgentSpec::doorbell_composer`]),
-    /// and never by an agent without one.
-    Unproven,
-}
-
-/// A human attach frame in flight for a pane
-/// ([`AgentPtyRegistry::human_frame_arriving`]); dropping it ends that, and
-/// the pane's last one removes its count.
-#[must_use]
-pub struct HumanFrameInFlight {
-    counts: Arc<Mutex<HashMap<String, usize>>>,
-    pane_id_env: String,
-}
-
-impl Drop for HumanFrameInFlight {
-    fn drop(&mut self) {
-        let mut counts = self.counts.lock().unwrap();
-        if let Some(count) = counts.get_mut(&self.pane_id_env) {
-            *count -= 1;
-            if *count == 0 {
-                counts.remove(&self.pane_id_env);
-            }
-        }
-    }
-}
-
 /// PRD #20 R20-003/R20-006: the live target that currently owns a pane, resolved
 /// atomically for the identity-guarded send path. Bundles the shared writer with
 /// the identity/liveness needed to re-validate after the writer lock is acquired.
@@ -2999,49 +2941,6 @@ struct PaneWriterTarget {
     writer: Arc<AsyncMutex<PaneWriter>>,
     agent_id: String,
     exited: Arc<AtomicBool>,
-}
-
-/// How far a single `write_all`-style loop got before an error.
-enum WriteProgress {
-    Complete,
-    /// At least one byte written, then an error / write-zero.
-    Partial,
-    /// 0 bytes written — the first write failed (nothing reached the target).
-    NothingWritten,
-    /// Issue #525: the PTY was still taking the write when the delivery stopped
-    /// waiting ([`PtyJobOutcome::Stalled`]). How much of it is in the input box
-    /// cannot be known, and whatever is not yet will still go in if the agent
-    /// ever reads: the bytes are committed, so nothing may be sent after them
-    /// on the assumption that they are not — an erase least of all.
-    Stalled,
-}
-
-/// Write all of `buf`, tracking whether any bytes reached the writer so a
-/// partial write can be told apart from a clean first-write failure. Retries on
-/// `Interrupted` like `write_all`.
-fn write_all_tracked(w: &mut (dyn std::io::Write + Send), buf: &[u8]) -> WriteProgress {
-    let mut written = 0usize;
-    while written < buf.len() {
-        match w.write(&buf[written..]) {
-            Ok(0) => {
-                return if written == 0 {
-                    WriteProgress::NothingWritten
-                } else {
-                    WriteProgress::Partial
-                };
-            }
-            Ok(n) => written += n,
-            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => {
-                return if written == 0 {
-                    WriteProgress::NothingWritten
-                } else {
-                    WriteProgress::Partial
-                };
-            }
-        }
-    }
-    WriteProgress::Complete
 }
 
 /// Issue #525: how long a guarded delivery waits on a single PTY write.
@@ -4194,6 +4093,15 @@ impl PaneInputState {
         self.note_user_bytes_as(pane_id_env, bytes, true);
     }
 
+    /// PRD #1666 part 3, round 5-wake (plan §1.4): the doorbell's line was
+    /// proven submitted with no human job since its admission, under the
+    /// pane's writer: the pane's stale draft bit is released.
+    fn reconcile_deck_submit(&mut self, pane_id_env: &str) {
+        if let Some(stream) = self.input.get_mut(pane_id_env) {
+            stream.draft.reconcile_deck_submit();
+        }
+    }
+
     /// PRD #1666 part 3, round 5-wake: how many times the user's own bytes
     /// have submitted or cleared `pane_id_env`'s box on its current stream.
     fn user_clears(&self, pane_id_env: &str) -> u64 {
@@ -4423,25 +4331,6 @@ impl PaneWriter {
         }
     }
 
-    /// Write as the DAEMON: the bytes are ours, so they are not user input and
-    /// must not move the human-input sequence. Every daemon-initiated write into
-    /// a pane goes through here; everything that reaches the plain
-    /// [`std::io::Write`] impl or [`Self::write_user`] is somebody else typing.
-    ///
-    /// Issue #544 (PR #1398 finding #16): the bytes are still fed into the
-    /// pane's input stream, as the deck's, at the moment the PTY accepts
-    /// them — see [`DeckSink`].
-    ///
-    /// Issue #525: each write waits at most `stall` for the PTY to take it —
-    /// see [`PtySink::write_tracked`].
-    fn daemon(&self, stall: Duration) -> DeckSink<'_> {
-        DeckSink {
-            writer: self,
-            stall,
-            flushed: None,
-        }
-    }
-
     /// Issue #525: forward a user's bytes (an attach client's `STREAM_IN`
     /// frame), awaiting the PTY rather than blocking the caller's thread on it.
     /// No bound: the frame is the user's own input, and a pane that is not
@@ -4534,9 +4423,6 @@ impl PaneWriter {
     /// drop guard of its own: the transaction is the job's one withdrawer
     /// while it runs, and the returned [`DeckJob`] leaves the in-flight count
     /// once for a take-back it sees. `None` when the writer thread is gone.
-    // The doorbell's driver calls it from activation (round 5-wake commit
-    // 6's switch), which removes these allows.
-    #[allow(dead_code)]
     pub(crate) fn queue_deck_job(
         &self,
         bytes: Vec<u8>,
@@ -4569,7 +4455,6 @@ impl PaneWriter {
 /// leaves nothing, and [`Self::reconcile_take_back`] leaves it once. The
 /// writer's own timeout and drop guard ([`WithdrawUnlessAnswered`]) never
 /// see this job, so nothing else takes it back while its transaction runs.
-#[allow(dead_code)]
 pub(crate) struct DeckJob {
     claim: Arc<crate::doorbell_txn::JobClaim>,
     in_flight: Arc<PtyInFlight>,
@@ -4578,7 +4463,6 @@ pub(crate) struct DeckJob {
     left: bool,
 }
 
-#[allow(dead_code)]
 impl DeckJob {
     /// The writer has claimed the job: some of its bytes may be in.
     pub(crate) fn started(&self) -> bool {
@@ -4859,7 +4743,6 @@ impl PtyInFlight {
     /// A job taken back by a withdrawer other than [`Self::withdraw`], which
     /// left nothing: a doorbell transaction's own take-back (Q24). Its
     /// driver calls this exactly once for the claim it saw taken back.
-    #[allow(dead_code)]
     pub(crate) fn left_by_withdrawal(&self) {
         self.leave();
     }
@@ -5109,6 +4992,7 @@ impl PtyWriterThread {
     /// Hand `op` to the thread and wait for it, at most `bound` when one is
     /// given. Dropping the returned future withdraws the job if it has not
     /// started.
+    #[cfg(test)]
     async fn run(&self, op: PtyOp, bound: Option<Duration>) -> PtyJobOutcome {
         self.run_ticketed(op, bound, None).await
     }
@@ -5348,94 +5232,6 @@ fn write_all_recorded(
         accepted: written,
         result: Ok(()),
         flushed: None,
-    }
-}
-
-/// Issue #525: where a guarded delivery's bytes go. Production writes through
-/// [`DeckSink`], which awaits [`PtyWriterThread`]; any [`std::io::Write`] is a
-/// sink too, written inline, which is what the fault-injecting writers in the
-/// tests below are.
-trait PtySink {
-    /// Write all of `buf`, reporting how far it got — see [`WriteProgress`].
-    fn write_tracked(
-        &mut self,
-        buf: &[u8],
-    ) -> impl std::future::Future<Output = WriteProgress> + Send;
-    fn flush_tracked(&mut self) -> impl std::future::Future<Output = std::io::Result<()>> + Send;
-}
-
-impl<W: std::io::Write + Send> PtySink for W {
-    async fn write_tracked(&mut self, buf: &[u8]) -> WriteProgress {
-        write_all_tracked(self, buf)
-    }
-
-    async fn flush_tracked(&mut self) -> std::io::Result<()> {
-        self.flush()
-    }
-}
-
-/// Issue #544 (PR #1398 finding #16): [`PaneWriter::daemon`]'s view of the
-/// writer. Each write goes to the PTY and then, for exactly the bytes the PTY
-/// ACCEPTED, into the pane's input stream as the deck's
-/// ([`PaneInputState::note_deck_bytes`]) — recorded by the writer's thread
-/// before it answers, so no user byte can land between the write and its
-/// record.
-///
-/// "Accepted" is the only count there is: a partial write feeds the prefix
-/// that went in. Accepted is not proven delivered — a later flush can fail —
-/// so for those bytes the stream can run ahead of the PTY. Deck bytes never set
-/// the draft bit, so what that can cost is framing or a clear: a paste our
-/// partial write opened reads as open, or a CR the writer accepted and the PTY
-/// never received reads as a submit. Nothing after `write` tells an accepted
-/// one-byte CR from a delivered one.
-///
-/// Issue #525: a write the PTY has not finished taking after `stall` is left
-/// to the thread and reported [`WriteProgress::Stalled`]; its bytes are
-/// recorded as and when the PTY takes them.
-struct DeckSink<'a> {
-    writer: &'a PaneWriter,
-    stall: Duration,
-    /// The flush the last write ran in its own job, which the next
-    /// [`PtySink::flush_tracked`] reports instead of sending one of its own.
-    flushed: Option<std::io::Result<()>>,
-}
-
-impl PtySink for DeckSink<'_> {
-    async fn write_tracked(&mut self, buf: &[u8]) -> WriteProgress {
-        let op = PtyOp::WriteAll(buf.to_vec(), ByteSource::Deck, true);
-        self.flushed = None;
-        match self.writer.pty.run(op, Some(self.stall)).await {
-            PtyJobOutcome::Done(PtyJobDone {
-                accepted,
-                result,
-                flushed,
-            }) => {
-                self.flushed = flushed;
-                match result {
-                    Ok(()) => WriteProgress::Complete,
-                    Err(_) if accepted == 0 => WriteProgress::NothingWritten,
-                    Err(_) => WriteProgress::Partial,
-                }
-            }
-            PtyJobOutcome::Withdrawn => WriteProgress::NothingWritten,
-            PtyJobOutcome::Stalled => WriteProgress::Stalled,
-            PtyJobOutcome::Gone => WriteProgress::NothingWritten,
-        }
-    }
-
-    async fn flush_tracked(&mut self) -> std::io::Result<()> {
-        // The write before this one already flushed, in its own job.
-        if let Some(flushed) = self.flushed.take() {
-            return flushed;
-        }
-        match self.writer.pty.run(PtyOp::Flush, Some(self.stall)).await {
-            PtyJobOutcome::Done(done) => done.result,
-            PtyJobOutcome::Withdrawn | PtyJobOutcome::Stalled => Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "the PTY did not take a flush in time",
-            )),
-            PtyJobOutcome::Gone => Err(PtyWriterThread::gone()),
-        }
     }
 }
 
@@ -6307,19 +6103,6 @@ pub struct AgentPtyRegistry {
     /// is what makes the record atomic with respect to writer handoff (H1). See
     /// [`PaneInputState`].
     pane_input: Arc<Mutex<PaneInputState>>,
-    /// PRD #1666 part 2 (`inbox/doorbell/031`): per pane, the human attach
-    /// frames that have arrived and not yet finished with the pane's writer
-    /// ([`Self::human_frame_arriving`]). A frame counts from before it waits
-    /// for the writer, so a doorbell holding the writer between its steps sees
-    /// the keystroke queued behind it, which [`Self::draft_pending`] cannot
-    /// until the frame is written. A pane is in the map only while one of
-    /// its frames is in flight.
-    ///
-    /// PRD #1666 part 3, round 5-wake: still the doorbell's live input until
-    /// commit 6 switches it to the generation's ingress ledger
-    /// ([`Self::ingress_ledger`]), which is filled beside it and read by
-    /// nothing in production yet.
-    human_frames_in_flight: Arc<Mutex<HashMap<String, usize>>>,
     /// Issue #525: how long a guarded delivery waits on one PTY write before
     /// it stops waiting — [`PTY_WRITE_STALL_BOUND`], lowered by tests. In
     /// milliseconds so a test can change it through the `Arc` every caller
@@ -6339,6 +6122,27 @@ pub struct AgentPtyRegistry {
     /// PRD #1666 part 3, round 5-wake (plan §4.6): the inherited releases a
     /// recognised dialog has disabled since the daemon started.
     doorbell_tripwires: crate::doorbell_generation::Tripwires,
+    /// PRD #1666 part 3, round 5-wake (plan §3.4′): the re-projection
+    /// publisher's requests, once it runs.
+    doorbell_publisher:
+        std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<doorbell_ring::Reprojection>>,
+    /// One re-projection at a time, the publisher's or a spawn's own, so two
+    /// never finish in the reverse of the order they read in.
+    doorbell_publishing: Mutex<()>,
+    /// Test seam: holds the publisher before each run while set.
+    #[cfg(test)]
+    publisher_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// Test seam: the first-ring settle window every typed generation gets
+    /// while set, in place of its release's (`inbox/doorbell/041`; no
+    /// measured release has one today).
+    #[cfg(test)]
+    doorbell_settle_for_test: Mutex<Option<Duration>>,
+    /// Test seam: re-projections wait between their reads and their hub
+    /// write while the flag is set; the bool says one reached it.
+    #[cfg(test)]
+    publisher_write_gate: Arc<(Mutex<bool>, AtomicBool)>,
+    #[cfg(test)]
+    publisher_write_released: std::sync::Condvar,
     /// PRD #1666 S8: how long a repaint nudge keeps the PTY one column
     /// narrower, in milliseconds ([`REPAINT_NUDGE_GAP`], or
     /// [`ENV_REPAINT_NUDGE_GAP_MS`]).
@@ -6508,6 +6312,12 @@ mod replacement_tests;
 #[cfg(all(test, unix))]
 #[path = "agent_pty_report_tests.rs"]
 mod report_tests;
+
+/// PRD #1666 part 3, round 5-wake (plan §1.1, §3.4′): the doorbell's ring on
+/// the real writer, and the re-projection publisher.
+#[path = "agent_pty_doorbell.rs"]
+mod doorbell_ring;
+pub use doorbell_ring::{RingOutcome, RingReport};
 
 /// PRD #1666 part 3, round 5-wake (plan §9.1): the release scanner's budget,
 /// measured by hand on the real push path.
@@ -8452,12 +8262,21 @@ impl AgentPtyRegistry {
             shutting_down: AtomicBool::new(false),
             admission_frozen: AtomicBool::new(false),
             pane_input: Arc::new(Mutex::new(PaneInputState::default())),
-            human_frames_in_flight: Arc::default(),
             pty_write_stall_bound_ms: AtomicU64::new(PTY_WRITE_STALL_BOUND.as_millis() as u64),
             repaint_nudges: Mutex::new(HashMap::new()),
             doorbell_txns: Mutex::new(HashMap::new()),
             doorbell_evidence: Mutex::new(HashMap::new()),
             doorbell_tripwires: Default::default(),
+            doorbell_publisher: std::sync::OnceLock::new(),
+            doorbell_publishing: Mutex::new(()),
+            #[cfg(test)]
+            publisher_gate: Mutex::new(None),
+            #[cfg(test)]
+            doorbell_settle_for_test: Mutex::new(None),
+            #[cfg(test)]
+            publisher_write_gate: Arc::new((Mutex::new(false), AtomicBool::new(false))),
+            #[cfg(test)]
+            publisher_write_released: std::sync::Condvar::new(),
             repaint_nudge_gap_ms: AtomicU64::new(
                 std::env::var(ENV_REPAINT_NUDGE_GAP_MS)
                     .ok()
@@ -10642,6 +10461,42 @@ impl AgentPtyRegistry {
         self.pane_input.lock().unwrap().input_hold(pane_id_env)
     }
 
+    /// Type `bytes` into `pane_id` as a user would, while `agent_id` is the
+    /// pane's live generation: one human operation admitted to its ledger,
+    /// the generation checked again under its writer before the write, and
+    /// nothing written for any other. Answers how far it got.
+    pub async fn write_user_bytes(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        bytes: &[u8],
+    ) -> Result<(), &'static str> {
+        let ticket = self.admit_ingress(agent_id);
+        let owner = |target: &PaneWriterTarget| {
+            target.agent_id == agent_id && !target.exited.load(Ordering::SeqCst)
+        };
+        let Some(target) = self.writer_target_for_pane(pane_id).filter(owner) else {
+            if let Some(ticket) = ticket {
+                ticket.refuse("not the pane's generation");
+            }
+            return Err("not the pane's generation");
+        };
+        let w = target.writer.lock().await;
+        if !self
+            .writer_target_for_pane(pane_id)
+            .is_some_and(|t| owner(&t))
+        {
+            if let Some(ticket) = ticket {
+                ticket.refuse("not the pane's generation");
+            }
+            return Err("not the pane's generation");
+        }
+        w.note_user_input(pane_id);
+        w.write_user_ticketed(bytes, ticket)
+            .await
+            .map_err(|_| "the write failed")
+    }
+
     /// PRD #1666 part 3, round 5-wake (plan §2.1′): admit one human operation
     /// on `agent_id`'s input to its generation's ledger, before any await. The
     /// returned guard owns the ticket until the operation's bytes are handed to
@@ -10700,8 +10555,35 @@ impl AgentPtyRegistry {
         self.accept_input_mode_with(agent_id, peer, sample, &InputModeLookups::PLATFORM)
     }
 
-    /// [`Self::accept_input_mode`] with the process lookups injected.
+    /// [`Self::accept_input_mode`] with the process lookups injected. A
+    /// report that leaves the generation held by a sticky clause for the
+    /// first time asks for its re-projection (Q18): the clause now holds the
+    /// typed doorbell for the rest of the generation, which WAKE reports.
     pub(crate) fn accept_input_mode_with(
+        &self,
+        agent_id: &str,
+        peer: crate::input_mode::Observer,
+        sample: crate::input_mode::ModeSample,
+        lookups: &InputModeLookups,
+    ) -> Result<crate::input_mode::Stored, &'static str> {
+        let sticky = || {
+            let inner = self.inner.lock();
+            inner.agents.get(agent_id).map(|agent| {
+                (
+                    agent.pane_id_env.clone(),
+                    agent.input_mode.lock().unwrap().sticky().is_some(),
+                )
+            })
+        };
+        let before = sticky().is_some_and(|(_, held)| held);
+        let stored = self.store_input_mode(agent_id, peer, sample, lookups);
+        if !before && let Some((Some(pane), true)) = sticky() {
+            self.request_reprojection(&pane, agent_id);
+        }
+        stored
+    }
+
+    fn store_input_mode(
         &self,
         agent_id: &str,
         peer: crate::input_mode::Observer,
@@ -10874,23 +10756,6 @@ impl AgentPtyRegistry {
             .map(|agent| Arc::clone(&agent.ingress))
     }
 
-    /// PRD #1666 part 2 (`inbox/doorbell/031`): a human attach frame for
-    /// `pane_id_env` has arrived and is about to wait for the pane's writer.
-    /// It counts as in flight until the returned guard drops, which the
-    /// caller does once the frame is written or refused.
-    pub fn human_frame_arriving(&self, pane_id_env: &str) -> HumanFrameInFlight {
-        *self
-            .human_frames_in_flight
-            .lock()
-            .unwrap()
-            .entry(pane_id_env.to_string())
-            .or_default() += 1;
-        HumanFrameInFlight {
-            counts: Arc::clone(&self.human_frames_in_flight),
-            pane_id_env: pane_id_env.to_string(),
-        }
-    }
-
     /// PRD #1666 part 3, round 5-wake (plan rev 2 §6): what ended
     /// `agent_id`'s output. A generation the registry still held at its EOF
     /// (`registered_at_eof`) ended on its own: its child's status, polled for
@@ -10932,16 +10797,6 @@ impl AgentPtyRegistry {
             Some(current) if current != agent_id => Termination::Replaced,
             _ => Termination::Closed,
         }
-    }
-
-    /// Whether a human attach frame for `pane_id_env` is in flight
-    /// ([`Self::human_frame_arriving`]): read by the doorbell under the pane's
-    /// writer, where an in-flight frame is one queued behind it.
-    pub fn human_frame_in_flight(&self, pane_id_env: &str) -> bool {
-        self.human_frames_in_flight
-            .lock()
-            .unwrap()
-            .contains_key(pane_id_env)
     }
 
     /// PRD #1666: generation `agent_id` reported `edge` of a turn on
@@ -11975,12 +11830,15 @@ impl AgentPtyRegistry {
         // executable path.
         #[cfg(feature = "e2e")]
         let standin =
-            crate::doorbell_screen::standin_selected(&captured_env, spawn_command.as_deref());
+            crate::doorbell_screen::standin_selected(&captured_env, spawn_command.as_deref())
+                .or_else(crate::doorbell_screen::standin_from_daemon_env);
         let profile = crate::doorbell_screen::profile_for_agent(spawn_agent_type.as_ref());
+        // A pane that names the stand-in wants it, whatever type it starts as.
         #[cfg(feature = "e2e")]
-        let profile = profile.or(standin
+        let profile = standin
             .as_ref()
-            .map(|_| &crate::doorbell_screen::STANDIN_PROFILE));
+            .map(|_| &crate::doorbell_screen::STANDIN_PROFILE)
+            .or(profile);
         let bus = Arc::new(AgentBus::for_generation(
             &preallocated_id,
             profile,
@@ -12060,6 +11918,15 @@ impl AgentPtyRegistry {
         #[cfg(feature = "e2e")]
         let doorbell = doorbell.with_standin(standin);
         let doorbell = Arc::new(doorbell);
+        if let Some(pane) = pane_id_env.clone() {
+            let registry = Arc::downgrade(self);
+            let id = preallocated_id.clone();
+            doorbell.on_moved(move || {
+                if let Some(registry) = registry.upgrade() {
+                    registry.request_reprojection(&pane, &id);
+                }
+            });
+        }
         let pane_writer = PaneWriter::new(
             writer,
             pane_id_env.clone(),
@@ -12161,6 +12028,15 @@ impl AgentPtyRegistry {
             #[cfg(test)]
             self.hold_handover(pane);
             hub.hand_over(pane, &id, || self.publication_owns_pane(pane, &id));
+        }
+        // PRD #1666 part 3, round 5-wake (plan §5.3, Q16): the generation's
+        // card and WAKE from its registration on, unlatched until its
+        // start-up header is read: published before the spawn returns, so no
+        // status reads the doorbell's route for it before its verdict is in.
+        if let Some(pane) = inbox_spawn.0.as_deref()
+            && self.doorbell_publisher.get().is_some()
+        {
+            self.reproject(pane, &id);
         }
         if let (Some(pane), Some((integration, refresh))) = (inbox_spawn.0, inbox_refresh) {
             self.note_inbox_spawn(&pane, &id, integration, refresh, &inbox_spawn.2);
@@ -12363,252 +12239,6 @@ impl AgentPtyRegistry {
                 agent_id: id.clone(),
                 exited: a.exited.clone(),
             })
-    }
-
-    /// PRD #1666 S4: the doorbell's write — the one automatic writer the inbox
-    /// keeps. Writes, in order and under one hold of the pane's writer: a bare
-    /// `\r` when `pre_cr` (submitting a ring a previous write may have left in
-    /// the box), then `line` encoded as a single line followed by
-    /// [`SUBMIT_DELAY`] and `\r`. A `pre_cr` followed by a line waits
-    /// [`SUBMIT_DELAY`] between them.
-    ///
-    /// Guards, all re-checked under the writer, so nothing typed or respawned
-    /// between the caller's decision and the write slips through:
-    ///
-    /// * **identity** — `expected_agent_id` must still own `pane_id` and run;
-    /// * **draft** — no ring while the user has an unsent draft in the pane
-    ///   ([`Self::draft_pending`]). There is deliberately NO cap: the doorbell
-    ///   waits for the user however long they take, and the caller re-asks on
-    ///   its next tick.
-    ///
-    /// * **composer** — an agent whose spec names a composer recogniser is
-    ///   written to only while the recogniser finds that composer EMPTY on the
-    ///   pane's screen, before and after the agent's first own hook (PRD #1666
-    ///   S7, decision A; decision 2 for a draft the agent kept after an Enter).
-    ///   The exception is a composer showing `stranded` — the line the
-    ///   doorbell last typed into this pane — unsubmitted, with the agent's
-    ///   cursor where the recogniser expects it after an Enter that was not
-    ///   taken: a write that starts with a CR sends that CR alone, which
-    ///   submits the line, and types nothing after it
-    ///   ([`DoorbellWrite::Flushed`]). With `stranded` `None` there is no
-    ///   exception. The match reads the screen, which proves neither where its
-    ///   text came from nor who owns the input: see
-    ///   [`crate::agent_registry::codex_composer_holds_doorbell_line`].
-    ///
-    /// No echo wait and no retry: whether the message arrived is the inbox's
-    /// to say, not the screen's. The screen is read only for the composer gate,
-    /// which can only withhold bytes.
-    pub async fn write_doorbell<F, Fut>(
-        &self,
-        pane_id: &str,
-        expected_agent_id: &str,
-        pre_cr: bool,
-        stranded: Option<&str>,
-        line: Option<&str>,
-        still_admitted: F,
-    ) -> DoorbellWrite
-    where
-        F: Fn() -> Fut,
-        Fut: std::future::Future<Output = bool>,
-    {
-        self.write_doorbell_when_ready(
-            pane_id,
-            expected_agent_id,
-            DoorbellReady::Ready,
-            pre_cr,
-            stranded,
-            line,
-            still_admitted,
-        )
-        .await
-    }
-
-    /// [`Self::write_doorbell`] for a generation whose readiness is `ready`
-    /// (PRD #1666 part 2, `inbox/doorbell/008`): one not yet ready by its own
-    /// hooks gets no byte unless the screen shows it is ([`DoorbellReady`]).
-    #[allow(clippy::too_many_arguments)]
-    pub async fn write_doorbell_when_ready<F, Fut>(
-        &self,
-        pane_id: &str,
-        expected_agent_id: &str,
-        ready: DoorbellReady,
-        pre_cr: bool,
-        stranded: Option<&str>,
-        line: Option<&str>,
-        still_admitted: F,
-    ) -> DoorbellWrite
-    where
-        F: Fn() -> Fut,
-        Fut: std::future::Future<Output = bool>,
-    {
-        let owner = |target: &PaneWriterTarget| {
-            target.agent_id == expected_agent_id && !target.exited.load(Ordering::SeqCst)
-        };
-        let Some(target) = self.writer_target_for_pane(pane_id) else {
-            return DoorbellWrite::NotOwner;
-        };
-        if !owner(&target) {
-            return DoorbellWrite::NotOwner;
-        }
-        if self.draft_pending(pane_id) {
-            return DoorbellWrite::DraftPending;
-        }
-        let payload = match line.map(encode_pane_payload).transpose() {
-            Ok(payload) => payload,
-            Err(error) => {
-                tracing::warn!(%error, pane_id = %pane_id, "doorbell line could not be encoded");
-                return DoorbellWrite::Failed;
-            }
-        };
-        let stall = self.pty_write_stall_bound();
-        let Some(w) = within_real_time(stall, target.writer.lock()).await else {
-            return DoorbellWrite::NotReading;
-        };
-        if within_real_time(stall, w.until_idle()).await.is_none() {
-            return DoorbellWrite::NotReading;
-        }
-        // Under the writer: user bytes are recorded while it is held, so these
-        // reads cannot miss a keystroke already in the PTY.
-        match self.writer_target_for_pane(pane_id) {
-            Some(current) if owner(&current) && current.agent_id == target.agent_id => {}
-            _ => return DoorbellWrite::NotOwner,
-        }
-        if self.draft_pending(pane_id) {
-            return DoorbellWrite::DraftPending;
-        }
-        // PRD #1666 S7 (decision A): a wrapped agent's screen may be a start
-        // dialog, where any byte — the line, a pre-ring CR or a cleanup CR —
-        // can answer it, or a composer holding a draft the input tracker
-        // believes was submitted (decision 2). So every write waits for the
-        // empty composer, read under the writer.
-        //
-        // The one non-empty composer a write may go to is one showing the
-        // exact line the doorbell last typed here, left there when its Enter
-        // was not taken: dropped, with the cursor right after it (live Codex
-        // 0.160.0, `codex/worker/001`), or turned into a newline, with the
-        // cursor on the empty row below it (`inbox/load/004`). The flushing CR
-        // is what submits it, so it goes alone, and no second line is typed
-        // on top.
-        let mut flush_only = false;
-        let gate = self.doorbell_composer_gate(expected_agent_id);
-        // PRD #1666 part 2 (`inbox/doorbell/008`): a generation not yet ready
-        // by its own hooks gets no byte unless the screen shows it is: its
-        // agent's prompt for one that only started, its composer gate below
-        // for one with no report at all, and nothing for an agent with
-        // neither. Read under the writer before the first step; the prompt is
-        // read again before each step (below).
-        match ready {
-            DoorbellReady::Ready => {}
-            DoorbellReady::Screen(prompt) => match self.screen_rows(expected_agent_id).await {
-                Some((rows, _)) if prompt(&rows) => {}
-                _ => return DoorbellWrite::NoComposer,
-            },
-            DoorbellReady::Unproven if gate.is_some() => {}
-            DoorbellReady::Unproven => return DoorbellWrite::NoComposer,
-        }
-        if let Some((empty, recognise)) = gate {
-            match self.screen_rows(expected_agent_id).await {
-                Some((rows, _)) if empty(&rows) => {}
-                Some((rows, cursor))
-                    if pre_cr
-                        && stranded
-                            .zip(recognise)
-                            .is_some_and(|(typed, recognise)| recognise(&rows, cursor, typed)) =>
-                {
-                    flush_only = true;
-                }
-                _ => return DoorbellWrite::NoComposer,
-            }
-        }
-        let withheld = flush_only && payload.is_some();
-        let mut steps: Vec<&[u8]> = Vec::with_capacity(3);
-        if pre_cr {
-            steps.push(b"\r");
-        }
-        // The step after which the ring's line is in the box.
-        let line_step = steps.len();
-        if let Some(payload) = payload.as_deref().filter(|_| !flush_only) {
-            steps.push(payload);
-            steps.push(b"\r");
-        }
-        let mut sink = w.daemon(stall);
-        // What withholding the steps from `n` on leaves behind.
-        let withdrawn = |n: usize| {
-            if n == 0 {
-                DoorbellWrite::NotAdmitted
-            } else {
-                DoorbellWrite::Cancelled {
-                    steps_written: u8::try_from(n).unwrap_or(u8::MAX),
-                    line_typed: payload.is_some() && !flush_only && n > line_step,
-                }
-            }
-        };
-        for (n, bytes) in steps.into_iter().enumerate() {
-            #[cfg(feature = "e2e")]
-            if pre_cr && line.is_some() && n == 1 {
-                crate::doorbell::pause_rering_for_test(pane_id, "after-pre-cr").await;
-            }
-            if n > 0 {
-                tokio::time::sleep(SUBMIT_DELAY).await;
-            }
-            #[cfg(feature = "e2e")]
-            if pre_cr && line.is_some() {
-                let phase = match n {
-                    0 => "before-pre-cr",
-                    1 => "after-delay",
-                    _ => "before-submit",
-                };
-                crate::doorbell::pause_rering_for_test(pane_id, phase).await;
-            }
-            // PRD #1666 hardening H3: the admission the doorbell decided on
-            // is asked for again under the writer before EVERY step — the
-            // pre-ring CR, the line, its submit and a cleanup CR — and after
-            // the wait between steps, so a dialog or a turn that started, or
-            // (part 2, `inbox/doorbell/031`) the ring's own message leaving the
-            // queue, stops what is left.
-            if !still_admitted().await {
-                return withdrawn(n);
-            }
-            // PR #1817 review 4348580010: a generation admitted on its screen
-            // is admitted on it again before every step. Its agent can replace
-            // the prompt with a dialog and report nothing, which the admission
-            // above does not see.
-            if let DoorbellReady::Screen(prompt) = ready
-                && !self
-                    .screen_rows(expected_agent_id)
-                    .await
-                    .is_some_and(|(rows, _)| prompt(&rows))
-            {
-                return withdrawn(n);
-            }
-            // A human frame that arrived while this write holds the writer is
-            // queued behind it: the keystroke is not in the draft tracker yet,
-            // so it is asked for separately, and the remaining steps are left
-            // to the user. Asked last, with nothing awaited between it and the
-            // write (review 4348580021), so a frame that arrived during the
-            // awaits above is seen.
-            if self.human_frame_in_flight(pane_id) || self.draft_pending(pane_id) {
-                return withdrawn(n);
-            }
-            match sink.write_tracked(bytes).await {
-                WriteProgress::Complete => {}
-                _ => {
-                    tracing::warn!(
-                        pane_id = %pane_id,
-                        agent_id = %expected_agent_id,
-                        step = n,
-                        "doorbell write did not complete"
-                    );
-                    return DoorbellWrite::Failed;
-                }
-            }
-            let _ = sink.flush_tracked().await;
-        }
-        if withheld {
-            DoorbellWrite::Flushed
-        } else {
-            DoorbellWrite::Written
-        }
     }
 
     /// Stop an agent: SIGKILL the child, reap it, drop its handles. Any
@@ -14630,55 +14260,6 @@ impl AgentPtyRegistry {
         }
     }
 
-    /// PRD #1666 part 2: whether `agent_id`'s doorbell writes go through a
-    /// composer gate ([`Self::write_doorbell`]), the one way a generation with
-    /// no readiness of its own may be rung.
-    pub fn has_doorbell_composer(&self, agent_id: &str) -> bool {
-        self.doorbell_composer_gate(agent_id).is_some()
-    }
-
-    /// PRD #1666 S7: the composer recogniser the doorbell must satisfy before
-    /// it writes to `agent_id`, or `None` when its spec names none. It applies
-    /// for the agent's whole life, not only until its first own hook: an
-    /// agent that has reported can still show a draft it kept, or a screen
-    /// the recogniser does not know (decision 2).
-    /// The agent's empty-composer and stranded-line recognisers
-    /// ([`crate::agent_registry::AgentSpec::doorbell_composer`]), or `None`
-    /// where the doorbell needs no screen to write.
-    #[allow(clippy::type_complexity)]
-    fn doorbell_composer_gate(
-        &self,
-        agent_id: &str,
-    ) -> Option<(
-        fn(&[String]) -> bool,
-        Option<crate::agent_registry::StrandedLineRecogniser>,
-    )> {
-        let inner = self.inner.lock();
-        let agent = inner.agents.get(agent_id)?;
-        let spec = crate::agent_registry::spec(agent.spawn_agent_type.as_ref()?);
-        Some((spec.doorbell_composer?, spec.doorbell_stranded_line))
-    }
-
-    /// The screen `agent_id`'s pane shows, one trimmed row each, with its
-    /// cursor, or `None` when it cannot be read
-    /// ([`crate::pane_screen_text::visible_rows_and_cursor`]).
-    async fn screen_rows(
-        &self,
-        agent_id: &str,
-    ) -> Option<(Vec<String>, crate::pane_screen_text::ScreenCursor)> {
-        let (bus, rows, cols) = {
-            let inner = self.inner.lock();
-            let agent = inner.agents.get(agent_id)?;
-            (Arc::clone(&agent.bus), agent.pty_rows, agent.pty_cols)
-        };
-        tokio::task::spawn_blocking(move || {
-            crate::pane_screen_text::visible_rows_and_cursor(&bus.snapshot(), rows, cols)
-        })
-        .await
-        .ok()
-        .flatten()
-    }
-
     pub fn note_quota_block(&self, pane_id: &str, agent_id: &str) -> Option<u64> {
         let epoch = QUOTA_BLOCK_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
         self.with_owner_quota_latch(pane_id, agent_id, |latch| *latch = Some(epoch))
@@ -16104,18 +15685,21 @@ impl AgentPtyRegistry {
                 }
             }
         };
-        if let Some(agent) = target.and_then(|id| inner.agents.get_mut(&id))
+        if let Some(id) = target
+            && let Some(agent) = inner.agents.get_mut(&id)
             && agent.agent_type.is_none()
         {
             agent.agent_type = Some(agent_type.clone());
             agent.badge_command = agent.spawn_command.clone();
             // PRD #1666 part 3, round 5-wake: the effective type's profile, for
-            // a generation spawned without a type (registry, then bus lock).
+            // a generation spawned without a type (registry, then bus lock),
+            // and its card and WAKE for the type it now has.
             if agent.spawn_agent_type.is_none()
                 && let Some(profile) = crate::doorbell_screen::profile_for_agent(Some(agent_type))
             {
                 agent.bus.adopt_profile(profile);
             }
+            self.request_reprojection(pane_id_env, &id);
         }
     }
 
@@ -16124,10 +15708,10 @@ impl AgentPtyRegistry {
             return;
         }
         let mut inner = self.inner.lock();
-        if let Some(agent) = inner
+        if let Some((id, agent)) = inner
             .agents
-            .values_mut()
-            .find(|a| a.pane_id_env.as_deref() == Some(pane_id_env))
+            .iter_mut()
+            .find(|(_, a)| a.pane_id_env.as_deref() == Some(pane_id_env))
             && agent.agent_type.is_none()
         {
             agent.agent_type = Some(agent_type.clone());
@@ -16137,6 +15721,7 @@ impl AgentPtyRegistry {
             {
                 agent.bus.adopt_profile(profile);
             }
+            self.request_reprojection(pane_id_env, id);
         }
     }
 
@@ -22604,124 +22189,6 @@ mod spawn_tests {
         );
     }
 
-    /// Scenario: a `cat` pane shows Claude Code's empty prompt box, and a doorbell for a generation that has only started (so it waits for that box on screen) types its line; before its Enter, the pane's screen is replaced by a start dialog with no hook event. The Enter is withheld and the write reports its line typed but not submitted; with the box left in place, the same write submits (control).
-    #[spec("inbox/doorbell/033")]
-    #[tokio::test]
-    async fn doorbell_033_a_dialog_replacing_the_prompt_between_steps_withholds_the_rest() {
-        const FRAME: &str = "────────\r\n❯\r\n────────\r\n";
-        const DIALOG: &[u8] =
-            b"\x1b[2J\x1b[HDo you trust the files in this folder?\r\n> 1. Yes\r\n";
-        for replaced in [true, false] {
-            let pane = format!("pane-doorbell-screen-{replaced}");
-            let registry = Arc::new(AgentPtyRegistry::new());
-            let id = registry
-                .spawn_agent(SpawnOptions {
-                    command: Some("/bin/cat"),
-                    env: crate::test_isolation::pin_unreachable_endpoints(vec![(
-                        DOT_AGENT_DECK_PANE_ID.to_string(),
-                        pane.clone(),
-                    )]),
-                    ..SpawnOptions::default()
-                })
-                .expect("spawn the doorbell's pane");
-            let bus = Arc::clone(&registry.inner.lock().agents[&id].bus);
-            bus.push(FRAME.as_bytes().to_vec());
-            let checks = std::sync::atomic::AtomicUsize::new(0);
-            let outcome = registry
-                .write_doorbell_when_ready(
-                    &pane,
-                    &id,
-                    DoorbellReady::Screen(crate::agent_registry::claude_prompt_on_screen),
-                    false,
-                    None,
-                    Some("RING"),
-                    || async {
-                        // The second step's re-check: the line is in, its
-                        // Enter is next.
-                        if replaced && checks.fetch_add(1, Ordering::SeqCst) == 1 {
-                            bus.push(DIALOG.to_vec());
-                        }
-                        true
-                    },
-                )
-                .await;
-            let expected = if replaced {
-                DoorbellWrite::Cancelled {
-                    steps_written: 1,
-                    line_typed: true,
-                }
-            } else {
-                DoorbellWrite::Written
-            };
-            assert_eq!(outcome, expected, "replaced={replaced}");
-            registry.shutdown_all();
-        }
-    }
-
-    /// Scenario: a `cat` pane plays a Claude Code generation that has only started, and a resize moves its PTY; the prompt box the agent repaints on that SIGWINCH reaches the pane's output between the resize's ioctl and the clearing of the old-size output. The doorbell's first line, which waits for that box on screen, is written and submitted.
-    #[spec("inbox/doorbell/034")]
-    #[tokio::test]
-    async fn doorbell_034_a_repaint_racing_the_resize_clear_survives_for_the_first_ring() {
-        const PANE: &str = "pane-doorbell-resize-repaint";
-        const FRAME: &str = "────────\r\n❯\r\n────────\r\n";
-        let registry = Arc::new(AgentPtyRegistry::new());
-        let id = registry
-            .spawn_agent(SpawnOptions {
-                command: Some("/bin/cat"),
-                rows: 24,
-                cols: 80,
-                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
-                    DOT_AGENT_DECK_PANE_ID.to_string(),
-                    PANE.to_string(),
-                )]),
-                ..SpawnOptions::default()
-            })
-            .expect("spawn the doorbell's pane");
-        let bus = Arc::clone(&registry.inner.lock().agents[&id].bus);
-        // The repaint is pushed from another thread, as the reader pushes it.
-        // The resize gives that push half a second to land before it clears:
-        // it lands at once unless the resize holds the ring meanwhile.
-        let repaint = Arc::new(std::sync::Mutex::new(None));
-        {
-            let pusher = Arc::clone(&bus);
-            let repaint = Arc::clone(&repaint);
-            *bus.between_resize_and_clear.lock().unwrap() = Some(Box::new(move || {
-                let (pushed_tx, pushed_rx) = std::sync::mpsc::channel();
-                let push = std::thread::spawn(move || {
-                    pusher.push(FRAME.as_bytes().to_vec());
-                    let _ = pushed_tx.send(());
-                });
-                let _ = pushed_rx.recv_timeout(Duration::from_millis(500));
-                *repaint.lock().unwrap() = Some(push);
-            }));
-        }
-        registry.resize(&id, 30, 100).expect("resize the pane");
-        repaint
-            .lock()
-            .unwrap()
-            .take()
-            .expect("test prerequisite: the repaint ran between the ioctl and the clear")
-            .join()
-            .expect("the repaint's push");
-        let outcome = registry
-            .write_doorbell_when_ready(
-                PANE,
-                &id,
-                DoorbellReady::Screen(crate::agent_registry::claude_prompt_on_screen),
-                false,
-                None,
-                Some("RING"),
-                || async { true },
-            )
-            .await;
-        assert_eq!(
-            outcome,
-            DoorbellWrite::Written,
-            "the prompt the agent repainted for the resize must still be on screen for the doorbell"
-        );
-        registry.shutdown_all();
-    }
-
     /// A Claude Code frame at `cols`: the full-width rules around an empty
     /// composer, preceded by Claude Code's full-redraw marker.
     fn claude_frame(cols: u16) -> Vec<u8> {
@@ -22902,11 +22369,10 @@ mod spawn_tests {
         let writer = registry.agent_writer(&id).expect("the writer");
         {
             let w = writer.lock().await;
-            let mut sink = w.daemon(Duration::from_secs(2));
-            assert!(matches!(
-                sink.write_tracked(b"\r").await,
-                WriteProgress::Complete
-            ));
+            let mut job = w
+                .queue_deck_job(b"\r".to_vec(), Arc::default())
+                .expect("the writer thread runs");
+            assert_eq!(job.done().await, Some((1, true)), "the deck's own Enter");
         }
         assert_eq!(
             doorbell.cell().load(),
@@ -23746,6 +23212,1623 @@ mod spawn_tests {
         }
     }
 
+    /// What a [`ModelEditor`]'s agent does with the deck's Enter.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum OnEnter {
+        /// Submit the composer: its text becomes a user message in the
+        /// transcript, and the agent's prompt hook reports a ring token it
+        /// carried.
+        Submit,
+        /// Submit without a hook report: only the transcript shows it.
+        SubmitSilently,
+        /// Drop the Enter: the composer keeps its text.
+        Drop,
+    }
+
+    /// How a [`ModelEditor`] draws.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Drawing {
+        /// Claude Code's ready screen, the composer as it holds.
+        Composer,
+        /// Claude Code's numbered-choice screen in place of the composer.
+        Dialog,
+        /// Nothing new: keystrokes are taken without a redraw.
+        Frozen,
+    }
+
+    /// The model editor's state the test can change while it runs.
+    struct EditorControl {
+        on_enter: OnEnter,
+        drawing: Drawing,
+        /// Draw a dialog once the composer holds this many characters.
+        dialog_at: Option<usize>,
+        /// The width the agent draws for.
+        cols: usize,
+    }
+
+    /// PRD #1666 part 3, round 5-wake: a pane whose agent is the test. A raw
+    /// `cat` (`stty raw -echo`, so the deck's master reads both bits clear)
+    /// writes whatever reaches the PTY to a file, and a thread reads it and
+    /// draws Claude Code 2.1.310's screen into the generation's bus for it:
+    /// its start-up header, a full-width rule above and below the composer,
+    /// the composer holding what was typed (its dim suggestion when empty),
+    /// and the user messages it submitted. The deck's line, its Enter and
+    /// its deletes therefore move a real transaction on the real writer.
+    struct ModelEditor {
+        registry: Arc<AgentPtyRegistry>,
+        id: String,
+        pane: String,
+        bus: Arc<AgentBus>,
+        typed: std::path::PathBuf,
+        control: Arc<Mutex<EditorControl>>,
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+        _dir: tempfile::TempDir,
+    }
+
+    const EDITOR_ROWS: u16 = 30;
+    const EDITOR_COLS: u16 = 200;
+
+    /// Claude Code's screen at [`EDITOR_ROWS`] rows and `cols` columns.
+    fn claude_screen(composer: &str, transcript: &[String], dialog: bool, cols: usize) -> Vec<u8> {
+        let rule = "─".repeat(cols);
+        let mut out = String::from("\x1b[2J\x1b[H\x1b[2;12HClaude Code v2.1.310\r");
+        for (i, message) in transcript.iter().enumerate() {
+            out.push_str(&format!(
+                "\x1b[{};1H\x1b[48;5;237m❯ {message}\x1b[0m",
+                4 + i * 2
+            ));
+        }
+        if dialog {
+            out.push_str("\x1b[20;1HDo you want to proceed?\x1b[22;1H❯ 1. Yes\x1b[23;1H  2. No");
+            return out.into_bytes();
+        }
+        out.push_str(&format!("\x1b[25;1H{rule}\x1b[26;1H❯\u{a0}"));
+        if composer.is_empty() {
+            out.push_str("\x1b[2mTry \"fix the bug\"\x1b[22m");
+        } else {
+            out.push_str(composer);
+        }
+        out.push_str(&format!(
+            "\x1b[27;1H{rule}\x1b[28;3H? for shortcuts\x1b[26;{}H",
+            3 + composer.chars().count()
+        ));
+        out.into_bytes()
+    }
+
+    impl ModelEditor {
+        fn spawn(registry: &Arc<AgentPtyRegistry>, pane: &str, on_enter: OnEnter) -> Self {
+            Self::spawn_as(registry, pane, on_enter, false)
+        }
+
+        /// A Claude Code editor that never draws its start-up header: it
+        /// shows only its empty composer, and redraws nothing.
+        fn spawn_headless(registry: &Arc<AgentPtyRegistry>, pane: &str) -> Self {
+            let editor = Self::spawn_drawing(registry, pane, OnEnter::Submit, false, false);
+            editor.control.lock().unwrap().drawing = Drawing::Frozen;
+            editor
+        }
+
+        /// [`Self::spawn`], with `wrapped` launching it the way the deck's
+        /// wrapper is launched (`dot-agent-deck wrap -- …`), by a stand-in
+        /// for an older wrapper that never reports the input mode.
+        fn spawn_as(
+            registry: &Arc<AgentPtyRegistry>,
+            pane: &str,
+            on_enter: OnEnter,
+            wrapped: bool,
+        ) -> Self {
+            Self::spawn_drawing(registry, pane, on_enter, wrapped, true)
+        }
+
+        /// [`Self::spawn_as`], its first screen drawn with the start-up
+        /// header or without it.
+        fn spawn_drawing(
+            registry: &Arc<AgentPtyRegistry>,
+            pane: &str,
+            on_enter: OnEnter,
+            wrapped: bool,
+            header: bool,
+        ) -> Self {
+            let dir = tempfile::tempdir().expect("a scratch directory");
+            let typed = dir.path().join("typed");
+            std::fs::write(&typed, b"").unwrap();
+            let raw_cat = format!(
+                "stty raw -echo && exec cat > '{}'",
+                typed.to_string_lossy().replace('\'', "'\\''")
+            );
+            let command = if wrapped {
+                let wrapper = dir.path().join(crate::platform::paths::DEFAULT_BINARY_NAME);
+                crate::test_isolation::write_script(&wrapper, format!("#!/bin/sh\n{raw_cat}\n"))
+                    .unwrap();
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+                format!("{} wrap --agent claude -- claude", wrapper.display())
+            } else {
+                raw_cat
+            };
+            let id = registry
+                .spawn_agent(SpawnOptions {
+                    command: Some(&command),
+                    rows: EDITOR_ROWS,
+                    cols: EDITOR_COLS,
+                    agent_type: Some(AgentType::ClaudeCode),
+                    env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                        DOT_AGENT_DECK_PANE_ID.to_string(),
+                        pane.to_string(),
+                    )]),
+                    ..SpawnOptions::default()
+                })
+                .expect("spawn the model editor's pane");
+            let bus = Arc::clone(&registry.inner.lock().agents[&id].bus);
+            let doorbell = registry.generation_doorbell(&id).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(8);
+            // A wrapped generation's mode is its wrapper's to report; the
+            // stand-in's `stty` is given a moment instead.
+            if wrapped {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            while !wrapped && doorbell.unwrapped_mode().is_err() {
+                assert!(Instant::now() < deadline, "the pane never went raw");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if header {
+                bus.push(claude_screen("", &[], false, EDITOR_COLS as usize));
+                // The header latched its release: re-projected, as the
+                // pane's reader asks when its push latches one.
+                registry.request_reprojection(pane, &id);
+            } else {
+                bus.push(claude_composer_only(EDITOR_COLS as usize));
+            }
+            let control = Arc::new(Mutex::new(EditorControl {
+                on_enter,
+                drawing: Drawing::Composer,
+                dialog_at: None,
+                cols: EDITOR_COLS as usize,
+            }));
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread = {
+                let (registry, bus, typed, control, stop) = (
+                    Arc::clone(registry),
+                    Arc::clone(&bus),
+                    typed.clone(),
+                    Arc::clone(&control),
+                    Arc::clone(&stop),
+                );
+                let (pane, id) = (pane.to_string(), id.clone());
+                std::thread::spawn(move || {
+                    let mut seen = 0usize;
+                    let mut composer = String::new();
+                    let mut transcript: Vec<String> = Vec::new();
+                    while !stop.load(Ordering::SeqCst) {
+                        let bytes = std::fs::read(&typed).unwrap_or_default();
+                        if bytes.len() > seen {
+                            let (on_enter, mut drawing, dialog_at, cols) = {
+                                let c = control.lock().unwrap();
+                                (c.on_enter, c.drawing, c.dialog_at, c.cols)
+                            };
+                            for &b in &bytes[seen..] {
+                                match b {
+                                    b'\r' if on_enter != OnEnter::Drop => {
+                                        let line = std::mem::take(&mut composer);
+                                        if on_enter == OnEnter::Submit
+                                            && let Some(token) = line
+                                                .strip_prefix('(')
+                                                .and_then(|rest| rest.get(..6))
+                                        {
+                                            registry.note_doorbell_evidence(RingEvidence {
+                                                pane_id: pane.clone(),
+                                                agent_id: id.clone(),
+                                                message_id: None,
+                                                token: token.to_string(),
+                                                shape: crate::event::PromptShape::Exact,
+                                            });
+                                        }
+                                        transcript.push(line);
+                                    }
+                                    b'\r' => {}
+                                    0x7f => {
+                                        composer.pop();
+                                    }
+                                    0x15 => composer.clear(),
+                                    b if b >= 0x20 => composer.push(char::from(b)),
+                                    _ => {}
+                                }
+                            }
+                            seen = bytes.len();
+                            if dialog_at.is_some_and(|at| composer.chars().count() >= at) {
+                                drawing = Drawing::Dialog;
+                                control.lock().unwrap().drawing = Drawing::Dialog;
+                            }
+                            match drawing {
+                                Drawing::Composer => {
+                                    bus.push(claude_screen(&composer, &transcript, false, cols))
+                                }
+                                Drawing::Dialog => {
+                                    bus.push(claude_screen(&composer, &transcript, true, cols))
+                                }
+                                Drawing::Frozen => {}
+                            }
+                        }
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                })
+            };
+            let editor = Self {
+                registry: Arc::clone(registry),
+                id,
+                pane: pane.to_string(),
+                bus,
+                typed,
+                control,
+                stop,
+                thread: Some(thread),
+                _dir: dir,
+            };
+            editor.wait_clean();
+            editor
+        }
+
+        /// Wait (bounded) until the screen the evidence state reads shows the
+        /// composer holding `text` (empty for none).
+        fn wait_drawn(&self, text: &str) {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            loop {
+                let shown = self.bus.clean_frame().map(|grid| {
+                    crate::doorbell_screen::frame(
+                        &crate::doorbell_screen::CLAUDE_PROFILE,
+                        &grid,
+                        0,
+                        true,
+                        None,
+                    )
+                });
+                let held = shown.as_ref().and_then(|f| f.composer.as_ref()).map(|c| {
+                    if c.placeholder {
+                        String::new()
+                    } else {
+                        c.text.clone()
+                    }
+                });
+                if held.as_deref() == Some(text) {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "never drawn {text:?}: {held:?}");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        /// What reached the PTY.
+        fn typed(&self) -> Vec<u8> {
+            std::fs::read(&self.typed).unwrap_or_default()
+        }
+
+        fn wait_clean(&self) {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            while !matches!(
+                self.bus.evidence().0,
+                crate::evidence_state::EvidenceStatus::Clean { .. }
+            ) {
+                assert!(
+                    Instant::now() < deadline,
+                    "the editor's screen never turned Clean"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        /// Ring for a fresh message id, the prompt hook live.
+        async fn ring(&self) -> RingReport {
+            self.ring_with(|| async { true }).await
+        }
+
+        async fn ring_with<F, Fut>(&self, still: F) -> RingReport
+        where
+            F: Fn() -> Fut + Send + Sync + 'static,
+            Fut: std::future::Future<Output = bool> + Send,
+        {
+            self.registry
+                .ring_doorbell(
+                    &self.pane,
+                    &self.id,
+                    crate::inbox::MessageId::parse("m-abcdefgh-0123456789abcdef").unwrap(),
+                    true,
+                    still,
+                )
+                .await
+        }
+
+        fn cell(&self) -> crate::doorbell_txn::Latch {
+            self.registry
+                .generation_doorbell(&self.id)
+                .map_or(crate::doorbell_txn::Latch::Retired, |d| d.cell().load())
+        }
+    }
+
+    impl Drop for ModelEditor {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// The token-led line in `typed`, the bytes that reached a pane, if any.
+    fn typed_line(typed: &[u8]) -> Option<String> {
+        let text = String::from_utf8_lossy(typed);
+        let at = text.find('(')?;
+        let end = text[at..].find("inbox fetch")? + at + "inbox fetch".len();
+        Some(text[at..end].to_string())
+    }
+
+    /// Scenario: A Claude Code 2.1.310 model editor shows its empty composer and its prompt hook is live; the deck rings, then rings again with the hook reporting nothing, the transcript alone showing the submit. The first ring types exactly its token-led line and one Enter and ends Submitted on the hook's token, the cell resolved as submitted; the second ends Submitted on the transcript; nothing else reaches the pane.
+    #[spec("inbox/doorbell/050")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn doorbell_050_a_ring_on_the_real_writer_submits_its_line_and_nothing_else() {
+        use crate::doorbell_txn::{Latch, Outcome, Resolution};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-submit", OnEnter::Submit);
+        let report = editor.ring().await;
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::Submitted),
+            "{report:?}"
+        );
+        let typed = editor.typed();
+        let line = typed_line(&typed).expect("the line was typed");
+        assert!(
+            line.ends_with(" dot-agent-deck: message m-abcdefgh-0123456789abcdef waiting, run: dot-agent-deck inbox fetch"),
+            "{line}"
+        );
+        assert_eq!(
+            typed,
+            format!("{line}\r").into_bytes(),
+            "the line and one Enter"
+        );
+        assert!(matches!(
+            editor.cell(),
+            Latch::Resolved(_, Resolution::Submitted)
+        ));
+        editor.control.lock().unwrap().on_enter = OnEnter::SubmitSilently;
+        let second = editor.ring().await;
+        assert_eq!(
+            second.outcome,
+            RingOutcome::Txn(Outcome::Submitted),
+            "{second:?}"
+        );
+        assert_eq!(
+            typed_line(&editor.typed()[typed.len()..]).map(|l| l.len()),
+            Some(line.len())
+        );
+        registry.shutdown_all();
+    }
+
+    /// Scenario: Q19, the ledger as the doorbell's input: a human operation is admitted to the model editor's generation and held, then the deck rings; then, with nothing outstanding, the deck rings again while a human operation is admitted between admission and its first byte. Both rings end with nothing written (human input), the pane receives no deck byte, and once nothing is outstanding the next ring is admitted and submitted.
+    #[spec("inbox/doorbell/050")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn doorbell_050_a_human_operation_before_the_first_byte_ends_the_ring_with_nothing_written()
+     {
+        use crate::doorbell_txn::{NotTyped, Outcome};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-human", OnEnter::Submit);
+        let held = registry.admit_ingress(&editor.id).expect("admitted");
+        let report = editor.ring().await;
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::NothingWritten(NotTyped::HumanInput)),
+            "an outstanding human operation holds admission"
+        );
+        drop(held);
+        // (h) admitted between the admission and the first byte: the
+        // admission re-check runs after the ledger was read.
+        let registry2 = Arc::clone(&registry);
+        let id = editor.id.clone();
+        let admitted = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&admitted);
+        let report = editor
+            .ring_with(move || {
+                let registry = Arc::clone(&registry2);
+                let id = id.clone();
+                let slot = Arc::clone(&slot);
+                async move {
+                    let mut slot = slot.lock().unwrap();
+                    if slot.is_none() {
+                        *slot = registry.admit_ingress(&id);
+                    }
+                    true
+                }
+            })
+            .await;
+        assert!(
+            matches!(report.outcome, RingOutcome::Txn(Outcome::NothingWritten(_))),
+            "{report:?}"
+        );
+        assert!(
+            editor.typed().is_empty(),
+            "no deck byte: {:?}",
+            editor.typed()
+        );
+        drop(admitted.lock().unwrap().take());
+        let control = editor.ring().await;
+        assert_eq!(
+            control.outcome,
+            RingOutcome::Txn(Outcome::Submitted),
+            "control"
+        );
+        registry.shutdown_all();
+    }
+
+    /// Wait (bounded) until the model editor has been typed something that
+    /// satisfies `done`.
+    async fn typed_until(editor: &ModelEditor, done: impl Fn(&[u8]) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !done(&editor.typed()) {
+            assert!(
+                Instant::now() < deadline,
+                "the pane never took what was awaited: {:?}",
+                String::from_utf8_lossy(&editor.typed())
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    fn line_in(typed: &[u8]) -> bool {
+        typed_line(typed).is_some()
+    }
+
+    /// Scenario: (a) While the deck's line is in the model editor's composer and its Enter not yet sent, a test thread holds the generation's output lock past the transaction's deadline and the ring's caller is dropped. The writer is free for a human write within the deadline plus 50 ms, no Enter or later byte is written, the attempt is suspended before the writer is released, and the human's bytes follow the line. (b) The same with the input-mode store's lock held.
+    #[spec("inbox/doorbell/050")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_050_a_lock_held_past_the_deadline_never_blocks_the_writer() {
+        use crate::doorbell_txn::{Latch, TXN_MAX};
+        for which in ["bus", "mode"] {
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let pane = format!("pane-ring-held-{which}");
+            let editor = ModelEditor::spawn(&registry, &pane, OnEnter::Submit);
+            let started = Instant::now();
+            let ring = {
+                let registry = Arc::clone(&registry);
+                let (pane, id) = (editor.pane.clone(), editor.id.clone());
+                tokio::spawn(async move {
+                    registry
+                        .ring_doorbell(
+                            &pane,
+                            &id,
+                            crate::inbox::MessageId::parse("m-abcdefgh-0123456789abcdef").unwrap(),
+                            true,
+                            || async { true },
+                        )
+                        .await
+                })
+            };
+            typed_until(&editor, line_in).await;
+            // Hold the lock from another thread across the deadline.
+            let (held_tx, held_rx) = std::sync::mpsc::channel();
+            let holder = {
+                let bus = Arc::clone(&editor.bus);
+                let mode = Arc::clone(&registry.inner.lock().agents[&editor.id].input_mode);
+                let which = which.to_string();
+                std::thread::spawn(move || {
+                    let hold = TXN_MAX + Duration::from_millis(500);
+                    if which == "bus" {
+                        let _guard = bus.state.lock().unwrap();
+                        let _ = held_tx.send(());
+                        std::thread::sleep(hold);
+                    } else {
+                        let _guard = mode.lock().unwrap();
+                        let _ = held_tx.send(());
+                        std::thread::sleep(hold);
+                    }
+                })
+            };
+            held_rx.recv().unwrap();
+            ring.abort();
+            registry
+                .write_user_bytes(&editor.pane, &editor.id, b"HUMAN")
+                .await
+                .expect("the human write goes in");
+            assert!(
+                started.elapsed() <= TXN_MAX + Duration::from_millis(50) + Duration::from_secs(1),
+                "{which}: the writer was held past its deadline: {:?}",
+                started.elapsed()
+            );
+            assert!(
+                matches!(editor.cell(), Latch::Suspended(..)),
+                "{which}: suspended before the release: {:?}",
+                editor.cell()
+            );
+            holder.join().unwrap();
+            typed_until(&editor, |t| t.ends_with(b"HUMAN")).await;
+            let typed = editor.typed();
+            let line = typed_line(&typed).unwrap();
+            assert_eq!(
+                typed,
+                format!("{line}HUMAN").into_bytes(),
+                "{which}: no Enter or later deck byte"
+            );
+            registry.shutdown_all();
+        }
+    }
+
+    /// Scenario: (c) The model editor stops drawing, so the deck's line is typed and never echoed, and the generation is closed while the transaction waits for the echo; a successor is then spawned in the same pane. The transaction ends at once, retired, well before its deadline, and the successor receives no byte of the deck's.
+    #[spec("inbox/doorbell/050")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn doorbell_050_retirement_during_the_hold_unwinds_and_spares_the_successor() {
+        use crate::doorbell_txn::{Outcome, TXN_MAX};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-retire", OnEnter::Submit);
+        editor.control.lock().unwrap().drawing = Drawing::Frozen;
+        let started = Instant::now();
+        let ring = {
+            let registry = Arc::clone(&registry);
+            let (pane, id) = (editor.pane.clone(), editor.id.clone());
+            tokio::spawn(async move {
+                registry
+                    .ring_doorbell(
+                        &pane,
+                        &id,
+                        crate::inbox::MessageId::parse("m-abcdefgh-0123456789abcdef").unwrap(),
+                        true,
+                        || async { true },
+                    )
+                    .await
+            })
+        };
+        typed_until(&editor, line_in).await;
+        registry
+            .close_agent(&editor.id)
+            .expect("close the generation");
+        let report = ring.await.unwrap();
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::Retired),
+            "{report:?}"
+        );
+        assert!(started.elapsed() < TXN_MAX, "{:?}", started.elapsed());
+        let successor = ModelEditor::spawn(&registry, "pane-ring-retire", OnEnter::Submit);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(successor.typed().is_empty(), "{:?}", successor.typed());
+        registry.shutdown_all();
+    }
+
+    /// Scenario: (d) The ring's caller is dropped as soon as the deck's line reaches the model editor, with nothing contending. The transaction carries on to its end on the writer it owns: the line's Enter is sent and the attempt resolves as submitted.
+    #[spec("inbox/doorbell/050")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn doorbell_050_a_dropped_caller_does_not_end_the_transaction() {
+        use crate::doorbell_txn::{Latch, Resolution};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-dropped", OnEnter::Submit);
+        let ring = {
+            let registry = Arc::clone(&registry);
+            let (pane, id) = (editor.pane.clone(), editor.id.clone());
+            tokio::spawn(async move {
+                registry
+                    .ring_doorbell(
+                        &pane,
+                        &id,
+                        crate::inbox::MessageId::parse("m-abcdefgh-0123456789abcdef").unwrap(),
+                        true,
+                        || async { true },
+                    )
+                    .await
+            })
+        };
+        typed_until(&editor, line_in).await;
+        ring.abort();
+        typed_until(&editor, |t| t.ends_with(b"\r")).await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !matches!(editor.cell(), Latch::Resolved(_, Resolution::Submitted)) {
+            assert!(Instant::now() < deadline, "{:?}", editor.cell());
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        registry.shutdown_all();
+    }
+
+    /// Scenario: (e) A human writes into the model editor's pane after the deck's line is typed and before its Enter, the human's operation admitted while the transaction holds the writer. The Enter still goes, the ring is submitted, and the human's bytes are written after the release, in order: the line, the Enter, then the human's text. (g) A second human write waits for the writer and its caller is dropped: its operation settles cancelled, the transaction is unaffected, and the next ring is admitted.
+    #[spec("inbox/doorbell/050")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_050_human_frames_after_the_line_wait_and_follow_in_order() {
+        use crate::doorbell_txn::Outcome;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-queued-human", OnEnter::Submit);
+        let ring = {
+            let registry = Arc::clone(&registry);
+            let (pane, id) = (editor.pane.clone(), editor.id.clone());
+            tokio::spawn(async move {
+                registry
+                    .ring_doorbell(
+                        &pane,
+                        &id,
+                        crate::inbox::MessageId::parse("m-abcdefgh-0123456789abcdef").unwrap(),
+                        true,
+                        || async { true },
+                    )
+                    .await
+            })
+        };
+        typed_until(&editor, line_in).await;
+        let human = {
+            let registry = Arc::clone(&registry);
+            let (pane, id) = (editor.pane.clone(), editor.id.clone());
+            tokio::spawn(async move { registry.write_user_bytes(&pane, &id, b"HUMAN").await })
+        };
+        // (g) another, dropped while it waits.
+        let ledger = registry.ingress_ledger(&editor.id).unwrap();
+        let dropped = {
+            let registry = Arc::clone(&registry);
+            let (pane, id) = (editor.pane.clone(), editor.id.clone());
+            tokio::spawn(async move { registry.write_user_bytes(&pane, &id, b"NEVER").await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        dropped.abort();
+        let report = ring.await.unwrap();
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::Submitted),
+            "{report:?}"
+        );
+        human.await.unwrap().expect("the human write");
+        typed_until(&editor, |t| t.ends_with(b"HUMAN")).await;
+        let typed = editor.typed();
+        let line = typed_line(&typed).unwrap();
+        assert_eq!(typed, format!("{line}\rHUMAN").into_bytes());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while ledger.any_outstanding() {
+            assert!(
+                Instant::now() < deadline,
+                "a dropped frame stranded the ledger"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            ledger
+                .settled()
+                .iter()
+                .any(|(_, how)| *how == crate::ingress_ledger::Settlement::Cancelled),
+            "{:?}",
+            ledger.settled()
+        );
+        // The human's text is in the composer: cleared, the next ring is
+        // admitted.
+        editor.wait_drawn("HUMAN");
+        registry
+            .write_user_bytes(&editor.pane, &editor.id, b"\x15")
+            .await
+            .unwrap();
+        editor.wait_drawn("");
+        assert_eq!(
+            editor.ring().await.outcome,
+            RingOutcome::Txn(Outcome::Submitted),
+            "the next admission is not stranded"
+        );
+        registry.shutdown_all();
+    }
+
+    /// Scenario: (f) The model editor drops the deck's Enter, so the line stays in its composer, and a human writes while the transaction waits for submit evidence. Claude Code has no placeholder to confirm a withdrawal, so the deck deletes nothing: the attempt ends unresolved (withdrawal refused), the cell is suspended, no byte follows the Enter, and the human's text is written after the release.
+    #[spec("inbox/doorbell/050")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_050_an_enter_not_taken_on_claude_is_refused_a_withdrawal() {
+        use crate::doorbell_txn::{Cause, Latch, Outcome};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-not-taken", OnEnter::Drop);
+        let ring = {
+            let registry = Arc::clone(&registry);
+            let (pane, id) = (editor.pane.clone(), editor.id.clone());
+            tokio::spawn(async move {
+                registry
+                    .ring_doorbell(
+                        &pane,
+                        &id,
+                        crate::inbox::MessageId::parse("m-abcdefgh-0123456789abcdef").unwrap(),
+                        true,
+                        || async { true },
+                    )
+                    .await
+            })
+        };
+        typed_until(&editor, |t| t.ends_with(b"\r")).await;
+        let human = {
+            let registry = Arc::clone(&registry);
+            let (pane, id) = (editor.pane.clone(), editor.id.clone());
+            tokio::spawn(async move { registry.write_user_bytes(&pane, &id, b"HUMAN").await })
+        };
+        let report = ring.await.unwrap();
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::Unresolved(Cause::WithdrawalRefused)),
+            "{report:?}"
+        );
+        assert!(report.cr_reached);
+        assert!(matches!(editor.cell(), Latch::Suspended(..)));
+        human.await.unwrap().expect("the human write");
+        typed_until(&editor, |t| t.ends_with(b"HUMAN")).await;
+        let typed = editor.typed();
+        let line = typed_line(&typed).unwrap();
+        assert_eq!(typed, format!("{line}\rHUMAN").into_bytes(), "no delete");
+        registry.shutdown_all();
+    }
+
+    /// The model editor's card, from the real hub.
+    fn shown_hold(editor: &ModelEditor) -> Option<crate::inbox_display::WakeHold> {
+        editor
+            .registry
+            .inbox()
+            .summary(&editor.pane, &editor.id)
+            .wake_hold
+    }
+
+    /// Scenario: (m) With the re-projection publisher running, a ring ends unresolved: the card shows uncertain_input and one wake update carries it; the user's own Enter then clears it. (i) With the publisher held at a gate, a ring ends unresolved and the user clears before the gate opens: once it runs, the cell is the user's, the card shows nothing and no update ever carried uncertain_input. (l) Held again, a ring ends unresolved, the generation is closed and a successor starts in the pane: the old request touches nothing of the successor's.
+    #[spec("inbox/doorbell/050")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_050_publication_shows_the_cell_as_it_is_when_it_runs() {
+        use crate::doorbell_txn::{Latch, Resolution};
+        use crate::inbox_display::WakeHold;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (tx, mut rx) = broadcast::channel(256);
+        registry.inbox().set_broadcast(tx);
+        let _publisher = registry.spawn_doorbell_publisher().expect("the publisher");
+        let editor = ModelEditor::spawn(&registry, "pane-ring-publish", OnEnter::Drop);
+        let carried = |rx: &mut broadcast::Receiver<crate::event::BroadcastMsg>| {
+            let mut holds = Vec::new();
+            while let Ok(message) = rx.try_recv() {
+                if let crate::event::BroadcastMsg::Inbox(notice) = message
+                    && notice.wake_update
+                {
+                    holds.push(notice.wake_hold);
+                }
+            }
+            holds
+        };
+        // (m)
+        let report = editor.ring().await;
+        assert!(matches!(
+            report.outcome,
+            RingOutcome::Txn(crate::doorbell_txn::Outcome::Unresolved(_))
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while shown_hold(&editor) != Some(WakeHold::UncertainInput) {
+            assert!(Instant::now() < deadline, "{:?}", shown_hold(&editor));
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let holds = carried(&mut rx);
+        assert_eq!(
+            holds
+                .iter()
+                .filter(|h| **h == Some(WakeHold::UncertainInput))
+                .count(),
+            1,
+            "{holds:?}"
+        );
+        registry
+            .write_user_bytes(&editor.pane, &editor.id, b"\x15")
+            .await
+            .unwrap();
+        editor.wait_drawn("");
+        while shown_hold(&editor).is_some() {
+            assert!(Instant::now() < deadline, "{:?}", shown_hold(&editor));
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // (i) the user clears while the publisher is held.
+        let _ = carried(&mut rx);
+        registry.hold_publisher(true);
+        let report = editor.ring().await;
+        assert!(
+            matches!(
+                report.outcome,
+                RingOutcome::Txn(crate::doorbell_txn::Outcome::Unresolved(_))
+            ),
+            "{report:?}"
+        );
+        registry
+            .write_user_bytes(&editor.pane, &editor.id, b"\x15")
+            .await
+            .unwrap();
+        editor.wait_drawn("");
+        assert!(matches!(
+            editor.cell(),
+            Latch::Resolved(_, Resolution::User)
+        ));
+        registry.hold_publisher(false);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(shown_hold(&editor), None);
+        assert!(
+            !carried(&mut rx).contains(&Some(WakeHold::UncertainInput)),
+            "a delayed request shows the current state"
+        );
+        // (l) retirement and a successor while held.
+        registry.hold_publisher(true);
+        let report = editor.ring().await;
+        assert!(
+            matches!(
+                report.outcome,
+                RingOutcome::Txn(crate::doorbell_txn::Outcome::Unresolved(_))
+            ),
+            "{report:?}"
+        );
+        registry.close_agent(&editor.id).unwrap();
+        let successor = ModelEditor::spawn(&registry, "pane-ring-publish", OnEnter::Submit);
+        registry.hold_publisher(false);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            shown_hold(&successor),
+            None,
+            "the successor's card is untouched"
+        );
+        assert!(!matches!(successor.cell(), Latch::Suspended(..)));
+        registry.shutdown_all();
+    }
+
+    /// Scenario: (n) The model editor drops the deck's Enter, and just before the attempt's suspension the agent's prompt hook reports the ring's token exact through the real hook arm. The arm resolves the attempt on receipt, the suspension is refused, the ring ends submitted, and uncertain_input is never shown.
+    #[spec("inbox/doorbell/050")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_050_evidence_at_the_suspension_wins() {
+        use crate::doorbell_txn::{Latch, Outcome, Resolution};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let _publisher = registry.spawn_doorbell_publisher().expect("the publisher");
+        let editor = ModelEditor::spawn(&registry, "pane-ring-cas", OnEnter::Drop);
+        {
+            let registry = Arc::clone(&registry);
+            let (pane, id) = (editor.pane.clone(), editor.id.clone());
+            let typed = editor.typed.clone();
+            registry
+                .generation_doorbell(&editor.id)
+                .unwrap()
+                .cell()
+                .before_next_suspend(move || {
+                    let line = typed_line(&std::fs::read(&typed).unwrap()).unwrap();
+                    registry.note_doorbell_evidence(RingEvidence {
+                        pane_id: pane,
+                        agent_id: id,
+                        message_id: None,
+                        token: line[1..7].to_string(),
+                        shape: crate::event::PromptShape::Exact,
+                    });
+                });
+        }
+        let report = editor.ring().await;
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::Submitted),
+            "{report:?}"
+        );
+        assert!(matches!(
+            editor.cell(),
+            Latch::Resolved(_, Resolution::Submitted)
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(shown_hold(&editor), None);
+        registry.shutdown_all();
+    }
+
+    /// The app state of a model editor whose own hooks reported its start
+    /// and its Idle, and a message waiting for it.
+    async fn idle_with_mail(editor: &ModelEditor) -> crate::state::SharedState {
+        let state: crate::state::SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        for event_type in [
+            crate::event::EventType::SessionStart,
+            crate::event::EventType::Idle,
+        ] {
+            state.write().await.apply_event(crate::event::AgentEvent {
+                session_id: format!("{}-session", editor.pane),
+                agent_type: crate::event::AgentType::ClaudeCode,
+                event_type,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: chrono::Utc::now(),
+                user_prompt: None,
+                metadata: Default::default(),
+                pane_id: Some(editor.pane.clone()),
+                agent_id: Some(editor.id.clone()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+                background: None,
+                background_revision: None,
+            });
+        }
+        editor
+            .registry
+            .inbox()
+            .post_direct(
+                crate::inbox::Recipient::bound(&editor.pane, &editor.id),
+                crate::inbox::Content::from_deck("seed", "task", "do it"),
+            )
+            .unwrap();
+        state
+    }
+
+    fn tick_config(wake_stall_after: Duration) -> crate::doorbell::DoorbellConfig {
+        crate::doorbell::DoorbellConfig {
+            tick: Duration::from_millis(20),
+            schedule: vec![Duration::from_secs(60)],
+            arm_grace: Duration::from_millis(1),
+            wake_stall_after,
+        }
+    }
+
+    /// Scenario: A Claude Code 2.1.310 model editor shows its empty composer and a message waits, with a 600 ms first-ring settle window and a 150 ms stall window, while the editor redraws the same frame every 20 ms. Inside the window the tick types nothing and the inbox names no hold, the hold clock paused; the redraws do not move the window's start, so the doorbell rings once it ends.
+    #[spec("inbox/doorbell/041")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_041_the_settle_window_pauses_the_hold_and_then_the_ring_goes() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        registry.set_doorbell_settle_for_test(Some(Duration::from_millis(600)));
+        let editor = ModelEditor::spawn(&registry, "pane-041-settle", OnEnter::Submit);
+        let state = idle_with_mail(&editor).await;
+        let started = Instant::now();
+        let bell = crate::doorbell::spawn(
+            registry.clone(),
+            state,
+            tick_config(Duration::from_millis(150)),
+        );
+        let redraw = {
+            let bus = Arc::clone(&editor.bus);
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopped = Arc::clone(&stop);
+            let thread = std::thread::spawn(move || {
+                while !stopped.load(Ordering::SeqCst) {
+                    bus.push(claude_screen("", &[], false, EDITOR_COLS as usize));
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            });
+            (stop, thread)
+        };
+        while started.elapsed() < Duration::from_millis(450) {
+            assert!(editor.typed().is_empty(), "typed inside the settle window");
+            assert_eq!(shown_hold(&editor), None, "a hold shown inside the window");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while typed_line(&editor.typed()).is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the ring never went after the window; the redraws moved its start"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(started.elapsed() >= Duration::from_millis(550));
+        redraw.0.store(true, Ordering::SeqCst);
+        redraw.1.join().unwrap();
+        bell.abort();
+        registry.shutdown_all();
+    }
+
+    /// Scenario: A model editor's pane is resized while a message waits and the editor never redraws, so its screen stays Dirty and nothing is typed. The tick sends one refresh nudge for the episode (one shrink and one restore), then the inbox names awaiting_prompt; resizing it again to the geometry it has adds no nudge, and nothing reaches the pane.
+    #[spec("inbox/doorbell/041")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_041_a_screen_left_dirty_gets_one_refresh_nudge_per_episode() {
+        use crate::inbox_display::WakeHold;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-041-dirty", OnEnter::Submit);
+        editor.control.lock().unwrap().drawing = Drawing::Frozen;
+        let cols = EDITOR_COLS - 20;
+        registry.resize(&editor.id, EDITOR_ROWS, cols).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !registry.doorbell_evidence_dirty(&editor.id) {
+            assert!(
+                Instant::now() < deadline,
+                "the resize never left the screen Dirty"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let edges_before = editor.bus.evidence().1;
+        let state = idle_with_mail(&editor).await;
+        let bell = crate::doorbell::spawn(
+            registry.clone(),
+            state,
+            tick_config(Duration::from_millis(150)),
+        );
+        while shown_hold(&editor) != Some(WakeHold::AwaitingPrompt) {
+            assert!(Instant::now() < deadline, "{:?}", shown_hold(&editor));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        while !registry.repaint_nudges.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "the nudge never finished");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let after_nudge = editor.bus.evidence().1;
+        assert_eq!(
+            after_nudge,
+            edges_before + 2,
+            "one nudge: a shrink and a restore"
+        );
+        for _ in 0..3 {
+            registry.resize(&editor.id, EDITOR_ROWS, cols).unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            editor.bus.evidence().1,
+            after_nudge,
+            "same-geometry resizes add no edge and no nudge"
+        );
+        assert!(editor.typed().is_empty(), "nothing reaches a Dirty pane");
+        bell.abort();
+        registry.shutdown_all();
+    }
+
+    /// Scenario: The doorbell tick rings a model editor that drops the deck's Enter, with a 60-second stall window. The ring ends unresolved and the inbox names uncertain_input at once, without waiting out the stall window.
+    #[spec("inbox/doorbell/041")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_041_an_unresolved_ring_shows_uncertain_input_at_once() {
+        use crate::inbox_display::WakeHold;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let _publisher = registry.spawn_doorbell_publisher().expect("the publisher");
+        let editor = ModelEditor::spawn(&registry, "pane-041-uncertain", OnEnter::Drop);
+        let state = idle_with_mail(&editor).await;
+        let started = Instant::now();
+        let bell = crate::doorbell::spawn(
+            registry.clone(),
+            state,
+            tick_config(Duration::from_secs(60)),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while shown_hold(&editor) != Some(WakeHold::UncertainInput) {
+            assert!(Instant::now() < deadline, "{:?}", shown_hold(&editor));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "shown well inside the 60-second stall window"
+        );
+        bell.abort();
+        registry.shutdown_all();
+    }
+
+    /// Scenario: inbox/doorbell/046 through the real adapter: a model editor drops the deck's Enter, so the ring ends unresolved and the doorbell is suspended with uncertain_input shown, while the user has a draft of their own in the tracker. An older attempt's token reported exact by the prompt hook moves nothing; this attempt's token reported exact afterwards resolves the attempt late, lifts the suspension and clears the card, and leaves the user's draft bit as it was.
+    #[spec("inbox/doorbell/046")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_046_late_exact_evidence_resolves_only_its_attempt_through_the_hook_arm() {
+        use crate::doorbell_txn::{Latch, Outcome, Resolution};
+        use crate::inbox_display::WakeHold;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let _publisher = registry.spawn_doorbell_publisher().expect("the publisher");
+        let editor = ModelEditor::spawn(&registry, "pane-046-late", OnEnter::Submit);
+        let first = editor.ring().await;
+        assert_eq!(
+            first.outcome,
+            RingOutcome::Txn(Outcome::Submitted),
+            "{first:?}"
+        );
+        let old_token = typed_line(&editor.typed()).unwrap()[1..7].to_string();
+        editor.control.lock().unwrap().on_enter = OnEnter::Drop;
+        let typed_before = editor.typed().len();
+        let report = editor.ring().await;
+        assert!(
+            matches!(report.outcome, RingOutcome::Txn(Outcome::Unresolved(_))),
+            "{report:?}"
+        );
+        until("uncertain_input", || {
+            shown_hold(&editor) == Some(WakeHold::UncertainInput)
+        })
+        .await;
+        registry
+            .write_user_bytes(&editor.pane, &editor.id, b"x")
+            .await
+            .unwrap();
+        assert!(
+            registry.draft_pending(&editor.pane),
+            "the user's key is a draft"
+        );
+        assert!(
+            matches!(editor.cell(), Latch::Suspended(..)),
+            "a key is no submit or clear"
+        );
+        let token = typed_line(&editor.typed()[typed_before..]).unwrap()[1..7].to_string();
+        let evidence = |token: &str| RingEvidence {
+            pane_id: editor.pane.clone(),
+            agent_id: editor.id.clone(),
+            message_id: None,
+            token: token.to_string(),
+            shape: crate::event::PromptShape::Exact,
+        };
+        registry.note_doorbell_evidence(evidence(&old_token));
+        assert!(
+            matches!(editor.cell(), Latch::Suspended(..)),
+            "an older attempt's token moves nothing: {:?}",
+            editor.cell()
+        );
+        registry.note_doorbell_evidence(evidence(&token));
+        assert!(
+            matches!(editor.cell(), Latch::Resolved(_, Resolution::LateExact)),
+            "{:?}",
+            editor.cell()
+        );
+        assert!(!registry.doorbell_suspended(&editor.id));
+        until("the card clears", || shown_hold(&editor).is_none()).await;
+        assert!(
+            registry.draft_pending(&editor.pane),
+            "late evidence never clears the user's draft"
+        );
+        registry.shutdown_all();
+    }
+
+    /// Hold `editor`'s generation as `input_mode_conflict`: a process in its
+    /// session reports its mode, then the same pid with another start time.
+    fn conflict(editor: &ModelEditor) {
+        use crate::input_mode::{NamespaceRead, Observer};
+        let leader = editor.registry.inner.lock().agents[&editor.id]
+            .child
+            .process_id()
+            .expect("the child's pid");
+        let procs = FakeProcs {
+            session: Some(leader),
+            started: Some(100),
+            own: NamespaceRead::NotFound,
+            peer: NamespaceRead::NotFound,
+        };
+        set_fake(procs.clone());
+        let observer = |start| Observer { pid: 4242, start };
+        assert!(
+            editor
+                .registry
+                .accept_input_mode_with(&editor.id, observer(100), fresh_raw(1), &FAKE_LOOKUPS)
+                .is_ok()
+        );
+        set_fake(FakeProcs {
+            started: Some(200),
+            ..procs
+        });
+        assert_eq!(
+            editor.registry.accept_input_mode_with(
+                &editor.id,
+                observer(200),
+                fresh_raw(2),
+                &FAKE_LOOKUPS
+            ),
+            Err("input_mode_conflict")
+        );
+    }
+
+    fn wake(editor: &ModelEditor) -> crate::inbox_hub::WakePath {
+        editor
+            .registry
+            .inbox()
+            .summary(&editor.pane, &editor.id)
+            .wake
+    }
+
+    async fn until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < deadline, "never: {what}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Scenario: inbox/doorbell/051's activated half: a measured Claude Code generation is held as input_mode_conflict by two processes reporting its input mode, and a message waits for it while it is Idle. The tick types nothing into it, and the inbox names cannot_type, the reason both clients show.
+    #[spec("inbox/doorbell/051")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_051_a_conflicted_generation_is_held_as_cannot_type() {
+        use crate::inbox_display::WakeHold;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-051-conflict", OnEnter::Submit);
+        conflict(&editor);
+        assert_eq!(
+            registry.doorbell_refusal(&editor.pane, &editor.id, true),
+            Some("input_mode_conflict")
+        );
+        let state = idle_with_mail(&editor).await;
+        let bell = crate::doorbell::spawn(
+            registry.clone(),
+            state,
+            tick_config(Duration::from_millis(150)),
+        );
+        until("cannot_type", || {
+            shown_hold(&editor) == Some(WakeHold::CannotType)
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            editor.typed().is_empty(),
+            "nothing typed into a conflicted generation"
+        );
+        bell.abort();
+        registry.shutdown_all();
+    }
+
+    /// Scenario: inbox/doorbell/052's activated half (f′): a measured Claude Code generation launched through a wrapper from before the input-mode reports, which never reports, so its evidence reads input_mode_unverified, while a message waits for it and it is Idle. The tick types nothing into it, and the inbox names cannot_type.
+    #[spec("inbox/doorbell/052")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_052_an_older_wrapper_is_held_as_cannot_type() {
+        use crate::inbox_display::WakeHold;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn_as(&registry, "pane-052-older", OnEnter::Submit, true);
+        assert!(
+            registry
+                .generation_doorbell(&editor.id)
+                .is_some_and(|doorbell| doorbell.wrapped()),
+            "launched as a wrapped generation"
+        );
+        assert_eq!(
+            registry.doorbell_refusal(&editor.pane, &editor.id, true),
+            Some("input_mode_unverified")
+        );
+        let state = idle_with_mail(&editor).await;
+        let bell = crate::doorbell::spawn(
+            registry.clone(),
+            state,
+            tick_config(Duration::from_millis(150)),
+        );
+        until("cannot_type", || {
+            shown_hold(&editor) == Some(WakeHold::CannotType)
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            editor.typed().is_empty(),
+            "nothing typed through an older wrapper"
+        );
+        bell.abort();
+        registry.shutdown_all();
+    }
+
+    /// Scenario: Q18 with the real publisher: a measured Claude Code generation reads doorbell; two processes then report its input mode, holding it as input_mode_conflict for the rest of its life, and its WAKE turns none with that clause. A second generation spends its last attempt number on a ring that submits, and turns none with attempt_exhausted; its next ring types nothing. Each refusal is published because the mode store or the counter changed, with nothing else asking.
+    #[spec("inbox/doorbell/057")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_057_sticky_refusals_reach_wake_through_the_publisher() {
+        use crate::inbox_hub::WakePath;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let _publisher = registry.spawn_doorbell_publisher().expect("the publisher");
+        let editor = ModelEditor::spawn(&registry, "pane-057-sticky", OnEnter::Submit);
+        until("doorbell once the header latched", || {
+            wake(&editor) == WakePath::Doorbell
+        })
+        .await;
+        conflict(&editor);
+        until("input_mode_conflict published", || {
+            registry
+                .inbox()
+                .wake_projection_for_test(&editor.pane, &editor.id)
+                .1
+                == Some("input_mode_conflict")
+        })
+        .await;
+        assert_eq!(wake(&editor), WakePath::None);
+
+        let last = ModelEditor::spawn(&registry, "pane-057-exhausted", OnEnter::Submit);
+        until("doorbell once the header latched", || {
+            wake(&last) == WakePath::Doorbell
+        })
+        .await;
+        registry
+            .generation_doorbell(&last.id)
+            .unwrap()
+            .counter()
+            .set_next_for_test(crate::doorbell_txn::ATTEMPT_RESERVED - 1);
+        let report = last.ring().await;
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(crate::doorbell_txn::Outcome::Submitted),
+            "{report:?}"
+        );
+        until("attempt_exhausted published", || {
+            registry
+                .inbox()
+                .wake_projection_for_test(&last.pane, &last.id)
+                .1
+                == Some("attempt_exhausted")
+        })
+        .await;
+        assert_eq!(wake(&last), WakePath::None);
+        let typed = last.typed();
+        let report = last.ring().await;
+        assert!(
+            matches!(
+                report.outcome,
+                RingOutcome::Txn(crate::doorbell_txn::Outcome::NothingWritten(_))
+            ),
+            "{report:?}"
+        );
+        assert_eq!(
+            last.typed(),
+            typed,
+            "an exhausted generation is not typed into"
+        );
+        registry.shutdown_all();
+    }
+
+    /// Scenario: inbox/doorbell/057 (i): with the publisher held at its gate, a generation's inputs change (two processes report its input mode) and a second request for it is queued. Nothing is published while held; once the gate opens, the hub holds the verdict for the newer inputs.
+    #[spec("inbox/doorbell/057")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_057_a_held_publisher_publishes_the_newer_inputs() {
+        use crate::inbox_hub::WakePath;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let _publisher = registry.spawn_doorbell_publisher().expect("the publisher");
+        let editor = ModelEditor::spawn(&registry, "pane-057-gate", OnEnter::Submit);
+        until("doorbell once the header latched", || {
+            wake(&editor) == WakePath::Doorbell
+        })
+        .await;
+        registry.hold_publisher(true);
+        conflict(&editor);
+        registry.request_reprojection(&editor.pane, &editor.id);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            wake(&editor),
+            WakePath::Doorbell,
+            "nothing published while held"
+        );
+        registry.hold_publisher(false);
+        until("the newer verdict", || wake(&editor) == WakePath::None).await;
+        registry.shutdown_all();
+    }
+
+    /// Scenario: The publisher's run for a generation reads its inputs and is held just before its hub write; meanwhile the generation exits and its hub entries go. Released, the run writes nothing back for the retired generation, and a successor in the pane reads its own route.
+    #[spec("inbox/doorbell/057")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_057_a_run_held_past_the_exit_puts_nothing_back() {
+        use crate::inbox_hub::WakePath;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let _publisher = registry.spawn_doorbell_publisher().expect("the publisher");
+        let editor = ModelEditor::spawn(&registry, "pane-057-fence", OnEnter::Submit);
+        conflict(&editor);
+        let projection = |id: &str| {
+            registry
+                .inbox()
+                .wake_projection_for_test("pane-057-fence", id)
+        };
+        until("the refusal published", || {
+            projection(&editor.id).1.is_some()
+        })
+        .await;
+        registry.hold_publisher_write(true);
+        registry.request_reprojection(&editor.pane, &editor.id);
+        until("the run read its inputs", || {
+            registry.publisher_write_reached()
+        })
+        .await;
+        let old = editor.id.clone();
+        registry.close_agent(&old).unwrap();
+        until("the exit cleared the entry", || {
+            projection(&old) == (None, None)
+        })
+        .await;
+        registry.hold_publisher_write(false);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            projection(&old),
+            (None, None),
+            "nothing put back for the retired generation"
+        );
+        drop(editor);
+        let successor = ModelEditor::spawn(&registry, "pane-057-fence", OnEnter::Submit);
+        until("the successor's own route", || {
+            wake(&successor) == WakePath::Doorbell
+        })
+        .await;
+        assert_eq!(projection(&old), (None, None));
+        registry.shutdown_all();
+    }
+
+    /// What a test thread logs, for the `doorbell attempt` line.
+    #[derive(Clone, Default)]
+    struct AttemptLog(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for AttemptLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for AttemptLog {
+        type Writer = AttemptLog;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Claude Code 2.1.310's empty composer with no header on the screen.
+    fn claude_composer_only(cols: usize) -> Vec<u8> {
+        let rule = "─".repeat(cols);
+        format!(
+            "\x1b[2J\x1b[H\x1b[25;1H{rule}\x1b[26;1H❯\u{a0}\x1b[2mTry \"fix the bug\"\x1b[22m\x1b[27;1H{rule}\x1b[28;3H? for shortcuts\x1b[26;3H"
+        )
+        .into_bytes()
+    }
+
+    /// Scenario: inbox/doorbell/055 (a′): a Claude Code 2.1.310 model editor's header is scrolled off by 200 lines and its screen redrawn without it before a ring. The admission uses the release latched from the header, and the `doorbell attempt` line names that release, that it came from the header, and the activation verdict.
+    #[spec("inbox/doorbell/055")]
+    #[tokio::test]
+    async fn doorbell_055_an_admission_after_the_header_scrolled_away_uses_the_latch() {
+        let log = AttemptLog::default();
+        let _capture = crate::test_isolation::capture_tracing_on_this_thread(
+            tracing_subscriber::fmt()
+                .with_writer(log.clone())
+                .with_max_level(tracing_subscriber::filter::LevelFilter::INFO)
+                .with_ansi(false)
+                .finish(),
+        );
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-055-scrolled", OnEnter::Submit);
+        editor.control.lock().unwrap().drawing = Drawing::Frozen;
+        editor.bus.push(b"scrolled\r\n".repeat(200));
+        editor.bus.push(claude_composer_only(EDITOR_COLS as usize));
+        editor.wait_clean();
+        let report = editor.ring().await;
+        assert!(
+            report.attempt.is_some(),
+            "admitted on the latch: {report:?}"
+        );
+        let text = String::from_utf8_lossy(&log.0.lock().unwrap()).into_owned();
+        let attempt = text
+            .lines()
+            .find(|line| line.contains("doorbell attempt") && !line.contains("not admitted"))
+            .unwrap_or_else(|| panic!("no attempt line in {text}"));
+        assert!(attempt.contains("release=\"2.1.310\""), "{attempt}");
+        assert!(attempt.contains("release_source=\"header\""), "{attempt}");
+        assert!(attempt.contains("activation=Go"), "{attempt}");
+        registry.shutdown_all();
+    }
+
+    /// Scenario: inbox/doorbell/055 (b′): a Claude Code model editor that never draws its start-up header shows its empty composer while a message waits and it is Idle. No release is latched, so the tick types nothing, the inbox names cannot_type with the words both clients show, and the message stays queued until a fetch takes it.
+    #[spec("inbox/doorbell/055")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_055_no_header_holds_the_doorbell_as_cannot_type() {
+        use crate::inbox_display::WakeHold;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn_headless(&registry, "pane-055-headless");
+        assert_eq!(
+            registry.doorbell_refusal(&editor.pane, &editor.id, true),
+            Some("unknown_release")
+        );
+        let state = idle_with_mail(&editor).await;
+        let bell = crate::doorbell::spawn(
+            registry.clone(),
+            state,
+            tick_config(Duration::from_millis(150)),
+        );
+        until("cannot_type", || {
+            shown_hold(&editor) == Some(WakeHold::CannotType)
+        })
+        .await;
+        assert_eq!(
+            WakeHold::CannotType.words(),
+            Some(crate::inbox_display::WAKE_HOLD_CANNOT_TYPE)
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            editor.typed().is_empty(),
+            "nothing typed with no release latched"
+        );
+        let facts = registry.inbox().doorbell_facts(&editor.pane, &editor.id);
+        assert_eq!(facts.queued.len(), 1, "the message stays queued");
+        let fetched = registry
+            .inbox()
+            .test_hook_fetch(&editor.pane, &editor.id, None);
+        assert_eq!(fetched.deliveries.len(), 1, "a fetch takes it");
+        bell.abort();
+        registry.shutdown_all();
+    }
+
+    /// Scenario: inbox/doorbell/037's PTY half: the model editor draws the deck's line only part-way and then stops, so the composer never holds the whole line. The deck waits out its echo window and sends no Enter: the attempt ends unresolved (echo mismatch) with no byte after the line.
+    #[spec("inbox/doorbell/037")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn doorbell_037_no_echo_of_the_whole_line_sends_no_enter_on_the_real_writer() {
+        use crate::doorbell_txn::{Cause, Outcome};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-no-echo", OnEnter::Submit);
+        editor.control.lock().unwrap().drawing = Drawing::Frozen;
+        let report = editor.ring().await;
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::Unresolved(Cause::EchoMismatch)),
+            "{report:?}"
+        );
+        let typed = editor.typed();
+        assert!(
+            !typed.contains(&b'\r'),
+            "{:?}",
+            String::from_utf8_lossy(&typed)
+        );
+        registry.shutdown_all();
+    }
+
+    /// Scenario: The line's write is parked inside the PTY so the writer started it and has not answered. Past the 200 ms write cap the transaction calls it stalled: the attempt ends unresolved (write stalled) with the cell suspended, the writer is released by the deadline, and once the write is let go its bytes land, with no Enter after them.
+    #[spec("inbox/doorbell/049")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_049_a_write_past_its_cap_is_stalled_and_the_writer_released() {
+        use crate::doorbell_txn::{Cause, Latch, Outcome, TXN_MAX};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-stalled", OnEnter::Submit);
+        let (reached, release) =
+            registry.pause_next_pty_write_for_test(&editor.pane, PtyWritePause::BeforeWrite);
+        let started = Instant::now();
+        let report = editor.ring().await;
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::Unresolved(Cause::WriteStalled)),
+            "{report:?}"
+        );
+        assert!(started.elapsed() < TXN_MAX + Duration::from_millis(500));
+        assert!(matches!(editor.cell(), Latch::Suspended(..)));
+        reached
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the write was parked");
+        release.send(()).unwrap();
+        typed_until(&editor, line_in).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!editor.typed().contains(&b'\r'));
+        registry.shutdown_all();
+    }
+
+    /// Scenario: The model editor's screen is replaced by a dialog once the deck's line is half typed, so the composer never shows the whole line. The deck sends no Enter: the attempt ends Unresolved for a dialog, the cell is suspended, and the next ring is refused while it stays so; the user's own Enter lifts it.
+    #[spec("inbox/doorbell/033")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn doorbell_033_a_dialog_mid_attempt_gets_no_enter_and_suspends_the_doorbell() {
+        use crate::doorbell_txn::{Latch, Outcome};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-dialog", OnEnter::Submit);
+        editor.control.lock().unwrap().dialog_at = Some(10);
+        let report = editor.ring().await;
+        let RingOutcome::Txn(Outcome::Unresolved(cause)) = report.outcome else {
+            panic!("{report:?}");
+        };
+        assert!(cause.is_dialog(), "{cause:?}");
+        assert!(
+            !editor.typed().contains(&b'\r'),
+            "no Enter: {:?}",
+            editor.typed()
+        );
+        assert!(matches!(editor.cell(), Latch::Suspended(..)));
+        assert_eq!(editor.ring().await.outcome, RingOutcome::Suspended);
+        let writer = registry.agent_writer(&editor.id).unwrap();
+        writer.lock().await.write_user(b"\r").await.unwrap();
+        assert!(matches!(
+            editor.cell(),
+            Latch::Resolved(_, crate::doorbell_txn::Resolution::User)
+        ));
+        registry.shutdown_all();
+    }
+
+    /// Scenario: A resize moves the model editor's PTY and the agent redraws its prompt for the new size between the resize's ioctl and the clearing of the old-size output. The doorbell's first ring after it is admitted on that redraw and submitted.
+    #[spec("inbox/doorbell/034")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn doorbell_034_a_repaint_racing_the_resize_clear_survives_for_the_first_ring() {
+        use crate::doorbell_txn::Outcome;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-resize", OnEnter::Submit);
+        let repaint = Arc::new(std::sync::Mutex::new(None));
+        const NARROWER: u16 = EDITOR_COLS - 10;
+        editor.control.lock().unwrap().cols = NARROWER as usize;
+        {
+            let pusher = Arc::clone(&editor.bus);
+            let repaint = Arc::clone(&repaint);
+            *editor.bus.between_resize_and_clear.lock().unwrap() = Some(Box::new(move || {
+                let (pushed_tx, pushed_rx) = std::sync::mpsc::channel();
+                let push = std::thread::spawn(move || {
+                    pusher.push(claude_screen("", &[], false, NARROWER as usize));
+                    let _ = pushed_tx.send(());
+                });
+                let _ = pushed_rx.recv_timeout(Duration::from_millis(500));
+                *repaint.lock().unwrap() = Some(push);
+            }));
+        }
+        registry
+            .resize(&editor.id, EDITOR_ROWS, NARROWER)
+            .expect("resize the pane");
+        repaint
+            .lock()
+            .unwrap()
+            .take()
+            .expect("test prerequisite: the repaint ran between the ioctl and the clear")
+            .join()
+            .expect("the repaint's push");
+        editor.wait_clean();
+        let report = editor.ring().await;
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::Submitted),
+            "the redraw for the resize must still be the frame the ring is admitted on"
+        );
+        registry.shutdown_all();
+    }
+
     /// Scenario: Admit human operations to a `cat` pane's ledger and end them every way they can end: refused, dropped by their caller, and written through the pane's writer; then let the deck write its own bytes. Each ticket settles once with its outcome, the watermark moves for every admission (so an operation already settled still shows), the job mark moves only when a ticket's bytes are queued for the PTY, and the deck's own bytes move neither.
     #[spec("inbox/doorbell/035")]
     #[tokio::test]
@@ -23755,10 +24838,14 @@ mod spawn_tests {
         let registry = Arc::new(AgentPtyRegistry::new());
         let (id, ledger) = ledger_pane(&registry, PANE);
         // The deck's own bytes take no ticket and move no mark.
-        let deck = registry
-            .write_doorbell(PANE, &id, false, None, Some("DECKLINE"), || async { true })
-            .await;
-        assert_eq!(deck, DoorbellWrite::Written);
+        {
+            let writer = registry.agent_writer(&id).expect("the pane's writer");
+            let w = writer.lock().await;
+            let mut job = w
+                .queue_deck_job(b"DECKLINE".to_vec(), Arc::default())
+                .expect("the writer thread runs");
+            assert_eq!(job.done().await, Some((8, true)));
+        }
         crate::test_pty_wait::wait_for_echo_bytes(&registry, &id, b"DECKLINE").await;
         let w0 = ledger.marks();
         assert_eq!((w0.watermark, w0.job_mark, w0.outstanding), (0, 0, 0));
@@ -23933,136 +25020,6 @@ mod spawn_tests {
             "nothing reaches the closed ledger"
         );
         drop(theirs);
-        registry.shutdown_all();
-    }
-
-    /// Scenario: A voice answer's ticket is admitted to a `cat` pane's generation and held while a doorbell is written; then an attach frame's job is parked inside the PTY write and its caller, which took the pane's frame count as the attach handler does, is dropped. The ledger keeps each outstanding, yet the doorbell's live input is still the caller-lifetime count: the doorbell is typed whole beside the voice ticket, and nothing reads in flight once the attach caller is gone.
-    #[spec("inbox/doorbell/035")]
-    #[tokio::test]
-    async fn doorbell_035_the_ledger_is_not_the_doorbells_input_yet() {
-        const PANE: &str = "pane-ledger-shadow";
-        let registry = Arc::new(AgentPtyRegistry::new());
-        let (id, ledger) = ledger_pane(&registry, PANE);
-
-        let voice = registry
-            .admit_ingress(&id)
-            .expect("a voice answer's ticket");
-        assert!(ledger.any_outstanding());
-        assert!(!registry.human_frame_in_flight(PANE));
-        let outcome = registry
-            .write_doorbell(PANE, &id, false, None, Some("SHADOWBELL"), || async {
-                true
-            })
-            .await;
-        assert_eq!(
-            outcome,
-            DoorbellWrite::Written,
-            "an outstanding voice ticket does not hold the doorbell yet"
-        );
-        crate::test_pty_wait::wait_for_echo_bytes(&registry, &id, b"SHADOWBELL").await;
-        drop(voice);
-
-        let writer = registry.agent_writer(&id).expect("the pane's writer");
-        let (reached, release) =
-            registry.pause_next_pty_write_for_test(PANE, PtyWritePause::BeforeWrite);
-        let ticket = registry.admit_ingress(&id).expect("admitted");
-        let attach = tokio::spawn({
-            let registry = Arc::clone(&registry);
-            let writer = writer.clone();
-            async move {
-                let _in_flight = registry.human_frame_arriving(PANE);
-                let w = writer.lock().await;
-                let _ = w.write_user_ticketed(b"ATTACHFRAME", Some(ticket)).await;
-            }
-        });
-        tokio::task::spawn_blocking(move || reached.recv_timeout(Duration::from_secs(8)))
-            .await
-            .unwrap()
-            .expect("the attach job reaches the PTY write");
-        assert!(
-            registry.human_frame_in_flight(PANE),
-            "while its caller lives"
-        );
-        attach.abort();
-        let _ = attach.await;
-        assert!(ledger.any_outstanding(), "the started job keeps its ticket");
-        assert!(
-            !registry.human_frame_in_flight(PANE),
-            "the doorbell's input ends with the attach caller, as before the ledger"
-        );
-        release.send(()).expect("release the parked write");
-        crate::test_pty_wait::wait_for_echo_bytes(&registry, &id, b"ATTACHFRAME").await;
-        registry.shutdown_all();
-    }
-
-    /// Qodo on PR #1817 (finding 17): a pane's human-frame count is kept only
-    /// while a frame for it is in flight, so a long-lived daemon holds none for
-    /// the panes it has finished with.
-    #[test]
-    fn a_pane_with_no_human_frame_in_flight_holds_no_count() {
-        let registry = AgentPtyRegistry::new();
-        let first = registry.human_frame_arriving("pane-a");
-        let second = registry.human_frame_arriving("pane-a");
-        let other = registry.human_frame_arriving("pane-b");
-        drop(first);
-        assert!(
-            registry.human_frame_in_flight("pane-a"),
-            "one frame is left"
-        );
-        drop(second);
-        drop(other);
-        assert!(!registry.human_frame_in_flight("pane-a"));
-        assert!(!registry.human_frame_in_flight("pane-b"));
-        assert!(
-            registry.human_frames_in_flight.lock().unwrap().is_empty(),
-            "a pane with no frame in flight keeps its count"
-        );
-        registry.shutdown_all();
-    }
-
-    /// Scenario: a doorbell writes its line into a `cat` pane, and a human input frame for that pane arrives while the doorbell awaits its admission re-check for the first step. The doorbell writes nothing and reports itself not admitted; once the frame is gone, the next doorbell is written (control).
-    #[spec("inbox/doorbell/032")]
-    #[tokio::test]
-    async fn doorbell_032_a_human_frame_during_the_admission_recheck_withholds_the_step() {
-        const PANE: &str = "pane-doorbell-human";
-        let registry = Arc::new(AgentPtyRegistry::new());
-        let id = registry
-            .spawn_agent(SpawnOptions {
-                command: Some("/bin/cat"),
-                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
-                    DOT_AGENT_DECK_PANE_ID.to_string(),
-                    PANE.to_string(),
-                )]),
-                ..SpawnOptions::default()
-            })
-            .expect("spawn the doorbell's pane");
-        let arrived = std::sync::Mutex::new(None);
-        let outcome = registry
-            .write_doorbell(PANE, &id, false, None, Some("TYPEDAHEAD"), || async {
-                let mut arrived = arrived.lock().unwrap();
-                if arrived.is_none() {
-                    *arrived = Some(registry.human_frame_arriving(PANE));
-                }
-                true
-            })
-            .await;
-        assert_eq!(
-            outcome,
-            DoorbellWrite::NotAdmitted,
-            "a human frame that arrived during the re-check must stop the step"
-        );
-        drop(arrived);
-        let control = registry
-            .write_doorbell(PANE, &id, false, None, Some("CONTROL"), || async { true })
-            .await;
-        assert_eq!(control, DoorbellWrite::Written, "control");
-        crate::test_pty_wait::wait_for_echo_bytes(&registry, &id, b"CONTROL").await;
-        let snapshot = registry.snapshot(&id).expect("pane snapshot");
-        assert!(
-            !String::from_utf8_lossy(&snapshot).contains("TYPEDAHEAD"),
-            "the doorbell typed ahead of the human frame: {:?}",
-            String::from_utf8_lossy(&snapshot)
-        );
         registry.shutdown_all();
     }
 

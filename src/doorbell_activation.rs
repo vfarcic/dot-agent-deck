@@ -78,7 +78,7 @@ pub enum Measurement<T> {
 }
 
 impl<T> Measurement<T> {
-    fn verified(&self) -> Option<&T> {
+    pub fn verified(&self) -> Option<&T> {
         match self {
             Measurement::Verified(value) => Some(value),
             _ => None,

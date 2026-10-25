@@ -12224,6 +12224,144 @@ pub fn write_late_announcing_paste_agent(
     )
 }
 
+/// PRD #1666 part 3, round 5-wake: an agent stand-in the doorbell can type
+/// into. In an e2e build the deck types only into an editor whose screen it has
+/// measured, and for tests that is the stand-in profile
+/// (`DOT_AGENT_DECK_TEST_COMPOSER_PROFILE=standin`, its contract in
+/// `tests/support/inbox_doorbell.rs`). This one puts its terminal in raw mode,
+/// draws that profile's rows and logs each line submitted to it to `argv[2]`:
+/// with `argv[3]` set to `late`, as [`LATE_ANNOUNCE_RECEIVED`] then
+/// `submitted|line`, each submit also reported with a `UserPromptSubmit` hook
+/// as Claude Code reports it; with `record`, as the line itself, and a
+/// doorbell line also runs `argv[1] inbox fetch` in the pane and appends what
+/// it printed.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub const PROFILED_AGENT: &str = r#"import os, sys, tty, termios, json, subprocess, re, select
+tty.setraw(0, termios.TCSANOW)
+deck, log, style = sys.argv[1], sys.argv[2], sys.argv[3]
+ring = re.compile(r'^\([a-z]{6}\) dot-agent-deck: message ')
+line = bytearray()
+escape = bytearray()
+taken = []
+def note(text):
+    with open(log, 'ab') as f:
+        f.write(text + b'\n')
+def redraw():
+    cols = os.get_terminal_size(0).columns
+    content = bytes(line) if line else b'\x1b[2m<empty>\x1b[22m'
+    os.write(1, b'\x1b[2J\x1b[HDOORBELL-STANDIN-READY\r\n' + b'W' * cols + b'\r\n\r\n'
+             + b''.join(b'SUBMITTED:' + t + b'\r\n' for t in taken[-5:])
+             + b'COMPOSER: ' + content)
+redraw()
+geometry = os.get_terminal_size(0)
+while True:
+    if os.get_terminal_size(0) != geometry:
+        geometry = os.get_terminal_size(0)
+        redraw()
+    if not select.select([0], [], [], 0.025)[0]:
+        continue
+    chunk = os.read(0, 4096)
+    if not chunk: break
+    for c in chunk:
+        if escape:
+            escape.append(c)
+            if len(escape) == 2 and c != 0x5b and c != 0x4f:
+                escape.clear()
+            elif len(escape) >= 3 and 0x40 <= c <= 0x7e:
+                escape.clear()
+        elif c == 27:
+            escape.append(c)
+        elif c == 13:
+            value = bytes(line)
+            taken.append(value)
+            line.clear()
+            redraw()
+            if style == 'late':
+                note(b'received|' + value)
+                prompt = {'hook_event_name': 'UserPromptSubmit',
+                          'session_id': 'genuine-' + os.environ.get('DOT_AGENT_DECK_PANE_ID', ''),
+                          'prompt': value.decode('utf-8', 'replace')}
+                subprocess.run([deck, 'hook', '--agent', 'claude-code'], input=json.dumps(prompt).encode(),
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
+                note(b'submitted|line')
+            else:
+                note(value)
+                if ring.match(value.decode('utf-8', 'replace')):
+                    result = subprocess.run([deck, 'inbox', 'fetch'], capture_output=True, timeout=8)
+                    note(result.stdout + result.stderr)
+        elif c == 21:
+            line.clear()
+        elif c in (8, 127):
+            if line: line.pop()
+        else:
+            line.append(c)
+    redraw()
+"#;
+
+/// Write [`PROFILED_AGENT`] into `dir` and answer its path, which the
+/// stand-in profile's binary variable names.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn write_profiled_agent(dir: &Path) -> PathBuf {
+    let path = dir.join("profiled-agent.py");
+    std::fs::write(&path, PROFILED_AGENT).expect("write profiled agent");
+    path
+}
+
+/// The shell line that hands a recorder shim's pane to [`PROFILED_AGENT`]
+/// (`script`), recording to `record` in its `record` style.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn exec_profiled_recorder(script: &Path, bin: &str, record: &Path) -> String {
+    let quote = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
+    format!(
+        "exec python3 {} {} {} record\n",
+        quote(&script.to_string_lossy()),
+        quote(bin),
+        quote(&record.to_string_lossy())
+    )
+}
+
+/// [`write_late_announcing_paste_agent`]'s prologue and genuine
+/// `SessionStart`, then [`PROFILED_AGENT`] in its `late` style as the
+/// reader. Answers the command to start, which names the profiled agent's
+/// path, and that path.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn write_late_announcing_profiled_agent(
+    dir: &Path,
+    log_name: &str,
+    announce_after_secs: u64,
+) -> (String, PathBuf) {
+    let genuine_start = late_announce_hook(
+        r#"{"hook_event_name":"SessionStart","session_id":"genuine-%s"}"#,
+        "\"$DOT_AGENT_DECK_PANE_ID\"",
+        98,
+    );
+    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
+    let script = write_profiled_agent(dir);
+    let quote = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
+    let shell = write_late_announcing_script(
+        dir,
+        &format!(
+            "{prologue}\
+             {genuine_start}\
+             exec python3 \"$1\" {bin} \"$log\" late\n",
+            prologue = late_announce_prologue(log_name, announce_after_secs),
+            bin = quote(bin),
+        ),
+    );
+    // `exec` all the way down, so the pane's own process is the one that runs
+    // the profiled agent's path.
+    let command = format!(
+        "exec {} {}",
+        quote(&shell.to_string_lossy()),
+        quote(&script.to_string_lossy())
+    );
+    (command, script)
+}
+
 /// Issue #1006: the same fixture with a REAL agent as its tail — the shape the
 /// field environment has (`devbox run agent` → init hooks → `claude`), and the
 /// one `prompt/new-pane/016` needs in order to be able to fail at all.

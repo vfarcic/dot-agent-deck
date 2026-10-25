@@ -122,12 +122,23 @@ while True:
     }
 
     fn start(daemon: &common::DaemonProc, text: &str, program: &std::path::Path) -> Pane {
+        Self::start_as(daemon, text, program, Some("codex"))
+    }
+
+    /// [`Self::start`], spawned as `agent_type`, or with none for the deck to
+    /// learn from the agent's own hooks.
+    fn start_as(
+        daemon: &common::DaemonProc,
+        text: &str,
+        program: &std::path::Path,
+        agent_type: Option<&str>,
+    ) -> Pane {
         let base = daemon.home.join("codex-inbox");
         std::fs::write(base.with_extension("screen"), text).unwrap();
         let reply = attach(
             daemon,
             json!({"op":"start-agent","command":common::capability_export_command(&format!("exec '{}'",program.display())),
-            "agent_type":"codex","cwd":daemon.home,"rows":40,"cols":140,
+            "agent_type":agent_type,"cwd":daemon.home,"rows":40,"cols":140,
             "env":[["DOT_AGENT_DECK_PANE_ID","codex-inbox"],["INBOX_CODEX_BASE",base],
                 ["CODEX_HOME",daemon.home.join(".codex")],
                 ["PATH",format!("{}:/usr/bin:/bin",program.parent().unwrap().display())]],"display_name":"codex inbox"}),
@@ -314,418 +325,70 @@ fn codex_003_hooks_dialog_receives_zero_bytes() {
     codex.no_bytes();
 }
 
-/// Scenario: Paint an unknown startup dialog in wrapped synthetic Codex and queue a task. The deck must withhold every byte until the child paints the positively recognised composer, then ring the fixed line without a launch prompt.
+/// Scenario: Paint an unknown startup dialog in wrapped synthetic Codex and queue a task, then paint its recognised empty composer. The deck types into no Codex release (its first stage commits what it types), so the pane must receive zero bytes on the dialog and on the composer, and the task must wait queued until a receiver takes it.
 #[spec("inbox/codex/004")]
 #[test]
-fn codex_004_unknown_dialog_holds_until_composer() {
+fn codex_004_codex_gets_no_byte_on_a_dialog_or_its_composer() {
     let codex = Codex::new(UNKNOWN);
     let id = codex.queued(BODY);
     codex.no_bytes();
     codex.paint(COMPOSER);
-    assert!(
-        common::wait_until(WAIT, || bytes(&codex.pane)
-            == format!("{}\r", fixed_line(&id)).as_bytes()),
-        "recognised composer must ring: {:?}",
-        bytes(&codex.pane)
-    );
-    codex.paint(UNKNOWN);
-    fetch(&codex.daemon, &codex.pane, true);
-    unchanged(&codex.pane, Duration::from_millis(1300));
-    assert_eq!(
-        bytes(&codex.pane),
-        format!("{}\r", fixed_line(&id)).as_bytes(),
-        "no cleanup CR into the unknown dialog"
-    );
-}
-
-/// Scenario: Start wrapped synthetic Codex directly at its empty composer before any own hook fires and queue a task. The fixed doorbell must be submitted without a launch-command prompt or body bytes.
-#[spec("inbox/codex/005")]
-#[test]
-fn codex_005_recognised_composer_rings_before_first_hook() {
-    let codex = Codex::new(COMPOSER);
-    let id = codex.queued(BODY);
-    assert!(
-        common::wait_until(WAIT, || bytes(&codex.pane)
-            == format!("{}\r", fixed_line(&id)).as_bytes()),
-        "composer must ring before the first own hook: {:?}",
-        bytes(&codex.pane)
-    );
-}
-
-/// Scenario: Strand a fixed line in Codex's recognized composer and pause its CR-only retry before admission. Fetch that selected task while another stays queued; releasing the attempt must send no CR and must not submit the settled task.
-#[spec("inbox/doorbell/031")]
-#[test]
-fn doorbell_031_codex_flush_only_rechecks_selected_message() {
-    let codex = Codex::new_with(
-        COMPOSER,
-        &[
-            ("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "500"),
-            ("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_PANE", "codex-inbox"),
-            ("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_DIR", "ring-barriers"),
-        ],
-    );
-    let root = codex.daemon.home.join("ring-barriers");
-    std::fs::create_dir_all(&root).unwrap();
-    let _budget = InterleaveBudget::start(&root);
-    std::fs::write(root.join("before-pre-cr.armed"), "").unwrap();
-    let base = codex.pane.capture.with_extension("strand");
-    std::fs::write(base.with_extension("empty"), COMPOSER).unwrap();
-    std::fs::write(&base, "").unwrap();
-    let id = codex.queued(BODY);
-    assert!(
-        common::wait_until(wait_budget(), || root
-            .join("before-pre-cr.reached")
-            .exists()),
-        "recognized Codex CR-only retry must reach its fence"
-    );
-    let first = format!("{}\r", fixed_line(&id));
-    assert_eq!(bytes(&codex.pane), first.as_bytes());
+    codex.no_bytes();
+    state(&codex.daemon, &codex.pane, &id, "queued");
     fetch(&codex.daemon, &codex.pane, true);
     state(&codex.daemon, &codex.pane, &id, "acknowledged");
-    let other = codex.queued("CODEX-SECOND-QUEUED");
-    state(&codex.daemon, &codex.pane, &other, "queued");
-    std::fs::write(root.join("completed.armed"), "").unwrap();
-    std::fs::write(root.join("before-pre-cr.release"), "").unwrap();
+    unchanged(&codex.pane, Duration::from_millis(500));
     assert!(
-        common::wait_until(wait_budget(), || root.join("completed.reached").exists()),
-        "CR-only attempt must complete"
+        bytes(&codex.pane).is_empty(),
+        "no byte after the fetch either"
     );
-    drained(&codex.pane);
-    assert_eq!(
-        bytes(&codex.pane),
-        first.as_bytes(),
-        "Codex CR-only retry must not submit the settled selected ID while another message remains queued"
-    );
-    assert!(
-        std::fs::read_to_string(base.with_extension("submitted"))
-            .unwrap_or_default()
-            .is_empty(),
-        "settled stranded Codex line was submitted"
-    );
-    std::fs::write(root.join("completed.release"), "").unwrap();
 }
 
-/// Scenario: Type into synthetic Codex and press Enter during its paste burst, which leaves the draft visible. A queued message must send zero bytes while that text remains, even after a native hook; clearing the composer must let the fixed doorbell ring separately, including when the screen poll starts after the placeholder has been replaced by the doorbell.
-#[spec("inbox/codex/012")]
+/// Scenario: Start wrapped synthetic Codex directly at its empty composer before any own hook fires and queue a task, then report its own SessionStart. The pane must receive zero bytes either way: no doorbell, no launch-command prompt and no body.
+#[spec("inbox/codex/005")]
 #[test]
-fn codex_012_retained_paste_burst_draft_holds_doorbell() {
-    for own_hook in [false, true] {
-        let codex = Codex::new(COMPOSER);
-        if own_hook {
-            codex.run_hook("SessionStart", None);
-        }
-        let base = codex.pane.capture.with_extension("keep");
-        std::fs::write(&base, "").unwrap();
-        std::fs::write(base.with_extension("empty"), COMPOSER).unwrap();
-        let mut input = common::AttachInput::attach(&codex.daemon.attach_socket, &codex.pane.agent);
-        input.write("human-retained-draft\r");
-        assert!(
-            common::wait_until(WAIT, || screen(&codex.daemon, &codex.pane)
-                .contains("› human-retained-draft")),
-            "stand-in must keep the human draft visibly on Enter"
-        );
-        let before = bytes(&codex.pane);
-        let id = codex.queued(BODY);
-        assert!(
-            !common::wait_until(Duration::from_millis(1300), || bytes(&codex.pane) != before),
-            "retained visible Codex draft must receive ZERO doorbell bytes (own_hook={own_hook}); before={before:?}; after={:?}\nPane:\n{}",
-            bytes(&codex.pane),
-            screen(&codex.daemon, &codex.pane)
-        );
-        state(&codex.daemon, &codex.pane, &id, "queued");
-        input.write("\x15");
-        if own_hook {
-            // Reproduce a slow screen poll deterministically: the doorbell
-            // may finish before the poll observes the empty placeholder.
-            assert!(common::wait_until(WAIT, || bytes(&codex.pane)
-                .ends_with(format!("{}\r", fixed_line(&id)).as_bytes())));
-        }
-        assert!(
-            common::wait_until(WAIT, || {
-                let shown = screen(&codex.daemon, &codex.pane);
-                shown.contains("Ask Codex to do anything") || shown.contains(&fixed_line(&id))
-            }),
-            "Ctrl+U must show an empty composer or its subsequently delivered doorbell"
-        );
-        assert!(
-            common::wait_until(WAIT, || bytes(&codex.pane)
-                .ends_with(format!("{}\r", fixed_line(&id)).as_bytes())),
-            "empty composer must release doorbell: {:?}",
-            bytes(&codex.pane)
-        );
-    }
-}
-
-/// Scenario: Start wrapped synthetic Codex at its empty composer, make it drop the first Enter after the doorbell line (as a real Codex 0.160.0 was seen to do), and queue a task. The line stays in the composer with the shortcuts hint hidden; the next ring must submit it with one bare carriage return instead of waiting for an empty composer forever, and must not type a second line on top of it.
-#[spec("inbox/codex/013")]
-#[test]
-fn codex_013_a_stranded_doorbell_line_is_submitted_by_the_next_ring() {
-    let codex = Codex::new_with(COMPOSER, &[("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "400")]);
-    let strand = codex.pane.capture.with_extension("strand");
-    std::fs::write(strand.with_extension("empty"), COMPOSER).unwrap();
-    std::fs::write(&strand, "").unwrap();
+fn codex_005_an_empty_composer_gets_no_byte_before_or_after_its_first_hook() {
+    let codex = Codex::new(COMPOSER);
     let id = codex.queued(BODY);
-    let line = fixed_line(&id);
-    assert!(
-        common::wait_until(WAIT, || screen(&codex.daemon, &codex.pane)
-            .contains(&format!("›  {}", line.trim_start()))),
-        "the stand-in must leave the rung line in its composer: {}",
-        screen(&codex.daemon, &codex.pane)
-    );
-    let flushed = format!("{line}\r\r");
-    assert!(
-        common::wait_until(WAIT, || bytes(&codex.pane).starts_with(flushed.as_bytes())),
-        "the next ring must submit the stranded line with a bare CR: {:?}\nPane:\n{}",
-        String::from_utf8_lossy(&bytes(&codex.pane)),
-        screen(&codex.daemon, &codex.pane)
-    );
-    // What follows the flush is the next ring's own pre-ring CR (the stand-in
-    // keeps the message queued), never a line typed on top of the flush.
-    assert!(
-        common::wait_until(WAIT, || bytes(&codex.pane).len() > flushed.len()),
-        "the doorbell must ring again while the message stays queued"
-    );
-    assert_eq!(
-        bytes(&codex.pane)[flushed.len()],
-        b'\r',
-        "no second line may be typed on top of the flush: {:?}",
-        String::from_utf8_lossy(&bytes(&codex.pane))
-    );
-    let submitted = strand.with_extension("submitted");
-    assert_eq!(
-        std::fs::read_to_string(&submitted)
-            .unwrap_or_default()
-            .lines()
-            .next(),
-        Some(line.as_str()),
-        "the flush must submit the stranded line itself"
-    );
-}
-
-/// The stand-in's composer holding `text`, shortcuts hint hidden as Codex
-/// 0.160 hides it while the composer holds text.
-fn holding(text: &str) -> String {
-    COMPOSER
-        .replace("Ask Codex to do anything", text)
-        .replace("? for shortcuts", "")
-}
-
-/// Scenario: Start wrapped synthetic Codex that drops the first Enter after text, queue a task and let its ring strand in the composer. Then repaint the composer so it holds a doorbell-shaped line naming a different message, cursor after it, while the deck's own ring is still outstanding: it must receive zero bytes. Repainting the deck's own line brings the flushing carriage return.
-#[spec("inbox/codex/014")]
-#[test]
-fn codex_014_a_doorbell_shaped_line_the_deck_did_not_type_gets_no_byte() {
-    let codex = Codex::new_with(COMPOSER, &[("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "2000")]);
-    let strand = codex.pane.capture.with_extension("strand");
-    std::fs::write(strand.with_extension("empty"), COMPOSER).unwrap();
-    std::fs::write(&strand, "").unwrap();
-    let id = codex.queued(BODY);
-    let line = fixed_line(&id);
-    let rung = format!("{line}\r");
-    assert!(
-        common::wait_until(WAIT, || bytes(&codex.pane) == rung.as_bytes()
-            && screen(&codex.daemon, &codex.pane)
-                .contains(&format!("›  {}", line.trim_start()))),
-        "the stand-in must leave the rung line in its composer: {:?}\nPane:\n{}",
-        String::from_utf8_lossy(&bytes(&codex.pane)),
-        screen(&codex.daemon, &codex.pane)
-    );
-    let crafted = fixed_line("m-crafted0-0000000000000000");
-    std::fs::write(
-        codex.pane.capture.with_extension("screen"),
-        holding(&crafted),
-    )
-    .unwrap();
-    assert!(
-        common::wait_until(WAIT, || screen(&codex.daemon, &codex.pane)
-            .contains(crafted.trim_start())),
-        "the crafted line must be on screen before the next ring is due: {}",
-        screen(&codex.daemon, &codex.pane)
-    );
-    assert!(
-        !common::wait_until(Duration::from_millis(4500), || bytes(&codex.pane).len()
-            > rung.len()),
-        "a doorbell-shaped line naming another message must get no byte, not even the flushing CR: {:?}\nPane:\n{}",
-        String::from_utf8_lossy(&bytes(&codex.pane)),
-        screen(&codex.daemon, &codex.pane)
-    );
+    codex.no_bytes();
+    codex.run_hook("SessionStart", None);
+    codex.no_bytes();
     state(&codex.daemon, &codex.pane, &id, "queued");
-    // Control: the same ring, due all along, flushes the deck's own line.
-    std::fs::write(codex.pane.capture.with_extension("screen"), holding(&line)).unwrap();
-    let flushed = format!("{line}\r\r");
-    assert!(
-        common::wait_until(WAIT, || bytes(&codex.pane).starts_with(flushed.as_bytes())),
-        "the deck's own stranded line must still be flushed: {:?}\nPane:\n{}",
-        String::from_utf8_lossy(&bytes(&codex.pane)),
-        screen(&codex.daemon, &codex.pane)
-    );
 }
 
-/// Scenario: Start wrapped synthetic Codex that drops the first Enter after text, queue a task, and let the next ring flush the stranded line. Then repaint the composer holding that same line and fetch the message so it leaves `queued` while no ring is due: the owed cleanup is the one carriage return that goes, and after it the still-painted line gets zero bytes. A second message queued under that line, which the deck never typed there, gets nothing either until the composer is empty again.
-#[spec("inbox/codex/015")]
+/// Scenario: Start the synthetic Codex at its empty composer under a name the deck does not recognise and with no agent type, then let its own hooks report it as Codex and queue a task. The deck learns the type from the hooks and still types nothing: zero bytes reach the pane, the task waits queued, and the agent's WAKE names its hooks' turn-end route, not the doorbell.
+#[spec("inbox/codex/024")]
 #[test]
-fn codex_015_no_flush_once_the_cleanup_cr_dropped_the_record() {
-    let codex = Codex::new_with(
-        COMPOSER,
-        &[("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "400,60000")],
-    );
-    let strand = codex.pane.capture.with_extension("strand");
-    std::fs::write(strand.with_extension("empty"), COMPOSER).unwrap();
-    std::fs::write(&strand, "").unwrap();
-    let id = codex.queued(BODY);
-    let line = fixed_line(&id);
-    let flushed = format!("{line}\r\r");
-    assert!(
-        common::wait_until(WAIT, || bytes(&codex.pane) == flushed.as_bytes()
-            && screen(&codex.daemon, &codex.pane)
-                .contains("› Ask Codex to do anything")),
-        "the second ring must flush the stranded line and leave the composer empty: {:?}\nPane:\n{}",
-        String::from_utf8_lossy(&bytes(&codex.pane)),
-        screen(&codex.daemon, &codex.pane)
-    );
-    std::fs::write(codex.pane.capture.with_extension("screen"), holding(&line)).unwrap();
-    assert!(
-        common::wait_until(WAIT, || screen(&codex.daemon, &codex.pane)
-            .contains(&format!("›  {}", line.trim_start()))),
-        "the repainted line must be on screen before the message leaves queued: {}",
-        screen(&codex.daemon, &codex.pane)
-    );
-    fetch(&codex.daemon, &codex.pane, true);
-    let cleaned = format!("{flushed}\r");
-    assert!(
-        common::wait_until(WAIT, || bytes(&codex.pane) == cleaned.as_bytes()),
-        "the message leaving queued is owed its one cleanup CR: {:?}\nPane:\n{}",
-        String::from_utf8_lossy(&bytes(&codex.pane)),
-        screen(&codex.daemon, &codex.pane)
-    );
-    // The stand-in repaints its empty composer after that CR; paint the line
-    // back only once it has, so its repaint cannot land on top.
-    assert!(
-        common::wait_until(WAIT, || screen(&codex.daemon, &codex.pane)
-            .contains("› Ask Codex to do anything")),
-        "the stand-in must repaint after the cleanup CR: {}",
-        screen(&codex.daemon, &codex.pane)
-    );
-    std::fs::write(codex.pane.capture.with_extension("screen"), holding(&line)).unwrap();
-    assert!(
-        common::wait_until(WAIT, || screen(&codex.daemon, &codex.pane)
-            .contains(&format!("›  {}", line.trim_start()))),
-        "the line must be painted back: {}",
-        screen(&codex.daemon, &codex.pane)
-    );
-    assert!(
-        !common::wait_until(Duration::from_millis(4500), || bytes(&codex.pane).len()
-            > cleaned.len()),
-        "once the message has left queued its line gets no further CR: {:?}\nPane:\n{}",
-        String::from_utf8_lossy(&bytes(&codex.pane)),
-        screen(&codex.daemon, &codex.pane)
-    );
-    let next = codex.queued(BODY);
-    assert!(
-        !common::wait_until(Duration::from_millis(4500), || bytes(&codex.pane).len()
-            > cleaned.len()),
-        "a line the deck has no record of gets nothing, not even for a due ring: {:?}\nPane:\n{}",
-        String::from_utf8_lossy(&bytes(&codex.pane)),
-        screen(&codex.daemon, &codex.pane)
-    );
-    state(&codex.daemon, &codex.pane, &next, "queued");
-    // Control: once the composer is empty the doorbell rings again.
-    std::fs::write(codex.pane.capture.with_extension("screen"), COMPOSER).unwrap();
-    let rung_again = format!("{cleaned}{}\r", fixed_line(&next));
-    assert!(
-        common::wait_until(WAIT, || bytes(&codex.pane)
-            .starts_with(rung_again.as_bytes())),
-        "an empty composer must take the next ring: {:?}",
-        String::from_utf8_lossy(&bytes(&codex.pane))
-    );
-}
-
-/// Scenario: Start wrapped synthetic Codex that, as real Codex 0.160.0 did under CPU pressure, takes the doorbell's Enter as a newline in its composer, leaving the line there with the cursor on the empty row below it at the composer indent, and queue a task. The next ring must submit the line with one bare carriage return instead of waiting forever, and type no second line on top of it.
-#[spec("inbox/codex/016")]
-#[test]
-fn codex_016_a_line_whose_enter_became_a_newline_is_submitted_by_the_next_ring() {
-    let codex = Codex::new_with(COMPOSER, &[("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "400")]);
-    let newline = codex.pane.capture.with_extension("newline");
-    std::fs::write(newline.with_extension("empty"), COMPOSER).unwrap();
-    std::fs::write(&newline, "").unwrap();
-    let id = codex.queued(BODY);
-    let line = fixed_line(&id);
-    let rung = format!("{line}\r");
-    assert!(
-        common::wait_until(WAIT, || bytes(&codex.pane).starts_with(rung.as_bytes())
-            && screen(&codex.daemon, &codex.pane)
-                .contains(&format!("›  {}", line.trim_start()))),
-        "the stand-in must leave the rung line in its composer: {:?}\nPane:\n{}",
-        String::from_utf8_lossy(&bytes(&codex.pane)),
-        screen(&codex.daemon, &codex.pane)
-    );
-    let flushed = format!("{rung}\r");
-    assert!(
-        common::wait_until(WAIT, || bytes(&codex.pane).starts_with(flushed.as_bytes())),
-        "the next ring must submit the line with a bare CR: {:?}\nPane:\n{}",
-        String::from_utf8_lossy(&bytes(&codex.pane)),
-        screen(&codex.daemon, &codex.pane)
-    );
-    let submitted = newline.with_extension("submitted");
-    assert!(
-        common::wait_until(WAIT, || std::fs::read_to_string(&submitted)
-            .unwrap_or_default()
-            .lines()
-            .next()
-            == Some(line.as_str())),
-        "the flush must submit the line itself: {:?}",
-        std::fs::read_to_string(&submitted)
-    );
-    // The stand-in keeps the message queued, so the doorbell rings again:
-    // that ring starts with its own pre-ring CR, never a line on top.
-    assert!(
-        common::wait_until(WAIT, || bytes(&codex.pane).len() > flushed.len()),
-        "the doorbell must ring again while the message stays queued"
-    );
+fn codex_024_a_pane_its_hooks_call_codex_gets_no_byte() {
+    let mut codex = Codex::new(UNKNOWN);
     assert_eq!(
-        bytes(&codex.pane)[flushed.len()],
-        b'\r',
-        "no second line may be typed on top of the flush: {:?}",
-        String::from_utf8_lossy(&bytes(&codex.pane))
+        attach(
+            &codex.daemon,
+            json!({"op":"stop-agent","id":codex.pane.agent})
+        )["ok"],
+        true
     );
-}
-
-/// Scenario: Start wrapped synthetic Codex that takes the doorbell's Enter as a newline in its composer and then also ignores the first flushing carriage return, and queue a task. The line is still the deck's own and still stranded, so the following ring must send another lone carriage return, which submits it: one swallowed flush must not strand the worker.
-#[spec("inbox/codex/017")]
-#[test]
-fn codex_017_a_swallowed_flush_is_retried_by_the_next_ring() {
-    let codex = Codex::new_with(COMPOSER, &[("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "400")]);
-    let newline = codex.pane.capture.with_extension("newline");
-    std::fs::write(newline.with_extension("empty"), COMPOSER).unwrap();
-    std::fs::write(newline.with_extension("swallow"), "").unwrap();
-    std::fs::write(&newline, "").unwrap();
+    for suffix in ["pid", "bytes"] {
+        let _ = std::fs::remove_file(codex.pane.capture.with_extension(suffix));
+    }
+    let untyped = codex._bin.path().join("assistant");
+    std::fs::copy(codex._bin.path().join("codex"), &untyped).unwrap();
+    codex.pane = Codex::start_as(&codex.daemon, COMPOSER, &untyped, None);
+    codex.run_hook("SessionStart", None);
+    codex.run_hook("Stop", None);
     let id = codex.queued(BODY);
-    let line = fixed_line(&id);
-    let swallowed = format!("{line}\r\r");
+    codex.no_bytes();
+    state(&codex.daemon, &codex.pane, &id, "queued");
+    // Codex's own hooks take its messages at the end of its turns, and
+    // that is the route WAKE names, not the doorbell.
     assert!(
-        common::wait_until(WAIT, || bytes(&codex.pane)
-            .starts_with(swallowed.as_bytes())
-            && !newline.with_extension("swallow").exists()),
-        "the stand-in must swallow the first flushing CR: {:?}\nPane:\n{}",
-        String::from_utf8_lossy(&bytes(&codex.pane)),
-        screen(&codex.daemon, &codex.pane)
-    );
-    let submitted = newline.with_extension("submitted");
-    let retried = format!("{swallowed}\r");
-    assert!(
-        common::wait_until(WAIT, || bytes(&codex.pane).starts_with(retried.as_bytes())
-            && std::fs::read_to_string(&submitted)
-                .unwrap_or_default()
-                .lines()
-                .next()
-                == Some(line.as_str())),
-        "the next ring's lone CR must submit the still-stranded line: {:?} submitted {:?}\nPane:\n{}",
-        String::from_utf8_lossy(&bytes(&codex.pane)),
-        std::fs::read_to_string(&submitted),
-        screen(&codex.daemon, &codex.pane)
+        common::wait_until(WAIT, || record(&codex)["inbox"]["wake"] == "turn_end"),
+        "{}",
+        record(&codex)
     );
 }
 
-/// Scenario: Report Codex's own busy hook, replace its screen with an unfamiliar mid-session screen and queue a task. Its own Idle must still wait for an empty recognised composer; restarting in the same pane on a startup dialog must keep every byte out of that dialog.
+/// Scenario: Report Codex's own busy hook, replace its screen with an unfamiliar mid-session screen and queue a task. Its own Idle must type nothing, and neither must its recognised composer drawn after, since the deck types into no Codex release; restarting in the same pane on a startup dialog must keep every byte out of that dialog.
 #[spec("inbox/codex/006")]
 #[test]
 fn codex_006_own_hook_gates_status_and_restart_resets_guard() {
@@ -745,10 +408,10 @@ fn codex_006_own_hook_gates_status_and_restart_resets_guard() {
     let mut response = Vec::new();
     std::io::Read::read_to_end(&mut socket, &mut response).unwrap();
     codex.no_bytes();
+    // Nor does its recognised composer: the deck types into no Codex release.
     codex.paint(COMPOSER);
-    assert!(common::wait_until(WAIT, || bytes(&codex.pane)
-        .windows(fixed_line(&id).len())
-        .any(|w| w == fixed_line(&id).as_bytes())));
+    codex.no_bytes();
+    state(&codex.daemon, &codex.pane, &id, "queued");
     assert_eq!(
         attach(
             &codex.daemon,
@@ -925,18 +588,15 @@ fn record(codex: &Codex) -> Value {
         .expect("the Codex agent's record")
 }
 
-/// Scenario: With none of the deck's Codex hooks running (untrusted), queue a task for idle synthetic Codex; the deck types its doorbell, and a stand-in model runs the real `dot-agent-deck inbox fetch` in the pane, which prints the framing and the block naming its attempt and settles it by its receipt. With the pane's receipt records made unwritable, a second fetch still prints and settles its task, and the card says messages may repeat.
+/// Scenario: With none of the deck's Codex hooks running (untrusted), queue a task for idle synthetic Codex; the deck types nothing into Codex, and a stand-in model runs the real `dot-agent-deck inbox fetch` in the pane, which prints the framing and the block naming its attempt and settles it by its receipt. With the pane's receipt records made unwritable, a second fetch still prints and settles its task, and the card says messages may repeat.
 #[spec("inbox/codex/020")]
 #[test]
 fn codex_020_untrusted_hooks_a_model_run_fetch_commits_on_receipts() {
     let codex = Codex::new(COMPOSER);
     let id = codex.queued("untrusted-hooks task 7c41");
-    assert!(
-        common::wait_until(WAIT, || bytes(&codex.pane)
-            == format!("{}\r", fixed_line(&id)).as_bytes()),
-        "the doorbell asks the model to fetch: {:?}",
-        bytes(&codex.pane)
-    );
+    // The deck types no doorbell into Codex; the model runs the fetch the
+    // way it would for the deck's own line.
+    codex.no_bytes();
     let fetched = codex.model_fetch();
     let stdout = String::from_utf8_lossy(&fetched.stdout);
     assert!(fetched.status.success(), "fetch: {fetched:?}");
@@ -978,18 +638,13 @@ fn codex_020_untrusted_hooks_a_model_run_fetch_commits_on_receipts() {
     );
 }
 
-/// Scenario: With Codex's prompt hook switched off and its Stop hook trusted, an idle task reaches the model through the doorbell and a model-run `inbox fetch`, and a busy task through the real Stop hook; then a Stop hook and a model-run fetch run at once over two queued tasks. Each task is handed over to exactly one of them, printed once and settled by its receipt once.
+/// Scenario: With Codex's prompt hook switched off and its Stop hook trusted, an idle task reaches the model through a model-run `inbox fetch` with nothing typed into the pane, and a busy task through the real Stop hook; then a Stop hook and a model-run fetch run at once over two queued tasks. Each task is handed over to exactly one of them, printed once and settled by its receipt once.
 #[spec("inbox/codex/021")]
 #[test]
 fn codex_021_prompt_hook_off_doorbell_fetch_idle_and_stop_busy_each_once() {
     let codex = Codex::new(COMPOSER);
     let idle = codex.queued("idle task via fetch 51aa");
-    assert!(
-        common::wait_until(WAIT, || bytes(&codex.pane)
-            == format!("{}\r", fixed_line(&idle)).as_bytes()),
-        "{:?}",
-        bytes(&codex.pane)
-    );
+    codex.no_bytes();
     let fetched = codex.model_fetch();
     assert!(fetched.status.success(), "{fetched:?}");
     assert!(String::from_utf8_lossy(&fetched.stdout).contains("idle task via fetch 51aa"));

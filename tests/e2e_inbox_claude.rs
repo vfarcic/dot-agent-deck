@@ -37,17 +37,46 @@ fn parent(endpoint: &impl Endpoint, name: &str) -> Pane {
 /// [`parent`] spawned as `agent_type`; `None` starts it from its command
 /// alone, as a role or a resumed session is, with no agent type to go by.
 fn parent_as(endpoint: &impl Endpoint, name: &str, agent_type: Option<&str>) -> Pane {
+    parent_with(endpoint, name, agent_type, false)
+}
+
+/// [`parent`] drawing the e2e stand-in profile's screen and selecting that
+/// profile, so the doorbell types into it (PRD #1666 part 3, round 5-wake: in
+/// an e2e build the deck types into no Claude Code release, since none is
+/// measured there).
+fn parent_profiled(endpoint: &impl Endpoint, name: &str) -> Pane {
+    parent_with(endpoint, name, Some("claude_code"), true)
+}
+
+fn parent_with(
+    endpoint: &impl Endpoint,
+    name: &str,
+    agent_type: Option<&str>,
+    profiled: bool,
+) -> Pane {
     let script = endpoint.cwd().join(format!("{name}.py"));
     std::fs::write(&script, r#"import os, sys, tty, termios, json, subprocess, glob, select, time
 tty.setraw(0, termios.TCSANOW)
-base, deck = sys.argv[1:]
+base, deck = sys.argv[1:3]
+profiled = sys.argv[3:] == ['profiled']
+line = bytearray()
+taken = []
+def redraw():
+    cols = os.get_terminal_size(0).columns
+    content = bytes(line) if line else b'\x1b[2m<empty>\x1b[22m'
+    os.write(1, b'\x1b[2J\x1b[HDOORBELL-STANDIN-READY\r\n' + b'W' * cols + b'\r\nCLAUDE-PARENT-READY\r\n'
+             + b''.join(b'SUBMITTED:' + t + b'\r\n' for t in taken[-5:])
+             + b'COMPOSER: ' + content)
 def publish(suffix, value):
     path = base + '.' + suffix
     with open(path + '.tmp', 'w') as f: json.dump(value, f)
     os.replace(path + '.tmp', path)
 with open(base + '.pid', 'w') as f: f.write(str(os.getpid()))
 capture = open(base + '.bytes', 'ab', buffering=0)
-os.write(1, b'CLAUDE-PARENT-READY\r\n')
+if profiled:
+    redraw()
+else:
+    os.write(1, b'CLAUDE-PARENT-READY\r\n')
 running = {}
 while True:
     for path in sorted(glob.glob(base + '.cmd-*')):
@@ -83,7 +112,8 @@ while True:
             argv = ['/bin/sh', '-c', request['shell']] if 'shell' in request else [deck, 'hook', '--agent', 'claude-code']
             result = subprocess.run(argv, input=payload, capture_output=True, timeout=15, env=env)
             publish('result-' + tag, {'code':result.returncode, 'stdout':result.stdout.decode(), 'stderr':result.stderr.decode()})
-            os.write(1, b'HOOK-FINISHED:' + tag.encode() + b'\r\n')
+            if not profiled:
+                os.write(1, b'HOOK-FINISHED:' + tag.encode() + b'\r\n')
     for tag, (child, out, err) in list(running.items()):
         code = child.poll()
         if code is not None:
@@ -94,7 +124,20 @@ while True:
         chunk = os.read(0, 4096)
         if not chunk: break
         capture.write(chunk)
-        os.write(1, chunk)
+        if not profiled:
+            os.write(1, chunk)
+            continue
+        for c in chunk:
+            if c == 13:
+                taken.append(bytes(line))
+                line.clear()
+            elif c == 21:
+                line.clear()
+            elif c in (8, 127):
+                if line: line.pop()
+            elif c >= 32:
+                line.append(c)
+        redraw()
 "#).unwrap();
     let base = endpoint.cwd().join(format!(".native-{name}"));
     let quote = |path: &std::path::Path| path.to_string_lossy().replace('\'', "'\\''");
@@ -102,16 +145,29 @@ while True:
         // Keep the managed shell alive after the scripted Claude dies. This
         // makes /007 test waiter parent-death handling, rather than the
         // daemon's whole-pane teardown killing the waiter for us.
-        "python3 '{}' '{}' '{}'; exec /bin/sleep 600",
+        "{}python3 '{}' '{}' '{}'{}",
+        // The profiled stand-in is the pane's own process, as the profile
+        // requires, so nothing outlives it.
+        if profiled { "exec " } else { "" },
         quote(&script),
         quote(&base),
-        quote(std::path::Path::new(env!("CARGO_BIN_EXE_dot-agent-deck")))
+        quote(std::path::Path::new(env!("CARGO_BIN_EXE_dot-agent-deck"))),
+        if profiled {
+            " profiled"
+        } else {
+            "; exec /bin/sleep 600"
+        }
     ));
     let mut start = json!({"op":"start-agent","command":command,
         "cwd":endpoint.cwd(),"rows":40,"cols":140,
         "env":[["DOT_AGENT_DECK_PANE_ID",name],["PATH",claude_path(endpoint.cwd())]],"display_name":name});
     if let Some(agent_type) = agent_type {
         start["agent_type"] = json!(agent_type);
+    }
+    if profiled {
+        let env = start["env"].as_array_mut().unwrap();
+        env.push(json!(["DOT_AGENT_DECK_TEST_COMPOSER_PROFILE", "standin"]));
+        env.push(json!(["DOT_AGENT_DECK_TEST_COMPOSER_BINARY", script]));
     }
     let reply = attach(endpoint, start);
     assert_eq!(reply["ok"], true, "scripted Claude spawn: {reply}");
@@ -998,7 +1054,7 @@ fn pre_inbox_env() -> Value {
 #[test]
 fn claude_047_a_pre_inbox_hook_that_never_asks_for_mail_is_named_and_recovers() {
     let daemon = daemon(&[]);
-    let pane = parent(&daemon, "claude-pre-inbox");
+    let pane = parent_profiled(&daemon, "claude-pre-inbox");
     command_with(
         &pane,
         "stale-start",
@@ -1032,10 +1088,10 @@ fn claude_047_a_pre_inbox_hook_that_never_asks_for_mail_is_named_and_recovers() 
         json!({"kind":"hook","payload":payload(&pane, "Stop"),"env":pre_inbox_env()}),
     );
     assert_eq!(result(&pane, "stale-stop")["code"], 0);
-    let line = fixed_line(&id);
     assert!(
         common::wait_until(WAIT, || String::from_utf8_lossy(&bytes(&pane))
-            .contains(line.trim_start())),
+            .split('\r')
+            .any(|line| is_ring_line(line, &id))),
         "the doorbell is typed for the old hooks: {:?}",
         String::from_utf8_lossy(&bytes(&pane))
     );

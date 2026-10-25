@@ -59,6 +59,11 @@ thread_local! {
 
 /// One six-second operation budget, shorter than the seam's eight seconds.
 /// Unwinding releases every armed barrier before the fixture is torn down.
+/// The doorbell's e2e interleave seams, in the order an attempt reaches them:
+/// the tick's decision, the transaction admitted with the writer held, its
+/// first line stage written, and the tick's completion.
+pub const RING_PHASES: [&str; 4] = ["decided", "admitted", "after-line", "completed"];
+
 pub struct InterleaveBudget {
     root: PathBuf,
 }
@@ -77,14 +82,7 @@ impl InterleaveBudget {
 
 impl Drop for InterleaveBudget {
     fn drop(&mut self) {
-        for phase in [
-            "decided",
-            "after-pre-cr",
-            "after-delay",
-            "before-submit",
-            "before-pre-cr",
-            "completed",
-        ] {
+        for phase in RING_PHASES {
             let _ = std::fs::write(self.root.join(format!("{phase}.release")), "");
         }
         INTERLEAVE_DEADLINE.with(|cell| cell.set(None));
@@ -95,14 +93,7 @@ impl Drop for InterleaveBudget {
 pub fn wait_budget() -> Duration {
     INTERLEAVE_ROOT.with(|cell| {
         if let Some(root) = cell.borrow().as_ref() {
-            for phase in [
-                "decided",
-                "after-pre-cr",
-                "after-delay",
-                "before-submit",
-                "before-pre-cr",
-                "completed",
-            ] {
+            for phase in RING_PHASES {
                 assert!(
                     !root.join(format!("{phase}.timed-out")).exists(),
                     "interleave seam timed out at {phase}"
@@ -149,13 +140,19 @@ fn write_all_budgeted(socket: &mut UnixStream, mut bytes: &[u8]) -> std::io::Res
 /// A completed policy tick at an explicitly advanced age, including all its
 /// spawned attempts. The recorder drain then makes zero input a history oracle.
 pub fn clock_step(daemon: &impl Endpoint, pane: &Pane, age_ms: u64) {
+    clock_step_holding(daemon, pane, age_ms, b"");
+}
+
+/// [`clock_step`] for a pane that already holds `held`: nothing may follow
+/// it at the controlled age.
+pub fn clock_step_holding(daemon: &impl Endpoint, pane: &Pane, age_ms: u64, held: &[u8]) {
     let root = daemon.home().join("ring-barriers");
     std::fs::write(root.join("clock-ms"), age_ms.to_string()).unwrap();
     assert!(
         common::wait_until(wait_budget(), || {
             assert!(
-                bytes(pane).is_empty(),
-                "unready generation received automatic input at controlled policy age {age_ms}ms: {:?}",
+                bytes(pane) == held,
+                "the pane received automatic input at controlled policy age {age_ms}ms: {:?}",
                 String::from_utf8_lossy(&bytes(pane))
             );
             std::fs::read_to_string(root.join("clock-observed"))
@@ -165,8 +162,8 @@ pub fn clock_step(daemon: &impl Endpoint, pane: &Pane, age_ms: u64) {
     );
     drained(pane);
     assert!(
-        bytes(pane).is_empty(),
-        "unready generation received automatic input at controlled policy age {age_ms}ms: {:?}",
+        bytes(pane) == held,
+        "the pane received automatic input at controlled policy age {age_ms}ms: {:?}",
         String::from_utf8_lossy(&bytes(pane))
     );
 }
@@ -244,10 +241,17 @@ pub fn pane(daemon: &impl Endpoint, name: &str) -> Pane {
 
 /// [`pane`], with `extra`'s fields merged into the start request (an
 /// `agent_type`, more `env` pairs appended to the pane's own).
+///
+/// PRD #1666 part 3, round 5-wake: the stand-in draws the e2e build's
+/// stand-in profile's screen (its ready row, a row of `W` as wide as the
+/// terminal, its label, the lines it took, and `COMPOSER: ` with what it
+/// holds or a dim `<empty>`), redrawn whole on every key and resize, and the
+/// pane selects that profile through its selector and the script's own path,
+/// so the doorbell types into it. `"profile": false` in `extra` leaves the
+/// pane unprofiled, which the doorbell holds as `cannot_type`.
 pub fn pane_with(daemon: &impl Endpoint, name: &str, extra: Value) -> Pane {
     let script = daemon.home().join(format!("{name}.py"));
-    // Raw mode preserves CR versus LF and disables kernel echo. Render the
-    // received line so the same bytes can also be checked through vt100.
+    // Raw mode preserves CR versus LF and disables kernel echo.
     std::fs::write(&script, r#"import os, sys, tty, termios, time, json, select
 tty.setraw(0, termios.TCSANOW)
 base = sys.argv[1]
@@ -256,29 +260,66 @@ with open(base + '.pid', 'w') as f: f.write(str(os.getpid()))
 capture = open(base + '.bytes', 'ab', buffering=0)
 turns = open(base + '.turns', 'a', buffering=1)
 label = os.environ.get('DOORBELL_STANDIN_LABEL', '')
-os.write(1, ('DOORBELL-STANDIN-READY' + label + '\r\n').encode())
 line = bytearray()
+escape = bytearray()
+string = bytearray()
+taken = []
+def redraw():
+    cols = os.get_terminal_size(0).columns
+    content = bytes(line) if line else b'\x1b[2m<empty>\x1b[22m'
+    frame = (b'\x1b[2J\x1b[HDOORBELL-STANDIN-READY\r\n' + b'W' * cols + b'\r\n'
+             + label.encode() + b'\r\n'
+             + b''.join(b'SUBMITTED:' + t + b'\r\n' for t in taken[-5:])
+             + b'COMPOSER: ' + content)
+    os.write(1, frame)
+redraw()
+geometry = os.get_terminal_size(0)
 while True:
+    current = os.get_terminal_size(0)
+    if current != geometry:
+        geometry = current
+        redraw()
     if not select.select([0], [], [], 0.025)[0]:
         if os.path.exists(base + '.drain'):
             os.remove(base + '.drain')
             open(base + '.drained', 'w').close()
-        if label: os.write(1, ('\r\n' + label + '\r\n').encode())
+        if label: redraw()
         continue
     chunk = os.read(0, 4096)
     if not chunk: break
     capture.write(chunk)
     for c in chunk:
-        if c == 13:
+        if string:
+            # OSC, DCS, APC and PM run to BEL or ESC backslash, as in a terminal.
+            if c == 7 or (string[-1] == 27 and c == 0x5c):
+                string.clear()
+            else:
+                string.append(c)
+        elif escape:
+            escape.append(c)
+            if len(escape) == 2 and c in (0x5d, 0x50, 0x5f, 0x5e):
+                escape.clear()
+                string.append(c)
+            elif len(escape) == 2 and c != 0x5b and c != 0x4f:
+                escape.clear()
+            elif len(escape) >= 3 and 0x40 <= c <= 0x7e:
+                escape.clear()
+        elif c == 27:
+            escape.append(c)
+        elif c == 13 and os.path.exists(base + '.drop-enter'):
+            # An editor that did not take the Enter: the line stays.
+            pass
+        elif c == 13:
             turns.write(json.dumps({'time':time.monotonic(), 'line':line.decode('utf-8', 'replace')}) + '\n')
-            os.write(1, b'\r\nSUBMITTED:' + line + b'\r\n')
+            taken.append(bytes(line))
             line.clear()
         elif c == 21:
             line.clear()
-            os.write(1, b'\r\x1b[2K')
+        elif c in (8, 127):
+            if line: line.pop()
         else:
             line.append(c)
-            os.write(1, bytes([c]))
+    redraw()
 "#).unwrap();
     let base = daemon.home().join(name);
     let quote = |path: &std::path::Path| path.to_string_lossy().replace('\'', "'\\''");
@@ -286,7 +327,15 @@ while True:
     let mut start = json!({"op":"start-agent",
         "command":common::capability_export_command(&command), "cwd":daemon.cwd(),
         "rows":40,"cols":140,"env":[["DOT_AGENT_DECK_PANE_ID",name]],"display_name":name});
+    if extra["profile"] != false {
+        let env = start["env"].as_array_mut().unwrap();
+        env.push(json!(["DOT_AGENT_DECK_TEST_COMPOSER_PROFILE", "standin"]));
+        env.push(json!(["DOT_AGENT_DECK_TEST_COMPOSER_BINARY", script]));
+    }
     for (key, value) in extra.as_object().into_iter().flatten() {
+        if key == "profile" {
+            continue;
+        }
         if key == "env" {
             let env = start["env"].as_array_mut().unwrap();
             env.extend(value.as_array().cloned().unwrap_or_default());
@@ -774,8 +823,52 @@ pub fn fetch_not_handed(daemon: &impl Endpoint, pane: &Pane) -> Value {
     reply
 }
 
+/// The doorbell line naming `id`, without its ring token.
 pub fn fixed_line(id: &str) -> String {
     format!("{PREFIX}{id} waiting, run: dot-agent-deck inbox fetch")
+}
+
+/// Whether `line` is the doorbell's token-led line naming `id`: `(`, six
+/// lowercase letters, `)`, then [`fixed_line`] (PRD #1666 part 3, round
+/// 5-wake).
+pub fn is_ring_line(line: &str, id: &str) -> bool {
+    token_led(line).is_some_and(|rest| rest == fixed_line(id))
+}
+
+/// The doorbell line `line` carries after its ring token, if it has one.
+pub fn token_led(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix('(')?;
+    let (token, rest) = rest.split_at_checked(6)?;
+    let rest = rest.strip_prefix(')')?;
+    (token.bytes().all(|b| b.is_ascii_lowercase()) && rest.starts_with(PREFIX)).then_some(rest)
+}
+
+/// Whether `line` is the start of a token-led doorbell line naming `id`, as
+/// a line still arriving shows.
+pub fn is_ring_line_prefix(line: &str, id: &str) -> bool {
+    let head: Vec<char> = line.chars().take(8).collect();
+    let token_ok = head.iter().enumerate().all(|(i, c)| match i {
+        0 => *c == '(',
+        7 => *c == ')',
+        _ => c.is_ascii_lowercase(),
+    });
+    token_ok && (line.len() <= 8 || fixed_line(id).starts_with(&line[8..]))
+}
+
+/// Every token-led line the pane took, in order, from its submitted turns.
+pub fn ring_lines(pane: &Pane) -> Vec<String> {
+    rings(pane)
+        .into_iter()
+        .filter_map(|turn| turn["line"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// The token-led line the pane took for `id`, from its submitted turns.
+pub fn rung_line(pane: &Pane, id: &str) -> Option<String> {
+    turns(pane)
+        .into_iter()
+        .filter_map(|turn| turn["line"].as_str().map(str::to_string))
+        .find(|line| is_ring_line(line, id))
 }
 
 pub fn bytes(pane: &Pane) -> Vec<u8> {
@@ -805,11 +898,7 @@ pub fn turns(pane: &Pane) -> Vec<Value> {
 pub fn rings(pane: &Pane) -> Vec<Value> {
     turns(pane)
         .into_iter()
-        .filter(|turn| {
-            turn["line"]
-                .as_str()
-                .is_some_and(|line| line.starts_with(PREFIX))
-        })
+        .filter(|turn| turn["line"].as_str().and_then(token_led).is_some())
         .collect()
 }
 
@@ -846,19 +935,17 @@ pub fn screen(daemon: &impl Endpoint, pane: &Pane) -> String {
 }
 
 pub fn ring(daemon: &impl Endpoint, pane: &Pane, id: &str) {
-    let line = fixed_line(id);
     assert!(
-        common::wait_until(wait_budget(), || rings(pane)
-            .iter()
-            .any(|turn| turn["line"] == line)),
-        "doorbell must submit {line:?}; received={:?}; grid={}",
+        common::wait_until(wait_budget(), || rung_line(pane, id).is_some()),
+        "doorbell must submit its line for {id}; received={:?}; grid={}",
         bytes(pane),
         screen(daemon, pane)
     );
+    let line = rung_line(pane, id).unwrap();
     assert!(
         common::wait_until(wait_budget(), || screen(daemon, pane)
             .contains(&format!("SUBMITTED:{line}"))),
-        "submitted fixed doorbell must be visible: {}",
+        "submitted doorbell must be visible: {}",
         screen(daemon, pane)
     );
     assert!(

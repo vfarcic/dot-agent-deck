@@ -4025,10 +4025,10 @@ without depending on the config struct API.
 
 #### orchestration/delegate
 
-##### orchestration/delegate/001 — An attested orchestrator delegates a multiline task to a synthetic worker. One bound inbox message and a task file without an ack-first header must result; the worker fetches the framed task after the fixed doorbell, without receiving task bytes on stdin.
+##### orchestration/delegate/001 — An attested orchestrator delegates a multiline task to a synthetic worker. One bound inbox message and a task file without an ack-first header must result; the worker fetches the framed task after the token-led doorbell, without receiving task bytes on stdin.
 - **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
 - **Agent:** none.
-- **Asserts:** An attested orchestrator delegates a multiline task to a synthetic worker. One bound inbox message and a task file without an ack-first header must result; the worker fetches the framed task after the fixed doorbell, without receiving task bytes on stdin.
+- **Asserts:** An attested orchestrator delegates a multiline task to a synthetic worker. One bound inbox message and a task file without an ack-first header must result; the worker fetches the framed task after the token-led doorbell, without receiving task bytes on stdin.
 - **Test:** `delegate_001_posts_one_bound_task_and_worker_fetches` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
@@ -6513,11 +6513,11 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** the fork-time event's own card-surfacing role; real codex-cli boot output (`codex/live/001`).
 - **Platform coverage:** mac+linux (unix-only — `openpty` and a POSIX shell stand-in).
 
-##### codex/wrap/007 — Create a dispatcher through the real TUI using a wrapped Codex stand-in with no Codex trust helper on PATH. Before fetching, the pane may receive only fixed doorbells; after Idle it fetches and visibly renders exactly one seed without typed seed content.
+##### codex/wrap/007 — Create a dispatcher through the real TUI using a wrapped Codex stand-in with no Codex trust helper on PATH. Nothing is typed into the Codex pane and its seed waits queued; when its model runs `inbox fetch` on its own, it visibly renders exactly one seed without typed seed content.
 - **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
 - **Agent:** none.
-- **Asserts:** Create a dispatcher through the real TUI using a wrapped Codex stand-in with no Codex trust helper on PATH. Before fetching, the pane may receive only fixed doorbells; after Idle it fetches and visibly renders exactly one seed without typed seed content.
-- **Test:** `codex_wrap_007_untrusted_codex_pane_receives_its_seed_once` in `tests/e2e_codex_seed_delivery.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Asserts:** Create a dispatcher through the real TUI using a wrapped Codex stand-in with no Codex trust helper on PATH. The pane receives zero bytes before and after its Idle, over a one-second observation, and the seed stays queued; the stand-in then runs the real `inbox fetch` on its own, as a model would, and the attached pane visibly renders exactly one seed, acknowledged, without typed seed content.
+- **Test:** `codex_wrap_007_untrusted_codex_pane_gets_no_typed_seed_and_fetches_it_once` in `tests/e2e_codex_seed_delivery.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
 
@@ -7655,10 +7655,10 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** any `$SHELL` fallback — `command` is now a required field, so there is no implicit-shell case (the former omitted-command fallback was removed); prompt delivery for this case (covered by spawn/002 + spawn/004).
 - **Platform coverage:** mac+linux.
 
-##### scheduler/spawn/004 — Fire a single scheduled task without a SessionStart hook. One agent and one bound inbox message appear; the pane fetches the prompt through its fixed doorbell rather than receiving prompt bytes on stdin.
+##### scheduler/spawn/004 — Fire a single scheduled task without a SessionStart hook. One agent and one bound inbox message appear; the pane fetches the prompt through its token-led doorbell rather than receiving prompt bytes on stdin.
 - **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
 - **Agent:** none.
-- **Asserts:** Fire a single scheduled task without a SessionStart hook. One agent and one bound inbox message appear; the pane fetches the prompt through its fixed doorbell rather than receiving prompt bytes on stdin.
+- **Asserts:** Fire a single scheduled task without a SessionStart hook. One agent and one bound inbox message appear; the pane fetches the prompt through its token-led doorbell rather than receiving prompt bytes on stdin.
 - **Test:** `spawn_004_fires_spawn_exactly_once_and_delivers` in `tests/e2e_scheduler_spawn.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
@@ -7811,10 +7811,10 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the cap counter's publication branch itself (the existing `abandonment_reports_state_and_never_writes_into_the_pane` unit test fills all 256 slots and proves that the 257th publishes this notice).
 - **Platform coverage:** mac+linux.
 
-##### scheduler/dispatch/023 — A human draft holds the fixed inbox doorbell until Enter.
+##### scheduler/dispatch/023 — A human draft holds the inbox doorbell until Enter.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), real binary, daemon-owned PTY and attach input stream.
-- **Agent:** none (raw Python stand-in; no agent credential).
-- **Asserts:** while Queued work waits behind a draft, more human keystrokes reach the pane promptly; Enter submits the draft separately and releases only the fixed doorbell. A companion case forwards terminal reports and checks they do not defer the fixed line. Replaces the typed-pointer fast test and its obsolete capped-write siblings under PRD #1666; Ctrl+U/no-cap and identity cancellation are in `inbox/doorbell/008–010`.
+- **Agent:** none (the e2e stand-in profile's Python editor (selected by `DOT_AGENT_DECK_TEST_COMPOSER_PROFILE=standin` with `DOT_AGENT_DECK_TEST_COMPOSER_BINARY` naming the executable the pane runs); no agent executable or credential).
+- **Asserts:** while Queued work waits behind a draft the stand-in's composer shows, more human keystrokes reach the pane promptly; Enter submits the draft separately and releases one token-led doorbell, the capture being exactly the draft, its Enter, the line and its Enter. A companion case forwards terminal reports (mouse, focus, cursor-position, device-attribute, OSC and DCS replies) and checks they do not defer the doorbell: the capture is exactly the reports, then the line and its Enter. Ctrl+U/no-cap and identity cancellation are in `inbox/doorbell/008–010`.
 - **Does not assert:** producer routing from delegate (S5), a real agent editor, or model execution.
 - **Platform coverage:** mac+linux.
 
@@ -7983,7 +7983,7 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 ##### scheduler/manager/002 — Editing a schedule reuses the Ctrl+n dir-picker + mode-locked Edit Schedule form; submitting spawns the seeded authoring agent running the CONFIGURED command (`default_command`), pre-filled with the row's current values (PRD #127 M3.3; PRD #170 M2.1 + unified Add/Edit flow).
 - **Layer:** L2 (same no-L1-seam reason for the manager dialog; the mode-locked form's render is covered at L1 by `scheduler/form/001`). Two shims are on PATH: a distinctive `default_command` (e.g. `stub-authoring`) shimmed to a recorder that posts SessionStart and records its delivered seed, and `claude` shimmed to a separate neutralizing recorder (so the host's real `claude` is never invoked and so a fall-back-to-`claude` regression is observable).
 - **Agent:** the shimmed authoring agent (records the built-in seed after gated delivery).
-- **Asserts:** (PRD #1666 S5: the seed is posted to the authoring agent's inbox; the recorder shim answers the deck's doorbell with `inbox fetch` and records what it fetched, so the seed it records is the one posted.) with `default_command` set to the distinctive stub, pressing `e` on a row opens the directory picker (` Select Directory `); confirming the dir with Space opens the mode-locked ` Edit Schedule ` form (Command pre-filled from `default_command`); submitting via `[Submit]` spawns the seeded authoring agent running THAT configured command — its recorder receives the authoring seed carrying the row's current prompt value (pre-fill), AND the `claude` recorder receives nothing (the confirmed command came from `default_command`). RED until the unified flow exists: today `e` opens the deleted pick-agent modal, so the dir picker's ` Select Directory ` chrome never renders and the wait times out.
+- **Asserts:** (PRD #1666 S5: the seed is posted to the authoring agent's inbox; the recorder shim posts its SessionStart and hands its pane to the shared profiled agent, which the deck types its doorbell into under the e2e stand-in profile, selected from the daemon's own environment, and which answers it with `inbox fetch` and records what it fetched, so the seed it records is the one posted.) with `default_command` set to the distinctive stub, pressing `e` on a row opens the directory picker (` Select Directory `); confirming the dir with Space opens the mode-locked ` Edit Schedule ` form (Command pre-filled from `default_command`); submitting via `[Submit]` spawns the seeded authoring agent running THAT configured command — its recorder receives the authoring seed carrying the row's current prompt value (pre-fill), AND the `claude` recorder receives nothing (the confirmed command came from `default_command`). RED until the unified flow exists: today `e` opens the deleted pick-agent modal, so the dir picker's ` Select Directory ` chrome never renders and the wait times out.
 - **Does not assert:** the full authoring seed-prompt text; that the agent ultimately calls `schedule update` (covered by the CLI + seed-delivery mechanism); the add (blank) path (covered by `scheduler/form/002` / `scheduler/manager/010`); the spawn-in-picked-dir / working_dir pre-seed (covered by `scheduler/form/002` / `scheduler/form/003`); the mode-locked form's render (covered by `scheduler/form/001`).
 - **Platform coverage:** mac+linux.
 
@@ -8032,7 +8032,7 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 ##### scheduler/manager/010 — A blank/unset `default_command` falls back to `claude` (`DEFAULT_AUTHORING_COMMAND`) for the authoring agent, NOT a bare `$SHELL` (PRD #170 R1 fallback, via the unified Add flow).
 - **Layer:** L2 (drives the real manager + dir-picker + mode-locked form via PTY; observed via a `claude` recorder shim on disk).
 - **Agent:** the shimmed `claude` authoring agent (records the gated-delivered seed).
-- **Asserts:** (PRD #1666 S5: the seed is posted to the authoring agent's inbox; the recorder shim answers the deck's doorbell with `inbox fetch` and records what it fetched, so the seed it records is the one posted.) with `default_command = ""` (the unconfigured-user case), pressing `a` (Add) opens the directory picker (` Select Directory `); confirming the dir with Space opens the mode-locked ` New Schedule ` form whose Command pre-fills via the resolved authoring command (a blank default → `claude`); submitting via `[Submit]` spawns `claude` — its recorder receives the base authoring seed (`throwaway authoring session`) — proving the blank command resolves to the default authoring command instead of spawning a bare login shell that cannot act on the seed. RED until the unified flow exists: today `a` opens the deleted pick-agent modal, so the dir picker never appears and the ` Select Directory ` wait times out.
+- **Asserts:** (PRD #1666 S5: the seed is posted to the authoring agent's inbox; the recorder shim posts its SessionStart and hands its pane to the shared profiled agent, which the deck types its doorbell into under the e2e stand-in profile, selected from the daemon's own environment, and which answers it with `inbox fetch` and records what it fetched, so the seed it records is the one posted.) with `default_command = ""` (the unconfigured-user case), pressing `a` (Add) opens the directory picker (` Select Directory `); confirming the dir with Space opens the mode-locked ` New Schedule ` form whose Command pre-fills via the resolved authoring command (a blank default → `claude`); submitting via `[Submit]` spawns `claude` — its recorder receives the base authoring seed (`throwaway authoring session`) — proving the blank command resolves to the default authoring command instead of spawning a bare login shell that cannot act on the seed. RED until the unified flow exists: today `a` opens the deleted pick-agent modal, so the dir picker never appears and the ` Select Directory ` wait times out.
 - **Does not assert:** the whitespace-only variant of the fallback (the same code path); the mode-locked form's render (covered by `scheduler/form/001`).
 - **Platform coverage:** mac+linux.
 
@@ -8062,14 +8062,14 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 ##### scheduler/form/002 — Manager Add reuses the Ctrl+n dir-picker + mode-locked ` New Schedule ` form; submitting spawns the seeded authoring agent IN the picked directory (PRD #170 unified Add/Edit flow).
 - **Layer:** L2 (drives the real manager → dir picker → mode-locked form via PTY; observed via distinct-name recorder shims on disk that record their spawn `pwd` then the delivered seed). `default_command = "stub-add-authoring"` (a recorder shim) with a `claude` neutralizer on PATH.
 - **Agent:** the shimmed `stub-add-authoring` authoring agent (records spawn cwd + the gated-delivered seed).
-- **Asserts:** (PRD #1666 S5: the seed is posted to the authoring agent's inbox; the recorder shim answers the deck's doorbell with `inbox fetch` and records what it fetched, so the seed it records is the one posted.) pressing `a` (Add) opens the directory picker (` Select Directory `); confirming the current dir with Space opens the mode-locked ` New Schedule ` form (Command pre-filled from `default_command`); submitting via `[Submit]` spawns the seeded authoring agent — its recorder receives the base authoring seed (`throwaway authoring session`) AND its recorded `pwd` carries the picked dir's basename (the agent spawned IN the confirmed directory), while the `claude` neutralizer stays empty. RED until the unified flow exists: today `a` opens the deleted pick-agent modal, so the dir picker never appears and the ` Select Directory ` wait times out.
+- **Asserts:** (PRD #1666 S5: the seed is posted to the authoring agent's inbox; the recorder shim posts its SessionStart and hands its pane to the shared profiled agent, which the deck types its doorbell into under the e2e stand-in profile, selected from the daemon's own environment, and which answers it with `inbox fetch` and records what it fetched, so the seed it records is the one posted.) pressing `a` (Add) opens the directory picker (` Select Directory `); confirming the current dir with Space opens the mode-locked ` New Schedule ` form (Command pre-filled from `default_command`); submitting via `[Submit]` spawns the seeded authoring agent — its recorder receives the base authoring seed (`throwaway authoring session`) AND its recorded `pwd` carries the picked dir's basename (the agent spawned IN the confirmed directory), while the `claude` neutralizer stays empty. RED until the unified flow exists: today `a` opens the deleted pick-agent modal, so the dir picker never appears and the ` Select Directory ` wait times out.
 - **Does not assert:** the Edit pre-fill / working_dir-from-row behavior (covered by `scheduler/form/003`); the blank-default→`claude` fallback (covered by `scheduler/manager/010`); the mode-locked form's render (covered by `scheduler/form/001`).
 - **Platform coverage:** mac+linux.
 
 ##### scheduler/form/003 — Manager Edit starts the dir picker at the row's `working_dir`, pre-fills the authoring seed with the existing schedule's values, and spawns the agent IN that working_dir (PRD #170 unified Add/Edit flow).
 - **Layer:** L2 (drives the real manager → dir picker → mode-locked form via PTY; observed via distinct-name recorder shims on disk that record their spawn `pwd` then the delivered seed). `default_command = "stub-edit-authoring"` (a recorder shim) with a `claude` neutralizer on PATH; the fixture row's `working_dir` is a distinctively-named existing dir (`.../EDITWORKDIR`) and its prompt is `EDITPROMPTMARKER`.
 - **Agent:** the shimmed `stub-edit-authoring` authoring agent (records spawn cwd + the gated-delivered seed).
-- **Asserts:** (PRD #1666 S5: the seed is posted to the authoring agent's inbox; the recorder shim answers the deck's doorbell with `inbox fetch` and records what it fetched, so the seed it records is the one posted.) pressing `e` (Edit) opens the directory picker which STARTS at the row's `working_dir`; confirming it with Space (no navigation) opens the mode-locked ` Edit Schedule ` form; submitting via `[Submit]` spawns the seeded authoring agent — its recorder receives the row's distinctive prompt `EDITPROMPTMARKER` (the seed is PRE-FILLED with the existing schedule's values) AND its recorded `pwd` carries `EDITWORKDIR` (the picker started at, and pre-seeded as the spawn cwd, the row's working_dir), while the `claude` neutralizer stays empty. RED until the unified flow exists: today `e` opens the deleted pick-agent modal, so the dir picker never appears and the ` Select Directory ` wait times out.
+- **Asserts:** (PRD #1666 S5: the seed is posted to the authoring agent's inbox; the recorder shim posts its SessionStart and hands its pane to the shared profiled agent, which the deck types its doorbell into under the e2e stand-in profile, selected from the daemon's own environment, and which answers it with `inbox fetch` and records what it fetched, so the seed it records is the one posted.) pressing `e` (Edit) opens the directory picker which STARTS at the row's `working_dir`; confirming it with Space (no navigation) opens the mode-locked ` Edit Schedule ` form; submitting via `[Submit]` spawns the seeded authoring agent — its recorder receives the row's distinctive prompt `EDITPROMPTMARKER` (the seed is PRE-FILLED with the existing schedule's values) AND its recorded `pwd` carries `EDITWORKDIR` (the picker started at, and pre-seeded as the spawn cwd, the row's working_dir), while the `claude` neutralizer stays empty. RED until the unified flow exists: today `e` opens the deleted pick-agent modal, so the dir picker never appears and the ` Select Directory ` wait times out.
 - **Does not assert:** the Add (blank-context) path (covered by `scheduler/form/002`); the configured-command vs `claude` resolution beyond the neutralizer check (covered by `scheduler/manager/002`); the mode-locked form's render (covered by `scheduler/form/001`).
 - **Platform coverage:** mac+linux.
 
@@ -8090,14 +8090,14 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 ##### scheduler/form/006 — On Edit, re-picking a DIFFERENT working_dir makes that picked dir WIN in the authoring seed — no conflicting old-vs-new working_dir (PRD #170 round 4, reviewer F3).
 - **Layer:** L2 (drives the real manager → dir picker → mode-locked form via PTY; observed via a distinct-name recorder shim on disk that records its spawn `pwd` then the delivered seed). `default_command = "stub-repick-authoring"` (a recorder shim) with a `claude` neutralizer on PATH; the fixture row's `working_dir` is a distinctively-named existing dir (`.../ROWDIRALPHA`) with a sibling re-pick target (`.../PICKDIRBRAVO`) and the row's prompt is `EDITPROMPTF3`.
 - **Agent:** the shimmed `stub-repick-authoring` authoring agent (records spawn cwd + the gated-delivered seed).
-- **Asserts:** (PRD #1666 S5: the seed is posted to the authoring agent's inbox; the recorder shim answers the deck's doorbell with `inbox fetch` and records what it fetched, so the seed it records is the one posted.) pressing `e` (Edit) opens the dir picker started at the row's `working_dir` (`ROWDIRALPHA`); going UP one level (`h`) and descending into the DIFFERENT sibling `PICKDIRBRAVO` (double-click, confirmed via its `INNERMARK` child) then confirming with Space, and submitting via `[Submit]`, spawns the seeded authoring agent whose recorded seed — once delivered through its `EDITPROMPTF3` prompt line (which follows the `working_dir:` line) — carries `PICKDIRBRAVO` but ZERO occurrences of the row's stale `ROWDIRALPHA`. RED today: the edit seed appends the row's `working_dir: .../ROWDIRALPHA` as a conflicting current value alongside the picked `working_dir DEFAULT: .../PICKDIRBRAVO`.
+- **Asserts:** (PRD #1666 S5: the seed is posted to the authoring agent's inbox; the recorder shim posts its SessionStart and hands its pane to the shared profiled agent, which the deck types its doorbell into under the e2e stand-in profile, selected from the daemon's own environment, and which answers it with `inbox fetch` and records what it fetched, so the seed it records is the one posted.) pressing `e` (Edit) opens the dir picker started at the row's `working_dir` (`ROWDIRALPHA`); going UP one level (`h`) and descending into the DIFFERENT sibling `PICKDIRBRAVO` (double-click, confirmed via its `INNERMARK` child) then confirming with Space, and submitting via `[Submit]`, spawns the seeded authoring agent whose recorded seed — once delivered through its `EDITPROMPTF3` prompt line (which follows the `working_dir:` line) — carries `PICKDIRBRAVO` but ZERO occurrences of the row's stale `ROWDIRALPHA`. RED today: the edit seed appends the row's `working_dir: .../ROWDIRALPHA` as a conflicting current value alongside the picked `working_dir DEFAULT: .../PICKDIRBRAVO`.
 - **Does not assert:** the unchanged-pick / pre-fill path (covered by `scheduler/form/003`); the in-`src` `build_schedule_authoring_mode` seed unit tests (the coder's); the Add path (covered by `scheduler/form/002`).
 - **Platform coverage:** mac+linux.
 
 ##### scheduler/form/007 — Selecting the experimental `schedule: issues` Mode option seeds the authoring agent with ISSUE-DISPATCH instructions (calls `schedule add --repo …`, gathers `max_per_run`), distinct from the plain `schedule` seed (PRD #120).
 - **Layer:** L2 (drives the real new-pane dialog via PTY — the experimental issue-dispatch option lives on the Ctrl+n Mode cycler, not the mode-locked manager form, so this drives Ctrl+n directly; observed via a `stub-issue-authoring` recorder shim on disk that records the gated-delivered seed). `default_command = "stub-issue-authoring"`; the deck is launched with `DOT_AGENT_DECK_EXPERIMENTAL=1`.
 - **Agent:** the shimmed `stub-issue-authoring` authoring agent (records the gated-delivered seed).
-- **Asserts:** (PRD #1666 S5: the seed is posted to the authoring agent's inbox; the recorder shim answers the deck's doorbell with `inbox fetch` and records what it fetched, so the seed it records is the one posted.) opening the new-pane form (Ctrl+n → Space confirms the dir) and cycling the Mode field to the `schedule: issues` option (waited on via the selection-dependent ` … — schedule: issues mode ` title), then submitting via `[Submit]`, spawns the seeded authoring agent whose recorded seed contains the issue-dispatch guidance `schedule add --repo` AND `max_per_run` — neither present in the plain `schedule` seed (which calls `schedule add --name`). RED today: no `schedule: issues` option exists, so cycling never lands on it and the `schedule: issues mode` title wait times out.
+- **Asserts:** (PRD #1666 S5: the seed is posted to the authoring agent's inbox; the recorder shim posts its SessionStart and hands its pane to the shared profiled agent, which the deck types its doorbell into under the e2e stand-in profile, selected from the daemon's own environment, and which answers it with `inbox fetch` and records what it fetched, so the seed it records is the one posted.) opening the new-pane form (Ctrl+n → Space confirms the dir) and cycling the Mode field to the `schedule: issues` option (waited on via the selection-dependent ` … — schedule: issues mode ` title), then submitting via `[Submit]`, spawns the seeded authoring agent whose recorded seed contains the issue-dispatch guidance `schedule add --repo` AND `max_per_run` — neither present in the plain `schedule` seed (which calls `schedule add --name`). RED today: no `schedule: issues` option exists, so cycling never lands on it and the `schedule: issues mode` title wait times out.
 - **Does not assert:** the flag-gated visibility of the option in the cycler (covered by `prompt/new-pane/010`); the CLI write the agent ultimately performs (covered by `scheduler/cli/004`); the full seed-prompt text (loose substring on the issue-dispatch-specific tokens); the plain `schedule` seed (covered by `scheduler/form/002`).
 - **Platform coverage:** mac+linux.
 
@@ -8178,7 +8178,7 @@ Since PRD #1666 S5 the deck types nothing into the orchestrator: its idle, waiti
 ##### scheduler/idle-worker/011 — A silent worker's inbox notice visibly renders in its synthetic orchestrator.
 - **Layer:** L2 PTY-attached, real binary and daemon, tests/e2e_idle_worker_detector.rs.
 - **Agent:** None; isolated routing recorders consume messages with the real in-pane inbox CLI.
-- **Asserts:** A delegated task remains queued; the overdue notice is fetched and acknowledged by its orchestrator, visibly shows daemon provenance and an untrusted worker-role label, and only fixed doorbell bytes enter its PTY.
+- **Asserts:** A delegated task remains queued; the overdue notice is fetched and acknowledged by its orchestrator, visibly shows daemon provenance and an untrusted worker-role label, and only token-led doorbell lines enter its PTY.
 - **Does not assert:** Real model compliance, covered by /012 and orchestration/delegate/024.
 - **Platform coverage:** mac+linux.
 
@@ -8547,15 +8547,15 @@ Since PRD #1666 S5 the deck types nothing into the orchestrator: its idle, waiti
 
 ##### newagent/authoring/001 — Every authoring kind posts the TUI's seed text once and is capability-advertised.
 - **Layer:** L2 lane 1 (one headless `daemon serve` driven over its attach and hook sockets; raw JSON pins `authoring_kind`'s desktop-facing wire independently of the typed client helper).
-- **Agent:** synthetic `claude` stand-ins that emit genuine `SessionStart` hooks and log every byte read after readiness; no credential.
-- **Asserts:** `StartAgent` with each of `schedule`, `schedule-issues`, and `dispatcher` posts exactly one message to that pane's inbox whose text contains the seed byte-for-byte equal to `AuthoringKind::compose_seed` for the selected working directory (PRD #1666); nothing is written before the readiness announcement, and the only bytes read after it are the fixed doorbell line naming that message, never the seed's content; no second message follows. `NewAgentOptions.authoring_kinds` lists all three values in order, and `Hello.capabilities` contains `authoring-kind`.
+- **Agent:** synthetic `claude` stand-ins that emit genuine `SessionStart` hooks and then hand their pane to the shared profiled agent (`tests/common/mod.rs`, `PROFILED_AGENT`, in raw mode under the e2e stand-in profile), which logs every line submitted after readiness; no credential.
+- **Asserts:** `StartAgent` with each of `schedule`, `schedule-issues`, and `dispatcher` posts exactly one message to that pane's inbox whose text contains the seed byte-for-byte equal to `AuthoringKind::compose_seed` for the selected working directory (PRD #1666); nothing is written before the readiness announcement, and the only lines read after it are the token-led doorbell line naming that message, never the seed's content; no second message follows. `NewAgentOptions.authoring_kinds` lists all three values in order, and `Hello.capabilities` contains `authoring-kind`.
 - **Does not assert:** desktop chip rendering or experimental filtering; real-agent interpretation of the seed (`newagent/live/001` owns that later lane-2 surface).
 - **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]` — the daemon, hook and PTY harness uses Unix-domain sockets and Unix PTYs).
 
 ##### newagent/authoring/002 — A late readiness announcement gates one seed and a plain start receives none.
 - **Layer:** L2 lane 1 (one headless `daemon serve`; the synthetic authoring pane withholds its genuine `SessionStart` for three seconds while inspecting its own PTY input queue).
-- **Agent:** two synthetic `claude` stand-ins, one authoring and one plain control, logging every byte read after readiness; no credential.
-- **Asserts:** no bytes are queued before the deliberately late readiness announcement; the exact schedule seed from `AuthoringKind::compose_seed` is posted to the authoring pane's inbox once, only the fixed doorbell line naming it is read after readiness, and no second copy follows. A `StartAgent` with no `authoring_kind` reaches readiness, its inbox stays empty, and it receives no daemon-owned input.
+- **Agent:** two synthetic `claude` stand-ins, one authoring and one plain control, each handing its pane to the shared profiled agent after its readiness announcement and logging every line submitted after it; no credential.
+- **Asserts:** no bytes are queued before the deliberately late readiness announcement; the exact schedule seed from `AuthoringKind::compose_seed` is posted to the authoring pane's inbox once, only the token-led doorbell line naming it is read after readiness, and no second copy follows. A `StartAgent` with no `authoring_kind` reaches readiness, its inbox stays empty, and it receives no daemon-owned input.
 - **Does not assert:** delivery-time latency after readiness, the native Pi `get-seed` path, any TUI or desktop surface, or the real agent's semantic interpretation of the seed.
 - **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]` — the daemon, hook and PTY harness uses Unix-domain sockets and Unix PTYs).
 
@@ -9582,138 +9582,138 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 
 The typed-delivery entries `orchestration/delegate/040–041` and `orchestration/work-done/010` are retired; their attached draft and arrival-order outcomes now live in `inbox/doorbell/009–012`. `scheduler/dispatch/023` is rewritten in the binary harness. Terminal-report filtering is retained as a control there.
 
-##### inbox/doorbell/001 — Only an Idle, unarmed pane with Queued work gets the fixed submitted line.
+##### inbox/doorbell/001 — Only an Idle, unarmed pane with Queued work gets the token-led submitted line.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), real binary and daemon-owned PTY, byte capture and vt100 replay.
-- **Agent:** none (raw Python stand-in; no agent executable or credential).
-- **Asserts:** An empty inbox receives nothing; one queued task receives exactly the leading-space fixed line plus CR, with no body or paste markers, and stays Queued.
+- **Agent:** none (the e2e stand-in profile's Python editor (selected by `DOT_AGENT_DECK_TEST_COMPOSER_PROFILE=standin` with `DOT_AGENT_DECK_TEST_COMPOSER_BINARY` naming the executable the pane runs); no agent executable or credential).
+- **Asserts:** An empty inbox receives nothing; one queued task receives exactly one token-led line (`(xxxxxx) dot-agent-deck: message <id> waiting, run: dot-agent-deck inbox fetch`, six lowercase letters in the token) plus one CR, with no body, paste markers, LF or extra submits, and stays Queued.
 - **Does not assert:** a real agent editor or real-model response; native agent adapters and producer migration have separate coverage.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/doorbell/002 — Unknown, busy, blocked and dialog statuses suppress the doorbell.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), real binary and daemon-owned PTY, byte capture and vt100 replay.
-- **Agent:** none (raw Python stand-in; no agent executable or credential).
-- **Asserts:** Before any hook and during WaitingForInput, PermissionRequest, Thinking, Working, Compacting and Blocked, the pane receives no bytes; Idle releases the fixed line. Synthetic status events cover Claude Code, OpenCode, Pi, Codex and Devin.
+- **Agent:** none (the e2e stand-in profile's Python editor (selected by `DOT_AGENT_DECK_TEST_COMPOSER_PROFILE=standin` with `DOT_AGENT_DECK_TEST_COMPOSER_BINARY` naming the executable the pane runs); no agent executable or credential).
+- **Asserts:** Before any hook and during WaitingForInput, PermissionRequest, Thinking, Working, Compacting and Blocked, the pane receives no bytes; Idle releases the doorbell line, which the stand-in submits. Synthetic status events cover Claude Code, OpenCode, Pi, Codex and Devin, the stand-in profile standing in for each agent's screen.
 - **Does not assert:** a real agent editor or real-model response; native agent adapters and producer migration have separate coverage.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/doorbell/003 — An armed native waiter suppresses typing and EOF restores fallback.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), real binary and daemon-owned PTY, byte capture and vt100 replay; the armed waiter is a Claude once-waiter opened from the test process at the one-shot integration.
-- **Agent:** none (raw Python stand-in; no agent executable or credential).
+- **Agent:** none (the e2e stand-in profile's Python editor (selected by `DOT_AGENT_DECK_TEST_COMPOSER_PROFILE=standin` with `DOT_AGENT_DECK_TEST_COMPOSER_BINARY` naming the executable the pane runs); no agent executable or credential).
 - **Asserts:** with `DOT_AGENT_DECK_INBOX_TEST_PAUSE_WAITER_DELIVERY=1` preserving registration/EOF but pausing native hand-over, the task remains Queued while armed and no bytes arrive beyond native grace; EOF drops armed to zero and the same still-Queued task rings. This isolates the armed guard from the separate Fetched guard.
 - **Does not assert:** a real agent editor or real-model response; native agent adapters and producer migration have separate coverage.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/doorbell/004 — Native announce gives a bounded arm grace period.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), real binary and daemon-owned PTY, byte capture and vt100 replay.
-- **Agent:** none (raw Python stand-in; no agent executable or credential).
+- **Agent:** none (the e2e stand-in profile's Python editor (selected by `DOT_AGENT_DECK_TEST_COMPOSER_PROFILE=standin` with `DOT_AGENT_DECK_TEST_COMPOSER_BINARY` naming the executable the pane runs); no agent executable or credential).
 - **Asserts:** With a shortened native grace, no bytes arrive early and fallback rings after grace; a TurnEnd announcement is unarmed and receives no native grace.
 - **Does not assert:** a real agent editor or real-model response; native agent adapters and producer migration have separate coverage.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/doorbell/005 — Queued work re-rings on schedule and fetching stops retries.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), real binary and daemon-owned PTY, byte capture and vt100 replay.
-- **Agent:** none (raw Python stand-in; no agent executable or credential).
-- **Asserts:** Accelerated increasing retry intervals reach the repeating final delay, with lower bounds on observed submissions; Fetched by a receipt fetch whose receiver stays open stops the schedule before ack and Acknowledged keeps it stopped.
+- **Agent:** none (the e2e stand-in profile's Python editor (selected by `DOT_AGENT_DECK_TEST_COMPOSER_PROFILE=standin` with `DOT_AGENT_DECK_TEST_COMPOSER_BINARY` naming the executable the pane runs); no agent executable or credential).
+- **Asserts:** Accelerated increasing retry intervals reach the repeating final delay, with lower bounds measured between the daemon's `doorbell rang` log lines; Fetched by a receipt fetch whose receiver stays open stops the schedule before ack and Acknowledged keeps it stopped.
 - **Does not assert:** a real agent editor or real-model response; native agent adapters and producer migration have separate coverage.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/doorbell/006 — One ring covers every queued task.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), real binary and daemon-owned PTY, byte capture and vt100 replay.
-- **Agent:** none (raw Python stand-in; no agent executable or credential).
-- **Asserts:** Three tasks queued before Idle yield one fixed line naming a queued id; one fetch returns all three and acknowledges them without typing any bodies.
+- **Agent:** none (the e2e stand-in profile's Python editor (selected by `DOT_AGENT_DECK_TEST_COMPOSER_PROFILE=standin` with `DOT_AGENT_DECK_TEST_COMPOSER_BINARY` naming the executable the pane runs); no agent executable or credential).
+- **Asserts:** Three tasks queued before Idle yield one token-led line naming one of the queued ids; one fetch returns all three and acknowledges them without typing any bodies, and no second ring follows within the observation.
 - **Does not assert:** a real agent editor or real-model response; native agent adapters and producer migration have separate coverage.
 - **Platform coverage:** mac+linux.
 
-##### inbox/doorbell/007 — Outstanding rings get pre-ring and cleanup bare CRs.
+##### inbox/doorbell/007 — An outstanding ring re-rings with a fresh token, and no bare CR goes before or after.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), real binary and daemon-owned PTY, byte capture and vt100 replay.
-- **Agent:** none (raw Python stand-in; no agent executable or credential).
-- **Asserts:** For each supported synthetic agent type, byte capture is exactly first-line CR, bare CR, second-line CR, and one cleanup CR on fetch; no further ring or cleanup follows.
+- **Agent:** none (the e2e stand-in profile's Python editor (selected by `DOT_AGENT_DECK_TEST_COMPOSER_PROFILE=standin` with `DOT_AGENT_DECK_TEST_COMPOSER_BINARY` naming the executable the pane runs); no agent executable or credential).
+- **Asserts:** For each of Claude Code, OpenCode, Pi, Codex and Devin as the reported type, the byte capture is exactly two token-led lines naming the task, with different tokens, each followed by one CR; after another consumer fetches the task nothing more arrives over 1.8 s (no cleanup CR), the pane has two submitted rings, and no empty composer was submitted.
 - **Does not assert:** a real agent editor or real-model response; native agent adapters and producer migration have separate coverage.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/doorbell/008 — Replacement readiness independent of session age, with settled policy steps.
 - **Layer:** Fast state age-invariance test (`src/state.rs`) paired with L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), subprocess and in-process daemons with real PTYs, byte capture and vt100 replay; `inbox/route/001` covers genuine clear=true delegation.
-- **Agent:** none (raw Python stand-in; no agent executable or credential).
-- **Asserts:** A draft holds an old task while its agent is stopped and the same pane identity is respawned; on both one-worker and four-worker daemons, a predecessor-session ShellIdle must leave its byte history empty after completed policy ticks at injected monotonic ages 5 s, 10 s, 86,399 s and 86,400 s, followed by a 6.5-second real-time observation. Controlled steps stop scheduling while their attempts finish before acknowledging settlement, accepting a writer-side readiness guard. The fast state pin changes actual session, event and pane timestamps to five seconds old, one day old and the oldest representable startup, without changing readiness signals, and requires age-invariant admission plus own Idle as a positive control. It permits optimistic scheduler admission in fresh and aged samples; the paired PTY pins require silence at the final write boundary. A separate in-process daemon seeds a bare hydrated placeholder with actual session/event and registry process-start timestamps at the oldest representable startup, then requires the same real-time zero-byte interval before own Idle permits the fixed line and real in-pane fetch. The clear=true route cases hold readiness before and after SessionStart and age hook history with shell samples before own Idle.
-- **Additional aged final-write cases:** The same in-process PTY pin also posts the generation's own native SessionStart and ages both its actual session/event timestamps and independent registry process-start timestamp to one day and the oldest representable startup. With no ready prompt drawn, each case requires zero input for the existing 6.5-second observation before own Idle submits the fixed line and the agent fetches its task.
+- **Agent:** none (the e2e stand-in profile's Python editor (selected by `DOT_AGENT_DECK_TEST_COMPOSER_PROFILE=standin` with `DOT_AGENT_DECK_TEST_COMPOSER_BINARY` naming the executable the pane runs); no agent executable or credential).
+- **Asserts:** A draft holds an old task while its agent is stopped and the same pane identity is respawned; on both one-worker and four-worker daemons, a predecessor-session ShellIdle must leave its byte history empty after completed policy ticks at injected monotonic ages 5 s, 10 s, 86,399 s and 86,400 s, followed by a 6.5-second real-time observation: a generation whose own hooks have not reported is not rung, whatever its screen shows. Controlled steps stop scheduling while their attempts finish before acknowledging settlement. The fast state pin changes actual session, event and pane timestamps to five seconds old, one day old and the oldest representable startup, without changing readiness signals, and requires age-invariant admission plus own Idle as a positive control. A separate in-process daemon seeds a bare hydrated placeholder with actual session/event and registry process-start timestamps at the oldest representable startup, then requires the same real-time zero-byte interval before own Idle permits the token-led line and a real in-pane fetch. The clear=true route cases hold readiness before and after SessionStart and age hook history with shell samples before own Idle.
+- **Additional aged final-write cases:** The same in-process PTY pin also posts the generation's own native SessionStart and ages both its actual session/event timestamps and independent registry process-start timestamp to one day and the oldest representable startup. The routing stand-in draws no ready row while held (`route::hold_ready`), so no prompt is on its screen; each case requires zero input for the 6.5-second observation, then the ready row is drawn again and own Idle submits the token-led line and the agent fetches its task.
 - **Does not assert:** an unlimited wall-clock horizon, arbitrary new timer sources, a real agent editor or real-model response; native agent adapters and producer migration have separate coverage.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/doorbell/009 — Enter releases a doorbell after an attached human draft.
 - **Layer:** L2 lane 1 (`tests/e2e_automatic_write_draft.rs`), real binary and daemon-owned PTY, attached real TUI.
-- **Agent:** none (raw Python stand-in; no agent executable or credential).
-- **Asserts:** Real TUI keystrokes keep a task deferred; Enter produces separate visible submissions for the human draft and fixed line, without typing message content.
+- **Agent:** none (the e2e stand-in profile's Python editor (selected by `DOT_AGENT_DECK_TEST_COMPOSER_PROFILE=standin` with `DOT_AGENT_DECK_TEST_COMPOSER_BINARY` naming the executable the pane runs); no agent executable or credential).
+- **Asserts:** Real TUI keystrokes keep a task deferred while the stand-in's composer shows the draft; Enter produces separate submissions for the human draft and the token-led line, exactly `<draft>\r<line>\r`, the attached TUI showing the submitted row's token and id, without typing message content.
 - **Does not assert:** a real agent editor or real-model response; native agent adapters and producer migration have separate coverage.
 - **Platform coverage:** mac+linux.
 
-##### inbox/doorbell/010 — An unsent draft has no force-submit timeout.
-- **Layer:** L2 lane 1 (`tests/e2e_automatic_write_draft.rs`), real binary and daemon-owned PTY, attached real TUI.
-- **Agent:** none (raw Python stand-in; no agent executable or credential).
-- **Asserts:** The real TUI holds a draft for fifteen accelerated legacy cap periods with the task Queued and no ring; Ctrl+U permits the fixed line without submitting the draft.
-- **Does not assert:** a real agent editor or real-model response; native agent adapters and producer migration have separate coverage.
-- **Platform coverage:** mac+linux.
+##### inbox/doorbell/010 — A genuine draft stays protected; an empty editor releases the doorbell.
+- **Layer:** L2 lane 1 (`tests/e2e_automatic_write_draft.rs`), real binary and daemon-owned PTY, attached real TUI; L2 lane 2 (`tests/e2e_inbox_claude_live.rs`), interactive Haiku in an attached TUI.
+- **Agent:** the e2e stand-in profile's Python editor and the tester's explicitly profiled synthetic composer (`tests/support/empty_composer.py`) in lane 1; real Claude Haiku in lane 2.
+- **Asserts:** The real TUI holds a draft for a 1500 ms observation with the task Queued and no ring; Ctrl+U permits the token-led line without submitting the draft. A companion deterministic case receives and fetches a control task (its capture settling at the line and one Enter, with no cleanup CR), presses Left, waits for captured navigation bytes and a processed empty-composer redraw, and requires another doorbell and nonce-bearing fetch. Its composer consumes navigation separately from text and supplies a redraw marker, width witness, dim placeholder and transcript echo; the e2e-only profile requires both the explicit selector and its executable path. Three controls require zero typed bytes, the task queued with no delivery and `cannot_type` past the stall threshold: no selector, the selector with no executable path, and the selector naming another executable copy that the pane does not run. The real-agent empty-editor cases first complete a fallback-delivered control task, then press Right in the empty editor or erase an exact visible draft completely with Backspace. Right has a recipient-processing barrier: a harmless marker is drawn after the initial key, Left and Right visibly move across it, and Backspace redraws the exact empty composer, without a submit or clear key. Another task must create its sentinel within 30 seconds without another keypress; exact sentinel contents, acknowledged state and single delivery are checked afterward with the helper's separate 120-second waits. Left opens Claude Code 2.1.310's background-session overview: a companion case observes it for 5 seconds with the input row exactly unchanged and showing its empty placeholder, an unchanged util-linux `script --log-in` input ledger, the task Queued, zero deliveries, no logged pane write, doorbell attempt or ring, and no sentinel. Capturing the human Left first validates the ledger; subsequent bytes would be automatic because the test sends no further input. The overview is not a recognised composer, so it holds delivery. A retained-draft case covers typed, history-recalled and partly deleted text, including navigation within text: over 5 seconds, longer than the configured 2-second stall threshold, the composer stays exact, the task stays Queued with zero deliveries, no doorbell is appended, and `wake_stalled` plus the matching log line are required; clearing then delivers the original sentinel once, and the hold must report `possible_draft`. Native waiters are killed by captured scratch-process pid to isolate fallback. On empty-editor failure, Ctrl+U recovery is recorded before the automatic-delivery assertion fails.
+- **Does not assert:** delivery through an armed native waiter; an age-based permission rule at arbitrary durations, which `inbox/doorbell/040` takes on with a controlled clock (the live observation is 5 seconds); Codex, OpenCode, Pi or the desktop client; bytes consumed internally by Claude after the input-recording relay, whose nested PTY's own mode the deck's termios read does not describe. Return from the overview is outside this guard: Claude Code 2.1.310 does not reliably return to a ready composer on Esc. Right and Backspace retain recovery coverage.
+- **Platform coverage:** mac+linux for the stand-in draft cases; linux for the synthetic composer-profile cases (their mode reporter uses SO_PEERCRED and /proc, and the stand-in profile reads the process's command line from /proc) and lane 2's captured-waiter fixture. The composer-profile cases are compiled out elsewhere, rather than reporting a successful runtime skip. Python 3 on PATH is an explicit failing preflight, with no pip dependencies. The live overview ledger additionally requires util-linux `script`.
 
-##### inbox/doorbell/011 — Cleanup CR respects a fresh human draft.
+##### inbox/doorbell/011 — A submitted ring sends nothing after a fresh human draft.
 - **Layer:** L2 lane 1 (`tests/e2e_automatic_write_draft.rs`), real binary and daemon-owned PTY, attached real TUI.
-- **Agent:** none (raw Python stand-in; no agent executable or credential).
-- **Asserts:** After a ring, fetching through another consumer while the attached TUI holds a new draft sends no cleanup; Ctrl+U releases exactly one bare CR without a new ring or submitted draft.
+- **Agent:** none (the e2e stand-in profile's Python editor (selected by `DOT_AGENT_DECK_TEST_COMPOSER_PROFILE=standin` with `DOT_AGENT_DECK_TEST_COMPOSER_BINARY` naming the executable the pane runs); no agent executable or credential).
+- **Asserts:** After a submitted ring, the attached TUI types a new draft and another consumer fetches and acknowledges the task: over 700 ms nothing submits the draft, Ctrl+U reaches the pane, and over a further 700 ms nothing follows it (the capture is exactly `<line>\r<draft>\x15`); one ring in all, and the draft is never submitted.
 - **Does not assert:** a real agent editor or real-model response; native agent adapters and producer migration have separate coverage.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/doorbell/012 — A drafted batch coalesces and fetch preserves arrival order.
 - **Layer:** L2 lane 1 (`tests/e2e_automatic_write_draft.rs`), real binary and daemon-owned PTY, attached real TUI.
-- **Agent:** none (raw Python stand-in; no agent executable or credential).
-- **Asserts:** Two reports wait behind a real TUI draft; clearing produces one fixed line and one fetch returns both bodies in order, with no body typed into the pane.
+- **Agent:** none (the e2e stand-in profile's Python editor (selected by `DOT_AGENT_DECK_TEST_COMPOSER_PROFILE=standin` with `DOT_AGENT_DECK_TEST_COMPOSER_BINARY` naming the executable the pane runs); no agent executable or credential).
+- **Asserts:** Two reports wait behind a real TUI draft; clearing it produces one token-led ring and one fetch returns both bodies in arrival order, with no body typed into the pane or shown on the deck's grid.
 - **Does not assert:** a real agent editor or real-model response; native agent adapters and producer migration have separate coverage.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/doorbell/013 — The doorbell policy rings only when every guard passes.
 - **Layer:** L1 unit (`src/doorbell.rs`, pure `decide` with injected time).
 - **Agent:** none.
-- **Asserts:** an empty queue never rings; a queued message is held while the agent is not Idle, while a draft is pending, while a waiter is armed, and while a Native announcement is inside its arm grace; it rings, naming the oldest queued id, once all pass.
+- **Asserts:** an empty queue never rings; a queued message is held while the agent is not Idle, while the generation is held (the deck may not type into it, it settles, its doorbell is suspended, or the agent did not take the last Enter), while a waiter is armed, and while a Native announcement is inside its arm grace; it rings, naming the oldest queued id, once all pass.
 - **Does not assert:** the daemon wiring or the bytes written (`inbox/doorbell/001–012`).
 - **Platform coverage:** mac+linux+windows.
 
-##### inbox/doorbell/014 — One ring covers the queue, re-rings on the schedule, and a fetch owes one cleanup CR.
+##### inbox/doorbell/014 — One ring covers the queue and re-rings on the schedule.
 - **Layer:** L1 unit (`src/doorbell.rs`, pure `decide` with injected time).
 - **Agent:** none.
-- **Asserts:** two queued messages share one ring; re-rings come exactly at each schedule delay with the last delay repeating and a pre-ring CR while the ring is outstanding; fetching a covered message owes one cleanup CR while the rest keep their schedule; an emptied queue restarts the schedule for the next message.
+- **Asserts:** two queued messages share one ring naming the oldest; re-rings come exactly at each schedule delay with the last delay repeating; fetching the first keeps the second on the running schedule; an emptied queue restarts the schedule for the next message, as does a queue holding none of the messages the last ring covered (the agent took them before the ring was confirmed), which rings the new message at once.
 - **Does not assert:** the daemon wiring or the bytes written (`inbox/doorbell/005`, `007`).
 - **Platform coverage:** mac+linux+windows.
 
-##### inbox/doorbell/015 — The cleanup CR waits for a draft and for Idle but not for an armed waiter.
+##### inbox/doorbell/015 — Nothing follows a ring once its message is taken.
 - **Layer:** L1 unit (`src/doorbell.rs`).
 - **Agent:** none.
-- **Asserts:** an owed cleanup CR is held while a draft is pending or the agent is busy, and sent while a waiter is armed (the component that armed after the ring is the case it exists for).
-- **Does not assert:** the daemon wiring (`inbox/doorbell/011`).
+- **Asserts:** after one ring, a queue emptied by a fetch decides nothing, whether the agent is Idle, busy, held or has a waiter armed, and leaves the bell idle: a submitted ring owes the pane no byte of its own.
+- **Does not assert:** the daemon wiring (`inbox/doorbell/007`, `011`).
 - **Platform coverage:** mac+linux+windows.
 
 ##### inbox/doorbell/016 — The doorbell's environment overrides parse, and bad values keep the defaults.
 - **Layer:** L1 unit (`src/doorbell.rs`, injected lookup).
 - **Agent:** none.
-- **Asserts:** `DOT_AGENT_DECK_DOORBELL_TICK_MS`, `DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS` (ordered, last delay repeats) and `DOT_AGENT_DECK_INBOX_ARM_GRACE_MS` replace the defaults; zero or unparsable values leave them; the fixed line is exactly the documented text.
+- **Asserts:** `DOT_AGENT_DECK_DOORBELL_TICK_MS`, `DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS` (ordered, last delay repeats) and `DOT_AGENT_DECK_INBOX_ARM_GRACE_MS` replace the defaults; zero or unparsable values leave them; the doorbell line that follows the ring token is exactly the documented text.
 - **Does not assert:** reading the real process environment.
 - **Platform coverage:** mac+linux+windows.
 
-##### inbox/doorbell/017 — The doorbell remembers the line it typed only while a flush is owed.
+##### inbox/doorbell/017 — A held generation is not rung until the hold ends.
 - **Layer:** L1 unit (`src/doorbell.rs`).
 - **Agent:** none.
-- **Asserts:** the recorded unsubmitted line survives an outstanding ring and an owed cleanup, and is cleared by the cleanup CR and by a new ring.
-- **Does not assert:** the daemon's doorbell task recording the line after a write, or a flush-only ring keeping the earlier line recorded (`inbox/codex/014`, `inbox/codex/017`).
+- **Asserts:** after a ring, a message kept queued past every schedule delay (1 s, 5 s and 60 s) gets no ring while the generation is held, and once the hold ends the next due ring goes, naming the message.
+- **Does not assert:** why the daemon holds a generation (`inbox/doorbell/041`, `042`, `050`).
 - **Platform coverage:** mac+linux+windows.
 
-##### inbox/doorbell/018 — A ring for other queued work replaces the owed cleanup, so the recorded line can outlive its message.
+##### inbox/doorbell/018 — A ring for the remaining work names it alone, one per due delay.
 - **Layer:** L1 unit (`src/doorbell.rs`, pure `decide` with injected time).
 - **Agent:** none.
-- **Asserts:** with the line naming the first of two messages recorded, fetching that message just as a ring is due brings a ring for the second, with its flushing CR, instead of the cleanup; with the record kept as a flush-only ring keeps it, each later due ring flushes again, exactly one ring per due time; once the second message leaves `queued` the cleanup CR goes and drops the record.
-- **Does not assert:** the daemon's `Flushed` arm keeping the record (the test sets it, as that arm does; `inbox/codex/017`), or what the screen shows.
+- **Asserts:** with a ring covering two messages, fetching the first just as a ring is due brings a ring naming the second alone; each later due delay brings exactly one more ring for it, and once the queue empties no ring follows.
+- **Does not assert:** the daemon wiring or what the screen shows.
 - **Platform coverage:** mac+linux+windows.
 
-##### inbox/doorbell/019 — An interrupt's Escapes stop holding the doorbell when the turn ends; drafts and an Idle agent's Escapes still hold it.
+##### inbox/doorbell/019 — An interrupt's Escapes stop holding the doorbell when the turn ends; a draft on screen still holds it.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), real binary, daemon-owned PTY and attach input stream.
-- **Agent:** none (raw Python stand-in announced as OpenCode, Claude Code, Codex and Pi; no agent credential).
-- **Asserts:** for each of the four agent types, Thinking, then Escape, 300 ms, Escape forwarded as the user's keys, then Idle: queued work rings the fixed doorbell after the two Escapes and a fetch delivers it. Text typed before or after the Escapes, and two Escapes pressed on an agent that is already Idle followed by two more Idle reports (OpenCode's duplicate pair), each leave the pane untouched and the task Queued.
-- **Does not assert:** a real agent's interrupt, an Idle from an agent that has since been replaced (`inbox/doorbell/020`), or an Idle racing the PTY write (`inbox/doorbell/022`, `inbox/doorbell/023`).
+- **Agent:** none (the e2e stand-in profile's Python editor (selected by `DOT_AGENT_DECK_TEST_COMPOSER_PROFILE=standin` with `DOT_AGENT_DECK_TEST_COMPOSER_BINARY` naming the executable the pane runs); no agent executable or credential), its hooks reported as OpenCode, Claude Code, Codex and Pi.
+- **Asserts:** for each of the four agent types, Thinking, then Escape, 300 ms, Escape forwarded as the user's keys, then Idle: the capture is exactly the two Escapes, then the token-led line and its Enter, and a fetch delivers the task. Text typed before or after the Escapes leaves the composer showing a draft, so the pane stays untouched and the task Queued. Two Escapes pressed on an agent that is already Idle followed by two more Idle reports (OpenCode's duplicate pair) leave the composer empty with nothing else drawn, and that pane is rung: the stand-in draws no menu, and the deck reads its screen.
+- **Does not assert:** a real agent's interrupt or menu screen, an Idle from an agent that has since been replaced (`inbox/doorbell/020`), or an Idle racing the PTY write (`inbox/doorbell/022`, `inbox/doorbell/023`).
 - **Platform coverage:** mac+linux.
 - **Cost:** none.
 
@@ -9805,33 +9805,27 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Platform coverage:** mac+linux.
 - **Cost:** none.
 
-##### inbox/doorbell/031 — Selected-message and human-input fences at forced retry interleaves.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`, `tests/e2e_inbox_codex.rs`), real binary and daemon-owned PTY with exact input capture and vt100 replay.
-- **Agent:** none (raw Python stand-in; no agent executable or credential).
-- **Asserts:** with Idle unchanged and a second message still queued, settling the selected ID after decision, after pre-CR, after the inter-step delay or before final submit withholds the remaining bytes. Decision also covers Fetched without acknowledgement. Still-queued controls complete the real retry, parked at completion so later retries cannot race exact capture comparisons. Human frames are forced after decision, before payload and after payload before final CR; already-written bytes are allowed, and remaining automatic bytes must stop. A recognized stranded Codex composer covers its CR-only retry. Separate unreleased completion and writer-held barriers time out and each logical slot permits another submitted ring. Cleanup CR accounting remains in 007.
-- **Does not assert:** a real editor's startup buffering, or settlement atomic with an already-enqueued PTY-thread write. E2E barriers use a configured single directory whose canonical target is checked under HOME; the harness supplies the isolated HOME and trusted filesystem, including marker leaves. These checks do not enforce no-symlink-escape confinement. Armed waits time out after eight seconds, and a test-only unwind guard clears busy slots; ordinary interleave fixtures share a six-second operation budget and release barriers on unwind. Between-step barriers retain the pane writer; completion barriers do not. Processes with fixture access can manipulate its files; these are not process-local barriers.
+##### inbox/doorbell/031 — Selected-message and human-input fences at forced re-ring interleaves.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), real binary and daemon-owned PTY with exact input capture and vt100 replay; e2e-only barriers at a re-ring's decision, at its transaction's admission (the writer held, nothing written) and after its line (the writer held, before its Enter), and at the tick's completion.
+- **Agent:** none (the e2e stand-in profile's Python editor (selected by `DOT_AGENT_DECK_TEST_COMPOSER_PROFILE=standin` with `DOT_AGENT_DECK_TEST_COMPOSER_BINARY` naming the executable the pane runs); no agent executable or credential).
+- **Asserts:** with Idle unchanged and a second message still queued, acknowledging the selected message (or fetching it without acknowledgement) while its re-ring waits after decision adds no byte; acknowledging it after the re-ring's line is typed deletes exactly that line and sends no Enter. A human frame that arrives after decision leaves the retry unwritten and the draft in the pane; one that arrives after the line waits for the writer, so the capture is the line, its Enter, then the human's bytes as typed, with the human's text never submitted. Still-queued controls complete the real re-ring, parked at completion so later re-rings cannot race exact capture comparisons. Separate unreleased completion and admission barriers time out and each pane then accepts and submits another scheduled ring, its writer and busy slot recovered.
+- **Does not assert:** a real editor's startup buffering, or the transaction's own deadline (`inbox/doorbell/049`, `050`). E2E barriers use a configured single directory whose canonical target is checked under HOME; the harness supplies the isolated HOME and trusted filesystem, including marker leaves. These checks do not enforce no-symlink-escape confinement. Armed waits time out after eight seconds, and a test-only unwind guard clears busy slots; ordinary interleave fixtures share a six-second operation budget and release barriers on unwind. The admission and after-line barriers retain the pane writer; the decision and completion barriers do not. Processes with fixture access can manipulate its files; these are not process-local barriers.
 - **Platform coverage:** mac+linux.
 
-##### inbox/doorbell/032 — A human frame arriving during the admission re-check stops the step.
-- **Layer:** Fast (`src/agent_pty.rs`, `spawn_tests`), the registry's doorbell write against a real `cat` PTY.
-- **Agent:** none (`cat`).
-- **Asserts:** a human input frame that starts arriving while the doorbell awaits its admission re-check for a step is seen before that step's bytes are written: the write reports `NotAdmitted` and the line never reaches the pane; with the frame gone, the next doorbell is written (control).
-- **Does not assert:** a frame that arrives after the last check, which waits behind the write for the pane's writer (inbox/doorbell/031 covers the frames between steps).
-- **Platform coverage:** mac+linux.
-- **Cost:** none.
+`inbox/doorbell/032` is retired: the step-by-step doorbell write it pinned is gone, and a human operation before the transaction's first byte, or after its line, is now `inbox/doorbell/050` (h) and (e).
 
-##### inbox/doorbell/033 — A prompt replaced between steps stops what is left of the ring.
-- **Layer:** Fast (`src/agent_pty.rs`, `spawn_tests`), the registry's doorbell write against a real `cat` PTY, with the pane's output fed directly.
-- **Agent:** none (`cat`), read with Claude Code's prompt recogniser.
-- **Asserts:** for a generation that waits for its prompt on screen, a screen that stops showing the prompt between the line and its Enter, with no hook event, withholds the Enter and reports the line typed but not submitted; with the prompt left in place, the same write submits (control).
-- **Does not assert:** a real agent's dialog, or a screen that changes after the last step's check.
+##### inbox/doorbell/033 — A dialog drawn mid-attempt gets no Enter and suspends the doorbell.
+- **Layer:** Fast (`src/agent_pty.rs`, `spawn_tests`), the real ring transaction on the real writer against a Claude Code 2.1.310 model editor over a raw `cat` PTY.
+- **Agent:** none (a model editor drawing Claude Code 2.1.310's screens).
+- **Asserts:** with the editor's screen replaced by a dialog once the deck's line is half typed, the composer never shows the whole line: no Enter is sent, the attempt ends Unresolved for a dialog, the latch cell is suspended and the next ring is refused while it stays so; the user's own Enter lifts it.
+- **Does not assert:** a real agent's dialog, or a dialog drawn after the Enter (`inbox/doorbell/036`'s dialog markers, the transaction model's `dialog_after_submit`).
 - **Platform coverage:** mac+linux.
 - **Cost:** none.
 
 ##### inbox/doorbell/034 — A repaint racing a resize's ring clear is kept for the first ring.
-- **Layer:** Fast (`src/agent_pty.rs`, `spawn_tests`), a real resize of a `cat` PTY, with a test hook between the resize's ioctl and its ring clear and the pane's output fed directly.
-- **Agent:** none (`cat`), read with Claude Code's prompt recogniser.
-- **Asserts:** a prompt box pushed from another thread, as the PTY reader pushes the agent's SIGWINCH repaint, between the ioctl and the clear survives the clear, and the doorbell for a generation that waits for its prompt on screen is written and submitted. Red when the clear can run after such a push.
+- **Layer:** Fast (`src/agent_pty.rs`, `spawn_tests`), a real resize of a model editor's raw `cat` PTY, with a test hook between the resize's ioctl and its ring clear and the editor's redraw pushed from another thread.
+- **Agent:** none (a model editor drawing Claude Code 2.1.310's screens).
+- **Asserts:** a redraw of the prompt for the new size, pushed as the PTY reader pushes the agent's SIGWINCH repaint, between the ioctl and the clear, survives the clear: the doorbell's first ring after it is admitted on that redraw and submitted. Red when the clear can run after such a push.
 - **Does not assert:** a real agent's repaint timing, or bytes written at the old size that the reader pushes after the clear (the best-effort part of a resize's single-epoch replay).
 - **Platform coverage:** mac+linux.
 - **Cost:** half a second, the time the hook gives the push to land before the clear.
@@ -9864,18 +9858,33 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** the real writer thread's faults (activation), or the card's words for the suspension (activation).
 - **Platform coverage:** all.
 
+##### inbox/doorbell/039 — Typing while the deck's line lands keeps the user's text apart.
+- **Layer:** L2 lane 1 (`tests/e2e_automatic_write_draft.rs`), real binary, daemon-owned PTY and attached real TUI, with the e2e-only after-line barrier on a re-ring (the writer held, before its Enter); L2 lane 2 (`tests/e2e_inbox_claude_live.rs`, `doorbell_039_live_typing_while_line_lands`), interactive Haiku in an attached TUI with the same barrier on its second ring.
+- **Agent:** the e2e stand-in profile's Python editor in lane 1; real Claude Code (Haiku) in lane 2, on a release the deck has measured (`SKIP:` otherwise).
+- **Asserts:** while the re-ring's token-led line is in the pane and the deck holds the writer, the user's keys typed in the attached TUI reach the daemon (the `human-arrived` observation); released, the capture is exactly the first ring, the re-ring's line, one Enter and then the user's text as typed, which sits alone in the composer; two rings are submitted and nothing containing the user's text is. In lane 2, after a fallback-delivered control task, the second ring is held at its line while the user types: the ring is logged, Haiku acts on the task once and acknowledges it, and the input box then shows exactly the user's text, which is not the last submitted prompt.
+- **Does not assert:** keys arriving after the Enter (they are the user's ordinary input), or how Claude Code places text typed while it works beyond the input box it draws.
+- **Platform coverage:** mac+linux in lane 1; linux in lane 2.
+
+##### inbox/doorbell/040 — No age gives the doorbell leave to type over a draft.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), real binary and daemon-owned PTY, the e2e-only controlled policy clock (`clock-ms`) and the daemon's log.
+- **Agent:** none (the e2e stand-in profile's Python editor; no agent executable or credential).
+- **Asserts:** with a human draft in an Idle stand-in's composer and a task queued, completed policy ticks at controlled ages of 5 s, 10 s, 86,399 s and 86,400 s, the later two past the stall window, each leave the pane holding exactly the draft and the task Queued; the inbox names `possible_draft`, and the daemon logs that reason once; once the clock is released and the draft cleared, the doorbell rings, the capture being the draft, Ctrl+U and the token-led line with its Enter.
+- **Does not assert:** a real agent's composer, or timer sources other than the doorbell's policy clock (the transaction's own deadline runs on the real clock).
+- **Platform coverage:** mac+linux.
+
+
 ##### inbox/doorbell/041 — The doorbell says why it holds an agent's waiting messages once the hold has lasted.
-- **Layer:** Fast (`src/doorbell.rs`, pure over the obstacle table and the hold episode; `src/agent_pty.rs`, `spawn_tests`, the real doorbell tick over a real `cat` pane, its writer and the real inbox).
+- **Layer:** Fast (`src/doorbell.rs`, pure over the obstacle table and the hold episode; `src/agent_pty.rs`, `spawn_tests`, the real doorbell tick over a real `cat` pane, its writer and the real inbox, and over Claude Code 2.1.310 model editors with the re-projection publisher).
 - **Agent:** none.
-- **Asserts:** the first obstacle that holds decides: nothing queued ends the episode; a native component armed or due, an integration notice on the card, or an agent working (any status but Idle and waiting for input) shows nothing and stops the episode's clock; the agent waiting for input is `awaiting_prompt`, an open paste `paste_open`, an unsent draft `possible_draft`, a last try that found no screen to type into `awaiting_prompt` until a write goes in (a try that wrote nothing for another reason leaves that as it was), otherwise no reason with the clock running. A reason shows only once the episode's running time passes the stall window, first-ever waiting for input included, before any ring; working time does not count; a reason changing inside the episode replaces the shown one without starting the count again; taking one of several queued messages leaves the episode running; an ended turn or an empty queue starts it over. Through the real tick the deck's inbox and the summary both clients read carry the same reason as the agent waits for input, gets an open paste, then a draft, works and stops working, and say nothing once the message is taken although the draft stays; only the user's bytes reach the pane.
-- **Does not assert:** the reasons of the typed doorbell itself (`cannot_type`, `not_taken`, `uncertain_input`, `dialog_during_ring`) or the settle window, which arrive with activation; the clients' words (`inbox/status/030`); the controller notice (`inbox/status/033`).
+- **Asserts:** the first obstacle that holds decides: nothing queued ends the episode; a native component armed or due, an agent working (any status but Idle and waiting for input) or a first ring still settling shows nothing and stops the episode's clock; the agent waiting for input is `awaiting_prompt`, an open paste `paste_open`, an unsent draft `possible_draft`, a generation the deck may not type into `cannot_type`, a last try that found no screen to type into `awaiting_prompt` until a write goes in (a try that wrote nothing for another reason leaves that as it was), an Enter the agent did not take `not_taken`, otherwise no reason with the clock running. A submitted, unresolved or withdrawn transaction counts as a ring, a withdrawal after the Enter reached the pane also as an Enter not taken, and a ring that wrote nothing (no token free, a human operation, a suspended doorbell, a pane gone or not reading) is none. A reason shows only once the episode's running time passes the stall window, first-ever waiting for input included, before any ring; working time does not count; a reason changing inside the episode replaces the shown one without starting the count again; taking one of several queued messages leaves the episode running; an ended turn or an empty queue starts it over. Through the real tick the deck's inbox and the summary both clients read carry the same reason as the agent waits for input, gets an open paste, then a draft, works and stops working, and say nothing once the message is taken although the draft stays; only the user's bytes reach the pane. Over model editors: inside a 600 ms settle window with a 150 ms stall window nothing is typed and no reason shows while the editor redraws the same frame every 20 ms, and the ring goes once the window ends (the redraws do not move its start); a pane resized while its editor never redraws stays Dirty, gets one refresh nudge for the episode (one shrink and one restore of its layout), then `awaiting_prompt`, and further resizes to the geometry it has add no nudge and no byte; a ring whose Enter the editor drops shows `uncertain_input` well inside a 60-second stall window.
+- **Does not assert:** the clients' words (`inbox/status/030`); the controller notice (`inbox/status/033`); a settle window read from a release record (the case sets the window through a test seam).
 - **Platform coverage:** mac+linux.
 
 ##### inbox/doorbell/042 — An Enter the agent did not take is withdrawn only once the placeholder is back.
-- **Layer:** Fast (`tests/doorbell_txn.rs`), pure: the transaction model (`src/doorbell_txn.rs`) driven by a model editor, a model writer thread and a clock the test moves; no PTY, lock or daemon.
-- **Agent:** none (a model editor).
-- **Asserts:** an agent that keeps the deck's Enter as a newline, or drops it, has the line deleted (with the kept newline) in one job only after the submit window, and the attempt is Withdrawn only once the composer's placeholder shows again; the human's frame waiting behind it goes in after that, and no second Enter is ever sent. An agent that takes the Enter late inside the window is Submitted and never withdrawn from. A profile with no measured placeholder deletes nothing and ends Unresolved (`withdrawal_refused`).
-- **Does not assert:** the end-to-end half against a stand-in agent (activation).
+- **Layer:** Fast (`tests/doorbell_txn.rs`), pure: the transaction model (`src/doorbell_txn.rs`) driven by a model editor, a model writer thread and a clock the test moves; L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), the real binary and daemon-owned PTY with a stand-in that drops every Enter.
+- **Agent:** none (a model editor; in lane 1 the e2e stand-in profile's Python editor (selected by `DOT_AGENT_DECK_TEST_COMPOSER_PROFILE=standin` with `DOT_AGENT_DECK_TEST_COMPOSER_BINARY` naming the executable the pane runs); no agent executable or credential).
+- **Asserts:** an agent that keeps the deck's Enter as a newline, or drops it, has the line deleted (with the kept newline) in one job only after the submit window, and the attempt is Withdrawn only once the composer's placeholder shows again; the human's frame waiting behind it goes in after that, and no second Enter is ever sent. An agent that takes the Enter late inside the window is Submitted and never withdrawn from. A profile with no measured placeholder deletes nothing and ends Unresolved (`withdrawal_refused`). In lane 1, a stand-in that drops the Enter receives exactly the line, one Enter and one delete per character of the line; nothing is submitted, the task stays queued, no further ring follows over 1.5 s, and the inbox names `not_taken`; when the user types a draft while the deck waits for the submit, the capture is the line, the Enter, the deletes and then the draft as typed, which sits alone in the composer.
+- **Does not assert:** a real agent that drops an Enter.
 - **Platform coverage:** all.
 
 ##### inbox/doorbell/043 — The ring token tells the deck's line from an earlier one, and a terminal that echoes is never typed into.
@@ -9900,10 +9909,10 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Platform coverage:** all.
 
 ##### inbox/doorbell/046 — A prompt hook reports the ring token its prompt carried, and the daemon hands it to the pane.
-- **Layer:** Fast (`tests/doorbell_ring_evidence.rs`, pure, over real UserPromptSubmit payloads; `src/daemon.rs`, `hook_provenance_audit_tests`, the real hook socket; `tests/doorbell_txn.rs`, the latch cell, the attempt ring and the re-projection model, pure; `src/agent_pty.rs`, `spawn_tests`, a real `cat` generation and its writer).
+- **Layer:** Fast (`tests/doorbell_ring_evidence.rs`, pure, over real UserPromptSubmit payloads; `src/daemon.rs`, `hook_provenance_audit_tests`, the real hook socket; `tests/doorbell_txn.rs`, the latch cell, the attempt ring and the re-projection model, pure; `src/agent_pty.rs`, `spawn_tests`, a real `cat` generation and its writer, and a Claude Code 2.1.310 model editor with the real hook arm and publisher).
 - **Agent:** none at test time; the payloads are Claude Code 2.1.310's and Codex 0.164.0's and 0.160.0's, captured with the token-led line submitted.
-- **Asserts:** the token-led doorbell line is read off each agent's real prompt payload with its token and message, `exact` only when the whole prompt (whitespace aside) is that one line and `with_other_text` when it is among other text; an older deck's untokened line, a malformed token and an invalid message id are no ring. The hook's doorbell fetch carries the ring's token and shape only for the message the line named, and without a ring its wire is an older hook's; an unknown shape decodes as unknown. Through the real hook socket, a fetch carrying a ring reaches the pane's evidence channel with the generation its token attests, the message, the token and the shape, although its fetch granted nothing; a fetch from an older hook with no ring and one attested to another pane put nothing on the channel. A generation's latch cell moves only forward, each move on its own attempt: an attempt opens once, ends with nothing written, suspends, and is resolved by exact evidence (late, once suspended), by the user, by a withdrawal or a transcript echo; a move naming another attempt (an older one, or a later one's suspension, exact evidence, transcript echo or withdrawal on an open or a suspended cell), a backward move (`Resolved(a)` to `Suspended(a)`, a re-suspension, an older attempt reopening) and anything after retirement are refused, and retirement between an attempt's allocation and its Open move leaves it writing nothing. Attempt numbers started just below the reserved maximum use the last one once and then refuse (`attempt_exhausted`) without repeating. Exact evidence that reaches the hook arm before the suspension's compare-and-swap resolves the open attempt, the suspension then fails and the transaction reports Submitted with nothing shown. The ring correlates the last 64 attempts: the 65th evicts the first, whose late evidence is a miss, a copy taken before the eviction cannot move a later attempt's cell, an older attempt's token and a report with other text move nothing, and each entry is one packed store. A re-projection request held back past a user clear, late exact evidence or an in-pause resolution shows the state when it runs and never carries the suspension; one for a generation no longer current touches nothing, its own cell suspended or not, while the successor's shows its own state; the positive control shows the suspension, then the clear's request shows it cleared, each broadcast once. Through the real hook socket, with nothing listening on the pane's channel, a generation's own exact ring evidence moves its open attempt's latch cell to submitted on receipt, while evidence shaped with other text, or from another pane's hook, moves nothing. On the real writer, the user's own submit resolves a suspended attempt as the user's while the deck's own Enter lifts nothing, and closing the generation retires its cell for good.
-- **Does not assert:** the real publisher or the cards (activation).
+- **Asserts:** the token-led doorbell line is read off each agent's real prompt payload with its token and message, `exact` only when the whole prompt (whitespace aside) is that one line and `with_other_text` when it is among other text; an older deck's untokened line, a malformed token and an invalid message id are no ring. The hook's doorbell fetch carries the ring's token and shape only for the message the line named, and without a ring its wire is an older hook's; an unknown shape decodes as unknown. Through the real hook socket, a fetch carrying a ring reaches the pane's evidence channel with the generation its token attests, the message, the token and the shape, although its fetch granted nothing; a fetch from an older hook with no ring and one attested to another pane put nothing on the channel. A generation's latch cell moves only forward, each move on its own attempt: an attempt opens once, ends with nothing written, suspends, and is resolved by exact evidence (late, once suspended), by the user, by a withdrawal or a transcript echo; a move naming another attempt (an older one, or a later one's suspension, exact evidence, transcript echo or withdrawal on an open or a suspended cell), a backward move (`Resolved(a)` to `Suspended(a)`, a re-suspension, an older attempt reopening) and anything after retirement are refused, and retirement between an attempt's allocation and its Open move leaves it writing nothing. Attempt numbers started just below the reserved maximum use the last one once and then refuse (`attempt_exhausted`) without repeating. Exact evidence that reaches the hook arm before the suspension's compare-and-swap resolves the open attempt, the suspension then fails and the transaction reports Submitted with nothing shown. The ring correlates the last 64 attempts: the 65th evicts the first, whose late evidence is a miss, a copy taken before the eviction cannot move a later attempt's cell, an older attempt's token and a report with other text move nothing, and each entry is one packed store. A re-projection request held back past a user clear, late exact evidence or an in-pause resolution shows the state when it runs and never carries the suspension; one for a generation no longer current touches nothing, its own cell suspended or not, while the successor's shows its own state; the positive control shows the suspension, then the clear's request shows it cleared, each broadcast once. Through the real hook socket, with nothing listening on the pane's channel, a generation's own exact ring evidence moves its open attempt's latch cell to submitted on receipt, while evidence shaped with other text, or from another pane's hook, moves nothing. On the real writer, the user's own submit resolves a suspended attempt as the user's while the deck's own Enter lifts nothing, and closing the generation retires its cell for good. Through the real adapter, with a ring unresolved because the model editor dropped its Enter and a draft of the user's in the tracker, an older attempt's token reported exact moves nothing, while this attempt's token reported exact resolves it late (`late_exact`), lifts the suspension, clears the card and leaves the draft bit set.
+- **Does not assert:** a real agent's prompt hook reporting late.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/doorbell/047 — An empty composer alone, or a line in the transcript that is not the user's whole message, is never a submit.
@@ -9927,18 +9936,26 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** the transaction driven on the real writer, its owned guard and a dropped caller (activation, `inbox/doorbell/050`); that the driver calls the transaction on time, which a release by the deadline in wall time also needs, since the model releases in the step it is given.
 - **Platform coverage:** all (the real writer-thread cases mac+linux).
 
+##### inbox/doorbell/050 — The doorbell's transaction on the real writer, from admission to release.
+- **Layer:** Fast (`src/agent_pty.rs`, `spawn_tests`), the real registry, `PaneWriter`, writer thread, ingress ledger, hook arm and re-projection publisher against a Claude Code 2.1.310 model editor over a raw `cat` PTY, with test hooks holding locks, the publisher and the latch cell's compare-and-swap.
+- **Agent:** none (a model editor drawing Claude Code 2.1.310's screens and reporting its prompt hook's ring token).
+- **Asserts:** a ring types exactly its token-led line and one Enter and ends Submitted on the hook's token, the cell resolved as submitted, and a second ends Submitted on the transcript alone; a human operation held, or admitted between admission and the first byte, ends the ring with nothing written and the next ring, with nothing outstanding, is admitted and submitted (the ledger as the doorbell's input); with the output lock or the input-mode store's lock held past the deadline while the line waits for its Enter and the caller dropped, the writer is free for a human write within the deadline plus 50 ms, no Enter follows, the attempt is suspended before the writer is released and the human's bytes follow the line; a generation closed while the transaction waits for its echo ends it at once, retired, and its successor in the pane receives no deck byte; a caller dropped as the line lands leaves the transaction to finish on the writer it owns, Enter sent and submitted; a human write after the line waits, the Enter still goes, and the human's bytes follow in order, while a second human write whose caller is dropped settles cancelled and leaves the next ring admitted; an Enter the editor drops is refused a withdrawal (no placeholder to confirm it), suspended, with no byte after the Enter and the human's text after the release; with the publisher running, an unresolved ring shows `uncertain_input`, carried by one wake update, and the user's Enter clears it; held at its gate, a user clear before it runs leaves the cell the user's and no update carrying `uncertain_input`, and a retirement and successor while held leaves the successor's card and cell untouched; exact evidence reaching the hook arm just before the suspension's compare-and-swap resolves the attempt, which ends Submitted with nothing shown.
+- **Does not assert:** a real agent, or the doorbell's tick deciding the ring (`inbox/doorbell/041`).
+- **Platform coverage:** mac+linux.
+
+
 ##### inbox/doorbell/051 — Only a token-bearing process in the pane's outer session, on the daemon's clock, may report a generation's input mode.
-- **Layer:** Fast (`src/daemon.rs`, `hook_provenance_audit_tests`, the real hook socket with helper processes started from a pane's shell; `src/agent_pty.rs`, `spawn_tests`, a real `cat` generation with the process table and time-namespace links injected).
+- **Layer:** Fast (`src/daemon.rs`, `hook_provenance_audit_tests`, the real hook socket with helper processes started from a pane's shell; `src/agent_pty.rs`, `spawn_tests`, a real `cat` generation with the process table and time-namespace links injected, and a Claude Code 2.1.310 model editor under the real doorbell tick).
 - **Agent:** none (a shell in the pane and helper processes that each send one report).
-- **Asserts:** the first helper in the pane's session to report with the generation's token binds its evidence and sets the settle anchor; a second helper in that session is refused as `input_mode_conflict`, the store records both and holds the conflict, refusing the first helper's next report too. A line shaped like a report printed in the pane's output, a helper in a session of its own, a report with no token, one with another pane's token and one whose process exited before its line was read each leave the store empty, and a proper report afterwards binds. After a restart the new generation starts with an empty store and no release latched, the old generation's token is refused, and a helper in the new session binds it with its own anchor. A reused pid with another start time is a second observer, never the bound one; an unreadable start time stores nothing. A peer in another time namespace, or whose namespace link cannot be read while the daemon's exists, is refused as `clock_namespace`; with no namespaces on either side a report is stored; an unreadable own link refuses every report as `clock_namespace_unreadable`; and a generation refused for its clock stays refused.
-- **Does not assert:** the card's `cannot_type` or typed bytes for a held generation (activation), or the wrapper's sending side (`inbox/doorbell/052`, `054`).
+- **Asserts:** the first helper in the pane's session to report with the generation's token binds its evidence and sets the settle anchor; a second helper in that session is refused as `input_mode_conflict`, the store records both and holds the conflict, refusing the first helper's next report too. A line shaped like a report printed in the pane's output, a helper in a session of its own, a report with no token, one with another pane's token and one whose process exited before its line was read each leave the store empty, and a proper report afterwards binds. After a restart the new generation starts with an empty store and no release latched, the old generation's token is refused, and a helper in the new session binds it with its own anchor. A reused pid with another start time is a second observer, never the bound one; an unreadable start time stores nothing. A peer in another time namespace, or whose namespace link cannot be read while the daemon's exists, is refused as `clock_namespace`; with no namespaces on either side a report is stored; an unreadable own link refuses every report as `clock_namespace_unreadable`; and a generation refused for its clock stays refused. A measured Claude Code generation held as `input_mode_conflict` is refused by the doorbell with that clause, and through the real tick nothing is typed into it while the inbox names `cannot_type`.
+- **Does not assert:** the clients' words for `cannot_type` (`inbox/status/030`), or the wrapper's sending side (`inbox/doorbell/052`, `054`).
 - **Platform coverage:** mac+linux (the time-namespace cases run on both through injected links; the real links are read on Linux only).
 
 ##### inbox/doorbell/052 — A wrapper sends input-mode reports only to a daemon identity that said it stores them, within one deadline, to a peer of its own user.
-- **Layer:** Fast (`src/input_mode_tests.rs`: the exchange over scripted connections, the verdict cache, and the wrapper's real sender against fake daemons each run as a process of its own; `src/daemon.rs`, `hook_provenance_audit_tests`, the real hook socket with a helper process started from a pane's shell).
+- **Layer:** Fast (`src/input_mode_tests.rs`: the exchange over scripted connections, the verdict cache, and the wrapper's real sender against fake daemons each run as a process of its own; `src/daemon.rs`, `hook_provenance_audit_tests`, the real hook socket with a helper process started from a pane's shell; `src/agent_pty.rs`, `spawn_tests`, a Claude Code 2.1.310 model editor launched as a wrapped generation under the real doorbell tick).
 - **Agent:** none (fake daemons, a shell in the pane and a helper process that sends the reports).
-- **Asserts:** neither the probe line nor the report line decodes as an agent event. A daemon the wrapper has not met gets one probe, and the report follows on the same connection only when it answers `input_mode_report: 1`; an answer without the field, a refusal, a malformed line, another version or no answer while the connection stays open is remembered as unsupported, and that daemon gets nothing on later connections; a supported one gets later reports with no probe. A probe whose connection ends (end of file, a reset, a failed write) records no verdict and the next connection probes again; an unidentified daemon gets nothing. A connection whose first bound fails writes nothing and records no verdict. An answer cut off by the deadline after its first bytes records none either, the probe alone written. A bound failing after a supporting answer stops at the stage it hits: before the report's write, the probe alone is written and the exchange ends unbounded; before the acknowledgement's read, the report is written and sent with no acknowledgement; either way the Supported verdict the answer recorded stays, and the next connection carries the report with no probe. Silence records Unsupported only after a probe written with at least the silence window of the deadline left, a fail-closed trade that keeps the wrapper from judging after too little observation without telling a slow live daemon from an unsupported one: a daemon whose every connect leaves less than the window is probed again on each send, each send ending within the send timeout plus scheduling slack, and a supporting daemon that answers only after the deadline is recorded Unsupported. One deadline bounds the whole send: against a listener whose accept queue is full, a daemon dripping its probe answer and one dripping its acknowledgement, the send returns within the send timeout plus scheduling slack. A peer read as another user, or whose user cannot be read, gets no byte, not even the probe carrying the token, while the same send to a peer of this user writes the probe. Verdicts are kept per daemon identity: a daemon met again while remembered is not probed, the same pid with a new start time is a new daemon, and the ninth identity evicts the least recently used, which is probed on its return. With the wrapper's real sender held at its turn at each replacement, one report in hand and a newer one in its slot, a daemon that serves the reports reads one probe and then reports, three replacements that don't (no field, no answer, an older daemon's reading) each read one probe and no report, the held one included, and a supporting replacement after them reads one probe and then reports, the held one among them. A daemon that drips every acknowledgement does not hold the sender: reports reach a replacement at the same path within a few send timeouts, and a sender closed while it waits on a dripped acknowledgement ends its thread within one send timeout. On the current daemon, reports from one helper going raw, cooked and raw while the card is Working, Blocked, WaitingForInput and Idle are all stored and leave the card (status, last activity and journal included) unchanged, broadcast nothing, and set the settle anchor once. An older wrapper that sends no probe and no report leaves the store empty, reading `input_mode_unverified`; its events are broadcast as before, and the doorbell's admission and stall flag read as they do with no evidence at all (admitted, not stalled).
-- **Does not assert:** a run against a released older binary (the old-daemon and old-wrapper sides are stand-ins); the card's `cannot_type` or typed bytes for an older wrapper (activation).
+- **Asserts:** neither the probe line nor the report line decodes as an agent event. A daemon the wrapper has not met gets one probe, and the report follows on the same connection only when it answers `input_mode_report: 1`; an answer without the field, a refusal, a malformed line, another version or no answer while the connection stays open is remembered as unsupported, and that daemon gets nothing on later connections; a supported one gets later reports with no probe. A probe whose connection ends (end of file, a reset, a failed write) records no verdict and the next connection probes again; an unidentified daemon gets nothing. A connection whose first bound fails writes nothing and records no verdict. An answer cut off by the deadline after its first bytes records none either, the probe alone written. A bound failing after a supporting answer stops at the stage it hits: before the report's write, the probe alone is written and the exchange ends unbounded; before the acknowledgement's read, the report is written and sent with no acknowledgement; either way the Supported verdict the answer recorded stays, and the next connection carries the report with no probe. Silence records Unsupported only after a probe written with at least the silence window of the deadline left, a fail-closed trade that keeps the wrapper from judging after too little observation without telling a slow live daemon from an unsupported one: a daemon whose every connect leaves less than the window is probed again on each send, each send ending within the send timeout plus scheduling slack, and a supporting daemon that answers only after the deadline is recorded Unsupported. One deadline bounds the whole send: against a listener whose accept queue is full, a daemon dripping its probe answer and one dripping its acknowledgement, the send returns within the send timeout plus scheduling slack. A peer read as another user, or whose user cannot be read, gets no byte, not even the probe carrying the token, while the same send to a peer of this user writes the probe. Verdicts are kept per daemon identity: a daemon met again while remembered is not probed, the same pid with a new start time is a new daemon, and the ninth identity evicts the least recently used, which is probed on its return. With the wrapper's real sender held at its turn at each replacement, one report in hand and a newer one in its slot, a daemon that serves the reports reads one probe and then reports, three replacements that don't (no field, no answer, an older daemon's reading) each read one probe and no report, the held one included, and a supporting replacement after them reads one probe and then reports, the held one among them. A daemon that drips every acknowledgement does not hold the sender: reports reach a replacement at the same path within a few send timeouts, and a sender closed while it waits on a dripped acknowledgement ends its thread within one send timeout. On the current daemon, reports from one helper going raw, cooked and raw while the card is Working, Blocked, WaitingForInput and Idle are all stored and leave the card (status, last activity and journal included) unchanged, broadcast nothing, and set the settle anchor once. An older wrapper that sends no probe and no report leaves the store empty, reading `input_mode_unverified`; its events are broadcast as before, and the doorbell's admission and stall flag read as they do with no evidence at all (admitted, not stalled). A measured Claude Code generation launched through a wrapper (`dot-agent-deck wrap … -- …`) that never reports is refused by the doorbell as `input_mode_unverified`, and through the real tick nothing is typed into it while the inbox names `cannot_type`.
+- **Does not assert:** a run against a released older binary (the old-daemon and old-wrapper sides are stand-ins); a released older wrapper binary (the wrapped generation's launcher is a stand-in script).
 - **Platform coverage:** mac+linux.
 
 ##### inbox/doorbell/053 — The activation table decides each release from its record, rule by rule.
@@ -9956,17 +9973,26 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Platform coverage:** mac+linux.
 
 ##### inbox/doorbell/055 — A generation's release is latched from its start-up header, whatever the evidence state and however the bytes were split.
-- **Layer:** Fast (`src/agent_pty.rs`, `spawn_tests`, the real bus `push` and resize paths, a real `cat` registry agent; `src/daemon.rs`, `hook_provenance_audit_tests`, the real hook socket).
+- **Layer:** Fast (`src/agent_pty.rs`, `spawn_tests`, the real bus `push` and resize paths, a real `cat` registry agent and Claude Code 2.1.310 model editors under the real ring and tick; `src/daemon.rs`, `hook_provenance_audit_tests`, the real hook socket).
 - **Agent:** none (`cat`, synthesized headers and erase storms, and commit 1's recorded Codex and Claude Code launches).
-- **Asserts:** a header drawn and then scrolled away 200 lines stays latched; header-like text in another shape latches nothing; once the window has closed at the first prompt, or at its byte limit, a later header is ignored and the release reads as unseen with the close reason; two different headers are a conflict; a header overwritten in place after a carriage return latches. One trace whose single push leaves no header on screen latches the same release split after the header, inside its escape sequences, inside a multibyte glyph and one byte per push, and two headers with a redraw are a conflict under each of those splits; commit 1's recorded launches latch through the bus at pseudo-random splits exactly as one byte at a time. A header before any Clean frame, before a layout edge that leaves the state Dirty, and drawn while Dirty after an edge all latch. A header painted right to left latches at its last character; one moved by scroll-up, insert-line and reverse-index latches once, at its print, and a non-matching row moved the same way latches nothing; an erase that removes a disqualifying cell inside the span completes the match; a repeat writing a version's last digit across a wrap leaves it unseen. A spawn over the scanner's cell budget has no scanner and reads as `scanner_geometry`; a resize over the budget drops the scanner, keeping a latch already made; the scanner keeps no scrollback. One read of erase-display at 512 × 512 passes the scanner's per-push work limit, and reads each under it at 512 × 512 pass its per-generation limit: either way the scanner is dropped at the first byte over the limit, the window closes at its work budget naming that limit, an unlatched generation reads as `scanner_budget`, which the activation table holds, a header after the trip is not read, and a release latched before a trip stays latched. Every recorded launch, replayed through the bus at its recorded read sizes at 50 × 200 and 80 × 300, stays inside both limits, using under a fifth of the per-push limit in any read and under a sixth of the per-generation one. Attaching and detaching leave the latch alone; a respawned generation starts empty and reads as unseen with no header of its own; the window's close at the first prompt, a generation's retirement and its PTY reader's end each drop the scanner; only a prompt attested to the generation by its hook token closes its window, through the real hook socket.
-- **Does not assert:** an admission using the latch, or the `cannot_type` and controller-notice halves (activation).
+- **Asserts:** a header drawn and then scrolled away 200 lines stays latched; header-like text in another shape latches nothing; once the window has closed at the first prompt, or at its byte limit, a later header is ignored and the release reads as unseen with the close reason; two different headers are a conflict; a header overwritten in place after a carriage return latches. One trace whose single push leaves no header on screen latches the same release split after the header, inside its escape sequences, inside a multibyte glyph and one byte per push, and two headers with a redraw are a conflict under each of those splits; commit 1's recorded launches latch through the bus at pseudo-random splits exactly as one byte at a time. A header before any Clean frame, before a layout edge that leaves the state Dirty, and drawn while Dirty after an edge all latch. A header painted right to left latches at its last character; one moved by scroll-up, insert-line and reverse-index latches once, at its print, and a non-matching row moved the same way latches nothing; an erase that removes a disqualifying cell inside the span completes the match; a repeat writing a version's last digit across a wrap leaves it unseen. A spawn over the scanner's cell budget has no scanner and reads as `scanner_geometry`; a resize over the budget drops the scanner, keeping a latch already made; the scanner keeps no scrollback. One read of erase-display at 512 × 512 passes the scanner's per-push work limit, and reads each under it at 512 × 512 pass its per-generation limit: either way the scanner is dropped at the first byte over the limit, the window closes at its work budget naming that limit, an unlatched generation reads as `scanner_budget`, which the activation table holds, a header after the trip is not read, and a release latched before a trip stays latched. Every recorded launch, replayed through the bus at its recorded read sizes at 50 × 200 and 80 × 300, stays inside both limits, using under a fifth of the per-push limit in any read and under a sixth of the per-generation one. Attaching and detaching leave the latch alone; a respawned generation starts empty and reads as unseen with no header of its own; the window's close at the first prompt, a generation's retirement and its PTY reader's end each drop the scanner; only a prompt attested to the generation by its hook token closes its window, through the real hook socket. After a model editor's header is scrolled away and its screen redrawn without it, a ring is admitted on the latched release, and its `doorbell attempt` line names `release="2.1.310"`, `release_source="header"` and the activation verdict. A Claude Code editor that never draws its header has no release latched, so the doorbell refuses it as `unknown_release`: through the real tick nothing is typed, the inbox names `cannot_type`, whose words are the ones both clients show, and the message stays queued until a fetch takes it.
+- **Does not assert:** the controller notice for a held generation (`inbox/status/033`, `inbox/doorbell/056`).
 - **Platform coverage:** mac+linux.
 
+##### inbox/doorbell/056 — An unmeasured Claude Code release is held where the user can see it, and a prompt recovers it.
+- **Layer:** L2 lane 1 (`tests/e2e_claude_unmeasured_release.rs`), PTY-attached real TUI, its lazy-spawned daemon, an orchestration with a routing-stand-in orchestrator, `daemon status --json`, and the deck's log.
+- **Agent:** none (`tests/support/claude_composer.py`, a scripted Claude Code screen in raw mode drawing the measured profile's rows with the header release it is given; it runs `dot-agent-deck inbox fetch` on every submitted prompt, as Claude Code's prompt hook hands over mail; no model or credential).
+- **Asserts:** a task delegated to a worker whose header names Claude Code 2.1.399, Idle at its empty composer with nothing armed, is held: the agent record names `cannot_type`, the worker's card on the orchestration tab shows the cannot_type words, `daemon status` shows WAKE `none`, the orchestrator's overdue notice reads `Wake path: none` without "rings the doorbell", over 1.5 s nothing reaches the pane, no `doorbell rang` is logged, a `doorbell off` line names `unmeasured_release` and the measured release 2.1.310, and the task stays queued. A prompt typed into the pane's input then has the screen fetch the task, which is acknowledged, and the hold clears. The control, a worker drawing the measured 2.1.310 header, shows WAKE `doorbell`, is rung once, and its task is fetched and acknowledged.
+- **Does not assert:** a real Claude Code (`inbox/claude/050`), or a `doorbell attempt` line for the held worker (a refused generation is not admitted, so none is written).
+- **Platform coverage:** mac+linux.
+- **Cost:** none.
+
+
 ##### inbox/doorbell/057 — The status's WAKE and the overdue notice name one route, from the generation's typed-fallback verdict.
-- **Layer:** Fast (`src/inbox_hub.rs`, a real hub with notices due at once and a real once-waiter; `src/agent_pty.rs`, the real `attach_inbox_summaries` over the registry's hub).
+- **Layer:** Fast (`src/inbox_hub.rs`, a real hub with notices due at once and a real once-waiter; `src/agent_pty.rs`, the real `attach_inbox_summaries` over the registry's hub, and Claude Code 2.1.310 model editors with the real re-projection publisher and its test gates).
 - **Agent:** none.
-- **Asserts:** with nothing armed and the typed fallback refused, the snapshot's wake is `none` and the overdue notice reads `Wake path: none` with the refused wording and no promise of the doorbell, while with it available both read `doorbell` and today's wording; refused with a native waiter armed, the wake is `native` and a delegated task is handed to the waiter, and the native notice wording is unchanged; refused with a turn-end announcement, `turn-end` with the refused wording and without "the doorbell rings while it is idle", and today's turn-end wording when available; a verdict that changes after the notice shows in the next snapshot while the notice keeps the route it was told; the verdict goes when its generation exits, and a successor in the pane reads `doorbell` until its own refusal, then `none`. At the record boundary, a record with no live status reads `none` whatever the verdict, and a reporting record reads `doorbell`, `none` once refused and `doorbell` again when available.
-- **Does not assert:** the re-projection publisher writing the verdict, or a publisher request held at a gate while the inputs change (activation).
+- **Asserts:** with nothing armed and the typed fallback refused, the snapshot's wake is `none` and the overdue notice reads `Wake path: none` with the refused wording and no promise of the doorbell, while with it available both read `doorbell` and today's wording; refused with a native waiter armed, the wake is `native` and a delegated task is handed to the waiter, and the native notice wording is unchanged; refused with a turn-end announcement, `turn-end` with the refused wording and without "the doorbell rings while it is idle", and today's turn-end wording when available; a verdict that changes after the notice shows in the next snapshot while the notice keeps the route it was told; the verdict goes when its generation exits, and a successor in the pane reads `doorbell` until its own refusal, then `none`. At the record boundary, a record with no live status reads `none` whatever the verdict, and a reporting record reads `doorbell`, `none` once refused and `doorbell` again when available. With the real publisher, a measured generation reads `doorbell` once its header latched; two processes reporting its input mode hold it as `input_mode_conflict`, which the publisher writes as its refusal with no other request, and its wake turns `none`; another generation that spends its last attempt number on a submitted ring is refused as `attempt_exhausted` and its next ring types nothing. With the publisher held at its gate while a generation's inputs change and a second request is queued, nothing is published until the gate opens, and then the verdict for the newer inputs. A run held after reading its inputs and before its hub write, while its generation exits and the exit clears its entries, writes nothing back for the retired generation, and a successor in the pane reads its own route.
+- **Does not assert:** the publisher's latency under load, which the `doorbell reprojection` debug line records per run (`queued_us`, `took_us`).
 - **Platform coverage:** all.
 
 #### inbox/boundary
@@ -10512,21 +10538,21 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 
 ##### inbox/status/003 — ListAgents carries live per-agent inbox counts and the currently armed wake path.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_status.rs`), real binary and attach/hook sockets.
-- **Agent:** none (raw Python stand-in; no credential).
+- **Agent:** none (the e2e stand-in profile's Python editor; no credential).
 - **Asserts:** AgentRecord.inbox separates queued/fetched counts by agent and tracks ack time; Pi's native announcement without a watcher retains doorbell fallback, then waiter arm/EOF changes doorbell → native → doorbell, followed by turn_end on announce.
 - **Does not assert:** native delivery to a real model, user-facing dashboard badges or status subprocess formatting.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/status/004 — Attached clients receive each direct-message lifecycle transition as a recognized Inbox broadcast.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_status.rs`), real binary and streaming attach subscription.
-- **Agent:** none (raw Python stand-in; no credential).
+- **Agent:** none (the e2e stand-in profile's Python editor; no credential).
 - **Asserts:** Queued → Fetched → Queued (a receipt fetch that reports it printed nothing) → Fetched → Acknowledged (explicit `ack`) and Queued → Undeliverable (agent stop) arrive in order with pane_id, message_id, subject and from_label; BroadcastMsg recognizes and preserves the inbox payload.
 - **Does not assert:** offers, publishes, real agent adapters or frontend rendering.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/status/005 — Hello carries the stable deck token used by inbox message ids.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_status.rs`), real binary and attach socket.
-- **Agent:** none (raw Python stand-in; no credential).
+- **Agent:** none (the e2e stand-in profile's Python editor; no credential).
 - **Asserts:** Two Hello replies name the same eight-character deck_id, and a posted message id uses that token.
 - **Does not assert:** persistence across daemon restart; the deck-id persistence round trip is `inbox/core/002`.
 - **Platform coverage:** mac+linux.
@@ -10843,8 +10869,8 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 
 ##### inbox/claude/047 — A pre-inbox hook that never asks for mail is named, and recovers.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), real hook CLI children, the e2e-only `DOT_AGENT_DECK_INBOX_TEST_HOOK_INTEGRATION=pre-inbox` knob (no version stamp, no inbox requests). Extends `inbox/claude/022` (PRD #1666 part 3, R-3).
-- **Agent:** none (synthetic Claude parent; no credential).
-- **Asserts:** a SessionStart from the stand-in prints nothing and the card's notice becomes `hooks_too_old`, with the deck's `hooks install --agent claude-code` command when it composes one; a task posted then is queued, and after the stand-in's Stop the doorbell line naming it is typed while the notice stands (the notice holds no mail), and `dot-agent-deck inbox fetch` run in the pane is handed it and it is acknowledged; a SessionStart from the deck's own hook clears the notice, and a prompt hook given a second task's doorbell line is handed that task, which is acknowledged.
+- **Agent:** none (synthetic Claude parent drawing the e2e stand-in profile's screen, the profile selected for its pane; no credential).
+- **Asserts:** a SessionStart from the stand-in prints nothing and the card's notice becomes `hooks_too_old`, with the deck's `hooks install --agent claude-code` command when it composes one; a task posted then is queued, and after the stand-in's Stop the token-led doorbell line naming it is typed while the notice stands (the notice holds no mail), and `dot-agent-deck inbox fetch` run in the pane is handed it and it is acknowledged; a SessionStart from the deck's own hook clears the notice, and a prompt hook given a second task's doorbell line is handed that task, which is acknowledged.
 - **Does not assert:** a genuine 0.46 binary, a hook older than the hook capability token (0.45 and earlier, refused before the deck can tell whose card it is), a real model choosing to run the fetch the doorbell names, or a real Claude reloading its hooks.
 - **Platform coverage:** mac+linux.
 
@@ -10861,6 +10887,15 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Asserts:** with the settings made a pre-0.47 install (status hooks on a stand-in copy whose `--version` is unreadable, no waiter), a Haiku started under them has the `hooks_too_old` integration notice and `deck hooks run a dot-agent-deck too old` is on its card on screen; with the stand-in removed, `hooks refresh` succeeds with `ok: true` and the settings gain the waiter and lose the stand-in; a Haiku started afterwards arms its waiter, writes a sentinel-writing task's file once, the task is acknowledged after one hand-over with no doorbell, and the card labels it.
 - **Does not assert:** a real 0.46 binary, an upgrade client running the refresh (`self_upgrade::agent_hooks`, `upgrade/upgrade-dialog/015`, desktop `local_upgrade_008`–`010`), or the stale Haiku itself answering a doorbell with `inbox fetch`.
 - **Platform coverage:** mac+linux.
+
+##### inbox/claude/050 — Live: an unmeasured Claude Code release is held, and a prompt delivers.
+- **Layer:** L2 lane 2 (`tests/e2e_inbox_claude_live.rs`), the real TUI in a PTY with the deck run under `DOT_AGENT_DECK_E2E_UNRECORD_CLAUDE_RELEASES` naming the installed release (`claude --version`), so that release is unrecorded.
+- **Agent:** Claude Code (Haiku).
+- **Asserts:** the cause is proved before the hold is read: the deck's log has a `pane release` line naming the installed release as latched, and, after the scratch pane's armed waiter is killed by its captured pid and none is armed, a `doorbell off` line naming `unmeasured_release`; if either is missing the test prints `SKIP:` naming what it saw, which `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` turns into a failure. For 20 seconds after that, no `doorbell rang` is logged and no doorbell line shows on the pane's screen, the last user prompt carries none, the directive task stays queued, and the card shows the cannot_type words. A short prompt typed into the pane with Enter then has the prompt hook hand Haiku the task: the sentinel is written once and the task acknowledged after one hand-over, not recorded as human history.
+- **Does not assert:** a release the deck has measured (`inbox/claude/014`), or macOS process discovery.
+- **Platform coverage:** linux.
+- **Cost:** one cheap model turn.
+
 
 ##### inbox/claude/023 — A raw exact commit needs the attempt's receipt.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), a raw `inbox_committed` sent to the hook socket by the scripted Claude parent itself (inside the agent's process tree), real waiter and hook CLI children, real spool.
@@ -11034,12 +11069,12 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** Waiter ordering, covered by inbox/claude/006.
 - **Platform coverage:** mac+linux.
 
-##### inbox/claude/014 — Killing a real Claude waiter falls back to doorbell injection and acknowledgement.
+##### inbox/claude/014 — On a measured release, killing a real Claude waiter falls back to doorbell injection and acknowledgement.
 - **Layer:** L2 real agent, lane 2 (PTY-attached).
 - **Agent:** Claude Code, Haiku.
-- **Asserts:** Killing the captured scratch waiter leaves none armed; the fixed doorbell wakes the agent and its submit hook fetches, injects and acknowledges the sentinel task without recording it as human history.
+- **Asserts:** A preflight reads the installed Claude Code release (`claude --version`) and runs the test only on a release the deck has measured (a complete record its activation table calls Go); otherwise it prints `SKIP:` naming the installed release and the measured ones, which `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` turns into a failure (UNVERIFIED, never green). On a measured release, killing the captured scratch waiter leaves none armed; the token-led doorbell wakes the agent (`doorbell rang` in the deck's log) and its submit hook fetches, injects and acknowledges the sentinel task without recording it as human history.
 - **Test:** `claude_014_live_killed_waiter_falls_back_to_injection` in `tests/e2e_inbox_claude_live.rs`.
-- **Does not assert:** macOS process discovery.
+- **Does not assert:** macOS process discovery, or an unmeasured release, which is held (`inbox/claude/050`).
 - **Platform coverage:** linux.
 
 ##### inbox/route/008 — A refused inbox post releases its delegation commission and permits a fresh task.
@@ -11081,14 +11116,14 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/codex/001 — The update-now startup dialog receives zero input bytes.
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`).
 - **Agent:** none (raw-mode Codex screen recorder behind the real wrapper).
-- **Asserts:** Queuing a task sends neither the doorbell nor a bare CR into the measured update dialog.
+- **Asserts:** Queuing a task sends neither the doorbell nor any other byte into the measured update dialog.
 - **Does not assert:** A real Codex update or model turn.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/codex/002 — The folder-trust startup dialog receives zero input bytes.
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`).
 - **Agent:** none (wrapped screen recorder).
-- **Asserts:** Raw-input readiness cannot permit a doorbell or bare CR into folder trust.
+- **Asserts:** Raw-input readiness permits no doorbell and no other byte into folder trust.
 - **Does not assert:** Filesystem trust changes in a real Codex.
 - **Platform coverage:** mac+linux.
 
@@ -11099,24 +11134,24 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** Real hook trust hashing, covered by codex/trust.
 - **Platform coverage:** mac+linux.
 
-##### inbox/codex/004 — Unknown startup screens hold delivery until a recognised composer and suppress cleanup CRs.
+##### inbox/codex/004 — Codex gets no byte, on an unknown dialog or at its recognised composer.
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`).
 - **Agent:** none (wrapped screen recorder).
-- **Asserts:** An unknown dialog gets zero bytes; painting the empty composer permits exactly the fixed doorbell; returning to an unknown dialog before fetch prevents a cleanup CR.
+- **Asserts:** An unknown dialog gets zero bytes; painting the recognised empty composer still gets zero bytes, since the deck types into no Codex release (`first_stage_commits`); the task waits queued, a receiver's fetch acknowledges it, and no byte follows.
 - **Does not assert:** Future Codex screen wording.
 - **Platform coverage:** mac+linux.
 
-##### inbox/codex/005 — A positively recognised composer permits a doorbell before the first own hook.
+##### inbox/codex/005 — An empty Codex composer gets no byte, before or after its first own hook.
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`).
 - **Agent:** none (wrapped screen recorder).
-- **Asserts:** A fresh Codex generation at its composer receives only the fixed submitted line without launch-prompt arguments.
-- **Does not assert:** A real model fetching the content.
+- **Asserts:** A fresh Codex generation at its composer receives zero bytes before its own SessionStart and after it, with the task still queued: no doorbell, launch-prompt argument or body.
+- **Does not assert:** A real model fetching the content (`inbox/codex/020`).
 - **Platform coverage:** mac+linux.
 
-##### inbox/codex/006 — Own-hook status and an empty recognised composer gate the doorbell; restart resets the startup guard.
+##### inbox/codex/006 — Neither Codex's own Idle nor its composer lets the doorbell type; a restart on a dialog gets nothing either.
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`).
 - **Agent:** none (wrapped screen recorder and real hook CLI).
-- **Asserts:** Busy status withholds bytes; after an own hook, Idle still holds an unfamiliar screen until the empty composer appears; replacement generation on a startup dialog receives zero bytes.
+- **Asserts:** Busy status withholds bytes; after its own hooks, an Idle with an unfamiliar screen gets no byte, and neither does the recognised empty composer drawn after it, the task staying queued; a replacement generation on a startup dialog receives zero bytes.
 - **Does not assert:** Cross-version compatibility.
 - **Platform coverage:** mac+linux.
 
@@ -11137,16 +11172,24 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/codex/020 — With untrusted hooks, a model-run fetch commits on receipts.
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`), the real `inbox fetch` CLI with the pane's identity and receipt spool (PRD #1666 part 3, H4).
 - **Agent:** none (no deck hook runs; wrapped stand-in Codex).
-- **Asserts:** the doorbell is typed; a stand-in model's `inbox fetch` prints the framing and the block naming its attempt, exits 0, and the task is settled by its receipt with the card not degraded; with the generation's receipt records directory made read-only, a second fetch still prints and settles its task and the record's `receipts_degraded` names the receipt.
+- **Asserts:** nothing is typed into the pane; a stand-in model's `inbox fetch` prints the framing and the block naming its attempt, exits 0, and the task is settled by its receipt with the card not degraded; with the generation's receipt records directory made read-only, a second fetch still prints and settles its task and the record's `receipts_degraded` names the receipt.
 - **Does not assert:** Codex's real sandbox (`inbox/codex/022`).
 - **Platform coverage:** mac+linux.
 
 ##### inbox/codex/021 — Prompt hook off, Stop on: each task is handed over and settled once.
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`), the real Codex Stop hook and `inbox fetch` CLI (PRD #1666 part 3, H4).
 - **Agent:** none (wrapped stand-in Codex; its prompt hook is never run).
-- **Asserts:** an idle task reaches the model through the doorbell and a model-run fetch; a busy task through Stop; a Stop and a fetch run at once over two queued tasks print each exactly once between them; every task is settled by its receipt with one delivery.
+- **Asserts:** an idle task reaches the model through a model-run fetch, with nothing typed into the pane; a busy task through Stop; a Stop and a fetch run at once over two queued tasks print each exactly once between them; every task is settled by its receipt with one delivery.
 - **Does not assert:** a real Codex (`inbox/codex/011`, `/022`).
 - **Platform coverage:** mac+linux.
+
+##### inbox/codex/024 — A pane its own hooks report as Codex gets no byte.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`), the real Codex hook CLI with the pane's identity.
+- **Agent:** none (the Codex screen recorder at its empty composer, under a name the deck does not recognise and spawned with no agent type).
+- **Asserts:** after the pane's own SessionStart and Stop report it as Codex, a queued task gets zero bytes and stays queued, and the agent record's wake reads `turn_end`, the route Codex's own hooks give, not `doorbell`.
+- **Does not assert:** a real Codex, or a modal present before admission (`inbox/codex/001`–`003`).
+- **Platform coverage:** mac+linux.
+
 
 ### Test harness: Claude Code prompt submission
 
@@ -11825,7 +11868,7 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 ##### inbox/route/001 — Delegate with clear enabled to a live stand-in. The old process is replaced before posting; exactly one task is bound to the new agent and only that generation can fetch it.
 - **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
 - **Agent:** none.
-- **Asserts:** Clear delegation replaces the predecessor and binds one task to its successor. In separate pre-SessionStart and post-SessionStart cases, 128 predecessor-session ShellIdle samples and 6.5 seconds without readiness must leave its input empty; with the stand-in's fetch capability enabled first, own Idle must submit the fixed line within one second and the submitted ring must trigger a successful real CLI fetch.
+- **Asserts:** Clear delegation replaces the predecessor and binds one task to its successor. In separate pre-SessionStart and post-SessionStart cases, 128 predecessor-session ShellIdle samples and 6.5 seconds without readiness must leave its input empty (in the SessionStart case the routing stand-in draws no ready row, so no prompt is on its screen); with the stand-in's fetch capability enabled first, own Idle must submit the token-led line within one second and the submitted ring must trigger a successful real CLI fetch.
 - **Test:** `route_001_clear_posts_after_respawn_to_new_agent` and `route_001_clear_session_start_is_not_ready` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
@@ -11849,7 +11892,7 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 ##### inbox/route/004 — Each supported agent starts with one inbox seed, without typed task content.
 - **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
 - **Agent:** none.
-- **Asserts:** One queued seed bound to each generation before SessionStart; the Codex stand-in paints the measured empty composer before a fixed doorbell fetch. Pi's legacy GetSeed alias consumes and acknowledges each oldest queued message once, including a message posted after startup, without typed task content.
+- **Asserts:** One queued seed bound to each generation before SessionStart, for Claude Code, OpenCode, Pi, Codex and Devin. Pi's legacy GetSeed alias is refused and leaves the seed queued. Codex, wrapped so the stand-in profile is not selected, gets zero bytes after its Idle over one second, its seed queued until a receiver fetches it; the other panes fetch after their token-led doorbell, without typed task content.
 - **Test:** `route_004_start_agent_seed_is_first_message_for_every_agent_type` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
@@ -11880,10 +11923,10 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 
 #### inbox/codex
 
-##### inbox/codex/009 — Real idle Codex receives a fixed doorbell and acts on submit-hook inbox context. [reel]
+##### inbox/codex/009 — Real idle Codex is held with nothing typed, and a prompt delivers. [reel]
 - **Layer:** L2 real agent, lane 2 (`tests/e2e_inbox_codex_live.rs`), attached interactive PTY.
-- **Agent:** Codex 0.160.0, cheap model from `codex_test_model()`, scratch HOME/CODEX_HOME and cwd outside the repository.
-- **Asserts:** visible interactive composer, doorbell and UserPromptSubmit injection, exact sentinel contents, acknowledgement and envelope card.
+- **Agent:** Codex (the installed release), cheap model from `codex_test_model()`, scratch HOME/CODEX_HOME and cwd outside the repository.
+- **Asserts:** with Codex idle, a posted task gets no doorbell (no `doorbell rang` logged), stays queued, and the card shows the cannot_type words; after the test types a prompt into the pane and presses Enter, Codex's hooks (`DoorbellHook` or `TurnEndHook` in the deck log) hand the task over, and the exact sentinel contents and the acknowledgement follow, still with no doorbell rung.
 - **Does not assert:** busy hand-over or startup dialogs, covered below.
 - **Cost:** one cheap model turn.
 
@@ -11904,52 +11947,13 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 ##### inbox/codex/022 — Real Codex with its hooks off delivers through a model-run fetch on receipts.
 - **Layer:** L2 real agent, lane 2 (`tests/e2e_inbox_codex_live.rs`), attached interactive PTY (PRD #1666 part 3, H4).
 - **Agent:** Codex 0.160.0, cheap model from `codex_test_model()`, `--sandbox workspace-write` with network access, every deck hook switched off in Codex's trust records, the build under test first on the pane's `PATH`.
-- **Asserts:** the doorbell rings; Codex's model runs `dot-agent-deck inbox fetch` in its own sandbox and that fetch reaches the deck as a hook receiver (`consumer=Cli` in the deck log; a fetch that never arrives fails as UNVERIFIED, not a pass); the sentinel is written once; the task is settled by its receipt; no deck hook fetched.
+- **Asserts:** no doorbell rings; after the test asks Codex in its pane to run `dot-agent-deck inbox fetch`, Codex's model runs it in its own sandbox and that fetch reaches the deck as a hook receiver (`consumer=Cli` in the deck log; a fetch that never arrives fails as UNVERIFIED, not a pass); the sentinel is written once; the task is settled by its receipt; no deck hook fetched.
 - **Does not assert:** a spool write the sandbox denies (`inbox/codex/020`), or Codex showing a failing hook's stderr.
 - **Cost:** one cheap model turn.
 - **Platform coverage:** mac+linux.
 
-##### inbox/codex/012 — A draft retained after paste-burst Enter prevents all doorbell input.
-- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`).
-- **Agent:** wrapped Codex-composer stand-in retaining its visible text after Enter.
-- **Asserts:** zero new input bytes while a draft remains, both before and after an own hook; Ctrl+U clears it and permits a separate fixed doorbell.
-- **Does not assert:** Codex's real paste-burst timing; the fixture recreates the measured retained-draft end-state.
-- **Cost:** none.
+`inbox/codex/012`–`017` are retired: the deck types into no Codex release (its first stage commits what it types), so the Codex composer gate they pinned, its retained-draft hold, the flush of a stranded line and the cleanup CR are gone; `inbox/codex/004`–`006` and `024` pin that nothing is typed into Codex.
 
-##### inbox/codex/013 — A doorbell line Codex left unsubmitted is submitted by the next ring.
-- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`).
-- **Agent:** wrapped Codex-composer stand-in that drops the first Enter after text, hides its shortcuts hint while the composer holds text and keeps its cursor right after the composer's text, as Codex 0.160.0 does.
-- **Asserts:** the rung line stays in the composer; the next ring sends one bare CR (no second line typed on top), and that CR submits the stranded line itself.
-- **Does not assert:** why a real Codex dropped the Enter; the fixture recreates the measured stranded end-state (live `codex/worker/001`, 2026-10-14).
-- **Cost:** none.
-
-##### inbox/codex/014 — A doorbell-shaped line the deck did not type gets no byte.
-- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`).
-- **Agent:** the `inbox/codex/013` stand-in, its screen repainted by the test.
-- **Asserts:** while the deck's own ring is outstanding, a composer holding a doorbell-shaped line naming another message, cursor after it, receives no byte across two due rings and the message stays `queued`; repainting the deck's own line brings the flushing CR.
-- **Does not assert:** that screen text proves who wrote it — a process drawing the deck's exact line still earns the CR (`docs/develop/agent-messaging.md`, "Doorbell guards").
-- **Cost:** none.
-
-##### inbox/codex/015 — No flush goes once the cleanup CR has dropped the record.
-- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`).
-- **Agent:** the `inbox/codex/013` stand-in, its screen repainted by the test.
-- **Asserts:** after the deck's flush submitted its stranded line and the composer shows that line again, fetching the lone message, with no ring due, brings exactly its one cleanup CR and then no byte while the line stays painted; a second message queued under that line, which the deck has no record of, gets no byte until an empty composer takes its ring.
-- **Does not assert:** how the line got back into a real Codex composer; the repaint stands in for retained or retyped text. That the record ends when its message leaves `queued`: when a ring for other queued work is due then, it goes in place of the cleanup and the record survives it (`inbox/doorbell/018`). Repeated flushes while the record lasts are allowed, one per due ring (`inbox/codex/017`).
-- **Cost:** none.
-
-##### inbox/codex/016 — A doorbell line whose Enter became a newline in Codex's composer is submitted by the next ring.
-- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`).
-- **Agent:** wrapped Codex-composer stand-in that takes the first Enter after text as a newline in its composer, leaving the line on the prompt row and its cursor on the empty row below at the composer indent, as Codex 0.160.0 did under CPU pressure (live `inbox/load/004`, 2026-10-14).
-- **Asserts:** the next ring sends one bare CR (no second line typed on top), and that CR submits the line itself.
-- **Does not assert:** why a real Codex took the Enter as a newline; the fixture recreates the measured end-state.
-- **Cost:** none.
-
-##### inbox/codex/017 — A swallowed flush is retried by the next ring.
-- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`).
-- **Agent:** the `inbox/codex/016` stand-in, which also ignores the first flushing CR.
-- **Asserts:** after the first flush CR is swallowed, the following ring sends another lone CR, which submits the still-stranded line.
-- **Does not assert:** that a real Codex swallows a flush; this pins the liveness bound, one lone CR per ring while the deck's own line stays stranded.
-- **Cost:** none.
 
 #### inbox/opencode
 
@@ -12259,10 +12263,10 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Does not assert:** private geometry_changes or geometry_tx counters (needs an in-process registry seam).
 - **Cost:** none.
 
-##### inbox/opencode/010 — Full and mini OpenCode retain the unarmed doorbell fallback.
+##### inbox/opencode/010 — Full and mini OpenCode with no stream armed are held without typing, and recover natively.
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`).
-- **Agent:** raw byte recorder announced as each OpenCode component without a stream.
-- **Asserts:** initial grace, then fixed doorbell, fetch and acknowledgement.
+- **Agent:** raw byte recorder announced as each OpenCode component without a stream, the stand-in profile not selected for it.
+- **Asserts:** for each of the full and mini components, past the grace and a 500 ms stall window the card holds the task as `cannot_type`, the pane receives zero bytes over a further second and the task stays queued with no delivery; when the component's receipt stream then arms, it is handed the task, the hold clears, and the deck has still typed nothing.
 - **Does not assert:** plugin interception (covered by inbox/opencode/011).
 - **Cost:** none.
 
@@ -12280,10 +12284,10 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Does not assert:** OpenCode loading the config.
 - **Cost:** none.
 
-##### inbox/opencode/013 — Explicit config refusal reports the repair and retains fallback delivery.
+##### inbox/opencode/013 — Explicit config refusal reports the repair, and the unarmed pane is held.
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`).
 - **Agent:** raw recorder only, real CLI installer facing a scratch symlink.
-- **Asserts:** nonzero exit, actionable stdout naming the config, reason and entry, untouched symlink and target, generic fallback ring and fetch.
+- **Asserts:** nonzero exit, actionable stdout naming the config, reason and entry, untouched symlink and target; an unarmed pane, the stand-in profile not selected for it, is held as `cannot_type` with zero bytes typed and the task queued with no delivery, until a receiver's fetch acknowledges it.
 - **Does not assert:** OpenCode's response to a missing plugin file.
 - **Cost:** none.
 
@@ -12344,11 +12348,11 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Does not assert:** Pi or OpenCode process crash cleanup.
 - **Cost:** cheap real-agent turns, sequential locally with strict preflight.
 
-##### inbox/opencode/022 — Real unarmed OpenCode intercepts a doorbell before the model.
+##### inbox/opencode/022 — Real unarmed OpenCode is held without typing.
 - **Layer:** L2 PTY-attached real agent, lane 2 (`tests/e2e_inbox_opencode_live.rs`).
 - **Agent:** interactive OpenCode 1.18.35, Haiku from `opencode_test_model()`, scratch HOME/XDG and cwd outside the repository; real delegate CLI and branch-installed plugins.
-- **Asserts:** An explicitly cancellable request reaches Thinking with a real running `bash` `sleep 30` call visible in both views before one logical Esc, 300 ms, Esc interrupt produces a genuine Idle and settled empty composer; no deck TUI watcher, genuine doorbell, server-plugin fetch bound to its doorbell-only receiver, ID-correlated frame and assembled execution token visible in both views, sentinel, `plugin_confirmed` / one delivery and a delivered card; interception before the model, with no model-side inbox fetch, restarted `sleep 30` or completion reply marker requested by the priming prompt through observed execution.
-- **Does not assert:** Cancellation of arbitrary earlier requests: this proves delivery and execution after an explicitly cancellable request; the deck does not cancel arbitrary earlier requests. Also excludes a completed natural-language final reply, future model behavior after execution, remote attach or non-TUI OpenCode commands.
+- **Asserts:** with no deck TUI watcher, an explicitly cancellable shell wait is interrupted to reach a genuine Idle with an empty composer, and a sentinel task is delegated; the card holds it as `cannot_type` within 60 seconds, then over ten seconds no `doorbell attempt` or `doorbell rang` is logged, the task stays queued with no delivery, and no sentinel is written.
+- **Does not assert:** what delivers the task once the user sends OpenCode a prompt, remote attach or non-TUI OpenCode commands.
 - **Cost:** cheap real-agent turns, sequential locally with strict preflight.
 
 #### inbox/pi
@@ -12498,10 +12502,10 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Does not assert:** Killing an unrelated watcher or arbitrary OS process recovery.
 - **Platform coverage:** linux (/proc ancestry).
 
-##### inbox/pi/020 — A real Pi doorbell transforms in place after the receiver sees registration.
-- **Layer:** L2 lane 2 (`tests/e2e_inbox_pi_live.rs`), PTY-attached binary with a labelled `--doorbell-only` watcher fixture and delayed registration reply. The fixture fixes the hand-out route so in-place substitution can be observed; it does not exercise the default boot route.
+##### inbox/pi/020 — Real unarmed Pi is held without typing, and a doorbell it is given transforms in place after the receiver sees registration.
+- **Layer:** L2 lane 2 (`tests/e2e_inbox_pi_live.rs`), PTY-attached binary with a watcher whose registration reply is delayed: by a minute for the hold case, and with a labelled `--doorbell-only` fixture for the transform case, which fixes the hand-out route so in-place substitution can be observed and does not exercise the default boot route.
 - **Agent:** Real interactive Pi on `common::pi_test_model()`, isolated configuration.
-- **Asserts:** A composed doorbell is submitted before the receiver sees registration; registration precedes exactly one integration-2 fetch for that rx, then ordered possession/handed/commit, one native opener/action/delivery and ExtensionConfirmed; no raw doorbell reaches the model and no model tool invokes inbox fetch.
+- **Asserts:** with nothing armed, a sentinel task delegated to Idle Pi is held: the card names `cannot_type` within 45 seconds, then over ten seconds no `doorbell attempt` or `doorbell rang` is logged, the task stays queued with no delivery, and no sentinel is written. A doorbell line the test composes and submits before the receiver sees registration: registration precedes exactly one integration-2 fetch for that rx, then ordered possession/handed/commit, one native opener/action/delivery and ExtensionConfirmed; no raw doorbell reaches the model and no model tool invokes inbox fetch.
 - **Does not assert:** Automatic scheduler wake or default watcher argv, which chain-smoke/pi/002 retains; the registration-delay knob delays the reply, not daemon registration.
 - **Platform coverage:** mac+linux.
 

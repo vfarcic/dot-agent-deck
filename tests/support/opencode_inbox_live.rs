@@ -62,6 +62,9 @@ impl OpenCode {
             .with_env("DOT_AGENT_DECK_LOG", "opencode-inbox-live.log")
             .with_env("DOT_AGENT_DECK_INBOX_ARM_GRACE_MS", "5000")
             .with_env("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "30000")
+            // A held task shows its reason after five seconds, not two
+            // minutes (`inbox/opencode/022`).
+            .with_env("DOT_AGENT_DECK_INBOX_WAKE_STALL_AFTER_MS", "5000")
             .with_env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "600")
             .launch_with_fixture("minimal");
         assert!(deck.wait_for_grid_string_within("No active agents", BUDGET));

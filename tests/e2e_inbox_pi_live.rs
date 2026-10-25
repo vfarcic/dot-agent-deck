@@ -268,6 +268,44 @@ fn pi_019_live_killed_watcher_retains_handed_followup_until_commit() {
     );
 }
 
+/// Scenario: Start real Pi with its watcher's registration held back for a minute, so nothing is armed, and delegate a sentinel task to it while it is Idle. The deck types into no Pi release: the agent's card must hold the task as cannot_type, and over a further ten seconds no doorbell is attempted or typed, the task stays queued with no delivery, and no sentinel is written.
+#[spec("inbox/pi/020")]
+#[test]
+fn pi_020_live_unarmed_is_held_without_typing() {
+    skip_unless!(live::available());
+    let pi = Pi::with_options(Options {
+        register_delay_ms: 60_000,
+        ..Options::default()
+    });
+    let name = "unarmed-held-41c7e2.txt";
+    let id = pi.append_task(name);
+    assert!(
+        common::wait_until(Duration::from_secs(45), || {
+            pi.record()["inbox"]["wake_hold"]
+                .to_string()
+                .contains("cannot_type")
+        }),
+        "the card holds the task as cannot_type; {}",
+        pi.evidence()
+    );
+    assert!(
+        !common::wait_until(Duration::from_secs(10), || {
+            let log = pi.log();
+            log.contains("doorbell attempt") || log.contains("doorbell rang")
+        }),
+        "the deck typed into Pi; {}",
+        pi.evidence()
+    );
+    let message = pi.message(&id);
+    assert_eq!(message["state"], "queued", "{message}; {}", pi.evidence());
+    assert_eq!(message["deliveries"], 0, "{message}; {}", pi.evidence());
+    assert!(
+        !pi.work.join(name).exists(),
+        "no sentinel without a delivery; {}",
+        pi.evidence()
+    );
+}
+
 /// Scenario: Submit a deck doorbell line in real Pi while its watcher registration reply is delayed. A labelled --doorbell-only fixture fixes the hand-out route so in-place substitution can be observed; Pi must replace the input and execute the task once, without exercising the default boot route or asking the model to fetch it.
 #[spec("inbox/pi/020")]
 #[test]

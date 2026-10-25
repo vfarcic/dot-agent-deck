@@ -211,59 +211,44 @@ fn opencode_021_live_watcher_respawns_and_next_delegate_is_native() {
     assert!(!op.log().contains("doorbell rang"), "{}", op.evidence());
 }
 
-/// Scenario: Remove the deck entry from scratch tui.json so no TUI watcher arms, start an explicitly cancellable shell wait with a completion reply marker, and interrupt it once after its running sleep is visible in both views to obtain a genuine Idle and empty composer. The server plugin must intercept the doorbell before the model, visibly execute the delegated task in both views without restarting the wait or emitting its completion reply marker, write the sentinel, acknowledge once, and show a delivered card. This covers delivery after explicit cancellation; the deck does not cancel arbitrary earlier requests.
+/// Scenario: Remove the deck entry from scratch tui.json so no TUI watcher arms, bring real OpenCode to a genuine Idle with an empty composer through an explicitly cancelled shell wait, and delegate a sentinel task. The deck types into no OpenCode release: the agent's card must hold the task as cannot_type, and over a further ten seconds no doorbell is attempted or typed, the task stays queued with no delivery, and no sentinel is written.
 #[spec("inbox/opencode/022")]
 #[test]
-fn opencode_022_live_unarmed_doorbell_is_intercepted_before_model() {
+fn opencode_022_live_unarmed_is_held_without_typing() {
     skip_unless!(live::available());
     let op = OpenCode::new(false, 0, false);
-    let priming_call = op.interrupted_cancellable_wait();
-    let id = op.delegate_execution("opencode-doorbell-52a1cd.txt", "022-52a1");
-    // PRD #1666 §4: the server plugin's doorbell-only receiver commits the
-    // substituted attempt on its own receipt stream, so the inbox records
-    // PluginConfirmed, as for the armed stream.
-    op.visible_execution(&id, "opencode-doorbell-52a1cd.txt", "NATIVE-EXEC-022-52a1");
-    let transcript = op.transcript();
-    let parts = transcript["part"].as_array().unwrap();
+    op.interrupted_cancellable_wait();
+    let name = "opencode-doorbell-52a1cd.txt";
+    let id = op.delegate_execution(name, "022-52a1");
     assert!(
-        !parts.iter().any(|p| p["data"]["type"] == "tool"
-            && p["id"] != priming_call
-            && p["data"]["state"]["input"]["command"]
-                .as_str()
-                .is_some_and(|command| command.contains("sleep 30"))),
-        "cancelled priming wait must not run again after delivery; {}",
+        common::wait_until(std::time::Duration::from_secs(60), || op.record()["inbox"]
+            ["wake_hold"]
+            .to_string()
+            .contains("cannot_type")),
+        "the card holds the task as cannot_type; {}",
         op.evidence()
     );
     assert!(
-        !parts.iter().any(|p| p["data"]["type"] == "text"
-            && p["data"]["text"]
-                .as_str()
-                .is_some_and(|text| text.contains("PRIME-INTERRUPT-022"))),
-        "cancelled wait's completion reply marker must not appear through delegated execution; {}",
+        !common::wait_until(std::time::Duration::from_secs(10), || {
+            let log = op.log();
+            log.contains("doorbell attempt") || log.contains("doorbell rang")
+        }),
+        "the deck typed into OpenCode; {}",
         op.evidence()
     );
-    assert!(op.log().contains("doorbell rang"), "{}", op.evidence());
-    assert!(op.log().contains("DoorbellHook"), "{}", op.evidence());
+    inbox::state(&op.deck, &op.pane, &id, "queued");
+    let listed = inbox::listing(&op.deck, &op.pane);
+    let message = listed["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == id)
+        .cloned()
+        .unwrap();
+    assert_eq!(message["deliveries"], 0, "{message}; {}", op.evidence());
     assert!(
-        !op.transcript()["part"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|p| p["data"]["type"] == "tool"
-                && p["data"]["state"]["input"]
-                    .to_string()
-                    .contains("inbox fetch")),
-        "interception must deliver before the model can fetch the tested task"
-    );
-    assert!(
-        !op.transcript()["part"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|p| p["data"]["type"] == "text"
-                && p["data"]["text"]
-                    .as_str()
-                    .is_some_and(|t| t.contains("waiting, run: dot-agent-deck inbox fetch"))),
-        "saved prompt must contain injected block, not doorbell"
+        !op.work.join(name).exists(),
+        "no sentinel without a delivery; {}",
+        op.evidence()
     );
 }

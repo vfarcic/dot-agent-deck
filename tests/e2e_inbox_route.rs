@@ -15,7 +15,7 @@ use serde_json::json;
 use spec::spec;
 use std::time::Duration;
 
-/// Scenario: An attested orchestrator delegates a multiline task to a synthetic worker. One bound inbox message and a task file without an ack-first header must result; the worker fetches the framed task after the fixed doorbell, without receiving task bytes on stdin.
+/// Scenario: An attested orchestrator delegates a multiline task to a synthetic worker. One bound inbox message and a task file without an ack-first header must result; the worker fetches the framed task after the token-led doorbell, without receiving task bytes on stdin.
 #[spec("orchestration/delegate/001")]
 #[test]
 fn delegate_001_posts_one_bound_task_and_worker_fetches() {
@@ -218,6 +218,14 @@ fn assert_clear_waits_for_ready(session_start: bool) {
     assert_eq!(route::count(&daemon, &new, 1)[0]["id"], id);
     {
         if session_start {
+            // Started, its prompt not drawn yet: SessionStart alone is not
+            // the readiness a ring needs.
+            route::hold_ready(&daemon, true);
+            assert!(
+                common::wait_until(WAIT, || screen(&daemon, &new)
+                    .contains("DOORBELL-STANDIN-BOOTING")),
+                "the successor must draw no prompt"
+            );
             status(&daemon, &new, "session_start", "claude_code");
         }
         // Age the bounded hook history past the predecessor's native hook.
@@ -245,6 +253,9 @@ fn assert_clear_waits_for_ready(session_start: bool) {
     // The submitted ring is consumed only once by the stand-in. Arm its
     // fetch before readiness so any correct wake/submit ordering can fetch.
     route::fetch_enable(&new);
+    if session_start {
+        route::hold_ready(&daemon, false);
+    }
     status(&daemon, &new, "idle", "claude_code");
     assert!(
         common::wait_until(Duration::from_secs(1), || bytes(&new).ends_with(b"\r")),
@@ -385,21 +396,13 @@ fn route_003_exited_bound_agent_is_undeliverable_and_notifies_sender() {
     );
 }
 
-/// Scenario: Start each supported agent type with a daemon seed while it has sent no SessionStart, showing Codex's recognised empty composer in its stand-in. The seed must already be queued once and bound to that generation; Pi's GetSeed alias, which predates the receipt stream, is refused and leaves the seed queued, while the other panes fetch after their fixed doorbell without receiving typed content.
+/// Scenario: Start each supported agent type with a daemon seed while it has sent no SessionStart, The seed must already be queued once and bound to that generation; Pi's GetSeed alias, which predates the receipt stream, is refused and leaves the seed queued; Codex, which runs under the deck's wrapper and is not typed into, receives zero bytes and a receiver takes its seed; the other panes fetch after their token-led doorbell without receiving typed content.
 #[spec("inbox/route/004")]
 #[test]
 fn route_004_start_agent_seed_is_first_message_for_every_agent_type() {
     let daemon = daemon_unbound(&[]);
-    let composer = daemon.home.join("codex-composer.txt");
-    std::fs::write(&composer, include_str!("fixtures/codex-inbox/composer.txt")).unwrap();
     for agent_type in ["claude_code", "open_code", "pi", "codex", "devin"] {
-        let mut extra = json!({"seed":route::TASK,"agent_type":agent_type});
-        if agent_type == "codex" {
-            extra["env"] = json!([
-                ["DOT_AGENT_DECK_PANE_ID", agent_type],
-                ["INBOX_ROUTE_CODEX_COMPOSER", composer]
-            ]);
-        }
+        let extra = json!({"seed":route::TASK,"agent_type":agent_type});
         let pane = route::start(&daemon, agent_type, extra);
         let messages = route::count(&daemon, &pane, 1);
         assert!(
@@ -418,6 +421,23 @@ fn route_004_start_agent_seed_is_first_message_for_every_agent_type() {
             let id = messages[0]["id"].as_str().unwrap();
             state(&daemon, &pane, id, "queued");
             assert!(!String::from_utf8_lossy(&bytes(&pane)).contains(route::TASK));
+            continue;
+        }
+        if agent_type == "codex" {
+            // PRD #1666 part 3, round 5-wake: a Codex pane runs under the
+            // deck's wrapper, so the stand-in's profile is not selected, and
+            // the deck does not type into Codex (its first stage commits). The
+            // seed waits queued with nothing typed, and a receiver takes it.
+            inbox::status(&daemon, &pane, "idle", "codex");
+            unchanged(&pane, Duration::from_millis(1000));
+            assert!(bytes(&pane).is_empty(), "the deck typed into Codex");
+            let id = messages[0]["id"].as_str().unwrap();
+            state(&daemon, &pane, id, "queued");
+            let fetched = fetch(&daemon, &pane, true).to_string();
+            assert!(
+                fetched.contains(id) && fetched.contains("ROUTE-TASK-a971"),
+                "{fetched}"
+            );
             continue;
         }
         eprintln!("route_004: fetching the seed for {agent_type}");

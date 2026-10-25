@@ -157,6 +157,18 @@ impl AttemptCounter {
         }
     }
 
+    /// Test seam: make `next` the next number this counter allocates.
+    #[cfg(test)]
+    pub fn set_next_for_test(&self, next: u32) {
+        self.next.store(next.max(1), Ordering::Release);
+    }
+
+    /// Whether the next number would be [`ATTEMPT_RESERVED`]: the generation
+    /// admits no more attempts (`attempt_exhausted`).
+    pub fn exhausted(&self) -> bool {
+        self.next.load(Ordering::Acquire) == ATTEMPT_RESERVED
+    }
+
     /// The next attempt number, or `None` once it would be
     /// [`ATTEMPT_RESERVED`].
     pub fn allocate(&self) -> Option<u32> {
@@ -350,15 +362,28 @@ impl Latch {
 /// meets interference retries and gives up once either condition fails, and
 /// none writes over `Retired`. "Clear" is how a resolved cell projects, never
 /// a write of a lower phase.
-#[derive(Debug)]
 pub struct LatchCell {
     word: AtomicU64,
+    /// Test seam: run once, just before the next suspension's
+    /// compare-and-swap (`inbox/doorbell/050` (n)).
+    #[cfg(test)]
+    before_suspend: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl std::fmt::Debug for LatchCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LatchCell")
+            .field("word", &self.load())
+            .finish()
+    }
 }
 
 impl Default for LatchCell {
     fn default() -> Self {
         Self {
             word: AtomicU64::new(word(0, PHASE_RESOLVED, Resolution::NotTyped as u8)),
+            #[cfg(test)]
+            before_suspend: std::sync::Mutex::new(None),
         }
     }
 }
@@ -418,6 +443,10 @@ impl LatchCell {
     /// The attempt ended `Unresolved(cause)`, expiry included: `Open(a)` to
     /// `Suspended(a, cause)`. Refused when exact evidence resolved it first.
     pub fn suspend(&self, attempt: u32, cause: Cause) -> Result<Latch, Latch> {
+        #[cfg(test)]
+        if let Some(hook) = self.before_suspend.lock().unwrap().take() {
+            hook();
+        }
         self.advance(
             |state| state == Latch::Open(attempt),
             word(attempt, PHASE_SUSPENDED, cause as u8),
@@ -467,6 +496,13 @@ impl LatchCell {
     /// The generation retired.
     pub fn retire(&self) {
         self.word.store(RETIRED, Ordering::Release);
+    }
+
+    /// Test seam: run `hook` once, just before the next suspension's
+    /// compare-and-swap.
+    #[cfg(test)]
+    pub(crate) fn before_next_suspend(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.before_suspend.lock().unwrap() = Some(Box::new(hook));
     }
 }
 
@@ -978,6 +1014,23 @@ impl<'c> Txn<'c> {
 
     pub fn deadline(&self) -> Instant {
         self.deadline
+    }
+
+    /// The job mark admission recorded (`J0`, plan §2.1′).
+    pub fn j0(&self) -> u64 {
+        self.j0
+    }
+
+    /// An Enter reached the pane: a withdrawal after it is of a line the
+    /// agent did not take.
+    pub fn cr_reached(&self) -> bool {
+        self.after_cr
+    }
+
+    /// The dialog the latest frame showed, by its measured name, or
+    /// `unrecognised` for one of the profile's shape with an unknown title.
+    pub fn last_dialog(&self) -> Option<&'static str> {
+        self.frame.dialog
     }
 
     pub fn phase(&self) -> Phase {

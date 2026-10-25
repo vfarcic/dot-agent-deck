@@ -4772,16 +4772,13 @@ mod tests {
             "the successor's inbox must not inherit the predecessor's prompt"
         );
 
-        // A barrier, not a sleep: an AUTHORIZED write — the doorbell's, the
-        // one automatic writer the deck keeps — that has demonstrably arrived
-        // proves the successor's PTY has drained past the point where a leaked
-        // prompt would have landed.
-        let barrier = registry
-            .write_doorbell(PANE, &successor, false, None, Some(BARRIER), || async {
-                true
-            })
-            .await;
-        assert_eq!(barrier, crate::agent_pty::DoorbellWrite::Written);
+        // A barrier, not a sleep: an AUTHORIZED write, bound to the successor,
+        // that has demonstrably arrived proves the successor's PTY has drained
+        // past the point where a leaked prompt would have landed.
+        registry
+            .write_user_bytes(PANE, &successor, BARRIER.as_bytes())
+            .await
+            .expect("the successor owns the pane, so a write bound to it goes in");
         crate::test_pty_wait::wait_for_echo_bytes(&registry, &successor, BARRIER.as_bytes()).await;
         let snapshot = registry.snapshot(&successor).expect("successor snapshot");
         assert!(

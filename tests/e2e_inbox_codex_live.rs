@@ -9,29 +9,43 @@ use live::{BUDGET, Codex};
 use spec::spec;
 use std::time::Duration;
 
-/// Scenario: Leave interactive Codex idle in its deck pane and post a sentinel task. The fixed doorbell and real submit hook must wake Codex, acknowledge the message, create the sentinel and show an envelope on its card.
+/// Scenario: Leave interactive Codex idle in its deck pane and post a sentinel task. The deck types nothing into Codex: no doorbell rings, the task stays queued and Codex's card says `waiting for the agent to fetch it. Send it a prompt.` Then the test sends Codex a prompt in its pane, as a user would: its real hooks hand the task over at that turn, and Codex acknowledges it and creates the sentinel.
 #[spec("inbox/codex/009")]
 #[test]
-fn codex_009_live_idle_doorbell_injects_and_acks() {
+fn codex_009_live_idle_is_held_and_a_prompt_delivers() {
     skip_unless!(common::check_codex_available());
     let codex = Codex::new(false);
     let name = "codex-idle-19cd36.txt";
     let id = codex.post(name);
-    codex.done(&id, name);
     assert!(
-        codex
-            .deck
-            .wait_for_grid_string_within("✉", Duration::from_secs(15)),
-        "idle delivery card must show envelope; {}",
+        codex.deck.wait_for_grid_string_within(
+            dot_agent_deck::inbox_display::WAKE_HOLD_CANNOT_TYPE,
+            BUDGET
+        ),
+        "the card holds the task; {}",
         codex.evidence()
     );
     assert!(
-        codex.log().contains("doorbell rang"),
+        !codex.log().contains("doorbell rang"),
         "{}",
         codex.evidence()
     );
-    assert!(codex.log().contains("DoorbellHook"), "{}", codex.evidence());
-    assert!(codex.screen().contains("DONE"), "{}", codex.evidence());
+    inbox::state(&codex.deck, &codex.pane, &id, "queued");
+    let mut input = codex.input("Check for new deck messages and do what they say.");
+    codex.wait_screen("Check for new deck messages");
+    input.write("\r");
+    codex.done(&id, name);
+    assert!(
+        !codex.log().contains("doorbell rang"),
+        "{}",
+        codex.evidence()
+    );
+    // Its prompt hook or its Stop hook at that turn's end.
+    assert!(
+        codex.log().contains("DoorbellHook") || codex.log().contains("TurnEndHook"),
+        "{}",
+        codex.evidence()
+    );
 }
 
 /// Scenario: Queue a task while real Codex displays its folder-trust selection. The dialog must stay on the same choice until the user accepts it, after which Codex must receive, act on and acknowledge the task.
@@ -126,7 +140,7 @@ fn codex_011_live_busy_stop_hands_over_and_acks() {
     );
 }
 
-/// Scenario: Start interactive Codex with every one of the deck's hooks switched off, so none of them runs, and post a sentinel task while it is idle. The deck types its doorbell; Codex's model runs `dot-agent-deck inbox fetch` inside its own sandbox, that fetch reaches the deck as a one-shot receiver (a sandbox that refuses the socket is UNVERIFIED, not a pass), the sentinel is written once, and the task is settled by its receipt with no hook having fetched.
+/// Scenario: Start interactive Codex with every one of the deck's hooks switched off, so none of them runs, and post a sentinel task while it is idle. The deck types nothing into Codex; the test asks Codex in its pane to run `dot-agent-deck inbox fetch`, and its model runs it inside its own sandbox, that fetch reaches the deck as a one-shot receiver (a sandbox that refuses the socket is UNVERIFIED, not a pass), the sentinel is written once, and the task is settled by its receipt with no hook having fetched.
 #[spec("inbox/codex/022")]
 #[test]
 fn codex_022_live_untrusted_hooks_a_model_run_fetch_delivers_on_receipts() {
@@ -134,6 +148,10 @@ fn codex_022_live_untrusted_hooks_a_model_run_fetch_delivers_on_receipts() {
     let codex = Codex::with_hooks(false, false);
     let name = "codex-untrusted-4e1c90.txt";
     let id = codex.post(name);
+    let mut input =
+        codex.input("Run dot-agent-deck inbox fetch in the shell and do what the messages say.");
+    codex.wait_screen("Run dot-agent-deck inbox fetch");
+    input.write("\r");
     let reached = common::wait_until(BUDGET, || {
         codex
             .log()
@@ -147,7 +165,7 @@ fn codex_022_live_untrusted_hooks_a_model_run_fetch_delivers_on_receipts() {
     );
     codex.done(&id, name);
     let log = codex.log();
-    assert!(log.contains("doorbell rang"), "{}", codex.evidence());
+    assert!(!log.contains("doorbell rang"), "{}", codex.evidence());
     assert!(
         !log.contains("DoorbellHook") && !log.contains("TurnEndHook"),
         "no deck hook fetched: {}",

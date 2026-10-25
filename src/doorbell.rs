@@ -2,15 +2,16 @@
 //! agent's pane.
 //!
 //! A message waits in the agent's inbox ([`crate::inbox_hub`]). When no
-//! agent-side component is armed to take it, the deck types one fixed line that
-//! names a waiting message and the command that fetches it:
+//! agent-side component is armed to take it, the deck types one line that
+//! names a waiting message and the command that fetches it, led by a ring
+//! token that ties the agent's prompt to this ring (PRD #1666 part 3, round
+//! 5-wake, plan §1.2):
 //!
 //! ```text
-//!  dot-agent-deck: message m-k3xzq2ab-0f3c9a71d2e4b850 waiting, run: dot-agent-deck inbox fetch
+//! (abcdfg) dot-agent-deck: message m-k3xzq2ab-0f3c9a71d2e4b850 waiting, run: dot-agent-deck inbox fetch
 //! ```
 //!
-//! The content itself is never typed. The leading space keeps two rings that
-//! end up on one line readable.
+//! The content itself is never typed.
 //!
 //! **When it rings** — every condition below, re-checked on each tick:
 //!
@@ -22,67 +23,31 @@
 //!    Error, or Unknown (no hook yet), nor the Idle of a Codex wrapper's
 //!    fork-time start alone — and its session has not declared the pane
 //!    history-only or view-only;
-//!    - part 2 (`inbox/doorbell/008`): that Idle is what the card presents;
-//!      the generation must also be ready by its OWN reports, kept per
-//!      generation outside the event journal
-//!      ([`crate::state::AppState::doorbell_readiness`]). Its own Idle makes
-//!      it ready; so does its own `SessionStart`, except for an agent that
-//!      posts it before its prompt is up (Claude Code), which is then rung
-//!      only while the writer recognises that prompt on screen. A
-//!      placeholder card, the shell monitor's frames (which can carry a
-//!      predecessor's session) and a wrapper's boot report establish none of
-//!      it, and neither does how long the card or process has existed;
-//!    - until the agent's own hooks have reported for this generation, an
-//!      agent whose spec names a composer (Codex) is written to only while that
-//!      composer is on screen: its wrapper reports Idle as soon as Codex takes
-//!      raw input, which is while its start dialogs are still up, and any byte
-//!      can answer one of those. Checked under the pane's writer, for the CRs
-//!      too ([`crate::agent_pty::AgentPtyRegistry::write_doorbell`]);
-//! 4. the user has no unsent draft in the pane — with no cap: the doorbell
-//!    waits for the user however long they take;
+//! 4. the deck may type into the generation at all: its release is one the
+//!    deck has measured ([`crate::doorbell_activation`]), its input mode is
+//!    proven raw, it has a way to show that the line was submitted, its
+//!    doorbell is not suspended on an earlier attempt, and its first ring has
+//!    waited out the settle window ([`crate::doorbell_generation`]); no paste
+//!    into the pane is open;
 //! 5. the ring is due on the schedule ([`DoorbellConfig::schedule`]).
 //!
-//! Conditions 2 to 4 are asked again under the pane's writer before each step
-//! of a write (the pre-ring CR, the line, its submit CR), after the wait
-//! between steps, and so is condition 1 for the **one message the ring
-//! names**: if it was fetched or acknowledged since the decision, the rest of
-//! the ring is withheld even while other mail stays queued (part 2,
-//! `inbox/doorbell/031`). A human keystroke that arrives while the doorbell
-//! holds the writer withholds the rest too. These are checks before each
-//! write, not one transaction with the inbox: an acknowledgement that lands
-//! between the last check and the PTY taking that step's bytes does not stop
-//! that one step.
+//! A ring is one transaction ([`crate::doorbell_txn`], driven on the real
+//! writer by [`AgentPtyRegistry::ring_doorbell`]): under one hold of the
+//! pane's writer it admits the attempt on a Clean frame showing the agent's
+//! empty ready composer, types its line, proves the agent echoed exactly that
+//! line, and presses Enter only after a synchronous re-check. It ends
+//! `Submitted` (the agent's prompt hook reported the token, or the transcript
+//! shows the line), `Withdrawn` (the deck deleted its own line under the
+//! strict recogniser), `Unresolved` (the generation's doorbell is then
+//! suspended until the user's own submit or clear, and the card says so), or
+//! with nothing written. An unsent draft the input tracker still remembers
+//! does not stop a ring: an empty composer on screen, and the echo, are the
+//! proof the draft is gone. No CR is ever sent without that echo, so nothing
+//! is flushed or cleaned up afterwards.
 //!
 //! It is **coalesced per agent**: one ring covers every queued message, and the
-//! schedule restarts only once the queue has emptied.
-//!
-//! **Flushing.** A ring can be left in the composer unsubmitted (its CR landed
-//! where the agent's TUI did not take it as Enter). So while a ring is
-//! *outstanding* — rung, with none of the messages it covered fetched since —
-//! the next ring is preceded by a bare CR, and once a covered message leaves
-//! `queued` by any route, one bare CR is sent under the same guards. Both are
-//! keyed on inbox state, never on the screen. For an agent whose composer is
-//! gated (Codex), that CR is the one write the gate lets into a non-empty
-//! composer, and only one showing the exact line this doorbell last typed
-//! into the pane ([`Bell::unsubmitted`]), with the agent's cursor where an
-//! Enter that was not taken leaves it; it then goes alone. A ring that only
-//! flushed keeps that line recorded, so if the agent swallowed the CR too,
-//! the next ring flushes again. The record lasts until the cleanup CR goes or
-//! a ring types a new line, which can be after the message it names has left
-//! `queued`: while other work is queued, a ring due for that work is sent in
-//! place of the owed cleanup, and if it only flushes it keeps the record. So
-//! while a frame matching the recorded line stays on screen and a message
-//! stays `queued`, each due ring the guards admit sends one lone CR, with no
-//! fixed total. That is deliberate: the flushed line runs `inbox fetch`,
-//! which serves whatever is queued, and dropping the record would leave that
-//! work behind a stranded line the deck sends no byte to. A flush that Codex
-//! also takes as a newline leaves the line above two blank composer rows with
-//! the cursor on the second, which the recogniser does not match, so the
-//! flushing stops there; that holds for that rendered layout, not for every
-//! way a renderer might draw it. The match is on what the screen shows, not
-//! proof of where it came from: anything that can draw the pane can draw that
-//! line and earn the CR, each time, and it goes to whatever then owns the
-//! pane's input ([`crate::agent_registry::codex_composer_holds_doorbell_line`]).
+//! schedule restarts only once the queue has emptied. An Enter the agent did
+//! not take, withdrawn, ends the rings until the agent's next turn.
 //!
 //! [`decide`] is the pure policy; [`spawn`] runs it against the daemon.
 
@@ -92,7 +57,7 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 
-use crate::agent_pty::{AgentPtyRegistry, DoorbellReady, DoorbellWrite};
+use crate::agent_pty::{AgentPtyRegistry, RingOutcome};
 use crate::inbox_hub::DoorbellFacts;
 use crate::state::SharedState;
 
@@ -227,11 +192,14 @@ fn ignored(variable: &str) {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Facts {
     pub inbox: DoorbellFacts,
-    /// The last hook-reported status is Idle, and the generation is ready by
-    /// its own reports or rung only through its composer gate.
+    /// The last hook-reported status is Idle, and the generation is fit to
+    /// ring by the session's own rules (plan §1 of PRD #1666 S5).
     pub idle: bool,
-    /// The user has an unsent draft in the pane.
-    pub draft: bool,
+    /// Something holds the ring this tick whatever the schedule: a paste is
+    /// open, the deck may not type into the generation, its first ring is
+    /// settling, its doorbell is suspended, or the agent did not take the
+    /// deck's last Enter in this episode.
+    pub held: bool,
 }
 
 /// The doorbell's memory of one agent generation.
@@ -241,101 +209,63 @@ pub struct Bell {
     pub rings: u32,
     /// When the last ring finished.
     pub last_ring: Option<Instant>,
-    /// The messages the last ring covered, while that ring is outstanding;
-    /// empty when it is not.
-    pub outstanding: Vec<String>,
-    /// A covered message left `queued` while its ring was outstanding, so one
-    /// bare CR is owed.
-    pub cleanup_owed: bool,
-    /// The line the doorbell last typed, while a CR that may submit it is
-    /// still owed (an outstanding ring or a cleanup). A ring that only
-    /// flushed it keeps it, since that CR may have been swallowed too; the
-    /// cleanup CR ([`Self::cleaned`]) and a ring that types a new line
-    /// replace it. Its message leaving `queued` does not: a ring due for
-    /// other queued work goes in place of the owed cleanup, and if it only
-    /// flushes, the record outlives that message (`inbox/doorbell/018`). A
-    /// gated composer showing anything else gets no byte
-    /// ([`AgentPtyRegistry::write_doorbell`]).
-    pub unsubmitted: Option<String>,
+    /// The messages queued when the last ring was decided.
+    pub covered: Vec<String>,
 }
 
 /// What the doorbell should do for one agent generation now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Nothing,
-    /// Type the line naming `id`, after a bare CR when `pre_cr`.
+    /// Ring for the message `id`: one transaction.
     Ring {
         id: String,
-        pre_cr: bool,
     },
-    /// Send one bare CR.
-    Cleanup,
 }
 
 impl Bell {
-    /// Fold this tick's inbox state in: an outstanding ring whose messages
-    /// were fetched is owed its cleanup CR, and an empty queue restarts the
-    /// schedule.
+    /// Fold this tick's inbox state in: an empty queue restarts the
+    /// schedule, and so does a queue none of whose messages the last ring
+    /// covered. A ring is confirmed only once the agent has taken it, which
+    /// can be after the agent fetched every message it named; mail that
+    /// arrived since is not that ring's to re-ring on its schedule.
     pub fn observe(&mut self, facts: &Facts) {
-        if !self.outstanding.is_empty()
-            && self
-                .outstanding
-                .iter()
-                .any(|id| !facts.inbox.queued.contains(id))
-        {
-            self.outstanding.clear();
-            self.cleanup_owed = true;
-        }
-        if facts.inbox.queued.is_empty() {
+        let queued = &facts.inbox.queued;
+        if queued.is_empty() || !self.covered.iter().any(|id| queued.contains(id)) {
             self.rings = 0;
             self.last_ring = None;
+            self.covered.clear();
         }
     }
 
-    /// Record a ring that covered `queued`. What it left in the box is the
-    /// caller's to record in [`Self::unsubmitted`].
-    pub fn rang(&mut self, now: Instant, queued: &[String]) {
+    /// Record a ring that wrote into the pane, decided while `covered` was
+    /// queued.
+    pub fn rang(&mut self, now: Instant, covered: Vec<String>) {
         self.rings = self.rings.saturating_add(1);
         self.last_ring = Some(now);
-        self.outstanding = queued.to_vec();
-        self.cleanup_owed = false;
-        self.unsubmitted = None;
+        self.covered = covered;
     }
 
-    /// Record the cleanup CR.
-    pub fn cleaned(&mut self) {
-        self.cleanup_owed = false;
-        self.unsubmitted = None;
-    }
-
-    /// Nothing left to remember: no ring outstanding or owed and no schedule
-    /// running.
+    /// Nothing left to remember: no schedule running.
     pub fn is_idle(&self) -> bool {
-        self.rings == 0 && self.outstanding.is_empty() && !self.cleanup_owed
+        self.rings == 0
     }
 }
 
 /// The policy. Call [`Bell::observe`] first.
 pub fn decide(bell: &Bell, facts: &Facts, config: &DoorbellConfig, now: Instant) -> Action {
-    if !facts.idle || facts.draft {
+    if !facts.idle || facts.held {
         return Action::Nothing;
     }
     let due = bell
         .last_ring
         .is_none_or(|last| now >= last + config.delay_after(bell.rings));
-    if let Some(id) = facts.inbox.queued.first()
-        && ring_still_admitted(&facts.inbox, config, now)
-        && due
-    {
-        return Action::Ring {
-            id: id.clone(),
-            pre_cr: !bell.outstanding.is_empty() || bell.cleanup_owed,
-        };
+    match facts.inbox.queued.first() {
+        Some(id) if due && ring_still_admitted(&facts.inbox, config, now) => {
+            Action::Ring { id: id.clone() }
+        }
+        _ => Action::Nothing,
     }
-    if bell.cleanup_owed {
-        return Action::Cleanup;
-    }
-    Action::Nothing
 }
 
 /// Whether a native component leaves the doorbell to ring for this agent at
@@ -439,15 +369,24 @@ pub struct HoldFacts {
     /// The agent reports a status other than Idle and waiting for input:
     /// working, compacting, blocked, an error, or none yet.
     pub working: bool,
+    /// The generation's first ring waits out its settle window (plan §4.4).
+    pub settling: bool,
     /// The agent reports it waits for input (a dialog, a permission prompt).
     pub waiting_for_input: bool,
     /// A paste into the pane has not finished.
     pub paste_open: bool,
     /// The user may have an unsent draft in the pane.
     pub draft: bool,
-    /// The doorbell's last try found no screen it could type into
-    /// ([`DoorbellWrite::NoComposer`]).
+    /// The deck may not type into the generation: its activation, its
+    /// input-mode evidence or a missing submit route says no, with this
+    /// clause.
+    pub cannot_type: Option<&'static str>,
+    /// The doorbell's last try found no screen it could type into (its
+    /// composer not shown empty and ready, a dialog, a layout edge), or the
+    /// pane's screen is not Clean.
     pub unrecognised: bool,
+    /// The agent did not take the deck's last Enter in this episode.
+    pub not_taken: bool,
     /// How many of the agent's turns have ended in the pane.
     pub turns: u64,
 }
@@ -466,15 +405,19 @@ pub enum HoldClock {
 /// doorbell, as the reason a card would show and what it does to the
 /// episode's clock. The first row that holds wins: nothing queued; a native
 /// component armed or due, or an integration notice on the card; the agent
-/// working; the agent waiting for input (`awaiting_prompt`); an open paste
-/// (`paste_open`); an unsent draft (`possible_draft`); the last try finding
-/// no screen to type into (`awaiting_prompt`); otherwise no reason, the clock
-/// running.
+/// working; the first ring settling; the agent waiting for input
+/// (`awaiting_prompt`); an open paste (`paste_open`); an unsent draft
+/// (`possible_draft`); a generation the deck may not type into
+/// (`cannot_type`); the last try finding no screen to type into, or a screen
+/// that is not Clean (`awaiting_prompt`); an Enter the agent did not take
+/// (`not_taken`); otherwise no reason, the clock running. A suspended
+/// doorbell's reason (`uncertain_input`, `dialog_during_ring`) is the
+/// publisher's, from the generation's latch cell, and shows over this one.
 pub fn obstacle(facts: &HoldFacts) -> (Option<crate::inbox_display::WakeHold>, HoldClock) {
     use crate::inbox_display::WakeHold;
     if !facts.queued {
         (None, HoldClock::Reset)
-    } else if facts.receiver || facts.working {
+    } else if facts.receiver || facts.working || facts.settling {
         (None, HoldClock::Paused)
     } else if facts.waiting_for_input {
         (Some(WakeHold::AwaitingPrompt), HoldClock::Runs)
@@ -482,8 +425,12 @@ pub fn obstacle(facts: &HoldFacts) -> (Option<crate::inbox_display::WakeHold>, H
         (Some(WakeHold::PasteOpen), HoldClock::Runs)
     } else if facts.draft {
         (Some(WakeHold::PossibleDraft), HoldClock::Runs)
+    } else if facts.cannot_type.is_some() {
+        (Some(WakeHold::CannotType), HoldClock::Runs)
     } else if facts.unrecognised {
         (Some(WakeHold::AwaitingPrompt), HoldClock::Runs)
+    } else if facts.not_taken {
+        (Some(WakeHold::NotTaken), HoldClock::Runs)
     } else {
         (None, HoldClock::Runs)
     }
@@ -539,21 +486,58 @@ impl HoldEpisode {
 }
 
 /// PRD #1666 part 3, round 5-wake: whether the doorbell's last try found no
-/// screen it could type into, after a write that ended in `outcome`: a try
-/// that found none holds as `awaiting_prompt` until a write goes in, and an
-/// outcome that wrote nothing for another reason leaves it as it was
-/// (`before`).
-fn unrecognised_after(outcome: DoorbellWrite, before: bool) -> bool {
+/// screen it could type into, after a ring that ended in `outcome`: a try
+/// whose admission frame showed no empty ready composer, a dialog or a layout
+/// edge holds as `awaiting_prompt` until a ring writes, and one that wrote
+/// nothing for another reason leaves it as it was (`before`).
+fn unrecognised_after(outcome: RingOutcome, before: bool) -> bool {
+    use crate::doorbell_txn::{NotTyped, Outcome};
     match outcome {
-        DoorbellWrite::NoComposer => true,
-        DoorbellWrite::Written
-        | DoorbellWrite::Flushed
-        | DoorbellWrite::Failed
-        | DoorbellWrite::Cancelled { .. } => false,
-        DoorbellWrite::DraftPending
-        | DoorbellWrite::NotOwner
-        | DoorbellWrite::NotReading
-        | DoorbellWrite::NotAdmitted => before,
+        RingOutcome::Txn(Outcome::NothingWritten(
+            NotTyped::AwaitingPrompt | NotTyped::Dialog(_) | NotTyped::Layout,
+        )) => true,
+        RingOutcome::Txn(
+            Outcome::Submitted | Outcome::Withdrawn | Outcome::Unresolved(_) | Outcome::Retired,
+        ) => false,
+        RingOutcome::Txn(Outcome::NothingWritten(_))
+        | RingOutcome::NotOwner
+        | RingOutcome::NotReading
+        | RingOutcome::Suspended => before,
+    }
+}
+
+/// What a ring's report does to its generation's bell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RingEffect {
+    /// It wrote into the pane: the schedule moves on, and the ring counts.
+    pub(crate) rang: bool,
+    /// The agent did not take its Enter: no more rings until a turn ends.
+    pub(crate) not_taken: bool,
+}
+
+/// What a ring that ended in `outcome` does (plan §5.1): a transaction that
+/// wrote counts as a ring, whatever it ended in; one that wrote nothing,
+/// a token draw that found none free included, is no ring and leaves the
+/// hold as it was; a withdrawal after an Enter reached the pane is an Enter
+/// the agent did not take.
+pub(crate) fn ring_effect(outcome: RingOutcome, cr_reached: bool) -> RingEffect {
+    use crate::doorbell_txn::Outcome;
+    match outcome {
+        RingOutcome::Txn(Outcome::Submitted | Outcome::Unresolved(_)) => RingEffect {
+            rang: true,
+            not_taken: false,
+        },
+        RingOutcome::Txn(Outcome::Withdrawn) => RingEffect {
+            rang: true,
+            not_taken: cr_reached,
+        },
+        RingOutcome::Txn(Outcome::NothingWritten(_) | Outcome::Retired)
+        | RingOutcome::NotOwner
+        | RingOutcome::NotReading
+        | RingOutcome::Suspended => RingEffect {
+            rang: false,
+            not_taken: false,
+        },
     }
 }
 
@@ -581,7 +565,12 @@ type AgentKey = (String, String);
 /// The caller holds neither the app-state nor inbox-hub lock while parked.
 #[cfg(feature = "e2e")]
 pub(crate) async fn pause_rering_for_test(pane: &str, phase: &str) {
-    if std::env::var("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_PANE").as_deref() != Ok(pane) {
+    // `*` pauses whichever pane gets there first, for a fixture that cannot
+    // know its pane's id before the daemon starts.
+    if !matches!(
+        std::env::var("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_PANE").as_deref(),
+        Ok(paused) if paused == pane || paused == "*"
+    ) {
         return;
     }
     let Some(root) = test_control_root() else {
@@ -651,15 +640,20 @@ pub(crate) fn record_for_test(event: &str) {
 #[derive(Default)]
 struct Slot {
     bell: Bell,
-    /// A write for this agent is in flight.
+    /// A ring for this agent is in flight.
     busy: bool,
     /// PR #1735 fifth review (R5).
     stall: StallClock,
     /// PRD #1666 part 3, round 5-wake.
     hold: HoldEpisode,
-    /// The last write found no screen it could type into
-    /// ([`DoorbellWrite::NoComposer`]), and none has gone in since.
+    /// The last ring found no screen it could type into, and none has written
+    /// since.
     unrecognised: bool,
+    /// The agent did not take the deck's Enter, at this turn count: no more
+    /// rings until a turn ends or the queue empties (plan §5.1, Q9).
+    not_taken: Option<u64>,
+    /// The turn count this episode's evidence-refresh nudge was sent at.
+    nudged: Option<u64>,
 }
 
 // Test-only cancellation cleanup: a seam timeout/panic must not strand a
@@ -775,28 +769,25 @@ async fn run_tick(
     }
     // PRD #1666 S5: a pane whose session declared it cannot take input
     // (history-only or view-only) is never rung, whatever its status says —
-    // the line would land in no live conversation.
-    // Part 2 (`inbox/doorbell/008`): and the generation's own readiness, kept
-    // apart from the Idle its card presents. One with none is rung only
-    // through its agent's composer gate, and the writer checks what is left on
-    // screen.
+    // the line would land in no live conversation. Part 2: and whether the
+    // generation's own hooks have reported, which says whether its prompt
+    // hook reports its prompts (the hook route of plan §1.4).
     type Admission = (
         Option<crate::state::DoorbellAdmission>,
-        DoorbellReady,
+        bool,
         Option<crate::state::SessionStatus>,
     );
     let admissions: Vec<Admission> = {
         let state = state.read().await;
         keys.iter()
             .map(|(pane, agent)| {
-                let ready = match state.doorbell_readiness(agent, pane) {
-                    (_, Some(prompt)) => DoorbellReady::Screen(prompt),
-                    (crate::state::ReadinessLevel::Unproven, None) => DoorbellReady::Unproven,
-                    _ => DoorbellReady::Ready,
-                };
+                let hooked = !matches!(
+                    state.doorbell_readiness(agent, pane).0,
+                    crate::state::ReadinessLevel::Unproven
+                );
                 (
                     state.doorbell_admission(agent, pane),
-                    ready,
+                    hooked,
                     state.agent_status(agent, pane),
                 )
             })
@@ -804,22 +795,29 @@ async fn run_tick(
     };
     #[cfg(not(feature = "e2e"))]
     let now = Instant::now();
-    for ((pane, agent), (admission, ready, status)) in keys.into_iter().zip(admissions) {
+    for ((pane, agent), (admission, hooked, status)) in keys.into_iter().zip(admissions) {
         let explained = status_explains_waiting(status.as_ref());
         let input = registry.pane_input_hold(&pane);
-        let facts = Facts {
-            inbox: hub.doorbell_facts(&pane, &agent),
-            idle: admission.is_some()
-                && (!matches!(ready, DoorbellReady::Unproven)
-                    || registry.has_doorbell_composer(&agent)),
-            draft: input.paste_open || input.draft,
-        };
-        let (action, stranded) = {
+        let inbox = hub.doorbell_facts(&pane, &agent);
+        let receiver = !ring_still_admitted(&inbox, config, now);
+        let queued = !inbox.queued.is_empty();
+        // Only asked while mail waits and nothing else takes it: each reads
+        // the generation's activation and evidence.
+        let refused = (queued && !receiver)
+            .then(|| registry.doorbell_refusal(&pane, &agent, hooked))
+            .flatten();
+        let settling = queued
+            && !receiver
+            && refused.is_none()
+            && registry.doorbell_settling(&pane, &agent, hooked);
+        let suspended = registry.doorbell_suspended(&agent);
+        let dirty = queued && refused.is_none() && registry.doorbell_evidence_dirty(&agent);
+        let (action, nudge, rering) = {
             let mut slots = slots.lock().unwrap_or_else(|e| e.into_inner());
             let slot = slots.entry((pane.clone(), agent.clone())).or_default();
-            let waiting = facts.inbox.armed == 0 && !explained;
+            let waiting = inbox.armed == 0 && !explained;
             match slot.stall.observe(
-                facts.inbox.queued.first().map(String::as_str),
+                inbox.queued.first().map(String::as_str),
                 waiting,
                 now,
                 config.wake_stall_after,
@@ -828,20 +826,32 @@ async fn run_tick(
                 StallChange::Clear => hub.set_wake_stalled(&pane, &agent, false),
                 StallChange::Nothing => {}
             }
+            // An episode ends when the queue empties or a turn ends: a
+            // not-taken Enter and the refresh nudge belong to one.
+            if !queued || slot.not_taken.is_some_and(|turns| turns != input.turns) {
+                slot.not_taken = None;
+            }
+            if !queued || slot.nudged.is_some_and(|turns| turns != input.turns) {
+                slot.nudged = None;
+            }
+            let working = !matches!(
+                status,
+                Some(
+                    crate::state::SessionStatus::Idle
+                        | crate::state::SessionStatus::WaitingForInput
+                )
+            );
             let hold = HoldFacts {
-                queued: !facts.inbox.queued.is_empty(),
-                receiver: !ring_still_admitted(&facts.inbox, config, now),
-                working: !matches!(
-                    status,
-                    Some(
-                        crate::state::SessionStatus::Idle
-                            | crate::state::SessionStatus::WaitingForInput
-                    )
-                ),
+                queued,
+                receiver,
+                working,
+                settling,
                 waiting_for_input: status == Some(crate::state::SessionStatus::WaitingForInput),
                 paste_open: input.paste_open,
                 draft: input.draft,
-                unrecognised: slot.unrecognised,
+                cannot_type: refused,
+                unrecognised: slot.unrecognised || dirty,
+                not_taken: slot.not_taken.is_some(),
                 turns: input.turns,
             };
             if let Some(shown) = slot.hold.observe(&hold, now, config.wake_stall_after) {
@@ -851,81 +861,105 @@ async fn run_tick(
             if slot.busy {
                 continue;
             }
+            let facts = Facts {
+                inbox,
+                // `inbox/doorbell/008`: a generation whose own hooks have not
+                // reported is never rung, whatever its screen shows; a
+                // predecessor's Idle on the pane is not its readiness.
+                idle: admission.is_some() && hooked,
+                held: input.paste_open
+                    || refused.is_some()
+                    || settling
+                    || suspended
+                    || slot.not_taken.is_some(),
+            };
             slot.bell.observe(&facts);
+            // Plan §2.2's evidence-refresh nudge: once per episode, between
+            // attempts, for a screen that stays Dirty with nothing redrawing
+            // it.
+            let nudge = dirty && facts.idle && !facts.held && !working && slot.nudged.is_none();
+            if nudge {
+                slot.nudged = Some(input.turns);
+            }
             let action = decide(&slot.bell, &facts, config, now);
             if action == Action::Nothing {
                 if slot.bell.is_idle() && facts.inbox.queued.is_empty() {
                     slots.remove(&(pane.clone(), agent.clone()));
                 }
-                continue;
+                (None, nudge, false)
+            } else {
+                slot.busy = true;
+                (
+                    Some((action, facts.inbox.queued.clone())),
+                    nudge,
+                    slot.bell.rings > 0,
+                )
             }
-            slot.busy = true;
-            (action, slot.bell.unsubmitted.clone())
         };
+        if nudge {
+            debug!(pane_id = %pane, agent_id = %agent, "doorbell evidence-refresh nudge");
+            registry.nudge_repaint(&agent);
+        }
+        let Some((Action::Ring { id }, covered)) = action else {
+            continue;
+        };
+        #[cfg(not(feature = "e2e"))]
+        let _ = rering;
         let registry = Arc::clone(registry);
         let slots = Arc::clone(slots);
         let state = Arc::clone(state);
         let config = config.clone();
-        // The queue as this tick's decision saw it, not as the write left it.
-        let queued = facts.inbox.queued;
         tokio::spawn(async move {
             #[cfg(feature = "e2e")]
             let mut _busy_guard = TestBusyGuard {
                 slots: Arc::clone(&slots),
                 key: Some((pane.clone(), agent.clone())),
             };
-            let (pre_cr, line) = match &action {
-                Action::Ring { id, pre_cr } => (*pre_cr, Some(doorbell_line(id))),
-                _ => (true, None),
-            };
             #[cfg(feature = "e2e")]
-            if pre_cr && line.is_some() {
+            if rering {
                 pause_rering_for_test(&pane, "decided").await;
             }
-            // PRD #1666 hardening H3: re-asked under the writer before every
-            // step. The same admission (nothing happened to the pane since
-            // this tick) and, for a ring, still no native component armed or
-            // inside the arm grace of an announcement. Part 2
-            // (`inbox/doorbell/031`): and the message this ring names still
-            // queued for this generation, from a fresh query each time. Other
-            // queued mail does not keep it alive: a ring is never typed for a
-            // message that was fetched or acknowledged since the decision.
-            // The query takes and drops the hub's lock; nothing here holds it
-            // across the writer's sleeps or writes.
-            let selected = match &action {
-                Action::Ring { id, .. } => Some(id.clone()),
-                _ => None,
-            };
-            let still_admitted = || {
+            // PRD #1666 hardening H3: re-asked before admission and while the
+            // transaction holds the writer. The same admission (nothing
+            // happened to the pane since this tick) and, for a ring, still no
+            // native component armed or inside the arm grace of an
+            // announcement. Part 2 (`inbox/doorbell/031`): and the message
+            // this ring names still queued for this generation, from a fresh
+            // query each time. The query takes and drops the hub's lock;
+            // nothing here holds it across the writer's waits.
+            let still_admitted = {
                 let state = Arc::clone(&state);
                 let registry = Arc::clone(&registry);
                 let (pane, agent) = (pane.clone(), agent.clone());
                 let config = config.clone();
-                let selected = selected.clone();
-                async move {
-                    let now = state.read().await.doorbell_admission(&agent, &pane);
-                    admission
-                        .zip(now)
-                        .is_some_and(|(decided, now)| decided.still_holds(&now))
-                        && selected.is_none_or(|id| {
-                            let facts = registry.inbox().doorbell_facts(&pane, &agent);
-                            facts.queued.contains(&id)
-                                && ring_still_admitted(&facts, &config, Instant::now())
-                        })
+                let selected = id.clone();
+                move || {
+                    let state = Arc::clone(&state);
+                    let registry = Arc::clone(&registry);
+                    let (pane, agent) = (pane.clone(), agent.clone());
+                    let config = config.clone();
+                    let selected = selected.clone();
+                    async move {
+                        let now = state.read().await.doorbell_admission(&agent, &pane);
+                        admission
+                            .zip(now)
+                            .is_some_and(|(decided, now)| decided.still_holds(&now))
+                            && {
+                                let facts = registry.inbox().doorbell_facts(&pane, &agent);
+                                facts.queued.contains(&selected)
+                                    && ring_still_admitted(&facts, &config, Instant::now())
+                            }
+                    }
                 }
             };
-            let outcome = registry
-                .write_doorbell_when_ready(
-                    &pane,
-                    &agent,
-                    ready,
-                    pre_cr,
-                    stranded.as_deref(),
-                    line.as_deref(),
-                    still_admitted,
-                )
+            let Some(message) = crate::inbox::MessageId::parse(&id) else {
+                warn!(pane_id = %pane, agent_id = %agent, message_id = %id, "doorbell: a queued id that does not parse");
+                return;
+            };
+            let report = registry
+                .ring_doorbell(&pane, &agent, message, hooked, still_admitted)
                 .await;
-            // The writer has been dropped; busy remains set so a completed
+            // The writer has been released; busy remains set so a completed
             // attempt can be inspected without a later retry changing bytes.
             #[cfg(feature = "e2e")]
             pause_rering_for_test(&pane, "completed").await;
@@ -940,93 +974,51 @@ async fn run_tick(
                 return;
             };
             slot.busy = false;
-            slot.unrecognised = unrecognised_after(outcome, slot.unrecognised);
-            match (outcome, &action) {
-                // A ring that failed part-way may still sit in the box, so it
-                // is treated as rung: the next one flushes it first. A ring
-                // that only flushed typed no line of its own and keeps the
-                // earlier one recorded: if its CR was swallowed, the line is
-                // still the deck's and still stranded, and the next ring sends
-                // one more lone CR. One that failed is recorded as having left
-                // its own line; if it failed before typing it, an earlier line
-                // still in the box no longer matches, and the composer gate
-                // holds. A ring withdrawn after its line went in but before its
-                // submit is likewise rung, with its line left in the box.
-                (
-                    DoorbellWrite::Written
-                    | DoorbellWrite::Flushed
-                    | DoorbellWrite::Failed
-                    | DoorbellWrite::Cancelled {
-                        line_typed: true, ..
-                    },
-                    Action::Ring { id, .. },
-                ) => {
-                    slot.bell.rang(Instant::now(), &queued);
-                    slot.bell.unsubmitted = if outcome == DoorbellWrite::Flushed {
-                        stranded
-                    } else {
-                        line
-                    };
-                    registry.inbox().note_ring(&pane, &agent);
-                    match outcome {
-                        DoorbellWrite::Written | DoorbellWrite::Flushed => info!(
-                            pane_id = %pane,
-                            agent_id = %agent,
-                            message_id = %id,
-                            queued_at_decision = queued.len(),
-                            rings = slot.bell.rings,
-                            pre_cr,
-                            ?outcome,
-                            "doorbell rang"
-                        ),
-                        DoorbellWrite::Cancelled { steps_written, .. } => info!(
-                            pane_id = %pane,
-                            agent_id = %agent,
-                            message_id = %id,
-                            queued_at_decision = queued.len(),
-                            rings = slot.bell.rings,
-                            pre_cr,
-                            steps_written,
-                            "doorbell ring withdrawn after its line was typed; its submit was withheld"
-                        ),
-                        _ => warn!(
-                            pane_id = %pane,
-                            agent_id = %agent,
-                            message_id = %id,
-                            queued_at_decision = queued.len(),
-                            rings = slot.bell.rings,
-                            pre_cr,
-                            "doorbell ring failed part-way or could not be encoded"
-                        ),
-                    }
-                }
-                // Part 2 (`inbox/doorbell/031`): only the pre-ring CR went in
-                // before the ring was withdrawn, so no line of this ring is in
-                // the box and nothing is recorded as rung. The CR may have
-                // submitted an earlier stranded line, or been swallowed, so
-                // that line stays recorded and the bell owes what it owed.
-                (
-                    DoorbellWrite::Cancelled {
-                        steps_written,
-                        line_typed: false,
-                    },
-                    Action::Ring { id, .. },
-                ) => {
+            slot.unrecognised = unrecognised_after(report.outcome, slot.unrecognised);
+            let effect = ring_effect(report.outcome, report.cr_reached);
+            if effect.rang {
+                slot.bell.rang(Instant::now(), covered);
+                registry.inbox().note_ring(&pane, &agent);
+            }
+            if effect.not_taken {
+                // Q9: the agent did not take the deck's Enter. No more rings
+                // until its next turn.
+                slot.not_taken = Some(registry.pane_input_hold(&pane).turns);
+            }
+            use crate::doorbell_txn::Outcome;
+            match report.outcome {
+                RingOutcome::Txn(Outcome::Submitted) => {
                     info!(
                         pane_id = %pane,
                         agent_id = %agent,
                         message_id = %id,
-                        queued_at_decision = queued.len(),
-                        steps_written,
-                        "doorbell ring withdrawn after its pre-ring CR; no line was typed"
+                        attempt = report.attempt,
+                        rings = slot.bell.rings,
+                        "doorbell rang"
                     );
                 }
-                (DoorbellWrite::Written, _) => {
-                    slot.bell.cleaned();
-                    debug!(pane_id = %pane, agent_id = %agent, "doorbell sent its cleanup CR");
+                RingOutcome::Txn(Outcome::Withdrawn) => {
+                    info!(
+                        pane_id = %pane,
+                        agent_id = %agent,
+                        message_id = %id,
+                        attempt = report.attempt,
+                        not_taken = report.cr_reached,
+                        "doorbell ring withdrawn"
+                    );
                 }
-                (outcome, _) => {
-                    debug!(pane_id = %pane, agent_id = %agent, ?outcome, "doorbell held");
+                RingOutcome::Txn(Outcome::Unresolved(cause)) => {
+                    warn!(
+                        pane_id = %pane,
+                        agent_id = %agent,
+                        message_id = %id,
+                        attempt = report.attempt,
+                        ?cause,
+                        "doorbell ring unresolved; the doorbell is suspended until the user submits or clears"
+                    );
+                }
+                outcome => {
+                    debug!(pane_id = %pane, agent_id = %agent, ?outcome, "doorbell ring not admitted; nothing typed");
                 }
             }
         });
@@ -1210,19 +1202,23 @@ mod tests {
         );
     }
 
-    /// Scenario: Check the obstacle table row by row: each fact that holds a ring maps to its reason in priority order, an armed component and a working agent show none with the clock stopped, nothing queued ends the episode, and a pane with nothing in the way runs the clock with no reason. Then check that a try that found no screen to type into holds as awaiting a prompt until a write goes in, and that a try that wrote nothing for another reason leaves that as it was.
+    /// Scenario: Check the obstacle table row by row: each fact that holds a ring maps to its reason in priority order (waiting for input, an open paste, a draft, a generation the deck may not type into, no screen to type into, an Enter not taken), an armed component, a working agent and a settling first ring show none with the clock stopped, nothing queued ends the episode, and a pane with nothing in the way runs the clock with no reason. Then check that a try whose admission found no empty ready composer, a dialog or a layout edge holds as awaiting a prompt until a ring writes, and that a try that wrote nothing for another reason leaves that as it was.
     #[spec("inbox/doorbell/041")]
     #[test]
     fn doorbell_041_the_obstacle_table_takes_the_first_row_that_holds() {
+        use crate::doorbell_txn::{Cause, NotTyped, Outcome};
         use crate::inbox_display::WakeHold;
         let all = HoldFacts {
             queued: true,
             receiver: true,
             working: true,
+            settling: true,
             waiting_for_input: true,
             paste_open: true,
             draft: true,
+            cannot_type: Some("unmeasured_release"),
             unrecognised: true,
+            not_taken: true,
             turns: 0,
         };
         assert_eq!(
@@ -1240,6 +1236,15 @@ mod tests {
         assert_eq!(obstacle(&all), (None, HoldClock::Paused));
         let all = HoldFacts {
             working: false,
+            ..all
+        };
+        assert_eq!(
+            obstacle(&all),
+            (None, HoldClock::Paused),
+            "a settling first ring pauses the clock"
+        );
+        let all = HoldFacts {
+            settling: false,
             ..all
         };
         assert_eq!(
@@ -1265,35 +1270,109 @@ mod tests {
         };
         assert_eq!(
             obstacle(&all),
+            (Some(WakeHold::CannotType), HoldClock::Runs)
+        );
+        let all = HoldFacts {
+            cannot_type: None,
+            ..all
+        };
+        assert_eq!(
+            obstacle(&all),
             (Some(WakeHold::AwaitingPrompt), HoldClock::Runs)
         );
         let all = HoldFacts {
             unrecognised: false,
             ..all
         };
+        assert_eq!(obstacle(&all), (Some(WakeHold::NotTaken), HoldClock::Runs));
+        let all = HoldFacts {
+            not_taken: false,
+            ..all
+        };
         assert_eq!(obstacle(&all), (None, HoldClock::Runs));
 
-        assert!(unrecognised_after(DoorbellWrite::NoComposer, false));
-        for wrote in [
-            DoorbellWrite::Written,
-            DoorbellWrite::Flushed,
-            DoorbellWrite::Failed,
-            DoorbellWrite::Cancelled {
-                steps_written: 1,
-                line_typed: false,
-            },
+        for found_none in [
+            NotTyped::AwaitingPrompt,
+            NotTyped::Dialog("trust"),
+            NotTyped::Layout,
         ] {
-            assert!(!unrecognised_after(wrote, true), "{wrote:?}");
+            assert!(
+                unrecognised_after(RingOutcome::Txn(Outcome::NothingWritten(found_none)), false),
+                "{found_none:?}"
+            );
+        }
+        for wrote in [
+            Outcome::Submitted,
+            Outcome::Withdrawn,
+            Outcome::Unresolved(Cause::NoSubmitEvidence),
+            Outcome::Retired,
+        ] {
+            assert!(
+                !unrecognised_after(RingOutcome::Txn(wrote), true),
+                "{wrote:?}"
+            );
         }
         for nothing in [
-            DoorbellWrite::DraftPending,
-            DoorbellWrite::NotOwner,
-            DoorbellWrite::NotReading,
-            DoorbellWrite::NotAdmitted,
+            RingOutcome::Txn(Outcome::NothingWritten(NotTyped::HumanInput)),
+            RingOutcome::Txn(Outcome::NothingWritten(NotTyped::Settling)),
+            RingOutcome::NotOwner,
+            RingOutcome::NotReading,
+            RingOutcome::Suspended,
         ] {
             assert!(unrecognised_after(nothing, true), "{nothing:?}");
             assert!(!unrecognised_after(nothing, false), "{nothing:?}");
         }
+    }
+
+    /// Scenario: Map each way a ring can end onto what it does to the bell: a submitted, unresolved or withdrawn transaction counts as a ring, a withdrawal after an Enter reached the pane is also an Enter not taken, and a ring that wrote nothing (a token draw that found none free, a human operation, a suspended doorbell, a pane gone or not reading) is no ring and leaves the hold as it was.
+    #[spec("inbox/doorbell/041")]
+    #[test]
+    fn doorbell_041_only_a_ring_that_wrote_counts_and_no_token_is_none() {
+        use crate::doorbell_txn::{Cause, NotTyped, Outcome};
+        let rang = RingEffect {
+            rang: true,
+            not_taken: false,
+        };
+        let none = RingEffect {
+            rang: false,
+            not_taken: false,
+        };
+        assert_eq!(
+            ring_effect(RingOutcome::Txn(Outcome::Submitted), true),
+            rang
+        );
+        assert_eq!(
+            ring_effect(
+                RingOutcome::Txn(Outcome::Unresolved(Cause::NoSubmitEvidence)),
+                true
+            ),
+            rang
+        );
+        assert_eq!(
+            ring_effect(RingOutcome::Txn(Outcome::Withdrawn), false),
+            rang
+        );
+        assert_eq!(
+            ring_effect(RingOutcome::Txn(Outcome::Withdrawn), true),
+            RingEffect {
+                rang: true,
+                not_taken: true,
+            }
+        );
+        for nothing in [
+            RingOutcome::Txn(Outcome::NothingWritten(NotTyped::NoToken)),
+            RingOutcome::Txn(Outcome::NothingWritten(NotTyped::HumanInput)),
+            RingOutcome::Txn(Outcome::Retired),
+            RingOutcome::Suspended,
+            RingOutcome::NotOwner,
+            RingOutcome::NotReading,
+        ] {
+            assert_eq!(ring_effect(nothing, true), none, "{nothing:?}");
+        }
+        // No token is no screen fact either: the hold carries on as it was.
+        let no_token = RingOutcome::Txn(Outcome::NothingWritten(NotTyped::NoToken));
+        assert!(unrecognised_after(no_token, true));
+        assert!(!unrecognised_after(no_token, false));
     }
 
     /// A working, compacting, asking or blocked agent explains its waiting
@@ -1336,32 +1415,27 @@ mod tests {
                 blocked: false,
             },
             idle: true,
-            draft: false,
+            held: false,
         }
     }
 
-    fn ring(id: &str, pre_cr: bool) -> Action {
-        Action::Ring {
-            id: id.to_string(),
-            pre_cr,
-        }
+    fn ring(id: &str) -> Action {
+        Action::Ring { id: id.to_string() }
     }
 
     fn step(bell: &mut Bell, facts: &Facts, config: &DoorbellConfig, now: Instant) -> Action {
         bell.observe(facts);
         let action = decide(bell, facts, config, now);
         if let Action::Ring { .. } = action {
-            bell.rang(now, &facts.inbox.queued);
-        } else if action == Action::Cleanup {
-            bell.cleaned();
+            bell.rang(now, facts.inbox.queued.clone());
         }
         action
     }
 
     /// Scenario: Feed the policy an empty inbox, then one queued message under
-    /// each guard in turn (not Idle, a draft, an armed waiter, a Native
-    /// announcement inside its grace). It must ring only once every guard
-    /// passes, and never with an empty queue.
+    /// each guard in turn (not Idle, a generation the deck is holding, an
+    /// armed waiter, a Native announcement inside its grace). It must ring
+    /// only once every guard passes, and never with an empty queue.
     #[spec("inbox/doorbell/013")]
     #[test]
     fn doorbell_013_rings_only_when_every_guard_passes() {
@@ -1372,9 +1446,9 @@ mod tests {
         let mut busy = facts(&["m1"]);
         busy.idle = false;
         assert_eq!(decide(&bell, &busy, &config, now), Action::Nothing);
-        let mut drafted = facts(&["m1"]);
-        drafted.draft = true;
-        assert_eq!(decide(&bell, &drafted, &config, now), Action::Nothing);
+        let mut held = facts(&["m1"]);
+        held.held = true;
+        assert_eq!(decide(&bell, &held, &config, now), Action::Nothing);
         let mut armed = facts(&["m1"]);
         armed.inbox.armed = 1;
         assert_eq!(decide(&bell, &armed, &config, now), Action::Nothing);
@@ -1383,21 +1457,20 @@ mod tests {
         assert_eq!(decide(&bell, &native, &config, now), Action::Nothing);
         assert_eq!(
             decide(&bell, &native, &config, now + config.arm_grace),
-            ring("m1", false)
+            ring("m1")
         );
-        assert_eq!(
-            decide(&bell, &facts(&["m1"]), &config, now),
-            ring("m1", false)
-        );
+        assert_eq!(decide(&bell, &facts(&["m1"]), &config, now), ring("m1"));
     }
 
     /// Scenario: Leave two messages queued and step the policy through time.
     /// One ring covers both and names the oldest; it re-rings after each
-    /// schedule delay with a pre-ring CR while the ring is outstanding, the
-    /// last delay repeats, and a fetch stops the rings and owes one cleanup CR.
+    /// schedule delay, the last delay repeats, a fetch of the first rings for
+    /// the second on the running schedule, and an emptied queue restarts the
+    /// schedule for the next message, as does a queue holding none of the
+    /// messages the last ring covered.
     #[spec("inbox/doorbell/014")]
     #[test]
-    fn doorbell_014_coalesces_reschedules_and_cleans_up() {
+    fn doorbell_014_coalesces_and_reschedules() {
         let config = DoorbellConfig {
             schedule: vec![Duration::from_secs(1), Duration::from_secs(2)],
             ..DoorbellConfig::default()
@@ -1405,127 +1478,106 @@ mod tests {
         let t0 = Instant::now();
         let both = facts(&["m1", "m2"]);
         let mut bell = Bell::default();
-        assert_eq!(step(&mut bell, &both, &config, t0), ring("m1", false));
+        assert_eq!(step(&mut bell, &both, &config, t0), ring("m1"));
         let at = |ms| t0 + Duration::from_millis(ms);
         assert_eq!(step(&mut bell, &both, &config, at(999)), Action::Nothing);
-        assert_eq!(step(&mut bell, &both, &config, at(1000)), ring("m1", true));
+        assert_eq!(step(&mut bell, &both, &config, at(1000)), ring("m1"));
         assert_eq!(step(&mut bell, &both, &config, at(2999)), Action::Nothing);
-        assert_eq!(step(&mut bell, &both, &config, at(3000)), ring("m1", true));
-        assert_eq!(step(&mut bell, &both, &config, at(5000)), ring("m1", true));
-        // m1 fetched: the outstanding ring is owed its flush, and m2 still
-        // rings on the running schedule.
+        assert_eq!(step(&mut bell, &both, &config, at(3000)), ring("m1"));
+        assert_eq!(step(&mut bell, &both, &config, at(5000)), ring("m1"));
         let rest = facts(&["m2"]);
-        assert_eq!(step(&mut bell, &rest, &config, at(5001)), Action::Cleanup);
-        assert_eq!(step(&mut bell, &rest, &config, at(5002)), Action::Nothing);
-        assert_eq!(step(&mut bell, &rest, &config, at(7000)), ring("m2", false));
-        // Everything fetched: one cleanup, then silence, and the schedule
-        // restarts for the next message.
+        assert_eq!(step(&mut bell, &rest, &config, at(5001)), Action::Nothing);
+        assert_eq!(step(&mut bell, &rest, &config, at(7000)), ring("m2"));
         let empty = facts(&[]);
-        assert_eq!(step(&mut bell, &empty, &config, at(7001)), Action::Cleanup);
-        assert_eq!(step(&mut bell, &empty, &config, at(9000)), Action::Nothing);
+        assert_eq!(step(&mut bell, &empty, &config, at(7001)), Action::Nothing);
         assert!(bell.is_idle());
         assert_eq!(
             step(&mut bell, &facts(&["m3"]), &config, at(9001)),
-            ring("m3", false)
+            ring("m3")
+        );
+        // The agent fetched m3 before the deck confirmed that ring, and m4
+        // arrived before a tick saw the queue empty: a ring none of whose
+        // messages is still queued starts no schedule for m4.
+        assert_eq!(
+            step(&mut bell, &facts(&["m4"]), &config, at(9002)),
+            ring("m4")
         );
     }
 
-    /// Scenario: Owe a cleanup CR while the user holds a draft, then while the
-    /// agent is busy, then with a waiter armed. The CR waits for the draft and
-    /// for Idle, but an armed waiter does not hold it.
+    /// Scenario: Ring once, then let the message be fetched while the agent is idle, busy, holding a draft or with a waiter armed. Nothing follows a ring that went: the policy decides nothing for an emptied queue under any of them, and owes no CR of its own.
     #[spec("inbox/doorbell/015")]
     #[test]
-    fn doorbell_015_cleanup_waits_for_draft_and_idle_not_for_waiters() {
+    fn doorbell_015_nothing_follows_a_ring_once_its_message_is_taken() {
         let config = DoorbellConfig::default();
         let now = Instant::now();
-        let mut bell = Bell::default();
-        bell.rang(now, &["m1".to_string()]);
-        let mut drafted = facts(&[]);
-        drafted.draft = true;
-        bell.observe(&drafted);
-        assert!(bell.cleanup_owed);
-        assert_eq!(decide(&bell, &drafted, &config, now), Action::Nothing);
-        let mut busy = facts(&[]);
-        busy.idle = false;
-        assert_eq!(decide(&bell, &busy, &config, now), Action::Nothing);
-        let mut armed = facts(&[]);
-        armed.inbox.armed = 1;
-        assert_eq!(decide(&bell, &armed, &config, now), Action::Cleanup);
+        for (why, tweak) in [
+            ("idle", (|_: &mut Facts| {}) as fn(&mut Facts)),
+            ("busy", |f: &mut Facts| f.idle = false),
+            ("held", |f: &mut Facts| f.held = true),
+            ("armed", |f: &mut Facts| f.inbox.armed = 1),
+        ] {
+            let mut bell = Bell::default();
+            assert_eq!(step(&mut bell, &facts(&["m1"]), &config, now), ring("m1"));
+            let mut taken = facts(&[]);
+            tweak(&mut taken);
+            assert_eq!(
+                step(&mut bell, &taken, &config, now + Duration::from_secs(600)),
+                Action::Nothing,
+                "{why}"
+            );
+            assert!(bell.is_idle(), "{why}");
+        }
     }
 
-    /// Scenario: Record a ring that left its line, then fold in a fetch, send
-    /// the cleanup CR, and ring again. The line stays recorded while a CR
-    /// that may submit it is owed, and is forgotten once that CR went or a
-    /// new ring replaced the record.
+    /// Scenario: Ring for a message, then keep it queued past every schedule delay while the generation is held (the deck may not type into it, it settles, its doorbell is suspended, or the agent did not take the last Enter). The policy rings for none of it while held, and once the hold ends the next due ring goes, naming the message.
     #[spec("inbox/doorbell/017")]
     #[test]
-    fn doorbell_017_remembers_its_line_only_while_a_flush_is_owed() {
-        let now = Instant::now();
-        let line = doorbell_line("m1");
-        let mut bell = Bell::default();
-        bell.rang(now, &["m1".to_string()]);
-        assert_eq!(bell.unsubmitted, None, "what a ring left is the caller's");
-        bell.unsubmitted = Some(line.clone());
-        bell.observe(&facts(&["m1"]));
-        assert_eq!(bell.unsubmitted.as_deref(), Some(line.as_str()));
-        bell.observe(&facts(&[]));
-        assert!(bell.cleanup_owed);
-        assert_eq!(
-            bell.unsubmitted.as_deref(),
-            Some(line.as_str()),
-            "the owed cleanup CR may still be the one that submits it"
-        );
-        bell.cleaned();
-        assert_eq!(bell.unsubmitted, None, "the cleanup CR went");
-        bell.unsubmitted = Some(line);
-        bell.rang(now, &["m2".to_string()]);
-        assert_eq!(bell.unsubmitted, None, "a new ring replaces the record");
-    }
-
-    /// Scenario: Ring for two messages and record the line naming the first,
-    /// then fetch the first just as a ring for the second is due. That ring
-    /// goes in place of the owed cleanup, with its flushing CR; a ring that
-    /// only flushed keeps the first line recorded, and each later due ring
-    /// flushes again, one CR per ring, until the second message leaves
-    /// `queued` and the cleanup CR drops the record.
-    #[spec("inbox/doorbell/018")]
-    #[test]
-    fn doorbell_018_a_ring_for_other_queued_work_keeps_the_record_past_its_message() {
+    fn doorbell_017_a_held_generation_is_not_rung_until_the_hold_ends() {
         let config = DoorbellConfig {
             schedule: vec![Duration::from_secs(1)],
             ..DoorbellConfig::default()
         };
         let t0 = Instant::now();
         let at = |ms| t0 + Duration::from_millis(ms);
-        let first = doorbell_line("m1");
+        let mut bell = Bell::default();
+        assert_eq!(step(&mut bell, &facts(&["m1"]), &config, t0), ring("m1"));
+        let mut held = facts(&["m1"]);
+        held.held = true;
+        for due in [1000, 5000, 60_000] {
+            assert_eq!(step(&mut bell, &held, &config, at(due)), Action::Nothing);
+        }
+        assert_eq!(
+            step(&mut bell, &facts(&["m1"]), &config, at(60_001)),
+            ring("m1")
+        );
+    }
+
+    /// Scenario: Ring for two messages, then fetch the first just as a ring for the second is due, and keep the second queued over several delays. Each due ring names the second message alone, one ring per delay, and the queue emptying ends the rings.
+    #[spec("inbox/doorbell/018")]
+    #[test]
+    fn doorbell_018_a_ring_for_remaining_work_names_it_alone() {
+        let config = DoorbellConfig {
+            schedule: vec![Duration::from_secs(1)],
+            ..DoorbellConfig::default()
+        };
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
         let mut bell = Bell::default();
         assert_eq!(
             step(&mut bell, &facts(&["m1", "m2"]), &config, t0),
-            ring("m1", false)
+            ring("m1")
         );
-        bell.unsubmitted = Some(first.clone());
         let rest = facts(&["m2"]);
         for due in [1000, 2000, 3000] {
-            bell.observe(&rest);
+            assert_eq!(step(&mut bell, &rest, &config, at(due)), ring("m2"));
             assert_eq!(
-                decide(&bell, &rest, &config, at(due)),
-                ring("m2", true),
-                "a due ring for the remaining work flushes first, in place of the cleanup"
-            );
-            // The daemon's `DoorbellWrite::Flushed` arm: a ring that only
-            // flushed keeps the line it found.
-            bell.rang(at(due), &rest.inbox.queued);
-            bell.unsubmitted = Some(first.clone());
-            assert!(!bell.cleanup_owed, "the ring took the cleanup's place");
-            assert_eq!(
-                decide(&bell, &rest, &config, at(due + 1)),
+                step(&mut bell, &rest, &config, at(due + 1)),
                 Action::Nothing,
-                "one CR per due ring"
+                "one ring per due delay"
             );
         }
         let empty = facts(&[]);
-        assert_eq!(step(&mut bell, &empty, &config, at(3001)), Action::Cleanup);
-        assert_eq!(bell.unsubmitted, None, "the cleanup CR drops the record");
+        assert_eq!(step(&mut bell, &empty, &config, at(3001)), Action::Nothing);
         assert_eq!(step(&mut bell, &empty, &config, at(9000)), Action::Nothing);
     }
 

@@ -973,13 +973,15 @@ while os.read(0,4096):pass
     }
 }
 
-/// Scenario: Announce OpenCode's full or mini component without keeping a stream armed. After the grace expires, the generic fixed doorbell must still reach the pane and the inbox may be fetched normally.
+/// Scenario: Announce OpenCode's full or mini component without keeping a stream armed, in a pane the deck cannot type into, and queue a task. Past the grace and the stall window the pane must have received zero bytes, the task must stay queued with no delivery, and the agent's card must hold it as cannot_type; when the component's stream then arms, it delivers the task once natively, the hold clears, and the deck has still typed nothing.
 #[spec("inbox/opencode/010")]
 #[test]
-fn opencode_010_full_and_mini_unarmed_fall_back_after_grace() {
+fn opencode_010_full_and_mini_unarmed_are_held_without_typing_and_recover_natively() {
     for component in ["opencode_plugin", "opencode_mini"] {
-        let daemon = daemon_unbound(&[]);
-        let pane = pane(&daemon, "unarmed-opencode");
+        let daemon = daemon_unbound(&[("DOT_AGENT_DECK_INBOX_WAKE_STALL_AFTER_MS", "500")]);
+        // PRD #1666 part 3, round 5-wake (Q11): the deck types into no
+        // OpenCode release, so the stand-in is not given the e2e profile.
+        let pane = pane_with(&daemon, "unarmed-opencode", json!({"profile": false}));
         status(&daemon, &pane, "idle", "opencode");
         let mut req = request(&pane, "inbox_announce");
         req["component"] = json!(component);
@@ -988,11 +990,62 @@ fn opencode_010_full_and_mini_unarmed_fall_back_after_grace() {
         req["component_version"] = json!("fallback-fixture");
         assert_eq!(hook(&daemon, req)["accepted"], true);
         let id = enqueue(&daemon, &pane, BODY);
-        unchanged(&pane, Duration::from_millis(250));
-        ring(&daemon, &pane, &id);
-        fetch(&daemon, &pane, true);
-        state(&daemon, &pane, &id, "acknowledged");
+        assert_held_cannot_type(&daemon, &pane, &id, component);
+        let mut stream = receipt_stream_as(&daemon, &pane, component);
+        let handed = receipt_handout(&mut stream, &id);
+        assert!(
+            handed.to_string().contains(BODY),
+            "{component}: the armed stream delivers the task: {handed}"
+        );
+        assert!(
+            common::wait_until(WAIT, || wake_hold(&daemon, &pane).is_null()),
+            "{component}: the hold clears once the task is delivered: {}",
+            wake_hold(&daemon, &pane)
+        );
+        assert!(
+            bytes(&pane).is_empty(),
+            "{component}: the deck typed nothing"
+        );
+        close(stream);
     }
+}
+
+/// The agent's `wake_hold`, as the daemon's agent records show it.
+fn wake_hold(daemon: &impl Endpoint, pane: &Pane) -> serde_json::Value {
+    attach(daemon, json!({"op":"list-agents"}))["agent_records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["id"] == pane.agent)
+        .map(|record| record["inbox"]["wake_hold"].clone())
+        .unwrap_or_default()
+}
+
+/// Q11's strict hold: zero bytes past the grace and the stall window, the
+/// task queued with no delivery, and `cannot_type` on the agent's card.
+fn assert_held_cannot_type(daemon: &impl Endpoint, pane: &Pane, id: &str, case: &str) {
+    assert!(
+        common::wait_until(WAIT, || wake_hold(daemon, pane)
+            .to_string()
+            .contains("cannot_type")),
+        "{case}: the card holds the task as cannot_type: {}",
+        wake_hold(daemon, pane)
+    );
+    unchanged(pane, Duration::from_millis(1000));
+    assert!(
+        bytes(pane).is_empty(),
+        "{case}: the deck typed into OpenCode: {:?}",
+        String::from_utf8_lossy(&bytes(pane))
+    );
+    state(daemon, pane, id, "queued");
+    let listed = listing(daemon, pane);
+    let message = listed["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == id)
+        .unwrap();
+    assert_eq!(message["deliveries"], 0, "{case}: {message}");
 }
 
 /// Scenario: Submit fixed doorbells through the generated server plugin in the full TUI's worker thread and inspect the original text-parts array. The substitution hands the message over, bound to the server context's own receiver: an unrelated answer commits nothing and nothing repeats it, the matching answer acknowledges it, recalling a handled doorbell leaves newer work untouched, and one coalesced assistant turn acknowledges two intercepted tasks around an intervening human message, each once.
@@ -1122,11 +1175,11 @@ fn opencode_012_cli_installs_jsonc_once() {
     );
 }
 
-/// Scenario: Explicitly install with a symlinked tui.json. The CLI must report the unchanged file, a refusal reason and the manual plugin path, exit nonzero, and leave the link target intact; an unarmed pane must still get the fallback doorbell.
+/// Scenario: Explicitly install with a symlinked tui.json. The CLI must report the unchanged file, a refusal reason and the manual plugin path, exit nonzero, and leave the link target intact; an unarmed pane is then held as cannot_type with nothing typed, and the task waits queued for a receiver.
 #[spec("inbox/opencode/013")]
 #[test]
-fn opencode_013_cli_refusal_is_actionable_and_falls_back() {
-    let daemon = daemon_unbound(&[]);
+fn opencode_013_cli_refusal_is_actionable_and_the_unarmed_pane_is_held() {
+    let daemon = daemon_unbound(&[("DOT_AGENT_DECK_INBOX_WAKE_STALL_AFTER_MS", "500")]);
     let root = daemon.home.join(".config/opencode");
     std::fs::create_dir_all(&root).unwrap();
     let target = daemon.home.join("user-tui.json");
@@ -1157,10 +1210,10 @@ fn opencode_013_cli_refusal_is_actionable_and_falls_back() {
             && stdout.contains(root.join("dot-agent-deck-tui.js").to_str().unwrap()),
         "refusal must be actionable: {stdout}"
     );
-    let pane = pane(&daemon, "refused-opencode");
+    let pane = pane_with(&daemon, "refused-opencode", json!({"profile": false}));
     status(&daemon, &pane, "idle", "opencode");
     let id = enqueue(&daemon, &pane, BODY);
-    ring(&daemon, &pane, &id);
+    assert_held_cannot_type(&daemon, &pane, &id, "refused install");
     fetch(&daemon, &pane, true);
     state(&daemon, &pane, &id, "acknowledged");
 }

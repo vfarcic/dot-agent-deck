@@ -35,7 +35,7 @@ use tempfile::TempDir;
 use tokio::sync::broadcast;
 
 use dot_agent_deck::agent_pty::{
-    AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, DoorbellWrite, SpawnOptions, TabMembership,
+    AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions, TabMembership,
 };
 use dot_agent_deck::dispatch_return::DispatchCaller;
 use dot_agent_deck::event::{BroadcastMsg, DelegateSignal};
@@ -799,27 +799,17 @@ fn work_done_006_feedback_is_refused_when_the_orchestrator_pane_changed_hands() 
             .work_done(&format!("Finished the second delegation. {FRESH_SENTINEL}"))
             .await;
 
-        // A barrier rather than a sleep: an authorized write — the doorbell's,
-        // the one automatic writer the deck keeps — that has demonstrably
-        // arrived proves the successor's PTY has drained past the point where
-        // leaked feedback would have landed.
-        let barrier = harness
+        // A barrier rather than a sleep: an authorized write, bound to the
+        // successor, that has demonstrably arrived proves the successor's PTY
+        // has drained past the point where leaked feedback would have landed.
+        harness
             .registry
-            .write_doorbell(
-                ORCH_PANE,
-                &successor,
-                false,
-                None,
-                Some(SUCCESSOR_BARRIER),
-                || async { true },
-            )
-            .await;
-        assert_eq!(
-            barrier,
-            DoorbellWrite::Written,
-            "the successor owns the pane, so a write bound to IT must go in — otherwise \
-             this test proves nothing about the refusal"
-        );
+            .write_user_bytes(ORCH_PANE, &successor, SUCCESSOR_BARRIER.as_bytes())
+            .await
+            .expect(
+                "the successor owns the pane, so a write bound to IT must go in — otherwise \
+                 this test proves nothing about the refusal",
+            );
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while !snapshot_of(&successor).contains(SUCCESSOR_BARRIER)
             && tokio::time::Instant::now() < deadline
@@ -948,16 +938,10 @@ async fn barrier_dispatch_return_observer(
     agent_id: &str,
     barrier: &str,
 ) -> String {
-    let outcome = registry
-        .write_doorbell(pane_id, agent_id, false, None, Some(barrier), || async {
-            true
-        })
-        .await;
-    assert_eq!(
-        outcome,
-        DoorbellWrite::Written,
-        "the observer owns the pane, so its barrier write must go in"
-    );
+    registry
+        .write_user_bytes(pane_id, agent_id, barrier.as_bytes())
+        .await
+        .expect("the observer owns the pane, so its barrier write must go in");
     let snapshot = wait_for_dispatch_return_snapshot(registry, agent_id, barrier).await;
     assert!(
         snapshot.contains(barrier),

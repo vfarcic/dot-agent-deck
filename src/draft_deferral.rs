@@ -185,6 +185,16 @@ impl DraftTracker {
         self.user_clears
     }
 
+    /// PRD #1666 part 3, round 5-wake (plan §1.4): the doorbell's own line
+    /// was submitted, proven by its ring evidence, with no human operation
+    /// queued since its admission: whatever held the bit had been processed
+    /// before the agent drew the line alone in its empty composer, so the
+    /// bit is released. The deck's own submit bytes no longer release it.
+    pub(crate) fn reconcile_deck_submit(&mut self) {
+        self.pending = false;
+        self.escapes = false;
+    }
+
     /// A turn of the agent's ended after everything fed so far reached it:
     /// the agent reported Idle having reported itself working. The caller
     /// decides that (`crate::agent_pty`'s turn edges, and its ordering of the
@@ -215,13 +225,16 @@ impl DraftTracker {
         origin: ByteOrigin,
     ) {
         if submits {
-            // Enter is a hard reset, whoever pressed it: the box was
-            // submitted, and whatever sequence was being parsed is over.
+            // Enter ends whatever sequence was being parsed, whoever pressed
+            // it. Only the user's releases the bit: the deck's own Enter is no
+            // evidence of what the box held (PRD #1666 part 3, round 5-wake,
+            // plan §1.4), and the doorbell reconciles the bit itself once its
+            // line is proven submitted ([`Self::reconcile_deck_submit`]).
             if origin == ByteOrigin::User {
                 self.user_clears += 1;
+                self.pending = false;
+                self.escapes = false;
             }
-            self.pending = false;
-            self.escapes = false;
             self.escape = Escape::Ground;
             return;
         }
@@ -725,17 +738,26 @@ mod tests {
         assert!(!pending_after(b"\x1b[201~"));
     }
 
-    /// Our own SUBMIT write is payload + CR, fed as the deck's bytes: the
-    /// payload sets nothing and the CR submits the box, the user's draft
-    /// included.
+    /// PRD #1666 part 3, round 5-wake (plan §1.4): the deck's own payload
+    /// and Enter, fed as the deck's bytes, release nothing: a written CR is
+    /// no evidence of what the box held. Only the doorbell's reconcile, once
+    /// its line is proven submitted, releases the bit, and the user's own
+    /// Enter still does.
     #[test]
-    fn our_own_submit_clears_the_bit() {
+    fn our_own_submit_no_longer_clears_the_bit() {
         let mut tracker = DraftTracker::default();
         feed(&mut tracker, b"draft");
         feed_as(&mut tracker, b"PAYLOAD", ByteOrigin::Deck);
         assert!(tracker.pending(), "our payload does not clear the draft");
         feed_as(&mut tracker, b"\r", ByteOrigin::Deck);
-        assert!(!tracker.pending());
+        assert!(tracker.pending(), "nor does our Enter");
+        assert_eq!(tracker.user_clears(), 0);
+        tracker.reconcile_deck_submit();
+        assert!(!tracker.pending(), "a proven submit reconciles it");
+        feed(&mut tracker, b"draft");
+        feed(&mut tracker, b"\r");
+        assert!(!tracker.pending(), "the user's own Enter");
+        assert_eq!(tracker.user_clears(), 1);
     }
 
     /// PR #1398 finding #16: the deck's bytes move the parser but never set
@@ -1042,7 +1064,11 @@ mod tests {
         fn expect(self, a: ByteOrigin, b: ByteOrigin, drafted: bool) -> bool {
             let (a, b) = (a == ByteOrigin::User, b == ByteOrigin::User);
             match self.clears {
-                Clears::Submit => return false,
+                // Only the user's own Enter releases the bit (PRD #1666 part
+                // 3, round 5-wake): the deck's ends the sequence and leaves
+                // the bit as it was.
+                Clears::Submit if b => return false,
+                Clears::Submit => return drafted,
                 Clears::UserKey if b => return false,
                 _ => {}
             }

@@ -176,9 +176,13 @@ fn manager_002_edit_spawns_seeded_authoring_agent_prefilled() {
             format!(
                 "#!/bin/sh\n\
                  {hook}\
-                 {answer}\n",
-                hook = common::claude_session_start_line(bin, "authoring"),
-                answer = record_and_answer_doorbell(bin, record),
+                 {answer}",
+                hook = common::claude_hook_line(bin, AUTHORING_SESSION_START),
+                answer = common::exec_profiled_recorder(
+                    &common::write_profiled_agent(&shim_dir),
+                    bin,
+                    record
+                ),
             ),
         )
         .unwrap_or_else(|e| panic!("write {name} shim: {e}"));
@@ -216,6 +220,8 @@ fn manager_002_edit_spawns_seeded_authoring_agent_prefilled() {
         .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
         .with_env("DOT_AGENT_DECK_CONFIG", config_path.to_string_lossy())
         .with_env("PATH", path_env)
+        .with_env(PROFILE_SELECTOR, "standin")
+        .with_env(PROFILE_BINARY, profiled_binary(&shim_dir))
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active agents");
 
@@ -559,25 +565,29 @@ fn manager_007_dialog_content_sized_unclipped_at_both_widths() {
     drop(scratch);
 }
 
-/// PRD #1666 S5: the recorder loop a shim runs once it has announced itself.
-/// It appends every line typed into it to `record`, and when that line is the
-/// deck's doorbell it does what an agent does — runs `inbox fetch` in its own
-/// pane — and appends what it fetched, so the seed the deck posted to its inbox
-/// lands in `record` whole.
-fn record_and_answer_doorbell(bin: &str, record: &std::path::Path) -> String {
-    format!(
-        "while IFS= read -r l; do printf '%s\\n' \"$l\" >> \"{rec}\"; \
-         case \"$l\" in \" dot-agent-deck: message \"*) \"{bin}\" inbox fetch >> \"{rec}\" 2>&1;; \
-         esac; done",
-        rec = record.to_string_lossy(),
-    )
+/// The `SessionStart` a recorder shim posts as it starts, which opens the
+/// gated-delivery readiness gate.
+const AUTHORING_SESSION_START: &str =
+    r#"{"hook_event_name":"SessionStart","session_id":"authoring"}"#;
+
+/// The selector and executable that type the doorbell into the recorders in
+/// a shim directory under the e2e stand-in profile (PRD #1666 part 3, round
+/// 5-wake), set for the daemon the TUI starts.
+const PROFILE_SELECTOR: &str = "DOT_AGENT_DECK_TEST_COMPOSER_PROFILE";
+const PROFILE_BINARY: &str = "DOT_AGENT_DECK_TEST_COMPOSER_BINARY";
+
+fn profiled_binary(shim_dir: &std::path::Path) -> String {
+    shim_dir
+        .join("profiled-agent.py")
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Write a recorder shim named `name` into `shim_dir`: it records its working
 /// directory (`pwd`) — the dir the agent was SPAWNED in — then opens the
 /// gated-delivery readiness gate (posts SessionStart via the real hook path) and
-/// records what reaches it ([`record_and_answer_doorbell`]: the doorbell, then
-/// the seed it fetches from its inbox), so BOTH the spawn cwd AND the authoring
+/// records what reaches it ([`common::PROFILED_AGENT`] in its `record` style:
+/// the doorbell, then the seed it fetches from its inbox), so BOTH the spawn cwd AND the authoring
 /// seed a spawned agent receives are observable on disk. Distinct-name
 /// shims let a test tell WHICH agent command actually spawned; the recorded
 /// `pwd` lets a test assert the agent spawned in the PICKED directory. Mirrors
@@ -591,10 +601,14 @@ fn write_recorder_shim(shim_dir: &std::path::Path, name: &str, record: &std::pat
             "#!/bin/sh\n\
              pwd >> \"{rec}\"\n\
              {hook}\
-             {answer}\n",
+             {answer}",
             rec = record.to_string_lossy(),
-            hook = common::claude_session_start_line(bin, "authoring"),
-            answer = record_and_answer_doorbell(bin, record),
+            hook = common::claude_hook_line(bin, AUTHORING_SESSION_START),
+            answer = common::exec_profiled_recorder(
+                &common::write_profiled_agent(shim_dir),
+                bin,
+                record
+            ),
         ),
     )
     .unwrap_or_else(|e| panic!("write {name} shim: {e}"));
@@ -654,6 +668,8 @@ fn manager_010_blank_default_command_falls_back_to_claude() {
         .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
         .with_env("DOT_AGENT_DECK_CONFIG", config_path.to_string_lossy())
         .with_env("PATH", path_env)
+        .with_env(PROFILE_SELECTOR, "standin")
+        .with_env(PROFILE_BINARY, profiled_binary(&shim_dir))
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active agents");
 
@@ -1034,6 +1050,8 @@ fn form_002_add_spawns_authoring_agent_in_picked_dir() {
         .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
         .with_env("DOT_AGENT_DECK_CONFIG", config_path.to_string_lossy())
         .with_env("PATH", path_env)
+        .with_env(PROFILE_SELECTOR, "standin")
+        .with_env(PROFILE_BINARY, profiled_binary(&shim_dir))
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active agents");
 
@@ -1154,6 +1172,8 @@ fn form_003_edit_prefills_seed_and_spawns_in_row_working_dir() {
         .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
         .with_env("DOT_AGENT_DECK_CONFIG", config_path.to_string_lossy())
         .with_env("PATH", path_env)
+        .with_env(PROFILE_SELECTOR, "standin")
+        .with_env(PROFILE_BINARY, profiled_binary(&shim_dir))
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active agents");
 
@@ -1459,6 +1479,8 @@ fn form_006_edit_repick_different_dir_wins_in_seed() {
         .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
         .with_env("DOT_AGENT_DECK_CONFIG", config_path.to_string_lossy())
         .with_env("PATH", path_env)
+        .with_env(PROFILE_SELECTOR, "standin")
+        .with_env(PROFILE_BINARY, profiled_binary(&shim_dir))
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active agents");
 
@@ -1588,6 +1610,8 @@ fn form_007_issue_dispatch_option_seeds_issue_dispatch_authoring() {
         // experimental flag — turn it ON so the cycler offers it.
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         .with_env("PATH", path_env)
+        .with_env(PROFILE_SELECTOR, "standin")
+        .with_env(PROFILE_BINARY, profiled_binary(&shim_dir))
         .launch_with_fixture("schedule-mode");
     deck.wait_for_string("No active agents");
 

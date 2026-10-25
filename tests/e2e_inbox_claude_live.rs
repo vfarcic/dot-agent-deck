@@ -45,14 +45,28 @@ impl Claude {
     }
 
     fn launch(command: &str) -> Self {
+        Self::launch_with(command, &[])
+    }
+
+    /// [`Self::launch`] with `extra` set for the deck and its daemon.
+    fn launch_with(command: &str, extra: &[(&str, &str)]) -> Self {
         let command = command.to_string();
-        let deck = common::TuiDeck::builder()
+        let mut builder = common::TuiDeck::builder();
+        for (key, value) in extra {
+            builder = builder.with_env(*key, *value);
+        }
+        let deck = builder
             .with_pty_size(180, 50)
             .with_imported_claude_credentials()
             .with_claude_trust_workdir()
             .with_env("DOT_AGENT_DECK_LOG", "inbox-live.log")
+            .with_env(
+                "RUST_LOG",
+                "info,pane_write=trace,dot_agent_deck::doorbell=debug",
+            )
             .with_env("DOT_AGENT_DECK_INBOX_ARM_GRACE_MS", "2000")
             .with_env("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "30000")
+            .with_env("DOT_AGENT_DECK_INBOX_WAKE_STALL_AFTER_MS", "2000")
             .with_continue_session("inbox-haiku", command)
             .launch_with_fixture("minimal");
         deck.wait_for_string("inbox-haiku");
@@ -111,6 +125,64 @@ impl Claude {
 
     fn log(&self) -> String {
         std::fs::read_to_string(self.deck.workdir().join("inbox-live.log")).unwrap_or_default()
+    }
+
+    /// Read the agent's composer using its actual PTY geometry, rather than
+    /// interpreting its bytes at the stand-in's fixed size.
+    fn pane_grid(&self) -> String {
+        self.pane_frame().0
+    }
+
+    fn pane_frame(&self) -> (String, (u16, u16)) {
+        let record = self.record();
+        let raw = common::pane_snapshot_on(self.deck.attach_socket_path(), &self.pane.agent);
+        let mut parser = dot_agent_deck::vt_grid::parser(
+            record["rows"].as_u64().unwrap() as u16,
+            record["cols"].as_u64().unwrap() as u16,
+            0,
+        );
+        parser.process(&raw);
+        (
+            parser.screen().contents(),
+            parser.screen().cursor_position(),
+        )
+    }
+
+    fn composer(&self) -> Option<String> {
+        if self
+            .pane_grid()
+            .contains("Your conversation moved to the background")
+        {
+            return None;
+        }
+        self.pane_grid().lines().rev().find_map(|row| {
+            let tail = row.trim_start().strip_prefix('❯')?;
+            Some(
+                tail.split("· ? for shortcuts")
+                    .next()
+                    .unwrap()
+                    .trim()
+                    .to_string(),
+            )
+        })
+    }
+
+    fn expect_composer(&self, expected: &str) {
+        assert!(
+            common::wait_until(Duration::from_secs(10), || self.composer().as_deref()
+                == Some(expected)),
+            "agent must draw exact composer {expected:?}, got {:?}; {}",
+            self.composer(),
+            self.evidence()
+        );
+    }
+
+    fn forwarded(&self, since: usize, payload: &str) -> bool {
+        self.log().get(since..).unwrap_or("").lines().any(|line| {
+            line.contains("STREAM_IN forwarded to PTY writer")
+                && line.contains(&format!("agent_id={}", self.pane.agent))
+                && line.contains(&format!("payload={payload}"))
+        })
     }
 
     fn evidence(&self) -> String {
@@ -298,13 +370,573 @@ fn claude_013_live_clear_waiters_claim_once() {
     claude.done(&id, name, true);
 }
 
-/// Scenario: Capture the pid of the scratch pane's armed waiter and kill that process, then post a task after the waiter disconnects. A fixed doorbell must wake interactive Haiku, whose submit hook injects and acknowledges the task and shows an envelope label before the sentinel is written.
+/// The installed Claude Code release, read from `claude --version`.
+#[cfg(target_os = "linux")]
+fn installed_claude_release() -> Result<String, String> {
+    let output = std::process::Command::new("claude")
+        .arg("--version")
+        .current_dir(std::env::temp_dir())
+        .output()
+        .map_err(|e| format!("`claude --version` did not run: {e}"))?;
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.split_whitespace()
+        .next()
+        .filter(|release| semver::Version::parse(release).is_ok())
+        .map(str::to_string)
+        .ok_or_else(|| format!("`claude --version` printed no release: {text:?}"))
+}
+
+/// Whether the deck types into Claude Code `release`: a complete record of
+/// its own activates it.
+#[cfg(target_os = "linux")]
+fn measured(release: &str) -> bool {
+    use dot_agent_deck::doorbell_activation::{Activation, LatchedRelease, RELEASE_RECORDS};
+    semver::Version::parse(release).is_ok_and(|version| {
+        matches!(
+            dot_agent_deck::doorbell_activation::activation(
+                &RELEASE_RECORDS,
+                &dot_agent_deck::event::AgentType::ClaudeCode,
+                &LatchedRelease::Known(version),
+                &[],
+            ),
+            Activation::Go { .. }
+        )
+    })
+}
+
+/// The Claude Code releases the deck has measured.
+#[cfg(target_os = "linux")]
+fn measured_releases() -> Vec<String> {
+    dot_agent_deck::doorbell_activation::RELEASE_RECORDS
+        .iter()
+        .filter(|record| record.agent == dot_agent_deck::event::AgentType::ClaudeCode)
+        .map(|record| record.release.to_string())
+        .filter(|release| measured(release))
+        .collect()
+}
+
+/// `inbox/claude/014`'s preflight: it runs only on a release the deck has
+/// measured, and is otherwise UNVERIFIED, never green.
+#[cfg(target_os = "linux")]
+fn claude_release_measured() -> Result<(), String> {
+    let installed = installed_claude_release()?;
+    eprintln!("Claude Code release under test: {installed}");
+    if measured(&installed) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Claude Code {installed} is installed, and the deck has measured only {:?}: \
+             the doorbell does not type into it",
+            measured_releases()
+        ))
+    }
+}
+
+/// Scenario: On a Claude Code release the deck has measured, capture the pid of the scratch pane's armed waiter and kill that process, then post a task after the waiter disconnects. The token-led doorbell must wake interactive Haiku, whose submit hook injects and acknowledges the task and shows an envelope label before the sentinel is written; on a release the deck has not measured the test reports SKIP naming both.
 #[spec("inbox/claude/014")]
 #[test]
 #[cfg(target_os = "linux")]
 fn claude_014_live_killed_waiter_falls_back_to_injection() {
     skip_unless!(common::check_claude_available());
+    skip_unless!(claude_release_measured());
     let claude = Claude::new();
+    kill_trial_waiter(&claude);
+    let name = "doorbell-fallback-908c2a.txt";
+    let id = claude.post(&claude.directive(name));
+    claude.done(&id, name, false);
+    assert!(
+        claude.log().contains("doorbell rang"),
+        "fallback must ring; {}",
+        claude.evidence()
+    );
+    assert!(
+        !claude.record()["live"]["last_user_prompt"]
+            .to_string()
+            .contains("waiting, run:")
+    );
+}
+
+/// Scenario: Run interactive Haiku in a deck that treats the installed Claude Code release as unmeasured, kill its scratch pane's armed waiter, and post a directive task naming a sentinel. The daemon's release line must name the installed release as latched and its `doorbell off` line must name unmeasured_release; for 20 seconds after that no doorbell rings or shows on the pane's screen or in its last prompt, the task stays queued, and the card shows the cannot_type words. The test then types a short prompt into the pane and presses Enter: the prompt hook hands Haiku the task, Haiku writes the sentinel, and the task is acknowledged.
+#[spec("inbox/claude/050")]
+#[test]
+#[cfg(target_os = "linux")]
+fn claude_050_live_unmeasured_release_is_held_and_a_prompt_delivers() {
+    skip_unless!(common::check_claude_available());
+    let release = match installed_claude_release() {
+        Ok(release) => release,
+        Err(why) => {
+            skip_unless!(Err(why));
+            return;
+        }
+    };
+    eprintln!("Claude Code release under test: {release}");
+    let claude = Claude::launch_with(
+        &common::capability_export_command(&format!("exec {CLAUDE}")),
+        &[("DOT_AGENT_DECK_E2E_UNRECORD_CLAUDE_RELEASES", &release)],
+    );
+    // The cause is proved, not assumed: the installed release latched, and
+    // the doorbell held as unmeasured_release.
+    let latched = format!("release={release}");
+    let saw_latch = common::wait_until(BUDGET, || {
+        claude
+            .log()
+            .lines()
+            .any(|line| line.contains("pane release") && line.contains(&latched))
+    });
+    if !saw_latch {
+        let lines: Vec<String> = claude
+            .log()
+            .lines()
+            .filter(|line| line.contains("pane release"))
+            .map(str::to_string)
+            .collect();
+        skip_unless!(Err(format!(
+            "the deck did not latch Claude Code {release}; its release lines: {lines:?}"
+        )));
+        return;
+    }
+    kill_trial_waiter(&claude);
+    assert!(
+        common::wait_until(BUDGET, || claude.listing()["armed"].as_u64() == Some(0)),
+        "the waiter must go; {}",
+        claude.evidence()
+    );
+    let name = "unmeasured-release-4d17b2.txt";
+    let id = claude.post(&claude.directive(name));
+    let held = common::wait_until(BUDGET, || {
+        claude
+            .log()
+            .lines()
+            .any(|line| line.contains("doorbell off") && line.contains("unmeasured_release"))
+    });
+    if !held {
+        skip_unless!(Err(format!(
+            "no `doorbell off` line named unmeasured_release; {}",
+            claude.evidence()
+        )));
+        return;
+    }
+    assert!(
+        !common::wait_until(Duration::from_secs(20), || {
+            claude.log().contains("doorbell rang") || claude.pane_grid().contains("waiting, run:")
+        }),
+        "a doorbell rang or its line is on the screen; {}",
+        claude.evidence()
+    );
+    assert!(
+        !claude.record()["live"]["last_user_prompt"]
+            .to_string()
+            .contains("waiting, run:")
+    );
+    assert!(
+        claude.listing()["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == id && m["state"] == "queued"),
+        "the task stays queued; {}",
+        claude.evidence()
+    );
+    assert!(
+        claude.deck.wait_for_grid_string_within(
+            dot_agent_deck::inbox_display::WAKE_HOLD_CANNOT_TYPE,
+            BUDGET
+        ),
+        "the card shows the words; {}",
+        claude.evidence()
+    );
+    claude
+        .deck
+        .send_keys(b"Check for new messages and do what they say.");
+    claude.deck.send_keys(b"\r");
+    claude.done(&id, name, false);
+}
+
+/// Scenario: Complete a fallback-delivered task in interactive Haiku, then post a second task and hold the deck's ring just after its line reaches the input box, before its Enter, while the user types into the pane. The deck submits its own line alone, Haiku acts on the task, and the user's text then sits in the input box exactly as typed, unsubmitted.
+#[spec("inbox/doorbell/039")]
+#[test]
+#[cfg(target_os = "linux")]
+fn doorbell_039_live_typing_while_line_lands() {
+    skip_unless!(common::check_claude_available());
+    skip_unless!(claude_release_measured());
+    let claude = fallback_ready_with(
+        Claude::launch_with(
+            &common::capability_export_command(&format!("exec {CLAUDE}")),
+            &[
+                ("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_PANE", "*"),
+                ("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_DIR", "ring-barriers"),
+            ],
+        ),
+        "typing",
+    );
+    let root = claude.deck.home_dir().join("ring-barriers");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("after-line.armed"), "").unwrap();
+    let name = "typing-while-line-lands-39a1.txt";
+    let id = claude.post(&claude.directive(name));
+    assert!(
+        common::wait_until(BUDGET, || root.join("after-line.reached").exists()),
+        "the ring must reach its line; {}",
+        claude.evidence()
+    );
+    let typed = "user-text-while-deck-types-39a1";
+    claude.deck.send_keys(typed.as_bytes());
+    assert!(
+        common::wait_until(BUDGET, || std::fs::read_to_string(
+            root.join("observations")
+        )
+        .unwrap_or_default()
+        .contains("human-arrived")),
+        "the user's keys must arrive while the deck holds the writer"
+    );
+    std::fs::write(root.join("after-line.release"), "").unwrap();
+    claude.done(&id, name, false);
+    assert!(
+        claude.log().contains("doorbell rang"),
+        "the deck's line was submitted; {}",
+        claude.evidence()
+    );
+    claude.expect_composer(typed);
+    assert!(
+        !claude.record()["live"]["last_user_prompt"]
+            .to_string()
+            .contains(typed),
+        "the user's text was not submitted; {}",
+        claude.evidence()
+    );
+}
+
+/// Scenario: Complete a fallback-delivered task in interactive Haiku, press Right in its empty input box, then visibly move across and erase a harmless marker before posting another task. The next task must create its sentinel without further human input; Ctrl+U is used only after a timeout to diagnose an empty editor held as a draft.
+#[spec("inbox/doorbell/010")]
+#[test]
+#[cfg(target_os = "linux")]
+fn doorbell_010_live_right_in_empty_editor_does_not_strand_task() {
+    skip_unless!(common::check_claude_available());
+    empty_editor_fallback("right", false);
+}
+
+/// Scenario: Complete a fallback-delivered task in interactive Haiku, type a unique draft, and erase every character with Backspace before posting another task. The empty editor must receive and act on the task without another keypress, while the existing genuine-draft case keeps protecting text that remains unsent.
+#[spec("inbox/doorbell/010")]
+#[test]
+#[cfg(target_os = "linux")]
+fn doorbell_010_live_backspaced_empty_editor_does_not_strand_task() {
+    skip_unless!(common::check_claude_available());
+    empty_editor_fallback("backspaced", true);
+}
+
+#[cfg(target_os = "linux")]
+fn fallback_ready(label: &str) -> Claude {
+    fallback_ready_with(Claude::new(), label)
+}
+
+#[cfg(target_os = "linux")]
+fn fallback_ready_with(claude: Claude, label: &str) -> Claude {
+    claude.deck.wait_for_string("? for shortcuts");
+    kill_trial_waiter(&claude);
+    let control = format!("wake-control-{label}-7e91.txt");
+    let id = claude.post(&claude.directive(&control));
+    claude.done(&id, &control, false);
+    // A completed model action alone can precede its Stop hook. Wait for the
+    // next native waiter and genuine Idle before disabling native delivery.
+    assert!(
+        common::wait_until(BUDGET, || {
+            claude.listing()["armed"].as_u64().unwrap_or(0) > 0
+                && claude.record()["live"]["status"] == "Idle"
+        }),
+        "control turn must finish; {}",
+        claude.evidence()
+    );
+    kill_trial_waiter(&claude);
+    claude.expect_composer("");
+    claude
+}
+
+#[cfg(target_os = "linux")]
+fn empty_editor_fallback(label: &str, erase_draft: bool) {
+    let claude = fallback_ready(label);
+    if erase_draft {
+        let draft = "empty-editor-probe-7e91";
+        claude.deck.send_keys(draft.as_bytes());
+        claude.expect_composer(draft);
+        claude.deck.send_keys(&vec![0x7f; draft.len()]);
+        claude.expect_composer("");
+    } else {
+        claude.expect_composer("");
+        let since = claude.log().len();
+        claude.deck.send_keys(b"\x1b[C");
+        assert!(
+            common::wait_until(Duration::from_secs(10), || claude
+                .forwarded(since, "\\x1b[C")),
+            "Right must be forwarded before posting; {}",
+            claude.evidence()
+        );
+        // A trace precedes the write. Instead, prove recipient processing:
+        // the marker is drawn after the empty-editor Right in FIFO input
+        // order, then Left/Right must visibly move across it. Backspace must
+        // draw empty again. These editing keys leave the draft bit set.
+        claude.deck.send_keys(b"r");
+        claude.expect_composer("r");
+        let end = claude.pane_frame().1;
+        claude.deck.send_keys(b"\x1b[D");
+        assert!(
+            common::wait_until(Duration::from_secs(10), || {
+                let (grid, cursor) = claude.pane_frame();
+                grid.lines().any(|row| {
+                    row.trim_start()
+                        .strip_prefix('❯')
+                        .is_some_and(|tail| tail.trim() == "r")
+                }) && cursor == (end.0, end.1 - 1)
+            }),
+            "Left must visibly move before the marker (end={end:?}, current={:?}); {}",
+            claude.pane_frame().1,
+            claude.evidence()
+        );
+        claude.deck.send_keys(b"\x1b[C");
+        assert!(
+            common::wait_until(Duration::from_secs(10), || claude.pane_frame().1 == end),
+            "Right must visibly move across the marker; {}",
+            claude.evidence()
+        );
+        claude.deck.send_keys(b"\x7f");
+        claude.expect_composer("");
+        eprintln!(
+            "Right processing barrier: marker drawn, Left/Right cursor transition confirmed at {end:?}, Backspace redrew exact empty composer"
+        );
+    }
+    let name = format!("wake-empty-{label}-7e91.txt");
+    let id = claude.post(&claude.directive(&name));
+    let delivered = common::wait_until(Duration::from_secs(30), || {
+        claude.deck.workdir().join(&name).exists()
+    });
+    let before_recovery = claude.evidence();
+    let recovered = if delivered {
+        false
+    } else {
+        // Diagnose the hold, and leave the real agent settled before failing.
+        claude.deck.send_keys(b"\x15");
+        common::wait_until(BUDGET, || claude.deck.workdir().join(&name).exists())
+    };
+    assert!(
+        delivered,
+        "empty editor stranded {label} task for 30s; Ctrl+U recovery={recovered}; before recovery:\n{before_recovery}\nafter recovery:\n{}",
+        claude.evidence()
+    );
+    claude.done(&id, &name, false);
+}
+
+/// Scenario: Complete a fallback task in interactive Haiku, then press Left in its empty composer to open the background-session overview and queue another task. For five seconds the input row must remain exactly empty with unchanged captured input bytes, the task queued and zero deliveries. This is a GREEN regression guard on the part-3 head because navigation sets the draft bit; after the fix the unrecognised overview must still hold delivery.
+#[spec("inbox/doorbell/010")]
+#[test]
+#[cfg(target_os = "linux")]
+fn doorbell_010_live_left_opens_overview_and_the_line_is_not_typed_there() {
+    skip_unless!(common::check_claude_available());
+    // util-linux script records every input byte before relaying it to the
+    // real interactive Claude PTY. No human keys follow Left, so any later
+    // input is automatic, even if a partial token is erased between samples.
+    let version = std::process::Command::new("script")
+        .arg("--version")
+        .output()
+        .expect("Linux overview input ledger requires util-linux script on PATH");
+    assert!(
+        version.status.success(),
+        "util-linux script preflight failed"
+    );
+    let claude = fallback_ready_with(
+        Claude::launch(&common::capability_export_command(&format!(
+            "exec script --quiet --flush --return --echo never --log-in overview-input.log --log-out /dev/null --command 'exec {CLAUDE}'"
+        ))),
+        "overview",
+    );
+    let input = || std::fs::read(claude.deck.workdir().join("overview-input.log")).unwrap();
+    let before_left = input();
+    claude.deck.send_keys(b"\x1b[D");
+    assert!(
+        common::wait_until(Duration::from_secs(10), || claude
+            .pane_grid()
+            .contains("Your conversation moved to the background")),
+        "Left must open the overview; {}",
+        claude.evidence()
+    );
+    assert!(
+        common::wait_until(Duration::from_secs(10), || input()[before_left.len()..]
+            .ends_with(b"\x1b[D")),
+        "input ledger must capture the human Left before observation; {}",
+        claude.evidence()
+    );
+    let input_before = input();
+    let input_row = |grid: &str| {
+        grid.lines()
+            .rev()
+            .find(|row| row.trim_start().starts_with('❯'))
+            .map(str::to_string)
+    };
+    let empty_row = input_row(&claude.pane_grid()).expect("overview must draw its input row");
+    assert_eq!(
+        empty_row.trim_start().strip_prefix('❯').unwrap().trim(),
+        "describe a task for a new session"
+    );
+    let since = claude.log().len();
+    let name = "overview-held-7e91.txt";
+    let id = claude.post(&claude.directive(name));
+    let leaked = std::cell::Cell::new(false);
+    // A bounded observation: the closure never asks to stop, so it samples
+    // for the whole five seconds.
+    common::wait_until(Duration::from_secs(5), || {
+        let grid = claude.pane_grid();
+        let listing = claude.listing();
+        let message = listing["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["id"] == id)
+            .unwrap();
+        let seen = grid.contains("dot-agent-deck: message")
+            || input_row(&grid).as_deref() != Some(empty_row.as_str())
+            || input() != input_before
+            || claude.log()[since..].lines().any(|line| {
+                line.contains("doorbell attempt")
+                    || line.contains("doorbell held")
+                    || line.contains("doorbell rang")
+                    || line.contains("doorbell ring withdrawn")
+                    || line.contains("doorbell ring failed")
+                    || line.contains("doorbell write")
+                    || line.contains("doorbell sent its cleanup CR")
+                    || line.contains("pane_write:")
+            })
+            || !grid.contains("Your conversation moved to the background")
+            || claude.deck.workdir().join(name).exists()
+            || message["state"] != "queued"
+            || message["deliveries"] != 0;
+        leaked.set(leaked.get() || seen);
+        false
+    });
+    let leaked = leaked.get();
+    let listing = claude.listing();
+    let message = listing["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["id"] == id)
+        .unwrap();
+    let evidence = claude.evidence();
+    eprintln!(
+        "overview observation: leaked={leaked}; input ledger unchanged={}; empty input row={empty_row:?}; message={message}; pane=\n{}",
+        input() == input_before,
+        claude.pane_grid()
+    );
+    assert!(
+        !leaked
+            && input() == input_before
+            && message["state"] == "queued"
+            && message["deliveries"] == 0,
+        "deck must not type its line or act on Enter in the overview; {evidence}"
+    );
+}
+
+/// Scenario: Disable native delivery, leave a unique human draft in interactive Haiku's composer, and queue a sentinel task past the accelerated stall threshold. Repeat with history-recalled and partly deleted drafts; each stays exact and unsent with zero deliveries and a stall diagnostic until the user clears it, then the original task runs once.
+#[spec("inbox/doorbell/010")]
+#[test]
+#[cfg(target_os = "linux")]
+fn doorbell_010_live_kept_draft_stays_held() {
+    skip_unless!(common::check_claude_available());
+    let mut holds = Vec::new();
+    for variant in ["typed", "history", "partial"] {
+        let claude = Claude::new();
+        claude.deck.wait_for_string("? for shortcuts");
+        kill_trial_waiter(&claude);
+        let draft = format!("human-kept-{variant}-c67e91");
+        if variant == "history" {
+            let prompt =
+                format!("{draft} Reply exactly HISTORY-READY and end your turn. Do not use tools.");
+            claude.deck.send_keys(format!("{prompt}\r").as_bytes());
+            assert!(
+                common::wait_until(BUDGET, || {
+                    claude.listing()["armed"].as_u64().unwrap_or(0) > 0
+                        && claude.record()["live"]["status"] == "Idle"
+                }),
+                "history seed must finish; {}",
+                claude.evidence()
+            );
+            kill_trial_waiter(&claude);
+            claude.deck.send_keys(b"\x1b[A");
+            claude.expect_composer(&prompt);
+            holds.push((variant, kept_draft_trial(&claude, variant, &prompt)));
+        } else {
+            claude.deck.send_keys(draft.as_bytes());
+            claude.expect_composer(&draft);
+            if variant == "partial" {
+                claude.deck.send_keys(b"-erase");
+                claude.expect_composer(&format!("{draft}-erase"));
+                claude.deck.send_keys(&[0x7f; 6]);
+                claude.expect_composer(&draft);
+            }
+            // Navigation inside retained text is also a draft, not permission.
+            claude.deck.send_keys(b"\x1b[D");
+            claude.expect_composer(&draft);
+            holds.push((variant, kept_draft_trial(&claude, variant, &draft)));
+        }
+    }
+    for (variant, hold) in holds {
+        assert!(
+            hold.to_string().contains("possible_draft"),
+            "retained {variant} draft must report possible_draft, got {hold}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn kept_draft_trial(claude: &Claude, variant: &str, draft: &str) -> Value {
+    let name = format!("kept-{variant}-c67e91.txt");
+    let since = claude.log().len();
+    let id = claude.post(&claude.directive(&name));
+    // A bounded observation: the closure asserts on every sample and never
+    // asks to stop, so it samples for the whole five seconds.
+    common::wait_until(Duration::from_secs(5), || {
+        let listing = claude.listing();
+        let message = listing["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == id)
+            .unwrap();
+        assert_eq!(message["state"], "queued", "{message}");
+        assert_eq!(message["deliveries"], 0, "{message}");
+        assert_eq!(
+            claude.composer().as_deref(),
+            Some(draft),
+            "retained {variant} composer changed; {}",
+            claude.evidence()
+        );
+        assert!(!claude.deck.workdir().join(&name).exists());
+        assert!(!claude.log()[since..].contains("doorbell rang"));
+        false
+    });
+    assert_eq!(
+        claude.record()["inbox"]["wake_stalled"],
+        true,
+        "{}",
+        claude.evidence()
+    );
+    assert!(
+        claude.log()[since..].lines().any(|line| {
+            line.contains("inbox: wake stalled")
+                && line.contains(&id)
+                && line.contains("stalled=true")
+        }),
+        "matching stall log required; {}",
+        claude.evidence()
+    );
+    let hold = claude.record()["inbox"]["wake_hold"].clone();
+    claude.deck.send_keys(b"\x15");
+    claude.done(&id, &name, false);
+    eprintln!(
+        "retained {variant}: exact draft held 5s, zero deliveries, wake_stalled and matching log; clear delivered original sentinel; wake_hold={hold}"
+    );
+    hold
+}
+
+#[cfg(target_os = "linux")]
+fn kill_trial_waiter(claude: &Claude) {
     let mut pids = Vec::new();
     for entry in std::fs::read_dir("/proc").unwrap().flatten() {
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
@@ -326,19 +958,6 @@ fn claude_014_live_killed_waiter_falls_back_to_injection() {
     assert!(common::wait_until(Duration::from_secs(10), || claude
         .listing()["armed"]
         == 0));
-    let name = "doorbell-fallback-908c2a.txt";
-    let id = claude.post(&claude.directive(name));
-    claude.done(&id, name, false);
-    assert!(
-        claude.log().contains("doorbell rang"),
-        "fallback must ring; {}",
-        claude.evidence()
-    );
-    assert!(
-        !claude.record()["live"]["last_user_prompt"]
-            .to_string()
-            .contains("waiting, run:")
-    );
 }
 
 /// The pids from `pid`'s parent up, read with `ps`, at most 64 of them.

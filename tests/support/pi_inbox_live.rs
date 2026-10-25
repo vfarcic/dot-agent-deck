@@ -97,6 +97,9 @@ impl Pi {
                 },
             )
             .with_env("DOT_AGENT_DECK_INBOX_NOT_STARTED_MS", WINDOW_MS.to_string())
+            // A held task shows its reason after five seconds, not two
+            // minutes (`inbox/pi/020`).
+            .with_env("DOT_AGENT_DECK_INBOX_WAKE_STALL_AFTER_MS", "5000")
             .with_env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "600");
         builder = if options.absent_auth {
             builder.without_agent_credentials()

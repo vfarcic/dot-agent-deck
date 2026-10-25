@@ -776,6 +776,9 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // are then pointed nowhere rather than at the default endpoint.
     pty_registry.set_attach_socket(daemon.attach_socket_path.clone());
     let state = daemon.state;
+    // PRD #1666 part 3, round 5-wake (plan §3.4′): the doorbell's
+    // re-projection publisher, before anything can ask it to run.
+    let doorbell_publisher = pty_registry.spawn_doorbell_publisher();
     // PRD #1666 S4: the doorbell, for agents no inbox component is armed for.
     let doorbell = crate::doorbell::spawn(
         Arc::clone(&pty_registry),
@@ -1121,6 +1124,9 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     inbox_ticker.abort();
     offer_assigner.abort();
     doorbell.abort();
+    if let Some(publisher) = doorbell_publisher {
+        publisher.abort();
+    }
     if let Some(h) = orphan_handle {
         h.abort();
     }

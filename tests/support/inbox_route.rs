@@ -37,43 +37,104 @@ fn client_log_tail(endpoint: &impl Endpoint) -> String {
     }
 }
 
+/// The routing stand-in's command. PRD #1666 part 3, round 5-wake: it draws
+/// the e2e build's stand-in profile's screen (`tests/support/inbox_doorbell.rs`
+/// has the contract) and selects that profile through the assignments in its
+/// own command, so the doorbell types into it whether it is started directly
+/// or as an orchestration role; on a token-led doorbell line it runs the real
+/// `inbox fetch`.
 pub fn command(dir: &Path) -> String {
     let script = dir.join("inbox-route-agent.py");
-    std::fs::write(&script, r#"import os, sys, tty, termios, json, subprocess, time
+    std::fs::write(&script, r#"import os, sys, tty, termios, json, subprocess, time, re
 tty.setraw(0, termios.TCSANOW)
 base = os.path.join(os.getcwd(), '.route-' + os.environ['DOT_AGENT_DECK_AGENT_ID'])
 with open(base + '.pid', 'w') as f: f.write(str(os.getpid()))
 capture = open(base + '.bytes', 'ab', buffering=0)
-os.write(1, b'ROUTE-AGENT-READY\r\n')
-composer = os.environ.get('INBOX_ROUTE_CODEX_COMPOSER')
-if composer:
-    with open(composer) as f:
-        os.write(1, f.read().replace('\n', '\r\n').encode())
+ring = re.compile(r'^\([a-z]{6}\) dot-agent-deck: message ')
+hold = os.path.join(os.getcwd(), '.route-hold-ready')
+held = os.path.exists(hold)
 line = bytearray()
+escape = bytearray()
+taken = []
+fetched = []
+def fetch():
+    global fetched
+    result = subprocess.run([sys.argv[1], 'inbox', 'fetch'], capture_output=True, timeout=8)
+    with open(base + '.fetches', 'a') as f:
+        f.write(json.dumps({'exit':result.returncode, 'stdout':result.stdout.decode(), 'stderr':result.stderr.decode()}) + '\n')
+    fetched = result.stdout.split(b'\n')
+def rows_of(text, cols):
+    return max(1, -(-len(text) // max(cols, 1)))
+def redraw():
+    cols, rows = os.get_terminal_size(0)
+    content = bytes(line) if line else b'\x1b[2m<empty>\x1b[22m'
+    ready = b'DOORBELL-STANDIN-BOOTING' if held else b'DOORBELL-STANDIN-READY'
+    submitted = [b'SUBMITTED:' + t for t in taken[-5:]]
+    # The last fetch's output, its tail where the message is, in the rows
+    # the fixed rows, the submitted lines and the composer leave.
+    budget = rows - 3 - sum(rows_of(t, cols) for t in submitted) - rows_of(b'COMPOSER: ' + bytes(line), cols)
+    shown = []
+    for text in reversed(fetched):
+        budget -= rows_of(text, cols)
+        if budget < 0:
+            break
+        shown.insert(0, text)
+    frame = (b'\x1b[2J\x1b[H' + ready + b'\r\n' + b'W' * cols + b'\r\n'
+             + b'ROUTE-AGENT-READY\r\n'
+             + b''.join(t + b'\r\n' for t in shown)
+             + b''.join(t + b'\r\n' for t in submitted)
+             + b'COMPOSER: ' + content)
+    os.write(1, frame)
+redraw()
+geometry = os.get_terminal_size(0)
+import select
 while True:
+    current = os.get_terminal_size(0)
+    if current != geometry:
+        geometry = current
+        redraw()
+    if not select.select([0], [], [], 0.025)[0]:
+        if os.path.exists(hold) != held:
+            held = not held
+            redraw()
+        if os.path.exists(base + '.fetch-now'):
+            # The model running `inbox fetch` on its own, with no line typed.
+            os.remove(base + '.fetch-now')
+            fetch()
+            redraw()
+        continue
     chunk = os.read(0, 4096)
     if not chunk: break
     capture.write(chunk)
     for c in chunk:
-        if c == 13:
+        if escape:
+            escape.append(c)
+            if len(escape) == 2 and c != 0x5b and c != 0x4f:
+                escape.clear()
+            elif len(escape) >= 3 and 0x40 <= c <= 0x7e:
+                escape.clear()
+        elif c == 27:
+            escape.append(c)
+        elif c == 13:
             value = line.decode('utf-8', 'replace')
-            os.write(1, b'\r\nSUBMITTED:' + line + b'\r\n')
+            taken.append(bytes(line))
             line.clear()
-            if value.startswith(' dot-agent-deck: message ') and os.path.exists(base + '.fetch-enabled'):
-                result = subprocess.run([sys.argv[1], 'inbox', 'fetch'], capture_output=True, timeout=8)
-                with open(base + '.fetches', 'a') as f:
-                    f.write(json.dumps({'exit':result.returncode, 'stdout':result.stdout.decode(), 'stderr':result.stderr.decode()}) + '\n')
-                os.write(1, result.stdout.replace(b'\n', b'\r\n'))
+            # Show the submit before running anything, as an agent does.
+            redraw()
+            if ring.match(value) and os.path.exists(base + '.fetch-enabled'):
+                fetch()
         elif c == 21:
             line.clear()
+        elif c in (8, 127):
+            if line: line.pop()
         else:
             line.append(c)
-            os.write(1, bytes([c]))
+    redraw()
 "#).unwrap();
     let quote = |s: &str| s.replace('\'', "'\\''");
+    let script = quote(&script.to_string_lossy());
     common::capability_export_command(&format!(
-        "exec python3 '{}' '{}'",
-        quote(&script.to_string_lossy()),
+        "export DOT_AGENT_DECK_TEST_COMPOSER_PROFILE=standin DOT_AGENT_DECK_TEST_COMPOSER_BINARY='{script}'; exec python3 '{script}' '{}'",
         quote(&common::contained_deck_binary().to_string_lossy())
     ))
 }
@@ -217,6 +278,18 @@ pub fn count(endpoint: &impl Endpoint, pane: &Pane, n: usize) -> Vec<Value> {
     result
 }
 
+/// While held, every routing stand-in in `endpoint`'s working directory draws
+/// no ready row, so its screen shows no prompt the doorbell may type into:
+/// an agent that has started but not yet drawn its prompt.
+pub fn hold_ready(endpoint: &impl Endpoint, held: bool) {
+    let path = endpoint.cwd().join(".route-hold-ready");
+    if held {
+        std::fs::write(path, "").unwrap();
+    } else {
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
 pub fn fetch_enable(pane: &Pane) {
     std::fs::write(pane.capture.with_extension("fetch-enabled"), "go").unwrap();
 }
@@ -231,10 +304,11 @@ pub fn only_doorbells(pane: &Pane, messages: &[Value]) {
         assert!(
             line.is_empty()
                 || messages.iter().any(|message| {
-                    let fixed = inbox::fixed_line(message["id"].as_str().unwrap());
-                    *line == fixed || (index == lines.len() - 1 && fixed.starts_with(line))
+                    let id = message["id"].as_str().unwrap();
+                    inbox::is_ring_line(line, id)
+                        || (index == lines.len() - 1 && inbox::is_ring_line_prefix(line, id))
                 }),
-            "seed must wait in inbox; automatic input must be fixed doorbells: {captured:?}"
+            "seed must wait in inbox; automatic input must be doorbell lines: {captured:?}"
         );
     }
 }
@@ -298,8 +372,8 @@ pub fn fetched(
     assert!(
         automated
             .split('\r')
-            .all(|line| line.is_empty() || line.starts_with(inbox::PREFIX)),
-        "automated input must contain only fixed doorbells and bare CR: {captured:?}"
+            .all(|line| line.is_empty() || inbox::token_led(line).is_some()),
+        "automated input must contain only doorbell lines and their Enter: {captured:?}"
     );
     block.into()
 }
@@ -320,9 +394,12 @@ pub fn notice(endpoint: &impl Endpoint, orch: &Pane, needle: &str) -> Value {
         "notice sender label: {reply}"
     );
     assert!(
-        inbox::bytes(orch).split(|byte| *byte == b'\r').all(|line|
-            line.is_empty() || String::from_utf8_lossy(line).starts_with(inbox::PREFIX)),
-        "notice prose typed into orchestrator: {:?}", inbox::bytes(orch)
+        inbox::bytes(orch)
+            .split(|byte| *byte == b'\r')
+            .all(|line| line.is_empty()
+                || inbox::token_led(&String::from_utf8_lossy(line)).is_some()),
+        "notice prose typed into orchestrator: {:?}",
+        inbox::bytes(orch)
     );
     reply
 }
@@ -589,12 +666,7 @@ pub fn client_seed(case: u8) {
     let deck = common::TuiDeck::builder()
         .with_pty_size(160, 45)
         .with_env("DOT_AGENT_DECK_DOORBELL_TICK_MS", "25")
-        // A wrapped pane can consume a ring before fetch_enable. Keep its
-        // next ring within the fetch wait, even when the first was early.
-        .with_env(
-            "DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS",
-            if case == 7 { "300" } else { "30000" },
-        )
+        .with_env("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "30000")
         // The TUI and detached daemon inherit this fixture's working directory.
         .with_env("DOT_AGENT_DECK_LOG", CLIENT_LOG)
         .with_env("DOT_AGENT_DECK_E2E_DROP_SESSION_EVENTS", "route-client-")
@@ -615,7 +687,12 @@ pub fn client_seed(case: u8) {
     let pane = first_pane(&deck);
     let first = count(&deck, &pane, 1);
     if case == 7 {
-        only_doorbells(&pane, &first);
+        // PRD #1666 part 3, round 5-wake: the deck types into no Codex
+        // release, so a Codex pane is never rung.
+        assert!(
+            inbox::bytes(&pane).is_empty(),
+            "nothing is typed into a Codex pane"
+        );
     } else {
         assert!(
             inbox::bytes(&pane).is_empty(),
@@ -632,6 +709,16 @@ pub fn client_seed(case: u8) {
     }
     // The daemon owns the target identity even when the TUI missed its event.
     client_event(&deck, &pane, "idle", "live");
+    if case == 7 {
+        inbox::unchanged(&pane, Duration::from_millis(1000));
+        assert!(
+            inbox::bytes(&pane).is_empty(),
+            "an Idle Codex pane gets no doorbell"
+        );
+        inbox::state(&deck, &pane, id, "queued");
+        // Its model fetches on its own.
+        std::fs::write(pane.capture.with_extension("fetch-now"), "").unwrap();
+    }
     let path = pane.capture.with_extension("fetches");
     assert!(
         common::wait_until(common::load_scaled(WAIT), || std::fs::read_to_string(&path)
