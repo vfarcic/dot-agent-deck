@@ -350,9 +350,10 @@ impl WidthsSeen {
 /// This holds for a row the agent draws in one run, as every witness row in
 /// the measured redraws was, however the PTY splits its reads. A row drawn in
 /// pieces with a cursor move between them, the first piece ending exactly at
-/// the new edge, is not always told apart: a move off the row reads as the
-/// row's end, and a move the parser clamps to the last cell lets a one-cell
-/// next piece overwrite that cell instead of running past it.
+/// the new edge, is not always told apart: a move off the row, or back along
+/// the same row away from its last cell, reads as the row's end, and a move
+/// the parser clamps to the last cell lets a one-cell next piece overwrite
+/// that cell instead of running past it.
 fn padded_edge_row(screen: &vt100::Screen, row: u16) -> bool {
     let (_, cols) = crate::vt_grid::size(screen);
     let padded = screen

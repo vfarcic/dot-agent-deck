@@ -21,9 +21,9 @@
 //! columns too wide stay pending whole, cut at any byte and pushed a byte at a
 //! time, and Codex's start-up logo stays pending after a move between the two
 //! widths that draw it alike. A row drawn in pieces with a cursor move at the
-//! new edge is not always refused (`src/doorbell_screen.rs`, on the padded
-//! row, says when); every measured redraw drew its rows in one run. A
-//! generation starts the same way from its first byte at the spawn geometry,
+//! new edge (off the row, or back along it) is not always refused
+//! (`src/doorbell_screen.rs`, on the padded row, says when); every measured
+//! redraw drew its rows in one run. A generation starts the same way from its first byte at the spawn geometry,
 //! needing the witness but no marker. A nudge whose restore fails leaves the
 //! width unknown until the next successful resize.
 //!

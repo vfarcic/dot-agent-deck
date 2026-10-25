@@ -319,7 +319,7 @@ fn doorbell_044_a_logo_two_adjacent_widths_share_stays_pending() {
     assert!(clean(&state));
 }
 
-/// Scenario: Push redraws whose rows reach the right edge without being a witness: for Codex, plain text exactly as wide as the terminal, plain text padded to the edge, the dim turn row's words run to the edge with no padding, and a numbered choice padded to the edge but not highlighted; for Claude Code, a row of other characters across the width and a rule with one cell broken. Each leaves the state pending; a real witness pushed after them turns it Clean.
+/// Scenario: Push redraws whose rows reach the right edge without being a witness: for Codex, plain text exactly as wide as the terminal, plain text padded to the edge, the dim turn row's words run to the edge with no padding, and a numbered choice padded to the edge but not highlighted; for Claude Code, a row of other characters across the width and a rule with one cell broken. Each leaves the state pending, and still pending after a carriage return or a cursor move ends the row; a real witness pushed after them turns it Clean.
 #[spec("inbox/doorbell/044")]
 #[test]
 fn doorbell_044_text_reaching_the_edge_is_not_a_witness() {
@@ -341,6 +341,15 @@ fn doorbell_044_text_reaching_the_edge_is_not_a_witness() {
             matches!(state.status(), EvidenceStatus::Pending { .. }),
             "{row:?}"
         );
+        // The row has ended once the cursor leaves it, so from here on only
+        // the row's shape keeps it from being a witness.
+        for tail in ["\r", "\x1b[45;1H"] {
+            state.push(tail.as_bytes(), |_| Vec::new());
+            assert!(
+                matches!(state.status(), EvidenceStatus::Pending { .. }),
+                "{row:?} then {tail:?}"
+            );
+        }
     }
     state.push(&codex_turn(cols), |_| Vec::new());
     assert!(clean(&state));
@@ -355,6 +364,13 @@ fn doorbell_044_text_reaching_the_edge_is_not_a_witness() {
             matches!(state.status(), EvidenceStatus::Pending { .. }),
             "{row:?}"
         );
+        for tail in ["\r\n", "\x1b[22;1H"] {
+            state.push(tail.as_bytes(), |_| Vec::new());
+            assert!(
+                matches!(state.status(), EvidenceStatus::Pending { .. }),
+                "{row:?} then {tail:?}"
+            );
+        }
     }
     state.push(&claude_frame(80), |_| Vec::new());
     assert!(clean(&state));

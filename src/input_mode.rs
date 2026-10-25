@@ -451,11 +451,14 @@ pub enum Exchange {
     /// The daemon's verdict is Unsupported: no report written.
     Withheld { probed: bool },
     /// The connection ended (EOF, a reset, a failed write) or the deadline
-    /// passed before a whole answer. A probe was written unless the probe's
-    /// own write failed (`probe_write_failed`). This connection recorded no
-    /// verdict, except that a report whose write failed after its probe was
-    /// answered (`report_write_failed`) leaves the Supported verdict that
-    /// answer recorded.
+    /// passed before a whole answer. On a connection whose identity had no
+    /// cached verdict, a probe was written unless the probe's own write
+    /// failed (`probe_write_failed`); on one whose identity was cached as
+    /// Supported, no probe was written and only the report's write can end
+    /// it (`report_write_failed`). This connection recorded no verdict,
+    /// except that a report whose write failed (`report_write_failed`)
+    /// leaves the Supported verdict standing, whether a probe on this
+    /// connection answered it or an earlier connection's did.
     Ended { why: &'static str },
     /// The daemon's identity could not be read: nothing written.
     IdentityUnreadable,
