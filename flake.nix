@@ -146,6 +146,12 @@
         ];
       };
 
+      # The patched crossterm alone, for the dependency-only build below.
+      vendoredCrossterm = lib.fileset.toSource {
+        root = ./vendor/crossterm;
+        fileset = ./vendor/crossterm;
+      };
+
       # Built once here and reused by packages, checks and the overlay, so the
       # overlay cannot drift from packages.default.
       mkDotAgentDeck = pkgs:
@@ -203,15 +209,17 @@
           # one is a dependency (Cargo.toml's `[patch.crates-io]`), so the stub
           # left ratatui-crossterm compiling against an empty crossterm. The
           # dummy source gets the real crate back, and this derivation is
-          # also rebuilt when that copy changes.
-          cargoArtifacts = craneLib.buildDepsOnly (builtins.removeAttrs commonArgs [ "src" ] // {
-            dummySrc = craneLib.mkDummySrc {
-              inherit src;
-              extraDummyScript = ''
-                rm -rf $out/vendor/crossterm
-                cp -r --no-preserve=mode ${src}/vendor/crossterm $out/vendor/crossterm
-              '';
-            };
+          # also rebuilt when that copy changes. It is copied from a source of
+          # its own, not from `src`, which would rebuild this derivation on
+          # every change to our code; and it goes in through `extraDummyScript`
+          # rather than a `dummySrc` of our own, which makes crane read the
+          # manifests out of a built derivation and fails `nix flake check
+          # --all-systems` for the systems this runner cannot build.
+          cargoArtifacts = craneLib.buildDepsOnly (commonArgs // {
+            extraDummyScript = ''
+              rm -rf $out/vendor/crossterm
+              cp -r --no-preserve=mode ${vendoredCrossterm} $out/vendor/crossterm
+            '';
           });
         in
         craneLib.buildPackage (commonArgs // {
