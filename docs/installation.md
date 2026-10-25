@@ -442,7 +442,7 @@ If you keep an older daemon, features added by the newer release may not work ag
 
 #### Your agents' hooks after an upgrade
 
-When the TUI, `dot-agent-deck upgrade` or the desktop app installs a new CLI, it runs `dot-agent-deck hooks refresh` from the new copy ([Agent hooks](#agent-hooks)), whether or not the daemon restarts, and the result says what happened:
+When the TUI, `dot-agent-deck upgrade` or the desktop app installs a new CLI, it runs `dot-agent-deck hooks refresh` from the new copy ([Agent hooks](#agent-hooks)), whether or not the daemon restarts, and the result says what happened. The copy doing the upgrade is what runs the refresh, so an upgrade made from a release that does not have it leaves the hooks as they were, and that includes the upgrade that first brings this feature in. After such an upgrade, run `dot-agent-deck hooks refresh` with the new copy, or start the TUI from the new copy, which updates the hooks as it starts; then restart agents that were already running.
 
 | What the result says | What it means | What to do |
 |---|---|---|
