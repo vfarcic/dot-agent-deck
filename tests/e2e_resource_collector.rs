@@ -219,7 +219,7 @@ fn resources_001_detached_cpu_joins_run_and_paths_are_opt_in() {
     );
 }
 
-/// Scenario: Double-fork a CPU burner under a cleared environment so it leaves every run's process tree, then sample before and after a file-triggered burn. The shared unattributed bucket must have CPU growth covering the measured burn, live processes, positive anonymous PSS and named anon/file/shmem points, without a run identity; unrelated host work can also contribute to this bucket.
+/// Scenario: Double-fork a CPU burner under a cleared environment so it leaves every run's process tree, then sample before and after a file-triggered burn. Wait for the shared unattributed bucket's exported CPU growth to cover the measured burn, with live processes, positive anonymous PSS and named anon/file/shmem points, without a run identity; unrelated host work can also contribute to this bucket.
 #[spec("telemetry/resources/002")]
 #[test]
 fn resources_002_cleared_detached_work_is_unattributed() {
@@ -278,25 +278,28 @@ fn resources_002_cleared_detached_work_is_unattributed() {
     assert_pss(resource, true);
     let burn = detached.burn();
     let after_burn = receiver.metrics().len();
-    assert!(
-        common::wait_until(Duration::from_secs(25), || receiver.metrics()[after_burn..]
+    // A request received after the burn may have started reading /proc
+    // during it. Wait for the measured growth, not merely the next delivery.
+    let completed_sample = || {
+        receiver.metrics()[after_burn..]
             .iter()
-            .any(
-                |entry| attribute(&entry["resource"], "deck.attribution") == "unattributed"
-            )),
-        "collector must sample again after the controlled burn"
+            .find(|entry| {
+                attribute(&entry["resource"], "deck.attribution") == "unattributed"
+                    && cpu(entry) - before_cpu >= burn - 0.02
+            })
+            .cloned()
+    };
+    assert!(
+        common::wait_until(Duration::from_secs(25), || completed_sample().is_some()),
+        "collector must export shared unattributed CPU growth covering the measured burn {burn} above baseline {before_cpu} (two clock-tick tolerance)"
     );
-    let samples = receiver.metrics();
-    let after = samples[after_burn..]
-        .iter()
-        .find(|entry| attribute(&entry["resource"], "deck.attribution") == "unattributed")
-        .unwrap();
-    let growth = cpu(after) - before_cpu;
+    let after = completed_sample().unwrap();
+    let growth = cpu(&after) - before_cpu;
     assert!(
         growth >= burn - 0.02,
         "shared unattributed CPU growth {growth} must cover measured burn {burn} (two clock-tick tolerance); other host processes may contribute"
     );
-    assert_pss(after, true);
+    assert_pss(&after, true);
 }
 
 fn standin(command_file: &str) -> String {
