@@ -365,10 +365,10 @@ pub struct Delivery {
 }
 
 impl Delivery {
-    fn new(offer: bool) -> Self {
+    fn new(offer: bool, a: u32) -> Self {
         Delivery {
             offer,
-            a: 1,
+            a,
             state: MessageState::Queued,
             revision: 0,
             attempts: Vec::new(),
@@ -636,6 +636,14 @@ pub struct AttemptModel {
     /// (which the evidence budget bounds, [`Limits::evidence_limit`]) and at
     /// most the inbox's retained history, not every message it saw.
     messages: BTreeMap<String, Delivery>,
+    /// Issue #1816: the highest assignment of any record [`Self::forget`]
+    /// dropped. A record [`Self::post`] creates starts its assignments above
+    /// it, so a message id posted again after its record went never reuses
+    /// an `(a, e)` of the one before it, and a late commit of the earlier
+    /// attempt (a stream's `committed` names only the id and the attempt)
+    /// cannot settle the new one. Zero until a record goes, so assignments
+    /// start at 1 as before.
+    forgotten_a: u32,
     evidence_reserved: usize,
     effects: Vec<Effect>,
     exited: bool,
@@ -661,6 +669,7 @@ impl AttemptModel {
             slots: BTreeMap::new(),
             next_rx: 1,
             messages: BTreeMap::new(),
+            forgotten_a: 0,
             evidence_reserved: 0,
             effects: Vec::new(),
             exited: false,
@@ -733,9 +742,10 @@ impl AttemptModel {
     }
 
     pub fn post(&mut self, id: &str, offer: bool) {
+        let a = self.forgotten_a + 1;
         self.messages
             .entry(id.to_string())
-            .or_insert_with(|| Delivery::new(offer));
+            .or_insert_with(|| Delivery::new(offer, a));
     }
 
     pub fn delivery(&self, id: &str) -> Option<&Delivery> {
@@ -1454,9 +1464,13 @@ impl AttemptModel {
     /// Issue #1816: whether `id`'s record has no use left inside this model.
     /// Its message ended and every attempt's evidence was reclaimed
     /// ([`Self::reclaim`]), so no attempt keeps a late-commit verifier, owes a
-    /// resume answer or a revoke, or is withheld. Nothing in its spool is left
-    /// to show a commit, so only an explicit `ack <id>` could still commit it,
-    /// and that reaches the record through the inbox's copy of the message.
+    /// resume answer or a revoke, or is withheld. The model no longer holds
+    /// any of its attempts' evidence, whose spool files the hub removes after
+    /// the lock is released, so a receipt in the spool no longer settles it.
+    /// No attempt keeps a verifier, so the design no longer counts on a late
+    /// commit to correct the sender, though a stream's `committed` or an
+    /// explicit `ack <id>` (through the inbox's copy) still reaches it while
+    /// the record is here.
     pub fn spent(&self, id: &str) -> bool {
         self.messages.get(id).is_some_and(|msg| {
             msg.state.is_terminal() && msg.attempts.iter().all(|at| at.reclaimed)
@@ -1464,9 +1478,18 @@ impl AttemptModel {
     }
 
     /// Issue #1816: drop `id`'s record if it is [`Self::spent`]. The caller
-    /// decides when nothing outside the model reads it any more.
+    /// decides when nothing outside the model reads it any more. Its
+    /// assignment raises [`Self::forgotten_a`], so a record created for the
+    /// same id later starts above every attempt this one had.
     pub fn forget(&mut self, id: &str) -> bool {
-        self.spent(id) && self.messages.remove(id).is_some()
+        if !self.spent(id) {
+            return false;
+        }
+        let Some(msg) = self.messages.remove(id) else {
+            return false;
+        };
+        self.forgotten_a = self.forgotten_a.max(msg.a);
+        true
     }
 
     /// The incarnation an attempt is bound to.
@@ -4602,6 +4625,40 @@ mod tests {
         }));
         assert!(m.forget("cancelled"), "the correction was its last use");
         assert_eq!(m.ids(), vec!["live".to_string()]);
+    }
+
+    /// Scenario: A message settles and its record is dropped; a sender then
+    /// posts a new message under the same id to the same generation. The new
+    /// record's attempt is numbered above the dropped one's, so the earlier
+    /// attempt's late commit is refused as unknown and the new message stays
+    /// attempting until its own attempt commits.
+    #[spec("inbox/attempts/037")]
+    #[test]
+    fn attempts_037_a_reused_id_takes_no_late_commit_of_a_dropped_record() {
+        let (mut m, t) = model();
+        let rx = m.register(t, Slot::OpencodeServer, false).rx;
+        m.post("m", false);
+        let old = issue_held(&mut m, t, "m", rx, 1);
+        m.stage(t, "m", old.a, old.e, Stage::Committed, Some(rx));
+        assert!(m.forget("m"));
+        m.post("m", false);
+        assert!(m.delivery("m").unwrap().a > old.a);
+        let new = issue_held(&mut m, t, "m", rx, 2);
+        assert_ne!((new.a, new.e), (old.a, old.e));
+        assert_eq!(
+            m.stage(t, "m", old.a, old.e, Stage::Committed, None),
+            StageOutcome::Unknown,
+            "the dropped record's attempt is not the new one"
+        );
+        assert_eq!(m.state("m"), Some(MessageState::Attempting));
+        m.stage(t, "m", new.a, new.e, Stage::Committed, None);
+        assert_eq!(m.state("m"), Some(MessageState::Settled));
+        m.post("other", false);
+        assert_eq!(
+            m.delivery("other").unwrap().a,
+            old.a + 1,
+            "a record created after one was dropped starts above it"
+        );
     }
 
     /// Scenario: A Claude waiter of an agent allowed one attempt per message

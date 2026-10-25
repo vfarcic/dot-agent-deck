@@ -9072,6 +9072,13 @@ The pure state model of a deck message's delivery attempts (`src/inbox_attempts.
 - **Does not assert:** when the hub's engine drops a spent record, which also waits for the inbox to drop its copy (inbox/boundary/075).
 - **Platform coverage:** mac+linux+windows.
 
+##### inbox/attempts/037 — A reused id takes no late commit of a dropped record.
+- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Agent:** none.
+- **Asserts:** after a settled record is dropped, a record created for the same id starts its assignment above the dropped one's, so the old `(a, e)`'s commit answers `Unknown` and leaves the new message attempting; its own attempt's commit settles it; any record created afterwards also starts above the dropped assignment (issue #1816).
+- **Does not assert:** the inbox accepting the reused id, which needs its dedup window and history to have let the old one go.
+- **Platform coverage:** mac+linux+windows.
+
 #### inbox/receipt
 
 The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the daemon's locked instance namespace under `<state_dir>/inbox-spool`, trusted one-component-at-a-time traversal from the state-directory anchor, immutable `Handed`/`Committed` bearer records, bounded resumable scans streamed to the cap-based evidence store, the exact lookup before absence, and the resumable sibling reaper, plus `platform::lock::try_lock_file`. It is library-only: nothing in the daemon calls it yet, records are published and read, nothing is pruned and no suppression decision is drawn from them.
