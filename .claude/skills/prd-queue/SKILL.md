@@ -290,7 +290,7 @@ Show what was excluded and why. In-flight exclusions especially: that is where t
 
 Otherwise **ask how many to dispatch, recommending 1–2.** That is deliberately lower than `/issue-queue`'s 2–3, for two reasons that compound:
 
-- **A PRD unit is the whole lifecycle, not one fix.** It runs to 100% completion, opens a PR, and waits for CI and Greptile to settle — typically more than once. Since issue #502 the e2e tier is CI's job rather than each unit's (CLAUDE.md rule 5), which takes the single most expensive local gate out of every unit, but a PRD unit still builds its own multi-GB `target/`, runs the full clippy and fast tiers repeatedly whenever its change has Rust in it (`cargo xtask affected-checks` selects them), and waits on review rounds.
+- **A PRD unit is the whole lifecycle, not one fix.** It runs to 100% completion, opens a PR, and waits for CI and the automated reviewers to settle — typically more than once. Since issue #502 the e2e tier is CI's job rather than each unit's (CLAUDE.md rule 5), which takes the single most expensive local gate out of every unit, but a PRD unit still builds its own multi-GB `target/`, runs the full clippy and fast tiers repeatedly whenever its change has Rust in it (`cargo xtask affected-checks` selects them), and waits on review rounds.
 - **A team unit is six agents, not one.** This repo's `dot-agent-deck` orchestration defines six roles (orchestrator, coder, reviewer, auditor, tester, release), so two team-shaped PRDs is twelve concurrent agents over two multi-GB `target/` trees. CLAUDE.md rule 14 records how that pressure surfaces — a misleading `linking with 'cc' failed`, or a `SIGKILL` on `rustc` — and an agent hitting either will blame its PRD rather than the batch size.
 
 Ask **which** PRDs too, unless the runner already named them. Relative priority among PRDs is theirs to judge and is not legible from the queue.
@@ -537,29 +537,26 @@ Do NOT send `DONE: merged & closed`. This run stops before merge, so that
 message would be false. Then append one line to .dot-agent-deck/notify-log.md
 (gitignored; create it if missing) exactly as that block describes.
 
-GREPTILE'S FINDINGS ARE PART OF THE JOB, NOT PART OF THE MERGE. Greptile
-reviews once, a few minutes after the PR opens, and never again —
-greptile.json sets triggerOnUpdates: false, so do NOT wait for a re-review
-after you push fixes. Qodo, evaluated beside it, re-reviews on EVERY push
-(.pr_agent.toml): after your last push, wait (bounded) for its re-review and
-answer what it raised. Do NOT wait for a Qodo check-run — it creates none
-(measured 2026-09-24 on #1235, #1257, #1271); it edits one summary comment in
-place and that body names the head SHA it reviewed, which is the signal. Its
-medium-and-above findings arrive at the same endpoint and are answered and
-resolved the same way; its informational tier stays in that summary comment
-(inline_comments_severity_threshold = 2), so read both. Greptile's findings
-live ONLY at
-`gh api repos/<owner>/<repo>/pulls/<pr>/comments --paginate`; the green
-`Greptile Review` check and the summary comment carry none of them. Keep the
+THE REVIEWERS' FINDINGS ARE PART OF THE JOB, NOT PART OF THE MERGE. Wait
+for the automated review apps with
+`.claude/skills/pr-create/wait-reviews.sh <pr>`: it waits, bounded per app,
+for every app in reviewers.json to finish on the PR's current head, and ends
+with REVIEWS=complete or REVIEWS=incomplete. Run it again after your LAST
+push: Greptile reviews only when the PR opens (greptile.json sets
+triggerOnUpdates: false), but Qodo re-reviews EVERY push (.pr_agent.toml), so
+a fix push can raise new findings. The findings live ONLY at
+`gh api repos/<owner>/<repo>/pulls/<pr>/comments --paginate`; a green check
+and the apps' summary comments carry none of them, except Qodo's
+informational tier, which stays in its "Code Review by Qodo" issue comment
+(inline_comments_severity_threshold = 2), so read both. Keep the
 --paginate: replies count toward the page, so without it a busy PR silently
-truncates the findings you are about to answer. Fetch that endpoint once the
-check-run completes, reply on each thread — what you fixed, or why you did
-not — AND RESOLVE THE THREAD, BEFORE you notify and stop. Resolving is half
-the job: an unresolved thread blocks the merge button AND the approval the
-merge needs, so a PR with every finding fixed still sits (PR #1035 sat a day
-that way). Bound the wait: a reviewer that is out of quota produces no
-check-run at all, so "wait until it appears" never returns — after a
-reasonable budget, proceed and report that no review was obtained. Do not defer it to the merge: this run stops
+truncates the findings you are about to answer. Reply on each thread — what
+you fixed, or why you did not — AND RESOLVE THE THREAD, BEFORE you notify and
+stop. Resolving is half the job: an unresolved thread blocks the merge button
+AND the approval the merge needs, so a PR with every finding fixed still sits
+(PR #1035 sat a day that way). REVIEWS=incomplete is a result, not a reason
+to keep waiting: an app that is out of quota produces nothing at all, so
+report which review was not obtained and go on. Do not defer it to the merge: this run stops
 before merge, and an armed auto-merge PR lands the moment the approval arrives,
 so a finding left for "before merging" is read by nobody. Measured on PR #869:
 five findings, two P1, unanswered through 3h45m of further commits.

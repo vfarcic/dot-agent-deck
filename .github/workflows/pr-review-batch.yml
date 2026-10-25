@@ -1,10 +1,10 @@
 ---
 # Agent PR review — enumeration, fan-out, and the vote.
 #
-# Shape mirrors issue-labeler-batch.yml: this plain workflow decides WHICH pull
-# requests to review, then calls the gh-aw reviewer (pr-review.lock.yml) once per
-# pull request. Enumeration is a plain `gh` query, so a sweep that finds nothing
-# eligible spends ZERO agent tokens — the review job does not run at all.
+# This plain workflow decides WHICH pull requests to review, then calls the
+# gh-aw reviewer (pr-review.lock.yml) once per pull request. Enumeration is a
+# plain `gh` query, so a sweep that finds nothing eligible spends ZERO agent
+# tokens — the review job does not run at all.
 #
 # The agent never holds a credential that can approve. It emits a verdict comment;
 # the `vote` job below holds the App token, re-validates the PR number, the head
@@ -86,7 +86,7 @@ env:
 
 jobs:
   prepare:
-    # Kill switch, mirroring the labeler's ISSUE_LABELER_ENABLED. Unset = off.
+    # Kill switch. Unset = off.
     if: vars.PR_REVIEW_ENABLED == 'true'
     runs-on: ubuntu-latest
     outputs:

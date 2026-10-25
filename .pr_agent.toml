@@ -1,7 +1,9 @@
-# Qodo code review — run in parallel with Greptile (`greptile.json`) as an
-# evaluation of whether Qodo can replace it. docs/develop/governance.md, "The
-# automated reviewer", has the reasoning; the settings below keep Qodo from
-# disturbing what this repo's own tooling reads.
+# Qodo code review — the primary automated reviewer, beside Greptile
+# (`greptile.json`), which reviews only when a PR opens (decided on issue #1256).
+# docs/develop/governance.md, "The automated reviewer", has the reasoning and
+# the measurements; the settings below keep Qodo from disturbing what this
+# repo's own tooling reads. How long the skills wait for it, and on what
+# signal, lives in .claude/skills/pr-create/reviewers.json, not here.
 #
 # Qodo reads this file from the default branch, so a change here takes effect
 # only for pull requests opened after it merges.
@@ -50,6 +52,16 @@ comments_location_policy = "both"
 inline_comments_severity_threshold = 2
 # A finding is advice to the author, not a commit Qodo writes. Default, pinned.
 enable_commitable_suggestions = false
+# Its most frequent false positive in the issue #1256 comparison: asking for a
+# changelog fragment on a change no user can observe, which CLAUDE.md rule 19
+# says gets none (#1763, #1765, #1806). Qodo's configuration reference lists
+# this key as extra instructions for its rule-checking agent; it does not say
+# whether the skill insights that raised those findings, or `/agentic_review`,
+# read it. So check on the next PR that changes only CI or skills, and move the
+# text to the key that works if this one does not.
+compliance_user_guidelines = """
+A changelog fragment (changelog.d/) is owed only for a change a user of dot-agent-deck can observe (CLAUDE.md rule 19). Changes confined to CI and repository automation (.github/), developer tooling (.claude/skills/, xtask/, scripts/), the test harness, developer docs (docs/develop/) or a refactor with no behavioural difference get no fragment of any type, so do not report a missing fragment for them.
+"""
 
 [pr_code_suggestions]
 # Do not auto-answer questions in PR comments. Nobody talks to Qodo on GitHub

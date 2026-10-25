@@ -146,7 +146,7 @@ impl std::fmt::Display for ValidationIssue {
 ///
 /// Characters, not bytes, so the cut can never land inside a UTF-8 sequence and
 /// the reported number matches what a reader would count.
-fn bound_chars(s: &str, max: usize) -> std::borrow::Cow<'_, str> {
+pub(crate) fn bound_chars(s: &str, max: usize) -> std::borrow::Cow<'_, str> {
     let total = s.chars().count();
     if total <= max {
         return std::borrow::Cow::Borrowed(s);
