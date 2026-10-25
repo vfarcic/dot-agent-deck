@@ -388,6 +388,26 @@ tasks:
       cargo install cargo-audit --locked
       cargo audit
 
+  # `security` skips the crates under vendor/, which have no registry source in
+  # Cargo.lock; this audits their upstream releases. The script has why, and
+  # what it does not check.
+  - key: security-vendored-upstream
+    if: ${{ tasks.backend.values.rust == 'true' }}
+    use: [code, rust]
+    tool-cache: ci-security-vendored-upstream-v1
+    run: |
+      cargo install cargo-audit --locked
+      scripts/audit-vendored-upstream.sh
+
+  # The patched crossterm's own test (vendor/crossterm/VENDORED.md), which
+  # `test` does not run: the crate is outside the workspace. `--locked` to the
+  # crate's own Cargo.lock, which pins the dev-dependencies the deck's lock
+  # does not carry.
+  - key: vendored-crossterm-test
+    if: ${{ tasks.backend.values.rust == 'true' }}
+    use: [code, rust]
+    run: cargo test --locked --manifest-path vendor/crossterm/Cargo.toml --lib event::source::unix::mio::tests
+
   # Nix, single-user: a task has no init system for the daemon.
   - key: nix-install
     if: ${{ tasks.backend.values.active == 'true' }}
