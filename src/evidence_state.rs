@@ -13,16 +13,32 @@
 //! parser at the new geometry starts at the marker, with the terminal modes in
 //! force there, and bytes before it are never parsed. The state turns
 //! **Clean** only once a frame from that parser shows the profile's width
-//! witness, a row the agent ties to the terminal's width, which rejects a full
-//! redraw the agent drew for the old width. A generation starts the same way
+//! witness, a row the agent ties to the terminal's width. It rejects a full
+//! redraw drawn for another width in the cases each profile's witness tells
+//! apart (`src/doorbell_screen.rs` says which), and stays pending in the
+//! rest. A generation starts the same way
 //! from its first byte at the spawn geometry, needing the witness but no
 //! marker. A nudge whose restore fails leaves the width unknown until the next
 //! successful resize.
 //!
 //! Nothing turns Dirty into Clean because time passed. An agent that redraws
 //! nothing after an edge stays Dirty.
+//!
+//! The parser's grid is bounded like the release scanner's
+//! ([`EVIDENCE_CELLS_MAX`]): a geometry over it, at the spawn or at an edge,
+//! builds no parser and leaves the state [`EvidenceStatus::OverBudget`],
+//! which recognises nothing, until an edge back within it. While Pending, the
+//! witness is read straight off the parser's screen, with no copy of it.
 
-use crate::doorbell_screen::{Grid, ScreenProfile, find_marker};
+use crate::doorbell_screen::{Grid, ScreenProfile, WidthsSeen, find_marker};
+
+/// The most cells (rows × cols) the evidence parser's grid may hold: the
+/// release scanner's bound ([`crate::release_scanner::SCANNER_CELLS_MAX`]).
+pub const EVIDENCE_CELLS_MAX: u32 = crate::release_scanner::SCANNER_CELLS_MAX;
+
+fn within_budget(rows: u16, cols: u16) -> bool {
+    u32::from(rows.max(1)) * u32::from(cols.max(1)) <= EVIDENCE_CELLS_MAX
+}
 
 /// What moved the layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +81,10 @@ pub enum EvidenceStatus {
     /// A nudge's restore failed at `since_seq`: the terminal's width is not
     /// known until the next successful resize.
     GeometryUnknown { since_seq: u64 },
+    /// The geometry in force since `since_seq` is over
+    /// [`EVIDENCE_CELLS_MAX`]: no parser runs and nothing is recognised until
+    /// an edge back within it.
+    OverBudget { since_seq: u64 },
 }
 
 impl EvidenceStatus {
@@ -75,6 +95,7 @@ impl EvidenceStatus {
             EvidenceStatus::Clean { .. } => "clean",
             EvidenceStatus::Dirty { .. } => "dirty",
             EvidenceStatus::GeometryUnknown { .. } => "geometry_unknown",
+            EvidenceStatus::OverBudget { .. } => "geometry_over_budget",
         }
     }
 }
@@ -100,6 +121,8 @@ pub struct EvidenceState {
     out_seq: u64,
     status: EvidenceStatus,
     parser: Option<vt100::Parser>,
+    /// Every width the terminal has had, for the witness.
+    widths: WidthsSeen,
     /// While Dirty: the last bytes pushed, one fewer than the marker, so a
     /// marker split across two pushes is still found.
     tail: Vec<u8>,
@@ -121,6 +144,9 @@ impl EvidenceState {
     /// The state of a generation starting at `rows` × `cols`.
     pub fn new(profile: Option<&'static ScreenProfile>, rows: u16, cols: u16) -> Self {
         let (status, parser) = match profile {
+            Some(_) if !within_budget(rows, cols) => {
+                (EvidenceStatus::OverBudget { since_seq: 0 }, None)
+            }
             Some(_) => (
                 EvidenceStatus::Pending {
                     since_seq: 0,
@@ -138,8 +164,17 @@ impl EvidenceState {
             out_seq: 0,
             status,
             parser,
+            widths: WidthsSeen::of([cols]),
             tail: Vec::new(),
         }
+    }
+
+    /// The cells the evidence parser holds now (0 with none running).
+    pub fn parser_cells(&self) -> u32 {
+        self.parser.as_ref().map_or(0, |parser| {
+            let (rows, cols) = crate::vt_grid::size(parser.screen());
+            u32::from(rows) * u32::from(cols)
+        })
     }
 
     pub fn status(&self) -> EvidenceStatus {
@@ -193,7 +228,9 @@ impl EvidenceState {
             return None;
         };
         match self.status {
-            EvidenceStatus::Unprofiled | EvidenceStatus::GeometryUnknown { .. } => {
+            EvidenceStatus::Unprofiled
+            | EvidenceStatus::GeometryUnknown { .. }
+            | EvidenceStatus::OverBudget { .. } => {
                 self.out_seq += bytes.len() as u64;
                 None
             }
@@ -256,8 +293,7 @@ impl EvidenceState {
         marker_seq: Option<u64>,
     ) -> Option<Transition> {
         let parser = self.parser.as_ref()?;
-        let frame = Grid::of(parser.screen(), self.out_seq);
-        if (profile.width_witness)(&frame) {
+        if (profile.width_witness)(parser.screen(), &self.widths) {
             return self.transition(EvidenceStatus::Clean { since_seq }, marker_seq);
         }
         None
@@ -269,16 +305,21 @@ impl EvidenceState {
         self.rows = rows;
         self.cols = cols;
         self.layout_epoch += 1;
+        self.widths.record(cols);
         self.profile?;
         self.parser = None;
         self.tail.clear();
-        self.transition(
+        let to = if within_budget(rows, cols) {
             EvidenceStatus::Dirty {
                 edge_seq: self.out_seq,
                 reason,
-            },
-            None,
-        )
+            }
+        } else {
+            EvidenceStatus::OverBudget {
+                since_seq: self.out_seq,
+            }
+        };
+        self.transition(to, None)
     }
 
     /// A nudge's restore ioctl failed: the width is unknown until the next

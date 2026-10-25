@@ -8,8 +8,8 @@ use dot_agent_deck::doorbell_activation::{
     Activation, Measurement, NoGo, RELEASE_RECORDS, ReleaseRecord, exact_verdict,
 };
 use dot_agent_deck::doorbell_screen::{
-    CLAUDE_PROFILE, CODEX_PROFILE, ComposerText, Dialog, Grid, ScreenProfile, WithdrawalRefusal,
-    find_marker, strict_withdrawal,
+    CLAUDE_PROFILE, CODEX_PROFILE, ComposerText, Dialog, Grid, ScreenProfile, WidthsSeen,
+    WithdrawalRefusal, find_marker, strict_withdrawal,
 };
 use dot_agent_deck::event::AgentType;
 use dot_agent_deck::release_scanner::{
@@ -79,6 +79,11 @@ impl Trace {
     /// The screen after the first `end` bytes, every resize applied at its
     /// place in the stream.
     fn grid_upto(&self, end: usize) -> Grid {
+        Grid::of(self.parser_upto(end).screen(), end as u64)
+    }
+
+    /// [`Self::grid_upto`]'s parser.
+    fn parser_upto(&self, end: usize) -> vt100::Parser {
         let mut parser = vt100::Parser::new(
             std::num::NonZeroU16::new(self.rows).unwrap(),
             std::num::NonZeroU16::new(self.cols).unwrap(),
@@ -99,7 +104,25 @@ impl Trace {
             );
         }
         parser.process(&self.bytes[pos..end]);
-        Grid::of(parser.screen(), end as u64)
+        parser
+    }
+
+    /// Every width the terminal had in the first `end` bytes.
+    fn widths_upto(&self, end: usize) -> WidthsSeen {
+        WidthsSeen::of(
+            std::iter::once(self.cols).chain(
+                self.edges
+                    .iter()
+                    .take_while(|(off, _, _)| *off < end)
+                    .map(|&(_, _, cols)| cols),
+            ),
+        )
+    }
+
+    /// Whether the screen after the first `end` bytes is `profile`'s width
+    /// witness.
+    fn witness_upto(&self, profile: &ScreenProfile, end: usize) -> bool {
+        (profile.width_witness)(self.parser_upto(end).screen(), &self.widths_upto(end))
     }
 
     fn grid(&self, point: &str) -> Grid {
@@ -144,6 +167,18 @@ impl Trace {
             lines: self.lines.clone(),
         }
     }
+}
+
+/// Whether `bytes`, parsed from a fresh terminal at `rows` × `cols` that has
+/// had no other width, are `profile`'s width witness.
+fn witness(profile: &ScreenProfile, bytes: &[u8], rows: u16, cols: u16) -> bool {
+    let mut parser = vt100::Parser::new(
+        std::num::NonZeroU16::new(rows).unwrap(),
+        std::num::NonZeroU16::new(cols).unwrap(),
+        0,
+    );
+    parser.process(bytes);
+    (profile.width_witness)(parser.screen(), &WidthsSeen::of([cols]))
 }
 
 fn latch_at_split(trace: &Trace) -> ScanLatch {
@@ -476,45 +511,64 @@ fn doorbell_036_dialog_markers_and_false_dialogs() {
     assert_eq!((CLAUDE_PROFILE.dialog)(&claude.grid("empty")), None);
 }
 
-/// Scenario: Parse a Claude Code frame and a Codex dialog frame at the width they were drawn at and at one column more. The width witness holds at the drawn width only; and Claude Code's recorded resizes each start with its full-redraw marker.
+/// Scenario: Parse a Claude Code frame and a Codex dialog frame at the width they were drawn at, at one column more and at one column fewer. The width witness holds at the drawn width only; and Claude Code's recorded resizes each start with its full-redraw marker.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_width_witness_and_redraw_marker() {
     let claude = fixture("claude-inbox/r5wake/claude-2.1.310-start-50x200");
     let end = claude.points["end"];
-    let at = |rows, cols| Grid::parse(&claude.bytes[..end], rows, cols);
-    assert!((CLAUDE_PROFILE.width_witness)(&at(
-        claude.rows,
-        claude.cols
-    )));
-    assert!(!(CLAUDE_PROFILE.width_witness)(&at(
+    let bytes = &claude.bytes[..end];
+    assert!(witness(&CLAUDE_PROFILE, bytes, claude.rows, claude.cols));
+    assert!(!witness(
+        &CLAUDE_PROFILE,
+        bytes,
         claude.rows,
         claude.cols + 1
-    )));
+    ));
+    assert!(!witness(
+        &CLAUDE_PROFILE,
+        bytes,
+        claude.rows,
+        claude.cols - 1
+    ));
     let update = fixture("codex-inbox/r5wake/codex-0.164.0-start-update-50x200");
-    let at = |rows, cols| Grid::parse(&update.bytes, rows, cols);
-    assert!((CODEX_PROFILE.width_witness)(&at(update.rows, update.cols)));
-    assert!(!(CODEX_PROFILE.width_witness)(&at(
+    assert!(witness(
+        &CODEX_PROFILE,
+        &update.bytes,
+        update.rows,
+        update.cols
+    ));
+    assert!(!witness(
+        &CODEX_PROFILE,
+        &update.bytes,
         update.rows,
         update.cols + 1
-    )));
+    ));
+    assert!(!witness(
+        &CODEX_PROFILE,
+        &update.bytes,
+        update.rows,
+        update.cols - 1
+    ));
     // Codex before its first prompt: the centred logo at 50 × 200. At 24 × 80
     // Codex draws no logo, so its first frame there has no witness and the
     // deck holds until a dialog or a finished turn draws one.
     let start = fixture("codex-inbox/r5wake/codex-0.164.0-layout-start-50x200");
     let end = start.points["empty"];
-    assert!((CODEX_PROFILE.width_witness)(&Grid::parse(
+    assert!(witness(
+        &CODEX_PROFILE,
         &start.bytes[..end],
         start.rows,
         start.cols
-    )));
-    assert!(!(CODEX_PROFILE.width_witness)(&Grid::parse(
+    ));
+    assert!(!witness(
+        &CODEX_PROFILE,
         &start.bytes[..end],
         start.rows,
         start.cols + 2
-    )));
+    ));
     let small = fixture("codex-inbox/r5wake/codex-0.164.0-composer-24x80");
-    assert!(!(CODEX_PROFILE.width_witness)(&small.grid("empty")));
+    assert!(!small.witness_upto(&CODEX_PROFILE, small.points["empty"]));
     // Claude Code's recorded resizes and nudges: each edge's bytes carry its
     // full-redraw marker, and the frame after it is a witness at the width in
     // force and not two columns wider.
@@ -527,19 +581,16 @@ fn doorbell_036_width_witness_and_redraw_marker() {
                 find_marker(&layout.bytes[mark..shot], CLAUDE_PROFILE.redraw_marker).is_some(),
                 "{kind}-{i}: no redraw"
             );
+            assert!(layout.witness_upto(&CLAUDE_PROFILE, shot), "{kind}-{i}");
             assert!(
-                (CLAUDE_PROFILE.width_witness)(&layout.grid_upto(shot)),
-                "{kind}-{i}"
-            );
-            assert!(
-                !(CLAUDE_PROFILE.width_witness)(&layout.widened().grid_upto(shot)),
+                !layout.widened().witness_upto(&CLAUDE_PROFILE, shot),
                 "{kind}-{i}: witness at the wrong width"
             );
         }
     }
 }
 
-/// Scenario: Replay Codex's recorded resizes and one-column nudges, before and after a first prompt, on 0.164.0 and 0.160.0. After each edge the bytes Codex writes contain its full-redraw marker, and the frame two and a half seconds later is a width witness at the width in force and not at two columns more.
+/// Scenario: Replay Codex's recorded resizes and one-column nudges, before and after a first prompt, on 0.164.0 and 0.160.0. After each edge the bytes Codex writes contain its full-redraw marker, and the frame five seconds later is a width witness at the width in force and not at two columns more.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_codex_layout_edges() {
@@ -562,12 +613,12 @@ fn doorbell_036_codex_layout_edges() {
                 let grid = trace.grid_upto(shot);
                 assert_eq!((grid.rows, grid.cols), (rows, cols));
                 assert!(
-                    (CODEX_PROFILE.width_witness)(&grid),
+                    trace.witness_upto(&CODEX_PROFILE, shot),
                     "{stem} {kind}-{i}: no witness"
                 );
                 // The same bytes on a terminal two columns wider.
                 assert!(
-                    !(CODEX_PROFILE.width_witness)(&trace.widened().grid_upto(shot)),
+                    !trace.widened().witness_upto(&CODEX_PROFILE, shot),
                     "{stem} {kind}-{i}: witness at the wrong width"
                 );
                 edges += 1;

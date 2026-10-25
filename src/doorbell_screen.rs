@@ -250,8 +250,9 @@ pub struct ScreenProfile {
     /// The bytes the agent writes first when it redraws its whole screen
     /// after a resize.
     pub redraw_marker: &'static [u8],
-    /// Whether a frame ties itself to the terminal's width.
-    pub width_witness: fn(&Grid) -> bool,
+    /// Whether a frame, read straight off the parser's screen, ties itself to
+    /// the terminal's width, given every width the terminal has had.
+    pub width_witness: fn(&vt100::Screen, &WidthsSeen) -> bool,
     /// The narrowest pane the measurements cover; a narrower one refuses.
     pub min_cols: u16,
 }
@@ -299,6 +300,85 @@ impl ScreenProfile {
             Some(ComposerText::Empty { placeholder: true })
         )
     }
+}
+
+/// The widths a generation's terminal has had (plan §2.2): an agent can only
+/// draw for a width its terminal reported, so a witness that two widths draw
+/// alike can still tell them apart while one of them never occurred.
+#[derive(Clone, PartialEq, Eq)]
+pub struct WidthsSeen {
+    bits: Box<[u64; 1024]>,
+}
+
+impl std::fmt::Debug for WidthsSeen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let widths: Vec<u16> = (0..=u16::MAX).filter(|&w| self.had(w)).collect();
+        f.debug_tuple("WidthsSeen").field(&widths).finish()
+    }
+}
+
+impl WidthsSeen {
+    /// Every width in `widths`.
+    pub fn of(widths: impl IntoIterator<Item = u16>) -> Self {
+        let mut seen = Self {
+            bits: Box::new([0; 1024]),
+        };
+        for cols in widths {
+            seen.record(cols);
+        }
+        seen
+    }
+
+    pub fn record(&mut self, cols: u16) {
+        self.bits[cols as usize / 64] |= 1 << (cols % 64);
+    }
+
+    pub fn had(&self, cols: u16) -> bool {
+        self.bits[cols as usize / 64] & (1 << (cols % 64)) != 0
+    }
+}
+
+/// Whether row `row` of `screen` was drawn to the right edge as one padded
+/// row for this width: its last cell holds a written blank (padding, which an
+/// agent writes up to the width it believes in), the row did not run on to
+/// the next one, and it is not itself the run-on of the row above. A row
+/// padded for a wider terminal runs past this edge, so the parser (which
+/// always wraps at the edge) marks it wrapped; one padded for a narrower
+/// terminal stops short of the edge. This holds for a row the agent draws in
+/// one run, as every witness row in the measured redraws was; a row drawn
+/// with a cursor jump exactly at the new edge is not told apart.
+fn padded_edge_row(screen: &vt100::Screen, row: u16) -> bool {
+    let (_, cols) = crate::vt_grid::size(screen);
+    let padded = screen
+        .cell(row, cols - 1)
+        .is_some_and(|c| c.has_contents() && c.contents().trim().is_empty());
+    padded && !screen.row_wrapped(row) && (row == 0 || !screen.row_wrapped(row - 1))
+}
+
+/// Whether row `row` of `screen` holds `N.` from column `col`.
+fn screen_numbered(screen: &vt100::Screen, row: u16, col: u16) -> bool {
+    let (_, cols) = crate::vt_grid::size(screen);
+    let mut digits = 0;
+    for c in col..cols {
+        let text = screen.cell(row, c).map(vt100::Cell::contents).unwrap_or("");
+        if text.len() == 1 && text.as_bytes()[0].is_ascii_digit() {
+            digits += 1;
+            continue;
+        }
+        return digits > 0 && text == ".";
+    }
+    false
+}
+
+/// Whether row `row` of `screen` reads `prefix` from column `col`, one
+/// character per cell.
+fn screen_text_starts(screen: &vt100::Screen, row: u16, col: u16, prefix: &str) -> bool {
+    prefix.chars().enumerate().all(|(i, ch)| {
+        screen.cell(row, col + i as u16).is_some_and(|c| {
+            let mut text = c.contents().chars();
+            text.next() == Some(ch) && text.next().is_none()
+        })
+    })
 }
 
 /// Where the first `needle` sits in `bytes`.
@@ -455,30 +535,45 @@ fn codex_transcript_user_line(grid: &Grid, line: &str) -> bool {
     })
 }
 
-/// Whether a frame ties itself to the width it was drawn at: a row written
-/// to the right edge (a dialog's highlighted choice, the dim rule Codex pads
-/// under a finished turn), or, before the first prompt, Codex's logo centred
-/// with its top row starting at column `cols / 2 - 5` (measured at eleven
-/// widths from 90 to 200 on 0.160.0 and 0.164.0). A frame drawn for another
-/// width puts neither where this width needs it.
-fn codex_width_witness(grid: &Grid) -> bool {
-    if (0..grid.rows).any(|r| grid.written_extent(r) == grid.cols) {
+/// Whether a frame ties itself to the width it was drawn at (`seen`: every
+/// width the generation's terminal has had). Either a padded edge row
+/// ([`padded_edge_row`]) of a shape Codex pads to the edge: a dialog's
+/// highlighted choice (`›` bold and inverse, then `N.`), or the dim
+/// `Worked for …` row under a finished turn, every cell dim. Or, before the
+/// first prompt, Codex's logo centred with its top row starting at column
+/// `cols / 2 - 5` (measured at eleven widths from 90 to 200 on 0.160.0 and
+/// 0.164.0); that formula puts the logo of the two widths `2k` and `2k + 1`
+/// in the same place, so the logo counts only while the terminal has never
+/// had the other one of the pair.
+fn codex_width_witness(screen: &vt100::Screen, seen: &WidthsSeen) -> bool {
+    let (rows, cols) = crate::vt_grid::size(screen);
+    let edge_row = (0..rows).any(|r| {
+        padded_edge_row(screen, r) && {
+            let glyph = screen.cell(r, 0);
+            let choice = glyph.is_some_and(|c| c.contents() == "›" && c.bold() && c.inverse())
+                && screen_numbered(screen, r, CODEX_INDENT);
+            let turn = screen_text_starts(screen, r, CODEX_INDENT, "Worked for ")
+                && (0..cols).all(|c| screen.cell(r, c).is_some_and(vt100::Cell::dim));
+            choice || turn
+        }
+    });
+    if edge_row {
         return true;
     }
-    let braille = |c: &GridCell| {
-        c.text
-            .chars()
-            .next()
-            .is_some_and(|ch| ('\u{2800}'..='\u{28ff}').contains(&ch))
+    let braille = |r: u16, c: u16| {
+        screen.cell(r, c).is_some_and(|cell| {
+            cell.contents()
+                .chars()
+                .next()
+                .is_some_and(|ch| ('\u{2800}'..='\u{28ff}').contains(&ch))
+        })
     };
-    let Some(top) = (0..grid.rows).find(|&r| grid.cells[r as usize].iter().any(braille)) else {
+    let Some((_, first)) =
+        (0..rows).find_map(|r| (0..cols).find(|&c| braille(r, c)).map(|c| (r, c)))
+    else {
         return false;
     };
-    let first = grid.cells[top as usize]
-        .iter()
-        .position(braille)
-        .unwrap_or(0);
-    (grid.cols / 2).checked_sub(5) == Some(first as u16)
+    (cols / 2).checked_sub(5) == Some(first) && !seen.had(cols ^ 1)
 }
 
 /// Codex 0.160.0 and 0.164.0: alternate screen; after a resize Codex waits
@@ -623,9 +718,19 @@ fn claude_transcript_user_line(grid: &Grid, line: &str) -> bool {
     })
 }
 
-/// A full-width rule tied to the width the agent drew at.
-fn claude_width_witness(grid: &Grid) -> bool {
-    (0..grid.rows).any(|r| claude_rule(grid, r))
+/// A full-width rule tied to the width the agent drew at: every cell `─`, the
+/// row neither running on to the next one nor the run-on of the row above. A
+/// rule drawn for a wider terminal runs past this edge, which the parser
+/// (always wrapping at the edge) marks; one drawn for a narrower terminal
+/// stops short of it. Like Codex's rows, this holds for a rule drawn in one
+/// run, as every measured redraw drew it.
+fn claude_width_witness(screen: &vt100::Screen, _seen: &WidthsSeen) -> bool {
+    let (rows, cols) = crate::vt_grid::size(screen);
+    (0..rows).any(|r| {
+        (0..cols).all(|c| screen.cell(r, c).is_some_and(|cell| cell.contents() == "─"))
+            && !screen.row_wrapped(r)
+            && (r == 0 || !screen.row_wrapped(r - 1))
+    })
 }
 
 /// The suggestion Claude Code shows, dim, in an empty composer: `Try "…"`,

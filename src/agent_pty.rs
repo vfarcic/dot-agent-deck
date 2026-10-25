@@ -2360,6 +2360,12 @@ impl AgentBus {
         self.state.lock().unwrap().evidence.clean_frame()
     }
 
+    /// The cells the evidence parser holds now.
+    #[cfg(test)]
+    fn evidence_parser_cells(&self) -> u32 {
+        self.state.lock().unwrap().evidence.parser_cells()
+    }
+
     /// The ring clear [`Self::resize_and_clear`] makes, without a resize.
     #[cfg(test)]
     fn clear_scrollback(&self) {
@@ -22425,6 +22431,52 @@ mod spawn_tests {
             .resize_and_mark_edge(EdgeReason::NudgeShrink, 24, 79, || Ok::<(), ()>(()))
             .unwrap();
         assert_eq!(evidence(&plain), EvidenceStatus::Unprofiled);
+    }
+
+    /// A Codex redraw for a terminal `cols` wide: its full-redraw marker and
+    /// a dialog's highlighted choice padded to the edge.
+    fn codex_choice_frame(cols: u16) -> Vec<u8> {
+        let text = "› 1. Trust and continue";
+        format!(
+            "\x1b[?2026h\x1b[1;1H\x1b[J\x1b[8;1H\x1b[1;7m{text}{}\x1b[0m",
+            " ".repeat(cols as usize - text.chars().count())
+        )
+        .into_bytes()
+    }
+
+    /// Scenario: A Codex-profiled bus is started at 4096 × 4096 and fed a full redraw: it builds no evidence parser, recognises nothing and its release scanner refuses the geometry too. Resized to 50 × 200 it runs a parser again and a redraw for that width turns it Clean; resized to exactly the cell budget it runs one, and one row more drops it again.
+    #[spec("inbox/doorbell/044")]
+    #[test]
+    fn doorbell_044_the_evidence_parser_keeps_the_scanner_budget() {
+        use crate::evidence_state::{EVIDENCE_CELLS_MAX, EvidenceStatus};
+        let bus = AgentBus::profiled(Some(&crate::doorbell_screen::CODEX_PROFILE), 4096, 4096);
+        assert!(matches!(evidence(&bus), EvidenceStatus::OverBudget { .. }));
+        assert_eq!(bus.evidence_parser_cells(), 0);
+        bus.push(codex_choice_frame(4096));
+        assert!(matches!(evidence(&bus), EvidenceStatus::OverBudget { .. }));
+        assert_eq!(bus.evidence_parser_cells(), 0);
+        assert!(bus.clean_frame().is_none());
+        assert_eq!(
+            bus.release().1,
+            Some(crate::release_scanner::WindowClose::Geometry)
+        );
+
+        bus.resize_and_clear(50, 200, || Ok::<(), ()>(())).unwrap();
+        assert!(matches!(evidence(&bus), EvidenceStatus::Dirty { .. }));
+        bus.push(codex_choice_frame(200));
+        assert!(matches!(evidence(&bus), EvidenceStatus::Clean { .. }));
+        assert_eq!(bus.evidence_parser_cells(), 50 * 200);
+
+        bus.resize_and_clear(512, 512, || Ok::<(), ()>(())).unwrap();
+        bus.push(codex_choice_frame(512));
+        assert_eq!(bus.evidence_parser_cells(), EVIDENCE_CELLS_MAX);
+        assert!(matches!(evidence(&bus), EvidenceStatus::Clean { .. }));
+        bus.resize_and_clear(513, 512, || Ok::<(), ()>(())).unwrap();
+        assert!(matches!(evidence(&bus), EvidenceStatus::OverBudget { .. }));
+        assert_eq!(bus.evidence_parser_cells(), 0);
+        bus.push(codex_choice_frame(512));
+        assert!(matches!(evidence(&bus), EvidenceStatus::OverBudget { .. }));
+        assert_eq!(bus.evidence_parser_cells(), 0);
     }
 
     /// Scenario: A doorbell transaction marks a `cat` pane's writer as held, and a repaint nudge is asked for meanwhile; then the transaction ends. The nudge does not start while the transaction holds the writer, and starts once it has ended.

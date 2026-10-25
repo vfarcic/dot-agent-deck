@@ -800,7 +800,7 @@ const CODEX_0160_DIALOGS: &[DialogKeys<'static>] = &[
 pub static RELEASE_RECORDS: [ReleaseRecord<'static>; 3] = [
     // Codex 0.164.0, the release current at measurement. Echo: the exact line
     // in the composer 30 of 30 (20 at 50 × 200, 10 at 24 × 80; ≤ 62 ms after
-    // its one write). Submit: the transcript's user message 30 of 30 ≤ 417 ms
+    // its one write). Submit: the transcript's user message 30 of 30 ≤ 418 ms
     // after the CR; the hook saw the exact prompt 30 of 30, but a session's
     // first prompt took 3.1 s and 5.5 s to reach it. Dialogs: update, folder
     // trust and hooks review, each raised 12 of 12 launches, the first at most
