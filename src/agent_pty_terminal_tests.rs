@@ -306,6 +306,103 @@ async fn return_026_g_a_closed_replacements_reports_stay_closed_across_publish()
     }
 }
 
+/// The two reporters `/026 (g)`'s fallback must not answer for the unit: an
+/// unrelated generation on the pane, and one reserved under another
+/// replacement's ticket that names the unit. Each reads the replacement's
+/// pending answer while the closed publication stands.
+async fn assert_only_the_successor_reads_the_unit(unit: &Unit, successor: &AttestFacts) {
+    let ticket = successor
+        .replacement_of
+        .expect("B is reserved under a ticket");
+    let not_the_successor = AttestFacts {
+        unit: Some(unit.unit_id()),
+        replacement_of: Some(ticket + 1_000_000),
+        ..successor.clone()
+    };
+    for (agent, facts) in [
+        ("r026g-unrelated", AttestFacts::default()),
+        ("r026g-not-the-successor", not_the_successor),
+    ] {
+        let answer = refused_with(
+            unit.report_from(unit.pane(), agent, facts, "done").await,
+            code::REPORT_PENDING,
+        );
+        assert_eq!(answer.report_id, None, "{agent}: {answer:?}");
+        assert_eq!(answer.destination, None, "{agent}: {answer:?}");
+    }
+}
+
+/// Scenario: A unit's replacement is paused before publication and its pane is closed, once with the unit ended and once after the predecessor's report completed it. Only the replacement's own successor reads the unit's answer; an unrelated generation on the pane and a generation reserved under another ticket are told the report is pending, never given the unit's report id or task_closed.
+#[spec("dispatch/return/026")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn return_026_g_only_the_successor_reads_a_closed_replacements_unit() {
+    for completed in [false, true] {
+        let unit = Arc::new(unit(&format!("r026gs-{completed}"), false).await);
+        let report = if completed {
+            Some(
+                paused_report(
+                    &unit,
+                    crate::task_completion::PAUSE_SAVED,
+                    "PREDECESSOR-026",
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        let (reached, release) = unit
+            .registry()
+            .pause_at_sync_for_test(PAUSE_RESPAWN_BEFORE_PUBLISH);
+        let respawn = {
+            let unit = Arc::clone(&unit);
+            tokio::spawn(async move {
+                unit.registry()
+                    .respawn_agent_for_pane(unit.pane(), "cat")
+                    .await
+            })
+        };
+        tokio::task::spawn_blocking(move || reached.recv_timeout(Duration::from_secs(10)))
+            .await
+            .unwrap()
+            .unwrap();
+        let b = unit.registry().pane_current_agent_id(unit.pane()).unwrap();
+        let facts = unit.facts(&b);
+        let accepted_id = match report {
+            Some((report, release)) => {
+                release.send(()).unwrap();
+                let answer = accepted(report.await.unwrap());
+                assert!(matches!(
+                    unit_entry(&unit.deck, &unit.unit_id()),
+                    Some(UnitEntry::Completed { .. })
+                ));
+                Some(answer.report_id.expect("an accepted report has an id"))
+            }
+            None => None,
+        };
+        drop(unit.registry().begin_pane_close(unit.pane()));
+        assert_only_the_successor_reads_the_unit(&unit, &facts).await;
+        let answer = unit.report_from(unit.pane(), &b, facts, "done").await;
+        match &accepted_id {
+            Some(id) => {
+                let answer = reply(answer);
+                assert_eq!(
+                    answer.disposition,
+                    WorkDoneDisposition::AlreadyAccepted,
+                    "{answer:?}"
+                );
+                assert_eq!(answer.report_id.as_ref(), Some(id));
+            }
+            None => {
+                refused_with(answer, code::TASK_CLOSED);
+            }
+        }
+        release.send(()).unwrap();
+        assert_eq!(respawn.await.unwrap().unwrap(), b);
+        assert_eq!(unit.completed(), usize::from(completed));
+        assert_eq!(unit.ended(), usize::from(!completed));
+    }
+}
+
 /// Scenario: An orchestration dispatch is paused after spawning its roles, and its orchestrator starts a delayed terminal report. A role closes before registration can finish, so the dispatch aborts; released afterwards, the report says unknown_task with the abandoned wording, saves nothing and never claims destination none.
 #[spec("dispatch/return/027")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

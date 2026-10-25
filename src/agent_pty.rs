@@ -2947,10 +2947,6 @@ pub struct RunningAgent {
     /// token attests with, moved here from its reservation when it is
     /// published. Never on the wire.
     pub attest_facts: crate::hook_provenance::AttestFacts,
-    /// PRD #1666 part 3, round 5 (plan D7): the replacement ticket this
-    /// generation was reserved under, when it is a respawned unit terminal's
-    /// successor. Never on the wire.
-    pub replacement_of: Option<u64>,
 }
 
 /// Issue #714: the source of [`RunningAgent::quota_block`] epochs. Only
@@ -7125,9 +7121,6 @@ struct RegistryInner {
     /// [`Self::pending_spawns`] attests with, by pre-allocated agent id, from
     /// the reservation that mints its token until its record carries them.
     pending_facts: HashMap<String, crate::hook_provenance::AttestFacts>,
-    /// PRD #1666 part 3, round 5 (plan D7): the replacement ticket each
-    /// reserved respawn successor belongs to, carried onto its record.
-    pending_replacement_of: HashMap<String, u64>,
     /// PRD #1666 part 3, round 5 (plan D7): what each reserved respawn
     /// successor's reader waits on at its EOF, by its agent id. Taken by the
     /// reader; dropped with a reservation that is given up.
@@ -7289,7 +7282,6 @@ impl<'a> SpawnReservation<'a> {
             inner.pending_spawn_dirs.remove(&id);
             inner.pending_busy.remove(&id);
             inner.pending_facts.remove(&id);
-            inner.pending_replacement_of.remove(&id);
             inner.replacement_waits.remove(&id);
             if let Some(pane) = inner.pending_turned.remove(&id) {
                 inner.abandoned_turns.push((pane, id));
@@ -7700,7 +7692,6 @@ impl AgentPtyRegistry {
                 pending_busy: HashSet::new(),
                 pending_turned: HashMap::new(),
                 pending_facts: HashMap::new(),
-                pending_replacement_of: HashMap::new(),
                 replacement_waits: HashMap::new(),
                 abandoned_turns: Vec::new(),
                 turn_seq: 0,
@@ -10887,7 +10878,6 @@ impl AgentPtyRegistry {
             .pending_facts
             .remove(&preallocated_id)
             .unwrap_or_default();
-        let replacement_of = inner.pending_replacement_of.remove(&preallocated_id);
         reservation.publish_locked(&mut inner);
         // Issue #424 H3: this agent is the pane's new occupant, so whatever the
         // previous one's guarded sends recorded about that input box describes a
@@ -11040,7 +11030,6 @@ impl AgentPtyRegistry {
             // PRD #1666 part 3, round 5: moved from the reservation, under
             // the lock that publishes the record.
             attest_facts,
-            replacement_of,
         };
 
         // Use the id we pre-allocated above (before spawn) and injected
@@ -11978,7 +11967,6 @@ impl AgentPtyRegistry {
             // as the same orchestration seat. Its `unit` is set when the
             // replacement is published, never copied.
             attest_facts: previous_facts,
-            replacement_of: _,
             // Issue #454: the OLD record is being removed outright, so its
             // handover flag has nothing left to disown. The fresh generation
             // starts `false` and takes the pane over in `spawn_agent`.
@@ -14759,7 +14747,6 @@ impl AgentPtyRegistry {
                 quota_block: None,
                 authoring_kind: None,
                 attest_facts: crate::hook_provenance::AttestFacts::default(),
-                replacement_of: None,
             },
         );
         id
@@ -15085,14 +15072,17 @@ impl AgentPtyRegistry {
         });
         inner.pending_facts.insert(
             id.clone(),
-            crate::hook_provenance::AttestFacts { seat, unit: None },
+            crate::hook_provenance::AttestFacts {
+                seat,
+                unit: None,
+                replacement_of: replacement.map(|ticket| ticket.id),
+            },
         );
         // PRD #1666 part 3, round 5 (plan D7): a replacement's successor is
         // bound to its ticket here, by the id just minted, after every refusal
         // above — a refused reservation never reaches this.
         if let Some(ticket) = replacement {
             let _ = ticket.successor.set(id.clone());
-            inner.pending_replacement_of.insert(id.clone(), ticket.id);
             if let Some(rx) = ticket
                 .latch_rx
                 .lock()
@@ -16375,14 +16365,15 @@ impl AgentPtyRegistry {
         unit_id: &str,
         ticket: Option<u64>,
     ) -> bool {
-        let (facts, reserved_under) = match inner.agents.get_mut(agent_id) {
-            Some(agent) => (&mut agent.attest_facts, agent.replacement_of),
-            None => match inner.pending_facts.get_mut(agent_id) {
-                Some(facts) => (facts, inner.pending_replacement_of.get(agent_id).copied()),
-                None => return false,
-            },
+        let Some(facts) = inner
+            .agents
+            .get_mut(agent_id)
+            .map(|agent| &mut agent.attest_facts)
+            .or_else(|| inner.pending_facts.get_mut(agent_id))
+        else {
+            return false;
         };
-        if ticket.is_some() && reserved_under != ticket {
+        if ticket.is_some() && facts.replacement_of != ticket {
             tracing::error!(
                 agent_id = %agent_id,
                 "dispatch: a replacement's successor was not reserved under its ticket; its \
