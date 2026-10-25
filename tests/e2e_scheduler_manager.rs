@@ -306,6 +306,9 @@ fn manager_003_delete_removes_definition_but_keeps_open_tab() {
     deck.send_keys(MANAGER_KEY);
     deck.wait_for_string("┌ Schedules");
     deck.send_keys(b"d"); // delete the auto-selected row → confirmation
+    // Issue #1799: a `y` queued before the question's first frame is dropped,
+    // as for the other confirmations, so answer the question once it is drawn.
+    deck.wait_for_string("(y/n)");
     deck.send_keys(b"y"); // confirm
 
     // Half 1: the definition is gone from the global config.

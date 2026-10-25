@@ -2138,10 +2138,10 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Platform coverage:** mac+linux.
 
 ##### prompt/dir-picker/003 — `l` / `Right` / `Enter` descend into the selected directory; `h` / `Left` / `Backspace` ascend.
-- **Layer:** L2.
+- **Layer:** L2; plus L1 `TestBackend` (`dir_picker_003_opens_only_an_entry_it_drew`, issue #1799).
 - **Agent:** none.
-- **Asserts:** after descending, the picker shows the child directory's contents; after ascending, it shows the parent's contents again.
-- **Does not assert:** any breadcrumb / path rendering beyond directory contents.
+- **Asserts:** after descending, the picker shows the child directory's contents; after ascending, it shows the parent's contents again. L1 (issue #1799): in a frame whose popup shows the current directory but no entry, `Enter`, `l` and `Right` open nothing while `Space` still picks the current directory; in one too short to show the current directory either, `Space` picks nothing; at 80×24, with the selected entry on screen, each of the three keys opens it, an entry whose name carries a combining accent included; with room for one entry row, `j` and Enter in one burst open nothing until the newly selected entry is drawn.
+- **Does not assert:** any breadcrumb / path rendering beyond directory contents; keys typed before the picker's first frame, which it still takes (it is not a confirmation, and the e2e tier types `Ctrl+n` and `Space` in one burst).
 - **Platform coverage:** mac+linux.
 
 ##### prompt/dir-picker/004 — `Space` confirms the current directory and advances to the new-pane form.
@@ -2170,6 +2170,15 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Agent:** none.
 - **Asserts:** the picker closes; no new pane appears; daemon `list_agents` is unchanged.
 - **Does not assert:** rendering of any toast / status-line message.
+- **Platform coverage:** mac+linux.
+
+#### prompt/star
+
+##### prompt/star/001 — The star prompt's `s` / `l` / `d` keys act only while the line naming them is on screen (issue #1799).
+- **Layer:** L1 `TestBackend` (`star_001_keys_are_refused_while_their_choices_are_not_drawn`), through the production `render_frame` and the read-back of the flushed frame that PRD #1666 part 2's confirmations use.
+- **Agent:** none.
+- **Asserts:** before the prompt's first frame, and at a height of 8 rows where its `s Star  l Later  d Don't ask again` line is cut off, `s`, `l` and `d` do not reach the prompt and Escape does; at 80×24 each key reaches it and the drawn `[Star]` button is clickable.
+- **Does not assert:** what `s` does once it reaches the prompt (opening the browser, the persisted dismissal), or when the prompt opens (`StarPromptState::increment_and_check`).
 - **Platform coverage:** mac+linux.
 
 #### prompt/new-pane
@@ -8001,9 +8010,10 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Platform coverage:** mac+linux.
 
 ##### scheduler/manager/005 — The delete confirmation stays contained within the modal even for a long schedule name (PRD #127 finding).
-- **Layer:** L2 (same no-L1-seam reason). Drives the real dialog via `S` + `d` and asserts on the rendered vt100 grid.
+- **Layer:** L2 (same no-L1-seam reason). Drives the real dialog via `S` + `d` and asserts on the rendered vt100 grid. Plus L1 `TestBackend` for its tiny-terminal case (issue #1799), through the production `render_frame` and the dialog's key handler.
 - **Agent:** none (fixture global `schedules.toml` via `DOT_AGENT_DECK_SCHEDULES`, one enabled task with a deliberately long name).
 - **Asserts:** after arming delete (`d`) on a long-named row, the confirmation's trailing `(y/n)` prompt — the only `(y/n)` in the app — still renders, proving the message is contained within the modal. Under PRD #144 the confirmation sits on two fixed natural lines (the name line; the `… (y/n)` trailer) and the content-sized modal grows in WIDTH to contain the long name line (clamped to ≤90% of the terminal), so the trailer is never clipped off the right border — superseding the PRD #127 wrap-to-grow-height band-aid.
+- **Asserts (L1, issue #1799, `manager_005_delete_is_refused_while_its_question_is_not_drawn`):** `y` deletes nothing before the question's first frame (input queued behind `d` waits for it), nor in an 80×6 terminal whose frame cuts off the question and its `(y/n)` line, where Escape still cancels; at 80×24, with both lines drawn, `y` deletes the schedule, one whose name carries a combining accent included; a question cancelled and asked again before its frame refuses `y` too.
 - **Does not assert:** the modal's precise content-sized width / clamp fraction; the confirmation wording beyond the `(y/n)` tail and `Delete schedule` prefix.
 - **Platform coverage:** mac+linux.
 
@@ -8578,8 +8588,8 @@ Since PRD #1666 S5 the deck types nothing into the orchestrator: its idle, waiti
 ##### newagent/visibility/002 — A desktop-prepared orchestration surfaces as its own TUI tab with every role.
 - **Layer:** L2 lane 1, PTY-attached (a headless real daemon receives the desktop's own client calls — `DaemonClient::prepare_orchestration`, which chooses the `prepare-orchestration` op this daemon advertises, with an empty task, then one `DaemonClient::start_prepared_role` per role — while or before a real TUI attaches; the control launches the same three-role fixture through the TUI's own form and role loop).
 - **Agent:** none (three `printf …; sleep 600` role stand-ins declared as Claude Code coordinator, OpenCode builder and Pi reviewer — the coordinator's also prints a `CONTEXT_LISTS <role>` line per agent its published coordinator context lists; no credential).
-- **Asserts:** the TUI-native control creates a separate orchestration tab containing `coordinator`, `builder`, and `reviewer`; the client chooses `PrepareSpelling::Orchestration` against this build's daemon (issue #1045), the preparation reports a unique context file inside the project, every configured start is answered rather than withheld, and the desktop path uses the desktop's 32×120 defaults, shares one orchestration id, and preserves role index/name/start-role/cwd/display-title membership, declared agent type and pane id across all prepared starts. Starting before attachment rebuilds the titled tab with all roles. Starting while the TUI is attached creates the same titled tab without a reconnect; switching into it shows `3 agent(s)` and the grouped, role-named `ClaudeCode · coordinator`, `OpenCode · builder`, and `Pi · reviewer` cards, and selecting the coordinator's card shows `CONTEXT_LISTS builder` and `CONTEXT_LISTS reviewer` (and no `CONTEXT_LISTS coordinator`) in its pane — the prepared context is what the role started with. Regression guard: before `9d66ef6b`, the live roles could appear as flat dashboard cards without their orchestration tab.
-- **Does not assert:** the Tauri form itself; the legacy `prepare-workflow` spelling (`project/launch/*` sends that one); coordinator prompt delivery; hook delivery; agent work; role-pane body contents beyond the exact role-card labels, session count and tab strip.
+- **Asserts:** the TUI-native control creates a separate orchestration tab containing `coordinator`, `builder`, and `reviewer`; the client chooses `PrepareSpelling::Orchestration` against this build's daemon (issue #1045), the preparation reports a unique context file inside the project, every configured start is answered rather than withheld, and the desktop path uses the desktop's 32×120 defaults, shares one orchestration id, and preserves role index/name/start-role/cwd/display-title membership, declared agent type and pane id across all prepared starts. Starting before attachment rebuilds the titled tab with all roles. Starting while the TUI is attached creates the same titled tab without a reconnect; switching into it shows `3 agent(s)` and the grouped, role-named `ClaudeCode · coordinator`, `OpenCode · builder`, and `Pi · reviewer` cards, and selecting the coordinator's card shows `CONTEXT_LISTS builder` and `CONTEXT_LISTS reviewer` (and no `CONTEXT_LISTS coordinator`) in its pane — the prepared context is what the role started with. Regression guard: before `9d66ef6b`, the live roles could appear as flat dashboard cards without their orchestration tab. Starting while the attached TUI's event stream is down (issue #1800: the `e2e`-build seams `DOT_AGENT_DECK_E2E_BREAK_STREAM_ON` break it on a plain Pi pane's `Thinking` from the real `agent-event --type running` CLI, and `DOT_AGENT_DECK_E2E_HOLD_STREAM_DOWN` keeps it down while a file exists and writes `<file>.held` once it holds): no tab appears while the stream is held down (precondition), and once it reconnects the titled tab appears and switching into it shows `3/4 agent(s)` (the trigger pane is the fourth) and the same three role-named cards — the resync rebuilds the tab from the deck's agent listing. Before the fix the resync carded only non-role agents, so the tab never appeared.
+- **Does not assert:** the Tauri form itself; the legacy `prepare-workflow` spelling (`project/launch/*` sends that one); coordinator prompt delivery; hook delivery; agent work; role-pane body contents beyond the exact role-card labels, session count and tab strip; a gap caused by a deck restart rather than a broken stream (the stream-gap case holds one process throughout), or a role spawned during a gap into an orchestration whose tab already exists: the unit tests `handshake_013_an_orchestration_with_any_unseen_role_is_surfaced_whole` (which orchestrations the resync queues) and `handshake_013_a_resync_surface_grows_the_existing_tab_and_keeps_the_seeded_card` (the render loop grows the tab and keeps the role's seeded state) pin that, against a scripted daemon rather than a PTY.
 - **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]` — the daemon/harness uses Unix-domain sockets and PTYs).
 
 ##### newagent/visibility/003 — A desktop-stopped plain agent disappears from an already-attached TUI dashboard.

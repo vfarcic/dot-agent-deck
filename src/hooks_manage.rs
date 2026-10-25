@@ -1016,6 +1016,16 @@ fn install_impl_in(
     // Issue #714: that includes a deck `StopFailure` rule left behind for a
     // Claude Code that no longer accepts it (a downgrade), which would
     // otherwise switch off every hook in the file.
+    //
+    // Binary-agnostic on purpose, and unlike the Codex and Devin sweeps, which
+    // take only their own install's rules (issue #730) — decided in issue #537
+    // (item 4.5). Codex ignores an event key it does not know; Claude Code
+    // drops every hook in the file over one. A build cannot tell whether a key
+    // it does not install is one the installed Claude Code accepts, so it does
+    // not keep another install's rule there, even a live sibling's whose
+    // command it keeps under every type it does install. The cost, accepted:
+    // two coexisting deck builds whose type lists differ remove each other's
+    // rules for the types only one installs, until that one installs again.
     let mut repaired = 0usize;
     let all_keys: Vec<String> = hooks_obj.keys().cloned().collect();
     for key in all_keys {
@@ -2401,6 +2411,58 @@ mod tests {
         }
     }
 
+    /// A waiter added beside a status handler the deck shares with a user's
+    /// hook goes into that shared rule, never into a rule of the user's own
+    /// that holds no deck handler.
+    #[test]
+    fn a_new_waiter_joins_the_rule_holding_the_status_handler() {
+        let gates = ClaudeHookGates {
+            stop_failure: false,
+            permission_request: false,
+            async_rewake: true,
+        };
+        let binary = crate::test_paths::abs("/opt/deck/dot-agent-deck");
+        let status = hook_command(&binary);
+        let mut settings = serde_json::json!({"hooks": {}});
+        for hook_type in WAITER_HOOK_TYPES {
+            settings["hooks"][*hook_type] = serde_json::json!([
+                {"hooks": [{"type": "command", "command": "notify-send done"}]},
+                {"hooks": [
+                    {"type": "command", "command": "logger turn"},
+                    {"type": "command", "command": status.clone()}
+                ]}
+            ]);
+        }
+
+        install_impl_gated(&mut settings, &binary, gates);
+
+        for hook_type in WAITER_HOOK_TYPES {
+            let rules = settings["hooks"][*hook_type].as_array().expect("rules");
+            let commands = |rule: &Value| -> Vec<String> {
+                rule["hooks"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|handler| handler["command"].as_str().map(str::to_string))
+                    .collect()
+            };
+            assert_eq!(
+                commands(&rules[0]),
+                ["notify-send done"],
+                "{hook_type}: the user's own rule gained a handler"
+            );
+            assert_eq!(
+                commands(&rules[1]),
+                [
+                    "logger turn".to_string(),
+                    status.clone(),
+                    waiter_command_for(&status)
+                ],
+                "{hook_type}: the waiter belongs beside the status handler"
+            );
+        }
+    }
+
     /// Issue #714: the `StopFailure` gate — written for a Claude Code that
     /// accepts it, withheld (and a stale one removed) for one that does not,
     /// and swept by uninstall. The end-to-end half is `status/blocked/011` in
@@ -2504,6 +2566,37 @@ mod tests {
             hook_types(ClaudeHookGates::stop_failure_only(false))
         );
         assert_eq!(second.repaired, 0);
+    }
+
+    /// A settings file that exists but cannot be read is refused, not taken for
+    /// an absent one: reading it as `{}` would publish a hooks-only file over
+    /// the user's settings. Only a missing file starts from empty.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_settings_file_is_refused_and_left_as_it_was() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::test_temp::tempdir().expect("settings tempdir");
+        let settings = dir.path().join("settings.json");
+        let original = br#"{"model":"opus"}"#;
+        std::fs::write(&settings, original).expect("seed settings");
+        std::fs::set_permissions(&settings, std::fs::Permissions::from_mode(0o200))
+            .expect("make settings write-only");
+        if std::fs::read(&settings).is_ok() {
+            eprintln!("SKIP: this user reads a 0200 file (root), so it cannot be unreadable");
+            return;
+        }
+
+        let result = install_to(&settings, "/opt/deck/dot-agent-deck");
+        std::fs::set_permissions(&settings, std::fs::Permissions::from_mode(0o600))
+            .expect("restore settings mode");
+
+        let err = result.expect_err("an unreadable settings file must refuse the install");
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied, "{err}");
+        assert_eq!(
+            std::fs::read(&settings).expect("read settings"),
+            original,
+            "the refused install replaced the user's settings"
+        );
     }
 
     /// Write `body` as an executable stand-in `claude` in `dir`.
