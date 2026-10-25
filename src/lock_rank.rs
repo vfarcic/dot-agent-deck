@@ -493,6 +493,9 @@ mod tests {
     /// Scenario: A guard is dropped while its thread's rank stack is already borrowed (a seam that holds the borrow). Its `Drop` does nothing and does not panic; the entry it could not remove is the only trace.
     #[spec("orchestration/work-done/032")]
     #[test]
+    // The rank stack exists only with debug assertions; a release-profile
+    // test build (the scanner budget measurement) has none to borrow.
+    #[cfg(debug_assertions)]
     fn work_done_032_a_guard_drop_with_the_stack_borrowed_does_not_panic() {
         let hub = RankedMutex::<R3, u32>::new(0);
         let guard = hub.lock();

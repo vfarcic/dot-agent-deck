@@ -349,7 +349,48 @@ pub enum CaptureEvent {
     Closed {
         reason: WindowClose,
         latch: ScanLatch,
+        /// What the scanner cost the generation while its window was open,
+        /// for the `release scanner timing` line.
+        cost: ScanCost,
     },
+}
+
+/// What a generation's scanner cost while its window was open (plan §9.1):
+/// the time each push spent in the scanner, which is time the push holds the
+/// pane's output lock for, and the scanner's own CPU time. Resizes are kept
+/// apart and charged to no push.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScanCost {
+    /// Pushes the scanner was fed.
+    pub pushes: u64,
+    /// Wall time inside the scanner, over every push.
+    pub push_ns_total: u64,
+    /// The longest single push inside the scanner.
+    pub push_ns_max: u64,
+    /// The scanner's CPU time (`CLOCK_THREAD_CPUTIME_ID` around its calls),
+    /// summed; 0 where the platform has no thread clock.
+    pub cpu_ns: u64,
+    pub resizes: u64,
+    /// The longest resize of the scanner's grid.
+    pub resize_ns_max: u64,
+}
+
+/// The calling thread's CPU time, in nanoseconds.
+#[cfg(unix)]
+pub fn thread_cpu_ns() -> Option<u64> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a stack-allocated `timespec` the call writes into.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    (rc == 0).then(|| ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64)
+}
+
+/// No thread clock off Unix: the CPU figure reads 0.
+#[cfg(not(unix))]
+pub fn thread_cpu_ns() -> Option<u64> {
+    None
 }
 
 /// A generation's release, latched from its start-up header, and the scanner
@@ -361,6 +402,10 @@ pub struct ReleaseCapture {
     scanner: Option<ReleaseScanner>,
     latch: ScanLatch,
     closed: Option<WindowClose>,
+    cost: ScanCost,
+    /// The last push's wall and CPU time inside the scanner, while it was
+    /// alive: what the budget measurement reads push by push.
+    last_push: Option<(u64, u64)>,
 }
 
 impl std::fmt::Debug for ReleaseCapture {
@@ -369,6 +414,7 @@ impl std::fmt::Debug for ReleaseCapture {
             .field("scanner", &self.scanner.is_some())
             .field("latch", &self.latch)
             .field("closed", &self.closed)
+            .field("cost", &self.cost)
             .finish()
     }
 }
@@ -381,12 +427,28 @@ impl ReleaseCapture {
                 scanner: Some(scanner),
                 latch: ScanLatch::Pending,
                 closed: None,
+                cost: ScanCost::default(),
+                last_push: None,
             },
             Err(_) => Self {
                 scanner: None,
                 latch: ScanLatch::Pending,
                 closed: Some(WindowClose::Geometry),
+                cost: ScanCost::default(),
+                last_push: None,
             },
+        }
+    }
+
+    /// A capture with no scanner and no window: what the budget measurement
+    /// compares a scanning push against.
+    pub fn disabled() -> Self {
+        Self {
+            scanner: None,
+            latch: ScanLatch::Pending,
+            closed: None,
+            cost: ScanCost::default(),
+            last_push: None,
         }
     }
 
@@ -394,12 +456,25 @@ impl ReleaseCapture {
     /// window's byte limit.
     pub fn push(&mut self, bytes: &[u8]) -> Vec<CaptureEvent> {
         let mut events = Vec::new();
+        self.last_push = None;
         let Some(scanner) = &mut self.scanner else {
             return events;
         };
         let room = RELEASE_WINDOW_BYTES.saturating_sub(scanner.fed()) as usize;
         let take = room.min(bytes.len());
-        if scanner.feed(&bytes[..take]) {
+        let started = std::time::Instant::now();
+        let cpu_before = thread_cpu_ns();
+        let changed = scanner.feed(&bytes[..take]);
+        let cpu = thread_cpu_ns()
+            .zip(cpu_before)
+            .map_or(0, |(after, before)| after.saturating_sub(before));
+        let wall = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.cost.pushes += 1;
+        self.cost.push_ns_total = self.cost.push_ns_total.saturating_add(wall);
+        self.cost.push_ns_max = self.cost.push_ns_max.max(wall);
+        self.cost.cpu_ns = self.cost.cpu_ns.saturating_add(cpu);
+        self.last_push = Some((wall, cpu));
+        if changed {
             self.latch = scanner.latch().clone();
             events.push(CaptureEvent::Latched(self.latch.clone()));
         }
@@ -412,7 +487,12 @@ impl ReleaseCapture {
     /// A layout edge to `rows` × `cols` at this place in the stream.
     pub fn resize(&mut self, rows: u16, cols: u16) -> Option<CaptureEvent> {
         let scanner = self.scanner.as_mut()?;
-        if scanner.resize(rows, cols).is_err() {
+        let started = std::time::Instant::now();
+        let over = scanner.resize(rows, cols).is_err();
+        let wall = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.cost.resizes += 1;
+        self.cost.resize_ns_max = self.cost.resize_ns_max.max(wall);
+        if over {
             return self.close(WindowClose::Geometry);
         }
         None
@@ -425,7 +505,19 @@ impl ReleaseCapture {
         Some(CaptureEvent::Closed {
             reason,
             latch: self.latch.clone(),
+            cost: self.cost,
         })
+    }
+
+    /// What the scanner has cost the generation so far.
+    pub fn cost(&self) -> ScanCost {
+        self.cost
+    }
+
+    /// The last push's wall and CPU nanoseconds inside the scanner, if the
+    /// scanner was alive for it.
+    pub fn last_push(&self) -> Option<(u64, u64)> {
+        self.last_push
     }
 
     pub fn latch(&self) -> &ScanLatch {

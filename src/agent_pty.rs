@@ -2020,6 +2020,21 @@ pub struct AgentBus {
     between_resize_and_clear: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
+/// What one [`AgentBus::push`] cost under the output lock (plan §9.1). Read
+/// by the budget measurement; production logs the scanner's share per
+/// generation (`release scanner timing`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct PushCost {
+    /// From taking the lock to releasing it.
+    hold_ns: u64,
+    /// The evidence parser's share.
+    evidence_ns: u64,
+    /// The release scanner's wall and CPU nanoseconds, while its window was
+    /// open.
+    scanner: Option<(u64, u64)>,
+}
+
 struct AgentBusState {
     scrollback: VecDeque<u8>,
     /// Issue #1537 — the terminal modes in force after the last byte pushed.
@@ -2109,6 +2124,19 @@ impl AgentBus {
         }
     }
 
+    /// [`Self::profiled`] with no release scanner: what the budget
+    /// measurement compares a scanning push against (plan §9.1).
+    #[cfg(test)]
+    fn profiled_without_scanner(
+        profile: Option<&'static crate::doorbell_screen::ScreenProfile>,
+        rows: u16,
+        cols: u16,
+    ) -> Self {
+        let bus = Self::profiled(profile, rows, cols);
+        bus.state.lock().unwrap().release = crate::release_scanner::ReleaseCapture::disabled();
+        bus
+    }
+
     #[cfg(test)]
     fn run_between_resize_and_clear(&self) {
         let hook = self.between_resize_and_clear.lock().unwrap().take();
@@ -2122,8 +2150,17 @@ impl AgentBus {
     /// concurrent `subscribe` can never split a write between snapshot and
     /// live receiver.
     fn push(&self, data: Vec<u8>) {
+        self.push_timed(data);
+    }
+
+    /// [`Self::push`], answering what the push cost under the output lock
+    /// (PRD #1666 part 3, round 5-wake, plan §9.1): how long it held the lock,
+    /// the evidence parser's share, and the release scanner's wall and CPU
+    /// time when its window was open.
+    fn push_timed(&self, data: Vec<u8>) -> PushCost {
         let arc = Arc::new(data);
         let mut state = self.state.lock().unwrap();
+        let held = Instant::now();
         // PRD #1666 part 3, round 5-wake: a parser that starts at a redraw
         // marker inside this push starts in the modes in force at the marker.
         let modes_before = state.live_modes.clone();
@@ -2132,7 +2169,9 @@ impl AgentBus {
             modes.feed(&arc[..at]);
             modes.preamble()
         });
+        let evidence_ns = u64::try_from(held.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let release = state.release.push(&arc);
+        let scanner = state.release.last_push();
         state.live_modes.feed(&arc);
         for &b in arc.iter() {
             state.scrollback.push_back(b);
@@ -2148,12 +2187,18 @@ impl AgentBus {
         // subscribers. `send` returns Err only when there are zero
         // receivers, which is fine — scrollback still has the bytes.
         let _ = self.tx.send(arc);
+        let hold_ns = u64::try_from(held.elapsed().as_nanos()).unwrap_or(u64::MAX);
         drop(state);
         if let Some(transition) = transition {
             log_evidence_transition(&transition, "output");
         }
         for event in release {
             self.log_release(&event);
+        }
+        PushCost {
+            hold_ns,
+            evidence_ns,
+            scanner,
         }
     }
 
@@ -2162,7 +2207,25 @@ impl AgentBus {
         use crate::release_scanner::{CaptureEvent, ScanLatch, WindowClose};
         let (latch, close) = match event {
             CaptureEvent::Latched(latch) => (latch, None),
-            CaptureEvent::Closed { reason, latch } => (latch, Some(*reason)),
+            CaptureEvent::Closed {
+                reason,
+                latch,
+                cost,
+            } => {
+                // Plan §9.1: what the scanner cost while its window was open.
+                tracing::debug!(
+                    target: "pane_release",
+                    agent_id = %self.label,
+                    pushes = cost.pushes,
+                    push_us_max = cost.push_ns_max / 1_000,
+                    push_us_total = cost.push_ns_total / 1_000,
+                    cpu_us = cost.cpu_ns / 1_000,
+                    resizes = cost.resizes,
+                    resize_us_max = cost.resize_ns_max / 1_000,
+                    "release scanner timing"
+                );
+                (latch, Some(*reason))
+            }
         };
         let close_words = close.map(WindowClose::as_str);
         match latch {
@@ -6283,6 +6346,12 @@ mod replacement_tests;
 #[cfg(all(test, unix))]
 #[path = "agent_pty_report_tests.rs"]
 mod report_tests;
+
+/// PRD #1666 part 3, round 5-wake (plan §9.1): the release scanner's budget,
+/// measured by hand on the real push path.
+#[cfg(all(test, unix))]
+#[path = "agent_pty_scanner_budget.rs"]
+mod scanner_budget;
 
 #[cfg(all(test, unix))]
 #[path = "agent_pty_terminal_tests.rs"]
