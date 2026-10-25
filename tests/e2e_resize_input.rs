@@ -13,10 +13,8 @@
 //! drawing the previous one produces. So each keystroke here follows two
 //! resizes, the second sent once the deck has started drawing the first.
 //!
-//! What it watches is filter-mode text, which only grows: two resizes in quick
-//! succession can leave cells of an earlier frame on the harness's grid, so a
-//! check that something has gone away could be fooled where a longer string
-//! cannot.
+//! What it watches is filter-mode text, which only grows, so each key has a
+//! check of its own that no earlier key can satisfy.
 
 mod common;
 

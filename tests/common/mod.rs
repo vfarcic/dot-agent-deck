@@ -1553,6 +1553,13 @@ impl TuiDeck {
     pub fn resize(&mut self, cols: u16, rows: u16) {
         self.cols = cols;
         self.rows = rows;
+        // Grid first, then the PTY, under one parser lock: the reader thread
+        // cannot parse a byte between the two, so a frame the deck draws for
+        // the new size never lands on the old-size grid. It used to, when the
+        // deck redrew fast enough, and the deck's later frames only send the
+        // cells that changed, so the misplaced ones stayed on the grid.
+        let mut parser = self.parser.lock().unwrap();
+        dot_agent_deck::vt_grid::set_size(parser.screen_mut(), rows, cols);
         self.pty_master
             .resize(PtySize {
                 rows,
@@ -1561,7 +1568,6 @@ impl TuiDeck {
                 pixel_height: 0,
             })
             .expect("resize PTY");
-        dot_agent_deck::vt_grid::set_size(self.parser.lock().unwrap().screen_mut(), rows, cols);
     }
 
     /// Resize to `first`, wait until the deck emits output after it, then
@@ -1569,8 +1575,7 @@ impl TuiDeck {
     /// drawing. A key sent straight after this reaches the deck together with
     /// that SIGWINCH, the moment `resize/sigwinch/004` needs. Decision 21: the
     /// wait is a poll on the reader's last-byte stamp, here rather than in a
-    /// test body. Two quick resizes can leave cells of the earlier frame on
-    /// this harness's grid, so check for text that has appeared, not gone.
+    /// test body.
     pub fn resize_during_redraw(&mut self, first: (u16, u16), second: (u16, u16)) {
         let before = Instant::now();
         self.resize(first.0, first.1);
