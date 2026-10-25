@@ -580,8 +580,10 @@ fn fresh(seq: u64) -> ModeSample {
         seq,
         icanon: false,
         echo: false,
-        sampled_mono_ns: at,
-        sample_done_mono_ns: at + 1,
+        // The done stamp is the clock read itself: a later read can equal it
+        // (macOS's monotonic clock ticks in microseconds), never precede it.
+        sampled_mono_ns: at.saturating_sub(1),
+        sample_done_mono_ns: at,
     }
 }
 
