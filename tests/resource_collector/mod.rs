@@ -258,6 +258,14 @@ pub fn start_collector(receiver: &Receiver) -> Running {
 }
 
 pub fn start_collector_with_paths(receiver: &Receiver, paths: bool) -> Running {
+    start_collector_configured(receiver, paths, false)
+}
+
+pub fn start_collector_with_disk(receiver: &Receiver, paths: bool) -> Running {
+    start_collector_configured(receiver, paths, true)
+}
+
+fn start_collector_configured(receiver: &Receiver, paths: bool, disk: bool) -> Running {
     let config = collector(receiver);
     // Share the exact same collector artifact and isolated exporter config as
     // --once. This is a separate /proc scraper; the agent never runs it or
@@ -272,7 +280,12 @@ pub fn start_collector_with_paths(receiver: &Receiver, paths: bool) -> Running {
         )
         .arg("180")
         .arg(config.get_program())
-        .args(["--interval", "1", "--disk-interval", "0"]);
+        .args([
+            "--interval",
+            "1",
+            "--disk-interval",
+            if disk { "60" } else { "0" },
+        ]);
     if paths {
         command.arg("--send-worktree-paths");
     }

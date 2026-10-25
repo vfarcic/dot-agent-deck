@@ -52,8 +52,8 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 
 ##### telemetry/resources/005 — Terminal run gauges keep their live resource identity.
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_resource_collector.rs`).
-- **Agent:** synthetic shell/cat run started by the real deck daemon; no real agent.
-- **Asserts:** collectors with and without path opt-in export a live worktree run and its terminal sample after pane close. Complete resource attributes remain identical, including deck.worktree.id and the opted-in canonical path; terminal process count and all three named PSS gauges are zero, and cumulative CPU does not decrease.
+- **Agent:** synthetic warm-up and measured shell/cat runs started by the real deck daemon; no real agent.
+- **Asserts:** collectors with and without path opt-in first export the warm-up worktree's disk series, proving discovery has answered before the measured run starts, then export that run's live and terminal samples after pane close. Complete resource attributes remain identical, including deck.worktree.id and the opted-in canonical path; terminal process count and all three named PSS gauges are zero, and cumulative CPU does not decrease.
 - **Does not assert:** worktree changes during a live run, successful delivery after export failures, or CPU in the final unsampled interval.
 - **Platform coverage:** Linux.
 

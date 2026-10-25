@@ -11,7 +11,7 @@ use dot_agent_deck::daemon_client::{DaemonClient, StartAgentOptions};
 use dot_agent_deck::telemetry::resource::parse_resource_attributes;
 use resource_collector::{
     Receiver, assert_figures, assert_pss, attribute, bounded_output, close, collector, cpu,
-    processes, run_resource, start_collector, start_collector_with_paths,
+    processes, run_resource, start_collector, start_collector_with_disk,
 };
 use serde_json::Value;
 use spec::spec;
@@ -358,6 +358,8 @@ fn resources_003_shared_worktree_has_one_disk_series() {
     assert!(output.status.success());
     let worktree = String::from_utf8(output.stdout).unwrap().trim().to_string();
     assert_eq!(worktree.len(), 32);
+    // --once waits for every lookup within the walk budget, rather than the
+    // periodic sampler's one-second first-sight deadline.
     let metrics = receiver.sample(false, true);
     for run_id in [&first, &second] {
         assert_eq!(
@@ -401,7 +403,7 @@ fn resources_003_shared_worktree_has_one_disk_series() {
     );
 }
 
-/// Scenario: Start a deck run in a git worktree and collect live metrics with and without path opt-in, then close the pane and await its terminal sample. Its complete resource attributes must stay identical, process and all PSS gauges must be zero, and cumulative CPU must not decrease.
+/// Scenario: Use a warm-up run's exported disk series to await worktree discovery by collectors with and without path opt-in, then start a new deck run in that worktree. Collect its live metrics, close its pane and await a terminal sample whose resource attributes stay identical, process and all PSS gauges are zero, and cumulative CPU does not decrease.
 #[spec("telemetry/resources/005")]
 #[test]
 fn resources_005_terminal_sample_preserves_live_resource_identity() {
@@ -410,20 +412,68 @@ fn resources_005_terminal_sample_preserves_live_resource_identity() {
         .without_agent_credentials()
         .with_env("OTEL_EXPORTER_OTLP_ENDPOINT", &receiver.endpoint)
         .with_env("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json")
-        .with_continue_session("resource-terminal", standin("collector-terminal.env"))
+        .with_continue_session("resource-warmup", standin("collector-warmup.env"))
         .launch_with_fixture("minimal");
     deck.wait_for_string("RESOURCE_SHARED_READY");
     std::fs::create_dir_all(deck.workdir().join(".git")).unwrap();
-    let run_id = environment_run(&deck.workdir().join("collector-terminal.env"));
-    let agent = common::agent_records_on(deck.attach_socket_path())
-        .into_iter()
-        .next()
-        .unwrap();
     // Separate receivers distinguish both collectors' resources without
     // introducing attributes that could hide an identity mismatch.
     let paths_receiver = Receiver::start();
-    let _collector = start_collector(&receiver);
-    let _paths_collector = start_collector_with_paths(&paths_receiver, true);
+    let _collector = start_collector_with_disk(&receiver, false);
+    let _paths_collector = start_collector_with_disk(&paths_receiver, true);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck-collector"));
+    command.env_clear().arg("worktree-id").arg(deck.workdir());
+    let output = bounded_output(command);
+    assert!(output.status.success());
+    let worktree = String::from_utf8(output.stdout).unwrap().trim().to_string();
+    // A slow first lookup may permanently leave the warm-up run without a
+    // worktree. Disk resources reflect completed discovery independently of
+    // that run's frozen identity. Wait for both collectors to publish this
+    // worktree before exposing the run whose terminal identity we test.
+    for source in [&receiver, &paths_receiver] {
+        assert!(
+            common::wait_until(Duration::from_secs(75), || source.metrics().iter().any(
+                |entry| {
+                    attribute(&entry["resource"], "deck.worktree.id") == worktree
+                        && entry["scopeMetrics"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .any(|scope| {
+                                scope["metrics"]
+                                    .as_array()
+                                    .into_iter()
+                                    .flatten()
+                                    .any(|metric| metric["name"] == "deck.worktree.disk.usage")
+                            })
+                }
+            )),
+            "collector must finish fixture worktree discovery before the tested run starts"
+        );
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let client = DaemonClient::new(deck.attach_socket_path().to_path_buf());
+    runtime
+        .block_on(client.start_agent(StartAgentOptions {
+            command: Some(standin("collector-terminal.env")),
+            cwd: Some(deck.workdir().to_string_lossy().into_owned()),
+            display_name: Some("resource-terminal".into()),
+            env: vec![("DOT_AGENT_DECK_PANE_ID".into(), "resource-terminal".into())],
+            ..StartAgentOptions::default()
+        }))
+        .unwrap();
+    common::wait_for_file_contains(
+        &deck.workdir().join("collector-terminal.env"),
+        "deck.run.id=",
+    );
+    let run_id = environment_run(&deck.workdir().join("collector-terminal.env"));
+    let agent = common::agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .find(|agent| agent.display_name.as_deref() == Some("resource-terminal"))
+        .unwrap();
     let find = |receiver: &Receiver, ended: bool| {
         receiver.metrics().into_iter().find(|entry| {
             attribute(&entry["resource"], "deck.run.id") == run_id
