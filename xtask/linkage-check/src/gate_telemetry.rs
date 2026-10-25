@@ -174,7 +174,8 @@ pub(crate) fn config_from(
     // Issue #1893: Claude Code removes every `OTEL_*` variable from the
     // commands it runs, so a gate run an agent starts arrives without the
     // deck's `OTEL_RESOURCE_ATTRIBUTES`. The deck's own variables survive, and
-    // fill the pairs that list would have carried; a pair from it still wins.
+    // fill the pairs that list would have carried; a pair from it still wins,
+    // unless its value is blank, which identifies nothing.
     let fallbacks: [(&str, &dyn Fn() -> Option<String>); 3] = [
         ("deck.run.id", &|| get(RUN_ID_ENV)),
         ("deck.pane.id", &|| get(PANE_ID_ENV)),
@@ -185,10 +186,15 @@ pub(crate) fn config_from(
         }),
     ];
     for (key, value) in fallbacks {
-        if !resource.iter().any(|(k, _)| k == key)
-            && let Some(value) = value()
-        {
-            resource.push((key.to_string(), value));
+        let at = resource.iter().position(|(k, _)| k == key);
+        if at.is_some_and(|i| !resource[i].1.trim().is_empty()) {
+            continue;
+        }
+        if let Some(value) = value() {
+            match at {
+                Some(i) => resource[i].1 = value,
+                None => resource.push((key.to_string(), value)),
+            }
         }
     }
     Some(Config {
@@ -959,6 +965,29 @@ mod tests {
                 ("host.name", "c"),
             ]),
             "a value from OTEL_RESOURCE_ATTRIBUTES wins"
+        );
+
+        assert_eq!(
+            resource(
+                &[
+                    BASE,
+                    (
+                        "OTEL_RESOURCE_ATTRIBUTES",
+                        "deck.run.id=,k=v,deck.pane.id=%20,host.name=",
+                    ),
+                    (RUN_ID_ENV, "env-run"),
+                    (PANE_ID_ENV, "env-pane"),
+                ],
+                Some("env-host"),
+            ),
+            pairs(&[
+                ("service.name", DEFAULT_SERVICE_NAME),
+                ("deck.run.id", "env-run"),
+                ("k", "v"),
+                ("deck.pane.id", "env-pane"),
+                ("host.name", "env-host"),
+            ]),
+            "a blank value in OTEL_RESOURCE_ATTRIBUTES is replaced by its fallback, in place"
         );
     }
 
