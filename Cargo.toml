@@ -111,6 +111,11 @@ getrandom = "0.4"
 # anything. Already in this workspace's lockfile (the desktop crate's graph
 # carries 0.10.9), so the version resolves to code the workspace builds today.
 sha2 = "0.11"
+# PRD #1859: the collector's body reader takes a response's chunks as reqwest
+# hands them over, as `bytes::Bytes`, so it can refuse one past its cap before
+# copying any of it. Already in the graph as reqwest's own dependency, so
+# naming it adds no new code to the build.
+bytes = "1"
 
 # Issue #250: `build.rs` validates an injected `DAD_VERSION` with the EXACT
 # parser `src/version.rs` uses (`semver::Version::parse`), so the set of

@@ -30,6 +30,7 @@ mod linux {
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+    use bytes::Bytes;
     use clap::{Parser, Subcommand};
     use dot_agent_deck::telemetry::collector::aggregate::{Aggregator, Sample};
     use dot_agent_deck::telemetry::collector::config::{Export, Settings};
@@ -661,10 +662,11 @@ mod linux {
         Failed,
     }
 
-    /// What one read of a body yields.
+    /// What one read of a body yields. `Data` is the chunk as the
+    /// transport handed it over, not yet copied anywhere.
     #[derive(Debug)]
     enum Chunk {
-        Data(Vec<u8>),
+        Data(Bytes),
         End,
         TimedOut,
         Failed,
@@ -679,7 +681,7 @@ mod linux {
     impl Chunks for reqwest::Response {
         async fn next_chunk(&mut self) -> Chunk {
             match self.chunk().await {
-                Ok(Some(chunk)) => Chunk::Data(chunk.to_vec()),
+                Ok(Some(chunk)) => Chunk::Data(chunk),
                 Ok(None) => Chunk::End,
                 Err(e) if e.is_timeout() => Chunk::TimedOut,
                 Err(_) => Chunk::Failed,
@@ -691,10 +693,12 @@ mod linux {
     /// most `max` bytes. A body is whole once its end is seen, so one that
     /// fills `max` exactly is read on until its end arrives, and fails when
     /// that end stalls or breaks; one that goes past `max`, inside a chunk
-    /// or with a later one, is `TooLarge`, and no more than `max` bytes of
-    /// it are kept. Unlike the deck exporter's `bounded_body`, a body that
-    /// fails or does not arrive in time is reported as such, not read as an
-    /// empty one.
+    /// or with a later one, is `TooLarge`. The body accumulated here never
+    /// holds more than `max` bytes: each chunk's size is checked before any
+    /// of it is copied in. The chunk itself is the transport's, buffered
+    /// however the transport reads, and is not bounded by `max`. Unlike the
+    /// deck exporter's `bounded_body`, a body that fails or does not arrive
+    /// in time is reported as such, not read as an empty one.
     async fn read_body(mut chunks: impl Chunks, max: usize, within: Duration) -> Body {
         let read = async move {
             let mut body = Vec::new();
@@ -819,7 +823,7 @@ mod linux {
         }
 
         fn data(bytes: &[u8]) -> Chunk {
-            Chunk::Data(bytes.to_vec())
+            Chunk::Data(Bytes::copy_from_slice(bytes))
         }
 
         /// V1/W1: a body is read whole once its end arrives, an empty one
@@ -938,33 +942,45 @@ mod linux {
         }
 
         /// Read one HTTP request: its head, then the `Content-Length` bytes
-        /// of its body.
-        async fn read_request(stream: &mut tokio::net::TcpStream) {
+        /// of its body. `false` when the client closed or the connection
+        /// failed before the request ended, or its head was not one this
+        /// reads: a sender that gave up early is not this backend's failure.
+        async fn read_request(stream: &mut tokio::net::TcpStream) -> bool {
             let mut seen = Vec::new();
             let mut buf = [0u8; 4096];
             let head_end = loop {
-                let n = stream.read(&mut buf).await.unwrap();
-                assert!(n > 0, "the client closed before its request ended");
-                seen.extend_from_slice(&buf[..n]);
+                match stream.read(&mut buf).await {
+                    Ok(n) if n > 0 => seen.extend_from_slice(&buf[..n]),
+                    _ => return false,
+                }
                 if let Some(at) = seen.windows(4).position(|w| w == b"\r\n\r\n") {
                     break at + 4;
                 }
             };
             let head = String::from_utf8_lossy(&seen[..head_end]).to_ascii_lowercase();
-            let length: usize = head
+            let length = match head
                 .lines()
                 .find_map(|line| line.strip_prefix("content-length:"))
-                .map_or(0, |v| v.trim().parse().unwrap());
+                .map(|v| v.trim().parse::<usize>())
+            {
+                None => 0,
+                Some(Ok(length)) => length,
+                Some(Err(_)) => return false,
+            };
             while seen.len() < head_end + length {
-                let n = stream.read(&mut buf).await.unwrap();
-                assert!(n > 0, "the client closed before its request ended");
-                seen.extend_from_slice(&buf[..n]);
+                match stream.read(&mut buf).await {
+                    Ok(n) if n > 0 => seen.extend_from_slice(&buf[..n]),
+                    _ => return false,
+                }
             }
+            true
         }
 
         /// A backend on loopback that gives its one connection `answer`.
         /// Returns its endpoint and a channel that yields once it has
-        /// accepted the connection and read the whole request.
+        /// accepted the connection and read the whole request, which it does
+        /// before writing any of `answer`. A request that never arrives
+        /// whole gets no answer, and the channel never yields.
         async fn backend(answer: Answer) -> (String, mpsc::Receiver<()>) {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let endpoint = format!("http://{}/v1/metrics", listener.local_addr().unwrap());
@@ -973,7 +989,9 @@ mod linux {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     return;
                 };
-                read_request(&mut stream).await;
+                if !read_request(&mut stream).await {
+                    return;
+                }
                 let _ = ready.send(()).await;
                 let hold = match answer {
                     Answer::Hold => true,
@@ -1009,20 +1027,25 @@ mod linux {
         const EXPORT_TIMEOUT: Duration = Duration::from_secs(600);
 
         /// Send an empty request to `answer`'s backend with an `interval`
-        /// deadline, after the backend has the request, within [`BOUND`].
-        async fn deliver_to(answer: Answer, interval: Duration) -> (Delivery, Option<String>) {
+        /// deadline, within [`BOUND`]. Returns how the send fared, and
+        /// whether the backend had read the whole request by the time it
+        /// ended: it reads it before writing any answer, so a send that
+        /// read an answer finds it had.
+        async fn send_to(answer: Answer, interval: Duration) -> ((Delivery, Option<String>), bool) {
             let (endpoint, mut requested) = backend(answer).await;
             let sender = sender(endpoint, EXPORT_TIMEOUT, interval);
-            let send =
-                tokio::spawn(async move { sender.deliver(&Request { resources: vec![] }).await });
-            tokio::time::timeout(BOUND, requested.recv())
+            let fared = tokio::time::timeout(BOUND, sender.deliver(&Request { resources: vec![] }))
                 .await
-                .expect("the backend did not get the request")
-                .expect("the backend stopped");
-            tokio::time::timeout(BOUND, send)
-                .await
-                .expect("the send outlived its deadline")
-                .unwrap()
+                .expect("the send outlived its deadline");
+            (fared, requested.try_recv().is_ok())
+        }
+
+        /// [`send_to`] for a test whose outcome comes from the answer's body,
+        /// so the backend must have had the request.
+        async fn deliver_to(answer: Answer, interval: Duration) -> (Delivery, Option<String>) {
+            let (fared, requested) = send_to(answer, interval).await;
+            assert!(requested, "the backend did not get the request: {fared:?}");
+            fared
         }
 
         /// A 200 answer with `body`, declaring `length` bytes of it.
@@ -1038,10 +1061,12 @@ mod linux {
         /// U3/V3 smoke test: a backend that takes the request and never
         /// answers holds the send for the sampling interval, not for the
         /// longer export timeout. Whatever stage the one-second deadline
-        /// ends it in, it fails as timed out.
+        /// ends it in, connecting, sending or awaiting the answer, it fails
+        /// as timed out, so whether the backend got the request is not
+        /// asked.
         #[tokio::test]
         async fn an_unanswered_send_ends_at_its_deadline() {
-            let (delivery, report) = deliver_to(Answer::Hold, Duration::from_secs(1)).await;
+            let ((delivery, report), _) = send_to(Answer::Hold, Duration::from_secs(1)).await;
             assert_eq!(delivery, Delivery::Failed);
             assert_eq!(report.as_deref(), Some(" failed: timed out"));
         }

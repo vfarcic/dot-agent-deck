@@ -855,16 +855,17 @@ mod tests {
         });
     }
 
+    /// Whether `result` is the permission denial a mode-restricted fixture
+    /// is meant to produce.
+    fn denied<T>(result: io::Result<T>) -> bool {
+        matches!(result, Err(e) if e.kind() == io::ErrorKind::PermissionDenied)
+    }
+
     /// V2: a root below an ancestor the user may search but not read is
     /// walked on both open paths, as a directory and as a file, as an
     /// ordinary path lookup would reach it.
     #[test]
     fn a_root_below_a_search_only_ancestor_is_walked() {
-        // SAFETY: `geteuid` has no preconditions and cannot fail.
-        if unsafe { libc::geteuid() } == 0 {
-            eprintln!("SKIP: root may read any directory");
-            return;
-        }
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let ancestor = canonical(&tmp).join("search-only");
@@ -876,11 +877,23 @@ mod tests {
         let file_bytes = usage_of(&file);
         // 0711 would leave its owner, this test, able to read it.
         fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o111)).unwrap();
+        // Whether the mode denies this process the listing is asked of the
+        // directory, not of the uid: a holder of CAP_DAC_OVERRIDE or
+        // CAP_DAC_READ_SEARCH may list it anyway, while root without both
+        // is refused like any other user.
+        if !denied(fs::read_dir(&ancestor)) {
+            fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!(
+                "SKIP: listing a directory of mode 0111 was not refused as denied \
+                 (a holder of CAP_DAC_OVERRIDE or CAP_DAC_READ_SEARCH, as root \
+                 usually is, may list it), so there is no search-only ancestor \
+                 to walk below"
+            );
+            return;
+        }
         let mut results = Vec::new();
         each_open_path(|| results.push((disk_usage(&root), disk_usage(&file))));
-        let listed = fs::read_dir(&ancestor).is_ok();
         fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(!listed, "the ancestor was readable, so this tested nothing");
         for (dir, file) in results {
             assert_eq!(dir.unwrap(), expected);
             assert_eq!(file.unwrap(), file_bytes);
@@ -892,11 +905,6 @@ mod tests {
     /// incomplete.
     #[test]
     fn denied_directories_count_against_the_inode_budget() {
-        // SAFETY: `geteuid` has no preconditions and cannot fail.
-        if unsafe { libc::geteuid() } == 0 {
-            eprintln!("SKIP: root may enter any directory");
-            return;
-        }
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let root = canonical(&tmp).join("wt");
@@ -905,6 +913,20 @@ mod tests {
         for dir in &locked {
             fs::create_dir(dir).unwrap();
             fs::set_permissions(dir, fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        // As in the test above, asked of the directories rather than of the
+        // uid.
+        if !locked.iter().all(|dir| denied(fs::read_dir(dir))) {
+            for dir in &locked {
+                fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            eprintln!(
+                "SKIP: listing a directory of mode 0000 was not refused as denied \
+                 (a holder of CAP_DAC_OVERRIDE or CAP_DAC_READ_SEARCH, as root \
+                 usually is, may list it), so there is no directory the walk may \
+                 not enter"
+            );
+            return;
         }
         let cancel = AtomicBool::new(false);
         let full = walk(&root, &limits(&DEFAULT_BUDGET, &cancel));

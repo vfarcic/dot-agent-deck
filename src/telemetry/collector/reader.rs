@@ -128,13 +128,17 @@ mod tests {
     impl KillPidfd {
         /// A pidfd for `pid`, which the caller knows names the process it
         /// means: the guard kills whatever process the pidfd names.
-        fn open(pid: libc::pid_t) -> KillPidfd {
+        fn open(pid: libc::pid_t) -> io::Result<KillPidfd> {
             // SAFETY: `pidfd_open` takes a pid and flags and returns a new
             // descriptor or -1.
             let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-            assert!(fd >= 0, "pidfd_open: {}", io::Error::last_os_error());
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
             // SAFETY: `fd` is a descriptor this test now owns.
-            KillPidfd(unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) })
+            Ok(KillPidfd(unsafe {
+                OwnedFd::from_raw_fd(fd as libc::c_int)
+            }))
         }
 
         /// Send `signal`; `false` once the process has exited.
@@ -156,6 +160,98 @@ mod tests {
     impl Drop for KillPidfd {
         fn drop(&mut self) {
             self.signal(libc::SIGKILL);
+        }
+    }
+
+    /// Whether the last failed call of this thread was interrupted by a
+    /// signal. Reads `errno` only, so a forked child may call it.
+    fn interrupted() -> bool {
+        // SAFETY: `__errno_location` returns this thread's `errno`.
+        unsafe { *libc::__errno_location() == libc::EINTR }
+    }
+
+    /// Write all of `bytes` to `fd`, retrying interrupted writes; `false`
+    /// when a write fails otherwise. It calls `write` only and allocates
+    /// nothing, so a forked child may call it.
+    fn write_all_raw(fd: libc::c_int, mut bytes: &[u8]) -> bool {
+        while !bytes.is_empty() {
+            // SAFETY: `bytes` is valid for its length.
+            let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+            if n > 0 {
+                bytes = &bytes[n as usize..];
+            } else if !(n < 0 && interrupted()) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Fill `buf` from `fd`, retrying interrupted reads; `false` at end of
+    /// file or when a read fails otherwise. It calls `read` only and
+    /// allocates nothing, so a forked child may call it.
+    fn read_exact_raw(fd: libc::c_int, mut buf: &mut [u8]) -> bool {
+        while !buf.is_empty() {
+            // SAFETY: `buf` is valid for writes of its length.
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n > 0 {
+                buf = &mut buf[n as usize..];
+            } else if !(n < 0 && interrupted()) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// What the parent tells a launcher over its handover pipe.
+    const HANDED_OVER: u8 = 1;
+    const ABANDONED: u8 = 0;
+
+    /// A launcher that still answers for the burner it forked. Dropped
+    /// before [`Launcher::hand_over`], it tells the launcher the setup was
+    /// abandoned, which makes the launcher kill and reap its burner and
+    /// exit, then reaps the launcher, killing it only if it has not exited
+    /// within the bound.
+    struct Launcher {
+        pid: libc::pid_t,
+        handover: Option<OwnedFd>,
+    }
+
+    impl Launcher {
+        /// Tell the launcher the parent holds the burner's pidfd, so from
+        /// here on the launcher only waits to be killed, and return the guard
+        /// that kills and reaps it.
+        fn hand_over(mut self) -> KillChild {
+            let handover = self.handover.as_ref().unwrap();
+            if !write_all_raw(handover.as_raw_fd(), &[HANDED_OVER]) {
+                // Dropping `self` abandons the setup instead.
+                panic!(
+                    "the launcher did not take the handover: {}",
+                    io::Error::last_os_error()
+                );
+            }
+            self.handover = None;
+            KillChild(self.pid)
+        }
+    }
+
+    impl Drop for Launcher {
+        fn drop(&mut self) {
+            let Some(handover) = self.handover.take() else {
+                return;
+            };
+            // Closing the pipe tells it too, should this write fail.
+            write_all_raw(handover.as_raw_fd(), &[ABANDONED]);
+            drop(handover);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while Instant::now() < deadline {
+                // SAFETY: a non-blocking wait on a child that has not been
+                // reaped.
+                if unsafe { libc::waitpid(self.pid, std::ptr::null_mut(), libc::WNOHANG) } != 0 {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            drop(KillChild(self.pid));
         }
     }
 
@@ -220,7 +316,7 @@ mod tests {
                 // 1 once it is non-dumpable, 0 when `prctl` failed.
                 let done: u8 =
                     u8::from(libc::prctl(libc::PR_SET_DUMPABLE, 0 as libc::c_ulong) == 0);
-                libc::write(ack_write, (&done as *const u8).cast(), 1);
+                write_all_raw(ack_write, &[done]);
                 loop {
                     libc::pause();
                 }
@@ -229,10 +325,9 @@ mod tests {
         let _kill = KillChild(pid);
         // SAFETY: the parent's copy of the write end, closed once.
         unsafe { libc::close(ack_write) };
-        let mut done = 0u8;
-        // SAFETY: `done` has room for one byte and `ack` is open.
-        let n = unsafe { libc::read(ack.as_raw_fd(), (&mut done as *mut u8).cast(), 1) };
-        assert_eq!((n, done), (1, 1), "the child did not become non-dumpable");
+        let mut done = [0u8];
+        let read = read_exact_raw(ack.as_raw_fd(), &mut done);
+        assert!(read && done == [1], "the child did not become non-dumpable");
         let pid = pid as u32;
         let own = own_uid();
         if own != 0 {
@@ -294,21 +389,35 @@ mod tests {
         );
         let path = CString::new(path).unwrap();
         let envp = [label.as_ptr(), path.as_ptr(), std::ptr::null()];
-        let mut fds = [0 as libc::c_int; 2];
-        // SAFETY: `fds` has room for the two descriptors.
-        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
-        // SAFETY: each descriptor is open and owned only here.
-        let (told, tell) = unsafe { (OwnedFd::from_raw_fd(fds[0]), fds[1]) };
-        // The launcher forks the burner, tells its pid, and waits to be
-        // killed without ever reaping it, so until the launcher exits that
-        // pid names the burner and no other process.
-        // SAFETY: the forked children make syscalls only and never return
-        // into Rust; the parent kills and reaps the launcher.
+        let pipe = || {
+            let mut fds = [0 as libc::c_int; 2];
+            // SAFETY: `fds` has room for the two descriptors.
+            assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+            // SAFETY: each descriptor is open and owned only here.
+            unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+        };
+        let (told, tell) = pipe();
+        let (handed, handover) = pipe();
+        let (tell_fd, handed_fd) = (tell.as_raw_fd(), handed.as_raw_fd());
+        // The launcher forks the burner and tells its pid, never reaping it,
+        // so while the launcher lives that pid names the burner and no other
+        // process. Until the parent hands over, saying it holds the burner's
+        // pidfd, the launcher answers for the burner: when the parent
+        // abandons the setup, or its end of the pipe closes, the launcher
+        // kills and reaps the burner and exits. After the handover it waits
+        // to be killed.
+        // SAFETY: the forked children make syscalls only, on descriptors
+        // and buffers made before the fork, and never return into Rust; the
+        // parent reaps the launcher.
         let launcher = unsafe { libc::fork() };
         assert!(launcher >= 0, "fork failed");
         if launcher == 0 {
             // SAFETY: the forked child, calling async-signal-safe syscalls.
             unsafe {
+                // Its copies of the parent's ends, so that the parent's end
+                // closing reads as the end of the pipe here.
+                libc::close(told.as_raw_fd());
+                libc::close(handover.as_raw_fd());
                 // An ignored SIGCHLD would reap the burner when it exits.
                 libc::signal(libc::SIGCHLD, libc::SIG_DFL);
                 let burner = libc::fork();
@@ -316,32 +425,46 @@ mod tests {
                     libc::execve(sh.as_ptr(), argv.as_ptr(), envp.as_ptr());
                     libc::_exit(127);
                 }
-                libc::write(tell, (&burner as *const libc::pid_t).cast(), 4);
+                let sent = write_all_raw(tell_fd, &burner.to_ne_bytes());
+                if burner < 0 {
+                    libc::_exit(1);
+                }
+                let mut said = [ABANDONED];
+                if !(sent && read_exact_raw(handed_fd, &mut said) && said == [HANDED_OVER]) {
+                    libc::kill(burner, libc::SIGKILL);
+                    while libc::waitpid(burner, std::ptr::null_mut(), 0) < 0 && interrupted() {}
+                    libc::_exit(1);
+                }
                 loop {
                     libc::pause();
                 }
             }
         }
-        let launcher = KillChild(launcher);
-        // SAFETY: the parent's copy of the write end, closed once.
-        unsafe { libc::close(tell) };
-        let mut pid: libc::pid_t = 0;
-        // SAFETY: `pid` has room for four bytes and `told` is open.
-        let n = unsafe { libc::read(told.as_raw_fd(), (&mut pid as *mut libc::pid_t).cast(), 4) };
-        assert!(n == 4 && pid > 0, "the launcher did not start the burner");
-        // The launcher is still running (it exits only once killed), so the
-        // burner, its unreaped child, still holds `pid`: the pidfd is the
-        // burner's.
-        let burner = KillPidfd::open(pid);
+        let launcher = Launcher {
+            pid: launcher,
+            handover: Some(handover),
+        };
+        drop((tell, handed));
+        let mut told_pid = [0u8; 4];
+        let read = read_exact_raw(told.as_raw_fd(), &mut told_pid);
+        let pid = libc::pid_t::from_ne_bytes(told_pid);
+        assert!(read && pid > 0, "the launcher did not start the burner");
+        // The launcher has not been handed over to, so it is still running
+        // unless killed, and the burner, its unreaped child, still holds
+        // `pid`. A failure here drops `launcher`, which has the launcher
+        // kill and reap the burner.
+        let burner = KillPidfd::open(pid).unwrap_or_else(|e| panic!("pidfd_open: {e}"));
         // SAFETY: a non-blocking wait on a child that has not been reaped.
-        let waited = unsafe { libc::waitpid(launcher.0, std::ptr::null_mut(), libc::WNOHANG) };
+        let waited = unsafe { libc::waitpid(launcher.pid, std::ptr::null_mut(), libc::WNOHANG) };
         if waited != 0 {
-            // Then neither the pidfd nor the launcher's pid is known to name
-            // the process meant, so neither guard may kill.
+            // Then the launcher was killed or exited (and, unless the wait
+            // failed, is reaped), so neither the pidfd nor its pid is known
+            // to name the process meant, and neither guard may kill.
             std::mem::forget(burner);
             std::mem::forget(launcher);
             panic!("the launcher exited before the pidfd was taken ({waited})");
         }
+        let launcher = launcher.hand_over();
         // The burner leaves the tree: its parent exits and is reaped.
         let launcher_pid = launcher.0 as u32;
         drop(launcher);
