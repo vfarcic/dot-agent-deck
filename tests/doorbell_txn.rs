@@ -11,11 +11,17 @@ use std::time::{Duration, Instant};
 use dot_agent_deck::doorbell_txn::{
     Action, Admission, AttemptCounter, AttemptRing, Caps, Cause, ComposerView, Event, Frame, Job,
     Latch, LatchCell, NotTyped, Outcome, Publisher, Resolution, RingToken, Seam, SeamRead, Shown,
-    TXN_MAX, Txn, admit, hook_evidence, pick_token, project, ring_entry, seam_until,
+    TOKEN_DRAWS, TXN_MAX, Txn, admit, hook_evidence, pick_token, project, ring_entry, seam_until,
 };
+use dot_agent_deck::inbox::MessageId;
 use spec::spec;
 
 const ID: &str = "m-k3xzq2ab-0f3c9a71d2e4b850";
+
+/// The message the doorbell names, as the validated id the model takes.
+fn id() -> MessageId {
+    MessageId::parse(ID).expect("a valid message id")
+}
 
 /// What the model editor does with the deck's Enter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,7 +45,10 @@ enum Write {
     FlushError,
     /// Starts and never finishes.
     Stall,
-    /// Never starts while the transaction runs.
+    /// Starts, stalls, and finishes this long after it started.
+    Late(Duration),
+    /// Stays queued: it starts only if it is not taken back, at the take-back
+    /// when the writer wins that race, else after the release.
     NeverStarts,
 }
 
@@ -80,6 +89,13 @@ struct World {
     human: Vec<String>,
     /// A started deck job still running when the writer was released.
     running: Option<String>,
+    /// A deck job queued on the writer and not started.
+    queued: Option<Job>,
+    /// The writer starts a queued job before the deck's take-back can
+    /// withdraw it.
+    takeback_loses: bool,
+    /// Jobs a take-back withdrew.
+    taken_back: Vec<Job>,
     /// Changes made just before the n-th job (0-based) is applied.
     before_job: Vec<(usize, Change)>,
     /// Changes made once the clock reaches an offset from the start.
@@ -134,6 +150,9 @@ impl World {
             pane: Vec::new(),
             human: Vec::new(),
             running: None,
+            queued: None,
+            takeback_loses: false,
+            taken_back: Vec::new(),
             before_job: Vec::new(),
             at: Vec::new(),
             after_admission: None,
@@ -204,7 +223,7 @@ impl World {
                                 .and_then(|rest| rest.get(..6))
                                 .and_then(RingToken::parse)
                         {
-                            let exact = token.line(ID) == line;
+                            let exact = token.line(&id()) == line;
                             hook_evidence(&self.cell, &self.ring, token, exact);
                             self.events.push_back(Event::Evidence { token, exact });
                         }
@@ -234,18 +253,39 @@ impl World {
         for change in changes {
             change(self);
         }
-        let bytes = match job {
-            Job::Line(text) => text.clone(),
-            Job::Cr => "\r".to_string(),
-            Job::Deletes(count) => "\u{7f}".repeat(*count),
-        };
-        let shown = match job {
-            Job::Line(text) => text.clone(),
-            Job::Cr => "<CR>".to_string(),
-            Job::Deletes(count) => format!("<DEL×{count}>"),
-        };
-        match self.writes.pop_front().unwrap_or(Write::Whole) {
-            Write::NeverStarts => {}
+        let write = self.writes.pop_front().unwrap_or(Write::Whole);
+        self.run_job(job, write);
+    }
+
+    /// The bytes a job writes, and how the pane log shows it.
+    fn bytes(job: &Job) -> (String, String) {
+        match job {
+            Job::Line(text) => (text.clone(), text.clone()),
+            Job::Cr => ("\r".to_string(), "<CR>".to_string()),
+            Job::Deletes(count) => ("\u{7f}".repeat(*count), format!("<DEL×{count}>")),
+        }
+    }
+
+    fn run_job(&mut self, job: &Job, write: Write) {
+        let (bytes, shown) = Self::bytes(job);
+        match write {
+            Write::NeverStarts => self.queued = Some(job.clone()),
+            Write::Late(after) => {
+                self.events.push_back(Event::JobStarted);
+                self.events.push_back(Event::JobStalled);
+                let at = self.now - self.start + after;
+                self.at.push((
+                    at,
+                    Box::new(move |w| {
+                        w.pane.push(shown);
+                        w.type_into_composer(&bytes);
+                        w.events.push_back(Event::JobEnded {
+                            accepted: bytes.len(),
+                            ok: true,
+                        });
+                    }),
+                ));
+            }
             Write::Stall => {
                 self.events.push_back(Event::JobStarted);
                 self.events.push_back(Event::JobStalled);
@@ -334,7 +374,7 @@ fn run(world: &mut World) -> (Result<Outcome, NotTyped>, String) {
         &ring,
         &cell,
         draws(),
-        ID,
+        &id(),
         world.caps,
         start,
     ) {
@@ -354,7 +394,22 @@ fn run(world: &mut World) -> (Result<Outcome, NotTyped>, String) {
         for action in std::mem::take(&mut actions) {
             match action {
                 Action::Enqueue(job) => world.apply(&job),
-                Action::TakeBack => {}
+                // The take-back races the writer for the queued job: it wins
+                // only while the job has not started.
+                Action::TakeBack => {
+                    let won = match world.queued.take() {
+                        Some(job) if world.takeback_loses => {
+                            world.run_job(&job, Write::Whole);
+                            false
+                        }
+                        Some(job) => {
+                            world.taken_back.push(job);
+                            true
+                        }
+                        None => false,
+                    };
+                    world.events.push_front(Event::TakenBack(won));
+                }
                 Action::WakeAt(at) => wake = Some(at),
                 Action::Reproject => {}
                 Action::Release(outcome) => {
@@ -364,6 +419,10 @@ fn run(world: &mut World) -> (Result<Outcome, NotTyped>, String) {
                     // after a started deck job still running.
                     if let Some(running) = world.running.take() {
                         world.pane.push(format!("{running} (late)"));
+                    }
+                    // A job still queued starts once the writer is free.
+                    if let Some(job) = world.queued.take() {
+                        world.pane.push(format!("{} (late)", World::bytes(&job).1));
                     }
                     let human = std::mem::take(&mut world.human);
                     world.pane.extend(human);
@@ -561,6 +620,55 @@ fn doorbell_038_option_a_writes_waiting_frames_after_an_unresolved_end() {
     assert_eq!(outcome, Ok(Outcome::Unresolved(Cause::WithdrawalStalled)));
 }
 
+/// Scenario: The deck's Enter stalls on the writer while the composer still shows the line, and finishes later. The deck sends no delete while that Enter can still land: an agent that submits it is Submitted late, one that drops it has the line withdrawn only after the Enter ended and the submit window passed, and one that takes it late inside that window is never withdrawn from.
+#[spec("inbox/doorbell/038")]
+#[test]
+fn doorbell_038_a_stalled_enter_is_never_followed_by_deletes() {
+    let mut submits = World::new();
+    submits
+        .writes
+        .extend([Write::Whole, Write::Late(Duration::from_millis(300))]);
+    let (outcome, line) = run(&mut submits);
+    assert_eq!(outcome, Ok(Outcome::Submitted));
+    assert_eq!(submits.pane, vec![line, "<CR>".to_string()]);
+    assert_eq!(
+        submits.cell_at_release,
+        Some(Latch::Resolved(1, Resolution::LateExact)),
+        "suspended for the stall, then resolved by the late Enter's evidence"
+    );
+
+    let mut drops = World::new();
+    drops.enter = Enter::Drop;
+    drops.hook = false;
+    drops
+        .writes
+        .extend([Write::Whole, Write::Late(Duration::from_millis(300))]);
+    let (outcome, line) = run(&mut drops);
+    assert_eq!(outcome, Ok(Outcome::Withdrawn));
+    let deletes = format!("<DEL×{}>", line.chars().count());
+    assert_eq!(drops.pane, vec![line, "<CR>".to_string(), deletes]);
+
+    let mut slow = World::new();
+    slow.enter = Enter::Drop;
+    slow.writes
+        .extend([Write::Whole, Write::Late(Duration::from_millis(300))]);
+    slow.before_job.push((
+        1,
+        Box::new(|w| {
+            w.at.push((
+                Duration::from_millis(900),
+                Box::new(|w| {
+                    w.enter = Enter::Submit;
+                    w.type_into_composer("\r");
+                }),
+            ));
+        }),
+    ));
+    let (outcome, line) = run(&mut slow);
+    assert_eq!(outcome, Ok(Outcome::Submitted));
+    assert_eq!(slow.pane, vec![line, "<CR>".to_string()]);
+}
+
 /// Scenario: The agent keeps the deck's Enter as a newline, or drops it. Only after the submit window does the deck delete its line (an agent that takes the Enter late inside the window is Submitted, never withdrawn from), newline included, in one job; it calls the attempt Withdrawn only once the placeholder is back, the human's waiting frame goes in after that, and no second Enter is ever sent. A profile with no placeholder deletes nothing and ends Unresolved, withdrawal refused.
 #[spec("inbox/doorbell/042")]
 #[test]
@@ -615,7 +723,7 @@ fn doorbell_042_an_enter_not_taken_is_withdrawn_only_on_the_placeholder() {
 #[spec("inbox/doorbell/043")]
 #[test]
 fn doorbell_043_an_earlier_line_or_a_kernel_echo_is_never_the_deck_s() {
-    let earlier = RingToken::parse("abcdfg").unwrap().line(ID);
+    let earlier = RingToken::parse("abcdfg").unwrap().line(&id());
     let mut stale = World::new();
     stale.composer = earlier.clone();
     stale.stale = Some(String::new());
@@ -646,10 +754,10 @@ fn doorbell_043_an_earlier_line_or_a_kernel_echo_is_never_the_deck_s() {
 fn doorbell_043_a_token_on_screen_or_recent_is_drawn_again() {
     let first = RingToken::from_draws(draws());
     let ring = AttemptRing::default();
-    let picked = pick_token(draws(), &format!("screen {} text", first.letters()), &ring);
+    let picked = pick_token(draws(), &format!("screen {} text", first.letters()), &ring).unwrap();
     assert_ne!(picked, first);
     ring.record(7, picked);
-    let again = pick_token(draws(), &format!("screen {} text", first.letters()), &ring);
+    let again = pick_token(draws(), &format!("screen {} text", first.letters()), &ring).unwrap();
     assert_ne!(again, picked);
     assert_ne!(again, first);
     for token in [first, picked, again] {
@@ -660,6 +768,56 @@ fn doorbell_043_a_token_on_screen_or_recent_is_drawn_again() {
                 .all(|b| dot_agent_deck::doorbell_txn::TOKEN_ALPHABET.contains(&b))
         );
     }
+}
+
+/// Scenario: A token draw that keeps giving the same letters, while those letters are on the admission screen and, separately, a recent attempt's. The pick gives up after its bounded number of draws, and admission says so with nothing allocated, recorded, opened or typed.
+#[spec("inbox/doorbell/043")]
+#[test]
+fn doorbell_043_a_draw_that_keeps_colliding_gives_up() {
+    const REPEATING: usize = TOKEN_DRAWS * 6;
+    /// Always the first letter, counting its calls; panics past the bound
+    /// rather than spinning.
+    fn stuck(calls: &std::cell::Cell<usize>) -> impl FnMut() -> u8 + '_ {
+        move || {
+            calls.set(calls.get() + 1);
+            assert!(calls.get() <= REPEATING, "drew past the bound");
+            0
+        }
+    }
+    let aaaaaa = RingToken::parse("aaaaaa").unwrap();
+    assert_eq!(RingToken::from_draws(|| 0), aaaaaa);
+    let calls = std::cell::Cell::new(0);
+    let ring = AttemptRing::default();
+    assert_eq!(pick_token(stuck(&calls), "screen aaaaaa text", &ring), None);
+    assert_eq!(calls.get(), REPEATING);
+    ring.record(5, aaaaaa);
+    let calls = std::cell::Cell::new(0);
+    assert_eq!(pick_token(stuck(&calls), "", &ring), None);
+    assert_eq!(calls.get(), REPEATING);
+
+    let world = World::new();
+    let mut admission = world.admission();
+    admission.frame.text = "aaaaaa".to_string();
+    let (counter, ring, cell) = (
+        AttemptCounter::default(),
+        AttemptRing::default(),
+        LatchCell::default(),
+    );
+    let calls = std::cell::Cell::new(0);
+    let admitted = admit(
+        &admission,
+        &counter,
+        &ring,
+        &cell,
+        stuck(&calls),
+        &id(),
+        caps(),
+        Instant::now(),
+    );
+    assert!(matches!(admitted, Err(NotTyped::NoToken)), "{admitted:?}");
+    assert_eq!(counter.allocate(), Some(1), "no attempt number was used");
+    assert_eq!(ring.lookup(aaaaaa), None, "nothing recorded");
+    assert_eq!(cell.load(), Latch::Resolved(0, Resolution::NotTyped));
 }
 
 /// Scenario: After the line is typed and echoed, the message is taken, the status moves, a receiver arms or the admission is lost, with a human frame arriving right after. With a delete key the deck withdraws its line; with none it submits it, a stale line's fetch finding nothing. Either way before the human frame goes in.
@@ -760,7 +918,7 @@ fn doorbell_047_only_a_whole_user_message_of_the_line_is_a_transcript_echo() {
     assert_ne!(
         scenario(Box::new(|w, _| w
             .user_cells
-            .push(RingToken::parse("abcdfg").unwrap().line(ID)))),
+            .push(RingToken::parse("abcdfg").unwrap().line(&id())))),
         Ok(Outcome::Submitted),
         "an older attempt's user message"
     );
@@ -828,7 +986,8 @@ fn doorbell_049_expiry_before_and_after_the_first_byte() {
     let start = queued.now;
     let (outcome, _) = run(&mut queued);
     assert_eq!(outcome, Ok(Outcome::NothingWritten(NotTyped::Deadline)));
-    assert!(queued.pane.is_empty());
+    assert!(queued.pane.is_empty(), "{:?}", queued.pane);
+    assert_eq!(queued.taken_back.len(), 1, "the queued line was taken back");
     assert!(queued.released_at.unwrap() <= start + TXN_MAX);
     assert!(matches!(
         queued.cell.load(),
@@ -845,6 +1004,165 @@ fn doorbell_049_expiry_before_and_after_the_first_byte() {
     assert_eq!(
         started.pane,
         vec![format!("{line} (late)"), "typed".to_string()]
+    );
+}
+
+/// Scenario: The line's job is still queued when the deadline comes, or when the admission is lost before the first byte, and the deck takes it back. When the take-back wins, nothing was written and nothing reaches the pane, even after the release. When the writer started the job first, the line is the deck's to account for: at the deadline the attempt is suspended before the release, and on the lost admission the deck withdraws its echoed line, or suspends the attempt when it cannot confirm a withdrawal.
+#[spec("inbox/doorbell/049")]
+#[test]
+fn doorbell_049_nothing_is_written_only_when_the_take_back_wins() {
+    let lost_admission = |w: &mut World| {
+        w.at.push((
+            Duration::from_millis(1),
+            Box::new(|w| w.events.push_back(Event::AdmissionLost)),
+        ));
+    };
+    for loses in [false, true] {
+        let mut deadline = World::new();
+        deadline.writes.push_back(Write::NeverStarts);
+        deadline.takeback_loses = loses;
+        let (outcome, line) = run(&mut deadline);
+        if loses {
+            assert_eq!(outcome, Ok(Outcome::Unresolved(Cause::Deadline)));
+            assert_eq!(
+                deadline.cell_at_release,
+                Some(Latch::Suspended(1, Cause::Deadline))
+            );
+            assert_eq!(deadline.pane, vec![line]);
+        } else {
+            assert_eq!(outcome, Ok(Outcome::NothingWritten(NotTyped::Deadline)));
+            assert_eq!(
+                deadline.cell_at_release,
+                Some(Latch::Resolved(1, Resolution::NotTyped))
+            );
+            assert!(deadline.pane.is_empty(), "{:?}", deadline.pane);
+            assert_eq!(deadline.taken_back, vec![Job::Line(line)]);
+        }
+
+        let mut lost = World::new();
+        lost.writes.push_back(Write::NeverStarts);
+        lost.takeback_loses = loses;
+        lost_admission(&mut lost);
+        let (outcome, line) = run(&mut lost);
+        if loses {
+            assert_eq!(outcome, Ok(Outcome::Withdrawn));
+            assert_eq!(
+                lost.cell_at_release,
+                Some(Latch::Resolved(1, Resolution::Withdrawn))
+            );
+            let deletes = format!("<DEL×{}>", line.chars().count());
+            assert_eq!(lost.pane, vec![line, deletes]);
+        } else {
+            assert_eq!(outcome, Ok(Outcome::NothingWritten(NotTyped::NotAdmitted)));
+            assert_eq!(
+                lost.cell_at_release,
+                Some(Latch::Resolved(1, Resolution::NotTyped))
+            );
+            assert!(lost.pane.is_empty(), "{:?}", lost.pane);
+        }
+    }
+    // A lost race on a profile that cannot confirm a withdrawal.
+    let mut unconfirmed = World::new();
+    unconfirmed.caps.placeholder = false;
+    unconfirmed.writes.push_back(Write::NeverStarts);
+    unconfirmed.takeback_loses = true;
+    lost_admission(&mut unconfirmed);
+    let (outcome, line) = run(&mut unconfirmed);
+    assert_eq!(outcome, Ok(Outcome::Unresolved(Cause::EchoMismatch)));
+    assert_eq!(
+        unconfirmed.cell_at_release,
+        Some(Latch::Suspended(1, Cause::EchoMismatch))
+    );
+    assert_eq!(unconfirmed.pane, vec![line]);
+}
+
+/// Scenario: After the first byte a later job is still queued on the writer when the transaction ends: the line's second stage or the Enter at the deadline, the deletes at the deadline or when the generation retires, and the Enter when the user submits the line and its exact evidence arrives first. The deck takes each back before the release, so it never runs after it; one the writer started first runs on and the attempt is accounted for as written.
+#[spec("inbox/doorbell/049")]
+#[test]
+fn doorbell_049_a_later_job_still_queued_is_taken_back_before_the_release() {
+    let mut stage = World::new();
+    stage.caps.staged_head = Some(9);
+    stage.writes.extend([Write::Whole, Write::NeverStarts]);
+    let (outcome, line) = run(&mut stage);
+    assert_eq!(outcome, Ok(Outcome::Unresolved(Cause::Deadline)));
+    assert_eq!(stage.pane, vec![line[..9].to_string()]);
+    assert_eq!(stage.taken_back, vec![Job::Line(line[9..].to_string())]);
+    assert_eq!(
+        stage.cell_at_release,
+        Some(Latch::Suspended(1, Cause::Deadline))
+    );
+
+    let mut enter = World::new();
+    enter.writes.extend([Write::Whole, Write::NeverStarts]);
+    let (outcome, line) = run(&mut enter);
+    assert_eq!(outcome, Ok(Outcome::Unresolved(Cause::Deadline)));
+    assert_eq!(enter.pane, vec![line]);
+    assert_eq!(enter.taken_back, vec![Job::Cr]);
+
+    // The writer starts the Enter before the take-back: it runs, and the
+    // attempt is suspended at the deadline as for any started job.
+    let mut started = World::new();
+    started.hook = false;
+    started.caps.transcript_route = false;
+    started.writes.extend([Write::Whole, Write::NeverStarts]);
+    started.takeback_loses = true;
+    let (outcome, line) = run(&mut started);
+    assert_eq!(outcome, Ok(Outcome::Unresolved(Cause::Deadline)));
+    assert_eq!(started.pane, vec![line, "<CR>".to_string()]);
+    assert_eq!(
+        started.cell_at_release,
+        Some(Latch::Suspended(1, Cause::Deadline))
+    );
+
+    let deletes_queued = || {
+        let mut world = World::new();
+        world.enter = Enter::Drop;
+        world.hook = false;
+        world
+            .writes
+            .extend([Write::Whole, Write::Whole, Write::NeverStarts]);
+        world
+    };
+    let mut expiring = deletes_queued();
+    let (outcome, line) = run(&mut expiring);
+    assert_eq!(outcome, Ok(Outcome::Unresolved(Cause::Deadline)));
+    assert_eq!(expiring.pane, vec![line.clone(), "<CR>".to_string()]);
+    assert_eq!(
+        expiring.taken_back,
+        vec![Job::Deletes(line.chars().count())]
+    );
+
+    let mut retiring = deletes_queued();
+    retiring.at.push((
+        Duration::from_millis(2000),
+        Box::new(|w| {
+            w.open = false;
+            w.events.push_back(Event::Retired);
+        }),
+    ));
+    let (outcome, line) = run(&mut retiring);
+    assert_eq!(outcome, Ok(Outcome::Retired));
+    assert_eq!(retiring.pane, vec![line.clone(), "<CR>".to_string()]);
+    assert_eq!(
+        retiring.taken_back,
+        vec![Job::Deletes(line.chars().count())]
+    );
+    assert_eq!(retiring.cell.load(), Latch::Retired);
+
+    // The user submits the line while the deck's Enter is still queued.
+    let mut evidence = World::new();
+    evidence.writes.extend([Write::Whole, Write::NeverStarts]);
+    evidence.at.push((
+        Duration::from_millis(400),
+        Box::new(|w| w.type_into_composer("\r")),
+    ));
+    let (outcome, line) = run(&mut evidence);
+    assert_eq!(outcome, Ok(Outcome::Submitted));
+    assert_eq!(evidence.pane, vec![line]);
+    assert_eq!(evidence.taken_back, vec![Job::Cr]);
+    assert_eq!(
+        evidence.cell_at_release,
+        Some(Latch::Resolved(1, Resolution::Submitted))
     );
 }
 
@@ -921,7 +1239,7 @@ fn doorbell_049_the_seam_checks_the_watermark_before_the_first_byte_and_the_job_
     );
 }
 
-/// Scenario: A resize lands while the deck waits for its echo: the frame goes dirty, then a Clean frame at the new width shows the line, and the deck presses Enter on that one. One that stays dirty to the deadline ends Unresolved for the layout, and no delete is ever sent on a frame from before the edge.
+/// Scenario: A resize lands while the deck waits for its echo: the frame goes dirty, then a Clean frame at the new width shows the line, and the deck presses Enter on that one. One that stays dirty to the deadline ends Unresolved for the layout, and no delete is ever sent on a frame from before the edge. A resize while the deck waits to withdraw lets the deletes go only on a Clean frame after it, and one while its deletes run is confirmed by the placeholder on the next Clean frame, at the new width.
 #[spec("inbox/doorbell/044")]
 #[test]
 fn doorbell_044_an_edge_during_the_transaction_waits_for_a_clean_frame() {
@@ -973,9 +1291,30 @@ fn doorbell_044_an_edge_during_the_transaction_waits_for_a_clean_frame() {
     ));
     let (outcome, _) = run(&mut withdrawing);
     assert_eq!(outcome, Ok(Outcome::Withdrawn));
+
+    let mut confirming = World::new();
+    confirming.enter = Enter::Drop;
+    confirming.hook = false;
+    confirming.before_job.push((
+        2,
+        Box::new(|w| {
+            w.clean = false;
+            w.epoch = 3;
+            let clean_at = w.now - w.start + Duration::from_millis(100);
+            w.at.push((clean_at, Box::new(|w| w.clean = true)));
+        }),
+    ));
+    let (outcome, line) = run(&mut confirming);
+    assert_eq!(outcome, Ok(Outcome::Withdrawn));
+    let deletes = format!("<DEL×{}>", line.chars().count());
+    assert_eq!(confirming.pane, vec![line, "<CR>".to_string(), deletes]);
+    assert_eq!(
+        confirming.cell_at_release,
+        Some(Latch::Resolved(1, Resolution::Withdrawn))
+    );
 }
 
-/// Scenario: Walk one generation's latch cell through every move of the transition table: an attempt opens, ends with nothing written, a later attempt suspends and is resolved late by exact evidence, another is resolved by the user, withdrawn and submitted; each move names its attempt, and a move naming another attempt, a backward move and anything after retirement are refused. Retirement between an attempt's allocation and its Open move leaves it writing nothing.
+/// Scenario: Walk one generation's latch cell through every move of the transition table: an attempt opens, ends with nothing written, a later attempt suspends and is resolved late by exact evidence, another is resolved by the user, withdrawn and submitted; each move names its attempt, and a move naming another attempt (an older one, or a later one on an open or suspended cell), a backward move and anything after retirement are refused. Retirement between an attempt's allocation and its Open move leaves it writing nothing.
 #[spec("inbox/doorbell/046")]
 #[test]
 fn doorbell_046_the_latch_cell_moves_only_forward_on_its_own_attempt() {
@@ -1016,8 +1355,36 @@ fn doorbell_046_the_latch_cell_moves_only_forward_on_its_own_attempt() {
     assert_eq!(cell.load(), Latch::Resolved(5, Resolution::Submitted));
     assert!(cell.open(4).is_err(), "an attempt never goes back");
 
-    // Retirement between allocation and Open: absorbing, by its own
-    // predicate, though Suspended(a+1) would compare above it.
+    // A later attempt's move on the current one compares above it, so only
+    // the exact-attempt guard refuses it, in either phase.
+    let fresh = LatchCell::default();
+    fresh.open(1).unwrap();
+    assert!(fresh.suspend(2, Cause::Deadline).is_err(), "suspend");
+    assert!(fresh.exact_evidence(2).is_err(), "evidence on Open");
+    assert!(
+        fresh.resolve(2, Resolution::Submitted).is_err(),
+        "a transcript echo on Open"
+    );
+    assert!(
+        fresh.resolve(2, Resolution::Withdrawn).is_err(),
+        "a withdrawal on Open"
+    );
+    assert_eq!(fresh.load(), Latch::Open(1));
+    fresh.suspend(1, Cause::Deadline).unwrap();
+    assert!(fresh.exact_evidence(2).is_err(), "evidence on Suspended");
+    assert!(
+        fresh.resolve(2, Resolution::Submitted).is_err(),
+        "a transcript echo on Suspended"
+    );
+    assert!(
+        fresh.resolve(2, Resolution::Withdrawn).is_err(),
+        "a withdrawal on Suspended"
+    );
+    assert_eq!(fresh.load(), Latch::Suspended(1, Cause::Deadline));
+
+    // Retirement between allocation and Open: absorbing. `Retired` is the
+    // all-ones word, so key comparison already refuses every move from it;
+    // its own predicate says so explicitly.
     let counter = AttemptCounter::default();
     let a = counter.allocate().unwrap();
     cell.retire();

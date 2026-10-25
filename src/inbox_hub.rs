@@ -2112,11 +2112,14 @@ impl InboxHub {
 
     /// PRD #1666 part 3, round 5-wake (plan §5): the doorbell's account of
     /// why it holds for `agent_id` in `pane_id`'s waiting messages (`hold`),
-    /// or that it says nothing now (`None`). Recorded against the oldest
-    /// message queued for it, shown in its summary, and broadcast in a wake
-    /// update that also carries the current wake stall, so both clients show
-    /// the reason. A hold with nothing queued is no hold. Cleared by the
-    /// doorbell or by the agent exiting.
+    /// or that it says nothing now (`None`). Recorded against the message
+    /// queued oldest when a reason is told, shown in its summary, and
+    /// broadcast in a wake update that also carries the current wake stall,
+    /// so both clients show the reason. The same reason told again keeps that
+    /// message, even once it is taken while another still waits: the record
+    /// names the message the hold was last told against, not necessarily the
+    /// oldest waiting now. A hold with nothing queued is no hold. Cleared by
+    /// the doorbell or by the agent exiting.
     pub fn set_wake_hold(
         &self,
         pane_id: &str,
@@ -6819,7 +6822,7 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// Scenario: The doorbell says why it holds for an agent whose wake has already stalled, changes the reason, then the message the stall was told against is taken and the agent exits. Every wake update the deck broadcasts carries both the stall and the reason as they stand, so a released client that reads only the stall keeps it while the reason changes; the summary says the same; the stall ending keeps the reason; the exit clears both in one update; and a hold asked for with nothing queued records nothing.
+    /// Scenario: The doorbell says why it holds for an agent whose wake has already stalled, changes the reason, then the message the stall was told against is taken and the agent exits. Every wake update the deck broadcasts carries both the stall and the reason as they stand, so a released client that reads only the stall keeps it while the reason changes; the summary says the same; the stall ending keeps the reason; the same reason told again after that take sends nothing, the hold still naming the taken message it was last told against while another waits; the exit clears both in one update naming that message; and a hold asked for with nothing queued records nothing.
     #[spec("inbox/status/034")]
     #[test]
     fn status_034_every_wake_update_carries_the_stall_and_the_hold() {
@@ -6870,7 +6873,10 @@ mod tests {
             rx.try_recv().is_err(),
             "an unchanged hold is not told again"
         );
-        let hook = hub.test_hook_fetch_named("p", "a", Some(oldest.as_str()), None);
+        // The oldest alone is taken; the second still waits.
+        let hook =
+            hub.test_hook_fetch_named("p", "a", Some(oldest.as_str()), Some(InboxBudget::Chars(1)));
+        assert_eq!(hook.ids(), vec![oldest.to_string()]);
         hub.test_hook_close(hook);
         let ended = std::iter::from_fn(|| rx.try_recv().ok())
             .filter_map(|msg| match msg {
@@ -6885,6 +6891,14 @@ mod tests {
             Some(WakeHold::AwaitingPrompt),
             "the hold stays"
         );
+        // After that partial take, the same reason told again keeps the
+        // message it was last told against.
+        hub.set_wake_hold("p", "a", Some(WakeHold::AwaitingPrompt));
+        assert!(
+            rx.try_recv().is_err(),
+            "an unchanged hold is not told again after a partial take"
+        );
+        assert_eq!(hub.summary("p", "a").queued, 1, "the second still waits");
         hub.agent_exited("p", "a");
         let exited = std::iter::from_fn(|| rx.try_recv().ok())
             .filter_map(|msg| match msg {
@@ -6894,6 +6908,11 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(exited.len(), 1, "{exited:?}");
         assert!(!exited[0].wake_stalled && exited[0].wake_hold.is_none());
+        assert_eq!(
+            exited[0].message_id,
+            oldest.to_string(),
+            "the message the hold was last told against, not the one still waiting"
+        );
         assert_eq!(hub.wake_hold("p", "a"), None);
     }
 

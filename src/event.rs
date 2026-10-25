@@ -3175,7 +3175,8 @@ pub struct InboxNotice {
     pub wake_stalled: bool,
     /// PR #1735 fifth review (B-03, B-04): this notice reports the agent's
     /// wake stall ([`Self::wake_stalled`]) and nothing else — the message it
-    /// names (the one the stall was recorded against) did not change state,
+    /// names (the one the stall, or the hold, was last recorded against) did
+    /// not change state,
     /// and `state` repeats the state it is in. Every change of the stall is
     /// sent as one of these, its end included, so a client follows the stall
     /// from them and the summary alone. Additive, as `wake_stalled` is.

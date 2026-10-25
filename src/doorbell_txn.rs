@@ -27,6 +27,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::inbox::MessageId;
+
 /// The writer is held for at most this long per ring (plan §2.3, Q3′).
 pub const TXN_MAX: Duration = Duration::from_secs(3);
 /// The echo proof's own cap, inside [`TXN_MAX`] (Q3).
@@ -90,24 +92,38 @@ impl RingToken {
     }
 
     /// The line the deck types for message `id`: `(token)` and the doorbell
-    /// line, `L_t` (plan §1.2).
-    pub fn line(self, id: &str) -> String {
-        format!("({}){}", self.letters(), crate::doorbell::doorbell_line(id))
+    /// line, `L_t` (plan §1.2). A message id is ASCII with no control
+    /// character, so the line is too.
+    pub fn line(self, id: &MessageId) -> String {
+        format!(
+            "({}){}",
+            self.letters(),
+            crate::doorbell::doorbell_line(id.as_str())
+        )
     }
 }
 
+/// How many candidates [`pick_token`] draws before it gives up. Admission
+/// runs inside the ring's one deadline, so the redraw is bounded work; a fair
+/// draw almost never collides, so only a draw that keeps repeating itself
+/// reaches the bound.
+pub const TOKEN_DRAWS: usize = 32;
+
 /// Pick the attempt's token (plan §1.2): draws from `draw` until a candidate
 /// appears neither in `screen` (the admission frame's text) nor among the
-/// ring's recent tokens. Two checked facts, not probabilities: the token was
-/// not on the pane's screen when the attempt began, and is no recent
-/// attempt's.
-pub fn pick_token(mut draw: impl FnMut() -> u8, screen: &str, ring: &AttemptRing) -> RingToken {
-    loop {
-        let candidate = RingToken::from_draws(&mut draw);
-        if !screen.contains(&candidate.letters()) && ring.lookup(candidate).is_none() {
-            return candidate;
-        }
-    }
+/// ring's recent tokens, at most [`TOKEN_DRAWS`] times. Two checked facts, not
+/// probabilities: the token was not on the pane's screen when the attempt
+/// began, and is no recent attempt's. `None` when every candidate collided.
+pub fn pick_token(
+    mut draw: impl FnMut() -> u8,
+    screen: &str,
+    ring: &AttemptRing,
+) -> Option<RingToken> {
+    (0..TOKEN_DRAWS)
+        .map(|_| RingToken::from_draws(&mut draw))
+        .find(|candidate| {
+            !screen.contains(&candidate.letters()) && ring.lookup(*candidate).is_none()
+        })
 }
 
 // ------------------------------------------------------------------------
@@ -596,6 +612,11 @@ pub enum NotTyped {
     Retired,
     /// No attempt number left (`attempt_exhausted`).
     Exhausted,
+    /// Every token drawn was on the admission screen or recent
+    /// ([`TOKEN_DRAWS`]). Not an attempt: no number was allocated, nothing
+    /// was recorded or typed and the cell did not move, so the hold carries
+    /// on as though this ring had not been tried.
+    NoToken,
     /// The deadline passed before the first byte.
     Deadline,
     /// The line's write failed before the pane took any of it.
@@ -649,7 +670,10 @@ pub enum Job {
 pub enum Action {
     /// Queue this job on the writer thread (the seam passed).
     Enqueue(Job),
-    /// Take back the queued job; only one not yet started can be.
+    /// Take back the queued job: a compare-and-swap on its queued-to-started
+    /// move, which only a job not yet started can lose. The daemon answers
+    /// with [`Event::TakenBack`] before any other event, and the transaction
+    /// releases nothing until it has.
     TakeBack,
     /// Call again at this time (a contended seam, a wait).
     WakeAt(Instant),
@@ -669,8 +693,13 @@ pub enum Event {
     /// The job ended, `accepted` bytes taken, `ok` when the write and its
     /// flush succeeded.
     JobEnded { accepted: usize, ok: bool },
-    /// The job's write did not finish within its bound.
+    /// The job's write did not finish within its bound. It is still the
+    /// transaction's until it ends.
     JobStalled,
+    /// The answer to [`Action::TakeBack`]: `true` when the queued job was
+    /// withdrawn before it started, `false` when the writer started it first
+    /// (its job events follow as any started job's do).
+    TakenBack(bool),
     /// Exact or other hook evidence forwarded by the hook arm, which has
     /// already moved the cell.
     Evidence { token: RingToken, exact: bool },
@@ -709,7 +738,43 @@ pub enum Phase {
     /// `Unresolved`, the cell suspended; late evidence or a strict
     /// withdrawal can still resolve it until the deadline.
     Pause(Cause),
+    /// The transaction is ending and its queued job is being taken back; it
+    /// ends once the take-back's answer says whether that job can still run.
+    TakingBack,
     Done(Outcome),
+}
+
+/// What a job the transaction queued does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobKind {
+    Line,
+    Cr,
+    Deletes,
+}
+
+/// The transaction's one job on the writer (plan §2.3): its own from the
+/// enqueue until the job ends or a take-back of it is confirmed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Owned {
+    Idle,
+    /// Queued and not started: a take-back can still withdraw it.
+    Queued(JobKind),
+    /// Started, or its take-back lost: its bytes may reach the pane until it
+    /// ends, stalled or not.
+    Running(JobKind),
+}
+
+/// Why the transaction is ending, held while a queued job is taken back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum End {
+    /// Nothing written, if the line's job never started.
+    NotTyped(NotTyped),
+    /// The deadline.
+    Expire,
+    /// Exact evidence resolved the attempt.
+    Submitted,
+    /// The generation retired.
+    Retired,
 }
 
 /// One doorbell transaction (plan §1.1), from admission to release.
@@ -726,8 +791,14 @@ pub struct Txn<'c> {
     epoch: u64,
     phase: Phase,
     frame: Frame,
-    /// A job is queued and has not started.
-    queued: bool,
+    /// The job the transaction owns, from its enqueue until it ends.
+    job: Owned,
+    /// How the transaction ends once a take-back is answered, and the phase
+    /// to go back to if the job turns out to have started first.
+    ending: Option<(End, Phase)>,
+    /// When the Enter's job last ended: no withdrawal starts within
+    /// [`SUBMIT_CONFIRM_WAIT`] of it, as the agent may still take it.
+    cr_ended_at: Option<Instant>,
     /// The first possible byte: a line job started (or could have).
     wrote: bool,
     /// The line's bytes the agent accepted.
@@ -745,8 +816,13 @@ pub struct Txn<'c> {
 }
 
 /// Step 1 and step 2 (plan §1.1): admit an attempt or say why not. On
-/// admission the attempt number is allocated, its ring entry written and the
-/// cell moved to `Open`, in that order, before any byte.
+/// admission the token is picked, then the attempt number allocated, its ring
+/// entry written and the cell moved to `Open`, in that order, before any byte.
+///
+/// A suspended cell does not refuse admission here: whether a suspended
+/// generation is rung at all is the doorbell's decision, which reads the cell
+/// before it admits (plan §3.4′, "Suspension"), and activation (commit 6)
+/// must pin that its driver never admits while the cell is suspended.
 #[allow(clippy::too_many_arguments)]
 pub fn admit<'c>(
     admission: &Admission,
@@ -754,7 +830,7 @@ pub fn admit<'c>(
     ring: &AttemptRing,
     cell: &'c LatchCell,
     draw: impl FnMut() -> u8,
-    id: &str,
+    id: &MessageId,
     caps: Caps,
     now: Instant,
 ) -> Result<Txn<'c>, NotTyped> {
@@ -784,8 +860,8 @@ pub fn admit<'c>(
     if cell.load() == Latch::Retired {
         return Err(NotTyped::Retired);
     }
+    let token = pick_token(draw, &admission.frame.text, ring).ok_or(NotTyped::NoToken)?;
     let attempt = counter.allocate().ok_or(NotTyped::Exhausted)?;
-    let token = pick_token(draw, &admission.frame.text, ring);
     ring.record(attempt, token);
     cell.open(attempt).map_err(|_| NotTyped::Retired)?;
     Ok(Txn {
@@ -800,7 +876,9 @@ pub fn admit<'c>(
         epoch: admission.frame.epoch,
         phase: Phase::Typing(0),
         frame: admission.frame.clone(),
-        queued: false,
+        job: Owned::Idle,
+        ending: None,
+        cr_ended_at: None,
         wrote: false,
         accepted: 0,
         line_done_at: None,
@@ -867,7 +945,8 @@ impl<'c> Txn<'c> {
     }
 
     /// Feed one event; returns what the daemon must do. After `Release` the
-    /// transaction takes nothing more.
+    /// transaction takes nothing more. After `TakeBack` it takes nothing but
+    /// the job's own reports until [`Event::TakenBack`] answers it.
     pub fn on(&mut self, event: Event, seam: &mut dyn Seam, now: Instant) -> Vec<Action> {
         if let Phase::Done(_) = self.phase {
             return Vec::new();
@@ -875,27 +954,24 @@ impl<'c> Txn<'c> {
         if let Event::Frame(frame) = &event {
             self.frame = frame.clone();
         }
+        self.track_job(&event, now);
         match event {
-            Event::Retired => return self.retired(),
+            Event::Retired => return self.retired(now),
+            Event::TakenBack(won) => return self.taken_back(won, now),
+            _ if self.phase == Phase::TakingBack => return Vec::new(),
             Event::Evidence { token, exact } => {
                 if let Some(actions) = self.evidence(token, exact, now) {
                     return actions;
                 }
             }
-            Event::JobStarted => {
-                self.queued = false;
-                if matches!(self.phase, Phase::LineJob(_)) {
-                    self.wrote = true;
-                }
-            }
             Event::AdmissionLost if !self.wrote => {
-                return self.nothing_written(NotTyped::NotAdmitted);
+                return self.nothing_written(NotTyped::NotAdmitted, now);
             }
             Event::AdmissionLost => self.admission_lost = true,
             _ => {}
         }
         if now >= self.deadline {
-            return self.expire(now);
+            return self.end(End::Expire, now);
         }
         match (self.phase, event) {
             (Phase::Typing(stage), _) => self.try_line(stage, seam, now),
@@ -955,28 +1031,109 @@ impl<'c> Txn<'c> {
         vec![Action::Reproject, Action::Release(outcome)]
     }
 
-    fn nothing_written(&mut self, why: NotTyped) -> Vec<Action> {
-        let _ = self.cell.not_typed(self.attempt);
-        let mut actions = Vec::new();
-        if self.queued {
-            actions.push(Action::TakeBack);
+    /// Keep the owned job in step with the writer's reports.
+    fn track_job(&mut self, event: &Event, now: Instant) {
+        match (event, self.job) {
+            (Event::JobStarted, Owned::Queued(kind)) => self.started(kind),
+            (Event::JobEnded { .. }, Owned::Queued(kind) | Owned::Running(kind)) => {
+                self.job = Owned::Idle;
+                if kind == JobKind::Cr {
+                    self.cr_ended_at = Some(now);
+                }
+            }
+            _ => {}
         }
-        actions.extend(self.release(Outcome::NothingWritten(why)));
-        actions
     }
 
-    fn retired(&mut self) -> Vec<Action> {
-        self.cell.retire();
-        if self.wrote {
-            self.release(Outcome::Retired)
-        } else {
-            self.nothing_written(NotTyped::Retired)
+    /// The owned job started: a line's first byte may be in the pane.
+    fn started(&mut self, kind: JobKind) {
+        self.job = Owned::Running(kind);
+        if kind == JobKind::Line {
+            self.wrote = true;
         }
+    }
+
+    /// Queue `job` on the writer (plan §2.3: one deck job in flight); the
+    /// transaction owns it until it ends or a take-back of it is confirmed.
+    fn enqueue(&mut self, kind: JobKind, job: Job, phase: Phase, now: Instant) -> Vec<Action> {
+        debug_assert_eq!(self.job, Owned::Idle, "one deck job in flight");
+        self.job = Owned::Queued(kind);
+        self.enter(phase, now);
+        vec![Action::Enqueue(job)]
+    }
+
+    /// End the transaction (plan §2.3). A queued job is taken back first, and
+    /// the ending waits for the answer: only a job withdrawn before it
+    /// started is one that cannot run after the release. A job already
+    /// started runs on after it, the release's one residual.
+    fn end(&mut self, end: End, now: Instant) -> Vec<Action> {
+        if let Some((ending, _)) = self.ending.as_mut() {
+            // Already taking back; retirement still ends it as retired.
+            if end == End::Retired {
+                *ending = End::Retired;
+            }
+            return Vec::new();
+        }
+        if let Owned::Queued(_) = self.job {
+            self.ending = Some((end, self.phase));
+            self.phase = Phase::TakingBack;
+            return vec![Action::TakeBack];
+        }
+        self.finish(end, now)
+    }
+
+    /// The take-back's answer. A job withdrawn in time leaves the ending as
+    /// it was; one the writer started first is a started job, so a line's
+    /// first byte may be in, and the ending is decided on that.
+    fn taken_back(&mut self, won: bool, now: Instant) -> Vec<Action> {
+        let Some((end, resume)) = self.ending.take() else {
+            return Vec::new();
+        };
+        match self.job {
+            Owned::Queued(_) if won => self.job = Owned::Idle,
+            Owned::Queued(kind) => self.started(kind),
+            Owned::Idle | Owned::Running(_) => {}
+        }
+        self.phase = resume;
+        self.finish(end, now)
+    }
+
+    fn finish(&mut self, end: End, now: Instant) -> Vec<Action> {
+        match end {
+            // The line's job started before its take-back: this is a
+            // cancellation after the first byte (plan §3.2), acted on once
+            // the echo can say whether the line is the deck's alone.
+            End::NotTyped(_) if self.wrote => {
+                self.admission_lost = true;
+                vec![Action::WakeAt(self.next_wake(now))]
+            }
+            End::NotTyped(why) => self.not_typed(why),
+            End::Expire => self.expire(now),
+            End::Submitted => self.release(Outcome::Submitted),
+            End::Retired if self.wrote => self.release(Outcome::Retired),
+            End::Retired => self.not_typed(NotTyped::Retired),
+        }
+    }
+
+    /// The attempt ends with nothing written, a queued line taken back first.
+    fn nothing_written(&mut self, why: NotTyped, now: Instant) -> Vec<Action> {
+        self.end(End::NotTyped(why), now)
+    }
+
+    /// Nothing was written and nothing can be: resolve and release.
+    fn not_typed(&mut self, why: NotTyped) -> Vec<Action> {
+        let _ = self.cell.not_typed(self.attempt);
+        self.release(Outcome::NothingWritten(why))
+    }
+
+    fn retired(&mut self, now: Instant) -> Vec<Action> {
+        self.cell.retire();
+        self.end(End::Retired, now)
     }
 
     /// Evidence forwarded by the hook arm. The arm moved the cell on receipt,
     /// so the cell decides: an attempt it resolved as submitted is over.
-    fn evidence(&mut self, token: RingToken, exact: bool, _now: Instant) -> Option<Vec<Action>> {
+    fn evidence(&mut self, token: RingToken, exact: bool, now: Instant) -> Option<Vec<Action>> {
         if token != self.token || !exact || !self.wrote {
             return None;
         }
@@ -984,19 +1141,19 @@ impl<'c> Txn<'c> {
             Latch::Resolved(a, Resolution::Submitted | Resolution::LateExact)
                 if a == self.attempt =>
             {
-                Some(self.release(Outcome::Submitted))
+                Some(self.end(End::Submitted, now))
             }
             _ => None,
         }
     }
 
-    /// The deadline (plan §2.3): before the first possible byte the attempt
-    /// ends with nothing written, taking back a queued job; after it, the cell
-    /// is suspended (unless evidence resolved it first) and the writer is
-    /// released, a started job running on.
+    /// The deadline (plan §2.3), once no queued job is left: before the first
+    /// possible byte the attempt ends with nothing written; after it, the
+    /// cell is suspended (unless evidence resolved it first) and the writer
+    /// is released, a started job running on.
     fn expire(&mut self, now: Instant) -> Vec<Action> {
         if !self.wrote {
-            return self.nothing_written(NotTyped::Deadline);
+            return self.not_typed(NotTyped::Deadline);
         }
         let _ = now;
         match self.cell.load() {
@@ -1071,28 +1228,26 @@ impl<'c> Txn<'c> {
                 if !ready {
                     return if first {
                         match frame.dialog {
-                            Some(dialog) => self.nothing_written(NotTyped::Dialog(dialog)),
-                            None => self.nothing_written(NotTyped::AwaitingPrompt),
+                            Some(dialog) => self.nothing_written(NotTyped::Dialog(dialog), now),
+                            None => self.nothing_written(NotTyped::AwaitingPrompt, now),
                         }
                     } else {
                         self.unresolve(Cause::DialogAfterTyping, seam, now)
                     };
                 }
                 let text = self.stages()[stage].clone();
-                self.queued = true;
-                self.enter(Phase::LineJob(stage), now);
-                vec![Action::Enqueue(Job::Line(text))]
+                self.enqueue(JobKind::Line, Job::Line(text), Phase::LineJob(stage), now)
             }
-            SeamVerdict::Human if first => self.nothing_written(NotTyped::HumanInput),
-            SeamVerdict::Layout if first => self.nothing_written(NotTyped::Layout),
+            SeamVerdict::Human if first => self.nothing_written(NotTyped::HumanInput, now),
+            SeamVerdict::Layout if first => self.nothing_written(NotTyped::Layout, now),
             SeamVerdict::Mode(clause) if first => {
-                self.nothing_written(NotTyped::CannotType(clause))
+                self.nothing_written(NotTyped::CannotType(clause), now)
             }
-            SeamVerdict::Closed if first => self.nothing_written(NotTyped::Retired),
-            SeamVerdict::Expired if first => self.nothing_written(NotTyped::Deadline),
+            SeamVerdict::Closed if first => self.nothing_written(NotTyped::Retired, now),
+            SeamVerdict::Expired if first => self.nothing_written(NotTyped::Deadline, now),
             SeamVerdict::Layout => vec![Action::WakeAt(self.next_wake(now))],
             SeamVerdict::Mode(_) => self.unresolve(Cause::ModeChanged, seam, now),
-            SeamVerdict::Closed => self.retired(),
+            SeamVerdict::Closed => self.retired(now),
             _ => self.unresolve(Cause::EchoMismatch, seam, now),
         }
     }
@@ -1113,7 +1268,7 @@ impl<'c> Txn<'c> {
         if accepted == 0 && stage == 0 {
             // Nothing reached the pane.
             self.wrote = false;
-            return self.nothing_written(NotTyped::WriteFailed);
+            return self.nothing_written(NotTyped::WriteFailed, now);
         }
         self.wrote = true;
         if !ok || accepted < wanted {
@@ -1193,14 +1348,12 @@ impl<'c> Txn<'c> {
                 if !frame.holds_exactly(&self.line) {
                     return self.unresolve(Cause::EchoMismatch, seam, now);
                 }
-                self.queued = true;
-                self.enter(Phase::CrJob, now);
-                vec![Action::Enqueue(Job::Cr)]
+                self.enqueue(JobKind::Cr, Job::Cr, Phase::CrJob, now)
             }
             SeamVerdict::Layout => self.edge(now),
             SeamVerdict::Mode(_) => self.unresolve(Cause::ModeChanged, seam, now),
-            SeamVerdict::Closed => self.retired(),
-            SeamVerdict::Expired => self.expire(now),
+            SeamVerdict::Closed => self.retired(now),
+            SeamVerdict::Expired => self.end(End::Expire, now),
             SeamVerdict::Human | SeamVerdict::JobMark => {
                 self.unresolve(Cause::EchoMismatch, seam, now)
             }
@@ -1311,12 +1464,24 @@ impl<'c> Txn<'c> {
         Some(owned.chars().count() + usize::from(newline))
     }
 
-    /// A failure after the first byte: withdraw strictly when it applies,
-    /// else `Unresolved(cause)` (plan §1.1, step 4 and 5's failures).
-    fn unresolve(&mut self, cause: Cause, seam: &mut dyn Seam, now: Instant) -> Vec<Action> {
-        if self.caps.delete_key
+    /// A withdrawal may start now: the profile can delete and confirm, the
+    /// transaction owns no job on the writer, stalled or queued (plan §3.3:
+    /// no deck job in flight), and any Enter ended at least
+    /// [`SUBMIT_CONFIRM_WAIT`] ago, as the agent may still take it.
+    fn may_withdraw(&self, now: Instant) -> bool {
+        self.caps.delete_key
             && self.caps.placeholder
-            && !self.queued
+            && self.job == Owned::Idle
+            && self
+                .cr_ended_at
+                .is_none_or(|ended| now >= ended + SUBMIT_CONFIRM_WAIT)
+    }
+
+    /// A failure after the first byte: withdraw strictly when it applies,
+    /// else `Unresolved(cause)` (plan §1.1, step 4 and 5's failures). The
+    /// pause can still withdraw once its job has ended.
+    fn unresolve(&mut self, cause: Cause, seam: &mut dyn Seam, now: Instant) -> Vec<Action> {
+        if self.may_withdraw(now)
             && let Some(deletes) = self.strict()
         {
             self.withdrawal = Some((deletes, cause));
@@ -1364,27 +1529,31 @@ impl<'c> Txn<'c> {
                 if self.strict() != Some(deletes) {
                     return self.suspend_and_pause(cause, now);
                 }
-                self.queued = true;
-                self.enter(Phase::DeleteJob, now);
-                vec![Action::Enqueue(Job::Deletes(deletes))]
+                self.enqueue(
+                    JobKind::Deletes,
+                    Job::Deletes(deletes),
+                    Phase::DeleteJob,
+                    now,
+                )
             }
             SeamVerdict::Layout => self.edge(now),
-            SeamVerdict::Closed => self.retired(),
-            SeamVerdict::Expired => self.expire(now),
+            SeamVerdict::Closed => self.retired(now),
+            SeamVerdict::Expired => self.end(End::Expire, now),
             SeamVerdict::Mode(_) => self.suspend_and_pause(Cause::ModeChanged, now),
             SeamVerdict::Human | SeamVerdict::JobMark => self.suspend_and_pause(cause, now),
         }
     }
 
     /// `Withdrawn` needs the delete job done in full and then a Clean frame
-    /// showing the placeholder.
+    /// showing the placeholder. After a layout edge that is the next Clean
+    /// frame, at the new epoch (plan §2.2).
     fn confirm_withdrawn(&mut self, now: Instant) -> Vec<Action> {
-        if self.frame.clean && self.frame.epoch == self.epoch && self.frame.placeholder_empty() {
-            let _ = self.cell.resolve(self.attempt, Resolution::Withdrawn);
-            return self.release(Outcome::Withdrawn);
-        }
-        if !self.frame.clean {
-            let _ = self.edge(now);
+        if self.frame.clean {
+            self.epoch = self.frame.epoch;
+            if self.frame.placeholder_empty() {
+                let _ = self.cell.resolve(self.attempt, Resolution::Withdrawn);
+                return self.release(Outcome::Withdrawn);
+            }
         }
         vec![Action::WakeAt(self.next_wake(now))]
     }
@@ -1413,9 +1582,8 @@ impl<'c> Txn<'c> {
         {
             return self.release(Outcome::Submitted);
         }
-        if self.caps.delete_key
-            && self.caps.placeholder
-            && self.withdrawal.is_none()
+        if self.withdrawal.is_none()
+            && self.may_withdraw(now)
             && let Some(deletes) = self.strict()
         {
             self.withdrawal = Some((deletes, cause));
