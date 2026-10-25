@@ -440,6 +440,10 @@ struct DirPickerState {
     filter_text: String,
     filtering: bool,
     filtered_indices: Vec<usize>,
+    /// Issue #1799: the directory, filter and entries (as indices into
+    /// `filtered_indices`) the last frame put rows for, so Enter does not open
+    /// an entry a key in the same burst moved onto before it was drawn.
+    drawn_rows: Option<(PathBuf, String, std::ops::Range<usize>)>,
 }
 
 impl DirPickerState {
@@ -452,6 +456,7 @@ impl DirPickerState {
             filter_text: String::new(),
             filtering: false,
             filtered_indices: Vec::new(),
+            drawn_rows: None,
         };
         state.refresh();
         state
@@ -18431,7 +18436,7 @@ impl ConfirmChoices {
     /// cut short — at any size, for a long path or name — written from column
     /// `x` of `row`: as much of `text` as the popup shows, up to its first
     /// character that is not printable ASCII (one [`Self::intact`] cannot read
-    /// back cell by cell). It counts as shown only when that part holds at
+    /// back cell by cell), less the one before it. It counts as shown only when that part holds at
     /// least `text`'s first `keep` characters.
     fn clipped(
         &self,
@@ -18441,11 +18446,18 @@ impl ConfirmChoices {
         keep: usize,
     ) -> (u16, Option<u16>, String) {
         let room = usize::from(self.inner.right().saturating_sub(x));
-        let part: String = text
+        let ascii = text
             .chars()
             .take_while(|ch| ch.is_ascii_graphic() || *ch == ' ')
-            .take(room)
-            .collect();
+            .count();
+        // What follows the run may share its last character's cell (a
+        // combining accent), so that character is left out too.
+        let ascii = if ascii < text.chars().count() {
+            ascii.saturating_sub(1)
+        } else {
+            ascii
+        };
+        let part: String = text.chars().take(ascii.min(room)).collect();
         let row = row.filter(|_| part.chars().count() >= keep.min(text.chars().count()));
         (x, row, part)
     }
@@ -18618,7 +18630,18 @@ fn refuse_undrawn_pick(key: &KeyEvent, ui: &UiState) -> Option<Action> {
         _ if opens && !picker.filtered_indices.is_empty() => 1,
         _ => return None,
     };
-    (!shown.contains(choice)).then_some(Action::Continue)
+    // The entry Enter opens is the one selected now: it must be one the last
+    // frame had a row for, in the directory and filter that frame showed.
+    let drawn = choice != 1
+        || picker
+            .drawn_rows
+            .as_ref()
+            .is_some_and(|(dir, filter, rows)| {
+                *dir == picker.current_dir
+                    && *filter == picker.filter_text
+                    && rows.contains(&picker.selected)
+            });
+    (!drawn || !shown.contains(choice)).then_some(Action::Continue)
 }
 
 fn render_quit_confirm(frame: &mut Frame, area: Rect, selected: usize) -> ConfirmDrawing {
@@ -20517,7 +20540,7 @@ fn render_dir_picker(
             if i == picker.selected {
                 // Its marker, at least, must be on screen.
                 selected_cell =
-                    choices.clipped(row_x, inside(line_idx).then(|| line_y(line_idx)), &text, 2);
+                    choices.clipped(row_x, inside(line_idx).then(|| line_y(line_idx)), &text, 1);
             }
             lines.push(Line::styled(text, style));
             if !inside(line_idx) {
@@ -20571,6 +20594,12 @@ fn render_dir_picker(
         Button::new("Filter", "", Action::PickerFilter, true),
     ];
     choices.cells.push(selected_cell);
+    let drawn = row_rects.first().zip(row_rects.last());
+    picker.drawn_rows = Some((
+        picker.current_dir.clone(),
+        picker.filter_text.clone(),
+        drawn.map_or(0..0, |((first, _), (last, _))| *first..*last + 1),
+    ));
     if !inside(button_line_idx) {
         return ((row_rects, Vec::new()), choices);
     }
@@ -20871,7 +20900,7 @@ fn render_scheduled_tasks(
             .map(|line| line.to_string().trim_start().to_string())
             .collect();
         if let [asked, answer] = texts.as_slice() {
-            let keep = "Delete schedule '".len();
+            let keep = "Delete schedule ".len();
             choices
                 .cells
                 .push(choices.clipped(x, question, asked, keep));
@@ -31738,6 +31767,7 @@ mod tests {
             filter_text: String::new(),
             filtering: false,
             filtered_indices: Vec::new(),
+            drawn_rows: None,
         };
         picker.refilter();
         picker
@@ -44148,6 +44178,22 @@ mod tests {
             );
             assert!(ui.scheduled_delete_confirm, "{height}: still asking");
 
+            // A drawn question about a name with a combining accent is answered.
+            if drawn {
+                let mut ui = default_ui();
+                ui.mode = UiMode::ScheduledTasks;
+                ui.scheduled_tasks = vec![make_scheduled_task("cafe\u{301}", true)];
+                guarded(&mut ui, KeyCode::Char('d'), handle_scheduled_tasks_key);
+                draw_sized(&mut ui, 80, height);
+                assert!(
+                    matches!(
+                        guarded(&mut ui, KeyCode::Char('y'), handle_scheduled_tasks_key),
+                        Action::ScheduleDelete(_)
+                    ),
+                    "{height}: `y` on a drawn accented name did not delete"
+                );
+            }
+
             // Cancelled and asked again with no frame between: the new question
             // waits for its own frame, whatever the last one showed.
             draw_sized(&mut ui, 80, height);
@@ -44223,7 +44269,7 @@ mod tests {
         }
     }
 
-    /// Scenario: the user opens the directory picker on a list with `alpha` selected. In a frame so short that the popup shows its current directory but no entry, Enter, `l` and Right open nothing while Space still picks the current directory it shows; in one too short to show even that, Space picks nothing either. At 80×24, where `alpha` is on screen, Enter opens it.
+    /// Scenario: the user opens the directory picker on a list with `alpha` selected. In a frame so short that the popup shows its current directory but no entry, Enter, `l` and Right open nothing while Space still picks the current directory it shows; in one too short to show even that, Space picks nothing either. At 80×24, where `alpha` is on screen, Enter opens it; with room for one entry, `j` and Enter in one burst open nothing until `beta` is drawn.
     #[spec("prompt/dir-picker/003")]
     #[test]
     fn dir_picker_003_opens_only_an_entry_it_drew() {
@@ -44267,6 +44313,50 @@ mod tests {
                 "{height}: Space picked the current directory:\n{shown}"
             );
         }
+
+        // A popup with room for one entry: `j` and Enter in one burst open
+        // nothing, since `beta` has no row yet; drawn, it opens.
+        let mut ui = default_ui();
+        ui.mode = UiMode::DirPicker;
+        let mut picker = make_dir_picker(&["..", "/tmp/alpha-1799", "/tmp/beta-1799"]);
+        picker.selected = 1;
+        ui.dir_picker = Some(picker);
+        let rows = draw_sized(&mut ui, 80, 9);
+        let shown = rows.join("\n");
+        assert!(
+            on_screen(&rows, "> alpha-1799/") && !on_screen(&rows, "beta-1799"),
+            "precondition: one entry row:\n{shown}"
+        );
+        guarded(&mut ui, KeyCode::Char('j'), handle_dir_picker_key);
+        guarded(&mut ui, KeyCode::Enter, handle_dir_picker_key);
+        let dir = |ui: &UiState| ui.dir_picker.as_ref().map(|p| p.current_dir.clone());
+        assert_eq!(
+            dir(&ui),
+            Some(PathBuf::from("/tmp")),
+            "opened an undrawn entry"
+        );
+        let rows = draw_sized(&mut ui, 80, 9);
+        assert!(on_screen(&rows, "> beta-1799/"), "{}", rows.join("\n"));
+        guarded(&mut ui, KeyCode::Enter, handle_dir_picker_key);
+        assert_eq!(
+            dir(&ui),
+            Some(PathBuf::from("/tmp/beta-1799")),
+            "drawn: opens"
+        );
+
+        // An entry whose name carries a combining accent opens when drawn.
+        let mut ui = default_ui();
+        ui.mode = UiMode::DirPicker;
+        let mut picker = make_dir_picker(&["..", "/tmp/cafe\u{301}-1799"]);
+        picker.selected = 1;
+        ui.dir_picker = Some(picker);
+        draw_sized(&mut ui, 80, 24);
+        guarded(&mut ui, KeyCode::Enter, handle_dir_picker_key);
+        assert_eq!(
+            dir(&ui),
+            Some(PathBuf::from("/tmp/cafe\u{301}-1799")),
+            "a drawn accented entry did not open"
+        );
     }
 }
 
