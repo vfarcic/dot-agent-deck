@@ -53,6 +53,9 @@ pub struct Settings {
     pub temporality: Temporality,
     /// The unrecognised temporality preference, for one warning.
     pub unknown_temporality: Option<String>,
+    /// Label each run with its user (`deck.run.uid`): set by `--all-users`,
+    /// where runs of several users are collected.
+    pub label_uids: bool,
 }
 
 impl Settings {
@@ -75,6 +78,7 @@ impl Settings {
             resource_pairs: own_resource_pairs(non_empty(env, OTEL_RESOURCE_ATTRIBUTES)),
             temporality,
             unknown_temporality,
+            label_uids: false,
         }
     }
 }
@@ -136,9 +140,12 @@ impl Export {
                 protocol.as_env_value().to_string(),
             ));
         }
+        // As `TelemetryConfig::from_env` reads the traces timeout: a value
+        // that is not a positive number of milliseconds is ignored.
         let timeout = non_empty(env, OTEL_EXPORTER_OTLP_METRICS_TIMEOUT)
             .or_else(|| non_empty(env, OTEL_EXPORTER_OTLP_TIMEOUT))
             .and_then(|v| v.parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
             .map(Duration::from_millis)
             .unwrap_or(DEFAULT_TIMEOUT);
         Ok(Some(Export {
@@ -271,6 +278,31 @@ mod tests {
             ])),
             Err(ExportError::UnsupportedProtocol("carrier-pigeon".into()))
         );
+    }
+
+    /// A zero timeout, general or metrics-specific, is ignored as the deck
+    /// ignores it, rather than giving every export an expired deadline.
+    #[test]
+    fn a_zero_timeout_is_the_default() {
+        for var in [
+            OTEL_EXPORTER_OTLP_TIMEOUT,
+            OTEL_EXPORTER_OTLP_METRICS_TIMEOUT,
+        ] {
+            let export = Export::from_env(&env(&[BASE, (var, "0")]))
+                .unwrap()
+                .unwrap();
+            assert_eq!(export.timeout, DEFAULT_TIMEOUT, "{var}");
+        }
+        // The metrics variable still takes the general one's place: a zero
+        // there does not fall back to the general value, as in the deck.
+        let export = Export::from_env(&env(&[
+            BASE,
+            (OTEL_EXPORTER_OTLP_TIMEOUT, "2500"),
+            (OTEL_EXPORTER_OTLP_METRICS_TIMEOUT, "0"),
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(export.timeout, DEFAULT_TIMEOUT);
     }
 
     #[test]

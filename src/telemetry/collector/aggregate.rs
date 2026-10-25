@@ -8,6 +8,12 @@
 //! run (it exec'd with a new one) moves it there. One with neither is
 //! unattributed, and is looked at again every sample.
 //!
+//! **Users.** A run is keyed by its id *and* the user its processes run as
+//! ([`RunKey`]): a process takes a run from its own environment under its
+//! own user, and inherits only from a parent of the same user. So a process
+//! of another user that names a run id, by accident or to pass its use off
+//! as another user's, is a separate run, however its id is written.
+//!
 //! **CPU.** Each process's `total` is `utime + stime + cutime + cstime`, so a
 //! child it reaped is in it. A process is credited its whole `total` the
 //! first time it is seen and its increase afterwards. A process that vanished
@@ -40,6 +46,8 @@ pub enum Environ {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessSample {
     pub pid: u32,
+    /// The user the process runs as (the owner of `/proc/<pid>`).
+    pub uid: u32,
     pub stat: ProcStat,
     pub environ: Environ,
     /// `None` when `smaps_rollup` could not be read.
@@ -61,10 +69,19 @@ pub struct Figures {
     pub processes: u64,
 }
 
+/// What a run is aggregated under: its id and its processes' user.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RunKey {
+    pub run_id: String,
+    pub uid: u32,
+}
+
 /// One run's figures in a sample.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunFigures {
     pub identity: RunIdentity,
+    /// The user its processes run as.
+    pub uid: u32,
     pub figures: Figures,
     /// No live process this sample: the run's last report.
     pub ended: bool,
@@ -73,18 +90,27 @@ pub struct RunFigures {
     pub members: Vec<u32>,
 }
 
+impl RunFigures {
+    pub fn key(&self) -> RunKey {
+        RunKey {
+            run_id: self.identity.run_id.clone(),
+            uid: self.uid,
+        }
+    }
+}
+
 /// The result of one sample.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Sample {
     pub time_unix_nanos: u64,
-    /// By run id.
+    /// By run id, then user.
     pub runs: Vec<RunFigures>,
     pub unattributed: Figures,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Attribution {
-    Run(String),
+    Run(RunKey),
     Unattributed,
 }
 
@@ -94,6 +120,7 @@ type Key = (u32, u64);
 #[derive(Debug, Clone)]
 struct Tracked {
     ppid: u32,
+    uid: u32,
     total: u64,
     children: u64,
     attribution: Attribution,
@@ -130,7 +157,7 @@ pub struct Aggregator {
     clk_tck: u64,
     boot_unix_secs: u64,
     tracked: HashMap<Key, Tracked>,
-    runs: BTreeMap<String, RunState>,
+    runs: BTreeMap<RunKey, RunState>,
     unattributed: Series,
 }
 
@@ -173,7 +200,7 @@ impl Aggregator {
 
         let mut current: HashMap<Key, Tracked> = HashMap::with_capacity(processes.len());
         let mut by_pid: HashMap<u32, Key> = HashMap::with_capacity(processes.len());
-        let mut new_runs: HashMap<String, u64> = HashMap::new();
+        let mut new_runs: HashMap<RunKey, u64> = HashMap::new();
         for p in &processes {
             let key = (p.pid, p.stat.starttime);
             let prev = self.tracked.get(&key);
@@ -181,20 +208,27 @@ impl Aggregator {
                 Environ::Read(Some(identity)) => Some(identity),
                 _ => None,
             };
+            // What it was attributed to stays only while it runs as the
+            // same user (a setuid exec changes that).
+            let prev = prev.filter(|t| t.uid == p.uid);
             let (attribution, own) = match (prev, own_run) {
                 (Some(t), _) if t.own => (t.attribution.clone(), true),
                 (_, Some(identity)) => {
-                    if !self.runs.contains_key(&identity.run_id) {
+                    let run = RunKey {
+                        run_id: identity.run_id.clone(),
+                        uid: p.uid,
+                    };
+                    if !self.runs.contains_key(&run) {
                         self.runs.insert(
-                            identity.run_id.clone(),
+                            run.clone(),
                             RunState {
                                 identity: identity.clone(),
                                 series: Series::new(0),
                             },
                         );
-                        new_runs.insert(identity.run_id.clone(), u64::MAX);
+                        new_runs.insert(run.clone(), u64::MAX);
                     }
-                    (Attribution::Run(identity.run_id.clone()), true)
+                    (Attribution::Run(run), true)
                 }
                 (Some(t), None) if matches!(t.attribution, Attribution::Run(_)) => {
                     (t.attribution.clone(), false)
@@ -203,15 +237,16 @@ impl Aggregator {
                     let parent = by_pid
                         .get(&p.stat.ppid)
                         .filter(|pk| pk.1 <= key.1)
-                        .and_then(|pk| current.get(pk));
+                        .and_then(|pk| current.get(pk))
+                        .filter(|parent| parent.uid == p.uid);
                     let attribution = parent
                         .map(|t| t.attribution.clone())
                         .unwrap_or(Attribution::Unattributed);
                     (attribution, false)
                 }
             };
-            if let Attribution::Run(run_id) = &attribution
-                && let Some(start) = new_runs.get_mut(run_id)
+            if let Attribution::Run(run) = &attribution
+                && let Some(start) = new_runs.get_mut(run)
             {
                 *start = (*start).min(p.stat.starttime);
             }
@@ -219,6 +254,7 @@ impl Aggregator {
                 key,
                 Tracked {
                     ppid: p.stat.ppid,
+                    uid: p.uid,
                     total: p.stat.total_ticks(),
                     children: p.stat.children_ticks(),
                     attribution,
@@ -227,9 +263,9 @@ impl Aggregator {
             );
             by_pid.insert(p.pid, key);
         }
-        for (run_id, starttime) in new_runs {
+        for (run, starttime) in new_runs {
             let start = self.start_unix_nanos(starttime);
-            if let Some(run) = self.runs.get_mut(&run_id) {
+            if let Some(run) = self.runs.get_mut(&run) {
                 run.series.start_unix_nanos = start;
             }
         }
@@ -280,23 +316,23 @@ impl Aggregator {
         }
 
         // Sum per run and for the unattributed bucket.
-        let mut run_ticks: HashMap<&str, u64> = HashMap::new();
+        let mut run_ticks: HashMap<&RunKey, u64> = HashMap::new();
         let mut unattributed_ticks = 0u64;
         for (key, c) in &credit {
             let ticks = u64::try_from((*c).max(0)).unwrap_or(u64::MAX);
             match &current[key].attribution {
-                Attribution::Run(run_id) => *run_ticks.entry(run_id.as_str()).or_default() += ticks,
+                Attribution::Run(run) => *run_ticks.entry(run).or_default() += ticks,
                 Attribution::Unattributed => unattributed_ticks += ticks,
             }
         }
-        let mut run_pss: HashMap<&str, (Pss, Vec<u32>)> = HashMap::new();
+        let mut run_pss: HashMap<&RunKey, (Pss, Vec<u32>)> = HashMap::new();
         let mut unattributed_pss = Pss::default();
         let mut unattributed_processes = 0u64;
         for p in &processes {
             let pss = p.pss.unwrap_or_default();
             match &current[&(p.pid, p.stat.starttime)].attribution {
-                Attribution::Run(run_id) => {
-                    let entry = run_pss.entry(run_id.as_str()).or_default();
+                Attribution::Run(run) => {
+                    let entry = run_pss.entry(run).or_default();
                     entry.0.add(&pss);
                     entry.1.push(p.pid);
                 }
@@ -309,17 +345,18 @@ impl Aggregator {
 
         let mut runs = Vec::with_capacity(self.runs.len());
         let mut ended = Vec::new();
-        for (run_id, run) in &mut self.runs {
-            let ticks = run_ticks.get(run_id.as_str()).copied().unwrap_or(0);
-            let (pss, members) = run_pss.remove(run_id.as_str()).unwrap_or_default();
+        for (key, run) in &mut self.runs {
+            let ticks = run_ticks.get(key).copied().unwrap_or(0);
+            let (pss, members) = run_pss.remove(key).unwrap_or_default();
             let previous = run.series.last_unix_nanos;
             run.series.ticks += ticks;
             run.series.last_unix_nanos = Some(time_unix_nanos);
             if members.is_empty() {
-                ended.push(run_id.clone());
+                ended.push(key.clone());
             }
             runs.push(RunFigures {
                 identity: run.identity.clone(),
+                uid: key.uid,
                 figures: Figures {
                     cpu_seconds: run.series.ticks as f64 / self.clk_tck as f64,
                     cpu_seconds_delta: ticks as f64 / self.clk_tck as f64,
@@ -332,8 +369,8 @@ impl Aggregator {
                 members,
             });
         }
-        for run_id in ended {
-            self.runs.remove(&run_id);
+        for key in ended {
+            self.runs.remove(&key);
         }
 
         let previous = self.unattributed.last_unix_nanos;
@@ -383,7 +420,10 @@ mod tests {
         children: u64,
         run: Option<&'static str>,
         pss: Option<Pss>,
+        uid: u32,
     }
+
+    const UID: u32 = 1000;
 
     fn p(pid: u32, ppid: u32, start: u64, run: Option<&'static str>) -> P {
         P {
@@ -394,6 +434,7 @@ mod tests {
             children: 0,
             run,
             pss: None,
+            uid: UID,
         }
     }
 
@@ -401,6 +442,10 @@ mod tests {
         fn cpu(mut self, own: u64, children: u64) -> Self {
             self.own = own;
             self.children = children;
+            self
+        }
+        fn uid(mut self, uid: u32) -> Self {
+            self.uid = uid;
             self
         }
         fn pss(mut self, anon: u64, file: u64, shmem: u64) -> Self {
@@ -415,6 +460,7 @@ mod tests {
             };
             ProcessSample {
                 pid: self.pid,
+                uid: self.uid,
                 stat: ProcStat {
                     ppid: self.ppid,
                     flags: 0,
@@ -722,6 +768,44 @@ mod tests {
             run(&second, "a").figures.start_unix_nanos,
             run(&first, "a").figures.start_unix_nanos
         );
+    }
+
+    /// Another user's process naming the same run id is a separate run, and
+    /// a child never inherits a run across users.
+    #[test]
+    fn runs_of_different_users_never_share_a_key() {
+        let mut agg = Aggregator::new(CLK, BOOT, STARTED);
+        let s = step(
+            &mut agg,
+            0,
+            &[
+                p(10, 1, 500, Some("r1")).cpu(100, 0),
+                p(11, 10, 600, None).cpu(50, 0).uid(0),
+                p(20, 1, 700, Some("r1")).cpu(300, 0).uid(2000),
+            ],
+        );
+        let mine: Vec<_> = s.runs.iter().filter(|r| r.uid == UID).collect();
+        let theirs: Vec<_> = s.runs.iter().filter(|r| r.uid == 2000).collect();
+        assert_eq!(s.runs.len(), 2, "{s:#?}");
+        assert_eq!(mine[0].members, vec![10]);
+        assert!(approx(mine[0].figures.cpu_seconds, 1.0));
+        assert_eq!(theirs[0].members, vec![20]);
+        assert!(approx(theirs[0].figures.cpu_seconds, 3.0));
+        assert_eq!(mine[0].key().run_id, theirs[0].key().run_id);
+        assert_ne!(mine[0].key(), theirs[0].key());
+        // The root-owned child of a run process inherits nothing.
+        assert_eq!(s.unattributed.processes, 1);
+        // A process that changes user loses its sticky run.
+        let s = step(
+            &mut agg,
+            15,
+            &[
+                p(10, 1, 500, None).cpu(110, 0).uid(0),
+                p(20, 1, 700, Some("r1")).cpu(300, 0).uid(2000),
+            ],
+        );
+        assert!(s.runs.iter().any(|r| r.uid == UID && r.ended));
+        assert_eq!(s.unattributed.processes, 1);
     }
 
     #[test]

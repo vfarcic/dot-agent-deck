@@ -12,9 +12,9 @@
 //!
 //! This module holds what can be tested without a live `/proc`: the parsers
 //! ([`procfs`]), the attribution and accounting state machine ([`aggregate`]),
-//! worktree identity and the disk walk ([`disk`]), the configuration
-//! ([`config`]) and the OTLP/JSON encoding ([`otlp`]). Reading `/proc`,
-//! scheduling the walks and exporting belong to the binary
+//! worktree identity and the disk walk ([`disk`]), the pool the walks run on
+//! ([`walks`]), the configuration ([`config`]) and the OTLP encodings
+//! ([`otlp`]). Reading `/proc` and exporting belong to the binary
 //! (`src/bin/dot-agent-deck-collector.rs`).
 
 pub mod aggregate;
@@ -23,6 +23,7 @@ pub mod disk;
 pub mod identity;
 pub mod otlp;
 pub mod procfs;
+pub mod walks;
 
 /// The instrumentation scope, and the default `service.name`.
 pub const SCOPE_NAME: &str = "dot-agent-deck-collector";
@@ -36,9 +37,14 @@ pub mod keys {
     pub const SCHEMA_VERSION: &str = "deck.collector.schema_version";
     pub const ATTRIBUTION: &str = "deck.attribution";
     pub const RUN_ID: &str = "deck.run.id";
+    /// The numeric user a run's processes run as; sent only with
+    /// `--all-users`, where two users' runs can share an id.
+    pub const RUN_UID: &str = "deck.run.uid";
     pub const WORKTREE_ID: &str = "deck.worktree.id";
     pub const WORKTREE_PATH: &str = "deck.worktree.path";
     pub const MEMORY_KIND: &str = "deck.memory.kind";
+    /// On a disk point whose walk stopped at a limit: `"false"`.
+    pub const DISK_COMPLETE: &str = "deck.worktree.disk.complete";
 }
 
 /// Metric names.

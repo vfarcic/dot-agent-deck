@@ -22,12 +22,13 @@ fn main() -> ExitCode {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::HashMap;
     use std::fs;
     use std::io::Write;
-    use std::path::{Path, PathBuf};
+    use std::os::unix::fs::MetadataExt;
+    use std::path::PathBuf;
     use std::process::ExitCode;
-    use std::sync::mpsc;
+    use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use clap::{Parser, Subcommand};
@@ -36,14 +37,23 @@ mod linux {
     };
     use dot_agent_deck::telemetry::collector::config::{Export, Settings};
     use dot_agent_deck::telemetry::collector::disk::{
-        canonical_toplevel, disk_usage, git_toplevel, worktree_id,
+        self, DEFAULT_BUDGET, canonical_toplevel, git_toplevel, worktree_id,
     };
     use dot_agent_deck::telemetry::collector::identity::run_identity;
     use dot_agent_deck::telemetry::collector::otlp::{
-        Request, WorktreeRef, WorktreeUsage, build_request, encode_json, encode_protobuf,
+        PendingTerminals, Request, RunWorktrees, WorktreeRef, WorktreeUsage, build_request,
+        encode_json, encode_protobuf,
     };
     use dot_agent_deck::telemetry::collector::procfs::{ProcStat, Pss, parse_boot_time};
+    use dot_agent_deck::telemetry::collector::walks::{InUse, MAX_OUTSTANDING, WORKERS, Walks};
     use dot_agent_deck::telemetry::config::{Protocol, process_env, redacted_endpoint};
+    use dot_agent_deck::telemetry::exporter::{
+        MAX_RESPONSE_BODY, RETRY_INITIAL_BACKOFF, RETRY_MAX_BACKOFF, bounded_body,
+        is_retryable_status, jittered, retry_after,
+    };
+    use dot_agent_deck::telemetry::otlp::{
+        decode_metrics_partial_success_json, decode_partial_success_protobuf,
+    };
     use dot_agent_deck::telemetry::resource::host_name;
 
     /// A failed export is logged at most this often.
@@ -69,6 +79,10 @@ mod linux {
         /// Also send each worktree's path (deck.worktree.path).
         #[arg(long)]
         send_worktree_paths: bool,
+        /// Collect every user's processes it can read, not only its own
+        /// user's, and label each run with its user (deck.run.uid).
+        #[arg(long)]
+        all_users: bool,
         #[command(subcommand)]
         command: Option<Command>,
     }
@@ -94,7 +108,8 @@ mod linux {
             };
         }
         let env = process_env();
-        let settings = Settings::from_env(&env);
+        let mut settings = Settings::from_env(&env);
+        settings.label_uids = cli.all_users;
         if let Some(value) = &settings.unknown_temporality {
             eprintln!(
                 "dot-agent-deck-collector: unknown temporality preference {value:?}; using cumulative"
@@ -116,7 +131,7 @@ mod linux {
             }
         };
         let sink = match export {
-            Some(export) => match Sender::new(export) {
+            Some(export) => match Sender::new(export, Duration::from_secs(cli.interval)) {
                 Ok(sender) => Sink::Send(sender),
                 Err(e) => {
                     eprintln!("dot-agent-deck-collector: cannot build the OTLP client: {e}");
@@ -148,7 +163,7 @@ mod linux {
     async fn run(cli: Cli, mut sampler: Sampler, mut sink: Sink) -> ExitCode {
         if cli.once {
             let request = sampler.sample_once();
-            return if sink.emit(&request, true).await {
+            return if sink.emit(&request, true).await == Delivery::Delivered {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::FAILURE
@@ -167,20 +182,21 @@ mod linux {
             cli.interval,
             sink.describe()
         );
+        let mut pending = PendingTerminals::default();
         let mut ticker = tokio::time::interval(Duration::from_secs(cli.interval));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
                     let request = sampler.sample();
-                    sink.emit(&request, false).await;
+                    sink.emit_holding(request, &mut pending).await;
                 }
                 _ = terminate.recv() => break,
                 _ = interrupt.recv() => break,
             }
         }
         let request = sampler.sample();
-        sink.emit(&request, false).await;
+        sink.emit_holding(request, &mut pending).await;
         ExitCode::SUCCESS
     }
 
@@ -197,7 +213,13 @@ mod linux {
         settings: Settings,
         host: Option<String>,
         send_paths: bool,
-        disks: Option<Disks>,
+        /// The collector's own user, the only one it collects without
+        /// `--all-users`.
+        uid: u32,
+        all_users: bool,
+        run_worktrees: RunWorktrees,
+        disks: Option<Walks>,
+        last_incomplete_log: Option<Instant>,
     }
 
     impl Sampler {
@@ -212,63 +234,115 @@ mod linux {
                 .ok()
                 .filter(|t| *t > 0)
                 .unwrap_or(100);
+            // SAFETY: `geteuid` has no preconditions and cannot fail.
+            let uid = unsafe { libc::geteuid() };
+            let disks = if cli.disk_interval == 0 {
+                None
+            } else {
+                // `--once` walks each worktree once, whatever the interval.
+                let interval = if cli.once {
+                    Duration::MAX
+                } else {
+                    Duration::from_secs(cli.disk_interval)
+                };
+                match Walks::new(
+                    interval,
+                    WORKERS,
+                    MAX_OUTSTANDING,
+                    DEFAULT_BUDGET,
+                    Arc::new(disk::walk),
+                ) {
+                    Ok(walks) => Some(walks),
+                    Err(e) => {
+                        eprintln!(
+                            "dot-agent-deck-collector: cannot start the worktree walks ({e}); disk figures are off"
+                        );
+                        None
+                    }
+                }
+            };
             Ok(Sampler {
                 aggregator: Aggregator::new(clk_tck, boot, now_unix_nanos()),
                 settings,
                 host: host_name(),
                 send_paths: cli.send_worktree_paths,
-                disks: (cli.disk_interval > 0)
-                    .then(|| Disks::new(Duration::from_secs(cli.disk_interval))),
+                uid,
+                all_users: cli.all_users,
+                run_worktrees: RunWorktrees::default(),
+                disks,
+                last_incomplete_log: None,
             })
         }
 
-        /// One sample, with the worktrees in use walked on background threads.
+        /// One sample, with the worktrees in use walked in the background.
         fn sample(&mut self) -> Request {
-            let (sample, run_worktrees, in_use) = self.read();
+            let (sample, in_use) = self.read();
             let usage = match &mut self.disks {
                 Some(disks) => disks.update(&in_use),
                 None => Vec::new(),
             };
-            self.request(&sample, &run_worktrees, &usage)
+            self.request(&sample, &usage)
         }
 
         /// One sample, with every worktree in use walked before it is sent.
         fn sample_once(&mut self) -> Request {
-            let (sample, run_worktrees, in_use) = self.read();
-            let usage = match &self.disks {
-                Some(_) => walk_all(&in_use),
+            let (sample, in_use) = self.read();
+            let usage = match &mut self.disks {
+                Some(disks) => disks.measure_all(&in_use, Instant::now() + DEFAULT_BUDGET.time),
                 None => Vec::new(),
             };
-            self.request(&sample, &run_worktrees, &usage)
+            self.request(&sample, &usage)
         }
 
-        fn read(&mut self) -> (Sample, HashMap<String, WorktreeRef>, InUse) {
-            let processes = read_processes(&self.aggregator);
+        fn read(&mut self) -> (Sample, InUse) {
+            let processes = read_processes(&self.aggregator, self.uid, self.all_users);
             let sample = self.aggregator.step(now_unix_nanos(), processes);
-            let (run_worktrees, in_use) = worktrees(&sample, self.send_paths);
-            (sample, run_worktrees, in_use)
+            let (members, in_use) = worktrees(&sample, self.send_paths);
+            self.run_worktrees
+                .update(&sample, |pid| members.get(&pid).cloned());
+            (sample, in_use)
         }
 
-        fn request(
-            &self,
-            sample: &Sample,
-            run_worktrees: &HashMap<String, WorktreeRef>,
-            usage: &[WorktreeUsage],
-        ) -> Request {
-            build_request(
+        fn request(&mut self, sample: &Sample, usage: &[WorktreeUsage]) -> Request {
+            self.log_incomplete();
+            let request = build_request(
                 sample,
-                run_worktrees,
+                self.run_worktrees.get(),
                 usage,
                 &self.settings,
                 self.host.as_deref(),
-            )
+            );
+            self.run_worktrees.forget_ended(sample);
+            request
+        }
+
+        /// Say, at most once a minute, that a walk stopped at its limits.
+        /// Never the worktree's path: only its id.
+        fn log_incomplete(&mut self) {
+            let Some(disks) = &mut self.disks else {
+                return;
+            };
+            let incomplete = disks.take_incomplete();
+            let Some(id) = incomplete.first() else {
+                return;
+            };
+            if self
+                .last_incomplete_log
+                .is_none_or(|at| at.elapsed() >= FAILURE_LOG_EVERY)
+            {
+                self.last_incomplete_log = Some(Instant::now());
+                eprintln!(
+                    "dot-agent-deck-collector: the walk of worktree {id} stopped at the collector's limits; its disk figure is a lower bound (deck.worktree.disk.complete=false)"
+                );
+            }
         }
     }
 
     /// Every visible process, read in the order that keeps a child's reaping
     /// mid-sample least likely to be counted twice: every `stat` first, then
-    /// the environments that are not settled yet, then `smaps_rollup`.
-    fn read_processes(aggregator: &Aggregator) -> Vec<ProcessSample> {
+    /// the environments that are not settled yet, then `smaps_rollup`. Only
+    /// the processes of user `uid` are read, unless `all_users`.
+    fn read_processes(aggregator: &Aggregator, uid: u32, all_users: bool) -> Vec<ProcessSample> {
         let Ok(entries) = fs::read_dir("/proc") else {
             return Vec::new();
         };
@@ -290,6 +364,13 @@ mod linux {
         }
         let mut visible = Vec::with_capacity(stats.len());
         for (pid, stat) in stats {
+            // The owner of `/proc/<pid>` is the user the process runs as.
+            let Ok(owner) = fs::metadata(format!("/proc/{pid}")).map(|m| m.uid()) else {
+                continue;
+            };
+            if !all_users && owner != uid {
+                continue;
+            }
             let environ = if aggregator.environ_settled(pid, stat.starttime) {
                 Environ::NotRead
             } else {
@@ -300,12 +381,13 @@ mod linux {
                     Err(_) => continue,
                 }
             };
-            visible.push((pid, stat, environ));
+            visible.push((pid, owner, stat, environ));
         }
         visible
             .into_iter()
-            .map(|(pid, stat, environ)| ProcessSample {
+            .map(|(pid, owner, stat, environ)| ProcessSample {
                 pid,
+                uid: owner,
                 stat,
                 environ,
                 pss: fs::read_to_string(format!("/proc/{pid}/smaps_rollup"))
@@ -315,15 +397,12 @@ mod linux {
             .collect()
     }
 
-    /// The worktrees in use, by canonical toplevel.
-    type InUse = BTreeMap<PathBuf, WorktreeRef>;
-
-    /// Each live run's worktree (that of its oldest process that has one),
-    /// and every worktree a run-attributed process is in.
-    fn worktrees(sample: &Sample, send_paths: bool) -> (HashMap<String, WorktreeRef>, InUse) {
+    /// The worktree of each run-attributed process that is in one, by pid,
+    /// and every worktree such a process is in.
+    fn worktrees(sample: &Sample, send_paths: bool) -> (HashMap<u32, WorktreeRef>, InUse) {
         let mut toplevels: HashMap<PathBuf, Option<PathBuf>> = HashMap::new();
         let mut in_use = InUse::new();
-        let mut run_worktrees = HashMap::new();
+        let mut members = HashMap::new();
         for run in &sample.runs {
             for pid in &run.members {
                 let Ok(cwd) = fs::read_link(format!("/proc/{pid}/cwd")) else {
@@ -344,110 +423,20 @@ mod linux {
                         id: worktree_id(toplevel),
                         path: send_paths.then(|| toplevel.to_string_lossy().into_owned()),
                     });
-                run_worktrees
-                    .entry(run.identity.run_id.clone())
-                    .or_insert_with(|| worktree.clone());
+                members.insert(*pid, worktree.clone());
             }
         }
-        (run_worktrees, in_use)
+        (members, in_use)
     }
 
-    fn measure(toplevel: &Path, worktree: &WorktreeRef) -> Option<WorktreeUsage> {
-        let bytes = disk_usage(toplevel).ok()?;
-        Some(WorktreeUsage {
-            worktree: worktree.clone(),
-            bytes,
-            measured_unix_nanos: now_unix_nanos(),
-        })
-    }
-
-    /// Walk every worktree in use at once, each on its own thread.
-    fn walk_all(in_use: &InUse) -> Vec<WorktreeUsage> {
-        std::thread::scope(|scope| {
-            let walks: Vec<_> = in_use
-                .iter()
-                .map(|(toplevel, worktree)| scope.spawn(move || measure(toplevel, worktree)))
-                .collect();
-            walks
-                .into_iter()
-                .filter_map(|walk| walk.join().ok().flatten())
-                .collect()
-        })
-    }
-
-    #[derive(Default)]
-    struct DiskState {
-        last: Option<WorktreeUsage>,
-        started: Option<Instant>,
-        walking: bool,
-    }
-
-    /// The background walks: each worktree in use is walked at most once per
-    /// interval, and a request carries its most recent completed walk.
-    struct Disks {
-        interval: Duration,
-        state: HashMap<PathBuf, DiskState>,
-        done_tx: mpsc::Sender<(PathBuf, Option<WorktreeUsage>)>,
-        done_rx: mpsc::Receiver<(PathBuf, Option<WorktreeUsage>)>,
-    }
-
-    impl Disks {
-        fn new(interval: Duration) -> Self {
-            let (done_tx, done_rx) = mpsc::channel();
-            Disks {
-                interval,
-                state: HashMap::new(),
-                done_tx,
-                done_rx,
-            }
-        }
-
-        fn update(&mut self, in_use: &InUse) -> Vec<WorktreeUsage> {
-            while let Ok((toplevel, usage)) = self.done_rx.try_recv() {
-                if let Some(state) = self.state.get_mut(&toplevel) {
-                    state.walking = false;
-                    if usage.is_some() {
-                        state.last = usage;
-                    }
-                }
-            }
-            // A worktree no run uses any more is forgotten; a walk still
-            // running for it finishes into nothing.
-            self.state
-                .retain(|toplevel, _| in_use.contains_key(toplevel));
-            let mut out = Vec::new();
-            for (toplevel, worktree) in in_use {
-                let state = self.state.entry(toplevel.clone()).or_default();
-                let due = state
-                    .started
-                    .is_none_or(|started| started.elapsed() >= self.interval);
-                if !state.walking && due {
-                    state.walking = true;
-                    state.started = Some(Instant::now());
-                    let done = self.done_tx.clone();
-                    let toplevel = toplevel.clone();
-                    let worktree = worktree.clone();
-                    let spawned = std::thread::Builder::new()
-                        .name("worktree-walk".into())
-                        .spawn(move || {
-                            let usage = measure(&toplevel, &worktree);
-                            let _ = done.send((toplevel, usage));
-                        });
-                    if spawned.is_err() {
-                        state.walking = false;
-                    }
-                }
-                if let Some(last) = &state.last {
-                    // The id or path may be stated differently this sample
-                    // (paths switched on): send what this sample names.
-                    out.push(WorktreeUsage {
-                        worktree: worktree.clone(),
-                        ..last.clone()
-                    });
-                }
-            }
-            out
-        }
+    /// How a request fared.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Delivery {
+        Delivered,
+        /// Accepted, but the backend reported data points it did not take
+        /// (OTLP `partial_success`). Not retried.
+        PartiallyRejected,
+        Failed,
     }
 
     enum Sink {
@@ -463,17 +452,39 @@ mod linux {
             }
         }
 
-        /// Print or send one request; `false` when it was not delivered.
+        /// Print or send one request.
         /// `always_log` reports a failure even within a minute of the last.
-        async fn emit(&mut self, request: &Request, always_log: bool) -> bool {
+        async fn emit(&mut self, request: &Request, always_log: bool) -> Delivery {
             match self {
                 Sink::Stdout => {
                     let mut line = encode_json(request);
                     line.push(b'\n');
                     let mut out = std::io::stdout().lock();
-                    out.write_all(&line).and_then(|()| out.flush()).is_ok()
+                    if out.write_all(&line).and_then(|()| out.flush()).is_ok() {
+                        Delivery::Delivered
+                    } else {
+                        Delivery::Failed
+                    }
                 }
                 Sink::Send(sender) => sender.send(request, always_log).await,
+            }
+        }
+
+        /// [`Self::emit`] in the loop: the ended runs' last reports that
+        /// earlier requests failed to deliver go along, and this request's
+        /// are held if it fails too. A partially rejected request is not
+        /// retried, so it is not held either.
+        async fn emit_holding(&mut self, mut request: Request, pending: &mut PendingTerminals) {
+            pending.attach(&mut request);
+            if self.emit(&request, false).await == Delivery::Failed {
+                let dropped = pending.failed(&request);
+                if dropped > 0 {
+                    eprintln!(
+                        "dot-agent-deck-collector: dropped the final figures of {dropped} ended runs held for a later export"
+                    );
+                }
+            } else {
+                pending.delivered();
             }
         }
     }
@@ -483,11 +494,15 @@ mod linux {
         endpoint: String,
         redacted: String,
         json: bool,
+        timeout: Duration,
+        /// Retries end within this long of the first attempt: the sampling
+        /// interval, so a struggling backend cannot pile up samples.
+        retry_window: Duration,
         last_failure_log: Option<Instant>,
     }
 
     impl Sender {
-        fn new(export: Export) -> Result<Self, reqwest::Error> {
+        fn new(export: Export, retry_window: Duration) -> Result<Self, reqwest::Error> {
             let mut headers = reqwest::header::HeaderMap::new();
             for (key, value) in &export.headers {
                 match (
@@ -515,29 +530,101 @@ mod linux {
                 redacted: redacted_endpoint(&export.endpoint),
                 endpoint: export.endpoint,
                 json: export.protocol == Protocol::HttpJson,
+                timeout: export.timeout,
+                retry_window,
                 last_failure_log: None,
             })
         }
 
-        async fn send(&mut self, request: &Request, always_log: bool) -> bool {
+        /// Send `request`, retrying a transient failure (HTTP 429, 502, 503
+        /// or 504, or the backend unreachable or slow) with jittered backoff,
+        /// honouring `Retry-After`, while within the export timeout and the
+        /// sampling interval. Any other answer is final.
+        async fn send(&mut self, request: &Request, always_log: bool) -> Delivery {
             let (body, content_type) = if self.json {
                 (encode_json(request), "application/json")
             } else {
                 (encode_protobuf(request), "application/x-protobuf")
             };
-            let failure = match self
-                .client
-                .post(&self.endpoint)
-                .header(reqwest::header::CONTENT_TYPE, content_type)
-                .body(body)
-                .send()
-                .await
-            {
-                Ok(response) if response.status().is_success() => return true,
-                Ok(response) => format!("HTTP {}", response.status().as_u16()),
-                Err(e) if e.is_timeout() => "timed out".to_string(),
-                Err(e) if e.is_connect() => "connection failed".to_string(),
-                Err(_) => "request failed".to_string(),
+            let start = Instant::now();
+            let deadline = start
+                .checked_add(self.timeout)
+                .unwrap_or_else(|| start + Duration::from_secs(86_400));
+            let window = self.timeout.min(self.retry_window);
+            let mut backoff = RETRY_INITIAL_BACKOFF;
+            let mut failure = "timed out".to_string();
+            let (delivery, report) = loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break (Delivery::Failed, format!(" failed: {failure}"));
+                }
+                let result = self
+                    .client
+                    .post(&self.endpoint)
+                    .timeout(remaining)
+                    .header(reqwest::header::CONTENT_TYPE, content_type)
+                    .body(body.clone())
+                    .send()
+                    .await;
+                let asked = match result {
+                    Ok(response) if response.status().is_success() => {
+                        let body = bounded_body(response, MAX_RESPONSE_BODY).await;
+                        let partial = if self.json {
+                            decode_metrics_partial_success_json(&body)
+                        } else {
+                            decode_partial_success_protobuf(&body)
+                        };
+                        // The backend's own message is never logged: it can
+                        // echo the configured headers' values.
+                        match partial {
+                            Some(p) if p.rejected > 0 => {
+                                break (
+                                    Delivery::PartiallyRejected,
+                                    format!(
+                                        ": the backend rejected {} of the request's {} data points",
+                                        p.rejected,
+                                        request.data_points()
+                                    ),
+                                );
+                            }
+                            Some(p) if !p.error_message.is_empty() => {
+                                break (
+                                    Delivery::Delivered,
+                                    ": the backend accepted the request with a warning".to_string(),
+                                );
+                            }
+                            _ => return Delivery::Delivered,
+                        }
+                    }
+                    Ok(response) if is_retryable_status(response.status().as_u16()) => {
+                        failure = format!("HTTP {}", response.status().as_u16());
+                        retry_after(&response)
+                    }
+                    Ok(response) => {
+                        break (
+                            Delivery::Failed,
+                            format!(" failed: HTTP {}", response.status().as_u16()),
+                        );
+                    }
+                    Err(e) if e.is_timeout() => {
+                        failure = "timed out".to_string();
+                        None
+                    }
+                    Err(e) if e.is_connect() => {
+                        failure = "connection failed".to_string();
+                        None
+                    }
+                    Err(_) => break (Delivery::Failed, " failed: request failed".to_string()),
+                };
+                // A `Retry-After` can lengthen the wait, never shorten it
+                // below the backoff.
+                let backoff_wait = jittered(backoff);
+                let wait = asked.map_or(backoff_wait, |asked| asked.max(backoff_wait));
+                if wait >= window.saturating_sub(start.elapsed()) {
+                    break (Delivery::Failed, format!(" failed: {failure}"));
+                }
+                tokio::time::sleep(wait).await;
+                backoff = (backoff * 2).min(RETRY_MAX_BACKOFF);
             };
             let due = self
                 .last_failure_log
@@ -545,11 +632,11 @@ mod linux {
             if always_log || due {
                 self.last_failure_log = Some(Instant::now());
                 eprintln!(
-                    "dot-agent-deck-collector: export to {} failed: {failure}",
+                    "dot-agent-deck-collector: export to {}{report}",
                     self.redacted
                 );
             }
-            false
+            delivery
         }
     }
 }

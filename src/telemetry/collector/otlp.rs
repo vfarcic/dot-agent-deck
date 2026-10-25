@@ -5,11 +5,11 @@
 //! resource, so `deck.run.id` sits on the resource exactly as it does in the
 //! agents' own telemetry, and a backend joins the two on it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use serde_json::{Value, json};
 
-use super::aggregate::{Figures, Sample};
+use super::aggregate::{Figures, RunKey, Sample};
 use super::config::{Settings, Temporality};
 use super::{SCHEMA_VERSION, SCOPE_NAME, keys, metrics};
 use crate::telemetry::otlp::{put_bytes, put_fixed64, put_varint_field};
@@ -29,6 +29,9 @@ pub struct WorktreeUsage {
     pub bytes: u64,
     /// When the walk completed (Unix nanoseconds).
     pub measured_unix_nanos: u64,
+    /// `false` when the walk stopped at a limit, so `bytes` is a lower
+    /// bound; sent as `deck.worktree.disk.complete` = `"false"`.
+    pub complete: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -36,10 +39,26 @@ pub struct Request {
     pub resources: Vec<ResourceMetrics>,
 }
 
+impl Request {
+    /// How many data points the request carries.
+    pub fn data_points(&self) -> usize {
+        self.resources
+            .iter()
+            .flat_map(|r| &r.metrics)
+            .map(|m| match &m.data {
+                MetricData::Sum { points, .. } | MetricData::Gauge { points } => points.len(),
+            })
+            .sum()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResourceMetrics {
     pub attributes: Vec<(String, String)>,
     pub metrics: Vec<Metric>,
+    /// The last report of a run that ended, which [`PendingTerminals`] keeps
+    /// until a request carrying it is delivered.
+    pub terminal: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -173,11 +192,11 @@ fn usage_metrics(figures: &Figures, time: u64, temporality: Temporality) -> Vec<
 }
 
 /// The request for one sample: a resource per run (with its worktree from
-/// `run_worktrees`, by run id, when it has one), the unattributed bucket,
-/// then a resource per worktree in `disks`.
+/// `run_worktrees` when it has one), the unattributed bucket, then a resource
+/// per worktree in `disks`.
 pub fn build_request(
     sample: &Sample,
-    run_worktrees: &HashMap<String, WorktreeRef>,
+    run_worktrees: &HashMap<RunKey, WorktreeRef>,
     disks: &[WorktreeUsage],
     settings: &Settings,
     host_name: Option<&str>,
@@ -189,12 +208,16 @@ pub fn build_request(
         attributes.push(kv(keys::ATTRIBUTION, "run"));
         attributes.push(kv(keys::RUN_ID, &run.identity.run_id));
         attributes.extend(run.identity.attributes.iter().cloned());
-        if let Some(worktree) = run_worktrees.get(&run.identity.run_id) {
+        if settings.label_uids {
+            attributes.push(kv(keys::RUN_UID, &run.uid.to_string()));
+        }
+        if let Some(worktree) = run_worktrees.get(&run.key()) {
             attributes.extend(worktree_attributes(worktree));
         }
         resources.push(ResourceMetrics {
             attributes,
             metrics: usage_metrics(&run.figures, sample.time_unix_nanos, settings.temporality),
+            terminal: run.ended,
         });
     }
     let mut attributes = base.clone();
@@ -206,6 +229,7 @@ pub fn build_request(
             sample.time_unix_nanos,
             settings.temporality,
         ),
+        terminal: false,
     });
     for disk in disks {
         let mut attributes = base.clone();
@@ -221,13 +245,110 @@ pub fn build_request(
                         start_unix_nanos: None,
                         time_unix_nanos: disk.measured_unix_nanos,
                         value: int(disk.bytes),
-                        attributes: Vec::new(),
+                        attributes: if disk.complete {
+                            Vec::new()
+                        } else {
+                            vec![kv(keys::DISK_COMPLETE, "false")]
+                        },
                     }],
                 },
             }],
+            terminal: false,
         });
     }
     Request { resources }
+}
+
+/// Each run's worktree, fixed the first time the run is seen with one: the
+/// worktree of its oldest live process that has one. It does not move when
+/// that process exits or another changes directory, and it is kept through
+/// the run's last report, so every point of a run, its terminal ones
+/// included, carries the same resource attributes.
+#[derive(Debug, Default)]
+pub struct RunWorktrees {
+    map: HashMap<RunKey, WorktreeRef>,
+}
+
+impl RunWorktrees {
+    /// Give each run in `sample` that has no worktree yet the first one
+    /// `worktree_of` names for its members, oldest first.
+    pub fn update(
+        &mut self,
+        sample: &Sample,
+        mut worktree_of: impl FnMut(u32) -> Option<WorktreeRef>,
+    ) {
+        for run in &sample.runs {
+            let key = run.key();
+            if self.map.contains_key(&key) {
+                continue;
+            }
+            if let Some(worktree) = run.members.iter().find_map(|pid| worktree_of(*pid)) {
+                self.map.insert(key, worktree);
+            }
+        }
+    }
+
+    pub fn get(&self) -> &HashMap<RunKey, WorktreeRef> {
+        &self.map
+    }
+
+    /// Forget the runs that ended in `sample`, once its request is built.
+    pub fn forget_ended(&mut self, sample: &Sample) {
+        for run in sample.runs.iter().filter(|r| r.ended) {
+            self.map.remove(&run.key());
+        }
+    }
+}
+
+/// Terminal resources held for a later request, at most. Past it the oldest
+/// is dropped and counted.
+pub const MAX_PENDING_TERMINALS: usize = 1024;
+
+/// The last reports of ended runs whose request was not delivered: each is
+/// added to the next request until one is, so a run's final figures reach
+/// the backend when a later send succeeds. A live run needs no such care:
+/// its next report carries its running total.
+#[derive(Debug, Default)]
+pub struct PendingTerminals {
+    held: VecDeque<ResourceMetrics>,
+    /// Terminal resources dropped because more than
+    /// [`MAX_PENDING_TERMINALS`] were held.
+    pub dropped: u64,
+}
+
+impl PendingTerminals {
+    /// Add the held terminal resources to `request`.
+    pub fn attach(&self, request: &mut Request) {
+        request.resources.extend(self.held.iter().cloned());
+    }
+
+    /// `request`, with what [`Self::attach`] added, was delivered.
+    pub fn delivered(&mut self) {
+        self.held.clear();
+    }
+
+    /// `request`, with what [`Self::attach`] added, was not delivered: hold
+    /// its terminal resources, newest kept; returns how many were dropped.
+    pub fn failed(&mut self, request: &Request) -> u64 {
+        self.held = request
+            .resources
+            .iter()
+            .filter(|r| r.terminal)
+            .cloned()
+            .collect();
+        let excess = self.held.len().saturating_sub(MAX_PENDING_TERMINALS);
+        self.held.drain(..excess);
+        self.dropped += excess as u64;
+        excess as u64
+    }
+
+    pub fn len(&self) -> usize {
+        self.held.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.held.is_empty()
+    }
 }
 
 fn json_attributes(attributes: &[(String, String)]) -> Value {
@@ -403,6 +524,7 @@ mod tests {
             resource_pairs: vec![("team".into(), "x".into())],
             temporality,
             unknown_temporality: None,
+            label_uids: false,
         }
     }
 
@@ -429,11 +551,19 @@ mod tests {
                     run_id: "run-1".into(),
                     attributes: vec![("deck.pane.id".into(), "3".into())],
                 },
+                uid: 1000,
                 figures: figures(4.02, 0.5, 6),
                 ended: false,
                 members: vec![10, 11],
             }],
             unattributed: figures(1.0, 0.25, 2),
+        }
+    }
+
+    fn run_1() -> RunKey {
+        RunKey {
+            run_id: "run-1".into(),
+            uid: 1000,
         }
     }
 
@@ -445,11 +575,12 @@ mod tests {
     }
 
     fn encoded(temporality: Temporality, path: Option<&str>) -> Value {
-        let worktrees = HashMap::from([("run-1".to_string(), worktree(path))]);
+        let worktrees = HashMap::from([(run_1(), worktree(path))]);
         let disks = [WorktreeUsage {
             worktree: worktree(path),
             bytes: 170_864_640,
             measured_unix_nanos: T - 1,
+            complete: true,
         }];
         let request = build_request(
             &sample(),
@@ -829,11 +960,12 @@ mod tests {
     #[test]
     fn protobuf_and_json_describe_the_same_request() {
         for temporality in [Temporality::Cumulative, Temporality::Delta] {
-            let worktrees = HashMap::from([("run-1".to_string(), worktree(Some("/w")))]);
+            let worktrees = HashMap::from([(run_1(), worktree(Some("/w")))]);
             let disks = [WorktreeUsage {
                 worktree: worktree(Some("/w")),
                 bytes: 170_864_640,
                 measured_unix_nanos: T - 1,
+                complete: false,
             }];
             let request = build_request(
                 &sample(),
@@ -845,5 +977,126 @@ mod tests {
             let json: Value = serde_json::from_slice(&encode_json(&request)).unwrap();
             assert_eq!(protobuf_as_json(&encode_protobuf(&request)), json);
         }
+    }
+
+    fn ended(mut sample: Sample) -> Sample {
+        sample.runs[0].ended = true;
+        sample.runs[0].members.clear();
+        sample
+    }
+
+    /// R1: a run's worktree is fixed when it is first seen, survives its
+    /// oldest process leaving or changing directory, and is still on its
+    /// terminal resource, so live and terminal points share one identity.
+    #[test]
+    fn a_runs_worktree_is_sticky_through_its_terminal_report() {
+        let mut runs = RunWorktrees::default();
+        let first = WorktreeRef {
+            id: "first".into(),
+            path: None,
+        };
+        let other = WorktreeRef {
+            id: "other".into(),
+            path: None,
+        };
+        // Only pid 11 has a worktree at first.
+        runs.update(&sample(), |pid| (pid == 11).then(|| first.clone()));
+        assert_eq!(runs.get().get(&run_1()), Some(&first));
+        // Pid 10 now has another worktree: the run keeps its own.
+        runs.update(&sample(), |_| Some(other.clone()));
+        assert_eq!(runs.get().get(&run_1()), Some(&first));
+
+        let live = build_request(
+            &sample(),
+            runs.get(),
+            &[],
+            &settings(Temporality::Cumulative),
+            None,
+        );
+        let last = ended(sample());
+        runs.update(&last, |_| None);
+        let terminal = build_request(
+            &last,
+            runs.get(),
+            &[],
+            &settings(Temporality::Cumulative),
+            None,
+        );
+        assert_eq!(
+            live.resources[0].attributes,
+            terminal.resources[0].attributes
+        );
+        assert!(terminal.resources[0].terminal);
+        assert!(!live.resources[0].terminal);
+        assert!(
+            terminal.resources[0]
+                .attributes
+                .contains(&("deck.worktree.id".into(), "first".into()))
+        );
+        runs.forget_ended(&last);
+        assert!(runs.get().is_empty());
+    }
+
+    /// R3: an ended run's last report rides along until a request carrying
+    /// it is delivered, and no more than the bound is held.
+    #[test]
+    fn a_terminal_report_is_held_until_delivered() {
+        let settings = settings(Temporality::Cumulative);
+        let mut pending = PendingTerminals::default();
+        let mut failed = build_request(&ended(sample()), &HashMap::new(), &[], &settings, None);
+        pending.attach(&mut failed);
+        assert_eq!(failed.resources.len(), 2);
+        assert_eq!(pending.failed(&failed), 0);
+        assert_eq!(pending.len(), 1);
+
+        // The next sample no longer has the run; its request carries it.
+        let mut next_sample = sample();
+        next_sample.runs.clear();
+        let mut next = build_request(&next_sample, &HashMap::new(), &[], &settings, None);
+        pending.attach(&mut next);
+        assert_eq!(next.resources.len(), 2);
+        assert_eq!(next.resources[1], failed.resources[0]);
+        // Failing again holds it once, not twice.
+        pending.failed(&next);
+        assert_eq!(pending.len(), 1);
+        pending.delivered();
+        assert!(pending.is_empty());
+
+        let mut many = build_request(&next_sample, &HashMap::new(), &[], &settings, None);
+        many.resources.extend(std::iter::repeat_n(
+            failed.resources[0].clone(),
+            MAX_PENDING_TERMINALS + 3,
+        ));
+        assert_eq!(pending.failed(&many), 3);
+        assert_eq!(pending.len(), MAX_PENDING_TERMINALS);
+        assert_eq!(pending.dropped, 3);
+    }
+
+    /// A2: a walk that stopped at a limit says so on its point; with
+    /// `--all-users`, a run names its user.
+    #[test]
+    fn incomplete_walks_and_run_users_are_labelled() {
+        let mut settings = settings(Temporality::Cumulative);
+        settings.label_uids = true;
+        let disks = [WorktreeUsage {
+            worktree: worktree(None),
+            bytes: 1,
+            measured_unix_nanos: T,
+            complete: false,
+        }];
+        let request = build_request(&sample(), &HashMap::new(), &disks, &settings, None);
+        assert!(
+            request.resources[0]
+                .attributes
+                .contains(&("deck.run.uid".into(), "1000".into()))
+        );
+        let MetricData::Gauge { points } = &request.resources[2].metrics[0].data else {
+            panic!("a gauge");
+        };
+        assert_eq!(
+            points[0].attributes,
+            vec![("deck.worktree.disk.complete".into(), "false".into())]
+        );
+        assert_eq!(request.data_points(), 5 + 5 + 1);
     }
 }
