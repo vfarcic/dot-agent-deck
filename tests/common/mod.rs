@@ -1578,7 +1578,11 @@ impl TuiDeck {
     /// ordinary frames, which it draws every event-loop pass, send only the
     /// changed cells and the cursor and do not clear the screen. This is
     /// a race amplifier, not a guarantee: the redraw can finish before the
-    /// second resize is sent. What it amplifies is the moment
+    /// second resize is sent. Nor is the clear it waits for proven to be the
+    /// first resize's: the reader puts a chunk on the grid before it appends
+    /// that chunk to the byte history, so a clear from an earlier resize that
+    /// is still between those two steps when this reads its starting offset
+    /// counts too, and the second resize then goes out early. What it amplifies is the moment
     /// `resize/sigwinch/004` needs, a key sent straight after the second
     /// resize arriving in the same readiness batch as its SIGWINCH. Decision
     /// 21: the wait is a poll on the reader's byte history, here rather than
