@@ -1,5 +1,5 @@
 //! The OTLP `ExportMetricsServiceRequest` the collector sends for one sample,
-//! and its OTLP/JSON encoding.
+//! and its OTLP/JSON and protobuf encodings.
 //!
 //! Each run, the unattributed bucket and each measured worktree is its own
 //! resource, so `deck.run.id` sits on the resource exactly as it does in the
@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 use super::aggregate::{Figures, Sample};
 use super::config::{Settings, Temporality};
 use super::{SCHEMA_VERSION, SCOPE_NAME, keys, metrics};
+use crate::telemetry::otlp::{put_bytes, put_fixed64, put_varint_field};
 
 /// A worktree as the collector names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,6 +301,93 @@ pub fn encode_json(request: &Request) -> Vec<u8> {
         .expect("a JSON value always serializes")
 }
 
+// Field numbers are those of `opentelemetry/proto/metrics/v1/metrics.proto`,
+// `common/v1/common.proto`, `resource/v1/resource.proto` and
+// `collector/metrics/v1/metrics_service.proto`.
+
+fn proto_key_value(key: &str, value: &str) -> Vec<u8> {
+    let mut any = Vec::new();
+    put_bytes(&mut any, 1, value.as_bytes());
+    let mut buf = Vec::new();
+    put_bytes(&mut buf, 1, key.as_bytes());
+    put_bytes(&mut buf, 2, &any);
+    buf
+}
+
+fn proto_point(point: &NumberPoint) -> Vec<u8> {
+    let mut buf = Vec::new();
+    if let Some(start) = point.start_unix_nanos {
+        put_fixed64(&mut buf, 2, start);
+    }
+    put_fixed64(&mut buf, 3, point.time_unix_nanos);
+    match point.value {
+        NumberValue::Double(d) => put_fixed64(&mut buf, 4, d.to_bits()),
+        // `as_int` is an `sfixed64`: the same eight little-endian bytes.
+        NumberValue::Int(i) => put_fixed64(&mut buf, 6, i as u64),
+    }
+    for (key, value) in &point.attributes {
+        put_bytes(&mut buf, 7, &proto_key_value(key, value));
+    }
+    buf
+}
+
+fn proto_metric(metric: &Metric) -> Vec<u8> {
+    let mut buf = Vec::new();
+    put_bytes(&mut buf, 1, metric.name.as_bytes());
+    put_bytes(&mut buf, 2, metric.description.as_bytes());
+    put_bytes(&mut buf, 3, metric.unit.as_bytes());
+    match &metric.data {
+        MetricData::Gauge { points } => {
+            let mut gauge = Vec::new();
+            for point in points {
+                put_bytes(&mut gauge, 1, &proto_point(point));
+            }
+            put_bytes(&mut buf, 5, &gauge);
+        }
+        MetricData::Sum {
+            temporality,
+            monotonic,
+            points,
+        } => {
+            let mut sum = Vec::new();
+            for point in points {
+                put_bytes(&mut sum, 1, &proto_point(point));
+            }
+            put_varint_field(&mut sum, 2, u64::from(temporality.otlp_value()));
+            if *monotonic {
+                put_varint_field(&mut sum, 3, 1);
+            }
+            put_bytes(&mut buf, 7, &sum);
+        }
+    }
+    buf
+}
+
+/// The protobuf body for `http/protobuf`: the same request [`encode_json`]
+/// describes.
+pub fn encode_protobuf(request: &Request) -> Vec<u8> {
+    let mut scope = Vec::new();
+    put_bytes(&mut scope, 1, SCOPE_NAME.as_bytes());
+    put_bytes(&mut scope, 2, env!("DAD_VERSION").as_bytes());
+    let mut body = Vec::new();
+    for r in &request.resources {
+        let mut resource = Vec::new();
+        for (key, value) in &r.attributes {
+            put_bytes(&mut resource, 1, &proto_key_value(key, value));
+        }
+        let mut scope_metrics = Vec::new();
+        put_bytes(&mut scope_metrics, 1, &scope);
+        for metric in &r.metrics {
+            put_bytes(&mut scope_metrics, 2, &proto_metric(metric));
+        }
+        let mut resource_metrics = Vec::new();
+        put_bytes(&mut resource_metrics, 1, &resource);
+        put_bytes(&mut resource_metrics, 2, &scope_metrics);
+        put_bytes(&mut body, 1, &resource_metrics);
+    }
+    body
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -569,5 +657,193 @@ mod tests {
         assert!(keys.contains(&"deck.attribution"));
         let body = encode_json(&request);
         assert!(!body.contains(&b'\n'), "one line per request");
+    }
+
+    /// Decode a protobuf body back into the OTLP/JSON shape, field by field,
+    /// so the two encodings can be compared whole.
+    fn protobuf_as_json(body: &[u8]) -> Value {
+        enum F<'a> {
+            Varint(u64),
+            Fixed64(u64),
+            Bytes(&'a [u8]),
+        }
+        fn varint(buf: &[u8], pos: &mut usize) -> u64 {
+            let mut value = 0u64;
+            let mut shift = 0;
+            loop {
+                let byte = buf[*pos];
+                *pos += 1;
+                value |= u64::from(byte & 0x7f) << shift;
+                if byte & 0x80 == 0 {
+                    return value;
+                }
+                shift += 7;
+            }
+        }
+        fn fields(buf: &[u8]) -> Vec<(u64, F<'_>)> {
+            let mut out = Vec::new();
+            let mut pos = 0;
+            while pos < buf.len() {
+                let tag = varint(buf, &mut pos);
+                let value = match tag & 7 {
+                    0 => F::Varint(varint(buf, &mut pos)),
+                    1 => {
+                        let v = u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap());
+                        pos += 8;
+                        F::Fixed64(v)
+                    }
+                    2 => {
+                        let len = varint(buf, &mut pos) as usize;
+                        pos += len;
+                        F::Bytes(&buf[pos - len..pos])
+                    }
+                    wire => panic!("unexpected wire type {wire}"),
+                };
+                out.push((tag >> 3, value));
+            }
+            out
+        }
+        fn text(bytes: &[u8]) -> String {
+            String::from_utf8(bytes.to_vec()).unwrap()
+        }
+        fn attribute(kv: &[u8]) -> Value {
+            let mut key = String::new();
+            let mut value = String::new();
+            for (n, f) in fields(kv) {
+                match (n, f) {
+                    (1, F::Bytes(b)) => key = text(b),
+                    (2, F::Bytes(any)) => {
+                        for (m, g) in fields(any) {
+                            if let (1, F::Bytes(b)) = (m, g) {
+                                value = text(b);
+                            }
+                        }
+                    }
+                    _ => panic!("unexpected KeyValue field {n}"),
+                }
+            }
+            json!({ "key": key, "value": { "stringValue": value } })
+        }
+        fn point(buf: &[u8]) -> Value {
+            let mut out = json!({ "attributes": [] });
+            for (n, f) in fields(buf) {
+                match (n, f) {
+                    (2, F::Fixed64(v)) => out["startTimeUnixNano"] = json!(v.to_string()),
+                    (3, F::Fixed64(v)) => out["timeUnixNano"] = json!(v.to_string()),
+                    (4, F::Fixed64(v)) => out["asDouble"] = json!(f64::from_bits(v)),
+                    (6, F::Fixed64(v)) => out["asInt"] = json!((v as i64).to_string()),
+                    (7, F::Bytes(b)) => {
+                        out["attributes"].as_array_mut().unwrap().push(attribute(b))
+                    }
+                    _ => panic!("unexpected NumberDataPoint field {n}"),
+                }
+            }
+            out
+        }
+        fn metric(buf: &[u8]) -> Value {
+            let mut out = json!({});
+            for (n, f) in fields(buf) {
+                match (n, f) {
+                    (1, F::Bytes(b)) => out["name"] = json!(text(b)),
+                    (2, F::Bytes(b)) => out["description"] = json!(text(b)),
+                    (3, F::Bytes(b)) => out["unit"] = json!(text(b)),
+                    (5, F::Bytes(b)) => {
+                        let points: Vec<Value> = fields(b)
+                            .into_iter()
+                            .map(|(_, p)| match p {
+                                F::Bytes(p) => point(p),
+                                _ => panic!("gauge point"),
+                            })
+                            .collect();
+                        out["gauge"] = json!({ "dataPoints": points });
+                    }
+                    (7, F::Bytes(b)) => {
+                        let mut sum = json!({ "dataPoints": [], "isMonotonic": false });
+                        for (m, g) in fields(b) {
+                            match (m, g) {
+                                (1, F::Bytes(p)) => {
+                                    sum["dataPoints"].as_array_mut().unwrap().push(point(p))
+                                }
+                                (2, F::Varint(v)) => sum["aggregationTemporality"] = json!(v),
+                                (3, F::Varint(v)) => sum["isMonotonic"] = json!(v == 1),
+                                _ => panic!("unexpected Sum field {m}"),
+                            }
+                        }
+                        out["sum"] = sum;
+                    }
+                    _ => panic!("unexpected Metric field {n}"),
+                }
+            }
+            out
+        }
+        let mut resources = Vec::new();
+        for (_, rm) in fields(body) {
+            let F::Bytes(rm) = rm else {
+                panic!("ResourceMetrics")
+            };
+            let mut out = json!({});
+            for (n, f) in fields(rm) {
+                let F::Bytes(b) = f else {
+                    panic!("ResourceMetrics field")
+                };
+                match n {
+                    1 => {
+                        let attributes: Vec<Value> = fields(b)
+                            .into_iter()
+                            .map(|(_, kv)| match kv {
+                                F::Bytes(kv) => attribute(kv),
+                                _ => panic!("attribute"),
+                            })
+                            .collect();
+                        out["resource"] = json!({ "attributes": attributes });
+                    }
+                    2 => {
+                        let mut scope = json!({});
+                        let mut metrics = Vec::new();
+                        for (m, g) in fields(b) {
+                            let F::Bytes(g) = g else {
+                                panic!("ScopeMetrics field")
+                            };
+                            match m {
+                                1 => {
+                                    for (k, h) in fields(g) {
+                                        let F::Bytes(h) = h else { panic!("scope") };
+                                        let key = if k == 1 { "name" } else { "version" };
+                                        scope[key] = json!(text(h));
+                                    }
+                                }
+                                2 => metrics.push(metric(g)),
+                                _ => panic!("unexpected ScopeMetrics field {m}"),
+                            }
+                        }
+                        out["scopeMetrics"] = json!([{ "scope": scope, "metrics": metrics }]);
+                    }
+                    _ => panic!("unexpected ResourceMetrics field {n}"),
+                }
+            }
+            resources.push(out);
+        }
+        json!({ "resourceMetrics": resources })
+    }
+
+    #[test]
+    fn protobuf_and_json_describe_the_same_request() {
+        for temporality in [Temporality::Cumulative, Temporality::Delta] {
+            let worktrees = HashMap::from([("run-1".to_string(), worktree(Some("/w")))]);
+            let disks = [WorktreeUsage {
+                worktree: worktree(Some("/w")),
+                bytes: 170_864_640,
+                measured_unix_nanos: T - 1,
+            }];
+            let request = build_request(
+                &sample(),
+                &worktrees,
+                &disks,
+                &settings(temporality),
+                Some("studio"),
+            );
+            let json: Value = serde_json::from_slice(&encode_json(&request)).unwrap();
+            assert_eq!(protobuf_as_json(&encode_protobuf(&request)), json);
+        }
     }
 }

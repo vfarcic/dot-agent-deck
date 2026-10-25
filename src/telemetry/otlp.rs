@@ -33,18 +33,18 @@ fn put_tag(buf: &mut Vec<u8>, field: u32, wire: u8) {
     put_varint(buf, (u64::from(field) << 3) | u64::from(wire));
 }
 
-fn put_bytes(buf: &mut Vec<u8>, field: u32, bytes: &[u8]) {
+pub(crate) fn put_bytes(buf: &mut Vec<u8>, field: u32, bytes: &[u8]) {
     put_tag(buf, field, WIRE_LEN);
     put_varint(buf, bytes.len() as u64);
     buf.extend_from_slice(bytes);
 }
 
-fn put_fixed64(buf: &mut Vec<u8>, field: u32, value: u64) {
+pub(crate) fn put_fixed64(buf: &mut Vec<u8>, field: u32, value: u64) {
     put_tag(buf, field, WIRE_FIXED64);
     buf.extend_from_slice(&value.to_le_bytes());
 }
 
-fn put_varint_field(buf: &mut Vec<u8>, field: u32, value: u64) {
+pub(crate) fn put_varint_field(buf: &mut Vec<u8>, field: u32, value: u64) {
     put_tag(buf, field, WIRE_VARINT);
     put_varint(buf, value);
 }
