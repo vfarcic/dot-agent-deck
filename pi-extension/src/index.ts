@@ -1337,10 +1337,16 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 			"Signal task completion back to the orchestrator via dot-agent-deck, with a summary of what was accomplished.",
 		promptSnippet: "Report task completion back to the orchestrator",
 		promptGuidelines: [
-			"Use work_done when you have finished the delegated task, passing a concise summary of what changed.",
+			"Use work_done when you have finished the delegated task, passing a concise summary of what changed and the task's id from its instructions as task_id.",
 		],
 		parameters: Type.Object({
 			summary: Type.String({ description: "Summary of what was accomplished, including file paths and outcomes." }),
+			task_id: Type.Optional(
+				Type.String({
+					description:
+						"The id of the delegated task this completes, as the task's instructions name it. Without it, the report is a note to the orchestrator that completes no task.",
+				}),
+			),
 			done: Type.Optional(
 				Type.Boolean({
 					description: "Set true ONLY to signal the entire orchestration is complete (orchestrator only).",
@@ -1348,11 +1354,11 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 			),
 		}),
 		async execute(_toolCallId, params, signal) {
-			const argv = buildWorkDoneArgv(params.summary, params.done ?? false);
-			await runDeck(pi, argv, signal);
+			const argv = buildWorkDoneArgv(params.summary, params.done ?? false, params.task_id);
+			const outcome = await runDeck(pi, argv, signal);
 			return {
-				content: [{ type: "text", text: "Reported work-done to dot-agent-deck." }],
-				details: { done: params.done ?? false },
+				content: [{ type: "text", text: outcome?.stdout?.trim() || "Reported work-done to dot-agent-deck." }],
+				details: { done: params.done ?? false, task_id: params.task_id },
 			};
 		},
 	});

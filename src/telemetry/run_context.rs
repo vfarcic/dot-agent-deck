@@ -11,7 +11,9 @@
 //! make an ordinary read run another program: a signature verifier for
 //! `log.showSignature`, an fsmonitor hook, a pager, a lazy fetch of missing
 //! objects in a partial clone (and the transport and credential helpers behind
-//! it). [`harden`] switches each of those off for these two commands, and the
+//! it). [`harden`] switches each of those off for these two commands, apart
+//! from fsmonitor, which [`crate::git_env::git_async`] already switches off
+//! (with hooks) for every git the deck runs, and the
 //! remote URL is read as configured (`git config`), without `insteadOf`
 //! rewriting. The lazy fetch is switched off by `GIT_NO_LAZY_FETCH`, which Git
 //! honours from 2.45; on an older Git, the remaining defence is
@@ -59,10 +61,10 @@ pub const MAX_PROBE_OUTPUT: u64 = 4096;
 const REAP_WAIT: Duration = Duration::from_secs(1);
 
 /// `-c` overrides that keep a read-only git command from running anything
-/// configuration names.
-pub const HARDENING_CONFIG: [&str; 13] = [
+/// configuration names, on top of the
+/// [`crate::git_env::NO_HOOKS_OR_FSMONITOR`] every deck git command carries.
+pub const HARDENING_CONFIG: [&str; 12] = [
     "log.showSignature=false",
-    "core.fsmonitor=false",
     "credential.helper=",
     // No transport: defence in depth behind `GIT_NO_LAZY_FETCH`, which a Git
     // older than 2.45 ignores. `protocol.allow` is only the default, which a
@@ -605,10 +607,13 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         let subcommand = args.iter().position(|a| a == "log").unwrap();
-        for config in HARDENING_CONFIG {
+        for config in HARDENING_CONFIG
+            .iter()
+            .chain(crate::git_env::NO_HOOKS_OR_FSMONITOR.iter())
+        {
             let at = args
                 .windows(2)
-                .position(|w| w[0] == "-c" && w[1] == config)
+                .position(|w| w[0] == "-c" && w[1] == *config)
                 .unwrap_or_else(|| panic!("-c {config} missing: {args:?}"));
             assert!(at < subcommand, "-c {config} must precede the subcommand");
         }

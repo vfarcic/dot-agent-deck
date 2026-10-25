@@ -46,7 +46,7 @@ use dot_agent_deck::daemon_protocol::{
     AttachRequest, bind_attach_listener, serve_attach_with_counter,
 };
 use dot_agent_deck::env_override;
-use dot_agent_deck::event::{BroadcastMsg, DelegateSignal, WorkDoneSignal};
+use dot_agent_deck::event::{BroadcastMsg, DelegateSignal};
 use dot_agent_deck::state::{
     AppState, OrchestrationIdentity, SharedState, worker_response_timeout,
 };
@@ -271,6 +271,16 @@ impl IdleHarness {
         }
         let cwd_str = cwd.path().to_string_lossy().to_string();
         let registry = Arc::new(AgentPtyRegistry::new());
+        // The retained store the daemon opens at its start: a report is
+        // accepted only once kept there (PRD #1666 part 3, round 5).
+        std::fs::create_dir_all(cwd.path().join(".deck-state")).expect("state dir");
+        registry
+            .inbox()
+            .set_retained_store(dot_agent_deck::retained_store::RetainedStore::open(
+                &cwd.path().join(".deck-state"),
+                dot_agent_deck::retained_store::StoreConfig::default(),
+                dot_agent_deck::retained_store::Now::current(),
+            ));
 
         // Raw no-echo cat gives one observable copy per injected prompt. The
         // readiness marker ensures termios has changed before a timer can fire.
@@ -417,27 +427,20 @@ impl IdleHarness {
     /// outstanding delegation and with it the idle watch. The report is then
     /// delivered, as `handle_work_done` does, before this returns.
     async fn work_done(&self, role: &str) -> tokio::time::Instant {
-        let state = self.state.read().await;
-        let delivery = state
-            .prepare_work_done(
-                WorkDoneSignal {
-                    pane_id: worker_pane(role),
-                    task: "The delegated test task is complete.".to_string(),
-                    done: false,
-                    timestamp: chrono::Utc::now(),
-                    token: None,
-                },
-                &self.registry,
-            )
-            .await;
-        let accepted = tokio::time::Instant::now();
-        let room = self
-            .registry
-            .inbox()
-            .reserve_reply()
-            .expect("room for the report");
-        delivery.deliver(&self.registry, room).await;
-        accepted
+        let (request, provenance) = dot_agent_deck::task_completion::worker_report(
+            &self.registry,
+            &worker_pane(role),
+            "The delegated test task is complete.",
+            false,
+        );
+        let _ = dot_agent_deck::task_completion::complete(
+            &self.state,
+            &self.registry,
+            request,
+            &provenance,
+        )
+        .await;
+        tokio::time::Instant::now()
     }
 
     fn snapshot_of(&self, agent_id: &str) -> String {
@@ -725,8 +728,70 @@ fn worker_pane(role: &str) -> String {
     format!("idle-{role}-pane")
 }
 
+/// PRD #1666 part 3 (H5): take and settle `agent`'s oldest waiting message in
+/// `pane` the way a model-run `inbox fetch` and its agent's `ack` do: a hook
+/// receiver ([`dot_agent_deck::inbox_hub::serve_hook`]) is handed what waits,
+/// the agent acknowledges the oldest by id, and the receiver reports the rest
+/// not handed over, which puts them back in the queue at once. Answers the
+/// text of the one it settled, or `None` when nothing waits.
+async fn take_acked(
+    hub: &Arc<dot_agent_deck::inbox_hub::InboxHub>,
+    pane: &str,
+    agent: &str,
+) -> Option<String> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let (client, server) = tokio::io::duplex(1 << 16);
+    let (read, write) = tokio::io::split(server);
+    let serve = tokio::spawn(dot_agent_deck::inbox_hub::serve_hook(
+        Arc::clone(hub),
+        pane.to_string(),
+        agent.to_string(),
+        dot_agent_deck::event::InboxComponent::Other,
+        dot_agent_deck::inbox_hub::HookFetch {
+            named: None,
+            budget: None,
+            hook_integration: Some(dot_agent_deck::inbox_hub::HOOK_INTEGRATION),
+            consumer: dot_agent_deck::event::InboxFetchConsumer::Cli,
+        },
+        BufReader::new(read),
+        write,
+    ));
+    let (from, mut to) = tokio::io::split(client);
+    let mut lines = BufReader::new(from).lines();
+    let line = lines.next_line().await.ok().flatten();
+    let mut handed = line
+        .and_then(|line| serde_json::from_str::<dot_agent_deck::event::InboxWaitReply>(&line).ok())
+        .and_then(|reply| reply.messages)
+        .unwrap_or_default()
+        .into_iter();
+    let first = handed.next();
+    if let Some(delivery) = &first {
+        hub.ack(
+            &delivery.id,
+            pane,
+            agent,
+            dot_agent_deck::inbox::AckHow::Explicit,
+        );
+    }
+    let rest: Vec<serde_json::Value> = handed
+        .filter_map(|delivery| {
+            let at = delivery.attempt?;
+            Some(serde_json::json!({"id": delivery.id, "a": at.a, "e": at.e}))
+        })
+        .collect();
+    if !rest.is_empty() {
+        let control = format!("{}\n", serde_json::json!({"not_handed": rest}));
+        let _ = to.write_all(control.as_bytes()).await;
+    }
+    let _ = to.shutdown().await;
+    drop(lines);
+    let _ = serve.await;
+    first.map(|delivery| delivery.text)
+}
+
 /// PRD #1666 S5: take each role's delegated task the way an agent's component
-/// would — fetch and acknowledge it from the worker pane's inbox, for whichever
+/// would — fetch and acknowledge it from the worker pane's inbox
+/// ([`take_acked`]), for whichever
 /// agent holds the pane when the task arrives — on a background task, so a
 /// test that holds a pane's dispatch lock is not blocked. Gives up after a
 /// while for a delegate that never posts (a refused one).
@@ -738,14 +803,7 @@ fn take_tasks_in_background(registry: &Arc<AgentPtyRegistry>, roles: &[&str]) {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
             while tokio::time::Instant::now() < deadline {
                 if let Some(agent) = registry.pane_current_agent_id(&pane)
-                    && registry
-                        .inbox()
-                        .fetch_first_acked(
-                            &pane,
-                            &agent,
-                            dot_agent_deck::inbox::AckHow::FetchedByCli,
-                        )
-                        .is_some()
+                    && take_acked(registry.inbox(), &pane, &agent).await.is_some()
                 {
                     return;
                 }

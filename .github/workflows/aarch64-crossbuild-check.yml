@@ -16,10 +16,14 @@
 # The cross version is part of what is mirrored (issue #323): if it drifts from
 # `release.yml`'s, this job stops predicting the leg it exists to predict.
 #
-# KEPT DELIBERATELY, not temporary. It is scoped to PRs that touch `Cargo.toml` /
-# `Cargo.lock` / this file, so it costs nothing on unrelated PRs and fires exactly
-# when the dependency graph — the thing that can break a C-library cross-build —
-# actually changed. It is the only pre-tag coverage of that leg.
+# KEPT DELIBERATELY, not temporary. It runs for PRs that touch the build inputs
+# listed under `paths:` below (the root manifest, the lockfile, the vendored
+# crates, the cargo configuration, a toolchain file, this file), so it costs
+# nothing on PRs that touch none of them. A change to the dependency graph — the
+# thing that can break a C-library cross-build — normally moves the lockfile;
+# many changes to those paths move no graph at all (a vendored crate's docs,
+# this file), and the check runs for them too. It is the only pre-tag coverage
+# of that leg.
 #
 # It cannot be replaced by a local check: a devbox/Nix toolchain makes `cross`
 # derive an invalid rustup toolchain name from `rustc --print sysroot`, a failure
@@ -38,13 +42,21 @@ on:
   # lets the check actually run on this branch's PR — which is the only moment it
   # is needed, since the point is to prove the aarch64 leg BEFORE tagging.
   #
-  # Scoped to PRs that touch the dependency graph or this file, so it does not
-  # add ~10 minutes of cross-compilation to every unrelated PR.
+  # Scoped to PRs that touch the manifest, the lockfile, the crates under
+  # `vendor/` (they are compiled into the binary), the cargo configuration (its
+  # host-target `linker` also links the build scripts the cross build compiles), a
+  # toolchain file (it would override the toolchain this job installs) or this
+  # file, so it does not add ~10 minutes of cross-compilation to every unrelated
+  # PR. `scripts/ci-changes.sh`'s `cargo` case is the same list for RWX.
   workflow_dispatch:
   pull_request:
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
+      - "vendor/**"
+      - ".cargo/**"
+      - "rust-toolchain"
+      - "rust-toolchain.toml"
       - ".github/workflows/aarch64-crossbuild-check.yml"
 
 permissions:

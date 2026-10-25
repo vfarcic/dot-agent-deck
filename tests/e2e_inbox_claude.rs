@@ -80,7 +80,8 @@ while True:
             conn.close()
             publish('result-' + tag, {'code':0, 'stdout':reply.decode(), 'stderr':''})
         else:
-            result = subprocess.run([deck, 'hook', '--agent', 'claude-code'], input=payload, capture_output=True, timeout=15, env=env)
+            argv = ['/bin/sh', '-c', request['shell']] if 'shell' in request else [deck, 'hook', '--agent', 'claude-code']
+            result = subprocess.run(argv, input=payload, capture_output=True, timeout=15, env=env)
             publish('result-' + tag, {'code':result.returncode, 'stdout':result.stdout.decode(), 'stderr':result.stderr.decode()})
             os.write(1, b'HOOK-FINISHED:' + tag.encode() + b'\r\n')
     for tag, (child, out, err) in list(running.items()):
@@ -146,7 +147,8 @@ fn command(pane: &Pane, tag: &str, kind: &str, payload: Value) {
 }
 
 /// [`command`] with the request's extra fields: `env` for the child, and for
-/// a waiter `shell`, the command line to run instead of the test's own deck.
+/// a waiter or a hook `shell`, the command line to run instead of the test's
+/// own deck.
 fn command_with(pane: &Pane, tag: &str, mut request: Value) {
     request["tag"] = json!(tag);
     let pending = sidecar(pane, &format!("pending-{tag}"));
@@ -985,6 +987,221 @@ fn claude_022_a_stale_hook_in_a_bare_claude_pane_is_refused_visibly() {
     state(&daemon, &pane, &id, "queued");
 }
 
+/// The env that makes a hook stand in for a dot-agent-deck from before the
+/// deck's messages: no version stamp, and it never asks for mail.
+fn pre_inbox_env() -> Value {
+    json!({"DOT_AGENT_DECK_INBOX_TEST_HOOK_INTEGRATION":"pre-inbox"})
+}
+
+/// Scenario: A Claude agent's hooks run a dot-agent-deck from before the deck's messages, which never asks for them, so its SessionStart is all the deck hears. The agent's card names the hooks-too-old notice with the deck's fix, while a task posted to it is still offered the old way: once the agent is idle the doorbell is typed, and running the `dot-agent-deck inbox fetch` it names hands the task over. Once its hooks run this deck again, the notice clears and the prompt hook answering the next task's doorbell is handed that task.
+#[spec("inbox/claude/047")]
+#[test]
+fn claude_047_a_pre_inbox_hook_that_never_asks_for_mail_is_named_and_recovers() {
+    let daemon = daemon(&[]);
+    let pane = parent(&daemon, "claude-pre-inbox");
+    command_with(
+        &pane,
+        "stale-start",
+        json!({"kind":"hook","payload":payload(&pane, "SessionStart"),"env":pre_inbox_env()}),
+    );
+    let stale = result(&pane, "stale-start");
+    assert_eq!(stale["code"], 0, "{stale}");
+    assert_eq!(
+        stale["stdout"], "",
+        "a pre-inbox hook frames nothing: {stale}"
+    );
+    let notice = || record(&daemon, &pane)["inbox"].clone();
+    assert!(
+        common::wait_until(WAIT, || notice()["integration"] == "hooks_too_old"),
+        "the card names the stale hooks: {}",
+        notice()
+    );
+    if let Some(command) = notice()["integration_command"].as_str() {
+        assert!(
+            command.ends_with(" hooks install --agent claude-code"),
+            "the fix is the deck's own hooks install: {command}"
+        );
+    }
+    let id = post(&daemon, &pane, NATIVE_BODY);
+    state(&daemon, &pane, &id, "queued");
+    // The notice holds nothing: the doorbell still asks the model to fetch
+    // with the CLI, which needs no hook.
+    command_with(
+        &pane,
+        "stale-stop",
+        json!({"kind":"hook","payload":payload(&pane, "Stop"),"env":pre_inbox_env()}),
+    );
+    assert_eq!(result(&pane, "stale-stop")["code"], 0);
+    let line = fixed_line(&id);
+    assert!(
+        common::wait_until(WAIT, || String::from_utf8_lossy(&bytes(&pane))
+            .contains(line.trim_start())),
+        "the doorbell is typed for the old hooks: {:?}",
+        String::from_utf8_lossy(&bytes(&pane))
+    );
+    assert_eq!(notice()["integration"], "hooks_too_old", "{}", notice());
+    // The model doing what the doorbell says is handed the task.
+    command_with(
+        &pane,
+        "cli-fetch",
+        json!({"kind":"wait","payload":{},
+               "shell":format!("'{}' inbox fetch", env!("CARGO_BIN_EXE_dot-agent-deck"))}),
+    );
+    let fetched = result(&pane, "cli-fetch");
+    assert!(
+        fetched["stdout"].as_str().unwrap().contains(NATIVE_BODY),
+        "the CLI fetch is handed the task: {fetched}"
+    );
+    state(&daemon, &pane, &id, "acknowledged");
+
+    // The user updated the hooks and restarted the agent: its events come
+    // from this deck's hook again.
+    run_hook(&pane, "fixed-start", payload(&pane, "SessionStart"));
+    assert!(
+        common::wait_until(WAIT, || notice()["integration"].is_null()),
+        "the notice clears once the hooks run this deck: {}",
+        notice()
+    );
+    let next = post(&daemon, &pane, &format!("{NATIVE_BODY}-next"));
+    let mut hook = payload(&pane, "UserPromptSubmit");
+    hook["prompt"] = json!(fixed_line(&next));
+    let handed = run_hook(&pane, "fixed-prompt", hook);
+    assert!(
+        context(&handed, "UserPromptSubmit").contains(&format!("{NATIVE_BODY}-next")),
+        "the prompt hook is handed the next task: {handed}"
+    );
+    state(&daemon, &pane, &next, "acknowledged");
+}
+
+/// Scenario: Claude's settings are an install from before the deck's messages, naming another live dot-agent-deck whose version cannot be read for its status hook and no waiter; its SessionStart names the hooks-too-old notice while a task waits. `hooks refresh` from the deck's installed copy, as an upgrade runs it, leaves that live install alone and names the command to run; once that copy is gone, the same refresh pins the deck's copy and adds the waiter. The waiter the settings now name is handed the task, and the notice is gone.
+#[spec("inbox/claude/048")]
+#[test]
+fn claude_048_an_upgrade_refreshes_pre_inbox_hooks_and_the_waiter_delivers() {
+    use std::os::unix::fs::PermissionsExt;
+    let daemon = daemon(&[]);
+    let home = daemon.home().to_path_buf();
+    let old = home.join("old-deck/dot-agent-deck");
+    std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+    // Its version is unreadable, so no copy takes its pin over, wherever the
+    // harness puts HOME.
+    std::fs::write(
+        &old,
+        format!(
+            "#!/bin/sh\n[ \"$1\" = --version ] && {{ echo 'dot-agent-deck (older)'; exit 0; }}\nDOT_AGENT_DECK_INBOX_TEST_HOOK_INTEGRATION=pre-inbox exec '{}' \"$@\"\n",
+            env!("CARGO_BIN_EXE_dot-agent-deck")
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let settings = home.join(".claude/settings.json");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    let rule = json!([{"hooks":[
+        {"type":"command","command":format!("'{}' hook --agent claude-code", old.display())}
+    ]}]);
+    std::fs::write(
+        &settings,
+        json!({"hooks":{"SessionStart":rule,"UserPromptSubmit":rule,"Stop":rule}}).to_string(),
+    )
+    .unwrap();
+    let session_start = |suffix: &str| {
+        let value: Value = serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+        value["hooks"]["SessionStart"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|rule| rule["hooks"].as_array().unwrap().clone())
+            .find_map(|hook| {
+                hook["command"]
+                    .as_str()
+                    .filter(|command| command.ends_with(suffix))
+                    .map(str::to_string)
+            })
+    };
+    let pane = parent(&daemon, "claude-pre-inbox-settings");
+    command_with(
+        &pane,
+        "stale",
+        json!({"kind":"hook","shell":session_start(" hook --agent claude-code").unwrap(),
+               "payload":payload(&pane, "SessionStart")}),
+    );
+    assert_eq!(result(&pane, "stale")["code"], 0);
+    let notice = || record(&daemon, &pane)["inbox"].clone();
+    assert!(
+        common::wait_until(WAIT, || notice()["integration"] == "hooks_too_old"),
+        "the card names the stale hooks: {}",
+        notice()
+    );
+    let id = post(&daemon, &pane, NATIVE_BODY);
+    state(&daemon, &pane, &id, "queued");
+
+    // The harness seeds the deck's durable copy into HOME; the daemon may be
+    // running it, so it is used as it is, never written over.
+    let installed = home.join(".local/bin/dot-agent-deck");
+    if !installed.exists() {
+        std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        if std::fs::hard_link(env!("CARGO_BIN_EXE_dot-agent-deck"), &installed).is_err() {
+            std::fs::copy(env!("CARGO_BIN_EXE_dot-agent-deck"), &installed).unwrap();
+        }
+    }
+    let refresh = || {
+        let out = std::process::Command::new(&installed)
+            .args(["hooks", "refresh", "--json"])
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", claude_path(&home))
+            .current_dir(&home)
+            .output()
+            .unwrap();
+        let report: Value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|error| panic!("a JSON report: {error}; {out:?}"));
+        (out.status.success(), report)
+    };
+    let (ok, kept) = refresh();
+    assert!(!ok, "a live install it kept needs attention: {kept}");
+    assert_eq!(kept["ok"], false, "{kept}");
+    let lines = kept["lines"].as_array().unwrap();
+    assert!(
+        lines.iter().any(|line| line["text"]
+            .as_str()
+            .unwrap()
+            .contains(&*old.to_string_lossy())),
+        "it names the install it left alone: {kept}"
+    );
+    assert!(
+        lines.iter().any(|line| line["command"]
+            .as_str()
+            .is_some_and(|command| command.ends_with(" hooks install --agent claude-code"))),
+        "it names the command that pins this copy: {kept}"
+    );
+    assert!(
+        session_start(" hook --agent claude-code")
+            .unwrap()
+            .contains(&*old.to_string_lossy()),
+        "the live install is left alone"
+    );
+
+    // The upgrade moved the older copy away: the same refresh repairs the pin.
+    std::fs::remove_file(&old).unwrap();
+    let (ok, fixed) = refresh();
+    assert!(ok, "{fixed}");
+    assert_eq!(fixed["ok"], true, "{fixed}");
+    let waiter = session_start(" inbox wait --agent claude-code").expect("the waiter is added");
+    assert!(!waiter.contains(&*old.to_string_lossy()), "{waiter}");
+    command_with(
+        &pane,
+        "fixed",
+        json!({"kind":"wait","shell":waiter,"payload":payload(&pane, "SessionStart")}),
+    );
+    let delivered = result(&pane, "fixed");
+    assert_eq!(
+        delivered["code"], 2,
+        "the refreshed waiter is handed the task: {delivered}"
+    );
+    assert!(delivered["stderr"].as_str().unwrap().contains(NATIVE_BODY));
+    state(&daemon, &pane, &id, "fetched");
+    assert!(notice()["integration"].is_null(), "{}", notice());
+}
+
 /// Scenario: A process in a Claude agent's own tree sends the deck the prompt hook's exact-commit request directly, without the hook. First the deck cannot write the caps file of the task's first attempt, so it never sends it: a request naming that attempt commits nothing and the task stays queued. A waiter armed again is handed attempt 1.2: a request naming it, with no commit receipt in the spool, commits nothing either and the task stays fetched. The real notification through the real prompt hook, which publishes that receipt, commits it.
 #[spec("inbox/claude/023")]
 #[test]
@@ -1025,10 +1242,10 @@ fn claude_023_a_raw_exact_commit_needs_the_attempts_receipt() {
     state(&daemon, &pane, &id, "acknowledged");
 }
 
-/// Scenario: In a pane started from its command alone, with no agent type and no deck waiter in Claude's settings, Claude's SessionStart hook — a process inside the pane's agent, as Claude's own hooks are — has connected to the deck but its event has not been read yet when a prompt hook too old for the deck's messages fetches a queued task's doorbell. The deck holds the fetch until the earlier connection's event is in: the hook prints nothing while it waits, and once the SessionStart event reports Claude Code the fetch is refused as hooks too old, the task stays queued and the card names the notice.
+/// Scenario: In a pane started from its command alone, with no agent type and no deck waiter in Claude's settings, Claude's SessionStart hook — a process inside the pane's agent, as Claude's own hooks are — has connected to the deck but its event has not been read yet when a prompt hook too old for the deck's messages fetches a queued task's doorbell. The deck does not wait for that connection: the stale hook is refused before the SessionStart event is sent, prints nothing, the task stays queued and the card says the hooks are too old. A current prompt hook in the same pane is then handed the task, also before SessionStart's event is in.
 #[spec("inbox/claude/024")]
 #[test]
-fn claude_024_a_stale_hook_waits_for_the_session_start_connected_before_it() {
+fn claude_024_a_stale_hook_is_refused_without_waiting_for_an_earlier_session_start() {
     let daemon = daemon(&[]);
     let pane = parent_as(&daemon, "claude-bare-early", None);
     let id = post(&daemon, &pane, NATIVE_BODY);
@@ -1037,6 +1254,7 @@ fn claude_024_a_stale_hook_waits_for_the_session_start_connected_before_it() {
     // connects, says so, and sends the event only once told to.
     let event = json!({"session_id":format!("native-{}", pane.agent),
         "pane_id":pane.id,"agent_id":pane.agent,"token":pane.token,
+        "deck_build":SYNTHETIC_DECK_BUILD,
         "agent_type":"claude_code","event_type":"session_start",
         "timestamp":chrono::Utc::now(),"cwd":daemon.cwd(),"metadata":{}});
     let line = sidecar(&pane, "session-start-line");
@@ -1076,24 +1294,11 @@ fn claude_024_a_stale_hook_waits_for_the_session_start_connected_before_it() {
     command_with(
         &pane,
         "stale",
-        json!({"kind":"hook","payload":hook,
+        json!({"kind":"hook","payload":hook.clone(),
                "env":{"DOT_AGENT_DECK_INBOX_TEST_HOOK_INTEGRATION":"none"}}),
     );
-    assert!(
-        !common::wait_until(Duration::from_millis(400), || sidecar(
-            &pane,
-            "result-stale"
-        )
-        .exists()),
-        "the fetch is held for the event connected before it: {:?}",
-        std::fs::read_to_string(sidecar(&pane, "result-stale"))
-    );
-    assert!(
-        record(&daemon, &pane)["agent_type"].is_null(),
-        "nothing typed the pane yet: {}",
-        record(&daemon, &pane)
-    );
-    std::fs::write(&go, b"").unwrap();
+    // PRD #1666 part 3 (H5): no legacy service is left for a wait to decide
+    // between, so the stale fetch is refused with SessionStart still unsent.
     let stale = result(&pane, "stale");
     assert!(
         !stale["stdout"].as_str().unwrap().contains(NATIVE_BODY),
@@ -1106,9 +1311,20 @@ fn claude_024_a_stale_hook_waits_for_the_session_start_connected_before_it() {
         notice()
     );
     state(&daemon, &pane, &id, "queued");
+    command_with(&pane, "current", json!({"kind":"hook","payload":hook}));
+    let current = result(&pane, "current");
+    let printed: Value =
+        serde_json::from_str(current["stdout"].as_str().unwrap().trim()).unwrap_or(Value::Null);
+    assert!(
+        printed["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .is_some_and(|context| context.contains(NATIVE_BODY)),
+        "a current hook is handed the task without waiting either: {current}"
+    );
+    std::fs::write(&go, b"").unwrap();
 }
 
-/// Scenario: A process in a Claude agent's own tree asks the deck directly whether it serves one-shot receipts, then sends the receipt verbs for what they do not serve: a once-wait from a Codex component, a Claude stream wait, a CLI fetch and a fetch a stream bound. The deck answers the question with the receipt support it serves; it refuses each of the others as unsupported, and a task queued beforehand stays queued.
+/// Scenario: A process in a Claude agent's own tree asks the deck directly whether it serves one-shot receipts, then sends the receipt verbs for what they do not serve: a once-wait from a Codex component, a Claude stream wait, a hook fetch naming a stream's or the waiter's component, and a fetch a stream bound. The deck answers the question with the receipt support and the senders it serves; it refuses each of the others as unsupported, and a task queued beforehand stays queued.
 #[spec("inbox/claude/031")]
 #[test]
 fn claude_031_the_deck_answers_its_receipts_and_refuses_what_they_do_not_serve() {
@@ -1125,6 +1341,12 @@ fn claude_031_the_deck_answers_its_receipts_and_refuses_what_they_do_not_serve()
     };
     let answer = ask("question", "inbox_receipts", json!({}));
     assert_eq!(answer["one_shot_receipts"], 1, "{answer}");
+    // PRD #1666 part 3 (H4): and the senders it serves beyond Claude Code's.
+    assert_eq!(
+        answer["one_shot_senders"],
+        json!(["claude_waiter", "claude_hooks", "codex_hooks", "cli"]),
+        "{answer}"
+    );
     for (tag, verb, extra) in [
         (
             "codex-once",
@@ -1137,9 +1359,16 @@ fn claude_031_the_deck_answers_its_receipts_and_refuses_what_they_do_not_serve()
             json!({"component":"claude_waiter", "mode":"stream", "hook_integration":1}),
         ),
         (
-            "cli-fetch",
+            "stream-component-fetch",
             "inbox_receipt_fetch",
-            json!({"consumer":"cli", "max_chars":65536, "hook_integration":1}),
+            json!({"consumer":"doorbell_hook", "component":"opencode_plugin",
+                "max_chars":65536, "hook_integration":1}),
+        ),
+        (
+            "waiter-component-fetch",
+            "inbox_receipt_fetch",
+            json!({"consumer":"turn_end_hook", "component":"claude_waiter",
+                "max_chars":65536, "hook_integration":1}),
         ),
         (
             "bound-fetch",

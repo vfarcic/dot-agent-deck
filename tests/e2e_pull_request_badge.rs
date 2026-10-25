@@ -412,8 +412,10 @@ fn pr_002_absent_pull_request_keeps_daemon_healthy() {
                     std::fs::read_to_string(fixture.scratch.path().join("git-probes"))
                         .unwrap_or_default()
                         .lines()
+                        // The deck puts global `-c` options ahead of every
+                        // subcommand (issue #1888), so match the subcommand.
                         .filter(|line| {
-                            *line == "symbolic-ref --quiet --short refs/remotes/origin/HEAD"
+                            line.ends_with("symbolic-ref --quiet --short refs/remotes/origin/HEAD")
                         })
                         .count()
                         >= 2

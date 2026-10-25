@@ -381,6 +381,8 @@ export interface DesktopAgentDto {
     integrationCommand?: string;
     receiptsDegraded?: string;
     evidencePaused?: number;
+    /** PRD #1666 part 3 (R-2): a refused request of the agent's own for its messages. */
+    admissionRefused?: string;
   };
   /**
    * PRD #1666 — the deck's notice explaining an `error` status (a message the
@@ -2418,6 +2420,7 @@ function inboxFromDto(inbox: NonNullable<DesktopAgentDto["inbox"]>): AgentInbox 
     ...(integration && typeof inbox.integrationCommand === "string" ? { integrationCommand: displayText(inbox.integrationCommand, DISPLAY_LIMITS.prompt) } : {}),
     ...(typeof inbox.receiptsDegraded === "string" ? { receiptsDegraded: displayText(inbox.receiptsDegraded, DISPLAY_LIMITS.prompt) } : {}),
     ...(typeof inbox.evidencePaused === "number" && Number.isFinite(inbox.evidencePaused) ? { evidencePaused: count(inbox.evidencePaused) } : {}),
+    ...(typeof inbox.admissionRefused === "string" ? { admissionRefused: displayText(inbox.admissionRefused, DISPLAY_LIMITS.prompt) } : {}),
   };
 }
 

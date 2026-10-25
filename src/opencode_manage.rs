@@ -2708,6 +2708,29 @@ pub fn auto_install() -> Vec<crate::hook_binary::HookPin> {
     auto_install_reporting().0
 }
 
+/// [`auto_install`] for `hooks refresh` (PRD #1666 part 3, R-3): whether
+/// OpenCode is installed here (a config root exists, as the install asks),
+/// and every integration file it could not write, which [`auto_install`]
+/// only logs. A root that cannot be inspected is a failure, not absence: only
+/// every root confirmed missing leaves OpenCode out.
+pub fn refresh_install() -> crate::hooks_refresh::InstallAttempt {
+    let mut found = false;
+    let mut failed = Vec::new();
+    for root in candidate_roots() {
+        match root.try_exists() {
+            Ok(exists) => found |= exists,
+            Err(e) => failed.push(format!("could not inspect {}: {e}", root.display())),
+        }
+    }
+    if !found && failed.is_empty() {
+        return crate::hooks_refresh::InstallAttempt::Absent;
+    }
+    if found {
+        failed.extend(auto_install_reporting().1);
+    }
+    crate::hooks_refresh::InstallAttempt::Ran { failed }
+}
+
 /// PRD #1666 §11: [`auto_install`], run as an OpenCode generation starts and
 /// before its child does, so the agent loads the integration this deck checks
 /// it against. Returns the pins and every integration file it could not

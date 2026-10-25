@@ -62,6 +62,7 @@ pub mod error;
 pub mod event;
 pub mod event_subscriber;
 pub mod features;
+pub mod guarded;
 // PRD #1105 M11: when the TUI claims focus on its daemon (terminal focus-in and
 // throttled input).
 pub mod focus_report;
@@ -76,6 +77,7 @@ pub mod hook;
 pub mod hook_binary;
 pub mod hook_provenance;
 pub mod hooks_manage;
+pub mod hooks_refresh;
 pub mod hyperlink;
 // PRD #1666: the per-agent inbox every deck message is posted to (pure data).
 pub mod inbox;
@@ -98,6 +100,7 @@ pub mod keybindings;
 // Issue #1540: the deck's last New-agent-form command, owned by the daemon.
 pub mod last_command;
 pub mod lifetime_tag;
+pub mod lock_rank;
 pub mod logging;
 pub mod login_shell;
 // PRD #1223 M2: what the daemon reports about itself to a new-agent form.
@@ -131,6 +134,8 @@ pub mod remote_daemon;
 pub mod remote_doctor;
 pub mod remote_tunnel;
 pub mod repo_identity;
+pub mod report_recovery;
+pub mod retained_store;
 pub mod schedule_cli;
 // Issue #1635: upgrading this machine's CLI and desktop app in place.
 pub mod scheduler;
@@ -142,6 +147,8 @@ pub mod submitted_prompt;
 pub mod system_browser;
 pub mod tab;
 pub mod tab_layout;
+pub mod task_completion;
+pub mod work_done_text;
 // PRD #1741: agent-run telemetry over OTLP, off unless an endpoint is set.
 pub mod telemetry;
 pub mod terminal_hangup;

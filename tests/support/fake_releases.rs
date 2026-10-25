@@ -27,6 +27,24 @@ pub(crate) fn release_script(version: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+/// [`release_script`] that also answers `hooks refresh --json` with a report
+/// saying `refreshed`, and appends every invocation's arguments to `log`, one
+/// line each, so a test can tell what an upgrade ran it with.
+#[allow(dead_code)]
+pub(crate) fn release_script_recording(
+    version: &str,
+    log: &std::path::Path,
+    refreshed: &str,
+) -> Vec<u8> {
+    let log = log.to_str().expect("UTF-8 log path");
+    assert!(!log.contains('\''), "{log}");
+    assert!(!refreshed.contains(['\'', '"', '\\']), "{refreshed}");
+    format!(
+        "#!/bin/sh\necho \"$*\" >> '{log}'\nif [ \"$#\" -eq 1 ] && [ \"$1\" = \"--version\" ]; then\n  echo 'dot-agent-deck {version}'\n  exit 0\nfi\nif [ \"$*\" = \"hooks refresh --json\" ]; then\n  echo '{{\"ok\":true,\"lines\":[{{\"text\":\"{refreshed}\"}}]}}'\n  exit 0\nfi\necho 'unexpected invocation' >&2\nexit 64\n"
+    )
+    .into_bytes()
+}
+
 /// `bytes`' SHA-256, as `checksums.txt` lists it.
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};

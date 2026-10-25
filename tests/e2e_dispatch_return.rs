@@ -22,7 +22,7 @@ fn dispatch_return_002_callback_survives_caller_detach_and_reattach() {
     route::dispatch_return(2);
 }
 
-/// Scenario: Dispatch a single stand-in and send an unrelated pane completion before the unit completes. Only the unit acknowledgement and completion are bound to the caller inbox, and its fetched report appears in the attached pane.
+/// Scenario: Dispatch a single stand-in and send an unrelated pane completion before the unit completes; that pane's `work-done --done` is refused with `incompatible_mode`. Only the unit acknowledgement and completion are bound to the caller inbox, and its fetched report appears in the attached pane.
 #[spec("dispatch/return/003")]
 #[test]
 fn dispatch_return_003_single_completion_routes_while_unknown_pane_stays_inert() {

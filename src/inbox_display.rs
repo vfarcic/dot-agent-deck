@@ -132,10 +132,59 @@ pub const NOT_ARMED: &str =
 /// waiter take their mail once at a time.
 pub const STREAM_UNSUPPORTED: &str =
     "this inbox component cannot stream; only a deck integration on message receipts can";
+/// PRD #1666 part 3 (H5): an `inbox wait` once from a component whose hooks
+/// take their messages themselves (Codex's, Devin's, an unknown one's), which
+/// only a dot-agent-deck from before those hooks moved onto message receipts
+/// sends.
+pub const WAIT_UNSUPPORTED: &str = "this inbox component cannot wait for messages: the agent's hooks or `dot-agent-deck inbox fetch` take them, so update the dot-agent-deck the agent runs";
 /// PRD #1666 §3: receipts cannot be recorded for this generation; `({error})`
 /// follows.
 pub const RECEIPTS_DEGRADED: &str =
     "messages may repeat: the deck cannot record message receipts for this agent";
+
+/// PRD #1666 part 3 (R-2): the headline of a card whose agent's own requests
+/// for its deck messages the deck refused while messages wait for it.
+pub const ADMISSION_REFUSED: &str = "Messages can't reach this agent";
+/// [`ADMISSION_REFUSED`]'s remedy, after the cause.
+pub const ADMISSION_REFUSED_REMEDY: &str = "Restart it from the deck; messages addressed to it are not handed to the restarted agent, so have them sent again.";
+/// [`ADMISSION_REFUSED`]'s causes, by the refusal code the agent's request got
+/// (`inbox_other_user`, …). An unknown code gets no cause.
+pub const ADMISSION_CAUSE_OTHER_USER: &str = "a process running as another user asked for them";
+pub const ADMISSION_CAUSE_UNIDENTIFIED: &str =
+    "the deck could not identify the process that asked for them";
+pub const ADMISSION_CAUSE_NOT_CALLER: &str = "its integration named a process other than its own";
+pub const ADMISSION_CAUSE_NESTED: &str =
+    "an agent of the same kind running inside it asked for them";
+pub const ADMISSION_CAUSE_NOT_MEMBER: &str = "a process outside the agent asked for them";
+pub const ADMISSION_CAUSE_ABOVE_AGENT: &str =
+    "its integration named a process the agent itself runs under";
+
+/// The cause [`ADMISSION_REFUSED`] names for the refusal `code`.
+pub fn admission_cause(code: &str) -> Option<&'static str> {
+    match code {
+        "inbox_other_user" => Some(ADMISSION_CAUSE_OTHER_USER),
+        "inbox_peer_unidentified" => Some(ADMISSION_CAUSE_UNIDENTIFIED),
+        "inbox_component_not_caller" => Some(ADMISSION_CAUSE_NOT_CALLER),
+        "inbox_nested_agent" => Some(ADMISSION_CAUSE_NESTED),
+        "inbox_not_agent_process" => Some(ADMISSION_CAUSE_NOT_MEMBER),
+        "inbox_receiver_above_agent" => Some(ADMISSION_CAUSE_ABOVE_AGENT),
+        _ => None,
+    }
+}
+
+/// PRD #1666 part 3 (R-2): the card's notice for a refusal with `code`:
+/// `Messages can't reach this agent: its connection to the deck was refused
+/// (<cause>). Restart it from the deck; messages addressed to it are not handed to the restarted agent, so have them sent again.`
+pub fn admission_refused_text(code: &str) -> String {
+    match admission_cause(code) {
+        Some(cause) => format!(
+            "{ADMISSION_REFUSED}: its connection to the deck was refused ({cause}). {ADMISSION_REFUSED_REMEDY}"
+        ),
+        None => format!(
+            "{ADMISSION_REFUSED}: its connection to the deck was refused. {ADMISSION_REFUSED_REMEDY}"
+        ),
+    }
+}
 
 /// PRD #1666 §7: hand-outs paused for room in the evidence store.
 pub fn evidence_paused_text(waiting: usize) -> String {
@@ -259,6 +308,9 @@ pub const CARD_INBOX_DEGRADED_METADATA_KEY: &str = "inbox_card_degraded";
 /// Beside [`CARD_INBOX_METADATA_KEY`]: the command that fixes the integration
 /// notice, when [`CardInbox::integration_command`] holds one.
 pub const CARD_INBOX_COMMAND_METADATA_KEY: &str = "inbox_card_command";
+/// Beside [`CARD_INBOX_METADATA_KEY`]: the refusal code of the agent's own
+/// request for its messages, when [`CardInbox::admission_refused`] holds one.
+pub const CARD_INBOX_ADMISSION_METADATA_KEY: &str = "inbox_card_admission";
 
 /// What a card shows of its agent's inbox.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -287,6 +339,9 @@ pub struct CardInbox {
     pub evidence_paused: Option<usize>,
     /// PRD #1666 §3: the deck's receipt-storage error for this agent.
     pub receipts_degraded: Option<String>,
+    /// PRD #1666 part 3 (R-2): the refusal code of this agent's own request
+    /// for its deck messages, while messages wait for it.
+    pub admission_refused: Option<String>,
 }
 
 impl CardInbox {
@@ -329,8 +384,13 @@ impl CardInbox {
     /// running out of attempts means, when every uncertain one has: its row
     /// offers no Retry), what a message the agent may not have received
     /// means, held_long attention, then failed receipt storage — the first
-    /// that holds.
+    /// that holds. A refused request of the agent's own for its messages comes
+    /// first of all (PRD #1666 part 3, R-2): nothing else reaches it until
+    /// that is fixed.
     pub fn notice_text(&self) -> Option<String> {
+        if let Some(code) = &self.admission_refused {
+            return Some(admission_refused_text(code));
+        }
         if self.integration == Some(IntegrationNotice::HooksTooOld) {
             return Some(hooks_too_old_text(self.integration_command.as_deref()));
         }
@@ -466,6 +526,26 @@ mod tests {
         assert_eq!(words["hooksTooOld"], HOOKS_TOO_OLD);
         assert_eq!(words["hooksTooOldUpgrade"], HOOKS_TOO_OLD_UPGRADE);
         assert_eq!(words["receiptsDegraded"], RECEIPTS_DEGRADED);
+        assert_eq!(words["admissionRefused"], ADMISSION_REFUSED);
+        assert_eq!(words["admissionRefusedRemedy"], ADMISSION_REFUSED_REMEDY);
+        for (code, cause) in [
+            ("inbox_other_user", ADMISSION_CAUSE_OTHER_USER),
+            ("inbox_peer_unidentified", ADMISSION_CAUSE_UNIDENTIFIED),
+            ("inbox_component_not_caller", ADMISSION_CAUSE_NOT_CALLER),
+            ("inbox_nested_agent", ADMISSION_CAUSE_NESTED),
+            ("inbox_not_agent_process", ADMISSION_CAUSE_NOT_MEMBER),
+            ("inbox_receiver_above_agent", ADMISSION_CAUSE_ABOVE_AGENT),
+        ] {
+            assert_eq!(words["admissionCauses"][code], cause, "{code}");
+            assert_eq!(admission_cause(code), Some(cause));
+        }
+        assert_eq!(
+            words["admissionCauses"]
+                .as_object()
+                .map(|causes| causes.len()),
+            Some(6),
+            "the fixture lists every cause the deck names"
+        );
         assert_eq!(
             words["evidencePaused"]
                 .as_str()
@@ -648,5 +728,34 @@ mod tests {
             assert_eq!(blocked.notice_text().as_deref(), Some(notice.text()));
         }
         assert_eq!(CardInbox::default().notice_text(), None);
+    }
+
+    /// PRD #1666 part 3 (R-2): a refused request of the agent's own comes
+    /// ahead of every other notice, names its cause and the remedy, and an
+    /// unknown code still says what to do.
+    #[test]
+    fn a_refused_connection_heads_the_notice_row_with_its_cause_and_remedy() {
+        let refused = CardInbox {
+            pending: 2,
+            uncertain: 1,
+            integration: Some(IntegrationNotice::HooksTooOld),
+            admission_refused: Some("inbox_peer_unidentified".into()),
+            ..CardInbox::default()
+        };
+        assert_eq!(
+            refused.notice_text().as_deref(),
+            Some(
+                "Messages can't reach this agent: its connection to the deck was refused (the \
+                 deck could not identify the process that asked for them). Restart it from the \
+                 deck; messages addressed to it are not handed to the restarted agent, so have \
+                 them sent again."
+            )
+        );
+        assert_eq!(
+            admission_refused_text("inbox_from_a_later_release"),
+            "Messages can't reach this agent: its connection to the deck was refused. Restart \
+             it from the deck; messages addressed to it are not handed to the restarted agent, so \
+             have them sent again."
+        );
     }
 }

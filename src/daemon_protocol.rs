@@ -1116,6 +1116,14 @@ pub const CAP_CLOSE_AGENTS: &str = "close-agents";
 /// reply advertised [`CAP_CLOSE_AGENTS`]. Advertised on every platform.
 pub const CAP_HELLO_FOLLOW_ON: &str = "hello-follow-on";
 
+/// Capability string for [`AttachRequest::ListOutcomes`] (PRD #1666 part 3,
+/// round 5, plan D10): the deck's recovery rows — reports and dispatch results
+/// set aside because their recipient was gone. Sent only by
+/// [`crate::daemon_client::DaemonClient::list_outcomes`], after a fresh
+/// `Hello` on the connection that carries it, so no [`PROTOCOL_VERSION`]
+/// bump. Advertised on every platform.
+pub const CAP_DECK_OUTCOMES: &str = "deck-outcomes";
+
 /// The longest [`FinalReply::text`] the daemon stores or sends, in bytes. A
 /// longer reply is cut to its longest valid UTF-8 prefix within the bound
 /// ([`clamp_turn_reply`]). Reading speaks a summary of the reply, so the head
@@ -1295,6 +1303,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_HOST_METRICS,
     CAP_CLOSE_AGENTS,
     CAP_HELLO_FOLLOW_ON,
+    CAP_DECK_OUTCOMES,
 ];
 #[cfg(not(unix))]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
@@ -1316,6 +1325,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_INBOX_ACTIONS,
     CAP_CLOSE_AGENTS,
     CAP_HELLO_FOLLOW_ON,
+    CAP_DECK_OUTCOMES,
 ];
 
 // ---------------------------------------------------------------------------
@@ -1562,6 +1572,76 @@ pub const CONTRACT_BREAKS: &[&str] = &[
     // not handed. Same request, same reply type; what moved is which acks
     // settle, for OpenCode and Pi as well as Claude Code.
     "1666-explicit-ack-requires-handed-attempt",
+    // PRD #1666 part 3 (R-1), at 12 without moving it. The inbox verbs used to
+    // admit only a process the deck could trace to the pane's agent through
+    // the process table, so Claude Code's background session host -- which
+    // runs a conversation outside the tree the deck recorded, with the pane's
+    // environment -- was refused `inbox_not_agent_process` and its mail
+    // queued for good. Membership is now the pane's current capability plus
+    // the deck's own OS user; generation identity and the capability's
+    // token -> spawn -> pane binding are unchanged, and so are the receiver
+    // checks but one: under required evidence a receiver whose place above or
+    // below the agent cannot be read (an unreadable parent, or a walk that
+    // runs out of steps) is now refused `inbox_peer_unidentified` rather than
+    // admitted (part 3, round 2). Same requests, same replies; what moved is
+    // who is admitted, and the refusal codes
+    // (`inbox_other_user`, `inbox_peer_unidentified`,
+    // `inbox_component_not_caller`, `inbox_receiver_above_agent`,
+    // `inbox_nested_agent`) that name the cause.
+    // `changelog.d/1666-pane-capability.breaking.md` is its fragment.
+    "1666-pane-capability-inbox-admission",
+    // PRD #1666 part 3 (H4), at 12 without moving it. Codex's prompt and Stop
+    // hooks and a model-run `dot-agent-deck inbox fetch` (Codex with its hooks
+    // off or untrusted, Devin, any other agent) become one-shot receipt
+    // receivers, as Claude Code's hooks did in part 2: each fetches on
+    // `inbox_receipt_fetch` (the CLI's refusal there is lifted), commits by
+    // writing its output whole, and no longer acknowledges by id, so a lost
+    // hand-over repeats marked or turns uncertain instead of being re-sent
+    // after the ack-wait. Each asks `inbox_receipts` first and goes on only
+    // when that answer names it in the additive `one_shot_senders`: a daemon
+    // answering `one_shot_receipts` 1 alone (part 2's) is handed nothing by
+    // them, with no legacy fallback. Additive request fields
+    // (`component`, `max_json_bytes`) and an unchanged attach wire; what moved
+    // is who takes mail on receipts and what settles it.
+    // `changelog.d/1666-remaining-inbox.breaking.md` is its fragment.
+    "1666-remaining-inbox-one-shot-receipts",
+    // PRD #1666 part 3 (H5), at 12 without moving it. The legacy delivery
+    // policy is withdrawn: a plain `inbox_fetch` with no stream bound takes
+    // nothing whatever it asks, `ack` included (`cli_too_old`, or for an
+    // agent's hook the one-shot floor's `hooks_too_old`); a once `inbox_wait`
+    // from Codex's, Devin's or an unknown component is refused `unsupported`;
+    // `get_seed` hands nothing over and answers no seed with the additive
+    // `refused: get_seed_removed`; and an `ack` of a message the deck never
+    // handed out answers `unknown` and changes nothing, where an older daemon
+    // acknowledged the queued copy. The attach wire, `ListInbox`'s nested
+    // vocabulary (the legacy `ack_how` spellings included) and the
+    // stream-bound fetch are unchanged; what moved is who may take mail.
+    // `changelog.d/1666-legacy-inbox.breaking.md` is its fragment.
+    "1666-legacy-inbox-delivery-withdrawal",
+    // PRD #1666 part 3, round 5, at 12 without moving it. A worker's
+    // `work-done` completes the task it names (`work_done_task`, sent only
+    // after `hook_capabilities` confirms version 1 on the same connection); a
+    // legacy `work_done` without `done` is a note that completes no task, and
+    // a terminal report (`done`) requires attestation. Reports are retained
+    // before they are acknowledged and go to a recovery row when their
+    // recipient is gone; `InboxNotice` / `MessageSummary` carry report
+    // provenance (an additive optional field); a unit that ends without a
+    // report produces a `dispatch ended` outcome, and a terminal report from a
+    // unit that already ended is refused (`task_closed`); a worker's exit
+    // notice names the task ids it is about; `destination: none` only for the
+    // orchestrator of a directly started orchestration (pinned at the spawn),
+    // `report_pending` for a generation a publication covers; a failed respawn
+    // of a unit's terminal ends the unit; a report from a forgotten or
+    // replaced generation is refused (`unknown_task`, `task_closed`); an
+    // attested note from a pane now in another orchestration is refused
+    // (`not_a_worker`); a daemon whose report state was torn by an internal
+    // panic refuses reports (`deck_unavailable`); a `dispatch` is refused
+    // before anything starts when its result could not be kept; and
+    // `delegate --supersede` ends the task it replaces, debt included. Nothing
+    // on the attach wire moved shape: `ListOutcomes` is a new request every
+    // sender withholds until the daemon advertises `CAP_DECK_OUTCOMES`.
+    // `changelog.d/1666-task-scoped-completion.breaking.md` is its fragment.
+    "1666-task-scoped-completion-and-recovery",
 ];
 
 /// What comparing this build's [`CONTRACT_BREAKS`] against a peer's found.
@@ -2166,6 +2246,11 @@ pub enum AttachRequest {
     ///
     /// **Withheld unless the daemon advertises [`CAP_CLOSE_AGENTS`]**, so no
     /// [`PROTOCOL_VERSION`] bump: every sender gates in the client library.
+    /// PRD #1666 part 3, round 5 (plan D10): the deck's recovery rows.
+    ///
+    /// **Withheld unless the daemon advertises [`CAP_DECK_OUTCOMES`]** on the
+    /// connection that carries it, so no [`PROTOCOL_VERSION`] bump.
+    ListOutcomes,
     CloseAgents {
         selector: CloseSelector,
         /// The calling agent's pane claim. Absent: a person.
@@ -3854,6 +3939,11 @@ pub struct AttachResponse {
     /// [`PROTOCOL_VERSION`] bump.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub close_report: Option<CloseReport>,
+    /// PRD #1666 part 3, round 5: the answer to [`AttachRequest::ListOutcomes`].
+    /// `None` on every other response, and on a refusal. Additive and
+    /// optional, and its request is capability-gated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deck_outcomes: Option<crate::report_recovery::DeckOutcomes>,
 }
 
 /// PRD #1487: this daemon process's identity for [`AttachResponse::instance_id`]
@@ -5996,6 +6086,9 @@ async fn handle_connection(
                 env,
                 tab_membership,
                 agent_type,
+                // PRD #1666 part 3, round 5 (plan D7): a client's start is an
+                // orchestration nobody dispatched.
+                origin: Some(crate::hook_provenance::InstanceOrigin::Direct),
             };
             #[cfg(unix)]
             let spawned = match prepared_dir.as_ref() {
@@ -6446,6 +6539,22 @@ async fn handle_connection(
             // desktop both mint fresh ones), and one that relied on the stronger
             // order would still race older daemons.
             drop(pane_cleanup_hold);
+        }
+        AttachRequest::ListOutcomes => {
+            // PRD #1666 part 3, round 5 (plan D15 rule 4): never a listing
+            // read from torn report state.
+            let resp = match registry.inbox().deck_outcomes() {
+                Ok(outcomes) => AttachResponse {
+                    deck_outcomes: Some(outcomes),
+                    ..AttachResponse::ok()
+                },
+                Err(_) => AttachResponse::err(
+                    "the deck daemon hit an internal error and has stopped recording results \
+                     (its log has the details); restart the deck daemon to list them again"
+                        .to_string(),
+                ),
+            };
+            write_resp(&mut stream, &resp).await?
         }
         AttachRequest::CloseAgents {
             selector,
@@ -7275,6 +7384,7 @@ fn post_message(
         spill_path: spill_path.map(std::path::PathBuf::from),
         id: None,
         preface: None,
+        provenance: None,
     };
     let to = crate::inbox::Recipient::bound(pane_id, live.clone());
     // Audit F2: a post the inbox would refuse is refused before anything is
@@ -9600,6 +9710,7 @@ mod tests {
                         spill_path: None,
                         id: None,
                         preface: None,
+                        provenance: None,
                     },
                 )
                 .expect("post")
@@ -9851,6 +9962,7 @@ mod tests {
                         spill_path: None,
                         id: None,
                         preface: None,
+                        provenance: None,
                     },
                 )
                 .expect("post");
@@ -12297,6 +12409,509 @@ mod tests {
         assert!(legacy.deck_id.is_none() && legacy.inbox_messages.is_none());
     }
 
+    /// One summary element as an older daemon wrote it, `ack_how` and
+    /// `extra` keys spliced in.
+    fn frozen_summary(ack_how: &str, extra: &str) -> String {
+        format!(
+            r#"{{"id":"m-k3xzq2ab-0123456789abcdef","kind":"direct","to":"inbox.k3xzq2ab.p","recipient":{{"pane_id":"p","agent_id":"a"}},"from":{{"type":"deck","reason":"seed"}},"subject":"legacy history","body_trust":"trusted","state":"acknowledged","ack_how":"{ack_how}","deliveries":1,"age_ms":12{extra}}}"#
+        )
+    }
+
+    /// Every `ack_how` spelling a daemon has written. The first three are the
+    /// legacy policy's, which PRD #1666 part 3 (H5) removed: no new daemon
+    /// produces them, and every build still reads them.
+    const EVERY_ACK_HOW: [(&str, crate::inbox::AckHow); 7] = [
+        ("prompt_observed", crate::inbox::AckHow::PromptObserved),
+        ("hook_handover", crate::inbox::AckHow::HookHandover),
+        ("fetched_by_cli", crate::inbox::AckHow::FetchedByCli),
+        ("plugin_confirmed", crate::inbox::AckHow::PluginConfirmed),
+        (
+            "extension_confirmed",
+            crate::inbox::AckHow::ExtensionConfirmed,
+        ),
+        ("explicit", crate::inbox::AckHow::Explicit),
+        ("offer_completed", crate::inbox::AckHow::OfferCompleted),
+    ];
+
+    /// Scenario: A 0.47 reader decodes a message summary and an inbox notice this build writes with report provenance set, for every provenance kind. This build decodes a provenance kind, a dispatch phase, an outcome phase, cause, delivery and operation, and a work-done disposition it does not know as `unknown`; a task-scoped work-done whose mode it does not know is refused `unsupported_mode` and changes nothing.
+    #[spec("inbox/boundary/074")]
+    #[tokio::test]
+    async fn boundary_074_report_provenance_crosses_versions() {
+        use crate::report_recovery::{
+            DispatchPhase, OutcomeCause, OutcomeDelivery, OutcomeOp, OutcomePhase, Producer,
+            ReportProvenance,
+        };
+        // 0.47's readers, field for field (no `deny_unknown_fields`, as 0.47).
+        #[allow(dead_code)]
+        mod v047 {
+            use serde::Deserialize;
+
+            #[derive(Deserialize)]
+            #[serde(rename_all = "snake_case")]
+            pub enum StateName {
+                Queued,
+                Fetched,
+                Claimed,
+                Acknowledged,
+                Undeliverable,
+            }
+
+            #[derive(Deserialize)]
+            pub struct MessageSummary {
+                pub id: String,
+                pub kind: String,
+                pub to: String,
+                pub subject: String,
+                pub state: StateName,
+                pub deliveries: u32,
+                pub age_ms: u64,
+            }
+
+            #[derive(Deserialize)]
+            pub struct InboxNotice {
+                pub pane_id: String,
+                #[serde(default)]
+                pub agent_id: Option<String>,
+                pub message_id: String,
+                pub subject: String,
+                pub from_label: String,
+                pub state: StateName,
+                #[serde(default)]
+                pub returned: bool,
+            }
+        }
+        let producer = Producer {
+            pane_id: "w".into(),
+            agent_id: "2".into(),
+            role: Some("coder".into()),
+        };
+        let every = [
+            ReportProvenance::Task {
+                task_id: "m-k3xzq2ab-0123456789abcdef".into(),
+                report_id: "r".into(),
+                producer: producer.clone(),
+            },
+            ReportProvenance::Terminal {
+                unit_id: "u".into(),
+                report_id: "r".into(),
+                producer: producer.clone(),
+            },
+            ReportProvenance::Uncorrelated {
+                report_id: "r".into(),
+                producer,
+            },
+            ReportProvenance::DispatchResult {
+                unit_id: Some("u".into()),
+                phase: DispatchPhase::Ended,
+                report_id: None,
+            },
+        ];
+        let base: crate::inbox::MessageSummary =
+            serde_json::from_str(&frozen_summary("explicit", "")).unwrap();
+        for provenance in every {
+            let summary = crate::inbox::MessageSummary {
+                provenance: Some(provenance.clone()),
+                ..base.clone()
+            };
+            let written = serde_json::to_string(&summary).unwrap();
+            assert!(written.contains("provenance"), "{written}");
+            serde_json::from_str::<v047::MessageSummary>(&written)
+                .unwrap_or_else(|e| panic!("0.47 reads {written}: {e}"));
+            let notice = serde_json::json!({
+                "pane_id": "o",
+                "agent_id": "1",
+                "message_id": "m-k3xzq2ab-0123456789abcdef",
+                "subject": "s",
+                "from_label": "l",
+                "state": "queued",
+            });
+            let mut notice: crate::event::InboxNotice = serde_json::from_value(notice).unwrap();
+            notice.provenance = Some(provenance);
+            let written = serde_json::to_string(&notice).unwrap();
+            serde_json::from_str::<v047::InboxNotice>(&written)
+                .unwrap_or_else(|e| panic!("0.47 reads {written}: {e}"));
+        }
+
+        // This build reads what a newer one may add.
+        assert_eq!(
+            serde_json::from_str::<ReportProvenance>(r#"{"kind":"later"}"#).unwrap(),
+            ReportProvenance::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<DispatchPhase>(r#""later""#).unwrap(),
+            DispatchPhase::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<OutcomePhase>(r#""later""#).unwrap(),
+            OutcomePhase::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<OutcomeCause>(r#""later""#).unwrap(),
+            OutcomeCause::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<OutcomeDelivery>(r#""later""#).unwrap(),
+            OutcomeDelivery::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<OutcomeOp>(r#""later""#).unwrap(),
+            OutcomeOp::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<crate::event::WorkDoneTaskReply>(r#"{"disposition":"later"}"#)
+                .unwrap()
+                .disposition,
+            crate::event::WorkDoneDisposition::Unknown
+        );
+        let request: crate::event::WorkDoneTaskRequest = serde_json::from_str(
+            r#"{"pane_id":"p","mode":{"kind":"later"},"report":"r","timestamp":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        assert_eq!(request.mode, crate::event::WorkDoneMode::Unknown);
+        let registry = std::sync::Arc::new(crate::agent_pty::AgentPtyRegistry::new());
+        let completion = crate::task_completion::complete(
+            &tokio::sync::RwLock::new(crate::state::AppState::default()),
+            &registry,
+            crate::task_completion::CompletionRequest {
+                pane_id: request.pane_id,
+                mode: request.mode,
+                report: request.report,
+            },
+            &crate::hook_provenance::Provenance::Unattested,
+        )
+        .await;
+        let crate::task_completion::Completion::Reply(reply) = completion else {
+            panic!("an answer");
+        };
+        assert_eq!(reply.code.as_deref(), Some("unsupported_mode"));
+        assert!(registry.inbox().deck_outcome_rows().is_empty());
+    }
+
+    /// Scenario: Frozen `ListInbox` answers as older daemons wrote them — one acknowledged message for each of the seven `ack_how` spellings, the three legacy ones together in one list, every state and undeliverable reason, both sender kinds, both trust levels, a minimal and a maximal summary, a body whose text opens like a block — are decoded by this build as an attach response, as a hook `inbox list` answer and as bare summaries; and a frozen copy of 0.47's reader, its nested types and closed enums included, decodes what this build writes as an attach response and as a hook `inbox list` answer: every state, undeliverable reason and `ack_how` spelling, both senders, each recipient shape, every wake, and a summary with every optional field set and one with none.
+    #[spec("inbox/boundary/070")]
+    #[test]
+    fn boundary_070_an_older_daemons_inbox_listing_still_decodes() {
+        use crate::inbox::{
+            BodyTrust, MessageSummary, Recipient, Sender, StateName, UndeliverableReason,
+        };
+        for (spelling, how) in EVERY_ACK_HOW {
+            let element = frozen_summary(spelling, "");
+            let attach: AttachResponse =
+                serde_json::from_str(&format!(r#"{{"ok":true,"inbox_messages":[{element}]}}"#))
+                    .unwrap_or_else(|e| panic!("{spelling} in an attach answer: {e}"));
+            let messages = attach.inbox_messages.expect("inbox_messages is read");
+            assert_eq!(messages[0].ack_how, Some(how), "{spelling}");
+            let hook: crate::event::InboxListReply =
+                serde_json::from_str(&format!(r#"{{"messages":[{element}],"armed":0}}"#))
+                    .unwrap_or_else(|e| panic!("{spelling} in a hook listing: {e}"));
+            assert_eq!(hook.messages[0].ack_how, Some(how), "{spelling}");
+            let bare: MessageSummary = serde_json::from_str(&element).unwrap();
+            assert_eq!(bare.ack_how, Some(how), "{spelling}");
+        }
+        // One legacy value must not make the whole listing unreadable.
+        let legacy = ["prompt_observed", "hook_handover", "fetched_by_cli"]
+            .map(|spelling| frozen_summary(spelling, ""))
+            .join(",");
+        let attach: AttachResponse =
+            serde_json::from_str(&format!(r#"{{"ok":true,"inbox_messages":[{legacy}]}}"#)).unwrap();
+        assert_eq!(attach.inbox_messages.unwrap().len(), 3);
+        let hook: crate::event::InboxListReply = serde_json::from_str(&format!(
+            r#"{{"messages":[{legacy}],"armed":2,"wake":"native","component":"claude_waiter"}}"#
+        ))
+        .unwrap();
+        assert_eq!((hook.messages.len(), hook.armed), (3, 2));
+
+        // Every state, and every reason a message became undeliverable.
+        for (spelling, state) in [
+            ("queued", StateName::Queued),
+            ("fetched", StateName::Fetched),
+            ("claimed", StateName::Claimed),
+            ("acknowledged", StateName::Acknowledged),
+            ("undeliverable", StateName::Undeliverable),
+        ] {
+            let element = r#"{"id":"m-k3xzq2ab-0123456789abcdef","kind":"direct","to":"t","recipient":null,"from":{"type":"deck","reason":"r"},"subject":"s","body_trust":"trusted","state":"STATE","deliveries":0,"age_ms":0}"#
+                .replace("STATE", spelling);
+            let summary: MessageSummary = serde_json::from_str(&element).unwrap();
+            assert_eq!(summary.state, state, "{spelling}");
+            assert!(summary.recipient.is_none() && summary.ack_how.is_none());
+        }
+        for spelling in [
+            "agent_exited",
+            "max_deliver",
+            "superseded",
+            "inbox_shut",
+            "cancelled",
+        ] {
+            let element = format!(
+                r#"{{"id":"m-k3xzq2ab-0123456789abcdef","kind":"direct","to":"t","recipient":{{"pane_id":"p","agent_id":null}},"from":{{"type":"deck","reason":"r"}},"subject":"s","body_trust":"untrusted","state":"undeliverable","undeliverable_reason":"{spelling}","deliveries":3,"age_ms":9}}"#
+            );
+            let summary: MessageSummary =
+                serde_json::from_str(&element).unwrap_or_else(|e| panic!("{spelling}: {e}"));
+            assert!(summary.undeliverable_reason.is_some(), "{spelling}");
+            assert_eq!(summary.body_trust, BodyTrust::Untrusted);
+            assert_eq!(summary.recipient.unwrap().agent_id, None);
+        }
+
+        // A maximal summary from an agent sender, its body opening like a
+        // block with a delivery: listed text, never an attempt to act on.
+        let maximal = frozen_summary(
+            "explicit",
+            r#","topic":"builds","pool":"reviewers","bind_agent":"a","spill_path":"/tmp/m.md","text":"[dot-agent-deck message m-k3xzq2ab-0123456789abcdef delivery 1.1 from the orchestrator]\nbody""#,
+        )
+        .replace(
+            r#"{"type":"deck","reason":"seed"}"#,
+            r#"{"type":"agent","pane_id":"o","agent_id":"b","role":null,"orchestration":"x"}"#,
+        );
+        let summary: MessageSummary = serde_json::from_str(&maximal).unwrap();
+        assert_eq!(summary.topic.as_deref(), Some("builds"));
+        assert_eq!(summary.pool.as_deref(), Some("reviewers"));
+        assert_eq!(summary.bind_agent.as_deref(), Some("a"));
+        assert!(summary.spill_path.is_some());
+        assert!(summary.text.as_deref().unwrap().contains("delivery 1.1"));
+        assert!(matches!(
+            summary.from,
+            Sender::Agent {
+                role: None,
+                orchestration: Some(_),
+                ..
+            }
+        ));
+
+        // The reverse direction: a frozen 0.47 reader of what this build
+        // writes. Every type below is `v0.47.0`'s, field for field and with
+        // its own serde attributes, down to the nested ones: its enums are the
+        // closed sets 0.47 shipped and its message id checks what 0.47's did.
+        #[allow(dead_code)]
+        mod v047 {
+            use serde::Deserialize;
+
+            #[derive(Deserialize)]
+            #[serde(try_from = "String")]
+            pub struct MessageId(String);
+
+            impl TryFrom<String> for MessageId {
+                type Error = String;
+                fn try_from(text: String) -> Result<Self, Self::Error> {
+                    const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+                    let valid = text
+                        .strip_prefix("m-")
+                        .and_then(|rest| rest.split_once('-'))
+                        .is_some_and(|(deck, hex)| {
+                            deck.len() == 8
+                                && deck.bytes().all(|b| ALPHABET.contains(&b))
+                                && hex.len() == 16
+                                && hex
+                                    .bytes()
+                                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                        });
+                    if valid {
+                        Ok(Self(text))
+                    } else {
+                        Err(format!("not a message id: {text:?}"))
+                    }
+                }
+            }
+
+            #[derive(Deserialize)]
+            pub struct Recipient {
+                pub pane_id: String,
+                pub agent_id: Option<String>,
+            }
+
+            #[derive(Deserialize)]
+            #[serde(rename_all = "snake_case", tag = "type")]
+            pub enum Sender {
+                Deck {
+                    reason: String,
+                },
+                Agent {
+                    pane_id: String,
+                    agent_id: String,
+                    role: Option<String>,
+                    orchestration: Option<String>,
+                },
+            }
+
+            #[derive(Deserialize)]
+            #[serde(rename_all = "snake_case")]
+            pub enum BodyTrust {
+                Trusted,
+                Untrusted,
+            }
+
+            #[derive(Deserialize)]
+            #[serde(rename_all = "snake_case")]
+            pub enum StateName {
+                Queued,
+                Fetched,
+                Claimed,
+                Acknowledged,
+                Undeliverable,
+            }
+
+            #[derive(Deserialize)]
+            #[serde(rename_all = "snake_case")]
+            pub enum UndeliverableReason {
+                AgentExited,
+                MaxDeliver,
+                Superseded,
+                InboxShut,
+                Cancelled,
+            }
+
+            #[derive(Deserialize)]
+            #[serde(rename_all = "snake_case")]
+            pub enum AckHow {
+                PromptObserved,
+                PluginConfirmed,
+                ExtensionConfirmed,
+                HookHandover,
+                FetchedByCli,
+                Explicit,
+                OfferCompleted,
+            }
+
+            #[derive(Deserialize)]
+            pub struct MessageSummary {
+                pub id: MessageId,
+                pub kind: String,
+                #[serde(default)]
+                pub topic: Option<String>,
+                #[serde(default)]
+                pub pool: Option<String>,
+                pub to: String,
+                pub recipient: Option<Recipient>,
+                #[serde(default)]
+                pub bind_agent: Option<String>,
+                pub from: Sender,
+                pub subject: String,
+                pub body_trust: BodyTrust,
+                #[serde(default)]
+                pub spill_path: Option<std::path::PathBuf>,
+                pub state: StateName,
+                #[serde(default)]
+                pub undeliverable_reason: Option<UndeliverableReason>,
+                #[serde(default)]
+                pub ack_how: Option<AckHow>,
+                pub deliveries: u32,
+                pub age_ms: u64,
+                #[serde(default)]
+                pub text: Option<String>,
+            }
+
+            #[derive(Deserialize)]
+            #[serde(rename_all = "snake_case")]
+            pub enum InboxWake {
+                Native,
+                TurnEnd,
+                DoorbellOnly,
+            }
+
+            /// The two fields of 0.47's `AttachResponse` a listing reads.
+            #[derive(Deserialize)]
+            pub struct AttachResponse {
+                pub ok: bool,
+                #[serde(default)]
+                pub inbox_messages: Option<Vec<MessageSummary>>,
+            }
+
+            #[derive(Deserialize)]
+            pub struct InboxListReply {
+                pub messages: Vec<MessageSummary>,
+                pub armed: usize,
+                #[serde(default)]
+                pub wake: Option<InboxWake>,
+                #[serde(default)]
+                pub component: Option<String>,
+            }
+        }
+        // What this build writes: every state, every undeliverable reason and
+        // every ack spelling its types hold, both senders, each recipient
+        // shape, and the optional fields both set and absent.
+        let produced: MessageSummary = serde_json::from_str(&maximal).unwrap();
+        let bare = MessageSummary {
+            topic: None,
+            pool: None,
+            recipient: None,
+            bind_agent: None,
+            from: Sender::Deck {
+                reason: "seed".to_string(),
+            },
+            body_trust: BodyTrust::Untrusted,
+            spill_path: None,
+            undeliverable_reason: None,
+            ack_how: None,
+            text: None,
+            ..produced.clone()
+        };
+        let mut written = vec![produced.clone(), bare.clone()];
+        for state in [
+            StateName::Queued,
+            StateName::Fetched,
+            StateName::Claimed,
+            StateName::Acknowledged,
+            StateName::Undeliverable,
+        ] {
+            written.push(MessageSummary {
+                state,
+                recipient: Some(Recipient::bound("p", "a")),
+                ..bare.clone()
+            });
+        }
+        for reason in [
+            UndeliverableReason::AgentExited,
+            UndeliverableReason::MaxDeliver,
+            UndeliverableReason::Superseded,
+            UndeliverableReason::InboxShut,
+            UndeliverableReason::Cancelled,
+        ] {
+            written.push(MessageSummary {
+                state: StateName::Undeliverable,
+                undeliverable_reason: Some(reason),
+                recipient: Some(Recipient {
+                    pane_id: "p".to_string(),
+                    agent_id: None,
+                }),
+                ..produced.clone()
+            });
+        }
+        for (_, how) in EVERY_ACK_HOW {
+            written.push(MessageSummary {
+                ack_how: Some(how),
+                state: StateName::Acknowledged,
+                ..produced.clone()
+            });
+        }
+        for summary in &written {
+            let wire = serde_json::to_string(&AttachResponse {
+                inbox_messages: Some(vec![summary.clone()]),
+                ..AttachResponse::hello(PROTOCOL_VERSION)
+            })
+            .unwrap();
+            let old: v047::AttachResponse = serde_json::from_str(&wire)
+                .unwrap_or_else(|e| panic!("a 0.47 reader of {wire}: {e}"));
+            assert!(old.ok);
+            assert_eq!(old.inbox_messages.map(|m| m.len()), Some(1), "{wire}");
+        }
+        for wake in [
+            None,
+            Some(crate::event::InboxWake::Native),
+            Some(crate::event::InboxWake::TurnEnd),
+            Some(crate::event::InboxWake::DoorbellOnly),
+        ] {
+            let wire = serde_json::to_string(&crate::event::InboxListReply {
+                messages: written.clone(),
+                armed: 2,
+                wake,
+                component: wake.map(|_| "claude_waiter".to_string()),
+            })
+            .unwrap();
+            let old: v047::InboxListReply = serde_json::from_str(&wire)
+                .unwrap_or_else(|e| panic!("a 0.47 hook listing reader of {wake:?}: {e}"));
+            assert_eq!((old.messages.len(), old.armed), (written.len(), 2));
+        }
+    }
+
     /// PRD #1666 S3: `BroadcastMsg::Inbox` is internally tagged `inbox` with
     /// its fields flattened beside the tag, and round-trips.
     #[test]
@@ -12315,6 +12930,7 @@ mod tests {
             attention_update: false,
             requeued: false,
             notices: Default::default(),
+            provenance: None,
         });
         let value = serde_json::to_value(&msg).unwrap();
         assert_eq!(

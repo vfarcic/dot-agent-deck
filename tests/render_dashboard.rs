@@ -925,6 +925,28 @@ fn status_018_card_warns_that_messages_may_repeat() {
     assert!(rendered.contains(&head), "{head:?} missing:\n{rendered}");
 }
 
+/// Scenario: The deck refused the agent's own request for its waiting messages, while its hooks are also out of date. The card says messages can't reach this agent, why and to restart it from the deck, in the words the desktop tile uses, ahead of the hooks notice.
+#[spec("inbox/status/027")]
+#[test]
+fn status_027_card_says_messages_cannot_reach_the_agent() {
+    let words = inbox_display_words();
+    let rendered = inbox_notice_card(serde_json::json!({
+        "queued": 1,
+        "admission_refused": "inbox_nested_agent",
+        "integration": "hooks_too_old"
+    }));
+    let head = format!(
+        "{}: its connection to the deck",
+        words["admissionRefused"].as_str().unwrap()
+    );
+    assert!(rendered.contains(&head), "{head:?} missing:\n{rendered}");
+    assert!(
+        !rendered.contains(words["hooksTooOld"].as_str().unwrap()),
+        "the refusal leads the hooks notice:\n{rendered}"
+    );
+    insta::assert_snapshot!(rendered);
+}
+
 /// Scenario: The daemon's snapshot lists deck messages a Pi agent may not have received: one alone, two together, and one beside an uncertain delivery and a held-long one. The card says `may not have reached the agent` ahead of the queued count, with its count for two and the reason under it, never as an error, and an uncertain delivery still leads.
 #[spec("inbox/status/023")]
 #[test]

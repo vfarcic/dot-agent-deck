@@ -125,3 +125,40 @@ fn codex_011_live_busy_stop_hands_over_and_acks() {
         codex.evidence()
     );
 }
+
+/// Scenario: Start interactive Codex with every one of the deck's hooks switched off, so none of them runs, and post a sentinel task while it is idle. The deck types its doorbell; Codex's model runs `dot-agent-deck inbox fetch` inside its own sandbox, that fetch reaches the deck as a one-shot receiver (a sandbox that refuses the socket is UNVERIFIED, not a pass), the sentinel is written once, and the task is settled by its receipt with no hook having fetched.
+#[spec("inbox/codex/022")]
+#[test]
+fn codex_022_live_untrusted_hooks_a_model_run_fetch_delivers_on_receipts() {
+    skip_unless!(common::check_codex_available());
+    let codex = Codex::with_hooks(false, false);
+    let name = "codex-untrusted-4e1c90.txt";
+    let id = codex.post(name);
+    let reached = common::wait_until(BUDGET, || {
+        codex
+            .log()
+            .lines()
+            .any(|line| line.contains("hook receiver's inbox fetch") && line.contains("Cli"))
+    });
+    assert!(
+        reached,
+        "UNVERIFIED: Codex's model-run `inbox fetch` never reached the deck (a sandbox that refuses the socket is not a pass); {}",
+        codex.evidence()
+    );
+    codex.done(&id, name);
+    let log = codex.log();
+    assert!(log.contains("doorbell rang"), "{}", codex.evidence());
+    assert!(
+        !log.contains("DoorbellHook") && !log.contains("TurnEndHook"),
+        "no deck hook fetched: {}",
+        codex.evidence()
+    );
+    assert_eq!(
+        std::fs::read_to_string(codex.deck.workdir().join(name))
+            .unwrap()
+            .matches("codex-inbox-action")
+            .count(),
+        1,
+        "the sentinel is written once"
+    );
+}

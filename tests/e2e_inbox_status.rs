@@ -160,16 +160,16 @@ fn transition(socket: &mut UnixStream, pane: &Pane, id: &str, expected: &str) {
     }
 }
 
-/// Scenario: Subscribe an attached client before posting a message, then fetch it without acknowledging, let its ack-wait run out, fetch it again and acknowledge it, and stop an agent with another queued message. The client must observe each Queued, Fetched, Acknowledged and Undeliverable transition in order with the message identity, subject and sender label.
+/// Scenario: Subscribe an attached client before posting a message, then fetch it with an `inbox fetch` that prints nothing, so the deck takes it back, fetch it again and acknowledge it, and stop an agent with another queued message. The client must observe each Queued, Fetched, Queued, Fetched, Acknowledged and Undeliverable transition in order with the message identity, subject and sender label.
 #[spec("inbox/status/004")]
 #[test]
 fn status_004_attached_client_receives_each_inbox_state_change() {
-    let daemon = daemon_unbound(&[("DOT_AGENT_DECK_INBOX_ACK_WAIT_MS", "1500")]);
+    let daemon = daemon_unbound(&[]);
     let worker = pane(&daemon, "broadcast-worker");
     let mut events = subscribe(&daemon);
     let id = enqueue(&daemon, &worker, "broadcast task");
     transition(&mut events, &worker, &id, "queued");
-    fetch(&daemon, &worker, false);
+    fetch_not_handed(&daemon, &worker);
     transition(&mut events, &worker, &id, "fetched");
     transition(&mut events, &worker, &id, "queued");
     fetch(&daemon, &worker, false);
