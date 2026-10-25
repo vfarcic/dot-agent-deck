@@ -4502,6 +4502,108 @@ impl PaneWriter {
     async fn until_idle(&self) {
         self.pty.until_idle().await
     }
+
+    /// PRD #1666 part 3, round 5-wake (Q24): queue one job of a doorbell
+    /// transaction, the deck's `bytes` written and flushed in one job, under
+    /// `claim`, the word the transaction's take-back and the writer's start
+    /// both move. Unlike [`Self::daemon`]'s writes it carries no bound and no
+    /// drop guard of its own: the transaction is the job's one withdrawer
+    /// while it runs, and the returned [`DeckJob`] leaves the in-flight count
+    /// once for a take-back it sees. `None` when the writer thread is gone.
+    // The doorbell's driver calls it from activation (round 5-wake commit
+    // 6's switch), which removes these allows.
+    #[allow(dead_code)]
+    pub(crate) fn queue_deck_job(
+        &self,
+        bytes: Vec<u8>,
+        claim: Arc<crate::doorbell_txn::JobClaim>,
+    ) -> Option<DeckJob> {
+        let (tx, done) = oneshot::channel();
+        let (claim, _) = self.pty.submit_claimed(
+            PtyOp::WriteAll(bytes, ByteSource::Deck, true),
+            PtyReply::Async(tx),
+            None,
+            claim,
+        )?;
+        Some(DeckJob {
+            claim,
+            in_flight: Arc::clone(&self.pty.in_flight),
+            done,
+            left: false,
+        })
+    }
+}
+
+/// PRD #1666 part 3, round 5-wake (Q24): a doorbell transaction's job on the
+/// PTY writer thread ([`PaneWriter::queue_deck_job`]), from its enqueue to
+/// its answer, correlated to the job by its own claim and its own answer
+/// channel: one transaction has one job in flight at a time.
+///
+/// The in-flight count stays exact across the three ways the job can go: a
+/// job the writer starts leaves the count when the writer answers it, late
+/// or not; a job the transaction takes back is skipped by the writer, which
+/// leaves nothing, and [`Self::reconcile_take_back`] leaves it once. The
+/// writer's own timeout and drop guard ([`WithdrawUnlessAnswered`]) never
+/// see this job, so nothing else takes it back while its transaction runs.
+#[allow(dead_code)]
+pub(crate) struct DeckJob {
+    claim: Arc<crate::doorbell_txn::JobClaim>,
+    in_flight: Arc<PtyInFlight>,
+    done: oneshot::Receiver<PtyJobDone>,
+    /// The take-back has left the in-flight count.
+    left: bool,
+}
+
+#[allow(dead_code)]
+impl DeckJob {
+    /// The writer has claimed the job: some of its bytes may be in.
+    pub(crate) fn started(&self) -> bool {
+        self.claim.state() == crate::doorbell_txn::ClaimState::Started
+    }
+
+    /// Account a take-back: when the claim was taken back, leave the
+    /// in-flight count, once however often this is called, and answer
+    /// `true`, the job never being written.
+    pub(crate) fn reconcile_take_back(&mut self) -> bool {
+        let withdrawn = self.claim.state() == crate::doorbell_txn::ClaimState::Withdrawn;
+        if withdrawn && !self.left {
+            self.left = true;
+            self.in_flight.left_by_withdrawal();
+        }
+        withdrawn
+    }
+
+    /// The writer's answer, once it has come: the bytes the PTY took, and
+    /// whether the write and its flush both succeeded. A job taken back
+    /// never answers.
+    pub(crate) fn try_done(&mut self) -> Option<(usize, bool)> {
+        self.done.try_recv().ok().map(Self::outcome)
+    }
+
+    /// Wait for the writer's answer; `None` when the writer thread is gone
+    /// or the job was taken back.
+    pub(crate) async fn done(&mut self) -> Option<(usize, bool)> {
+        (&mut self.done).await.ok().map(Self::outcome)
+    }
+
+    fn outcome(done: PtyJobDone) -> (usize, bool) {
+        let ok = done.result.is_ok() && done.flushed.as_ref().is_none_or(Result::is_ok);
+        (done.accepted, ok)
+    }
+}
+
+impl Drop for DeckJob {
+    /// Dropped only once its transaction can no longer step (it ended, or
+    /// its task was torn down with it), so this take-back cannot answer the
+    /// transaction's own: a job still queued then is taken back, leaving the
+    /// count once.
+    fn drop(&mut self) {
+        if !self.left && self.claim.withdraw() {
+            self.left = true;
+            self.in_flight.left_by_withdrawal();
+        }
+        self.reconcile_take_back();
+    }
 }
 
 /// Issue #525: whose bytes a PTY job carries, which decides the clock they move
@@ -4662,10 +4764,6 @@ enum PtyJobOutcome {
     Gone,
 }
 
-const PTY_JOB_QUEUED: u8 = 0;
-const PTY_JOB_STARTED: u8 = 1;
-const PTY_JOB_WITHDRAWN: u8 = 2;
-
 enum PtyReply {
     Async(oneshot::Sender<PtyJobDone>),
     Blocking(std::sync::mpsc::SyncSender<PtyJobDone>),
@@ -4673,10 +4771,11 @@ enum PtyReply {
 
 struct PtyJob {
     op: PtyOp,
-    /// [`PTY_JOB_QUEUED`] until the thread claims it ([`PTY_JOB_STARTED`]) or
-    /// its caller takes it back ([`PTY_JOB_WITHDRAWN`]); whichever CAS wins
-    /// decides whether a single byte of it is ever written.
-    state: Arc<AtomicU8>,
+    /// Queued until the thread claims it to start it or its caller takes it
+    /// back; whichever compare-and-swap wins decides whether a single byte of
+    /// it is ever written. PRD #1666 part 3, round 5-wake (Q24): the same
+    /// word a doorbell transaction holds for the job it queued.
+    state: Arc<crate::doorbell_txn::JobClaim>,
     reply: PtyReply,
     /// PRD #1666 part 3, round 5-wake (plan §2.1′): the human operation these
     /// bytes belong to, settled by the thread when the job ends. The deck's
@@ -4711,19 +4810,22 @@ impl PtyInFlight {
     }
 
     /// Take a still-queued job back. `true` when it will never be written.
-    fn withdraw(&self, state: &AtomicU8) -> bool {
-        let withdrawn = state
-            .compare_exchange(
-                PTY_JOB_QUEUED,
-                PTY_JOB_WITHDRAWN,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            )
-            .is_ok();
+    /// The winner of the take-back leaves the count, here; a writer that
+    /// then finds the job taken back skips it without leaving again.
+    fn withdraw(&self, claim: &crate::doorbell_txn::JobClaim) -> bool {
+        let withdrawn = claim.withdraw();
         if withdrawn {
             self.leave();
         }
         withdrawn
+    }
+
+    /// A job taken back by a withdrawer other than [`Self::withdraw`], which
+    /// left nothing: a doorbell transaction's own take-back (Q24). Its
+    /// driver calls this exactly once for the claim it saw taken back.
+    #[allow(dead_code)]
+    pub(crate) fn left_by_withdrawal(&self) {
+        self.leave();
     }
 }
 
@@ -4732,7 +4834,7 @@ impl PtyInFlight {
 /// shutdown — leaves no write of its behind to land later unrecorded.
 struct WithdrawUnlessAnswered<'a> {
     in_flight: &'a PtyInFlight,
-    state: &'a AtomicU8,
+    state: &'a crate::doorbell_txn::JobClaim,
     armed: bool,
     /// The job's ticket, settled `Cancelled` when the job is taken back.
     ticket: Option<crate::ingress_ledger::TicketHandle>,
@@ -4804,17 +4906,10 @@ impl PtyWriterThread {
             .name("pty-writer".to_string())
             .spawn(move || {
                 while let Ok(job) = queue.recv() {
-                    if job
-                        .state
-                        .compare_exchange(
-                            PTY_JOB_QUEUED,
-                            PTY_JOB_STARTED,
-                            Ordering::SeqCst,
-                            Ordering::SeqCst,
-                        )
-                        .is_err()
-                    {
-                        // Withdrawn by a caller that stopped waiting.
+                    if !job.state.start() {
+                        // Withdrawn by a caller that stopped waiting, or by
+                        // the doorbell transaction that queued it; whoever
+                        // took it back has left the in-flight count.
                         continue;
                     }
                     let len = job.op.len();
@@ -4913,8 +5008,8 @@ impl PtyWriterThread {
         )
     }
 
-    fn submit(&self, op: PtyOp, reply: PtyReply) -> Option<Arc<AtomicU8>> {
-        self.submit_ticketed(op, reply, None)
+    fn submit(&self, op: PtyOp, reply: PtyReply) -> Option<Arc<crate::doorbell_txn::JobClaim>> {
+        self.submit_claimed(op, reply, None, Arc::default())
             .map(|(state, _)| state)
     }
 
@@ -4926,8 +5021,32 @@ impl PtyWriterThread {
         op: PtyOp,
         reply: PtyReply,
         ticket: Option<crate::ingress_ledger::TicketGuard>,
-    ) -> Option<(Arc<AtomicU8>, Option<crate::ingress_ledger::TicketHandle>)> {
-        let state = Arc::new(AtomicU8::new(PTY_JOB_QUEUED));
+    ) -> Option<(
+        Arc<crate::doorbell_txn::JobClaim>,
+        Option<crate::ingress_ledger::TicketHandle>,
+    )> {
+        self.submit_claimed(op, reply, ticket, Arc::default())
+    }
+
+    /// [`Self::submit_ticketed`] with the job's claim word supplied by the
+    /// caller: a doorbell transaction queues its job under the claim it
+    /// already holds, so its take-back and the writer's start move one word
+    /// (Q24).
+    fn submit_claimed(
+        &self,
+        op: PtyOp,
+        reply: PtyReply,
+        ticket: Option<crate::ingress_ledger::TicketGuard>,
+        state: Arc<crate::doorbell_txn::JobClaim>,
+    ) -> Option<(
+        Arc<crate::doorbell_txn::JobClaim>,
+        Option<crate::ingress_ledger::TicketHandle>,
+    )> {
+        debug_assert_eq!(
+            state.state(),
+            crate::doorbell_txn::ClaimState::Queued,
+            "a claim is queued once"
+        );
         self.in_flight.count.fetch_add(1, Ordering::SeqCst);
         let queue = |ticket: Option<crate::ingress_ledger::JobTicket>| {
             let handle = ticket
@@ -25242,6 +25361,155 @@ mod spawn_tests {
             .close_agent(&successor)
             .expect("close the successor");
         assert!(!registry.pane_input_tracks(PANE));
+    }
+
+    /// A PTY writer whose writes block until the test lets each one through,
+    /// recording what it took.
+    struct ClaimGatedWriter {
+        gate: std::sync::mpsc::Receiver<()>,
+        entered: std::sync::mpsc::Sender<()>,
+        taken: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl std::io::Write for ClaimGatedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let _ = self.entered.send(());
+            let _ = self.gate.recv();
+            self.taken.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A writer over a [`ClaimGatedWriter`]: the writer, the gate that lets
+    /// one write through, the signal that a write has begun, and the bytes
+    /// taken.
+    type ClaimGated = (
+        PaneWriter,
+        std::sync::mpsc::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+        Arc<Mutex<Vec<u8>>>,
+    );
+
+    fn claim_gated_writer() -> ClaimGated {
+        let (open, gate) = std::sync::mpsc::channel();
+        let (entered, entering) = std::sync::mpsc::channel();
+        let taken = Arc::new(Mutex::new(Vec::new()));
+        let writer = PaneWriter::new(
+            Box::new(ClaimGatedWriter {
+                gate,
+                entered,
+                taken: Arc::clone(&taken),
+            }),
+            Some("q24-pane".to_string()),
+            Arc::new(Mutex::new(PaneInputState::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        (writer, open, entering, taken)
+    }
+
+    fn in_flight(writer: &PaneWriter) -> usize {
+        writer.pty.in_flight.count.load(Ordering::SeqCst)
+    }
+
+    /// Scenario: Queue a doorbell transaction's line behind a human write the PTY is still taking, take the line back through the transaction's own claim, and let the human write finish. The writer skips the line without writing a byte of it; the take-back leaves the in-flight count once however often it is accounted, so the pane goes idle and nothing is counted twice.
+    #[spec("inbox/doorbell/049")]
+    #[tokio::test]
+    async fn doorbell_049_a_taken_back_transaction_job_is_never_written_and_leaves_once() {
+        let (writer, open, entering, taken) = claim_gated_writer();
+        let human = std::thread::spawn({
+            let pty_jobs = writer.pty.jobs.clone();
+            let in_flight = Arc::clone(&writer.pty.in_flight);
+            move || {
+                let thread = PtyWriterThread {
+                    jobs: pty_jobs,
+                    in_flight,
+                };
+                thread.run_blocking(PtyOp::WriteAll(b"human".to_vec(), ByteSource::User, true))
+            }
+        });
+        entering.recv().unwrap();
+        let claim = Arc::new(crate::doorbell_txn::JobClaim::default());
+        let mut job = writer
+            .queue_deck_job(b"(abcdfg) line".to_vec(), Arc::clone(&claim))
+            .expect("the writer thread runs");
+        assert_eq!(in_flight(&writer), 2);
+        assert!(!job.started());
+        assert!(
+            claim.withdraw(),
+            "the transaction's take-back wins while queued"
+        );
+        assert!(job.reconcile_take_back());
+        assert!(job.reconcile_take_back(), "accounted again");
+        assert_eq!(in_flight(&writer), 1, "the take-back left the count once");
+        open.send(()).unwrap();
+        human.join().unwrap().expect("the human write is answered");
+        writer.until_idle().await;
+        assert_eq!(in_flight(&writer), 0);
+        assert_eq!(&*taken.lock().unwrap(), b"human", "no byte of the line");
+        assert!(job.done().await.is_none(), "a job taken back never answers");
+        drop(job);
+        assert_eq!(in_flight(&writer), 0, "dropping it leaves nothing more");
+    }
+
+    /// Scenario: Queue a doorbell transaction's line on an idle writer, let the writer start it, then try to take it back, and let the PTY finish the write only later. The take-back loses and accounts nothing; the job's late answer still arrives, correlated to it, with what the PTY took; the writer leaves the count once, so the pane goes idle.
+    #[spec("inbox/doorbell/049")]
+    #[tokio::test]
+    async fn doorbell_049_a_started_transaction_job_answers_late_and_leaves_once() {
+        let (writer, open, entering, taken) = claim_gated_writer();
+        let claim = Arc::new(crate::doorbell_txn::JobClaim::default());
+        let mut job = writer
+            .queue_deck_job(b"(abcdfg) line".to_vec(), Arc::clone(&claim))
+            .expect("the writer thread runs");
+        entering.recv().unwrap();
+        assert!(job.started());
+        assert!(!claim.withdraw(), "the writer claimed it first");
+        assert!(!job.reconcile_take_back());
+        assert_eq!(in_flight(&writer), 1);
+        assert!(job.try_done().is_none(), "still inside the PTY");
+        open.send(()).unwrap();
+        assert_eq!(job.done().await, Some((13, true)));
+        writer.until_idle().await;
+        assert_eq!(in_flight(&writer), 0);
+        assert_eq!(&*taken.lock().unwrap(), b"(abcdfg) line");
+    }
+
+    /// Scenario: Queue a doorbell transaction's line behind a human write, then drop its job handle without the transaction having taken it back, as a torn-down driver would. The drop takes the still-queued line back and leaves the count once: the line is never written and the pane goes idle.
+    #[spec("inbox/doorbell/049")]
+    #[tokio::test]
+    async fn doorbell_049_a_dropped_transaction_job_still_queued_is_taken_back_once() {
+        let (writer, open, entering, taken) = claim_gated_writer();
+        let human = std::thread::spawn({
+            let pty_jobs = writer.pty.jobs.clone();
+            let in_flight = Arc::clone(&writer.pty.in_flight);
+            move || {
+                let thread = PtyWriterThread {
+                    jobs: pty_jobs,
+                    in_flight,
+                };
+                thread.run_blocking(PtyOp::WriteAll(b"human".to_vec(), ByteSource::User, true))
+            }
+        });
+        entering.recv().unwrap();
+        let claim = Arc::new(crate::doorbell_txn::JobClaim::default());
+        let job = writer
+            .queue_deck_job(b"(abcdfg) line".to_vec(), Arc::clone(&claim))
+            .expect("the writer thread runs");
+        drop(job);
+        assert_eq!(
+            claim.state(),
+            crate::doorbell_txn::ClaimState::Withdrawn,
+            "taken back by the drop"
+        );
+        assert_eq!(in_flight(&writer), 1);
+        open.send(()).unwrap();
+        human.join().unwrap().expect("the human write is answered");
+        writer.until_idle().await;
+        assert_eq!(in_flight(&writer), 0);
+        assert_eq!(&*taken.lock().unwrap(), b"human");
     }
 
     /// Issue #542: the user-byte stamp inside `PaneWriter`'s `Write` impl

@@ -671,18 +671,39 @@ const JOB_QUEUED: u8 = 0;
 const JOB_STARTED: u8 = 1;
 const JOB_WITHDRAWN: u8 = 2;
 
-/// One queued job's claim word (plan §2.3), shared by the transaction and the
-/// writer thread as the writer's own jobs share theirs: queued until the
-/// writer claims it to start it or the transaction takes it back, and
-/// whichever compare-and-swap wins decides whether any byte of the job is
-/// ever written. The take-back's result is known in the step that makes it,
-/// so ending a transaction waits on no answer.
+/// One queued job's claim word (plan §2.3, Q24): the one word the PTY writer
+/// thread's job (`PtyJob` in `src/agent_pty.rs`), the writer, every
+/// withdrawer and the transaction read and move. Queued until the writer
+/// claims it to start it or a withdrawer takes it back, and whichever
+/// compare-and-swap wins decides whether any byte of the job is ever
+/// written. The take-back's result is known in the step that makes it, so
+/// ending a transaction waits on no answer.
 #[derive(Debug, Default)]
 pub struct JobClaim {
     state: AtomicU8,
 }
 
+/// Where a [`JobClaim`] stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimState {
+    Queued,
+    /// The writer claimed it: some, all or none of its bytes may be in.
+    Started,
+    /// Taken back before the writer came to it: it is never written.
+    Withdrawn,
+}
+
 impl JobClaim {
+    /// Where the claim stands now. A `Queued` answer can be stale the moment
+    /// it is read; `Started` and `Withdrawn` are final.
+    pub fn state(&self) -> ClaimState {
+        match self.state.load(Ordering::Acquire) {
+            JOB_QUEUED => ClaimState::Queued,
+            JOB_STARTED => ClaimState::Started,
+            _ => ClaimState::Withdrawn,
+        }
+    }
+
     /// The writer, before the job's first byte: `true` when this call moved
     /// the job from queued to started, so the writer may write it; `false`
     /// when it was no longer queued, because it was taken back (drop it
@@ -700,9 +721,11 @@ impl JobClaim {
     ///
     /// `false` names the writer only when this is the job's sole withdrawer
     /// and its first call, which is how [`Txn`] uses it: a fresh claim per
-    /// enqueue, one `withdraw` consuming it. A second withdrawer on the same
-    /// word, such as the writer's timeout or drop guard once activation
-    /// shares it, breaks that premise and must be reconciled with it.
+    /// enqueue, one `withdraw` consuming it. The daemon keeps that premise by
+    /// giving a transaction's job no other withdrawer while the transaction
+    /// runs: it is queued without the writer's timeout or drop guard, and
+    /// the doorbell's driver, which owns the transaction, takes the claim
+    /// back only once the transaction can no longer step (Q24).
     pub fn withdraw(&self) -> bool {
         self.state
             .compare_exchange(
