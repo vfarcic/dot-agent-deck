@@ -35,12 +35,25 @@
 //! builds no parser and leaves the state [`EvidenceStatus::OverBudget`],
 //! which recognises nothing, until an edge back within it. While Pending, the
 //! witness is read straight off the parser's screen, with no copy of it.
+//!
+//! The parser's work is bounded too (Q25): each byte is priced in
+//! [`crate::vt_work`]'s units before it is parsed, and the first byte that
+//! would take one push past [`EVIDENCE_WORK_PER_PUSH`] is not parsed. The
+//! parser is dropped there and the state is
+//! [`EvidenceStatus::WorkOverBudget`], which recognises nothing, until the
+//! next layout edge starts the evidence over.
 
 use crate::doorbell_screen::{Grid, ScreenProfile, WidthsSeen, find_marker};
 
 /// The most cells (rows × cols) the evidence parser's grid may hold: the
 /// release scanner's bound ([`crate::release_scanner::SCANNER_CELLS_MAX`]).
 pub const EVIDENCE_CELLS_MAX: u32 = crate::release_scanner::SCANNER_CELLS_MAX;
+
+/// The most work, in [`crate::vt_work`] units, the evidence parser may do
+/// inside one push (Q25): the release scanner's per-push bound
+/// ([`crate::release_scanner::SCANNER_WORK_PER_PUSH`]), 2.9 ms of CPU at the
+/// dearest cost per unit measured (`src/agent_pty_scanner_budget.rs`).
+pub const EVIDENCE_WORK_PER_PUSH: u64 = crate::release_scanner::SCANNER_WORK_PER_PUSH;
 
 fn within_budget(rows: u16, cols: u16) -> bool {
     u32::from(rows.max(1)) * u32::from(cols.max(1)) <= EVIDENCE_CELLS_MAX
@@ -91,6 +104,10 @@ pub enum EvidenceStatus {
     /// [`EVIDENCE_CELLS_MAX`]: no parser runs and nothing is recognised until
     /// an edge back within it.
     OverBudget { since_seq: u64 },
+    /// A byte at `since_seq` would have taken one push past
+    /// [`EVIDENCE_WORK_PER_PUSH`]: the parser was dropped there, and nothing
+    /// is recognised until the next layout edge.
+    WorkOverBudget { since_seq: u64 },
 }
 
 impl EvidenceStatus {
@@ -102,6 +119,7 @@ impl EvidenceStatus {
             EvidenceStatus::Dirty { .. } => "dirty",
             EvidenceStatus::GeometryUnknown { .. } => "geometry_unknown",
             EvidenceStatus::OverBudget { .. } => "geometry_over_budget",
+            EvidenceStatus::WorkOverBudget { .. } => "work_over_budget",
         }
     }
 }
@@ -126,7 +144,7 @@ pub struct EvidenceState {
     layout_epoch: u64,
     out_seq: u64,
     status: EvidenceStatus,
-    parser: Option<vt100::Parser>,
+    parser: Option<crate::vt_work::MeteredParser>,
     /// Every width the terminal has had, for the witness.
     widths: WidthsSeen,
     /// While Dirty: the last bytes pushed, one fewer than the marker, so a
@@ -158,7 +176,7 @@ impl EvidenceState {
                     since_seq: 0,
                     after_edge: None,
                 },
-                Some(crate::vt_grid::parser(rows, cols, 0)),
+                Some(crate::vt_work::MeteredParser::new(rows, cols, 0)),
             ),
             None => (EvidenceStatus::Unprofiled, None),
         };
@@ -236,18 +254,18 @@ impl EvidenceState {
         match self.status {
             EvidenceStatus::Unprofiled
             | EvidenceStatus::GeometryUnknown { .. }
-            | EvidenceStatus::OverBudget { .. } => {
+            | EvidenceStatus::OverBudget { .. }
+            | EvidenceStatus::WorkOverBudget { .. } => {
                 self.out_seq += bytes.len() as u64;
                 None
             }
             EvidenceStatus::Pending { since_seq, .. } => {
-                self.feed(bytes);
+                if let Some(over) = self.feed(bytes) {
+                    return over;
+                }
                 self.check_witness(profile, since_seq, None)
             }
-            EvidenceStatus::Clean { .. } => {
-                self.feed(bytes);
-                None
-            }
+            EvidenceStatus::Clean { .. } => self.feed(bytes).flatten(),
             EvidenceStatus::Dirty { .. } => {
                 let marker = profile.redraw_marker;
                 let mut window = std::mem::take(&mut self.tail);
@@ -263,9 +281,25 @@ impl EvidenceState {
                 // at its first byte either way.
                 let base = self.out_seq;
                 let marker_seq = base - carried as u64 + at as u64;
-                let mut parser = crate::vt_grid::parser(self.rows, self.cols, 0);
-                parser.process(&modes_at(at.saturating_sub(carried)));
-                parser.process(&window[at..]);
+                let mut parser = crate::vt_work::MeteredParser::new(self.rows, self.cols, 0);
+                let modes = modes_at(at.saturating_sub(carried));
+                let fed = modes
+                    .iter()
+                    .chain(&window[at..])
+                    .position(|&b| !parser.feed_byte(b, EVIDENCE_WORK_PER_PUSH));
+                if let Some(refused) = fed {
+                    // The refused byte's place in the stream: the preamble
+                    // is the deck's own and has none, so it is charged to
+                    // the marker.
+                    let past_marker = refused.saturating_sub(modes.len()) as u64;
+                    self.out_seq = base + bytes.len() as u64;
+                    return self.transition(
+                        EvidenceStatus::WorkOverBudget {
+                            since_seq: marker_seq + past_marker,
+                        },
+                        Some(marker_seq),
+                    );
+                }
                 self.parser = Some(parser);
                 self.out_seq = base + bytes.len() as u64;
                 let edge_seq = match self.status {
@@ -285,11 +319,23 @@ impl EvidenceState {
         }
     }
 
-    fn feed(&mut self, bytes: &[u8]) {
-        if let Some(parser) = &mut self.parser {
-            parser.process(bytes);
-        }
+    /// Feed one push to the running parser. `Some` when a byte would have
+    /// taken the push past [`EVIDENCE_WORK_PER_PUSH`]: the parser is dropped
+    /// and the state has moved to [`EvidenceStatus::WorkOverBudget`], with
+    /// the transition if there was one.
+    fn feed(&mut self, bytes: &[u8]) -> Option<Option<Transition>> {
+        let base = self.out_seq;
         self.out_seq += bytes.len() as u64;
+        let parser = self.parser.as_mut()?;
+        let limit = parser.spent().saturating_add(EVIDENCE_WORK_PER_PUSH);
+        let refused = bytes.iter().position(|&b| !parser.feed_byte(b, limit))?;
+        self.parser = None;
+        Some(self.transition(
+            EvidenceStatus::WorkOverBudget {
+                since_seq: base + refused as u64,
+            },
+            None,
+        ))
     }
 
     fn check_witness(

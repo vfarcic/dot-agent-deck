@@ -29,6 +29,13 @@
 //! inserted line) is not checked again, so a header-like text drawn on
 //! another row and moved is missed rather than read, and the header itself is
 //! read when it is drawn, on its row.
+//! The scanner works to a budget ([`SCANNER_WORK_PER_PUSH`],
+//! [`SCANNER_WORK_TOTAL`]) counted in [`crate::vt_work`]'s units before each
+//! byte is parsed, so a pane that prints whole-grid operations without pause
+//! at a very large size costs its push at most the per-push limit: the
+//! scanner is dropped at the first byte that would pass a limit, and a
+//! generation not yet latched reads as `scanner_budget`.
+//!
 //! Not seen: a repeat (`CSI b`) that prints across a wrap writes several rows
 //! in one byte and only the row the cursor ends on is checked (none of the
 //! 372 measured traces uses one); a resize that truncates a span. Either way
@@ -198,12 +205,47 @@ pub struct OverBudget {
     pub cols: u16,
 }
 
+/// The most work, in [`crate::vt_work`] units, the scanner may do for one
+/// generation (Q25): 48 ms of CPU at the dearest cost per unit measured
+/// (0.57 ns, `src/agent_pty_scanner_budget.rs`, on the recorded launches and
+/// fifteen pathological traces). The most any recorded launch uses, at
+/// 50 × 200 or 80 × 300, is 12.6 million.
+pub const SCANNER_WORK_TOTAL: u64 = 85_000_000;
+
+/// The most work the scanner may do inside one push (Q25): 2.9 ms of CPU at
+/// the same cost per unit, so that with the evidence parser's bound
+/// ([`crate::evidence_state::EVIDENCE_WORK_PER_PUSH`]) a push's added lock
+/// hold stays under plan §4.6's 10 ms with room for a slower machine. The
+/// largest push of any recorded launch uses 0.56 million.
+pub const SCANNER_WORK_PER_PUSH: u64 = 5_000_000;
+
+/// Which of the scanner's work limits a byte would have passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkLimit {
+    /// [`SCANNER_WORK_PER_PUSH`].
+    Push,
+    /// [`SCANNER_WORK_TOTAL`].
+    Total,
+}
+
+impl WorkLimit {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WorkLimit::Push => "push",
+            WorkLimit::Total => "total",
+        }
+    }
+}
+
 /// A generation's own header parser. See the module documentation.
 pub struct ReleaseScanner {
-    parser: vt100::Parser,
+    parser: crate::vt_work::MeteredParser,
     recognisers: &'static [HeaderRecogniser],
     fed: u64,
     latch: ScanLatch,
+    /// The limit a byte would have passed. Set once; the scanner is fed
+    /// nothing after it.
+    over: Option<WorkLimit>,
 }
 
 fn within_budget(rows: u16, cols: u16) -> Result<(), OverBudget> {
@@ -224,23 +266,52 @@ impl ReleaseScanner {
     ) -> Result<Self, OverBudget> {
         within_budget(rows, cols)?;
         Ok(Self {
-            parser: crate::vt_grid::parser(rows, cols, 0),
+            parser: crate::vt_work::MeteredParser::new(rows, cols, 0),
             recognisers,
             fed: 0,
             latch: ScanLatch::Pending,
+            over: None,
         })
     }
 
-    /// Feed bytes in stream order, checking the cursor's row after each.
-    /// Returns whether the latch changed.
+    /// Feed one push's bytes in stream order, checking the cursor's row after
+    /// each. Returns whether the latch changed.
+    ///
+    /// Each byte is priced before it is parsed ([`crate::vt_work`]). The
+    /// first byte that would take this push past [`SCANNER_WORK_PER_PUSH`],
+    /// or the generation past [`SCANNER_WORK_TOTAL`], is not parsed, and
+    /// neither is anything after it, in this push or a later one
+    /// ([`Self::over_budget`]); the latch keeps what it had.
     pub fn feed(&mut self, bytes: &[u8]) -> bool {
         let before = self.latch.clone();
+        if self.over.is_some() {
+            return false;
+        }
+        let push_limit = self.parser.spent().saturating_add(SCANNER_WORK_PER_PUSH);
+        let (limit, which) = if push_limit < SCANNER_WORK_TOTAL {
+            (push_limit, WorkLimit::Push)
+        } else {
+            (SCANNER_WORK_TOTAL, WorkLimit::Total)
+        };
         for &byte in bytes {
-            self.parser.process(&[byte]);
+            if !self.parser.feed_byte(byte, limit) {
+                self.over = Some(which);
+                break;
+            }
             self.fed += 1;
             self.check();
         }
         self.latch != before
+    }
+
+    /// The work limit a byte would have passed, once one has.
+    pub fn over_budget(&self) -> Option<WorkLimit> {
+        self.over
+    }
+
+    /// The work done so far, in [`crate::vt_work`] units.
+    pub fn work(&self) -> u64 {
+        self.parser.spent()
     }
 
     fn check(&mut self) {
@@ -328,6 +399,9 @@ pub enum WindowClose {
     Retired,
     /// The pane's geometry went over [`SCANNER_CELLS_MAX`].
     Geometry,
+    /// A byte would have taken the scanner past one of its work limits
+    /// (Q25).
+    WorkBudget,
 }
 
 impl WindowClose {
@@ -338,6 +412,7 @@ impl WindowClose {
             WindowClose::AgentExit => "closed at agent exit",
             WindowClose::Retired => "closed at retirement",
             WindowClose::Geometry => "scanner dropped: geometry over budget",
+            WindowClose::WorkBudget => "scanner dropped: work over budget",
         }
     }
 }
@@ -373,6 +448,12 @@ pub struct ScanCost {
     pub resizes: u64,
     /// The longest resize of the scanner's grid.
     pub resize_ns_max: u64,
+    /// The scanner's work, in [`crate::vt_work`] units, over every push.
+    pub work: u64,
+    /// The most work any one push gave it.
+    pub push_work_max: u64,
+    /// The work limit a byte would have passed, if one did.
+    pub over: Option<WorkLimit>,
 }
 
 /// The calling thread's CPU time, in nanoseconds.
@@ -397,7 +478,8 @@ pub fn thread_cpu_ns() -> Option<u64> {
 /// that reads it while the header window is open (plan §4.6). The latch lives
 /// as long as the generation; the scanner is dropped at the first of the
 /// window's close (first prompt, byte limit), the generation's retirement,
-/// the end of its PTY reader, or a geometry over [`SCANNER_CELLS_MAX`].
+/// the end of its PTY reader, a geometry over [`SCANNER_CELLS_MAX`], or a byte
+/// over its work budget (Q25).
 pub struct ReleaseCapture {
     scanner: Option<ReleaseScanner>,
     latch: ScanLatch,
@@ -464,21 +546,28 @@ impl ReleaseCapture {
         let take = room.min(bytes.len());
         let started = std::time::Instant::now();
         let cpu_before = thread_cpu_ns();
+        let work_before = scanner.work();
         let changed = scanner.feed(&bytes[..take]);
         let cpu = thread_cpu_ns()
             .zip(cpu_before)
             .map_or(0, |(after, before)| after.saturating_sub(before));
         let wall = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let work = scanner.work() - work_before;
         self.cost.pushes += 1;
         self.cost.push_ns_total = self.cost.push_ns_total.saturating_add(wall);
         self.cost.push_ns_max = self.cost.push_ns_max.max(wall);
         self.cost.cpu_ns = self.cost.cpu_ns.saturating_add(cpu);
+        self.cost.work = scanner.work();
+        self.cost.push_work_max = self.cost.push_work_max.max(work);
+        self.cost.over = scanner.over_budget();
         self.last_push = Some((wall, cpu));
         if changed {
             self.latch = scanner.latch().clone();
             events.push(CaptureEvent::Latched(self.latch.clone()));
         }
-        if scanner.fed() >= RELEASE_WINDOW_BYTES {
+        if scanner.over_budget().is_some() {
+            events.extend(self.close(WindowClose::WorkBudget));
+        } else if scanner.fed() >= RELEASE_WINDOW_BYTES {
             events.extend(self.close(WindowClose::ByteLimit));
         }
         events
@@ -552,6 +641,9 @@ impl ReleaseCapture {
             ScanLatch::Conflict { .. } => LatchedRelease::Conflict,
             ScanLatch::Pending if self.closed == Some(WindowClose::Geometry) => {
                 LatchedRelease::ScannerGeometry
+            }
+            ScanLatch::Pending if self.closed == Some(WindowClose::WorkBudget) => {
+                LatchedRelease::ScannerBudget
             }
             _ => LatchedRelease::Unseen,
         }

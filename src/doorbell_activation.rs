@@ -16,7 +16,7 @@
 //! The rules apply in order, and the first that matches decides:
 //!
 //! 1. the release is not latched → `unknown_release` (or the latch's own
-//!    clause, `release_conflict` or `scanner_geometry`);
+//!    clause, `release_conflict`, `scanner_geometry` or `scanner_budget`);
 //! 2. a record exists for exactly this release → that record decides, and it
 //!    never falls through to inheritance;
 //! 3. the agent is not Codex, the release is a pre-release, or no record is
@@ -174,6 +174,9 @@ pub enum NoGo {
     ReleaseConflict,
     /// The pane was too large for the release scanner when it started.
     ScannerGeometry,
+    /// The release scanner was dropped at its work budget before it saw the
+    /// header (Q25).
+    ScannerBudget,
     /// The release's record lacks a required measurement.
     MissingMeasurement(&'static str),
     /// The release's record has a required measurement that is unverified or
@@ -201,6 +204,7 @@ impl NoGo {
             NoGo::UnknownRelease => "unknown_release",
             NoGo::ReleaseConflict => "release_conflict",
             NoGo::ScannerGeometry => "scanner_geometry",
+            NoGo::ScannerBudget => "scanner_budget",
             NoGo::MissingMeasurement(_) => "missing_measurement",
             NoGo::UnverifiedMeasurement(_) => "unverified_measurement",
             NoGo::UnmeasuredRelease => "unmeasured_release",
@@ -248,6 +252,9 @@ pub enum LatchedRelease {
     /// The scanner was not built or was dropped for its geometry before a
     /// header was seen.
     ScannerGeometry,
+    /// The scanner was dropped at its work budget before a header was seen
+    /// (Q25).
+    ScannerBudget,
 }
 
 /// The bytes of the line's first stage that are the same on every ring: the
@@ -341,6 +348,7 @@ pub fn activation<'a>(
         LatchedRelease::Unseen => return Activation::NoGo(NoGo::UnknownRelease),
         LatchedRelease::Conflict => return Activation::NoGo(NoGo::ReleaseConflict),
         LatchedRelease::ScannerGeometry => return Activation::NoGo(NoGo::ScannerGeometry),
+        LatchedRelease::ScannerBudget => return Activation::NoGo(NoGo::ScannerBudget),
     };
     let own: Vec<&ReleaseRecord<'a>> = records.iter().filter(|r| r.agent == *agent).collect();
     // Rule 2: an exact record decides, complete or not.

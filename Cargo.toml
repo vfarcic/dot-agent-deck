@@ -96,6 +96,11 @@ semver = "1"
 # 0.8.1 keeps the flag, and the whole problem, out of the tree.
 portable-pty = "=0.8.1"
 vt100 = "0.18"
+# PRD #1666 part 3, round 5-wake (Q25): `src/vt_work.rs` prices each byte with
+# the tokenizer `vt100` runs on, before `vt100` parses it. Already in the graph
+# through `vt100` 0.18; it must stay the one version `vt100` uses, which
+# `vt_work`'s `the_meter_and_vt100_share_one_vte` checks in `Cargo.lock`.
+vte = { version = "0.15", default-features = false }
 futures-util = "=0.3.34"
 regex = "1"
 open = "5"
@@ -288,6 +293,12 @@ opt-level = 3
 # in debug builds; this crate's own code still builds at the dev profile's
 # settings.
 [profile.dev.package.vt100]
+opt-level = 3
+
+# PRD #1666 part 3, round 5-wake (Q25): the work meter (`src/vt_work.rs`) runs
+# `vte` beside `vt100` on every byte those replays feed, so it is optimised
+# for the same reason.
+[profile.dev.package.vte]
 opt-level = 3
 
 # crossterm 0.29.0 with its Unix event source fixed to handle a whole readiness

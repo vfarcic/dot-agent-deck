@@ -80,6 +80,7 @@ For a watch loop, `bacon test-fast` (or `bacon test-e2e` / `bacon test-e2e-live`
 ## Developer docs
 
 - [Agent messaging](docs/develop/agent-messaging.md) — per-agent inbox states and limits, native wake and acknowledgement signals, doorbell guards, framing and developer environment tunings.
+- [Doorbell admission](docs/develop/doorbell-admission.md) — what the deck reads before it types the doorbell line, and the work budgets of the parsers that read it.
 
 Maintainer-facing references that are intentionally **not** published live under [`docs/develop/`](docs/develop/). They render as plain Markdown here on GitHub.
 

@@ -2212,7 +2212,8 @@ impl AgentBus {
                 latch,
                 cost,
             } => {
-                // Plan §9.1: what the scanner cost while its window was open.
+                // Plan §9.1: what the scanner cost while its window was open,
+                // and, with Q25, its work against its two limits.
                 tracing::debug!(
                     target: "pane_release",
                     agent_id = %self.label,
@@ -2222,6 +2223,9 @@ impl AgentBus {
                     cpu_us = cost.cpu_ns / 1_000,
                     resizes = cost.resizes,
                     resize_us_max = cost.resize_ns_max / 1_000,
+                    work = cost.work,
+                    push_work_max = cost.push_work_max,
+                    work_limit = cost.over.map(crate::release_scanner::WorkLimit::as_str),
                     "release scanner timing"
                 );
                 (latch, Some(*reason))
@@ -2251,10 +2255,10 @@ impl AgentBus {
             ScanLatch::Pending => tracing::info!(
                 target: "pane_release",
                 agent_id = %self.label,
-                release = if close == Some(WindowClose::Geometry) {
-                    "scanner_geometry"
-                } else {
-                    "unknown_release"
+                release = match close {
+                    Some(WindowClose::Geometry) => "scanner_geometry",
+                    Some(WindowClose::WorkBudget) => "scanner_budget",
+                    _ => "unknown_release",
                 },
                 close = close_words,
                 "pane release"
@@ -22637,13 +22641,13 @@ mod spawn_tests {
         assert_eq!(seen, ScanLatch::Pending);
         assert_eq!(closed, Some(WindowClose::FirstPrompt));
         assert!(!alive, "the scanner is dropped at the window's close");
-        // (f) a header starting past the byte limit is ignored.
+        // (f) a header starting past the byte limit is ignored. The filler
+        // is pushed at the PTY reader's largest read, as the reader would.
         let bus = AgentBus::for_generation("g-f", None, 24, 80);
-        bus.push(vec![
-            b'x';
-            crate::release_scanner::RELEASE_WINDOW_BYTES as usize
-                - 4
-        ]);
+        let filler = vec![b'x'; crate::release_scanner::RELEASE_WINDOW_BYTES as usize - 4];
+        for chunk in filler.chunks(8192) {
+            bus.push(chunk.to_vec());
+        }
         bus.push(codex_header("0.164.0"));
         let (seen, closed, _) = bus.release();
         assert_eq!(seen, ScanLatch::Pending);
@@ -22864,6 +22868,184 @@ mod spawn_tests {
             state.release.latched_for(&AgentType::Codex),
             LatchedRelease::ScannerGeometry
         );
+    }
+
+    /// 8192 bytes of erase-display at 512 × 512, one PTY read's worth: over
+    /// the per-push work limit of both the scanner and the evidence parser.
+    fn erase_storm() -> Vec<u8> {
+        b"\x1b[2J".repeat(2048)
+    }
+
+    /// Scenario: Feed generations at 512 × 512 one read of erase-display, then a run of reads each under the per-push limit that add up past the per-generation limit, then a header after a trip, and a latched generation the same erase-display. An unlatched generation's scanner is dropped at the first byte over either limit and reads as scanner_budget, which the activation table holds; nothing after a trip is read; a release latched before a trip stays latched.
+    #[spec("inbox/doorbell/055")]
+    #[test]
+    fn doorbell_055_the_scanner_works_to_a_budget() {
+        use crate::doorbell_activation::{Activation, LatchedRelease, NoGo, RELEASE_RECORDS};
+        use crate::release_scanner::{ScanLatch, WindowClose, WorkLimit};
+        let over = |bus: &AgentBus| bus.state.lock().unwrap().release.cost().over;
+        let latched_for = |bus: &AgentBus| {
+            bus.state
+                .lock()
+                .unwrap()
+                .release
+                .latched_for(&AgentType::Codex)
+        };
+        // One read over the per-push limit.
+        let bus = AgentBus::for_generation("g-s", None, 512, 512);
+        bus.push(erase_storm());
+        let (seen, closed, alive) = bus.release();
+        assert_eq!(seen, ScanLatch::Pending);
+        assert_eq!(closed, Some(WindowClose::WorkBudget));
+        assert!(!alive, "the scanner is dropped at its budget");
+        assert_eq!(over(&bus), Some(WorkLimit::Push));
+        assert_eq!(latched_for(&bus), LatchedRelease::ScannerBudget);
+        assert_eq!(
+            crate::doorbell_activation::activation(
+                &RELEASE_RECORDS,
+                &AgentType::Codex,
+                &latched_for(&bus),
+                &[],
+            ),
+            Activation::NoGo(NoGo::ScannerBudget)
+        );
+        assert_eq!(NoGo::ScannerBudget.clause(), "scanner_budget");
+        // Nothing after the trip is read, a header included.
+        bus.push(codex_header("0.164.0"));
+        assert_eq!(bus.release().0, ScanLatch::Pending);
+        assert_eq!(latched_for(&bus), LatchedRelease::ScannerBudget);
+
+        // Reads each under the per-push limit, past the generation's.
+        let bus = AgentBus::for_generation("g-t", None, 512, 512);
+        let read = b"\r\x1b[K".repeat(2048);
+        let mut reads = 0;
+        while bus.release().2 {
+            bus.push(read.clone());
+            reads += 1;
+            assert!(reads < 64, "the scanner outlived its total budget");
+        }
+        assert!(
+            reads > 1,
+            "one read of erase-in-line is under the per-push limit"
+        );
+        assert_eq!(over(&bus), Some(WorkLimit::Total));
+        assert_eq!(bus.release().1, Some(WindowClose::WorkBudget));
+        assert_eq!(latched_for(&bus), LatchedRelease::ScannerBudget);
+
+        // A release latched before a trip stays latched.
+        let bus = AgentBus::for_generation("g-u", None, 512, 512);
+        bus.push(codex_header("0.164.0"));
+        bus.push(erase_storm());
+        let (seen, closed, alive) = bus.release();
+        assert!(matches!(seen, ScanLatch::Latched { ref release, .. } if *release == V164));
+        assert_eq!(closed, Some(WindowClose::WorkBudget));
+        assert!(!alive);
+        assert_eq!(latched_for(&bus), LatchedRelease::Known(V164));
+    }
+
+    /// Scenario: Replay every recorded launch through the real push path at its recorded read sizes, at 50 × 200 and 80 × 300. No launch takes the release scanner past either work limit: each window closes at its byte limit or stays open, never at the budget, and the most work any one read gives the scanner is well inside the per-push limit.
+    #[spec("inbox/doorbell/055")]
+    #[test]
+    fn doorbell_055_recorded_launches_stay_within_the_scanner_budget() {
+        use crate::release_scanner::{SCANNER_WORK_PER_PUSH, SCANNER_WORK_TOTAL, WindowClose};
+        for (rows, cols) in [(50u16, 200u16), (80, 300)] {
+            for trace in super::scanner_budget::traces() {
+                let bus = AgentBus::for_generation(&trace.name, None, rows, cols);
+                for chunk in super::scanner_budget::chunks(&trace.bytes, &trace.read_lens) {
+                    bus.push(chunk.to_vec());
+                }
+                let cost = bus.state.lock().unwrap().release.cost();
+                assert_eq!(cost.over, None, "{} at {rows}x{cols}", trace.name);
+                assert_ne!(bus.release().1, Some(WindowClose::WorkBudget));
+                // Margins the calibration measured: a launch's largest read
+                // and its whole window use under a fifth and a sixth.
+                assert!(
+                    cost.push_work_max < SCANNER_WORK_PER_PUSH / 5,
+                    "{} at {rows}x{cols}: {} units in one read",
+                    trace.name,
+                    cost.push_work_max
+                );
+                assert!(
+                    cost.work < SCANNER_WORK_TOTAL / 6,
+                    "{} at {rows}x{cols}: {} units",
+                    trace.name,
+                    cost.work
+                );
+            }
+        }
+    }
+
+    /// Scenario: A Codex-profiled bus at 512 × 512 turns Clean on a redraw, then is fed one read of erase-display. The evidence parser is dropped at the first byte over its per-push limit and the state reads work_over_budget, with no frame to read; later reads, a full redraw included, leave it there; the next layout edge starts the evidence over, and a redraw turns it Clean again.
+    #[spec("inbox/doorbell/044")]
+    #[test]
+    fn doorbell_044_the_evidence_parser_works_to_a_per_push_bound() {
+        use crate::evidence_state::EvidenceStatus;
+        let bus = AgentBus::profiled(Some(&crate::doorbell_screen::CODEX_PROFILE), 512, 512);
+        bus.push(codex_choice_frame(512));
+        assert!(matches!(evidence(&bus), EvidenceStatus::Clean { .. }));
+        let at = bus.evidence().2;
+        bus.push(erase_storm());
+        let status = evidence(&bus);
+        let EvidenceStatus::WorkOverBudget { since_seq } = status else {
+            panic!("the storm left the state {status:?}");
+        };
+        assert!(
+            since_seq > at && since_seq < at + 8192,
+            "dropped inside the read"
+        );
+        assert_eq!(status.as_str(), "work_over_budget");
+        assert!(bus.clean_frame().is_none());
+        assert_eq!(bus.evidence_parser_cells(), 0);
+        bus.push(codex_choice_frame(512));
+        assert!(matches!(
+            evidence(&bus),
+            EvidenceStatus::WorkOverBudget { .. }
+        ));
+        assert!(bus.clean_frame().is_none());
+
+        // The next edge resets it.
+        bus.resize_and_mark_edge(
+            crate::evidence_state::EdgeReason::NudgeShrink,
+            512,
+            511,
+            || Ok::<(), ()>(()),
+        )
+        .unwrap();
+        assert!(matches!(evidence(&bus), EvidenceStatus::Dirty { .. }));
+        bus.resize_and_clear(512, 512, || Ok::<(), ()>(())).unwrap();
+        bus.push(codex_choice_frame(512));
+        assert!(matches!(evidence(&bus), EvidenceStatus::Clean { .. }));
+        assert!(bus.clean_frame().is_some());
+
+        // A redraw marker followed in the same read by the storm drops the
+        // parser it starts.
+        bus.resize_and_clear(512, 512, || Ok::<(), ()>(())).unwrap();
+        let mut read = codex_choice_frame(512);
+        read.extend(erase_storm());
+        bus.push(read);
+        assert!(matches!(
+            evidence(&bus),
+            EvidenceStatus::WorkOverBudget { .. }
+        ));
+    }
+
+    /// Scenario: Replay every recorded launch through a bus profiled for its agent, at its recorded read sizes, at 50 × 200 and 80 × 300. No read of any launch takes the evidence parser past its per-push limit.
+    #[spec("inbox/doorbell/044")]
+    #[test]
+    fn doorbell_044_recorded_launches_stay_within_the_evidence_bound() {
+        use crate::evidence_state::EvidenceStatus;
+        for (rows, cols) in [(50u16, 200u16), (80, 300)] {
+            for trace in super::scanner_budget::traces() {
+                let bus = AgentBus::for_generation(&trace.name, Some(trace.profile), rows, cols);
+                for chunk in super::scanner_budget::chunks(&trace.bytes, &trace.read_lens) {
+                    bus.push(chunk.to_vec());
+                    assert!(
+                        !matches!(evidence(&bus), EvidenceStatus::WorkOverBudget { .. }),
+                        "{} at {rows}x{cols}",
+                        trace.name
+                    );
+                }
+            }
+        }
     }
 
     /// Scenario: Latch a `cat` generation's release, attach to it and detach, start the window's first-prompt close through the registry, restart the pane, close a generation, and let a generation's PTY reach its end. Attaching changes nothing; the respawned generation starts with an empty latch and reads as unseen with no header of its own; closing or retiring a generation and its reader's end each drop its scanner.

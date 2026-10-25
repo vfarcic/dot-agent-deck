@@ -180,7 +180,7 @@ fn doorbell_053_go_iff_every_required_measurement_is_verified() {
     );
 }
 
-/// Scenario: Ask the table about generations whose header latched nothing, latched two releases, or ran a scanner over its budget, and about records whose capability-only fields are absent. The first three are held with their own clause; missing capabilities leave a complete record Go.
+/// Scenario: Ask the table about generations whose header latched nothing, latched two releases, ran a scanner over its cell budget, or had its scanner dropped at its work budget, and about records whose capability-only fields are absent. The first four are held with their own clause; missing capabilities leave a complete record Go.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_unlatched_releases_and_capabilities() {
@@ -189,6 +189,7 @@ fn doorbell_053_unlatched_releases_and_capabilities() {
         (LatchedRelease::Unseen, NoGo::UnknownRelease),
         (LatchedRelease::Conflict, NoGo::ReleaseConflict),
         (LatchedRelease::ScannerGeometry, NoGo::ScannerGeometry),
+        (LatchedRelease::ScannerBudget, NoGo::ScannerBudget),
     ] {
         assert_eq!(
             no_go(&activation(&records, &CODEX, &latch, &[])),
@@ -196,6 +197,7 @@ fn doorbell_053_unlatched_releases_and_capabilities() {
         );
         assert_eq!(NoGo::UnknownRelease.clause(), "unknown_release");
     }
+    assert_eq!(NoGo::ScannerBudget.clause(), "scanner_budget");
     let bare = ReleaseRecord {
         placeholder_empty: Measurement::Absent,
         delete_key: Measurement::Absent,
