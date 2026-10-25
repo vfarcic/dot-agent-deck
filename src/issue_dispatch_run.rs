@@ -4851,65 +4851,18 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn planted_hooks_and_fsmonitor_never_run_from_the_decks_git() {
-        use std::os::unix::fs::PermissionsExt;
         let tmp = crate::test_temp::tempdir().unwrap();
-        let repo = tmp.path().join("repo");
-        let wt = tmp.path().join("repo-dispatch-x");
-        init_repo_with_worktree(tmp.path(), &repo, &wt);
-
-        let marker = tmp.path().join("MARKER");
-        let trap = |path: &Path| {
-            crate::test_isolation::write_script(
-                path,
-                format!("#!/bin/sh\necho \"$0\" >> '{}'\nexit 1\n", marker.display()),
-            )
-            .unwrap();
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        };
-        let hooks = repo.join(".git").join("hooks");
-        std::fs::create_dir_all(&hooks).unwrap();
-        trap(&hooks.join("post-checkout"));
-        let fsmonitor = tmp.path().join("fsmonitor.sh");
-        trap(&fsmonitor);
-        let git = |dir: &Path, args: &[&str]| {
-            crate::git_env::fixture_git_with_hooks(dir, tmp.path())
-                .args(args)
-                .output()
-                .expect("git available")
-        };
-        let config = git(
-            &repo,
-            &["config", "core.fsmonitor", &fsmonitor.to_string_lossy()],
-        );
-        assert!(config.status.success(), "{config:?}");
-
-        // The control: plain git with this repository runs both traps. The
-        // add's own status is the hook's, which fails on purpose.
-        let control = tmp.path().join("repo-control");
-        git(
-            &repo,
-            &[
-                "worktree",
-                "add",
-                "-q",
-                "-b",
-                "control",
-                &control.to_string_lossy(),
-            ],
-        );
-        let fired = std::fs::read_to_string(&marker).unwrap_or_default();
-        assert!(
-            fired.contains("post-checkout"),
-            "hook trap armed: {fired:?}"
-        );
-        std::fs::remove_file(&marker).unwrap();
-        git(&wt, &["status", "--porcelain"]);
-        let fired = std::fs::read_to_string(&marker).unwrap_or_default();
-        assert!(
-            fired.contains("fsmonitor.sh"),
-            "fsmonitor trap armed: {fired:?}"
-        );
-        std::fs::remove_file(&marker).unwrap();
+        let sandbox = tmp.path().to_path_buf();
+        let repo = sandbox.join("repo");
+        let marker = sandbox.join("MARKER");
+        // The fixture is synchronous git and file work, so it runs off the
+        // runtime's thread.
+        tokio::task::spawn_blocking({
+            let (repo, marker) = (repo.clone(), marker.clone());
+            move || plant_hook_and_fsmonitor_traps(&sandbox, &repo, &marker)
+        })
+        .await
+        .unwrap();
 
         let created = tmp.path().join("repo-dispatch-y");
         let outcome = create_worktree_from(
@@ -4923,13 +4876,78 @@ mod tests {
         .await;
         assert_eq!(outcome, Ok(WorktreeCreation::Created));
         assert_eq!(worktree_is_dirty(&created).await, Ok(false));
-        std::fs::write(created.join("scratch.txt"), "work").unwrap();
+        tokio::fs::write(created.join("scratch.txt"), "work")
+            .await
+            .unwrap();
         assert_eq!(worktree_is_dirty(&created).await, Ok(true));
         assert!(
-            !marker.exists(),
+            !tokio::fs::try_exists(&marker).await.unwrap(),
             "the deck's git ran a planted program: {}",
-            std::fs::read_to_string(&marker).unwrap_or_default()
+            tokio::fs::read_to_string(&marker).await.unwrap_or_default()
         );
+    }
+
+    /// The fixture for [`planted_hooks_and_fsmonitor_never_run_from_the_decks_git`]:
+    /// a repository with a linked worktree, a `post-checkout` hook and a
+    /// `core.fsmonitor` command that each append their name to `marker`, and a
+    /// control showing that plain git runs both. Leaves `marker` absent.
+    #[cfg(unix)]
+    fn plant_hook_and_fsmonitor_traps(sandbox: &Path, repo: &Path, marker: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let wt = sandbox.join("repo-dispatch-x");
+        init_repo_with_worktree(sandbox, repo, &wt);
+        let trap = |path: &Path| {
+            crate::test_isolation::write_script(
+                path,
+                format!("#!/bin/sh\necho \"$0\" >> '{}'\nexit 1\n", marker.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let hooks = repo.join(".git").join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        trap(&hooks.join("post-checkout"));
+        let fsmonitor = sandbox.join("fsmonitor.sh");
+        trap(&fsmonitor);
+        let git = |dir: &Path, args: &[&str]| {
+            crate::git_env::fixture_git_with_hooks(dir, sandbox)
+                .args(args)
+                .output()
+                .expect("git available")
+        };
+        let config = git(
+            repo,
+            &["config", "core.fsmonitor", &fsmonitor.to_string_lossy()],
+        );
+        assert!(config.status.success(), "{config:?}");
+
+        // The control: plain git with this repository runs both traps. The
+        // add's own status is the hook's, which fails on purpose.
+        let control = sandbox.join("repo-control");
+        git(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "control",
+                &control.to_string_lossy(),
+            ],
+        );
+        let fired = std::fs::read_to_string(marker).unwrap_or_default();
+        assert!(
+            fired.contains("post-checkout"),
+            "hook trap armed: {fired:?}"
+        );
+        std::fs::remove_file(marker).unwrap();
+        git(&wt, &["status", "--porcelain"]);
+        let fired = std::fs::read_to_string(marker).unwrap_or_default();
+        assert!(
+            fired.contains("fsmonitor.sh"),
+            "fsmonitor trap armed: {fired:?}"
+        );
+        std::fs::remove_file(marker).unwrap();
     }
 
     #[test]
