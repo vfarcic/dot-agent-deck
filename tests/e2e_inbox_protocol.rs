@@ -1121,7 +1121,7 @@ fn inbox_protocol_023_a_refused_request_of_the_agents_own_shows_on_its_card() {
     );
 }
 
-/// Scenario: A real TUI card has a queued message when the agent's own fetch arrives over a connection whose creator exited. The attached terminal shows the refusal cause and restart remedy on that card, then clears the notice after an admitted fetch.
+/// Scenario: A synthetic Codex agent's real TUI card has a queued message when its own fetch arrives over a connection whose creator exited. The attached terminal shows the refusal cause and restart remedy on that card, then clears the notice after an admitted fetch.
 #[spec("inbox/protocol/023")]
 #[test]
 fn inbox_protocol_023_a_refused_connection_renders_cause_and_remedy_on_the_card() {
@@ -1131,7 +1131,8 @@ fn inbox_protocol_023_a_refused_connection_renders_cause_and_remedy_on_the_card(
         .with_pty_size(3000, 50)
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active agents");
-    let pane = inbox_card::pane(&deck, "refused-card");
+    let pane = inbox_card::pane_with(&deck, "refused-card", json!({"agent_type":"codex"}));
+    assert!(deck.wait_for_grid_string_within("Codex", WAIT));
     inbox_card::enqueue(&deck, &pane, "waiting for the refused agent");
     let mut request = inbox_card::request(&pane, "inbox_fetch");
     request["consumer"] = json!("cli");
