@@ -24,6 +24,9 @@ const COMPOSER: &str = include_str!("fixtures/codex-inbox/composer.txt");
 struct Codex {
     pane: Pane,
     daemon: common::DaemonProc,
+    /// The receipt spool the deck pinned for the pane, as its environment
+    /// names it: what the agent's hooks and its model-run `inbox fetch` see.
+    spool: Option<String>,
     _bin: tempfile::TempDir,
 }
 
@@ -46,6 +49,7 @@ if 'app-server' in sys.argv:
     sys.exit(0)
 tty.setraw(0, termios.TCSANOW)
 base = os.environ['INBOX_CODEX_BASE']
+with open(base + '.env','w') as f: json.dump({k: os.environ[k] for k in ['DOT_AGENT_DECK_INBOX_SPOOL'] if k in os.environ}, f)
 with open(base + '.pid','w') as f: f.write(str(os.getpid()))
 capture = open(base + '.bytes','ab',buffering=0)
 previous = None
@@ -108,9 +112,11 @@ while True:
         // the stand-in pane's agent; inbox/protocol/014 and /015 pin the binding.
         let daemon = daemon_unbound(&env);
         let pane = Self::start(&daemon, screen_text, &program);
+        let spool = pane_env(&pane, "DOT_AGENT_DECK_INBOX_SPOOL");
         Self {
             pane,
             daemon,
+            spool,
             _bin: bin,
         }
     }
@@ -169,19 +175,20 @@ while True:
     }
 
     fn run_hook(&self, event: &str, prompt: Option<&str>) -> String {
+        let output = self.hook_output(event, prompt);
+        assert!(output.status.success(), "hook: {output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    /// The deck's own Codex hook for `event`, run with the pane's identity
+    /// and spool, and what it did.
+    fn hook_output(&self, event: &str, prompt: Option<&str>) -> std::process::Output {
         let mut payload = json!({"hook_event_name":event,"session_id":"codex-inbox-session","cwd":self.daemon.home});
         if let Some(prompt) = prompt {
             payload["prompt"] = json!(prompt);
         }
-        let mut child = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
-            .args(["hook", "--agent", "codex"])
-            .env_clear()
-            .env("HOME", &self.daemon.home)
-            .env("CODEX_HOME", self.daemon.home.join(".codex"))
-            .env("DOT_AGENT_DECK_SOCKET", &self.daemon.hook_socket)
-            .env("DOT_AGENT_DECK_PANE_ID", &self.pane.id)
-            .env("DOT_AGENT_DECK_AGENT_ID", &self.pane.agent)
-            .env("DOT_AGENT_DECK_PANE_CAPABILITY", &self.pane.token)
+        let mut child = self
+            .in_pane(&["hook", "--agent", "codex"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -193,9 +200,58 @@ while True:
             .unwrap()
             .write_all(payload.to_string().as_bytes())
             .unwrap();
-        let output = child.wait_with_output().unwrap();
-        assert!(output.status.success(), "hook: {output:?}");
-        String::from_utf8(output.stdout).unwrap()
+        child.wait_with_output().unwrap()
+    }
+
+    /// `dot-agent-deck <args>` with the environment the pane's processes
+    /// get: its identity, its capability and its receipt spool.
+    fn in_pane(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
+        command
+            .args(args)
+            .env_clear()
+            .env("HOME", &self.daemon.home)
+            .env("CODEX_HOME", self.daemon.home.join(".codex"))
+            .env("DOT_AGENT_DECK_SOCKET", &self.daemon.hook_socket)
+            .env("DOT_AGENT_DECK_PANE_ID", &self.pane.id)
+            .env("DOT_AGENT_DECK_AGENT_ID", &self.pane.agent)
+            .env("DOT_AGENT_DECK_PANE_CAPABILITY", &self.pane.token);
+        if let Some(spool) = &self.spool {
+            command.env("DOT_AGENT_DECK_INBOX_SPOOL", spool);
+        }
+        command
+    }
+
+    /// What a model-run `dot-agent-deck inbox fetch` in the pane prints.
+    fn model_fetch(&self) -> std::process::Output {
+        self.in_pane(&["inbox", "fetch"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    }
+
+    /// The listing's entry for message `id`.
+    fn summary(&self, id: &str) -> Value {
+        listing(&self.daemon, &self.pane)["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("message {id} is listed"))
+    }
+
+    /// Message `id` settled on its receipt, its exact attempt committed by
+    /// the receiver it was handed to, and handed over `deliveries` times:
+    /// not acknowledged by id (`hook_handover`, `fetched_by_cli`).
+    fn committed(&self, id: &str, deliveries: u64) {
+        state(&self.daemon, &self.pane, id, "acknowledged");
+        let summary = self.summary(id);
+        assert_eq!(
+            summary["ack_how"], "plugin_confirmed",
+            "settled by its receipt, not by an id-only ack: {summary}"
+        );
+        assert_eq!(summary["deliveries"], deliveries, "{summary}");
     }
 
     fn queued(&self, body: &str) -> String {
@@ -708,16 +764,21 @@ fn codex_006_own_hook_gates_status_and_restart_resets_guard() {
     codex.no_bytes();
 }
 
-/// Scenario: Queue several token-dense tasks while synthetic Codex is busy, then invoke its real Stop hook. The hook must block with framed content within 6000 UTF-8 bytes, acknowledge just the handed-over ids and retain overflow; an empty subsequent Stop must print no block.
-#[spec("inbox/codex/007")]
+/// Scenario: Queue several token-dense tasks while synthetic Codex is busy, then invoke its real Stop hook. It must print a `decision: block` JSON whose whole line fits 6000 UTF-8 bytes, carrying a bounded subset of the tasks, each block naming its attempt; those are settled by their receipts (never an id-only ack) and the rest stay queued, issued to no one, until later Stops take them; an empty Stop prints nothing and nothing is typed into the pane.
+#[spec("inbox/codex/019")]
 #[test]
-fn codex_007_stop_hands_over_budgeted_content_and_retains_overflow() {
+fn codex_019_stop_hands_over_on_receipts_and_keeps_overflow_unissued() {
     let codex = Codex::new(COMPOSER);
     codex.busy("busy human turn");
     let ids: Vec<_> = (0..4)
         .map(|n| codex.queued(&format!("codex-task-{n}: {}", "界".repeat(700))))
         .collect();
     let stdout = codex.run_hook("Stop", None);
+    assert!(
+        stdout.len() <= 6000,
+        "the whole Stop output fits Codex's 6000-byte budget: {}",
+        stdout.len()
+    );
     let output: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
         panic!(
             "queued busy Codex needs Stop decision:block with framed reason; {e}; stdout={stdout:?}"
@@ -725,15 +786,6 @@ fn codex_007_stop_hands_over_budgeted_content_and_retains_overflow() {
     });
     assert_eq!(output["decision"], "block");
     let reason = output["reason"].as_str().expect("Stop reason");
-    assert!(
-        reason.len() <= 6000,
-        "reason exceeds UTF-8 byte budget: {}",
-        reason.len()
-    );
-    assert!(
-        reason.contains("[dot-agent-deck message")
-            && reason.contains("[end of dot-agent-deck message")
-    );
     let handed: Vec<_> = ids
         .iter()
         .filter(|id| reason.contains(id.as_str()))
@@ -743,16 +795,20 @@ fn codex_007_stop_hands_over_budgeted_content_and_retains_overflow() {
         "budget must retain overflow: {reason}"
     );
     for id in &ids {
-        state(
-            &codex.daemon,
-            &codex.pane,
-            id,
-            if reason.contains(id) {
-                "acknowledged"
-            } else {
-                "queued"
-            },
-        );
+        if reason.contains(id.as_str()) {
+            assert!(
+                reason.contains(&format!("[dot-agent-deck message {id} delivery 1.1 from ")),
+                "a one-shot's block names its attempt: {reason}"
+            );
+            codex.committed(id, 1);
+        } else {
+            state(&codex.daemon, &codex.pane, id, "queued");
+            assert_eq!(
+                codex.summary(id)["deliveries"],
+                0,
+                "overflow was never issued"
+            );
+        }
     }
     for _ in 0..ids.len() {
         if !listing(&codex.daemon, &codex.pane)["messages"]
@@ -764,9 +820,12 @@ fn codex_007_stop_hands_over_budgeted_content_and_retains_overflow() {
             break;
         }
         let stdout = codex.run_hook("Stop", None);
+        assert!(stdout.len() <= 6000, "{}", stdout.len());
         let more: Value = serde_json::from_str(&stdout).unwrap();
         assert_eq!(more["decision"], "block");
-        assert!(more["reason"].as_str().unwrap().len() <= 6000);
+    }
+    for id in &ids {
+        codex.committed(id, 1);
     }
     assert!(
         codex.run_hook("Stop", None).trim().is_empty(),
@@ -778,17 +837,22 @@ fn codex_007_stop_hands_over_budgeted_content_and_retains_overflow() {
     );
 }
 
-/// Scenario: While synthetic Codex is busy, queue multiple token-dense messages and submit the fixed doorbell to its real UserPromptSubmit hook. Its additionalContext must contain framed tasks within 6000 UTF-8 bytes, acknowledge those ids, retain overflow and keep the deck line out of human prompt history while the card shows an envelope.
-#[spec("inbox/codex/008")]
+/// Scenario: While synthetic Codex is busy, queue several token-dense messages and submit the fixed doorbell to its real UserPromptSubmit hook. Its whole JSON output fits 6000 UTF-8 bytes and its additionalContext carries a bounded subset of framed tasks, each naming its attempt; those are settled by their receipts, the rest stay queued and unissued, the deck line stays out of human prompt history and the card shows an envelope.
+#[spec("inbox/codex/018")]
 #[test]
-fn codex_008_doorbell_submit_injects_and_acks_with_codex_budget() {
+fn codex_018_doorbell_submit_hands_over_on_receipts_within_the_byte_budget() {
     let codex = Codex::new(COMPOSER);
     codex.busy("original human prompt");
     let ids: Vec<_> = (0..4)
-        .map(|n| codex.queued(&format!("submit-{n}: {}", "界".repeat(700))))
+        .map(|n| codex.queued(&format!("submit-{n}: \"quoted\" \\ {}", "界".repeat(700))))
         .collect();
     let events = common::EventSub::subscribe(&codex.daemon.attach_socket);
     let stdout = codex.run_hook("UserPromptSubmit", Some(fixed_line(&ids[0]).trim_start()));
+    assert!(
+        stdout.len() <= 6000,
+        "the whole hook output, JSON escaping included, fits 6000 bytes: {}",
+        stdout.len()
+    );
     let output: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
         panic!("Codex doorbell submit must inject additionalContext; {e}; stdout={stdout:?}")
     });
@@ -799,11 +863,6 @@ fn codex_008_doorbell_submit_injects_and_acks_with_codex_budget() {
     let context = output["hookSpecificOutput"]["additionalContext"]
         .as_str()
         .unwrap();
-    assert!(
-        context.len() <= 6000,
-        "Codex context byte budget: {}",
-        context.len()
-    );
     assert!(context.contains("[dot-agent-deck message"));
     let handed = ids
         .iter()
@@ -814,16 +873,20 @@ fn codex_008_doorbell_submit_injects_and_acks_with_codex_budget() {
         "hand over a bounded subset and retain overflow"
     );
     for id in &ids {
-        state(
-            &codex.daemon,
-            &codex.pane,
-            id,
-            if context.contains(id) {
-                "acknowledged"
-            } else {
-                "queued"
-            },
-        );
+        if context.contains(id.as_str()) {
+            assert!(
+                context.contains(&format!("[dot-agent-deck message {id} delivery 1.1 from ")),
+                "{context}"
+            );
+            codex.committed(id, 1);
+        } else {
+            state(&codex.daemon, &codex.pane, id, "queued");
+            assert_eq!(
+                codex.summary(id)["deliveries"],
+                0,
+                "overflow was never issued"
+            );
+        }
     }
     let records = attach(&codex.daemon, json!({"op":"list-agents"}));
     let record = records["agent_records"]
@@ -849,4 +912,126 @@ fn codex_008_doorbell_submit_injects_and_acks_with_codex_budget() {
         },
         WAIT,
     );
+}
+
+/// The record `list-agents` gives the Codex pane's agent.
+fn record(codex: &Codex) -> Value {
+    attach(&codex.daemon, json!({"op":"list-agents"}))["agent_records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == codex.pane.agent)
+        .cloned()
+        .expect("the Codex agent's record")
+}
+
+/// Scenario: With none of the deck's Codex hooks running (untrusted), queue a task for idle synthetic Codex; the deck types its doorbell, and a stand-in model runs the real `dot-agent-deck inbox fetch` in the pane, which prints the framing and the block naming its attempt and settles it by its receipt. With the pane's receipt records made unwritable, a second fetch still prints and settles its task, and the card says messages may repeat.
+#[spec("inbox/codex/020")]
+#[test]
+fn codex_020_untrusted_hooks_a_model_run_fetch_commits_on_receipts() {
+    let codex = Codex::new(COMPOSER);
+    let id = codex.queued("untrusted-hooks task 7c41");
+    assert!(
+        common::wait_until(WAIT, || bytes(&codex.pane)
+            == format!("{}\r", fixed_line(&id)).as_bytes()),
+        "the doorbell asks the model to fetch: {:?}",
+        bytes(&codex.pane)
+    );
+    let fetched = codex.model_fetch();
+    let stdout = String::from_utf8_lossy(&fetched.stdout);
+    assert!(fetched.status.success(), "fetch: {fetched:?}");
+    assert!(
+        stdout.starts_with(dot_agent_deck::inbox_hub::AGENT_FRAMING)
+            && stdout.contains(&format!("[dot-agent-deck message {id} delivery 1.1 from "))
+            && stdout.contains("untrusted-hooks task 7c41"),
+        "{stdout}"
+    );
+    codex.committed(&id, 1);
+    assert!(
+        record(&codex)["inbox"]["receipts_degraded"].is_null(),
+        "{}",
+        record(&codex)
+    );
+
+    let spool = codex.spool.clone().expect("the deck pins the pane a spool");
+    let rec = std::path::Path::new(&spool)
+        .join(dot_agent_deck::inbox::encode_token(&codex.pane.id))
+        .join(dot_agent_deck::inbox::encode_token(&codex.pane.agent))
+        .join("rec");
+    assert!(rec.is_dir(), "{}", rec.display());
+    std::fs::set_permissions(&rec, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let second = codex.queued("sandboxed-spool task 2b9e");
+    let fetched = codex.model_fetch();
+    std::fs::set_permissions(&rec, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(fetched.status.success(), "fetch: {fetched:?}");
+    assert!(
+        String::from_utf8_lossy(&fetched.stdout).contains("sandboxed-spool task 2b9e"),
+        "{fetched:?}"
+    );
+    codex.committed(&second, 1);
+    assert!(
+        common::wait_until(WAIT, || record(&codex)["inbox"]["receipts_degraded"]
+            .as_str()
+            .is_some_and(|why| why.contains("receipt"))),
+        "a receipt it could not record degrades the card: {}",
+        record(&codex)
+    );
+}
+
+/// Scenario: With Codex's prompt hook switched off and its Stop hook trusted, an idle task reaches the model through the doorbell and a model-run `inbox fetch`, and a busy task through the real Stop hook; then a Stop hook and a model-run fetch run at once over two queued tasks. Each task is handed over to exactly one of them, printed once and settled by its receipt once.
+#[spec("inbox/codex/021")]
+#[test]
+fn codex_021_prompt_hook_off_doorbell_fetch_idle_and_stop_busy_each_once() {
+    let codex = Codex::new(COMPOSER);
+    let idle = codex.queued("idle task via fetch 51aa");
+    assert!(
+        common::wait_until(WAIT, || bytes(&codex.pane)
+            == format!("{}\r", fixed_line(&idle)).as_bytes()),
+        "{:?}",
+        bytes(&codex.pane)
+    );
+    let fetched = codex.model_fetch();
+    assert!(fetched.status.success(), "{fetched:?}");
+    assert!(String::from_utf8_lossy(&fetched.stdout).contains("idle task via fetch 51aa"));
+    codex.committed(&idle, 1);
+
+    codex.busy("a long human turn");
+    let busy = codex.queued("busy task via stop 8d03");
+    let stdout = codex.run_hook("Stop", None);
+    let output: Value = serde_json::from_str(&stdout).expect("a Stop block");
+    assert!(
+        output["reason"]
+            .as_str()
+            .unwrap()
+            .contains("busy task via stop 8d03")
+    );
+    codex.committed(&busy, 1);
+
+    let pair = [
+        codex.queued("overlap task one 0e7f"),
+        codex.queued("overlap task two 93c2"),
+    ];
+    let (stop, fetch) = std::thread::scope(|scope| {
+        let stop = scope.spawn(|| codex.hook_output("Stop", None));
+        let fetch = scope.spawn(|| codex.model_fetch());
+        (stop.join().unwrap(), fetch.join().unwrap())
+    });
+    assert!(stop.status.success(), "{stop:?}");
+    assert!(fetch.status.success(), "{fetch:?}");
+    let printed = format!(
+        "{}{}",
+        String::from_utf8_lossy(&stop.stdout),
+        String::from_utf8_lossy(&fetch.stdout)
+    );
+    for (id, body) in pair
+        .iter()
+        .zip(["overlap task one 0e7f", "overlap task two 93c2"])
+    {
+        assert_eq!(
+            printed.matches(body).count(),
+            1,
+            "{id} is handed to one of them, once: {printed}"
+        );
+        codex.committed(id, 1);
+    }
 }

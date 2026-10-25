@@ -1,0 +1,30 @@
+---
+source: tests/render_upgrade_dialog.rs
+expression: text
+---
+                                                                                                    
+                                                                                                    
+                                                                                                    
+  ┌ Upgrade to v0.47.0 ──────────────────────────────────────────────────────────────────────────┐  
+  │                                                                                              │  
+  │ dot-agent-deck CLI: update available: v0.47.0 (current: v0.46.0)                             │  
+  │ Downloaded binary at /home/u/.local/bin/dot-agent-deck. Upgrading downloads                  │  
+  │ `dot-agent-deck-linux-amd64` from release v0.47.0, checks it, and replaces                   │  
+  │ /home/u/.local/bin/dot-agent-deck.                                                           │  
+  │ Its checksum is checked against the release's checksum file. Build provenance will NOT be    │  
+  │ checked: the GitHub CLI (`gh`) is not installed.                                             │  
+  │ Upgrading does not restart the daemon on this machine, so its agents keep running. The next  │  
+  │ time you start the TUI, it restarts a daemon running another version onto its own, asking    │  
+  │ first when agents are running on it.                                                         │  
+  │ Upgraded /home/u/.local/bin/dot-agent-deck to v0.47.0.                                       │  
+  │ Build provenance was not checked: the GitHub CLI (`gh`) is not installed.                    │  
+  │ Claude Code's hooks still run another copy, /opt/homebrew/bin/dot-agent-deck.                │  
+  │ To have them run this copy, run:                                                             │  
+  │   /home/u/.local/bin/dot-agent-deck hooks install --agent claude-code                        │  
+  │ Then restart the affected agents.                                                            │  
+  │ Quit the TUI and start it again to run v0.47.0.                                              │  
+  │                                                                                              │  
+  │ > Close                                                                                      │  
+  │                                                                                              │  
+  │ Enter or Esc closes                                                                          │  
+  └──────────────────────────────────────────────────────────────────────────────────────────────┘

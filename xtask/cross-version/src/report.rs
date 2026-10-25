@@ -58,17 +58,76 @@ pub struct Tell {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failed_parts: Vec<String>,
     /// The pane a failed half measured, as the daemon itself named it — for
-    /// tell-4's `status` half, the reviewer's pane id from the last readable
-    /// `daemon status` rows. `breaks.rs` requires a refusal to name this pane
-    /// before attributing the failure to a declared break.
+    /// tell-4, the reviewer's pane id from the last readable `daemon status`
+    /// rows. A record of the run only: `breaks.rs` attributes a failure
+    /// through [`Self::part_ops`], never through this pane.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_pane: Option<String>,
+    /// For a tell asserted in halves, the operations each half ran, each with
+    /// its pane and the stretch of the sandbox `deck.log` it ran across. A half
+    /// may run more than one: tell-4's `work-done` is reported from the
+    /// reviewer's pane and fetched in the orchestrator's. A declared break
+    /// explains a half only through the operation it names (`breaks.rs`), so
+    /// a half that records none here is not explained.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub part_ops: Vec<PartOp>,
+    /// What the client CLI itself printed in a half's pane, as the capture
+    /// recorded it with stderr folded in: `(half, pane, output)`, the pane
+    /// being the one the capture recorded. Only a CLIENT-declared break may
+    /// take its witness from here (`breaks.rs`); not written to the evidence
+    /// file, where an explanation quotes the line it used.
+    #[serde(skip)]
+    pub client_outputs: Vec<(String, String, String)>,
     /// Set on a FAILED tell when a contract break the two builds declare
     /// differently accounts for every half that failed, with the evidence
     /// (`breaks.rs`). Such a tell does not make the run FAIL: the run is a
     /// [`RunVerdict::DeclaredBreak`] instead, once everything else holds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declared_break: Option<BreakExplanation>,
+}
+
+/// One operation a tell's half ran: what it was, in which pane, and where in
+/// the sandbox `deck.log` the daemon's record of it can be.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartOp {
+    /// The half it belongs to ([`Tell::failed_parts`]).
+    pub part: String,
+    /// What it was: `fetch`, `listing`, `report`, `status`. A known effect
+    /// names the one it explains (`breaks.rs`).
+    pub op: String,
+    /// The pane it ran in.
+    pub pane: String,
+    /// The `deck.log` length in bytes just before the operation began and
+    /// just after it ended: a line the daemon wrote for it starts inside
+    /// `[from, to)`. The daemon writes its log synchronously, before it
+    /// answers, so a refusal of this operation is inside it. `None` when the
+    /// log's length could not be read, and then no line of the log can be
+    /// tied to the operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_span: Option<(u64, u64)>,
+}
+
+impl PartOp {
+    pub fn new(part: &str, op: &str, pane: &str, log_span: Option<(u64, u64)>) -> Self {
+        PartOp {
+            part: part.to_string(),
+            op: op.to_string(),
+            pane: pane.to_string(),
+            log_span,
+        }
+    }
+}
+
+impl Tell {
+    /// The operations `op` half `part` recorded, as `(pane, log span)`. A
+    /// half that recorded no `op` names none.
+    pub fn ops_of(&self, part: &str, op: &str) -> Vec<(&str, Option<(u64, u64)>)> {
+        self.part_ops
+            .iter()
+            .filter(|o| o.part == part && o.op == op)
+            .map(|o| (o.pane.as_str(), o.log_span))
+            .collect()
+    }
 }
 
 /// Why a failed tell is a declared break's intended outcome (`breaks.rs`).
@@ -222,6 +281,8 @@ impl Evidence {
             detail,
             failed_parts: Vec::new(),
             subject_pane: None,
+            part_ops: Vec::new(),
+            client_outputs: Vec::new(),
             declared_break: None,
         });
     }
@@ -415,11 +476,16 @@ impl Evidence {
             let _ = writeln!(
                 s,
                 "**Every tell was measured, and each one that failed failed exactly as a contract \
-                 break says it will**: a break the daemon's build declares in `CONTRACT_BREAKS` and \
-                 the client's build does not, with the refusal that break describes found in the \
-                 sandbox `deck.log`. CLAUDE.md rule 12 records a declared break as the outcome, not \
-                 as a regression. A failure no declared break accounts for would have made this \
-                 run FAIL (`xtask/cross-version/src/breaks.rs`).\n"
+                 break says it will**: a break one build declares in `CONTRACT_BREAKS` and the \
+                 other does not — the daemon's build, or the client's for a break whose client \
+                 refuses an older daemon — with that break's record found for the operation it \
+                 acts on, in that operation's pane: the daemon's refusal in the sandbox \
+                 `deck.log`, written while the operation ran, or, for a break the client declares \
+                 and refuses before sending the daemon anything, the client's own output in that \
+                 pane. Each explained tell below quotes the line it used. CLAUDE.md rule 12 \
+                 records a declared break as the outcome, not as a regression. A failure no \
+                 declared break accounts for would have made this run FAIL \
+                 (`xtask/cross-version/src/breaks.rs`).\n"
             );
         }
         if let Some(note) = &self.skip_build {
@@ -770,6 +836,8 @@ mod tests {
             detail: "no ss(8) on this host".into(),
             failed_parts: Vec::new(),
             subject_pane: None,
+            part_ops: Vec::new(),
+            client_outputs: Vec::new(),
             declared_break: None,
         });
         assert!(e.missing_tells().is_empty(), "every tell was recorded");
@@ -788,6 +856,8 @@ mod tests {
             detail: "2 lines, expected 1".into(),
             failed_parts: Vec::new(),
             subject_pane: None,
+            part_ops: Vec::new(),
+            client_outputs: Vec::new(),
             declared_break: None,
         });
         assert!(!e.passed());
@@ -886,6 +956,8 @@ mod tests {
             detail: "first\nsecond".into(),
             failed_parts: Vec::new(),
             subject_pane: None,
+            part_ops: Vec::new(),
+            client_outputs: Vec::new(),
             declared_break: None,
         });
         let out = e.render();

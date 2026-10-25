@@ -806,6 +806,12 @@ pub fn is_newer_release(candidate: &str, than: &str) -> bool {
     crate::daemon_upgrade::client_is_newer(candidate, than)
 }
 
+/// How release `a` compares with release `b`, read as [`is_newer_release`]
+/// reads them, or `None` when either side cannot be parsed.
+pub fn compare_releases(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    crate::daemon_upgrade::release_order(a, b)
+}
+
 /// The release a build id (`<version>-g<sha>[-dirty]`, or `<version>-unknown`
 /// when git was unavailable at build time) was built from.
 pub fn release_of_build(build: &str) -> &str {
@@ -1910,6 +1916,19 @@ fn remedy_for_shell(
         text: REMEDY_UPGRADE_OR_REINSTALL.to_string(),
         command: None,
     }
+}
+
+/// Whether `binary`, as an agent's hook config names it, is this deck's own
+/// file. An absolute path is resolved through the filesystem; a bare command
+/// never is.
+pub fn names_this_deck(deck: &DeckIdentity, binary: &str) -> bool {
+    TrustedPin::classify(deck, binary).is_self
+}
+
+/// `path` as the program word(s) of a command for this platform's default
+/// shell, quoted as [`remedy_for`]'s commands are.
+pub fn shell_program(path: &str) -> String {
+    Shell::CURRENT.program(path)
 }
 
 /// The shell a notice's command is written for: the one a user pastes it into

@@ -1635,7 +1635,9 @@ pub fn agent_event_line(event: &AgentEvent, token: Option<&str>) -> serde_json::
         }
         // Issue #1637: which deck sent this, so the daemon can tell when an
         // agent's hooks run an older copy than itself.
-        crate::hook_binary::stamp_hook_line(map);
+        if !crate::inbox_oneshot::stands_in_for_pre_inbox_hooks() {
+            crate::hook_binary::stamp_hook_line(map);
+        }
     }
     serde_json::to_string(&value)
 }
@@ -1655,6 +1657,15 @@ pub enum DaemonMessage {
     /// Worker (or orchestrator with `done`) reports task completion.
     #[serde(rename = "work_done")]
     WorkDone(WorkDoneSignal),
+    /// PRD #1666 part 3, round 5 (plan D1): which hook verbs this daemon
+    /// serves, answered with a [`HookCapabilitiesReply`] on the same
+    /// connection, which then carries the mutation.
+    #[serde(rename = "hook_capabilities")]
+    HookCapabilities(HookCapabilitiesRequest),
+    /// PRD #1666 part 3, round 5 (plan D1): a task-scoped `work-done`,
+    /// answered with a [`WorkDoneTaskReply`] once the deck kept the report.
+    #[serde(rename = "work_done_task")]
+    WorkDoneTask(WorkDoneTaskRequest),
     /// PRD #201 native prompt delivery: a READ-ONLY request for the seed the
     /// daemon prepared for a pane, so the pane's extension can deliver it
     /// NATIVELY (`pi.sendUserMessage`) instead of the daemon typing it into the
@@ -1810,6 +1821,8 @@ impl DaemonMessage {
         match self {
             DaemonMessage::Delegate(s) => &s.pane_id,
             DaemonMessage::WorkDone(s) => &s.pane_id,
+            DaemonMessage::HookCapabilities(r) => &r.pane_id,
+            DaemonMessage::WorkDoneTask(r) => &r.pane_id,
             DaemonMessage::GetSeed(r) => &r.pane_id,
             DaemonMessage::Dispatch(s) => &s.pane_id,
             DaemonMessage::ListTargets(r) => &r.pane_id,
@@ -1837,6 +1850,8 @@ impl DaemonMessage {
         match self {
             DaemonMessage::Delegate(s) => s.token.as_deref(),
             DaemonMessage::WorkDone(s) => s.token.as_deref(),
+            DaemonMessage::HookCapabilities(r) => r.token.as_deref(),
+            DaemonMessage::WorkDoneTask(r) => r.token.as_deref(),
             DaemonMessage::GetSeed(r) => r.token.as_deref(),
             DaemonMessage::Dispatch(s) => s.token.as_deref(),
             DaemonMessage::ListTargets(r) => r.token.as_deref(),
@@ -1879,6 +1894,8 @@ impl DaemonMessage {
             | DaemonMessage::Ack(_) => true,
             DaemonMessage::Delegate(_)
             | DaemonMessage::WorkDone(_)
+            | DaemonMessage::HookCapabilities(_)
+            | DaemonMessage::WorkDoneTask(_)
             | DaemonMessage::GetSeed(_)
             | DaemonMessage::Dispatch(_)
             | DaemonMessage::ListTargets(_)
@@ -1907,6 +1924,8 @@ impl DaemonMessage {
             }
             DaemonMessage::Delegate(_)
             | DaemonMessage::WorkDone(_)
+            | DaemonMessage::HookCapabilities(_)
+            | DaemonMessage::WorkDoneTask(_)
             | DaemonMessage::GetSeed(_)
             | DaemonMessage::Dispatch(_)
             | DaemonMessage::ListTargets(_)
@@ -1924,6 +1943,8 @@ impl DaemonMessage {
         match self {
             DaemonMessage::Delegate(_) => "delegate",
             DaemonMessage::WorkDone(_) => "work_done",
+            DaemonMessage::HookCapabilities(_) => "hook_capabilities",
+            DaemonMessage::WorkDoneTask(_) => "work_done_task",
             DaemonMessage::GetSeed(_) => "get_seed",
             DaemonMessage::Dispatch(_) => "dispatch",
             DaemonMessage::ListTargets(_) => "list_targets",
@@ -1982,14 +2003,21 @@ impl DaemonMessage {
                 orchestrations: Vec::new(),
                 error: Some(message.to_string()),
             }),
-            // A refused `get-seed` answers exactly as "no seed pending" does.
-            // The extension then no-sends and the daemon's own PTY-injection
-            // safety net still delivers the seed to the pane's real occupant, so
-            // a refusal costs the legitimate pane nothing — while an `error`
-            // field the response has never carried would have to be invented,
-            // and would tell a caller that guessed a pane id that the pane
-            // exists.
-            DaemonMessage::GetSeed(_) => serde_json::to_string(&GetSeedResponse { seed: None }),
+            // A refused `get-seed` answers exactly as an admitted one does:
+            // since PRD #1666 part 3 (H5) the verb takes nothing for anyone
+            // ([`GetSeedResponse::withdrawn`]), so the answer tells a caller
+            // that guessed a pane id nothing about the pane.
+            DaemonMessage::GetSeed(_) => serde_json::to_string(&GetSeedResponse::withdrawn()),
+            // A refused question names the refusal and confirms no verb, so
+            // the sender withholds its mutation and says why.
+            DaemonMessage::HookCapabilities(_) => serde_json::to_string(&HookCapabilitiesReply {
+                task_scoped_completion: None,
+                code: Some(reason.to_string()),
+                message: Some(message.to_string()),
+            }),
+            DaemonMessage::WorkDoneTask(_) => {
+                serde_json::to_string(&WorkDoneTaskReply::refused(reason, message))
+            }
             DaemonMessage::WorkDone(_)
             | DaemonMessage::Dispatch(_)
             | DaemonMessage::Ack(_)
@@ -2060,6 +2088,8 @@ impl DaemonMessage {
         match self {
             DaemonMessage::Dispatch(_) => serde_json::to_string(&SignalAck::accepted()).ok(),
             DaemonMessage::WorkDone(_)
+            | DaemonMessage::HookCapabilities(_)
+            | DaemonMessage::WorkDoneTask(_)
             | DaemonMessage::Delegate(_)
             | DaemonMessage::RestartRole(_)
             | DaemonMessage::SpawnRole(_)
@@ -2305,9 +2335,8 @@ pub struct GetSeedRequest {
     /// older CLI omits it, which deserializes to `None`.
     ///
     /// `None` therefore means "the caller could not say", not "the caller is
-    /// nobody", and the daemon treats it as such: it hands over a message only
-    /// for the agent the request's token attests, and refuses a request that
-    /// names a different one (`get_seed_inbox_alias` in `crate::daemon`).
+    /// nobody". Since PRD #1666 part 3 (H5) the daemon hands over nothing for
+    /// any agent, named or not (`get_seed_withdrawn` in `crate::daemon`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
     /// Issue #1077: the per-spawn hook capability token from the sender's
@@ -2333,10 +2362,34 @@ pub struct GetSeedRequest {
 /// single JSON line back on the hook-socket connection. `seed` is `None`
 /// (serialized as `null`) when no seed is pending for the pane — the pane is
 /// unknown, or the seed was already delivered (pulled or injected).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GetSeedResponse {
     #[serde(default)]
     pub seed: Option<String>,
+    /// PRD #1666 part 3 (H5): why no seed was handed over. Additive: an
+    /// older reader ignores it and reads `seed: null` as nothing pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// PRD #1666 part 3 (H5): [`GetSeedResponse::withdrawn`]'s code.
+pub const GET_SEED_REMOVED: &str = "get_seed_removed";
+
+impl GetSeedResponse {
+    /// The answer to every `get-seed` since PRD #1666 part 3 (H5): the verb
+    /// takes no message any more. A pane's seed is its first inbox message,
+    /// which the agent's own receiver takes.
+    pub fn withdrawn() -> Self {
+        Self {
+            seed: None,
+            refused: Some(GET_SEED_REMOVED.to_string()),
+            error: Some(
+                "get-seed no longer takes messages: the deck hands the agent its seed as its first message".to_string(),
+            ),
+        }
+    }
 }
 
 /// PRD #220: payload of [`DaemonMessage::ListTargets`] — the pane whose repo's
@@ -3118,6 +3171,11 @@ pub struct InboxNotice {
     /// reads every unseen queued message as new, as before it existed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub requeued: bool,
+    /// PRD #1666 part 3, round 5 (plan D10): what the message is, when it is
+    /// a report or a dispatch result, so a client moves the task or unit it
+    /// names by id. Additive: a client that does not know it ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<crate::report_recovery::ReportProvenance>,
     #[serde(flatten, default)]
     pub notices: crate::inbox_hub::InboxCardNotices,
 }
@@ -3324,6 +3382,27 @@ pub enum InboxBudget {
     Chars(usize),
     /// UTF-8 bytes.
     Bytes(usize),
+    /// PRD #1666 part 3 (H4): UTF-8 bytes once escaped as a JSON string's
+    /// contents ([`json_escaped_len`]), for a hand-over printed inside a hook's
+    /// JSON (Codex's): the whole output, its escaping included, has to fit.
+    JsonBytes(usize),
+}
+
+/// The bytes `c` takes inside a JSON string as `serde_json` writes it: a
+/// quote, a backslash and the short control escapes take two, another
+/// control character six (`\u00XX`), anything else its UTF-8 length.
+fn json_escaped_char_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// The bytes `text` takes inside a JSON string as `serde_json` writes it,
+/// without the quotes around it.
+pub fn json_escaped_len(text: &str) -> usize {
+    text.chars().map(json_escaped_char_len).sum()
 }
 
 impl InboxBudget {
@@ -3332,12 +3411,13 @@ impl InboxBudget {
         match self {
             InboxBudget::Chars(_) => text.chars().count(),
             InboxBudget::Bytes(_) => text.len(),
+            InboxBudget::JsonBytes(_) => json_escaped_len(text),
         }
     }
 
     pub fn limit(self) -> usize {
         match self {
-            InboxBudget::Chars(n) | InboxBudget::Bytes(n) => n,
+            InboxBudget::Chars(n) | InboxBudget::Bytes(n) | InboxBudget::JsonBytes(n) => n,
         }
     }
 
@@ -3347,6 +3427,7 @@ impl InboxBudget {
         match self {
             InboxBudget::Chars(_) => InboxBudget::Chars(rest),
             InboxBudget::Bytes(_) => InboxBudget::Bytes(rest),
+            InboxBudget::JsonBytes(_) => InboxBudget::JsonBytes(rest),
         }
     }
 
@@ -3361,6 +3442,15 @@ impl InboxBudget {
                     end -= 1;
                 }
                 end
+            }
+            InboxBudget::JsonBytes(_) => {
+                let mut used = 0;
+                text.char_indices()
+                    .find(|(_, c)| {
+                        used += json_escaped_char_len(*c);
+                        used > max
+                    })
+                    .map_or(text.len(), |(i, _)| i)
             }
         };
         &text[..end]
@@ -3676,6 +3766,40 @@ pub struct InboxFetchRequest {
     /// for its `may` and stage controls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hook_integration: Option<u32>,
+    /// PRD #1666 part 3 (H4): the hook that fetches as a receiver of its own,
+    /// on [`DaemonMessage::InboxReceiptFetch`] (`codex_hooks` for Codex's).
+    /// Additive: a hook fetch without it is Claude Code's, as from part 2's
+    /// hooks. The CLI sends none; the deck knows its agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component: Option<InboxComponent>,
+    /// PRD #1666 part 3 (H4): the most UTF-8 bytes the hand-out's blocks may
+    /// take once escaped inside a JSON string, separators included
+    /// ([`InboxBudget::JsonBytes`]), for a hook that prints them inside its
+    /// JSON. Additive; when set it governs over `max_bytes` and `max_chars`.
+    /// Sent only to a deck that confirmed it serves the sender
+    /// ([`InboxWaitReply::one_shot_senders`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_json_bytes: Option<usize>,
+}
+
+/// PRD #1666 part 3 (H4): a one-shot that takes mail on the receipt verbs, as
+/// a deck's answer to [`DaemonMessage::InboxReceipts`] names the ones it
+/// serves ([`InboxWaitReply::one_shot_senders`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxOneShotSender {
+    /// Claude Code's `asyncRewake` waiter.
+    ClaudeWaiter,
+    /// Claude Code's prompt hook.
+    ClaudeHooks,
+    /// Codex's prompt and `Stop` hooks.
+    CodexHooks,
+    /// `dot-agent-deck inbox fetch`, run by the agent's model.
+    Cli,
+    /// A sender a later deck names. Read so a new one does not make the whole
+    /// answer unparseable.
+    #[serde(other)]
+    Unknown,
 }
 
 /// PRD #1666 part 2 §1.3: payload of [`DaemonMessage::InboxCommitted`].
@@ -3877,6 +4001,13 @@ pub struct InboxWaitReply {
     /// other lines (refusals, keepalives, batches) omit it from any daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub one_shot_receipts: Option<u32>,
+    /// PRD #1666 part 3 (H4): with [`Self::one_shot_receipts`], the one-shot
+    /// senders this daemon serves on the receipt verbs. Additive. A sender
+    /// other than Claude Code's goes on only when it is named here, in the
+    /// answer on its own connection: `one_shot_receipts` 1 alone is Claude
+    /// Code's support (part 2's daemon answers it and serves no other).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub one_shot_senders: Vec<InboxOneShotSender>,
 }
 
 impl InboxWaitReply {
@@ -4037,6 +4168,112 @@ pub struct WorkDoneSignal {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
     pub timestamp: DateTime<Utc>,
+}
+
+/// PRD #1666 part 3, round 5 (plan D1): the version of task-scoped
+/// completion this daemon serves, answered to [`HookCapabilitiesRequest`].
+/// A sender requires equality, never `>=`: a later version says it still
+/// serves version-1 senders by advertising version 1.
+pub const TASK_SCOPED_COMPLETION: u32 = 1;
+
+/// PRD #1666 part 3, round 5 (plan D1): which hook verbs this daemon serves,
+/// asked on the connection that will carry the mutation. An older daemon
+/// decodes it as nothing it knows and answers nothing, so a sender withholds
+/// its mutation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HookCapabilitiesRequest {
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
+/// The answer to a [`HookCapabilitiesRequest`]. Additive: a field a sender
+/// does not know is ignored, and one it needs but is absent reads as "not
+/// served".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookCapabilitiesReply {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_scoped_completion: Option<u32>,
+    /// On a refusal (the provenance gate), its stable code and sentence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// What a [`WorkDoneTaskRequest`] reports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkDoneMode {
+    /// The delegated task with this id is complete.
+    Task { task_id: String },
+    /// The dispatched unit this agent is the terminal of is complete
+    /// (`--done`).
+    Terminal,
+    /// A note to the orchestrator that completes no task.
+    Uncorrelated,
+    /// A mode this daemon does not know; refused `unsupported_mode`.
+    #[serde(other)]
+    Unknown,
+}
+
+/// PRD #1666 part 3, round 5 (plan D1): a `work-done`, sent only on a
+/// connection where the daemon confirmed [`TASK_SCOPED_COMPLETION`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkDoneTaskRequest {
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    pub mode: WorkDoneMode,
+    pub report: String,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// How a [`WorkDoneTaskRequest`] was settled (plan D5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkDoneDisposition {
+    Accepted,
+    AlreadyAccepted,
+    Uncorrelated,
+    Refused,
+    /// A disposition a newer daemon added: the sender reads it as unconfirmed.
+    #[serde(other)]
+    Unknown,
+}
+
+/// The answer to a [`WorkDoneTaskRequest`] (plan D5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkDoneTaskReply {
+    pub disposition: WorkDoneDisposition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<crate::report_recovery::Destination>,
+    /// A repeat whose body differs from the report already taken.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub differs: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl WorkDoneTaskReply {
+    /// A refusal with its stable `code` and the sentence the worker reads.
+    pub fn refused(code: &str, message: &str) -> Self {
+        WorkDoneTaskReply {
+            disposition: WorkDoneDisposition::Refused,
+            task_id: None,
+            report_id: None,
+            destination: None,
+            differs: false,
+            code: Some(code.to_string()),
+            message: Some(message.to_string()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4633,6 +4870,7 @@ mod tests {
         // Some(seed) round-trips…
         let resp = GetSeedResponse {
             seed: Some("Read .dot-agent-deck/worker-task-coder.md for your task.".into()),
+            ..GetSeedResponse::default()
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: GetSeedResponse = serde_json::from_str(&json).unwrap();
@@ -4641,11 +4879,22 @@ mod tests {
             Some("Read .dot-agent-deck/worker-task-coder.md for your task.")
         );
         // …and "no seed" is a null the get-seed CLI reads as "print nothing".
-        let none = GetSeedResponse { seed: None };
+        let none = GetSeedResponse::default();
         let json = serde_json::to_string(&none).unwrap();
         assert_eq!(json, "{\"seed\":null}");
         let back: GetSeedResponse = serde_json::from_str(&json).unwrap();
         assert!(back.seed.is_none());
+        // PRD #1666 part 3 (H5): the withdrawal's fields are additive, so a
+        // reader of `{"seed": …}` alone still reads no seed.
+        let withdrawn = serde_json::to_value(GetSeedResponse::withdrawn()).unwrap();
+        assert!(withdrawn["seed"].is_null());
+        assert_eq!(withdrawn["refused"], GET_SEED_REMOVED);
+        #[derive(serde::Deserialize)]
+        struct OldReader {
+            seed: Option<String>,
+        }
+        let old: OldReader = serde_json::from_value(withdrawn).unwrap();
+        assert!(old.seed.is_none());
     }
 
     #[test]

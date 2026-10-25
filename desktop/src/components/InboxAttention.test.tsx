@@ -222,6 +222,20 @@ describe("deck messages that need a decision (PRD #1666 §6)", () => {
     expect(card.getByTestId("inbox-notice-7")).toHaveTextContent(`${words.hooksTooOld}: ${words.hooksTooOldUpgrade}`);
   });
 
+  /// Scenario: The deck refused the agent's own request for its waiting messages; the tile's notice row says messages can't reach this agent, the cause and to restart it from the deck, in the words the TUI's card and Deck messages picker use, ahead of an out-of-date hooks notice. A cause code this build does not know still says what to do.
+  it("shows a refused connection with its cause and remedy first", () => {
+    const code = "inbox_peer_unidentified";
+    const notice = `${words.admissionRefused}: its connection to the deck was refused (${words.admissionCauses[code]}). ${words.admissionRefusedRemedy}`;
+    let card = tile(mapDesktopSnapshot(snapshot({ queued: 1, admissionRefused: code, integration: "hooks_too_old" })).agents[0]);
+    expect(card.getByTestId("inbox-notice-7")).toHaveTextContent(notice);
+    expect(card.getByTestId("inbox-notice-7")).not.toHaveTextContent(words.hooksTooOld);
+    document.body.innerHTML = "";
+    card = tile(mapDesktopSnapshot(snapshot({ queued: 1, admissionRefused: "inbox_from_a_later_release" })).agents[0]);
+    expect(card.getByTestId("inbox-notice-7")).toHaveTextContent(
+      `${words.admissionRefused}: its connection to the deck was refused. ${words.admissionRefusedRemedy}`,
+    );
+  });
+
   /// Scenario: Hand-outs are paused for room in the evidence store, or receipts cannot be recorded; the tile says so in the words the TUI uses.
   it("shows paused hand-outs and failed receipts", () => {
     let card = tile(mapDesktopSnapshot(snapshot({ evidencePaused: 3 })).agents[0]);

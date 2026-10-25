@@ -752,6 +752,21 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
                 hub.set_spool_error(&error.to_string());
             }
         }
+        // PRD #1666 part 3, round 5 (plan D3, D14): the store that keeps
+        // reports and dispatch results whose recipient may be gone, with the
+        // files of daemon runs that ended taken over. A directory it cannot
+        // use makes every report it would keep refused, which it logs.
+        let retained_dir = std::path::absolute(&state_dir).unwrap_or_else(|_| state_dir.clone());
+        let retained = crate::retained_store::RetainedStore::open(
+            &retained_dir,
+            crate::retained_store::StoreConfig::from_env(),
+            crate::retained_store::Now::current(),
+        );
+        hub.set_retained_store(std::sync::Arc::clone(&retained));
+        drop(crate::retained_store::spawn_maintenance(
+            std::sync::Arc::clone(&hub),
+            retained,
+        ));
         pty_registry.install_inbox(hub);
     }
     let inbox_ticker = pty_registry.inbox().spawn_ticker();
@@ -819,9 +834,15 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // from this deck's own install path.
     {
         let deck = state.read().await.hook_binaries.deck().clone();
-        let remedy =
-            crate::hook_binary::remedy_for(&deck, false, &[crate::event::AgentType::ClaudeCode]);
-        pty_registry.inbox().set_hooks_remedy(remedy.command);
+        for agent in [
+            crate::event::AgentType::ClaudeCode,
+            crate::event::AgentType::Codex,
+        ] {
+            let remedy = crate::hook_binary::remedy_for(&deck, false, std::slice::from_ref(&agent));
+            pty_registry
+                .inbox()
+                .set_agent_hooks_remedy(&agent, remedy.command);
+        }
     }
     // Issue #424: give the spawn-time delivery path a way to REPORT a failed
     // delivery as state on the pane's card instead of typing a diagnostic line
@@ -1651,13 +1672,15 @@ pub async fn ingest_event(
 /// (its `deck_build` / `deck_exe` stamp, or the absence of one), and broadcast
 /// the notices when that changes them. Under the state's write guard, so a
 /// `SubscribeEventsWithSnapshot` reply holds a change or its stream does.
+/// Answers whether the line carried a stamp.
 async fn observe_hook_sender(
     state: &SharedState,
     event_tx: &broadcast::Sender<BroadcastMsg>,
     agent_type: &crate::event::AgentType,
     line: &str,
-) {
+) -> bool {
     let sender = crate::hook_binary::HookLineSender::from_line(line);
+    let stamped = sender.is_reported();
     // The steady state — an agent's hooks sending the stamp they sent last time
     // — changes nothing, so it is settled under a read guard and never queues
     // behind or blocks the event's own write.
@@ -1667,7 +1690,7 @@ async fn observe_hook_sender(
         .hook_binaries
         .would_change(agent_type, &sender)
     {
-        return;
+        return stamped;
     }
     let mut state = state.write().await;
     if state.hook_binaries.observe(agent_type, &sender) {
@@ -1677,6 +1700,7 @@ async fn observe_hook_sender(
             },
         ));
     }
+    stamped
 }
 
 /// Issue #1637: every [`crate::hook_binary::HOOK_PIN_REFRESH_INTERVAL`], read
@@ -2423,9 +2447,6 @@ struct QuestionConnection<'a, R, W> {
     slot: &'a mut Option<tokio::sync::OwnedSemaphorePermit>,
     holds: &'a Arc<tokio::sync::Semaphore>,
     hold_deadline: Duration,
-    /// R2F-R02: the connection's place in the ingest order, settled once the
-    /// question's agent type is written.
-    ingest: Option<&'a mut IngestTicket>,
 }
 
 /// PRD #1631: apply a producer's [`crate::event::QuestionSignal`] and, for a
@@ -2475,7 +2496,7 @@ async fn handle_question_signal<R, W>(
     state: &SharedState,
     event_tx: &broadcast::Sender<BroadcastMsg>,
     registry: &Arc<AgentPtyRegistry>,
-    mut conn: QuestionConnection<'_, R, W>,
+    conn: QuestionConnection<'_, R, W>,
 ) -> Option<crate::agent_pty::HeldReply>
 where
     R: tokio::io::AsyncBufRead + Unpin,
@@ -2537,9 +2558,6 @@ where
             attested_agent.as_deref().or(event.agent_id.as_deref()),
             &event.agent_type,
         );
-    }
-    if let Some(ingest) = conn.ingest.take() {
-        ingest.settle();
     }
     let Some((id, agent_id, _budget)) = holding else {
         ingest_hook_event(state, event_tx, registry, event, unproven, attested_agent).await;
@@ -4390,52 +4408,6 @@ async fn run_shell_activity_monitor_with<S, F>(
     }
 }
 
-/// PRD #1589 D5: mark a dispatched unit complete from a `work-done --done`,
-/// gated on the generation the hook gate ATTESTED for this report.
-///
-/// Threaded from the `WorkDone` arm rather than resolved inside
-/// `prepare_dispatch_completion`, because that seam sees only the signal and
-/// the registry: looking the pane's occupant up there would launder a
-/// predecessor's late report into its successor, and reading the retained
-/// return's own agent id would compare the record to itself (auditor B2). Only
-/// an attested sender that is the unit's authorized terminal generation, and
-/// still speaks for its pane, marks it; a missing token admitted under
-/// `DOT_AGENT_DECK_HOOK_PROVENANCE=warn`, an unattested pane, a superseded
-/// generation and a worker role of an orchestration never do. The return
-/// route's delivery is unchanged and runs whatever this decides. Returns the
-/// unit id it marked, if any.
-pub(crate) fn mark_dispatched_unit_completion(
-    registry: &crate::agent_pty::AgentPtyRegistry,
-    signal: &crate::event::WorkDoneSignal,
-    provenance: &crate::hook_provenance::Provenance,
-) -> Option<String> {
-    if !signal.done {
-        return None;
-    }
-    let crate::hook_provenance::Provenance::Attested { agent_id } = provenance else {
-        return None;
-    };
-    if registry.generation_ownership(Some(&signal.pane_id), Some(agent_id))
-        != crate::state::Ownership::Owned
-    {
-        return None;
-    }
-    let marked = registry.dispatched_units().mark_completed(
-        &signal.pane_id,
-        agent_id,
-        chrono::Utc::now().timestamp_millis(),
-    );
-    if let Some(unit_id) = marked.as_deref() {
-        info!(
-            unit_id = %unit_id,
-            pane_id = %signal.pane_id,
-            agent_id = %agent_id,
-            "dispatch: unit reported done; it may now be closed without --force"
-        );
-    }
-    marked
-}
-
 /// PRD #1589 D2: the `(agent id, cwd)` a `dispatch` is recorded and run under,
 /// resolved as ONE pair from one record.
 ///
@@ -4455,7 +4427,7 @@ pub(crate) fn resolve_dispatch_caller(
     provenance: &crate::hook_provenance::Provenance,
 ) -> Option<(String, String)> {
     match provenance {
-        crate::hook_provenance::Provenance::Attested { agent_id } => {
+        crate::hook_provenance::Provenance::Attested { agent_id, .. } => {
             if registry.pane_current_agent_id(pane_id).as_deref() != Some(agent_id.as_str()) {
                 return None;
             }
@@ -4840,14 +4812,91 @@ fn handle_inbox_ack(
     outcome.into()
 }
 
-/// PRD #1666: `inbox_fetch` — hand the attested agent its queued messages.
-/// PRD #1666 hardening M2: the refusal code for an inbox component whose
-/// process is not the pane's agent or one of its descendants.
-const INBOX_NOT_AGENT_PROCESS: &str = "inbox_not_agent_process";
+/// PRD #1666 part 3 (R-1): why the deck refused an inbox request whose token
+/// attests the pane, each cause with its own code and a message naming the
+/// remedy ([`Self::message`]).
+///
+/// Membership of a pane is the pane's current capability, which the gate
+/// ahead of these checks has resolved token → spawn record → pane, plus the
+/// deck's own OS user, as the kernel recorded it for the connection. Where
+/// the caller sits in the process table is not membership: Claude Code can
+/// run a conversation in a background session host outside the process tree
+/// the deck recorded for the pane, and that host's tool shell and hooks are
+/// still the pane's agent. Process identity still decides which instance is
+/// the agent's receiver ([`ComponentUse::Receiver`]), and whether the
+/// connecting process is still the one that connected
+/// ([`still_the_accepted_peer`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComponentRefusal {
+    /// The connecting process runs as another OS user than the deck's.
+    OtherUser,
+    /// Neither the pane's agent process tree nor the deck's own user can be
+    /// shown: a platform that does not read the client's user, where the
+    /// caller is outside the tree or the pane has no agent process.
+    NotMember,
+    /// The deck cannot tell which process made the connection, or that the
+    /// process is still the one that made it.
+    Unidentified,
+    /// The receiver instance the request names is neither the caller nor one
+    /// of its parents.
+    NotCaller,
+    /// An agent of the same kind as the receiver the request names sits
+    /// between it and the caller (audit F3).
+    NestedAgent,
+    /// The receiver the request names is, or resolves through shells to, a
+    /// process the agent itself runs under: the deck, a terminal, init.
+    AboveAgent,
+}
 
-/// [`INBOX_NOT_AGENT_PROCESS`]'s message.
-const INBOX_NOT_AGENT_PROCESS_MESSAGE: &str = "this process is not the pane's agent or one of its processes, so it may not receive \
-     the agent's inbox";
+impl ComponentRefusal {
+    fn code(self) -> &'static str {
+        match self {
+            ComponentRefusal::OtherUser => "inbox_other_user",
+            ComponentRefusal::NotMember => "inbox_not_agent_process",
+            ComponentRefusal::Unidentified => "inbox_peer_unidentified",
+            ComponentRefusal::NotCaller => "inbox_component_not_caller",
+            ComponentRefusal::NestedAgent => "inbox_nested_agent",
+            ComponentRefusal::AboveAgent => "inbox_receiver_above_agent",
+        }
+    }
+
+    /// The cause and what to do about it, for the caller. Fixed text: it never
+    /// echoes a token, a pid or anything the request carried.
+    fn message(self) -> &'static str {
+        match self {
+            ComponentRefusal::OtherUser => {
+                "this process runs as a different OS user from the deck, and only the deck's own \
+                 user may use a pane's inbox; run it as the user that runs the deck"
+            }
+            ComponentRefusal::NotMember => {
+                "this process is not the pane's agent or one of its processes, and the deck cannot \
+                 confirm here that it runs as the deck's own user; run it from the agent's own pane"
+            }
+            ComponentRefusal::Unidentified => {
+                "the deck could not identify the process that made this connection: it may have \
+                 exited or handed the connection to another process, so it may not take or settle \
+                 the agent's messages; run the command again from the agent's own pane, and keep \
+                 it running until the deck answers"
+            }
+            ComponentRefusal::NotCaller => {
+                "the receiver this request names is not the process that sent it or one of its \
+                 parents, so the deck will not register it; run the inbox command from the agent's \
+                 own integration"
+            }
+            ComponentRefusal::NestedAgent => {
+                "an agent of the same kind sits between this process and the agent it names, so a \
+                 nested agent cannot act as that agent's receiver; run the receiver from the \
+                 pane's own agent, not from an agent it started"
+            }
+            ComponentRefusal::AboveAgent => {
+                "the receiver this request names is, or runs under shells that lead to, a process \
+                 the agent itself runs under, such as the deck or a terminal, so the deck will not \
+                 register it; run the inbox command from the agent's own integration, not from a \
+                 shell outside the agent"
+            }
+        }
+    }
+}
 
 /// PRD #1666 part 2: the refusal code of a receipt verb asking for what is
 /// not served on receipts — a wait other than Claude's once-waiter, or a
@@ -4866,42 +4915,42 @@ const ENV_TEST_UNBOUND_COMPONENTS: &str = "DOT_AGENT_DECK_INBOX_TEST_UNBOUND_COM
 /// Which inbox verb a component is admitted for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ComponentUse {
-    /// A post, or settling a job: the agent's own process tree may use its
-    /// token, tools included.
+    /// A post, or taking or settling the agent's mail: any member of the pane
+    /// may use its token, tools included.
     Cli,
     /// Arming a waiter or announcing a wake: registering the agent's native
-    /// receiver ([`admit_receiver_process`]).
+    /// receiver ([`receiver_instance`]).
     Receiver,
 }
 
-/// How much a component's ancestry must prove for an inbox verb.
+/// How much the deck must be able to show about a component for an inbox
+/// verb.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Evidence {
-    /// Refused only on a positive "not the agent's"; a walk that cannot say
-    /// admits. For the verbs that post or settle a job.
+    /// Refused only on a positive "no"; a check that cannot say admits. For
+    /// the verbs that post or settle a job.
     BestEffort,
-    /// PR #1735 second review: admitted only on a positive "the agent's". For
-    /// the verbs that take or settle the agent's own mail — fetch, ack,
-    /// get-seed and arming a waiter — and, since the third review, announcing
-    /// a wake, which pins the agent's receiver: a caller can make its ancestry
+    /// PR #1735 second review: admitted only on positive evidence. For the
+    /// verbs that take or settle the agent's own mail — fetch, ack, get-seed
+    /// and arming a waiter — and, since the third review, announcing a wake,
+    /// which pins the agent's receiver: a caller can make its identity
     /// unreadable on purpose, since a connection whose creator exited still
     /// reports that creator as its peer.
     Required,
 }
 
-/// [`admit_component_process`] — or [`admit_receiver_process`] for a
-/// receiver — on this platform's process table, unless the `e2e`-only
-/// [`ENV_TEST_UNBOUND_COMPONENTS`] knob is set. [`Evidence::Required`] falls
-/// back to [`Evidence::BestEffort`] on a platform without
-/// [`crate::platform::proc::ANCESTRY_LOOKUP`], where no caller could prove
-/// anything.
+/// [`admit_inbox_component_with`] on this platform's process table, unless
+/// the `e2e`-only [`ENV_TEST_UNBOUND_COMPONENTS`] knob is set.
+/// [`Evidence::Required`] falls back to [`Evidence::BestEffort`] on a
+/// platform without [`crate::platform::proc::ANCESTRY_LOOKUP`], where no
+/// caller could prove anything.
 fn admit_inbox_component(
     peer: Option<AcceptedPeer>,
     claimed: Option<u32>,
     root: Option<u32>,
     used_as: ComponentUse,
     evidence: Evidence,
-) -> Result<Option<u32>, &'static str> {
+) -> Result<Option<u32>, ComponentRefusal> {
     #[cfg(feature = "e2e")]
     if std::env::var(ENV_TEST_UNBOUND_COMPONENTS)
         .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
@@ -4924,18 +4973,26 @@ fn admit_inbox_component(
 /// cannot be read. A connection keeps reporting the process that made it after
 /// that process exits, and its pid can then be reused; the start time tells
 /// the process that connected from a later one holding the same number.
+///
+/// PRD #1666 part 3 (R-1): and whether it runs as the deck's own user, as the
+/// kernel recorded it when the connection was made
+/// ([`crate::platform::peercred::peer_is_same_user`]), `None` where that
+/// cannot be read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AcceptedPeer {
     pid: u32,
     started: Option<u64>,
+    same_user: Option<bool>,
 }
 
 impl AcceptedPeer {
-    /// The peer `pid` names, read now, as the connection is accepted.
-    fn accept(pid: Option<u32>) -> Option<Self> {
+    /// The peer `pid` names, read now, as the connection is accepted, running
+    /// as the deck's own user or not (`same_user`).
+    fn accept(pid: Option<u32>, same_user: Option<bool>) -> Option<Self> {
         pid.map(|pid| Self {
             pid,
             started: crate::platform::proc::process_start_of(pid),
+            same_user,
         })
     }
 }
@@ -4957,14 +5014,16 @@ const PLATFORM_LOOKUPS: ProcessLookups = ProcessLookups {
     started: crate::platform::proc::process_start_of,
 };
 
-/// [`admit_inbox_component`] over `lookups`, with `evidence` already settled
-/// for the platform.
+/// Whether the connecting process `peer` may use, for `used_as`, the token of
+/// the generation whose agent process is `root`; answers the receiver
+/// instance to arm or pin under, or `claimed` for [`ComponentUse::Cli`].
 ///
-/// PR #1735 third review (F2): the peer's ancestry is walked by its pid, so
-/// once the walk has answered, the peer must still be the process accepted
-/// ([`still_the_accepted_peer`]). Read after the walk, the same start time
-/// means that process was alive from the accept through the walk, so the walk
-/// read its ancestry and not a later process's that reuses its pid.
+/// [`admit_component`] decides membership and the receiver. Then, PR #1735
+/// third review (F2), the peer must still be the process accepted
+/// ([`still_the_accepted_peer`]): read after the process-table walks, the
+/// same start time means that process was alive from the accept through the
+/// walks, so they read its ancestry and not a later process's that reuses its
+/// pid.
 fn admit_inbox_component_with(
     peer: Option<AcceptedPeer>,
     claimed: Option<u32>,
@@ -4972,22 +5031,17 @@ fn admit_inbox_component_with(
     used_as: ComponentUse,
     evidence: Evidence,
     lookups: &ProcessLookups,
-) -> Result<Option<u32>, &'static str> {
-    let pid = peer.map(|peer| peer.pid);
-    let admitted = match used_as {
-        ComponentUse::Cli => {
-            admit_component_process(pid, claimed, root, lookups.descends, evidence)
-        }
-        ComponentUse::Receiver => admit_receiver_process(
-            pid,
-            claimed,
-            root,
-            lookups.descends,
-            lookups.parent_of,
-            lookups.executable_of,
-            evidence,
-        ),
-    }?;
+) -> Result<Option<u32>, ComponentRefusal> {
+    let admitted = admit_component(
+        peer,
+        claimed,
+        root,
+        used_as,
+        evidence,
+        lookups.descends,
+        lookups.parent_of,
+        lookups.executable_of,
+    )?;
     if let Some(peer) = peer {
         still_the_accepted_peer(peer, lookups.started, evidence)?;
     }
@@ -5003,81 +5057,185 @@ fn still_the_accepted_peer(
     peer: AcceptedPeer,
     started_of: fn(u32) -> Option<u64>,
     evidence: Evidence,
-) -> Result<(), &'static str> {
+) -> Result<(), ComponentRefusal> {
     match (peer.started, started_of(peer.pid)) {
         (Some(then), Some(now)) if then == now => Ok(()),
-        (Some(_), Some(_)) => {
-            Err("the connecting process has exited, and its process id now names another")
-        }
-        _ if evidence == Evidence::Required => Err("the connecting process cannot be identified"),
+        (Some(_), Some(_)) => Err(ComponentRefusal::Unidentified),
+        _ if evidence == Evidence::Required => Err(ComponentRefusal::Unidentified),
         _ => Ok(()),
     }
 }
 
 /// PR #1735 review: whether the connecting process `peer` may take or settle
-/// `agent_id`'s own mail — `inbox_fetch`, `ack` and the `get_seed` alias — on
-/// the same terms as the verbs that post ([`ComponentUse::Cli`]): only the
-/// agent's own process tree may use its token for them, and only on positive
-/// evidence that the caller is in it ([`Evidence::Required`]). Logs a refusal.
+/// `agent_id`'s own mail — `inbox_fetch`, `inbox_committed`, `ack` and the
+/// `get_seed` alias — on the same terms as the verbs that post
+/// ([`ComponentUse::Cli`]), but only on positive evidence
+/// ([`Evidence::Required`]). Logs a refusal.
 fn mail_taker_admitted(
     registry: &AgentPtyRegistry,
     peer: Option<AcceptedPeer>,
     agent_id: &str,
     verb: &str,
     pane_id: &str,
-) -> bool {
-    match admit_inbox_component(
+) -> Result<(), ComponentRefusal> {
+    let admitted = admit_inbox_component(
         peer,
         None,
         registry.child_pid(agent_id),
         ComponentUse::Cli,
         Evidence::Required,
-    ) {
-        Ok(_) => true,
-        Err(why) => {
-            warn!(
-                verb,
-                pane_id = %escape_id_for_log(pane_id),
-                why,
-                "hook socket: refused an inbox verb from outside the pane's agent"
-            );
-            false
-        }
+    )
+    .map(|_| ());
+    if let Err(refusal) = admitted {
+        warn!(
+            verb,
+            pane_id = %escape_id_for_log(pane_id),
+            reason = refusal.code(),
+            "hook socket: refused an inbox verb from a process the deck cannot admit for the \
+             pane"
+        );
+    }
+    note_admission(registry, pane_id, agent_id, admitted);
+    admitted
+}
+
+/// PRD #1666 part 3 (R-2): tell the inbox how the deck answered `agent_id`'s
+/// own request to take its messages or register its receiver in `pane_id`: a
+/// refusal raises that card's notice, an admission ends it. Only while
+/// `agent_id` holds the pane, and the request's capability attested
+/// `agent_id` before admission ran, so a request naming another agent's pane
+/// never marks that agent's card.
+fn note_admission(
+    registry: &AgentPtyRegistry,
+    pane_id: &str,
+    agent_id: &str,
+    admitted: Result<(), ComponentRefusal>,
+) {
+    if registry.pane_current_agent_id(pane_id).as_deref() != Some(agent_id) {
+        return;
+    }
+    match admitted {
+        Ok(()) => registry.inbox().admission_admitted(pane_id, agent_id),
+        Err(refusal) => registry
+            .inbox()
+            .admission_refused(pane_id, agent_id, refusal.code()),
     }
 }
 
-/// Audit F3: [`admit_component_process`] for a component registering the
-/// agent's native receiver. Answers the instance the receiver is pinned by
-/// ([`receiver_instance`]), and refuses one with an agent of its own kind
-/// between it and the caller ([`nested_between`]).
+/// PRD #1666 part 3 (R-1): admit `peer` for `used_as` the token of the
+/// generation whose agent process is `root`. `claimed` is the receiver
+/// instance a [`ComponentUse::Receiver`] request names (the process that runs
+/// its watcher, which the stream is keyed by).
 ///
-/// Audit D1: this bounds registration to the agent's process tree; it does not
-/// tell the visible integration from another process the agent runs. A waiter
-/// started from the agent's own tool shell resolves to the agent, and a nested
-/// agent of another kind naming the outer agent's pid passes the same-kind
-/// check; either is then the same receiver as far as the pin can tell.
-fn admit_receiver_process(
-    peer: Option<u32>,
+/// **Membership.** The pane's agent process tree is membership, and so is the
+/// deck's own OS user: a peer outside the tree is admitted when the kernel
+/// recorded it as the deck's user ([`AcceptedPeer::same_user`]), since the
+/// gate ahead of this admitted its token as the pane's current capability.
+/// Another user outside the tree is refused under either [`Evidence`]
+/// ([`ComponentRefusal::OtherUser`]); inside it, the tree admits whatever the
+/// user reads. Where the user cannot be read (no peer,
+/// or a platform that does not read it), the process tree alone decides, as
+/// it did before: a positive "outside" refuses, and so, under
+/// [`Evidence::Required`], does a walk that cannot say, a pane with no agent
+/// process and a peer the kernel does not identify.
+///
+/// **The receiver** ([`ComponentUse::Receiver`]). The instance a request
+/// names must be the caller or one of its parents, and not a process above
+/// the agent's own ([`ComponentRefusal::AboveAgent`]), so a member cannot
+/// register an arbitrary process as the agent's receiver; it is pinned through
+/// hook shells to the process that runs them ([`receiver_instance`]), and what
+/// that resolves to must not be above the agent's either, read on positive
+/// evidence under [`Evidence::Required`]; and a
+/// process between the caller and that instance running the instance's own
+/// executable — an agent of the same kind, started inside the one whose
+/// receiver it names — is refused ([`nested_between`], audit F3).
+#[allow(clippy::too_many_arguments)]
+fn admit_component(
+    peer: Option<AcceptedPeer>,
     claimed: Option<u32>,
     root: Option<u32>,
+    used_as: ComponentUse,
+    evidence: Evidence,
     descends: impl Fn(u32, u32) -> Option<bool>,
     parent_of: impl Fn(u32) -> Option<u32> + Copy,
     executable_of: impl Fn(u32) -> Option<std::path::PathBuf> + Copy,
-    evidence: Evidence,
-) -> Result<Option<u32>, &'static str> {
-    let instance = admit_component_process(peer, claimed, root, descends, evidence)?
-        .map(|claimed| receiver_instance(claimed, root, parent_of, executable_of));
-    if let (Some(peer), Some(instance)) = (peer, instance)
-        && nested_between(peer, instance, parent_of, executable_of) == Some(true)
-    {
-        return Err("an agent of the same kind sits between the caller and the component it names");
+) -> Result<Option<u32>, ComponentRefusal> {
+    let required = evidence == Evidence::Required;
+    let Some(peer) = peer else {
+        return if required {
+            Err(ComponentRefusal::Unidentified)
+        } else {
+            Ok(claimed)
+        };
+    };
+    let in_tree = root.map(|root| descends(peer.pid, root));
+    match (in_tree, peer.same_user) {
+        (Some(Some(true)), _) | (_, Some(true)) => {}
+        (_, Some(false)) => return Err(ComponentRefusal::OtherUser),
+        (Some(Some(false)), None) => return Err(ComponentRefusal::NotMember),
+        (None, None) if required => return Err(ComponentRefusal::NotMember),
+        (Some(None), None) if required => return Err(ComponentRefusal::Unidentified),
+        (_, None) => {}
     }
-    Ok(instance)
+    let Some(claimed) = claimed.filter(|_| used_as == ComponentUse::Receiver) else {
+        return Ok(claimed);
+    };
+    // Whether the agent `root` descends from `candidate`. A walk that ran out
+    // of steps is no answer here (round 1's U3): `descends` reads it as "no",
+    // which suits a membership check that refuses on "no", not this one,
+    // which admits on it.
+    let below = |root: u32, candidate: u32| match descends(root, candidate) {
+        Some(false)
+            if crate::platform::proc::ancestry_with(root, candidate, parent_of)
+                == crate::platform::proc::Ancestry::TooDeep =>
+        {
+            None
+        }
+        answer => answer,
+    };
+    // Nor a process above the agent — the deck, a terminal, init — which the
+    // caller descends from as every process of the pane does.
+    if claimed <= 1 {
+        return Err(ComponentRefusal::AboveAgent);
+    }
+    if let Some(root) = root.filter(|&root| claimed != root) {
+        match below(root, claimed) {
+            Some(false) => {}
+            Some(true) => return Err(ComponentRefusal::AboveAgent),
+            None if required => return Err(ComponentRefusal::Unidentified),
+            None => {}
+        }
+    }
+    match descends(peer.pid, claimed) {
+        Some(true) => {}
+        Some(false) => return Err(ComponentRefusal::NotCaller),
+        None if required => return Err(ComponentRefusal::Unidentified),
+        None => {}
+    }
+    let instance = receiver_instance(claimed, root, parent_of, executable_of);
+    // PRD #1666 part 3, round 1: the resolved instance is held to what a
+    // named one is. In the tree the walk stops at the agent; a caller outside
+    // it can name a shell on a branch it shares with the agent, which would
+    // climb to the terminal or the deck above it.
+    if let Some(root) = root.filter(|&root| instance != claimed && instance != root) {
+        match below(root, instance) {
+            Some(false) => {}
+            Some(true) => return Err(ComponentRefusal::AboveAgent),
+            None if required => return Err(ComponentRefusal::Unidentified),
+            None => {}
+        }
+    }
+    if nested_between(peer.pid, instance, parent_of, executable_of) == Some(true) {
+        return Err(ComponentRefusal::NestedAgent);
+    }
+    Ok(Some(instance))
 }
 
 /// Audit F3: the process an agent's receiver is pinned by — `claimed`, or,
 /// when `claimed` is a shell the agent runs a hook through, the nearest
-/// ancestor that is not a shell, never above the agent's own process `root`.
+/// ancestor that is not a shell. Inside the agent's tree the walk stops at its
+/// own process `root`; from a shell outside it nothing here bounds the walk,
+/// so [`admit_component`] refuses a result above `root`.
 ///
 /// Claude Code runs every hook through a new `sh` that does not `exec` it
 /// (measured on 2.1.299: `claude ── sh ── hook`), so its announcement and each
@@ -5150,112 +5308,27 @@ fn nested_between(
     Some(false)
 }
 
-/// PRD #1666 hardening M2: bind an inbox component to the pane's managed
-/// agent. `peer` is the connecting process as the kernel reports it, `claimed`
-/// the component instance it names (the process that runs its watcher, which
-/// the stream is keyed by), and `root` the agent process the deck spawned.
-/// Each must be `root` or descend from it, and the claimed instance must be an
-/// ancestor of the caller (or the caller itself). Under
-/// [`Evidence::BestEffort`], where `descends` cannot say — a Unix other than
-/// Linux or macOS, or a process that exited during the walk — the check is
-/// skipped, as it is without a `peer` or a `root`. Under
-/// [`Evidence::Required`] each of those refuses. Windows reads parents from a
-/// process snapshot since PR #1735's review. Answers the instance to arm the
-/// stream under.
-fn admit_component_process(
-    peer: Option<u32>,
-    claimed: Option<u32>,
-    root: Option<u32>,
-    descends: impl Fn(u32, u32) -> Option<bool>,
-    evidence: Evidence,
-) -> Result<Option<u32>, &'static str> {
-    let required = evidence == Evidence::Required;
-    let Some(root) = root else {
-        return if required {
-            Err("the pane has no agent process to bind the caller to")
-        } else {
-            Ok(claimed)
-        };
-    };
-    // `Err(true)` for a positive "no", `Err(false)` for "cannot say" where
-    // the evidence must be positive.
-    let check = |pid: u32, ancestor: u32| match descends(pid, ancestor) {
-        Some(true) => Ok(()),
-        Some(false) => Err(true),
-        None if required => Err(false),
-        None => Ok(()),
-    };
-    const UNREADABLE: &str = "the caller's process ancestry cannot be read";
-    match peer {
-        Some(peer) => check(peer, root).map_err(|not| {
-            if not {
-                "the connecting process is not the agent's"
-            } else {
-                UNREADABLE
-            }
-        })?,
-        None if required => return Err("the connecting process cannot be identified"),
-        None => {}
-    }
-    if let Some(claimed) = claimed {
-        check(claimed, root).map_err(|not| {
-            if not {
-                "the named component process is not the agent's"
-            } else {
-                UNREADABLE
-            }
-        })?;
-        if let Some(peer) = peer {
-            check(peer, claimed).map_err(|not| {
-                if not {
-                    "the named component process is not the caller's"
-                } else {
-                    UNREADABLE
-                }
-            })?;
-        }
-    }
-    Ok(claimed)
-}
-
-/// PRD #1666 hardening H2: the inbox half of `get-seed` — the oldest message
-/// queued for the agent, rendered and acknowledged, which an extension that
-/// predates the inbox reads as its seed. It acts only for `attested`, the
-/// agent the request's token attests, and only while that agent is the pane's
-/// `live` one: an unattested request (admitted under the `warn` provenance
-/// policy) gets nothing, and so does one naming any other agent (`requested`),
-/// so no generation can take another's work.
-///
-/// PRD #1666 G10: a Pi generation (`pi`) is on the receipt stream, so only
-/// an extension from before it asks; it is refused like an old adapter — no
-/// seed, its mail stays queued for the receiver and its card says to restart
-/// the agent.
-fn get_seed_inbox_alias(
-    hub: &crate::inbox_hub::InboxHub,
+/// PRD #1666 part 3 (H5): the answer to `get-seed`, which takes no message
+/// any more. Until H5 it handed the agent's oldest queued message over and
+/// acknowledged it in the same step, the verb an extension from before the
+/// inbox read its seed with; a seed is the pane's first inbox message, which
+/// the agent's own receiver takes. Every caller is answered at once with no
+/// seed and a refusal an older reader ignores, and nothing is taken or
+/// acknowledged. A Pi generation (`attested`, the pane's `live` agent) asking
+/// runs an extension from before the receipt stream, so its card says to
+/// restart the agent (G10).
+fn get_seed_withdrawn(
+    registry: &AgentPtyRegistry,
     pane_id: &str,
-    requested: Option<&str>,
     attested: Option<&str>,
     live: Option<&str>,
-    pi: bool,
-) -> Option<String> {
-    let agent = attested?;
-    if requested.is_some_and(|requested| !requested.is_empty() && requested != agent) {
-        warn!(
-            pane_id = %escape_id_for_log(pane_id),
-            "get-seed named an agent other than the one its token attests; no inbox message \
-             was handed over"
-        );
-        return None;
+) -> crate::event::GetSeedResponse {
+    if let Some(agent) = attested.filter(|agent| live == Some(*agent))
+        && pi_generation(registry, pane_id, agent)
+    {
+        registry.inbox().refuse_old_adapter(pane_id, agent);
     }
-    if live != Some(agent) {
-        return None;
-    }
-    if pi {
-        hub.refuse_old_adapter(pane_id, agent);
-        return None;
-    }
-    hub.fetch_first_acked(pane_id, agent, crate::inbox::AckHow::ExtensionConfirmed)
-        .map(|delivery| delivery.text)
+    crate::event::GetSeedResponse::withdrawn()
 }
 
 /// PRD #1666 G10: whether `agent_id` in `pane_id` is a Pi generation: started
@@ -5266,340 +5339,118 @@ fn pi_generation(registry: &AgentPtyRegistry, pane_id: &str, agent_id: &str) -> 
             == Some(crate::event::InboxComponent::PiExtension)
 }
 
-/// How a hook's inbox fetch is served ([`claude_hook_fetch`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HookRoute {
-    /// A one-shot receiver of its own ([`crate::inbox_hub::serve_hook`]).
-    OneShot,
-    /// The legacy fetch.
-    Legacy,
-    /// A hook fetch that declares no one-shot integration, from a generation
-    /// nothing yet types: one-shot if it turns out to be Claude Code, legacy
-    /// otherwise.
-    Undecided,
+/// The budget a fetch asked for: `max_bytes` when set, else `max_chars`.
+fn fetch_budget(req: &crate::event::InboxFetchRequest) -> Option<crate::event::InboxBudget> {
+    req.max_json_bytes
+        .map(crate::event::InboxBudget::JsonBytes)
+        .or(req.max_bytes.map(crate::event::InboxBudget::Bytes))
+        .or(req.max_chars.map(crate::event::InboxBudget::Chars))
 }
 
-/// R2F-R02: how long an [`HookRoute::Undecided`] fetch is held for the hook
-/// events accepted before it ([`route_hook_fetch`]). An event is usually in
-/// within milliseconds; the bound is reached when a connection accepted
-/// earlier has not sent a complete line, or its message is slow to process,
-/// and it stays well inside the hook's own 5-second request timeout. A wait
-/// budget, not a wall-clock bound: the placement reads
-/// ([`may_type_generation`]) run synchronously before each wait, so slow
-/// process-table reads or a starved runtime can stretch the hold past it.
-const HOOK_ROUTE_WAIT: Duration = Duration::from_secs(2);
+/// PRD #1666 part 3 (H4): the hook component an `inbox_receipt_fetch` is
+/// served as, or `None` when the receipt verb does not serve it (it is
+/// refused `unsupported`, nothing issued). A hook names its component, and one
+/// without it is Claude Code's prompt hook (part 2's); only Claude Code's and
+/// Codex's hooks fetch this way. A model-run `inbox fetch` names none: it is
+/// served as the hook of the generation's agent, `agent`, the spawn's type
+/// else the one its hooks reported (a routing hint for the budget and the
+/// log, not authority: the fetch is admitted like any other). A fetch a
+/// stream bound (`rx`) is that stream's doorbell substitution, on the legacy
+/// verb, never this one.
+fn receipt_fetch_component(
+    req: &crate::event::InboxFetchRequest,
+    agent: Option<crate::event::AgentType>,
+) -> Option<crate::event::InboxComponent> {
+    use crate::event::{AgentType, InboxComponent, InboxFetchConsumer};
+    if req.rx.is_some() {
+        return None;
+    }
+    match req.consumer {
+        InboxFetchConsumer::Cli => Some(match agent {
+            Some(AgentType::ClaudeCode) => InboxComponent::ClaudeHooks,
+            Some(AgentType::Codex) => InboxComponent::CodexHooks,
+            Some(AgentType::Devin) => InboxComponent::DevinHooks,
+            _ => InboxComponent::Other,
+        }),
+        InboxFetchConsumer::DoorbellHook | InboxFetchConsumer::TurnEndHook => {
+            match req.component.unwrap_or(InboxComponent::ClaudeHooks) {
+                component @ (InboxComponent::ClaudeHooks | InboxComponent::CodexHooks) => {
+                    Some(component)
+                }
+                _ => None,
+            }
+        }
+    }
+}
 
-/// Part 2 §2.4: how `req`, a fetch from `agent_id`, is served. A Claude
-/// hook's fetch — a doorbell or turn-end hand-over — is served as a one-shot
-/// receiver of its own: one that declares the one-shot integration (only
-/// Claude's hook does, until H4), or one from a generation known to be
-/// Claude Code, so an older hook there meets the floor and is refused
-/// visibly rather than handed mail on the legacy terms.
-///
-/// A generation is known to be Claude Code by its spawn, by the Claude
-/// component it announced, or by its own hook events reporting Claude Code
-/// (R2-R03). A pane started from a bare command carries no spawn type, and a
-/// Claude without the deck's waiter announces nothing, so the hook-reported
-/// type is what tells that Claude apart: its SessionStart hook sends it
-/// before any prompt can carry a doorbell. A hook producer can claim that
-/// type: a claimed Claude type routes a stale fetch to its visible refusal,
-/// and, since the first type reported stands, a non-Claude type reported
-/// first keeps a later Claude report from typing the generation, so a real
-/// bare Claude's stale fetch is then served the legacy way, its mail handed
-/// on legacy terms with no notice. Under the `warn` provenance policy that
-/// first report can be a token-less one. The type is a routing hint, not
-/// authentication of the agent or its hooks.
-///
-/// A hook fetch from a generation nothing types yet is
-/// [`HookRoute::Undecided`]: [`route_hook_fetch`] holds it until the hook
-/// events accepted before it are in (R2F-R02), since SessionStart's send
-/// returns before the deck has read it. A CLI fetch stays on the legacy path
-/// until H4.
-fn claude_hook_fetch(
+/// PRD #1666 G10, part 3 (H5): whether `req`, a fetch on the legacy verb, is
+/// a doorbell fetch from an OpenCode plugin or Pi extension from before the
+/// receipt stream (no stream bound): refused as an out-of-date adapter.
+fn old_adapter_doorbell(
     registry: &AgentPtyRegistry,
     req: &crate::event::InboxFetchRequest,
     agent_id: &str,
-) -> HookRoute {
+) -> bool {
     use crate::event::{AgentType, InboxComponent, InboxFetchConsumer};
-    if !matches!(
-        req.consumer,
-        InboxFetchConsumer::DoorbellHook | InboxFetchConsumer::TurnEndHook
-    ) || req.rx.is_some()
-    {
-        return HookRoute::Legacy;
-    }
-    if req.hook_integration.is_some() {
-        return HookRoute::OneShot;
-    }
-    let announced = registry.inbox().announced_component(&req.pane_id, agent_id);
-    if matches!(
-        announced,
-        Some(InboxComponent::ClaudeHooks | InboxComponent::ClaudeWaiter)
-    ) {
-        return HookRoute::OneShot;
+    req.consumer == InboxFetchConsumer::DoorbellHook
+        && req.rx.is_none()
+        && (registry.spawn_agent_type(agent_id) == Some(AgentType::OpenCode)
+            || pi_generation(registry, &req.pane_id, agent_id)
+            || matches!(
+                registry.inbox().announced_component(&req.pane_id, agent_id),
+                Some(InboxComponent::OpenCodePlugin | InboxComponent::OpenCodeMini)
+            ))
+}
+
+/// PRD #1666 part 3 (H5): whether `req`, a fetch on the legacy verb, is an
+/// agent hook's: a doorbell or turn-end fetch with no stream bound, from no
+/// out-of-date adapter. It meets the one-shot floor ([`crate::inbox_hub::serve_hook`]):
+/// one from an older dot-agent-deck, declaring no integration, is refused.
+fn legacy_verb_hook_fetch(
+    registry: &AgentPtyRegistry,
+    req: &crate::event::InboxFetchRequest,
+    agent_id: &str,
+) -> bool {
+    req.consumer != crate::event::InboxFetchConsumer::Cli
+        && req.rx.is_none()
+        && !old_adapter_doorbell(registry, req, agent_id)
+}
+
+/// PRD #1666 part 3 (H5): the hook component a legacy-verb hook fetch from
+/// `agent_id` comes from, for its card's remedy and its budget: the agent's
+/// type (the spawn's, else the one its hooks reported, a hint and not
+/// authority), else a Claude component it announced, else Claude Code's hooks
+/// for a fetch declaring the one-shot integration (only Claude's hook did, on
+/// this verb, in part 2), else none the deck can name.
+fn legacy_hook_component(
+    registry: &AgentPtyRegistry,
+    req: &crate::event::InboxFetchRequest,
+    agent_id: &str,
+) -> crate::event::InboxComponent {
+    use crate::event::{AgentType, InboxComponent};
+    if let Some(component) = req.component {
+        return component;
     }
     match registry
         .spawn_agent_type(agent_id)
         .or_else(|| registry.reported_agent_type(agent_id))
     {
-        Some(AgentType::ClaudeCode) => HookRoute::OneShot,
-        None if announced.is_none() => HookRoute::Undecided,
-        _ => HookRoute::Legacy,
-    }
-}
-
-/// R2F-R02: serve-time routing of `req`, a fetch from `agent_id` on the
-/// connection `order` numbered `seq`. An [`HookRoute::Undecided`] fetch is
-/// held until every connection accepted before it that could be this
-/// generation's own hook has had its first message ingested, for `wait` at
-/// most, and is then routed again; still undecided, it is served the legacy
-/// way ([`HookRoute::Legacy`]).
-///
-/// R2-fix3 (U2), a trade the orchestrator accepted: an earlier connection
-/// that sends no complete line holds the fetch for the whole `wait`, and a
-/// SessionStart still unread at that bound loses the race it was held for,
-/// so the stale fetch is handed mail on legacy terms, as before H3. A held
-/// fetch keeps its hook-pool slot meanwhile, so a burst of them adds pool
-/// pressure for that long. Only `Undecided` fetches wait at all (a hook
-/// fetch declaring no integration, from a bare-command pane nothing types
-/// yet). And only earlier connections from the agent's own process tree, or
-/// ones the deck cannot place ([`may_type_generation`], best-effort ancestry
-/// placement), hold one: a silent peer placed outside that tree does not.
-async fn route_hook_fetch(
-    registry: &AgentPtyRegistry,
-    req: &crate::event::InboxFetchRequest,
-    agent_id: &str,
-    order: &IngestOrder,
-    seq: u64,
-    wait: Duration,
-) -> HookRoute {
-    route_hook_fetch_with(
-        registry,
-        req,
-        agent_id,
-        order,
-        seq,
-        wait,
-        may_type_generation,
-    )
-    .await
-}
-
-/// [`route_hook_fetch`] with the placement of each earlier connection's peer
-/// (`may_type`) injected, so a test can stand in a process table.
-async fn route_hook_fetch_with(
-    registry: &AgentPtyRegistry,
-    req: &crate::event::InboxFetchRequest,
-    agent_id: &str,
-    order: &IngestOrder,
-    seq: u64,
-    wait: Duration,
-    may_type: impl Fn(&AcceptedPeer, Option<u32>) -> bool,
-) -> HookRoute {
-    let route = claude_hook_fetch(registry, req, agent_id);
-    if route != HookRoute::Undecided {
-        return route;
-    }
-    info!(
-        pane_id = %escape_id_for_log(&req.pane_id),
-        "holding a hook fetch until the hook events accepted before it are in"
-    );
-    let root = registry.child_pid(agent_id);
-    let settled = order
-        .earlier_settled(seq, wait, |peer| may_type(peer, root))
-        .await;
-    match claude_hook_fetch(registry, req, agent_id) {
-        HookRoute::Undecided => {
-            info!(
-                pane_id = %escape_id_for_log(&req.pane_id),
-                settled,
-                "no hook event typed this generation; serving its hook fetch the legacy way"
-            );
-            HookRoute::Legacy
-        }
-        route => route,
-    }
-}
-
-/// R2-fix3 (U2): whether the connection `peer` made could carry a hook event
-/// for the generation whose agent process is `root`. Best-effort ancestry
-/// placement, a scheduling hint for the routing hold and not a check of what
-/// the peer runs: the peer is left out only on positive evidence that it is
-/// outside `root`'s tree (R2-fix4, [`may_type_generation_with`]); every
-/// uncertain case keeps it.
-fn may_type_generation(peer: &AcceptedPeer, root: Option<u32>) -> bool {
-    may_type_generation_with(
-        peer,
-        root,
-        crate::platform::proc::placement_parent_of,
-        crate::platform::proc::process_start_of,
-    )
-}
-
-/// [`may_type_generation`] over `parent_of` and `started_of`.
-///
-/// R2-fix4 (U2): the peer is left out only when all three hold: it is
-/// identifiable (its start time was read at accept), the walk up from its pid
-/// ends outside `root`'s tree ([`Ancestry::Outside`], not a parent it cannot
-/// read nor a walk that runs out of steps), and its pid still names the
-/// process accepted once the walk has answered, as
-/// [`admit_inbox_component_with`] checks, so the walk read the accepted
-/// process's ancestry and not a later one's that reuses its pid. It is still
-/// best effort: a parent that exits during the walk can reparent the peer
-/// out of the tree (to init on Linux), and the walk reads ancestry now, not
-/// at connect.
-///
-/// [`Ancestry::Outside`]: crate::platform::proc::Ancestry::Outside
-fn may_type_generation_with(
-    peer: &AcceptedPeer,
-    root: Option<u32>,
-    parent_of: impl Fn(u32) -> Option<u32>,
-    started_of: impl Fn(u32) -> Option<u64>,
-) -> bool {
-    let (Some(root), Some(started)) = (root, peer.started) else {
-        return true;
-    };
-    if crate::platform::proc::ancestry_with(peer.pid, root, parent_of)
-        != crate::platform::proc::Ancestry::Outside
-    {
-        return true;
-    }
-    started_of(peer.pid) != Some(started)
-}
-
-/// R2F-R02: the hook socket's accepted connections whose first message the
-/// daemon has not yet ingested, numbered in accept order. A producer whose
-/// connect returned before another's began is queued, and so accepted,
-/// ahead of it (a listener accepts from its backlog in order), so once every
-/// connection numbered below a fetch's has settled, whatever type those
-/// first lines reported is in.
-///
-/// A ticket is taken only for a connection the hook pool admitted, and goes
-/// with its connection task, so no more are pending than the pool serves
-/// connections at once.
-#[derive(Default)]
-struct IngestOrder {
-    next: std::sync::atomic::AtomicU64,
-    /// Each pending connection's peer, once its task has read it
-    /// ([`IngestTicket::place`]); `None` until then, or when it cannot be.
-    pending: std::sync::Mutex<std::collections::BTreeMap<u64, Option<AcceptedPeer>>>,
-    settled: tokio::sync::Notify,
-}
-
-impl IngestOrder {
-    /// The next accepted connection's ticket, pending until it settles.
-    fn admit(self: &Arc<Self>) -> IngestTicket {
-        let seq = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(seq, None);
-        IngestTicket {
-            order: Arc::clone(self),
-            seq,
-            settled: false,
-        }
-    }
-
-    /// Wait, for at most `bound`, until no connection accepted before `seq`
-    /// is pending whose peer `relevant` keeps; one whose peer is not known is
-    /// always kept. Answers whether that happened within the bound.
-    async fn earlier_settled(
-        &self,
-        seq: u64,
-        bound: Duration,
-        relevant: impl Fn(&AcceptedPeer) -> bool,
-    ) -> bool {
-        let deadline = tokio::time::Instant::now() + bound;
-        loop {
-            let notified = self.settled.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            let earlier: Vec<Option<AcceptedPeer>> = self
-                .pending
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .range(..seq)
-                .map(|(_, peer)| *peer)
-                .collect();
-            if !earlier
-                .iter()
-                .any(|peer| peer.as_ref().is_none_or(&relevant))
-            {
-                return true;
+        Some(AgentType::ClaudeCode) => InboxComponent::ClaudeHooks,
+        Some(AgentType::Codex) => InboxComponent::CodexHooks,
+        Some(AgentType::Devin) => InboxComponent::DevinHooks,
+        _ => match registry.inbox().announced_component(&req.pane_id, agent_id) {
+            Some(InboxComponent::ClaudeHooks | InboxComponent::ClaudeWaiter) => {
+                InboxComponent::ClaudeHooks
             }
-            if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                return false;
-            }
-        }
-    }
-
-    /// How many connections are pending.
-    #[cfg(all(test, unix))]
-    fn pending(&self) -> usize {
-        self.pending.lock().unwrap_or_else(|e| e.into_inner()).len()
+            _ if req.hook_integration.is_some() => InboxComponent::ClaudeHooks,
+            _ => InboxComponent::Other,
+        },
     }
 }
 
-/// One accepted connection's place in [`IngestOrder`]: it settles once, when
-/// its first message is in or the connection ends.
-struct IngestTicket {
-    order: Arc<IngestOrder>,
-    seq: u64,
-    settled: bool,
-}
-
-impl IngestTicket {
-    fn seq(&self) -> u64 {
-        self.seq
-    }
-
-    /// Record the process that made this connection, read once the
-    /// connection task starts, for [`IngestOrder::earlier_settled`].
-    fn place(&self, peer: Option<AcceptedPeer>) {
-        let Some(peer) = peer else {
-            return;
-        };
-        if self.settled {
-            return;
-        }
-        if let Some(slot) = self
-            .order
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_mut(&self.seq)
-        {
-            *slot = Some(peer);
-        }
-        self.order.settled.notify_waiters();
-    }
-
-    fn settle(&mut self) {
-        if std::mem::replace(&mut self.settled, true) {
-            return;
-        }
-        self.order
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.seq);
-        self.order.settled.notify_waiters();
-    }
-}
-
-impl Drop for IngestTicket {
-    fn drop(&mut self) {
-        self.settle();
-    }
-}
-
-/// The budget a fetch asked for: `max_bytes` when set, else `max_chars`.
-fn fetch_budget(req: &crate::event::InboxFetchRequest) -> Option<crate::event::InboxBudget> {
-    req.max_bytes
-        .map(crate::event::InboxBudget::Bytes)
-        .or(req.max_chars.map(crate::event::InboxBudget::Chars))
-}
+/// PRD #1666 part 3 (H5): what an `inbox fetch` from an older dot-agent-deck
+/// is told: it fetches the way the deck no longer serves.
+const CLI_FETCH_TOO_OLD: &str = "this dot-agent-deck is older than the deck daemon and can no longer take messages, so none was taken and they stay waiting: run inbox fetch with the dot-agent-deck the daemon runs, or upgrade dot-agent-deck";
 
 fn handle_inbox_fetch(
     registry: &AgentPtyRegistry,
@@ -5607,12 +5458,6 @@ fn handle_inbox_fetch(
     agent_id: &str,
 ) -> crate::event::InboxWaitReply {
     use crate::event::InboxFetchConsumer;
-    use crate::inbox::{AckHow, Consumer};
-    let (consumer, how) = match req.consumer {
-        InboxFetchConsumer::Cli => (Consumer::FetchCli, AckHow::FetchedByCli),
-        InboxFetchConsumer::TurnEndHook => (Consumer::TurnEndHook, AckHow::HookHandover),
-        InboxFetchConsumer::DoorbellHook => (Consumer::DoorbellHook, AckHow::HookHandover),
-    };
     let budget = fetch_budget(req);
     let doorbell = req
         .doorbell
@@ -5656,32 +5501,34 @@ fn handle_inbox_fetch(
     }
     // PRD #1666 G10: Pi's too — a plain doorbell fetch is an extension from
     // before the receipt stream.
-    if req.consumer == InboxFetchConsumer::DoorbellHook
-        && (registry.spawn_agent_type(agent_id) == Some(crate::event::AgentType::OpenCode)
-            || pi_generation(registry, &req.pane_id, agent_id))
-    {
+    if old_adapter_doorbell(registry, req, agent_id) {
         registry.inbox().refuse_old_adapter(&req.pane_id, agent_id);
         return crate::event::InboxWaitReply::refused(
             "adapter_too_old",
             crate::inbox_display::ADAPTER_TOO_OLD,
         );
     }
-    let messages = registry.inbox().fetch_named_within(
-        &req.pane_id,
-        agent_id,
-        consumer,
-        budget,
-        req.ack.then_some(how),
-        doorbell,
-    );
-    info!(
+    // PRD #1666 part 3 (H5): the legacy fetch is withdrawn. Whatever it
+    // asked, `ack` included, nothing is taken or acknowledged and the mail
+    // stays queued for the agent's own receiver; an agent's hook meets the
+    // one-shot floor before it gets here.
+    warn!(
         pane_id = %escape_id_for_log(&req.pane_id),
         consumer = ?req.consumer,
         ack = req.ack,
-        count = messages.len(),
-        "Received inbox fetch"
+        "inbox: refused a fetch the way only an older dot-agent-deck asks; nothing was taken"
     );
-    crate::event::InboxWaitReply::messages(messages)
+    match req.consumer {
+        InboxFetchConsumer::Cli => {
+            crate::event::InboxWaitReply::refused("cli_too_old", CLI_FETCH_TOO_OLD)
+        }
+        InboxFetchConsumer::DoorbellHook | InboxFetchConsumer::TurnEndHook => {
+            crate::event::InboxWaitReply::refused(
+                "hooks_too_old",
+                crate::inbox_display::HOOKS_TOO_OLD,
+            )
+        }
+    }
 }
 
 /// PRD #1666: `inbox_list` — the caller's own inbox, or with `all` an
@@ -5809,15 +5656,13 @@ async fn run_hook_loop_with_idle_timeout(
         shutdown,
         worktree_registry,
         HookLoopLimits::production(idle_timeout),
-        Arc::default(),
     )
     .await
 }
 
 /// [`run_hook_loop`] with every bound supplied — the seam the PRD #1631 hold
 /// tests use to reach the connection cap, the hold budget and the hold
-/// deadline without spending their production values — and the
-/// [`IngestOrder`] its connections are numbered in.
+/// deadline without spending their production values.
 #[allow(clippy::too_many_arguments)]
 async fn run_hook_loop_with_limits(
     listener: IpcListener,
@@ -5827,7 +5672,6 @@ async fn run_hook_loop_with_limits(
     shutdown: Arc<Notify>,
     worktree_registry: crate::issue_dispatch_run::WorktreeRegistry,
     limits: HookLoopLimits,
-    ingest_order: Arc<IngestOrder>,
 ) -> Result<(), DaemonError> {
     let idle_timeout = limits.idle_timeout;
     // Issue #319: bound how many hook connections are being served at once.
@@ -5864,10 +5708,6 @@ async fn run_hook_loop_with_limits(
             accept_res = accept_hook_connection(&listener, &conn_limit, limits.max_connections, &mut at_cap) => match accept_res {
             Ok((permit, stream)) => {
                 let hold_limit = Arc::clone(&hold_limit);
-                // Taken here, in the accept loop, so tickets follow the order
-                // the listener accepted connections in.
-                let mut ingest = ingest_order.admit();
-                let ingest_order = Arc::clone(&ingest_order);
                 let state = state.clone();
                 let event_tx = event_tx.clone();
                 let pty_registry = pty_registry.clone();
@@ -5897,11 +5737,13 @@ async fn run_hook_loop_with_limits(
                     //
                     // PR #1735 third review (F2): recorded with when that
                     // process started, so every later check names the process
-                    // that connected, not whatever reuses its pid.
+                    // that connected, not whatever reuses its pid. Part 3
+                    // (R-1): and whether it runs as the deck's user, which
+                    // with the pane's capability makes it a member of the pane.
                     let peer_pid = AcceptedPeer::accept(
                         crate::platform::peercred::peer_pid(&stream).ok(),
+                        crate::platform::peercred::peer_is_same_user(&stream),
                     );
-                    ingest.place(peer_pid);
                     let (read_half, mut write_half) = tokio::io::split(stream);
                     let mut reader = tokio::io::BufReader::new(read_half);
 
@@ -5915,13 +5757,7 @@ async fn run_hook_loop_with_limits(
                     // daemon owns. `read_capped_line` resolves the same three
                     // outcomes under a ceiling; see `MAX_HOOK_LINE_BYTES` for
                     // where the number comes from.
-                    let mut first_line = true;
                     loop {
-                        // R2F-R02: the connection's first message is in by
-                        // the time it asks for a second.
-                        if !std::mem::take(&mut first_line) {
-                            ingest.settle();
-                        }
                         // The `timeout` is what keeps a stalled connection from
                         // holding its slot forever — see
                         // `HOOK_CONNECTION_IDLE_TIMEOUT`. It wraps the READ and
@@ -5994,12 +5830,6 @@ async fn run_hook_loop_with_limits(
                             }
                         };
                         if let Ok(msg) = serde_json::from_str::<DaemonMessage>(&line) {
-                            // R2F-R02: a question types its generation as an
-                            // event does, and settles once it has; every other
-                            // verb types nothing a fetch could be waiting for.
-                            if !matches!(msg, DaemonMessage::Question(_)) {
-                                ingest.settle();
-                            }
                             // Issue #1077: ONE provenance gate for every verb on
                             // this socket, ahead of the match rather than inside
                             // each arm.
@@ -6028,6 +5858,10 @@ async fn run_hook_loop_with_limits(
                             // dispatch is accepted (below) until the result is
                             // posted in the `Dispatch` arm.
                             let mut dispatch_result_room = None;
+                            // PRD #1666 part 3, round 5 (plan §3.2): and the
+                            // room the result's file and fallback body need,
+                            // reserved before anything starts.
+                            let mut dispatch_result_store = None;
                             match crate::hook_provenance::admits(
                                 &provenance,
                                 crate::hook_provenance::policy(),
@@ -6117,6 +5951,28 @@ async fn run_hook_loop_with_limits(
                                                 continue;
                                             }
                                         }
+                                        match crate::dispatch_return::admit_dispatch_result(
+                                            &pty_registry,
+                                        ) {
+                                            Ok(room) => dispatch_result_store = room,
+                                            Err((code, message)) => {
+                                                warn!(
+                                                    claimed_pane = %escape_id_for_log(msg.claimed_pane()),
+                                                    code,
+                                                    "hook socket: refused a dispatch; the deck \
+                                                     cannot keep its result"
+                                                );
+                                                let refusal =
+                                                    crate::event::SignalAck::refused(code, &message);
+                                                if let Ok(json) = serde_json::to_string(&refusal) {
+                                                    let line = format!("{json}\n");
+                                                    let _ =
+                                                        write_half.write_all(line.as_bytes()).await;
+                                                    let _ = write_half.flush().await;
+                                                }
+                                                continue;
+                                            }
+                                        }
                                     }
                                     if let Some(json) = msg.provenance_ack_reply() {
                                         let line = format!("{json}\n");
@@ -6154,7 +6010,7 @@ async fn run_hook_loop_with_limits(
                             // admitted above for its status events, but has no
                             // agent this daemon can bind a message to.
                             let attested_agent = match &provenance {
-                                crate::hook_provenance::Provenance::Attested { agent_id } => {
+                                crate::hook_provenance::Provenance::Attested { agent_id, .. } => {
                                     Some(agent_id.clone())
                                 }
                                 _ => None,
@@ -6221,6 +6077,8 @@ async fn run_hook_loop_with_limits(
                                         one_shot_receipts: Some(
                                             crate::inbox_hub::ONE_SHOT_RECEIPTS,
                                         ),
+                                        one_shot_senders: crate::inbox_hub::ONE_SHOT_SENDERS
+                                            .to_vec(),
                                         ..crate::event::InboxWaitReply::default()
                                     };
                                     if let Ok(json) = serde_json::to_string(&reply) {
@@ -6265,26 +6123,33 @@ async fn run_hook_loop_with_limits(
                                         }
                                         continue;
                                     }
-                                    let instance = match admit_inbox_component(
+                                    let admitted = admit_inbox_component(
                                         peer_pid,
                                         req.pid,
                                         pty_registry.child_pid(&agent_id),
                                         ComponentUse::Receiver,
                                         // A waiter is handed the agent's mail.
                                         Evidence::Required,
-                                    ) {
+                                    );
+                                    note_admission(
+                                        &pty_registry,
+                                        &req.pane_id,
+                                        &agent_id,
+                                        admitted.map(|_| ()),
+                                    );
+                                    let instance = match admitted {
                                         Ok(instance) => instance,
-                                        Err(why) => {
+                                        Err(refusal) => {
                                             warn!(
                                                 pane_id = %escape_id_for_log(&req.pane_id),
                                                 component = ?req.component,
-                                                why,
-                                                "hook socket: refused an inbox wait from outside \
-                                                 the pane's agent"
+                                                reason = refusal.code(),
+                                                "hook socket: refused an inbox wait the deck \
+                                                 cannot admit for the pane"
                                             );
                                             let reply = crate::event::InboxWaitReply::refused(
-                                                INBOX_NOT_AGENT_PROCESS,
-                                                INBOX_NOT_AGENT_PROCESS_MESSAGE,
+                                                refusal.code(),
+                                                refusal.message(),
                                             );
                                             if let Ok(json) = serde_json::to_string(&reply) {
                                                 let line = format!("{json}\n");
@@ -6337,26 +6202,33 @@ async fn run_hook_loop_with_limits(
                                     // positive evidence as arming a waiter: an
                                     // unproven one could pin a dead process and
                                     // lock the real integration out.
-                                    let instance = match admit_inbox_component(
+                                    let admitted = admit_inbox_component(
                                         peer_pid,
                                         req.pid,
                                         pty_registry.child_pid(&agent_id),
                                         ComponentUse::Receiver,
                                         Evidence::Required,
-                                    ) {
+                                    );
+                                    note_admission(
+                                        &pty_registry,
+                                        &req.pane_id,
+                                        &agent_id,
+                                        admitted.map(|_| ()),
+                                    );
+                                    let instance = match admitted {
                                         Ok(instance) => instance,
-                                        Err(why) => {
+                                        Err(refusal) => {
                                         warn!(
                                             pane_id = %escape_id_for_log(&req.pane_id),
                                             component = ?req.component,
-                                            why,
-                                            "hook socket: refused an inbox announce from outside \
-                                             the pane's agent"
+                                            reason = refusal.code(),
+                                            "hook socket: refused an inbox announce the deck \
+                                             cannot admit for the pane"
                                         );
                                         if let Ok(json) =
                                             serde_json::to_string(&crate::event::SignalAck::refused(
-                                                INBOX_NOT_AGENT_PROCESS,
-                                                INBOX_NOT_AGENT_PROCESS_MESSAGE,
+                                                refusal.code(),
+                                                refusal.message(),
                                             ))
                                         {
                                             let line = format!("{json}\n");
@@ -6399,20 +6271,27 @@ async fn run_hook_loop_with_limits(
                                     let Some(agent_id) = attested_agent else {
                                         continue;
                                     };
-                                    // Part 2 §2.4, §2.7: a Claude hook's fetch is
-                                    // a one-shot receiver of its own, held on
+                                    // Part 2 §2.4, §2.7: a hook's fetch is a
+                                    // one-shot receiver of its own, held on
                                     // this connection for its controls; below
                                     // the integration floor nothing is issued
                                     // ([`crate::inbox_hub::serve_hook`]). On the
                                     // receipt verb it says so itself; a legacy
-                                    // fetch is routed. Until H4, only a hook's
-                                    // fetch that no stream bound is served on
-                                    // receipts.
-                                    let route = if receipt_verb {
-                                        if req.rx.is_some()
-                                            || req.consumer
-                                                == crate::event::InboxFetchConsumer::Cli
-                                        {
+                                    // fetch is routed. PRD #1666 part 3 (H4):
+                                    // Claude Code's and Codex's hooks and a
+                                    // model-run `inbox fetch` are served on
+                                    // receipts; a fetch a stream bound is not.
+                                    let mut component = crate::event::InboxComponent::ClaudeHooks;
+                                    let one_shot = if receipt_verb {
+                                        let served = receipt_fetch_component(
+                                            &req,
+                                            pty_registry
+                                                .spawn_agent_type(&agent_id)
+                                                .or_else(|| {
+                                                    pty_registry.reported_agent_type(&agent_id)
+                                                }),
+                                        );
+                                        let Some(served) = served else {
                                             let reply = crate::event::InboxWaitReply::refused(
                                                 INBOX_RECEIPT_UNSUPPORTED,
                                                 INBOX_RECEIPT_UNSUPPORTED_MESSAGE,
@@ -6424,21 +6303,23 @@ async fn run_hook_loop_with_limits(
                                                 let _ = write_half.flush().await;
                                             }
                                             continue;
-                                        }
-                                        HookRoute::OneShot
+                                        };
+                                        component = served;
+                                        true
+                                    } else if legacy_verb_hook_fetch(&pty_registry, &req, &agent_id) {
+                                        // PRD #1666 part 3 (H5): no legacy
+                                        // service is left, so a hook's fetch
+                                        // on the legacy verb meets the
+                                        // one-shot floor at once, and the
+                                        // card names that agent's hooks.
+                                        component =
+                                            legacy_hook_component(&pty_registry, &req, &agent_id);
+                                        true
                                     } else {
-                                        route_hook_fetch(
-                                            &pty_registry,
-                                            &req,
-                                            &agent_id,
-                                            &ingest_order,
-                                            ingest.seq(),
-                                            HOOK_ROUTE_WAIT,
-                                        )
-                                        .await
+                                        false
                                     };
-                                    if route == HookRoute::OneShot {
-                                        if !mail_taker_admitted(
+                                    if one_shot {
+                                        if let Err(refusal) = mail_taker_admitted(
                                             &pty_registry,
                                             peer_pid,
                                             &agent_id,
@@ -6446,8 +6327,8 @@ async fn run_hook_loop_with_limits(
                                             &req.pane_id,
                                         ) {
                                             let reply = crate::event::InboxWaitReply::refused(
-                                                INBOX_NOT_AGENT_PROCESS,
-                                                INBOX_NOT_AGENT_PROCESS_MESSAGE,
+                                                refusal.code(),
+                                                refusal.message(),
                                             );
                                             if let Ok(json) = serde_json::to_string(&reply) {
                                                 let line = format!("{json}\n");
@@ -6467,7 +6348,7 @@ async fn run_hook_loop_with_limits(
                                             hub,
                                             req.pane_id.clone(),
                                             agent_id,
-                                            crate::event::InboxComponent::ClaudeHooks,
+                                            component,
                                             crate::inbox_hub::HookFetch {
                                                 named: req
                                                     .doorbell
@@ -6475,6 +6356,7 @@ async fn run_hook_loop_with_limits(
                                                     .filter(|id| crate::inbox::is_valid_message_id(id)),
                                                 budget: fetch_budget(&req),
                                                 hook_integration: req.hook_integration,
+                                                consumer: req.consumer,
                                             },
                                             reader,
                                             write_half,
@@ -6482,19 +6364,18 @@ async fn run_hook_loop_with_limits(
                                         .await;
                                         return;
                                     }
-                                    let reply = if mail_taker_admitted(
+                                    let reply = match mail_taker_admitted(
                                         &pty_registry,
                                         peer_pid,
                                         &agent_id,
                                         "inbox_fetch",
                                         &req.pane_id,
                                     ) {
-                                        handle_inbox_fetch(&pty_registry, &req, &agent_id)
-                                    } else {
-                                        crate::event::InboxWaitReply::refused(
-                                            INBOX_NOT_AGENT_PROCESS,
-                                            INBOX_NOT_AGENT_PROCESS_MESSAGE,
-                                        )
+                                        Ok(()) => handle_inbox_fetch(&pty_registry, &req, &agent_id),
+                                        Err(refusal) => crate::event::InboxWaitReply::refused(
+                                            refusal.code(),
+                                            refusal.message(),
+                                        ),
                                     };
                                     if let Ok(json) = serde_json::to_string(&reply) {
                                         let line = format!("{json}\n");
@@ -6506,10 +6387,11 @@ async fn run_hook_loop_with_limits(
                                     let Some(agent_id) = attested_agent else {
                                         continue;
                                     };
-                                    // Part 2 §1.3: admitted from the agent's own
-                                    // process tree, as `ack` is, for the
+                                    // Part 2 §1.3: admitted from a member of the
+                                    // pane (part 3, R-1: its current capability
+                                    // and the deck's user), as `ack` is, for the
                                     // generation the token attests. That makes
-                                    // it an in-tree, same-user authority, not
+                                    // it a same-user authority, not
                                     // proof that Claude's hook sent it; what it
                                     // may commit is bounded by the attempt's own
                                     // witness instead (R2-A01): released by the
@@ -6519,13 +6401,19 @@ async fn run_hook_loop_with_limits(
                                     // cannot read (no spool, or no scanner) is
                                     // the exception: it is degraded already, and
                                     // there the first two alone decide.
-                                    let reply = if mail_taker_admitted(
+                                    let admitted = mail_taker_admitted(
                                         &pty_registry,
                                         peer_pid,
                                         &agent_id,
                                         "inbox_committed",
                                         &req.pane_id,
-                                    ) {
+                                    );
+                                    let reply = if let Err(refusal) = admitted {
+                                        crate::event::InboxWaitReply::refused(
+                                            refusal.code(),
+                                            refusal.message(),
+                                        )
+                                    } else {
                                         let applied = pty_registry.inbox().one_shot_committed(
                                             &req.pane_id,
                                             &agent_id,
@@ -6540,11 +6428,6 @@ async fn run_hook_loop_with_limits(
                                             "Received a prompt's exact commits"
                                         );
                                         crate::event::InboxWaitReply::default()
-                                    } else {
-                                        crate::event::InboxWaitReply::refused(
-                                            INBOX_NOT_AGENT_PROCESS,
-                                            INBOX_NOT_AGENT_PROCESS_MESSAGE,
-                                        )
                                     };
                                     if let Ok(json) = serde_json::to_string(&reply) {
                                         let line = format!("{json}\n");
@@ -6581,10 +6464,10 @@ async fn run_hook_loop_with_limits(
                                         continue;
                                     };
                                     // Hardening M2 for the verbs that reach
-                                    // other agents or move a job between them:
-                                    // only the agent's own process tree may
-                                    // use its token.
-                                    if let Err(why) = admit_inbox_component(
+                                    // other agents or move a job between them,
+                                    // as part 3 (R-1) widened it: only a member
+                                    // of the pane may use its token.
+                                    if let Err(refusal) = admit_inbox_component(
                                         peer_pid,
                                         None,
                                         pty_registry.child_pid(&agent_id),
@@ -6594,13 +6477,13 @@ async fn run_hook_loop_with_limits(
                                         warn!(
                                             verb = msg.verb(),
                                             pane_id = %escape_id_for_log(msg.claimed_pane()),
-                                            why,
-                                            "hook socket: refused an inbox post from outside the \
-                                             pane's agent"
+                                            reason = refusal.code(),
+                                            "hook socket: refused an inbox post the deck cannot \
+                                             admit for the pane"
                                         );
                                         if let Some(json) = msg.provenance_refusal_reply(
-                                            INBOX_NOT_AGENT_PROCESS,
-                                            INBOX_NOT_AGENT_PROCESS_MESSAGE,
+                                            refusal.code(),
+                                            refusal.message(),
                                         ) {
                                             let line = format!("{json}\n");
                                             let _ = write_half.write_all(line.as_bytes()).await;
@@ -6684,6 +6567,7 @@ async fn run_hook_loop_with_limits(
                                     let sender_agent_id = match &provenance {
                                         crate::hook_provenance::Provenance::Attested {
                                             agent_id,
+                                            ..
                                         } => Some(agent_id.clone()),
                                         _ => None,
                                     };
@@ -6891,6 +6775,20 @@ async fn run_hook_loop_with_limits(
                                     let Some(room) = dispatch_result_room.take() else {
                                         continue;
                                     };
+                                    // PRD #1666 part 3, round 5 (plan §3.2):
+                                    // the result is saved, or held in memory,
+                                    // before it is posted.
+                                    let record = crate::dispatch_return::retain_dispatch_result(
+                                        &pty_registry,
+                                        dispatch_result_store.take(),
+                                        &signal.pane_id,
+                                        &caller_agent_id,
+                                        &signal.name,
+                                        &result.message,
+                                        result.success,
+                                        result.unit_id.clone(),
+                                    )
+                                    .await;
                                     crate::dispatch_return::post_dispatch_result(
                                         &pty_registry,
                                         room,
@@ -6899,6 +6797,7 @@ async fn run_hook_loop_with_limits(
                                         &signal.name,
                                         result.success,
                                         &result.message,
+                                        record,
                                     );
                                 }
                                 DaemonMessage::WorkDone(signal) => {
@@ -6907,80 +6806,110 @@ async fn run_hook_loop_with_limits(
                                         done = signal.done,
                                         "Received work-done signal"
                                     );
-                                    // The report is posted AFTER the read guard is
-                                    // released: `prepare_work_done` runs under it
-                                    // and `deliver` after it. PRD #1666 S5:
-                                    // `deliver` is an inbox post and waits on
-                                    // nothing.
-                                    //
                                     // PRD #1631: the `work-done` CLI is acked
-                                    // HERE, once its report is posted, not at the
-                                    // provenance gate. Acked at the gate, a
-                                    // worker's second report could reach the
-                                    // orchestrator ahead of its first. Acked
-                                    // after the post, a sender that waits for its
-                                    // ack is ordered, and the wait is the state
-                                    // change and the post, never the agent
-                                    // reading it.
-                                    // PRD #1589 D5: the completion mark `close`
-                                    // reads, bound to the attested sender. Before
-                                    // the return route's own handling, which is
-                                    // unchanged.
-                                    //
-                                    // PR #1735 fifth review (N3): room for the
-                                    // report is held BEFORE anything is taken on —
-                                    // the completion mark, the delegation, a
-                                    // dispatched unit's return edge — so a report
-                                    // the worker is told was accepted cannot then
-                                    // be refused by its orchestrator's full inbox
-                                    // or a deck that filled meanwhile. With no room
-                                    // now the work-done is refused, visibly, and
-                                    // nothing it would have consumed is touched.
-                                    let room = match pty_registry.inbox().reserve_reply() {
-                                        Ok(room) => room,
-                                        Err(error) => {
-                                            warn!(
-                                                pane_id = %escape_id_for_log(&signal.pane_id),
-                                                %error,
-                                                "hook socket: refused a work-done; the deck has \
-                                                 no room for its report"
-                                            );
-                                            let refusal = crate::event::SignalAck::refused(
-                                                "deck_full",
-                                                &format!(
-                                                    "{error}, so it could not take this work-done \
-                                                     report; nothing was reported, so run \
-                                                     work-done again once the deck has room"
-                                                ),
-                                            );
-                                            if let Ok(json) = serde_json::to_string(&refusal) {
-                                                let line = format!("{json}\n");
-                                                let _ = write_half.write_all(line.as_bytes()).await;
-                                                let _ = write_half.flush().await;
-                                            }
-                                            continue;
-                                        }
-                                    };
-                                    mark_dispatched_unit_completion(
+                                    // HERE, from the result of the report's
+                                    // whole handling, not at the provenance
+                                    // gate. PRD #1666 part 3, round 5: the
+                                    // legacy verb runs the task-scoped
+                                    // transaction, `--done` as a terminal
+                                    // report and anything else as a note
+                                    // (plan D1), and an unconfirmed outcome
+                                    // closes the connection with no line.
+                                    let (claimed_pane, terminal) =
+                                        (signal.pane_id.clone(), signal.done);
+                                    let completion = crate::task_completion::complete_legacy(
+                                        &state,
                                         &pty_registry,
-                                        &signal,
+                                        signal,
                                         &provenance,
-                                    );
-                                    let delivery = state
-                                        .read()
-                                        .await
-                                        .prepare_work_done(signal, &pty_registry)
+                                    )
+                                    .await;
+                                    // Said once per report, because an older
+                                    // CLI's `work-done` used to complete the
+                                    // worker's task and now does not. The
+                                    // cross-version harness reads this line
+                                    // (`xtask/cross-version/src/breaks.rs`).
+                                    if !terminal
+                                        && matches!(
+                                            &completion,
+                                            crate::task_completion::Completion::Reply(reply)
+                                                if reply.disposition
+                                                    == crate::event::WorkDoneDisposition::Uncorrelated
+                                        )
+                                    {
+                                        warn!(
+                                            verb = "work_done",
+                                            claimed_pane = %escape_id_for_log(&claimed_pane),
+                                            reason = "no_task",
+                                            "hook socket: delivered a work-done that names no task as a note that completes no task; a dot-agent-deck CLI older than this daemon sends that, and `work-done --task-id` completes a task"
+                                        );
+                                    }
+                                    pty_registry
+                                        .pause_point(crate::task_completion::PAUSE_COMMITTED)
                                         .await;
-                                    // PRD #1666 S5: a post, not a write — nothing
-                                    // waits on the recipient.
-                                    delivery.deliver(&pty_registry, room).await;
-                                    if let Ok(json) = serde_json::to_string(
-                                        &crate::event::SignalAck::accepted(),
-                                    ) {
+                                    let Some(ack) = completion.to_signal_ack() else {
+                                        break;
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&ack) {
                                         let line = format!("{json}\n");
                                         let _ = write_half.write_all(line.as_bytes()).await;
                                         let _ = write_half.flush().await;
                                     }
+                                    pty_registry
+                                        .pause_point(crate::task_completion::PAUSE_ACKED)
+                                        .await;
+                                }
+                                DaemonMessage::HookCapabilities(_) => {
+                                    // PRD #1666 part 3, round 5 (plan D1): the
+                                    // question, answered on this connection,
+                                    // which then carries the mutation.
+                                    let reply = crate::event::HookCapabilitiesReply {
+                                        task_scoped_completion: Some(
+                                            crate::event::TASK_SCOPED_COMPLETION,
+                                        ),
+                                        ..Default::default()
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&reply) {
+                                        let line = format!("{json}\n");
+                                        let _ = write_half.write_all(line.as_bytes()).await;
+                                        let _ = write_half.flush().await;
+                                    }
+                                }
+                                DaemonMessage::WorkDoneTask(request) => {
+                                    info!(
+                                        pane_id = %escape_id_for_log(&request.pane_id),
+                                        mode = ?std::mem::discriminant(&request.mode),
+                                        "Received a task-scoped work-done"
+                                    );
+                                    let completion = crate::task_completion::complete(
+                                        &state,
+                                        &pty_registry,
+                                        crate::task_completion::CompletionRequest {
+                                            pane_id: request.pane_id,
+                                            mode: request.mode,
+                                            report: request.report,
+                                        },
+                                        &provenance,
+                                    )
+                                    .await;
+                                    pty_registry
+                                        .pause_point(crate::task_completion::PAUSE_COMMITTED)
+                                        .await;
+                                    let crate::task_completion::Completion::Reply(reply) =
+                                        completion
+                                    else {
+                                        // Unconfirmed: no line, and the
+                                        // connection closes.
+                                        break;
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&reply) {
+                                        let line = format!("{json}\n");
+                                        let _ = write_half.write_all(line.as_bytes()).await;
+                                        let _ = write_half.flush().await;
+                                    }
+                                    pty_registry
+                                        .pause_point(crate::task_completion::PAUSE_ACKED)
+                                        .await;
                                 }
                                 DaemonMessage::Ack(signal) => {
                                     // Issue #1383: the id is producer-supplied, so
@@ -6992,31 +6921,30 @@ async fn run_hook_loop_with_limits(
                                     let attested_agent_id = match &provenance {
                                         crate::hook_provenance::Provenance::Attested {
                                             agent_id,
+                                            ..
                                         } => Some(agent_id.as_str()),
                                         _ => None,
                                     };
                                     // PRD #1666: every id is an inbox message's,
                                     // acknowledged for the agent the token attests,
-                                    // and only from that agent's own process tree
-                                    // (PR #1735 review).
+                                    // and only from a member of its pane (PR #1735
+                                    // review; part 3, R-1).
                                     let ack = match attested_agent_id {
-                                        Some(agent_id)
-                                            if !mail_taker_admitted(
-                                                &pty_registry,
-                                                peer_pid,
-                                                agent_id,
-                                                "ack",
-                                                &signal.pane_id,
-                                            ) =>
-                                        {
-                                            crate::event::SignalAck::refused(
-                                                INBOX_NOT_AGENT_PROCESS,
-                                                INBOX_NOT_AGENT_PROCESS_MESSAGE,
-                                            )
-                                        }
-                                        Some(agent_id) => crate::event::SignalAck::acknowledged(
-                                            handle_inbox_ack(&pty_registry, &signal, agent_id),
-                                        ),
+                                        Some(agent_id) => match mail_taker_admitted(
+                                            &pty_registry,
+                                            peer_pid,
+                                            agent_id,
+                                            "ack",
+                                            &signal.pane_id,
+                                        ) {
+                                            Err(refusal) => crate::event::SignalAck::refused(
+                                                refusal.code(),
+                                                refusal.message(),
+                                            ),
+                                            Ok(()) => crate::event::SignalAck::acknowledged(
+                                                handle_inbox_ack(&pty_registry, &signal, agent_id),
+                                            ),
+                                        },
                                         None => crate::event::SignalAck::acknowledged(
                                             crate::event::AckDelivery::Unknown,
                                         ),
@@ -7028,23 +6956,13 @@ async fn run_hook_loop_with_limits(
                                     }
                                 }
                                 DaemonMessage::GetSeed(req) => {
-                                    // PRD #1666 S5 (the design's S9 alias): a
-                                    // seed is the pane's first inbox message, so
-                                    // `get-seed` hands over the agent's oldest
-                                    // queued message, rendered, and acknowledges
-                                    // it — the verb a Pi extension that predates
-                                    // the inbox used. A Pi generation is refused
-                                    // since G10 (`pi` below). `None` →
-                                    // `{"seed":null}`.
-                                    //
-                                    // Hardening H2: it acts only for the agent
-                                    // the token attests, never for an id the
-                                    // caller names or the pane's occupant
-                                    // ([`get_seed_inbox_alias`]).
-                                    //
-                                    // PR #1735 review: and only from that agent's
-                                    // own process tree; a refusal answers as "no
-                                    // seed pending" does.
+                                    // PRD #1666 part 3 (H5): `get-seed` takes
+                                    // no message any more
+                                    // ([`get_seed_withdrawn`]): every caller is
+                                    // answered at once with no seed. Only a
+                                    // member of the pane, for the agent its
+                                    // token attests, marks a Pi generation's
+                                    // card (G10, PR #1735 review).
                                     let attested = attested_agent.as_deref().filter(|agent| {
                                         mail_taker_admitted(
                                             &pty_registry,
@@ -7053,28 +6971,21 @@ async fn run_hook_loop_with_limits(
                                             "get_seed",
                                             &req.pane_id,
                                         )
+                                        .is_ok()
                                     });
-                                    let pi = attested.is_some_and(|agent| {
-                                        pi_generation(&pty_registry, &req.pane_id, agent)
-                                    });
-                                    let seed = get_seed_inbox_alias(
-                                        pty_registry.inbox(),
+                                    let resp = get_seed_withdrawn(
+                                        &pty_registry,
                                         &req.pane_id,
-                                        req.agent_id.as_deref(),
                                         attested,
                                         pty_registry
                                             .pane_current_agent_id(&req.pane_id)
                                             .as_deref(),
-                                        pi,
                                     );
                                     info!(
                                         pane_id = %escape_id_for_log(&req.pane_id),
                                         agent_id = ?req.agent_id,
-                                        has_seed = seed.is_some(),
-                                        "Received get-seed request"
+                                        "Refused a get-seed request: get-seed takes no message any more"
                                     );
-                                    let resp =
-                                        crate::event::GetSeedResponse { seed };
                                     if let Ok(json) = serde_json::to_string(&resp) {
                                         let line = format!("{json}\n");
                                         let _ =
@@ -7112,7 +7023,6 @@ async fn run_hook_loop_with_limits(
                                             slot: &mut permit,
                                             holds: &hold_limit,
                                             hold_deadline: limits.hold_deadline,
-                                            ingest: Some(&mut ingest),
                                         },
                                     )
                                     .await
@@ -7272,7 +7182,7 @@ async fn run_hook_loop_with_limits(
                                 crate::hook_provenance::Provenance::Unattested
                             );
                             let attested_agent = match &provenance {
-                                crate::hook_provenance::Provenance::Attested { agent_id } => {
+                                crate::hook_provenance::Provenance::Attested { agent_id, .. } => {
                                     Some(agent_id.clone())
                                 }
                                 _ => None,
@@ -7400,8 +7310,6 @@ async fn run_hook_loop_with_limits(
                                     );
                                 }
                             }
-                            // R2F-R02: the type this event reports is in.
-                            ingest.settle();
                             // Fan out to subscribed attach connections and
                             // apply locally as ONE ordered operation, so a
                             // client can never observe two concurrent events
@@ -7436,8 +7344,28 @@ async fn run_hook_loop_with_limits(
                             // Issue #1637: which deck binary sent this line,
                             // read off the line like the token, and never part
                             // of the event.
-                            observe_hook_sender(&state, &event_tx, &event.agent_type, &line)
-                                .await;
+                            let stamped =
+                                observe_hook_sender(&state, &event_tx, &event.agent_type, &line)
+                                    .await;
+                            // PRD #1666 part 3 (R-3): Claude Code's and
+                            // Codex's hooks from before the deck's messages
+                            // never ask for them, and their lines carry no
+                            // stamp. Only a line attested to its generation
+                            // says whose card.
+                            if matches!(
+                                event.agent_type,
+                                crate::event::AgentType::ClaudeCode
+                                    | crate::event::AgentType::Codex
+                            ) && let (Some(pane_id), Some(agent_id)) =
+                                (event.pane_id.as_deref(), attested_agent.as_deref())
+                            {
+                                pty_registry.inbox().observe_hook_stamp(
+                                    pane_id,
+                                    agent_id,
+                                    &event.agent_type,
+                                    stamped,
+                                );
+                            }
                             ingest_hook_event(
                                 &state,
                                 &event_tx,
@@ -7473,238 +7401,6 @@ async fn run_hook_loop_with_limits(
             }
             } // end accept_res match
         } // end tokio::select!
-    }
-}
-
-#[cfg(test)]
-mod ingest_order_tests {
-    use super::*;
-    use spec::spec;
-
-    /// R2F-R02: a fetch waits for the connections accepted before it, not
-    /// for its own or later ones, and a ticket dropped unsettled settles.
-    #[tokio::test]
-    async fn a_fetch_waits_only_for_connections_accepted_before_it() {
-        let order = Arc::new(IngestOrder::default());
-        let mut earlier = order.admit();
-        let mut fetch = order.admit();
-        let later = order.admit();
-        fetch.settle();
-        let short = Duration::from_millis(50);
-        assert!(
-            !order.earlier_settled(fetch.seq(), short, |_| true).await,
-            "an earlier connection is still pending"
-        );
-        let waiting = {
-            let order = Arc::clone(&order);
-            let seq = fetch.seq();
-            tokio::spawn(async move {
-                order
-                    .earlier_settled(seq, Duration::from_secs(5), |_| true)
-                    .await
-            })
-        };
-        tokio::time::sleep(short).await;
-        earlier.settle();
-        assert!(
-            waiting.await.unwrap(),
-            "settled once the earlier one was in"
-        );
-        drop(later);
-        let mut next = order.admit();
-        let unsettled = order.admit();
-        drop(unsettled);
-        next.settle();
-        assert!(order.earlier_settled(next.seq() + 2, short, |_| true).await);
-    }
-
-    /// Scenario: In a pane started from a bare command, with nothing typing its agent yet, a hook fetch that declares no integration is routed while an earlier hook connection has sent nothing. When the deck cannot tell where that connection came from, or it came from the agent's own process tree, the fetch is held for the full two seconds and then served the legacy way; when it came from a process outside the agent's tree, the fetch is routed at once.
-    #[cfg(unix)]
-    #[spec("inbox/claude/025")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn claude_025_a_silent_earlier_connection_holds_a_stale_fetch_for_two_seconds_then_legacy()
-     {
-        use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
-        let registry = Arc::new(AgentPtyRegistry::new());
-        let agent = registry
-            .spawn_agent(SpawnOptions {
-                command: Some("/bin/sh"),
-                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "pane-r".to_string())],
-                ..SpawnOptions::default()
-            })
-            .expect("spawn shell agent");
-        let req: crate::event::InboxFetchRequest = serde_json::from_value(serde_json::json!({
-            "pane_id": "pane-r",
-            "consumer": "doorbell_hook",
-        }))
-        .unwrap();
-        assert_eq!(
-            claude_hook_fetch(&registry, &req, &agent),
-            HookRoute::Undecided
-        );
-        let order = Arc::new(IngestOrder::default());
-        let route = |silent: IngestTicket| {
-            let (registry, req, agent, order) = (&registry, &req, &agent, Arc::clone(&order));
-            async move {
-                let mut fetch = order.admit();
-                fetch.settle();
-                let started = tokio::time::Instant::now();
-                let route =
-                    route_hook_fetch(registry, req, agent, &order, fetch.seq(), HOOK_ROUTE_WAIT)
-                        .await;
-                drop(silent);
-                (route, started.elapsed())
-            }
-        };
-
-        let unplaced = order.admit();
-        let (routed, took) = route(unplaced).await;
-        assert_eq!(routed, HookRoute::Legacy, "served the legacy way");
-        assert!(
-            took >= HOOK_ROUTE_WAIT && took < HOOK_ROUTE_WAIT + Duration::from_secs(3),
-            "held for the bound and no longer: {took:?}"
-        );
-
-        let inside = order.admit();
-        inside.place(AcceptedPeer::accept(registry.child_pid(&agent)));
-        let (routed, took) = route(inside).await;
-        assert_eq!(routed, HookRoute::Legacy);
-        assert!(
-            took >= HOOK_ROUTE_WAIT,
-            "a connection from the agent's tree holds it: {took:?}"
-        );
-
-        let outside = order.admit();
-        outside.place(AcceptedPeer::accept(Some(std::process::id())));
-        let (routed, took) = route(outside).await;
-        assert_eq!(routed, HookRoute::Legacy);
-        assert!(
-            took < HOOK_ROUTE_WAIT / 2,
-            "a silent peer outside the agent's tree holds nothing: {took:?}"
-        );
-        assert_eq!(order.pending(), 0);
-        registry.shutdown_all();
-    }
-
-    /// Scenario: In a pane started from a bare command, a hook fetch that declares no integration is routed while an earlier hook connection has sent nothing, over a stand-in process table. A peer whose ancestry reaches the agent only past the walk's step limit, a peer whose start time could not be read, and a peer whose pid names another process once the walk has answered each hold the fetch for the whole wait and it is served the legacy way; a readable peer whose walk ends outside the agent's tree is routed at once.
-    #[cfg(unix)]
-    #[spec("inbox/claude/027")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn claude_027_a_peer_the_deck_cannot_place_outside_the_tree_holds_the_fetch() {
-        use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
-        use std::sync::atomic::{AtomicBool, Ordering};
-        const PEER: u32 = 3_000_000;
-        const STARTED: u64 = 7;
-        const WAIT: Duration = Duration::from_millis(400);
-        let registry = Arc::new(AgentPtyRegistry::new());
-        let agent = registry
-            .spawn_agent(SpawnOptions {
-                command: Some("/bin/sh"),
-                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "pane-p".to_string())],
-                ..SpawnOptions::default()
-            })
-            .expect("spawn shell agent");
-        let root = registry.child_pid(&agent).expect("the agent's pid");
-        let req: crate::event::InboxFetchRequest = serde_json::from_value(serde_json::json!({
-            "pane_id": "pane-p",
-            "consumer": "doorbell_hook",
-        }))
-        .unwrap();
-        let order = Arc::new(IngestOrder::default());
-        let route =
-            async |started: Option<u64>, may_type: &dyn Fn(&AcceptedPeer, Option<u32>) -> bool| {
-                let silent = order.admit();
-                silent.place(Some(AcceptedPeer { pid: PEER, started }));
-                let mut fetch = order.admit();
-                fetch.settle();
-                let begun = tokio::time::Instant::now();
-                let route = route_hook_fetch_with(
-                    &registry,
-                    &req,
-                    &agent,
-                    &order,
-                    fetch.seq(),
-                    WAIT,
-                    may_type,
-                )
-                .await;
-                drop(silent);
-                (route, begun.elapsed())
-            };
-        let outside = |pid: u32| (pid == PEER).then_some(1);
-        let stable = |_: u32| Some(STARTED);
-
-        let (routed, took) = route(Some(STARTED), &|peer, root| {
-            may_type_generation_with(peer, root, outside, stable)
-        })
-        .await;
-        assert_eq!(routed, HookRoute::Legacy);
-        assert!(
-            took < WAIT / 2,
-            "a readable peer outside the tree holds nothing: {took:?}"
-        );
-
-        let deep = |pid: u32| {
-            let depth = pid.checked_sub(PEER)?;
-            match depth {
-                0..200 => Some(pid + 1),
-                200 => Some(root),
-                _ => None,
-            }
-        };
-        let (routed, took) = route(Some(STARTED), &|peer, root| {
-            may_type_generation_with(peer, root, deep, stable)
-        })
-        .await;
-        assert_eq!(routed, HookRoute::Legacy, "served the legacy way");
-        assert!(
-            took >= WAIT,
-            "a peer in the tree past the walk's limit holds it: {took:?}"
-        );
-
-        let (routed, took) = route(None, &|peer, root| {
-            may_type_generation_with(peer, root, outside, |_| None)
-        })
-        .await;
-        assert_eq!(routed, HookRoute::Legacy);
-        assert!(
-            took >= WAIT,
-            "a peer whose start time was never read holds it: {took:?}"
-        );
-
-        let walked = AtomicBool::new(false);
-        let reused = |pid: u32| {
-            walked.store(true, Ordering::SeqCst);
-            outside(pid)
-        };
-        let after_walk = |_: u32| {
-            if walked.load(Ordering::SeqCst) {
-                Some(STARTED + 1)
-            } else {
-                Some(STARTED)
-            }
-        };
-        let (routed, took) = route(Some(STARTED), &|peer, root| {
-            may_type_generation_with(peer, root, reused, after_walk)
-        })
-        .await;
-        assert_eq!(routed, HookRoute::Legacy);
-        assert!(
-            took >= WAIT,
-            "a peer whose pid was reused during the walk holds it: {took:?}"
-        );
-
-        let (routed, took) = route(Some(STARTED), &|peer, root| {
-            may_type_generation_with(peer, root, outside, |_| None)
-        })
-        .await;
-        assert_eq!(routed, HookRoute::Legacy);
-        assert!(
-            took >= WAIT,
-            "a peer that cannot be identified after the walk holds it: {took:?}"
-        );
-        assert_eq!(order.pending(), 0);
-        registry.shutdown_all();
     }
 }
 
@@ -7764,7 +7460,7 @@ mod orphan_watchdog_tests {
 mod close_verb_seam_tests {
     use super::*;
     use crate::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
-    use crate::hook_provenance::{Provenance, Refusal};
+    use crate::hook_provenance::Provenance;
 
     fn spawn(registry: &Arc<AgentPtyRegistry>, pane: &str, cwd: &str, command: &str) -> String {
         registry
@@ -7785,99 +7481,6 @@ mod close_verb_seam_tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("the child never exited");
-    }
-
-    fn done(pane: &str, done: bool) -> crate::event::WorkDoneSignal {
-        serde_json::from_value(serde_json::json!({
-            "pane_id": pane,
-            "task": "finished",
-            "done": done,
-            "timestamp": chrono::Utc::now(),
-        }))
-        .expect("a work-done signal")
-    }
-
-    fn unit(registry: &AgentPtyRegistry, pane: &str, agent: &str) -> String {
-        registry
-            .dispatched_units()
-            .register(crate::dispatched_units::NewUnit {
-                name: format!("unit-{pane}"),
-                worktree: std::path::PathBuf::from("/wt"),
-                branch: "b".to_string(),
-                clone_dir: std::path::PathBuf::from("/repo"),
-                dispatcher: crate::dispatched_units::Dispatcher {
-                    pane_id: "disp".to_string(),
-                    agent_id: "disp-agent".to_string(),
-                },
-                kind: crate::dispatched_units::UnitKind::Single {
-                    pane_id: pane.to_string(),
-                    agent_id: agent.to_string(),
-                },
-                dispatched_at_ms: 1,
-            })
-    }
-
-    fn completed(registry: &AgentPtyRegistry, id: &str) -> bool {
-        registry
-            .dispatched_units()
-            .get(id)
-            .is_some_and(|u| u.completed_at_ms.is_some())
-    }
-
-    /// Scenario: a dispatched unit's `work-done --done` marks it complete only
-    /// when the hook gate attested the report to the unit's own terminal
-    /// generation. A token-less report admitted under the `warn` escape hatch,
-    /// an unattested pane, another generation's token, a non-terminal report,
-    /// and a superseded generation's late `--done` mark nothing.
-    #[test]
-    fn completion_is_marked_only_by_the_attested_current_terminal_generation() {
-        let registry = Arc::new(AgentPtyRegistry::new());
-        let agent = spawn(&registry, "unit-pane", "/tmp", "sleep 30");
-        let id = unit(&registry, "unit-pane", &agent);
-        let signal = done("unit-pane", true);
-        for provenance in [
-            Provenance::Unattested,
-            Provenance::Refused(Refusal::Missing),
-            Provenance::Attested {
-                agent_id: "someone-else".to_string(),
-            },
-        ] {
-            assert_eq!(
-                mark_dispatched_unit_completion(&registry, &signal, &provenance),
-                None,
-                "{provenance:?}"
-            );
-        }
-        let attested = Provenance::Attested {
-            agent_id: agent.clone(),
-        };
-        assert_eq!(
-            mark_dispatched_unit_completion(&registry, &done("unit-pane", false), &attested),
-            None,
-            "progress without --done is not completion"
-        );
-        assert!(!completed(&registry, &id));
-        assert_eq!(
-            mark_dispatched_unit_completion(&registry, &signal, &attested),
-            Some(id.clone())
-        );
-        assert!(completed(&registry, &id));
-
-        // A generation whose pane was handed over cannot mark its unit late.
-        let old = spawn(&registry, "recycled", "/tmp", "/usr/bin/true");
-        let old_unit = unit(&registry, "recycled", &old);
-        wait_exited(&registry, &old);
-        let _new = spawn(&registry, "recycled", "/tmp", "sleep 30");
-        assert_eq!(
-            mark_dispatched_unit_completion(
-                &registry,
-                &done("recycled", true),
-                &Provenance::Attested { agent_id: old },
-            ),
-            None
-        );
-        assert!(!completed(&registry, &old_unit));
-        registry.shutdown_all();
     }
 
     /// Scenario: a dispatcher A exits and B takes its pane in another
@@ -7904,7 +7507,14 @@ mod close_verb_seam_tests {
         );
         let b_cwd = b_dir.path().to_string_lossy().into_owned();
         assert_eq!(
-            resolve_dispatch_caller(&registry, "disp", &Provenance::Attested { agent_id: a }),
+            resolve_dispatch_caller(
+                &registry,
+                "disp",
+                &Provenance::Attested {
+                    agent_id: a,
+                    facts: Default::default()
+                }
+            ),
             None,
             "a superseded generation must not dispatch as its successor"
         );
@@ -7913,7 +7523,8 @@ mod close_verb_seam_tests {
                 &registry,
                 "disp",
                 &Provenance::Attested {
-                    agent_id: b.clone()
+                    agent_id: b.clone(),
+                    facts: Default::default(),
                 }
             ),
             Some((b.clone(), b_cwd.clone()))
@@ -8964,7 +8575,6 @@ mod hook_ingestion_tests {
                 slot: &mut slot,
                 holds: &holds,
                 hold_deadline: Duration::from_secs(5),
-                ingest: None,
             },
         )
         .await;
@@ -10282,7 +9892,7 @@ mod hook_ingestion_tests {
             "dispatch from unknown pane",
             "Received work-done signal",
             "work-done from unknown pane",
-            "Received get-seed request",
+            "Refused a get-seed request",
             "Received list-targets request",
             "Received event",
             "unrecognized event_type",
@@ -12340,11 +11950,24 @@ mod hook_ingestion_tests {
         );
     }
 
-    /// PRD #1666 hardening M2: a component is admitted only from the pane's
-    /// agent process tree, and only under an instance that is the caller's own
-    /// ancestry; where the platform cannot say, it is not checked.
+    /// The connecting process `pid` for [`admit_component`], running as the
+    /// deck's user or not (`same_user`); its start time is
+    /// [`still_the_accepted_peer`]'s business, not this function's.
+    fn peer(pid: u32, same_user: Option<bool>) -> Option<AcceptedPeer> {
+        Some(AcceptedPeer {
+            pid,
+            started: None,
+            same_user,
+        })
+    }
+
+    /// PRD #1666 hardening M2, where the deck cannot read the caller's user
+    /// (a platform that does not, as on Windows today): a component is
+    /// admitted only from the pane's agent process tree, and a receiver only
+    /// under an instance that is the caller's own ancestry; where the
+    /// platform cannot say, best effort does not check.
     #[test]
-    fn admit_component_process_binds_to_the_agent_process_tree() {
+    fn without_the_callers_user_the_agent_process_tree_decides() {
         // 1 ── 10 (agent) ── 11 (plugin host) ── 12 (watcher CLI)
         //  └── 20 (unrelated) ── 21
         let parents = |pid: u32| match pid {
@@ -12355,73 +11978,436 @@ mod hook_ingestion_tests {
             _ => None,
         };
         let descends = |pid, root| crate::platform::proc::descends_from_with(pid, root, parents);
+        let admit = |peer_pid: u32, claimed, root, used_as, evidence| {
+            admit_component(
+                peer(peer_pid, None),
+                claimed,
+                root,
+                used_as,
+                evidence,
+                descends,
+                parents,
+                |_| None,
+            )
+        };
+        use ComponentUse::{Cli, Receiver};
+        use Evidence::{BestEffort, Required};
         assert_eq!(
-            admit_component_process(Some(12), Some(11), Some(10), descends, Evidence::BestEffort),
+            admit(12, Some(11), Some(10), Receiver, BestEffort),
             Ok(Some(11))
         );
+        assert_eq!(admit(12, None, Some(10), Cli, BestEffort), Ok(None));
         assert_eq!(
-            admit_component_process(Some(12), None, Some(10), descends, Evidence::BestEffort),
-            Ok(None)
+            admit(21, None, Some(10), Cli, BestEffort),
+            Err(ComponentRefusal::NotMember)
         );
-        assert!(
-            admit_component_process(Some(21), Some(20), Some(10), descends, Evidence::BestEffort)
-                .is_err()
+        assert_eq!(
+            admit(21, Some(20), Some(10), Receiver, BestEffort),
+            Err(ComponentRefusal::NotMember)
         );
-        assert!(
-            admit_component_process(Some(12), Some(20), Some(10), descends, Evidence::BestEffort)
-                .is_err()
+        // A receiver names the caller or one of its parents, never a process
+        // the caller does not descend from nor one above the agent.
+        assert_eq!(
+            admit(12, Some(20), Some(10), Receiver, BestEffort),
+            Err(ComponentRefusal::NotCaller)
         );
-        assert!(
-            admit_component_process(Some(11), Some(12), Some(10), descends, Evidence::BestEffort)
-                .is_err()
+        assert_eq!(
+            admit(11, Some(12), Some(10), Receiver, BestEffort),
+            Err(ComponentRefusal::NotCaller)
         );
-        assert!(
-            admit_component_process(Some(12), Some(10), Some(10), descends, Evidence::BestEffort)
-                .is_ok()
+        assert_eq!(
+            admit(12, Some(1), Some(10), Receiver, BestEffort),
+            Err(ComponentRefusal::AboveAgent)
+        );
+        assert_eq!(
+            admit(12, Some(10), Some(10), Receiver, BestEffort),
+            Ok(Some(10))
         );
         // Cannot say: unknown pids, or no agent process to check against.
         assert_eq!(
-            admit_component_process(Some(99), Some(98), Some(10), descends, Evidence::BestEffort),
+            admit(99, Some(98), Some(10), Receiver, BestEffort),
             Ok(Some(98))
         );
         assert_eq!(
-            admit_component_process(Some(21), Some(20), None, descends, Evidence::BestEffort),
+            admit(21, Some(20), None, Receiver, BestEffort),
             Ok(Some(20))
+        );
+        // PR #1735 second review: the verbs that take the agent's mail need
+        // positive evidence. A peer whose ancestry cannot be read — it exited,
+        // as a connection's creator can on purpose — is refused, and so are a
+        // missing peer and a pane with no agent process; the agent's own tree
+        // is still admitted.
+        assert_eq!(admit(12, None, Some(10), Cli, Required), Ok(None));
+        assert_eq!(
+            admit(12, Some(11), Some(10), Receiver, Required),
+            Ok(Some(11))
+        );
+        assert_eq!(admit(10, None, Some(10), Cli, Required), Ok(None));
+        assert_eq!(
+            admit(99, None, Some(10), Cli, Required),
+            Err(ComponentRefusal::Unidentified)
+        );
+        assert_eq!(
+            admit(12, None, None, Cli, Required),
+            Err(ComponentRefusal::NotMember)
+        );
+        assert_eq!(
+            admit(12, Some(98), Some(10), Receiver, Required),
+            Err(ComponentRefusal::NotCaller)
+        );
+        assert_eq!(
+            admit_component(
+                None,
+                None,
+                Some(10),
+                Cli,
+                Required,
+                descends,
+                parents,
+                |_| None
+            ),
+            Err(ComponentRefusal::Unidentified)
+        );
+        assert_eq!(
+            admit_component(
+                None,
+                None,
+                Some(10),
+                Cli,
+                BestEffort,
+                descends,
+                parents,
+                |_| None
+            ),
+            Ok(None)
         );
     }
 
-    /// PR #1735 second review: a verb that takes the agent's mail is admitted
-    /// only on positive evidence. A peer whose ancestry cannot be read — it
-    /// exited, as a connection's creator can on purpose — is refused, and so
-    /// are a missing peer and a pane with no agent process; the agent's own
-    /// tree is still admitted.
+    /// PRD #1666 part 3 (R-1): a process outside the agent's process tree is
+    /// a member of the pane when it runs as the deck's own user, since the
+    /// gate ahead of this admitted its token as the pane's current
+    /// capability — Claude Code's background session host, whose tool shell
+    /// and hooks the deck's recorded agent did not start, is one. It takes
+    /// and settles mail on positive evidence, and registers a receiver under
+    /// an instance that is its own ancestry; another user outside the tree is
+    /// refused under either evidence, even with the token.
     #[test]
-    fn a_mail_taker_must_prove_it_is_the_agents() {
-        // 1 ── 10 (agent) ── 11 (hook shell) ── 12 (hook CLI); 99 exited.
+    fn a_capability_holder_outside_the_tree_must_be_the_decks_user() {
+        // 1 ── 10 (agent, the deck's front end)
+        //  └── 30 (background host) ── 31 sh (tool shell) ── 32 CLI
+        //  └── 40 (another user's process)
         let parents = |pid: u32| match pid {
-            10 => Some(1),
-            11 => Some(10),
-            12 => Some(11),
+            10 | 30 | 40 => Some(1),
+            31 => Some(30),
+            32 => Some(31),
             _ => None,
         };
+        let executables = |pid: u32| {
+            Some(std::path::PathBuf::from(match pid {
+                10 | 30 => "/opt/claude",
+                31 => "/bin/sh",
+                32 => "/opt/dot-agent-deck",
+                _ => return None,
+            }))
+        };
         let descends = |pid, root| crate::platform::proc::descends_from_with(pid, root, parents);
-        let required = |peer, claimed, root| {
-            admit_component_process(peer, claimed, root, descends, Evidence::Required)
+        let admit = |peer, claimed, used_as, evidence| {
+            admit_component(
+                peer,
+                claimed,
+                Some(10),
+                used_as,
+                evidence,
+                descends,
+                parents,
+                executables,
+            )
         };
-        assert_eq!(required(Some(12), None, Some(10)), Ok(None));
-        assert_eq!(required(Some(12), Some(11), Some(10)), Ok(Some(11)));
-        assert_eq!(required(Some(10), None, Some(10)), Ok(None));
-        assert!(required(Some(99), None, Some(10)).is_err());
-        assert!(required(None, None, Some(10)).is_err());
-        assert!(required(Some(12), None, None).is_err());
-        assert!(required(Some(12), Some(98), Some(10)).is_err());
-        // The same callers under best effort, as the posting verbs see them.
-        let best_effort = |peer, claimed, root| {
-            admit_component_process(peer, claimed, root, descends, Evidence::BestEffort)
+        use ComponentUse::{Cli, Receiver};
+        use Evidence::{BestEffort, Required};
+        for evidence in [Required, BestEffort] {
+            assert_eq!(admit(peer(32, Some(true)), None, Cli, evidence), Ok(None));
+            // The tool shell's receiver resolves through the shell to the host.
+            assert_eq!(
+                admit(peer(32, Some(true)), Some(31), Receiver, evidence),
+                Ok(Some(30))
+            );
+            for claimed in [None, Some(30)] {
+                let used_as = if claimed.is_some() { Receiver } else { Cli };
+                assert_eq!(
+                    admit(peer(40, Some(false)), claimed, used_as, evidence),
+                    Err(ComponentRefusal::OtherUser),
+                    "{evidence:?} {used_as:?}"
+                );
+                assert_eq!(
+                    admit(peer(32, Some(false)), claimed, used_as, evidence),
+                    Err(ComponentRefusal::OtherUser),
+                    "{evidence:?} {used_as:?}"
+                );
+            }
+            // Its own receiver, not the deck's agent nor another process's.
+            assert_eq!(
+                admit(peer(32, Some(true)), Some(10), Receiver, evidence),
+                Err(ComponentRefusal::NotCaller)
+            );
+            assert_eq!(
+                admit(peer(32, Some(true)), Some(40), Receiver, evidence),
+                Err(ComponentRefusal::NotCaller)
+            );
+            assert_eq!(
+                admit(peer(32, Some(true)), Some(1), Receiver, evidence),
+                Err(ComponentRefusal::AboveAgent)
+            );
+        }
+        // The agent's own tree stays a member whatever the user reads.
+        assert_eq!(admit(peer(10, Some(false)), None, Cli, Required), Ok(None));
+        // No root to check against: the user alone decides.
+        assert_eq!(
+            admit_component(
+                peer(32, Some(true)),
+                None,
+                None,
+                Cli,
+                Required,
+                descends,
+                parents,
+                executables
+            ),
+            Ok(None)
+        );
+    }
+
+    /// PRD #1666 part 3, round 1 (reviewer R1, auditor U2): a capability
+    /// holder outside the agent's tree names a shell it shares a branch with
+    /// — a sibling of the agent under the terminal's shell, or a shell the
+    /// deck itself started — and the walk through shells would climb to the
+    /// terminal or the deck, above the agent. The resolved receiver is held to
+    /// what a named one is, so it is refused as above the agent; Claude Code's
+    /// background host, outside the tree and under init or the deck, still
+    /// resolves to itself.
+    #[test]
+    fn a_shell_outside_the_tree_cannot_resolve_to_a_process_above_the_agent() {
+        // 1 ── 5 terminal ── 6 bash ──┬── 10 agent
+        //                             └── 30 sh ── 31 CLI (another pane's tool)
+        //   └── 2 deck ──┬── 11 agent (a second deck pane)
+        //                ├── 20 sh ── 21 CLI
+        //                └── 40 claude (re-parented to the deck) ── 41 sh ── 42 CLI
+        //   └── 50 claude (re-parented to init) ── 51 sh ── 52 CLI
+        let parents = |pid: u32| match pid {
+            2 | 5 | 50 => Some(1),
+            6 => Some(5),
+            10 | 30 => Some(6),
+            31 => Some(30),
+            11 | 20 | 40 => Some(2),
+            21 => Some(20),
+            41 => Some(40),
+            42 => Some(41),
+            51 => Some(50),
+            52 => Some(51),
+            _ => None,
         };
-        assert!(best_effort(Some(99), None, Some(10)).is_ok());
-        assert!(best_effort(None, None, Some(10)).is_ok());
-        assert!(best_effort(Some(12), None, None).is_ok());
+        let executables = |pid: u32| {
+            Some(std::path::PathBuf::from(match pid {
+                5 => "/usr/bin/kitty",
+                6 => "/bin/bash",
+                10 | 11 | 40 | 50 => "/opt/claude",
+                2 | 31 | 21 | 42 | 52 => "/opt/dot-agent-deck",
+                20 | 30 | 41 | 51 => "/bin/sh",
+                _ => return None,
+            }))
+        };
+        let descends = |pid, root| crate::platform::proc::descends_from_with(pid, root, parents);
+        let admit = |peer_pid, claimed, root, evidence| {
+            admit_component(
+                peer(peer_pid, Some(true)),
+                claimed,
+                Some(root),
+                ComponentUse::Receiver,
+                evidence,
+                descends,
+                parents,
+                executables,
+            )
+        };
+        let above = |result: Result<Option<u32>, ComponentRefusal>| {
+            result.is_err_and(|refusal| refusal.code() == "inbox_receiver_above_agent")
+        };
+        for evidence in [Evidence::Required, Evidence::BestEffort] {
+            // The sibling shell climbs bash 6 to the terminal 5, above agent 10.
+            let sibling = admit(31, Some(30), 10, evidence);
+            assert!(above(sibling), "{evidence:?}: {sibling:?}");
+            // A shell the deck started climbs to the deck, above agent 11.
+            let deck = admit(21, Some(20), 11, evidence);
+            assert!(above(deck), "{evidence:?}: {deck:?}");
+            // Named directly, the processes above the agent are refused the same.
+            for claimed in [6, 5, 1] {
+                let direct = admit(31, Some(claimed), 10, evidence);
+                assert!(above(direct), "{evidence:?} {claimed}: {direct:?}");
+            }
+            // Claude Code outside the tree resolves to itself, whether it was
+            // re-parented to the deck that is above the agent or to init.
+            assert_eq!(admit(42, Some(41), 11, evidence), Ok(Some(40)));
+            assert_eq!(admit(52, Some(51), 10, evidence), Ok(Some(50)));
+            // In the tree the walk still stops at the agent.
+            assert_eq!(admit(42, Some(41), 40, evidence), Ok(Some(40)));
+        }
+        // Where the agent's own ancestry cannot be read, a walk that moved
+        // cannot show it stayed below the agent: refused on positive evidence.
+        let unreadable = |pid: u32| if pid == 10 { None } else { parents(pid) };
+        let without_10 =
+            |pid, root| crate::platform::proc::descends_from_with(pid, root, unreadable);
+        let resolve = |evidence| {
+            admit_component(
+                peer(52, Some(true)),
+                Some(51),
+                Some(10),
+                ComponentUse::Receiver,
+                evidence,
+                without_10,
+                unreadable,
+                executables,
+            )
+        };
+        assert_eq!(
+            resolve(Evidence::Required),
+            Err(ComponentRefusal::Unidentified)
+        );
+        assert_eq!(resolve(Evidence::BestEffort), Ok(Some(50)));
+    }
+
+    /// PRD #1666 part 3, round 2 (round 1's U3): a walk from the agent that
+    /// runs out of steps before it meets the terminal says nothing about
+    /// whether the terminal is above the agent. Under required evidence the
+    /// receiver is unidentified, whether a sibling shell resolves to the
+    /// terminal or the terminal is named directly; the same tree a few
+    /// processes shallower is refused as above the agent.
+    #[test]
+    fn a_walk_too_deep_to_place_the_receiver_is_not_evidence_it_is_below_the_agent() {
+        // 1 ── 5 terminal ── 6 bash ──┬── 1000 ── 1001 ── … ── 10 agent
+        //                             └── 30 sh ── 31 CLI
+        let tree = |depth: u32| {
+            move |pid: u32| match pid {
+                5 => Some(1),
+                6 => Some(5),
+                30 | 1000 => Some(6),
+                31 => Some(30),
+                10 => Some(1000 + depth - 1),
+                pid if (1001..1000 + depth).contains(&pid) => Some(pid - 1),
+                _ => None,
+            }
+        };
+        let executables = |pid: u32| {
+            Some(std::path::PathBuf::from(match pid {
+                5 => "/usr/bin/kitty",
+                6 => "/bin/bash",
+                10 => "/opt/claude",
+                31 => "/opt/dot-agent-deck",
+                30 => "/bin/sh",
+                _ => "/usr/bin/env",
+            }))
+        };
+        let admit = |depth: u32, claimed, evidence| {
+            let parents = tree(depth);
+            admit_component(
+                peer(31, Some(true)),
+                Some(claimed),
+                Some(10),
+                ComponentUse::Receiver,
+                evidence,
+                |pid, root| crate::platform::proc::descends_from_with(pid, root, parents),
+                parents,
+                executables,
+            )
+        };
+        let deep = crate::platform::proc::MAX_ANCESTRY_DEPTH as u32 + 8;
+        for claimed in [30, 5] {
+            assert_eq!(
+                admit(deep, claimed, Evidence::Required),
+                Err(ComponentRefusal::Unidentified),
+                "{claimed}"
+            );
+            // The control: shallow enough to read, it is placed above the agent.
+            assert_eq!(
+                admit(4, claimed, Evidence::Required),
+                Err(ComponentRefusal::AboveAgent),
+                "{claimed}"
+            );
+        }
+    }
+
+    /// PRD #1666 part 3, round 3: a receiver named directly, not resolved
+    /// through a shell, whose place relative to the agent cannot be read
+    /// because a parent on the agent's walk is unreadable. Under required
+    /// evidence it is unidentified, where it used to be admitted; under best
+    /// effort it is still admitted. The terminal is named so the resolved
+    /// instance is the named process and only the direct check decides.
+    #[test]
+    fn a_directly_named_receiver_whose_walk_is_unreadable_is_unidentified() {
+        // 1 ── 5 terminal ── 6 bash ── 30 sh ── 31 CLI
+        //      ? ── 1000 ── 10 agent   (1000's parent cannot be read)
+        let parents = |pid: u32| match pid {
+            5 => Some(1),
+            6 => Some(5),
+            30 => Some(6),
+            31 => Some(30),
+            10 => Some(1000),
+            _ => None,
+        };
+        let executables = |pid: u32| {
+            Some(std::path::PathBuf::from(match pid {
+                5 => "/usr/bin/kitty",
+                6 => "/bin/bash",
+                10 => "/opt/claude",
+                30 => "/bin/sh",
+                31 => "/opt/dot-agent-deck",
+                _ => "/usr/bin/env",
+            }))
+        };
+        let admit = |evidence| {
+            admit_component(
+                peer(31, Some(true)),
+                Some(5),
+                Some(10),
+                ComponentUse::Receiver,
+                evidence,
+                |pid, root| crate::platform::proc::descends_from_with(pid, root, parents),
+                parents,
+                executables,
+            )
+        };
+        assert_eq!(
+            crate::platform::proc::ancestry_with(10, 5, parents),
+            crate::platform::proc::Ancestry::Unreadable
+        );
+        assert_eq!(
+            admit(Evidence::Required),
+            Err(ComponentRefusal::Unidentified)
+        );
+        assert_eq!(admit(Evidence::BestEffort), Ok(Some(5)));
+    }
+
+    /// Every refusal names its own cause, and a fixed message that says what
+    /// to do about it and echoes nothing the request carried.
+    #[test]
+    fn each_component_refusal_has_its_own_code_and_a_remedy() {
+        let all = [
+            ComponentRefusal::OtherUser,
+            ComponentRefusal::NotMember,
+            ComponentRefusal::Unidentified,
+            ComponentRefusal::NotCaller,
+            ComponentRefusal::NestedAgent,
+            ComponentRefusal::AboveAgent,
+        ];
+        let codes: std::collections::HashSet<_> = all.iter().map(|r| r.code()).collect();
+        assert_eq!(codes.len(), all.len(), "one code per cause");
+        for refusal in all {
+            assert!(refusal.code().starts_with("inbox_"), "{refusal:?}");
+            assert!(
+                refusal.message().contains("; run "),
+                "{refusal:?} names a remedy: {}",
+                refusal.message()
+            );
+        }
     }
 
     /// PR #1735 third review (F2): a connection's creator exited and its pid
@@ -12464,14 +12450,17 @@ mod hook_ingestion_tests {
         let reused = AcceptedPeer {
             pid: 12,
             started: Some(1000),
+            same_user: Some(true),
         };
         let accepted = AcceptedPeer {
             pid: 12,
             started: Some(2000),
+            same_user: Some(true),
         };
         let unread_at_accept = AcceptedPeer {
             pid: 12,
             started: None,
+            same_user: Some(true),
         };
         for evidence in [Evidence::Required, Evidence::BestEffort] {
             for (used_as, claimed) in [
@@ -12480,7 +12469,7 @@ mod hook_ingestion_tests {
             ] {
                 assert_eq!(
                     admit(Some(reused), claimed, used_as, evidence),
-                    Err("the connecting process has exited, and its process id now names another"),
+                    Err(ComponentRefusal::Unidentified),
                     "{used_as:?} {evidence:?}"
                 );
                 assert_eq!(
@@ -12511,6 +12500,7 @@ mod hook_ingestion_tests {
         let gone = AcceptedPeer {
             pid: 12,
             started: Some(2000),
+            same_user: Some(true),
         };
         let without_12 = ProcessLookups {
             started: |pid| (pid != 12).then_some(1),
@@ -12583,17 +12573,23 @@ mod hook_ingestion_tests {
             Some(std::path::PathBuf::from(exe))
         };
         let descends = |pid, root| crate::platform::proc::descends_from_with(pid, root, parents);
-        let admit = |peer, claimed, root| {
-            admit_receiver_process(
-                peer,
-                claimed,
-                root,
-                descends,
-                parents,
-                executables,
-                Evidence::BestEffort,
-            )
-        };
+        let receiver =
+            |peer_pid: Option<u32>,
+             claimed,
+             root,
+             executables: &dyn Fn(u32) -> Option<std::path::PathBuf>| {
+                admit_component(
+                    peer_pid.and_then(|pid| peer(pid, None)),
+                    claimed,
+                    root,
+                    ComponentUse::Receiver,
+                    Evidence::BestEffort,
+                    descends,
+                    parents,
+                    executables,
+                )
+            };
+        let admit = |peer, claimed, root| receiver(peer, claimed, root, &executables);
 
         // The outer agent's hooks, each through its own shell, naming the
         // shell or the agent: all are the agent's one receiver.
@@ -12604,7 +12600,10 @@ mod hook_ingestion_tests {
         assert_eq!(admit(Some(23), Some(22), Some(20)), Ok(Some(22)));
         // The nested agent of the same kind naming the outer agent as its
         // instance is refused.
-        assert!(admit(Some(14), Some(10), Some(10)).is_err());
+        assert_eq!(
+            admit(Some(14), Some(10), Some(10)),
+            Err(ComponentRefusal::NestedAgent)
+        );
         // Naming its own shell, or itself, it is the nested agent's own
         // instance, which the pin refuses once the outer agent has armed or
         // announced (`InboxHub::arm`).
@@ -12615,27 +12614,11 @@ mod hook_ingestion_tests {
         assert_eq!(admit(Some(19), Some(11), Some(10)), Ok(Some(10)));
         // A walk that cannot say does not refuse, and pins what was named.
         assert_eq!(
-            admit_receiver_process(
-                Some(14),
-                Some(10),
-                Some(10),
-                descends,
-                parents,
-                |_| None,
-                Evidence::BestEffort
-            ),
+            receiver(Some(14), Some(10), Some(10), &|_| None),
             Ok(Some(10))
         );
         assert_eq!(
-            admit_receiver_process(
-                Some(16),
-                Some(15),
-                Some(10),
-                descends,
-                parents,
-                |_| None,
-                Evidence::BestEffort
-            ),
+            receiver(Some(16), Some(15), Some(10), &|_| None),
             Ok(Some(15))
         );
     }
@@ -12702,47 +12685,44 @@ mod hook_ingestion_tests {
         let _ = outer.wait();
     }
 
-    /// PRD #1666 hardening H2: the inbox half of get-seed hands over only the
-    /// attested agent's own message, and only while it is the pane's live one.
+    /// PRD #1666 part 3 (H5): `get-seed` takes nothing for any caller — not
+    /// for the attested live agent either — and answers each with no seed
+    /// and the withdrawal; the message stays queued with no hand-over
+    /// counted.
     #[test]
-    fn get_seed_inbox_alias_acts_only_for_the_attested_live_agent() {
-        let hub = crate::inbox_hub::InboxHub::new(
-            crate::inbox::DeckId::parse("k3xzq2ab").unwrap(),
-            crate::inbox::InboxLimits::default(),
-            crate::inbox_hub::DEFAULT_KEEPALIVE,
-        );
+    fn get_seed_takes_nothing_for_any_caller() {
+        let registry = AgentPtyRegistry::new();
+        let hub = Arc::clone(registry.inbox());
         let id = hub
             .post_direct(
                 crate::inbox::Recipient::bound("p", "new"),
                 crate::inbox::Content::from_deck("seed", "task", "the successor's task"),
             )
             .unwrap();
-        let queued = || {
-            hub.list("p")
-                .iter()
-                .any(|m| m.id == id && m.state == crate::inbox::StateName::Queued)
-        };
-        for (requested, attested, live) in [
-            (Some("new"), Some("old"), Some("new")),
-            (None, Some("old"), Some("new")),
-            (Some("new"), None, Some("new")),
-            (None, None, Some("new")),
-            (Some("old"), Some("new"), Some("new")),
-            (None, Some("new"), Some("newer")),
+        for (attested, live) in [
+            (Some("old"), Some("new")),
+            (None, Some("new")),
+            (Some("new"), Some("newer")),
+            (Some("new"), Some("new")),
         ] {
+            let answer = get_seed_withdrawn(&registry, "p", attested, live);
+            assert!(answer.seed.is_none(), "{attested:?} {live:?}");
             assert_eq!(
-                get_seed_inbox_alias(&hub, "p", requested, attested, live, false),
-                None,
-                "{requested:?} {attested:?} {live:?}"
+                answer.refused.as_deref(),
+                Some(crate::event::GET_SEED_REMOVED),
+                "{attested:?} {live:?}"
             );
-            assert!(queued(), "{requested:?} {attested:?} {live:?}");
+            let listed = hub.list("p").into_iter().find(|m| m.id == id).unwrap();
+            assert_eq!(
+                (listed.state, listed.deliveries),
+                (crate::inbox::StateName::Queued, 0),
+                "{attested:?} {live:?}"
+            );
         }
-        let seed = get_seed_inbox_alias(&hub, "p", Some("new"), Some("new"), Some("new"), false)
-            .expect("its own agent gets it");
-        assert!(seed.contains("the successor's task"));
+        assert_eq!(hub.integration_notice("p", "new"), None);
     }
 
-    /// Scenario: A Pi generation whose extension predates the receipt stream holds a queued deck message. Its stream without the deck's integration, its plain doorbell fetch and its get-seed are each refused as an out-of-date adapter: the message stays queued and the card says to restart the agent. An OpenCode generation's stream is refused the same way, and a Claude hook's plain doorbell fetch is still served.
+    /// Scenario: A Pi generation whose extension predates the receipt stream holds a queued deck message. Its stream without the deck's integration, its plain doorbell fetch and its get-seed are each refused as an out-of-date adapter: the message stays queued and the card says to restart the agent. An OpenCode generation's stream is refused the same way, and a Claude hook's plain doorbell fetch is no adapter's: it meets the hooks' one-shot floor, and the legacy fetch takes nothing.
     #[spec("inbox/boundary/030")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn boundary_030_a_pi_extension_from_before_the_receipt_stream_is_refused() {
@@ -12814,23 +12794,19 @@ mod hook_ingestion_tests {
         };
         let reply = handle_inbox_fetch(&registry, &fetch("p"), "a");
         assert_eq!(reply.refused.as_deref(), Some("adapter_too_old"));
-        assert_eq!(
-            get_seed_inbox_alias(
-                &hub,
-                "p",
-                None,
-                Some("a"),
-                Some("a"),
-                pi_generation(&registry, "p", "a")
-            ),
-            None
+        assert!(
+            get_seed_withdrawn(&registry, "p", Some("a"), Some("a"))
+                .seed
+                .is_none()
         );
         assert!(queued("p", &id), "no seed, no fetch: it stays queued");
         assert_eq!(
             hub.integration_notice("p", "a"),
             Some(IntegrationNotice::AdapterTooOld)
         );
-        // A Claude hook's doorbell fetch is still served.
+        // A Claude hook's plain doorbell fetch is no adapter's: it meets the
+        // one-shot floor as Claude's (PRD #1666 part 3, H5), never the
+        // legacy fetch.
         hub.announce(
             "c",
             "a",
@@ -12842,9 +12818,16 @@ mod hook_ingestion_tests {
         let claude = post("c", "a");
         let mut req = fetch("c");
         req.doorbell = Some(claude.as_str().to_string());
+        assert!(!old_adapter_doorbell(&registry, &req, "a"));
+        assert!(legacy_verb_hook_fetch(&registry, &req, "a"));
+        assert_eq!(
+            legacy_hook_component(&registry, &req, "a"),
+            InboxComponent::ClaudeHooks
+        );
+        assert!(!legacy_verb_hook_fetch(&registry, &fetch("p"), "a"));
         let reply = handle_inbox_fetch(&registry, &req, "a");
-        assert_eq!(reply.refused, None);
-        assert_eq!(reply.messages.map(|m| m.len()), Some(1));
+        assert!(reply.messages.is_none());
+        assert!(queued("c", &claude), "the legacy fetch takes nothing");
     }
 
     // ---------------------------------------------------------------------
@@ -12966,6 +12949,16 @@ mod hook_ingestion_tests {
             let dir = tempfile::tempdir().unwrap();
             std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
                 .expect("chmod tempdir");
+            // The retained store the daemon opens at its start: a report is
+            // accepted only once kept there (PRD #1666 part 3, round 5).
+            std::fs::create_dir_all(dir.path().join("state")).expect("state dir");
+            registry
+                .inbox()
+                .set_retained_store(crate::retained_store::RetainedStore::open(
+                    &dir.path().join("state"),
+                    crate::retained_store::StoreConfig::default(),
+                    crate::retained_store::Now::current(),
+                ));
             let sock = dir.path().join("hook.sock");
             let listener = IpcListener::from_tokio_listener(
                 UnixListener::bind(&sock).expect("bind hook socket"),
@@ -13161,6 +13154,231 @@ mod hook_ingestion_tests {
 
     /// PRD #1666 S5: whether any message in `pane_id`'s inbox, rendered whole,
     /// contains `needle`.
+    /// PRD #1666 part 3, round 5: a hook connection carrying a task-scoped
+    /// `work-done`, as the CLI sends it: the capabilities question, its
+    /// answer, then the report.
+    struct TaskReport {
+        reader: tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
+        _writer: tokio::net::unix::OwnedWriteHalf,
+    }
+
+    impl TaskReport {
+        async fn send(fx: &ProvenanceFixture, task_id: &str, report: &str) -> Self {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+            let stream = UnixStream::connect(&fx.sock).await.expect("connect");
+            let (read, mut write) = stream.into_split();
+            let mut reader = tokio::io::BufReader::new(read);
+            let token = Some(fx.worker_token.clone());
+            let question = crate::event::DaemonMessage::HookCapabilities(
+                crate::event::HookCapabilitiesRequest {
+                    pane_id: PROV_WORKER_PANE.to_string(),
+                    token: token.clone(),
+                },
+            );
+            write
+                .write_all(format!("{}\n", serde_json::to_string(&question).unwrap()).as_bytes())
+                .await
+                .unwrap();
+            let mut answer = String::new();
+            reader.read_line(&mut answer).await.unwrap();
+            assert_eq!(
+                crate::hook::confirms_task_scoped_completion(&answer),
+                Ok(()),
+                "{answer:?}"
+            );
+            let mutation =
+                crate::event::DaemonMessage::WorkDoneTask(crate::event::WorkDoneTaskRequest {
+                    pane_id: PROV_WORKER_PANE.to_string(),
+                    token,
+                    mode: crate::event::WorkDoneMode::Task {
+                        task_id: task_id.to_string(),
+                    },
+                    report: report.to_string(),
+                    timestamp: chrono::Utc::now(),
+                });
+            write
+                .write_all(format!("{}\n", serde_json::to_string(&mutation).unwrap()).as_bytes())
+                .await
+                .unwrap();
+            TaskReport {
+                reader,
+                _writer: write,
+            }
+        }
+
+        /// The next line, if one arrives within `budget`.
+        async fn line_within(&mut self, budget: Duration) -> Option<String> {
+            use tokio::io::AsyncBufReadExt;
+            let mut line = String::new();
+            match tokio::time::timeout(budget, self.reader.read_line(&mut line)).await {
+                Ok(Ok(n)) if n > 0 => Some(line),
+                _ => None,
+            }
+        }
+    }
+
+    /// Delegate the fixture's task and answer its id, once posted.
+    async fn delegated_task(fx: &ProvenanceFixture) -> String {
+        let response = fx
+            .delegate(PROV_ORCH_PANE, Some(&fx.orchestrator_token))
+            .await;
+        assert!(response.error.is_none(), "{response:?}");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(task) = fx.registry.inbox().open_tasks_of(PROV_WORKER_PANE).pop() {
+                return task;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the task was never posted"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Send a legacy `work_done` with no token and read its acknowledgement.
+    async fn legacy_unattested(fx: &ProvenanceFixture, done: bool) -> crate::event::SignalAck {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let msg = DaemonMessage::WorkDone(crate::event::WorkDoneSignal {
+            pane_id: PROV_WORKER_PANE.to_string(),
+            task: "LEGACY-033".to_string(),
+            done,
+            timestamp: chrono::Utc::now(),
+            token: None,
+        });
+        let mut stream = UnixStream::connect(&fx.sock).await.expect("connect");
+        stream
+            .write_all(format!("{}\n", serde_json::to_string(&msg).unwrap()).as_bytes())
+            .await
+            .unwrap();
+        stream.shutdown().await.unwrap();
+        let mut buf = String::new();
+        stream.read_to_string(&mut buf).await.unwrap();
+        serde_json::from_str(buf.trim()).unwrap_or_else(|e| panic!("{e}: {buf:?}"))
+    }
+
+    /// Scenario: Under the `warn` escape hatch, an older CLI's token-less `work-done --done` is refused `unattested` and changes nothing; its token-less report without `--done` is delivered as a note that completes nothing, so the worker's task stays open and its commission owed.
+    #[spec("inbox/protocol/033")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn protocol_033_the_legacy_verb_is_gated_by_what_it_reports() {
+        let _lock = HOOK_PROVENANCE_ENV_LOCK.lock().await;
+        let _env = HookProvenanceEnv::set("warn");
+        let fx = ProvenanceFixture::start().await;
+        let task = delegated_task(&fx).await;
+        let refused = legacy_unattested(&fx, true).await;
+        assert!(!refused.accepted, "{refused:?}");
+        assert_eq!(refused.reason.as_deref(), Some("unattested"), "{refused:?}");
+        assert_eq!(
+            fx.registry.inbox().open_tasks_of(PROV_WORKER_PANE),
+            vec![task.clone()]
+        );
+        let note = legacy_unattested(&fx, false).await;
+        assert!(note.accepted, "{note:?}");
+        assert!(
+            fx.orchestrator_saw("LEGACY-033", Duration::from_secs(10))
+                .await
+        );
+        assert_eq!(
+            fx.registry.inbox().open_tasks_of(PROV_WORKER_PANE),
+            vec![task]
+        );
+        assert!(fx.registry.owes_delegation_commission(PROV_WORKER_PANE));
+        fx.stop().await;
+    }
+
+    /// Scenario: A worker's task report over the real hook socket. Paused after its save, no byte is readable on the connection for 300 ms; a save failure injected meanwhile makes the only line `report_save_failed`. Paused at `work-done-committed`, no byte is readable while the report is already in the orchestrator's inbox and the task already retired; released, exactly one line, `accepted`.
+    #[spec("orchestration/work-done/038")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn work_done_038_the_answer_is_written_only_after_the_commit() {
+        let fx = ProvenanceFixture::start().await;
+        let task = delegated_task(&fx).await;
+
+        let (reached, release) = fx
+            .registry
+            .pause_at_for_test(crate::task_completion::PAUSE_SAVED);
+        let mut report = TaskReport::send(&fx, &task, "first try").await;
+        reached.await.unwrap();
+        assert_eq!(report.line_within(Duration::from_millis(300)).await, None);
+        fx.registry.inject_fault_for_test(
+            crate::task_completion::FAULT_FAIL_SAVE,
+            crate::agent_pty::TestFault::Fail,
+        );
+        release.send(()).unwrap();
+        let line = report
+            .line_within(Duration::from_secs(10))
+            .await
+            .expect("a line");
+        let refused: crate::event::WorkDoneTaskReply = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(
+            refused.code.as_deref(),
+            Some("report_save_failed"),
+            "{line}"
+        );
+
+        let (reached, release) = fx
+            .registry
+            .pause_at_for_test(crate::task_completion::PAUSE_COMMITTED);
+        let mut report = TaskReport::send(&fx, &task, "WORK-DONE-038-REPORT").await;
+        reached.await.unwrap();
+        assert_eq!(report.line_within(Duration::from_millis(300)).await, None);
+        assert!(pane_inbox_contains(
+            &fx.registry,
+            PROV_ORCH_PANE,
+            "WORK-DONE-038-REPORT"
+        ));
+        assert!(
+            fx.registry
+                .inbox()
+                .open_tasks_of(PROV_WORKER_PANE)
+                .is_empty()
+        );
+        release.send(()).unwrap();
+        let line = report
+            .line_within(Duration::from_secs(10))
+            .await
+            .expect("a line");
+        let accepted: crate::event::WorkDoneTaskReply = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(
+            accepted.disposition,
+            crate::event::WorkDoneDisposition::Accepted,
+            "{line}"
+        );
+        assert_eq!(
+            report.line_within(Duration::from_millis(200)).await,
+            None,
+            "one line"
+        );
+        fx.stop().await;
+    }
+
+    /// Scenario: Paused right after the answer's line is written: the line is readable, and by then the task's commission arm and delivery watch are already gone and the task is reported. The answer never precedes any part of the commit.
+    #[spec("orchestration/work-done/039")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn work_done_039_the_answer_follows_every_part_of_the_commit() {
+        let fx = ProvenanceFixture::start().await;
+        let task = delegated_task(&fx).await;
+        let (reached, release) = fx
+            .registry
+            .pause_at_for_test(crate::task_completion::PAUSE_ACKED);
+        let mut report = TaskReport::send(&fx, &task, "done").await;
+        reached.await.unwrap();
+        let line = report
+            .line_within(Duration::from_secs(5))
+            .await
+            .expect("written");
+        assert!(line.contains("accepted"), "{line}");
+        assert!(!fx.registry.owes_delegation_commission(PROV_WORKER_PANE));
+        assert!(!fx.registry.inbox().watched_tasks_for_test().contains(&task));
+        assert!(
+            fx.registry
+                .inbox()
+                .open_tasks_of(PROV_WORKER_PANE)
+                .is_empty()
+        );
+        release.send(()).unwrap();
+        fx.stop().await;
+    }
+
     fn pane_inbox_contains(registry: &AgentPtyRegistry, pane_id: &str, needle: &str) -> bool {
         registry
             .inbox()
@@ -14973,14 +15191,16 @@ mod hook_provenance_audit_tests {
         assert_eq!(
             classify_event(Some(pane), Some(&agent), Some(&token), &*registry),
             Provenance::Attested {
-                agent_id: agent.clone()
+                agent_id: agent.clone(),
+                facts: Default::default(),
             },
             "a token minted for an in-flight spawn names that spawn"
         );
         assert_eq!(
             classify_event(None, Some(&paneless), Some(&paneless_token), &*registry),
             Provenance::Attested {
-                agent_id: paneless.clone()
+                agent_id: paneless.clone(),
+                facts: Default::default(),
             },
             "the paneless in-flight spawn resolves the same way"
         );
@@ -17684,7 +17904,6 @@ mod question_hold_tests {
         registry: Arc<AgentPtyRegistry>,
         state: SharedState,
         event_tx: broadcast::Sender<BroadcastMsg>,
-        ingest: Arc<IngestOrder>,
         sock: std::path::PathBuf,
         _dir: tempfile::TempDir,
         handle: tokio::task::JoinHandle<Result<(), DaemonError>>,
@@ -17707,12 +17926,10 @@ mod question_hold_tests {
             let state: SharedState =
                 Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
             let (event_tx, _rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
-            let ingest = Arc::new(IngestOrder::default());
             let handle = tokio::spawn({
                 let registry = registry.clone();
                 let state = state.clone();
                 let event_tx = event_tx.clone();
-                let ingest = Arc::clone(&ingest);
                 let wtr = crate::issue_dispatch_run::new_worktree_registry();
                 async move {
                     run_hook_loop_with_limits(
@@ -17723,7 +17940,6 @@ mod question_hold_tests {
                         Arc::new(Notify::new()),
                         wtr,
                         limits,
-                        ingest,
                     )
                     .await
                 }
@@ -17732,7 +17948,6 @@ mod question_hold_tests {
                 registry,
                 state,
                 event_tx,
-                ingest,
                 sock,
                 _dir: dir,
                 handle,
@@ -18293,37 +18508,6 @@ mod question_hold_tests {
             "the new question survives the answer's clearing event"
         );
         drop(second);
-    }
-
-    /// Scenario: With the hook connection pool cut to two and a short idle window, ten producers connect to the hook socket and send nothing. The deck accepts no more of them at once than the pool serves, so no more than two are ever waiting for their first message, and as each is dropped at the idle window the next is accepted, until all ten were taken and none is left waiting.
-    #[spec("inbox/claude/026")]
-    #[tokio::test]
-    async fn claude_026_silent_connections_wait_no_more_than_the_pool_serves() {
-        let deck = Deck::start(HookLoopLimits {
-            max_connections: 2,
-            idle_timeout: Duration::from_millis(200),
-            ..limits()
-        })
-        .await;
-        let mut silent = Vec::new();
-        for _ in 0..10 {
-            silent.push(UnixStream::connect(&deck.sock).await.expect("connect"));
-        }
-        let accepted = || deck.ingest.next.load(std::sync::atomic::Ordering::Relaxed);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        let mut most = 0;
-        while accepted() < 10 || deck.ingest.pending() > 0 {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "{} accepted, {} pending",
-                accepted(),
-                deck.ingest.pending()
-            );
-            most = most.max(deck.ingest.pending());
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        assert!(most <= 2, "at most the pool's two were pending: {most}");
-        assert!(most >= 1, "the silent connections were pending in turn");
     }
 
     /// Scenario: With the hook connection pool cut to two, three agents each

@@ -187,7 +187,11 @@ pub fn handle_hook(agent: &str) -> ExitCode {
     // PRD #1666 S6: what Claude Code's own hooks do for the deck's inbox, in a
     // deck pane only — every Claude session runs these global hooks.
     let mut announce = None;
+    // A test standing in for a hook from before the deck's messages does
+    // nothing for the inbox at all.
+    let pre_inbox = crate::inbox_oneshot::stands_in_for_pre_inbox_hooks();
     if matches!(agent, "claude-code" | "claude_code" | "claude")
+        && !pre_inbox
         && crate::inbox_prompt::in_deck_pane()
         && let Some(output) = claude_inbox_hooks(&input, &mut event, &mut announce)
     {
@@ -196,13 +200,25 @@ pub fn handle_hook(agent: &str) -> ExitCode {
     // PRD #1666 S7: Codex's side. A `Stop` that hands messages over keeps the
     // turn going, so it reports no Idle: the doorbell must not ring for the
     // rest while Codex works on what it was just given.
-    if agent == "codex" && crate::inbox_prompt::in_deck_pane() {
+    if agent == "codex" && !pre_inbox && crate::inbox_prompt::in_deck_pane() {
         match codex_inbox_hooks(&input, &mut event, &mut announce) {
             CodexInbox::Nothing => {}
             CodexInbox::Print(output) => output.print(),
-            CodexInbox::ContinueTurn(output) => {
-                output.print();
-                return ExitCode::SUCCESS;
+            // PRD #1666 part 3 (H4): a hand-over whose output was written and
+            // flushed whole with a block in it goes on with the turn. One the
+            // fence refused whole printed nothing, and one whose write or
+            // flush failed reports the turn's end too, its blocks only
+            // possibly handed — although a write that stopped at the
+            // trailing newline, or a flush that failed after every byte was
+            // taken, can leave a whole decision Codex still reads and goes
+            // on with (inbox/receipt/033): then the card reads idle while
+            // Codex works, and a block it did take may come again, marked as
+            // a possible repeat.
+            #[cfg(unix)]
+            CodexInbox::TurnEnd(injection) => {
+                if injection.print().continues_turn() {
+                    return ExitCode::SUCCESS;
+                }
             }
         }
     }
@@ -346,12 +362,10 @@ fn claude_inbox_hooks(
     }
 }
 
-/// What a hook prints for the inbox, and the messages that output hands over.
+/// What a hook prints for the inbox.
 pub struct HookOutput {
     stdout: String,
-    /// Fetched, not yet acknowledged: acknowledged once `stdout` is written.
-    fetched: Vec<String>,
-    /// Part 2 §1.2: Claude's doorbell hand-over on receipts, which prints and
+    /// Part 2 §1.2: a doorbell's hand-over on receipts, which prints and
     /// reports its own attempts instead.
     #[cfg(unix)]
     one_shot: Option<crate::inbox_prompt::OneShotInjection>,
@@ -361,16 +375,13 @@ impl HookOutput {
     fn text(stdout: String) -> Self {
         Self {
             stdout,
-            fetched: Vec::new(),
             #[cfg(unix)]
             one_shot: None,
         }
     }
 
-    /// Write the output, then acknowledge the messages it hands over. A write
-    /// that fails acknowledges nothing, so what it carried is handed over
-    /// again after the ack-wait (PR #1735 review). A one-shot hand-over
-    /// commits what it wrote in full instead, on each attempt's own cap.
+    /// Write the output. A one-shot hand-over commits what it wrote in full,
+    /// on each attempt's own cap.
     fn print(self) {
         #[cfg(unix)]
         if let Some(one_shot) = self.one_shot {
@@ -378,115 +389,7 @@ impl HookOutput {
             return;
         }
         let mut out = std::io::stdout();
-        if writeln!(out, "{}", self.stdout).is_ok() && out.flush().is_ok() {
-            acknowledge_handed_over(&self.fetched);
-        }
-    }
-}
-
-/// How many times a hook asks the deck to record one acknowledgement.
-const HOOK_ACK_ATTEMPTS: u32 = 3;
-/// The wait before a hook asks again; it doubles for each ask after that.
-const HOOK_ACK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
-
-/// PR #1735 review: acknowledge `ids`, which this hook fetched and has just
-/// handed to its agent, and confirm each with the deck ([`acknowledge_at`]).
-/// Nothing is sent without the pane's token. One the deck never records costs
-/// a second hand-over after the ack-wait, never the message.
-pub(crate) fn acknowledge_handed_over(ids: &[String]) {
-    if ids.is_empty() {
-        return;
-    }
-    let Some(pane_id) = std::env::var(DOT_AGENT_DECK_PANE_ID)
-        .ok()
-        .filter(|pane| !pane.is_empty())
-    else {
-        return;
-    };
-    let Some(token) = crate::hook_provenance::token_from_env() else {
-        return;
-    };
-    let agent_id = std::env::var(crate::agent_pty::DOT_AGENT_DECK_AGENT_ID)
-        .ok()
-        .filter(|agent| !agent.is_empty());
-    let acks: Vec<(String, String)> = ids
-        .iter()
-        .filter_map(|id| {
-            serde_json::to_string(&crate::event::DaemonMessage::Ack(crate::event::AckSignal {
-                pane_id: pane_id.clone(),
-                delivery_id: id.clone(),
-                agent_id: agent_id.clone(),
-                token: Some(token.clone()),
-            }))
-            .ok()
-            .map(|line| (id.clone(), line))
-        })
-        .collect();
-    acknowledge_at(
-        &client_socket_path(),
-        &acks,
-        SIGNAL_ACK_TIMEOUT,
-        &mut std::io::stderr(),
-    );
-}
-
-/// [`acknowledge_handed_over`] against an explicit endpoint: `acks` pairs each
-/// message id with its `ack` line.
-///
-/// PR #1735 third review: each acknowledgement is sent on its own connection
-/// and confirmed by the deck's answer ([`ack_confirmation`]). One the deck
-/// does not answer for is asked again, up to [`HOOK_ACK_ATTEMPTS`] times,
-/// [`HOOK_ACK_RETRY_DELAY`] apart and doubling — an `ack` is idempotent, so
-/// asking again after an answer that was lost records nothing twice. The whole
-/// exchange stays within `budget`, as the single connection it replaces did.
-/// One the deck refuses by id, or never answers for, is written to `report`
-/// (the hook's stderr), naming the message.
-fn acknowledge_at(
-    path: &std::path::Path,
-    acks: &[(String, String)],
-    budget: std::time::Duration,
-    report: &mut dyn std::io::Write,
-) {
-    let deadline = std::time::Instant::now() + budget;
-    let mut left: Vec<&(String, String)> = acks.iter().collect();
-    let mut delay = HOOK_ACK_RETRY_DELAY;
-    for attempt in 0..HOOK_ACK_ATTEMPTS {
-        if attempt > 0 {
-            if std::time::Instant::now() + delay >= deadline {
-                break;
-            }
-            std::thread::sleep(delay);
-            delay *= 2;
-        }
-        let mut unanswered = Vec::new();
-        for ack in left {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                unanswered.push(ack);
-                continue;
-            }
-            match ack_confirmation(&request_from_socket_at(path, &ack.1, Some(remaining))) {
-                AckConfirmation::Recorded => {}
-                AckConfirmation::Refused(reason) => {
-                    let _ = writeln!(
-                        report,
-                        "dot-agent-deck: the deck could not record message {} as delivered ({reason})",
-                        ack.0
-                    );
-                }
-                AckConfirmation::Unconfirmed => unanswered.push(ack),
-            }
-        }
-        left = unanswered;
-        if left.is_empty() {
-            return;
-        }
-    }
-    for (id, _) in left {
-        let _ = writeln!(
-            report,
-            "dot-agent-deck: the deck did not confirm message {id} as delivered; it may hand it over again"
-        );
+        let _ = writeln!(out, "{}", self.stdout).and_then(|()| out.flush());
     }
 }
 
@@ -530,13 +433,15 @@ enum CodexInbox {
     Nothing,
     /// Print this, then report the event as usual.
     Print(HookOutput),
-    /// Print this and report nothing: the turn goes on.
-    ContinueTurn(HookOutput),
+    /// PRD #1666 part 3 (H4): hand this over as the `Stop` block; a hand-over
+    /// written and flushed whole goes on with the turn and reports nothing.
+    #[cfg(unix)]
+    TurnEnd(crate::inbox_prompt::OneShotInjection),
 }
 
 /// PRD #1666 S7: Codex's side of the inbox, for one hook payload in a deck
 /// pane. Codex is woken by the doorbell when idle; its hooks run outside its
-/// sandbox, so they, not the model, fetch and acknowledge.
+/// sandbox, so they, not the model, take the messages for it.
 ///
 /// - `SessionStart` queues an `inbox_announce` `TurnEnd` line, sent ahead of
 ///   the status event.
@@ -546,9 +451,15 @@ enum CodexInbox {
 ///   so Codex continues the turn with it. Nothing waiting, or no answer from
 ///   the daemon, and the turn ends as usual.
 ///
-/// Every hand-over is headed by [`crate::inbox_hub::AGENT_FRAMING`] and stays
-/// within [`crate::event::InboxComponent::CodexHooks`]'s byte budget; what does
-/// not fit stays queued for the next `Stop` or doorbell.
+/// PRD #1666 part 3 (H4): both hand-overs are one-shot receipt receivers, as
+/// Claude Code's prompt hook is (part 2 §1.4): each asks the deck whether it
+/// serves Codex's hooks, fetches on that connection, and commits what it wrote
+/// and flushed; nothing is acknowledged by id. Each is headed by
+/// [`crate::inbox_hub::AGENT_FRAMING`], and its whole JSON — envelope, framing
+/// and escaped blocks — stays within
+/// [`crate::event::InboxComponent::CodexHooks`]'s byte budget; what does not
+/// fit stays queued for the next `Stop` or doorbell. The one-shots are Unix
+/// only: elsewhere Codex's hooks hand nothing over, as Claude Code's do not.
 fn codex_inbox_hooks(
     input: &str,
     event: &mut AgentEvent,
@@ -557,7 +468,6 @@ fn codex_inbox_hooks(
     let Ok(payload) = serde_json::from_str::<Value>(input) else {
         return CodexInbox::Nothing;
     };
-    let budget = crate::event::InboxComponent::CodexHooks.inline_budget();
     let framing = crate::inbox_hub::AGENT_FRAMING;
     match payload.get("hook_event_name").and_then(Value::as_str) {
         Some("SessionStart") => {
@@ -579,36 +489,33 @@ fn codex_inbox_hooks(
                 )
             })
             .map_or(CodexInbox::Nothing, CodexInbox::Print),
-        Some("Stop") => crate::inbox_prompt::turn_end_hand_over(budget, framing).map_or(
-            CodexInbox::Nothing,
-            |hand_over| {
-                CodexInbox::ContinueTurn(HookOutput {
-                    stdout: serde_json::json!({"decision": "block", "reason": hand_over.context})
-                        .to_string(),
-                    fetched: hand_over.fetched,
-                    #[cfg(unix)]
-                    one_shot: None,
-                })
+        #[cfg(unix)]
+        Some("Stop") => crate::inbox_prompt::one_shot_injection(
+            crate::inbox_prompt::HookHandOver {
+                component: crate::event::InboxComponent::CodexHooks,
+                consumer: crate::event::InboxFetchConsumer::TurnEndHook,
+                rung: None,
+                envelope: &crate::inbox_prompt::Envelope::Block,
+                framing,
             },
-        ),
+            std::time::Instant::now() + crate::inbox_prompt::prompt_receipts_wait(),
+        )
+        .map_or(CodexInbox::Nothing, CodexInbox::TurnEnd),
         _ => CodexInbox::Nothing,
     }
 }
 
 /// PRD #1666 S6: the `UserPromptSubmit` side of the inbox, agent-neutral so
 /// every agent whose hook accepts `hookSpecificOutput.additionalContext`
-/// shares it (Claude Code now, Codex in S7), each with its `component`'s
+/// shares it (Claude Code, and Codex since S7), each with its `component`'s
 /// budget and the `framing` that heads an injection. An ordinary prompt costs
 /// a local scan and no daemon call. A doorbell line fetches only while the
 /// message it names is queued.
 ///
-/// Claude Code's hooks are on receipts (part 2 §1.2, §1.3): the blocks the
-/// prompt carries whole are committed by their exact attempts
+/// Both are on receipts (part 2 §1.2, §1.3; Codex's since part 3's H4): the
+/// blocks the prompt carries whole are committed by their exact attempts
 /// ([`crate::inbox_prompt::commit_delivered`]), never acknowledged by id, and
 /// a doorbell's hand-over is a one-shot receiver that commits what it wrote.
-/// Codex's still acknowledge: what a doorbell hands over once the hook has
-/// printed it ([`HookOutput::print`]), and a block the prompt itself opens
-/// before this returns.
 pub fn deck_prompt_submit(
     prompt: &str,
     component: crate::event::InboxComponent,
@@ -619,60 +526,50 @@ pub fn deck_prompt_submit(
     if ids.is_empty() {
         return None;
     }
-    let budget = component.inline_budget();
-    if component == crate::event::InboxComponent::ClaudeHooks {
-        // One socket-wait budget shared by the commit and the doorbell fetch
-        // (what it leaves out: `prompt_receipts_wait`): the hook blocks the
-        // user's prompt while it runs.
-        let receipts_by = std::time::Instant::now() + crate::inbox_prompt::prompt_receipts_wait();
-        crate::inbox_prompt::commit_delivered(prompt, receipts_by);
-        #[cfg(unix)]
-        {
-            let injection = ids.rung.first().and_then(|rung| {
-                crate::inbox_prompt::one_shot_injection(
-                    budget,
+    // One socket-wait budget shared by the commit and the doorbell fetch
+    // (what it leaves out: `prompt_receipts_wait`): the hook blocks the
+    // user's prompt while it runs.
+    let receipts_by = std::time::Instant::now() + crate::inbox_prompt::prompt_receipts_wait();
+    crate::inbox_prompt::commit_delivered(
+        prompt,
+        crate::inbox_prompt::sender_of(component),
+        receipts_by,
+    );
+    #[cfg(unix)]
+    {
+        let envelope = crate::inbox_prompt::Envelope::Context {
+            hook_event_name: "UserPromptSubmit".to_string(),
+        };
+        let injection = ids.rung.first().and_then(|rung| {
+            crate::inbox_prompt::one_shot_injection(
+                crate::inbox_prompt::HookHandOver {
+                    component,
+                    consumer: crate::event::InboxFetchConsumer::DoorbellHook,
+                    rung: Some(rung),
+                    envelope: &envelope,
                     framing,
-                    rung,
-                    "UserPromptSubmit",
-                    receipts_by,
-                )
-            });
-            let fetched = injection
-                .as_ref()
-                .map(crate::inbox_prompt::OneShotInjection::ids)
-                .unwrap_or_default();
-            let _ = crate::inbox_prompt::mark_event(event, &ids, &fetched);
-            return injection.map(|injection| HookOutput {
-                stdout: String::new(),
-                fetched: Vec::new(),
-                one_shot: Some(injection),
-            });
-        }
-        // The one-shot receivers are Unix only: no body is injected here,
-        // so a doorbell does not deliver to Claude on Windows yet.
-        #[cfg(not(unix))]
-        {
-            let _ = crate::inbox_prompt::mark_event(event, &ids, &[]);
-            return None;
-        }
+                },
+                receipts_by,
+            )
+        });
+        let fetched = injection
+            .as_ref()
+            .map(crate::inbox_prompt::OneShotInjection::ids)
+            .unwrap_or_default();
+        crate::inbox_prompt::mark_event(event, &ids, &fetched);
+        injection.map(|injection| HookOutput {
+            stdout: String::new(),
+            one_shot: Some(injection),
+        })
     }
-    let injection = ids.rung.first().and_then(|rung| {
-        crate::inbox_prompt::doorbell_injection(budget, framing, Some(rung.as_str()))
-    });
-    let fetched = injection
-        .as_ref()
-        .map(|injection| injection.fetched.clone())
-        .unwrap_or_default();
-    // PR #1735 second review: the content of the blocks the prompt opens is
-    // already in the model's context, so they are acknowledged here, with the
-    // `ack` verb the daemon admits only from the agent's own process tree.
-    acknowledge_handed_over(&crate::inbox_prompt::mark_event(event, &ids, &fetched));
-    injection.map(|injection| HookOutput {
-        stdout: crate::inbox_prompt::hook_output("UserPromptSubmit", &injection.context),
-        fetched: injection.fetched,
-        #[cfg(unix)]
-        one_shot: None,
-    })
+    // The one-shot receivers are Unix only: no body is injected here, so a
+    // doorbell does not deliver to Claude Code or Codex on Windows yet.
+    #[cfg(not(unix))]
+    {
+        let _ = (component, framing);
+        crate::inbox_prompt::mark_event(event, &ids, &[]);
+        None
+    }
 }
 
 /// PRD #1666 S8: send an `inbox_announce` on its own connection, for a
@@ -2246,7 +2143,7 @@ pub fn build_agent_event_cli(
         let ids = crate::inbox_prompt::scan(prompt);
         if !ids.is_empty() {
             let handed_over: Vec<String> = ids.opened.clone();
-            let _ = crate::inbox_prompt::mark_event(&mut event, &ids, &handed_over);
+            crate::inbox_prompt::mark_event(&mut event, &ids, &handed_over);
         }
     }
     event
@@ -2509,6 +2406,264 @@ pub const SIGNAL_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// older daemon starts reporting a phantom failure, while
 /// [`SocketReply::Unreachable`] is the one case the caller may report as "not
 /// delivered".
+/// PRD #1666 part 3, round 5 (plan D1): what [`send_gated`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Gated {
+    /// The daemon did not confirm the verb, so the mutation was withheld:
+    /// nothing was sent. `refusal` is the daemon's own `(code, message)`
+    /// when it refused the question; `why` names the rest, for the log.
+    NotConfirmed {
+        refusal: Option<(String, String)>,
+        why: &'static str,
+    },
+    /// The mutation was attempted and no well-formed answer came back: it
+    /// may or may not have been taken. `why` names the case, for the log.
+    Unconfirmed(&'static str),
+    /// The daemon's answer to the mutation, one line.
+    Reply(String),
+}
+
+/// How long [`send_gated`] waits, in all, to connect, ask its question and
+/// read the whole answer; the one write under way when it ends may run past
+/// it ([`write_gated`]).
+pub const GATED_QUESTION_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long [`send_gated`] waits, in all, to write its mutation and read the
+/// whole answer: the daemon answers once the report is kept, after a bounded
+/// wait on any earlier report of the same task. The one write under way when
+/// it ends may run past it ([`write_gated`]).
+pub const GATED_REPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// The longest line [`send_gated`] reads.
+const GATED_MAX_LINE: usize = 64 * 1024;
+
+/// PRD #1666 part 3, round 5 (plan D1): ask the daemon, on one connection,
+/// whether it serves a verb (`question`), and send `mutation` on the same
+/// connection only when `confirms` accepts the answer. It never reconnects,
+/// and never falls back to an older verb. Once the mutation is attempted,
+/// every outcome but one well-formed line is [`Gated::Unconfirmed`]: a write
+/// error or partial write, the connection closing, the deadline.
+pub fn send_gated(
+    question: &str,
+    mutation: &str,
+    confirms: impl Fn(&str) -> Result<(), Option<(String, String)>>,
+) -> Gated {
+    send_gated_at(
+        &client_socket_path(),
+        question,
+        mutation,
+        confirms,
+        GATED_QUESTION_WAIT,
+        GATED_REPLY_WAIT,
+    )
+}
+
+/// [`send_gated`] against an explicit endpoint and deadlines.
+pub fn send_gated_at(
+    path: &std::path::Path,
+    question: &str,
+    mutation: &str,
+    confirms: impl Fn(&str) -> Result<(), Option<(String, String)>>,
+    question_wait: std::time::Duration,
+    reply_wait: std::time::Duration,
+) -> Gated {
+    let not_confirmed = |why| Gated::NotConfirmed { refusal: None, why };
+    // Each wait is a deadline for its whole exchange, not a timeout per read
+    // or write: it is checked before every read and before every write of at
+    // most `GATED_WRITE_CHUNK` bytes, so a peer that sends or takes a byte at
+    // a time stretches the exchange past it by no more than the one write
+    // under way when it passes (`write_gated`).
+    let question_deadline = std::time::Instant::now() + question_wait;
+    let Ok(mut client) = crate::platform::ipc::IpcClient::connect_timeout(path, question_wait)
+    else {
+        return not_confirmed("no daemon answered");
+    };
+    if write_gated(
+        &mut client,
+        format!("{question}\n").as_bytes(),
+        question_deadline,
+    )
+    .is_err()
+    {
+        return not_confirmed("the question could not be sent");
+    }
+    let answer = match read_gated_line(&mut client, question_deadline) {
+        Ok(Some(line)) => line,
+        Ok(None) => return not_confirmed("the daemon closed the connection unanswered"),
+        Err(_) => return not_confirmed("no answer within the wait"),
+    };
+    if let Err(refusal) = confirms(&answer) {
+        return Gated::NotConfirmed {
+            refusal,
+            why: "the daemon did not confirm the verb",
+        };
+    }
+    let reply_deadline = std::time::Instant::now() + reply_wait;
+    if arm_gated(&client, reply_deadline).is_err() {
+        return not_confirmed("the connection could not be bounded");
+    }
+    if write_gated(
+        &mut client,
+        format!("{mutation}\n").as_bytes(),
+        reply_deadline,
+    )
+    .is_err()
+    {
+        return Gated::Unconfirmed("the report could not be written whole");
+    }
+    match read_gated_line(&mut client, reply_deadline) {
+        Ok(Some(line)) => Gated::Reply(line),
+        Ok(None) => Gated::Unconfirmed("the daemon closed the connection with no answer"),
+        Err(_) => Gated::Unconfirmed("no answer within the wait"),
+    }
+}
+
+/// Bound `client`'s next read and write by what is left until `deadline`; an
+/// error once it has passed.
+fn arm_gated(
+    client: &crate::platform::ipc::IpcClient,
+    deadline: std::time::Instant,
+) -> std::io::Result<()> {
+    match deadline.checked_duration_since(std::time::Instant::now()) {
+        Some(left) if !left.is_zero() => {
+            timeouts_set(client.set_timeouts(left), || peer_hung_up(client))
+        }
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "the wait is over",
+        )),
+    }
+}
+
+/// What a failed attempt to set a gated connection's timeouts means.
+///
+/// XNU's `sosetopt` answers `EINVAL` to a socket option on a socket whose
+/// receive and send sides are both shut, which is where a daemon that
+/// answered and closed leaves the connection on macOS. Only there, and only
+/// when the connection also reports the hang-up (`hung_up`, `POLLHUP`), is
+/// that error let through: a read then returns what is buffered and then end
+/// of file, and a write fails, without blocking, so the deadline still
+/// holds. `EINVAL` on a connection that has not hung up, any other error,
+/// and every error on another platform stand.
+#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+fn timeouts_set(
+    result: std::io::Result<()>,
+    hung_up: impl FnOnce() -> bool,
+) -> std::io::Result<()> {
+    match result {
+        #[cfg(target_os = "macos")]
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) && hung_up() => Ok(()),
+        result => result,
+    }
+}
+
+/// Whether the far end of `client` has hung up: `poll(2)` reports `POLLHUP`
+/// on it now.
+#[cfg(unix)]
+fn peer_hung_up(client: &crate::platform::ipc::IpcClient) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut fds = libc::pollfd {
+        fd: client.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `fds` is one live `pollfd` on this stack frame, and its fd is
+    // the socket `client` owns for the whole call; a zero timeout returns at
+    // once.
+    let ready = unsafe { libc::poll(&mut fds, 1, 0) };
+    ready > 0 && fds.revents & libc::POLLHUP != 0
+}
+
+#[cfg(not(unix))]
+fn peer_hung_up(_client: &crate::platform::ipc::IpcClient) -> bool {
+    false
+}
+
+/// The most [`write_gated`] hands one write call. A blocking write to a
+/// local socket keeps waiting for room for as long as its peer makes some,
+/// each wait getting the socket's whole timeout again, so one large write
+/// could outlast any deadline; a small one returns, and the deadline is
+/// checked again before the next.
+const GATED_WRITE_CHUNK: usize = 16 * 1024;
+
+/// Write all of `bytes` by `deadline`, then flush: an error for a write
+/// failure or the deadline. The deadline is checked before each write of at
+/// most [`GATED_WRITE_CHUNK`] bytes, which gets what is left of it, so a peer
+/// that drains a little at a time stretches the whole write past it by no
+/// more than the one write under way when it passes. How long that one write
+/// takes is the platform socket's and the peer's to decide, not this
+/// function's: a strict bound would need a nonblocking write, which
+/// `IpcClient` does not offer.
+fn write_gated(
+    client: &mut crate::platform::ipc::IpcClient,
+    mut bytes: &[u8],
+    deadline: std::time::Instant,
+) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        arm_gated(client, deadline)?;
+        match client.write(&bytes[..bytes.len().min(GATED_WRITE_CHUNK)]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "the connection took nothing",
+                ));
+            }
+            Ok(n) => bytes = &bytes[n..],
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    client.flush()
+}
+
+/// One line, at most [`GATED_MAX_LINE`] bytes, read by `deadline`: `Ok(None)`
+/// at a clean end of the connection, an error for a read failure, the
+/// deadline or an over-long line. Each read is bounded by what is left of the
+/// deadline, so the whole line is.
+fn read_gated_line(
+    client: &mut crate::platform::ipc::IpcClient,
+    deadline: std::time::Instant,
+) -> std::io::Result<Option<String>> {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        arm_gated(client, deadline)?;
+        match client.read(&mut byte)? {
+            0 if line.is_empty() => return Ok(None),
+            0 => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "the line was cut",
+                ));
+            }
+            _ if byte[0] == b'\n' => {
+                return String::from_utf8(line).map(Some).map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "not UTF-8")
+                });
+            }
+            _ if line.len() >= GATED_MAX_LINE => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "the line is too long",
+                ));
+            }
+            _ => line.push(byte[0]),
+        }
+    }
+}
+
+/// PRD #1666 part 3, round 5 (plan D1): whether a capabilities answer
+/// confirms task-scoped completion, by equality with the version this build
+/// speaks. A refusal of the question comes back with its code and message.
+pub fn confirms_task_scoped_completion(line: &str) -> Result<(), Option<(String, String)>> {
+    let Ok(reply) = serde_json::from_str::<crate::event::HookCapabilitiesReply>(line.trim()) else {
+        return Err(None);
+    };
+    if reply.task_scoped_completion == Some(crate::event::TASK_SCOPED_COMPLETION) {
+        return Ok(());
+    }
+    Err(reply.code.zip(reply.message))
+}
+
 pub fn send_and_await_signal_ack(json: &str) -> SocketReply {
     request_from_socket_inner(json, Some(SIGNAL_ACK_TIMEOUT))
 }
@@ -6190,108 +6345,6 @@ mod question_tests {
         assert!(opencode_question_event(r#"{"session_id":"s","event":"session.idle"}"#).is_none());
     }
 
-    /// A stand-in daemon that answers one line per connection, the `n`th
-    /// connection with `replies[n]` (the last for every later one; `None`
-    /// closes without an answer), until the returned flag is set; the join
-    /// hands back each connection's line.
-    #[cfg(unix)]
-    fn scripted_daemon(
-        replies: Vec<Option<String>>,
-    ) -> (
-        tempfile::TempDir,
-        std::path::PathBuf,
-        std::sync::Arc<std::sync::atomic::AtomicBool>,
-        std::thread::JoinHandle<Vec<String>>,
-    ) {
-        use std::io::BufRead as _;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("hook.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let stop = done.clone();
-        let handle = std::thread::spawn(move || {
-            let mut lines = Vec::new();
-            loop {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        stream.set_nonblocking(false).unwrap();
-                        let mut reader = std::io::BufReader::new(stream);
-                        let mut line = String::new();
-                        reader.read_line(&mut line).unwrap();
-                        let reply = replies[lines.len().min(replies.len() - 1)].clone();
-                        lines.push(line.trim().to_owned());
-                        if let Some(reply) = reply {
-                            let _ = writeln!(reader.get_mut(), "{reply}");
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        if stop.load(std::sync::atomic::Ordering::SeqCst) {
-                            return lines;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(5));
-                    }
-                    Err(e) => panic!("accept: {e}"),
-                }
-            }
-        });
-        (dir, path, done, handle)
-    }
-
-    /// PR #1735 third review: a hook's acknowledgement of what it handed its
-    /// agent is confirmed by the deck's answer. While the deck does not answer
-    /// it is asked again on a new connection, a bounded number of times; a
-    /// refusal by id stops at once. Either outcome without a record is written
-    /// to the hook's stderr, naming the message.
-    #[cfg(unix)]
-    #[test]
-    fn a_hooks_acknowledgement_is_asked_again_until_the_deck_records_it() {
-        use crate::event::{AckDelivery, SignalAck};
-        let id = "m-k3xzq2ab-0f3c9a71d2e4b850".to_owned();
-        let acks = vec![(
-            id.clone(),
-            format!(r#"{{"message_type":"ack","delivery_id":"{id}"}}"#),
-        )];
-        let recorded =
-            serde_json::to_string(&SignalAck::acknowledged(AckDelivery::Acknowledged)).unwrap();
-        let undeliverable =
-            serde_json::to_string(&SignalAck::acknowledged(AckDelivery::Undeliverable)).unwrap();
-        let run = |replies: Vec<Option<String>>| {
-            let (_dir, path, done, server) = scripted_daemon(replies);
-            let mut report = Vec::new();
-            acknowledge_at(&path, &acks, SIGNAL_ACK_TIMEOUT, &mut report);
-            done.store(true, std::sync::atomic::Ordering::SeqCst);
-            (server.join().unwrap(), String::from_utf8(report).unwrap())
-        };
-
-        let (asked, report) = run(vec![None, Some(recorded)]);
-        assert_eq!(
-            asked.len(),
-            2,
-            "asked again after no answer, then no more: {asked:?}"
-        );
-        assert!(asked.iter().all(|line| line.contains(&id)), "{asked:?}");
-        assert_eq!(report, "", "a recorded acknowledgement reports nothing");
-
-        let (asked, report) = run(vec![None]);
-        assert_eq!(
-            asked.len(),
-            HOOK_ACK_ATTEMPTS as usize,
-            "a silent deck is asked a bounded number of times"
-        );
-        assert!(
-            report.contains(&id),
-            "the hook says which message: {report:?}"
-        );
-
-        let (asked, report) = run(vec![Some(undeliverable)]);
-        assert_eq!(asked.len(), 1, "a refusal by id is final: {asked:?}");
-        assert!(
-            report.contains(&id) && report.contains("undeliverable"),
-            "{report:?}"
-        );
-    }
-
     /// A one-shot stand-in daemon: accepts one connection, reads one line,
     /// answers with `reply` (or closes without one), and hands back the line.
     #[cfg(unix)]
@@ -7157,5 +7210,393 @@ mod opencode_child_permission_tests {
             SessionStatus::Thinking,
             "the old-client view of the answer is the legacy Thinking"
         );
+    }
+}
+
+/// PRD #1666 part 3, round 5 (plan D1, §6.5): the task-scoped `work-done`
+/// sender against a scripted daemon on a socket of its own: what it sends,
+/// on which connection, and what it reads as unconfirmed.
+#[cfg(all(test, unix))]
+mod gated_send_tests {
+    use std::io::BufRead as _;
+    use std::os::unix::net::UnixListener;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use spec::spec;
+
+    use super::*;
+
+    /// What the scripted daemon does after it reads the question.
+    #[derive(Clone)]
+    enum Script {
+        /// Answer nothing, holding the connection open.
+        Silent,
+        /// Close the connection without answering.
+        Close,
+        /// Answer this line, after `delay`.
+        Answer(&'static str, Duration),
+        /// Confirm, read the mutation, then answer `reply` (`None`: close).
+        Confirm(Option<&'static str>),
+        /// Confirm, read part of the mutation, then reset the connection.
+        ConfirmThenCut,
+        /// Write the confirmation one byte at a time, this far apart.
+        DripConfirm(Duration),
+        /// Confirm, read the mutation, then write `reply` one byte at a time,
+        /// this far apart.
+        ConfirmThenDrip(&'static str, Duration),
+        /// Confirm, then read the mutation at most this many bytes at a time,
+        /// this far apart, and never answer.
+        ConfirmThenDrain(usize, Duration),
+    }
+
+    const CONFIRMED: &str = r#"{"task_scoped_completion":1}"#;
+
+    struct Stub {
+        path: std::path::PathBuf,
+        _dir: tempfile::TempDir,
+        /// Every line the stub read, by connection.
+        lines: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    fn stub(script: Script) -> Stub {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("hook.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let lines: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
+        let seen = Arc::clone(&lines);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut read = Vec::new();
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                read.push(line.trim().to_string());
+                let index = {
+                    let mut seen = seen.lock().unwrap();
+                    seen.push(read.clone());
+                    seen.len() - 1
+                };
+                let record = |line: &str| seen.lock().unwrap()[index].push(line.trim().to_string());
+                match script.clone() {
+                    Script::Silent => std::thread::sleep(Duration::from_secs(2)),
+                    Script::Close => {}
+                    Script::Answer(answer, delay) => {
+                        std::thread::sleep(delay);
+                        let _ = writeln!(stream, "{answer}");
+                        let mut more = String::new();
+                        if reader.read_line(&mut more).unwrap_or(0) > 0 {
+                            record(&more);
+                        }
+                    }
+                    Script::Confirm(reply) => {
+                        writeln!(stream, "{CONFIRMED}").unwrap();
+                        let mut mutation = String::new();
+                        if reader.read_line(&mut mutation).unwrap_or(0) > 0 {
+                            record(&mutation);
+                        }
+                        if let Some(reply) = reply {
+                            let _ = writeln!(stream, "{reply}");
+                        }
+                    }
+                    Script::ConfirmThenCut => {
+                        writeln!(stream, "{CONFIRMED}").unwrap();
+                        let mut first = [0u8; 8];
+                        let _ = std::io::Read::read(&mut reader, &mut first);
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                    }
+                    Script::DripConfirm(every) => {
+                        for byte in format!("{CONFIRMED}\n").bytes() {
+                            std::thread::sleep(every);
+                            if stream.write_all(&[byte]).is_err() {
+                                break;
+                            }
+                        }
+                        let mut more = String::new();
+                        if reader.read_line(&mut more).unwrap_or(0) > 0 {
+                            record(&more);
+                        }
+                    }
+                    Script::ConfirmThenDrip(reply, every) => {
+                        writeln!(stream, "{CONFIRMED}").unwrap();
+                        let mut mutation = String::new();
+                        if reader.read_line(&mut mutation).unwrap_or(0) > 0 {
+                            record(&mutation);
+                        }
+                        for byte in format!("{reply}\n").bytes() {
+                            std::thread::sleep(every);
+                            if stream.write_all(&[byte]).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Script::ConfirmThenDrain(chunk, every) => {
+                        writeln!(stream, "{CONFIRMED}").unwrap();
+                        let mut buf = vec![0u8; chunk];
+                        loop {
+                            std::thread::sleep(every);
+                            match std::io::Read::read(&mut reader, &mut buf) {
+                                Ok(0) | Err(_) => break,
+                                Ok(_) => {}
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        Stub {
+            path,
+            _dir: dir,
+            lines,
+        }
+    }
+
+    fn send(stub: &Stub) -> Gated {
+        send_gated_at(
+            &stub.path,
+            r#"{"message_type":"hook_capabilities","pane_id":"p"}"#,
+            r#"{"message_type":"work_done_task","pane_id":"p","mode":{"kind":"uncorrelated"},"report":"r","timestamp":"2026-01-01T00:00:00Z"}"#,
+            confirms_task_scoped_completion,
+            Duration::from_millis(300),
+            Duration::from_millis(500),
+        )
+    }
+
+    fn mutations(stub: &Stub) -> usize {
+        std::thread::sleep(Duration::from_millis(100));
+        stub.lines
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .filter(|line| line.contains("work_done_task"))
+            .count()
+    }
+
+    /// Scenario: A daemon that answers the capabilities question with nothing, within the wait, gets no report: the sender says the daemon did not confirm, and the stub never reads a mutation.
+    #[spec("inbox/protocol/024")]
+    #[test]
+    fn protocol_024_a_silent_daemon_gets_no_report() {
+        let stub = stub(Script::Silent);
+        assert!(matches!(send(&stub), Gated::NotConfirmed { .. }));
+        assert_eq!(mutations(&stub), 0);
+    }
+
+    /// Scenario: A daemon that answers the capabilities question one byte at a time, each byte well inside the wait but the whole answer far past it, gets no report: the question's wait bounds the whole answer, not each read, so the sender says the daemon did not confirm within about the wait, and the stub never reads a mutation.
+    #[spec("inbox/protocol/024")]
+    #[test]
+    fn protocol_024_a_dripped_answer_is_bounded_by_the_whole_wait() {
+        let stub = stub(Script::DripConfirm(Duration::from_millis(60)));
+        let started = std::time::Instant::now();
+        assert!(matches!(send(&stub), Gated::NotConfirmed { .. }));
+        assert!(
+            started.elapsed() < Duration::from_millis(1000),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(mutations(&stub), 0);
+    }
+
+    /// Scenario: A daemon that confirms, reads the report, and then drips its answer one byte at a time past the reply's wait: the sender stops at the wait and says the result is unconfirmed, having sent the report once.
+    #[spec("inbox/protocol/028")]
+    #[test]
+    fn protocol_028_a_dripped_reply_is_bounded_by_the_whole_wait() {
+        let reply = r#"{"disposition":"uncorrelated","destination":"inbox","report_id":"0123456789abcdef0123456789abcdef"}"#;
+        let stub = stub(Script::ConfirmThenDrip(reply, Duration::from_millis(30)));
+        let started = std::time::Instant::now();
+        assert!(matches!(send(&stub), Gated::Unconfirmed(_)));
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(mutations(&stub), 1);
+    }
+
+    /// Scenario: A daemon that confirms, then takes a large report a few kilobytes at a time, each read well inside the reply's wait but the whole report far past it: the sender checks the reply's deadline between small writes, so it stops soon after the wait rather than when the report is drained, and says the result is unconfirmed.
+    #[spec("inbox/protocol/028")]
+    #[test]
+    fn protocol_028_a_slowly_drained_report_gives_up_long_before_it_drains() {
+        let stub = stub(Script::ConfirmThenDrain(4096, Duration::from_millis(20)));
+        // At 4 KiB every 20 ms the report takes about 40 s to drain.
+        let mutation = format!(
+            r#"{{"message_type":"work_done_task","pane_id":"p","mode":{{"kind":"uncorrelated"}},"report":"{}","timestamp":"2026-01-01T00:00:00Z"}}"#,
+            "x".repeat(8 * 1024 * 1024)
+        );
+        let started = std::time::Instant::now();
+        let sent = send_gated_at(
+            &stub.path,
+            r#"{"message_type":"hook_capabilities","pane_id":"p"}"#,
+            &mutation,
+            confirms_task_scoped_completion,
+            Duration::from_millis(300),
+            Duration::from_millis(500),
+        );
+        assert!(matches!(sent, Gated::Unconfirmed(_)), "{sent:?}");
+        assert!(
+            started.elapsed() < Duration::from_millis(2000),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Scenario: A daemon that answers the question with something else — an empty object, a legacy acknowledgement, a refusal with no capability — gets no report.
+    #[spec("inbox/protocol/025")]
+    #[test]
+    fn protocol_025_a_wrong_answer_withholds_the_report() {
+        for answer in [
+            "{}",
+            r#"{"kind":"signal_ack","accepted":true}"#,
+            r#"{"task_scoped_completion":null}"#,
+        ] {
+            let stub = stub(Script::Answer(answer, Duration::ZERO));
+            assert!(
+                matches!(send(&stub), Gated::NotConfirmed { .. }),
+                "{answer}"
+            );
+            assert_eq!(mutations(&stub), 0, "{answer}");
+        }
+    }
+
+    /// Scenario: A malformed answer, a closed connection, and an answer that arrives after the wait each withhold the report; nothing is sent after them.
+    #[spec("inbox/protocol/026")]
+    #[test]
+    fn protocol_026_malformed_closed_and_late_answers_withhold_the_report() {
+        for script in [
+            Script::Answer("not json at all", Duration::ZERO),
+            Script::Close,
+            Script::Answer(CONFIRMED, Duration::from_millis(700)),
+        ] {
+            let stub = stub(script);
+            assert!(matches!(send(&stub), Gated::NotConfirmed { .. }));
+            assert_eq!(mutations(&stub), 0);
+        }
+    }
+
+    /// Scenario: A daemon that confirms gets the report on the same connection that asked, once, and its one answer is what the sender reads.
+    #[spec("inbox/protocol/027")]
+    #[test]
+    fn protocol_027_a_confirmed_report_rides_the_asking_connection() {
+        let stub = stub(Script::Confirm(Some(r#"{"disposition":"uncorrelated"}"#)));
+        assert_eq!(
+            send(&stub),
+            Gated::Reply(r#"{"disposition":"uncorrelated"}"#.to_string())
+        );
+        let lines = stub.lines.lock().unwrap().clone();
+        assert_eq!(lines.len(), 1, "one connection: {lines:?}");
+        assert_eq!(
+            lines[0].len(),
+            2,
+            "the question, then the report: {lines:?}"
+        );
+    }
+
+    /// A timeout that could not be set: let through only as macOS's `EINVAL`
+    /// on a connection that has hung up. The same `EINVAL` on a live
+    /// connection, another error, and any error elsewhere fail.
+    #[test]
+    fn a_timeout_error_stands_unless_macos_says_the_peer_hung_up() {
+        let einval = || Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+        assert!(timeouts_set(Ok(()), || false).is_ok());
+        assert!(
+            timeouts_set(einval(), || false).is_err(),
+            "a live connection"
+        );
+        assert!(
+            timeouts_set(Err(std::io::Error::from_raw_os_error(libc::EBADF)), || true).is_err()
+        );
+        assert_eq!(
+            timeouts_set(einval(), || true).is_ok(),
+            cfg!(target_os = "macos"),
+            "a hung-up connection"
+        );
+    }
+
+    /// The hang-up the macOS exception asks for: none on a connection whose
+    /// peer is still there, reported once the peer has closed, with an
+    /// answer still buffered.
+    #[cfg(unix)]
+    #[test]
+    fn a_closed_peer_reads_as_hung_up_and_a_live_one_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hung.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let client =
+            crate::platform::ipc::IpcClient::connect_timeout(&path, Duration::from_secs(5))
+                .unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        assert!(!peer_hung_up(&client), "a live connection");
+        peer.write_all(b"answer\n").unwrap();
+        drop(peer);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !peer_hung_up(&client) {
+            assert!(std::time::Instant::now() < deadline, "no hang-up reported");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut client = client;
+        assert_eq!(
+            read_gated_line(
+                &mut client,
+                std::time::Instant::now() + Duration::from_secs(1)
+            )
+            .unwrap()
+            .as_deref(),
+            Some("answer"),
+            "the buffered answer is still read"
+        );
+    }
+
+    /// Scenario: The report is sent and the daemon closes without answering: the sender reads it as unconfirmed, and does not send it again.
+    #[spec("inbox/protocol/028")]
+    #[test]
+    fn protocol_028_a_lost_answer_is_unconfirmed() {
+        let stub = stub(Script::Confirm(None));
+        assert!(matches!(send(&stub), Gated::Unconfirmed(_)));
+        assert_eq!(mutations(&stub), 1, "sent once, never again");
+    }
+
+    /// Scenario: A capability of 2, of -1, or given as a string is not version 1: the report is withheld (equality, not at-least).
+    #[spec("inbox/protocol/030")]
+    #[test]
+    fn protocol_030_only_version_one_confirms() {
+        for answer in [
+            r#"{"task_scoped_completion":2}"#,
+            r#"{"task_scoped_completion":-1}"#,
+            r#"{"task_scoped_completion":"1"}"#,
+        ] {
+            let stub = stub(Script::Answer(answer, Duration::ZERO));
+            assert!(
+                matches!(send(&stub), Gated::NotConfirmed { .. }),
+                "{answer}"
+            );
+            assert_eq!(mutations(&stub), 0, "{answer}");
+        }
+    }
+
+    /// Scenario: The daemon resets the connection partway through reading the report: unconfirmed, sent once. An answer whose disposition this build does not know is read as unconfirmed too, with exit 1 and the wording for its mode.
+    #[spec("inbox/protocol/031")]
+    #[test]
+    fn protocol_031_cut_reports_and_unknown_dispositions_are_unconfirmed() {
+        let stub = stub(Script::ConfirmThenCut);
+        assert!(matches!(send(&stub), Gated::Unconfirmed(_)));
+        let reply: crate::event::WorkDoneTaskReply =
+            serde_json::from_str(r#"{"disposition":"from_the_future"}"#).unwrap();
+        assert_eq!(
+            reply.disposition,
+            crate::event::WorkDoneDisposition::Unknown
+        );
+        for (task, terminal) in [(Some("m-1"), false), (None, true), (None, false)] {
+            let answer = crate::work_done_text::cli_answer(&reply, task, terminal);
+            assert!(!answer.success);
+            assert_eq!(
+                answer.stderr,
+                Some(crate::work_done_text::unconfirmed(task, terminal)),
+                "{task:?} {terminal}"
+            );
+        }
+        assert!(!crate::work_done_text::unconfirmed(None, true).contains("note"));
     }
 }

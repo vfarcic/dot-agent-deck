@@ -15,13 +15,28 @@
 //! half of it is explained:
 //!
 //! * [`KNOWN_EFFECTS`] names the break, the tell and the half;
-//! * the build serving the DAEMON lists the break and the build acting as the
-//!   CLIENT does not — so the break is declared between these two builds, in
-//!   the direction that refuses the client;
-//! * one line of the sandbox `deck.log` carries every piece of the effect's
-//!   log signature and names the pane the failed half measured
-//!   ([`crate::report::Tell::subject_pane`]): the daemon refused that pane's
-//!   message, for the reason the break gives, in this run.
+//! * the build the effect names as declaring it ([`Declarer`]) lists the break
+//!   and the other build does not — so the break is declared between these two
+//!   builds, in the direction the effect describes: usually the DAEMON's build,
+//!   whose daemon refuses or reinterprets what an older client sends, and for
+//!   PRD #1666 part 3's task-scoped `work-done` also the CLIENT's build, whose
+//!   CLI asks an older daemon a question that daemon cannot read;
+//! * its witness, in this run, carries every piece of the effect's signature
+//!   and comes from the operation of the failed half the effect names
+//!   ([`KnownEffect::op`], [`crate::report::Tell::ops_of`]): it names that
+//!   operation's pane and, in the daemon's log, starts inside the stretch of
+//!   the log written while that operation ran. A half that ran several
+//!   operations in different panes — tell-4's `work-done` is reported from
+//!   the reviewer's pane and fetched in the orchestrator's — is explained
+//!   only by the one the break acts on, so a refusal of the reviewer's
+//!   earlier fetch of its delegate cannot explain the orchestrator's failed
+//!   fetch of the report. The witness is one line of the
+//!   sandbox `deck.log` — the daemon logged that pane's message the way the
+//!   break says it will — except for a CLIENT-declared effect whose client
+//!   refuses before it sends anything the daemon could log: such an effect
+//!   may instead name a line of the client CLI's own output, as the tell's
+//!   capture recorded it in that pane ([`Witness::ClientOutput`]). A
+//!   daemon-declared effect always needs the daemon's log.
 //!
 //! A half the harness could not measure is not named like one that measured a
 //! refusal: tell-4 calls its status half `status-query` when `daemon status`
@@ -33,7 +48,7 @@
 //! a tell sees fails the run until its effect is added below, which is the
 //! point: the entry is the reviewed statement that this failure is that break.
 
-use crate::report::{BreakExplanation, Evidence, Verdict};
+use crate::report::{BreakExplanation, Evidence, Tell, Verdict};
 use crate::sandbox::Direction;
 
 /// A failure a declared break is known to cause, and the daemon's own record
@@ -45,19 +60,31 @@ pub struct KnownEffect {
     pub tell: &'static str,
     /// The half of that tell it fails ([`crate::report::Tell::failed_parts`]).
     pub part: &'static str,
-    /// Substrings that must all appear on ONE line of the sandbox `deck.log`:
-    /// the daemon's refusal, in its own words.
+    /// The operation of that half it fails ([`crate::report::PartOp::op`]):
+    /// its witness must name that operation's pane and, for the daemon's log,
+    /// start inside that operation's stretch of it. A half runs several, in
+    /// different panes — tell-4's `work-done` is the reviewer's `report` and
+    /// the orchestrator's `fetch` — and a refusal of one of them says nothing
+    /// about another.
+    pub op: &'static str,
+    /// Which build must declare the break, the other one not.
+    pub declared_by: Declarer,
+    /// Where the run's record of the break is.
+    pub witness: Witness,
+    /// Substrings that must all appear on ONE line of the witness: the
+    /// daemon's refusal in its own words, or the client's.
     pub log_signature: &'static [&'static str],
-    /// The field that line names the refused message's pane in, as
-    /// `<field><pane>`; the pane must be the tell's
-    /// [`subject_pane`](crate::report::Tell::subject_pane).
-    pub pane_field: &'static str,
-    /// The one log call that writes the refusal, as `(source file, texts)`:
-    /// every text must appear inside the SAME `warn!(…);` call there — its
-    /// message and each field the signature and pane field read — so renaming
-    /// a field in that call fails `every_known_effect_is_pinned_to_the_source`
-    /// even while another log call still spells it the old way. A message split
-    /// across source lines is matched with its continuation escapes joined.
+    /// How that line names the message's pane; the pane must be the one
+    /// [`Self::op`] ran in ([`crate::report::Tell::ops_of`]).
+    pub pane_field: PaneField,
+    /// The one call that writes the line, as `(source file, texts)`: every
+    /// text must appear inside the SAME `warn!(…);` call there — its message
+    /// and each field the signature and pane field read — so renaming a field
+    /// in that call fails `every_known_effect_is_pinned_to_the_source` even
+    /// while another log call still spells it the old way; for a
+    /// [`Witness::ClientOutput`], inside the one constant
+    /// [`Self::client_text`] names. A message split across source lines is
+    /// matched with its continuation escapes joined.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "read by the source-pin guard test only")
@@ -70,39 +97,255 @@ pub struct KnownEffect {
         expect(dead_code, reason = "read by the source-pin guard test only")
     )]
     pub source_pins: &'static [(&'static str, &'static str)],
+    /// For a [`Witness::ClientOutput`], the declaration that opens the
+    /// constant the client prints (`pub const NAME: &str =`); empty otherwise.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the source-pin guard test only")
+    )]
+    pub client_text: &'static str,
     /// Why the break fails that half, for the evidence file.
     pub why: &'static str,
 }
 
-/// Every break known to fail a tell, and how. Keep each `log_signature` pinned
-/// to the daemon's source by the test below.
-pub const KNOWN_EFFECTS: &[KnownEffect] = &[KnownEffect {
-    id: "318-hook-event-capability-token",
-    tell: "tell-4",
-    part: "status",
-    log_signature: &[
-        "refused a status event whose hook capability token",
-        "verb=\"agent_event\"",
-        "reason=\"missing_token\"",
+/// Where a run records what a break did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Witness {
+    /// A line of the sandbox `deck.log`: the daemon's own record.
+    DaemonLog,
+    /// A line the client CLI printed in the pane the half measured, as the
+    /// tell's capture recorded it. Only for a CLIENT-declared break whose
+    /// client stops before sending the daemon anything to log.
+    ClientOutput,
+}
+
+/// Which of the two builds declares the break an effect explains.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Declarer {
+    /// The daemon's build declares it and the client's does not.
+    Daemon,
+    /// The client's build declares it and the daemon's does not.
+    Client,
+}
+
+impl Declarer {
+    fn name(self) -> &'static str {
+        match self {
+            Declarer::Daemon => "daemon",
+            Declarer::Client => "client",
+        }
+    }
+}
+
+/// How a log line names a pane.
+#[derive(Clone, Copy, Debug)]
+pub enum PaneField {
+    /// The client's own output names no pane: the pane is the one the
+    /// capture recorded running it ([`Witness::ClientOutput`] only).
+    Capture,
+    /// A `tracing` field: `<field><pane>` is one whitespace-separated word of
+    /// the line.
+    Word(&'static str),
+    /// A JSON member of a line the daemon logged: the line contains
+    /// `<member><pane>"`, the closing quote keeping pane `3` from matching
+    /// `33`.
+    Json(&'static str),
+}
+
+impl PaneField {
+    /// The text that names `pane`, as it appears in the line.
+    fn token(self, pane: &str) -> String {
+        match self {
+            PaneField::Capture => format!("pane={pane}"),
+            PaneField::Word(field) => format!("{field}{pane}"),
+            PaneField::Json(member) => format!("{member}{pane}\""),
+        }
+    }
+
+    fn names(self, line: &str, pane: &str) -> bool {
+        let token = self.token(pane);
+        match self {
+            // Checked against the capture's own pane, not the line.
+            PaneField::Capture => false,
+            PaneField::Word(_) => line.split_whitespace().any(|w| w == token),
+            PaneField::Json(_) => line.contains(&token),
+        }
+    }
+}
+
+/// The break of PRD #1666 part 3, round 5: a worker's `work-done` completes the
+/// task it names, and is sent only to a daemon that confirms it serves that.
+const TASK_SCOPED_COMPLETION: &str = "1666-task-scoped-completion-and-recovery";
+
+/// PRD #1666 part 3 (H5): the daemon refuses the legacy `inbox fetch` an
+/// older CLI sends, and takes nothing.
+const LEGACY_FETCH_WITHDRAWN: &str = "1666-legacy-inbox-delivery-withdrawal";
+
+/// PRD #1666 part 3 (H4): `inbox fetch` takes messages only from a daemon
+/// that confirms it serves this command on receipts.
+const ONE_SHOT_RECEIPTS: &str = "1666-remaining-inbox-one-shot-receipts";
+
+/// The H5 refusal, the same for every tell it fails: the branch daemon logs
+/// refusing the older CLI's fetch, naming the fetching pane.
+const H5_SIGNATURE: &[&str] = &[
+    "refused a fetch the way only an older dot-agent-deck asks; nothing was taken",
+    "consumer=Cli",
+];
+const H5_LOG_SITE: (&str, &[&str]) = (
+    "src/daemon.rs",
+    &[
+        "inbox: refused a fetch the way only an older dot-agent-deck asks; nothing was taken",
+        "pane_id = %escape_id_for_log(&req.pane_id),",
+        "consumer = ?req.consumer,",
     ],
-    pane_field: "claimed_pane=",
-    log_site: (
-        "src/daemon.rs",
-        &[
-            "hook socket: refused a status event whose hook capability token",
-            "verb = \"agent_event\",",
-            "claimed_pane = %escape_id_for_log(",
-            "reason = refusal.code(),",
+);
+const H5_SOURCE_PINS: &[(&str, &str)] = &[(
+    "src/event.rs",
+    "pub enum InboxFetchConsumer {\n    /// `dot-agent-deck inbox fetch`.\n    Cli,",
+)];
+const H5_WHY: &str = "a daemon declaring it refuses the `inbox fetch` that only a CLI from a build \
+     that does not declare it sends, and takes nothing, so that pane's message is never handed \
+     over";
+
+/// Every break known to fail a tell, and how. Keep each `log_signature` pinned
+/// to the source by the test below.
+pub const KNOWN_EFFECTS: &[KnownEffect] = &[
+    KnownEffect {
+        id: "318-hook-event-capability-token",
+        tell: "tell-4",
+        part: "status",
+        op: "status",
+        declared_by: Declarer::Daemon,
+        witness: Witness::DaemonLog,
+        log_signature: &[
+            "refused a status event whose hook capability token",
+            "verb=\"agent_event\"",
+            "reason=\"missing_token\"",
         ],
-    ),
-    source_pins: &[(
-        "src/hook_provenance.rs",
-        "Refusal::Missing => \"missing_token\",",
-    )],
-    why: "a daemon declaring it refuses a status report from a deck-spawned pane that carries \
+        pane_field: PaneField::Word("claimed_pane="),
+        log_site: (
+            "src/daemon.rs",
+            &[
+                "hook socket: refused a status event whose hook capability token",
+                "verb = \"agent_event\",",
+                "claimed_pane = %escape_id_for_log(",
+                "reason = refusal.code(),",
+            ],
+        ),
+        source_pins: &[(
+            "src/hook_provenance.rs",
+            "Refusal::Missing => \"missing_token\",",
+        )],
+        client_text: "",
+        why: "a daemon declaring it refuses a status report from a deck-spawned pane that carries \
           no hook capability token, and a CLI from a build that does not declare it sends \
           `agent-event` without one",
-}];
+    },
+    // Forward: the branch CLI asks the old daemon `hook_capabilities` first,
+    // the old daemon cannot decode that and logs it as a malformed event, and
+    // the CLI sends no report. The logging is the previous release's own
+    // fallback for a line it cannot decode (`Malformed event:`, the token
+    // redacted since #318); it is pinned to the branch's copy of that code,
+    // which is the same call. The reporting pane is the reviewer's.
+    KnownEffect {
+        id: TASK_SCOPED_COMPLETION,
+        tell: "tell-4",
+        part: "work-done",
+        op: "report",
+        declared_by: Declarer::Client,
+        witness: Witness::DaemonLog,
+        log_signature: &["Malformed event:", "\"message_type\":\"hook_capabilities\""],
+        pane_field: PaneField::Json("\"pane_id\":\""),
+        log_site: (
+            "src/daemon.rs",
+            &[
+                "line_bytes = line.len(),",
+                "\"Malformed event: {}\",",
+                "hook_line_for_log(&line)",
+            ],
+        ),
+        source_pins: &[
+            ("src/event.rs", "#[serde(tag = \"message_type\")]"),
+            ("src/event.rs", "#[serde(rename = \"hook_capabilities\")]"),
+            (
+                "src/event.rs",
+                "pub struct HookCapabilitiesRequest {\n    pub pane_id: String,",
+            ),
+        ],
+        client_text: "",
+        why: "a CLI declaring it sends `work-done` only after the daemon confirms task-scoped \
+              completion on the same connection, and a daemon from a build that does not \
+              declare it cannot read that question, so the CLI reports nothing",
+    },
+    // Reverse, tell 3: the old CLI's `inbox fetch` in the coder's pane is the
+    // legacy fetch, which the branch daemon refuses.
+    KnownEffect {
+        id: LEGACY_FETCH_WITHDRAWN,
+        tell: "tell-3",
+        part: "fetch",
+        op: "fetch",
+        declared_by: Declarer::Daemon,
+        witness: Witness::DaemonLog,
+        log_signature: H5_SIGNATURE,
+        pane_field: PaneField::Word("pane_id="),
+        log_site: H5_LOG_SITE,
+        source_pins: H5_SOURCE_PINS,
+        client_text: "",
+        why: H5_WHY,
+    },
+    // Reverse, tell 4: the old CLI's report is delivered as a note, which
+    // the orchestrator's old `inbox fetch` then cannot take, for the same
+    // reason. The note being delivered is not a failure, so it is not an
+    // effect; the refused fetch, in the orchestrator's pane, is — and only a
+    // refusal of THAT fetch: the reviewer's own earlier fetch of its delegate
+    // is refused the same way, on its own pane, before it reports.
+    KnownEffect {
+        id: LEGACY_FETCH_WITHDRAWN,
+        tell: "tell-4",
+        part: "work-done",
+        op: "fetch",
+        declared_by: Declarer::Daemon,
+        witness: Witness::DaemonLog,
+        log_signature: H5_SIGNATURE,
+        pane_field: PaneField::Word("pane_id="),
+        log_site: H5_LOG_SITE,
+        source_pins: H5_SOURCE_PINS,
+        client_text: "",
+        why: H5_WHY,
+    },
+    // Forward, tell 3: the branch CLI's `inbox fetch` asks the old daemon
+    // whether it serves receipts, reads no, and takes nothing. The old daemon
+    // logs nothing for that, so the only record is what the CLI printed in the
+    // coder's pane.
+    KnownEffect {
+        id: ONE_SHOT_RECEIPTS,
+        tell: "tell-3",
+        part: "fetch",
+        op: "fetch",
+        declared_by: Declarer::Client,
+        witness: Witness::ClientOutput,
+        log_signature: &[
+            "Could not fetch messages: the deck daemon did not confirm that it can \
+             hand them to this `dot-agent-deck inbox fetch`, so no message was taken",
+        ],
+        pane_field: PaneField::Capture,
+        log_site: (
+            "src/inbox_cli.rs",
+            &[
+                "Could not fetch messages: the deck daemon did not confirm that it can hand them \
+               to this `dot-agent-deck inbox fetch`, so no message was taken",
+            ],
+        ),
+        source_pins: &[(
+            "src/inbox_cli.rs",
+            "Opened::Unsupported => return say(err, CLI_RECEIPTS_UNSUPPORTED),",
+        )],
+        client_text: "pub const CLI_RECEIPTS_UNSUPPORTED: &str =",
+        why: "a CLI declaring it takes messages only from a daemon that confirms it serves \
+              `inbox fetch` on receipts, and a daemon from a build that does not declare it does \
+              not confirm that, so the CLI takes nothing and says so",
+    },
+];
 
 /// The `contract_breaks` list of a `daemon hello` document, or `None` when the
 /// document does not parse or carries no such list.
@@ -137,7 +380,10 @@ pub fn explain(ev: &mut Evidence, direction: Direction, deck_log: &str) {
         }
         return;
     };
-    let declared: Vec<&String> = daemon.iter().filter(|b| !client.contains(b)).collect();
+    let declared = Declared {
+        by_daemon: daemon.iter().filter(|b| !client.contains(b)).collect(),
+        by_client: client.iter().filter(|b| !daemon.contains(b)).collect(),
+    };
     let mut notes = Vec::new();
     for tell in ev.tells.iter_mut().filter(|t| t.verdict == Verdict::Fail) {
         if tell.failed_parts.is_empty() {
@@ -151,13 +397,7 @@ pub fn explain(ev: &mut Evidence, direction: Direction, deck_log: &str) {
         let mut explained = Vec::new();
         let mut unexplained = Vec::new();
         for part in &tell.failed_parts {
-            match explain_part(
-                &tell.id,
-                part,
-                tell.subject_pane.as_deref(),
-                &declared,
-                deck_log,
-            ) {
+            match explain_part(tell, part, &declared, deck_log) {
                 Ok(why) => explained.push(why),
                 Err(why) => unexplained.push(format!("`{part}`: {why}")),
             }
@@ -181,59 +421,132 @@ pub fn explain(ev: &mut Evidence, direction: Direction, deck_log: &str) {
     }
 }
 
+/// The breaks one build of the run declares and the other does not.
+struct Declared<'a> {
+    by_daemon: Vec<&'a String>,
+    by_client: Vec<&'a String>,
+}
+
+/// The lines of `log` that start inside `[from, to)`.
+fn lines_in(log: &str, (from, to): (u64, u64)) -> impl Iterator<Item = &str> {
+    let mut start = 0u64;
+    log.split_inclusive('\n').filter(move |line| {
+        let at = start;
+        start += line.len() as u64;
+        (from..to).contains(&at)
+    })
+}
+
 /// Whether a declared break explains one failed half of one tell: `Ok` with
 /// the explanation's summary and detail, or `Err` with why not.
 fn explain_part(
-    tell: &str,
+    tell: &Tell,
     part: &str,
-    subject_pane: Option<&str>,
-    declared: &[&String],
+    declared: &Declared<'_>,
     deck_log: &str,
 ) -> Result<(String, String), String> {
     let candidates: Vec<&KnownEffect> = KNOWN_EFFECTS
         .iter()
-        .filter(|e| e.tell == tell && e.part == part)
+        .filter(|e| e.tell == tell.id && e.part == part)
         .collect();
     if candidates.is_empty() {
         return Err("no declared break is known to fail it".to_string());
     }
     let mut why_not = Vec::new();
     for effect in candidates {
-        if !declared.iter().any(|b| b.as_str() == effect.id) {
+        let (by, other) = match effect.declared_by {
+            Declarer::Daemon => (&declared.by_daemon, Declarer::Client),
+            Declarer::Client => (&declared.by_client, Declarer::Daemon),
+        };
+        if !by.iter().any(|b| b.as_str() == effect.id) {
             why_not.push(format!(
-                "`{}` is not declared by the daemon's build without the client's",
-                effect.id
+                "`{}` is not declared by the {}'s build without the {}'s",
+                effect.id,
+                effect.declared_by.name(),
+                other.name()
             ));
             continue;
         }
-        let Some(pane) = subject_pane else {
+        let ops = tell.ops_of(part, effect.op);
+        if ops.is_empty() {
             why_not.push(format!(
-                "`{}` is declared, but the run did not record which pane the failed half \
-                 measured, so no refusal can be tied to it",
-                effect.id
+                "`{}` is declared, but the run recorded no `{}` the failed half ran, or not its \
+                 pane, so no refusal can be tied to it",
+                effect.id, effect.op
             ));
             continue;
+        }
+        let panes: Vec<&str> = ops.iter().map(|(pane, _)| *pane).collect();
+        let witnessed = match effect.witness {
+            // An operation whose stretch of the log was not measured has no
+            // line the log can place inside it.
+            Witness::DaemonLog => ops.iter().find_map(|(pane, span)| {
+                lines_in(deck_log, (*span)?)
+                    .find(|l| {
+                        effect.log_signature.iter().all(|sig| l.contains(sig))
+                            && effect.pane_field.names(l, pane)
+                    })
+                    .map(|line| format!("the daemon logged: `{}`", line.trim()))
+            }),
+            // The client's own words stand in for the daemon's log only for a
+            // break the CLIENT declares: a daemon's refusal is the daemon's to
+            // record.
+            Witness::ClientOutput if effect.declared_by != Declarer::Client => {
+                why_not.push(format!(
+                    "`{}` names the client's output as its witness, which only a \
+                     client-declared break may",
+                    effect.id
+                ));
+                continue;
+            }
+            Witness::ClientOutput => tell
+                .client_outputs
+                .iter()
+                .filter(|(half, pane, _)| half == part && panes.contains(&pane.as_str()))
+                .find_map(|(_, pane, out)| {
+                    out.lines()
+                        .find(|l| effect.log_signature.iter().all(|sig| l.contains(sig)))
+                        .map(|line| {
+                            format!("the client printed, in pane {pane}: `{}`", line.trim())
+                        })
+                }),
         };
-        let pane_token = format!("{}{pane}", effect.pane_field);
-        let Some(line) = deck_log.lines().find(|l| {
-            effect.log_signature.iter().all(|sig| l.contains(sig))
-                && l.split_whitespace().any(|w| w == pane_token)
-        }) else {
+        let Some(witnessed) = witnessed else {
+            let unmeasured = ops.iter().filter(|(_, span)| span.is_none()).count();
+            if effect.witness == Witness::DaemonLog && unmeasured == ops.len() {
+                why_not.push(format!(
+                    "`{}` is declared, but the stretch of the log the `{}` ran across could not \
+                     be measured, so no refusal can be tied to it",
+                    effect.id, effect.op
+                ));
+                continue;
+            }
+            let tokens: Vec<String> = panes.iter().map(|p| effect.pane_field.token(p)).collect();
             why_not.push(format!(
-                "`{}` is declared, but the daemon logged no refusal matching {:?} for \
-                 `{pane_token}`",
-                effect.id, effect.log_signature
+                "`{}` is declared, but {} matching {:?} for {}",
+                effect.id,
+                match effect.witness {
+                    Witness::DaemonLog => "during that operation the daemon logged no refusal",
+                    Witness::ClientOutput => "the client printed no line",
+                },
+                effect.log_signature,
+                tokens
+                    .iter()
+                    .map(|t| format!("`{t}`"))
+                    .collect::<Vec<_>>()
+                    .join(" or ")
             ));
             continue;
         };
         return Ok((
             format!("`{part}` half: `{}`", effect.id),
             format!(
-                "`{part}` half: `{}` — {}. The daemon's build declares it and the client's does \
-                 not; the daemon logged: `{}`",
+                "`{part}` half: `{}` — {}. The {}'s build declares it and the {}'s does not; \
+                 {witnessed}",
                 effect.id,
                 effect.why,
-                line.trim()
+                effect.declared_by.name(),
+                other.name(),
             ),
         ));
     }
@@ -243,7 +556,7 @@ fn explain_part(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::report::{CONTRACT_TELLS, ROLE_SET_TELL, RunVerdict, Verdict};
+    use crate::report::{CONTRACT_TELLS, PartOp, ROLE_SET_TELL, RunVerdict, Verdict};
 
     /// `daemon hello` of v0.45.1, as the PR #1595 run recorded it.
     const V0451_HELLO: &str = r#"{"ok":true,"server_version":10,"build_version":"0.45.1-g4a332587","daemon_version":"0.45.1","contract_breaks":["617-pane-write-agent-binding","1049-stop-daemon-verb","1077-hook-capability-token","1105-focused-client-terminal-size","580-delegate-refuses-busy-worker","555-orchestration-title-uniqueness","708-worker-failure-reports-submitted","1233-prepare-refuses-ambiguous-orchestration","1337-respawn-failure-report-submitted","505-unsolicited-work-done-label-reworded"]}"#;
@@ -255,6 +568,534 @@ mod tests {
     /// The line the branch daemon wrote into that run's sandbox `deck.log` when
     /// it refused the v0.45.1 CLI's `agent-event --type running`.
     const REFUSAL_LINE: &str = r#"2026-10-05T17:08:35.602037Z  WARN dot_agent_deck::daemon: hook socket: refused a status event whose hook capability token does not attest the pane it names; see docs/develop/hook-provenance.md verb="agent_event" event_type=Thinking claimed_pane=3 reason="missing_token""#;
+
+    /// The branch daemon's line for a v0.45.1 CLI's `work-done --task`, which
+    /// names no task (PRD #1666 part 3, round 5), on the reviewer's pane `3`.
+    const NOTE_LINE: &str = r#"2026-10-23T09:12:01.000000Z  WARN dot_agent_deck::daemon: hook socket: delivered a work-done that names no task as a note that completes no task; a dot-agent-deck CLI older than this daemon sends that, and `work-done --task-id` completes a task verb="work_done" claimed_pane=3 reason="no_task""#;
+
+    /// What a previous-release daemon logs for the branch CLI's capability
+    /// question on pane `3`: its fallback for a line it cannot decode, the
+    /// token taken out.
+    const QUESTION_LINE: &str = r#"2026-10-23T09:12:01.000000Z  WARN dot_agent_deck::daemon: Malformed event: {"message_type":"hook_capabilities","pane_id":"3"} line_bytes=94"#;
+
+    /// The log span of an operation in a fixture that places no line in time:
+    /// the whole log, stated, unlike a span production could not measure
+    /// (`None`), which no line can be tied to.
+    const WHOLE_LOG: Option<(u64, u64)> = Some((0, u64::MAX));
+
+    /// The branch's `daemon hello`, declaring the task-scoped break on top of
+    /// [`BRANCH_HELLO`]'s list.
+    fn task_scoped_hello() -> String {
+        BRANCH_HELLO.replace(
+            r#""318-hook-event-capability-token"]"#,
+            r#""318-hook-event-capability-token","1666-task-scoped-completion-and-recovery"]"#,
+        )
+    }
+
+    /// A run of `direction` in which tell-4's `work-done` half failed and its
+    /// status half held, the reviewer's pane `pane`, the branch declaring the
+    /// task-scoped break when `declared`.
+    fn work_done_run(direction: Direction, declared: bool, pane: &str) -> Evidence {
+        let branch = if declared {
+            task_scoped_hello()
+        } else {
+            BRANCH_HELLO.to_string()
+        };
+        let mut ev = Evidence {
+            branch: "6f38d2a559ba4bca111f2419d9c71e0e80d8c77e".into(),
+            direction,
+            old_hello: V0451_HELLO.into(),
+            new_hello: branch,
+            ..Default::default()
+        };
+        for id in ["tell-1", "tell-2", "tell-3", ROLE_SET_TELL] {
+            ev.tell(id, "t", Verdict::Pass, "measured");
+        }
+        ev.tell_in_parts(
+            "tell-4",
+            "hooks (work-done, status) still arrived",
+            &[("work-done", false), ("status", true)],
+            "work-done: the feedback line did NOT appear",
+        );
+        let t = ev.tells.last_mut().unwrap();
+        t.part_ops = vec![PartOp::new("work-done", "report", pane, WHOLE_LOG)];
+        t.subject_pane = Some(pane.to_string());
+        ev
+    }
+
+    fn log_with(line: &str) -> String {
+        format!("{}{line}\n", deck_log(false))
+    }
+
+    /// Reverse: the old CLI's report reached the branch daemon, which logged
+    /// delivering it as a note, but the work-done half failed for another
+    /// reason the log does not show (no H5 refusal). The note line explains
+    /// nothing: it is not an effect, so the run FAILS.
+    #[test]
+    fn a_note_logged_while_delivery_failed_for_another_reason_is_not_explained() {
+        let mut ev = work_done_run(Direction::Reverse, true, "3");
+        explain(&mut ev, Direction::Reverse, &log_with(NOTE_LINE));
+        assert_eq!(ev.verdict(), RunVerdict::Fail);
+        assert!(ev.tells.iter().all(|t| t.declared_break.is_none()));
+    }
+
+    /// Forward: the branch CLI declares the break, and the old daemon logged
+    /// the CLI's question on the reviewer's pane as a line it cannot decode. A
+    /// DECLARED BREAK.
+    #[test]
+    fn an_unread_question_is_the_task_scoped_break_forward() {
+        let mut ev = work_done_run(Direction::Forward, true, "3");
+        explain(&mut ev, Direction::Forward, &log_with(QUESTION_LINE));
+        let v = ev.verdict();
+        assert!(is_declared_break(&v), "{}", v.label());
+        let tell = ev.tells.iter().find(|t| t.id == "tell-4").unwrap();
+        let detail = &tell.declared_break.as_ref().unwrap().detail;
+        assert!(
+            detail.contains("The client's build declares it"),
+            "{detail}"
+        );
+    }
+
+    /// Controls: each direction's witness explains only its own direction, the
+    /// break must be declared, and the line must name the subject pane.
+    #[test]
+    fn the_task_scoped_break_needs_its_own_witness_declaration_and_pane() {
+        // The forward witness in the reverse direction.
+        let mut ev = work_done_run(Direction::Reverse, true, "3");
+        explain(&mut ev, Direction::Reverse, &log_with(QUESTION_LINE));
+        assert_eq!(ev.verdict(), RunVerdict::Fail);
+        // Not declared.
+        let mut ev = work_done_run(Direction::Forward, false, "3");
+        explain(&mut ev, Direction::Forward, &log_with(QUESTION_LINE));
+        assert_eq!(ev.verdict(), RunVerdict::Fail);
+        // Another pane, one whose id extends the subject's.
+        let mut ev = work_done_run(Direction::Forward, true, "33");
+        explain(&mut ev, Direction::Forward, &log_with(QUESTION_LINE));
+        assert_eq!(ev.verdict(), RunVerdict::Fail);
+        let thirty_three = QUESTION_LINE.replace(r#""pane_id":"3""#, r#""pane_id":"33""#);
+        let mut ev = work_done_run(Direction::Forward, true, "3");
+        explain(&mut ev, Direction::Forward, &log_with(&thirty_three));
+        assert_eq!(ev.verdict(), RunVerdict::Fail);
+    }
+
+    /// The branch daemon's H5 refusal of an older CLI's `inbox fetch` in pane
+    /// `pane`.
+    fn h5_line(pane: &str) -> String {
+        format!(
+            "2026-10-24T09:12:01.000000Z  WARN dot_agent_deck::daemon: inbox: refused a fetch \
+             the way only an older dot-agent-deck asks; nothing was taken pane_id={pane} \
+             consumer=Cli ack=false"
+        )
+    }
+
+    /// `CLI_RECEIPTS_UNSUPPORTED` (`src/inbox_cli.rs`), whole: what the
+    /// branch CLI prints when the daemon does not confirm receipts.
+    /// `every_known_effect_is_pinned_to_the_source` holds the constant to
+    /// exactly this text.
+    const H4_TEXT: &str = "Could not fetch messages: the deck daemon did not confirm that it \
+        can hand them to this `dot-agent-deck inbox fetch`, so no message was taken and they \
+        stay waiting. The daemon most likely runs an older dot-agent-deck than this command. \
+        Restart the deck daemon on this release (see \"Recycling the daemon\" in \
+        `dot-agent-deck docs troubleshooting`), or run `inbox fetch` with the dot-agent-deck \
+        the daemon runs.";
+
+    /// What the branch CLI's `inbox fetch` captured in pane `pane` against a
+    /// daemon that does not serve receipts: the capture's pane line, the
+    /// CLI's stderr, its exit status.
+    fn h4_capture(pane: &str) -> String {
+        format!("pane={pane}\nError: {H4_TEXT}\nexit=1\n")
+    }
+
+    /// The branch's `daemon hello`, declaring the round's other two breaks
+    /// too.
+    fn inbox_hello() -> String {
+        task_scoped_hello().replace(
+            r#""1666-task-scoped-completion-and-recovery"]"#,
+            r#""1666-task-scoped-completion-and-recovery","1666-remaining-inbox-one-shot-receipts","1666-legacy-inbox-delivery-withdrawal"]"#,
+        )
+    }
+
+    /// A run of `direction` in which `tell`'s halves held or failed as
+    /// `parts`, each half running the operations `part_ops` names as
+    /// `(half, operation, pane)` over [`WHOLE_LOG`], with the
+    /// client's `outputs` per half, the branch declaring the round's breaks
+    /// when `declared`. Every other contract tell passed.
+    fn run_of(
+        direction: Direction,
+        declared: bool,
+        tell: &str,
+        parts: &[(&str, bool)],
+        part_ops: &[(&str, &str, &str)],
+        outputs: &[(&str, &str, String)],
+    ) -> Evidence {
+        let mut ev = Evidence {
+            branch: "6f38d2a559ba4bca111f2419d9c71e0e80d8c77e".into(),
+            direction,
+            old_hello: V0451_HELLO.into(),
+            new_hello: if declared {
+                inbox_hello()
+            } else {
+                BRANCH_HELLO.to_string()
+            },
+            ..Default::default()
+        };
+        for id in ["tell-1", "tell-2", "tell-3", "tell-4", ROLE_SET_TELL] {
+            if id == tell {
+                ev.tell_in_parts(id, "t", parts, "measured");
+                let t = ev.tells.last_mut().unwrap();
+                t.part_ops = part_ops
+                    .iter()
+                    .map(|(h, op, p)| PartOp::new(h, op, p, WHOLE_LOG))
+                    .collect();
+                t.client_outputs = outputs
+                    .iter()
+                    .map(|(h, p, o)| (h.to_string(), p.to_string(), o.clone()))
+                    .collect();
+            } else {
+                ev.tell(id, "t", Verdict::Pass, "measured");
+            }
+        }
+        ev
+    }
+
+    /// Reverse, tell 3: the old CLI's fetch in the coder's pane `2` is the
+    /// legacy fetch, which the branch daemon refused and logged. A DECLARED
+    /// BREAK; not without that line, not for another pane, not undeclared.
+    #[test]
+    fn a_refused_legacy_fetch_is_h5_in_reverse_on_tell_3() {
+        let run = |declared: bool| {
+            run_of(
+                Direction::Reverse,
+                declared,
+                "tell-3",
+                &[("fetch", false)],
+                &[("fetch", "fetch", "2")],
+                &[],
+            )
+        };
+        let mut ev = run(true);
+        explain(&mut ev, Direction::Reverse, &log_with(&h5_line("2")));
+        assert!(is_declared_break(&ev.verdict()), "{}", ev.verdict().label());
+        assert!(ev.verdict().label().contains(LEGACY_FETCH_WITHDRAWN));
+        for (declared, log) in [
+            (true, deck_log(false)),
+            (true, log_with(&h5_line("22"))),
+            (true, log_with(&h5_line("5"))),
+            (false, log_with(&h5_line("2"))),
+        ] {
+            let mut ev = run(declared);
+            explain(&mut ev, Direction::Reverse, &log);
+            assert_eq!(ev.verdict(), RunVerdict::Fail, "{declared} {log}");
+        }
+    }
+
+    /// Reverse, tell 4: the old CLI's report reached the orchestrator's inbox
+    /// as a note, and the orchestrator's old fetch in pane `1` was refused.
+    /// The work-done half ran the reviewer's report on pane `3` and the
+    /// orchestrator's fetch on `1`; the refusal names `1`. A DECLARED BREAK;
+    /// the note alone is not, nor a refusal on `1` when the half recorded no
+    /// fetch.
+    #[test]
+    fn a_refused_legacy_fetch_is_h5_in_reverse_on_tell_4() {
+        let run = |ops: &[(&str, &str, &str)]| {
+            run_of(
+                Direction::Reverse,
+                true,
+                "tell-4",
+                &[("work-done", false), ("status", true)],
+                ops,
+                &[],
+            )
+        };
+        let both = [("work-done", "report", "3"), ("work-done", "fetch", "1")];
+        let mut ev = run(&both);
+        explain(
+            &mut ev,
+            Direction::Reverse,
+            &log_with(&format!("{NOTE_LINE}\n{}", h5_line("1"))),
+        );
+        assert!(is_declared_break(&ev.verdict()), "{}", ev.verdict().label());
+        let mut ev = run(&both);
+        explain(&mut ev, Direction::Reverse, &log_with(NOTE_LINE));
+        assert_eq!(ev.verdict(), RunVerdict::Fail, "the note alone");
+        let mut ev = run(&[("work-done", "report", "3")]);
+        explain(&mut ev, Direction::Reverse, &log_with(&h5_line("1")));
+        assert_eq!(
+            ev.verdict(),
+            RunVerdict::Fail,
+            "a pane the half did not measure"
+        );
+    }
+
+    /// Where, in the run's order, a line of the daemon's log was written
+    /// relative to tell-4's `work-done` half.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum At {
+        /// Before the reviewer reported: its own fetch of the delegate.
+        BeforeReport,
+        /// After the reviewer typed `work-done`, before the orchestrator's
+        /// fetch.
+        Report,
+        /// During the orchestrator's fetch of the report.
+        Fetch,
+        /// During the orchestrator's listing.
+        Listing,
+    }
+
+    /// Tell-4 as production records it: the reviewer (pane `3`) reports, the
+    /// orchestrator (pane `1`) fetches and lists; the `work-done` half failed
+    /// and the status half held. `fetched` when the orchestrator's fetch handed
+    /// the report over, so only its listing failed. Each line of `lines` is
+    /// written to the log at its place in the run. Returns the run and its log.
+    fn tell4_run(
+        direction: Direction,
+        fetched: bool,
+        lines: &[(At, String)],
+    ) -> (Evidence, String) {
+        let mut log = deck_log(false);
+        // Where each place in the run begins in the log, and where it ends.
+        let mut begins = Vec::new();
+        for at in [At::BeforeReport, At::Report, At::Fetch, At::Listing] {
+            begins.push(log.len() as u64);
+            for (_, line) in lines.iter().filter(|(a, _)| *a == at) {
+                log.push_str(line);
+                log.push('\n');
+            }
+        }
+        let end = log.len() as u64;
+        let (report, fetch, listing) = ((begins[1], end), (begins[2], begins[3]), (begins[3], end));
+        let mut ev = run_of(
+            direction,
+            true,
+            "tell-4",
+            &[("work-done", false), ("status", true)],
+            &[],
+            &[],
+        );
+        let t = ev.tells.iter_mut().find(|t| t.id == "tell-4").unwrap();
+        // As production records it: a fetch that handed the report over leaves
+        // only the listing to have failed.
+        if !fetched {
+            t.part_ops
+                .push(PartOp::new("work-done", "report", "3", Some(report)));
+            t.part_ops
+                .push(PartOp::new("work-done", "fetch", "1", Some(fetch)));
+        }
+        t.part_ops
+            .push(PartOp::new("work-done", "listing", "1", Some(listing)));
+        (ev, log)
+    }
+
+    fn explained(direction: Direction, fetched: bool, lines: &[(At, String)]) -> RunVerdict {
+        let (mut ev, log) = tell4_run(direction, fetched, lines);
+        explain(&mut ev, direction, &log);
+        ev.verdict()
+    }
+
+    /// Reverse, tell 4 (review R31 / U2-2): H5 explains the orchestrator's
+    /// failed fetch of the report only with a refusal of THAT fetch. The
+    /// reviewer's own earlier fetch of its delegate, refused on pane `3`, is a
+    /// different operation and explains nothing — nor does a refusal on the
+    /// orchestrator's pane from before the report was sent, nor any refusal
+    /// once the fetch handed the report over and only the listing failed.
+    #[test]
+    fn h5_explains_tell_4_only_with_the_orchestrators_own_fetch() {
+        let r = Direction::Reverse;
+        let v = explained(r, false, &[(At::Fetch, h5_line("1"))]);
+        assert!(is_declared_break(&v), "{}", v.label());
+        let v = explained(
+            r,
+            false,
+            &[(At::BeforeReport, h5_line("3")), (At::Fetch, h5_line("1"))],
+        );
+        assert!(is_declared_break(&v), "{}", v.label());
+        for (fetched, lines, why) in [
+            (
+                false,
+                vec![(At::BeforeReport, h5_line("3"))],
+                "only the reviewer's earlier refusal",
+            ),
+            (
+                false,
+                vec![(At::Fetch, h5_line("3"))],
+                "a refusal on the reporter's pane during the fetch",
+            ),
+            (
+                false,
+                vec![(At::BeforeReport, h5_line("1"))],
+                "an earlier refusal on the orchestrator's pane",
+            ),
+            (
+                false,
+                vec![(At::Listing, h5_line("1"))],
+                "a refusal after the fetch ended",
+            ),
+            (
+                true,
+                vec![(At::Fetch, h5_line("1"))],
+                "the fetch handed the report over; only the listing failed",
+            ),
+        ] {
+            assert_eq!(explained(r, fetched, &lines), RunVerdict::Fail, "{why}");
+        }
+    }
+
+    /// Review U3-1: an operation the run recorded but whose stretch of the log
+    /// it could not measure cannot be tied to any line of it. Reverse, the
+    /// orchestrator's fetch is recorded on pane `1` with no span, and the only
+    /// refusal on `1` came before the report was sent: not explained.
+    #[test]
+    fn an_operation_without_a_measured_span_is_not_explained() {
+        let r = Direction::Reverse;
+        let (mut ev, log) = tell4_run(r, false, &[(At::BeforeReport, h5_line("1"))]);
+        let t = ev.tells.iter_mut().find(|t| t.id == "tell-4").unwrap();
+        for op in t.part_ops.iter_mut().filter(|o| o.op == "fetch") {
+            op.log_span = None;
+        }
+        explain(&mut ev, r, &log);
+        assert_eq!(ev.verdict(), RunVerdict::Fail);
+        assert!(
+            ev.steps.iter().any(|s| s.contains("could not be measured")),
+            "{:?}",
+            ev.steps
+        );
+    }
+
+    /// Review U3-1: nor is a half that recorded no operation at all, even with
+    /// its subject pane known and a refusal naming that pane in the log.
+    #[test]
+    fn a_half_that_recorded_no_operation_is_not_explained() {
+        let r = Direction::Reverse;
+        let (mut ev, _) = tell4_run(r, false, &[]);
+        let t = ev.tells.iter_mut().find(|t| t.id == "tell-4").unwrap();
+        t.part_ops.clear();
+        t.subject_pane = Some("1".to_string());
+        assert!(t.ops_of("work-done", "fetch").is_empty());
+        explain(&mut ev, r, &log_with(&h5_line("1")));
+        assert_eq!(ev.verdict(), RunVerdict::Fail);
+    }
+
+    /// Review U3-1, the client's witness: forward, tell 3's fetch half recorded
+    /// no operation, yet its subject pane `2` is known and the client printed
+    /// H4's line in that pane. A client-output witness reads no log span, so
+    /// only the absence of a recorded operation keeps this unexplained.
+    #[test]
+    fn a_half_that_recorded_no_operation_is_not_explained_by_the_clients_output() {
+        let mut ev = run_of(
+            Direction::Forward,
+            true,
+            "tell-3",
+            &[("fetch", false)],
+            &[],
+            &[("fetch", "2", h4_capture("2"))],
+        );
+        let t = ev.tells.iter_mut().find(|t| t.id == "tell-3").unwrap();
+        t.subject_pane = Some("2".to_string());
+        assert!(t.ops_of("fetch", "fetch").is_empty());
+        explain(&mut ev, Direction::Forward, &deck_log(false));
+        assert_eq!(ev.verdict(), RunVerdict::Fail);
+    }
+
+    /// Forward, tell 4: the task-scoped break explains the half only with the
+    /// REPORTER's unread capability question, sent after it typed `work-done`
+    /// — not one naming the orchestrator's pane, not one from before the
+    /// report, and not when the report was fetched and only the listing failed.
+    #[test]
+    fn the_task_scoped_break_explains_tell_4_only_with_the_reporters_question() {
+        let f = Direction::Forward;
+        let v = explained(f, false, &[(At::Report, QUESTION_LINE.to_string())]);
+        assert!(is_declared_break(&v), "{}", v.label());
+        let on_orchestrator = QUESTION_LINE.replace(r#""pane_id":"3""#, r#""pane_id":"1""#);
+        for (fetched, lines, why) in [
+            (
+                false,
+                vec![(At::Report, on_orchestrator)],
+                "the question on the orchestrator's pane",
+            ),
+            (
+                false,
+                vec![(At::BeforeReport, QUESTION_LINE.to_string())],
+                "a question from before the report",
+            ),
+            (
+                true,
+                vec![(At::Report, QUESTION_LINE.to_string())],
+                "the report was fetched; only the listing failed",
+            ),
+        ] {
+            assert_eq!(explained(f, fetched, &lines), RunVerdict::Fail, "{why}");
+        }
+    }
+
+    /// Forward, tell 3: the branch CLI's fetch in the coder's pane `2` read
+    /// that the old daemon does not serve receipts, took nothing and said so;
+    /// the old daemon logged nothing. The CLIENT declares the break, so its own
+    /// output is the witness: a DECLARED BREAK. Not for output captured in
+    /// another pane, not without the line, not when the line is only in the
+    /// daemon's log, and not undeclared.
+    #[test]
+    fn an_unconfirmed_receipt_fetch_is_h4_forward_on_tell_3() {
+        let run = |declared: bool, outputs: &[(&str, &str, String)]| {
+            run_of(
+                Direction::Forward,
+                declared,
+                "tell-3",
+                &[("fetch", false)],
+                &[("fetch", "fetch", "2")],
+                outputs,
+            )
+        };
+        let mut ev = run(true, &[("fetch", "2", h4_capture("2"))]);
+        explain(&mut ev, Direction::Forward, &deck_log(false));
+        assert!(is_declared_break(&ev.verdict()), "{}", ev.verdict().label());
+        let detail = &ev.tells[2].declared_break.as_ref().unwrap().detail;
+        assert!(detail.contains("the client printed, in pane 2"), "{detail}");
+        assert!(
+            detail.contains("The client's build declares it"),
+            "{detail}"
+        );
+        for (declared, outputs, log) in [
+            (true, vec![("fetch", "5", h4_capture("5"))], deck_log(false)),
+            (
+                true,
+                vec![("fetch", "2", "pane=2\nexit=0\n".to_string())],
+                deck_log(false),
+            ),
+            (true, vec![], log_with(&h4_capture("2"))),
+            (
+                false,
+                vec![("fetch", "2", h4_capture("2"))],
+                deck_log(false),
+            ),
+        ] {
+            let mut ev = run(declared, &outputs);
+            explain(&mut ev, Direction::Forward, &log);
+            assert_eq!(ev.verdict(), RunVerdict::Fail, "{declared} {outputs:?}");
+        }
+    }
+
+    /// Only a CLIENT-declared break may name the client's output as its
+    /// witness: a daemon's refusal is the daemon's to log.
+    #[test]
+    fn only_client_declared_effects_take_the_clients_output_as_witness() {
+        for effect in KNOWN_EFFECTS {
+            if effect.witness == Witness::ClientOutput {
+                assert_eq!(effect.declared_by, Declarer::Client, "{}", effect.id);
+                assert!(
+                    matches!(effect.pane_field, PaneField::Capture),
+                    "{}",
+                    effect.id
+                );
+                assert!(!effect.client_text.is_empty(), "{}", effect.id);
+            } else {
+                assert!(
+                    !matches!(effect.pane_field, PaneField::Capture),
+                    "{}",
+                    effect.id
+                );
+            }
+        }
+    }
 
     fn deck_log(with_refusal: bool) -> String {
         let mut log = String::from(
@@ -297,7 +1138,14 @@ mod tests {
             &[("work-done", work_done), (status_part, false)],
             "status: the status never changed",
         );
-        ev.tells.last_mut().unwrap().subject_pane = subject_pane.map(str::to_string);
+        let t = ev.tells.last_mut().unwrap();
+        // As production records it: the status half's operation exists only
+        // when `daemon status` named the reviewer's pane.
+        t.part_ops = subject_pane
+            .map(|p| PartOp::new(status_part, "status", p, WHOLE_LOG))
+            .into_iter()
+            .collect();
+        t.subject_pane = subject_pane.map(str::to_string);
         assert!(
             CONTRACT_TELLS
                 .iter()
@@ -481,6 +1329,10 @@ mod tests {
         );
         assert!(md.contains("> failed: status"), "{md}");
         assert!(md.contains("reason=\"missing_token\""), "{md}");
+        // The introduction states the witness rule `explain` applies, the
+        // client's own output included, not a daemon-log-only rule.
+        assert!(md.contains("written while the operation ran"), "{md}");
+        assert!(md.contains("the client's own output in that pane"), "{md}");
     }
 
     /// Strip Rust's string-continuation escapes (`\` + newline + indentation)
@@ -504,6 +1356,50 @@ mod tests {
             let call = &call[..call.find(");").unwrap_or(call.len())];
             texts.iter().all(|t| call.contains(t))
         })
+    }
+
+    /// The value of the one string literal a `const` declaration opening
+    /// with `open` binds, from its opening quote to its closing one followed
+    /// by `;`, escapes read: `None` when `open` is absent or not followed by
+    /// exactly that. Nothing past the declaration's own `;` is read.
+    fn const_literal(src: &str, open: &str) -> Option<String> {
+        let rest = src[src.find(open)? + open.len()..].trim_start();
+        let mut chars = rest.strip_prefix('"')?.chars();
+        let mut value = String::new();
+        loop {
+            match chars.next()? {
+                '\\' => match chars.next()? {
+                    'n' => value.push('\n'),
+                    c @ ('"' | '\\') => value.push(c),
+                    _ => return None,
+                },
+                '"' => break,
+                c => value.push(c),
+            }
+        }
+        chars
+            .as_str()
+            .trim_start()
+            .starts_with(';')
+            .then_some(value)
+    }
+
+    #[test]
+    fn a_constant_is_read_to_its_own_end_and_no_further() {
+        let src = "pub const A: &str = \"one \\\"two\\\" three\";\npub const B: &str = \"four\";";
+        assert_eq!(
+            const_literal(src, "pub const A: &str =").as_deref(),
+            Some("one \"two\" three")
+        );
+        assert_eq!(
+            const_literal(src, "pub const B: &str =").as_deref(),
+            Some("four")
+        );
+        assert_eq!(
+            const_literal("pub const A: &str = f(\"x\");", "pub const A: &str ="),
+            None
+        );
+        assert_eq!(const_literal(src, "pub const C: &str ="), None);
     }
 
     #[test]
@@ -538,7 +1434,9 @@ mod tests {
         let source = |file: &str| -> String {
             joined(match file {
                 "src/daemon.rs" => include_str!("../../../src/daemon.rs"),
+                "src/event.rs" => include_str!("../../../src/event.rs"),
                 "src/hook_provenance.rs" => include_str!("../../../src/hook_provenance.rs"),
+                "src/inbox_cli.rs" => include_str!("../../../src/inbox_cli.rs"),
                 other => panic!("a source pin names {other}, which this test does not read"),
             })
         };
@@ -555,17 +1453,36 @@ mod tests {
                 effect.id
             );
             let (site_file, site) = effect.log_site;
+            // A client's line names no pane, so it pins no pane field.
+            let pane_pins = usize::from(effect.witness == Witness::DaemonLog);
             assert!(
-                site.len() > effect.log_signature.len(),
+                site.len() >= effect.log_signature.len() + pane_pins,
                 "`{}` pins fewer texts in its log call than it has signature pieces and a \
                  pane field",
                 effect.id
             );
-            assert!(
-                one_call_contains(&source(site_file), "warn!(", site),
-                "`{}`: no single `warn!(…);` call in {site_file} contains all of {site:?}",
-                effect.id
-            );
+            match effect.witness {
+                Witness::DaemonLog => assert!(
+                    one_call_contains(&source(site_file), "warn!(", site),
+                    "`{}`: no single `warn!(…` in {site_file} contains all of {site:?}",
+                    effect.id
+                ),
+                Witness::ClientOutput => {
+                    let value = const_literal(&source(site_file), effect.client_text)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "`{}`: {site_file} declares no `{} \"…\";`",
+                                effect.id, effect.client_text
+                            )
+                        });
+                    assert!(
+                        site.iter().all(|t| value.contains(t))
+                            && effect.log_signature.iter().all(|t| value.contains(t)),
+                        "`{}`: the constant {value:?} does not contain all of {site:?}",
+                        effect.id
+                    );
+                }
+            }
             for (file, text) in effect.source_pins {
                 assert!(
                     source(file).contains(text),
@@ -574,14 +1491,34 @@ mod tests {
                 );
             }
         }
-        // The pins really are what the #1595 run's daemon wrote.
-        let status = &KNOWN_EFFECTS[0];
-        assert!(
-            status
-                .log_signature
-                .iter()
-                .all(|sig| REFUSAL_LINE.contains(sig))
-                && REFUSAL_LINE.contains(&format!("{}3 ", status.pane_field))
+        // The pins really are what the #1595 run's daemon wrote, and what
+        // the task-scoped break's two lines say.
+        let h5 = h5_line("3");
+        let h4 = h4_capture("3");
+        for (effect, line) in KNOWN_EFFECTS.iter().zip([
+            REFUSAL_LINE,
+            QUESTION_LINE,
+            h5.as_str(),
+            h5.as_str(),
+            h4.lines().nth(1).unwrap(),
+        ]) {
+            assert!(
+                effect.log_signature.iter().all(|sig| line.contains(sig))
+                    && (effect.witness == Witness::ClientOutput
+                        || effect.pane_field.names(line, "3")),
+                "`{}` does not match {line}",
+                effect.id
+            );
+        }
+        // The client's line is the constant the CLI prints, exactly.
+        assert_eq!(
+            const_literal(&source("src/inbox_cli.rs"), KNOWN_EFFECTS[4].client_text).as_deref(),
+            Some(H4_TEXT)
         );
+        assert_eq!(
+            h4.lines().nth(1),
+            Some(format!("Error: {H4_TEXT}").as_str())
+        );
+        assert_eq!(KNOWN_EFFECTS.len(), 5);
     }
 }

@@ -801,34 +801,7 @@ export default {id:'deck-test-route',tui:async(api)=>{
         assert_eq!(message["ack_how"], ack_how, "{message}");
     }
     fn final_reply(&self, id: &str) -> Option<String> {
-        let transcript = self.transcript();
-        let messages = transcript["message"].as_array().unwrap();
-        let parts = transcript["part"].as_array().unwrap();
-        let opener = format!("[dot-agent-deck message {id}");
-        let user = messages.iter().find(|m| {
-            m["data"]["role"] == "user"
-                && parts.iter().any(|p| {
-                    p["message_id"] == m["id"]
-                        && p["data"]["text"]
-                            .as_str()
-                            .is_some_and(|s| s.contains(&opener))
-                })
-        })?;
-        let assistant = messages
-            .iter()
-            .filter(|m| {
-                m["data"]["role"] == "assistant"
-                    && m["data"]["parentID"] == user["id"]
-                    && m["data"]["finish"] == "stop"
-            })
-            .max_by_key(|m| m["time_created"].as_u64())?;
-        let text = parts
-            .iter()
-            .filter(|p| p["message_id"] == assistant["id"] && p["data"]["type"] == "text")
-            .filter_map(|p| p["data"]["text"].as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        (!text.trim().is_empty()).then_some(text)
+        completed_reply(&self.transcript(), id)
     }
     pub fn wait_reply(&self, id: &str) {
         // Derive the expected text from this turn's completed assistant, then
@@ -983,6 +956,52 @@ impl Drop for OpenCode {
     }
 }
 
+fn completed_reply(transcript: &Value, id: &str) -> Option<String> {
+    let messages = transcript["message"].as_array().unwrap();
+    let parts = transcript["part"].as_array().unwrap();
+    let opener = format!("[dot-agent-deck message {id}");
+    let user = messages.iter().find(|m| {
+        m["data"]["role"] == "user"
+            && parts.iter().any(|p| {
+                p["message_id"] == m["id"]
+                    && p["data"]["text"]
+                        .as_str()
+                        .is_some_and(|s| s.contains(&opener))
+            })
+    })?;
+    let completed = messages
+        .iter()
+        .filter(|m| {
+            m["data"]["role"] == "assistant"
+                && m["data"]["parentID"] == user["id"]
+                && m["data"]["finish"] == "stop"
+        })
+        .max_by_key(|m| m["time_created"].as_u64())?;
+    // OpenCode may finish with a textless stop after a reply plus work-done
+    // tools. Still require this delivery's stop before accepting its text.
+    // Order comes from `time_created` alone: this assumes OpenCode stamps a
+    // turn's messages with distinct, increasing values, so a message sharing
+    // the stop's timestamp counts as before it.
+    messages
+        .iter()
+        .filter(|m| {
+            m["data"]["role"] == "assistant"
+                && m["data"]["parentID"] == user["id"]
+                && m["time_created"].as_u64() <= completed["time_created"].as_u64()
+        })
+        .filter_map(|m| {
+            let text = parts
+                .iter()
+                .filter(|p| p["message_id"] == m["id"] && p["data"]["type"] == "text")
+                .filter_map(|p| p["data"]["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.trim().is_empty()).then_some((m["time_created"].as_u64(), text))
+        })
+        .max_by_key(|(created, _)| *created)
+        .map(|(_, text)| text)
+}
+
 fn normalize(text: &str) -> String {
     text.chars()
         .filter(|c| c.is_alphanumeric())
@@ -1057,6 +1076,69 @@ fn join_observer(observer: std::thread::JoinHandle<()>, budget: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn completed_delivery() -> Value {
+        json!({
+            "message": [
+                {"id":"user", "time_created":1, "data":{"role":"user"}},
+                {"id":"answer", "time_created":2, "data":{"role":"assistant", "parentID":"user", "finish":"tool-calls"}},
+                {"id":"cleanup", "time_created":3, "data":{"role":"assistant", "parentID":"user", "finish":"tool-calls"}},
+                {"id":"stop", "time_created":4, "data":{"role":"assistant", "parentID":"user", "finish":"stop"}},
+                {"id":"unrelated", "time_created":5, "data":{"role":"assistant", "parentID":"another-user", "finish":"stop"}}
+            ],
+            "part": [
+                {"message_id":"user", "data":{"type":"text", "text":"[dot-agent-deck message m-fixture] Reply FIRST-DONE"}},
+                {"message_id":"answer", "data":{"type":"text", "text":"FIRST-DONE"}},
+                {"message_id":"cleanup", "data":{"type":"text", "text":"Now cleaning up the report file:"}},
+                {"message_id":"cleanup", "data":{"type":"tool", "text":"TOOL-OUTPUT"}},
+                {"message_id":"stop", "data":{"type":"step-finish"}},
+                {"message_id":"unrelated", "data":{"type":"text", "text":"UNRELATED-REPLY"}}
+            ]
+        })
+    }
+
+    /// Scenario: A delivered task visibly replies before report cleanup and finishes with a textless stop. Select its latest assistant text, preserving a textual final reply when one exists and ignoring text written after the stop.
+    #[test]
+    fn completed_reply_accepts_text_before_a_textless_stop() {
+        let mut transcript = completed_delivery();
+        assert_eq!(
+            completed_reply(&transcript, "m-fixture").as_deref(),
+            Some("Now cleaning up the report file:")
+        );
+        transcript["part"].as_array_mut().unwrap().push(json!({
+            "message_id":"stop", "data":{"type":"text", "text":"Task completed."}
+        }));
+        assert_eq!(
+            completed_reply(&transcript, "m-fixture").as_deref(),
+            Some("Task completed.")
+        );
+        transcript["message"].as_array_mut().unwrap().push(json!({
+            "id":"later", "time_created":6, "data":{"role":"assistant", "parentID":"user"}
+        }));
+        transcript["part"].as_array_mut().unwrap().push(json!({
+            "message_id":"later", "data":{"type":"text", "text":"Still working"}
+        }));
+        assert_eq!(
+            completed_reply(&transcript, "m-fixture").as_deref(),
+            Some("Task completed.")
+        );
+    }
+
+    /// Scenario: The delivery has no assistant reply, or its assistant has not finished. User echoes, tool output and another task's completed reply must not satisfy the visible-reply oracle.
+    #[test]
+    fn completed_reply_rejects_a_missing_delivery_reply() {
+        let transcript = completed_delivery();
+        assert_eq!(completed_reply(&transcript, "m-missing"), None);
+        let mut unfinished = transcript.clone();
+        unfinished["message"][3]["data"]["finish"] = json!("tool-calls");
+        assert_eq!(completed_reply(&unfinished, "m-fixture"), None);
+        let mut missing_text = transcript;
+        missing_text["part"].as_array_mut().unwrap().retain(|p| {
+            p["message_id"] != "answer"
+                && !(p["message_id"] == "cleanup" && p["data"]["type"] == "text")
+        });
+        assert_eq!(completed_reply(&missing_text, "m-fixture"), None);
+    }
 
     #[test]
     fn inbox_observer_bounds_the_entire_sample() {

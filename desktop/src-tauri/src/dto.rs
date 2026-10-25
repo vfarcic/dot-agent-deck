@@ -846,6 +846,11 @@ pub struct DesktopInbox {
     /// PRD #1666 §7: delivered messages whose evidence pauses hand-outs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evidence_paused: Option<usize>,
+    /// PRD #1666 part 3 (R-2): the refusal code the deck gave the agent's own
+    /// request for its messages, while messages wait for it
+    /// (`inbox_peer_unidentified`, …), a display copy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admission_refused: Option<String>,
 }
 
 /// PRD #1666 §6.4: one deck message a tile lists with its own Retry and
@@ -2319,6 +2324,11 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
             .as_deref()
             .map(safe_display_text),
         evidence_paused: summary.notices.evidence_paused,
+        admission_refused: summary
+            .notices
+            .admission_refused
+            .as_deref()
+            .map(safe_display_text),
     });
     let delivery_notice = live
         .filter(|snapshot| snapshot.status == SessionStatus::Error)
@@ -4140,7 +4150,7 @@ mod tests {
         );
     }
 
-    /// Scenario: Map a daemon record whose inbox summary lists an uncertain delivery, an integration notice, failed receipts and paused hand-outs into the desktop DTO; each survives, by its wire spelling, for the tile's notice row and its Retry and Cancel rows.
+    /// Scenario: Map a daemon record whose inbox summary lists an uncertain delivery, an integration notice, failed receipts, paused hand-outs and a refused request of the agent's own into the desktop DTO; each survives, by its wire spelling, for the tile's notice row and its Retry and Cancel rows.
     #[test]
     fn agent_mapping_carries_the_inbox_card_notices() {
         let mut record = fixture_record();
@@ -4152,7 +4162,8 @@ mod tests {
                     "subject": "review"}],
                 "integration": "not_armed",
                 "receipts_degraded": "disk full",
-                "evidence_paused": 3
+                "evidence_paused": 3,
+                "admission_refused": "inbox_nested_agent"
             }))
             .unwrap(),
         );
@@ -4174,6 +4185,7 @@ mod tests {
         assert_eq!(inbox["integration"], "not_armed");
         assert_eq!(inbox["receiptsDegraded"], "disk full");
         assert_eq!(inbox["evidencePaused"], 3);
+        assert_eq!(inbox["admissionRefused"], "inbox_nested_agent");
     }
 
     /// Issue #856: the CLI column is the DAEMON's answer, copied through

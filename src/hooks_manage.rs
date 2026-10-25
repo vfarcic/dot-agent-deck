@@ -1474,6 +1474,31 @@ pub fn auto_install() -> Vec<crate::hook_binary::HookPin> {
     .collect()
 }
 
+/// [`auto_install`] for `hooks refresh` (PRD #1666 part 3, R-3): whether
+/// Claude Code is installed here, and what the install could not read or
+/// write, which [`auto_install`] only logs.
+pub fn refresh_install() -> crate::hooks_refresh::InstallAttempt {
+    refresh_install_at(
+        &settings_path(),
+        crate::platform::paths::durable_binary_path,
+        || installed_claude_hook_gates().0,
+    )
+}
+
+/// [`refresh_install`] against an explicit settings path, with the binary
+/// resolver and the gates injected as [`auto_install_to_gated`] takes them.
+fn refresh_install_at(
+    path: &Path,
+    resolve: impl FnOnce() -> Result<String, String>,
+    gates: impl FnOnce() -> ClaudeHookGates,
+) -> crate::hooks_refresh::InstallAttempt {
+    let attempt = try_auto_install_to_gated(path, resolve, gates);
+    if let Err(e) = &attempt {
+        tracing::warn!("auto-install: {e}");
+    }
+    crate::hooks_refresh::InstallAttempt::of(attempt.transpose())
+}
+
 /// What Claude Code's hooks are pinned to now, read back from its settings
 /// without installing anything (issue #1637's pin refresh,
 /// `CLAUDE.configured_pins`). An empty list when the settings file is
@@ -1522,8 +1547,8 @@ fn configured_pins_in(path: &Path) -> Option<Vec<crate::hook_binary::HookPin>> {
 /// that value never reaches the file.
 ///
 /// The resolver is called only after the settings *directory* check, so the
-/// common "Claude Code not installed" case still costs one `exists()` and no
-/// filesystem walk.
+/// common "Claude Code not installed" case still costs one `try_exists()` and
+/// no filesystem walk.
 ///
 /// Issue #714: this seam installs the base hook set, which every Claude Code
 /// accepts, and never the version-gated `StopFailure`; [`auto_install_to_gated`]
@@ -1545,38 +1570,39 @@ pub fn auto_install_to_gated(
     resolve: impl FnOnce() -> Result<String, String>,
     gates: impl FnOnce() -> ClaudeHookGates,
 ) -> Option<crate::hook_binary::HookPin> {
-    if path.parent().is_none_or(|p| !p.exists()) {
-        return None;
-    }
-
-    let binary_path = match resolve() {
-        Ok(binary_path) => binary_path,
-        // PRD #381 M6: no durable path means no write at all — not a bare
-        // command name, not a build-artifact path that breaks later.
-        Err(e) => {
-            tracing::warn!("auto-install: {e}");
-            return None;
-        }
-    };
-    if let Err(e) = crate::agent_hook_config::ensure_hook_path_is_shell_safe(&binary_path) {
+    try_auto_install_to_gated(path, resolve, gates).unwrap_or_else(|e| {
         tracing::warn!("auto-install: {e}");
-        return None;
+        None
+    })
+}
+
+/// [`auto_install_to_gated`], returning why it wrote nothing rather than
+/// logging it: `Ok(None)` when Claude Code is not installed here.
+fn try_auto_install_to_gated(
+    path: &Path,
+    resolve: impl FnOnce() -> Result<String, String>,
+    gates: impl FnOnce() -> ClaudeHookGates,
+) -> Result<Option<crate::hook_binary::HookPin>, String> {
+    // Only a directory confirmed missing means Claude Code is not installed:
+    // one that cannot be inspected is a failure to report (PRD #1666 part 3),
+    // and nothing is written either way.
+    let Some(dir) = path.parent() else {
+        return Ok(None);
+    };
+    match dir.try_exists() {
+        Ok(true) => {}
+        Ok(false) => return Ok(None),
+        Err(e) => return Err(format!("could not inspect {}: {e}", dir.display())),
     }
 
-    let _guard = match lock_settings(path) {
-        Ok(guard) => guard,
-        Err(e) => {
-            tracing::warn!("auto-install: {e}");
-            return None;
-        }
-    };
-    let mut settings = match load_settings_or_refuse(path) {
-        Ok(settings) => settings,
-        Err(e) => {
-            tracing::warn!("auto-install: {e}");
-            return None;
-        }
-    };
+    // PRD #381 M6: no durable path means no write at all — not a bare
+    // command name, not a build-artifact path that breaks later.
+    let binary_path = resolve()?;
+    crate::agent_hook_config::ensure_hook_path_is_shell_safe(&binary_path)
+        .map_err(|e| e.to_string())?;
+
+    let _guard = lock_settings(path).map_err(|e| e.to_string())?;
+    let mut settings = load_settings_or_refuse(path).map_err(|e| e.to_string())?;
     let before = settings.clone();
     let outcome = install_impl_in(
         &mut settings,
@@ -1593,13 +1619,11 @@ pub fn auto_install_to_gated(
         binary: outcome.named.clone(),
     };
     if settings == before {
-        return Some(pin);
+        return Ok(Some(pin));
     }
 
-    if let Err(e) = write_settings(path, &settings) {
-        tracing::warn!("auto-install: failed to write Claude Code hooks: {e}");
-        return None;
-    }
+    write_settings(path, &settings)
+        .map_err(|e| format!("failed to write Claude Code hooks: {e}"))?;
     let binary_path = outcome.named.clone();
     crate::agent_hook_config::log_auto_install_change(
         "claude-code",
@@ -1625,7 +1649,7 @@ pub fn auto_install_to_gated(
             outcome.installed.join(", ")
         );
     }
-    Some(pin)
+    Ok(Some(pin))
 }
 
 /// `dot-agent-deck hooks install --agent claude-code` — the explicit, chatty
@@ -1810,6 +1834,51 @@ mod tests {
     /// settings directory or an unparseable file (which is left as it is), no
     /// pin for missing settings or settings holding no deck hook, and the
     /// binary the deck's hooks name once they are there.
+    /// Scenario (PRD #1666 part 3, R-3): `hooks refresh` runs the startup
+    /// install and must tell a Claude Code that is not installed from one
+    /// whose settings it could not update. No settings directory is absent;
+    /// malformed settings, which the install refuses and leaves as they were,
+    /// and a refused binary path both ran and failed, with why; good settings
+    /// ran and failed nothing.
+    #[test]
+    fn refresh_install_tells_not_installed_from_failed() {
+        use crate::hooks_refresh::InstallAttempt;
+        let dir = crate::test_temp::tempdir().expect("settings tempdir");
+        let exe = crate::test_paths::abs("/opt/deck/dot-agent-deck");
+        let resolve = || Ok(exe.clone());
+        assert_eq!(
+            refresh_install_at(
+                &dir.path().join("absent").join("settings.json"),
+                resolve,
+                ClaudeHookGates::default
+            ),
+            InstallAttempt::Absent
+        );
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, b"{ not json").unwrap();
+        match refresh_install_at(&path, resolve, ClaudeHookGates::default) {
+            InstallAttempt::Ran { failed } => assert_eq!(failed.len(), 1, "{failed:?}"),
+            other => panic!("malformed settings must fail: {other:?}"),
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), b"{ not json");
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            refresh_install_at(
+                &path,
+                || Err("no durable path".to_string()),
+                ClaudeHookGates::default
+            ),
+            InstallAttempt::Ran {
+                failed: vec!["no durable path".into()]
+            }
+        );
+        assert_eq!(
+            refresh_install_at(&path, resolve, ClaudeHookGates::default),
+            InstallAttempt::Ran { failed: Vec::new() }
+        );
+        assert!(path.exists());
+    }
+
     #[test]
     fn configured_pins_reads_the_settings_back_without_writing() {
         let dir = crate::test_temp::tempdir().expect("settings tempdir");
