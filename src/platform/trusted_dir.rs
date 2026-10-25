@@ -342,17 +342,24 @@ mod unix {
             {
                 return Err(io::Error::from_raw_os_error(errno));
             }
+            // The system call itself, not glibc's `renameat2` wrapper, which
+            // only glibc 2.28 and later have: the aarch64 release build links
+            // against an older one. A kernel without the call answers
+            // `ENOSYS`, an unsupported rename like any other.
             #[cfg(any(target_os = "linux", target_os = "android"))]
             // SAFETY: live descriptors and valid names; no link is followed.
+            // `renameat2` takes two descriptors, two NUL-terminated paths and
+            // its flags, and returns 0 or -1 with `errno` set.
             cvt(unsafe {
-                libc::renameat2(
+                libc::syscall(
+                    libc::SYS_renameat2,
                     from_fd,
                     f.as_ptr(),
                     to_fd,
                     t.as_ptr(),
-                    libc::RENAME_NOREPLACE as _,
+                    libc::RENAME_NOREPLACE,
                 )
-            })?;
+            } as libc::c_int)?;
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             // SAFETY: as above.
             cvt(unsafe {
