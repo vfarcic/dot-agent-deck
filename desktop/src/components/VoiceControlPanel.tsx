@@ -207,7 +207,7 @@ export const DIALOG_MOVED_ON = "The New agent dialog changed while that was bein
  * re-checks, not a copy of them. Edits the declaration does not carry, such as
  * a typed Name, are not a change of context either.
  */
-export function sameNewAgentDeclaration(a: VoiceNewAgentDto | undefined, b: VoiceNewAgentDto | undefined): boolean {
+function sameNewAgentDeclaration(a: VoiceNewAgentDto | undefined, b: VoiceNewAgentDto | undefined): boolean {
   return (a === undefined) === (b === undefined) && (a?.form === undefined) === (b?.form === undefined);
 }
 
@@ -218,7 +218,7 @@ export function sameNewAgentDeclaration(a: VoiceNewAgentDto | undefined, b: Voic
  * read before it can be answered. A starting value (the PRD's Open Question
  * 2). The countdown is on screen for all of it, and expiry runs nothing.
  */
-export const VOICE_CHOICE_WINDOW_MS = 20_000;
+const VOICE_CHOICE_WINDOW_MS = 20_000;
 
 /**
  * PRD #1261 — what the report says when a pending choice ends without an
@@ -228,16 +228,16 @@ export const VOICE_CHOICE_WINDOW_MS = 20_000;
  * `CLOSED` is the one a non-answer gets, which is then resolved as the
  * ordinary utterance it is, so the report shows both.
  */
-export const VOICE_CHOICE_CLOSED = "Choice closed.";
-export const VOICE_CHOICE_CANCELLED = "Choice cancelled — nothing ran.";
-export const VOICE_CHOICE_EXPIRED = "The choice expired, so nothing ran.";
-export const VOICE_CHOICE_REFUSED = "That is not one of the entries on offer, or it is no longer there, so nothing ran. Say the command again.";
+const VOICE_CHOICE_CLOSED = "Choice closed.";
+const VOICE_CHOICE_CANCELLED = "Choice cancelled — nothing ran.";
+const VOICE_CHOICE_EXPIRED = "The choice expired, so nothing ran.";
+const VOICE_CHOICE_REFUSED = "That is not one of the entries on offer, or it is no longer there, so nothing ran. Say the command again.";
 /**
  * PRD #1261 — the refusal for a bare number or cancel word that is also an
  * offered entry's name (`collidingChoiceEntry`): either reading could be
  * wrong, so the sentence says how to pick that entry unambiguously.
  */
-export function voiceChoiceCollision(entry: number): string {
+function voiceChoiceCollision(entry: number): string {
   return `That is both an entry's name and a number or cancel word, so nothing ran. Say the command again, then click the entry or say “number ${entry}”.`;
 }
 
@@ -248,19 +248,19 @@ export function voiceChoiceCollision(entry: number): string {
  * without a sentence of its own, because the mode's exit already said that
  * nothing was sent and why.
  */
-export const VOICE_MODE_MOVED_ON = "Typing mode changed while that was being worked out, so nothing ran. Say it again.";
+const VOICE_MODE_MOVED_ON = "Typing mode changed while that was being worked out, so nothing ran. Say it again.";
 /**
  * PRD #1260 review — the agent in the pane on screen was replaced by a new one
  * under the same deck and agent id while an utterance was being worked out.
  */
-export const VOICE_PANE_REPLACED = "The agent in this pane was replaced while that was being worked out, so nothing ran. Say it again.";
+const VOICE_PANE_REPLACED = "The agent in this pane was replaced while that was being worked out, so nothing ran. Say it again.";
 /**
  * PRD #1260 review, round 4 — any other reason {@link contextLost} refuses to
  * type into, or press Enter in, a pane before anything was written: a
  * confirmation is open, or the pane on screen is not the one the utterance was
  * declared on.
  */
-export function voiceNothingRan(why: string): string {
+function voiceNothingRan(why: string): string {
   return `Nothing ran — ${why}. Say it again.`;
 }
 /**
@@ -314,14 +314,14 @@ export function voiceQuestionWaitingNoTyping(label: string, reach: QuestionReach
  * PRD #1260 review — a pending one-shot send called off because the agent it
  * would have pressed Enter for was replaced under the same id.
  */
-export function voiceSendReplaced(label: string): string {
+function voiceSendReplaced(label: string): string {
   return `The agent in ${label}'s pane was replaced, so nothing was sent. What was typed went to the agent it replaced.`;
 }
 /**
  * PRD #1260 review, round 3 — a pending one-shot send called off because the
  * context it was typed in moved (see {@link contextLost}).
  */
-export function voiceSendCalledOff(label: string, why: string): string {
+function voiceSendCalledOff(label: string, why: string): string {
   return `Sending to ${label} was called off — ${why}. Nothing was sent; what was typed stays in its prompt.`;
 }
 
@@ -335,13 +335,13 @@ export function voiceSendCalledOff(label: string, why: string): string {
  * daemon replaced the agent under the same id, or the selected deck changed,
  * so the id now names a different agent (or none).
  */
-export const VOICE_CHOICE_AGENT_REPLACED = "The agent you chose was replaced after the choice was offered, so nothing ran. Say the command again.";
+const VOICE_CHOICE_AGENT_REPLACED = "The agent you chose was replaced after the choice was offered, so nothing ran. Say the command again.";
 /**
  * PRD #1261 — PR #1451 review: the agent an entry names was removed from the
  * selected deck after the choice was offered — distinct from a same-id
  * replacement, and refused the same way.
  */
-export const VOICE_CHOICE_AGENT_GONE = "The agent you chose is gone since the choice was offered, so nothing ran. Say the command again.";
+const VOICE_CHOICE_AGENT_GONE = "The agent you chose is gone since the choice was offered, so nothing ran. Say the command again.";
 export const VOICE_CHOICE_DECK_MOVED_ON = "The selected deck changed after the choice was offered, so nothing ran. Say the command again.";
 export const VOICE_CHOICE_SCREEN_MOVED_ON = "You moved to another screen after the choice was offered, so nothing ran. Say the command again here.";
 export const VOICE_CHOICE_DIALOG_MOVED_ON = "The New agent dialog changed after the choice was offered, so nothing ran. Say the command again.";
@@ -353,8 +353,8 @@ export const VOICE_CHOICE_DIALOG_MOVED_ON = "The New agent dialog changed after 
  * another item's. The second is the same for a numbered choice that list
  * offered.
  */
-export const VOICE_NUMBERS_MOVED_ON = "The numbers on screen changed while you were saying that, so nothing ran. Say the number again.";
-export const VOICE_NUMBERS_CHOICE_MOVED_ON = "The numbers on screen changed after the choice was offered, so nothing ran. Say the number again.";
+const VOICE_NUMBERS_MOVED_ON = "The numbers on screen changed while you were saying that, so nothing ran. Say the number again.";
+const VOICE_NUMBERS_CHOICE_MOVED_ON = "The numbers on screen changed after the choice was offered, so nothing ran. Say the number again.";
 /** What a numbered answer's report names as having answered it: the app itself, with no backend asked. */
 const NUMBERS_BACKEND = "local";
 /**
@@ -363,7 +363,7 @@ const NUMBERS_BACKEND = "local";
  * show it ("select daemon 13" while directory 13 is on screen), which the
  * sentence points at without acting on (round 4, D7).
  */
-export function voiceNumberNotShown(number: number, section?: VoiceNumberedSectionKind, elsewhere: readonly VoiceNumberedSectionKind[] = []): string {
+function voiceNumberNotShown(number: number, section?: VoiceNumberedSectionKind, elsewhere: readonly VoiceNumberedSectionKind[] = []): string {
   const item = section === undefined ? "item" : SECTION_NOUNS[section].one;
   /* Zero, and a number too long to say back (Qodo #16 on PR #1451). */
   if (number < 1 || !Number.isSafeInteger(number)) return `No ${item} on screen shows that number, so nothing ran.`;
@@ -373,7 +373,7 @@ export function voiceNumberNotShown(number: number, section?: VoiceNumberedSecti
 }
 
 /** A section said with a number when that section numbers nothing on screen: "mode 2" on the dashboard (round 4, D7). */
-export function voiceSectionNotNumbered(section: VoiceNumberedSectionKind, shown: readonly VoiceNumberedSectionKind[]): string {
+function voiceSectionNotNumbered(section: VoiceNumberedSectionKind, shown: readonly VoiceNumberedSectionKind[]): string {
   const names = shown.map((kind) => SECTION_NOUNS[kind].many);
   const what = names.length > 1 ? `${names.slice(0, -1).join(", ")} and ${names.at(-1)}` : names[0];
   return `No ${SECTION_NOUNS[section].many} are numbered on screen, so nothing ran.${what ? ` The numbers are on ${what}.` : ""}`;
@@ -430,7 +430,7 @@ export const VOICE_CAP_DISCARDED = "That ran to the 30 s limit with no pause in 
  * knows what went wrong. `DISPLAY_LIMITS.message` bounds the pair, eliding with
  * its own marker rather than passing a truncation off as complete.
  */
-export const VOICE_RELEASE_REFUSED = "The microphone may still be open — releasing it was refused. Press Voice again to retry.";
+const VOICE_RELEASE_REFUSED = "The microphone may still be open — releasing it was refused. Press Voice again to retry.";
 
 /**
  * What the report row says before the first utterance (PRD #802).
@@ -453,7 +453,7 @@ export const VOICE_RELEASE_REFUSED = "The microphone may still be open — relea
  * `VOICE_RELEASE_REFUSED`: nothing in the command table knows a user is
  * standing here having said nothing yet.
  */
-export const VOICE_EMPTY_STATE = "Say “what can I say?” for the list, or “voice off” to stop — the Voice button stops it too.";
+const VOICE_EMPTY_STATE = "Say “what can I say?” for the list, or “voice off” to stop — the Voice button stops it too.";
 
 /**
  * PRD #802 D6 — how long the surface waits, with nobody speaking, before it
@@ -547,7 +547,7 @@ export const VOICE_DICTATION_TICK_MS = 1_000;
  * A single trailing space so consecutive utterances do not run together — the
  * agent's input is being appended to, not replaced.
  */
-export function dictationText(transcript: string): string {
+function dictationText(transcript: string): string {
   const typed = transcript.replace(/[\p{Cc}\p{Cf}]+/gu, " ").replace(/\s+/g, " ").trim();
   return typed === "" ? "" : `${typed} `;
 }
@@ -586,6 +586,12 @@ export const VOICE_SUBMIT_SETTLE_MS = 750;
  * the prompt to count. A client constant, not a deck value, because the deck
  * serves the rule and its pacing, and its pause budget is checked against
  * these counts (`desktop/src-tauri/src/dto.rs`, held in step by a drift test).
+ *
+ * No module imports it, but it stays exported: the drift test finds this
+ * declaration by its `export const VOICE_CLEAR_PRESSES` prefix. The tag below
+ * tells knip (`/code-cleanup`) not to report it as an unused export.
+ *
+ * @public
  */
 export const VOICE_CLEAR_PRESSES: Record<"per_line" | "per_wrapped_row", number> = { per_line: 32, per_wrapped_row: 64 };
 /**
@@ -597,8 +603,8 @@ export const VOICE_CLEAR_PRESSES: Record<"per_line" | "per_wrapped_row", number>
  * Only a prompt within that reach is marked empty after a clear, or offered
  * an Undo ({@link clearCovers}).
  */
-export const VOICE_CLEAR_PRESSES_PER_LINE = 2;
-export const VOICE_CLEAR_ROW_COLUMNS = 20;
+const VOICE_CLEAR_PRESSES_PER_LINE = 2;
+const VOICE_CLEAR_ROW_COLUMNS = 20;
 
 /**
  * PRD #1541 (PR #1558 review) — whether `presses` of the clear key, under the
@@ -606,7 +612,7 @@ export const VOICE_CLEAR_ROW_COLUMNS = 20;
  * break and every character outside ASCII as two columns, so a wide character
  * never makes a prompt look shorter than it is.
  */
-export function clearCovers(text: string, rule: "per_line" | "per_wrapped_row", presses: number): boolean {
+function clearCovers(text: string, rule: "per_line" | "per_wrapped_row", presses: number): boolean {
   const lines = text.split(/[\r\n]/);
   if (rule === "per_line") return lines.length * VOICE_CLEAR_PRESSES_PER_LINE <= presses;
   let rows = 0;
@@ -628,7 +634,7 @@ export function clearCovers(text: string, rule: "per_line" | "per_wrapped_row", 
  * prompt's cursor is {@link mouseButtonReported}.
  */
 const TERMINAL_REPORTS = /^(?:\x1b\[[IO]|\x1b\[<\d+;\d+;\d+[Mm]|\x1b\[M[\x20-￿]{3})+$/;
-export function terminalReportsOnly(data: string): boolean {
+function terminalReportsOnly(data: string): boolean {
   return TERMINAL_REPORTS.test(data);
 }
 /** Each mouse report in input, capturing an SGR report's button code or an X10 report's button byte. */
@@ -640,7 +646,7 @@ const MOUSE_REPORT = /\x1b\[<(\d+);\d+;\d+[Mm]|\x1b\[M([\x20-￿])[\x20-￿]{2}/
  * agent's prompt, so voice no longer knows where its words are; focus,
  * motion and wheel reports leave the cursor where it was.
  */
-export function mouseButtonReported(data: string): boolean {
+function mouseButtonReported(data: string): boolean {
   for (const [, sgr, x10] of data.matchAll(MOUSE_REPORT)) {
     const button = sgr !== undefined ? Number(sgr) : x10.codePointAt(0)! - 32;
     if ((button & 32) === 0 && (button & 0xc0) !== 64) return true;
@@ -657,7 +663,7 @@ export const VOICE_INTERRUPT_REPEAT_MS = 3_000;
  * PRD #1541 — the longest write "scratch that" removes, in characters, for
  * every agent; the deck's own `maxLiteralWriteChars` lowers it further.
  */
-export const VOICE_SCRATCH_MAX_CHARS = 800;
+const VOICE_SCRATCH_MAX_CHARS = 800;
 
 /** PRD #1541 — what each command cannot do on an agent the deck served no keys for. */
 const PROMPT_KEY_MISSING = {
@@ -665,12 +671,12 @@ const PROMPT_KEY_MISSING = {
   clear: "clear its prompt",
   scratch: "remove dictated words",
 } as const;
-export function voiceNoPromptKey(label: string, command: keyof typeof PROMPT_KEY_MISSING): string {
+function voiceNoPromptKey(label: string, command: keyof typeof PROMPT_KEY_MISSING): string {
   return `${label} has no voice key to ${PROMPT_KEY_MISSING[command]}.`;
 }
 
 /** PRD #1541 — a prompt command said while another is still waiting or running for the same pane. */
-export function voicePromptCommandPending(label: string): string {
+function voicePromptCommandPending(label: string): string {
   return `${label} already has a voice command pending — wait for it to finish, then say it again.`;
 }
 /** PRD #1541 — why a clear's Undo types nothing back: the prompt changed after the clear. */
@@ -903,14 +909,14 @@ export const VOICE_NOTHING_TO_CLOSE = "Nothing to close — this is the screen i
  * is the worst outcome available. So while dictating the segment is
  * transcribed and typed like any other, and this says it ran to the limit.
  */
-export const VOICE_CAP_TYPED = "That ran to the 30 s limit with no pause in it, so it was typed as one piece.";
+const VOICE_CAP_TYPED = "That ran to the 30 s limit with no pause in it, so it was typed as one piece.";
 
 /**
  * PRD #1260 — what the report says when `type off` was said with no mode on.
  * Rust cannot know — it keeps no memory between utterances — so the surface
  * answers for its own state.
  */
-export const VOICE_NOT_DICTATING = "Not typing to any agent, so there was nothing to stop.";
+const VOICE_NOT_DICTATING = "Not typing to any agent, so there was nothing to stop.";
 
 /**
  * PRD #1260 — the sentences about the dictation mode's own state, which only
@@ -918,12 +924,12 @@ export const VOICE_NOT_DICTATING = "Not typing to any agent, so there was nothin
  * pane that cannot take input. The label is the deck's own text and crosses
  * `displayText` at the render seam like every other free-form string here.
  */
-export function dictationStopped(label: string, why?: string): string {
+function dictationStopped(label: string, why?: string): string {
   return why === undefined
     ? `Typing mode off. Nothing was sent to ${label}.`
     : `Typing mode off — ${why}. Nothing was sent to ${label}.`;
 }
-export function dictationRefused(label: string, reason: string): string {
+function dictationRefused(label: string, reason: string): string {
   return `Typing mode not started for ${label}: ${reason}`;
 }
 
@@ -1135,7 +1141,7 @@ type Lost = { code: "screen" | "dialog" | "mode" | "confirmation" | "pane" | "re
  * every write, so the preview shows it typed); the typing mode refuses such a pane at entry
  * (`startDictation`), where the failure would otherwise repeat every utterance.
  */
-export function contextLost(was: VoiceContext, now: VoiceContext, touches: Touches): Lost | undefined {
+function contextLost(was: VoiceContext, now: VoiceContext, touches: Touches): Lost | undefined {
   if (touches.answer) {
     if (now.screen !== was.screen) return { code: "screen", why: "you moved to another screen" };
     if (!sameNewAgentDeclaration(was.newAgent, now.newAgent) || now.instance !== was.instance) return { code: "dialog", why: "the New agent dialog changed" };
@@ -1574,7 +1580,7 @@ function sentenceOf(cause: unknown): string {
  * measurement nobody took — silence short-circuits before any backend call, and
  * the backend still names what would have answered.
  */
-export function voiceCost(backend: string, ms: number | null): string {
+function voiceCost(backend: string, ms: number | null): string {
   if (ms === null) return backend;
   return `${backend}, ${ms >= 1_000 ? `${(ms / 1_000).toFixed(1)} s` : `${ms} ms`}`;
 }
