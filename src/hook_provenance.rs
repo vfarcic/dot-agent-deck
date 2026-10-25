@@ -298,8 +298,9 @@ pub struct AttestFacts {
     pub unit: Option<String>,
     /// PRD #1666 part 3, round 5 (plan D7): the replacement ticket this
     /// generation was reserved under, when it is a respawned unit terminal's
-    /// successor. Tickets are never reused within a daemon, so it names that
-    /// one replacement.
+    /// successor. Tickets come from a daemon-wide wrapping `u64` counter that
+    /// starts at 1, so a daemon's first 2^64 draws are all distinct and it
+    /// names that one replacement; only a wraparound past them repeats one.
     pub replacement_of: Option<u64>,
 }
 
