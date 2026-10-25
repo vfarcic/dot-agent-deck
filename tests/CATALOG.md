@@ -14,7 +14,7 @@ This is the authoritative list of test cases the harness must cover. IDs are sta
 
 Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows once the harness's Windows path is ready per Decision 4); **mac+linux+windows** = portable from day one.
 
-Tier vocabulary (issue #502, CLAUDE.md rule 5): L1 tests run in the fast tier, `cargo test-fast`. L2 tests are split by whether they reach a **real agent** — **lane 1** is the credential-free `tests/e2e_*.rs` files, `cargo test-e2e`, which CI runs on every PR; **lane-2** entries below are in a file gated `#![cfg(all(feature = "e2e", feature = "e2e-live"))]`, run by `cargo test-e2e-live`, which **runs on a developer's machine and nowhere in CI** — no e2e test reaches a real agent on a runner, and no test credential is registered on this repository (the separately credentialed Codex issue-labeler is out of scope; see [`docs/develop/issue-labeling.md`](../docs/develop/issue-labeling.md)). Lane 2 is where the real-agent tests live and it is flaky-tolerant. Nothing here is a "pre-PR" tier any more — that obligation was removed with #502 — but this catalog is how you find the tests that cover what you changed, which rule 5 still requires you to run and to name. See [`docs/develop/e2e-lanes.md`](../docs/develop/e2e-lanes.md), and note that a lane-2 test whose preflight cannot be satisfied SKIPS and is counted as a pass.
+Tier vocabulary (issue #502, CLAUDE.md rule 5): L1 tests run in the fast tier, `cargo test-fast`. L2 tests are split by whether they reach a **real agent** — **lane 1** is the credential-free `tests/e2e_*.rs` files, `cargo test-e2e`, which CI runs on every PR; **lane-2** entries below are in a file gated `#![cfg(all(feature = "e2e", feature = "e2e-live"))]`, run by `cargo test-e2e-live`, which **runs on a developer's machine and nowhere in CI** — no e2e test reaches a real agent on a runner, and no test credential is registered on this repository (the separately credentialed agent PR reviewer is out of scope; see [`docs/develop/governance.md`](../docs/develop/governance.md#the-automated-reviewer)). Lane 2 is where the real-agent tests live and it is flaky-tolerant. Nothing here is a "pre-PR" tier any more — that obligation was removed with #502 — but this catalog is how you find the tests that cover what you changed, which rule 5 still requires you to run and to name. See [`docs/develop/e2e-lanes.md`](../docs/develop/e2e-lanes.md), and note that a lane-2 test whose preflight cannot be satisfied SKIPS and is counted as a pass.
 
 Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> — <headline>` line opts that test into the PRD #180 demo reel (`.claude/skills/demo-reel-adapter`). Eligibility is **opt-in** — the default (no marker) is *not* eligible even for a PTY-attached test that records a cast. Mark a test only if it validates the feature **as a user actually runs and sees it** — a real agent genuinely spinning up (spawn → agent → work) — never a synthetic/stand-in test (`cat`, scripted echo, recorder stubs, terminal-probe, or synthesized hook events). The adapter includes a marked test in the reel only when it *also* has a cast and its source changed on the branch.
 
@@ -116,7 +116,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### telemetry/otlp/014 — Shell operation metadata classifies safe command shapes without exporting content.
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
 - **Agent:** shell/cat stand-in with synthetic shell-tool and Read hooks.
-- **Asserts:** program/word classification of plain commands, assignments/prefixes/segments, program shape filtering and conditional word filtering, the word deny-list, first-line handling, neither program nor word for comments, command substitutions and variable expansions before the first word, or a shell reserved word or `eval` as the program, on both the Bash and Codex `shell` paths, child identity/duration/count and absence of sentinel, private and raw command text from captured bodies.
+- **Asserts:** program/word classification of plain commands, assignments/prefixes/segments, the commands of a chained line up to the first that declines, the command a listed wrapper runs and no wrapped command for an unlisted one, program shape filtering and conditional word filtering, the word deny-list, first-line handling, neither program nor word for comments, command substitutions and variable expansions before the first word, or a shell reserved word or `eval` as the program, on both the Bash and Codex `shell` paths, child identity/duration/count and absence of sentinel, private and raw command text from captured bodies.
 - **Does not assert:** native hook availability for each agent or nested shell grammar.
 - **Platform coverage:** mac+linux.
 
@@ -12769,6 +12769,19 @@ PRD #1666 part 3, round 5: where the deck keeps a worker's report, or a dispatch
 - **Why it exists:** reviewer U3-3/U3-5, auditor U3-3/U3-5: conservative accounting, complete-scan-only recounts.
 - **Does not assert:** a same-user process writing a file under a valid adopted name, which is charged from the next sweep (a stated limit).
 - **Platform coverage:** mac+linux.
+
+## Desktop native driver scenarios
+
+These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[spec]` scanner, and run in CI's advisory `desktop-driver` job. `docs/develop/desktop-gui.md` ("The driver tier") describes the harness.
+
+##### desktop/fleet/001 — All Decks shows two real daemons apart, and one stopping is that deck's problem alone.
+
+- **Test:** `desktop/driver/fleet.test.ts`, `fleet_001`.
+- **Layer:** native Tauri/WebKitGTK driver (`tauri-driver` and `WebKitWebDriver` under Xvfb) against two real `daemon serve` processes. The second is reached as a remote deck through the app's own `ssh -N -L` tunnel to a loopback `sshd` the harness runs; the window runs under `nss_wrapper` so the app's strict host-key check reads the sandbox's `known_hosts`.
+- **Agent:** none; one `bash --noprofile --norc` per daemon, started over its attach socket. No credential.
+- **Asserts:** both daemons give their agent the same id (required, not assumed); with All Decks selected the window shows two connected sections, each holding only its own deck's row, with both lamps connected and the deck counter at `2/2`; after the far daemon is stopped, its section stays, reads disconnected with a disconnected lamp and lists no agents, while the local deck keeps exactly its own row and its connected lamp, and the counter reads `1/2`.
+- **Does not assert:** three or more decks, a deck waiting to report, an unconfigured deck-list row, a deck coming back, New agent or a pane on the far deck, or a far deck on another machine; the far deck shares this machine's filesystem, so it says nothing about a window rendering a far host's paths.
+- **Platform coverage:** Linux WebKitGTK only. Needs a system `sshd` (`DAD_DRIVER_SSHD`) and `libnss_wrapper.so` (`DAD_DRIVER_NSS_WRAPPER`); the scenario fails naming whichever is missing.
 
 ## Desktop native network scenarios
 

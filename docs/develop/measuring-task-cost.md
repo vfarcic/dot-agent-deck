@@ -69,6 +69,17 @@ When the invocation names a level (N=1, N=3, N=5):
 - **`time -v`'s max RSS is the largest single process, not a sum.** At N>1 total memory is the binding constraint and only the box sampler can see it. Do not present your peak as the machine's.
 - **Record your own start time** so "N=3" means three agents actually overlapping, rather than one finishing before another began.
 
+## Measuring a build-configuration lever
+
+Issues #864 and #927 compared debug-info settings, `sccache`, a shared target directory and seeded worktrees; the results and the cold-build baseline for a fresh dispatch worktree are in [`build-gate.md`](build-gate.md#not-doing-the-work-twice-debug-info-sccache-a-shared-target-directory-seeded-worktrees). These are what that run got wrong once, or nearly did:
+
+- **Give every variant its own fresh `CARGO_TARGET_DIR`** on a disk-backed path (CLAUDE.md rule 14), and say when one run had a head start, such as a test build after `cargo clippy` had already built the build scripts and proc macros the two share.
+- **`cargo --config K=V nextest run` does not reach the build nextest runs.** The override applies to the outer `cargo` only, so the "variant" builds the default configuration; it showed up as a dependency `.rlib` of exactly the default's size. Put `--config` after `nextest run`, which passes it on, or use the `CARGO_PROFILE_*` variables, which the inner build inherits.
+- **A configuration edit in the worktree applies to the baseline too.** Once `.cargo/config.toml` carries the change, a "baseline" build from that checkout is a variant build. Measure the baseline before the edit, or from a checkout without it.
+- **Peak memory per link** needs a linker wrapper: point `DAD_LINKER` at a script that runs `cc` under `/usr/bin/time -a -o <log> -f '%e %M <output>'`. `DAD_LINKER` turns off `link-gate.sh`'s mold injection, so the wrapper has to pass `-fuse-ld=mold` itself, plus `-Wl,--no-fork`, without which mold's working process is not the one `time` measures. The link gate still applies around it.
+- **Under `sccache`, `/usr/bin/time` undercounts CPU**, because the compiles run as children of the `sccache` server rather than of `cargo`. Compare wall time across a wrapper boundary, not CPU.
+- **A target directory from another worktree rebuilds everything.** The `linker` path in `.cargo/config.toml` is resolved per checkout and is part of every unit's fingerprint, so copying or sharing a target directory between worktrees reuses nothing unless the linker path is made the same in both (`CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER`, as the seeding measurement did).
+
 ## Evidence, not recollection
 
 Paste real command output. Where you cannot evidence something and are estimating, **say so and label it an estimate** — a soft number labelled soft is useful; a soft number presented as hard is worse than none.

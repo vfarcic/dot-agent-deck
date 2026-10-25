@@ -689,9 +689,13 @@ describe("PRD #1401 — the pull request browser by voice", () => {
   it("hides the PR page under real voice help and leaves Escape to help", async () => {
     const { host } = fakeHost();
     await openVoiceHelp(host);
-    await act(async () => { await Promise.resolve(); });
-    expect.soft(screen.getByTestId("pr-browser")).toHaveAttribute("data-covered", "true");
-    expect.soft(host.setVisible).toHaveBeenLastCalledWith(false);
+    /* Coverage arrives through a MutationObserver, so React applies it on a
+       later task, not within one microtask; until it does, the PR's own Escape
+       handler is still armed and would close the PR instead of the help. */
+    await waitFor(() => {
+      expect(screen.getByTestId("pr-browser")).toHaveAttribute("data-covered", "true");
+      expect(host.setVisible).toHaveBeenLastCalledWith(false);
+    });
     fireEvent.keyDown(window, { key: "Escape" });
     expect.soft(screen.queryByTestId("voice-help")).not.toBeInTheDocument();
     expect(screen.queryByTestId("pr-browser"), "Escape must preserve the PR underneath voice help").toBeInTheDocument();

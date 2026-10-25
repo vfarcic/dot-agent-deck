@@ -21,7 +21,7 @@
 //!
 //! **A shell command is an `agent.operation`**, from the shell tool's start to
 //! its end as the agent's hooks report them. Its command text is classified
-//! as the event arrives ([`super::operation::classify_tool`]) and only the
+//! as the event arrives ([`super::operation::describe_tool`]) and only the
 //! classification is kept: the copy of the event the tracker holds — in a
 //! run's cards, or waiting for its run to open — has the tool's detail and the
 //! command taken out.
@@ -47,7 +47,7 @@ use crate::event::{AgentEvent, AgentType, DAEMON_PANE_CLOSED_METADATA_KEY, Event
 use crate::state::{AppState, SessionStatus};
 
 use super::ci::{CiEffect, RunCi};
-use super::operation::{Operation, classify_tool, is_shell_tool};
+use super::operation::{Description, describe_tool, is_shell_tool};
 use super::run_context::RunContext;
 use super::span::{
     Attribute, SpanEventRecord, SpanId, SpanRecord, TraceId, new_span_id, new_trace_id,
@@ -203,7 +203,7 @@ struct OpenStatus {
 struct OpenOperation {
     span_id: SpanId,
     start: u64,
-    operation: Operation,
+    operation: Description,
     /// The agent's id for the call, when it reports one.
     call_id: Option<String>,
 }
@@ -797,7 +797,7 @@ fn observe_operation(
                 operation: kept
                     .operation
                     .clone()
-                    .unwrap_or_else(|| classify_tool(event.tool_name.as_deref(), None)),
+                    .unwrap_or_else(|| describe_tool(event.tool_name.as_deref(), None)),
                 call_id: call_id.cloned(),
             });
         }
@@ -829,14 +829,21 @@ fn observe_operation(
 /// command it starts, made before those were taken out.
 struct KeptEvent {
     event: AgentEvent,
-    operation: Option<Operation>,
+    operation: Option<Description>,
 }
 
 impl KeptEvent {
     fn of(event: &AgentEvent) -> Self {
+        // Claude Code's hook cuts `tool_detail` at 120 bytes and keeps the
+        // whole command beside it, which the later commands of a long line
+        // need.
+        let command = event
+            .metadata
+            .get(BASH_COMMAND_METADATA_KEY)
+            .or(event.tool_detail.as_ref());
         let operation = (event.event_type == EventType::ToolStart
             && is_shell_tool(event.tool_name.as_deref()))
-        .then(|| classify_tool(event.tool_name.as_deref(), event.tool_detail.as_deref()));
+        .then(|| describe_tool(event.tool_name.as_deref(), command.map(String::as_str)));
         let mut event = AgentEvent {
             tool_detail: None,
             ..event.clone()
@@ -990,13 +997,26 @@ fn status_span(run: &ActiveRun, open: OpenStatus, now: u64) -> SpanRecord {
 
 fn operation_span(run: &ActiveRun, open: OpenOperation, now: u64) -> SpanRecord {
     let mut attributes = identity_attributes(&run.start_info);
+    let described = &open.operation;
     attributes.extend(Attribute::opt_str(
         AttrKey::OperationProgram,
-        open.operation.program.as_deref(),
+        described.operation.program.as_deref(),
     ));
     attributes.extend(Attribute::opt_str(
         AttrKey::OperationWord,
-        open.operation.word.as_deref(),
+        described.operation.word.as_deref(),
+    ));
+    attributes.extend(Attribute::opt_str(
+        AttrKey::OperationCommands,
+        described.commands_value().as_deref(),
+    ));
+    attributes.extend(Attribute::opt_str(
+        AttrKey::OperationWrappedProgram,
+        described.wrapped.program.as_deref(),
+    ));
+    attributes.extend(Attribute::opt_str(
+        AttrKey::OperationWrappedWord,
+        described.wrapped.word.as_deref(),
     ));
     SpanRecord {
         trace_id: run.trace_id,
@@ -1842,12 +1862,100 @@ pub(crate) mod tests {
             .collect()
     }
 
+    /// The attributes of a line of one command.
     fn op_attrs(program: Option<&str>, word: Option<&str>) -> Vec<Attribute> {
         let mut out = Attribute::opt_str(AttrKey::OperationProgram, program)
             .into_iter()
             .collect::<Vec<_>>();
         out.extend(Attribute::opt_str(AttrKey::OperationWord, word));
+        let command = program.map(|p| word.map_or(p.to_string(), |w| format!("{p} {w}")));
+        out.extend(Attribute::opt_str(
+            AttrKey::OperationCommands,
+            command.as_deref(),
+        ));
         out
+    }
+
+    /// A chained line's span names each of its commands, and a wrapper's the
+    /// command it runs, besides the first command's program and word.
+    #[test]
+    fn a_chained_or_wrapped_line_names_its_commands() {
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        for (t, (kind, command)) in [
+            (
+                EventType::ToolStart,
+                "cargo fmt && cargo xtask affected-checks --run",
+            ),
+            (
+                EventType::ToolEnd,
+                "cargo fmt && cargo xtask affected-checks --run",
+            ),
+            (EventType::ToolStart, "cd x && timeout 600 cargo test"),
+            (EventType::ToolEnd, "cd x && timeout 600 cargo test"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            tracker.observe_event(
+                &shell("p1", kind, "Bash", Some(command), None),
+                10 + t as u64,
+            );
+        }
+        tracker.end_run("p1", EndReason::Exited, None, 100);
+        let str_attr = |key, value: &str| Attribute::str(key, value);
+        assert_eq!(
+            operations(&tracker.take_finished()),
+            vec![
+                (
+                    vec![
+                        str_attr(AttrKey::OperationProgram, "cargo"),
+                        str_attr(AttrKey::OperationWord, "fmt"),
+                        str_attr(AttrKey::OperationCommands, "cargo fmt,cargo xtask"),
+                    ],
+                    10,
+                    11
+                ),
+                (
+                    vec![
+                        str_attr(AttrKey::OperationProgram, "timeout"),
+                        str_attr(AttrKey::OperationWord, "600"),
+                        str_attr(AttrKey::OperationCommands, "timeout 600"),
+                        str_attr(AttrKey::OperationWrappedProgram, "cargo"),
+                        str_attr(AttrKey::OperationWrappedWord, "test"),
+                    ],
+                    12,
+                    13
+                ),
+            ]
+        );
+    }
+
+    /// A line longer than the hook's cut `tool_detail` is described from the
+    /// whole command the hook keeps beside it.
+    #[test]
+    fn a_long_line_is_described_from_the_whole_command() {
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        let line = format!("git commit -m '{}' && cargo test", "x".repeat(150));
+        let mut begin = shell("p1", EventType::ToolStart, "Bash", Some(&line[..120]), None);
+        begin.tool_detail = Some(format!("{}…", &line[..120]));
+        begin
+            .metadata
+            .insert(BASH_COMMAND_METADATA_KEY.into(), line.clone());
+        tracker.observe_event(&begin, 10);
+        tracker.observe_event(&shell("p1", EventType::ToolEnd, "Bash", None, None), 11);
+        tracker.end_run("p1", EndReason::Exited, None, 100);
+        let ops = operations(&tracker.take_finished());
+        assert_eq!(ops.len(), 1);
+        assert!(
+            ops[0].0.contains(&Attribute::str(
+                AttrKey::OperationCommands,
+                "git commit,cargo test"
+            )),
+            "{:?}",
+            ops[0].0
+        );
     }
 
     /// One `agent.operation` per shell command, from its start to its end,

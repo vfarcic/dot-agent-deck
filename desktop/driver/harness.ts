@@ -10,7 +10,19 @@
 // on the wrong thing.
 
 import { type ChildProcess, execFile, spawn } from "node:child_process";
-import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  accessSync,
+  closeSync,
+  constants,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { readFile } from "node:fs/promises";
 import { connect, createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
@@ -74,7 +86,46 @@ const paths = {
   xclip: process.env.DAD_DRIVER_XCLIP ?? "xclip",
   xdotool: process.env.DAD_DRIVER_XDOTOOL ?? "xdotool",
   results: process.env.DAD_DRIVER_RESULTS ?? join(REPO_ROOT, "desktop", "driver-results"),
+  // Issue #1356 — what the far deck's loopback `sshd` needs. Resolved when a
+  // scenario asks for a far deck, so the others need none of it.
+  sshd: process.env.DAD_DRIVER_SSHD,
+  sshKeygen: process.env.DAD_DRIVER_SSH_KEYGEN ?? "ssh-keygen",
+  nssWrapper: process.env.DAD_DRIVER_NSS_WRAPPER,
 };
+
+/**
+ * Issue #1356 — where a system `sshd` is looked for: absolute paths, since it
+ * is normally on no ordinary user's PATH. The list `tests/e2e_remote_deck_transport.rs`
+ * uses, Linux's half of it.
+ */
+const SSHD_CANDIDATES = ["/usr/sbin/sshd", "/usr/bin/sshd", "/usr/libexec/sshd", "/usr/local/sbin/sshd", "/run/current-system/sw/bin/sshd"];
+
+/**
+ * The `ssh` the app's tunnel runs: `SSH_PROGRAM_CANDIDATES` in
+ * `src/remote_tunnel.rs`, first executable wins. The preflight runs the same
+ * one, so a login it proves is the login the tunnel will make.
+ */
+const SSH_CANDIDATES = ["/usr/bin/ssh", "/bin/ssh", "/usr/local/bin/ssh", "/opt/homebrew/bin/ssh", "/opt/local/bin/ssh", "/run/current-system/sw/bin/ssh"];
+
+/** Where `libnss_wrapper.so` is looked for: apt's `libnss-wrapper` and the usual multilib layouts. */
+const NSS_WRAPPER_CANDIDATES = [
+  "/usr/lib/x86_64-linux-gnu/libnss_wrapper.so",
+  "/usr/lib/aarch64-linux-gnu/libnss_wrapper.so",
+  "/usr/lib64/libnss_wrapper.so",
+  "/usr/lib/libnss_wrapper.so",
+];
+
+/** The first of `candidates` this process could execute or read, or `undefined`. */
+function firstAccessible(candidates: string[], mode: number): string | undefined {
+  return candidates.find((candidate) => {
+    try {
+      accessSync(candidate, mode);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+}
 
 /**
  * Poll `probe` until it returns something other than `undefined`, `null` or
@@ -147,11 +198,11 @@ async function nativeDriverBindFailure(log: string): Promise<string | undefined>
     ?.trim();
 }
 
-function run(file: string, args: string[], env: NodeJS.ProcessEnv): Promise<{ code: number; stdout: string }> {
+function run(file: string, args: string[], env: NodeJS.ProcessEnv): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((settle) => {
-    execFile(file, args, { env, timeout: WAIT_MS }, (error, stdout) => {
+    execFile(file, args, { env, timeout: WAIT_MS }, (error, stdout, stderr) => {
       const code = error ? (typeof error.code === "number" ? error.code : 1) : 0;
-      settle({ code, stdout });
+      settle({ code, stdout, stderr });
     });
   });
 }
@@ -251,6 +302,33 @@ function request(socketPath: string, payload: unknown, onResponse?: (response: A
   });
 }
 
+/**
+ * Issue #1356 — start `command` as an agent on the daemon behind `socketPath`,
+ * the way the TUI does, over the attach protocol and not through any window.
+ */
+async function startAgent(socketPath: string, command: string, cwd: string, displayName: string): Promise<void> {
+  (
+    await request(socketPath, {
+      op: "start-agent",
+      command,
+      cwd,
+      rows: 24,
+      cols: 80,
+      env: [],
+      display_name: displayName,
+    })
+  ).destroy();
+}
+
+type DaemonAgent = { agent_id: string; cwd?: string; label?: string };
+
+/** A daemon's own view of its agents, from the CLI rather than the window. */
+async function daemonAgents(env: NodeJS.ProcessEnv): Promise<DaemonAgent[]> {
+  const { code, stdout } = await run(paths.daemon, ["daemon", "status", "--json"], env);
+  if (code !== 0) throw new Error(`daemon status exited ${code}`);
+  return (JSON.parse(stdout) as { agents: DaemonAgent[] }).agents;
+}
+
 /** What a scenario's deck is configured with. */
 /** One mounted terminal, as the build-gated seam's `terminalScreens()` reports it. */
 type TerminalScreen = {
@@ -269,6 +347,12 @@ export type DeckOptions = {
   defaultCommand?: string;
   /** Explicit process overrides for a native-driver scenario (e.g. a system-browser recorder). */
   env?: NodeJS.ProcessEnv;
+  /**
+   * Issue #1356 — also start a second daemon, reached as a configured remote
+   * deck through a loopback `sshd` this harness runs (see `FarDeck`), and open
+   * the window with All Decks selected.
+   */
+  farDeck?: boolean;
 };
 
 export class Deck {
@@ -277,6 +361,10 @@ export class Deck {
   readonly project: string;
   readonly env: NodeJS.ProcessEnv;
   session!: Session;
+  /** Issue #1356 — the second daemon, when the scenario asked for one. */
+  far?: FarDeck;
+  /** What the window runs under: `env`, plus what a far deck adds for the app's `ssh` alone. */
+  private windowEnv?: NodeJS.ProcessEnv;
   private daemon?: ChildProcess;
   private driver?: ChildProcess;
   /** Issue #1457 — the app window whose focus this page follows, once `setWindowFocus` has found it. */
@@ -340,6 +428,10 @@ export class Deck {
     const deck = new Deck(realpathSync(mkdtempSync(join(tmpdir(), "dad-driver-"))), options);
     try {
       if (options.daemonFirst) await deck.startDaemon();
+      if (options.farDeck) {
+        deck.far = await FarDeck.start(deck.sandbox, deck.env);
+        deck.windowEnv = deck.far.windowEnv;
+      }
       await deck.startWindow();
     } catch (error) {
       await deck.close(error, name);
@@ -368,7 +460,7 @@ export class Deck {
     this.driver = launch(
       paths.tauriDriver,
       ["--port", String(port), "--native-port", String(nativePort), "--native-driver", paths.nativeDriver],
-      this.env,
+      this.windowEnv ?? this.env,
       driverLog,
     );
     const base = `http://127.0.0.1:${port}`;
@@ -656,10 +748,13 @@ export class Deck {
   }
 
   /** The daemon's own view of its agents, from the CLI rather than the window. */
-  async daemonAgents(): Promise<{ agent_id: string; cwd?: string; label?: string }[]> {
-    const { code, stdout } = await run(paths.daemon, ["daemon", "status", "--json"], this.env);
-    if (code !== 0) throw new Error(`daemon status exited ${code}`);
-    return (JSON.parse(stdout) as { agents: { agent_id: string; cwd?: string; label?: string }[] }).agents;
+  async daemonAgents(): Promise<DaemonAgent[]> {
+    return daemonAgents(this.env);
+  }
+
+  /** Issue #1356 — start `command` in `cwd` on this deck's daemon over its attach socket. */
+  async startAgent(command: string, cwd: string, displayName: string): Promise<void> {
+    await startAgent(this.env.DOT_AGENT_DECK_ATTACH_SOCKET as string, command, cwd, displayName);
   }
 
   /** Issue #1457 — what every mounted terminal's xterm holds as its selection, for a failure message. */
@@ -818,6 +913,7 @@ export class Deck {
       await run(paths.daemon, ["daemon", "stop", "--force"], this.env);
       await stopChild(this.daemon);
     }
+    await this.far?.close();
     if (failure === undefined) rmSync(this.sandbox, { recursive: true, force: true });
   }
 
@@ -833,14 +929,363 @@ export class Deck {
     } catch (error) {
       writeFileSync(join(dir, "capture-error.txt"), String(error));
     }
-    for (const log of ["daemon.out", "driver.log", "deck.log", join("state", "daemon.log")]) {
+    // Every scenario's far-deck paths, not only those whose far deck came up:
+    // a far deck that failed to start has the logs that say why, and a
+    // scenario without one has none of these files to copy.
+    for (const log of ["daemon.out", "driver.log", "deck.log", join("state", "daemon.log"), ...FarDeck.LOGS]) {
       try {
-        writeFileSync(join(dir, log.replace("/", "-")), readFileSync(join(this.sandbox, log)));
+        writeFileSync(join(dir, log.replaceAll("/", "-")), readFileSync(join(this.sandbox, log)));
       } catch {
         // Not every scenario produces every log.
       }
     }
     writeFileSync(join(dir, "sandbox.txt"), `${this.sandbox}\n`);
+  }
+}
+
+/**
+ * Issue #1356 — a second real daemon that the window reaches the way it
+ * reaches every deck but its local one: a row in the deck list
+ * (`remotes.toml`), carried by the app's own `ssh -N -L` child to the far
+ * daemon's attach socket. The far end is an `sshd` this harness runs: its own
+ * host key, its own `authorized_keys` naming a keypair generated here, on an
+ * ephemeral loopback port, as the current user — the approach
+ * `tests/e2e_remote_deck_transport.rs` (`fleet/observe/002`) takes.
+ *
+ * What that file could do and this one cannot is hand the tunnel a different
+ * `ssh`: the app resolves its own from `SSH_PROGRAM_CANDIDATES`, and its
+ * forced `StrictHostKeyChecking=yes` is anchored at `~/.ssh/known_hosts` —
+ * which OpenSSH expands against `getpwuid()`'s home, not `$HOME`, so the
+ * sandbox `HOME` does not move it. Writing the generated host key into the
+ * operator's real `~/.ssh` is not a trade a test may make. So the window runs
+ * under `nss_wrapper` (cwrap's `LD_PRELOAD` library, made for exactly this),
+ * whose passwd file gives this uid the sandbox home: the app's `ssh` finds the
+ * one `known_hosts` line written here, and strict checking still runs — the
+ * tunnel would not come up if the key did not match. Measured both ways
+ * before relying on it: the same `ssh -o BatchMode=yes -o
+ * StrictHostKeyChecking=yes` login failed with "No ED25519 host key is known"
+ * without the wrapper and succeeded with it.
+ *
+ * Only the window gets the wrapper (`windowEnv`), with `XDG_RUNTIME_DIR` moved
+ * into the sandbox, because the tunnel's start-up sweep deletes stale sockets
+ * under `$XDG_RUNTIME_DIR/dot-agent-deck/tunnels` and must not reach the
+ * operator's. `SSH_AUTH_SOCK` is dropped, so the generated key is the only one
+ * offered. The daemons, the `sshd` and every CLI call run without the wrapper.
+ */
+export class FarDeck {
+  /** The far deck's name in the deck list, which the window shows as its group's name. */
+  static readonly NAME = "far-deck";
+  /** The far side's logs, relative to the sandbox, for a failure's evidence. */
+  static readonly LOGS = [
+    join("far", "daemon.out"),
+    join("far", "deck.log"),
+    join("far", "state", "daemon.log"),
+    join("ssh", "sshd.log"),
+    join("ssh", "sshd.out"),
+  ];
+
+  /** The far daemon's own environment: every socket, state dir and home its own. */
+  readonly env: NodeJS.ProcessEnv;
+  /** A directory the far deck's agent runs in, distinct from the local deck's. */
+  readonly project: string;
+  /** What the window runs under — see the class comment. Set once the far end is up. */
+  windowEnv!: NodeJS.ProcessEnv;
+  private readonly sandbox: string;
+  /** The window's deck's environment, which the far deck's own is derived from. */
+  private readonly deckEnv: NodeJS.ProcessEnv;
+  private readonly tools: { sshd: string; ssh: string; nssWrapper: string };
+  private readonly far: string;
+  private readonly ssh: string;
+  private daemon?: ChildProcess;
+  private sshd?: ChildProcess;
+
+  private constructor(sandbox: string, deckEnv: NodeJS.ProcessEnv, tools: { sshd: string; ssh: string; nssWrapper: string }) {
+    this.sandbox = sandbox;
+    this.deckEnv = deckEnv;
+    this.tools = tools;
+    this.far = join(sandbox, "far");
+    this.ssh = join(sandbox, "ssh");
+    this.project = join(this.far, "far-project");
+    mkdirSync(this.project, { recursive: true });
+    mkdirSync(join(this.far, "home"));
+    mkdirSync(join(this.far, "state"));
+    mkdirSync(this.ssh, { mode: 0o700 });
+    writeFileSync(join(this.far, "config.toml"), `default_dir = ${JSON.stringify(this.project)}\n`);
+    const home = join(this.far, "home");
+    this.env = {
+      ...deckEnv,
+      HOME: home,
+      XDG_CONFIG_HOME: join(home, ".config"),
+      XDG_CACHE_HOME: join(home, ".cache"),
+      XDG_DATA_HOME: join(home, ".local", "share"),
+      XDG_STATE_HOME: join(home, ".local", "state"),
+      DOT_AGENT_DECK_ATTACH_SOCKET: join(this.far, "attach.sock"),
+      DOT_AGENT_DECK_SOCKET: join(this.far, "hook.sock"),
+      DOT_AGENT_DECK_STATE_DIR: join(this.far, "state"),
+      DOT_AGENT_DECK_SESSION: join(this.far, "session.toml"),
+      DOT_AGENT_DECK_SCHEDULES: join(this.far, "schedules.toml"),
+      DOT_AGENT_DECK_LOG: join(this.far, "deck.log"),
+      DOT_AGENT_DECK_DESKTOP_CONFIG: join(this.far, "desktop.toml"),
+      DOT_AGENT_DECK_CONFIG: join(this.far, "config.toml"),
+    };
+  }
+
+  /**
+   * Start the far daemon and its `sshd`, register it in the window's deck list
+   * with All Decks selected, and prove the login the tunnel will make before
+   * any window depends on it. Everything it started is stopped if it throws.
+   */
+  static async start(sandbox: string, deckEnv: NodeJS.ProcessEnv): Promise<FarDeck> {
+    const sshd = paths.sshd ?? firstAccessible(SSHD_CANDIDATES, constants.X_OK);
+    const ssh = firstAccessible(SSH_CANDIDATES, constants.X_OK);
+    const nssWrapper = paths.nssWrapper ?? firstAccessible(NSS_WRAPPER_CANDIDATES, constants.R_OK);
+    if (!sshd) throw new Error(`no sshd at ${SSHD_CANDIDATES.join(", ")} (apt: openssh-server, or set DAD_DRIVER_SSHD)`);
+    if (!ssh) throw new Error(`no ssh at ${SSH_CANDIDATES.join(", ")}, where the app's tunnel looks for one`);
+    if (!nssWrapper) {
+      throw new Error(
+        `no libnss_wrapper.so at ${NSS_WRAPPER_CANDIDATES.join(", ")} (apt: libnss-wrapper, or set ` +
+          "DAD_DRIVER_NSS_WRAPPER; docs/develop/desktop-gui.md's driver tier says how to get one without root)",
+      );
+    }
+    const far = new FarDeck(sandbox, deckEnv, { sshd, ssh, nssWrapper });
+    try {
+      await far.startDaemon();
+      const { port, clientKey } = await far.startSshd();
+      await far.configureWindow(port, clientKey);
+      await far.proveLogin(port, clientKey);
+    } catch (error) {
+      await far.close();
+      throw error;
+    }
+    return far;
+  }
+
+  /** Start the far `daemon serve` and wait until it answers a Hello, as `Deck.startDaemon` does. */
+  private async startDaemon(): Promise<void> {
+    this.daemon = launch(paths.daemon, ["daemon", "serve"], this.env, join(this.far, "daemon.out"));
+    await waitFor("the far daemon to answer a Hello", async () => {
+      assertRunning(this.daemon, "the far daemon");
+      return (await run(paths.daemon, ["daemon", "endpoint"], this.env)).code === 0;
+    });
+  }
+
+  /**
+   * Generate the keys, start `sshd` on a free loopback port and wait for its
+   * own log to say it is listening. That wait is on a line rather than a
+   * probe connection, because OpenSSH 9.8+ penalises a source address for a
+   * connection that never authenticates, and a readiness probe would be one.
+   * A lost race for the port is retried on another port, a few times.
+   */
+  private async startSshd(): Promise<{ port: number; clientKey: string }> {
+    const hostKey = join(this.ssh, "hostkey");
+    const clientKey = join(this.ssh, "clientkey");
+    for (const key of [hostKey, clientKey]) {
+      const { code, stderr } = await run(paths.sshKeygen, ["-q", "-t", "ed25519", "-N", "", "-C", "dad-driver", "-f", key], this.deckEnv);
+      if (code !== 0) throw new Error(`${paths.sshKeygen} exited ${code} generating ${key}: ${stderr.trim()}`);
+    }
+    const authorizedKeys = join(this.ssh, "authorized_keys");
+    writeFileSync(authorizedKeys, readFileSync(`${clientKey}.pub`), { mode: 0o600 });
+    const log = join(this.ssh, "sshd.log");
+    let last = "";
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const [port] = await freePorts(1);
+      const config = join(this.ssh, "sshd_config");
+      // A private sshd: its own key material and port, no PAM, no password
+      // login, nothing the tunnel does not need. `StrictModes no` because the
+      // key files are in the sandbox rather than under a `~/.ssh`;
+      // `AllowStreamLocalForwarding` because the tunnel forwards a Unix socket.
+      writeFileSync(
+        config,
+        [
+          `Port ${port}`,
+          "ListenAddress 127.0.0.1",
+          `HostKey ${hostKey}`,
+          `AuthorizedKeysFile ${authorizedKeys}`,
+          "PidFile none",
+          "StrictModes no",
+          "UsePAM no",
+          "PasswordAuthentication no",
+          "KbdInteractiveAuthentication no",
+          "PubkeyAuthentication yes",
+          // `yes`, though the tunnel forwards no TCP: measured, OpenSSH 10.2
+          // denied the Unix-socket `-L` ("open failed") with this `no`, even
+          // beside `AllowStreamLocalForwarding yes`.
+          "AllowTcpForwarding yes",
+          "AllowStreamLocalForwarding yes",
+          "X11Forwarding no",
+          "PrintMotd no",
+          "LogLevel VERBOSE",
+          "",
+        ].join("\n"),
+      );
+      writeFileSync(log, "");
+      // Its own process group, so teardown reaches the per-connection
+      // children it forks with one signal to this group and no other.
+      const fd = openSync(join(this.ssh, "sshd.out"), "a");
+      const sshd = spawn(this.tools.sshd, ["-D", "-f", config, "-E", log], { env: this.deckEnv, stdio: ["ignore", fd, fd], detached: true });
+      closeSync(fd);
+      sshd.once("error", (error) => {
+        (sshd as ChildProcess & { launchError?: Error }).launchError = error;
+      });
+      this.sshd = sshd;
+      const listening = `Server listening on 127.0.0.1 port ${port}`;
+      const up = await waitFor("the far deck's sshd to listen", async () => {
+        if ((await readFile(log, "utf8")).includes(listening)) return "listening";
+        try {
+          assertRunning(sshd, "sshd");
+        } catch (error) {
+          return (error as Error).message;
+        }
+        return undefined;
+      });
+      if (up === "listening") return { port, clientKey };
+      last = `attempt ${attempt}: ${up}; sshd said: ${readFileSync(log, "utf8").trim()}`;
+      await this.stopSshd();
+    }
+    throw new Error(`the far deck's sshd would not come up: ${last}`);
+  }
+
+  /**
+   * Write what the window reads: the host key's one `known_hosts` line in the
+   * window's sandbox home, the passwd and group files that make that home
+   * `getpwuid()`'s answer, the deck list naming the far daemon, and
+   * `desktop.toml` selecting All Decks.
+   */
+  private async configureWindow(port: number, clientKey: string): Promise<void> {
+    const home = this.deckEnv.HOME as string;
+    mkdirSync(join(home, ".ssh"), { mode: 0o700 });
+    // From the generated key rather than `ssh-keyscan`, which would ask the
+    // server for its key and then believe the answer. `[host]:port` is how
+    // OpenSSH keys a non-default port.
+    const [algorithm, material] = readFileSync(join(this.ssh, "hostkey.pub"), "utf8").trim().split(/\s+/);
+    writeFileSync(join(home, ".ssh", "known_hosts"), `[127.0.0.1]:${port} ${algorithm} ${material}\n`, { mode: 0o600 });
+
+    const lookup = async (database: string, key: number) => {
+      const { code, stdout } = await run("getent", [database, String(key)], this.deckEnv);
+      if (code !== 0) throw new Error(`getent ${database} ${key} exited ${code}`);
+      return stdout.trim();
+    };
+    const uid = process.getuid?.() ?? 0;
+    const gid = process.getgid?.() ?? 0;
+    const user = (await lookup("passwd", uid)).split(":");
+    user[5] = home;
+    const passwd = [user.join(":")];
+    const group = [await lookup("group", gid)];
+    if (uid !== 0) passwd.push(await lookup("passwd", 0));
+    if (gid !== 0) group.push(await lookup("group", 0));
+    const nss = join(this.sandbox, "nss");
+    mkdirSync(nss);
+    writeFileSync(join(nss, "passwd"), `${passwd.join("\n")}\n`);
+    writeFileSync(join(nss, "group"), `${group.join("\n")}\n`);
+
+    const version = (await run(paths.daemon, ["--version"], this.deckEnv)).stdout.trim().split(/\s+/).pop() ?? "0.0.0";
+    const remotes = join(this.sandbox, "remotes.toml");
+    writeFileSync(
+      remotes,
+      [
+        "[[remotes]]",
+        `name = ${JSON.stringify(FarDeck.NAME)}`,
+        'type = "ssh"',
+        'host = "127.0.0.1"',
+        `port = ${port}`,
+        `key = ${JSON.stringify(clientKey)}`,
+        `socket = ${JSON.stringify(this.env.DOT_AGENT_DECK_ATTACH_SOCKET)}`,
+        `version = ${JSON.stringify(version)}`,
+        'added_at = "2026-01-01T00:00:00Z"',
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(this.deckEnv.DOT_AGENT_DECK_DESKTOP_CONFIG as string, 'version = 1\n\n[endpoints]\nselection = "all"\n');
+
+    const runtime = join(this.sandbox, "run");
+    mkdirSync(runtime, { mode: 0o700 });
+    const preload = [this.tools.nssWrapper, this.deckEnv.LD_PRELOAD].filter(Boolean).join(":");
+    const { SSH_AUTH_SOCK: _agent, ...withoutAgent } = this.deckEnv;
+    this.windowEnv = {
+      ...withoutAgent,
+      LD_PRELOAD: preload,
+      NSS_WRAPPER_PASSWD: join(nss, "passwd"),
+      NSS_WRAPPER_GROUP: join(nss, "group"),
+      XDG_RUNTIME_DIR: runtime,
+      DOT_AGENT_DECK_REMOTES: remotes,
+    };
+  }
+
+  /**
+   * The login the tunnel will make, made first by the same `ssh` under the
+   * window's environment, so a host that cannot run this is a named failure
+   * here rather than a deck that never connects, `WAIT_MS` later.
+   */
+  private async proveLogin(port: number, clientKey: string): Promise<void> {
+    const args = ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10"];
+    const { code, stderr } = await run(this.tools.ssh, [...args, "-p", String(port), "-i", clientKey, "--", "127.0.0.1", "true"], this.windowEnv);
+    if (code !== 0) {
+      // ssh's own stderr carries the reason this check exists for (an unknown
+      // host key, a preload that did not load); the sshd log, the server's half.
+      throw new Error(
+        `a pubkey login to the far deck's sshd with strict host-key checking failed (exit ${code}); ` +
+          `ssh said: ${stderr.trim()}; sshd said: ${readFileSync(join(this.ssh, "sshd.log"), "utf8").trim()}`,
+      );
+    }
+  }
+
+  /** The far daemon's own view of its agents, from the CLI. */
+  async daemonAgents(): Promise<DaemonAgent[]> {
+    return daemonAgents(this.env);
+  }
+
+  /** Start `command` in `cwd` on the far daemon over its attach socket. */
+  async startAgent(command: string, cwd: string, displayName: string): Promise<void> {
+    await startAgent(this.env.DOT_AGENT_DECK_ATTACH_SOCKET as string, command, cwd, displayName);
+  }
+
+  /** Stop the far daemon alone: peer-pid-scoped `daemon stop`, then its own child by pid. */
+  async stopDaemon(): Promise<void> {
+    if (!this.daemon) return;
+    await run(paths.daemon, ["daemon", "stop", "--force"], this.env);
+    await stopChild(this.daemon);
+    this.daemon = undefined;
+  }
+
+  /** Stop `sshd` and every connection child it forked: its own process group, and no other. */
+  private async stopSshd(): Promise<void> {
+    const sshd = this.sshd;
+    this.sshd = undefined;
+    if (!sshd?.pid) return;
+    const signalGroup = (signal: NodeJS.Signals) => {
+      try {
+        process.kill(-(sshd.pid as number), signal);
+      } catch {
+        // ESRCH: the group is already gone.
+      }
+    };
+    signalGroup("SIGTERM");
+    await stopChild(sshd);
+    signalGroup("SIGKILL");
+  }
+
+  /**
+   * The app's own `ssh` tunnel children. The app starts each in its own
+   * session, so a window that exits without closing its tunnels leaves them
+   * running — measured on the first run of `fleet_001`. Matched on the
+   * sandbox's own tunnel directory, which nothing outside this sandbox names.
+   */
+  private reapTunnels(): void {
+    const marker = `${join(this.sandbox, "run", "dot-agent-deck", "tunnels")}/`;
+    for (const entry of readdirSync("/proc")) {
+      if (!/^\d+$/.test(entry)) continue;
+      try {
+        if (readFileSync(join("/proc", entry, "cmdline"), "utf8").includes(marker)) process.kill(Number(entry), "SIGKILL");
+      } catch {
+        // Gone already, or not ours to read.
+      }
+    }
+  }
+
+  async close(): Promise<void> {
+    this.reapTunnels();
+    await this.stopDaemon();
+    await this.stopSshd();
   }
 }
 

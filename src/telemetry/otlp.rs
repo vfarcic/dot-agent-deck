@@ -658,6 +658,12 @@ pub(crate) mod tests {
             "cd /home/u/SENTINEL-CWD && ./SENTINEL-TITLE.sh",
             "TOKEN=SENTINEL-ENV-VALUE curl https://SENTINEL-PR-URL.example",
             "sudo -u root echo SENTINEL-BRANCH",
+            // The later commands of a chain and a wrapper's command are read
+            // by the same rules.
+            "cargo fmt && git commit -m 'SENTINEL-PROMPT' && echo SENTINEL-BRANCH",
+            "make ci && SENTINEL-COMMAND run",
+            "timeout 5 cat SENTINEL-TOOL-ARGS",
+            "kubectl exec SENTINEL-TITLE -- make ci",
         ] {
             for event_type in [EventType::ToolStart, EventType::ToolEnd] {
                 let mut e = loaded_event("pane-1", event_type);
@@ -686,7 +692,7 @@ pub(crate) mod tests {
         );
         assert!(
             run.attributes
-                .contains(&Attribute::int(AttrKey::OperationsCount, 7)),
+                .contains(&Attribute::int(AttrKey::OperationsCount, 11)),
             "the shell commands were classified"
         );
         spans
