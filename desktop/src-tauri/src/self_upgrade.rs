@@ -2060,6 +2060,22 @@ mod tests {
     struct FakeRelease {
         dir: tempfile::TempDir,
         base: String,
+        /// Set on drop, so the server stops taking connections and its
+        /// thread ends with the fixture rather than with the test process.
+        stop: Arc<AtomicBool>,
+        server: Option<std::thread::JoinHandle<()>>,
+    }
+
+    #[cfg(unix)]
+    impl Drop for FakeRelease {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            // Wakes the blocked `accept`, which then sees `stop`.
+            let _ = std::net::TcpStream::connect(self.base.trim_start_matches("http://"));
+            if let Some(server) = self.server.take() {
+                let _ = server.join();
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -2071,13 +2087,21 @@ mod tests {
             use std::io::{BufRead, BufReader, Write};
 
             let dir = tempfile::tempdir().expect("a folder for the fake release");
-            let log = dir.path().join("invocations.log");
+            // Single-quoted for the shell, an apostrophe in the temp path
+            // included.
+            let log = format!(
+                "'{}'",
+                dir.path()
+                    .join("invocations.log")
+                    .to_str()
+                    .expect("a UTF-8 temp path")
+                    .replace('\'', r"'\''")
+            );
             let asset = Platform::current()
                 .expect("a platform with release assets")
                 .cli_asset();
             let script = format!(
-                "#!/bin/sh\necho \"$*\" >> '{log}'\nif [ \"$*\" = \"--version\" ]; then\n  echo 'dot-agent-deck {LATEST}'\n  exit 0\nfi\nif [ \"$*\" = \"hooks refresh --json\" ]; then\n  echo '{{\"ok\":true,\"lines\":[{{\"text\":\"{refreshed}\"}}]}}'\n  exit 0\nfi\nexit 64\n",
-                log = log.display(),
+                "#!/bin/sh\necho \"$*\" >> {log}\nif [ \"$*\" = \"--version\" ]; then\n  echo 'dot-agent-deck {LATEST}'\n  exit 0\nfi\nif [ \"$*\" = \"hooks refresh --json\" ]; then\n  echo '{{\"ok\":true,\"lines\":[{{\"text\":\"{refreshed}\"}}]}}'\n  exit 0\nfi\nexit 64\n",
                 refreshed = Self::REFRESHED,
             )
             .into_bytes();
@@ -2088,8 +2112,13 @@ mod tests {
 
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
-            std::thread::spawn(move || {
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopped = stop.clone();
+            let server = std::thread::spawn(move || {
                 for mut stream in listener.incoming().flatten() {
+                    if stopped.load(Ordering::SeqCst) {
+                        break;
+                    }
                     let mut request = String::new();
                     let mut reader = BufReader::new(stream.try_clone().unwrap());
                     if reader.read_line(&mut request).is_err() {
@@ -2121,7 +2150,12 @@ mod tests {
                     let _ = stream.write_all(body);
                 }
             });
-            Self { dir, base }
+            Self {
+                dir,
+                base,
+                stop,
+                server: Some(server),
+            }
         }
 
         /// Every invocation of the release's CLI so far, one per line.
