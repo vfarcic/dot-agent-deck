@@ -24,7 +24,8 @@
 //! caller-lifetime counter (decision Q19).
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::inbox::MessageId;
@@ -104,9 +105,10 @@ impl RingToken {
 }
 
 /// How many candidates [`pick_token`] draws before it gives up. Admission
-/// runs inside the ring's one deadline, so the redraw is bounded work; a fair
-/// draw almost never collides, so only a draw that keeps repeating itself
-/// reaches the bound.
+/// runs inside the ring's one deadline, so the redraw is bounded work. The
+/// bound counts collisions, whatever makes them: one candidate drawn again
+/// and again, distinct candidates each on the screen or recent, or a fair
+/// draw that collides that many times in a row.
 pub const TOKEN_DRAWS: usize = 32;
 
 /// Pick the attempt's token (plan §1.2): draws from `draw` until a candidate
@@ -665,16 +667,60 @@ pub enum Job {
     Deletes(usize),
 }
 
+const JOB_QUEUED: u8 = 0;
+const JOB_STARTED: u8 = 1;
+const JOB_WITHDRAWN: u8 = 2;
+
+/// One queued job's claim word (plan §2.3), shared by the transaction and the
+/// writer thread as the writer's own jobs share theirs: queued until the
+/// writer claims it to start it or the transaction takes it back, and
+/// whichever compare-and-swap wins decides whether any byte of the job is
+/// ever written. The take-back's result is known in the step that makes it,
+/// so ending a transaction waits on no answer.
+#[derive(Debug, Default)]
+pub struct JobClaim {
+    state: AtomicU8,
+}
+
+impl JobClaim {
+    /// The writer, before the job's first byte: `true` when it may write the
+    /// job, `false` when the job was taken back and is dropped unwritten.
+    pub fn start(&self) -> bool {
+        self.state
+            .compare_exchange(JOB_QUEUED, JOB_STARTED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// The transaction's take-back: `true` when the job will never be
+    /// written, `false` when the writer started it first.
+    pub fn withdraw(&self) -> bool {
+        self.state
+            .compare_exchange(
+                JOB_QUEUED,
+                JOB_WITHDRAWN,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
+/// Two claims are equal only when they are the same job's.
+impl PartialEq for JobClaim {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+
+impl Eq for JobClaim {}
+
 /// What the transaction asks of the daemon.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    /// Queue this job on the writer thread (the seam passed).
-    Enqueue(Job),
-    /// Take back the queued job: a compare-and-swap on its queued-to-started
-    /// move, which only a job not yet started can lose. The daemon answers
-    /// with [`Event::TakenBack`] before any other event, and the transaction
-    /// releases nothing until it has.
-    TakeBack,
+    /// Queue this job on the writer thread (the seam passed). The writer
+    /// starts it only through its claim ([`JobClaim::start`]), which the
+    /// transaction can take back first.
+    Enqueue(Job, Arc<JobClaim>),
     /// Call again at this time (a contended seam, a wait).
     WakeAt(Instant),
     /// Request a re-projection of the generation (plan §3.4′).
@@ -696,10 +742,6 @@ pub enum Event {
     /// The job's write did not finish within its bound. It is still the
     /// transaction's until it ends.
     JobStalled,
-    /// The answer to [`Action::TakeBack`]: `true` when the queued job was
-    /// withdrawn before it started, `false` when the writer started it first
-    /// (its job events follow as any started job's do).
-    TakenBack(bool),
     /// Exact or other hook evidence forwarded by the hook arm, which has
     /// already moved the cell.
     Evidence { token: RingToken, exact: bool },
@@ -738,9 +780,6 @@ pub enum Phase {
     /// `Unresolved`, the cell suspended; late evidence or a strict
     /// withdrawal can still resolve it until the deadline.
     Pause(Cause),
-    /// The transaction is ending and its queued job is being taken back; it
-    /// ends once the take-back's answer says whether that job can still run.
-    TakingBack,
     Done(Outcome),
 }
 
@@ -753,7 +792,7 @@ enum JobKind {
 }
 
 /// The transaction's one job on the writer (plan §2.3): its own from the
-/// enqueue until the job ends or a take-back of it is confirmed.
+/// enqueue until the job ends or is taken back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Owned {
     Idle,
@@ -764,7 +803,7 @@ enum Owned {
     Running(JobKind),
 }
 
-/// Why the transaction is ending, held while a queued job is taken back.
+/// Why the transaction is ending.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum End {
     /// Nothing written, if the line's job never started.
@@ -793,9 +832,8 @@ pub struct Txn<'c> {
     frame: Frame,
     /// The job the transaction owns, from its enqueue until it ends.
     job: Owned,
-    /// How the transaction ends once a take-back is answered, and the phase
-    /// to go back to if the job turns out to have started first.
-    ending: Option<(End, Phase)>,
+    /// The queued job's claim, while the writer has not reported it started.
+    claim: Option<Arc<JobClaim>>,
     /// When the Enter's job last ended: no withdrawal starts within
     /// [`SUBMIT_CONFIRM_WAIT`] of it, as the agent may still take it.
     cr_ended_at: Option<Instant>,
@@ -808,7 +846,9 @@ pub struct Txn<'c> {
     /// Deletes for the current withdrawal, and the cause to report if it is
     /// refused or stalls.
     withdrawal: Option<(usize, Cause)>,
-    /// The withdrawal started after the Enter (the measured not-taken path).
+    /// An Enter reached the pane, so a newline the agent kept after the line
+    /// is the deck's (the measured not-taken path), whether the Enter's job
+    /// ended at once or late, after a stall.
     after_cr: bool,
     /// The generation stopped being fit for the ring after the first byte;
     /// acted on once the echo can say whether the line is the deck's alone.
@@ -877,7 +917,7 @@ pub fn admit<'c>(
         phase: Phase::Typing(0),
         frame: admission.frame.clone(),
         job: Owned::Idle,
-        ending: None,
+        claim: None,
         cr_ended_at: None,
         wrote: false,
         accepted: 0,
@@ -945,8 +985,7 @@ impl<'c> Txn<'c> {
     }
 
     /// Feed one event; returns what the daemon must do. After `Release` the
-    /// transaction takes nothing more. After `TakeBack` it takes nothing but
-    /// the job's own reports until [`Event::TakenBack`] answers it.
+    /// transaction takes nothing more.
     pub fn on(&mut self, event: Event, seam: &mut dyn Seam, now: Instant) -> Vec<Action> {
         if let Phase::Done(_) = self.phase {
             return Vec::new();
@@ -957,8 +996,6 @@ impl<'c> Txn<'c> {
         self.track_job(&event, now);
         match event {
             Event::Retired => return self.retired(now),
-            Event::TakenBack(won) => return self.taken_back(won, now),
-            _ if self.phase == Phase::TakingBack => return Vec::new(),
             Event::Evidence { token, exact } => {
                 if let Some(actions) = self.evidence(token, exact, now) {
                     return actions;
@@ -1027,6 +1064,10 @@ impl<'c> Txn<'c> {
     }
 
     fn release(&mut self, outcome: Outcome) -> Vec<Action> {
+        debug_assert!(
+            !matches!(self.job, Owned::Queued(_)),
+            "a queued job is taken back before the release"
+        );
         self.phase = Phase::Done(outcome);
         vec![Action::Reproject, Action::Release(outcome)]
     }
@@ -1035,10 +1076,12 @@ impl<'c> Txn<'c> {
     fn track_job(&mut self, event: &Event, now: Instant) {
         match (event, self.job) {
             (Event::JobStarted, Owned::Queued(kind)) => self.started(kind),
-            (Event::JobEnded { .. }, Owned::Queued(kind) | Owned::Running(kind)) => {
+            (Event::JobEnded { accepted, .. }, Owned::Queued(kind) | Owned::Running(kind)) => {
                 self.job = Owned::Idle;
+                self.claim = None;
                 if kind == JobKind::Cr {
                     self.cr_ended_at = Some(now);
+                    self.after_cr |= *accepted > 0;
                 }
             }
             _ => {}
@@ -1048,54 +1091,46 @@ impl<'c> Txn<'c> {
     /// The owned job started: a line's first byte may be in the pane.
     fn started(&mut self, kind: JobKind) {
         self.job = Owned::Running(kind);
+        self.claim = None;
         if kind == JobKind::Line {
             self.wrote = true;
         }
     }
 
     /// Queue `job` on the writer (plan §2.3: one deck job in flight); the
-    /// transaction owns it until it ends or a take-back of it is confirmed.
+    /// transaction owns it until it ends or is taken back.
     fn enqueue(&mut self, kind: JobKind, job: Job, phase: Phase, now: Instant) -> Vec<Action> {
         debug_assert_eq!(self.job, Owned::Idle, "one deck job in flight");
+        let claim = Arc::new(JobClaim::default());
         self.job = Owned::Queued(kind);
+        self.claim = Some(Arc::clone(&claim));
         self.enter(phase, now);
-        vec![Action::Enqueue(job)]
+        vec![Action::Enqueue(job, claim)]
     }
 
-    /// End the transaction (plan §2.3). A queued job is taken back first, and
-    /// the ending waits for the answer: only a job withdrawn before it
-    /// started is one that cannot run after the release. A job already
-    /// started runs on after it, the release's one residual.
+    /// End the transaction (plan §2.3). A queued job is taken back first, in
+    /// this same step, and the ending is decided on the result: only a job
+    /// withdrawn before it started cannot run after the release. A job
+    /// already started runs on after it, the release's one residual.
     fn end(&mut self, end: End, now: Instant) -> Vec<Action> {
-        if let Some((ending, _)) = self.ending.as_mut() {
-            // Already taking back; retirement still ends it as retired.
-            if end == End::Retired {
-                *ending = End::Retired;
-            }
-            return Vec::new();
-        }
-        if let Owned::Queued(_) = self.job {
-            self.ending = Some((end, self.phase));
-            self.phase = Phase::TakingBack;
-            return vec![Action::TakeBack];
-        }
+        self.take_back();
         self.finish(end, now)
     }
 
-    /// The take-back's answer. A job withdrawn in time leaves the ending as
-    /// it was; one the writer started first is a started job, so a line's
-    /// first byte may be in, and the ending is decided on that.
-    fn taken_back(&mut self, won: bool, now: Instant) -> Vec<Action> {
-        let Some((end, resume)) = self.ending.take() else {
-            return Vec::new();
+    /// Take back the queued job, if the writer has not reported it started:
+    /// a compare-and-swap on its claim, settled here. Withdrawn, it can never
+    /// be written; claimed by the writer first, it is a started job, and a
+    /// line's first byte may be in.
+    fn take_back(&mut self) {
+        let Owned::Queued(kind) = self.job else {
+            return;
         };
-        match self.job {
-            Owned::Queued(_) if won => self.job = Owned::Idle,
-            Owned::Queued(kind) => self.started(kind),
-            Owned::Idle | Owned::Running(_) => {}
+        let claim = self.claim.take().expect("a queued job has its claim");
+        if claim.withdraw() {
+            self.job = Owned::Idle;
+        } else {
+            self.started(kind);
         }
-        self.phase = resume;
-        self.finish(end, now)
     }
 
     fn finish(&mut self, end: End, now: Instant) -> Vec<Action> {
@@ -1388,7 +1423,6 @@ impl<'c> Txn<'c> {
                 (self.phase_since + SUBMIT_CONFIRM_WAIT).min(self.next_wake(now)),
             )];
         }
-        self.after_cr = true;
         if self.strict().is_some() && !self.caps.placeholder {
             return self.suspend_and_pause(Cause::WithdrawalRefused, now);
         }

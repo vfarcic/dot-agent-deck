@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 
 use dot_agent_deck::doorbell_txn::{
     Action, Admission, AttemptCounter, AttemptRing, Caps, Cause, ComposerView, Event, Frame, Job,
-    Latch, LatchCell, NotTyped, Outcome, Publisher, Resolution, RingToken, Seam, SeamRead, Shown,
-    TOKEN_DRAWS, TXN_MAX, Txn, admit, hook_evidence, pick_token, project, ring_entry, seam_until,
+    JobClaim, Latch, LatchCell, NotTyped, Outcome, Publisher, Resolution, RingToken, Seam,
+    SeamRead, Shown, TOKEN_DRAWS, TXN_MAX, Txn, admit, hook_evidence, pick_token, project,
+    ring_entry, seam_until,
 };
 use dot_agent_deck::inbox::MessageId;
 use spec::spec;
@@ -47,8 +48,10 @@ enum Write {
     Stall,
     /// Starts, stalls, and finishes this long after it started.
     Late(Duration),
-    /// Stays queued: it starts only if it is not taken back, at the take-back
-    /// when the writer wins that race, else after the release.
+    /// Stays queued: the writer claims it only when a test says it races
+    /// the deck's take-back ([`writer_claims`]), else once the writer is
+    /// free after the release, and either way only if it was not taken back
+    /// first.
     NeverStarts,
 }
 
@@ -89,12 +92,10 @@ struct World {
     human: Vec<String>,
     /// A started deck job still running when the writer was released.
     running: Option<String>,
-    /// A deck job queued on the writer and not started.
-    queued: Option<Job>,
-    /// The writer starts a queued job before the deck's take-back can
-    /// withdraw it.
-    takeback_loses: bool,
-    /// Jobs a take-back withdrew.
+    /// A deck job queued on the writer and not started, with its claim.
+    queued: Option<(Job, Arc<JobClaim>)>,
+    /// Jobs the writer found taken back when it reached them, and dropped
+    /// unwritten.
     taken_back: Vec<Job>,
     /// Changes made just before the n-th job (0-based) is applied.
     before_job: Vec<(usize, Change)>,
@@ -151,7 +152,6 @@ impl World {
             human: Vec::new(),
             running: None,
             queued: None,
-            takeback_loses: false,
             taken_back: Vec::new(),
             before_job: Vec::new(),
             at: Vec::new(),
@@ -240,7 +240,7 @@ impl World {
         }
     }
 
-    fn apply(&mut self, job: &Job) {
+    fn apply(&mut self, job: &Job, claim: Arc<JobClaim>) {
         let n = self.jobs;
         self.jobs += 1;
         let changes: Vec<Change> = {
@@ -254,7 +254,40 @@ impl World {
             change(self);
         }
         let write = self.writes.pop_front().unwrap_or(Write::Whole);
-        self.run_job(job, write);
+        if write == Write::NeverStarts {
+            self.queued = Some((job.clone(), claim));
+        } else if claim.start() {
+            self.run_job(job, write);
+        } else {
+            self.taken_back.push(job.clone());
+        }
+    }
+
+    /// The writer reaches the queued job and claims it: when the claim wins,
+    /// its bytes go in now and its reports reach the transaction `reports`
+    /// later; when the deck took the job back first, it is dropped unwritten.
+    fn claim_queued(&mut self, reports: Duration) {
+        let Some((job, claim)) = self.queued.take() else {
+            return;
+        };
+        if !claim.start() {
+            self.taken_back.push(job);
+            return;
+        }
+        let (bytes, shown) = Self::bytes(&job);
+        self.pane.push(shown);
+        self.type_into_composer(&bytes);
+        let at = self.now - self.start + reports;
+        self.at.push((
+            at,
+            Box::new(move |w| {
+                w.events.push_back(Event::JobStarted);
+                w.events.push_back(Event::JobEnded {
+                    accepted: bytes.len(),
+                    ok: true,
+                });
+            }),
+        ));
     }
 
     /// The bytes a job writes, and how the pane log shows it.
@@ -269,7 +302,7 @@ impl World {
     fn run_job(&mut self, job: &Job, write: Write) {
         let (bytes, shown) = Self::bytes(job);
         match write {
-            Write::NeverStarts => self.queued = Some(job.clone()),
+            Write::NeverStarts => unreachable!("a job that never starts stays queued"),
             Write::Late(after) => {
                 self.events.push_back(Event::JobStarted);
                 self.events.push_back(Event::JobStalled);
@@ -346,6 +379,15 @@ impl Seam for World {
     }
 }
 
+/// The writer claims the job still queued at `at` from the start, just ahead
+/// of anything the transaction does at that moment, so a take-back then
+/// finds it started; its reports reach the transaction `reports` after that.
+fn writer_claims(world: &mut World, at: Duration, reports: Duration) {
+    world
+        .at
+        .push((at, Box::new(move |w| w.claim_queued(reports))));
+}
+
 /// A token draw that spells `bxdmpw`'s cousins from the alphabet in turn.
 fn draws() -> impl FnMut() -> u8 {
     let mut n = 0u8;
@@ -393,23 +435,7 @@ fn run(world: &mut World) -> (Result<Outcome, NotTyped>, String) {
         let mut wake = None;
         for action in std::mem::take(&mut actions) {
             match action {
-                Action::Enqueue(job) => world.apply(&job),
-                // The take-back races the writer for the queued job: it wins
-                // only while the job has not started.
-                Action::TakeBack => {
-                    let won = match world.queued.take() {
-                        Some(job) if world.takeback_loses => {
-                            world.run_job(&job, Write::Whole);
-                            false
-                        }
-                        Some(job) => {
-                            world.taken_back.push(job);
-                            true
-                        }
-                        None => false,
-                    };
-                    world.events.push_front(Event::TakenBack(won));
-                }
+                Action::Enqueue(job, claim) => world.apply(&job, claim),
                 Action::WakeAt(at) => wake = Some(at),
                 Action::Reproject => {}
                 Action::Release(outcome) => {
@@ -420,9 +446,14 @@ fn run(world: &mut World) -> (Result<Outcome, NotTyped>, String) {
                     if let Some(running) = world.running.take() {
                         world.pane.push(format!("{running} (late)"));
                     }
-                    // A job still queued starts once the writer is free.
-                    if let Some(job) = world.queued.take() {
-                        world.pane.push(format!("{} (late)", World::bytes(&job).1));
+                    // A job still queued starts once the writer is free,
+                    // unless it was taken back.
+                    if let Some((job, claim)) = world.queued.take() {
+                        if claim.start() {
+                            world.pane.push(format!("{} (late)", World::bytes(&job).1));
+                        } else {
+                            world.taken_back.push(job);
+                        }
                     }
                     let human = std::mem::take(&mut world.human);
                     world.pane.extend(human);
@@ -620,7 +651,7 @@ fn doorbell_038_option_a_writes_waiting_frames_after_an_unresolved_end() {
     assert_eq!(outcome, Ok(Outcome::Unresolved(Cause::WithdrawalStalled)));
 }
 
-/// Scenario: The deck's Enter stalls on the writer while the composer still shows the line, and finishes later. The deck sends no delete while that Enter can still land: an agent that submits it is Submitted late, one that drops it has the line withdrawn only after the Enter ended and the submit window passed, and one that takes it late inside that window is never withdrawn from.
+/// Scenario: The deck's Enter stalls on the writer while the composer still shows the line, and finishes later. The deck sends no delete while that Enter can still land: an agent that submits it is Submitted late, one that drops it, or keeps it as a newline, has the line (and that newline) withdrawn only after the Enter ended and the submit window passed, and one that takes it late inside that window is never withdrawn from.
 #[spec("inbox/doorbell/038")]
 #[test]
 fn doorbell_038_a_stalled_enter_is_never_followed_by_deletes() {
@@ -647,6 +678,21 @@ fn doorbell_038_a_stalled_enter_is_never_followed_by_deletes() {
     assert_eq!(outcome, Ok(Outcome::Withdrawn));
     let deletes = format!("<DEL×{}>", line.chars().count());
     assert_eq!(drops.pane, vec![line, "<CR>".to_string(), deletes]);
+
+    // The late Enter kept as a newline: the newline is the deck's too.
+    let mut newline = World::new();
+    newline.enter = Enter::Newline;
+    newline.hook = false;
+    newline
+        .writes
+        .extend([Write::Whole, Write::Late(Duration::from_millis(300))]);
+    let start = newline.now;
+    let (outcome, line) = run(&mut newline);
+    assert_eq!(outcome, Ok(Outcome::Withdrawn));
+    let deletes = format!("<DEL×{}>", line.chars().count() + 1);
+    assert_eq!(newline.pane, vec![line, "<CR>".to_string(), deletes]);
+    assert_eq!(newline.composer, "");
+    assert!(newline.released_at.unwrap() <= start + TXN_MAX);
 
     let mut slow = World::new();
     slow.enter = Enter::Drop;
@@ -1020,7 +1066,9 @@ fn doorbell_049_nothing_is_written_only_when_the_take_back_wins() {
     for loses in [false, true] {
         let mut deadline = World::new();
         deadline.writes.push_back(Write::NeverStarts);
-        deadline.takeback_loses = loses;
+        if loses {
+            writer_claims(&mut deadline, TXN_MAX, Duration::from_millis(5));
+        }
         let (outcome, line) = run(&mut deadline);
         if loses {
             assert_eq!(outcome, Ok(Outcome::Unresolved(Cause::Deadline)));
@@ -1041,7 +1089,13 @@ fn doorbell_049_nothing_is_written_only_when_the_take_back_wins() {
 
         let mut lost = World::new();
         lost.writes.push_back(Write::NeverStarts);
-        lost.takeback_loses = loses;
+        if loses {
+            writer_claims(
+                &mut lost,
+                Duration::from_millis(1),
+                Duration::from_millis(5),
+            );
+        }
         lost_admission(&mut lost);
         let (outcome, line) = run(&mut lost);
         if loses {
@@ -1065,7 +1119,11 @@ fn doorbell_049_nothing_is_written_only_when_the_take_back_wins() {
     let mut unconfirmed = World::new();
     unconfirmed.caps.placeholder = false;
     unconfirmed.writes.push_back(Write::NeverStarts);
-    unconfirmed.takeback_loses = true;
+    writer_claims(
+        &mut unconfirmed,
+        Duration::from_millis(1),
+        Duration::from_millis(5),
+    );
     lost_admission(&mut unconfirmed);
     let (outcome, line) = run(&mut unconfirmed);
     assert_eq!(outcome, Ok(Outcome::Unresolved(Cause::EchoMismatch)));
@@ -1083,8 +1141,10 @@ fn doorbell_049_a_later_job_still_queued_is_taken_back_before_the_release() {
     let mut stage = World::new();
     stage.caps.staged_head = Some(9);
     stage.writes.extend([Write::Whole, Write::NeverStarts]);
+    let start = stage.now;
     let (outcome, line) = run(&mut stage);
     assert_eq!(outcome, Ok(Outcome::Unresolved(Cause::Deadline)));
+    assert!(stage.released_at.unwrap() <= start + TXN_MAX);
     assert_eq!(stage.pane, vec![line[..9].to_string()]);
     assert_eq!(stage.taken_back, vec![Job::Line(line[9..].to_string())]);
     assert_eq!(
@@ -1105,7 +1165,7 @@ fn doorbell_049_a_later_job_still_queued_is_taken_back_before_the_release() {
     started.hook = false;
     started.caps.transcript_route = false;
     started.writes.extend([Write::Whole, Write::NeverStarts]);
-    started.takeback_loses = true;
+    writer_claims(&mut started, TXN_MAX, Duration::from_millis(5));
     let (outcome, line) = run(&mut started);
     assert_eq!(outcome, Ok(Outcome::Unresolved(Cause::Deadline)));
     assert_eq!(started.pane, vec![line, "<CR>".to_string()]);
@@ -1164,6 +1224,185 @@ fn doorbell_049_a_later_job_still_queued_is_taken_back_before_the_release() {
         evidence.cell_at_release,
         Some(Latch::Resolved(1, Resolution::Submitted))
     );
+}
+
+/// Scenario: The writer claims the deck's queued job at the very moment the transaction ends, and the job's reports reach the deck only after the deadline: the line at the deadline, its second stage, the Enter and the deletes at the deadline, the line when the admission is lost just before it, the Enter when the user submits the line, and the deletes when the generation retires. The take-back settles in the same step, so each release comes no later than the deadline without waiting for the reports, the job the writer claimed is accounted for as written, and a job the deck won back is never written, even once the writer is free.
+#[spec("inbox/doorbell/049")]
+#[test]
+fn doorbell_049_a_take_back_racing_the_writer_never_holds_past_the_deadline() {
+    // The claim word: whichever side moves it first decides.
+    let claim = JobClaim::default();
+    assert!(claim.withdraw());
+    assert!(!claim.start(), "a job taken back is never started");
+    assert!(!claim.withdraw());
+    let claim = JobClaim::default();
+    assert!(claim.start());
+    assert!(!claim.withdraw(), "a started job cannot be taken back");
+    assert!(!claim.start());
+
+    let after_deadline = TXN_MAX + Duration::from_secs(1);
+    let ends_by_deadline = |world: &World, start: Instant| {
+        let released = world.released_at.expect("released");
+        assert!(
+            released <= start + TXN_MAX,
+            "released {:?} after the deadline",
+            released - start
+        );
+        assert!(
+            !world.pane.iter().any(|w| w.ends_with("(late)")),
+            "a queued job ran after the release: {:?}",
+            world.pane
+        );
+    };
+
+    // The line, claimed at the deadline: the deadline still releases it, as
+    // written.
+    let mut line_job = World::new();
+    line_job.writes.push_back(Write::NeverStarts);
+    writer_claims(&mut line_job, TXN_MAX, after_deadline);
+    let start = line_job.now;
+    let (outcome, line) = run(&mut line_job);
+    assert_eq!(outcome, Ok(Outcome::Unresolved(Cause::Deadline)));
+    assert_eq!(line_job.pane, vec![line]);
+    assert_eq!(
+        line_job.cell_at_release,
+        Some(Latch::Suspended(1, Cause::Deadline))
+    );
+    ends_by_deadline(&line_job, start);
+
+    // A later job, claimed at the deadline: the second stage, the Enter, the
+    // deletes.
+    let mut stage = World::new();
+    stage.caps.staged_head = Some(9);
+    stage.writes.extend([Write::Whole, Write::NeverStarts]);
+    writer_claims(&mut stage, TXN_MAX, after_deadline);
+    let start = stage.now;
+    let (outcome, line) = run(&mut stage);
+    assert_eq!(outcome, Ok(Outcome::Unresolved(Cause::Deadline)));
+    assert_eq!(
+        stage.pane,
+        vec![line[..9].to_string(), line[9..].to_string()]
+    );
+    assert_eq!(
+        stage.cell_at_release,
+        Some(Latch::Suspended(1, Cause::Deadline))
+    );
+    ends_by_deadline(&stage, start);
+
+    let mut enter = World::new();
+    enter.hook = false;
+    enter.caps.transcript_route = false;
+    enter.writes.extend([Write::Whole, Write::NeverStarts]);
+    writer_claims(&mut enter, TXN_MAX, after_deadline);
+    let start = enter.now;
+    let (outcome, line) = run(&mut enter);
+    assert_eq!(outcome, Ok(Outcome::Unresolved(Cause::Deadline)));
+    assert_eq!(enter.pane, vec![line, "<CR>".to_string()]);
+    assert_eq!(
+        enter.cell_at_release,
+        Some(Latch::Suspended(1, Cause::Deadline))
+    );
+    ends_by_deadline(&enter, start);
+
+    let mut deletes = World::new();
+    deletes.enter = Enter::Drop;
+    deletes.hook = false;
+    deletes
+        .writes
+        .extend([Write::Whole, Write::Whole, Write::NeverStarts]);
+    writer_claims(&mut deletes, TXN_MAX, after_deadline);
+    let start = deletes.now;
+    let (outcome, line) = run(&mut deletes);
+    assert_eq!(outcome, Ok(Outcome::Unresolved(Cause::Deadline)));
+    let count = line.chars().count();
+    assert_eq!(
+        deletes.pane,
+        vec![line, "<CR>".to_string(), format!("<DEL×{count}>")]
+    );
+    assert_eq!(
+        deletes.cell_at_release,
+        Some(Latch::Suspended(1, Cause::Deadline))
+    );
+    ends_by_deadline(&deletes, start);
+
+    // An early ending just before the deadline whose job the writer claims:
+    // the lost admission still ends by the deadline, suspended, as the line
+    // may be in.
+    let just_before = TXN_MAX - Duration::from_millis(10);
+    let mut lost = World::new();
+    lost.writes.push_back(Write::NeverStarts);
+    writer_claims(&mut lost, just_before, after_deadline);
+    lost.at.push((
+        just_before,
+        Box::new(|w| w.events.push_back(Event::AdmissionLost)),
+    ));
+    let start = lost.now;
+    let (outcome, line) = run(&mut lost);
+    assert_eq!(outcome, Ok(Outcome::Unresolved(Cause::Deadline)));
+    assert_eq!(lost.pane, vec![line]);
+    assert_eq!(
+        lost.cell_at_release,
+        Some(Latch::Suspended(1, Cause::Deadline))
+    );
+    ends_by_deadline(&lost, start);
+
+    // The same lost admission with the take-back winning: nothing is ever
+    // written, even after the release.
+    let mut lost_won = World::new();
+    lost_won.writes.push_back(Write::NeverStarts);
+    lost_won.at.push((
+        just_before,
+        Box::new(|w| w.events.push_back(Event::AdmissionLost)),
+    ));
+    let start = lost_won.now;
+    let (outcome, line) = run(&mut lost_won);
+    assert_eq!(outcome, Ok(Outcome::NothingWritten(NotTyped::NotAdmitted)));
+    assert!(lost_won.pane.is_empty(), "{:?}", lost_won.pane);
+    assert_eq!(lost_won.taken_back, vec![Job::Line(line)]);
+    ends_by_deadline(&lost_won, start);
+
+    // Exact evidence while the Enter is queued and claimed in that moment.
+    let mut evidence = World::new();
+    evidence.writes.extend([Write::Whole, Write::NeverStarts]);
+    evidence.at.push((
+        Duration::from_millis(400),
+        Box::new(|w| w.type_into_composer("\r")),
+    ));
+    writer_claims(&mut evidence, Duration::from_millis(400), after_deadline);
+    let start = evidence.now;
+    let (outcome, line) = run(&mut evidence);
+    assert_eq!(outcome, Ok(Outcome::Submitted));
+    assert_eq!(evidence.pane, vec![line, "<CR>".to_string()]);
+    assert!(evidence.taken_back.is_empty());
+    assert!(evidence.released_at.unwrap() < start + Duration::from_secs(1));
+    ends_by_deadline(&evidence, start);
+
+    // Retirement while the deletes are queued and claimed in that moment.
+    let mut retiring = World::new();
+    retiring.enter = Enter::Drop;
+    retiring.hook = false;
+    retiring
+        .writes
+        .extend([Write::Whole, Write::Whole, Write::NeverStarts]);
+    writer_claims(&mut retiring, Duration::from_millis(2000), after_deadline);
+    retiring.at.push((
+        Duration::from_millis(2000),
+        Box::new(|w| {
+            w.open = false;
+            w.events.push_back(Event::Retired);
+        }),
+    ));
+    let start = retiring.now;
+    let (outcome, line) = run(&mut retiring);
+    assert_eq!(outcome, Ok(Outcome::Retired));
+    let count = line.chars().count();
+    assert_eq!(
+        retiring.pane,
+        vec![line, "<CR>".to_string(), format!("<DEL×{count}>")]
+    );
+    assert!(retiring.released_at.unwrap() <= start + Duration::from_millis(2000));
+    assert_eq!(retiring.cell.load(), Latch::Retired);
+    ends_by_deadline(&retiring, start);
 }
 
 /// Scenario: The seam's locks stay contended. Its retry loop never tries at or after the deadline and enqueues nothing; a transaction whose Enter seam never gets its locks is released by the deadline with its cell already suspended.
