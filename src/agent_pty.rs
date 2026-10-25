@@ -2412,6 +2412,16 @@ impl AgentBus {
         result
     }
 
+    /// PRD #1666 part 3, round 5-wake: the generation's profile, learned from
+    /// the agent type its own hooks reported, under the lock `push` takes so
+    /// its edge sits at its place in the stream.
+    fn adopt_profile(&self, profile: &'static crate::doorbell_screen::ScreenProfile) {
+        let transition = self.state.lock().unwrap().evidence.adopt(profile);
+        if let Some(transition) = transition {
+            log_evidence_transition(&transition, "profile_learned");
+        }
+    }
+
     /// The evidence state's status, layout epoch and stream position.
     pub fn evidence(&self) -> (crate::evidence_state::EvidenceStatus, u64, u64) {
         let state = self.state.lock().unwrap();
@@ -3099,6 +3109,10 @@ pub struct RunningAgent {
     /// this generation's input, from arrival until its bytes are done with
     /// the PTY. Closed when the generation retires.
     pub ingress: Arc<crate::ingress_ledger::IngressLedger>,
+    /// PRD #1666 part 3, round 5-wake (plan §3.4′): this generation's
+    /// doorbell latch cell, attempt numbers and attempt ring, and the
+    /// admission's other per-generation inputs. Retired with the generation.
+    pub doorbell: Arc<crate::doorbell_generation::GenerationDoorbell>,
     /// Value of [`DOT_AGENT_DECK_PANE_ID`] captured from the spawn-time env,
     /// if the caller supplied one. Echoed back to clients via the M2.x
     /// rehydration path so the TUI can re-bind a freshly-attached pane to
@@ -4180,6 +4194,14 @@ impl PaneInputState {
         self.note_user_bytes_as(pane_id_env, bytes, true);
     }
 
+    /// PRD #1666 part 3, round 5-wake: how many times the user's own bytes
+    /// have submitted or cleared `pane_id_env`'s box on its current stream.
+    fn user_clears(&self, pane_id_env: &str) -> u64 {
+        self.input
+            .get(pane_id_env)
+            .map_or(0, |stream| stream.draft.user_clears())
+    }
+
     /// [`Self::note_user_bytes`], for a human's bytes (`human`) or a voice
     /// answer's, which leave the human-input sequence alone (PRD #1631).
     fn note_user_bytes_as(&mut self, pane_id_env: &str, bytes: &[u8], human: bool) {
@@ -4371,6 +4393,7 @@ impl PaneWriter {
         pane_id_env: Option<String>,
         state: Arc<Mutex<PaneInputState>>,
         retired: Arc<AtomicBool>,
+        doorbell: Option<Arc<crate::doorbell_generation::GenerationDoorbell>>,
     ) -> Self {
         let pty = PtyWriterThread::spawn(
             inner,
@@ -4378,6 +4401,7 @@ impl PaneWriter {
                 pane_id_env,
                 state: state.clone(),
                 retired: retired.clone(),
+                doorbell,
             },
         );
         Self {
@@ -4627,6 +4651,9 @@ struct InputRecorder {
     pane_id_env: Option<String>,
     state: Arc<Mutex<PaneInputState>>,
     retired: Arc<AtomicBool>,
+    /// PRD #1666 part 3, round 5-wake (plan §3.4′): the generation's doorbell
+    /// state, whose suspension the user's own submit or clear lifts.
+    doorbell: Option<Arc<crate::doorbell_generation::GenerationDoorbell>>,
 }
 
 impl InputRecorder {
@@ -4655,10 +4682,19 @@ impl InputRecorder {
         if self.retired.load(Ordering::SeqCst) {
             return;
         }
+        let clears_before = state.user_clears(pane_id);
         match source {
             ByteSource::Deck => state.note_deck_bytes(pane_id, accepted),
             ByteSource::User => state.note_user_bytes(pane_id, accepted),
             ByteSource::Answer => state.note_user_bytes_as(pane_id, accepted, false),
+        }
+        // PRD #1666 part 3, round 5-wake: the user's own submit or clear,
+        // in the order the PTY took it, lifts a suspended doorbell.
+        if state.user_clears(pane_id) != clears_before
+            && let Some(doorbell) = &self.doorbell
+            && let Some(latch) = doorbell.user_cleared()
+        {
+            tracing::info!(target: "doorbell", pane_id, ?latch, "doorbell latch: user");
         }
         state.settle_written_bytes(pane_id, turns_after_write);
         // PRD #1741: a person's keys, typed or a voice answer, can be an
@@ -6300,6 +6336,9 @@ pub struct AgentPtyRegistry {
     /// PRD #1666 part 3, round 5-wake (plan §2.3): per pane, the channel a
     /// prompt hook's ring evidence reaches a waiting doorbell transaction on.
     doorbell_evidence: Mutex<HashMap<String, broadcast::Sender<RingEvidence>>>,
+    /// PRD #1666 part 3, round 5-wake (plan §4.6): the inherited releases a
+    /// recognised dialog has disabled since the daemon started.
+    doorbell_tripwires: crate::doorbell_generation::Tripwires,
     /// PRD #1666 S8: how long a repaint nudge keeps the PTY one column
     /// narrower, in milliseconds ([`REPAINT_NUDGE_GAP`], or
     /// [`ENV_REPAINT_NUDGE_GAP_MS`]).
@@ -8418,6 +8457,7 @@ impl AgentPtyRegistry {
             repaint_nudges: Mutex::new(HashMap::new()),
             doorbell_txns: Mutex::new(HashMap::new()),
             doorbell_evidence: Mutex::new(HashMap::new()),
+            doorbell_tripwires: Default::default(),
             repaint_nudge_gap_ms: AtomicU64::new(
                 std::env::var(ENV_REPAINT_NUDGE_GAP_MS)
                     .ok()
@@ -10756,8 +10796,10 @@ impl AgentPtyRegistry {
             .subscribe()
     }
 
-    /// A prompt hook reported `evidence`: handed to whoever waits on its
-    /// pane, and logged.
+    /// A prompt hook reported `evidence`: applied to the attested
+    /// generation's latch cell on receipt (plan §3.4′), so the cell never
+    /// depends on a transaction draining its channel; then handed to whoever
+    /// waits on its pane, and logged.
     pub fn note_doorbell_evidence(&self, evidence: RingEvidence) {
         tracing::info!(
             target: "doorbell",
@@ -10767,6 +10809,30 @@ impl AgentPtyRegistry {
             shape = ?evidence.shape,
             "doorbell evidence"
         );
+        if let Some(doorbell) = self.generation_doorbell(&evidence.agent_id) {
+            let before = doorbell.cell().load();
+            let exact = evidence.shape == crate::event::PromptShape::Exact;
+            match doorbell.evidence(&evidence.token, exact) {
+                Some(after) => tracing::info!(
+                    target: "doorbell",
+                    pane_id = %evidence.pane_id,
+                    agent_id = %evidence.agent_id,
+                    event = "hook_evidence",
+                    from = ?before,
+                    to = ?after,
+                    "doorbell latch"
+                ),
+                None => tracing::info!(
+                    target: "doorbell",
+                    pane_id = %evidence.pane_id,
+                    agent_id = %evidence.agent_id,
+                    event = "hook_evidence",
+                    exact,
+                    current = ?before,
+                    "doorbell latch: no move"
+                ),
+            }
+        }
         let mut channels = self.doorbell_evidence.lock().unwrap();
         if let Some(tx) = channels.get(&evidence.pane_id) {
             if tx.receiver_count() == 0 {
@@ -10775,6 +10841,25 @@ impl AgentPtyRegistry {
                 let _ = tx.send(evidence);
             }
         }
+    }
+
+    /// `agent_id`'s doorbell state (PRD #1666 part 3, round 5-wake), while
+    /// it is in the registry.
+    pub fn generation_doorbell(
+        &self,
+        agent_id: &str,
+    ) -> Option<Arc<crate::doorbell_generation::GenerationDoorbell>> {
+        let inner = self.inner.lock();
+        inner
+            .agents
+            .get(agent_id)
+            .map(|agent| Arc::clone(&agent.doorbell))
+    }
+
+    /// The releases whose tripwire is set since the daemon started (plan
+    /// §4.6).
+    pub fn doorbell_tripwires(&self) -> &crate::doorbell_generation::Tripwires {
+        &self.doorbell_tripwires
     }
 
     /// `agent_id`'s ingress ledger, while it is in the registry.
@@ -11844,8 +11929,10 @@ impl AgentPtyRegistry {
             for agent in inner.agents.values() {
                 if agent.pane_id_env.as_deref() == Some(claimed.as_str()) {
                     agent.pane_retired.store(true, Ordering::SeqCst);
-                    // PRD #1666 part 3, round 5-wake: the retired generation's ledger.
+                    // PRD #1666 part 3, round 5-wake: the retired generation's
+                    // ledger and doorbell cell.
                     agent.ingress.close();
+                    agent.doorbell.retire();
                     agent
                         .bus
                         .close_release(crate::release_scanner::WindowClose::Retired);
@@ -11883,10 +11970,20 @@ impl AgentPtyRegistry {
 
         // PRD #1666 part 3, round 5-wake: the evidence state tracks the spawn
         // type's measured screen, and the release scanner reads the header,
-        // from the generation's first byte.
+        // from the generation's first byte. The e2e build's stand-in editor
+        // has a profile of its own, chosen only by its explicit selector and
+        // executable path.
+        #[cfg(feature = "e2e")]
+        let standin =
+            crate::doorbell_screen::standin_selected(&captured_env, spawn_command.as_deref());
+        let profile = crate::doorbell_screen::profile_for_agent(spawn_agent_type.as_ref());
+        #[cfg(feature = "e2e")]
+        let profile = profile.or(standin
+            .as_ref()
+            .map(|_| &crate::doorbell_screen::STANDIN_PROFILE));
         let bus = Arc::new(AgentBus::for_generation(
             &preallocated_id,
-            crate::doorbell_screen::profile_for_agent(spawn_agent_type.as_ref()),
+            profile,
             captured_rows,
             captured_cols,
         ));
@@ -11938,12 +12035,6 @@ impl AgentPtyRegistry {
         });
 
         let pane_retired = Arc::new(AtomicBool::new(false));
-        let pane_writer = PaneWriter::new(
-            writer,
-            pane_id_env.clone(),
-            self.pane_input.clone(),
-            pane_retired.clone(),
-        );
         let child_role = match spawn_command.as_deref() {
             Some(command)
                 if crate::wrap::launches_wrapper(
@@ -11958,6 +12049,24 @@ impl AgentPtyRegistry {
             }
             _ => ChildRole::PaneCommand,
         };
+        // PRD #1666 part 3, round 5-wake: the generation's doorbell state.
+        // The wrapper reports the agent's input mode itself; any other pane's
+        // PTY slave is the agent's terminal, read from the master.
+        let doorbell = crate::doorbell_generation::GenerationDoorbell::new(
+            child_role == ChildRole::Wrapper,
+            #[cfg(unix)]
+            master.as_raw_fd(),
+        );
+        #[cfg(feature = "e2e")]
+        let doorbell = doorbell.with_standin(standin);
+        let doorbell = Arc::new(doorbell);
+        let pane_writer = PaneWriter::new(
+            writer,
+            pane_id_env.clone(),
+            self.pane_input.clone(),
+            pane_retired.clone(),
+            Some(Arc::clone(&doorbell)),
+        );
         let agent = RunningAgent {
             child,
             process_group,
@@ -11971,6 +12080,7 @@ impl AgentPtyRegistry {
             child_role,
             input_mode: Arc::default(),
             ingress: crate::ingress_ledger::IngressLedger::new(),
+            doorbell,
             pane_id_env,
             display_name,
             cwd: cwd_stored,
@@ -12550,8 +12660,10 @@ impl AgentPtyRegistry {
                 .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?;
             // Before the pane-state lock below — see [`PaneWriter::retired`].
             agent.pane_retired.store(true, Ordering::SeqCst);
-            // PRD #1666 part 3, round 5-wake: the retired generation's ledger.
+            // PRD #1666 part 3, round 5-wake: the retired generation's ledger
+            // and doorbell cell.
             agent.ingress.close();
+            agent.doorbell.retire();
             agent
                 .bus
                 .close_release(crate::release_scanner::WindowClose::Retired);
@@ -12859,8 +12971,10 @@ impl AgentPtyRegistry {
             // old generation's writer is retired all the same, so a write it is
             // still finishing cannot record into the successor's input box.
             removed.pane_retired.store(true, Ordering::SeqCst);
-            // PRD #1666 part 3, round 5-wake: the retired generation's ledger.
+            // PRD #1666 part 3, round 5-wake: the retired generation's ledger
+            // and doorbell cell.
             removed.ingress.close();
+            removed.doorbell.retire();
             removed
                 .bus
                 .close_release(crate::release_scanner::WindowClose::Retired);
@@ -12962,6 +13076,9 @@ impl AgentPtyRegistry {
             pane_retired: _,
             // Closed where the record was removed, above.
             ingress: _,
+            // Retired where the record was removed, above; the replacement
+            // starts its own.
+            doorbell: _,
             child_role: _,
             // The replacement's evidence starts empty.
             input_mode: _,
@@ -15729,8 +15846,13 @@ impl AgentPtyRegistry {
         inner.next_id += 1;
         let id = format!("test-agent-{}", inner.next_id);
         let pane_retired = Arc::new(AtomicBool::new(false));
-        let pane_writer =
-            PaneWriter::new(writer, None, self.pane_input.clone(), pane_retired.clone());
+        let pane_writer = PaneWriter::new(
+            writer,
+            None,
+            self.pane_input.clone(),
+            pane_retired.clone(),
+            None,
+        );
         inner.agents.insert(
             id.clone(),
             RunningAgent {
@@ -15750,6 +15872,11 @@ impl AgentPtyRegistry {
                 child_role: ChildRole::PaneCommand,
                 input_mode: Arc::default(),
                 ingress: crate::ingress_ledger::IngressLedger::new(),
+                doorbell: Arc::new(crate::doorbell_generation::GenerationDoorbell::new(
+                    false,
+                    #[cfg(unix)]
+                    None,
+                )),
                 pane_id_env: pane_id_env.map(str::to_string),
                 display_name: None,
                 cwd: None,
@@ -15982,6 +16109,13 @@ impl AgentPtyRegistry {
         {
             agent.agent_type = Some(agent_type.clone());
             agent.badge_command = agent.spawn_command.clone();
+            // PRD #1666 part 3, round 5-wake: the effective type's profile, for
+            // a generation spawned without a type (registry, then bus lock).
+            if agent.spawn_agent_type.is_none()
+                && let Some(profile) = crate::doorbell_screen::profile_for_agent(Some(agent_type))
+            {
+                agent.bus.adopt_profile(profile);
+            }
         }
     }
 
@@ -15998,6 +16132,11 @@ impl AgentPtyRegistry {
         {
             agent.agent_type = Some(agent_type.clone());
             agent.badge_command = agent.spawn_command.clone();
+            if agent.spawn_agent_type.is_none()
+                && let Some(profile) = crate::doorbell_screen::profile_for_agent(Some(agent_type))
+            {
+                agent.bus.adopt_profile(profile);
+            }
         }
     }
 
@@ -22694,6 +22833,76 @@ mod spawn_tests {
         assert_eq!(bus.evidence_parser_cells(), 0);
     }
 
+    /// Scenario: A `cat` generation's doorbell is suspended on an attempt. The deck writes its own Enter into the pane, then the user types a word and presses Enter, then the generation is closed. The deck's Enter lifts nothing; the user's own submit resolves the attempt as the user's; closing retires the cell for good.
+    #[spec("inbox/doorbell/046")]
+    #[tokio::test]
+    async fn doorbell_046_the_users_own_submit_lifts_a_suspension_and_the_decks_does_not() {
+        use crate::doorbell_txn::{Cause, Latch, Resolution};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (id, _) = ledger_pane(&registry, "pane-user-clear");
+        let doorbell = registry.generation_doorbell(&id).expect("its doorbell");
+        let attempt = doorbell.counter().allocate().unwrap();
+        doorbell.cell().open(attempt).unwrap();
+        doorbell
+            .cell()
+            .suspend(attempt, Cause::NoSubmitEvidence)
+            .unwrap();
+        let writer = registry.agent_writer(&id).expect("the writer");
+        {
+            let w = writer.lock().await;
+            let mut sink = w.daemon(Duration::from_secs(2));
+            assert!(matches!(
+                sink.write_tracked(b"\r").await,
+                WriteProgress::Complete
+            ));
+        }
+        assert_eq!(
+            doorbell.cell().load(),
+            Latch::Suspended(attempt, Cause::NoSubmitEvidence),
+            "the deck's own Enter"
+        );
+        writer
+            .lock()
+            .await
+            .write_user(b"done\r")
+            .await
+            .expect("the user's keys");
+        assert_eq!(
+            doorbell.cell().load(),
+            Latch::Resolved(attempt, Resolution::User)
+        );
+        registry.close_agent(&id).expect("close the generation");
+        assert_eq!(doorbell.cell().load(), Latch::Retired);
+        registry.shutdown_all();
+    }
+
+    /// Scenario: A generation spawned with no agent type has an unprofiled evidence state; its hooks then report Claude Code, and the agent redraws its screen. The state takes up Claude Code's profile as a layout edge, Dirty until the redraw marker, and the redraw for the width in force turns it Clean; a generation that has a profile keeps it.
+    #[spec("inbox/doorbell/044")]
+    #[test]
+    fn doorbell_044_a_profile_learned_from_hooks_is_taken_up_as_an_edge() {
+        use crate::evidence_state::{EdgeReason, EvidenceStatus};
+        let bus = AgentBus::profiled(None, 24, 80);
+        bus.push(claude_frame(80));
+        assert_eq!(evidence(&bus), EvidenceStatus::Unprofiled);
+        let epoch = bus.evidence().1;
+        bus.adopt_profile(&crate::doorbell_screen::CLAUDE_PROFILE);
+        assert!(matches!(
+            evidence(&bus),
+            EvidenceStatus::Dirty {
+                reason: EdgeReason::ProfileLearned,
+                ..
+            }
+        ));
+        assert_eq!(bus.evidence().1, epoch + 1);
+        bus.push(claude_frame(80));
+        assert!(matches!(evidence(&bus), EvidenceStatus::Clean { .. }));
+        bus.adopt_profile(&crate::doorbell_screen::CODEX_PROFILE);
+        assert!(
+            matches!(evidence(&bus), EvidenceStatus::Clean { .. }),
+            "a profiled state keeps its profile"
+        );
+    }
+
     /// Scenario: A doorbell transaction marks a `cat` pane's writer as held, and a repaint nudge is asked for meanwhile; then the transaction ends. The nudge does not start while the transaction holds the writer, and starts once it has ended.
     #[spec("inbox/doorbell/044")]
     #[tokio::test]
@@ -25217,6 +25426,7 @@ mod spawn_tests {
                 pane_id_env: None,
                 state: Arc::new(Mutex::new(PaneInputState::default())),
                 retired: Arc::new(AtomicBool::new(false)),
+                doorbell: None,
             },
         ));
         let first = {
@@ -25407,6 +25617,7 @@ mod spawn_tests {
             Some("q24-pane".to_string()),
             Arc::new(Mutex::new(PaneInputState::default())),
             Arc::new(AtomicBool::new(false)),
+            None,
         );
         (writer, open, entering, taken)
     }
@@ -25526,6 +25737,7 @@ mod spawn_tests {
             Some(PANE.to_string()),
             state.clone(),
             retired.clone(),
+            None,
         );
         writer.write_all(b"typed").expect("write to sink");
         assert!(state.lock().unwrap().tracks_pane(PANE), "the control");

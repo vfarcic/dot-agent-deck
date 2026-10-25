@@ -779,11 +779,224 @@ pub static CLAUDE_PROFILE: ScreenProfile = ScreenProfile {
     min_cols: 80,
 };
 
+// ---------------------------------------------------------------------------
+// The e2e build's stand-in (`tests/support/empty_composer.py`)
+// ---------------------------------------------------------------------------
+
+/// The variable that selects the stand-in profile for a pane, set in the
+/// pane's own environment: `standin`.
+#[cfg(feature = "e2e")]
+pub const STANDIN_SELECTOR_ENV: &str = "DOT_AGENT_DECK_TEST_COMPOSER_PROFILE";
+
+/// The variable naming the stand-in's executable, by absolute path: the
+/// profile applies only to a pane that runs that file.
+#[cfg(feature = "e2e")]
+pub const STANDIN_BINARY_ENV: &str = "DOT_AGENT_DECK_TEST_COMPOSER_BINARY";
+
+#[cfg(feature = "e2e")]
+const STANDIN_READY: &str = "DOORBELL-STANDIN-READY";
+#[cfg(feature = "e2e")]
+const STANDIN_COMPOSER: &str = "COMPOSER: ";
+#[cfg(feature = "e2e")]
+const STANDIN_SUBMITTED: &str = "SUBMITTED:";
+
+/// The stand-in's composer: the row that starts `COMPOSER: `.
+#[cfg(feature = "e2e")]
+fn standin_composer(grid: &Grid) -> Option<Composer> {
+    let indent = STANDIN_COMPOSER.chars().count() as u16;
+    let row = (0..grid.rows).find(|&r| {
+        grid.text_from(r, 0)
+            .starts_with(STANDIN_COMPOSER.trim_end())
+    })?;
+    let text = grid.text_from(row, indent);
+    let cells = &grid.cells[row as usize][indent as usize..];
+    let shown: Vec<&GridCell> = cells.iter().filter(|c| !c.text.trim().is_empty()).collect();
+    let dim = !shown.is_empty() && shown.iter().all(|c| c.dim);
+    let end = indent + text.chars().count() as u16;
+    Some(Composer {
+        prompt_row: row,
+        last_row: row,
+        cursor_at_end: grid.cursor == (row, end),
+        text,
+        dim,
+    })
+}
+
+#[cfg(feature = "e2e")]
+fn standin_ready(grid: &Grid) -> bool {
+    grid.text_from(0, 0) == STANDIN_READY && standin_composer(grid).is_some()
+}
+
+#[cfg(feature = "e2e")]
+fn standin_placeholder(text: &str) -> bool {
+    text == "<empty>"
+}
+
+#[cfg(feature = "e2e")]
+fn standin_dialog(_grid: &Grid) -> Option<Dialog> {
+    None
+}
+
+#[cfg(feature = "e2e")]
+fn standin_transcript_user_line(grid: &Grid, line: &str) -> bool {
+    (0..grid.rows).any(|r| {
+        grid.text_from(r, 0)
+            .strip_prefix(STANDIN_SUBMITTED)
+            .is_some_and(|text| text == line)
+    })
+}
+
+/// The stand-in draws a row of `W` across the whole width under its ready
+/// row, in one run.
+#[cfg(feature = "e2e")]
+fn standin_width_witness(screen: &vt100::Screen, _seen: &WidthsSeen) -> bool {
+    let (rows, cols) = crate::vt_grid::size(screen);
+    rows > 1
+        && (0..cols).all(|c| screen.cell(1, c).is_some_and(|cell| cell.contents() == "W"))
+        && !screen.row_wrapped(1)
+        && !screen.row_wrapped(0)
+        && row_ended(screen, 1)
+}
+
+/// The e2e build's stand-in editor (`tests/support/empty_composer.py`): its
+/// fixed rows are this profile's contract, not a recogniser of any agent.
+/// It redraws in full (`ESC[2J ESC[H`) on every key and every resize.
+#[cfg(feature = "e2e")]
+pub static STANDIN_PROFILE: ScreenProfile = ScreenProfile {
+    id: "e2e-standin",
+    composer: standin_composer,
+    ready: standin_ready,
+    placeholder: standin_placeholder,
+    dialog: standin_dialog,
+    transcript_user_line: standin_transcript_user_line,
+    redraw_marker: b"\x1b[2J\x1b[H",
+    width_witness: standin_width_witness,
+    min_cols: 120,
+};
+
+/// The stand-in's executable when a pane's spawn selects the stand-in
+/// profile: the selector says `standin`, the binary variable names an
+/// absolute path, and the pane's command names that path. Anything less
+/// selects nothing.
+#[cfg(feature = "e2e")]
+pub fn standin_selected(
+    env: &[(String, String)],
+    command: Option<&str>,
+) -> Option<std::path::PathBuf> {
+    let value = |name: &str| {
+        env.iter()
+            .rev()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    };
+    if value(STANDIN_SELECTOR_ENV) != Some("standin") {
+        return None;
+    }
+    let binary = std::path::PathBuf::from(value(STANDIN_BINARY_ENV)?);
+    if !binary.is_absolute() || !command?.contains(binary.to_str()?) {
+        return None;
+    }
+    Some(binary)
+}
+
+/// Whether process `pid` runs `binary`: one of its arguments is that path,
+/// as a script's interpreter is given it (Linux; elsewhere nothing is read,
+/// and the stand-in is not recognised).
+#[cfg(feature = "e2e")]
+pub fn standin_running(pid: Option<u32>, binary: &std::path::Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(pid) = pid else {
+            return false;
+        };
+        let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            return false;
+        };
+        let wanted = binary.as_os_str().as_encoded_bytes();
+        cmdline.split(|b| *b == 0).any(|arg| arg == wanted)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (pid, binary);
+        false
+    }
+}
+
 /// The profile a record names.
 pub fn profile(id: &str) -> Option<&'static ScreenProfile> {
     [&CODEX_PROFILE, &CLAUDE_PROFILE]
         .into_iter()
         .find(|p| p.id == id)
+}
+
+/// What the doorbell's transaction reads of one frame (PRD #1666 part 3,
+/// round 5-wake, plan §1.1): `grid`, recognised by `profile`, as a
+/// [`crate::doorbell_txn::Frame`]. `clean` says whether the evidence state is
+/// Clean and `epoch` its layout epoch; a frame that is not Clean carries no
+/// composer and no dialog, so nothing can be decided on it. `line` is the
+/// attempt's `L_t`, for the transcript route. The composer is read only at a
+/// width the profile's measurements cover, and an empty one only on the
+/// profile's ready screen: an empty input row anywhere else is not the
+/// composer the doorbell may type into. A composer holding text is read on
+/// whatever screen draws it, since typing can hide what the agent draws
+/// only while it waits (Codex's footer hint).
+pub fn frame(
+    profile: &ScreenProfile,
+    grid: &Grid,
+    epoch: u64,
+    clean: bool,
+    line: Option<&str>,
+) -> crate::doorbell_txn::Frame {
+    use crate::doorbell_txn::{ComposerView, Frame};
+    let text = (0..grid.rows)
+        .map(|r| grid.text_from(r, 0))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !clean {
+        return Frame {
+            epoch,
+            clean,
+            text,
+            ..Frame::default()
+        };
+    }
+    let dialog = (profile.dialog)(grid).map(|dialog| match dialog {
+        Dialog::Measured(name) => name,
+        Dialog::Unrecognised => "unrecognised",
+    });
+    let composer = (grid.cols >= profile.min_cols)
+        .then(|| (profile.composer)(grid))
+        .flatten()
+        .filter(|composer| {
+            let empty =
+                composer.text.is_empty() || (composer.dim && (profile.placeholder)(&composer.text));
+            !empty || (profile.ready)(grid)
+        })
+        .map(|composer| {
+            let selection = (composer.prompt_row..=composer.last_row).any(|r| {
+                grid.cells[r as usize]
+                    .iter()
+                    .any(|c| c.inverse && !c.text.trim().is_empty())
+            });
+            ComposerView {
+                placeholder: composer.dim && (profile.placeholder)(&composer.text),
+                text: composer.text,
+                cursor_at_end: composer.cursor_at_end,
+                selection,
+            }
+        });
+    let user_cells = line
+        .filter(|line| (profile.transcript_user_line)(grid, line))
+        .map(|line| vec![line.to_string()])
+        .unwrap_or_default();
+    Frame {
+        epoch,
+        clean,
+        dialog,
+        composer,
+        user_cells,
+        text,
+    }
 }
 
 /// Why the strict recogniser refuses to withdraw the deck's text.
@@ -864,5 +1077,132 @@ pub fn profile_for_agent(
         crate::event::AgentType::Codex => Some(&CODEX_PROFILE),
         crate::event::AgentType::ClaudeCode => Some(&CLAUDE_PROFILE),
         _ => None,
+    }
+}
+
+#[cfg(all(test, feature = "e2e"))]
+mod standin_tests {
+    use super::*;
+
+    fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// The bytes `tests/support/empty_composer.py` draws for `content`
+    /// (`None`: its dim placeholder) and `transcript`, at `cols`.
+    fn standin_frame(cols: usize, transcript: &str, content: Option<&str>) -> Vec<u8> {
+        let content = match content {
+            Some(text) => text.to_string(),
+            None => "\x1b[2m<empty>\x1b[22m".to_string(),
+        };
+        format!(
+            "\x1b[2J\x1b[HDOORBELL-STANDIN-READY\r\n{}\r\n{transcript}\r\nPROCESSED:1\r\nCOMPOSER: {content}",
+            "W".repeat(cols)
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn the_standin_needs_its_selector_and_its_own_executable_path() {
+        let binary = "/home/t/doorbell-composer";
+        let command = Some("export X=1; exec '/home/t/doorbell-composer' '/home/t/base'");
+        let selected = env(&[
+            (STANDIN_SELECTOR_ENV, "standin"),
+            (STANDIN_BINARY_ENV, binary),
+        ]);
+        assert_eq!(
+            standin_selected(&selected, command),
+            Some(std::path::PathBuf::from(binary))
+        );
+        assert_eq!(
+            standin_selected(&env(&[(STANDIN_BINARY_ENV, binary)]), command),
+            None,
+            "no selector"
+        );
+        assert_eq!(
+            standin_selected(&env(&[(STANDIN_SELECTOR_ENV, "standin")]), command),
+            None,
+            "a missing path"
+        );
+        assert_eq!(
+            standin_selected(
+                &env(&[
+                    (STANDIN_SELECTOR_ENV, "standin"),
+                    (STANDIN_BINARY_ENV, "/home/t/another-editor"),
+                ]),
+                command
+            ),
+            None,
+            "a path the pane does not run"
+        );
+        assert_eq!(
+            standin_selected(
+                &env(&[
+                    (STANDIN_SELECTOR_ENV, "standin"),
+                    (STANDIN_BINARY_ENV, "doorbell-composer"),
+                ]),
+                command
+            ),
+            None,
+            "a relative path"
+        );
+        assert_eq!(
+            standin_selected(
+                &env(&[
+                    (STANDIN_SELECTOR_ENV, "other"),
+                    (STANDIN_BINARY_ENV, binary)
+                ]),
+                command
+            ),
+            None,
+            "another selector"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_standin_is_recognised_only_in_a_process_running_its_path() {
+        let own = std::env::current_exe().expect("this test's executable");
+        let argv0 = std::env::args().next().expect("argv[0]");
+        assert!(standin_running(
+            Some(std::process::id()),
+            std::path::Path::new(&argv0)
+        ));
+        assert!(!standin_running(
+            Some(std::process::id()),
+            &own.with_file_name("not-this-test")
+        ));
+        assert!(!standin_running(None, &own));
+    }
+
+    #[test]
+    fn the_standin_profile_reads_its_fixed_rows() {
+        let line = "(abcdfg) dot-agent-deck: message m-abcdefgh-0123456789abcdef waiting, run: dot-agent-deck inbox fetch";
+        let p = &STANDIN_PROFILE;
+        let empty = Grid::parse(&standin_frame(160, "", None), 45, 160);
+        assert!(p.empty_and_ready(&empty));
+        assert!(p.placeholder_empty(&empty));
+        let f = frame(p, &empty, 0, true, Some(line));
+        assert!(f.empty_and_ready());
+        let typed = Grid::parse(&standin_frame(160, "", Some(line)), 45, 160);
+        assert!(frame(p, &typed, 0, true, Some(line)).holds_exactly(line));
+        let submitted = Grid::parse(
+            &standin_frame(160, &format!("SUBMITTED:{line}"), None),
+            45,
+            160,
+        );
+        let f = frame(p, &submitted, 0, true, Some(line));
+        assert_eq!(f.user_cells, vec![line.to_string()]);
+        assert!(f.empty_and_ready());
+        // Its width witness: the W row as wide as the terminal, in one run.
+        let mut parser = crate::vt_grid::parser(45, 160, 0);
+        parser.process(&standin_frame(160, "", None));
+        assert!((p.width_witness)(parser.screen(), &WidthsSeen::of([160])));
+        let mut wider = crate::vt_grid::parser(45, 160, 0);
+        wider.process(&standin_frame(170, "", None));
+        assert!(!(p.width_witness)(wider.screen(), &WidthsSeen::of([160])));
     }
 }

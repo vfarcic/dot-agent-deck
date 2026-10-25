@@ -15655,6 +15655,63 @@ mod hook_provenance_audit_tests {
         registry.shutdown_all();
     }
 
+    /// Scenario: A generation has an open doorbell attempt and nothing listens on its pane's evidence channel. Through the daemon's real hook socket its prompt hook reports the attempt's token shaped with other text, then another pane's hook reports the same token, then its own hook reports it exact. Only the last moves the generation's latch cell, on receipt, to submitted; the cell never waits for a transaction to drain the channel.
+    #[spec("inbox/doorbell/046")]
+    #[tokio::test]
+    async fn doorbell_046_the_hook_arm_resolves_the_open_attempt_on_receipt() {
+        use crate::doorbell_txn::{Latch, Resolution, RingToken};
+        const PANE: &str = "pane-ring-cell";
+        const OTHER: &str = "pane-ring-cell-other";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent = spawn(&registry, Some(PANE), "/bin/cat");
+        let token = registry.hook_token_of(&agent).expect("the token");
+        let other = spawn(&registry, Some(OTHER), "/bin/cat");
+        let other_token = registry.hook_token_of(&other).expect("the other token");
+        let doorbell = registry.generation_doorbell(&agent).expect("its doorbell");
+        let attempt = doorbell.counter().allocate().unwrap();
+        doorbell
+            .ring()
+            .record(attempt, RingToken::parse("abcdfg").unwrap());
+        doorbell.cell().open(attempt).unwrap();
+        let deck = AuditDeck::start(registry.clone()).await;
+        let fetch = |token: &str, agent: &str, pane: &str, shape: &str| {
+            serde_json::json!({
+                "message_type": "inbox_fetch", "pane_id": pane, "agent_id": agent,
+                "token": token, "consumer": "doorbell_hook",
+                "doorbell": "m-abcdefgh-0123456789abcdef", "max_chars": 4096,
+                "doorbell_ring": "abcdfg", "doorbell_prompt": shape
+            })
+        };
+        let ask = |payload: serde_json::Value| {
+            let deck = &deck;
+            async move {
+                use tokio::io::AsyncBufReadExt;
+                let stream = deck.open(payload).await;
+                let mut reply = String::new();
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    tokio::io::BufReader::new(stream).read_line(&mut reply),
+                )
+                .await;
+            }
+        };
+        ask(fetch(&token, &agent, PANE, "with_other_text")).await;
+        assert_eq!(doorbell.cell().load(), Latch::Open(attempt), "not exact");
+        ask(fetch(&other_token, &other, OTHER, "exact")).await;
+        assert_eq!(
+            doorbell.cell().load(),
+            Latch::Open(attempt),
+            "another generation's hook"
+        );
+        ask(fetch(&token, &agent, PANE, "exact")).await;
+        assert_eq!(
+            doorbell.cell().load(),
+            Latch::Resolved(attempt, Resolution::Submitted)
+        );
+        deck.handle.abort();
+        registry.shutdown_all();
+    }
+
     /// Scenario: A generation is spawned, and status events reach the daemon's real hook socket: one carrying no prompt, then a prompt with no hook token, then a prompt attested by the generation's own token. Only the attested prompt closes the generation's header window, at the first prompt; the others leave its scanner reading.
     #[spec("inbox/doorbell/055")]
     #[tokio::test]

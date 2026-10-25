@@ -159,6 +159,10 @@ pub(crate) struct DraftTracker {
     /// Set by [`Self::ground`] when this byte opened a NEW sequence, whose
     /// sender is this byte's alone.
     fresh: bool,
+    /// PRD #1666 part 3, round 5-wake (plan §3.4′): how many times the user's
+    /// own bytes submitted or cleared the box (a submit they sent, or their
+    /// `Ctrl+U` or `Ctrl+C` outside a paste): what lifts a suspended doorbell.
+    user_clears: u64,
 }
 
 /// Who wrote a byte into a pane's PTY input. See [`DraftTracker`].
@@ -174,6 +178,11 @@ pub(crate) enum ByteOrigin {
 impl DraftTracker {
     pub(crate) fn pending(&self) -> bool {
         self.pending || self.escapes
+    }
+
+    /// See [`Self::user_clears`]'s field.
+    pub(crate) fn user_clears(&self) -> u64 {
+        self.user_clears
     }
 
     /// A turn of the agent's ended after everything fed so far reached it:
@@ -208,6 +217,9 @@ impl DraftTracker {
         if submits {
             // Enter is a hard reset, whoever pressed it: the box was
             // submitted, and whatever sequence was being parsed is over.
+            if origin == ByteOrigin::User {
+                self.user_clears += 1;
+            }
             self.pending = false;
             self.escapes = false;
             self.escape = Escape::Ground;
@@ -472,6 +484,7 @@ impl DraftTracker {
                 if self.by_user {
                     self.pending = false;
                     self.escapes = false;
+                    self.user_clears += 1;
                 }
                 Escape::Ground
             }

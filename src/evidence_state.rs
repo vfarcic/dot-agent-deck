@@ -68,6 +68,9 @@ pub enum EdgeReason {
     NudgeShrink,
     /// A repaint nudge's restore.
     NudgeRestore,
+    /// The generation's agent type was learned from its own hooks after it
+    /// started, and with it the profile: nothing parsed before is trusted.
+    ProfileLearned,
 }
 
 impl EdgeReason {
@@ -76,6 +79,7 @@ impl EdgeReason {
             EdgeReason::Resize => "resize",
             EdgeReason::NudgeShrink => "nudge_shrink",
             EdgeReason::NudgeRestore => "nudge_restore",
+            EdgeReason::ProfileLearned => "profile_learned",
         }
     }
 }
@@ -372,6 +376,36 @@ impl EvidenceState {
             }
         };
         self.transition(to, None)
+    }
+
+    /// The generation's profile, learned after it started (from the agent
+    /// type its own hooks reported): an unprofiled state takes it up as a
+    /// layout edge, Dirty until the profile's redraw marker, since none of
+    /// what was drawn before was parsed. A state that has a profile keeps it.
+    pub fn adopt(&mut self, profile: &'static ScreenProfile) -> Option<Transition> {
+        if self.profile.is_some() {
+            return None;
+        }
+        self.profile = Some(profile);
+        self.layout_epoch += 1;
+        self.parser = None;
+        self.tail.clear();
+        let to = if within_budget(self.rows, self.cols) {
+            EvidenceStatus::Dirty {
+                edge_seq: self.out_seq,
+                reason: EdgeReason::ProfileLearned,
+            }
+        } else {
+            EvidenceStatus::OverBudget {
+                since_seq: self.out_seq,
+            }
+        };
+        self.transition(to, None)
+    }
+
+    /// The profile the state tracks, if any.
+    pub fn profile(&self) -> Option<&'static ScreenProfile> {
+        self.profile
     }
 
     /// A nudge's restore ioctl failed: the width is unknown until the next

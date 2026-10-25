@@ -716,3 +716,48 @@ fn doorbell_036_go_no_go_over_measured_key_effects() {
         );
     }
 }
+
+/// Scenario: Read recorded Claude Code 2.1.310 and Codex composer launches through the frame builder the doorbell's transaction reads: the empty composer, the composer holding a typed token-led line, the screen after that line was submitted, and the same screens as a state that is not Clean. The empty composer is empty and ready; the typed line is held exactly, cursor at its end, and is no user message; after its submit a frame shows it as a user message with the composer no longer holding it; a frame that is not Clean has no composer and no dialog, so nothing is decided on it.
+#[spec("inbox/doorbell/036")]
+#[test]
+fn doorbell_036_the_transaction_reads_real_frames_through_the_profile() {
+    use dot_agent_deck::doorbell_screen::frame;
+    for (stem, profile) in [
+        (
+            "claude-inbox/r5wake/claude-2.1.310-composer-24x80",
+            &CLAUDE_PROFILE,
+        ),
+        (
+            "codex-inbox/r5wake/codex-0.164.0-composer-24x80",
+            &CODEX_PROFILE,
+        ),
+    ] {
+        let trace = fixture(stem);
+        let line = &trace.lines[0];
+        let empty = frame(profile, &trace.grid("empty"), 3, true, Some(line));
+        assert!(empty.empty_and_ready(), "{stem}: empty");
+        assert_eq!(empty.epoch, 3);
+        assert!(empty.user_cells.is_empty());
+        let typed = frame(profile, &trace.grid("typed-01"), 3, true, Some(line));
+        assert!(typed.holds_exactly(line), "{stem}: typed {typed:?}");
+        assert!(!typed.empty_and_ready());
+        assert!(
+            typed.user_cells.is_empty(),
+            "{stem}: the composer is no user cell"
+        );
+        let submitted = trace
+            .reads_between(trace.points["mark:cr-1"], trace.points["after-01"])
+            .iter()
+            .map(|grid| frame(profile, grid, 3, true, Some(line)))
+            .find(|f| f.user_cells == vec![line.clone()]);
+        let submitted = submitted.unwrap_or_else(|| panic!("{stem}: the line as a user message"));
+        assert!(!submitted.holds_exactly(line));
+        let dirty = frame(profile, &trace.grid("typed-01"), 4, false, Some(line));
+        assert!(!dirty.clean);
+        assert!(dirty.composer.is_none() && dirty.dialog.is_none());
+        assert!(
+            dirty.text.contains("dot-agent-deck: message"),
+            "text is still read"
+        );
+    }
+}
