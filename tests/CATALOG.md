@@ -3469,6 +3469,13 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** the exact debounce window (a harness constant).
 - **Platform coverage:** mac+linux.
 
+##### resize/sigwinch/004 — Keys typed right after a terminal resize take effect without any further input.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_resize_input.rs`).
+- **Agent:** none (empty dashboard, `minimal` fixture).
+- **Asserts:** with the dashboard filter open, sixty characters each typed straight after a resize pair — the second resize sent once the deck starts drawing the first (`TuiDeck::resize_during_redraw`) — each appear in the `/ ` prompt within ten seconds with no other byte sent. The check is on text that only grows, because quick successive resizes can leave an earlier frame's cells on the harness grid. Against crossterm 0.29.0's unpatched event source it failed on the first character in all ten of ten runs, and one more byte released the key every time; a failure reports that release, which tells a stranded key from a lost one.
+- **Does not assert:** the redraw at the new size (covered by `resize/sigwinch/001`); a resize that arrives behind typing in the same batch, which the vendored crate's own test reproduces (`vendor/crossterm/VENDORED.md`); what the stale cells on the harness grid say about a real terminal.
+- **Platform coverage:** mac+linux.
+
 #### resize/layout
 
 ##### resize/layout/001 — `Ctrl+t` toggles stacked / tiled dashboard layout without dropping any agents.

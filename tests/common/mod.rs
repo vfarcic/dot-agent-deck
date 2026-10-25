@@ -1564,6 +1564,29 @@ impl TuiDeck {
         dot_agent_deck::vt_grid::set_size(self.parser.lock().unwrap().screen_mut(), rows, cols);
     }
 
+    /// Resize to `first`, wait until the deck emits output after it, then
+    /// resize to `second`, so the second SIGWINCH lands while the deck is
+    /// drawing. A key sent straight after this reaches the deck together with
+    /// that SIGWINCH, the moment `resize/sigwinch/004` needs. Decision 21: the
+    /// wait is a poll on the reader's last-byte stamp, here rather than in a
+    /// test body. Two quick resizes can leave cells of the earlier frame on
+    /// this harness's grid, so check for text that has appeared, not gone.
+    pub fn resize_during_redraw(&mut self, first: (u16, u16), second: (u16, u16)) {
+        let before = Instant::now();
+        self.resize(first.0, first.1);
+        let deadline = before + WAIT_TIMEOUT;
+        while *self.last_byte_at.lock().unwrap() <= before {
+            assert!(
+                Instant::now() < deadline,
+                "the deck emitted nothing within {WAIT_TIMEOUT:?} of a resize to {}x{}",
+                first.0,
+                first.1
+            );
+            std::thread::sleep(Duration::from_micros(200));
+        }
+        self.resize(second.0, second.1);
+    }
+
     /// Quiescence wait: blocks until the deck has emitted no bytes for
     /// at least [`QUIESCENT_IDLE_MS`].
     pub fn wait_until_quiescent(&self) {
