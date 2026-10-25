@@ -18,12 +18,46 @@ use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
 
 /// The git toplevel of `dir`: the nearest directory, `dir` itself included,
-/// holding an entry named `.git` (a directory for a main checkout, a file for
-/// a linked worktree). `None` when no ancestor has one.
+/// holding a `.git` that git would take for a checkout's ([`is_git_entry`]).
+/// `None` when no ancestor has one.
 pub fn git_toplevel(dir: &Path) -> Option<PathBuf> {
     dir.ancestors()
-        .find(|candidate| fs::symlink_metadata(candidate.join(".git")).is_ok())
+        .find(|candidate| is_git_entry(&candidate.join(".git")))
         .map(Path::to_path_buf)
+}
+
+/// What a `.git` entry must start with when it is a file: a linked worktree's
+/// or a submodule's pointer to its git directory.
+const GITDIR_PREFIX: &[u8] = b"gitdir: ";
+
+/// Whether `entry` is a checkout's `.git`: a directory (a main checkout), or
+/// a regular file whose contents start with `gitdir: ` (a linked worktree or
+/// a submodule). A symlink, wherever it points, and any other kind of entry
+/// are not. The file is opened without following a symlink and without
+/// waiting on a FIFO swapped in, and what is checked is the file opened.
+pub fn is_git_entry(entry: &Path) -> bool {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let Ok(meta) = fs::symlink_metadata(entry) else {
+        return false;
+    };
+    if meta.file_type().is_dir() {
+        return true;
+    }
+    if !meta.file_type().is_file() {
+        return false;
+    }
+    let Ok(mut file) = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(entry)
+    else {
+        return false;
+    };
+    let mut head = [0u8; GITDIR_PREFIX.len()];
+    file.metadata().is_ok_and(|m| m.file_type().is_file())
+        && file.read_exact(&mut head).is_ok()
+        && head == GITDIR_PREFIX
 }
 
 /// `deck.worktree.id`: the lowercase hex of the first 16 bytes of SHA-256
@@ -162,6 +196,9 @@ pub fn walk(root: &Path, limits: &Limits<'_>) -> io::Result<Walk> {
     };
     let st = root_dir.stat()?;
     let device = fd::dev(&st);
+    // The root's mount, read only once a directory is opened by the
+    // fallback, which does not refuse to cross one itself.
+    let mut root_mount: Option<Option<u64>> = None;
     let mut seen: HashSet<(u64, u64)> = HashSet::new();
     seen.insert(fd::id(&st));
     let mut total = fd::bytes(&st);
@@ -173,9 +210,19 @@ pub fn walk(root: &Path, limits: &Limits<'_>) -> io::Result<Walk> {
         let Some(top) = stack.last_mut() else {
             break;
         };
-        let Some(name) = top.next_name() else {
-            stack.pop();
-            continue;
+        let name = match top.next_name() {
+            Ok(Some(name)) => name,
+            Ok(None) => {
+                stack.pop();
+                continue;
+            }
+            // A directory that could not be read to its end: what it holds
+            // past the error is not counted.
+            Err(_) => {
+                complete = false;
+                stack.pop();
+                continue;
+            }
         };
         entries += 1;
         if entries > limits.budget.max_entries
@@ -185,17 +232,26 @@ pub fn walk(root: &Path, limits: &Limits<'_>) -> io::Result<Walk> {
             complete = false;
             break;
         }
-        let Ok(st) = top.stat_at(&name) else {
-            continue;
+        let st = match top.stat_at(&name) {
+            Ok(st) => st,
+            // Gone since it was listed: nothing of it is left to count.
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => continue,
+            // There, but not looked at (a directory it may read and not
+            // search): its blocks are not counted.
+            Err(_) => {
+                complete = false;
+                continue;
+            }
         };
         if !fd::is_dir(&st) {
             if fd::links(&st) > 1 {
-                if seen.len() >= limits.budget.max_tracked {
-                    complete = false;
-                    break;
-                }
-                if !seen.insert(fd::id(&st)) {
-                    continue;
+                match track(&mut seen, fd::id(&st), limits.budget.max_tracked) {
+                    Tracked::New => {}
+                    Tracked::Counted => continue,
+                    Tracked::NoRoom => {
+                        complete = false;
+                        break;
+                    }
                 }
             }
             total += fd::bytes(&st);
@@ -206,37 +262,59 @@ pub fn walk(root: &Path, limits: &Limits<'_>) -> io::Result<Walk> {
             continue;
         }
         before_open(OsStr::from_bytes(name.to_bytes()));
-        let child = match top.open_child(&name) {
+        let (child, opened_by) = match top.open_child(&name) {
             Ok(child) => child,
             Err(e) => {
-                // A directory it may not enter still holds its own blocks; a
-                // symlink, a mount point or a vanished entry holds none here.
-                let denied = matches!(e.raw_os_error(), Some(libc::EACCES | libc::EPERM));
-                if denied && fd::dev(&st) == device {
-                    if seen.len() >= limits.budget.max_tracked {
-                        complete = false;
-                        break;
+                match e.raw_os_error() {
+                    // A directory it may not enter still holds its own
+                    // blocks; on another filesystem it is not the worktree's.
+                    Some(libc::EACCES | libc::EPERM) if fd::dev(&st) == device => {
+                        match track(&mut seen, fd::id(&st), limits.budget.max_tracked) {
+                            Tracked::New => total += fd::bytes(&st),
+                            Tracked::Counted => {}
+                            Tracked::NoRoom => {
+                                complete = false;
+                                break;
+                            }
+                        }
                     }
-                    if seen.insert(fd::id(&st)) {
-                        total += fd::bytes(&st);
-                    }
+                    // A symlink or a mount point, which the walk leaves out
+                    // on purpose, or an entry that vanished.
+                    Some(
+                        libc::EACCES
+                        | libc::EPERM
+                        | libc::ELOOP
+                        | libc::ENOTDIR
+                        | libc::EXDEV
+                        | libc::ENOENT,
+                    ) => {}
+                    // Any other failure leaves a directory uncounted.
+                    _ => complete = false,
                 }
                 continue;
             }
         };
         // What was opened is what is checked, not what the name showed.
         let Ok(opened) = child.stat() else {
+            complete = false;
             continue;
         };
-        if !fd::is_dir(&opened) || fd::dev(&opened) != device || child.holds(c".git") {
+        if !fd::is_dir(&opened) || fd::dev(&opened) != device || child.holds_git() {
             continue;
         }
-        if seen.len() >= limits.budget.max_tracked {
-            complete = false;
-            break;
+        if opened_by == fd::OpenedBy::Fallback {
+            let root = *root_mount.get_or_insert_with(|| stack[0].mount_id());
+            if crossed_mount(root, child.mount_id()) {
+                continue;
+            }
         }
-        if !seen.insert(fd::id(&opened)) {
-            continue;
+        match track(&mut seen, fd::id(&opened), limits.budget.max_tracked) {
+            Tracked::New => {}
+            Tracked::Counted => continue,
+            Tracked::NoRoom => {
+                complete = false;
+                break;
+            }
         }
         total += fd::bytes(&opened);
         stack.push(child);
@@ -245,6 +323,41 @@ pub fn walk(root: &Path, limits: &Limits<'_>) -> io::Result<Walk> {
         bytes: total,
         complete,
     })
+}
+
+/// What [`track`] found.
+#[derive(Debug, PartialEq, Eq)]
+enum Tracked {
+    /// Not seen before in this walk, and now held: count it.
+    New,
+    /// Already counted in this walk: skipping it needs no room.
+    Counted,
+    /// Not seen before, and the budget holds no more: the walk stops.
+    NoRoom,
+}
+
+/// Hold `id` in `seen`, at most `max` of them. An inode already held is
+/// [`Tracked::Counted`] whatever room is left, so a repeat hard link never
+/// stops a walk.
+fn track(seen: &mut HashSet<(u64, u64)>, id: (u64, u64), max: usize) -> Tracked {
+    if seen.contains(&id) {
+        Tracked::Counted
+    } else if seen.len() >= max {
+        Tracked::NoRoom
+    } else {
+        seen.insert(id);
+        Tracked::New
+    }
+}
+
+/// Whether a directory opened by the `openat` fallback is on another mount
+/// than the walk's root, from their mount ids (`statx`'s `STATX_MNT_ID`): the
+/// check `openat2`'s `RESOLVE_NO_XDEV` makes on the primary path, which also
+/// catches a bind mount of the root's own filesystem, where the devices
+/// match. When either id is unknown (a kernel older than 5.8, or `statx`
+/// refused) a crossing is not known, and only the device check applies.
+fn crossed_mount(root: Option<u64>, child: Option<u64>) -> bool {
+    matches!((root, child), (Some(root), Some(child)) if root != child)
 }
 
 #[cfg(test)]
@@ -355,8 +468,9 @@ mod fd {
         }
 
         /// The subdirectory `name`, opened relative to this one without
-        /// following a symlink (and, on Linux, without crossing a mount).
-        pub fn open_child(&self, name: &CStr) -> io::Result<Dir> {
+        /// following a symlink (and, on Linux with `openat2`, without
+        /// crossing a mount), and which of the two opened it.
+        pub fn open_child(&self, name: &CStr) -> io::Result<(Dir, OpenedBy)> {
             #[cfg(target_os = "linux")]
             if let Some(opened) = openat2(
                 self.fd.0,
@@ -364,11 +478,47 @@ mod fd {
                 OPEN_DIR,
                 RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH | RESOLVE_NO_XDEV,
             ) {
-                return Dir::from_fd(opened?);
+                return Ok((Dir::from_fd(opened?)?, OpenedBy::Openat2));
             }
             // SAFETY: `name` is a NUL-terminated string and `fd` is open.
             let fd = check(unsafe { libc::openat(self.fd.0, name.as_ptr(), OPEN_DIR) })?;
-            Dir::from_fd(fd)
+            Ok((Dir::from_fd(fd)?, OpenedBy::Fallback))
+        }
+
+        /// The id of the mount the open directory is on (`statx`'s
+        /// `STATX_MNT_ID`, Linux 5.8); `None` where the kernel does not
+        /// report one or refuses `statx`.
+        #[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
+        pub fn mount_id(&self) -> Option<u64> {
+            #[cfg(test)]
+            if NO_MOUNT_ID.with(std::cell::Cell::get) {
+                return None;
+            }
+            let mut stx = std::mem::MaybeUninit::<libc::statx>::zeroed();
+            // SAFETY: the empty path with `AT_EMPTY_PATH` names the open
+            // descriptor itself, and `stx` is writable.
+            let rc = unsafe {
+                libc::statx(
+                    self.fd.0,
+                    c"".as_ptr(),
+                    libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+                    STATX_MNT_ID,
+                    stx.as_mut_ptr(),
+                )
+            };
+            if rc != 0 {
+                return None;
+            }
+            // SAFETY: `statx` succeeded, so it filled `stx`; it was zeroed
+            // before, so a field it did not fill reads as 0.
+            let stx = unsafe { stx.assume_init() };
+            (stx.stx_mask & STATX_MNT_ID != 0).then_some(stx.stx_mnt_id)
+        }
+
+        /// Elsewhere no mount id is known.
+        #[cfg(not(all(target_os = "linux", any(target_env = "gnu", target_env = "musl"))))]
+        pub fn mount_id(&self) -> Option<u64> {
+            None
         }
 
         /// The open directory's own metadata.
@@ -385,28 +535,115 @@ mod fd {
             stat_at(&self.fd, name)
         }
 
-        /// Whether the directory holds an entry `name` of any kind.
-        pub fn holds(&self, name: &CStr) -> bool {
-            self.stat_at(name).is_ok()
+        /// Whether the directory holds a checkout's `.git`, by the rule of
+        /// [`super::is_git_entry`]: a directory, or a regular file starting
+        /// `gitdir: `, opened relative to this one without following a
+        /// symlink or waiting on a FIFO.
+        pub fn holds_git(&self) -> bool {
+            let Ok(st) = self.stat_at(c".git") else {
+                return false;
+            };
+            if is_dir(&st) {
+                return true;
+            }
+            if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+                return false;
+            }
+            let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+            // SAFETY: the name is NUL-terminated and `fd` is open.
+            let Ok(file) = check(unsafe { libc::openat(self.fd.0, c".git".as_ptr(), flags) })
+            else {
+                return false;
+            };
+            let file = Fd(file);
+            let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: `st` is writable and `file` is open.
+            if check(unsafe { libc::fstat(file.0, st.as_mut_ptr()) }).is_err() {
+                return false;
+            }
+            // SAFETY: `fstat` succeeded, so it filled `st`.
+            if unsafe { st.assume_init() }.st_mode & libc::S_IFMT != libc::S_IFREG {
+                return false;
+            }
+            let mut head = [0u8; super::GITDIR_PREFIX.len()];
+            let mut read = 0;
+            while read < head.len() {
+                // SAFETY: the buffer's tail is writable for its length.
+                let n = unsafe {
+                    libc::read(file.0, head[read..].as_mut_ptr().cast(), head.len() - read)
+                };
+                if n <= 0 {
+                    return false;
+                }
+                read += n as usize;
+            }
+            head == super::GITDIR_PREFIX
         }
 
-        /// The next entry's name, `.` and `..` left out; `None` at the end
-        /// or on a read error.
-        pub fn next_name(&mut self) -> Option<CString> {
+        /// The next entry's name, `.` and `..` left out; `None` at the
+        /// end. A read error is an error, not the end: the entries after it
+        /// were not seen.
+        pub fn next_name(&mut self) -> io::Result<Option<CString>> {
             loop {
+                #[cfg(test)]
+                if let Some(errno) = READDIR_ERROR.with(std::cell::Cell::take) {
+                    return Err(io::Error::from_raw_os_error(errno));
+                }
+                // `readdir` tells an error from the end only by `errno`.
+                clear_errno();
                 // SAFETY: `stream` is open; the entry it returns is valid
                 // until the next `readdir` on it, and is copied before that.
                 let entry = unsafe { libc::readdir(self.stream) };
                 if entry.is_null() {
-                    return None;
+                    let error = io::Error::last_os_error();
+                    return match error.raw_os_error() {
+                        None | Some(0) => Ok(None),
+                        Some(_) => Err(error),
+                    };
                 }
                 // SAFETY: `d_name` is a NUL-terminated array in the entry.
                 let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
                 if name.to_bytes() != b"." && name.to_bytes() != b".." {
-                    return Some(name.to_owned());
+                    return Ok(Some(name.to_owned()));
                 }
             }
         }
+    }
+
+    /// Which call opened a subdirectory.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum OpenedBy {
+        /// `openat2`, which refuses to cross a mount.
+        Openat2,
+        /// The `openat` fallback, which does not.
+        Fallback,
+    }
+
+    /// `STATX_MNT_ID` of `linux/stat.h`.
+    #[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
+    const STATX_MNT_ID: libc::c_uint = 0x1000;
+
+    /// Set `errno` to 0, so that a call that reports an error only through
+    /// it can be told apart from one that succeeded.
+    fn clear_errno() {
+        // SAFETY: each returns this thread's `errno`, which is writable.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        unsafe {
+            *libc::__errno_location() = 0
+        };
+        // SAFETY: as above.
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+        unsafe {
+            *libc::__error() = 0
+        };
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        /// A test's `errno` for the next `readdir` to fail with, once.
+        pub static READDIR_ERROR: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+        /// A test's switch to a kernel that reports no mount ids.
+        pub static NO_MOUNT_ID: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     /// The metadata of the entry `name` of the open directory `dir`, a
@@ -669,6 +906,63 @@ mod tests {
         // The temp directory's own ancestors hold no `.git` on a sane box;
         // whatever they hold, the answer is not inside `plain`.
         assert!(git_toplevel(&outside).is_none_or(|t| !t.starts_with(&outside)));
+    }
+
+    /// Finding 5: only a `.git` directory, or a regular `.git` file that
+    /// starts `gitdir: `, makes a checkout. A directory holding a `.git`
+    /// symlink, to a real git directory even, or a `.git` file of any other
+    /// content, is not one.
+    #[test]
+    fn a_git_symlink_or_a_stray_git_file_makes_no_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = canonical(&tmp);
+        let real = base.join("real");
+        fs::create_dir_all(real.join(".git")).unwrap();
+        let linked = base.join("linked");
+        fs::create_dir_all(linked.join("sub")).unwrap();
+        std::os::unix::fs::symlink(real.join(".git"), linked.join(".git")).unwrap();
+        let stray = base.join("stray");
+        fs::create_dir_all(&stray).unwrap();
+        fs::write(stray.join(".git"), "not a pointer\n").unwrap();
+        let short = base.join("short");
+        fs::create_dir_all(&short).unwrap();
+        fs::write(short.join(".git"), "gitdir").unwrap();
+
+        assert!(!is_git_entry(&linked.join(".git")));
+        assert!(!is_git_entry(&stray.join(".git")));
+        assert!(!is_git_entry(&short.join(".git")));
+        assert!(is_git_entry(&real.join(".git")));
+        for dir in [
+            linked.join("sub"),
+            linked.clone(),
+            stray.clone(),
+            short.clone(),
+        ] {
+            // Whatever the temp directory's ancestors hold, the answer is
+            // not one of these.
+            assert!(
+                git_toplevel(&dir).is_none_or(|t| !t.starts_with(&base)),
+                "{dir:?}: {:?}",
+                git_toplevel(&dir)
+            );
+        }
+        assert!(
+            canonical_toplevel(&linked).is_err()
+                || !canonical_toplevel(&linked).unwrap().starts_with(&base)
+        );
+
+        // Inside a worktree's walk, such a directory is not a nested
+        // checkout: it is walked and counted like any other.
+        let root = base.join("wt");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        let inner = root.join("inner");
+        fs::create_dir_all(&inner).unwrap();
+        std::os::unix::fs::symlink(real.join(".git"), inner.join(".git")).unwrap();
+        write_allocated(&inner.join("data.bin"), 64 * 1024);
+        each_open_path(|| {
+            let total = disk_usage(&root).unwrap();
+            assert!(total >= 64 * 1024, "{total}: the directory was skipped");
+        });
     }
 
     #[test]
@@ -996,5 +1290,141 @@ mod tests {
         let cancelled = walk(&root, &limits(&DEFAULT_BUDGET, &cancel)).unwrap();
         assert!(!cancelled.complete);
         assert_eq!(cancelled.bytes, usage_of(&root));
+    }
+
+    /// Finding 9: once the inode budget is full, a hard link to an inode
+    /// already counted is skipped, not taken for one more to hold, so it
+    /// does not stop the walk.
+    #[test]
+    fn repeat_hard_links_never_stop_a_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = canonical(&tmp).join("wt");
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("f.bin");
+        write_allocated(&file, 16 * 1024);
+        for i in 0..8 {
+            fs::hard_link(&file, root.join(format!("link{i}"))).unwrap();
+        }
+        // The root and the file: exactly the inodes there are to hold.
+        let full = Budget {
+            max_tracked: 2,
+            ..DEFAULT_BUDGET
+        };
+        let cancel = AtomicBool::new(false);
+        let walked = walk(&root, &limits(&full, &cancel)).unwrap();
+        assert!(walked.complete, "{walked:?}");
+        assert_eq!(walked.bytes, usage_of(&root) + usage_of(&file));
+    }
+
+    /// Finding 3: a directory whose listing fails part-way is not read to
+    /// its end, so the walk is incomplete rather than a complete figure
+    /// short of what that directory holds.
+    #[test]
+    fn a_readdir_error_makes_the_walk_incomplete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = canonical(&tmp).join("wt");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        write_allocated(&root.join("sub/f.bin"), 16 * 1024);
+        let cancel = AtomicBool::new(false);
+        let whole = walk(&root, &limits(&DEFAULT_BUDGET, &cancel)).unwrap();
+        assert!(whole.complete);
+        fd::READDIR_ERROR.with(|e| e.set(Some(libc::EIO)));
+        let failed = walk(&root, &limits(&DEFAULT_BUDGET, &cancel));
+        fd::READDIR_ERROR.with(|e| e.set(None));
+        let failed = failed.unwrap();
+        assert!(!failed.complete, "{failed:?}");
+        assert_eq!(failed.bytes, usage_of(&root));
+    }
+
+    /// Finding 3: an entry the walk lists but may not look at (in a
+    /// directory it may read but not search) is not counted, so the walk is
+    /// incomplete; while a directory it may not enter at all is the counted
+    /// case, and leaves it complete.
+    #[test]
+    fn an_entry_it_cannot_look_at_makes_the_walk_incomplete() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = canonical(&tmp).join("wt");
+        let unsearchable = root.join("read-only");
+        fs::create_dir_all(&unsearchable).unwrap();
+        write_allocated(&unsearchable.join("f.bin"), 16 * 1024);
+        fs::set_permissions(&unsearchable, fs::Permissions::from_mode(0o444)).unwrap();
+        let looked = fs::symlink_metadata(unsearchable.join("f.bin"));
+        if !denied(looked) {
+            fs::set_permissions(&unsearchable, fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!(
+                "SKIP: looking at an entry of a directory of mode 0444 was not refused \
+                 as denied (a holder of CAP_DAC_OVERRIDE or CAP_DAC_READ_SEARCH, as \
+                 root usually is, may), so there is no entry the walk cannot look at"
+            );
+            return;
+        }
+        let cancel = AtomicBool::new(false);
+        let mut results = Vec::new();
+        each_open_path(|| results.push(walk(&root, &limits(&DEFAULT_BUDGET, &cancel))));
+        fs::set_permissions(&unsearchable, fs::Permissions::from_mode(0o755)).unwrap();
+        for result in results {
+            let walked = result.unwrap();
+            assert!(!walked.complete, "{walked:?}");
+            assert!(walked.bytes < 16 * 1024, "{walked:?}");
+        }
+    }
+
+    /// Finding 8: the fallback's mount check. A directory is known to be on
+    /// another mount only when both mount ids are known and differ.
+    #[test]
+    fn a_mount_is_crossed_only_when_both_ids_are_known_and_differ() {
+        assert!(crossed_mount(Some(1), Some(2)));
+        assert!(!crossed_mount(Some(1), Some(1)));
+        assert!(!crossed_mount(None, Some(2)));
+        assert!(!crossed_mount(Some(1), None));
+        assert!(!crossed_mount(None, None));
+    }
+
+    /// Finding 8: the mount ids the fallback compares are real: a directory
+    /// and its subdirectory share one, and `/proc`, a mount of its own, has
+    /// another than `/`'s. Where the kernel reports none (older than 5.8),
+    /// there is nothing to compare and the test says so.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mount_ids_tell_mounts_apart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = canonical(&tmp);
+        fs::create_dir_all(root.join("sub")).unwrap();
+        let dir = fd::Dir::open_root(&root).unwrap();
+        let Some(id) = dir.mount_id() else {
+            eprintln!("SKIP: this kernel reports no mount id (STATX_MNT_ID)");
+            return;
+        };
+        let (sub, _) = dir.open_child(c"sub").unwrap();
+        assert_eq!(sub.mount_id(), Some(id));
+        let slash = fd::Dir::open_root(Path::new("/")).unwrap().mount_id();
+        let proc = fd::Dir::open_root(Path::new("/proc")).unwrap().mount_id();
+        assert!(slash.is_some() && proc.is_some());
+        assert_ne!(slash, proc);
+        assert!(crossed_mount(slash, proc));
+    }
+
+    /// Finding 8: with the fallback and no mount ids (a kernel older than
+    /// `openat2` and `STATX_MNT_ID` both), the walk still measures a tree
+    /// on one mount the same as the primary path does.
+    #[test]
+    fn the_fallback_without_mount_ids_walks_as_before() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = canonical(&tmp).join("wt");
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        write_allocated(&root.join("a/b/f.bin"), 16 * 1024);
+        let primary = disk_usage(&root).unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            fd::FORCE_OPENAT.with(|c| c.set(true));
+            fd::NO_MOUNT_ID.with(|c| c.set(true));
+            let fallback = disk_usage(&root);
+            fd::NO_MOUNT_ID.with(|c| c.set(false));
+            let checked = disk_usage(&root);
+            fd::FORCE_OPENAT.with(|c| c.set(false));
+            assert_eq!(fallback.unwrap(), primary);
+            assert_eq!(checked.unwrap(), primary);
+        }
     }
 }
