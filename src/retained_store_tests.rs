@@ -1248,7 +1248,7 @@ fn temps_in(dir: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Scenario: A write whose new file cannot be made owner-only fails and leaves nothing untracked, so a retry with the same report id is saved; when the file's own removal fails too, the store removes it, or keeps it as a charged stray that the next sweep removes, and even a zero-byte write's stray charges a byte. A write that fails and whose temporary file cannot be removed reports an orphaned attempt: the temporary file stays charged its room without taking a file slot or blocking the same id, the next sweep removes it once removals work, and one left when the run ends is removed by the next run's takeover, which retires the run.
+/// Scenario: A write whose new file cannot be made owner-only fails and leaves nothing untracked, so a retry with the same report id is saved; when the file's own removal fails too, the store removes it, or keeps it as a charged stray that the next sweep removes, and even a zero-byte write's stray charges a byte, as does a saved zero-byte write's link-fallback alias that cannot be removed. A write that fails and whose temporary file cannot be removed reports an orphaned attempt: the temporary file stays charged its room without taking a file slot or blocking the same id, the next sweep removes it once removals work, and one left when the run ends is removed by the next run's takeover, which retires the run.
 #[spec("inbox/recovery/023")]
 #[test]
 fn recovery_023_a_failed_write_leaves_nothing_untracked() {
@@ -1349,6 +1349,32 @@ fn recovery_023_a_failed_write_leaves_nothing_untracked() {
         "a zero-byte stray is charged"
     );
     drop(zero);
+    // So does a saved zero-byte write's link-fallback alias that stays.
+    let alias_root = crate::test_temp::tempdir().unwrap();
+    let alias = open(alias_root.path(), config(1, 100), start);
+    let room = alias.reserve(0).unwrap();
+    crate::platform::trusted_dir::test_seams::fail_next_rename_into(libc::ENOSYS);
+    alias.seams.fail_unlink.store(true, Ordering::SeqCst);
+    alias.write(room, "empty", b"", start).unwrap();
+    alias.seams.fail_unlink.store(false, Ordering::SeqCst);
+    assert_eq!(alias.own_state("empty"), Some(OwnState::Pinned));
+    assert_eq!(
+        temps_in(alias.dir()).len(),
+        1,
+        "{:?}",
+        names_in(alias.dir())
+    );
+    assert_eq!(
+        (counts(&alias).stray_files, counts(&alias).stray_bytes),
+        (1, 1)
+    );
+    assert!(
+        matches!(alias.reserve(0), Err(StoreRefusal::Bytes { .. })),
+        "a zero-byte alias is charged"
+    );
+    assert_eq!(alias.sweep(start).removed, 1);
+    assert_eq!(temps_in(alias.dir()), Vec::<String>::new());
+    drop(alias);
     put(&store, "stray", "the same id again", start);
     assert_eq!(store.own_state("stray"), Some(OwnState::Pinned));
     let swept = store.sweep(start);

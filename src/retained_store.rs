@@ -1424,10 +1424,11 @@ impl RetainedStore {
     }
 
     /// Reserve `bytes` and one file slot, or refuse, consuming nothing. A
-    /// reservation is at least one byte, so a stray, which is charged its
-    /// write's reservation and takes no file slot, always charges at least
-    /// one: the byte budget bounds how many there can be. No caller in the
-    /// deck asks for less; a report's and a dispatch result's files are
+    /// reservation is at least one byte. A stray takes no file slot and
+    /// charges at least one byte too: a failed write's its reservation, a
+    /// saved write's leftover alias its file's length or one byte, whichever
+    /// is more. So the byte budget bounds how many there can be. No caller in
+    /// the deck asks for less; a report's and a dispatch result's files are
     /// sized from nonzero bounds.
     pub fn reserve(&self, bytes: u64) -> Result<Reservation, StoreRefusal> {
         self.refuse_unusable()?;
@@ -1558,8 +1559,10 @@ impl RetainedStore {
                         },
                     );
                     st.own_bytes = st.own_bytes.saturating_add(bytes);
+                    // A kept alias takes no slot, so it charges at least
+                    // the reservation's floor of one byte.
                     if let Some(stray) = stray {
-                        st.stray.insert(stray, bytes);
+                        st.stray.insert(stray, bytes.max(1));
                     }
                     st.revision += 1;
                 }
