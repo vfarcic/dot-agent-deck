@@ -1139,6 +1139,7 @@ impl StoreLock<'_> {
 
     /// See [`RetainedStore::reserve`].
     pub fn reserve(&mut self, bytes: u64) -> Result<Reservation, StoreRefusal> {
+        let bytes = bytes.max(1);
         self.store.refuse_unusable()?;
         self.store.admit(&self.st, bytes)?;
         self.st.reserved_bytes += bytes;
@@ -1176,8 +1177,12 @@ impl StoreLock<'_> {
 
 /// A write's reserved room while the write runs: an unwind before the write's
 /// own accounting returns it, through `lock_in_drop`, which never panics. It
-/// does not record a file the write already created; the caller's `discard`
-/// removes one, and one it cannot remove stays uncharged.
+/// does not record a file the write already created. The caller's `discard`
+/// knows only the own name, which an unwind before publication has not
+/// taken: such an unwind leaves the attempt's temporary name, uncharged and
+/// untracked by this run, for the next run's takeover to remove. One after
+/// publication leaves the own name, for `discard`; one that cannot be removed
+/// stays uncharged.
 struct RoomOnUnwind<'a> {
     store: &'a RetainedStore,
     bytes: Option<u64>,
@@ -1418,7 +1423,12 @@ impl RetainedStore {
         Ok(())
     }
 
-    /// Reserve `bytes` and one file slot, or refuse, consuming nothing.
+    /// Reserve `bytes` and one file slot, or refuse, consuming nothing. A
+    /// reservation is at least one byte, so a stray, which is charged its
+    /// write's reservation and takes no file slot, always charges at least
+    /// one: the byte budget bounds how many there can be. No caller in the
+    /// deck asks for less; a report's and a dispatch result's files are
+    /// sized from nonzero bounds.
     pub fn reserve(&self, bytes: u64) -> Result<Reservation, StoreRefusal> {
         self.refuse_unusable()?;
         self.lock()
@@ -1471,7 +1481,16 @@ impl RetainedStore {
         let mut stray = None;
         let written = (|| {
             let attempt = temp_name(report_id)?;
-            let mut file = dirs.mine.create_new_owner_only(&attempt)?;
+            let mut file = match dirs.mine.create_new_owner_only(&attempt) {
+                Ok(file) => file,
+                // Created, but neither made owner-only nor removed: the
+                // cleanup below retries it, and keeps it as a stray.
+                Err(error) if crate::platform::trusted_dir::left_behind(&error) => {
+                    temp = Some(attempt);
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            };
             temp = Some(attempt.clone());
             #[cfg(test)]
             if self.seams.fail_write.swap(false, Ordering::SeqCst)

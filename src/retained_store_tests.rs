@@ -1248,7 +1248,7 @@ fn temps_in(dir: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Scenario: A write whose new file cannot be made owner-only fails and leaves nothing behind, so a retry with the same report id is saved. A write that fails and whose temporary file cannot be removed reports an orphaned attempt: the temporary file stays charged its room without taking a file slot or blocking the same id, the next sweep removes it once removals work, and one left when the run ends is removed by the next run's takeover, which retires the run.
+/// Scenario: A write whose new file cannot be made owner-only fails and leaves nothing untracked, so a retry with the same report id is saved; when the file's own removal fails too, the store removes it, or keeps it as a charged stray that the next sweep removes, and even a zero-byte write's stray charges a byte. A write that fails and whose temporary file cannot be removed reports an orphaned attempt: the temporary file stays charged its room without taking a file slot or blocking the same id, the next sweep removes it once removals work, and one left when the run ends is removed by the next run's takeover, which retires the run.
 #[spec("inbox/recovery/023")]
 #[test]
 fn recovery_023_a_failed_write_leaves_nothing_untracked() {
@@ -1266,6 +1266,43 @@ fn recovery_023_a_failed_write_leaves_nothing_untracked() {
     assert_eq!(counts(&store), StoreCounts::default());
     put(&store, "perm", "retried", start);
     assert_eq!(names_in(store.dir()), vec!["r-perm.md"]);
+
+    // The owner-only step fails and so does its own removal of the file: the
+    // store removes it instead, or keeps it as a charged stray that the next
+    // sweep removes once removals work.
+    for unlink_fails in [false, true] {
+        crate::platform::trusted_dir::test_seams::fail_next_owner_only();
+        crate::platform::trusted_dir::test_seams::fail_next_rollback();
+        store
+            .seams
+            .fail_unlink
+            .store(unlink_fails, Ordering::SeqCst);
+        let room = store.reserve(64).unwrap();
+        let failed = store.write(room, "both", b"body", start);
+        store.seams.fail_unlink.store(false, Ordering::SeqCst);
+        let left = temps_in(store.dir());
+        let held = counts(&store);
+        assert_eq!(held.reserved_bytes, 0);
+        assert_eq!(store.own_state("both"), None);
+        if unlink_fails {
+            assert!(
+                matches!(failed, Err(WriteFailure::IoOrphaned(_))),
+                "{failed:?}"
+            );
+            assert_eq!(left.len(), 1, "{:?}", names_in(store.dir()));
+            assert!(left[0].starts_with("w-both."));
+            assert_eq!((held.stray_files, held.stray_bytes), (1, 64));
+            assert_eq!(store.sweep(start).removed, 1);
+        } else {
+            assert!(matches!(failed, Err(WriteFailure::Io(_))), "{failed:?}");
+        }
+        assert_eq!(temps_in(store.dir()), Vec::<String>::new());
+        assert_eq!(names_in(store.dir()), vec!["r-perm.md"]);
+        assert_eq!(
+            (counts(&store).stray_files, counts(&store).stray_bytes),
+            (0, 0)
+        );
+    }
 
     let room = store.reserve(64).unwrap();
     store.seams.fail_unlink.store(true, Ordering::SeqCst);
@@ -1295,6 +1332,23 @@ fn recovery_023_a_failed_write_leaves_nothing_untracked() {
         "a stray's room stays charged"
     );
     drop(tight);
+    // A zero-byte write's stray still charges a byte, so strays are bounded.
+    let zero_root = crate::test_temp::tempdir().unwrap();
+    let zero = open(zero_root.path(), config(1, 100), start);
+    let room = zero.reserve(0).unwrap();
+    zero.seams.fail_unlink.store(true, Ordering::SeqCst);
+    zero.seams.fail_write.store(true, Ordering::SeqCst);
+    assert!(zero.write(room, "empty", b"", start).is_err());
+    zero.seams.fail_unlink.store(false, Ordering::SeqCst);
+    assert_eq!(
+        (counts(&zero).stray_files, counts(&zero).stray_bytes),
+        (1, 1)
+    );
+    assert!(
+        matches!(zero.reserve(0), Err(StoreRefusal::Bytes { .. })),
+        "a zero-byte stray is charged"
+    );
+    drop(zero);
     put(&store, "stray", "the same id again", start);
     assert_eq!(store.own_state("stray"), Some(OwnState::Pinned));
     let swept = store.sweep(start);
