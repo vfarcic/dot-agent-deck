@@ -347,7 +347,8 @@ tasks:
   - key: desktop-driver
     if: ${{ tasks.backend.values.rust == 'true' }}
     use: [system-packages, code, rust, pnpm]
-    tool-cache: ci-desktop-driver-v1
+    # v2: v1's cache held a deleted /etc/ssh/sshd_config, which fails openssh-server's postinst.
+    tool-cache: ci-desktop-driver-v2
     timeout: 30m
     env:
       TAURI_DRIVER_VERSION: 2.0.6
