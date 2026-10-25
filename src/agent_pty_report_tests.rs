@@ -969,6 +969,92 @@ impl Team {
 const EXITED: &str = "worker exited";
 const UNDELIVERED: &str = "task not delivered";
 
+/// Scenario: With the idle detector off, an acknowledged task's report is saving when its worker exits. The exit notice stays withheld until the save fails, then arrives once and a retry says the task is closed.
+#[spec("orchestration/work-done/045")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn work_done_045_b_a_failed_save_after_exit_with_the_detector_off() {
+    let team = Arc::new(team("wd045b"));
+    let task = team.delegate("detector off");
+    team.acknowledge();
+    assert!(team.registry().delegations.lock().records.is_empty());
+    team.registry()
+        .inject_fault_for_test(crate::task_completion::FAULT_FAIL_SAVE, TestFault::Fail);
+    let (report, release) = team
+        .paused(&task, crate::task_completion::PAUSE_SAVED)
+        .await;
+    team.worker_exits().await;
+    assert_eq!(team.notices_naming(EXITED, &task), 0);
+    release.send(()).unwrap();
+    refused_with(report.await.unwrap(), code::REPORT_SAVE_FAILED);
+    eventually("the withheld exit notice", || {
+        team.notices_naming(EXITED, &task) == 1
+    })
+    .await;
+    refused_with(team.report_task(&task, "retry").await, code::TASK_CLOSED);
+    assert_eq!(team.notices_naming(EXITED, &task), 1);
+    assert!(store_files(&team.deck.store).is_empty());
+}
+
+/// Scenario: A worker acknowledges its first task and receives a second without reporting the first. The second supersedes the first, so their exit cannot leave two open tasks: the old report is refused and the exit names only the unacknowledged successor.
+#[spec("orchestration/work-done/045")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn work_done_045_k_supersede_prevents_two_open_tasks_on_one_generation() {
+    let team = team("wd045k");
+    let old = team.delegate("acknowledged first task");
+    team.acknowledge();
+    let new = team.delegate("unacknowledged second task");
+    assert_eq!(
+        team.registry().inbox().open_tasks_of(&team.worker_pane),
+        vec![new.clone()]
+    );
+    refused_with(
+        team.report_task(&old, "late report").await,
+        code::TASK_SUPERSEDED,
+    );
+    team.worker_exits().await;
+    assert_eq!(team.notices_naming(EXITED, &old), 0);
+    assert_eq!(team.notices_naming(UNDELIVERED, &old), 0);
+    assert_eq!(team.notices_naming(UNDELIVERED, &new), 1);
+    assert_eq!(team.notices_naming(EXITED, &new), 0);
+}
+
+/// Scenario: An idle-worker tracker record without a ledger task remains when a real worker child exits, and there is no commission arm. The orchestrator still receives exactly one worker-exited notice naming that pane through the EOF fallback.
+#[spec("orchestration/work-done/045")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn work_done_045_h_eof_reports_a_tracker_record_without_a_ledger_task() {
+    let team = team("wd045h");
+    let armed = team
+        .registry()
+        .arm_outstanding_delegation(
+            &team.worker_pane,
+            "coder",
+            &team.orch_pane,
+            &team.orch,
+            None,
+        )
+        .unwrap();
+    team.registry()
+        .bind_delegation_worker_agent_id(&team.worker_pane, armed.seq, &team.worker);
+    assert!(
+        team.registry()
+            .inbox()
+            .open_tasks_of(&team.worker_pane)
+            .is_empty()
+    );
+    assert!(
+        !team
+            .registry()
+            .owes_delegation_commission(&team.worker_pane)
+    );
+    kill_child(team.registry(), &team.worker);
+    eventually("the non-ledger EOF fallback notice", || {
+        team.notices_naming(EXITED, &team.worker_pane) == 1
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(team.notices_naming(EXITED, &team.worker_pane), 1);
+}
+
 /// Scenario: Through the worker's real exit: (a) an acknowledged task whose report is paused when the worker exits, then fails its save: its "worker exited" notice is withheld at the exit and posted once by the failure, the task is closed, and a repeat reads `task_closed`. (c) a newer acknowledged task beside the claimed one: its notice is posted at the exit, the claimed task's by the failure. (d) as (a) with the save succeeding: the claimed task's notice is never posted. (e) an unacknowledged claimed task: its undeliverable notice is withheld and posted once by the failure. (f) a failure before the exit: the task is open at the exit, which posts its notice once.
 #[spec("orchestration/work-done/045")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

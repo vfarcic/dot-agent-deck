@@ -6,6 +6,8 @@
 //! that enqueue seam early lets S2 run independently of producer migration (S5).
 
 mod common;
+#[path = "support/inbox_doorbell.rs"]
+mod inbox_card;
 
 use common::DaemonProc;
 use dot_agent_deck::daemon_protocol::{KIND_REQ, KIND_RESP};
@@ -1117,6 +1119,41 @@ fn inbox_protocol_023_a_refused_request_of_the_agents_own_shows_on_its_card() {
         "an admitted request clears it: {}",
         record(&daemon, &own)
     );
+}
+
+/// Scenario: A synthetic Codex agent's real TUI card has a queued message when its own fetch arrives over a connection whose creator exited. The attached terminal shows the refusal cause and restart remedy on that card, then clears the notice after an admitted fetch.
+#[spec("inbox/protocol/023")]
+#[test]
+fn inbox_protocol_023_a_refused_connection_renders_cause_and_remedy_on_the_card() {
+    // Card notices occupy one line; leave room for the cause and remedy even
+    // when the dashboard shares the terminal with its pane column.
+    let deck = common::TuiDeck::builder()
+        .with_pty_size(3000, 50)
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active agents");
+    let pane = inbox_card::pane_with(&deck, "refused-card", json!({"agent_type":"codex"}));
+    assert!(deck.wait_for_grid_string_within("Codex", WAIT));
+    inbox_card::enqueue(&deck, &pane, "waiting for the refused agent");
+    let mut request = inbox_card::request(&pane, "inbox_fetch");
+    request["consumer"] = json!("cli");
+    let (mut socket, _) = connect_from_an_exited_process(deck.hook_socket_path());
+    writeln!(socket.get_mut(), "{request}").unwrap();
+    let reply = line(&mut socket);
+    assert_eq!(reply["refused"], "inbox_peer_unidentified", "{reply}");
+    for text in [
+        "refused-card",
+        "Messages can't reach this agent",
+        "the deck could not identify the process that asked for them",
+        "Restart it from the deck",
+    ] {
+        assert!(
+            deck.wait_for_grid_string_within(text, WAIT),
+            "card must show {text:?}: {}",
+            deck.snapshot_grid()
+        );
+    }
+    inbox_card::fetch(&deck, &pane, true);
+    deck.wait_for_absence("Messages can't reach this agent");
 }
 
 /// Scenario: Fill a deck that may hold one message, then have an agent pane ask it to dispatch a unit. The deck has no room for the dispatch's result, so it refuses the dispatch with deck_full instead of accepting it, and no unit is started.
