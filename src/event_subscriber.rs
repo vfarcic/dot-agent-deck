@@ -219,10 +219,11 @@ async fn e2e_hold_stream_down() {
     let path = std::path::PathBuf::from(path);
     let mut held = path.clone().into_os_string();
     held.push(".held");
-    if path.exists() {
-        let _ = std::fs::write(&held, b"");
+    let exists = || tokio::fs::try_exists(&path);
+    if exists().await.unwrap_or(false) {
+        let _ = tokio::fs::write(&held, b"").await;
     }
-    while path.exists() {
+    while exists().await.unwrap_or(false) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -1516,6 +1517,70 @@ mod tests {
             )],
             "the unseen roles were not queued as their orchestration's one surface"
         );
+    }
+
+    /// Scenario: after a gap, the deck's snapshot lists three orchestrations. In `mixed`, one role is carded and placed in its tab and the other has no card; in `tabless`, the only role has a card but was never placed in a tab; in `shown`, the only role is carded and placed. `mixed` is queued with both roles, so the render loop places the missing one beside the one its tab holds, and only the uncarded role gets a new card; `tabless` is queued so its tab is built; `shown` is not queued (issue #1800).
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_an_orchestration_with_any_unseen_role_is_surfaced_whole() {
+        use crate::daemon_client::Incarnation;
+        let mut tui = AppState::default();
+        tui.learn_stream_incarnation(Incarnation::from(Some("b".to_string())));
+        for (pane, agent) in [("m0", "1"), ("t0", "3"), ("s0", "4")] {
+            tui.apply_event(event_on(pane, agent, pane, EventType::SessionStart, 1));
+        }
+        for (pane, role) in [("m0", "lead"), ("s0", "lead")] {
+            tui.pane_role_map.insert(pane.into(), role.into());
+        }
+        let role = |id: &str, pane: &str, name: &str, index: usize| {
+            serde_json::json!({ "id": id, "pane_id_env": pane, "tab_membership": {
+                "kind": "orchestration", "name": name, "role_index": index,
+                "role_name": format!("r{index}"), "is_start_role": index == 0,
+                "orchestration_cwd": format!("/work/{name}"),
+                "orchestration_id": format!("{name}-id") } })
+        };
+        let records: Vec<AgentRecord> = serde_json::from_value(serde_json::json!([
+            role("1", "m0", "mixed", 0),
+            role("2", "m1", "mixed", 1),
+            role("3", "t0", "tabless", 0),
+            role("4", "s0", "shown", 0),
+        ]))
+        .unwrap();
+        tui.card_unseen_agents(&records);
+        let queued: Vec<(String, Vec<String>)> = tui
+            .pending_orchestration_surfaces
+            .iter()
+            .map(|(surface, _)| {
+                (
+                    surface.name.clone(),
+                    surface.roles.iter().map(|r| r.pane_id.clone()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            queued,
+            vec![
+                (
+                    "mixed".to_string(),
+                    vec!["m0".to_string(), "m1".to_string()]
+                ),
+                ("tabless".to_string(), vec!["t0".to_string()]),
+            ],
+            "the orchestrations with an unseen role were not queued whole, or a shown one was"
+        );
+        let cards_on = |pane: &str| {
+            tui.sessions
+                .values()
+                .filter(|card| card.pane_id.as_deref() == Some(pane))
+                .count()
+        };
+        for (pane, cards) in [("m0", 1), ("m1", 1), ("t0", 1), ("s0", 1)] {
+            assert_eq!(
+                cards_on(pane),
+                cards,
+                "pane {pane} has the wrong number of cards"
+            );
+        }
     }
 
     /// Scenario: after a gap the deck's snapshot lists an idle agent with no card, and the TUI cards it. The agent then reports it is thinking, with no new session start, and its card says Thinking; a later resync whose snapshot says it waits for input moves the card there. A report applied while the stream comes from another deck process does not update the card: the card is dropped for the restart notice, and the report draws that process's own card (control).

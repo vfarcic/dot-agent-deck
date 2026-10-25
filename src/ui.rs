@@ -4462,26 +4462,32 @@ fn surface_one_orchestration(
     state: &SharedState,
     embedded: &EmbeddedPaneController,
     tab_manager: &mut TabManager,
-    surface: OrchestrationSurface,
+    mut surface: OrchestrationSurface,
     learned_from: &crate::daemon_client::Incarnation,
     ui: &mut UiState,
 ) {
-    // Idempotency: skip if an existing tab already owns any of this surface's
-    // role panes (a duplicate broadcast, or reconnect-hydration that beat us to
-    // it). Matching on the globally-unique role pane ids is more robust than a
-    // (cwd, name) compare — an unnamed orchestration's surface `name` is the
-    // resolved cwd-basename while the tab's `config.name` may be the raw
-    // (possibly empty) config name, so they wouldn't compare equal.
-    let already_built = surface
-        .roles
-        .iter()
-        .any(|r| tab_manager.tab_index_for_pane(&r.pane_id).is_some());
-    if already_built {
+    // Idempotency: skip if an existing tab already owns every one of this
+    // surface's role panes (a duplicate broadcast, or reconnect-hydration that
+    // beat us to it). Matching on the globally-unique role pane ids is more
+    // robust than a (cwd, name) compare — an unnamed orchestration's surface
+    // `name` is the resolved cwd-basename while the tab's `config.name` may be
+    // the raw (possibly empty) config name, so they wouldn't compare equal.
+    //
+    // Issue #1800: a surface the resync rebuilt from the deck's listing carries
+    // every live role of its orchestration, some of them possibly in its tab
+    // already. Those are dropped and the rest are placed below, which grows the
+    // existing tab, rather than the whole surface being skipped.
+    let owned = |tab_manager: &TabManager, role: &crate::event::OrchestrationSurfaceRole| {
+        tab_manager.tab_index_for_pane(&role.pane_id).is_some()
+    };
+    if surface.roles.iter().any(|r| !owned(tab_manager, r)) {
+        surface.roles.retain(|r| !owned(tab_manager, r));
+    } else {
         adopt_context_path_into_owning_tab(tab_manager, &surface);
         tracing::debug!(
             cwd = %surface.cwd,
             orchestration = %surface.name,
-            "live orchestration surface: tab already owns a role pane, skipping"
+            "live orchestration surface: a tab already owns every role pane, skipping"
         );
         return;
     }
@@ -4671,13 +4677,23 @@ fn surface_one_orchestration(
                 }
                 st.register_pane(role.pane_id.clone());
                 let learned_from = attached_on.unwrap_or_else(|| st.stream_incarnation.clone());
-                st.insert_placeholder_session_learned(
-                    role.pane_id.clone(),
-                    Some(surface.cwd.clone()),
-                    None,
-                    agent_id,
-                    learned_from,
-                );
+                // Issue #1800: a card the resync seeded from the deck's listing
+                // for this same agent keeps the live state it was seeded with,
+                // which a fresh placeholder would reset to idle.
+                let seeded = agent_id.is_some()
+                    && st
+                        .sessions
+                        .get(&crate::state::placeholder_session_id(&role.pane_id))
+                        .is_some_and(|card| card.agent_id == agent_id);
+                if !seeded {
+                    st.insert_placeholder_session_learned(
+                        role.pane_id.clone(),
+                        Some(surface.cwd.clone()),
+                        None,
+                        agent_id,
+                        learned_from,
+                    );
+                }
                 // Issue #462 — the reference note for all five TUI-side
                 // registrations of these maps; the other four cite it.
                 //
@@ -41661,6 +41677,107 @@ mod tests {
         card.display_name = Some(name.into());
         card.incarnation = crate::daemon_client::Incarnation::from(Some(process.to_string()));
         card
+    }
+
+    /// Scenario: An orchestration tab already holds its orchestrator's pane when the event stream comes back after a gap in which the deck started a worker for it. The resync queues the orchestration's whole listed role set and cards the worker from the listing, which says it is working. The render loop places the worker in the existing tab rather than skipping the surface because the tab holds one of its roles, and the worker's card still says it is working (issue #1800).
+    // The restart fixture is a Unix-socket daemon.
+    #[cfg(unix)]
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_a_resync_surface_grows_the_existing_tab_and_keeps_the_seeded_card() {
+        use crate::daemon_client::Incarnation;
+        use crate::daemon_client::restart_fixture::RestartingDaemon;
+        use crate::embedded_pane::EmbeddedPaneController;
+        use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
+        use tokio::sync::RwLock;
+        let role = |name: &str, start: bool| OrchestrationRoleConfig {
+            agent: None,
+            name: name.to_string(),
+            command: "cat".to_string(),
+            start,
+            description: None,
+            prompt_template: None,
+            clear: false,
+        };
+        let cfg = OrchestrationConfig {
+            default: false,
+            name: "team".to_string(),
+            roles: vec![role("orchestrator", true), role("worker", false)],
+        };
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        // The fixture serves `pane-1` as agent `1`, the worker here.
+        let daemon = runtime.block_on(async { RestartingDaemon::spawn("a") });
+        let controller = Arc::new(
+            EmbeddedPaneController::new(daemon.path.clone(), runtime.handle().clone())
+                .with_protocol_gate(),
+        );
+        let pc: Arc<dyn PaneController> = controller.clone();
+        let mut tabs = TabManager::new(pc.clone());
+        let cwd = tempfile::tempdir().unwrap();
+        let cwd = cwd.path().to_string_lossy().into_owned();
+        let identity = crate::state::OrchestrationIdentity {
+            id: "unit".into(),
+            name: "team".into(),
+        };
+        tabs.open_orchestration_tab_with_existing_role_panes(
+            &cfg,
+            &cwd,
+            vec![Some("pane-0".into()), Some(dead_slot_pane_id(&identity, 1))],
+            None,
+            Some("unit"),
+        )
+        .expect("the orchestration's tab, holding its orchestrator");
+        let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+        {
+            let mut st = state.blocking_write();
+            st.learn_stream_incarnation(Incarnation::from(Some("a".to_string())));
+            st.pane_role_map
+                .insert("pane-0".into(), "orchestrator".into());
+            let records: Vec<crate::agent_pty::AgentRecord> =
+                serde_json::from_value(serde_json::json!([
+                    { "id": "0", "pane_id_env": "pane-0", "tab_membership": {
+                        "kind": "orchestration", "name": "team", "role_index": 0,
+                        "role_name": "orchestrator", "is_start_role": true,
+                        "orchestration_cwd": cwd, "orchestration_id": "unit" } },
+                    { "id": "1", "pane_id_env": "pane-1", "tab_membership": {
+                        "kind": "orchestration", "name": "team", "role_index": 1,
+                        "role_name": "worker", "orchestration_cwd": cwd,
+                        "orchestration_id": "unit" },
+                      "live": { "status": "Working", "tool_count": 0 } },
+                ]))
+                .unwrap();
+            st.card_unseen_agents(&records);
+        }
+        let mut ui = default_ui();
+        process_pending_orchestration_surfaces(&state, &pc, &mut tabs, &mut ui);
+        let tab = tabs.tab_index_for_pane("pane-0");
+        assert!(tab.is_some(), "the orchestrator left its tab");
+        assert_eq!(
+            tabs.tab_index_for_pane("pane-1"),
+            tab,
+            "the worker was not placed in its orchestration's existing tab"
+        );
+        assert_eq!(
+            tabs.tab_count(),
+            2,
+            "a second tab was built for the orchestration"
+        );
+        let statuses: Vec<_> = state
+            .blocking_read()
+            .sessions
+            .values()
+            .filter(|card| card.pane_id.as_deref() == Some("pane-1"))
+            .map(|card| card.status.clone())
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![SessionStatus::Working],
+            "the worker's card lost the state the resync seeded it with"
+        );
     }
 
     /// Scenario: A same-build restart drops this TUI's stopped cards, panes and emptied unit tab locally, keeps a new-process tab active, leaves the worktree files intact and shows one notice naming the stopped agents, while a same-process reconnect keeps them (control). The remembered Dashboard key is cleared even while another tab stays active, so a reused key inherits neither name nor selection. A queued orchestration attaches only on its originating process, and a placeholder learned from that actual attach can post to its process but refuses a successor that reuses its ids.
