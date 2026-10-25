@@ -42,7 +42,9 @@ pub enum Environ {
     NotRead,
     /// Not readable: a process of the collector's own user that made itself
     /// non-dumpable, whose environment and memory figures only root may
-    /// read. It names no run of its own and can take only its parent's.
+    /// read. It names no run of its own: it keeps a run it was already
+    /// attributed to (sticky, by its own environment or its parent's), and
+    /// otherwise can take only its parent's.
     Unreadable,
 }
 

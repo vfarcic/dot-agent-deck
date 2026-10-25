@@ -114,7 +114,9 @@ pub fn disk_usage(root: &Path) -> io::Result<u64> {
 /// The walk goes through open directories rather than paths: the root is
 /// opened refusing a symlink in any component (on Linux with `openat2`,
 /// falling back to opening it one component at a time, each relative to the
-/// directory opened before it, with `O_NOFOLLOW`), and each
+/// directory opened before it, with `O_NOFOLLOW`, and on Linux each ancestor
+/// with `O_PATH`, so that it needs search permission and not read
+/// permission, as an ordinary path lookup does), and each
 /// subdirectory is opened relative to its parent's open directory without
 /// following a symlink (on Linux with `openat2`, which also
 /// refuses to cross a mount point, falling back to `openat` with
@@ -147,7 +149,7 @@ pub fn walk(root: &Path, limits: &Limits<'_>) -> io::Result<Walk> {
             };
             let name = std::ffi::CString::new(name.as_bytes())
                 .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-            let st = fd::Dir::open_root(parent)?.stat_at(&name)?;
+            let st = fd::stat_beneath(parent, &name)?;
             if fd::is_dir(&st) || fd::is_symlink(&st) {
                 return Err(e);
             }
@@ -276,6 +278,15 @@ mod fd {
     const OPEN_DIR: libc::c_int =
         libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
 
+    /// A directory opened only to resolve names beneath it, which needs
+    /// search permission on it but not read permission (Linux's `O_PATH`).
+    #[cfg(target_os = "linux")]
+    const OPEN_PATH: libc::c_int =
+        libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    /// Elsewhere a directory is opened for reading, as the walk's own are.
+    #[cfg(not(target_os = "linux"))]
+    const OPEN_PATH: libc::c_int = OPEN_DIR;
+
     struct Fd(libc::c_int);
 
     impl Fd {
@@ -340,36 +351,7 @@ mod fd {
         /// `root`, opened as a directory, no component of it followed when
         /// it is a symlink.
         pub fn open_root(root: &Path) -> io::Result<Dir> {
-            #[cfg(target_os = "linux")]
-            {
-                let path = CString::new(root.as_os_str().as_bytes())
-                    .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-                if let Some(opened) = openat2(libc::AT_FDCWD, &path, RESOLVE_NO_SYMLINKS) {
-                    return Dir::from_fd(opened?);
-                }
-            }
-            // One component at a time, each opened relative to the
-            // directory opened before it, so a symlink anywhere in the path,
-            // put there at any time, is refused rather than followed.
-            let start = if root.has_root() { c"/" } else { c"." };
-            // SAFETY: `start` is a NUL-terminated string.
-            let mut dir = Fd(check(unsafe { libc::open(start.as_ptr(), OPEN_DIR) })?);
-            for component in root.components() {
-                let name = match component {
-                    Component::RootDir | Component::CurDir => continue,
-                    Component::Normal(name) => CString::new(name.as_bytes())
-                        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?,
-                    // A canonical path has neither.
-                    Component::ParentDir | Component::Prefix(_) => {
-                        return Err(io::Error::from(io::ErrorKind::InvalidInput));
-                    }
-                };
-                // SAFETY: `name` is a NUL-terminated string and `dir` is open.
-                dir = Fd(check(unsafe {
-                    libc::openat(dir.0, name.as_ptr(), OPEN_DIR)
-                })?);
-            }
-            Dir::from_fd(dir.into_raw())
+            Dir::from_fd(open_beneath(root, OPEN_DIR)?.into_raw())
         }
 
         /// The subdirectory `name`, opened relative to this one without
@@ -379,6 +361,7 @@ mod fd {
             if let Some(opened) = openat2(
                 self.fd.0,
                 name,
+                OPEN_DIR,
                 RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH | RESOLVE_NO_XDEV,
             ) {
                 return Dir::from_fd(opened?);
@@ -399,18 +382,7 @@ mod fd {
 
         /// The metadata of the entry `name`, a symlink not followed.
         pub fn stat_at(&self, name: &CStr) -> io::Result<libc::stat> {
-            let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
-            // SAFETY: `name` is NUL-terminated, `st` writable, `fd` open.
-            check(unsafe {
-                libc::fstatat(
-                    self.fd.0,
-                    name.as_ptr(),
-                    st.as_mut_ptr(),
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            })?;
-            // SAFETY: `fstatat` succeeded, so it filled `st`.
-            Ok(unsafe { st.assume_init() })
+            stat_at(&self.fd, name)
         }
 
         /// Whether the directory holds an entry `name` of any kind.
@@ -437,6 +409,80 @@ mod fd {
         }
     }
 
+    /// The metadata of the entry `name` of the open directory `dir`, a
+    /// symlink not followed. `dir` may be an `O_PATH` descriptor.
+    fn stat_at(dir: &Fd, name: &CStr) -> io::Result<libc::stat> {
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `name` is NUL-terminated, `st` writable, `dir` open.
+        check(unsafe {
+            libc::fstatat(
+                dir.0,
+                name.as_ptr(),
+                st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        })?;
+        // SAFETY: `fstatat` succeeded, so it filled `st`.
+        Ok(unsafe { st.assume_init() })
+    }
+
+    /// The metadata of the entry `name` in the directory `parent`, opened
+    /// as [`open_beneath`] does, needing only search permission on it.
+    pub fn stat_beneath(parent: &Path, name: &CStr) -> io::Result<libc::stat> {
+        stat_at(&open_beneath(parent, OPEN_PATH)?, name)
+    }
+
+    /// The directory `path`, opened with `flags`, no component of it
+    /// followed when it is a symlink. On Linux `openat2` resolves it in one
+    /// call; otherwise, or where `openat2` is unavailable, it is opened one
+    /// component at a time, each relative to the directory opened before it,
+    /// so a symlink anywhere in the path, put there at any time, is refused
+    /// rather than followed. Each component before the last is opened with
+    /// [`OPEN_PATH`], so that, as with an ordinary path lookup, an ancestor
+    /// needs search permission and not read permission on Linux.
+    fn open_beneath(path: &Path, flags: libc::c_int) -> io::Result<Fd> {
+        #[cfg(target_os = "linux")]
+        {
+            let whole = CString::new(path.as_os_str().as_bytes())
+                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+            if let Some(opened) = openat2(libc::AT_FDCWD, &whole, flags, RESOLVE_NO_SYMLINKS) {
+                return opened.map(Fd);
+            }
+        }
+        let mut names = Vec::new();
+        for component in path.components() {
+            match component {
+                Component::RootDir | Component::CurDir => {}
+                Component::Normal(name) => names.push(
+                    CString::new(name.as_bytes())
+                        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?,
+                ),
+                // A canonical path has neither.
+                Component::ParentDir | Component::Prefix(_) => {
+                    return Err(io::Error::from(io::ErrorKind::InvalidInput));
+                }
+            }
+        }
+        let start = if path.has_root() { c"/" } else { c"." };
+        let flags_at = |i: usize| {
+            if i + 1 == names.len() {
+                flags
+            } else {
+                OPEN_PATH
+            }
+        };
+        let first = if names.is_empty() { flags } else { OPEN_PATH };
+        // SAFETY: `start` is a NUL-terminated string.
+        let mut dir = Fd(check(unsafe { libc::open(start.as_ptr(), first) })?);
+        for (i, name) in names.iter().enumerate() {
+            // SAFETY: `name` is a NUL-terminated string and `dir` is open.
+            dir = Fd(check(unsafe {
+                libc::openat(dir.0, name.as_ptr(), flags_at(i))
+            })?);
+        }
+        Ok(dir)
+    }
+
     #[cfg(target_os = "linux")]
     const RESOLVE_NO_XDEV: u64 = 0x01;
     #[cfg(target_os = "linux")]
@@ -455,10 +501,15 @@ mod fd {
         pub static FORCE_OPENAT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
-    /// `openat2(dirfd, name, OPEN_DIR, resolve)`: `None` when the kernel
-    /// does not provide it, for the caller to fall back to `openat`.
+    /// `openat2(dirfd, name, flags, resolve)`: `None` when the kernel does
+    /// not provide it, for the caller to fall back to `openat`.
     #[cfg(target_os = "linux")]
-    fn openat2(dirfd: libc::c_int, name: &CStr, resolve: u64) -> Option<io::Result<libc::c_int>> {
+    fn openat2(
+        dirfd: libc::c_int,
+        name: &CStr,
+        flags: libc::c_int,
+        resolve: u64,
+    ) -> Option<io::Result<libc::c_int>> {
         use std::sync::atomic::Ordering;
         #[cfg(test)]
         if FORCE_OPENAT.with(std::cell::Cell::get) {
@@ -475,7 +526,7 @@ mod fd {
             resolve: u64,
         }
         let how = OpenHow {
-            flags: OPEN_DIR as u64,
+            flags: flags as u64,
             mode: 0,
             resolve,
         };
@@ -802,6 +853,38 @@ mod tests {
             );
             assert!(result.is_err(), "{result:?}");
         });
+    }
+
+    /// V2: a root below an ancestor the user may search but not read is
+    /// walked on both open paths, as a directory and as a file, as an
+    /// ordinary path lookup would reach it.
+    #[test]
+    fn a_root_below_a_search_only_ancestor_is_walked() {
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("SKIP: root may read any directory");
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let ancestor = canonical(&tmp).join("search-only");
+        let root = ancestor.join("wt");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        let file = ancestor.join("file.bin");
+        write_allocated(&file, 64 * 1024);
+        let expected = usage_of(&root) + usage_of(&root.join(".git"));
+        let file_bytes = usage_of(&file);
+        // 0711 would leave its owner, this test, able to read it.
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o111)).unwrap();
+        let mut results = Vec::new();
+        each_open_path(|| results.push((disk_usage(&root), disk_usage(&file))));
+        let listed = fs::read_dir(&ancestor).is_ok();
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!listed, "the ancestor was readable, so this tested nothing");
+        for (dir, file) in results {
+            assert_eq!(dir.unwrap(), expected);
+            assert_eq!(file.unwrap(), file_bytes);
+        }
     }
 
     /// U6: a directory the walk may not enter is held to the same inode

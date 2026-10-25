@@ -45,8 +45,8 @@ mod linux {
     use dot_agent_deck::telemetry::collector::walks::{InUse, MAX_OUTSTANDING, WORKERS, Walks};
     use dot_agent_deck::telemetry::config::{Protocol, process_env, redacted_endpoint};
     use dot_agent_deck::telemetry::exporter::{
-        MAX_RESPONSE_BODY, RETRY_INITIAL_BACKOFF, RETRY_MAX_BACKOFF, bounded_body,
-        is_retryable_status, jittered, retry_after,
+        MAX_RESPONSE_BODY, RETRY_INITIAL_BACKOFF, RETRY_MAX_BACKOFF, is_retryable_status, jittered,
+        retry_after,
     };
     use dot_agent_deck::telemetry::otlp::{
         decode_metrics_partial_success_json, decode_partial_success_protobuf,
@@ -475,29 +475,45 @@ mod linux {
             })
         }
 
+        /// Send `request`, and log a failure (`always_log`: even within a
+        /// minute of the last).
+        async fn send(&mut self, request: &Request, always_log: bool) -> Delivery {
+            let (delivery, report) = self.deliver(request).await;
+            let Some(report) = report else {
+                return delivery;
+            };
+            let due = self
+                .last_failure_log
+                .is_none_or(|at| at.elapsed() >= FAILURE_LOG_EVERY);
+            if always_log || due {
+                self.last_failure_log = Some(Instant::now());
+                eprintln!(
+                    "dot-agent-deck-collector: export to {}{report}",
+                    self.redacted
+                );
+            }
+            delivery
+        }
+
         /// Send `request`, retrying a transient failure (HTTP 429, 502, 503
         /// or 504, or the backend unreachable or slow) with jittered backoff,
         /// honouring `Retry-After`. The whole send — every attempt, the waits
         /// between them and reading the answer — ends within the export
-        /// timeout and the sampling interval, whichever is shorter. Any other
-        /// answer is final.
-        async fn send(&mut self, request: &Request, always_log: bool) -> Delivery {
+        /// timeout and the sampling interval, whichever is shorter
+        /// ([`Attempts`]). Any other answer is final. Returns how it fared
+        /// and, unless it was plainly delivered, what to log.
+        async fn deliver(&self, request: &Request) -> (Delivery, Option<String>) {
             let (body, content_type) = if self.json {
                 (encode_json(request), "application/json")
             } else {
                 (encode_protobuf(request), "application/x-protobuf")
             };
-            let start = Instant::now();
-            let deadline = start
-                .checked_add(self.timeout.min(self.retry_window))
-                .unwrap_or_else(|| start + Duration::from_secs(86_400));
-            let mut backoff = RETRY_INITIAL_BACKOFF;
+            let mut attempts = Attempts::new(Instant::now(), self.timeout, self.retry_window);
             let mut failure = "timed out".to_string();
             let (delivery, report) = loop {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
+                let Some(remaining) = attempts.remaining(Instant::now()) else {
                     break (Delivery::Failed, format!(" failed: {failure}"));
-                }
+                };
                 let result = self
                     .client
                     .post(&self.endpoint)
@@ -508,14 +524,28 @@ mod linux {
                     .await;
                 let asked = match result {
                     Ok(response) if response.status().is_success() => {
-                        // Delivered whatever happens next; an answer that
-                        // does not arrive in time reports no rejection.
-                        let body = tokio::time::timeout(
-                            deadline.saturating_duration_since(Instant::now()),
-                            bounded_body(response, MAX_RESPONSE_BODY),
-                        )
-                        .await
-                        .unwrap_or_default();
+                        let within = attempts.remaining(Instant::now()).unwrap_or_default();
+                        // An answer that does not arrive whole in time may
+                        // have rejected points nobody will know about, so it
+                        // is a failure: `--once` fails and the ended runs'
+                        // reports stay held. It is not retried, since the
+                        // backend may have kept the request.
+                        let body = match read_body(response, MAX_RESPONSE_BODY, within).await {
+                            Body::Read(body) => body,
+                            Body::TimedOut => {
+                                break (
+                                    Delivery::Failed,
+                                    " failed: the backend's answer did not arrive in time"
+                                        .to_string(),
+                                );
+                            }
+                            Body::Failed => {
+                                break (
+                                    Delivery::Failed,
+                                    " failed: the backend's answer could not be read".to_string(),
+                                );
+                            }
+                        };
                         let partial = if self.json {
                             decode_metrics_partial_success_json(&body)
                         } else {
@@ -540,7 +570,7 @@ mod linux {
                                     ": the backend accepted the request with a warning".to_string(),
                                 );
                             }
-                            _ => return Delivery::Delivered,
+                            _ => return (Delivery::Delivered, None),
                         }
                     }
                     Ok(response) if is_retryable_status(response.status().as_u16()) => {
@@ -563,68 +593,242 @@ mod linux {
                     }
                     Err(_) => break (Delivery::Failed, " failed: request failed".to_string()),
                 };
-                // A `Retry-After` can lengthen the wait, never shorten it
-                // below the backoff.
-                let backoff_wait = jittered(backoff);
-                let wait = asked.map_or(backoff_wait, |asked| asked.max(backoff_wait));
-                if wait >= deadline.saturating_duration_since(Instant::now()) {
+                let Some(wait) = attempts.next_wait(Instant::now(), asked, jittered) else {
                     break (Delivery::Failed, format!(" failed: {failure}"));
-                }
+                };
                 tokio::time::sleep(wait).await;
-                backoff = (backoff * 2).min(RETRY_MAX_BACKOFF);
             };
-            let due = self
-                .last_failure_log
-                .is_none_or(|at| at.elapsed() >= FAILURE_LOG_EVERY);
-            if always_log || due {
-                self.last_failure_log = Some(Instant::now());
-                eprintln!(
-                    "dot-agent-deck-collector: export to {}{report}",
-                    self.redacted
-                );
-            }
-            delivery
+            (delivery, Some(report))
         }
+    }
+
+    /// The deadline and the waits of one send, kept apart from the clock
+    /// and the network so that they are decided from given instants.
+    #[derive(Debug)]
+    struct Attempts {
+        deadline: Instant,
+        backoff: Duration,
+    }
+
+    impl Attempts {
+        /// A send that starts at `start` ends within `timeout` and
+        /// `interval`, whichever is shorter.
+        fn new(start: Instant, timeout: Duration, interval: Duration) -> Self {
+            let deadline = start
+                .checked_add(timeout.min(interval))
+                .unwrap_or_else(|| start + Duration::from_secs(86_400));
+            Attempts {
+                deadline,
+                backoff: RETRY_INITIAL_BACKOFF,
+            }
+        }
+
+        /// What is left of the deadline at `now`; `None` once nothing is.
+        fn remaining(&self, now: Instant) -> Option<Duration> {
+            Some(self.deadline.saturating_duration_since(now)).filter(|left| !left.is_zero())
+        }
+
+        /// The wait before the next attempt, from `now`: the backoff as
+        /// `jitter` scales it, lengthened, never shortened, by the
+        /// `Retry-After` the backend `asked` for. `None` when that wait
+        /// would not end before the deadline, so it is not started. The
+        /// backoff then doubles, up to `RETRY_MAX_BACKOFF`.
+        fn next_wait(
+            &mut self,
+            now: Instant,
+            asked: Option<Duration>,
+            jitter: impl FnOnce(Duration) -> Duration,
+        ) -> Option<Duration> {
+            let backoff = jitter(self.backoff);
+            let wait = asked.map_or(backoff, |asked| asked.max(backoff));
+            if wait >= self.deadline.saturating_duration_since(now) {
+                return None;
+            }
+            self.backoff = (self.backoff * 2).min(RETRY_MAX_BACKOFF);
+            Some(wait)
+        }
+    }
+
+    /// How reading a 2xx answer's body ended.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Body {
+        /// The body, or its first `max` bytes: an empty one is a body too.
+        Read(Vec<u8>),
+        TimedOut,
+        /// The connection failed while the body was read.
+        Failed,
+    }
+
+    /// At most `max` bytes of `response`'s body, read within `within`.
+    /// Unlike the deck exporter's `bounded_body`, a body that fails or does
+    /// not arrive in time is reported as such, not read as an empty one.
+    async fn read_body(mut response: reqwest::Response, max: usize, within: Duration) -> Body {
+        let read = async move {
+            let mut body = Vec::new();
+            while body.len() < max {
+                match response.chunk().await {
+                    Ok(Some(chunk)) => {
+                        let room = max - body.len();
+                        body.extend_from_slice(&chunk[..chunk.len().min(room)]);
+                    }
+                    Ok(None) => break,
+                    Err(e) if e.is_timeout() => return Body::TimedOut,
+                    Err(_) => return Body::Failed,
+                }
+            }
+            Body::Read(body)
+        };
+        tokio::time::timeout(within, read)
+            .await
+            .unwrap_or(Body::TimedOut)
     }
 
     #[cfg(test)]
     mod tests {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
+        use tokio::sync::mpsc;
 
         use super::*;
 
-        /// A backend on loopback that answers its `n`-th connection (from 0)
-        /// with `answers[n]`, or holds the connection open and never answers
-        /// past the end of `answers`. Returns its endpoint and how many
-        /// connections it took.
-        async fn backend(answers: &'static [&'static str]) -> (String, Arc<AtomicUsize>) {
+        /// The jitter at its largest, so a wait is the backoff itself.
+        fn unjittered(backoff: Duration) -> Duration {
+            backoff
+        }
+
+        /// U3/V3: one send ends within the export timeout and the sampling
+        /// interval, whichever is shorter.
+        #[test]
+        fn the_deadline_is_the_shorter_of_timeout_and_interval() {
+            let start = Instant::now();
+            let s = Duration::from_secs;
+            let by_interval = Attempts::new(start, s(10), s(2));
+            assert_eq!(by_interval.remaining(start), Some(s(2)));
+            assert_eq!(by_interval.remaining(start + s(1)), Some(s(1)));
+            assert_eq!(by_interval.remaining(start + s(2)), None);
+            assert_eq!(by_interval.remaining(start + s(3)), None);
+            let by_timeout = Attempts::new(start, s(1), s(15));
+            assert_eq!(by_timeout.remaining(start), Some(s(1)));
+            assert_eq!(by_timeout.remaining(start + s(1)), None);
+        }
+
+        /// U3/V3: a wait that would end at or past the deadline is not
+        /// started, and the backoff doubles up to its cap.
+        #[test]
+        fn a_wait_past_the_deadline_is_not_started() {
+            let start = Instant::now();
+            let s = Duration::from_secs;
+            let mut attempts = Attempts::new(start, s(10), s(2));
+            assert_eq!(attempts.next_wait(start, None, unjittered), Some(s(1)));
+            // 2 s more from 1 s in ends at 3 s, past the 2 s deadline.
+            assert_eq!(attempts.next_wait(start + s(1), None, unjittered), None);
+            // Ending exactly at the deadline is not started either.
+            assert_eq!(attempts.next_wait(start, None, unjittered), None);
+            let mut long = Attempts::new(start, s(600), s(600));
+            let waits: Vec<_> = (0..5)
+                .map(|_| long.next_wait(start, None, unjittered).unwrap())
+                .collect();
+            assert_eq!(waits, [s(1), s(2), s(4), s(5), s(5)]);
+            // The jitter applies to the backoff.
+            let mut jittered = Attempts::new(start, s(600), s(600));
+            assert_eq!(
+                jittered.next_wait(start, None, |b| b / 2),
+                Some(Duration::from_millis(500))
+            );
+        }
+
+        /// U3/V3: `Retry-After` can lengthen a wait, never shorten it, and
+        /// a wait it lengthens past the deadline is not started.
+        #[test]
+        fn retry_after_only_lengthens_a_wait() {
+            let start = Instant::now();
+            let s = Duration::from_secs;
+            let mut attempts = Attempts::new(start, s(60), s(60));
+            assert_eq!(
+                attempts.next_wait(start, Some(s(0)), unjittered),
+                Some(s(1))
+            );
+            assert_eq!(
+                attempts.next_wait(start, Some(s(1)), unjittered),
+                Some(s(2))
+            );
+            assert_eq!(
+                attempts.next_wait(start, Some(s(30)), unjittered),
+                Some(s(30))
+            );
+            assert_eq!(attempts.next_wait(start, Some(s(60)), unjittered), None);
+            assert_eq!(
+                attempts.next_wait(start + s(31), Some(s(30)), unjittered),
+                None
+            );
+        }
+
+        /// What a loopback backend does on one connection, after reading
+        /// the whole request.
+        #[derive(Clone, Copy)]
+        enum Answer {
+            /// Write nothing and keep the connection open.
+            Hold,
+            /// Write this, then keep the connection open.
+            WriteThenHold(&'static str),
+            /// Write this, then close the connection.
+            WriteThenClose(&'static str),
+        }
+
+        /// Read one HTTP request: its head, then the `Content-Length` bytes
+        /// of its body.
+        async fn read_request(stream: &mut tokio::net::TcpStream) {
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 4096];
+            let head_end = loop {
+                let n = stream.read(&mut buf).await.unwrap();
+                assert!(n > 0, "the client closed before its request ended");
+                seen.extend_from_slice(&buf[..n]);
+                if let Some(at) = seen.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break at + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&seen[..head_end]).to_ascii_lowercase();
+            let length: usize = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .map_or(0, |v| v.trim().parse().unwrap());
+            while seen.len() < head_end + length {
+                let n = stream.read(&mut buf).await.unwrap();
+                assert!(n > 0, "the client closed before its request ended");
+                seen.extend_from_slice(&buf[..n]);
+            }
+        }
+
+        /// A backend on loopback that gives its one connection `answer`.
+        /// Returns its endpoint and a channel that yields once it has
+        /// accepted the connection and read the whole request.
+        async fn backend(answer: Answer) -> (String, mpsc::Receiver<()>) {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let endpoint = format!("http://{}/v1/metrics", listener.local_addr().unwrap());
-            let taken = Arc::new(AtomicUsize::new(0));
-            let counter = Arc::clone(&taken);
+            let (ready, requested) = mpsc::channel(1);
             tokio::spawn(async move {
-                loop {
-                    let Ok((mut stream, _)) = listener.accept().await else {
-                        return;
-                    };
-                    let n = counter.fetch_add(1, Ordering::SeqCst);
-                    tokio::spawn(async move {
-                        let mut buf = [0u8; 4096];
-                        let _ = stream.read(&mut buf).await;
-                        match answers.get(n) {
-                            Some(answer) => {
-                                let _ = stream.write_all(answer.as_bytes()).await;
-                                let _ = stream.shutdown().await;
-                            }
-                            None => tokio::time::sleep(Duration::from_secs(60)).await,
-                        }
-                    });
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                read_request(&mut stream).await;
+                let _ = ready.send(()).await;
+                let hold = match answer {
+                    Answer::Hold => true,
+                    Answer::WriteThenHold(bytes) => {
+                        let _ = stream.write_all(bytes.as_bytes()).await;
+                        true
+                    }
+                    Answer::WriteThenClose(bytes) => {
+                        let _ = stream.write_all(bytes.as_bytes()).await;
+                        false
+                    }
+                };
+                if hold {
+                    tokio::time::sleep(Duration::from_secs(600)).await;
                 }
             });
-            (endpoint, taken)
+            (endpoint, requested)
         }
 
         fn sender(endpoint: String, timeout: Duration, interval: Duration) -> Sender {
@@ -637,43 +841,75 @@ mod linux {
             Sender::new(export, interval).unwrap()
         }
 
-        const UNAVAILABLE: &str =
-            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        /// Far past every deadline below, and far short of the export
+        /// timeout: a send that ends within it was bounded by its deadline.
+        const BOUND: Duration = Duration::from_secs(30);
+        const EXPORT_TIMEOUT: Duration = Duration::from_secs(600);
 
-        /// U3: a backend that never answers holds the send for the sampling
-        /// interval, not for the longer export timeout.
-        #[tokio::test]
-        async fn a_slow_first_attempt_ends_within_the_interval() {
-            let (endpoint, taken) = backend(&[]).await;
-            let mut sender = sender(
-                endpoint,
-                Duration::from_secs(10),
-                Duration::from_millis(500),
-            );
-            let start = Instant::now();
-            let delivery = sender.send(&Request { resources: vec![] }, false).await;
-            let took = start.elapsed();
-            assert_eq!(delivery, Delivery::Failed);
-            assert_eq!(taken.load(Ordering::SeqCst), 1);
-            assert!(took >= Duration::from_millis(450), "{took:?}");
-            assert!(took < Duration::from_secs(2), "{took:?}");
+        /// Send an empty request to `answer`'s backend with a one-second
+        /// interval, after the backend has the request, within [`BOUND`].
+        async fn deliver_to(answer: Answer) -> (Delivery, Option<String>) {
+            let (endpoint, mut requested) = backend(answer).await;
+            let sender = sender(endpoint, EXPORT_TIMEOUT, Duration::from_secs(1));
+            let send =
+                tokio::spawn(async move { sender.deliver(&Request { resources: vec![] }).await });
+            tokio::time::timeout(BOUND, requested.recv())
+                .await
+                .expect("the backend did not get the request")
+                .expect("the backend stopped");
+            tokio::time::timeout(BOUND, send)
+                .await
+                .expect("the send outlived its deadline")
+                .unwrap()
         }
 
-        /// U3: a retry after a transient answer gets only what is left of
-        /// the interval, not a fresh export timeout.
+        /// U3/V3 smoke test: a backend that takes the request and never
+        /// answers holds the send for the sampling interval, not for the
+        /// longer export timeout.
         #[tokio::test]
-        async fn a_slow_retry_ends_within_the_interval() {
-            let (endpoint, taken) = backend(&[UNAVAILABLE]).await;
-            // The first backoff is at most a second, so the retry starts
-            // inside this interval.
-            let mut sender = sender(endpoint, Duration::from_secs(10), Duration::from_secs(2));
-            let start = Instant::now();
-            let delivery = sender.send(&Request { resources: vec![] }, false).await;
-            let took = start.elapsed();
+        async fn an_unanswered_send_ends_at_its_deadline() {
+            let (delivery, report) = deliver_to(Answer::Hold).await;
             assert_eq!(delivery, Delivery::Failed);
-            assert_eq!(taken.load(Ordering::SeqCst), 2, "the retry was made");
-            assert!(took >= Duration::from_millis(1900), "{took:?}");
-            assert!(took < Duration::from_secs(4), "{took:?}");
+            assert_eq!(report.as_deref(), Some(" failed: timed out"));
+        }
+
+        /// V1: a 2xx answer whose body stalls, here part-way through a
+        /// partial rejection, is not delivered, and ends at the deadline.
+        #[tokio::test]
+        async fn a_success_whose_body_stalls_is_not_delivered() {
+            const STALLED: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 200\r\n\r\n{\"partialSuccess\":{\"rejectedDataPoints\":\"1\"";
+            let (delivery, report) = deliver_to(Answer::WriteThenHold(STALLED)).await;
+            assert_eq!(delivery, Delivery::Failed);
+            assert_eq!(
+                report.as_deref(),
+                Some(" failed: the backend's answer did not arrive in time")
+            );
+        }
+
+        /// V1: a 2xx answer whose connection fails mid-body is not
+        /// delivered, while a 2xx with an empty body is.
+        #[tokio::test]
+        async fn a_success_whose_body_fails_is_not_delivered() {
+            const CUT: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 200\r\n\r\n{\"partialSuccess\":";
+            let (delivery, report) = deliver_to(Answer::WriteThenClose(CUT)).await;
+            assert_eq!(delivery, Delivery::Failed);
+            assert_eq!(
+                report.as_deref(),
+                Some(" failed: the backend's answer could not be read")
+            );
+
+            const EMPTY: &str = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+            let (delivery, report) = deliver_to(Answer::WriteThenHold(EMPTY)).await;
+            assert_eq!((delivery, report), (Delivery::Delivered, None));
+        }
+
+        /// V1: a partial rejection that arrives whole within the deadline is
+        /// still reported.
+        #[tokio::test]
+        async fn a_partial_rejection_in_time_is_reported() {
+            const REJECTED: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 45\r\n\r\n{\"partialSuccess\":{\"rejectedDataPoints\":\"1\"}}";
+            let (delivery, _) = deliver_to(Answer::WriteThenHold(REJECTED)).await;
+            assert_eq!(delivery, Delivery::PartiallyRejected);
         }
     }
 }
