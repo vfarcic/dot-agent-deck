@@ -12,13 +12,15 @@
 //!
 //! This module holds the parsers ([`procfs`]), the `/proc` reader
 //! ([`reader`], Linux only), the attribution and accounting state machine
-//! ([`aggregate`]), worktree identity and the disk walk ([`disk`]), the pool
-//! the walks run on ([`walks`]), the configuration ([`config`]) and the OTLP
+//! ([`aggregate`]), worktree identity and the disk walk ([`disk`]), the pools
+//! that find each working directory's worktree ([`discovery`]) and walk the
+//! worktrees ([`walks`]), the configuration ([`config`]) and the OTLP
 //! encodings ([`otlp`]). The sampling loop and exporting belong to the binary
 //! (`src/bin/dot-agent-deck-collector.rs`).
 
 pub mod aggregate;
 pub mod config;
+pub mod discovery;
 pub mod disk;
 pub mod identity;
 pub mod otlp;

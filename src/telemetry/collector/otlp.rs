@@ -298,6 +298,12 @@ impl RunWorktrees {
         &self.map
     }
 
+    /// Whether the worktree of the run `key` is decided, as having none
+    /// included: a run that is not is decided at the next [`Self::update`].
+    pub fn is_decided(&self, key: &RunKey) -> bool {
+        self.decided.contains(key)
+    }
+
     /// Forget the runs that ended in `sample`, once its request is built.
     pub fn forget_ended(&mut self, sample: &Sample) {
         for run in sample.runs.iter().filter(|r| r.ended) {
@@ -360,6 +366,15 @@ impl PendingTerminals {
         self.held.drain(..excess);
         self.dropped += excess as u64;
         excess as u64
+    }
+
+    /// Hold `request`'s terminal resources for a later request without
+    /// sending it: the collector's sample in progress at shutdown, whose
+    /// request the final one replaces. Returns how many were dropped past
+    /// the bound, as [`Self::failed`] does.
+    pub fn hold(&mut self, request: &Request) -> u64 {
+        self.attached_at = None;
+        self.failed(request)
     }
 
     pub fn len(&self) -> usize {
@@ -1090,6 +1105,23 @@ mod tests {
         assert_eq!(pending.failed(&many), 3);
         assert_eq!(pending.len(), MAX_PENDING_TERMINALS);
         assert_eq!(pending.dropped, 3);
+    }
+
+    /// Finding 7: the sample in progress at shutdown is not sent, and its
+    /// ended runs' last reports go with the final request instead.
+    #[test]
+    fn a_superseded_request_hands_its_terminal_reports_on() {
+        let settings = settings(Temporality::Cumulative);
+        let mut pending = PendingTerminals::default();
+        let superseded = build_request(&ended(sample()), &HashMap::new(), &[], &settings, None);
+        assert_eq!(pending.hold(&superseded), 0);
+        assert_eq!(pending.len(), 1);
+        let mut final_sample = sample();
+        final_sample.runs.clear();
+        let mut last = build_request(&final_sample, &HashMap::new(), &[], &settings, None);
+        pending.attach(&mut last);
+        assert_eq!(last.resources.last(), Some(&superseded.resources[0]));
+        assert!(last.resources.last().unwrap().terminal);
     }
 
     /// R1/U5: a run first seen in no worktree keeps none, even when it

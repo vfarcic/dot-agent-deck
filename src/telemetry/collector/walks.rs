@@ -9,6 +9,10 @@
 //! the completion of the walk a worktree is waiting for is applied to it.
 //! Every walk runs under a [`Budget`]; dropping the [`Walks`] cancels what is
 //! running.
+//!
+//! A walk that fails (the worktree vanished or cannot be opened) withdraws
+//! the worktree's last figure: what is sent is only ever the most recent
+//! walk's, and until a walk succeeds again none is sent.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io;
@@ -42,7 +46,15 @@ struct Job {
 struct Done {
     toplevel: PathBuf,
     generation: u64,
-    usage: Option<WorktreeUsage>,
+    usage: Result<WorktreeUsage, WalkFailure>,
+}
+
+/// A walk that failed: the worktree's id, never its path, and what kind of
+/// error stopped it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalkFailure {
+    pub worktree_id: String,
+    pub kind: io::ErrorKind,
 }
 
 #[derive(Default)]
@@ -70,6 +82,8 @@ pub struct Walks {
     /// Ids of worktrees whose walk completed incomplete since the last
     /// [`Self::take_incomplete`].
     incomplete: Vec<String>,
+    /// Walks that failed since the last [`Self::take_failed`].
+    failed: Vec<WalkFailure>,
 }
 
 fn now_unix_nanos() -> u64 {
@@ -123,6 +137,7 @@ impl Walks {
             max_outstanding: max_outstanding.max(1),
             generation: 0,
             incomplete: Vec::new(),
+            failed: Vec::new(),
         })
     }
 
@@ -139,6 +154,12 @@ impl Walks {
         std::mem::take(&mut self.incomplete)
     }
 
+    /// The walks that failed since the last call. Each failure has already
+    /// withdrawn its worktree's figure.
+    pub fn take_failed(&mut self) -> Vec<WalkFailure> {
+        std::mem::take(&mut self.failed)
+    }
+
     fn apply(&mut self, done: Done) {
         let Some(state) = self.state.get_mut(&done.toplevel) else {
             return;
@@ -148,11 +169,19 @@ impl Walks {
             return;
         }
         state.outstanding = None;
-        if let Some(usage) = done.usage {
-            if !usage.complete {
-                self.incomplete.push(usage.worktree.id.clone());
+        match done.usage {
+            Ok(usage) => {
+                if !usage.complete {
+                    self.incomplete.push(usage.worktree.id.clone());
+                }
+                state.last = Some(usage);
             }
-            state.last = Some(usage);
+            // The last figure is no longer what the worktree holds: it is
+            // withdrawn, not sent on as current.
+            Err(failure) => {
+                state.last = None;
+                self.failed.push(failure);
+            }
         }
     }
 
@@ -207,6 +236,32 @@ impl Walks {
     pub fn update(&mut self, in_use: &InUse) -> Vec<WorktreeUsage> {
         self.drain();
         self.schedule(in_use);
+        self.usage(in_use)
+    }
+
+    /// Wait until no worktree in use has a walk outstanding, or until
+    /// `deadline`, whichever comes first, applying what completes: the
+    /// collector's shutdown, so that its final request carries the walks
+    /// that were queued or running when it was asked to stop. A walk that
+    /// has not finished by `deadline` is left running and not reported.
+    pub fn settle(&mut self, in_use: &InUse, deadline: Instant) -> Vec<WorktreeUsage> {
+        loop {
+            self.drain();
+            let waiting = in_use.keys().any(|toplevel| {
+                self.state
+                    .get(toplevel)
+                    .is_some_and(|s| s.outstanding.is_some())
+            });
+            let now = Instant::now();
+            if !waiting || now >= deadline {
+                break;
+            }
+            match self.done_rx.recv_timeout(deadline - now) {
+                Ok(done) => self.apply(done),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
         self.usage(in_use)
     }
 
@@ -319,12 +374,18 @@ fn work(shared: &Shared, done: &mpsc::Sender<Done>, walk: &WalkFn, budget: &Budg
             deadline: Instant::now() + budget.time,
             cancel: &shared.cancel,
         };
-        let usage = walk(&job.toplevel, &limits).ok().map(|w| WorktreeUsage {
-            worktree: job.worktree,
-            bytes: w.bytes,
-            measured_unix_nanos: now_unix_nanos(),
-            complete: w.complete,
-        });
+        let usage = match walk(&job.toplevel, &limits) {
+            Ok(w) => Ok(WorktreeUsage {
+                worktree: job.worktree,
+                bytes: w.bytes,
+                measured_unix_nanos: now_unix_nanos(),
+                complete: w.complete,
+            }),
+            Err(e) => Err(WalkFailure {
+                worktree_id: job.worktree.id,
+                kind: e.kind(),
+            }),
+        };
         let finished = Done {
             toplevel: job.toplevel,
             generation: job.generation,
@@ -510,10 +571,106 @@ mod tests {
         walks.apply(Done {
             toplevel: PathBuf::from("/w/a"),
             generation: waiting + 7,
-            usage: None,
+            usage: Err(WalkFailure {
+                worktree_id: "a".into(),
+                kind: io::ErrorKind::NotFound,
+            }),
         });
         assert_eq!(walks.state[Path::new("/w/a")].outstanding, Some(waiting));
         gate.release();
+    }
+
+    /// Findings 4 and 11: a walk that fails after an earlier one succeeded
+    /// withdraws the old figure, which is not sent on as current, and says
+    /// which worktree failed and how, by id; a later success brings a figure
+    /// back.
+    #[test]
+    fn a_failed_walk_withdraws_the_last_figure() {
+        let fail = Arc::new(AtomicBool::new(false));
+        let failing = Arc::clone(&fail);
+        let walk: WalkFn = Arc::new(move |_root, _limits| {
+            if failing.load(Ordering::SeqCst) {
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            } else {
+                Ok(Walk {
+                    bytes: 42,
+                    complete: true,
+                })
+            }
+        });
+        let mut walks = Walks::new(Duration::ZERO, 1, 16, DEFAULT_BUDGET, walk).unwrap();
+        let a = in_use(&["a"]);
+        let usage = settle(&mut walks, &a);
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].bytes, 42);
+        assert!(walks.take_failed().is_empty());
+
+        fail.store(true, Ordering::SeqCst);
+        // Due again at once (interval 0): the next walk fails.
+        let until = Instant::now() + Duration::from_secs(10);
+        let mut failed = Vec::new();
+        while failed.is_empty() {
+            assert!(Instant::now() < until, "the failing walk never landed");
+            walks.update(&a);
+            failed = walks.take_failed();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            failed[0],
+            WalkFailure {
+                worktree_id: "a".into(),
+                kind: io::ErrorKind::NotFound,
+            }
+        );
+        assert!(walks.usage(&a).is_empty(), "the old figure is still sent");
+
+        fail.store(false, Ordering::SeqCst);
+        let until = Instant::now() + Duration::from_secs(10);
+        while walks.update(&a).is_empty() {
+            assert!(Instant::now() < until, "no figure came back");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Finding 7: at shutdown, a worktree's first walk that is still running
+    /// is waited for, within the bound, so the final request carries it; a
+    /// walk that outlasts the bound is not waited for past it.
+    #[test]
+    fn settle_waits_for_outstanding_walks_within_its_bound() {
+        let gate = Gate::new();
+        let mut walks = Walks::new(
+            Duration::from_secs(3600),
+            2,
+            16,
+            DEFAULT_BUDGET,
+            gate.walk(),
+        )
+        .unwrap();
+        let a = in_use(&["a"]);
+        assert!(walks.update(&a).is_empty());
+        gate.wait_started(1);
+        let started = Instant::now();
+        let usage = walks.settle(&a, started + Duration::from_millis(100));
+        assert!(usage.is_empty(), "{usage:?}");
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(100), "{waited:?}");
+        assert!(waited < Duration::from_secs(5), "{waited:?}");
+
+        let releaser = {
+            let gate = Arc::clone(&gate);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                gate.release();
+            })
+        };
+        let usage = walks.settle(&a, Instant::now() + Duration::from_secs(10));
+        releaser.join().unwrap();
+        assert_eq!(usage.len(), 1, "{usage:?}");
+        assert_eq!(usage[0].bytes, 42);
+        // With nothing outstanding it returns at once.
+        let started = Instant::now();
+        walks.settle(&a, started + Duration::from_secs(10));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     /// `--once`: every worktree in use is walked through the pool, and a

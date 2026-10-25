@@ -2,11 +2,15 @@
 //! much CPU and memory each run used, sample by sample.
 //!
 //! **Attribution.** A process whose own environment names a run belongs to
-//! it for its whole life. One whose environment names none takes its parent's
-//! run (a test harness or a tool that replaced its environment) and keeps it
-//! when its parent exits; a later sample in which its own environment names a
-//! run (it exec'd with a new one) moves it there. One with neither is
-//! unattributed, and is looked at again every sample.
+//! it, and stays in it when it later execs with an environment that names
+//! none; when it execs with one that names another run, it moves there from
+//! that sample on, and what it was credited before stays with the run it
+//! left. One whose environment names none takes its parent's run (a test
+//! harness or a tool that replaced its environment) and keeps it when its
+//! parent exits; a later sample in which its own environment names a run (it
+//! exec'd with a new one) moves it there. One with neither is unattributed,
+//! and is looked at again every sample. Its environment is read at every
+//! sample, which is what notices an exec.
 //!
 //! **Users.** A run is keyed by its id *and* the user its processes run as
 //! ([`RunKey`]): a process takes a run from its own environment under its
@@ -38,8 +42,6 @@ const MAX_ANCESTRY: usize = 64;
 pub enum Environ {
     /// Read: the run it names, if any.
     Read(Option<RunIdentity>),
-    /// Not read, because [`Aggregator::environ_settled`] said it need not be.
-    NotRead,
     /// Not readable: a process of the collector's own user that made itself
     /// non-dumpable, whose environment and memory figures only root may
     /// read. It names no run of its own: it keeps a run it was already
@@ -130,7 +132,8 @@ struct Tracked {
     total: u64,
     children: u64,
     attribution: Attribution,
-    /// Attributed by its own environment, so settled for good.
+    /// Attributed by its own environment: an environment that names no run
+    /// later does not take it out of that run.
     own: bool,
 }
 
@@ -181,16 +184,6 @@ impl Aggregator {
         }
     }
 
-    /// Whether the process `(pid, starttime)`, now running as `uid`, is
-    /// attributed by its own environment already, so the reader need not read
-    /// its environment again. A process whose user changed is not: what it
-    /// was attributed to does not carry over.
-    pub fn environ_settled(&self, pid: u32, starttime: u64, uid: u32) -> bool {
-        self.tracked
-            .get(&(pid, starttime))
-            .is_some_and(|t| t.own && t.uid == uid)
-    }
-
     fn ticks_to_seconds(&self, ticks: u64) -> f64 {
         ticks as f64 / self.clk_tck as f64
     }
@@ -222,7 +215,9 @@ impl Aggregator {
             // same user (a setuid exec changes that).
             let prev = prev.filter(|t| t.uid == p.uid);
             let (attribution, own) = match (prev, own_run) {
-                (Some(t), _) if t.own => (t.attribution.clone(), true),
+                // Its own environment names a run: that run's, wherever it
+                // was before. A process that exec'd into another run's
+                // environment moves; its earlier credit stays where it was.
                 (_, Some(identity)) => {
                     let run = RunKey {
                         run_id: identity.run_id.clone(),
@@ -240,6 +235,9 @@ impl Aggregator {
                     }
                     (Attribution::Run(run), true)
                 }
+                // It names none now (it exec'd with a cleared environment,
+                // or made itself unreadable): it stays where it was.
+                (Some(t), None) if t.own => (t.attribution.clone(), true),
                 (Some(t), None) if matches!(t.attribution, Attribution::Run(_)) => {
                     (t.attribution.clone(), false)
                 }
@@ -462,12 +460,8 @@ mod tests {
             self.pss = Some(Pss { anon, file, shmem });
             self
         }
-        fn sample(&self, agg: &Aggregator) -> ProcessSample {
-            let environ = if agg.environ_settled(self.pid, self.start, self.uid) {
-                Environ::NotRead
-            } else {
-                Environ::Read(self.run.map(identity))
-            };
+        fn sample(&self) -> ProcessSample {
+            let environ = Environ::Read(self.run.map(identity));
             ProcessSample {
                 pid: self.pid,
                 uid: self.uid,
@@ -487,7 +481,7 @@ mod tests {
     }
 
     fn step(agg: &mut Aggregator, t: u64, procs: &[P]) -> Sample {
-        let samples = procs.iter().map(|p| p.sample(agg)).collect();
+        let samples = procs.iter().map(P::sample).collect();
         agg.step(STARTED + t * 1_000_000_000, samples)
     }
 
@@ -669,18 +663,48 @@ mod tests {
     }
 
     #[test]
-    fn an_own_environment_is_read_once_and_is_sticky() {
+    fn an_own_environment_is_sticky_through_one_that_names_no_run() {
         let mut agg = Aggregator::new(CLK, BOOT, STARTED);
-        assert!(!agg.environ_settled(10, 500, 1000));
         step(&mut agg, 0, &[p(10, 1, 500, Some("r1"))]);
-        assert!(agg.environ_settled(10, 500, 1000));
-        // A reused pid is a new process.
-        assert!(!agg.environ_settled(10, 501, 1000));
-        // One that now runs as another user is read again.
-        assert!(!agg.environ_settled(10, 500, 0));
         // It exec'd with a cleared environment: it is still the run's.
         let s = step(&mut agg, 15, &[p(10, 1, 500, None).cpu(10, 0)]);
         assert_eq!(run(&s, "r1").figures.processes, 1);
+        // And so is a child it starts with no environment of its own.
+        let s = step(
+            &mut agg,
+            30,
+            &[p(10, 1, 500, None).cpu(10, 0), p(11, 10, 600, None)],
+        );
+        assert_eq!(run(&s, "r1").members, vec![10, 11]);
+    }
+
+    /// Finding 2: a process that keeps its pid but execs with another run's
+    /// environment moves to that run from that sample on; what it was
+    /// credited before stays with the run it left, which ends when it was
+    /// that run's last process.
+    #[test]
+    fn a_process_that_execs_into_another_run_moves_to_it() {
+        let mut agg = Aggregator::new(CLK, BOOT, STARTED);
+        let s = step(&mut agg, 0, &[p(10, 1, 500, Some("a")).cpu(100, 0)]);
+        assert!(approx(run(&s, "a").figures.cpu_seconds, 1.0));
+        let s = step(&mut agg, 15, &[p(10, 1, 500, Some("b")).cpu(150, 0)]);
+        let a = run(&s, "a");
+        assert!(a.ended, "{a:?}");
+        assert!(approx(a.figures.cpu_seconds, 1.0));
+        let b = run(&s, "b");
+        assert_eq!(b.members, vec![10]);
+        // Only what it used since the last sample, not its whole total.
+        assert!(approx(b.figures.cpu_seconds, 0.5));
+        // It stays in b, and its child with no environment of its own
+        // follows it.
+        let s = step(
+            &mut agg,
+            30,
+            &[p(10, 1, 500, None).cpu(170, 0), p(11, 10, 600, None)],
+        );
+        assert_eq!(run(&s, "b").members, vec![10, 11]);
+        assert!(approx(run(&s, "b").figures.cpu_seconds, 0.7));
+        assert!(s.runs.iter().all(|r| r.identity.run_id != "a"));
     }
 
     #[test]

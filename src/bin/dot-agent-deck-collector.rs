@@ -4,8 +4,9 @@
 //! traces on `deck.run.id`. Linux only.
 //!
 //! The pure-data core is `dot_agent_deck::telemetry::collector`; this binary
-//! holds the command line, the `/proc` reader, the worktree walks and the
-//! sampling-and-export loop.
+//! holds the command line and the sampling-and-export loop. In the loop, each
+//! sample runs on a blocking thread, off the async runtime, so a slow `/proc`
+//! read holds up neither a signal nor the runtime's timers.
 
 use std::process::ExitCode;
 
@@ -22,7 +23,7 @@ fn main() -> ExitCode {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
     use std::fs;
     use std::io::Write;
     use std::path::PathBuf;
@@ -34,8 +35,9 @@ mod linux {
     use clap::{Parser, Subcommand};
     use dot_agent_deck::telemetry::collector::aggregate::{Aggregator, Sample};
     use dot_agent_deck::telemetry::collector::config::{Export, Settings};
+    use dot_agent_deck::telemetry::collector::discovery::{self, Discovery, FIRST_SIGHT_WAIT};
     use dot_agent_deck::telemetry::collector::disk::{
-        self, DEFAULT_BUDGET, canonical_toplevel, git_toplevel, worktree_id,
+        self, DEFAULT_BUDGET, canonical_toplevel, worktree_id,
     };
     use dot_agent_deck::telemetry::collector::otlp::{
         PendingTerminals, Request, RunWorktrees, WorktreeRef, WorktreeUsage, build_request,
@@ -53,9 +55,17 @@ mod linux {
         decode_metrics_partial_success_json, decode_partial_success_protobuf,
     };
     use dot_agent_deck::telemetry::resource::host_name;
+    use tokio::task::JoinHandle;
 
     /// A failed export is logged at most this often.
     const FAILURE_LOG_EVERY: Duration = Duration::from_secs(60);
+    /// At SIGTERM or SIGINT, how long the final sample waits for the walks
+    /// queued or running then, so that its request carries their figures.
+    const SHUTDOWN_WALK_WAIT: Duration = Duration::from_secs(5);
+    /// At SIGTERM or SIGINT, how long the collector waits for a sample in
+    /// progress and then its final one. Past it, it exits without its final
+    /// request rather than wait on a `/proc` read that does not return.
+    const SHUTDOWN_SAMPLE_LIMIT: Duration = Duration::from_secs(10);
 
     /// Report each agent run's CPU and memory, and each worktree's disk use,
     /// over OTLP, from the standard OTEL_EXPORTER_OTLP_* variables.
@@ -155,7 +165,11 @@ mod linux {
                 return ExitCode::FAILURE;
             }
         };
-        runtime.block_on(run(cli, sampler, sink))
+        let code = runtime.block_on(run(cli, sampler, sink));
+        // A sample abandoned at shutdown can still be blocked reading
+        // `/proc`: exit without waiting for it.
+        runtime.shutdown_background();
+        code
     }
 
     async fn run(cli: Cli, mut sampler: Sampler, mut sink: Sink) -> ExitCode {
@@ -183,18 +197,76 @@ mod linux {
         let mut pending = PendingTerminals::default();
         let mut ticker = tokio::time::interval(Duration::from_secs(cli.interval));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The sampler is lent to a blocking thread for each sample and comes
+        // back with its request. A tick that comes while a sample runs is
+        // skipped.
+        let mut idle = Some(sampler);
+        let mut sampling: Option<JoinHandle<(Sampler, Request)>> = None;
         loop {
             tokio::select! {
-                _ = ticker.tick() => {
-                    let request = sampler.sample();
+                _ = ticker.tick(), if idle.is_some() => {
+                    let mut lent = idle.take().expect("the branch runs only with the sampler idle");
+                    sampling = Some(tokio::task::spawn_blocking(move || {
+                        let request = lent.sample();
+                        (lent, request)
+                    }));
+                }
+                joined = async {
+                    sampling.as_mut().expect("the branch runs only while sampling").await
+                }, if sampling.is_some() => {
+                    sampling = None;
+                    let Ok((returned, request)) = joined else {
+                        eprintln!("dot-agent-deck-collector: a sample failed; exiting");
+                        return ExitCode::FAILURE;
+                    };
+                    idle = Some(returned);
                     sink.emit_holding(request, &mut pending).await;
                 }
                 _ = terminate.recv() => break,
                 _ = interrupt.recv() => break,
             }
         }
-        let request = sampler.sample();
-        sink.emit_holding(request, &mut pending).await;
+        shutdown(idle, sampling, sink, pending).await
+    }
+
+    /// The final sample and export, at SIGTERM or SIGINT. A sample in
+    /// progress is waited for, its ended runs' last reports held for the
+    /// final request; the final sample then waits up to
+    /// [`SHUTDOWN_WALK_WAIT`] for the walks queued or running. All of it
+    /// ends within [`SHUTDOWN_SAMPLE_LIMIT`] of the signal, or the collector
+    /// exits without its final request.
+    async fn shutdown(
+        idle: Option<Sampler>,
+        sampling: Option<JoinHandle<(Sampler, Request)>>,
+        mut sink: Sink,
+        mut pending: PendingTerminals,
+    ) -> ExitCode {
+        let stopped = Instant::now();
+        let limit = tokio::time::Instant::from_std(stopped + SHUTDOWN_SAMPLE_LIMIT);
+        let gave_up = || {
+            eprintln!(
+                "dot-agent-deck-collector: the final sample did not finish within {}s of the stop; exiting without it",
+                SHUTDOWN_SAMPLE_LIMIT.as_secs()
+            );
+            ExitCode::SUCCESS
+        };
+        let mut sampler = match (idle, sampling) {
+            (Some(sampler), _) => sampler,
+            (None, Some(running)) => match tokio::time::timeout_at(limit, running).await {
+                Ok(Ok((sampler, request))) => {
+                    pending.hold(&request);
+                    sampler
+                }
+                _ => return gave_up(),
+            },
+            (None, None) => return gave_up(),
+        };
+        let walks_until = stopped + SHUTDOWN_WALK_WAIT;
+        let last = tokio::task::spawn_blocking(move || sampler.sample_final(walks_until));
+        match tokio::time::timeout_at(limit, last).await {
+            Ok(Ok(request)) => sink.emit_holding(request, &mut pending).await,
+            _ => return gave_up(),
+        }
         ExitCode::SUCCESS
     }
 
@@ -205,7 +277,8 @@ mod linux {
             .unwrap_or(0)
     }
 
-    /// Reads `/proc`, accounts each sample and keeps the worktree walks.
+    /// Reads `/proc`, accounts each sample and keeps the worktree lookups
+    /// and walks.
     struct Sampler {
         aggregator: Aggregator,
         settings: Settings,
@@ -215,8 +288,12 @@ mod linux {
         /// without `--all-users`.
         users: Users,
         run_worktrees: RunWorktrees,
+        /// `None` when no lookup thread could start: then no run has a
+        /// worktree and no disk is walked.
+        discovery: Option<Discovery>,
         disks: Option<Walks>,
         last_incomplete_log: Option<Instant>,
+        last_walk_failure_log: Option<Instant>,
     }
 
     impl Sampler {
@@ -258,6 +335,19 @@ mod linux {
                     }
                 }
             };
+            let discovery = match Discovery::new(
+                discovery::WORKERS,
+                discovery::MAX_OUTSTANDING,
+                Arc::new(discovery::toplevel),
+            ) {
+                Ok(discovery) => Some(discovery),
+                Err(e) => {
+                    eprintln!(
+                        "dot-agent-deck-collector: cannot start the worktree lookups ({e}); runs are reported without worktrees and disk figures are off"
+                    );
+                    None
+                }
+            };
             Ok(Sampler {
                 aggregator: Aggregator::new(clk_tck, boot, now_unix_nanos()),
                 settings,
@@ -268,14 +358,16 @@ mod linux {
                     all: cli.all_users,
                 },
                 run_worktrees: RunWorktrees::default(),
+                discovery,
                 disks,
                 last_incomplete_log: None,
+                last_walk_failure_log: None,
             })
         }
 
         /// One sample, with the worktrees in use walked in the background.
         fn sample(&mut self) -> Request {
-            let (sample, in_use) = self.read();
+            let (sample, in_use) = self.read(Instant::now() + FIRST_SIGHT_WAIT, false);
             let usage = match &mut self.disks {
                 Some(disks) => disks.update(&in_use),
                 None => Vec::new(),
@@ -283,20 +375,63 @@ mod linux {
             self.request(&sample, &usage)
         }
 
-        /// One sample, with every worktree in use walked before it is sent.
+        /// One sample, with every worktree in use looked up and walked
+        /// before it is sent, all within the walk's time budget.
         fn sample_once(&mut self) -> Request {
-            let (sample, in_use) = self.read();
+            let deadline = Instant::now() + DEFAULT_BUDGET.time;
+            let (sample, in_use) = self.read(deadline, true);
             let usage = match &mut self.disks {
-                Some(disks) => disks.measure_all(&in_use, Instant::now() + DEFAULT_BUDGET.time),
+                Some(disks) => disks.measure_all(&in_use, deadline),
                 None => Vec::new(),
             };
             self.request(&sample, &usage)
         }
 
-        fn read(&mut self) -> (Sample, InUse) {
-            let processes = reader::read_processes(&self.aggregator, self.users, reader::pids());
+        /// The last sample, at shutdown: [`Self::sample`], then a wait until
+        /// `walks_until` for the walks queued or running, so that its
+        /// request carries what they measure.
+        fn sample_final(&mut self, walks_until: Instant) -> Request {
+            let lookups_until = (Instant::now() + FIRST_SIGHT_WAIT).min(walks_until);
+            let (sample, in_use) = self.read(lookups_until, false);
+            let usage = match &mut self.disks {
+                Some(disks) => {
+                    disks.update(&in_use);
+                    disks.settle(&in_use, walks_until)
+                }
+                None => Vec::new(),
+            };
+            self.request(&sample, &usage)
+        }
+
+        /// Read and account one sample, and find its worktrees: each run
+        /// seen for the first time waits until `until` for the lookups its
+        /// worktree is decided from (`every_lookup`: every lookup of the
+        /// sample waits, as `--once` does). A lookup still outstanding then
+        /// is no worktree for that run, which keeps none (§5.4 of the
+        /// design); the sample waits for nothing else.
+        fn read(&mut self, until: Instant, every_lookup: bool) -> (Sample, InUse) {
+            let processes = reader::read_processes(self.users, reader::pids());
             let sample = self.aggregator.step(now_unix_nanos(), processes);
-            let (members, in_use) = worktrees(&sample, self.send_paths);
+            let cwds = working_directories(&sample);
+            let (members, in_use) = match &mut self.discovery {
+                Some(discovery) => {
+                    let all: BTreeSet<PathBuf> = cwds.values().cloned().collect();
+                    let wanted: BTreeSet<PathBuf> = if every_lookup {
+                        all.clone()
+                    } else {
+                        sample
+                            .runs
+                            .iter()
+                            .filter(|run| !self.run_worktrees.is_decided(&run.key()))
+                            .flat_map(|run| &run.members)
+                            .filter_map(|pid| cwds.get(pid).cloned())
+                            .collect()
+                    };
+                    discovery.update(&all, &wanted, until);
+                    worktrees(&cwds, discovery, self.send_paths)
+                }
+                None => (HashMap::new(), InUse::new()),
+            };
             self.run_worktrees
                 .update(&sample, |pid| members.get(&pid).cloned());
             (sample, in_use)
@@ -304,6 +439,7 @@ mod linux {
 
         fn request(&mut self, sample: &Sample, usage: &[WorktreeUsage]) -> Request {
             self.log_incomplete();
+            self.log_walk_failures();
             let request = build_request(
                 sample,
                 self.run_worktrees.get(),
@@ -335,36 +471,63 @@ mod linux {
                 );
             }
         }
+
+        /// Say, at most once a minute, that a walk failed and its worktree's
+        /// figure is withheld. Never the worktree's path, nor the error's
+        /// text: only its id and the kind of error.
+        fn log_walk_failures(&mut self) {
+            let Some(disks) = &mut self.disks else {
+                return;
+            };
+            let failed = disks.take_failed();
+            let Some(failure) = failed.first() else {
+                return;
+            };
+            if self
+                .last_walk_failure_log
+                .is_none_or(|at| at.elapsed() >= FAILURE_LOG_EVERY)
+            {
+                self.last_walk_failure_log = Some(Instant::now());
+                eprintln!(
+                    "dot-agent-deck-collector: the walk of worktree {} failed ({}); its disk figure is withheld until a walk succeeds",
+                    failure.worktree_id, failure.kind
+                );
+            }
+        }
     }
 
-    /// The worktree of each run-attributed process that is in one, by pid,
-    /// and every worktree such a process is in.
-    fn worktrees(sample: &Sample, send_paths: bool) -> (HashMap<u32, WorktreeRef>, InUse) {
-        let mut toplevels: HashMap<PathBuf, Option<PathBuf>> = HashMap::new();
+    /// Each run-attributed process's working directory, by pid. Reading
+    /// `/proc/<pid>/cwd`'s link names the directory without looking it up
+    /// on its filesystem, so it cannot stall on one that does not answer.
+    fn working_directories(sample: &Sample) -> HashMap<u32, PathBuf> {
+        sample
+            .runs
+            .iter()
+            .flat_map(|run| &run.members)
+            .filter_map(|pid| Some((*pid, fs::read_link(format!("/proc/{pid}/cwd")).ok()?)))
+            .collect()
+    }
+
+    /// The worktree of each process in `cwds` whose directory's lookup has
+    /// answered with one, by pid, and every worktree such a process is in.
+    fn worktrees(
+        cwds: &HashMap<u32, PathBuf>,
+        discovery: &Discovery,
+        send_paths: bool,
+    ) -> (HashMap<u32, WorktreeRef>, InUse) {
         let mut in_use = InUse::new();
         let mut members = HashMap::new();
-        for run in &sample.runs {
-            for pid in &run.members {
-                let Ok(cwd) = fs::read_link(format!("/proc/{pid}/cwd")) else {
-                    continue;
-                };
-                let toplevel = toplevels
-                    .entry(cwd)
-                    .or_insert_with_key(|cwd| {
-                        git_toplevel(cwd).and_then(|dir| fs::canonicalize(dir).ok())
-                    })
-                    .clone();
-                let Some(toplevel) = toplevel else {
-                    continue;
-                };
-                let worktree = in_use
-                    .entry(toplevel)
-                    .or_insert_with_key(|toplevel| WorktreeRef {
-                        id: worktree_id(toplevel),
-                        path: send_paths.then(|| toplevel.to_string_lossy().into_owned()),
-                    });
-                members.insert(*pid, worktree.clone());
-            }
+        for (pid, cwd) in cwds {
+            let Some(Some(toplevel)) = discovery.toplevel(cwd) else {
+                continue;
+            };
+            let worktree = in_use
+                .entry(toplevel.clone())
+                .or_insert_with_key(|toplevel| WorktreeRef {
+                    id: worktree_id(toplevel),
+                    path: send_paths.then(|| toplevel.to_string_lossy().into_owned()),
+                });
+            members.insert(*pid, worktree.clone());
         }
         (members, in_use)
     }

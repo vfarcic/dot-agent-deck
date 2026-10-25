@@ -4,7 +4,7 @@
 use std::fs;
 use std::io;
 
-use super::aggregate::{Aggregator, Environ, ProcessSample};
+use super::aggregate::{Environ, ProcessSample};
 use super::identity::run_identity;
 use super::procfs::{ProcStat, Pss, parse_effective_uid};
 
@@ -30,8 +30,13 @@ pub fn pids() -> Vec<u32> {
 
 /// The visible processes among `pids`, read in the order that keeps a
 /// child's reaping mid-sample least likely to be counted twice: every `stat`
-/// first, then each one's user and the environments that are not settled
-/// yet, then `smaps_rollup`.
+/// first, then each one's user and environment, then `smaps_rollup`.
+///
+/// Every visible process's environment is read at every sample, not only
+/// until its run is known: that is how a process that exec'd into another
+/// run's environment is noticed. Reading them all cost about as much as
+/// reading every `stat` (3 ms for 100 processes, against 112 ms for their
+/// `smaps_rollup`, measured for PRD #1859).
 ///
 /// A process is visible when it is not a kernel thread, its effective user
 /// (from `status`, not the owner of `/proc/<pid>`, which is root for a
@@ -39,11 +44,7 @@ pub fn pids() -> Vec<u32> {
 /// environment can be read. One of the collector's own user whose
 /// environment it may not read (a process that made itself non-dumpable) is
 /// visible too, as [`Environ::Unreadable`]: it can take its parent's run.
-pub fn read_processes(
-    aggregator: &Aggregator,
-    users: Users,
-    pids: impl IntoIterator<Item = u32>,
-) -> Vec<ProcessSample> {
+pub fn read_processes(users: Users, pids: impl IntoIterator<Item = u32>) -> Vec<ProcessSample> {
     let mut stats = Vec::new();
     for pid in pids {
         if let Ok(text) = fs::read_to_string(format!("/proc/{pid}/stat"))
@@ -64,16 +65,12 @@ pub fn read_processes(
         if !users.all && uid != users.own {
             continue;
         }
-        let environ = if aggregator.environ_settled(pid, stat.starttime, uid) {
-            Environ::NotRead
-        } else {
-            match fs::read(format!("/proc/{pid}/environ")) {
-                Ok(bytes) => Environ::Read(run_identity(&bytes)),
-                Err(e) if uid == users.own && denied(&e) => Environ::Unreadable,
-                // Another user's that it may not read is not visible, and
-                // counted nowhere; one that vanished is gone.
-                Err(_) => continue,
-            }
+        let environ = match fs::read(format!("/proc/{pid}/environ")) {
+            Ok(bytes) => Environ::Read(run_identity(&bytes)),
+            Err(e) if uid == users.own && denied(&e) => Environ::Unreadable,
+            // Another user's that it may not read is not visible, and
+            // counted nowhere; one that vanished is gone.
+            Err(_) => continue,
         };
         visible.push((pid, uid, stat, environ));
     }
@@ -103,6 +100,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+    use crate::telemetry::collector::aggregate::Aggregator;
     use crate::telemetry::collector::procfs::parse_boot_time;
 
     /// Kills and reaps the child it holds when dropped, so a failed
@@ -338,7 +336,7 @@ mod tests {
             assert_eq!(owner, 0);
         }
 
-        let read = read_processes(&aggregator(), Users { own, all: false }, [pid]);
+        let read = read_processes(Users { own, all: false }, [pid]);
         assert_eq!(read.len(), 1, "{read:?}");
         assert_eq!(read[0].pid, pid);
         assert_eq!(read[0].uid, own);
@@ -360,7 +358,7 @@ mod tests {
             own: own.wrapping_add(1),
             all: false,
         };
-        assert!(read_processes(&aggregator(), other, [pid]).is_empty());
+        assert!(read_processes(other, [pid]).is_empty());
     }
 
     /// R6: a process that cleared its environment and left the tree (double
@@ -490,7 +488,7 @@ mod tests {
             own: own_uid(),
             all: false,
         };
-        let read = read_processes(&aggregator, users, [pid]);
+        let read = read_processes(users, [pid]);
         assert_eq!(read.len(), 1, "{read:?}");
         assert_eq!(read[0].environ, Environ::Read(None));
         let sample = aggregator.step(1, read);
