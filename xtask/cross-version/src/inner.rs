@@ -19,7 +19,7 @@ use crate::isolation::{self, Plan};
 use crate::outer::epoch_secs;
 use crate::proc::{self, Identity, Mismatch, SandboxProcess, Terminated};
 use crate::pty;
-use crate::report::{Evidence, RunVerdict, Verdict};
+use crate::report::{Evidence, PartOp, RunVerdict, Verdict};
 use crate::sandbox::{self, Direction, EndpointMatrix, EndpointMode, Sandbox};
 use crate::{ctl, probes};
 
@@ -678,6 +678,18 @@ pub(crate) fn wait_for_status(
         StatusWait::Satisfied(rows) => Ok(rows),
         StatusWait::Unsatisfied(_, why) | StatusWait::Failing(why) => Err(why),
     })
+}
+
+/// The length of `path` in bytes, which marks where an operation begins or
+/// ends in the daemon's append-only log ([`crate::report::PartOp::log_span`]);
+/// `None` when it cannot be read.
+pub(crate) fn log_len(path: &Path) -> Option<u64> {
+    std::fs::metadata(path).ok().map(|m| m.len())
+}
+
+/// The span of the daemon's log between two [`log_len`] readings.
+fn span(from: Option<u64>, to: Option<u64>) -> Option<(u64, u64)> {
+    Some((from?, to?))
 }
 
 pub(crate) fn count_in_file(path: &Path, needle: &str) -> usize {
@@ -1508,6 +1520,7 @@ fn with_attached_tui(
     // listing, read from a different pane, must then show that very message
     // acknowledged. The sentinel is checked in what the deck HANDED the worker;
     // judgement reads parsed fetch JSON, rather than terminal echo.
+    let fetch_from = log_len(&sb.log);
     let coder_fetch = fetch_in_pane(
         g,
         tui,
@@ -1516,6 +1529,7 @@ fn with_attached_tui(
         (ROLE_CODER, coder_pane),
         &delegate_sentinel,
     )?;
+    let listing_from = log_len(&sb.log);
     let listing = capture_in_pane(
         g,
         tui,
@@ -1528,21 +1542,18 @@ fn with_attached_tui(
             shell_word(&cast.pane_cli)
         ),
     )?;
-    let (delivered, delivery_note) = judge_inbox_delivery(
+    let listing_to = log_len(&sb.log);
+    let (delivery_halves, delivery_note) = inbox_delivery_halves(
         coder_fetch.out.as_deref(),
         listing.out.as_deref(),
         &delegate_sentinel,
         coder_pane,
         orchestrator_pane,
     );
-    ev.tell(
+    ev.tell_in_parts(
         "tell-3",
         "a delegate still routed",
-        if delivered {
-            Verdict::Pass
-        } else {
-            Verdict::Fail
-        },
+        &delivery_halves,
         format!(
             "delegated `{delegate_sentinel}` from the orchestrator pane to `{ROLE_CODER}` and \
              `{ROLE_REVIEWER}` with the {} CLI (`{}`), typed into the orchestrator's own PTY \
@@ -1558,6 +1569,21 @@ fn with_attached_tui(
             refusal_note(coder_fetch.refused, ROLE_CODER),
         ),
     );
+    // Each half names the operation it ran, its pane and its stretch of the
+    // log; the fetch's own output is what a client-declared break may cite
+    // (`breaks.rs`).
+    if let Some(t) = ev.tells.last_mut() {
+        t.part_ops = vec![
+            PartOp::new("fetch", "fetch", coder_pane, span(fetch_from, listing_from)),
+            PartOp::new(
+                "listing",
+                "listing",
+                orchestrator_pane,
+                span(listing_from, listing_to),
+            ),
+        ];
+        t.client_outputs = client_output("fetch", coder_fetch.out.as_deref());
+    }
 
     // Hooks. `work-done` first, `agent-event` last: a bare `AgentEvent` makes
     // the daemon classify that pane's agent type as `Pi`, which routes prompt
@@ -1599,6 +1625,7 @@ fn with_attached_tui(
         &plan.env,
         ev,
     )?;
+    let report_from = log_len(&sb.log);
     type_into_pane(
         tui,
         &format!(
@@ -1610,6 +1637,7 @@ fn with_attached_tui(
     // The report goes to the orchestrator's inbox; the orchestrator takes it
     // and its own listing must show it acknowledged — tell 3's evidence, for
     // the report travelling the other way.
+    let report_fetch_from = log_len(&sb.log);
     let orchestrator_fetch = fetch_in_pane(
         g,
         tui,
@@ -1618,6 +1646,7 @@ fn with_attached_tui(
         (ROLE_ORCHESTRATOR, orchestrator_pane),
         &work_done_sentinel,
     )?;
+    let report_listing_from = log_len(&sb.log);
     let orchestrator_listing = capture_in_pane(
         g,
         tui,
@@ -1630,6 +1659,11 @@ fn with_attached_tui(
             shell_word(&cast.pane_cli)
         ),
     )?;
+    let report_listing_to = log_len(&sb.log);
+    let report_fetched = orchestrator_fetch.out.as_deref().is_some_and(|out| {
+        captured_pane(out) == Some(orchestrator_pane)
+            && fetched_id(out, &work_done_sentinel).is_some()
+    });
     let (work_done_arrived, work_done_note) = judge_inbox_delivery(
         orchestrator_fetch.out.as_deref(),
         orchestrator_listing.out.as_deref(),
@@ -1644,6 +1678,7 @@ fn with_attached_tui(
         &plan.env,
         ev,
     )?;
+    let status_from = log_len(&sb.log);
     type_into_pane(
         tui,
         &format!("{} agent-event --type running", shell_word(&cast.pane_cli)),
@@ -1662,10 +1697,11 @@ fn with_attached_tui(
             })
         },
     )?;
+    let status_to = log_len(&sb.log);
     // The status half is named `status` only when the daemon answered with
     // readable rows that never showed the change; a query that could not be
     // read is `status-query`, which no declared break explains (`breaks.rs`).
-    let (status_part, status_ok, status_note, reviewer_pane) = match &status_wait {
+    let (status_part, status_ok, status_note, status_pane) = match &status_wait {
         StatusWait::Satisfied(rows) => {
             let row = rows.iter().find(|r| r.role.contains(ROLE_REVIEWER));
             (
@@ -1678,7 +1714,9 @@ fn with_attached_tui(
                     cast.daemon_side.to_uppercase(),
                     row.map(|r| r.status.clone()).unwrap_or_default()
                 ),
-                None,
+                // The `work-done` half measured this pane too, and a declared
+                // break that explains it names it (PRD #1666 part 3).
+                row.map(|r| r.pane_id.clone()).filter(|p| !p.is_empty()),
             )
         }
         StatusWait::Unsatisfied(rows, why) => (
@@ -1715,7 +1753,46 @@ fn with_attached_tui(
         ),
     );
     if let Some(t) = ev.tells.last_mut() {
-        t.subject_pane = reviewer_pane;
+        // The `work-done` half was reported from the reviewer's pane and
+        // fetched and listed in the orchestrator's: three operations, each
+        // with its pane and its stretch of the log, so a break explains it
+        // only through the operation it acts on (`breaks.rs`). The report
+        // runs until the half was measured, since the CLI typed into the pane
+        // sends it while the harness has already moved on to the fetch. A
+        // fetch that handed the report over leaves only the listing to have
+        // failed, so the report and the fetch are not recorded then. The
+        // status half names the reviewer's pane as `daemon status` reported
+        // it.
+        if !report_fetched {
+            t.part_ops.push(PartOp::new(
+                "work-done",
+                "report",
+                reviewer_pane,
+                span(report_from, report_listing_to),
+            ));
+            t.part_ops.push(PartOp::new(
+                "work-done",
+                "fetch",
+                orchestrator_pane,
+                span(report_fetch_from, report_listing_from),
+            ));
+        }
+        t.part_ops.push(PartOp::new(
+            "work-done",
+            "listing",
+            orchestrator_pane,
+            span(report_listing_from, report_listing_to),
+        ));
+        if let Some(pane) = &status_pane {
+            t.part_ops.push(PartOp::new(
+                status_part,
+                "status",
+                pane,
+                span(status_from, status_to),
+            ));
+        }
+        t.client_outputs = client_output("work-done", orchestrator_fetch.out.as_deref());
+        t.subject_pane = status_pane;
     }
 
     // --- the branch-specific stimulus, reverse only --------------------------
@@ -1924,8 +2001,9 @@ fn with_attached_tui(
     }
 
     let deck_log = std::fs::read_to_string(&sb.log).unwrap_or_default();
-    // A failed tell that a break declared by the daemon's build, and not the
-    // client's, accounts for is that break's intended outcome (issue #1596).
+    // A failed tell that a break declared by one build and not the other
+    // accounts for, witnessed in this log or in the client's own output, is
+    // that break's intended outcome (issue #1596).
     crate::breaks::explain(ev, plan.direction, &deck_log);
     ev.excerpt("sandbox deck.log (tail)", tail(&deck_log, 80));
     Ok(())
@@ -3625,6 +3703,47 @@ pub(crate) fn judge_inbox_delivery(
     }
 }
 
+/// Tell 3's halves from its two captures, and the note judging them. `fetch`:
+/// whether `inbox fetch`, run in `expected_recipient`'s pane, was handed a
+/// message carrying `sentinel`. `listing`: whether the deck then lists that
+/// message acknowledged in that pane's inbox. The listing is judged only when
+/// the fetch took the message; otherwise it has nothing to show, and is no
+/// half of the tell.
+pub(crate) fn inbox_delivery_halves(
+    fetch: Option<&str>,
+    list: Option<&str>,
+    sentinel: &str,
+    expected_recipient: &str,
+    expected_listing_pane: &str,
+) -> (Vec<(&'static str, bool)>, String) {
+    let (delivered, note) = judge_inbox_delivery(
+        fetch,
+        list,
+        sentinel,
+        expected_recipient,
+        expected_listing_pane,
+    );
+    let fetched = fetch.is_some_and(|out| {
+        captured_pane(out) == Some(expected_recipient) && fetched_id(out, sentinel).is_some()
+    });
+    let halves = if fetched {
+        vec![("fetch", true), ("listing", delivered)]
+    } else {
+        vec![("fetch", false)]
+    };
+    (halves, note)
+}
+
+/// A capture's output as a tell half's client output, `(half, pane, output)`,
+/// with the pane the capture itself recorded; none when it recorded none.
+fn client_output(half: &str, out: Option<&str>) -> Vec<(String, String, String)> {
+    out.and_then(|out| {
+        captured_pane(out).map(|pane| (half.to_string(), pane.to_string(), out.to_string()))
+    })
+    .into_iter()
+    .collect()
+}
+
 /// The line a tell's detail ends with when the deck refused input typed into
 /// `role`'s pane.
 fn refusal_note(refused: bool, role: &str) -> String {
@@ -3738,8 +3857,11 @@ pub fn compare_hellos(old_raw: &str, new_raw: &str) -> Result<Vec<String>, Strin
             "CONTRACT_BREAKS differ: old {obr:?}, branch {nbr:?}. The desktop's \
              `classify_handshake` refuses across any difference in that list, so a new app would \
              refuse this older daemon outright — a surface this harness does not exercise. A tell \
-             that fails the way one of these breaks says it will, with the daemon's refusal \
-             logged, is reported as a DECLARED BREAK rather than a FAIL (`breaks.rs`)"
+             that fails the way one of these breaks says it will, with that break's record found \
+             for the operation it acts on, in that operation's pane — the daemon's refusal in the \
+             sandbox `deck.log`, written while the operation ran, or, for a break the client \
+             declares and refuses before sending the daemon anything, the client's own output in \
+             that pane — is reported as a DECLARED BREAK rather than a FAIL (`breaks.rs`)"
         )
     });
     Ok(notes)
@@ -3993,6 +4115,18 @@ mod tests {
             notes.iter().any(|n| n.contains("classify_handshake")),
             "{notes:?}"
         );
+        // Review U3-3: the note states the witness rule `breaks.rs` applies,
+        // the client's own output included, not a daemon-log-only one.
+        let note = notes
+            .iter()
+            .find(|n| n.contains("CONTRACT_BREAKS differ"))
+            .expect("the differ note");
+        assert!(note.contains("written while the operation ran"), "{note}");
+        assert!(
+            note.contains("the client's own output in that pane"),
+            "{note}"
+        );
+        assert!(!note.contains("with the daemon's refusal logged"), "{note}");
     }
 
     #[test]
@@ -5030,6 +5164,44 @@ mod inbox_delivery_tests {
             "deliveries": 1, "age_ms": 1200,
         }]});
         format!("pane=1\n{reply}\nexit=0\n")
+    }
+
+    /// Scenario: Tell 3 in halves. A fetch that took the delegate and a listing that shows it acknowledged pass both halves; a listing that shows it unacknowledged fails only the listing half; a fetch that took nothing, or ran in another pane, fails the fetch half and leaves no listing half, since the listing has nothing to show.
+    #[test]
+    fn tell_3_is_judged_in_a_fetch_and_a_listing_half() {
+        let fetched = fetch_capture("2", &format!("{SENTINEL} list the files"));
+        let halves = |fetch: &str, list: &str| {
+            inbox_delivery_halves(Some(fetch), Some(list), SENTINEL, "2", "1").0
+        };
+        assert_eq!(
+            halves(&fetched, &list_capture("2", "acknowledged")),
+            vec![("fetch", true), ("listing", true)]
+        );
+        assert_eq!(
+            halves(&fetched, &list_capture("2", "fetched")),
+            vec![("fetch", true), ("listing", false)]
+        );
+        let refused = "pane=2\nError: Could not fetch messages\nexit=1\n";
+        assert_eq!(
+            halves(refused, &list_capture("2", "queued")),
+            vec![("fetch", false)]
+        );
+        assert_eq!(
+            halves(
+                &fetch_capture("5", &format!("{SENTINEL} list")),
+                &list_capture("2", "acknowledged")
+            ),
+            vec![("fetch", false)]
+        );
+        assert_eq!(
+            inbox_delivery_halves(None, None, SENTINEL, "2", "1").0,
+            vec![("fetch", false)]
+        );
+        assert_eq!(
+            client_output("fetch", Some(refused)),
+            vec![("fetch".to_string(), "2".to_string(), refused.to_string())]
+        );
+        assert!(client_output("fetch", Some("exit=1\n")).is_empty());
     }
 
     /// Scenario: The coder fetches its delegate and the orchestrator lists that exact message acknowledged in coder's inbox.

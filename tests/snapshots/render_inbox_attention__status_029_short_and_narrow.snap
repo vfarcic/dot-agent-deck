@@ -1,0 +1,15 @@
+---
+source: tests/render_inbox_attention.rs
+expression: rendered
+---
+                              
+ ┌ Deck messages ───────────┐ 
+ │  Messages can't reach    │ 
+ │  this agent: its         │ 
+ │  connection to the deck  │ 
+ │  was refused (the deck   │ 
+ │  … make the window taller│ 
+ │  to read the whole notice│ 
+ │  [Close]                 │ 
+ │  Esc to close            │ 
+ └──────────────────────────┘

@@ -887,6 +887,11 @@ jobs:
           # the debug info, which is most of a test build's `target/`: it links
           # faster and leaves a smaller cache entry for the 10 GB repository limit.
           CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      # The patched crossterm's own test (vendor/crossterm/VENDORED.md), which
+      # the step above does not run: the crate is outside the workspace.
+      # `--locked` to the crate's own Cargo.lock, which pins the dev-dependencies
+      # the deck's lock does not carry.
+      - run: cargo test --locked --manifest-path vendor/crossterm/Cargo.toml --lib event::source::unix::mio::tests
       # Issue #564: keep this attempt's results after a job-level re-run
       # overwrites the conclusion. Full rationale on the identical step in
       # `build-macos` below — the masking is a property of re-running any job,
@@ -1665,6 +1670,10 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
       - run: cargo install cargo-audit --locked
       - run: cargo audit
+      # `cargo audit` skips the crates under vendor/, which have no registry
+      # source in Cargo.lock; this audits their upstream releases. The script
+      # has why, and what it does not check.
+      - run: scripts/audit-vendored-upstream.sh
 
   # PRD #231 M2: the only check that exercises the root flake.nix. Nothing else
   # in CI evaluates or builds it: the Rust jobs install their toolchain via

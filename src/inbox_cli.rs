@@ -13,9 +13,9 @@ use std::time::Duration;
 use crate::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID};
 use crate::event::{
     DaemonMessage, InboxClaimReply, InboxClaimRequest, InboxComponent, InboxFetchConsumer,
-    InboxFetchRequest, InboxListReply, InboxListRequest, InboxOfferRequest, InboxPostReply,
-    InboxPublishRequest, InboxWaitMode, InboxWaitReply, InboxWaitRequest, InboxWaitSession,
-    InboxWake,
+    InboxFetchRequest, InboxListReply, InboxListRequest, InboxOfferRequest, InboxOneShotSender,
+    InboxPostReply, InboxPublishRequest, InboxWaitMode, InboxWaitReply, InboxWaitRequest,
+    InboxWaitSession, InboxWake,
 };
 use crate::inbox_hub::AGENT_FRAMING;
 
@@ -290,34 +290,37 @@ fn wait_once(json: &str, question: Option<&str>) -> ExitCode {
     exit_when_orphaned();
     let path = crate::endpoint_resolve::client_socket_path();
     let mut connection = match question {
-        Some(question) => match Connection::open_receipts(&path, question) {
-            // The request is written within a budget of its own from the
-            // answer; only the wait for a batch after it is unbounded.
-            Opened::Ready(mut connection) => {
-                let by = std::time::Instant::now() + crate::inbox_oneshot::receipts_answer_wait();
-                if connection.send(json, by).is_err() {
-                    return ExitCode::SUCCESS;
+        Some(question) => {
+            match Connection::open_receipts(&path, question, InboxOneShotSender::ClaudeWaiter) {
+                // The request is written within a budget of its own from the
+                // answer; only the wait for a batch after it is unbounded.
+                Opened::Ready(mut connection) => {
+                    let by =
+                        std::time::Instant::now() + crate::inbox_oneshot::receipts_answer_wait();
+                    if connection.send(json, by).is_err() {
+                        return ExitCode::SUCCESS;
+                    }
+                    connection
                 }
-                connection
+                Opened::Unsupported => {
+                    crate::inbox_oneshot::report_unsupported(InboxOneShotSender::ClaudeWaiter);
+                    return ExitCode::FAILURE;
+                }
+                Opened::Lost => {
+                    crate::inbox_oneshot::report_connection_lost();
+                    return ExitCode::FAILURE;
+                }
+                Opened::TimedOut => {
+                    crate::inbox_oneshot::report_timed_out(InboxOneShotSender::ClaudeWaiter);
+                    return ExitCode::FAILURE;
+                }
+                Opened::Foreign => {
+                    crate::inbox_oneshot::report_foreign_socket();
+                    return ExitCode::FAILURE;
+                }
+                Opened::Refused(_) | Opened::Unreachable => return ExitCode::SUCCESS,
             }
-            Opened::Unsupported => {
-                crate::inbox_oneshot::report_unsupported();
-                return ExitCode::FAILURE;
-            }
-            Opened::Lost => {
-                crate::inbox_oneshot::report_connection_lost();
-                return ExitCode::FAILURE;
-            }
-            Opened::TimedOut => {
-                crate::inbox_oneshot::report_timed_out();
-                return ExitCode::FAILURE;
-            }
-            Opened::Foreign => {
-                crate::inbox_oneshot::report_foreign_socket();
-                return ExitCode::FAILURE;
-            }
-            Opened::Refused(_) | Opened::Unreachable => return ExitCode::SUCCESS,
-        },
+        }
         None => match Connection::open(&path, json) {
             Ok(connection) => connection,
             Err(_) => return ExitCode::SUCCESS,
@@ -425,9 +428,339 @@ fn refusal(line: &str) -> Option<String> {
 }
 
 /// `dot-agent-deck inbox fetch`: print the framing sentence and every message
-/// waiting for this agent, and acknowledge them once they are printed.
+/// waiting for this agent, and settle each one the output carried whole.
+///
+/// PRD #1666 part 3 (H4): it is a one-shot receipt receiver, as an agent's
+/// hook is ([`fetch_one_shot`]): it asks the deck whether it serves this
+/// command, fetches on that connection, and commits what it wrote and flushed
+/// to stdout. A deck that does not confirm it serves it, an older one
+/// included, is sent nothing that could take mail. The one-shot is Unix only:
+/// elsewhere it takes nothing and says so (H5: the deck no longer serves the
+/// legacy fetch). A process standing in for an older dot-agent-deck
+/// ([`crate::inbox_oneshot::declared_hook_integration`], a test knob) sends
+/// the legacy fetch an older one sends, which a current deck refuses.
 pub fn fetch(json: bool) -> ExitCode {
+    #[cfg(unix)]
+    if crate::inbox_oneshot::declared_hook_integration().is_some() {
+        let Some(identity) = identity() else {
+            eprintln!("{NOT_IN_PANE}");
+            return ExitCode::FAILURE;
+        };
+        let (pane, agent) = (
+            identity.pane_id.clone(),
+            identity.agent_id.clone().unwrap_or_default(),
+        );
+        return fetch_one_shot(
+            json,
+            identity,
+            &crate::endpoint_resolve::client_socket_path(),
+            crate::inbox_oneshot::receipts_answer_wait(),
+            raw_stdout(),
+            &|| crate::inbox_oneshot::Pinned::from_env(&pane, &agent),
+            &mut std::io::stderr(),
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = json;
+        eprintln!("{FETCH_NOT_ON_THIS_PLATFORM}");
+        ExitCode::FAILURE
+    }
+    #[cfg(unix)]
     fetch_as(json, None, None, None)
+}
+
+/// PRD #1666 part 3 (H5): what `inbox fetch` says where it cannot take
+/// messages on receipts, which the deck requires.
+#[cfg(not(unix))]
+const FETCH_NOT_ON_THIS_PLATFORM: &str = "Could not fetch messages: dot-agent-deck inbox fetch does not run on this platform yet, so no message was taken and they stay waiting.";
+
+/// PRD #1666 part 3 (H4): what `inbox fetch` says when the deck did not
+/// confirm that it serves this command on receipts
+/// ([`crate::inbox_oneshot::Opened::Unsupported`]): nothing was taken.
+pub const CLI_RECEIPTS_UNSUPPORTED: &str = "Could not fetch messages: the deck daemon did not confirm that it can hand them to this `dot-agent-deck inbox fetch`, so no message was taken and they stay waiting. The daemon most likely runs an older dot-agent-deck than this command. Restart the deck daemon on this release (see \"Recycling the daemon\" in `dot-agent-deck docs troubleshooting`), or run `inbox fetch` with the dot-agent-deck the daemon runs.";
+
+/// What `inbox fetch` says when the deck did not answer in time whether it
+/// serves this command, or did not take the fetch in time: the fetch was not
+/// sent, so nothing was taken. An older daemon answers nothing at all.
+pub const CLI_RECEIPTS_TIMED_OUT: &str = "Could not fetch messages: the deck daemon did not answer in time whether it can hand them to this `dot-agent-deck inbox fetch`, so no message was taken and they stay waiting. A busy daemon can answer late; one older than this command does not answer at all. Run the command again; if this keeps happening, restart the deck daemon on this release (see \"Recycling the daemon\" in `dot-agent-deck docs troubleshooting`).";
+
+/// What `inbox fetch` says when the connection was lost before the deck
+/// answered whether it serves this command: nothing was asked that could take
+/// mail.
+pub const CLI_RECEIPTS_CONNECTION_LOST: &str = "Could not fetch messages: the connection to the deck daemon was lost before it answered, so no message was taken. Check that it is running with `dot-agent-deck daemon status`.";
+
+/// What `inbox fetch` says when the fetch was sent and its answer did not
+/// come in time. Unlike [`CLI_RECEIPTS_TIMED_OUT`], it does not say nothing
+/// was taken: the deck may have set messages aside for this fetch.
+pub const CLI_FETCH_TIMED_OUT: &str = "Could not fetch messages: the deck daemon did not answer this fetch in time. It may have set messages aside for it; the deck offers any it did again later, marked as a possible repeat.";
+
+/// What `inbox fetch` says when the connection was lost after the fetch was
+/// sent and before its answer.
+pub const CLI_FETCH_CONNECTION_LOST: &str = "Could not fetch messages: the connection to the deck daemon was lost after this fetch was sent. It may have set messages aside for it; the deck offers any it did again later, marked as a possible repeat.";
+
+/// What `inbox fetch` says when the deck socket refused it access
+/// ([`crate::inbox_oneshot::Opened::Foreign`]): nothing was asked.
+pub const CLI_FOREIGN_SOCKET: &str = "Could not fetch messages: the deck socket refused this command access, either because the deck listening on it runs as another user or because of the permissions of the socket or a directory above it, so it asked nothing and no message was taken. If you set DOT_AGENT_DECK_SOCKET or DOT_AGENT_DECK_ATTACH_SOCKET, point them at your own deck daemon's sockets, or unset them to use the default; otherwise fix the permissions of that socket and the directories above it.";
+
+/// What `inbox fetch` says when it was handed messages and printed none of
+/// them: the deck took the hand-over back (a revoke, a closed connection, an
+/// approval that ran out), or the receipt spool could not be read.
+pub const CLI_NOTHING_PRINTED: &str = "Could not fetch messages: none of them was printed, because the deck did not let this fetch hand them over (it may have taken them back, or this process could not read the deck's receipt records). The deck still has any that are waiting.";
+
+/// What `inbox fetch` says when its fetch request could not be sent whole,
+/// `timed_out` or on a lost connection. A request the deck took no byte of is
+/// one it never read, so no message was taken. Once part of it went, the deck
+/// may have read the whole request but its newline (a final line with none is
+/// read at the end of a connection) and served it, so it is worded as a fetch
+/// sent.
+#[cfg(unix)]
+fn request_not_sent(part_sent: bool, timed_out: bool) -> &'static str {
+    match (part_sent, timed_out) {
+        (false, true) => CLI_RECEIPTS_TIMED_OUT,
+        (false, false) => CLI_RECEIPTS_CONNECTION_LOST,
+        (true, true) => CLI_FETCH_TIMED_OUT,
+        (true, false) => CLI_FETCH_CONNECTION_LOST,
+    }
+}
+
+/// What `inbox fetch` says when its output was cut short or not confirmed
+/// written: what it printed may have reached the agent.
+pub const CLI_CUT_SHORT: &str = "Could not print every message: what was printed may have reached the agent, and the deck may hand some of them over again, marked as a possible repeat.";
+
+/// PRD #1666 part 3 (H4): plain `inbox fetch` as a one-shot receipt receiver
+/// at the deck at `path` (part 2 §1.5): ask whether the deck serves this
+/// command (an `inbox_receipts` question whose answer names
+/// [`InboxOneShotSender::Cli`]), and only then send `inbox_receipt_fetch` on
+/// that connection; print what it was issued to `stdout` — the framing and
+/// each block, or with `json` a public projection of each message, never its
+/// attempt or caps — asking `may` for every attempt and fencing each block
+/// right before its first byte; publish a `committed` receipt into the spool
+/// `pinned` opens once the deck has answered (it makes the generation's
+/// directory as it registers the fetch) for every block written and flushed
+/// whole (`handed` for one cut short);
+/// and report every attempt on the connection. A block none of whose bytes
+/// went is reported not handed, and the deck requeues it at once. What it
+/// says goes to `err`, never anything of the batch but its text on stdout.
+///
+/// `wait` bounds the question and, from its answer, the fetch's request and
+/// reply ([`crate::inbox_oneshot::RECEIPTS_ANSWER_WAIT`]).
+#[cfg(unix)]
+fn fetch_one_shot<W: Write>(
+    json: bool,
+    identity: Identity,
+    path: &std::path::Path,
+    wait: Duration,
+    stdout: std::io::Result<W>,
+    pinned: &dyn Fn() -> crate::inbox_oneshot::Pinned,
+    err: &mut dyn Write,
+) -> ExitCode {
+    use crate::inbox_oneshot::{Connection, OneShotBatch, Opened, Piece, Receiver};
+    let say = |err: &mut dyn Write, text: &str| {
+        let _ = writeln!(err, "{text}");
+        ExitCode::FAILURE
+    };
+    let Some(token) = identity.token.clone() else {
+        return say(
+            err,
+            "Could not fetch messages: this process has no capability token from the deck, so the deck cannot tell it is this pane's agent. Run it inside the agent's own pane.",
+        );
+    };
+    let Some(question) = crate::inbox_oneshot::receipts_question(
+        &identity.pane_id,
+        identity.agent_id.as_deref(),
+        &token,
+    ) else {
+        return ExitCode::FAILURE;
+    };
+    let mut connection = match Connection::open_receipts_within(
+        path,
+        &question,
+        InboxOneShotSender::Cli,
+        wait,
+    ) {
+        Opened::Ready(connection) => connection,
+        Opened::Unsupported => return say(err, CLI_RECEIPTS_UNSUPPORTED),
+        Opened::TimedOut => return say(err, CLI_RECEIPTS_TIMED_OUT),
+        Opened::Lost => return say(err, CLI_RECEIPTS_CONNECTION_LOST),
+        Opened::Foreign => return say(err, CLI_FOREIGN_SOCKET),
+        Opened::Refused(reply) => {
+            let why = match (reply.refused, reply.error) {
+                (Some(code), Some(error)) => format!("{error} ({code})"),
+                (Some(code), None) => code,
+                _ => "refused".to_string(),
+            };
+            return say(err, &format!("The deck refused to fetch messages: {why}."));
+        }
+        Opened::Unreachable => {
+            return say(
+                err,
+                "Could not fetch messages: the deck did not answer; it may not be running, or may predate the inbox.",
+            );
+        }
+    };
+    let request = DaemonMessage::InboxReceiptFetch(InboxFetchRequest {
+        pane_id: identity.pane_id,
+        agent_id: identity.agent_id,
+        token: Some(token),
+        consumer: InboxFetchConsumer::Cli,
+        max_chars: None,
+        max_bytes: None,
+        ack: false,
+        doorbell: None,
+        adapter_integration: None,
+        rx: None,
+        hook_integration: crate::inbox_oneshot::declared_hook_integration(),
+        component: None,
+        max_json_bytes: None,
+    });
+    let Ok(request) = serde_json::to_string(&request) else {
+        return ExitCode::FAILURE;
+    };
+    // The request gets a budget of its own from the answer, as the waiter's
+    // does.
+    let by = std::time::Instant::now() + wait;
+    if let Err(error) = connection.send(&request, by) {
+        return say(
+            err,
+            request_not_sent(
+                connection.left_a_line_cut(),
+                error.kind() == std::io::ErrorKind::TimedOut,
+            ),
+        );
+    }
+    let reply = loop {
+        match connection.next(Some(by)) {
+            Some(reply) if reply.keepalive => continue,
+            Some(reply) => break reply,
+            None if connection.ended() => return say(err, CLI_FETCH_CONNECTION_LOST),
+            None => return say(err, CLI_FETCH_TIMED_OUT),
+        }
+    };
+    if reply.refused.is_some() || reply.not_in_deck {
+        let why = match (reply.refused, reply.error) {
+            (Some(code), Some(error)) => format!("{error} ({code})"),
+            (Some(code), None) => code,
+            (None, _) => {
+                "this process is not the live agent of a pane the deck manages (not_in_deck)"
+                    .to_string()
+            }
+        };
+        return say(err, &format!("The deck refused to fetch messages: {why}."));
+    }
+    let Some(messages) = reply.messages else {
+        return say(
+            err,
+            "Could not fetch messages: the deck's answer was not one this build understands.",
+        );
+    };
+    let grant_ttl = reply
+        .registered
+        .as_ref()
+        .and_then(|registered| registered.grant_ttl_ms)
+        .map_or(crate::inbox::DEFAULT_ACK_WAIT, Duration::from_millis);
+    // Only a hand-out naming its attempt is the receipt protocol's.
+    let messages: Vec<crate::event::InboxDelivery> = messages
+        .into_iter()
+        .filter(|message| message.attempt.is_some())
+        .collect();
+    let public: Vec<String> = messages
+        .iter()
+        .map(|message| {
+            serde_json::json!({
+                "id": message.id,
+                "subject": message.subject,
+                "from": message.from,
+                "text": message.text,
+            })
+            .to_string()
+        })
+        .collect();
+    let batch = OneShotBatch::new(messages);
+    let Ok(mut stdout) = stdout else {
+        batch.decline(&mut connection, Receiver::Hook);
+        return say(
+            err,
+            "Could not fetch messages: this process's output could not be opened, so none was printed. The deck still has them.",
+        );
+    };
+    let mut pieces = Vec::new();
+    if json {
+        pieces.push(Piece::Frame(b"{\"messages\":["));
+        for (i, message) in public.iter().enumerate() {
+            if i > 0 {
+                pieces.push(Piece::Joint(b","));
+            }
+            pieces.push(Piece::Block(i, message.as_bytes()));
+        }
+        pieces.push(Piece::Frame(b"]}\n"));
+    } else if batch.is_empty() {
+        pieces.push(Piece::Frame(b"No dot-agent-deck messages are waiting.\n"));
+    } else {
+        pieces.push(Piece::Open(AGENT_FRAMING.as_bytes()));
+        pieces.push(Piece::Open(crate::inbox_hub::BLOCK_SEPARATOR.as_bytes()));
+        for i in 0..batch.len() {
+            if i > 0 {
+                pieces.push(Piece::Joint(crate::inbox_hub::BLOCK_SEPARATOR.as_bytes()));
+            }
+            pieces.push(Piece::Block(
+                i,
+                batch.text(i).unwrap_or_default().as_bytes(),
+            ));
+        }
+        pieces.push(Piece::Close(b"\n"));
+    }
+    if batch.is_empty() {
+        // Nothing was issued, so there is nothing to approve or report: the
+        // deck ended this fetch already.
+        connection.finish();
+        let written = pieces.iter().try_for_each(|piece| match piece {
+            Piece::Frame(bytes) => stdout.write_all(bytes),
+            Piece::Block(..) | Piece::Joint(_) | Piece::Open(_) | Piece::Close(_) => Ok(()),
+        });
+        return if written.and_then(|()| stdout.flush()).is_ok() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+    let ran = batch.run(
+        &mut connection,
+        &pinned(),
+        grant_ttl,
+        &mut stdout,
+        &pieces,
+        Receiver::Hook,
+        None,
+    );
+    let written =
+        |output: &crate::inbox_oneshot::Output| *output == crate::inbox_oneshot::Output::Written;
+    if ran.error.is_none() && ran.outputs.iter().all(written) {
+        return ExitCode::SUCCESS;
+    }
+    if !ran.handed_any() {
+        return say(err, CLI_NOTHING_PRINTED);
+    }
+    // The error's kind only: fixed words, nothing of the batch.
+    let _ = writeln!(
+        err,
+        "{CLI_CUT_SHORT}{}",
+        ran.error
+            .map(|error| format!(" ({})", error.kind()))
+            .unwrap_or_default()
+    );
+    ExitCode::FAILURE
+}
+
+/// This process's stdout as the descriptor itself, with no buffer between a
+/// write and the pipe, so every byte a write accepted is one the agent can
+/// read.
+#[cfg(unix)]
+fn raw_stdout() -> std::io::Result<std::fs::File> {
+    use std::os::fd::AsFd;
+    Ok(std::fs::File::from(
+        std::io::stdout().as_fd().try_clone_to_owned()?,
+    ))
 }
 
 /// PRD #1666 S8: `dot-agent-deck inbox fetch --json --doorbell <id>`, run by
@@ -469,21 +802,16 @@ fn fetch_as(
         identity,
         &mut request,
         &mut std::io::stdout().lock(),
-        &mut |ids| crate::hook::acknowledge_handed_over(ids),
     )
 }
 
-/// [`fetch_as`] with its three effects passed in: `send` asks the deck,
-/// `out` is where the content goes, and `settle` acknowledges what reached
-/// `out`.
+/// [`fetch_as`] with its two effects passed in: `send` asks the deck, and
+/// `out` is where the content goes.
 ///
-/// PR #1735 fifth review (N2): the fetch never acknowledges. A plain fetch
-/// writes the content, flushes it, and only then acknowledges exactly what it
-/// wrote, so a reply lost on the way, a request that timed out or a closed
-/// stdout leaves the messages to be handed over again instead of shown as
-/// delivered. A doorbell fetch acknowledges nothing here: its component does,
-/// once its agent has the content. `get-seed`, the compatibility alias, keeps
-/// its own acknowledge-on-fetch in the daemon and does not come through here.
+/// The fetch on the legacy verb acknowledges nothing (PR #1735 fifth review,
+/// N2): a doorbell fetch's component acknowledges once its agent has the
+/// content. A plain one, which only a process standing in for an older
+/// dot-agent-deck sends, is refused by a current deck (PRD #1666 part 3, H5).
 fn fetch_with(
     json: bool,
     doorbell: Option<&str>,
@@ -491,7 +819,6 @@ fn fetch_with(
     identity: Identity,
     send: &mut dyn FnMut(&DaemonMessage) -> Result<String, String>,
     out: &mut dyn Write,
-    settle: &mut dyn FnMut(&[String]),
 ) -> ExitCode {
     let message = DaemonMessage::InboxFetch(InboxFetchRequest {
         pane_id: identity.pane_id,
@@ -509,6 +836,8 @@ fn fetch_with(
         adapter_integration,
         rx,
         hook_integration: None,
+        component: None,
+        max_json_bytes: None,
     });
     let line = match send(&message) {
         Ok(line) => line,
@@ -544,10 +873,6 @@ fn fetch_with(
     };
     if written.and_then(|()| out.flush()).is_err() {
         return ExitCode::FAILURE;
-    }
-    if doorbell.is_none() {
-        let ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
-        settle(&ids);
     }
     ExitCode::SUCCESS
 }
@@ -875,6 +1200,7 @@ pub fn parse_duration_ms(text: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spec::spec;
 
     /// PRD #1666 C5: a stream without `--adapter-integration` is one the deck
     /// no longer serves, so `inbox wait` asks it nothing; a receipt stream and
@@ -902,15 +1228,13 @@ mod tests {
         }
     }
 
-    /// PR #1735 fifth review (N2): plain `inbox fetch` asks the deck for the
-    /// messages without acknowledging them, writes them, and acknowledges
-    /// exactly what it wrote, only once the write succeeded. Output that
-    /// never reaches the caller — a closed stdout — acknowledges nothing, so
-    /// the deck hands the message over again rather than showing it
-    /// delivered. A doorbell fetch, which the component acknowledges itself,
-    /// settles nothing here.
+    /// PR #1735 fifth review (N2), PRD #1666 part 3 (H5): a fetch on the
+    /// legacy verb — the doorbell fetch of OpenCode's plugin, or the plain one
+    /// a stand-in for an older dot-agent-deck sends — asks without
+    /// acknowledging, writes what it got, and acknowledges nothing; output
+    /// that never reaches the caller (a closed stdout) is a failure.
     #[test]
-    fn a_plain_fetch_acknowledges_only_what_it_wrote() {
+    fn a_fetch_on_the_legacy_verb_acknowledges_nothing() {
         let delivery = crate::event::InboxDelivery {
             id: "m-k3xzq2ab-0123456789abcdef".to_string(),
             subject: "subject".to_string(),
@@ -927,7 +1251,6 @@ mod tests {
         };
         let run = |json: bool, doorbell: Option<&str>, out: &mut dyn Write| {
             let mut asked = Vec::new();
-            let mut settled = Vec::new();
             let code = fetch_with(
                 json,
                 doorbell,
@@ -938,36 +1261,383 @@ mod tests {
                     Ok(answer.clone())
                 },
                 out,
-                &mut |ids| settled.extend_from_slice(ids),
             );
-            (code, asked, settled)
+            (code, asked)
         };
         let acked = |asked: &[DaemonMessage]| match asked {
             [DaemonMessage::InboxFetch(request)] => request.ack,
             other => panic!("one inbox_fetch, got {other:?}"),
         };
 
-        let (code, asked, settled) = run(false, None, &mut Closed);
+        let (code, asked) = run(false, None, &mut Closed);
         assert_eq!(code, ExitCode::FAILURE);
         assert!(!acked(&asked), "the fetch itself must not acknowledge");
-        assert!(settled.is_empty(), "nothing was written: {settled:?}");
+
+        for (json, doorbell) in [
+            (false, None),
+            (true, None),
+            (true, Some(delivery.id.as_str())),
+        ] {
+            let mut out = Vec::new();
+            let (code, asked) = run(json, doorbell, &mut out);
+            assert_eq!(code, ExitCode::SUCCESS);
+            assert!(!acked(&asked), "json: {json}, doorbell: {doorbell:?}");
+            assert!(String::from_utf8(out).unwrap().contains(&delivery.text));
+        }
+    }
+
+    /// The two caps every stand-in hand-out below carries, which no output
+    /// of `inbox fetch` may show.
+    #[cfg(unix)]
+    const HANDED_CAP: &str = "0123456789abcdef0123456789abcdef";
+    #[cfg(unix)]
+    const COMMIT_CAP: &str = "fedcba9876543210fedcba9876543210";
+
+    /// The deck's answers to a one-shot whose deck serves `inbox fetch`:
+    /// the question's, then its batch of `ids` (each with the known caps),
+    /// then a grant for each `may`, then `extra`.
+    #[cfg(unix)]
+    fn serving(ids: &[&str], extra: &[String]) -> Vec<String> {
+        let handouts: Vec<serde_json::Value> = ids
+            .iter()
+            .map(|id| {
+                serde_json::json!({"id": id, "subject": format!("about {id}"),
+                    "from": "the orchestrator",
+                    "text": format!("[dot-agent-deck message {id} delivery 1.1 from the orchestrator]\nbody of {id}\n[end of dot-agent-deck message {id}]"),
+                    "a": 1, "e": 1, "d": 1,
+                    "caps": {"handed": HANDED_CAP, "commit": COMMIT_CAP}})
+            })
+            .collect();
+        let mut lines = vec![
+            r#"{"one_shot_receipts":1,"one_shot_senders":["claude_waiter","claude_hooks","codex_hooks","cli"]}"#.to_string(),
+            serde_json::json!({"registered": {"rx": 3, "slot": "hook", "keepalive_ms": 1000,
+                "grant_ttl_ms": 5000}, "messages": handouts})
+            .to_string(),
+        ];
+        for q in 1..=ids.len() {
+            lines.push(format!(r#"{{"grant":{{"q":{q},"ok":true}}}}"#));
+        }
+        lines.extend(extra.iter().cloned());
+        lines
+    }
+
+    /// A writer that takes `0` bytes, or that many and then refuses, or
+    /// everything and then fails its flush.
+    #[cfg(unix)]
+    struct Out {
+        took: Vec<u8>,
+        room: Option<usize>,
+        flush_fails: bool,
+    }
+
+    #[cfg(unix)]
+    impl Write for Out {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let n = match self.room {
+                Some(0) => return Err(std::io::ErrorKind::BrokenPipe.into()),
+                Some(room) => buf.len().min(room),
+                None => buf.len(),
+            };
+            if let Some(room) = &mut self.room {
+                *room -= n;
+            }
+            self.took.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.flush_fails {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Scenario: Run plain and `--json` `inbox fetch` against stand-in decks: one that serves it, handing two messages with known caps; one whose stdout takes nothing, one that takes a prefix, one whose flush fails; one that revokes the attempt between its grant and the output; a silent deck, part 2's deck (receipts 1, no CLI) and a deck that never answers the fetch itself. Whole output commits both attempts and neither cap is in stdout, the JSON or stderr; zero bytes reports both not handed, a prefix or a failed flush possibly handed, and a revoke not handed with nothing printed; the gates send only the question, and a reply that never came after the fetch was sent says so in other words than one never asked for.
+    #[cfg(unix)]
+    #[spec("inbox/cli/006")]
+    #[test]
+    fn inbox_cli_006_a_model_run_fetch_is_a_one_shot_that_never_shows_a_cap() {
+        use crate::event::InboxStreamControl;
+        let (one, two) = ("m-k3xzq2ab-0f3c9a71d2e4b850", "m-k3xzq2ab-1a2b3c4d5e6f7081");
+        let identity = || Identity {
+            pane_id: "p".to_string(),
+            agent_id: Some("a".to_string()),
+            token: Some("t".to_string()),
+        };
+        let wait = Duration::from_millis(400);
+        let run = |json: bool, answers: Option<Vec<String>>, out: Out| {
+            let dir = crate::test_temp::tempdir().unwrap();
+            let (path, deck) =
+                crate::inbox_oneshot::tests::stand_in_deck(dir.path(), vec![answers]);
+            let mut err = Vec::new();
+            let mut out = out;
+            let code = fetch_one_shot(
+                json,
+                identity(),
+                &path,
+                wait,
+                Ok(&mut out),
+                &|| crate::inbox_oneshot::Pinned::Unpinned,
+                &mut err,
+            );
+            let lines = deck
+                .join()
+                .unwrap()
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            (
+                code,
+                String::from_utf8(out.took).unwrap(),
+                String::from_utf8(err).unwrap(),
+                lines,
+            )
+        };
+        let controls = |lines: &[String]| -> Vec<InboxStreamControl> {
+            lines
+                .iter()
+                .filter(|line| !line.contains("message_type") && !line.contains("\"may\""))
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect()
+        };
+        let ats = |ids: &[&str]| -> Vec<crate::event::InboxAttemptRef> {
+            ids.iter()
+                .map(|id| crate::event::InboxAttemptRef {
+                    id: id.to_string(),
+                    a: 1,
+                    e: 1,
+                })
+                .collect()
+        };
+        let whole = || Out {
+            took: Vec::new(),
+            room: None,
+            flush_fails: false,
+        };
+        let no_cap = |what: &str, text: &str| {
+            for cap in [HANDED_CAP, COMMIT_CAP] {
+                assert!(!text.contains(cap), "{what} shows a cap: {text}");
+            }
+        };
 
         for json in [false, true] {
-            let mut out = Vec::new();
-            let (code, asked, settled) = run(json, None, &mut out);
-            assert_eq!(code, ExitCode::SUCCESS);
-            assert!(!acked(&asked));
-            assert!(String::from_utf8(out).unwrap().contains(&delivery.text));
-            assert_eq!(settled, vec![delivery.id.clone()], "json: {json}");
+            let (code, stdout, stderr, lines) = run(json, Some(serving(&[one, two], &[])), whole());
+            assert_eq!(code, ExitCode::SUCCESS, "{stderr}");
+            no_cap("stdout", &stdout);
+            no_cap("stderr", &stderr);
+            no_cap("the lines it sent", &lines.join("\n"));
+            assert!(lines[0].contains("inbox_receipts"), "{lines:?}");
+            assert!(lines[1].contains("inbox_receipt_fetch") && lines[1].contains("\"cli\""));
+            if json {
+                let printed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+                for message in printed["messages"].as_array().unwrap() {
+                    let mut keys: Vec<&str> = message
+                        .as_object()
+                        .unwrap()
+                        .keys()
+                        .map(String::as_str)
+                        .collect();
+                    keys.sort();
+                    assert_eq!(keys, ["from", "id", "subject", "text"], "{message}");
+                }
+                assert_eq!(printed["messages"].as_array().unwrap().len(), 2);
+            } else {
+                assert!(stdout.starts_with(AGENT_FRAMING), "{stdout}");
+                assert!(stdout.contains("body of m-k3xzq2ab-1a2b3c4d5e6f7081"));
+            }
+            let reported = controls(&lines);
+            assert_eq!(reported.len(), 1, "{lines:?}");
+            assert_eq!(reported[0].committed, ats(&[one, two]));
         }
 
-        let mut out = Vec::new();
-        let (_, asked, settled) = run(true, Some(delivery.id.as_str()), &mut out);
-        assert!(!acked(&asked));
-        assert!(
-            settled.is_empty(),
-            "a doorbell fetch's component acknowledges"
+        let (code, stdout, stderr, lines) = run(
+            false,
+            Some(serving(&[one, two], &[])),
+            Out {
+                took: Vec::new(),
+                room: Some(0),
+                flush_fails: false,
+            },
         );
+        assert_eq!(code, ExitCode::FAILURE);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains(CLI_NOTHING_PRINTED), "{stderr}");
+        assert_eq!(
+            controls(&lines)[0].not_handed,
+            ats(&[one, two]),
+            "zero bytes"
+        );
+
+        for (out, what) in [
+            (
+                Out {
+                    took: Vec::new(),
+                    room: Some(AGENT_FRAMING.len() + 20),
+                    flush_fails: false,
+                },
+                "a prefix",
+            ),
+            (
+                Out {
+                    took: Vec::new(),
+                    room: None,
+                    flush_fails: true,
+                },
+                "a failed flush",
+            ),
+        ] {
+            let (code, _, stderr, lines) = run(false, Some(serving(&[one], &[])), out);
+            assert_eq!(code, ExitCode::FAILURE, "{what}");
+            assert!(stderr.contains(CLI_CUT_SHORT), "{what}: {stderr}");
+            no_cap(what, &stderr);
+            let reported = controls(&lines);
+            assert_eq!(reported[0].handed, ats(&[one]), "{what}: possibly handed");
+            assert!(reported[0].committed.is_empty(), "{what}");
+        }
+
+        let revoke = format!(r#"{{"revoke":[{{"id":"{one}","a":1,"e":1}}]}}"#);
+        let (code, stdout, stderr, lines) = run(false, Some(serving(&[one], &[revoke])), whole());
+        assert_eq!(code, ExitCode::FAILURE);
+        assert!(!stdout.contains("body of"), "{stdout}");
+        assert!(stderr.contains(CLI_NOTHING_PRINTED), "{stderr}");
+        assert_eq!(controls(&lines)[0].not_handed, ats(&[one]), "revoked first");
+
+        let only_asked = |lines: &[String]| {
+            assert_eq!(lines.len(), 1, "only the question: {lines:?}");
+            assert!(lines[0].contains("inbox_receipts"));
+        };
+        let (code, stdout, stderr, lines) = run(false, Some(Vec::new()), whole());
+        assert_eq!(code, ExitCode::FAILURE);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains(CLI_RECEIPTS_TIMED_OUT), "silent: {stderr}");
+        only_asked(&lines);
+        let (code, _, stderr, lines) = run(
+            false,
+            Some(vec![r#"{"one_shot_receipts":1}"#.to_string()]),
+            whole(),
+        );
+        assert_eq!(code, ExitCode::FAILURE);
+        assert!(
+            stderr.contains(CLI_RECEIPTS_UNSUPPORTED),
+            "part 2's deck: {stderr}"
+        );
+        only_asked(&lines);
+        let mut asked_only = serving(&[], &[]);
+        asked_only.truncate(1);
+        let (code, _, stderr, lines) = run(false, Some(asked_only), whole());
+        assert_eq!(code, ExitCode::FAILURE);
+        assert!(
+            stderr.contains(CLI_FETCH_TIMED_OUT),
+            "after the fetch: {stderr}"
+        );
+        assert_ne!(CLI_FETCH_TIMED_OUT, CLI_RECEIPTS_TIMED_OUT);
+        assert!(!CLI_FETCH_TIMED_OUT.contains("no message was taken"));
+        assert!(lines[1].contains("inbox_receipt_fetch"), "{lines:?}");
+    }
+
+    /// Scenario: Run `inbox fetch --json` against a stand-in deck that hands it three messages and refuses the grant of the first, the middle or the last. Each time stdout parses as JSON listing exactly the other two, each with only its public keys, and the deck is told those two committed and the refused one not handed. With every grant refused, stdout is an empty list and nothing commits.
+    #[cfg(unix)]
+    #[spec("inbox/cli/007")]
+    #[test]
+    fn inbox_cli_007_a_fenced_out_message_leaves_the_json_whole() {
+        use crate::event::InboxStreamControl;
+        let ids = [
+            "m-k3xzq2ab-0f3c9a71d2e4b850",
+            "m-k3xzq2ab-1a2b3c4d5e6f7081",
+            "m-k3xzq2ab-2b3c4d5e6f708192",
+        ];
+        let at = |id: &str| crate::event::InboxAttemptRef {
+            id: id.to_string(),
+            a: 1,
+            e: 1,
+        };
+        let mut refusals: Vec<Vec<usize>> = (0..ids.len()).map(|i| vec![i]).collect();
+        refusals.push((0..ids.len()).collect());
+        for refused in refusals {
+            let mut answers = serving(&ids, &[]);
+            for &i in &refused {
+                answers[2 + i] = format!(r#"{{"grant":{{"q":{},"ok":false}}}}"#, i + 1);
+            }
+            let dir = crate::test_temp::tempdir().unwrap();
+            let (path, deck) =
+                crate::inbox_oneshot::tests::stand_in_deck(dir.path(), vec![Some(answers)]);
+            let mut out = Out {
+                took: Vec::new(),
+                room: None,
+                flush_fails: false,
+            };
+            let mut err = Vec::new();
+            fetch_one_shot(
+                true,
+                Identity {
+                    pane_id: "p".to_string(),
+                    agent_id: Some("a".to_string()),
+                    token: Some("t".to_string()),
+                },
+                &path,
+                Duration::from_millis(400),
+                Ok(&mut out),
+                &|| crate::inbox_oneshot::Pinned::Unpinned,
+                &mut err,
+            );
+            let lines: Vec<String> = deck.join().unwrap().into_iter().flatten().collect();
+            let stdout = String::from_utf8(out.took).unwrap();
+            let printed: serde_json::Value = serde_json::from_str(&stdout)
+                .unwrap_or_else(|error| panic!("refused {refused:?}: {error}: {stdout}"));
+            let kept: Vec<&str> = (0..ids.len())
+                .filter(|i| !refused.contains(i))
+                .map(|i| ids[i])
+                .collect();
+            let listed: Vec<&str> = printed["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|message| {
+                    let mut keys: Vec<&str> = message
+                        .as_object()
+                        .unwrap()
+                        .keys()
+                        .map(String::as_str)
+                        .collect();
+                    keys.sort();
+                    assert_eq!(keys, ["from", "id", "subject", "text"], "{message}");
+                    message["id"].as_str().unwrap()
+                })
+                .collect();
+            assert_eq!(listed, kept, "refused {refused:?}");
+            let reported: Vec<InboxStreamControl> = lines
+                .iter()
+                .filter(|line| !line.contains("message_type") && !line.contains("\"may\""))
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect();
+            assert_eq!(reported.len(), 1, "{lines:?}");
+            assert_eq!(
+                reported[0].committed,
+                kept.iter().map(|id| at(id)).collect::<Vec<_>>(),
+                "refused {refused:?}"
+            );
+            assert_eq!(
+                reported[0].not_handed,
+                refused.iter().map(|&i| at(ids[i])).collect::<Vec<_>>(),
+                "refused {refused:?}"
+            );
+        }
+    }
+
+    /// Round 3's review: a fetch request the deck took part of may have been
+    /// read whole but its newline, so its failure is worded as a fetch sent,
+    /// never as one that took nothing; one it took nothing of took nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_request_partly_written_is_worded_as_sent() {
+        assert_eq!(request_not_sent(false, true), CLI_RECEIPTS_TIMED_OUT);
+        assert_eq!(request_not_sent(false, false), CLI_RECEIPTS_CONNECTION_LOST);
+        for timed_out in [true, false] {
+            let said = request_not_sent(true, timed_out);
+            assert!(!said.contains("no message was taken"), "{said}");
+            assert!(said.contains("possible repeat"), "{said}");
+        }
     }
 
     /// PRD #1666 S8: `inbox wait --agent opencode-mini` speaks for OpenCode's

@@ -57,6 +57,14 @@ pub(super) fn peer_query_for(stream: &IpcStream) -> PeerQuery {
     }
 }
 
+/// PRD #1666 part 3 (R-1): whether the client on the other end of `stream`
+/// runs as this process's user. Always `None` here: this backend does not read
+/// the client's account yet, so the daemon's inbox admission on Windows still
+/// rests on the process tree alone.
+pub fn peer_is_same_user(_stream: &IpcStream) -> Option<bool> {
+    None
+}
+
 /// Return the PID of the process holding the *other* end of `stream`.
 pub fn peer_pid(stream: &IpcStream) -> std::io::Result<u32> {
     let mut pid: u32 = 0;

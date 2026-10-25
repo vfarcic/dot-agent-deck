@@ -450,10 +450,9 @@ impl Telemetry {
     /// `spawn_env` is the spawn's own overlay and is applied over the daemon's
     /// environment captured by [`Self::start_in`]: a value set in either counts as
     /// the user's. `cwd` is used only to resolve the run's git context, off
-    /// this thread. With the shim installed, its directory
-    /// goes first on the agent's `PATH` — the spawn's own, else the daemon's —
-    /// and the run id beside it ([`super::shim::RUN_ID_ENV`]). `None` when
-    /// telemetry is off.
+    /// this thread. The run id goes in as [`super::shim::RUN_ID_ENV`], and with
+    /// the shim installed its directory goes first on the agent's `PATH` — the
+    /// spawn's own, else the daemon's. `None` when telemetry is off.
     pub fn prepare_run(
         self: &Arc<Self>,
         mut start: RunStart,
@@ -479,13 +478,15 @@ impl Telemetry {
             self.host.as_deref(),
         );
         env.extend(super::launch::extra_env(&start.agent, &base));
+        // Whether or not the shim is installed: without it, an id the daemon
+        // inherited from another deck's agent would reach this one (#1902).
+        env.push((super::shim::RUN_ID_ENV.to_string(), start.run_id.clone()));
         if let Some(shim) = self.shim_dir.as_deref().and_then(Path::to_str)
             && let Some(path) = base.get("PATH")
         {
             // An empty `PATH` is the current directory, and stays so after
             // the shim: `<shim>:` ends in an empty entry.
             env.push(("PATH".to_string(), format!("{shim}:{path}")));
-            env.push((super::shim::RUN_ID_ENV.to_string(), start.run_id.clone()));
         }
         let prepared = PreparedRun {
             env,
@@ -1900,8 +1901,8 @@ mod tests {
     }
 
     /// With the shim installed every agent's `PATH` starts with its directory
-    /// — in front of the spawn's own `PATH`, else the daemon's — and carries
-    /// its run id; without it neither is added.
+    /// — in front of the spawn's own `PATH`, else the daemon's; without it the
+    /// `PATH` is left alone. Every agent carries its run id either way (#1902).
     #[cfg(unix)]
     #[tokio::test]
     async fn the_shim_goes_first_on_every_agents_path() {
@@ -1941,7 +1942,11 @@ mod tests {
         );
         let run = plain.prepare_run(run_start("p3"), &[], None).unwrap();
         assert_eq!(get(&run.env, "PATH"), None, "no shim, no PATH");
-        assert_eq!(get(&run.env, super::super::shim::RUN_ID_ENV), None);
+        assert_eq!(
+            get(&run.env, super::super::shim::RUN_ID_ENV),
+            Some(run.run_id.as_str()),
+            "no shim, still the run id"
+        );
     }
 
     /// The Devin configurations the shim writes for a run go when that run's

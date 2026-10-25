@@ -49,7 +49,32 @@ export const INBOX_WORDS = {
   hooksTooOldUpgrade: "upgrade the dot-agent-deck the hooks run, or run hooks install from the copy you want them to use, then restart the agent",
   receiptsDegraded: "messages may repeat: the deck cannot record message receipts for this agent",
   evidencePaused: "deck messages paused: {n} delivered messages still wait for proof that older copies cannot run; restart the agent to clear them",
+  /** PRD #1666 part 3 (R-2): the deck refused the agent's own request for its waiting messages. */
+  admissionRefused: "Messages can't reach this agent",
+  /** `admissionRefused`'s remedy, after the cause. */
+  admissionRefusedRemedy: "Restart it from the deck; messages addressed to it are not handed to the restarted agent, so have them sent again.",
+  /** `admissionRefused`'s cause, by the refusal code; an unknown code names none. */
+  admissionCauses: {
+    inbox_other_user: "a process running as another user asked for them",
+    inbox_peer_unidentified: "the deck could not identify the process that asked for them",
+    inbox_component_not_caller: "its integration named a process other than its own",
+    inbox_nested_agent: "an agent of the same kind running inside it asked for them",
+    inbox_not_agent_process: "a process outside the agent asked for them",
+    inbox_receiver_above_agent: "its integration named a process the agent itself runs under",
+  },
 } as const;
+
+/**
+ * PRD #1666 part 3 (R-2): the card's notice for a refusal with `code`, the
+ * row the TUI's card and Deck messages picker print too.
+ */
+export function admissionRefusedText(code: string): string {
+  const causes: Record<string, string> = INBOX_WORDS.admissionCauses;
+  const cause = Object.prototype.hasOwnProperty.call(causes, code) ? causes[code] : undefined;
+  return cause
+    ? `${INBOX_WORDS.admissionRefused}: its connection to the deck was refused (${cause}). ${INBOX_WORDS.admissionRefusedRemedy}`
+    : `${INBOX_WORDS.admissionRefused}: its connection to the deck was refused. ${INBOX_WORDS.admissionRefusedRemedy}`;
+}
 
 const countOf = (inbox: AgentInbox, kinds: ReadonlyArray<InboxAttentionItem["kind"]>) =>
   (inbox.attention ?? []).filter((item) => kinds.includes(item.kind)).length;
@@ -88,7 +113,8 @@ export function inboxBadge(inbox: AgentInbox | undefined): string | undefined {
 
 /**
  * PRD #1666 §6.5: the card's inbox notice row, when the deck has something to
- * say beyond the badge — the first that holds of: why the integration takes
+ * say beyond the badge — the first that holds of: a refused request of the
+ * agent's own for its messages (part 3, R-2), why the integration takes
  * nothing yet, paused hand-outs, what an uncertain delivery means (what running
  * out of attempts means, when every uncertain one has: its row offers no
  * Retry), what a message the agent may not have received means, held_long
@@ -96,6 +122,8 @@ export function inboxBadge(inbox: AgentInbox | undefined): string | undefined {
  */
 export function inboxNotice(inbox: AgentInbox | undefined): string | undefined {
   if (!inbox) return undefined;
+  // PRD #1666 part 3 (R-2): nothing else reaches the agent until this is fixed.
+  if (inbox.admissionRefused !== undefined) return admissionRefusedText(inbox.admissionRefused);
   if (inbox.integration === "cli_too_old") return INBOX_WORDS.cliTooOld;
   if (inbox.integration === "adapter_too_old") return INBOX_WORDS.adapterTooOld;
   if (inbox.integration === "not_armed") return INBOX_WORDS.notArmed;

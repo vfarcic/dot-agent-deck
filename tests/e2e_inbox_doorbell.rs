@@ -133,7 +133,7 @@ fn doorbell_004_native_announce_gets_arm_grace() {
     ring(&daemon, &turn_end, &id);
 }
 
-/// Scenario: Leave one Idle pane's task Queued across five accelerated ring intervals, then fetch it without ack. Rings must follow the configured increasing delays and final repeated delay; Fetched and later Acknowledged stop further rings.
+/// Scenario: Leave one Idle pane's task Queued across five accelerated ring intervals, then fetch it without ack, the fetch's receiver kept open. Rings must follow the configured increasing delays and final repeated delay; Fetched and later Acknowledged stop further rings.
 #[spec("inbox/doorbell/005")]
 #[test]
 fn doorbell_005_rerings_on_schedule_and_stops_on_fetch() {
@@ -170,7 +170,7 @@ fn doorbell_005_rerings_on_schedule_and_stops_on_fetch() {
         );
     }
     state(&daemon, &pane, &id, "queued");
-    fetch(&daemon, &pane, false);
+    let (held, _) = take(&daemon, &pane);
     state(&daemon, &pane, &id, "fetched");
     let count = rings(&pane).len();
     assert!(
@@ -181,6 +181,7 @@ fn doorbell_005_rerings_on_schedule_and_stops_on_fetch() {
     ack["delivery_id"] = json!(id);
     hook(&daemon, ack);
     state(&daemon, &pane, &id, "acknowledged");
+    close(held);
     unchanged(&pane, Duration::from_millis(1100));
 }
 
@@ -588,8 +589,18 @@ fn assert_ack_fences_rering(phase: &str, ack: bool, draft: bool) {
             "{phase}: barrier must precede payload: {:?}",
             bytes(&pane)
         );
+        let mut _held = None;
         if acknowledge && !draft {
-            let fetched = fetch(&daemon, &pane, ack).to_string();
+            // Without an ack the fetch keeps its receiver, which holds the
+            // message for it (PRD #1666 part 3).
+            let fetched = if ack {
+                fetch(&daemon, &pane, true)
+            } else {
+                let (socket, reply) = take(&daemon, &pane);
+                _held = Some(socket);
+                reply
+            }
+            .to_string();
             assert!(fetched.contains(&id) && fetched.contains(BODY), "{fetched}");
             state(
                 &daemon,

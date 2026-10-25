@@ -53,7 +53,7 @@ pub const COMMAND_NOT_SHOWN: &str =
 /// indented and exactly as the core built it. The core builds no command that
 /// [`say`]'s filter would change, so one that it would is not printed in any
 /// form, rewritten or not: [`COMMAND_NOT_SHOWN`] says it was left out.
-fn say_items(out: &mut dyn Write, items: &[plan::PlanLine]) {
+pub(crate) fn say_items(out: &mut dyn Write, items: &[plan::PlanLine]) {
     for item in items {
         match item {
             plan::PlanLine::Text(text) => say(out, text),
@@ -423,6 +423,14 @@ async fn upgrade_each(
             Ok(outcome) => {
                 say_items(out, &outcome.items());
                 ok &= outcome.upgraded();
+                // R-3: a CLI the upgrade installed refreshes the agents' hooks.
+                let (hooks_host, hooks_plan) = (host.clone(), plan.clone());
+                let hooks = tokio::task::spawn_blocking(move || {
+                    super::agent_hooks::after_upgrade(&*hooks_host, &hooks_plan, &outcome)
+                })
+                .await
+                .unwrap_or_default();
+                say_items(out, &hooks);
             }
             Err(e) => {
                 say(out, &e.to_string());

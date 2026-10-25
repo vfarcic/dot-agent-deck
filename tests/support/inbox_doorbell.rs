@@ -251,6 +251,7 @@ pub fn pane_with(daemon: &impl Endpoint, name: &str, extra: Value) -> Pane {
     std::fs::write(&script, r#"import os, sys, tty, termios, time, json, select
 tty.setraw(0, termios.TCSANOW)
 base = sys.argv[1]
+with open(base + '.env', 'w') as f: json.dump({k: os.environ[k] for k in ['DOT_AGENT_DECK_INBOX_SPOOL'] if k in os.environ}, f)
 with open(base + '.pid', 'w') as f: f.write(str(os.getpid()))
 capture = open(base + '.bytes', 'ab', buffering=0)
 turns = open(base + '.turns', 'a', buffering=1)
@@ -327,6 +328,18 @@ while True:
     pane
 }
 
+/// The value of `name` in the environment the deck gave the stand-in's
+/// process, of the keys it writes beside its pid as it starts: only
+/// `DOT_AGENT_DECK_INBOX_SPOOL`, so the file never holds the pane's capability
+/// or anything else the stand-in inherited.
+pub fn pane_env(pane: &Pane, name: &str) -> Option<String> {
+    let env: Value = serde_json::from_str(
+        &std::fs::read_to_string(pane.capture.with_extension("env")).expect("the pane's env"),
+    )
+    .expect("the pane's env is JSON");
+    env[name].as_str().map(str::to_string)
+}
+
 pub fn request(pane: &Pane, verb: &str) -> Value {
     json!({"message_type":verb,"pane_id":pane.id,"agent_id":pane.agent,"token":pane.token})
 }
@@ -377,9 +390,35 @@ pub fn hook(daemon: &impl Endpoint, req: Value) -> Value {
     line(&mut connect(daemon, &req))
 }
 
+/// PRD #1666 part 3, round 5: a `work-done` as this release's CLI sends it —
+/// the capability question, then, on the same connection once the daemon
+/// confirmed, the report in `mode` (`{"kind":"task","task_id":…}`,
+/// `{"kind":"uncorrelated"}` or `{"kind":"terminal"}`). Returns the reply.
+pub fn work_done_task(daemon: &impl Endpoint, pane: &Pane, mode: Value, report: &str) -> Value {
+    let mut socket = connect(daemon, &request(pane, "hook_capabilities"));
+    let caps = line(&mut socket);
+    assert_eq!(
+        caps["task_scoped_completion"], 1,
+        "capability answer: {caps}"
+    );
+    let mut req = request(pane, "work_done_task");
+    req["mode"] = mode;
+    req["report"] = json!(report);
+    req["timestamp"] = json!(chrono::Utc::now());
+    write_all_budgeted(socket.get_mut(), format!("{req}\n").as_bytes()).unwrap();
+    line(&mut socket)
+}
+
+/// The version stamp a synthetic hook line carries. Every hook line from a
+/// current deck is stamped, and an unstamped Claude line reads as hooks from
+/// before the deck's messages (PRD #1666 part 3, R-3); an empty build counts as
+/// stamped and is never compared with the daemon's own.
+pub const SYNTHETIC_DECK_BUILD: &str = "";
+
 pub fn status(daemon: &impl Endpoint, pane: &Pane, event: &str, agent_type: &str) {
     let req = json!({"session_id":format!("doorbell-{}", pane.agent),
         "pane_id":pane.id,"agent_id":pane.agent,"token":pane.token,
+        "deck_build":SYNTHETIC_DECK_BUILD,
         "agent_type":agent_type,"event_type":event,"timestamp":chrono::Utc::now(),
         "cwd":daemon.cwd(),"metadata":if event == "quota_blocked" {
             json!({"quota_blocked_kind":"usage_limit","quota_blocked_detail":"synthetic quota"})
@@ -566,13 +605,172 @@ pub fn waiter(daemon: &impl Endpoint, pane: &Pane) -> BufReader<UnixStream> {
     connect(daemon, &req)
 }
 
+/// Take what is waiting for `pane`'s agent as a current `dot-agent-deck inbox
+/// fetch` does (PRD #1666 part 3): a one-shot receipt fetch, consumer `cli`,
+/// at the one-shot integration, granted each block before it would print it
+/// (`may`). With `ack`, the agent then acknowledges each message it was
+/// handed (`ack <id>`), which settles it. Without, it is [`take`] with the
+/// fetch's connection closed at once: each block may have reached the agent
+/// and nothing settles it, and with its receiver gone the deck soon offers it
+/// again, marked as a possible repeat (an `ack` of it still settles it).
+/// Answers the fetch's reply, each message carrying its attempt.
 pub fn fetch(daemon: &impl Endpoint, pane: &Pane, ack: bool) -> Value {
-    let mut req = request(pane, "inbox_fetch");
+    let (mut socket, reply) = take_granted(daemon, pane);
+    if ack {
+        for message in reply["messages"].as_array().into_iter().flatten() {
+            let mut ack = request(pane, "ack");
+            ack["delivery_id"] = message["id"].clone();
+            let answer = hook(daemon, ack);
+            assert!(
+                answer["accepted"] == true
+                    && matches!(
+                        answer["delivery"].as_str(),
+                        Some("acknowledged" | "claimed")
+                    ),
+                "the fetched {message} is acknowledged: {answer}"
+            );
+        }
+    } else {
+        report_handed(daemon, pane, &mut socket, &reply);
+    }
+    close(socket);
+    reply
+}
+
+/// [`fetch`] without acknowledging, its receiver kept: each block may have
+/// reached the agent, its `handed` receipt is published and reported, and
+/// the deck holds the messages for this receiver while its connection stays
+/// open (a hook's hold, one ack-wait). Answers the open connection and the
+/// fetch's reply.
+pub fn take(daemon: &impl Endpoint, pane: &Pane) -> (BufReader<UnixStream>, Value) {
+    let (mut socket, reply) = take_granted(daemon, pane);
+    report_handed(daemon, pane, &mut socket, &reply);
+    (socket, reply)
+}
+
+/// A one-shot receipt fetch for `pane`'s agent, granted each block it was
+/// handed; its connection open.
+fn take_granted(daemon: &impl Endpoint, pane: &Pane) -> (BufReader<UnixStream>, Value) {
+    let mut req = request(pane, "inbox_receipt_fetch");
     req["consumer"] = json!("cli");
+    req["hook_integration"] = json!(1);
     req["max_chars"] = json!(65536);
-    req["ack"] = json!(ack);
-    let reply = hook(daemon, req);
+    let mut socket = connect(daemon, &req);
+    let reply = line(&mut socket);
     assert!(reply["messages"].is_array(), "fetch blocks: {reply}");
+    for (q, message) in reply["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let may =
+            json!({"may": {"q": q, "id": message["id"], "a": message["a"], "e": message["e"]}});
+        writeln!(socket.get_mut(), "{may}").unwrap();
+        let grant = line(&mut socket);
+        assert_eq!(
+            grant["grant"]["ok"], true,
+            "the fetch may print {message}: {grant}"
+        );
+    }
+    (socket, reply)
+}
+
+/// Publish each block of `reply` as possibly handed to the agent, as an
+/// `inbox fetch` whose output may not have arrived whole does, and report it
+/// on `socket`.
+fn report_handed(
+    daemon: &impl Endpoint,
+    pane: &Pane,
+    socket: &mut BufReader<UnixStream>,
+    reply: &Value,
+) {
+    let messages = reply["messages"].as_array().cloned().unwrap_or_default();
+    if messages.is_empty() {
+        return;
+    }
+    let spool = dot_agent_deck::inbox_receipt::GenerationSpool::open(
+        &spool_instance(daemon),
+        &pane.id,
+        &pane.agent,
+    )
+    .expect("the pane's receipt spool opens");
+    let mut handed = Vec::new();
+    for message in &messages {
+        let cap = dot_agent_deck::inbox_receipt::Cap::from_hex(
+            message["caps"]["handed"]
+                .as_str()
+                .expect("the hand-out's caps"),
+        )
+        .expect("a cap");
+        spool
+            .publish(
+                &dot_agent_deck::inbox_receipt::RecordKey {
+                    msg: message["id"].as_str().unwrap().to_string(),
+                    a: message["a"].as_u64().unwrap() as u32,
+                    e: message["e"].as_u64().unwrap() as u32,
+                    stage: dot_agent_deck::inbox_receipt::RecordStage::Handed,
+                },
+                &cap,
+            )
+            .expect("the handed receipt is published");
+        handed.push(json!({"id": message["id"], "a": message["a"], "e": message["e"]}));
+    }
+    writeln!(socket.get_mut(), "{}", json!({"handed": handed})).unwrap();
+}
+
+/// End a one-shot receiver: closing our half ends it, and the deck closes its
+/// own once it has applied every control written before.
+pub fn close(mut socket: BufReader<UnixStream>) {
+    socket
+        .get_mut()
+        .shutdown(std::net::Shutdown::Write)
+        .unwrap();
+    let mut rest = String::new();
+    let _ = socket.read_to_string(&mut rest);
+}
+
+/// The receipt spool instance `daemon` runs, the directory a pane's
+/// `DOT_AGENT_DECK_INBOX_SPOOL` names: the newest under its state directory,
+/// which the harness puts beside its `HOME`.
+pub fn spool_instance(daemon: &impl Endpoint) -> std::path::PathBuf {
+    let root = daemon
+        .home()
+        .parent()
+        .expect("the harness's work directory")
+        .join("state")
+        .join(dot_agent_deck::inbox_receipt::SPOOL_DIR_NAME);
+    std::fs::read_dir(&root)
+        .unwrap_or_else(|e| panic!("the daemon's receipt spool {root:?}: {e}"))
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .max_by_key(|entry| entry.metadata().and_then(|m| m.modified()).ok())
+        .map(|entry| entry.path())
+        .unwrap_or_else(|| panic!("no receipt spool instance under {root:?}"))
+}
+
+/// [`fetch`] whose `inbox fetch` printed nothing: it tells the deck its
+/// hand-out positively did not reach the agent (`not_handed`), so the deck
+/// queues the messages again at once. Answers the fetch's reply.
+pub fn fetch_not_handed(daemon: &impl Endpoint, pane: &Pane) -> Value {
+    let mut req = request(pane, "inbox_receipt_fetch");
+    req["consumer"] = json!("cli");
+    req["hook_integration"] = json!(1);
+    req["max_chars"] = json!(65536);
+    let mut socket = connect(daemon, &req);
+    let reply = line(&mut socket);
+    let attempts: Vec<Value> = reply["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|m| json!({"id": m["id"], "a": m["a"], "e": m["e"]}))
+        .collect();
+    assert!(
+        !attempts.is_empty(),
+        "the fetch is handed something: {reply}"
+    );
+    writeln!(socket.get_mut(), "{}", json!({"not_handed": attempts})).unwrap();
+    close(socket);
     reply
 }
 

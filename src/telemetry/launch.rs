@@ -528,7 +528,7 @@ pub fn remove_config_file(path: &Path) {
 
 /// Whether `id` is a run id as [`super::span::new_run_id`] makes them: 32
 /// lowercase hex digits.
-fn is_run_id(id: &str) -> bool {
+pub(crate) fn is_run_id(id: &str) -> bool {
     id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 

@@ -9,6 +9,9 @@ members = [
     "xtask/site",
     "xtask/spec",
 ]
+# The patched crossterm below is a path dependency inside the workspace root,
+# which cargo would otherwise make a member and lint as our own code.
+exclude = ["vendor/crossterm"]
 
 # Issue #451 — the minimum supported Rust toolchain, inherited by every member
 # through `rust-version.workspace = true`. Without it, a build on an older
@@ -56,9 +59,12 @@ ratatui = "0.30"
 # hand, and re-read `ctrl_c0_byte`'s contract, before bumping it. (The
 # `keyevent_ctrl_c0_matches_crossterm_decoder` round-trip test catches an
 # encoder/decoder mismatch under `cargo test-fast`, but not a stale line
-# reference.) NOTE: ratatui 0.30 pulls crossterm 0.29 in via `ratatui-crossterm`;
-# the two coexist because 0.28/0.29 are semver-incompatible, and this pin binds
-# only OUR direct dependency — the one `src/ui.rs` reads events from.
+# reference.) ratatui 0.30 also depends on crossterm, through
+# `ratatui-crossterm`. Both requirements resolve to the one patched copy that
+# `[patch.crates-io]` below supplies, so a bump also means re-applying or
+# dropping that patch: a version the patch does not supply makes cargo use the
+# registry crate with only a warning, which `tests/vendored_crossterm.rs`
+# turns into a failure.
 crossterm = "=0.29.0"
 clap = { version = "4", features = ["derive"] }
 toml = "1.0"
@@ -282,3 +288,12 @@ path = "examples/diff_config.rs"
 # at the dev profile's settings.
 [profile.dev.package.earshot]
 opt-level = 3
+
+# crossterm 0.29.0 with its Unix event source fixed to handle a whole readiness
+# batch: upstream stranded keys typed right after a terminal resize until the
+# next keystroke. Replaces the registry crate for every dependent, ratatui's
+# included. vendor/crossterm/VENDORED.md has the change, why no release or
+# feature avoids it, when to drop it, and what keeps it applied and audited
+# (`tests/vendored_crossterm.rs`, `scripts/audit-vendored-upstream.sh`).
+[patch.crates-io]
+crossterm = { path = "vendor/crossterm" }

@@ -474,7 +474,15 @@ pub(crate) async fn pause_rering_for_test(pane: &str, phase: &str) {
 
 #[cfg(feature = "e2e")]
 fn test_control_root() -> Option<std::path::PathBuf> {
-    let root = std::env::var_os("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_DIR")?;
+    test_control_dir("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_DIR")
+}
+
+/// The test-control directory the environment variable `var` names, one
+/// component under HOME, created if missing. Also read by the work-done seams
+/// (`crate::task_completion::e2e_seams`).
+#[cfg(feature = "e2e")]
+pub(crate) fn test_control_dir(var: &str) -> Option<std::path::PathBuf> {
+    let root = std::env::var_os(var)?;
     let root = std::path::PathBuf::from(root);
     // Check the configured directory under HOME. The harness supplies a private
     // HOME and trusted marker leaves; this is not a no-follow filesystem boundary.

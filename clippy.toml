@@ -1,0 +1,7 @@
+# PRD #1666 part 3, round 5 (plan D6): no ranked lock guard is held across an
+# `.await`. That keeps `crate::lock_rank`'s thread-local rank stack sound under
+# Tokio, and is one of the three obligations that keep `AppState`'s `RwLock`
+# (R0) the outermost rank, which the rank checker cannot see.
+await-holding-invalid-types = [
+    { path = "dot_agent_deck::lock_rank::RankedGuard", reason = "a ranked lock guard must not be held across an `.await` (crate::lock_rank)" },
+]

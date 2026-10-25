@@ -1044,10 +1044,13 @@ fn release_version(raw: &str) -> Option<semver::Version> {
 /// Whether `client` is strictly newer than `daemon`. Never true for a version
 /// either side cannot parse, so a malformed report never offers an upgrade.
 pub fn client_is_newer(client: &str, daemon: &str) -> bool {
-    match (release_version(client), release_version(daemon)) {
-        (Some(c), Some(d)) => c > d,
-        _ => false,
-    }
+    release_order(client, daemon) == Some(std::cmp::Ordering::Greater)
+}
+
+/// How release `a` compares with release `b`, build stamps aside, or `None`
+/// when either side cannot be parsed.
+pub fn release_order(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    Some(release_version(a)?.cmp(&release_version(b)?))
 }
 
 /// Whether a client should offer to upgrade a daemon. Computed in Rust so no

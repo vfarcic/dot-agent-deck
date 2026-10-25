@@ -162,7 +162,30 @@ pub fn teardown_began(telemetry: Option<Arc<Telemetry>>, cause: &str) {
 /// run and add its identity to the agent's environment. `None` when telemetry
 /// is off or the pane has no id; drop the result to abandon the run when the
 /// spawn is refused, and pass it to [`commit_spawn`] once the agent started.
+///
+/// With no run prepared, [`shim::RUN_ID_ENV`] is set blank unless the spawn
+/// sets it itself, which every reader takes as unset: a daemon started inside
+/// another deck's agent would otherwise pass that agent's run id on next to
+/// this deck's own pane id, and a tool's spans would join the other run
+/// (#1902). That holds with telemetry off too, where the work does run under
+/// the other deck's agent: the agent's `DOT_AGENT_DECK_PANE_ID` is this deck's
+/// either way, so the pair would name a run and a pane that never belonged
+/// together.
 pub fn prepare_spawn(
+    telemetry: Option<Arc<Telemetry>>,
+    pane_id: Option<&str>,
+    agent_id: &str,
+    opts: &mut crate::agent_pty::SpawnOptions<'_>,
+    membership: Option<&crate::agent_pty::TabMembership>,
+) -> Option<PreparedRun> {
+    let run = prepare_run_for_spawn(telemetry, pane_id, agent_id, opts, membership);
+    if run.is_none() && !opts.env.iter().any(|(k, _)| k == shim::RUN_ID_ENV) {
+        opts.env.push((shim::RUN_ID_ENV.to_string(), String::new()));
+    }
+    run
+}
+
+fn prepare_run_for_spawn(
     telemetry: Option<Arc<Telemetry>>,
     pane_id: Option<&str>,
     agent_id: &str,
@@ -588,6 +611,111 @@ mod tests {
                 .shutdown(std::time::Duration::from_millis(100))
                 .await;
         }
+    }
+
+    /// Issue #1902: a daemon that inherited another deck's run id hands each
+    /// agent it starts a run for that run's own id, shim or no shim, and a
+    /// blank one to an agent it starts no run for — telemetry off, or no pane
+    /// id — unless the spawn sets its own. The last value for a variable in
+    /// the spawn's environment is the one the agent gets.
+    #[tokio::test]
+    async fn an_agent_gets_its_own_run_id_and_never_an_inherited_one() {
+        const INHERITED: &str = "0123456789abcdef0123456789abcdef";
+        fn run_id(opts: &crate::agent_pty::SpawnOptions<'_>) -> Option<String> {
+            opts.env
+                .iter()
+                .rev()
+                .find(|(k, _)| k == shim::RUN_ID_ENV)
+                .map(|(_, v)| v.clone())
+        }
+        let daemon_env = |on: bool| {
+            let mut env = if on {
+                exporting_env()
+            } else {
+                config::EnvMap::new()
+            };
+            env.insert("PATH".into(), "/usr/bin".into());
+            env.insert(shim::RUN_ID_ENV.into(), INHERITED.into());
+            env
+        };
+        // Telemetry on: with the shim (Unix only writes one) and without it.
+        let decks: &[Option<&str>] = if cfg!(unix) {
+            &[Some("/opt/deck"), None]
+        } else {
+            &[None]
+        };
+        for &deck in decks {
+            let dir = tempfile::tempdir().unwrap();
+            let (event_tx, _) = tokio::sync::broadcast::channel(8);
+            let registry = crate::agent_pty::AgentPtyRegistry::new();
+            let telemetry = start_from(
+                &daemon_env(true),
+                dir.path().to_path_buf(),
+                deck,
+                &event_tx,
+                &registry,
+            );
+            assert_eq!(dir.path().join(shim::DIR_NAME).exists(), deck.is_some());
+            let mut ids = Vec::new();
+            for pane in ["p1", "p2"] {
+                let mut opts = crate::agent_pty::SpawnOptions {
+                    command: Some("codex"),
+                    env: crate::test_isolation::pin_unreachable_endpoints(Vec::new()),
+                    ..Default::default()
+                };
+                let run = prepare_spawn(registry.telemetry(), Some(pane), "a1", &mut opts, None)
+                    .unwrap_or_else(|| panic!("no run, shim {deck:?}"));
+                let id = run_id(&opts).unwrap();
+                assert!(launch::is_run_id(&id), "{id:?}, shim {deck:?}");
+                assert_ne!(id, INHERITED, "shim {deck:?}");
+                assert!(
+                    run.env
+                        .iter()
+                        .any(|(k, v)| k == shim::RUN_ID_ENV && *v == id),
+                    "the run's own id, shim {deck:?}"
+                );
+                assert_eq!(
+                    opts.env.iter().any(|(k, _)| k == "PATH"),
+                    deck.is_some(),
+                    "PATH changes only for the shim"
+                );
+                ids.push(id);
+            }
+            assert_ne!(ids[0], ids[1], "each spawn its own run");
+            // A spawn with no pane id gets no run, so no id either.
+            let mut opts = crate::agent_pty::SpawnOptions::default();
+            assert!(prepare_spawn(registry.telemetry(), None, "a1", &mut opts, None).is_none());
+            assert_eq!(run_id(&opts).as_deref(), Some(""));
+            telemetry
+                .shutdown(std::time::Duration::from_millis(100))
+                .await;
+        }
+        // Telemetry off: no run, and the inherited id is blanked rather than
+        // passed through; an id the spawn sets itself is kept as it is.
+        let dir = tempfile::tempdir().unwrap();
+        let (event_tx, _) = tokio::sync::broadcast::channel(8);
+        let registry = crate::agent_pty::AgentPtyRegistry::new();
+        let telemetry = start_from(
+            &daemon_env(false),
+            dir.path().to_path_buf(),
+            Some("/opt/deck"),
+            &event_tx,
+            &registry,
+        );
+        assert!(registry.telemetry().is_none());
+        let mut opts = crate::agent_pty::SpawnOptions::default();
+        assert!(prepare_spawn(registry.telemetry(), Some("p1"), "a1", &mut opts, None).is_none());
+        assert_eq!(opts.env, [(shim::RUN_ID_ENV.to_string(), String::new())]);
+        let own = [(shim::RUN_ID_ENV.to_string(), "mine".to_string())];
+        let mut opts = crate::agent_pty::SpawnOptions {
+            env: own.to_vec(),
+            ..Default::default()
+        };
+        assert!(prepare_spawn(registry.telemetry(), Some("p1"), "a1", &mut opts, None).is_none());
+        assert_eq!(opts.env, own);
+        telemetry
+            .shutdown(std::time::Duration::from_millis(100))
+            .await;
     }
 
     fn exporting_registry() -> (Arc<Telemetry>, Arc<crate::agent_pty::AgentPtyRegistry>) {
