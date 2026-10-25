@@ -46,7 +46,8 @@ xtask-docs = { path = "../docs" }
 # PRD #1419: `cargo xtask site <out-dir>` dispatches into this library.
 xtask-site = { path = "../site" }
 
-# `clean-e2e-tmp` needs two libc calls that have no std equivalent:
+# `clean-e2e-tmp` needs two libc calls that have no std equivalent, and gate
+# telemetry a third:
 #
 # - `geteuid(2)` (issue #322) scopes the harness's private `/var/tmp` parent to
 #   the effective UID, and proves that parent is really this user's before
@@ -54,6 +55,8 @@ xtask-site = { path = "../site" }
 # - `kill(pid, 0)` (issue #461) decides ownership by liveness — the only call
 #   that distinguishes "no such process" (ESRCH, dead) from "not yours" (EPERM,
 #   alive).
+# - `gethostname(2)` (issue #1893) fills the gate spans' `host.name` the way the
+#   deck fills its own, so the two group by machine.
 #
 # `libc` is already a workspace dependency at the same version and gating (the
 # root package declares it under `[target.'cfg(unix)'.dependencies]`), so this

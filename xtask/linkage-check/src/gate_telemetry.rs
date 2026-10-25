@@ -58,7 +58,9 @@ pub(crate) struct Config {
     pub(crate) protocol: Protocol,
     pub(crate) headers: Vec<(String, String)>,
     pub(crate) timeout: Duration,
-    /// `service.name` first, then every `OTEL_RESOURCE_ATTRIBUTES` pair.
+    /// `service.name` first, then every `OTEL_RESOURCE_ATTRIBUTES` pair, then
+    /// whichever of `deck.run.id`, `deck.pane.id` and `host.name` those lack
+    /// and the deck's own variables or the machine supply.
     pub(crate) resource: Vec<(String, String)>,
 }
 
@@ -78,15 +80,24 @@ impl std::fmt::Debug for Config {
     }
 }
 
+/// The deck's run id in an agent's environment, equal to the run's
+/// `deck.run.id` (`RUN_ID_ENV` in the deck's `src/telemetry/shim.rs`).
+const RUN_ID_ENV: &str = "DOT_AGENT_DECK_TELEMETRY_RUN_ID";
+/// The deck's pane id in an agent's environment, the run's `deck.pane.id`.
+const PANE_ID_ENV: &str = "DOT_AGENT_DECK_PANE_ID";
+
 /// The export configuration, or `None` when the environment does not turn
-/// export on. `env` looks a variable up; [`from_process_env`] passes the real
-/// environment.
+/// export on. `env` looks a variable up and `host_name` reads the machine's
+/// host name; [`from_process_env`] passes the real ones.
 ///
 /// Off when `OTEL_SDK_DISABLED` is `true`, when `OTEL_TRACES_EXPORTER` is set
 /// and names no `otlp`, when no endpoint is set, and when the protocol is one
 /// this cannot send (`grpc`, or anything unrecognised): a `grpc` endpoint does
 /// not answer an HTTP POST, so sending would only spend the bound.
-pub(crate) fn config_from(env: &dyn Fn(&str) -> Option<String>) -> Option<Config> {
+pub(crate) fn config_from(
+    env: &dyn Fn(&str) -> Option<String>,
+    host_name: &dyn Fn() -> Option<String>,
+) -> Option<Config> {
     let get = |key: &str| {
         env(key)
             .map(|v| v.trim().to_string())
@@ -160,6 +171,32 @@ pub(crate) fn config_from(env: &dyn Fn(&str) -> Option<String>) -> Option<Config
         .unwrap_or_else(|| DEFAULT_SERVICE_NAME.to_string());
     let mut resource = vec![("service.name".to_string(), service)];
     resource.extend(user.into_iter().filter(|(k, _)| k != "service.name"));
+    // Issue #1893: Claude Code removes every `OTEL_*` variable from the
+    // commands it runs, so a gate run an agent starts arrives without the
+    // deck's `OTEL_RESOURCE_ATTRIBUTES`. The deck's own variables survive, and
+    // fill the pairs that list would have carried; a pair from it still wins,
+    // unless its value is blank, which identifies nothing.
+    let fallbacks: [(&str, &dyn Fn() -> Option<String>); 3] = [
+        ("deck.run.id", &|| get(RUN_ID_ENV)),
+        ("deck.pane.id", &|| get(PANE_ID_ENV)),
+        ("host.name", &|| {
+            host_name()
+                .map(|h| h.trim().to_string())
+                .filter(|h| !h.is_empty())
+        }),
+    ];
+    for (key, value) in fallbacks {
+        let at = resource.iter().position(|(k, _)| k == key);
+        if at.is_some_and(|i| !resource[i].1.trim().is_empty()) {
+            continue;
+        }
+        if let Some(value) = value() {
+            match at {
+                Some(i) => resource[i].1 = value,
+                None => resource.push((key.to_string(), value)),
+            }
+        }
+    }
     Some(Config {
         endpoint,
         protocol,
@@ -170,7 +207,33 @@ pub(crate) fn config_from(env: &dyn Fn(&str) -> Option<String>) -> Option<Config
 }
 
 pub(crate) fn from_process_env() -> Option<Config> {
-    config_from(&|key| std::env::var(key).ok())
+    config_from(&|key| std::env::var(key).ok(), &read_host_name)
+}
+
+/// This machine's host name, read as the deck reads the `host.name` it
+/// exports (`read_host_name` in its `src/telemetry/resource.rs`), so the spans
+/// group with the deck's by machine.
+#[cfg(unix)]
+fn read_host_name() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is writable for its whole length, which is what we pass;
+    // the result is read only up to the first NUL, and the last byte is never
+    // written past.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len() - 1) };
+    if rc != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+    let name = String::from_utf8_lossy(&buf[..end]).trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+#[cfg(not(unix))]
+fn read_host_name() -> Option<String> {
+    std::env::var("COMPUTERNAME")
+        .ok()
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
 }
 
 /// The W3C Baggage `key=value,key2=value2` list `OTEL_RESOURCE_ATTRIBUTES` and
@@ -643,6 +706,11 @@ mod tests {
         move |key| pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
     }
 
+    /// [`config_from`] on `pairs`, on a machine that reports no host name.
+    fn from_pairs(pairs: &[(&str, &str)]) -> Option<Config> {
+        config_from(&env(pairs), &|| None)
+    }
+
     const BASE: (&str, &str) = ("OTEL_EXPORTER_OTLP_ENDPOINT", "https://collector:4318/");
 
     #[test]
@@ -654,6 +722,11 @@ mod tests {
                 ("OTEL_SERVICE_NAME", "x"),
                 ("OTEL_RESOURCE_ATTRIBUTES", "a=b"),
             ],
+            &[
+                (RUN_ID_ENV, "run-1"),
+                (PANE_ID_ENV, "pane-1"),
+                ("OTEL_RESOURCE_ATTRIBUTES", "deck.run.id=run-1"),
+            ],
             &[BASE, ("OTEL_SDK_DISABLED", "true")],
             &[BASE, ("OTEL_SDK_DISABLED", "TRUE")],
             &[BASE, ("OTEL_TRACES_EXPORTER", "none")],
@@ -661,7 +734,7 @@ mod tests {
             &[BASE, ("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "grpc")],
         ];
         for pairs in off {
-            assert_eq!(config_from(&env(pairs)), None, "{pairs:?}");
+            assert_eq!(from_pairs(pairs), None, "{pairs:?}");
         }
         let on: &[&[(&str, &str)]] = &[
             &[BASE],
@@ -671,20 +744,20 @@ mod tests {
             &[BASE, ("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json")],
         ];
         for pairs in on {
-            assert!(config_from(&env(pairs)).is_some(), "{pairs:?}");
+            assert!(from_pairs(pairs).is_some(), "{pairs:?}");
         }
     }
 
     #[test]
     fn the_endpoint_protocol_headers_and_timeout_follow_the_standard_variables() {
-        let config = config_from(&env(&[
+        let config = from_pairs(&[
             BASE,
             (
                 "OTEL_EXPORTER_OTLP_HEADERS",
                 "x-honeycomb-team=k%3D1, other=2",
             ),
             ("OTEL_EXPORTER_OTLP_TIMEOUT", "500"),
-        ]))
+        ])
         .unwrap();
         assert_eq!(config.endpoint, "https://collector:4318/v1/traces");
         assert_eq!(config.protocol, Protocol::HttpProtobuf);
@@ -701,7 +774,7 @@ mod tests {
             "header values are not printed"
         );
 
-        let config = config_from(&env(&[
+        let config = from_pairs(&[
             BASE,
             ("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://c:4318/x"),
             ("OTEL_EXPORTER_OTLP_HEADERS", "a=1"),
@@ -709,20 +782,20 @@ mod tests {
             ("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf"),
             ("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "HTTP/JSON"),
             ("OTEL_EXPORTER_OTLP_TIMEOUT", "600000"),
-        ]))
+        ])
         .unwrap();
         assert_eq!(config.endpoint, "http://c:4318/x");
         assert_eq!(config.protocol, Protocol::HttpJson);
         assert_eq!(config.headers, [("b".to_string(), "2".to_string())]);
         assert_eq!(config.timeout, EXPORT_BOUND, "a long timeout is capped");
 
-        let config = config_from(&env(&[
+        let config = from_pairs(&[
             BASE,
             (
                 "OTEL_EXPORTER_OTLP_HEADERS",
                 "x-honeycomb-team=old,other=1,X-Honeycomb-Team=new",
             ),
-        ]))
+        ])
         .unwrap();
         assert_eq!(
             config.headers,
@@ -737,7 +810,7 @@ mod tests {
     #[test]
     fn otel_resource_attributes_reach_the_resource() {
         let deck = "deck.run.id=run-1,deck.pane.id=7,deck.role=coder,host.name=box";
-        let config = config_from(&env(&[BASE, ("OTEL_RESOURCE_ATTRIBUTES", deck)])).unwrap();
+        let config = from_pairs(&[BASE, ("OTEL_RESOURCE_ATTRIBUTES", deck)]).unwrap();
         let pairs = |list: &[(&str, &str)]| -> Vec<(String, String)> {
             list.iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -783,7 +856,7 @@ mod tests {
 
     #[test]
     fn the_service_name_resolves_as_an_sdk_resolves_it() {
-        let name = |pairs: &[(&str, &str)]| config_from(&env(pairs)).unwrap().resource;
+        let name = |pairs: &[(&str, &str)]| from_pairs(pairs).unwrap().resource;
         assert_eq!(
             name(&[BASE, ("OTEL_RESOURCE_ATTRIBUTES", "service.name=a,k=v")]),
             [
@@ -799,6 +872,128 @@ mod tests {
             ]),
             [("service.name".to_string(), "b".to_string())]
         );
+    }
+
+    fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
+        list.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn the_decks_own_variables_fill_a_missing_run_pane_and_host() {
+        let resource = |vars: &[(&str, &str)], host: Option<&str>| {
+            let host = host.map(str::to_string);
+            config_from(&env(vars), &move || host.clone())
+                .unwrap()
+                .resource
+        };
+
+        assert_eq!(
+            resource(&[BASE], None),
+            pairs(&[("service.name", DEFAULT_SERVICE_NAME)]),
+            "nothing is added when neither source has a value"
+        );
+        assert_eq!(
+            resource(&[BASE, (RUN_ID_ENV, " "), (PANE_ID_ENV, "")], Some("  ")),
+            pairs(&[("service.name", DEFAULT_SERVICE_NAME)]),
+            "a blank value is no value"
+        );
+        assert_eq!(
+            resource(
+                &[BASE, (RUN_ID_ENV, "run-1"), (PANE_ID_ENV, "pane-7")],
+                Some("box")
+            ),
+            pairs(&[
+                ("service.name", DEFAULT_SERVICE_NAME),
+                ("deck.run.id", "run-1"),
+                ("deck.pane.id", "pane-7"),
+                ("host.name", "box"),
+            ]),
+            "without OTEL_RESOURCE_ATTRIBUTES, each comes from its fallback"
+        );
+
+        // Each fallback applies only to its own missing attribute.
+        for (otel, kept) in [
+            ("deck.run.id=otel-run", ("deck.run.id", "otel-run")),
+            ("deck.pane.id=otel-pane", ("deck.pane.id", "otel-pane")),
+            ("host.name=otel-host", ("host.name", "otel-host")),
+        ] {
+            let got = resource(
+                &[
+                    BASE,
+                    ("OTEL_RESOURCE_ATTRIBUTES", otel),
+                    (RUN_ID_ENV, "env-run"),
+                    (PANE_ID_ENV, "env-pane"),
+                ],
+                Some("env-host"),
+            );
+            for (key, fallback) in [
+                ("deck.run.id", "env-run"),
+                ("deck.pane.id", "env-pane"),
+                ("host.name", "env-host"),
+            ] {
+                let values: Vec<&str> = got
+                    .iter()
+                    .filter(|(k, _)| k == key)
+                    .map(|(_, v)| v.as_str())
+                    .collect();
+                let want = if key == kept.0 { kept.1 } else { fallback };
+                assert_eq!(values, [want], "{key} with {otel}: {got:?}");
+            }
+        }
+
+        let config = config_from(
+            &env(&[
+                BASE,
+                (
+                    "OTEL_RESOURCE_ATTRIBUTES",
+                    "deck.run.id=a,deck.pane.id=b,host.name=c",
+                ),
+                (RUN_ID_ENV, "env-run"),
+                (PANE_ID_ENV, "env-pane"),
+            ]),
+            &|| panic!("the host name is not read when the resource has one"),
+        )
+        .unwrap();
+        assert_eq!(
+            config.resource,
+            pairs(&[
+                ("service.name", DEFAULT_SERVICE_NAME),
+                ("deck.run.id", "a"),
+                ("deck.pane.id", "b"),
+                ("host.name", "c"),
+            ]),
+            "a value from OTEL_RESOURCE_ATTRIBUTES wins"
+        );
+
+        assert_eq!(
+            resource(
+                &[
+                    BASE,
+                    (
+                        "OTEL_RESOURCE_ATTRIBUTES",
+                        "deck.run.id=,k=v,deck.pane.id=%20,host.name=",
+                    ),
+                    (RUN_ID_ENV, "env-run"),
+                    (PANE_ID_ENV, "env-pane"),
+                ],
+                Some("env-host"),
+            ),
+            pairs(&[
+                ("service.name", DEFAULT_SERVICE_NAME),
+                ("deck.run.id", "env-run"),
+                ("k", "v"),
+                ("deck.pane.id", "env-pane"),
+                ("host.name", "env-host"),
+            ]),
+            "a blank value in OTEL_RESOURCE_ATTRIBUTES is replaced by its fallback, in place"
+        );
+    }
+
+    #[test]
+    fn the_host_name_is_never_empty() {
+        assert!(read_host_name().is_none_or(|h| !h.is_empty() && h == h.trim()));
     }
 
     fn info() -> RunInfo {
