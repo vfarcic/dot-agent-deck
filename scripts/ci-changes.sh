@@ -17,8 +17,9 @@
 #                are skipped, nix runs
 #   binary       the change feeds the binary or the cross-version harness, so
 #                `cross-version` runs (a PR only; a manual run always does)
-#   cargo        Cargo.toml, Cargo.lock, a vendored crate or a CI definition
-#                changed, so the aarch64 cross-build runs
+#   cargo        Cargo.toml, Cargo.lock, a vendored crate, the cargo
+#                configuration, a toolchain file or a CI definition changed, so
+#                the aarch64 cross-build runs
 set -euo pipefail
 
 event=${1:?usage: ci-changes.sh <event> <author> < changed-paths}
@@ -66,7 +67,8 @@ case "$event" in
           ;;
       esac
       case "$f" in
-        Cargo.toml | Cargo.lock | vendor/* | .github/workflows/aarch64-crossbuild-check.yml | .rwx/ci.yml)
+        Cargo.toml | Cargo.lock | vendor/* | .cargo/* | rust-toolchain | rust-toolchain.toml | \
+          .github/workflows/aarch64-crossbuild-check.yml | .rwx/ci.yml)
           cargo=true
           ;;
       esac
