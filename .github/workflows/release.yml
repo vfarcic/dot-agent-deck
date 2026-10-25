@@ -566,6 +566,25 @@ jobs:
         with:
           name: dot-agent-deck-${{ matrix.artifact_suffix }}
           path: ${{ env.BINARY_NAME }}
+      # PRD #1859: the resource collector, a second binary of the same package
+      # that the build above already compiled. Linux only: on macOS it is a
+      # stub that exits 3, so it is not published there. Its artifact name
+      # matches finalize's `dot-agent-deck-*` pattern, so it lands in `dist/`,
+      # in `checksums.txt` and in `attest` with the deck's own binaries.
+      - name: Package the collector
+        if: contains(matrix.target, '-linux-')
+        env:
+          MATRIX_TARGET: ${{ matrix.target }}
+          MATRIX_ARTIFACT_SUFFIX: ${{ matrix.artifact_suffix }}
+        run: |
+          COLLECTOR_NAME="dot-agent-deck-collector-${MATRIX_ARTIFACT_SUFFIX}"
+          cp "target/${MATRIX_TARGET}/release/dot-agent-deck-collector" "$COLLECTOR_NAME"
+          echo "COLLECTOR_NAME=$COLLECTOR_NAME" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: contains(matrix.target, '-linux-')
+        with:
+          name: dot-agent-deck-collector-${{ matrix.artifact_suffix }}
+          path: ${{ env.COLLECTOR_NAME }}
 
   finalize:
     needs: [prepare, build]
@@ -713,7 +732,7 @@ jobs:
   # The topology is the design. This job hangs off `prepare`, NOT `build`, so it
   # runs concurrently with the CLI matrix and adds nothing to the critical path;
   # and `finalize` deliberately does not list it in `needs:`, so the GitHub
-  # Release and its five CLI assets are created on exactly today's path whether
+  # Release and its CLI assets are created on exactly today's path whether
   # this job succeeds, fails, or is skipped. A broken bundler can therefore
   # neither slow a tag nor break one.
   #
