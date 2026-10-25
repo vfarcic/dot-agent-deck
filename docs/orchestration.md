@@ -442,7 +442,7 @@ A role "reaches no worker" when it is not in the file, when it is the orchestrat
 
 | Outcome | Exit status | Printed |
 |---|---|---|
-| The task's report was taken | 0 | `Reported task <id> to the orchestrator.`, or, when the orchestrator is no longer running, that the deck saved it in Deck notices |
+| The task's report was taken | 0 | `Reported task <id> to the orchestrator.`, or, when the orchestrator is no longer running, that the deck saved the report to a file, with the report's id. The TUI and the desktop app cannot show or list saved reports yet; [Saved results and reports](troubleshooting.md#saved-results-and-reports) says where the file is |
 | The same report was already taken | 0 | `Task <id> was already reported; nothing new was sent.` |
 | A different report for a task already reported | non-zero | `Task <id> was already reported; this different report was NOT delivered. …` |
 | No `--task-id` | 0 | `Sent to the orchestrator as a note that completes no task. …` |

@@ -283,7 +283,7 @@ fn route_002_worker_notices_are_bound_deck_messages() {
     }
 }
 
-/// Scenario: Exit a bound worker before fetching its delegated message. The task remains inspectable as Undeliverable and the orchestrator receives a daemon notice naming that exact task id, rather than losing the task or delivering it to another generation. Then, in a second team, replace the orchestrator before its worker runs the real `work-done --task-id`: the CLI says the report was saved in Deck notices, the deck's recovery rows list it as a worker report for that task, and the successor orchestrator gets nothing.
+/// Scenario: Exit a bound worker before fetching its delegated message. The task remains inspectable as Undeliverable and the orchestrator receives a daemon notice naming that exact task id, rather than losing the task or delivering it to another generation. Then, in a second team, replace the orchestrator before its worker runs the real `work-done --task-id`: the CLI says the report was saved to a file, naming the report id that the deck's recovery rows list for that task's worker report, and that the clients cannot show saved reports yet, and the successor orchestrator gets nothing.
 #[spec("inbox/route/003")]
 #[test]
 fn route_003_exited_bound_agent_is_undeliverable_and_notifies_sender() {
@@ -356,22 +356,25 @@ fn route_003_exited_bound_agent_is_undeliverable_and_notifies_sender() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert_eq!(
-        String::from_utf8_lossy(&out.stdout),
-        format!(
-            "Reported task {id}. Its orchestrator is no longer running, so the deck saved the \
-             report in Deck notices.\n"
-        )
-    );
     let rows = attach(&daemon, json!({"op":"list-outcomes"}));
     let outcomes = rows["deck_outcomes"]["outcomes"]
         .as_array()
         .unwrap_or_else(|| panic!("list-outcomes answers rows: {rows}"));
-    assert!(
-        outcomes
-            .iter()
-            .any(|row| row["phase"] == "worker_report" && row["task_id"] == id.as_str()),
-        "a worker_report row for the task: {rows}"
+    let row = outcomes
+        .iter()
+        .find(|row| row["phase"] == "worker_report" && row["task_id"] == id.as_str())
+        .unwrap_or_else(|| panic!("a worker_report row for the task: {rows}"));
+    let report = row["report_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the row names its report: {rows}"));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!(
+            "Reported task {id}. Its orchestrator is no longer running, so the deck saved the \
+             report to a file, report {report}. The TUI and the desktop app cannot show or list \
+             saved reports yet; `dot-agent-deck docs troubleshooting`, section \"Saved results \
+             and reports\", says where the file is.\n"
+        )
     );
     route::no_messages(&daemon, &successor, Duration::from_millis(500));
     assert!(
