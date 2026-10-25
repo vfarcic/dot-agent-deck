@@ -1570,23 +1570,43 @@ impl TuiDeck {
             .expect("resize PTY");
     }
 
-    /// Resize to `first`, wait until the reader has recorded output after the
-    /// call, then resize to `second`. This is a race amplifier, not a
-    /// guarantee: it makes it likely that the second SIGWINCH reaches the deck
-    /// while it is still drawing for the first, so that a key sent straight
-    /// after it arrives in the same readiness batch, the moment
-    /// `resize/sigwinch/004` needs. The output it sees can be older buffered
-    /// output, or a redraw that has finished before the second resize is sent.
-    /// Decision 21: the wait is a poll on the reader's last-byte stamp, here
-    /// rather than in a test body.
+    /// Resize to `first`, wait until the reader has recorded the clear-screen
+    /// (`ESC [2J`) that starts the deck's redraw for a new size, then resize
+    /// to `second`. ratatui clears the whole screen when it finds the size
+    /// changed and then writes every cell, so the second SIGWINCH is sent
+    /// while that full-frame write is likely still under way; the deck's
+    /// ordinary frames, which it draws every event-loop pass, send only the
+    /// changed cells and the cursor and do not clear the screen. This is
+    /// a race amplifier, not a guarantee: the redraw can finish before the
+    /// second resize is sent. What it amplifies is the moment
+    /// `resize/sigwinch/004` needs, a key sent straight after the second
+    /// resize arriving in the same readiness batch as its SIGWINCH. Decision
+    /// 21: the wait is a poll on the reader's byte history, here rather than
+    /// in a test body.
     pub fn resize_during_redraw(&mut self, first: (u16, u16), second: (u16, u16)) {
-        let before = Instant::now();
+        const CLEAR_SCREEN: &[u8] = b"\x1b[2J";
+        let mut scan_from = self.byte_history.lock().unwrap().len();
         self.resize(first.0, first.1);
-        let deadline = before + WAIT_TIMEOUT;
-        while *self.last_byte_at.lock().unwrap() <= before {
+        let deadline = Instant::now() + WAIT_TIMEOUT;
+        loop {
+            {
+                let hist = self.byte_history.lock().unwrap();
+                if hist[scan_from..]
+                    .windows(CLEAR_SCREEN.len())
+                    .any(|w| w == CLEAR_SCREEN)
+                {
+                    break;
+                }
+                // Keep the last bytes, which can be the start of a clear
+                // whose end the reader has not recorded yet.
+                scan_from = hist
+                    .len()
+                    .saturating_sub(CLEAR_SCREEN.len() - 1)
+                    .max(scan_from);
+            }
             assert!(
                 Instant::now() < deadline,
-                "the deck emitted nothing within {WAIT_TIMEOUT:?} of a resize to {}x{}",
+                "the deck did not start a redraw within {WAIT_TIMEOUT:?} of a resize to {}x{}",
                 first.0,
                 first.1
             );
