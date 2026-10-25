@@ -23,8 +23,8 @@ use super::disk::git_toplevel;
 /// Worker threads looking directories up.
 pub const WORKERS: usize = 2;
 /// Lookups queued or running at once, at most. A directory past it waits
-/// for a later sample; one never answered goes first, then the one whose
-/// last lookup is oldest.
+/// for a place: one a sample waits for goes first, then one never answered,
+/// then the one whose last lookup is oldest.
 pub const MAX_OUTSTANDING: usize = 64;
 /// How long a sample waits for the lookups that decide the worktree of a run
 /// it sees for the first time. A lookup still outstanding then counts as no
@@ -129,20 +129,35 @@ impl Discovery {
     }
 
     /// Queue a lookup of each directory in `cwds` that has none
-    /// outstanding, up to the bound, and forget the directories not in it
-    /// whose lookup has finished. Then wait, until `until` at the latest,
-    /// for the directories in `wanted` that have a lookup outstanding and no
-    /// answer yet. A directory of `wanted` that could not be queued is not
-    /// waited for; [`Self::look_up_all`] waits for those too.
+    /// outstanding, up to the bound and those in `wanted` without an answer
+    /// first, and forget the directories not in it whose lookup has
+    /// finished. Then wait, until `until` at the latest, for the directories
+    /// in `wanted` that have no answer yet, queueing each that missed the
+    /// bound once a place frees, as [`Self::look_up_all`] does.
     pub fn update(&mut self, cwds: &BTreeSet<PathBuf>, wanted: &BTreeSet<PathBuf>, until: Instant) {
         self.drain();
-        self.schedule(cwds);
+        self.schedule(cwds, wanted);
         loop {
-            let waiting = wanted.iter().any(|cwd| {
-                self.state
-                    .get(cwd)
-                    .is_some_and(|s| s.answer.is_none() && s.outstanding.is_some())
-            });
+            let unqueued: Vec<PathBuf> = wanted
+                .iter()
+                .filter(|cwd| {
+                    cwds.contains(*cwd)
+                        && self
+                            .state
+                            .get(*cwd)
+                            .is_some_and(|s| s.answer.is_none() && s.outstanding.is_none())
+                })
+                .cloned()
+                .collect();
+            let room = self.max_outstanding.saturating_sub(self.outstanding());
+            let left = unqueued.len().saturating_sub(room);
+            self.queue(unqueued.into_iter().take(room).collect());
+            let waiting = left > 0
+                || wanted.iter().any(|cwd| {
+                    self.state
+                        .get(cwd)
+                        .is_some_and(|s| s.answer.is_none() && s.outstanding.is_some())
+                });
             let now = Instant::now();
             if !waiting || now >= until {
                 return;
@@ -218,22 +233,25 @@ impl Discovery {
             .retain(|cwd, state| cwds.contains(cwd) || state.outstanding.is_some());
     }
 
-    fn schedule(&mut self, cwds: &BTreeSet<PathBuf>) {
+    fn schedule(&mut self, cwds: &BTreeSet<PathBuf>, wanted: &BTreeSet<PathBuf>) {
         self.forget_unused(cwds);
-        let mut due: Vec<(&PathBuf, bool, Option<Instant>)> = Vec::new();
+        let mut due: Vec<(&PathBuf, bool, bool, Option<Instant>)> = Vec::new();
         for cwd in cwds {
             let state = self.state.entry(cwd.clone()).or_default();
             if state.outstanding.is_none() {
-                due.push((cwd, state.answer.is_some(), state.queued));
+                let answered = state.answer.is_some();
+                let awaited = !answered && wanted.contains(cwd);
+                due.push((cwd, !awaited, answered, state.queued));
             }
         }
-        // Never answered first, then the oldest lookup.
-        due.sort_by_key(|(_, answered, queued)| (*answered, *queued));
+        // What the sample waits for first, then never answered, then the
+        // oldest lookup.
+        due.sort_by_key(|(_, not_awaited, answered, queued)| (*not_awaited, *answered, *queued));
         let room = self.max_outstanding.saturating_sub(self.outstanding());
         let due: Vec<PathBuf> = due
             .into_iter()
             .take(room)
-            .map(|(cwd, _, _)| cwd.clone())
+            .map(|(cwd, _, _, _)| cwd.clone())
             .collect();
         self.queue(due);
     }
@@ -460,6 +478,48 @@ mod tests {
             discovery.toplevel(Path::new("/w/b")),
             Some(&Some(PathBuf::from("/w/b")))
         );
+    }
+
+    /// Qodo 4371872375: a sample that sees more new directories than may be
+    /// outstanding at once queues the rest as places free during its wait,
+    /// so each lookup that answers at once lands within the wait, not at a
+    /// later sample.
+    #[test]
+    fn a_first_sight_wait_refills_past_the_bound() {
+        let looked_up = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&looked_up);
+        let lookup: LookupFn = Arc::new(move |cwd: &Path| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Some(cwd.to_path_buf())
+        });
+        let mut discovery = Discovery::new(2, 3, lookup).unwrap();
+        let cwds: BTreeSet<PathBuf> = (0..20).map(|i| PathBuf::from(format!("/w/{i}"))).collect();
+        discovery.update(&cwds, &cwds, Instant::now() + FIRST_SIGHT_WAIT);
+        for cwd in &cwds {
+            assert_eq!(discovery.toplevel(cwd), Some(&Some(cwd.clone())), "{cwd:?}");
+        }
+        assert_eq!(looked_up.load(Ordering::SeqCst), cwds.len());
+        assert_eq!(discovery.outstanding(), 0);
+    }
+
+    /// Qodo 4371872375: with room for one lookup, a directory the sample
+    /// waits for goes before one it does not, even one never answered.
+    #[test]
+    fn a_directory_a_sample_waits_for_is_looked_up_first() {
+        let gate = Gate::new();
+        let mut discovery = Discovery::new(1, 1, gate.lookup()).unwrap();
+        let cwds = set(&["/stalled/a", "/w/z"]);
+        discovery.update(
+            &cwds,
+            &set(&["/w/z"]),
+            Instant::now() + Duration::from_secs(10),
+        );
+        assert_eq!(
+            discovery.toplevel(Path::new("/w/z")),
+            Some(&Some(PathBuf::from("/w/z")))
+        );
+        assert_eq!(gate.stalled.load(Ordering::SeqCst), 0);
+        gate.release();
     }
 
     /// N1: `--once` looks up every directory, more of them than may be

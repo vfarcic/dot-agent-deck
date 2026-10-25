@@ -549,10 +549,15 @@ mod fd {
                 return None;
             }
             let mut stx = std::mem::MaybeUninit::<libc::statx>::zeroed();
+            // The raw syscall rather than the C library's `statx` wrapper,
+            // which glibc gained only in 2.28: a reference to the wrapper
+            // fails to link against an older glibc, such as the aarch64
+            // release build's.
             // SAFETY: the empty path with `AT_EMPTY_PATH` names the open
-            // descriptor itself, and `stx` is writable.
+            // descriptor itself, and `stx` is a writable `struct statx`.
             let rc = unsafe {
-                libc::statx(
+                libc::syscall(
+                    libc::SYS_statx,
                     self.fd.0,
                     c"".as_ptr(),
                     libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
@@ -569,7 +574,8 @@ mod fd {
             (stx.stx_mask & STATX_MNT_ID != 0).then_some(stx.stx_mnt_id)
         }
 
-        /// Without the C library's `statx`, `/proc` alone reports it.
+        /// Where the `libc` crate defines no `struct statx`, `/proc` alone
+        /// reports it.
         #[cfg(all(target_os = "linux", not(any(target_env = "gnu", target_env = "musl"))))]
         fn statx_mount_id(&self) -> Option<u64> {
             None

@@ -1641,6 +1641,38 @@ mod linux {
             assert_eq!(decided, Some(expected));
         }
 
+        /// Qodo 4371872375: a first sample with more new runs, each in its
+        /// own directory, than lookups may be outstanding at once still
+        /// decides every run's worktree within the first-sight wait.
+        #[test]
+        fn every_new_run_gets_its_worktree_past_the_lookup_bound() {
+            let cli = Cli::parse_from(["dot-agent-deck-collector", "--disk-interval", "0"]);
+            let mut sampler = Sampler::new(&cli, settings(Temporality::Cumulative)).unwrap();
+            let lookup: discovery::LookupFn = Arc::new(|cwd: &std::path::Path| Some(cwd.into()));
+            sampler.discovery = Some(Discovery::new(2, 3, lookup).unwrap());
+            let cwd_of = |pid: u32| Some(PathBuf::from(format!("/w/{pid}")));
+            let (sample, _) = sampler.read_from(
+                || {
+                    (0..20)
+                        .map(|i| process(5000 + i, &format!("run-{i}"), CLK_TCK))
+                        .collect()
+                },
+                cwd_of,
+                LookupWait::FirstSight { cap: None },
+            );
+            assert_eq!(sample.runs.len(), 20);
+            for run in &sample.runs {
+                let pid = run.members[0];
+                let decided = sampler
+                    .run_worktrees
+                    .get()
+                    .get(&run.key())
+                    .map(|w| w.id.clone());
+                let expected = worktree_id(&cwd_of(pid).unwrap());
+                assert_eq!(decided, Some(expected), "{:?}", run.key());
+            }
+        }
+
         /// A sample is timed once its processes are read: a run that
         /// started during a slow read is no later than the sample, so its
         /// first CPU interval is not inverted.
