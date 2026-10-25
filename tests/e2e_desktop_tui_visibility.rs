@@ -1290,6 +1290,136 @@ fn visibility_002_desktop_prepared_orchestration_surfaces_into_attached_tui_as_o
     );
 }
 
+/// Scenario: Attach a real TUI to a daemon running one plain Pi pane, with its
+/// event stream set to break on that pane's `Thinking` and then stay down
+/// while a hold file exists. Send `agent-event --type running` for the pane to
+/// break the stream, launch the desktop's prepared three-role orchestration
+/// (whose roles emit no hooks) while it is down, then remove the hold file:
+/// once the stream reconnects, the titled tab must appear and switching into it
+/// must show all three role-named cards (issue #1800).
+#[spec("newagent/visibility/002")]
+#[test]
+fn visibility_002_desktop_prepared_orchestration_started_during_a_stream_gap_gets_its_tab() {
+    const TRIGGER_PANE: &str = "pane-stream-gap-trigger";
+    const TRIGGER_LABEL: &str = "stream-gap-trigger";
+
+    let daemon = common::spawn_daemon_serve_with_env(
+        None,
+        "0",
+        &[("DOT_AGENT_DECK_HOOK_PROVENANCE", "warn")],
+    );
+    let response = daemon
+        .send_attach_request(&AttachRequest::StartAgent {
+            command: Some("sh -c 'sleep 600'".into()),
+            cwd: None,
+            rows: 24,
+            cols: 80,
+            env: vec![(DOT_AGENT_DECK_PANE_ID.into(), TRIGGER_PANE.into())],
+            display_name: Some(TRIGGER_LABEL.into()),
+            tab_membership: None,
+            agent_type: Some(AgentType::Pi),
+            seed: None,
+            authoring_kind: None,
+            client_seeded_kind: None,
+            remember_command: false,
+        })
+        .expect("StartAgent the trigger pane over the attach socket");
+    assert!(
+        response.error.is_none(),
+        "StartAgent should succeed, got error: {:?}",
+        response.error
+    );
+    let trigger_agent_id = daemon.wait_for_agent_count(1, Duration::from_secs(10))[0]
+        .id
+        .clone();
+
+    // The `e2e`-build seams: `main.rs`'s `e2e_subscriber_breaks` tears the
+    // stream down on the trigger pane's first `Thinking`, and
+    // `event_subscriber::e2e_hold_stream_down` keeps it down while the hold
+    // file exists, writing `<hold>.held` once it is holding.
+    let hold_dir = common::harness_tempdir().expect("create the stream-hold directory");
+    let hold = hold_dir.path().join("hold-stream-down");
+    let held = hold_dir.path().join("hold-stream-down.held");
+    std::fs::write(&hold, b"").expect("create the stream-hold file");
+    let deck = TuiDeck::builder()
+        .with_pty_size(120, 40)
+        .with_env(
+            "DOT_AGENT_DECK_ATTACH_SOCKET",
+            daemon.attach_socket.to_string_lossy().to_string(),
+        )
+        .with_env(
+            "DOT_AGENT_DECK_SOCKET",
+            daemon.hook_socket.to_string_lossy().to_string(),
+        )
+        .with_env(
+            "DOT_AGENT_DECK_E2E_BREAK_STREAM_ON",
+            format!("{TRIGGER_PANE}/Thinking"),
+        )
+        .with_env(
+            "DOT_AGENT_DECK_E2E_HOLD_STREAM_DOWN",
+            hold.to_string_lossy().to_string(),
+        )
+        .launch_with_fixture("minimal");
+    deck.wait_for_string(TRIGGER_LABEL);
+
+    let output = daemon.run_agent_event(TRIGGER_PANE, Some(&trigger_agent_id), "running");
+    assert!(
+        output.status.success(),
+        "the real `agent-event --type running` CLI failed: status={:?} stdout={:?} stderr={:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        common::wait_until(Duration::from_secs(15), || held.exists()),
+        "the TUI's event stream never broke and held down on {TRIGGER_PANE}/Thinking, so the \
+         orchestration below would not start during a gap. Grid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // The orchestration starts while nothing in the TUI is listening.
+    let project = write_orchestration_project();
+    let project_path = canonical_string(project.path());
+    start_orchestration_from_desktop(&daemon, &project_path);
+    let records =
+        daemon.wait_for_agent_count(ORCHESTRATION_ROLES.len() + 1, Duration::from_secs(10));
+    assert!(
+        !common::wait_until(Duration::from_secs(1), || {
+            deck.snapshot_grid().contains(ORCHESTRATION_TITLE)
+        }),
+        "precondition: the tab must not appear while the stream is held down, or this test \
+         is not exercising a gap. Grid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    std::fs::remove_file(&hold).expect("release the stream hold");
+    assert!(
+        common::wait_until(Duration::from_secs(15), || {
+            deck.snapshot_grid().lines().next().is_some_and(|tabs| {
+                tabs.contains("Dashboard") && tabs.contains(ORCHESTRATION_TITLE)
+            })
+        }),
+        "after the stream reconnected, the resync must rebuild the tab {ORCHESTRATION_TITLE:?} \
+         of the orchestration started during the gap. Daemon records: {records:#?}\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+    deck.send_bytes(b"\x1b[C"); // Right -> next tab -> Desktop prepared run
+    assert!(
+        common::wait_until(Duration::from_secs(10), || {
+            let grid = deck.snapshot_grid();
+            // Three of the deck's four agents (the trigger pane is the fourth).
+            grid.contains("3/4 agent(s)")
+                && grid.contains("ClaudeCode · coordinator")
+                && grid.contains("OpenCode · builder")
+                && grid.contains("Pi · reviewer")
+        }),
+        "the rebuilt tab {ORCHESTRATION_TITLE:?} must show three of the four sessions, the \
+         role-named ClaudeCode coordinator, OpenCode builder, and Pi reviewer cards. \
+         Daemon records: {records:#?}\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+}
+
 /// Scenario: Start the same named plain agent through the desktop-shaped
 /// request twice against already-attached TUIs. A confirmed TUI-native close is
 /// the control; a desktop-shaped `StopAgent` must remove the second card from
