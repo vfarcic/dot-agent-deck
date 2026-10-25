@@ -11,7 +11,8 @@
 //! narrow: the SIGWINCH and the keys have to be waiting together when the event
 //! loop next polls, which is what a resize landing while the deck is still
 //! drawing the previous one produces. So each keystroke here follows two
-//! resizes, the second sent once the deck has started drawing the first.
+//! resizes, the second sent once the deck has written output after the first,
+//! which makes that overlap likely rather than certain.
 //!
 //! What it watches is filter-mode text, which only grows, so each key has a
 //! check of its own that no earlier key can satisfy.
@@ -39,7 +40,7 @@ const KEY_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Scenario: Launch the deck on an empty dashboard and open the filter with
 /// `/`. Then, sixty times, resize the terminal, resize it again once the deck
-/// starts redrawing, and type one character straight after the second resize;
+/// has written output, and type one character straight after the second resize;
 /// every character must appear in the filter prompt without the test sending
 /// any further byte. The filter is closed with Esc and reopened every fifteen
 /// characters.

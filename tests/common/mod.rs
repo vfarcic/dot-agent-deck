@@ -1570,12 +1570,15 @@ impl TuiDeck {
             .expect("resize PTY");
     }
 
-    /// Resize to `first`, wait until the deck emits output after it, then
-    /// resize to `second`, so the second SIGWINCH lands while the deck is
-    /// drawing. A key sent straight after this reaches the deck together with
-    /// that SIGWINCH, the moment `resize/sigwinch/004` needs. Decision 21: the
-    /// wait is a poll on the reader's last-byte stamp, here rather than in a
-    /// test body.
+    /// Resize to `first`, wait until the reader has recorded output after the
+    /// call, then resize to `second`. This is a race amplifier, not a
+    /// guarantee: it makes it likely that the second SIGWINCH reaches the deck
+    /// while it is still drawing for the first, so that a key sent straight
+    /// after it arrives in the same readiness batch, the moment
+    /// `resize/sigwinch/004` needs. The output it sees can be older buffered
+    /// output, or a redraw that has finished before the second resize is sent.
+    /// Decision 21: the wait is a poll on the reader's last-byte stamp, here
+    /// rather than in a test body.
     pub fn resize_during_redraw(&mut self, first: (u16, u16), second: (u16, u16)) {
         let before = Instant::now();
         self.resize(first.0, first.1);
