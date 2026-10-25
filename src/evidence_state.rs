@@ -13,13 +13,19 @@
 //! parser at the new geometry starts at the marker, with the terminal modes in
 //! force there, and bytes before it are never parsed. The state turns
 //! **Clean** only once a frame from that parser shows the profile's width
-//! witness, a row the agent ties to the terminal's width. It rejects a full
-//! redraw drawn for another width in the cases each profile's witness tells
-//! apart (`src/doorbell_screen.rs` says which), and stays pending in the
-//! rest. A generation starts the same way
-//! from its first byte at the spawn geometry, needing the witness but no
-//! marker. A nudge whose restore fails leaves the width unknown until the next
-//! successful resize.
+//! witness, a row the agent ties to the terminal's width, and a witness row
+//! counts only once the stream has moved the cursor off it, so a PTY read
+//! that ends inside a row drawn for a wider terminal is never taken for one
+//! drawn for this width. The tested scope (`inbox/doorbell/044`): Claude
+//! Code's rule and Codex's padded choice and turn rows drawn one or twenty
+//! columns too wide stay pending whole, cut at any byte and pushed a byte at a
+//! time, and Codex's start-up logo stays pending after a move between the two
+//! widths that draw it alike. A row drawn in pieces with a cursor move at the
+//! new edge is not always refused (`src/doorbell_screen.rs`, on the padded
+//! row, says when); every measured redraw drew its rows in one run. A
+//! generation starts the same way from its first byte at the spawn geometry,
+//! needing the witness but no marker. A nudge whose restore fails leaves the
+//! width unknown until the next successful resize.
 //!
 //! Nothing turns Dirty into Clean because time passed. An agent that redraws
 //! nothing after an edge stays Dirty.

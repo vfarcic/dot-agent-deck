@@ -22433,12 +22433,13 @@ mod spawn_tests {
         assert_eq!(evidence(&plain), EvidenceStatus::Unprofiled);
     }
 
-    /// A Codex redraw for a terminal `cols` wide: its full-redraw marker and
-    /// a dialog's highlighted choice padded to the edge.
+    /// A Codex redraw for a terminal `cols` wide: its full-redraw marker, a
+    /// dialog's highlighted choice padded to the edge, and the next choice,
+    /// whose cursor move ends the padded row as in Codex's recorded frames.
     fn codex_choice_frame(cols: u16) -> Vec<u8> {
         let text = "› 1. Trust and continue";
         format!(
-            "\x1b[?2026h\x1b[1;1H\x1b[J\x1b[8;1H\x1b[1;7m{text}{}\x1b[0m",
+            "\x1b[?2026h\x1b[1;1H\x1b[J\x1b[8;1H\x1b[1;7m{text}{}\x1b[0m\x1b[9;3H2. Back",
             " ".repeat(cols as usize - text.chars().count())
         )
         .into_bytes()

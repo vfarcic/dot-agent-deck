@@ -339,20 +339,42 @@ impl WidthsSeen {
 }
 
 /// Whether row `row` of `screen` was drawn to the right edge as one padded
-/// row for this width: its last cell holds a written blank (padding, which an
-/// agent writes up to the width it believes in), the row did not run on to
-/// the next one, and it is not itself the run-on of the row above. A row
+/// row for this width, and ended there: its last cell holds a written blank
+/// (padding, which an agent writes up to the width it believes in), the row
+/// did not run on to the next one, it is not itself the run-on of the row
+/// above, and the stream has moved the cursor off it ([`row_ended`]). A row
 /// padded for a wider terminal runs past this edge, so the parser (which
-/// always wraps at the edge) marks it wrapped; one padded for a narrower
-/// terminal stops short of the edge. This holds for a row the agent draws in
-/// one run, as every witness row in the measured redraws was; a row drawn
-/// with a cursor jump exactly at the new edge is not told apart.
+/// always wraps at the edge) marks it wrapped once the cell past the edge
+/// arrives; one padded for a narrower terminal stops short of the edge.
+///
+/// This holds for a row the agent draws in one run, as every witness row in
+/// the measured redraws was, however the PTY splits its reads. A row drawn in
+/// pieces with a cursor move between them, the first piece ending exactly at
+/// the new edge, is not always told apart: a move off the row reads as the
+/// row's end, and a move the parser clamps to the last cell lets a one-cell
+/// next piece overwrite that cell instead of running past it.
 fn padded_edge_row(screen: &vt100::Screen, row: u16) -> bool {
     let (_, cols) = crate::vt_grid::size(screen);
     let padded = screen
         .cell(row, cols - 1)
         .is_some_and(|c| c.has_contents() && c.contents().trim().is_empty());
-    padded && !screen.row_wrapped(row) && (row == 0 || !screen.row_wrapped(row - 1))
+    padded
+        && !screen.row_wrapped(row)
+        && (row == 0 || !screen.row_wrapped(row - 1))
+        && row_ended(screen, row)
+}
+
+/// Whether the stream shows that row `row` ended at this width: the cursor is
+/// off the row's last cell. Writing that cell leaves the parser's cursor on
+/// it, waiting to wrap, so a PTY read that ends there has delivered a row
+/// that a wider redraw continues past the edge in the next read; a carriage
+/// return, a line feed, a cursor move or the next row drawn takes the cursor
+/// away and ends the row. Until one arrives the row is not a witness, however
+/// the screen looks.
+fn row_ended(screen: &vt100::Screen, row: u16) -> bool {
+    let (_, cols) = crate::vt_grid::size(screen);
+    let (cursor_row, cursor_col) = screen.cursor_position();
+    cursor_row != row || cursor_col < cols - 1
 }
 
 /// Whether row `row` of `screen` holds `N.` from column `col`.
@@ -719,17 +741,20 @@ fn claude_transcript_user_line(grid: &Grid, line: &str) -> bool {
 }
 
 /// A full-width rule tied to the width the agent drew at: every cell `─`, the
-/// row neither running on to the next one nor the run-on of the row above. A
-/// rule drawn for a wider terminal runs past this edge, which the parser
+/// row neither running on to the next one nor the run-on of the row above,
+/// and the cursor moved off it ([`row_ended`]). A rule drawn for a wider
+/// terminal runs past this edge once its next cell arrives, which the parser
 /// (always wrapping at the edge) marks; one drawn for a narrower terminal
 /// stops short of it. Like Codex's rows, this holds for a rule drawn in one
-/// run, as every measured redraw drew it.
+/// run, as every measured redraw drew it ([`padded_edge_row`] says what a
+/// rule drawn in two pieces does).
 fn claude_width_witness(screen: &vt100::Screen, _seen: &WidthsSeen) -> bool {
     let (rows, cols) = crate::vt_grid::size(screen);
     (0..rows).any(|r| {
         (0..cols).all(|c| screen.cell(r, c).is_some_and(|cell| cell.contents() == "─"))
             && !screen.row_wrapped(r)
             && (r == 0 || !screen.row_wrapped(r - 1))
+            && row_ended(screen, r)
     })
 }
 

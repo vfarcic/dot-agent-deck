@@ -274,3 +274,12 @@ path = "examples/diff_config.rs"
 # at the dev profile's settings.
 [profile.dev.package.earshot]
 opt-level = 3
+
+# PRD #1666 part 3: `inbox/doorbell/044` replays recorded agent runs through
+# the doorbell's evidence parser one byte per push, so a PTY read cut at any
+# byte is covered; unoptimised, `vt100` makes each replay take minutes in
+# `cargo test-fast`. Like `earshot` above, this optimises that one dependency
+# in debug builds; this crate's own code still builds at the dev profile's
+# settings.
+[profile.dev.package.vt100]
+opt-level = 3
