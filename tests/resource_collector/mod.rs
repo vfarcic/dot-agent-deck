@@ -30,6 +30,7 @@ pub fn attribute(value: &Value, key: &str) -> String {
 pub struct Request {
     pub path: String,
     pub body: Value,
+    pub content_type: String,
 }
 
 pub struct Receiver {
@@ -42,12 +43,17 @@ pub struct Receiver {
 
 impl Receiver {
     pub fn start() -> Self {
+        Self::with_metrics_response("application/json", b"{}".to_vec())
+    }
+
+    pub fn with_metrics_response(content_type: &str, body: Vec<u8>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let captured = Arc::clone(&requests);
         let stopped = Arc::clone(&stop);
+        let content_type = content_type.to_string();
         let worker = std::thread::spawn(move || {
             for stream in listener.incoming() {
                 if stopped.load(Ordering::Relaxed) {
@@ -55,8 +61,19 @@ impl Receiver {
                 }
                 let mut stream = stream.unwrap();
                 if let Some(request) = read_request(&stream) {
+                    let metrics = request.path == "/v1/metrics";
                     captured.lock().unwrap().push(request);
-                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+                    let (kind, response) = if metrics {
+                        (content_type.as_str(), body.as_slice())
+                    } else {
+                        ("application/json", b"{}".as_slice())
+                    };
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        response.len()
+                    );
+                    let _ = stream.write_all(response);
                 }
             }
         });
@@ -165,7 +182,7 @@ fn read_request(stream: &TcpStream) -> Option<Request> {
     let path = line.split_whitespace().nth(1)?.to_string();
     let mut size = 0;
     let mut chunked = false;
-    let mut json = false;
+    let mut content_type = String::new();
     loop {
         line.clear();
         if reader.read_line(&mut line).ok()? == 0 {
@@ -178,7 +195,7 @@ fn read_request(stream: &TcpStream) -> Option<Request> {
         match key.to_ascii_lowercase().as_str() {
             "content-length" => size = value.trim().parse().ok()?,
             "transfer-encoding" => chunked = value.trim().eq_ignore_ascii_case("chunked"),
-            "content-type" => json = value.contains("json"),
+            "content-type" => content_type = value.trim().to_string(),
             _ => {}
         }
     }
@@ -203,10 +220,16 @@ fn read_request(stream: &TcpStream) -> Option<Request> {
         bytes.resize(size, 0);
         reader.read_exact(&mut bytes).ok()?;
     }
-    assert!(json, "collector/deck receiver requires application/json");
     Some(Request {
         path,
-        body: serde_json::from_slice(&bytes).expect("OTLP JSON body"),
+        body: if content_type.contains("json") {
+            serde_json::from_slice(&bytes).expect("OTLP JSON body")
+        } else {
+            assert_eq!(content_type, "application/x-protobuf");
+            assert!(!bytes.is_empty(), "OTLP protobuf request must not be empty");
+            Value::Null
+        },
+        content_type,
     })
 }
 
@@ -222,26 +245,71 @@ pub fn collector(receiver: &Receiver) -> Command {
 }
 
 pub fn start_collector(receiver: &Receiver) -> Running {
+    start_collector_with_paths(receiver, false)
+}
+
+pub fn start_collector_with_paths(receiver: &Receiver, paths: bool) -> Running {
     let config = collector(receiver);
     // Share the exact same collector artifact and isolated exporter config as
     // --once. This is a separate /proc scraper; the agent never runs it or
     // receives its path. The deck itself always uses the contained TuiDeck launch.
+    let mut command = Command::new("/usr/bin/timeout");
+    command
+        .env_clear()
+        .envs(
+            config
+                .get_envs()
+                .filter_map(|(key, value)| value.map(|value| (key, value))),
+        )
+        .arg("180")
+        .arg(config.get_program())
+        .args(["--interval", "1", "--disk-interval", "0"]);
+    if paths {
+        command.arg("--send-worktree-paths");
+    }
     Running(
-        Command::new("/usr/bin/timeout")
-            .env_clear()
-            .envs(
-                config
-                    .get_envs()
-                    .filter_map(|(key, value)| value.map(|value| (key, value))),
-            )
-            .arg("180")
-            .arg(config.get_program())
-            .args(["--interval", "1", "--disk-interval", "0"])
+        command
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .unwrap(),
     )
+}
+
+pub fn cpu(resource: &Value) -> f64 {
+    metric(resource, "deck.run.cpu.time")["sum"]["dataPoints"][0]["asDouble"]
+        .as_f64()
+        .unwrap()
+}
+
+pub fn processes(resource: &Value) -> u64 {
+    metric(resource, "deck.run.processes")["gauge"]["dataPoints"][0]["asInt"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+pub fn assert_pss(resource: &Value, live: bool) {
+    let pss = &metric(resource, "deck.run.memory.pss")["gauge"]["dataPoints"];
+    let points = pss.as_array().expect("PSS points");
+    assert_eq!(points.len(), 3, "PSS must contain anon, file and shmem");
+    for kind in ["anon", "file", "shmem"] {
+        let point = points
+            .iter()
+            .find(|point| attribute(point, "deck.memory.kind") == kind)
+            .unwrap_or_else(|| panic!("missing PSS kind {kind}: {points:?}"));
+        let bytes: u64 = point["asInt"]
+            .as_str()
+            .expect("OTLP int64 string")
+            .parse()
+            .unwrap();
+        if live && kind == "anon" {
+            assert!(bytes > 0, "live fixture must have anonymous PSS");
+        } else if !live {
+            assert_eq!(bytes, 0, "terminal PSS kind {kind} must be zero");
+        }
+    }
 }
 
 pub struct Running(pub Child);
@@ -319,28 +387,10 @@ pub fn run_resource<'a>(metrics: &'a [Value], run_id: &str) -> &'a Value {
 
 pub fn assert_figures(resource: &Value, minimum_cpu: f64) {
     assert_eq!(attribute(&resource["resource"], "deck.attribution"), "run");
-    let cpu = metric(resource, "deck.run.cpu.time")["sum"]["dataPoints"][0]["asDouble"]
-        .as_f64()
-        .unwrap();
+    let cpu = cpu(resource);
     assert!(
         cpu >= minimum_cpu && cpu > 0.0,
         "CPU {cpu} must cover fixture burn {minimum_cpu}"
     );
-    let pss = &metric(resource, "deck.run.memory.pss")["gauge"]["dataPoints"];
-    let points = pss.as_array().expect("PSS points");
-    assert_eq!(points.len(), 3, "PSS must contain anon, file and shmem");
-    for kind in ["anon", "file", "shmem"] {
-        let point = points
-            .iter()
-            .find(|point| attribute(point, "deck.memory.kind") == kind)
-            .unwrap();
-        let bytes: u64 = point["asInt"]
-            .as_str()
-            .expect("OTLP int64 string")
-            .parse()
-            .unwrap();
-        if kind == "anon" {
-            assert!(bytes > 0, "live fixture must have anonymous PSS");
-        }
-    }
+    assert_pss(resource, true);
 }

@@ -7,11 +7,11 @@ mod common;
 mod resource_collector;
 
 use common::TuiDeck;
-use resource_collector::{Receiver, assert_figures, attribute, close, start_collector};
+use resource_collector::{Receiver, assert_figures, attribute, close, cpu, start_collector};
 use spec::spec;
 use std::time::Duration;
 
-/// Scenario: Start trusted interactive Claude Haiku in an attached pane while the resource collector samples to a local receiver. Ask Claude to copy a uniquely named fixture through Bash, observe Thinking, Working/Bash and Idle plus the sentinel proof, then close the pane and require its positive CPU and PSS figures to share the deck's actual agent.run identity.
+/// Scenario: Start trusted interactive Claude Haiku in an attached pane and collect a baseline before asking it to copy a uniquely named fixture through Bash. Observe Thinking, Working/Bash and Idle plus the sentinel proof, then require a later collector sample with CPU growth, positive anonymous PSS and named anon/file/shmem points sharing the deck's actual agent.run identity.
 #[spec("telemetry/resources/004")]
 #[test]
 fn resources_004_real_interactive_haiku_figures_join_deck_run() {
@@ -45,6 +45,22 @@ fn resources_004_real_interactive_haiku_figures_join_deck_run() {
     // Independent deadline bounds the collector even if nextest kills this
     // test process. No real-agent credential is needed by the collector.
     let mut collector = start_collector(&receiver);
+    let pane_samples = || {
+        receiver
+            .metrics()
+            .into_iter()
+            .filter(|entry| {
+                attribute(&entry["resource"], "deck.pane.id") == pane
+                    && !attribute(&entry["resource"], "deck.run.id").is_empty()
+            })
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        common::wait_until(Duration::from_secs(25), || !pane_samples().is_empty()),
+        "collector must export a baseline before the agent task"
+    );
+    let baseline = pane_samples().last().unwrap().clone();
+    let baseline_cpu = cpu(&baseline);
     let start = deck.stream_text().len();
     let directive = format!(
         "Use Bash exactly once to run: sleep 3; cat '{}/{SENTINEL}' > '{}/{PROOF}'. Do not modify any other file. Then reply RESOURCE_DONE and end your turn.",
@@ -76,13 +92,14 @@ fn resources_004_real_interactive_haiku_figures_join_deck_run() {
         "collector must keep sampling during real work"
     );
     assert!(
-        common::wait_until(Duration::from_secs(25), || receiver.metrics().iter().any(
-            |entry| {
-                attribute(&entry["resource"], "deck.pane.id") == pane
-                    && !attribute(&entry["resource"], "deck.run.id").is_empty()
-            }
-        )),
-        "collector never exported figures for the real Haiku pane"
+        common::wait_until(Duration::from_secs(25), || {
+            let samples = pane_samples();
+            samples.len() >= 2
+                && samples
+                    .last()
+                    .is_some_and(|entry| cpu(entry) > baseline_cpu)
+        }),
+        "collector must export at least two samples with run CPU growth during the real Haiku task (baseline {baseline_cpu})"
     );
     let metrics = receiver.metrics();
     let resource = metrics
@@ -91,6 +108,14 @@ fn resources_004_real_interactive_haiku_figures_join_deck_run() {
         .find(|entry| attribute(&entry["resource"], "deck.pane.id") == pane)
         .unwrap();
     assert_figures(resource, 0.0);
+    assert!(
+        cpu(resource) > baseline_cpu,
+        "task CPU must exceed the pre-task baseline"
+    );
+    assert_eq!(
+        attribute(&resource["resource"], "deck.run.id"),
+        attribute(&baseline["resource"], "deck.run.id")
+    );
     close(&deck, &agent);
     let span = receiver.run(pane);
     assert_eq!(
