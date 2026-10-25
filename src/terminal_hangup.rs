@@ -32,9 +32,12 @@
 //!         Ok(read_count) => { if read_count > 0 { self.parser.advance(..) } }
 //!         Err(e) => { if WouldBlock { break } else if Interrupted { continue } }
 //!     };
-//!     if let Some(event) = self.parser.next() { return Ok(Some(event)); }
+//!     if !self.parser.internal_events.is_empty() { break; }
 //! }
 //! ```
+//!
+//! (That is the deck's patched copy in `vendor/crossterm`; upstream 0.29.0
+//! returns the event there instead of breaking.)
 //!
 //! There is **no break on `Ok(0)`**. A hung-up terminal polls readable forever
 //! and reads 0 bytes forever, so that loop never terminates: `event::poll` does

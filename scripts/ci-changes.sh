@@ -61,7 +61,7 @@ case "$event" in
       case "$f" in
         src/* | build.rs | build_version_resolve.rs | Cargo.toml | Cargo.lock | \
           .cargo/* | scripts/link-gate.sh | scripts/build-gate.sh | \
-          rust-toolchain | rust-toolchain.toml | xtask/cross-version/*)
+          rust-toolchain | rust-toolchain.toml | vendor/* | xtask/cross-version/*)
           binary=true
           ;;
       esac

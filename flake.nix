@@ -117,6 +117,9 @@
       #     `include_str!`s every page it lists, and fails the build when one is
       #     missing. Only the manifest and the Markdown outside `docs/develop/` are
       #     taken: the images are not embedded and maintainer docs never are.
+      #   * `vendor/`, because Cargo.toml's `[patch.crates-io]` replaces
+      #     crossterm with the patched copy in `vendor/crossterm`, which the
+      #     binary compiles.
       #
       # `tests/` is left out on purpose: `doCheck = false`, so nothing compiles
       # it.
@@ -134,6 +137,7 @@
           ./examples
           ./xtask
           ./desktop/src-tauri
+          ./vendor
           (lib.fileset.difference
             (lib.fileset.fileFilter
               (file: file.hasExt "md" || file.name == "published.toml")
