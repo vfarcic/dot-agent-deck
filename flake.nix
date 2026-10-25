@@ -198,7 +198,21 @@
           # dependency graph, aws-lc-sys and its ~600 C files included. It is
           # keyed on Cargo.lock and Cargo.toml, so it survives every change to
           # our own code and gets rebuilt only when the dependency set moves.
-          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+          #
+          # Except `vendor/crossterm`: crane stubs every path crate, and that
+          # one is a dependency (Cargo.toml's `[patch.crates-io]`), so the stub
+          # left ratatui-crossterm compiling against an empty crossterm. The
+          # dummy source gets the real crate back, and this derivation is
+          # also rebuilt when that copy changes.
+          cargoArtifacts = craneLib.buildDepsOnly (builtins.removeAttrs commonArgs [ "src" ] // {
+            dummySrc = craneLib.mkDummySrc {
+              inherit src;
+              extraDummyScript = ''
+                rm -rf $out/vendor/crossterm
+                cp -r --no-preserve=mode ${src}/vendor/crossterm $out/vendor/crossterm
+              '';
+            };
+          });
         in
         craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
