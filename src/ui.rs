@@ -1806,7 +1806,8 @@ struct UiState {
     /// back from that frame as it was flushed to the terminal
     /// ([`record_flushed_confirmation`]). [`refuse_undrawn_choice`] refuses
     /// Down and Enter onto one it did not show, and Stop's `y` while its Yes
-    /// is not shown.
+    /// is not shown. Issue #1799: also kept for the Schedules delete question,
+    /// the star prompt and the directory picker.
     ///
     /// G-fix7g: also the confirmations' render-before-input gate, which was
     /// the close confirmation's alone (PRD #241 review F5). Cleared when a
@@ -8473,6 +8474,8 @@ fn handle_scheduled_tasks_key(key: KeyEvent, ui: &mut UiState) -> Action {
         KeyCode::Char('d') => {
             if ui.scheduled_selected < len {
                 ui.scheduled_delete_confirm = true;
+                // Issue #1799: this question waits for its own frame.
+                ui.confirm_choices_drawn = None;
             }
             Action::Continue
         }
@@ -11537,6 +11540,8 @@ fn dispatch_action(
         Action::ScheduleArmDelete => {
             if ui.scheduled_selected < ui.scheduled_tasks.len() {
                 ui.scheduled_delete_confirm = true;
+                // Issue #1799: this question waits for its own frame.
+                ui.confirm_choices_drawn = None;
             }
         }
         Action::ScheduleRunNow(name) => {
@@ -16493,6 +16498,9 @@ fn draw_modal(frame: &mut Frame, area: Rect, ui: &mut UiState) {
     {
         ui.modal_button_rects = render_inbox_attention_overlay(frame, area, dialog);
     }
+    // G-fix7i: a confirmation's buttons are not click targets yet, nor its
+    // choices counted: both wait for the frame as flushed.
+    let mut confirmation = None;
     if ui.mode == UiMode::DirPicker {
         // Capture the picker's row/button rects after the `dir_picker` borrow
         // ends so they can be stored back on `ui`.
@@ -16500,9 +16508,14 @@ fn draw_modal(frame: &mut Frame, area: Rect, ui: &mut UiState) {
             .dir_picker
             .as_mut()
             .map(|picker| render_dir_picker(frame, area, picker));
-        if let Some((rows, buttons)) = captured {
+        if let Some(((rows, buttons), choices)) = captured {
             ui.picker_row_rects = rows;
             ui.picker_button_rects = buttons;
+            // Issue #1799: what it showed of what Space and Enter pick.
+            confirmation = Some(ConfirmDrawing {
+                buttons: Vec::new(),
+                choices,
+            });
         }
     }
     if ui.mode == UiMode::NewPaneForm {
@@ -16519,16 +16532,18 @@ fn draw_modal(frame: &mut Frame, area: Rect, ui: &mut UiState) {
         }
     }
     if ui.mode == UiMode::ScheduledTasks {
-        let (button_rects, row_rects) = render_scheduled_tasks(frame, area, ui);
+        let (button_rects, row_rects, delete_question) = render_scheduled_tasks(frame, area, ui);
         ui.modal_button_rects = button_rects;
         ui.scheduled_row_rects = row_rects;
+        // Issue #1799: the armed delete question is a confirmation.
+        confirmation = delete_question.map(|choices| ConfirmDrawing {
+            buttons: Vec::new(),
+            choices,
+        });
     }
     if ui.mode == UiMode::StarPrompt {
-        ui.modal_button_rects = render_star_prompt(frame, area);
+        confirmation = Some(render_star_prompt(frame, area));
     }
-    // G-fix7i: a confirmation's buttons are not click targets yet, nor its
-    // choices counted: both wait for the frame as flushed.
-    let mut confirmation = None;
     if ui.mode == UiMode::ConfigGenPrompt {
         confirmation = Some(render_config_gen_prompt(
             frame,
@@ -18412,6 +18427,29 @@ impl ConfirmChoices {
         shown
     }
 
+    /// Issue #1799: the cell of a choice on a line the popup's right border may
+    /// cut short — at any size, for a long path or name — written from column
+    /// `x` of `row`: as much of `text` as the popup shows, up to its first
+    /// character that is not printable ASCII (one [`Self::intact`] cannot read
+    /// back cell by cell). It counts as shown only when that part holds at
+    /// least `text`'s first `keep` characters.
+    fn clipped(
+        &self,
+        x: u16,
+        row: Option<u16>,
+        text: &str,
+        keep: usize,
+    ) -> (u16, Option<u16>, String) {
+        let room = usize::from(self.inner.right().saturating_sub(x));
+        let part: String = text
+            .chars()
+            .take_while(|ch| ch.is_ascii_graphic() || *ch == ' ')
+            .take(room)
+            .collect();
+        let row = row.filter(|_| part.chars().count() >= keep.min(text.chars().count()));
+        (x, row, part)
+    }
+
     /// Whether `text`, written from column `x` of row `y`, lies wholly inside
     /// the popup and every one of its cells in `buf` still reads as written.
     fn intact(&self, x: u16, y: u16, text: &str, buf: &Buffer) -> bool {
@@ -18489,14 +18527,20 @@ fn render_confirm_buttons(
 
 /// PRD #1666 part 2 (G-fix7g): whether the open confirmation has not been
 /// drawn since it opened — [`UiState::confirm_choices_drawn`] holds no record
-/// for its mode. Never for any other mode.
+/// for its mode. Never for any other mode. Issue #1799: the star prompt and
+/// the Schedules delete question are confirmations too.
 fn confirmation_awaits_frame(ui: &UiState) -> bool {
-    matches!(
+    (matches!(
         ui.mode,
-        UiMode::QuitConfirm | UiMode::CloseConfirm | UiMode::StopConfirm | UiMode::ConfigGenPrompt
-    ) && !ui
-        .confirm_choices_drawn
-        .is_some_and(|(mode, _)| mode == ui.mode)
+        UiMode::QuitConfirm
+            | UiMode::CloseConfirm
+            | UiMode::StopConfirm
+            | UiMode::ConfigGenPrompt
+            | UiMode::StarPrompt
+    ) || (ui.mode == UiMode::ScheduledTasks && ui.scheduled_delete_confirm))
+        && !ui
+            .confirm_choices_drawn
+            .is_some_and(|(mode, _)| mode == ui.mode)
 }
 
 /// PRD #1666 part 2 (G-fix7f): refuse Down/`j` onto, and Enter on, a choice
@@ -18513,6 +18557,28 @@ fn refuse_undrawn_choice(key: &KeyEvent, ui: &UiState) -> Option<Action> {
         .confirm_choices_drawn
         .filter(|(drawn_for, _)| *drawn_for == mode)
         .map_or(ChoicesShown::default(), |(_, shown)| shown);
+    // Issue #1799: the dialogs that predate this guard. The Schedules delete
+    // question's `y` needs the question and its `(y/n)` line shown, and the
+    // star prompt's keys each need their own choice on its key line shown.
+    match mode {
+        UiMode::ScheduledTasks => {
+            let refused = ui.scheduled_delete_confirm
+                && key.code == KeyCode::Char('y')
+                && !(shown.contains(0) && shown.contains(1));
+            return refused.then_some(Action::Continue);
+        }
+        UiMode::StarPrompt => {
+            let choice = match key.code {
+                KeyCode::Char('s') => 0,
+                KeyCode::Char('l') => 1,
+                KeyCode::Char('d') => 2,
+                _ => return None,
+            };
+            return (!shown.contains(choice)).then_some(Action::Continue);
+        }
+        UiMode::DirPicker => return refuse_undrawn_pick(key, ui),
+        _ => {}
+    }
     let selected = match mode {
         UiMode::QuitConfirm => ui.quit_confirm_selected,
         UiMode::CloseConfirm => ui.close_confirm.selected,
@@ -18529,6 +18595,30 @@ fn refuse_undrawn_choice(key: &KeyEvent, ui: &UiState) -> Option<Action> {
         _ => false,
     };
     refused.then_some(Action::Continue)
+}
+
+/// Issue #1799: refuse the directory picker's Space while its last frame did
+/// not show the current directory, and its Enter, `l` and Right while it did
+/// not show the selected entry, or the current directory where they pick that
+/// (no subdirectories). Unlike a confirmation, the picker takes what is typed
+/// before its first frame, as it always has: picking a directory leads to the
+/// form, where nothing has started yet.
+fn refuse_undrawn_pick(key: &KeyEvent, ui: &UiState) -> Option<Action> {
+    let picker = ui.dir_picker.as_ref().filter(|picker| !picker.filtering)?;
+    let (_, shown) = ui
+        .confirm_choices_drawn
+        .filter(|(drawn_for, _)| *drawn_for == UiMode::DirPicker)?;
+    let opens = matches!(
+        key.code,
+        KeyCode::Enter | KeyCode::Right | KeyCode::Char('l')
+    );
+    let choice = match key.code {
+        KeyCode::Char(' ') => 0,
+        _ if opens && !picker.has_subdirs() => 0,
+        _ if opens && !picker.filtered_indices.is_empty() => 1,
+        _ => return None,
+    };
+    (!shown.contains(choice)).then_some(Action::Continue)
 }
 
 fn render_quit_confirm(frame: &mut Frame, area: Rect, selected: usize) -> ConfirmDrawing {
@@ -18826,7 +18916,14 @@ fn star_popup_width(area_width: u16, identity: &str) -> u16 {
     50u16.max(needed).min(area_width.saturating_sub(4))
 }
 
-fn render_star_prompt(frame: &mut Frame, area: Rect) -> Vec<(Action, Rect)> {
+/// The star prompt's key line, and the choices on it in key order: Star,
+/// Later, Don't ask again.
+const STAR_PROMPT_KEYS: (&str, [&str; 3]) = (
+    "s Star  l Later  d Don't ask again",
+    ["s Star", "l Later", "d Don't ask again"],
+);
+
+fn render_star_prompt(frame: &mut Frame, area: Rect) -> ConfirmDrawing {
     let popup_width = star_popup_width(area.width, repo_identity::DISPLAY);
     let popup_height = 10u16.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
@@ -18847,8 +18944,11 @@ fn render_star_prompt(frame: &mut Frame, area: Rect) -> Vec<(Action, Rect)> {
                 .add_modifier(Modifier::UNDERLINED),
         ),
         Line::from(""),
-        Line::styled("  s Star  l Later  d Don't ask again", text_primary()),
+        Line::styled(format!("  {}", STAR_PROMPT_KEYS.0), text_primary()),
     ];
+    // Issue #1799: where the key line puts each of its choices, so the frame
+    // as flushed can be read back for which of them it shows.
+    let key_line = u16::try_from(text.len() - 1).ok();
 
     let block = Block::default()
         .title(" ⭐ Enjoying dot-agent-deck? ")
@@ -18877,7 +18977,25 @@ fn render_star_prompt(frame: &mut Frame, area: Rect) -> Vec<(Action, Rect)> {
         width: popup_area.width.saturating_sub(2),
         height: 1,
     };
-    render_modal_button_row(frame, &buttons, btn_row, 1)
+    let inner = popup_area.inner(ratatui::layout::Margin::new(1, 1));
+    let (line, labels) = STAR_PROMPT_KEYS;
+    let row = key_line.and_then(|n| inner.y.checked_add(n));
+    let cells = labels
+        .iter()
+        .map(|label| {
+            let offset = line.find(label).and_then(|i| u16::try_from(i).ok());
+            let x = offset.and_then(|i| inner.x.checked_add(2)?.checked_add(i));
+            (
+                x.unwrap_or(inner.x),
+                row.filter(|_| x.is_some()),
+                (*label).to_string(),
+            )
+        })
+        .collect();
+    ConfirmDrawing {
+        buttons: render_confirm_buttons(frame, &buttons, btn_row),
+        choices: ConfirmChoices { inner, cells },
+    }
 }
 
 fn render_config_gen_prompt(frame: &mut Frame, area: Rect, selected: usize) -> ConfirmDrawing {
@@ -20284,12 +20402,15 @@ type PickerClickTargets = (Vec<(usize, Rect)>, Vec<(Action, Rect)>);
 /// `(row_rects, button_rects)`. `row_rects` pairs each visible entry's screen
 /// `Rect` with its index into `filtered_indices` (matching
 /// `DirPickerState.selected`); `button_rects` carries the `[Confirm]` /
-/// `[Cancel]` / `[Filter]` affordances. PRD #80 M7.
+/// `[Cancel]` / `[Filter]` affordances. PRD #80 M7. Issue #1799: also where
+/// it put the current directory (choice 0, which Space picks) and the
+/// selected entry (choice 1, which Enter opens), for
+/// [`record_flushed_confirmation`] to read back.
 fn render_dir_picker(
     frame: &mut Frame,
     area: Rect,
     picker: &mut DirPickerState,
-) -> PickerClickTargets {
+) -> (PickerClickTargets, ConfirmChoices) {
     let popup_width = 60.min(area.width.saturating_sub(4));
     let popup_height = 20u16.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
@@ -20344,6 +20465,18 @@ fn render_dir_picker(
     let row_x = popup_area.x + 1;
     let row_width = popup_area.width.saturating_sub(2);
     let mut row_rects: Vec<(usize, Rect)> = Vec::new();
+    let mut choices = ConfirmChoices {
+        inner: popup_area.inner(ratatui::layout::Margin::new(1, 1)),
+        cells: Vec::new(),
+    };
+    let current = choices.clipped(
+        row_x.saturating_add(2),
+        inside(0).then(|| line_y(0)),
+        &picker.current_dir.display().to_string(),
+        1,
+    );
+    choices.cells.push(current);
+    let mut selected_cell = (row_x, None, String::new());
 
     if picker.filtered_indices.is_empty() {
         let message = if picker.entries.is_empty() {
@@ -20380,7 +20513,13 @@ fn render_dir_picker(
             };
             let suffix = if is_parent { "" } else { "/" };
             let line_idx = lines.len();
-            lines.push(Line::styled(format!("{prefix}{name}{suffix}"), style));
+            let text = format!("{prefix}{name}{suffix}");
+            if i == picker.selected {
+                // Its marker, at least, must be on screen.
+                selected_cell =
+                    choices.clipped(row_x, inside(line_idx).then(|| line_y(line_idx)), &text, 2);
+            }
+            lines.push(Line::styled(text, style));
             if !inside(line_idx) {
                 continue;
             }
@@ -20431,8 +20570,9 @@ fn render_dir_picker(
         Button::new("Cancel", "", Action::PickerCancel, true),
         Button::new("Filter", "", Action::PickerFilter, true),
     ];
+    choices.cells.push(selected_cell);
     if !inside(button_line_idx) {
-        return (row_rects, Vec::new());
+        return ((row_rects, Vec::new()), choices);
     }
     let btn_row = Rect {
         x: row_x,
@@ -20442,7 +20582,7 @@ fn render_dir_picker(
     };
     let button_rects = render_modal_button_row(frame, &buttons, btn_row, 1);
 
-    (row_rects, button_rects)
+    ((row_rects, button_rects), choices)
 }
 
 /// Footer-hint string for the unified new-pane form. Factored out so the
@@ -20490,7 +20630,13 @@ fn new_pane_form_footer_hint(
 /// the `[Add]`/`[Edit]`/`[Delete]`/`[Run now]` button rects (recorded in
 /// `UiState::modal_button_rects`) and the schedule row rects each paired with
 /// its index into `scheduled_tasks` (recorded in `UiState::scheduled_row_rects`).
-type ScheduledTasksClickTargets = (Vec<(Action, Rect)>, Vec<(usize, Rect)>);
+/// Issue #1799: and, while the delete question is armed, where it put the
+/// question (choice 0) and its `(y/n)` line (choice 1).
+type ScheduledTasksClickTargets = (
+    Vec<(Action, Rect)>,
+    Vec<(usize, Rect)>,
+    Option<ConfirmChoices>,
+);
 
 /// PRD #127 M3.3: render the "Schedules" manager dialog — a
 /// read-only-plus-actions list of the configured schedules, each row showing
@@ -20706,7 +20852,33 @@ fn render_scheduled_tasks(
     // it never clips on narrow terminals — a Paragraph doesn't wrap, so padding
     // it to the right of the buttons would push it past the border once the
     // modal shrinks with the terminal width.
+    let mut delete_question = None;
     let button_row_index = if ui.scheduled_delete_confirm {
+        // Issue #1799: the question and its `(y/n)` line, as written below
+        // their two-cell indent. A long name may run past the right border, as
+        // it does at any size, but its question must show up to the name.
+        let inner = popup_area.inner(ratatui::layout::Margin::new(1, 1));
+        let question = u16::try_from(lines.len())
+            .ok()
+            .and_then(|n| inner.y.checked_add(n));
+        let x = inner.x.saturating_add(2);
+        let mut choices = ConfirmChoices {
+            inner,
+            cells: Vec::new(),
+        };
+        let texts: Vec<String> = confirm_lines
+            .iter()
+            .map(|line| line.to_string().trim_start().to_string())
+            .collect();
+        if let [asked, answer] = texts.as_slice() {
+            let keep = "Delete schedule '".len();
+            choices
+                .cells
+                .push(choices.clipped(x, question, asked, keep));
+            let below = question.and_then(|y| y.checked_add(1));
+            choices.cells.push((x, below, answer.clone()));
+        }
+        delete_question = Some(choices);
         // Pre-wrapped above so a long name grows the modal in HEIGHT (name on its
         // own line) instead of spilling the trailing `(y/n)` past the border.
         lines.extend(confirm_lines);
@@ -20737,7 +20909,7 @@ fn render_scheduled_tasks(
     let Some(row_idx) = button_row_index else {
         // Delete confirmation is armed: no action buttons and no row-click
         // re-selection — `y`/`n`/Esc are the only inputs.
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), delete_question);
     };
     let has_rows = !ui.scheduled_tasks.is_empty();
     let run_now_action = ui
@@ -20789,6 +20961,7 @@ fn render_scheduled_tasks(
     (
         render_modal_button_row(frame, &buttons, btn_row, 1),
         row_rects,
+        delete_question,
     )
 }
 
@@ -43660,7 +43833,7 @@ mod tests {
                     Paragraph::new(vec![Line::from("X".repeat(120)); 10]),
                     frame.area(),
                 );
-                targets = render_dir_picker(frame, Rect::new(0, 0, 120, 7), &mut picker);
+                (targets, _) = render_dir_picker(frame, Rect::new(0, 0, 120, 7), &mut picker);
             })
             .unwrap();
         let buffer = terminal.backend().buffer();
@@ -43901,6 +44074,199 @@ mod tests {
             Some("New agent failed: Command failed: daemon refused the start")
         );
         insta::assert_snapshot!(glossary_status_row(&state, &mut ui), @" COMMAND  New agent failed: Command failed: daemon refused the start");
+    }
+
+    // --- Issue #1799: the dialogs that predate PRD #1666 part 2's guard ---
+
+    /// The key path's order for a dialog's own keys, as [`handle_key_event`]
+    /// runs it: the guard first, then the mode's handler. `handler` stands in
+    /// for the handler so a test does not run one with side effects.
+    fn guarded(
+        ui: &mut UiState,
+        code: KeyCode,
+        handler: impl FnOnce(KeyEvent, &mut UiState) -> Action,
+    ) -> Action {
+        let key = KeyEvent::new(code, KeyModifiers::NONE);
+        refuse_undrawn_choice(&key, ui).unwrap_or_else(|| handler(key, ui))
+    }
+
+    fn on_screen(rows: &[String], text: &str) -> bool {
+        rows.iter().any(|row| row.contains(text))
+    }
+
+    /// Scenario: with one schedule configured, the user opens Schedules and presses `d`. In an 80×6 terminal, whose frame cuts off the delete question and its `(y/n)` line, `y` deletes nothing and Escape still cancels; at 80×24, where both lines are on screen, `y` deletes the schedule. A `y` before the question's first frame deletes nothing at either size.
+    #[spec("scheduler/manager/005")]
+    #[test]
+    fn manager_005_delete_is_refused_while_its_question_is_not_drawn() {
+        let armed = |height: u16| {
+            let mut ui = default_ui();
+            ui.mode = UiMode::ScheduledTasks;
+            ui.scheduled_tasks = vec![make_scheduled_task("nightly", true)];
+            draw_sized(&mut ui, 80, height);
+            guarded(&mut ui, KeyCode::Char('d'), handle_scheduled_tasks_key);
+            assert!(ui.scheduled_delete_confirm, "{height}: `d` arms the delete");
+            ui
+        };
+        for (height, drawn) in [(6u16, false), (24, true)] {
+            let mut ui = armed(height);
+            let rows = draw_sized(&mut ui, 80, height);
+            let shown = rows.join("\n");
+            assert_eq!(
+                on_screen(&rows, "(y/n)") && on_screen(&rows, "Delete schedule 'nightly'?"),
+                drawn,
+                "{height}: precondition:\n{shown}"
+            );
+            let answer = guarded(&mut ui, KeyCode::Char('y'), handle_scheduled_tasks_key);
+            if drawn {
+                assert!(
+                    matches!(answer, Action::ScheduleDelete(ref name) if name == "nightly"),
+                    "{height}: `y` on the drawn question did not delete:\n{shown}"
+                );
+            } else {
+                assert!(
+                    matches!(answer, Action::Continue),
+                    "{height}: `y` deleted a schedule whose question is not drawn:\n{shown}"
+                );
+                assert!(ui.scheduled_delete_confirm, "{height}: still asking");
+                // The way back is never refused.
+                guarded(&mut ui, KeyCode::Esc, handle_scheduled_tasks_key);
+                assert!(!ui.scheduled_delete_confirm, "{height}: Esc cancels");
+            }
+
+            // Before the question's first frame.
+            let mut ui = armed(height);
+            assert!(
+                confirmation_awaits_frame(&ui),
+                "{height}: input queued behind `d` waits for its frame"
+            );
+            assert!(
+                matches!(
+                    guarded(&mut ui, KeyCode::Char('y'), handle_scheduled_tasks_key),
+                    Action::Continue
+                ),
+                "{height}: `y` before the question's first frame deleted"
+            );
+            assert!(ui.scheduled_delete_confirm, "{height}: still asking");
+
+            // Cancelled and asked again with no frame between: the new question
+            // waits for its own frame, whatever the last one showed.
+            draw_sized(&mut ui, 80, height);
+            guarded(&mut ui, KeyCode::Esc, handle_scheduled_tasks_key);
+            guarded(&mut ui, KeyCode::Char('d'), handle_scheduled_tasks_key);
+            assert!(confirmation_awaits_frame(&ui), "{height}: asked again");
+            assert!(
+                matches!(
+                    guarded(&mut ui, KeyCode::Char('y'), handle_scheduled_tasks_key),
+                    Action::Continue
+                ),
+                "{height}: `y` answered a question asked again before its frame"
+            );
+        }
+    }
+
+    /// Scenario: the star prompt opens. At a height of 8 rows, where its `s Star  l Later  d Don't ask again` line is cut off, `s`, `l` and `d` choose nothing and Escape still closes it; at 80×24, where the line is on screen, each key reaches the prompt. Before its first frame none of the three reaches it at either size.
+    #[spec("prompt/star/001")]
+    #[test]
+    fn star_001_keys_are_refused_while_their_choices_are_not_drawn() {
+        let keys = [KeyCode::Char('s'), KeyCode::Char('l'), KeyCode::Char('d')];
+        let reached = |ui: &mut UiState, code: KeyCode| {
+            let mut reached = false;
+            guarded(ui, code, |_, _| {
+                reached = true;
+                Action::Continue
+            });
+            reached
+        };
+        let open = || {
+            let mut ui = default_ui();
+            ui.mode = UiMode::StarPrompt;
+            ui
+        };
+        for (height, drawn) in [(8u16, false), (24, true)] {
+            let mut ui = open();
+            let rows = draw_sized(&mut ui, 80, height);
+            let shown = rows.join("\n");
+            assert_eq!(
+                on_screen(&rows, "s Star  l Later  d Don't ask again"),
+                drawn,
+                "{height}: precondition:\n{shown}"
+            );
+            for code in keys {
+                assert_eq!(
+                    reached(&mut ui, code),
+                    drawn,
+                    "{height}: {code:?} with its choice drawn={drawn}:\n{shown}"
+                );
+            }
+            assert!(
+                reached(&mut ui, KeyCode::Esc),
+                "{height}: Esc is the way back"
+            );
+            if drawn {
+                assert!(
+                    ui.modal_button_rects
+                        .iter()
+                        .any(|(action, _)| matches!(action, Action::StarConfirm)),
+                    "{height}: the drawn [Star] button is not clickable:\n{shown}"
+                );
+            }
+
+            // Before its first frame.
+            let mut ui = open();
+            assert!(confirmation_awaits_frame(&ui), "{height}: not drawn yet");
+            for code in keys {
+                assert!(
+                    !reached(&mut ui, code),
+                    "{height}: {code:?} answered the prompt before its first frame"
+                );
+            }
+        }
+    }
+
+    /// Scenario: the user opens the directory picker on a list with `alpha` selected. In a frame so short that the popup shows its current directory but no entry, Enter, `l` and Right open nothing while Space still picks the current directory it shows; in one too short to show even that, Space picks nothing either. At 80×24, where `alpha` is on screen, Enter opens it.
+    #[spec("prompt/dir-picker/003")]
+    #[test]
+    fn dir_picker_003_opens_only_an_entry_it_drew() {
+        // (height, the entry drawn, the current directory drawn)
+        for (height, entry, current) in [(8u16, false, true), (6, false, false), (24, true, true)] {
+            let fresh = || {
+                let mut ui = default_ui();
+                ui.mode = UiMode::DirPicker;
+                let mut picker = make_dir_picker(&["..", "/tmp/alpha-1799", "/tmp/beta-1799"]);
+                picker.selected = 1;
+                ui.dir_picker = Some(picker);
+                ui
+            };
+            let mut ui = fresh();
+            let rows = draw_sized(&mut ui, 80, height);
+            let shown = rows.join("\n");
+            assert_eq!(
+                on_screen(&rows, "> alpha-1799/"),
+                entry,
+                "{height}: precondition (entry):\n{shown}"
+            );
+            assert_eq!(
+                on_screen(&rows, "  /tmp"),
+                current,
+                "{height}: precondition (current directory):\n{shown}"
+            );
+            for code in [KeyCode::Enter, KeyCode::Char('l'), KeyCode::Right] {
+                let mut ui = fresh();
+                draw_sized(&mut ui, 80, height);
+                guarded(&mut ui, code, handle_dir_picker_key);
+                let opened = ui
+                    .dir_picker
+                    .as_ref()
+                    .is_some_and(|p| p.current_dir == Path::new("/tmp/alpha-1799"));
+                assert_eq!(opened, entry, "{height}: {code:?} opened alpha:\n{shown}");
+            }
+            guarded(&mut ui, KeyCode::Char(' '), handle_dir_picker_key);
+            assert_eq!(
+                ui.mode != UiMode::DirPicker,
+                current,
+                "{height}: Space picked the current directory:\n{shown}"
+            );
+        }
     }
 }
 
