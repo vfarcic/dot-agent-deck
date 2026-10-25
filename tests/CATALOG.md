@@ -20,6 +20,36 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 
 ### Telemetry export (PRD #1741)
 
+#### telemetry/resources
+
+##### telemetry/resources/001 — Detached work keeps its run identity in resource exports.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_resource_collector.rs`).
+- **Agent:** synthetic Python stand-in with a double-forked CPU-burning grandchild; no real agent.
+- **Asserts:** the grandchild is reparented and burns measurable CPU; the collector's HTTP/JSON run resource covers that burn, reports anon/file/shmem PSS and shares deck.run.id with the deck's actual agent.run span at the same receiver. Working-directory paths are absent by default and present as deck.worktree.path after explicit opt-in.
+- **Does not assert:** work that exits between samples, exact whole-host CPU totals, cgroup accuracy, protobuf encoding or a hosted backend.
+- **Platform coverage:** Linux.
+
+##### telemetry/resources/002 — Cleared detached work is reported as unattributed.
+- **Layer:** L2 process integration, lane 1 (`tests/e2e_resource_collector.rs`).
+- **Agent:** synthetic double-forked Python burner with a cleared environment; no real agent.
+- **Asserts:** after a measurable CPU burn and reparenting, a process with no OTEL_RESOURCE_ATTRIBUTES remains represented by exactly one unattributed resource, with no deck.run.id, CPU at least its observed burn, live process count and three PSS points.
+- **Does not assert:** exact unattributed totals or individual process membership, since other processes share the bucket and exported metrics intentionally omit pids; cleared-environment children that remain in a run's ancestry.
+- **Platform coverage:** Linux.
+
+##### telemetry/resources/003 — Runs sharing a worktree share one disk series.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_resource_collector.rs`).
+- **Agent:** two synthetic shell/cat runs started by the real deck daemon; no real agent.
+- **Asserts:** distinct deck.run.id resources carry the same deck.worktree.id returned by the collector's worktree-id command, and exactly one deck.worktree.disk.usage series covers the fixture's allocated bytes.
+- **Does not assert:** background disk-walk cadence, hardlink or nested-repository traversal, exact total disk usage or disk attribution per run.
+- **Platform coverage:** Linux.
+
+##### telemetry/resources/004 — Real interactive Haiku resource figures join the deck run. [reel]
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_resource_collector_live.rs`), developer machine only.
+- **Agent:** real interactive Claude Code on pinned Haiku with imported isolated credentials, onboarding and project trust.
+- **Asserts:** a directive visibly advances Thinking → Working/Bash → Idle and copies a uniquely named sentinel fixture while the collector runs; positive CPU and anon/file/shmem PSS arrive at the local HTTP/JSON receiver carrying the same deck.run.id as the completed agent.run span.
+- **Does not assert:** native Claude telemetry, exact CPU or memory values, hosted-backend ingestion, cgroup accuracy or non-Linux collection.
+- **Platform coverage:** Linux.
+
 #### telemetry/otlp
 
 ##### telemetry/otlp/001 — No telemetry configuration leaves export and agent enablement off.
