@@ -190,7 +190,7 @@ Classify the row into exactly one of three outcomes, and **report all three** in
 
 ### What these greps do NOT decide, measured on this backlog
 
-**Symbol absence is not evidence of staleness, and for a PRD it is actively misleading.** Extracting every backticked `[a-z][a-z0-9_]{5,}` identifier from the 215 open issues on 2026-09-04 and testing it against `origin/main` flagged **65 — 30% of the backlog** — and in a twelve-row sample none indicated a stale premise. **The single largest category was a symbol the issue proposes creating**, which is absent precisely because the work is *undone*: `check_gemini_available` (#211, the Gemini adapter PRD) and `check_aider_available` (#212, the Aider adapter PRD) are both PRD rows where absence means the PRD is **live**. A PRD describes what does not exist yet, so for this skill the naive sweep does not merely add noise — **on a PRD row it can point the wrong way entirely**, reporting a live PRD as stale for the very reason it is live. A separate heuristic premise-check over this backlog on the same day produced **24 flags with 23 false positives**. Its one true positive was #483, where the cited `ensure_claim_label` survives only in the prose of `prds/421-issue-triage-labels-and-dispatch-claims.md` and not in `src/` — a reminder that *where* you search decides the answer as much as *what* you search for.
+**Symbol absence is not evidence of staleness, and for a PRD it is actively misleading.** Extracting every backticked `[a-z][a-z0-9_]{5,}` identifier from the 215 open issues on 2026-09-04 and testing it against `origin/main` flagged **65 — 30% of the backlog** — and in a twelve-row sample none indicated a stale premise. **The single largest category was a symbol the issue proposes creating**, which is absent precisely because the work is *undone*: `check_gemini_available` (#211, the Gemini adapter PRD) and `check_aider_available` (#212, the Aider adapter PRD) are both PRD rows where absence means the PRD is **live**. A PRD describes what does not exist yet, so for this skill the naive sweep does not merely add noise — **on a PRD row it can point the wrong way entirely**, reporting a live PRD as stale for the very reason it is live. A separate heuristic premise-check over this backlog on the same day produced **24 flags with 23 false positives**. Its one true positive was #483, where that sweep found the cited `ensure_claim_label` in the prose of [PRD #421](https://github.com/vfarcic/dot-agent-deck/issues/421) rather than in `src/` — a reminder that *where* you search decides the answer as much as *what* you search for.
 
 The remaining sampled flags were a git SHA (`dac0ad0`, `e22cd1e`), fields of a dependency crate's `termios` (`c_ispeed`, `c_line`, from `libc`), GitHub Actions YAML keys (`workflow_call`), a label name (`wontfix`), an external binary (`ffmpeg`), and a test id absent as a whole token but present as the prefix of two real test functions (`spawn_006`) — seven kinds in all, of things that merely look like a symbol.
 
@@ -290,7 +290,7 @@ Show what was excluded and why. In-flight exclusions especially: that is where t
 
 Otherwise **ask how many to dispatch, recommending 1–2.** That is deliberately lower than `/issue-queue`'s 2–3, for two reasons that compound:
 
-- **A PRD unit is the whole lifecycle, not one fix.** It runs to 100% completion, opens a PR, and waits for CI and Greptile to settle — typically more than once. Since issue #502 the e2e tier is CI's job rather than each unit's (CLAUDE.md rule 5), which takes the single most expensive local gate out of every unit, but a PRD unit still builds its own multi-GB `target/`, runs the full clippy and fast tiers repeatedly whenever its change has Rust in it (`cargo xtask affected-checks` selects them), and waits on review rounds.
+- **A PRD unit is the whole lifecycle, not one fix.** It runs to 100% completion, opens a PR, and waits for CI and the automated reviewers to settle — typically more than once. Since issue #502 the e2e tier is CI's job rather than each unit's (CLAUDE.md rule 5), which takes the single most expensive local gate out of every unit, but a PRD unit still builds its own multi-GB `target/`, runs the full clippy and fast tiers repeatedly whenever its change has Rust in it (`cargo xtask affected-checks` selects them), and waits on review rounds.
 - **A team unit is six agents, not one.** This repo's `dot-agent-deck` orchestration defines six roles (orchestrator, coder, reviewer, auditor, tester, release), so two team-shaped PRDs is twelve concurrent agents over two multi-GB `target/` trees. CLAUDE.md rule 14 records how that pressure surfaces — a misleading `linking with 'cc' failed`, or a `SIGKILL` on `rustc` — and an agent hitting either will blame its PRD rather than the batch size.
 
 Ask **which** PRDs too, unless the runner already named them. Relative priority among PRDs is theirs to judge and is not legible from the queue.
@@ -537,29 +537,26 @@ Do NOT send `DONE: merged & closed`. This run stops before merge, so that
 message would be false. Then append one line to .dot-agent-deck/notify-log.md
 (gitignored; create it if missing) exactly as that block describes.
 
-GREPTILE'S FINDINGS ARE PART OF THE JOB, NOT PART OF THE MERGE. Greptile
-reviews once, a few minutes after the PR opens, and never again —
-greptile.json sets triggerOnUpdates: false, so do NOT wait for a re-review
-after you push fixes. Qodo, evaluated beside it, re-reviews on EVERY push
-(.pr_agent.toml): after your last push, wait (bounded) for its re-review and
-answer what it raised. Do NOT wait for a Qodo check-run — it creates none
-(measured 2026-09-24 on #1235, #1257, #1271); it edits one summary comment in
-place and that body names the head SHA it reviewed, which is the signal. Its
-medium-and-above findings arrive at the same endpoint and are answered and
-resolved the same way; its informational tier stays in that summary comment
-(inline_comments_severity_threshold = 2), so read both. Greptile's findings
-live ONLY at
-`gh api repos/<owner>/<repo>/pulls/<pr>/comments --paginate`; the green
-`Greptile Review` check and the summary comment carry none of them. Keep the
+THE REVIEWERS' FINDINGS ARE PART OF THE JOB, NOT PART OF THE MERGE. Wait
+for the automated review apps with
+`.claude/skills/pr-create/wait-reviews.sh <pr>`: it waits, bounded per app,
+for every app in reviewers.json to finish on the PR's current head, and ends
+with REVIEWS=complete or REVIEWS=incomplete. Run it again after your LAST
+push: Greptile reviews only when the PR opens (greptile.json sets
+triggerOnUpdates: false), but Qodo re-reviews EVERY push (.pr_agent.toml), so
+a fix push can raise new findings. The findings live ONLY at
+`gh api repos/<owner>/<repo>/pulls/<pr>/comments --paginate`; a green check
+and the apps' summary comments carry none of them, except Qodo's
+informational tier, which stays in its "Code Review by Qodo" issue comment
+(inline_comments_severity_threshold = 2), so read both. Keep the
 --paginate: replies count toward the page, so without it a busy PR silently
-truncates the findings you are about to answer. Fetch that endpoint once the
-check-run completes, reply on each thread — what you fixed, or why you did
-not — AND RESOLVE THE THREAD, BEFORE you notify and stop. Resolving is half
-the job: an unresolved thread blocks the merge button AND the approval the
-merge needs, so a PR with every finding fixed still sits (PR #1035 sat a day
-that way). Bound the wait: a reviewer that is out of quota produces no
-check-run at all, so "wait until it appears" never returns — after a
-reasonable budget, proceed and report that no review was obtained. Do not defer it to the merge: this run stops
+truncates the findings you are about to answer. Reply on each thread — what
+you fixed, or why you did not — AND RESOLVE THE THREAD, BEFORE you notify and
+stop. Resolving is half the job: an unresolved thread blocks the merge button
+AND the approval the merge needs, so a PR with every finding fixed still sits
+(PR #1035 sat a day that way). REVIEWS=incomplete is a result, not a reason
+to keep waiting: an app that is out of quota produces nothing at all, so
+report which review was not obtained and go on. Do not defer it to the merge: this run stops
 before merge, and an armed auto-merge PR lands the moment the approval arrives,
 so a finding left for "before merging" is read by nobody. Measured on PR #869:
 five findings, two P1, unanswered through 3h45m of further commits.

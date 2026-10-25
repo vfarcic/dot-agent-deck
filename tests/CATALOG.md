@@ -14,9 +14,153 @@ This is the authoritative list of test cases the harness must cover. IDs are sta
 
 Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows once the harness's Windows path is ready per Decision 4); **mac+linux+windows** = portable from day one.
 
-Tier vocabulary (issue #502, CLAUDE.md rule 5): L1 tests run in the fast tier, `cargo test-fast`. L2 tests are split by whether they reach a **real agent** — **lane 1** is the credential-free `tests/e2e_*.rs` files, `cargo test-e2e`, which CI runs on every PR; **lane-2** entries below are in a file gated `#![cfg(all(feature = "e2e", feature = "e2e-live"))]`, run by `cargo test-e2e-live`, which **runs on a developer's machine and nowhere in CI** — no e2e test reaches a real agent on a runner, and no test credential is registered on this repository (the separately credentialed Codex issue-labeler is out of scope; see [`docs/develop/issue-labeling.md`](../docs/develop/issue-labeling.md)). Lane 2 is where the real-agent tests live and it is flaky-tolerant. Nothing here is a "pre-PR" tier any more — that obligation was removed with #502 — but this catalog is how you find the tests that cover what you changed, which rule 5 still requires you to run and to name. See [`docs/develop/e2e-lanes.md`](../docs/develop/e2e-lanes.md), and note that a lane-2 test whose preflight cannot be satisfied SKIPS and is counted as a pass.
+Tier vocabulary (issue #502, CLAUDE.md rule 5): L1 tests run in the fast tier, `cargo test-fast`. L2 tests are split by whether they reach a **real agent** — **lane 1** is the credential-free `tests/e2e_*.rs` files, `cargo test-e2e`, which CI runs on every PR; **lane-2** entries below are in a file gated `#![cfg(all(feature = "e2e", feature = "e2e-live"))]`, run by `cargo test-e2e-live`, which **runs on a developer's machine and nowhere in CI** — no e2e test reaches a real agent on a runner, and no test credential is registered on this repository (the separately credentialed agent PR reviewer is out of scope; see [`docs/develop/governance.md`](../docs/develop/governance.md#the-automated-reviewer)). Lane 2 is where the real-agent tests live and it is flaky-tolerant. Nothing here is a "pre-PR" tier any more — that obligation was removed with #502 — but this catalog is how you find the tests that cover what you changed, which rule 5 still requires you to run and to name. See [`docs/develop/e2e-lanes.md`](../docs/develop/e2e-lanes.md), and note that a lane-2 test whose preflight cannot be satisfied SKIPS and is counted as a pass.
 
 Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> — <headline>` line opts that test into the PRD #180 demo reel (`.claude/skills/demo-reel-adapter`). Eligibility is **opt-in** — the default (no marker) is *not* eligible even for a PTY-attached test that records a cast. Mark a test only if it validates the feature **as a user actually runs and sees it** — a real agent genuinely spinning up (spawn → agent → work) — never a synthetic/stand-in test (`cat`, scripted echo, recorder stubs, terminal-probe, or synthesized hook events). The adapter includes a marked test in the reel only when it *also* has a cast and its source changed on the branch.
+
+### Telemetry export (PRD #1741)
+
+#### telemetry/otlp
+
+##### telemetry/otlp/001 — No telemetry configuration leaves export and agent enablement off.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
+- **Agent:** synthetic shell and cat; no real agent.
+- **Asserts:** the stand-in receives no OTEL_RESOURCE_ATTRIBUTES or CLAUDE_CODE_ENABLE_TELEMETRY, and the local receiver gets no requests across an export interval after the pane closes.
+- **Does not assert:** observing arbitrary destinations outside the isolated receiver.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/002 — Configured export describes the run and its status intervals.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
+- **Agent:** synthetic shell and cat with synthesized status hooks.
+- **Asserts:** visible Thinking and Working transitions produce a completed agent.run with run/pane identity, agent kind, closed end reason, status child spans sharing its trace, status-change events, and service/version/host/schema resource attributes at the local HTTP/JSON receiver.
+- **Does not assert:** a hosted collector, protobuf encoding or agent-native telemetry.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/003 — The spawned agent and exported run share the same run id.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
+- **Agent:** synthetic shell recording its environment.
+- **Asserts:** OTEL_RESOURCE_ATTRIBUTES contains a nonempty deck.run.id equal to the receiver's run for that pane, and the configured endpoint reaches the agent unchanged.
+- **Does not assert:** a real agent exporting its own telemetry (005).
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/004 — Private content stays out of exports and telemetry-module logs while interventions remain visible.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
+- **Agent:** synthetic shell and cat with synthesized hook content.
+- **Asserts:** with HTTP/JSON, distinct sentinels from output, TUI-typed human input, prompt/tool hook fields, pane title, OTLP secret header, file contents printed by the stand-in, git branch, command argument, pane cwd directory and an ordinary environment value appear in no received request body, URI, non-authentication header or captured telemetry-module log line; the telemetry exporter's startup log is present, the authentication header arrives as intended and the completed run contains an intervention event. A successor actually reads the private file in the privately named git cwd before its run is exported.
+- **Does not assert:** content policies for an external agent's own exporter or daemon log targets outside dot_agent_deck::telemetry and its submodules.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/005 — Real interactive Claude telemetry joins the deck run. [reel]
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_telemetry_export_live.rs`), developer machine only.
+- **Agent:** real interactive Claude Code on pinned Haiku, isolated credentials and project trust.
+- **Asserts:** a native inbox task visibly advances Thinking → Working/Bash → Idle and copies a unique fixture sentinel; Claude's own HTTP/JSON metrics or logs and the deck's completed run arrive at the local receiver with equal deck.run.id attributes. At least one trace request has service.name=dot-agent-deck, and those deck-owned requests exclude the task prompt, fixture file contents, sentinel/proof filenames and working-directory path.
+- **Does not assert:** privacy of Claude-owned telemetry bodies, hosted-backend ingestion, OpenCode plugin propagation or cross-machine export.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/006 — Claude telemetry defaults respect the user's explicit opt-out.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
+- **Agent:** PATH-first executable named claude recording its environment; no real agent or credentials.
+- **Asserts:** with OTLP configured, the Claude stand-in receives default telemetry enablement, OTLP metrics/log exporters and the effective default HTTP/protobuf protocol when unset; a separate daemon with explicit CLAUDE_CODE_ENABLE_TELEMETRY=0 and OTEL_METRICS_EXPORTER=none preserves both values; neither case enables prompt or tool-detail logging.
+- **Does not assert:** Claude's native exporter, other agent kinds or OpenCode's native export.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/007 — Real interactive OpenCode telemetry joins the deck run. [reel]
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_telemetry_export_live.rs`), developer machine only.
+- **Agent:** real interactive OpenCode on `common::opencode_test_model()` (default Haiku), a cheap mini or the subscription-compatible `openai/gpt-5.6-luna` override selected through `DOT_AGENT_DECK_OPENCODE_TEST_MODEL`, isolated imported credentials.
+- **Asserts:** a genuine interactive Bash turn visibly works, copies a unique fixture sentinel, replies and returns to Idle; the deck's completed run and OpenCode's own logs or traces arrive at the local receiver with matching deck.run.id, structurally read from their JSON or protobuf resource attributes and service.name=opencode. At least one trace request has service.name=dot-agent-deck, and those deck-owned requests exclude the task prompt, fixture file contents, sentinel/proof filenames and working-directory path.
+- **Does not assert:** privacy of OpenCode-owned telemetry bodies, hosted-backend ingestion, OpenCode plugin changes or cross-machine export.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/008 — Redirects never forward OTLP exports or custom credentials.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
+- **Agent:** synthetic shell and cat; no real agent.
+- **Asserts:** the configured receiver gets an export and its custom x-honeycomb-team authentication header; a 307 redirect to a different local port results in no request and no authentication sentinel at the target across an export interval.
+- **Does not assert:** other redirect status codes or a hosted collector.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/009 — Transient collector failures retry the completed run without duplication.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
+- **Agent:** synthetic shell and cat; no real agent.
+- **Asserts:** a receiver returning two 503 responses with Retry-After and then 200 eventually accepts the completed agent.run; rejected attempts retain the same run id and only one accepted run is delivered across a further export interval.
+- **Does not assert:** exact jitter/backoff timing, permanent failures or every retryable status code.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/010 — Natural exit retains the final published status.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
+- **Agent:** synthetic shell waiting on an exit gate, with synthesized hooks.
+- **Asserts:** after visible Thinking, a final Working hook is published immediately before natural exit; the completed run says exited and includes the Working child interval and status-change event.
+- **Does not assert:** a deliberately paused exporter subscriber, real-agent hooks or an exit-code attribute.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/011 — Respawning an orchestration worker mints a new run identity.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
+- **Agent:** synthetic cat orchestrator and environment-recording shell worker.
+- **Asserts:** a real delegate CLI call to a clear=true worker replaces its agent; two completed runs share the pane and carry distinct run ids, the first ends closed or unknown, and the replacement receives its own exported run id through OTEL_RESOURCE_ATTRIBUTES.
+- **Does not assert:** a real agent consuming the delegated task or the separate pane-restart verb.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/012 — Graceful daemon shutdown flushes open runs within a bounded process exit.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
+- **Agent:** synthetic shell and cat; no real agent.
+- **Asserts:** the harness identifies and SIGTERMs its own daemon while a run is open; the daemon exits without SIGKILL in under fifteen seconds and the receiver gets the run with end_reason=daemon_shutdown.
+- **Does not assert:** shutdown with a stalled git probe, a stalled collector or a wire StopDaemon request.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/013 — Protobuf exports exclude private content across the binary's export pipeline.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
+- **Agent:** synthetic shell and cat with synthesized hook content.
+- **Asserts:** the same private channels as 004 stay absent from raw HTTP/protobuf request bodies, URIs, non-authentication headers and telemetry-module logs. Accepted protobuf bodies contain the original and successor run ids with agent.run, the original run exports a human intervention, the authentication header arrives and the telemetry startup log is captured.
+- **Does not assert:** a full protobuf schema decode or privacy of external agents' own telemetry.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/014 — Shell operation metadata classifies safe command shapes without exporting content.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
+- **Agent:** shell/cat stand-in with synthetic shell-tool and Read hooks.
+- **Asserts:** program/word classification of plain commands, assignments/prefixes/segments, the commands of a chained line up to the first that declines, the command a listed wrapper runs and no wrapped command for an unlisted one, program shape filtering and conditional word filtering, the word deny-list, first-line handling, neither program nor word for comments, command substitutions and variable expansions before the first word, or a shell reserved word or `eval` as the program, on both the Bash and Codex `shell` paths, child identity/duration/count and absence of sentinel, private and raw command text from captured bodies.
+- **Does not assert:** native hook availability for each agent or nested shell grammar.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/015 — Polled PR check rollups export CI intervals, results and counters.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
+- **Agent:** cat stand-in; offline gh stub and local fixture git repository.
+- **Asserts:** pending → failing → pending → passing is served before each next update and exports four change events, two child CI spans with final counts, two rounds and one failure.
+- **Does not assert:** sub-poll timing precision, real GitHub or CI provider identification.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/016 — Codex launch activates traces and metrics while preserving user choices.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
+- **Agent:** PATH stand-in named codex, a recorder linked from where npm installs Codex's launcher (`node_modules/@openai/codex/bin/codex.js`), launched directly, through a shell script calling codex by name, and by absolute path.
+- **Asserts:** scripted and plain launches activate safe trace/metric overrides with signal URLs and JSON protocol, preserve original arguments and header/run identity in env, and add no logs exporter or secret in argv. In-script CODEX_HOME and trace opt-outs take effect; absolute-path launches and a script putting the real Codex's directory ahead of the shim on PATH bypass activation; export off preserves PATH and argv with no shim directory on PATH.
+- **Does not assert:** real Codex export (018) or all TOML exporter forms.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/017 — Devin launch uses a private temporary metadata-only overlay.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
+- **Agent:** PATH stand-in named devin, a native program built with `cc` that runs a recorder, recording argv, env and config content/mode through direct, scripted and absolute-path launches.
+- **Asserts:** scripted and plain launches receive a 0600 overlay preserving JSONC settings, endpoint/resource identity and user OTel choices, excluding header values and disabling content logging by default; the overlay exists while running and is removed at pane close. In-script config-home, enabled:false, metric opt-outs and explicit --config are respected; absolute paths bypass activation; export off preserves PATH and argv without a shim directory.
+- **Does not assert:** authenticated Devin delivery (020) or crash-recovery cleanup.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/018 — Real interactive Codex safely joins its own telemetry to the deck run. [reel]
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_telemetry_export_live.rs`).
+- **Agent:** real Codex called by name inside a wrapper shell script on the auth-compatible cheap model (ChatGPT default gpt-5.6-luna).
+- **Asserts:** real shell copies a unique fixture, the pane completes and card settles, native traces/metrics carry the deck resource run id, no logs are captured and prompt/file/output sentinels are absent from every captured body.
+- **Does not assert:** Codex sandbox enforcement or native metric values.
+- **Platform coverage:** mac+linux when authenticated.
+
+##### telemetry/otlp/019 — Real interactive Pi Haiku exports metadata with the deck identity. [reel]
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_telemetry_export_live.rs`).
+- **Agent:** real Pi on Anthropic claude-haiku-4-5, using the automatically bundled extension.
+- **Asserts:** an inbox directive makes real bash copy a unique fixture, the pane completes and card settles, Pi's own resource run id joins the deck run and prompt/file/output sentinels are absent from every captured body.
+- **Does not assert:** provider fallback or exact token/cost values.
+- **Platform coverage:** mac+linux with Anthropic credentials.
+
+##### telemetry/otlp/020 — Authenticated real Devin exports metadata joined to the deck run. [reel]
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_telemetry_export_live.rs`); authentication preflight becomes failure with DOT_AGENT_DECK_REQUIRE_REAL_E2E=1.
+- **Agent:** real Devin on its account-default model.
+- **Asserts:** a real exec writes a proof file, the pane visibly completes and native telemetry resources carry the deck run id without prompt/output sentinels.
+- **Does not assert:** delivery on a logged-out host; that outcome is unverified, not a successful delivery check.
+- **Platform coverage:** mac+linux when authenticated.
 
 ### Session pull requests
 
@@ -2441,6 +2585,24 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Agent:** none — the pane runs a byte recorder (`stty raw -echo; exec cat -u > keys.log`), because the subject is the bytes the deck forwards, not what an agent does with them. What each of the five supported agents does with those bytes was measured by hand and is in `docs/develop/desktop-gui.md` ("Keys in an agent's terminal").
 - **Asserts:** writing to the deck's PTY the encoding a terminal emits for each key — CSI u for Ctrl+Backspace and the Super/Cmd chords, the xterm modifier form for the rest — the recorder receives ETB for Ctrl+Backspace, `ESC d` for Ctrl+Delete and Alt/Option+Delete, `ESC[1;3D` / `ESC[1;3C` for Alt/Option+Left/Right, and SOH / ENQ / NAK for Super/Cmd+Left / Right / Backspace, which is what the desktop sends; and, unchanged, Home, End, Ctrl+Left/Right, Alt+Backspace, Shift+Enter, Ctrl+Enter, Ctrl+/, the bytes a macOS terminal sends for Option+Left/Right (`ESC b` / `ESC f`) and the readline bytes a terminal set up for macOS text editing sends (Ctrl+A, Ctrl+E, Ctrl+U, Ctrl+W, `ESC d`), a legacy terminal's BS, and a bracketed paste's text; BS for Ctrl+Shift+Backspace and `ESC BS` for Ctrl+Alt+Backspace (both CSI u), and Shift+Delete and Home/End with Ctrl, Shift or Alt in their modifier form (`ESC[3;2~`, `ESC[1;5H`…). Then the pane's program turns application cursor mode on (`ESC[?1h`, on a file the test creates): Up, Down, Right, Left, Home and End arrive as `ESC O A`…`ESC O F` whether the terminal typed the CSI or the SS3 form, while Shift+Up, Ctrl+Left, Alt+Right, Ctrl+End and Delete keep their ordinary bytes; after `ESC[?1l` the cursor keys are back to the CSI form. A phase starts only once the recorder has the previous phase's marker, so no key straddles a mode change. The deck must still be in the pane afterwards, so none of those keys was taken by a deck shortcut.
 - **Does not assert:** what a real terminal emits for a physical key (the sequences are injected already encoded, and a terminal may keep a chord, Cmd above all, for itself); what an agent does with the bytes; application cursor mode in a pane other than the focused one, or across a reattach; the desktop side, which is `desktop/src/components/TerminalViewport.keys.test.tsx` and `desktop/e2e/agent-terminal-input.spec.ts`.
+- **Platform coverage:** mac+linux.
+
+### Deck log containment (issues #1791, #1796)
+
+#### logging/containment
+
+##### logging/containment/001 — An explicitly armed test process never opens a deck.log outside its owned root.
+- **Layer:** fast tier (`tests/deck_log_containment.rs`): the real binary's `wrap --agent codex -- /bin/true` with a cleared environment, the containment marker and an explicit owned root.
+- **Agent:** none (`/bin/true` stands in for the wrapped child; `CODEX_HOME` outside the root makes the automatic install log a containment refusal).
+- **Asserts:** with `DOT_AGENT_DECK_LOG` naming a file in a separate directory standing in for the developer's state dir, that file is never created; with the log inside the owned root, the same run writes the refusal there, so the absence is the logger refusing the path and not a run with nothing to log.
+- **Does not assert:** a log inherited from the shell that lies inside an owned root (the temp dir included), which the binary cannot tell apart from a log a test chose; the default debug log, which a test cannot write without touching the shared file (the `config_write_guard` unit test `a_test_process_opens_only_a_log_it_owns` pins its refusal).
+- **Platform coverage:** mac+linux.
+
+##### logging/containment/002 — A process armed only by nextest's environment never opens a deck.log outside every test scratch root.
+- **Layer:** fast tier (`tests/deck_log_containment.rs`): the same wrapper run, armed only by `NEXTEST` and `NEXTEST_RUN_ID`, the way a binary spawned without a cleared environment inherits them.
+- **Agent:** none (`/bin/true`).
+- **Asserts:** a log in cargo's target tmp dir (checked to be outside the private base; the child is handed its own temp dir, so the system one is not among its roots) is never created; a log in the child's temp dir receives the refused install's line.
+- **Does not assert:** that the test runner itself scrubs `DOT_AGENT_DECK_LOG` before `main`; a deck started with a cleared environment and no containment variables, which is not a test process to the binary.
 - **Platform coverage:** mac+linux.
 
 ### Hook delivery
@@ -7139,6 +7301,78 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** real GitHub latency, live agents, output byte budgets or notification sanitisation.
 - **Platform coverage:** mac+linux.
 
+##### scheduler/dispatch/032 — A fresh foreign claim gates dispatch and names its claimant.
+
+- **Layer:** L2 (headless daemon, offline stateful GitHub stub; lane 1).
+- **Agent:** synthetic `cat` orchestration.
+- **Asserts:** a fresh COLLABORATOR claim skips issue 7 with schedule, machine and actual GitHub login attribution; unclaimed issue 8 dispatches, as do issues 9 and 10 where NONE and CONTRIBUTOR authors copy and freshly edit the collaborator's full claim body. With an hourly cron and a 3-hour reader TTL, a 24-hour-old trusted claim stating a 168-hour lifetime skips and stays intact, while an equally old legacy-format claim without the lifetime dispatches; gating remains enabled.
+- **Does not assert:** real GitHub permissions or agent work.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/033 — A stale foreign claim permits dispatch and a new own record advances freshness.
+
+- **Layer:** L2 (headless daemon, offline stateful GitHub stub; lane 1).
+- **Agent:** synthetic `cat` orchestration.
+- **Asserts:** foreign record and label event older than the TTL permit dispatch; the foreign record stays intact and the own record has a current update time.
+- **Does not assert:** a live GitHub clock.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/034 — Workspace loss recovers from an own dead claim without intervening GitHub writes.
+
+- **Layer:** L2 (headless daemon, offline stateful GitHub stub; lane 1).
+- **Agent:** synthetic `cat` orchestration.
+- **Asserts:** SIGKILL and removal of daemon state, clone and worktree followed by a fresh daemon permits redispatch; an additional stale foreign record permits it, a live foreign record gates it; no repo write occurs between fires.
+- **Does not assert:** graceful-close cleanup or real GitHub operations.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/035 — Default and explicit false kill switches preserve claim writes.
+
+- **Layer:** L2 (headless daemon, offline stateful GitHub stub; lane 1).
+- **Agent:** synthetic `cat` orchestration.
+- **Asserts:** gating omitted or false dispatches a fresh foreign-claimed issue and writes an own claim alongside the unchanged foreign record.
+- **Does not assert:** CLI authoring of these file-only keys.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/036 — A worktree skip refreshes the owner record at most once per half-TTL.
+
+- **Layer:** L2 (headless daemon, offline stateful GitHub stub; lane 1).
+- **Agent:** synthetic `cat` orchestration.
+- **Asserts:** with gating enabled, omitted, false, or disabled at load for a daily TTL of 48 hours, a worktree-backed own record older than half-TTL receives one changed-body edit; the next fire skips without another edit or spawn. Two fresh worktree skips cost exactly one account lookup and two comments reads with per_page=100, no events or writes, plus issue enumeration and the open-PR barrier's PR check.
+- **Does not assert:** elapsed wall-clock hours; GitHub timestamps are fixture data.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/037 — A TTL below twice the longest cron gap plus one hour disables gating with a warning.
+
+- **Layer:** L2 (headless daemon, offline stateful GitHub stub; lane 1).
+- **Agent:** synthetic `cat` orchestration.
+- **Asserts:** a weekday schedule with TTL 100 hours loads, emits a scheduler warning naming claim_gating is OFF for the task, and dispatches a freshly foreign-claimed issue.
+- **Does not assert:** the full cron-validation matrix.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/038 — Removing the claim label releases a fresh foreign claim.
+
+- **Layer:** L2 (headless daemon, offline stateful GitHub stub; lane 1).
+- **Agent:** synthetic `cat` orchestration.
+- **Asserts:** a later `unlabeled` event permits issue 7 to dispatch despite a fresh foreign record; the foreign comment stays intact and an own record is written; an otherwise equivalent issue whose label is still present skips with foreign claimant attribution and starts no worktree.
+- **Does not assert:** real GitHub label removal permissions or human UI interactions.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/039 — A failed claim read permits dispatch with an explanatory warning.
+
+- **Layer:** L2 (headless daemon, offline stateful GitHub stub; lane 1).
+- **Agent:** synthetic `cat` orchestration.
+- **Asserts:** HTTP 502 from events, comments or account reads permits dispatch despite a fresh foreign claim, with an unchecked-claims explanation and a recovered own claim write. Hanging each of those reads exhausts a shared two-second budget across three issues; all three dispatch unchecked without IssueDispatchFailed, and the exact claim-call count is bounded at the hanging step with no subsequent write.
+- **Does not assert:** live GitHub outages or post-spawn write timeouts (scheduler/dispatch/031).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/040 — A failed or timed-out refresh preserves a clean worktree skip.
+
+- **Layer:** L2 (headless daemon, offline stateful GitHub stub; lane 1).
+- **Agent:** synthetic `cat` orchestration.
+- **Asserts:** an aged own claim backed by a worktree still skips cleanly when PATCH returns HTTP 502 or comments/account/events/PATCH hangs to the shared budget; the record, worktree and running agent survive, with no IssueDispatchFailed or claim-failure notification. Exact claim-call counts stop at the failed step; an open-PR sibling proves the run finishes.
+- **Does not assert:** live GitHub outages, real agent work or the open-PR short-circuit (scheduler/dispatch/012).
+- **Platform coverage:** mac+linux.
+
 #### scheduler/pi
 
 ##### scheduler/pi/001 — A SCHEDULED, UNATTENDED real `pi` job (no TUI client attached) boots and its bundled extension reports the Pi pane's status via `agent-event`, re-broadcast on the daemon's event stream (PRD #201 M4.2).
@@ -7891,7 +8125,8 @@ Live real-backend tests in `desktop/src-tauri/tests/voice_phrase_fixtures.rs`, n
 - **Layer:** L2 lane 1, PTY-attached (the real `dot-agent-deck` binary on the `minimal` fixture, launched and panicked on a spawned thread named after the test so `TuiDeck`'s `Drop` runs its failure path).
 - **Agent:** sleeping shell stand-in on Unix; no real agent or credential.
 - **Asserts:** the thread ends in the deliberate panic, not a launch or `wait_for_string` timeout, which would take the same failure path; the drop still writes the failure dump (`provenance.json` with `outcome: failed`, `final-grid.txt`); the paired `test.md` is not written. On Unix, the captured sandbox daemon and agent pids must both stop within two seconds after teardown, so neither can continue work with a deleted cwd; the test reaps only those captured pids if the regression fails. A `test.md` already in the recordings directory is set aside for the run and restored afterwards. Before the fix, the panicking drop called `regenerate_paired_doc`, which syn-parses every `#[spec]`-bearing source file and wrote this test's `test.md`; it took 8–24s on a loaded 16-core box and kept CI's `manager_016` alive past nextest's 180s timeout on starved 4-CPU runners.
-- **Does not assert:** a wall-clock bound on the drop (the observation is the skipped step, which does not depend on machine load); the record-on-success path (`DOT_AGENT_DECK_RECORD=1`), which still regenerates the doc; the content of any dumped artifact beyond the provenance outcome.
+- **Also asserts:** a relative tracing log is collected from the actual launch subdirectory, and session metadata is collected from the effective overridden sandbox HOME. Transcript input is a synthetic JSONL fixture; this does not establish real-agent mode behavior.
+- **Does not assert:** a wall-clock bound on the drop (the observation is the skipped step, which does not depend on machine load); the record-on-success path (`DOT_AGENT_DECK_RECORD=1`), which still regenerates the doc.
 - **Platform coverage:** mac+linux.
 
 ##### harness/teardown/002 — The teardown stop never stops a daemon reached through a fixture socket name that leads to another deck's socket (PRD #1666 audit A2-1).
@@ -11521,6 +11756,19 @@ Manual merge gate: opt in with `DOT_AGENT_DECK_INBOX_LOAD_TEST=1` only when sche
 - **Asserts:** 20 messages across genuine spawn seed, idle and a sleep-tool turn are acknowledged and acted on, and the actual inbox list CLI lists each as acknowledged, within a 300-second agent window; a message left queued fails it (until 2026-10-14 a queued message passed, so a run with nothing acknowledged was green). Three busy-loop processes per available CPU run throughout and are killed/reaped using captured children in Drop; PSI load context is emitted on success and failure; vt100 bottom rows contain no stranded doorbell line or message opener after settling.
 - **Does not assert:** Persistence across daemon restart, exact model prose, or load-test execution in normal verification; only the scheduled opt-in run exercises the loaded scenario.
 - **Platform coverage:** mac+linux, local credentials only; never CI.
+
+## Desktop native driver scenarios
+
+These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[spec]` scanner, and run in CI's advisory `desktop-driver` job. `docs/develop/desktop-gui.md` ("The driver tier") describes the harness.
+
+##### desktop/fleet/001 — All Decks shows two real daemons apart, and one stopping is that deck's problem alone.
+
+- **Test:** `desktop/driver/fleet.test.ts`, `fleet_001`.
+- **Layer:** native Tauri/WebKitGTK driver (`tauri-driver` and `WebKitWebDriver` under Xvfb) against two real `daemon serve` processes. The second is reached as a remote deck through the app's own `ssh -N -L` tunnel to a loopback `sshd` the harness runs; the window runs under `nss_wrapper` so the app's strict host-key check reads the sandbox's `known_hosts`.
+- **Agent:** none; one `bash --noprofile --norc` per daemon, started over its attach socket. No credential.
+- **Asserts:** both daemons give their agent the same id (required, not assumed); with All Decks selected the window shows two connected sections, each holding only its own deck's row, with both lamps connected and the deck counter at `2/2`; after the far daemon is stopped, its section stays, reads disconnected with a disconnected lamp and lists no agents, while the local deck keeps exactly its own row and its connected lamp, and the counter reads `1/2`.
+- **Does not assert:** three or more decks, a deck waiting to report, an unconfigured deck-list row, a deck coming back, New agent or a pane on the far deck, or a far deck on another machine; the far deck shares this machine's filesystem, so it says nothing about a window rendering a far host's paths.
+- **Platform coverage:** Linux WebKitGTK only. Needs a system `sshd` (`DAD_DRIVER_SSHD`) and `libnss_wrapper.so` (`DAD_DRIVER_NSS_WRAPPER`); the scenario fails naming whichever is missing.
 
 ## Desktop native network scenarios
 

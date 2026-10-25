@@ -45,7 +45,7 @@ for example `dot-agent-deck · PRD #180 · PR #182 — PRD demo reel`. Each piec
 | `<repo>` | basename of the `origin` remote URL, minus a trailing `.git`. |
 | `<prd>` | the digits after the leading `prd-` in the current branch name (e.g. `prd-180-…` → `180`). |
 | `<pr>` | the open PR number for the branch (`gh pr view --json number`). **Omitted** (the whole ` · PR #<pr>` segment) when there is no open PR yet — no error. |
-| `<short desc>` | the H1 of `prds/<prd>-*.md`, stripped of a leading `PRD #<n>:` prefix (e.g. `# PRD #180: PRD demo reel` → `PRD demo reel`). Falls back to `demo reel` if no PRD heading is found. |
+| `<short desc>` | the H1 of `prds/<prd>-*.md`, stripped of a leading `PRD #<n>:` prefix (e.g. `# PRD #180: PRD demo reel` → `PRD demo reel`). When there is no such file (since issue #1591 a PRD lives in its issue), the PRD issue's title (`gh issue view <prd> --json title`), stripped of a leading `PRD: ` or `PRD #<n>:` prefix and of control characters; the title is printed as text, never evaluated. Falls back to `demo reel` when neither gives a description, including when `gh` fails. |
 
 Composition degrades gracefully — a missing repo/PRD/PR drops only its own segment — so it never errors. Pass `--title "…"` to override the whole thing verbatim; this is needed for manual/dogfood runs where the branch/PRD don't match the clips being stitched. Inspect what would be used without publishing via `build.sh title`.
 

@@ -1374,6 +1374,11 @@ fn is_retired_delivery_id(id: &str) -> bool {
 }
 
 fn main() -> ExitCode {
+    // PRD #1741: the telemetry PATH shim, first, so the agent's arguments it
+    // carries are never read as the deck's.
+    if let Some(code) = dot_agent_deck::telemetry::shim::run_if_invoked() {
+        return code;
+    }
     // PRD #89 M3.4: the `--continue` flag was removed — auto-restore is now the
     // default. Intercept a stale invocation before clap parsing so the user
     // gets a guiding message ("auto-restore is the default; just run
@@ -2603,6 +2608,11 @@ fn init_logging_from_env() {
         } else {
             std::path::PathBuf::from(log_val)
         };
+        // Issues #1791, #1796: a test process does not open an inherited log
+        // that is not its own; see `config_write_guard::log_write_allowed`.
+        if !dot_agent_deck::config_write_guard::log_write_allowed(&log_path) {
+            return;
+        }
         match std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -4057,6 +4067,7 @@ async fn run_schedule_cli(action: ScheduleAction) -> ExitCode {
                 max_per_run: max_per_run.unwrap_or_else(default_max_per_run),
                 label,
                 query,
+                claim: Default::default(),
             });
             schedule_cli::add(
                 &mut tasks,

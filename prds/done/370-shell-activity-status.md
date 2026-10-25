@@ -4,7 +4,7 @@
 **Priority**: Medium
 **Created**: 2026-08-04 (issue filed) / 2026-08-05 (PRD written)
 **GitHub Issue**: [#370](https://github.com/vfarcic/dot-agent-deck/issues/370)
-**Related**: [#234](https://github.com/vfarcic/dot-agent-deck/issues/234) (`prds/234-screen-state-observation-hookless-agents.md`) — adjacent problem (hookless/redrawing-TUI agents), different mechanism (vt100 screen-diff vs. this PRD's PTY foreground-process-group check); do not conflate the two. `src/state.rs` (`SessionStatus`, `AppState::apply_event`), `src/hook.rs`, `src/wrap.rs` (`classify_line`), `src/platform/proc/{mod.rs,unix.rs}` (`AgentProcessGroup`, `pid_to_pgid`)
+**Related**: [#234](https://github.com/vfarcic/dot-agent-deck/issues/234) — adjacent problem (hookless/redrawing-TUI agents), different mechanism (vt100 screen-diff vs. this PRD's PTY foreground-process-group check); do not conflate the two. `src/state.rs` (`SessionStatus`, `AppState::apply_event`), `src/hook.rs`, `src/wrap.rs` (`classify_line`), `src/platform/proc/{mod.rs,unix.rs}` (`AgentProcessGroup`, `pid_to_pgid`)
 
 ## Problem Statement
 

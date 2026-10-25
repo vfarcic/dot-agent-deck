@@ -38,6 +38,7 @@
       "[ -n \"$DAD_DEV_BIN\" ] && export PATH=\"$DAD_DEV_BIN:$PATH\" || true",
       "[ -n \"$USE_VALS\" ] && [ -z \"$GOOGLE_APPLICATION_CREDENTIALS\" ] && [ -f \"$HOME/.config/gcloud/dot-agent-deck-secrets.json\" ] && export GOOGLE_APPLICATION_CREDENTIALS=\"$HOME/.config/gcloud/dot-agent-deck-secrets.json\" || true",
       "[ -n \"$USE_VALS\" ] && eval \"$(vals env -export -f .env.vals.yaml)\" || true",
+      "[ -n \"$HONEYCOMB_INGEST_KEY\" ] && [ -z \"$OTEL_EXPORTER_OTLP_HEADERS\" ] && export OTEL_EXPORTER_OTLP_HEADERS=\"x-honeycomb-team=$HONEYCOMB_INGEST_KEY\" || true",
       "[ -f .env ] && source .env || true"
     ],
     "scripts": {
@@ -63,7 +64,7 @@
       "oc-kimi":            ["opencode --model openrouter/moonshotai/kimi-k2.6"],
       "codex-big": [
         "\"$DEVBOX_PROJECT_ROOT/scripts/box/require-codex-version.sh\"",
-        "codex --model gpt-6.1-sol --sandbox danger-full-access --ask-for-approval never -c model_reasoning_effort=high"
+        "codex --model gpt-6.1-sol --sandbox danger-full-access --ask-for-approval never -c model_reasoning_effort=high -c check_for_update_on_startup=false"
       ]
     }
   }

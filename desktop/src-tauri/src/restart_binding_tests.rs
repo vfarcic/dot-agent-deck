@@ -175,21 +175,25 @@ impl RestartingDeck {
                                     recorded.lock().unwrap().push((process, op.clone()));
                                 }
                                 let live = script.lock().unwrap().live.clone();
-                                with_live(serve(&op), live)
+                                let reply = with_live(serve(&op), live);
+                                // The restart lands before the reply is
+                                // written: no connection the client opens
+                                // after reading it reaches `process`, and a
+                                // `restart_after` set after the client read
+                                // it never fires on this request.
+                                let mut script = script.lock().unwrap();
+                                if script.current == process
+                                    && let Some((after, next)) = script.restart_after
+                                    && after == op
+                                {
+                                    script.current = next;
+                                    script.restart_after = None;
+                                }
+                                reply
                             };
                             let encoded = serde_json::to_vec(&reply).expect("serialize the reply");
                             let _ = write_frame(&mut writer, KIND_RESP, &encoded).await;
                             if op != "hello" {
-                                {
-                                    let mut script = script.lock().unwrap();
-                                    if script.current == process
-                                        && let Some((after, next)) = script.restart_after
-                                        && after == op
-                                    {
-                                        script.current = next;
-                                        script.restart_after = None;
-                                    }
-                                }
                                 if op == "attach-stream" && script.lock().unwrap().terminal_probe {
                                     let _ = write_frame(
                                         &mut writer,
@@ -687,7 +691,7 @@ fn permission_question() -> dot_agent_deck::question::PendingQuestion {
     }
 }
 
-/// Scenario: agent `1` waits on a permission question and the voice panel answers it through the real `desktop_voice_answer_question` command, invoked over IPC on Tauri's mock runtime, after the same-build deck restarted. The answer is refused with the gone sentence and the successor is sent no answer; with no restart, the deck that listed the question receives the answer (control).
+/// Scenario: agent `1` waits on a permission question and the voice panel answers it through the real `desktop_voice_answer_question` command, invoked over IPC on Tauri's mock runtime, with the same-build deck restarting before the question is refreshed or between that refresh and the answer. The answer is refused with the gone sentence and the successor receives no action, while a read-only listing may refresh the question; with no restart, the deck that listed the question receives the answer (control).
 #[test]
 fn handshake_013_a_voice_answer_after_a_restart_answers_nothing() {
     use tauri::ipc::{CallbackFn, InvokeBody};
@@ -700,7 +704,17 @@ fn handshake_013_a_voice_answer_after_a_restart_answers_nothing() {
         .build()
         .expect("a runtime for the scripted deck");
     let _selection = runtime.block_on(crate::dto::SELECTION_LOCK.lock());
-    for restarted in [false, true] {
+    enum Restart {
+        Never,
+        BeforeQuestionRead,
+        AfterQuestionRead,
+    }
+    for restart in [
+        Restart::Never,
+        Restart::BeforeQuestionRead,
+        Restart::AfterQuestionRead,
+    ] {
+        let restarted = !matches!(restart, Restart::Never);
         let deck = {
             let _entered = runtime.enter();
             RestartingDeck::start("g5-voice", "a")
@@ -714,10 +728,12 @@ fn handshake_013_a_voice_answer_after_a_restart_answers_nothing() {
             .clone()
             .expect("agent 1 waits on a question");
         assert_eq!(row.incarnation.as_deref(), Some("a"));
-        if restarted {
+        match restart {
+            Restart::Never => {}
+            Restart::BeforeQuestionRead => deck.restart_as("b"),
             // The command reads the question afresh, then sends the answer:
             // the deck restarts between the two.
-            deck.restart_after("list-agents", "b");
+            Restart::AfterQuestionRead => deck.restart_after("list-agents", "b"),
         }
 
         let app = mock_builder()
@@ -757,8 +773,17 @@ fn handshake_013_a_voice_answer_after_a_restart_answers_nothing() {
             },
         );
         if restarted {
+            // Refreshing the question may list the successor before its
+            // incarnation is compared with the held row. That read is not an
+            // answer; every other recorded request (including PTY input)
+            // must still be absent.
+            let actions: Vec<_> = deck
+                .received_by("b")
+                .into_iter()
+                .filter(|op| op != "list-agents")
+                .collect();
             assert_eq!(
-                deck.received_by("b"),
+                actions,
                 Vec::<String>::new(),
                 "a voice answer reached the successor; answer={answer:?}"
             );

@@ -810,9 +810,13 @@ select_ids() {
 #   repo      <- basename of the origin remote URL, minus a trailing '.git'.
 #   prd       <- digits after the leading 'prd-' in the current branch name.
 #   pr        <- open PR number for this branch (gh); OMITTED when there is none.
-#   short desc<- H1 of prds/<prd>-*.md, minus a leading 'PRD #<n>:' prefix.
+#   short desc<- H1 of prds/<prd>-*.md, minus a leading 'PRD #<n>:' prefix; when
+#                that file does not exist (since issue #1591 a PRD lives in its
+#                issue), the PRD issue's title (gh), minus a leading 'PRD: ' or
+#                'PRD #<n>:' prefix and any control characters.
 # Every piece degrades gracefully: a missing repo/prd/pr drops just its segment,
-# and a missing PRD heading falls back to a sane default — composition never
+# and a PRD with neither a heading nor a readable issue title falls back to
+# 'demo reel' — composition never
 # errors, so a manual/dogfood run on an off-pattern branch still yields a title
 # (or the caller overrides the whole thing with --title).
 compose_title() {
@@ -835,6 +839,15 @@ compose_title() {
     if [[ -n "$prd_file" && -f "$prd_file" ]]; then
       # H1, minus the leading '# ', then minus a leading 'PRD #<n>:' prefix.
       desc="$(grep -m1 '^# ' "$prd_file" 2>/dev/null | sed -E 's/^# +//; s/^PRD #?[0-9]+:[[:space:]]*//')"
+    fi
+    if [[ -z "$desc" ]]; then
+      # No prds/ file: the issue title. Whoever opened the issue can set it, so
+      # it is only ever assigned and printed, never evaluated; control
+      # characters (newlines included) are dropped so it stays one line. Any gh
+      # failure (offline, no auth, no such issue) leaves desc empty.
+      desc="$(gh issue view "$prd" --json title --jq .title 2>/dev/null \
+        | LC_ALL=C tr -d '[:cntrl:]' \
+        | sed -E 's/^PRD( #?[0-9]+)?:[[:space:]]*//' || true)"
     fi
   fi
   [[ -n "$desc" ]] || desc="demo reel"

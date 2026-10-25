@@ -11,7 +11,9 @@
  *      (running / waiting / finished) and card detail (directory, submitted
  *      prompt, tool calls — issue #622) via `dot-agent-deck agent-event` — so
  *      a Pi pane's card is driven with NO Claude-Code hook installed and NO
- *      `~/.claude/settings.json` mutation.
+ *      `~/.claude/settings.json` mutation, and
+ *   4. when the deck exports telemetry, exports Pi's own usage metadata over
+ *      OTLP (`./telemetry.ts`, PRD #1741).
  *
  * All the testable decisions (argv construction, event→state mapping, error
  * classification) live in the pure, import-free `./orchestrator.ts`. This file
@@ -65,6 +67,7 @@ import {
 	untagHandOver,
 	WATCHER_NOT_IN_DECK_EXIT,
 } from "./orchestrator.ts";
+import { createPiTelemetry } from "./telemetry.ts";
 
 /**
  * The deck CLI this pane shells: the operator's absolute `DOT_AGENT_DECK_BIN`
@@ -1283,6 +1286,22 @@ function guarded<E, C, R>(handler: (event: E, ctx: C) => Promise<R> | R): (event
 }
 
 export default function orchestratorExtension(pi: ExtensionAPI): void {
+	// PRD #1741: Pi's own telemetry, only when the deck switched it on.
+	const telemetry = createPiTelemetry(process.env);
+	if (telemetry !== undefined) {
+		pi.on("session_start", (event) => telemetry.observe("session_start", event));
+		pi.on("agent_start", (event) => telemetry.observe("agent_start", event));
+		pi.on("message_end", (event) => telemetry.observe("message_end", event));
+		pi.on("tool_execution_end", (event) => telemetry.observe("tool_execution_end", event));
+		pi.on("agent_end", (event) => {
+			telemetry.observe("agent_end", event);
+			void telemetry.flush();
+		});
+		pi.on("session_shutdown", async (event) => {
+			telemetry.observe("session_shutdown", event);
+			await telemetry.shutdown();
+		});
+	}
 	// --- M2.1: native delegate tool --------------------------------------
 	pi.registerTool({
 		name: "delegate",

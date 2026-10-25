@@ -16,14 +16,14 @@
 # the full tier is 26.4-26.9s root-only and 25.3-26.7s with `--workspace` —
 # indistinguishable, because the tier's wall clock is set by its slowest test
 # (~20s), not by its count.
-test-fast = "nextest run --workspace"
+test-fast = "nextest run --workspace --config env.OTEL_SDK_DISABLED='true'"
 # Issue #494: `--features e2e` names the CARGO FEATURE `e2e`, NOT a nextest
 # profile. There is no `-P` / `--profile` here, so this — like `test-fast`
 # above, and like every `cargo nextest run` in `.github/workflows/` — runs
 # under nextest's `default` profile, the only profile `.config/nextest.toml`
 # declares. Timeout carve-outs therefore belong under
 # `[[profile.default.overrides]]`.
-test-e2e = "nextest run --workspace --features e2e"
+test-e2e = "nextest run --workspace --features e2e --config env.OTEL_SDK_DISABLED='true'"
 # Issue #502 lane 2. NOTE THE SHAPE: enabling BOTH features is a SUPERSET run
 # — every `tests/e2e_*.rs` file, i.e. the deterministic ones `test-e2e`
 # already runs PLUS the credentialed ones. It is NOT a live-only run, and
@@ -46,7 +46,20 @@ test-e2e = "nextest run --workspace --features e2e"
 # `--workspace` for the same reason as the two aliases above (issue #489):
 # without it cargo selects the root package alone and every test in
 # `xtask/linkage-check` and `xtask/docs` drops out of the gate.
-test-e2e-live = "nextest run --workspace --features e2e,e2e-live"
+test-e2e-live = "nextest run --workspace --features e2e,e2e-live --config env.OTEL_SDK_DISABLED='true'"
+# PRD #1741: `--config env.OTEL_SDK_DISABLED='true'` on the three test aliases
+# above. Several tests run a daemon IN-PROCESS (`run_daemon_with`), and the
+# daemon reads its telemetry configuration from the process environment, so in
+# a shell carrying `OTEL_EXPORTER_OTLP_*` (the maintainer's `USE_VALS=1` devbox
+# loads a real Honeycomb endpoint and key) every test daemon would export spans
+# to it. `OTEL_SDK_DISABLED=true` turns the deck's telemetry off before it reads
+# anything else. It is nextest's `--config` override of cargo's `[env]`, scoped
+# to these aliases on purpose: a `[env]` table in this file would also reach
+# `cargo run` and `tauri dev` (which runs the desktop through cargo), and so
+# silently disable telemetry for every daemon a dev build starts. Not forced, so
+# an `OTEL_SDK_DISABLED` already in the environment wins. The e2e harness
+# `env_clear`s the binaries it spawns, so its telemetry tests still set their
+# own `OTEL_*` and are unaffected. A raw `cargo nextest run` does not carry it.
 # PRD #77 Decision 7: `cargo xtask linkage-check` enforces catalog↔test
 # linkage. Args after the alias pass through to the binary.
 xtask = "run --quiet --package xtask-linkage-check --"
@@ -115,3 +128,21 @@ docs-screenshots = "run --quiet --package xtask-screenshots --"
 # and the degradation ladder are in `docs/develop/build-gate.md`.
 [target.x86_64-unknown-linux-gnu]
 linker = "./scripts/link-gate.sh"
+# Issues #864 / #927 — split debug info. rustc writes each object's DWARF to a
+# `.dwo` file beside it instead of into the object, so the linker no longer
+# copies the whole dependency graph's debug info into every one of the ~130
+# test binaries. Measured on the 16-core / 62 GiB dev box, one test build
+# (`cargo nextest run --workspace --no-run`): `target/` 37 GB -> 17 GB, and a
+# relink of every test binary peaks at 1.55 GiB per link instead of 3.0 GiB
+# (mean about 335 MiB instead of 607). The debug info is still there for a
+# debugger: checked with gdb, local variables print and a panic's backtrace
+# keeps file:line. That is why this and not `debug = "line-tables-only"`,
+# which saves about as much but leaves gdb no variables to show.
+#
+# HERE AND NOT IN `[profile.dev]`, because `unpacked` is a Linux and macOS
+# value: rustc refuses it on Windows MSVC, so a profile setting would break
+# every Windows MSVC dev build. macOS never reads this table, and `unpacked` is
+# already its dev default anyway. A `RUSTFLAGS` variable
+# replaces this table's `rustflags` entirely, so setting one opts out.
+# `docs/develop/build-gate.md` has the measurements.
+rustflags = ["-C", "split-debuginfo=unpacked"]
