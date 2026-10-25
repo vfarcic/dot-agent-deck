@@ -140,7 +140,12 @@ impl Receiver {
         if paths {
             command.arg("--send-worktree-paths");
         }
-        let output = bounded_output(command);
+        // --once waits for the worktrees of other live deck runs on this host,
+        // too. The measured cold walk is already 27 seconds; two collectors
+        // sharing a busy host exceeded the old 30-second fixture deadline.
+        // Keep two samples inside nextest's 180-second test deadline while
+        // allowing these disk walks more time than the small fixture commands.
+        let output = bounded_output_with_timeout(command, Duration::from_secs(75));
         assert!(
             output.status.success(),
             "collector --once must export resource metrics; status={}; stderr={}",
@@ -321,17 +326,21 @@ impl Drop for Running {
     }
 }
 
-pub fn bounded_output(mut command: Command) -> Output {
+pub fn bounded_output(command: Command) -> Output {
+    bounded_output_with_timeout(command, Duration::from_secs(30))
+}
+
+fn bounded_output_with_timeout(mut command: Command, timeout: Duration) -> Output {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let child = std::cell::RefCell::new(Running(command.spawn().expect("start collector/fixture")));
     assert!(
-        common::wait_until(Duration::from_secs(30), || child
+        common::wait_until(timeout, || child
             .borrow_mut()
             .0
             .try_wait()
             .unwrap()
             .is_some()),
-        "collector/fixture must exit within 30 seconds"
+        "collector/fixture must exit within {timeout:?}"
     );
     let mut child = child.into_inner();
     let mut stdout = Vec::new();
