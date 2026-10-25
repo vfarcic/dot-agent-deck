@@ -814,7 +814,22 @@ pub(crate) fn backup_malformed(dest: &Path, bytes: &[u8]) -> Backup {
     })();
     drop(file);
 
-    let outcome = match written.and_then(|()| std::fs::hard_link(&tmp, &backup)) {
+    let outcome = publish_outcome(
+        written.and_then(|()| std::fs::hard_link(&tmp, &backup)),
+        backup,
+        bytes,
+    );
+    // The temp is this call's own unpredictable name; the backup, published or
+    // not, is never unlinked here.
+    let _ = std::fs::remove_file(&tmp);
+    outcome
+}
+
+/// What [`backup_malformed`]'s write and `hard_link` publish of `backup` came
+/// to. Split out so an error other than `AlreadyExists` can be handed in by a
+/// test: one cannot be produced on purpose on the filesystem a test runs on.
+fn publish_outcome(published: io::Result<()>, backup: PathBuf, bytes: &[u8]) -> Backup {
+    match published {
         Ok(()) => Backup::Preserved(backup),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
             if holds_exactly(&backup, bytes) {
@@ -827,11 +842,7 @@ pub(crate) fn backup_malformed(dest: &Path, bytes: &[u8]) -> Backup {
         // mounts): no copy, and the caller's message says so. The original is
         // still untouched, which is what the refusal promises.
         Err(_) => Backup::Failed,
-    };
-    // The temp is this call's own unpredictable name; the backup, published or
-    // not, is never unlinked here.
-    let _ = std::fs::remove_file(&tmp);
-    outcome
+    }
 }
 
 /// Whether `path` is a regular file holding exactly `bytes` — read without
@@ -2658,11 +2669,45 @@ mod tests {
         );
     }
 
-    /// Scenario: the same retired-rule takeover for Claude Code's settings file, whose retired-event sweep removes every deck rule whichever install wrote it.
+    /// Scenario: the same retired-rule takeover for Claude Code's settings file, whose retired-event sweep removes every deck rule whichever install wrote it: an ineligible copy keeps the live sibling's command on every hook type it installs, and still removes that sibling's rule under the retired one, leaving the user's handler there (issue #537 item 4.5).
     #[cfg(unix)]
     #[test]
     fn config_auto_install_claude_takeover_prunes_a_retired_rule() {
         takeover_prunes_a_retired_rule("claude-code");
+        let fixture = crate::test_temp::tempdir().unwrap();
+        let (a, retired) = takeover_over_a_retired_rule(
+            "claude-code",
+            fixture.path(),
+            crate::hook_binary::Takeover::ineligible(),
+        );
+        assert_eq!(
+            deck_commands_in("claude-code", &retired),
+            Vec::<String>::new(),
+            "Claude Code drops every hook in the file over a key it does not accept, so a \
+             build does not keep a deck rule under a type it does not install, not even a \
+             live sibling's: {retired:?}"
+        );
+        assert!(
+            retired.to_string().contains("/user/audit-handler"),
+            "the user's handler under the retired type must stay: {retired:?}"
+        );
+        let path = fixture
+            .path()
+            .join("fake-operator-home")
+            .join(config_name("claude-code"));
+        let after: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let a_command = build_command(&a, "hook --agent claude-code", HookShell::Posix);
+        let installed = after["hooks"].as_object().unwrap();
+        assert!(installed.len() > 1, "{after:#}");
+        for (hook_type, rules) in installed {
+            if hook_type != "UpgradeRetiredEvent" {
+                assert_eq!(
+                    deck_commands_in("claude-code", rules),
+                    vec![a_command.clone()],
+                    "{hook_type}: the live sibling is still kept wherever this build installs"
+                );
+            }
+        }
     }
 
     /// Scenario: Install Codex hooks from live install A, then auto-install from install B. The hooks file keeps its bytes, inode and mtime and still names A.
@@ -4628,6 +4673,32 @@ mod tests {
                 "unexpected temp name shape: {name}"
             );
         }
+    }
+
+    /// A publish that failed for any reason but a taken name made no copy, and
+    /// says so: it must not be reported as a name something else holds.
+    #[test]
+    fn a_publish_failing_for_another_reason_is_reported_as_no_copy() {
+        let dir = crate::test_temp::tempdir().expect("backup tempdir");
+        let backup = dir.path().join("settings.json.bak");
+
+        assert_eq!(
+            publish_outcome(
+                Err(io::Error::from(io::ErrorKind::Unsupported)),
+                backup.clone(),
+                b"{ not json",
+            ),
+            Backup::Failed
+        );
+        std::fs::write(&backup, b"the user's own copy").expect("seed the user's backup");
+        assert_eq!(
+            publish_outcome(
+                Err(io::Error::from(io::ErrorKind::AlreadyExists)),
+                backup.clone(),
+                b"{ not json",
+            ),
+            Backup::Occupied(backup)
+        );
     }
 
     /// The backup half of #731, on the shared helper.
