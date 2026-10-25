@@ -480,7 +480,10 @@ mod linux {
             cwd_of: impl Fn(u32) -> Option<PathBuf>,
             wait: LookupWait,
         ) -> (Sample, InUse) {
-            let sample = self.aggregator.step(now_unix_nanos(), processes());
+            // The sample's time is taken once the processes are read, so no
+            // process it holds started after it.
+            let processes = processes();
+            let sample = self.aggregator.step(now_unix_nanos(), processes);
             let cwds = working_directories(&sample, cwd_of);
             let (members, in_use) = match &mut self.discovery {
                 Some(discovery) => {
@@ -1636,6 +1639,36 @@ mod linux {
             let run = sample.runs[0].key();
             let decided = sampler.run_worktrees.get().get(&run).map(|w| w.id.clone());
             assert_eq!(decided, Some(expected));
+        }
+
+        /// A sample is timed once its processes are read: a run that
+        /// started during a slow read is no later than the sample, so its
+        /// first CPU interval is not inverted.
+        #[test]
+        fn a_run_started_during_a_slow_read_is_not_after_the_sample() {
+            let cli = Cli::parse_from(["dot-agent-deck-collector", "--disk-interval", "0"]);
+            let mut sampler = Sampler::new(&cli, settings(Temporality::Cumulative)).unwrap();
+            sampler.aggregator = Aggregator::new(CLK_TCK, BOOT, now_unix_nanos());
+            let started = std::cell::Cell::new(0);
+            let (sample, _) = sampler.read_from(
+                || {
+                    std::thread::sleep(Duration::from_millis(100));
+                    let now = now_unix_nanos();
+                    started.set(now);
+                    std::thread::sleep(Duration::from_millis(100));
+                    let mut p = process(4242, RUN, CLK_TCK);
+                    p.stat.starttime = (now - BOOT * 1_000_000_000) * CLK_TCK / 1_000_000_000;
+                    vec![p]
+                },
+                |_| None,
+                LookupWait::FirstSight { cap: None },
+            );
+            let start = sample.runs[0].figures.start_unix_nanos;
+            assert!(start <= sample.time_unix_nanos, "{start} > {sample:#?}");
+            assert!(
+                sample.time_unix_nanos >= started.get(),
+                "the sample was timed before its processes were read: {sample:#?}"
+            );
         }
 
         /// A 200 answer with `body`, declaring `length` bytes of it.

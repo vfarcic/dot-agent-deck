@@ -272,7 +272,9 @@ impl Aggregator {
             by_pid.insert(p.pid, key);
         }
         for (run, starttime) in new_runs {
-            let start = self.start_unix_nanos(starttime);
+            // Never after the sample: a series cannot start after its first
+            // point, whatever the clocks say.
+            let start = self.start_unix_nanos(starttime).min(time_unix_nanos);
             if let Some(run) = self.runs.get_mut(&run) {
                 run.series.start_unix_nanos = start;
             }
@@ -779,6 +781,18 @@ mod tests {
         let s = step(&mut agg, 30, &[p(20, 1, 600, Some("r2")).cpu(3, 0)]);
         assert_eq!(s.runs.len(), 1);
         assert_eq!(s.runs[0].identity.run_id, "r2");
+    }
+
+    /// A run whose oldest process started after the sample's time (a slow
+    /// read, or a clock that stepped back) starts its series at the sample,
+    /// never after it.
+    #[test]
+    fn a_series_never_starts_after_its_first_sample() {
+        let mut agg = Aggregator::new(CLK, BOOT, STARTED);
+        let at = BOOT * 1_000_000_000 + 5_000_000_000;
+        // Started 6 s after boot, sampled 5 s after boot.
+        let s = agg.step(at, vec![p(10, 1, 600, Some("r1")).cpu(1, 0).sample()]);
+        assert_eq!(run(&s, "r1").figures.start_unix_nanos, at);
     }
 
     #[test]
