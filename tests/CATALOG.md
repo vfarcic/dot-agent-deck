@@ -2138,10 +2138,10 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Platform coverage:** mac+linux.
 
 ##### prompt/dir-picker/003 — `l` / `Right` / `Enter` descend into the selected directory; `h` / `Left` / `Backspace` ascend.
-- **Layer:** L2.
+- **Layer:** L2; plus L1 `TestBackend` (`dir_picker_003_opens_only_an_entry_it_drew`, issue #1799).
 - **Agent:** none.
-- **Asserts:** after descending, the picker shows the child directory's contents; after ascending, it shows the parent's contents again.
-- **Does not assert:** any breadcrumb / path rendering beyond directory contents.
+- **Asserts:** after descending, the picker shows the child directory's contents; after ascending, it shows the parent's contents again. L1 (issue #1799): in a frame whose popup shows the current directory but no entry, `Enter`, `l` and `Right` open nothing while `Space` still picks the current directory; in one too short to show the current directory either, `Space` picks nothing; at 80×24, with the selected entry on screen, each of the three keys opens it, an entry whose name carries a combining accent included; with room for one entry row, `j` and Enter in one burst open nothing until the newly selected entry is drawn.
+- **Does not assert:** any breadcrumb / path rendering beyond directory contents; keys typed before the picker's first frame, which it still takes (it is not a confirmation, and the e2e tier types `Ctrl+n` and `Space` in one burst).
 - **Platform coverage:** mac+linux.
 
 ##### prompt/dir-picker/004 — `Space` confirms the current directory and advances to the new-pane form.
@@ -2170,6 +2170,15 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Agent:** none.
 - **Asserts:** the picker closes; no new pane appears; daemon `list_agents` is unchanged.
 - **Does not assert:** rendering of any toast / status-line message.
+- **Platform coverage:** mac+linux.
+
+#### prompt/star
+
+##### prompt/star/001 — The star prompt's `s` / `l` / `d` keys act only while the line naming them is on screen (issue #1799).
+- **Layer:** L1 `TestBackend` (`star_001_keys_are_refused_while_their_choices_are_not_drawn`), through the production `render_frame` and the read-back of the flushed frame that PRD #1666 part 2's confirmations use.
+- **Agent:** none.
+- **Asserts:** before the prompt's first frame, and at a height of 8 rows where its `s Star  l Later  d Don't ask again` line is cut off, `s`, `l` and `d` do not reach the prompt and Escape does; at 80×24 each key reaches it and the drawn `[Star]` button is clickable.
+- **Does not assert:** what `s` does once it reaches the prompt (opening the browser, the persisted dismissal), or when the prompt opens (`StarPromptState::increment_and_check`).
 - **Platform coverage:** mac+linux.
 
 #### prompt/new-pane
@@ -2876,6 +2885,20 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** the `claude --version` probe itself (covered by the issue #714 probe tests in the same file); that a real Claude Code honours the timeout (`question/live/*`).
 - **Platform coverage:** mac+linux.
 
+##### hooks/install/019 — `hooks refresh` reports an installed agent whose hooks it could not update (PRD #1666 part 3, R-3).
+- **Layer:** fast real-binary subprocess integration (`tests/scratch_binary_hook_install.rs`), the real `hooks refresh --json` from a copy in an isolated HOME's `.local/bin`.
+- **Agent:** none; a stand-in `codex` on `PATH` makes Codex count as installed.
+- **Asserts:** malformed Claude settings alone, the same beside a Codex whose hooks it updates, and settings already naming this copy in a folder it cannot write each give a non-zero exit, `ok: false`, `Claude Code's hooks could not be updated…`, a `hooks install --agent claude-code` command and no `now run this copy` line for Claude Code; Codex is reported as updated and gets no command; the settings are left byte for byte.
+- **Does not assert:** OpenCode's or Devin's failures (their `refresh_install` reuses the same startup install), an upgrade client showing the report (`self_upgrade::agent_hooks` unit tests, `upgrade/cli-upgrade/008`).
+- **Platform coverage:** mac+linux.
+
+##### hooks/install/020 — `hooks refresh` reports an agent whose config folder it cannot inspect, rather than leaving it out (PRD #1666 part 3, R-3).
+- **Layer:** fast real-binary subprocess integration (`tests/scratch_binary_hook_install.rs`), the real `hooks refresh --json` from a copy in an isolated HOME's `.local/bin`.
+- **Agent:** none.
+- **Asserts:** with no Claude Code or OpenCode folder the report is ok and says no installed agent was found; an OpenCode XDG root under a `~/.config` that cannot be searched (no legacy `~/.opencode`), and a `~/.claude` symlink into a folder that cannot be searched, each give a non-zero exit, `ok: false`, `<agent>'s hooks could not be updated…` and that agent's `hooks install` command, and no `No installed agent` line.
+- **Does not assert:** Codex or Devin, which count as installed by an executable on `PATH` rather than by a config folder, and whose install creates and reports on that folder itself; a root run, which prints `SKIP:` because root ignores the directory modes.
+- **Platform coverage:** mac+linux.
+
 #### hooks/stale
 
 ##### hooks/stale/001 — The notice names the agents, binary, versions and remedy, keeping the agents and both versions at 60 columns.
@@ -3453,6 +3476,13 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Agent:** none.
 - **Asserts:** observed reflow count under a burst of resize events is bounded; final size matches the last input.
 - **Does not assert:** the exact debounce window (a harness constant).
+- **Platform coverage:** mac+linux.
+
+##### resize/sigwinch/004 — Keys typed right after a terminal resize take effect without any further input.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_resize_input.rs`).
+- **Agent:** none (empty dashboard, `minimal` fixture).
+- **Asserts:** with the dashboard filter open, sixty characters each typed straight after a resize pair — the second resize sent once the reader has recorded a screen clear after the first, normally the one that starts the deck's redraw for it (`TuiDeck::resize_during_redraw`; a clear from the previous pair that the reader records late can also release it), so it is likely, not certain, that it lands while the deck is still drawing — each appear in the `/ ` prompt within ten seconds with no other byte sent. The check is on text that only grows, so no earlier key can satisfy a later key's check. Against crossterm 0.29.0's unpatched event source it failed in all ten of ten runs, within the first two characters, and one more byte released the key every time; a failure reports that release, which tells a stranded key from a lost one.
+- **Does not assert:** the redraw at the new size (covered by `resize/sigwinch/001`); a resize that arrives behind typing in the same batch, or a paste longer than one terminal read that arrives with a resize, both of which the vendored crate's own test reproduces (`vendor/crossterm/VENDORED.md`).
 - **Platform coverage:** mac+linux.
 
 #### resize/layout
@@ -4058,7 +4088,7 @@ without depending on the config struct API.
 ##### orchestration/delegate/013 — In separate runs leave a delegate Queued or Fetched past the accelerated undelivered deadline. The orchestrator receives one daemon-labelled inbox notice naming the message, worker, state and doorbell path, without pane text being typed.
 - **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
 - **Agent:** none.
-- **Asserts:** In separate runs leave a delegate Queued or Fetched past the accelerated undelivered deadline. The orchestrator receives one daemon-labelled inbox notice naming the message, worker, state and doorbell path, without pane text being typed. A replacement orchestrator must receive no stale notice from its predecessor's still-unacknowledged task, which remains fetchable by the original worker.
+- **Asserts:** In separate runs leave a delegate Queued or Fetched past the accelerated undelivered deadline. For the Queued one the orchestrator receives one daemon-labelled inbox notice naming the message, worker, state and doorbell path, without pane text being typed; the Fetched one, which may have reached the worker, raises none (PRD #1666 part 3, H5). A replacement orchestrator must receive no stale notice from its predecessor's still-unacknowledged task, which remains fetchable by the original worker.
 - **Test:** `delegate_013_silent_worker_surfaces_notice_in_orchestrator_pane` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
@@ -4225,10 +4255,10 @@ without depending on the config struct API.
 - **Does not assert:** what the orchestrator's pane shows for the refusal; the TUI opening the successor's pane itself (the test sends the `StartAgent` a TUI would send).
 - **Platform coverage:** mac+linux (unix-only PTY/UDS, `python3` stand-in roles).
 
-##### orchestration/delegate/052 — An addendum sent with `delegate --supersede` to a `clear = true` worker that is working on a task restarts the worker, and the new agent gets the addendum without the original task; a `clear = false` worker keeps its agent but owes a `work-done` for each task (issue #1784).
+##### orchestration/delegate/052 — An addendum sent with `delegate --supersede` to a `clear = true` worker that is working on a task restarts the worker, and the new agent gets the addendum without the original task; a `clear = false` worker keeps its agent, and the addendum replaces the original task (issue #1784; PRD #1666 part 3).
 - **Layer:** fast integration (`tests/delegate_respawn_recovery.rs`; the real `handle_delegate_with_state` against an in-process daemon whose roles were started through the real `StartAgent`, and the worker's tasks fetched and acknowledged from its inbox as an agent's component does).
 - **Agent:** none: `cat` stand-ins for both roles, because what is under test is which agent the daemon hands the addendum to, not what an agent does with it.
-- **Asserts:** for a `clear = true` `coder`: the original task is dispatched and taken, so the worker owes a `work-done`; a plain delegate of the addendum is refused with `coder` in `busy`; the `--supersede` delegate is dispatched; the addendum is taken by a different agent than the one that took the original task, that agent is no longer running, and both the delivered text and `worker-task-coder.md` carry the addendum without the original task; after one `work-done`, a plain delegate is not refused as busy. Control: the same steps on a `clear = false` `coder` hand the addendum to the agent that took the original task, which is still running, and after one `work-done` a plain delegate IS refused as busy, because the addendum is a task of its own (the orchestrator's instructions say so; PR #1785 review).
+- **Asserts:** for a `clear = true` `coder`: the original task is dispatched and taken, so the worker owes a `work-done`; a plain delegate of the addendum is refused with `coder` in `busy`; the `--supersede` delegate is dispatched; the addendum is taken by a different agent than the one that took the original task, that agent is no longer running, and both the delivered text and `worker-task-coder.md` carry the addendum without the original task; after one `work-done`, a plain delegate is not refused as busy. Control: the same steps on a `clear = false` `coder` hand the addendum to the agent that took the original task, which is still running, and after one `work-done` a plain delegate is not refused as busy, because `--supersede` ended the original task and its debt (PRD #1666 part 3, round 5, plan D8; before it, the worker owed a `work-done` for each task, PR #1785 review).
 - **Why it exists:** issue #1784. Confirmed red when written to assert what the user wanted (`left: "4"`, `right: "3"`: the agent that was working was replaced), and green with the same assertions on `clear = false`, so the restart comes from `clear = true` and not from `--supersede`. It pins `--supersede`'s meaning, which the issue keeps and the orchestrator's instructions warn about; an addendum that keeps a `clear = true` worker's agent needs its own path, which is scheduled after PRD #1666.
 - **Does not assert:** a real agent losing its conversation (a `cat` has none; the agent being replaced is what loses it); the orchestrator's instructions (`orchestrator_context` unit tests cover those); a `--supersede` before the worker took its task.
 - **Platform coverage:** mac+linux (unix-only PTYs).
@@ -4238,7 +4268,7 @@ without depending on the config struct API.
 ##### orchestration/work-done/001 — A `work-done` from a worker with NO outstanding delegation is reported to the orchestrator as unsolicited, and does not overwrite the last commissioned report (issue #448).
 - **Layer:** fast integration (real `handle_work_done` against daemon-owned PTYs; `cat` stand-ins, no LLM and no `e2e` feature gate).
 - **Agent:** none (a raw no-echo `cat` orchestrator observer, whose inbox is the observable, plus a `cat` worker).
-- **Asserts:** with an earlier delegation's report already parked at `.dot-agent-deck/work-done-coder.md` and nothing delegated, the worker's `work-done` posts one message to the orchestrator's inbox whose deck-written preface carries the unsolicited label (`the deck has no outstanding delegation to that worker on record`, reworded by issue #505); the filed-report note (`Their full report is also saved at .dot-agent-deck/work-done-coder.md.`) is ABSENT; the worker's report travels in the message inside the `[UNTRUSTED-WORKER-REPORT:` frame with the test's fresh sentinel; and the parked earlier report is still on disk byte-for-byte. The inbox is read whole, rendered as `inbox fetch` prints it, with no state changed (PRD #1666 S5).
+- **Asserts:** with an earlier delegation's report already parked at `.dot-agent-deck/work-done-coder.md` and nothing delegated, the worker's `work-done` posts one message to the orchestrator's inbox whose deck-written preface carries the unsolicited label (`the deck has no outstanding delegation to that worker on record`, reworded by issue #505); the filed-report note (`Their full report is also saved at .dot-agent-deck/work-done-coder.md.`) is ABSENT; the worker's report travels in the message inside the `[UNTRUSTED-WORKER-REPORT:` frame with the test's fresh sentinel; and the parked earlier report is still on disk byte-for-byte. The inbox is read whole, rendered as `inbox fetch` prints it, with no state changed (PRD #1666 S5). PRD #1666 part 3, round 5 (plan D10, §8, rewritten on purpose): a report that names no task is a note, and its label is now `This report names no task, so the deck marked no task complete`.
 - **Does not assert:** what the orchestrator then DOES with the label (an LLM decision); the commonest sibling trace — a worker redirected by a human mid-delegation, which produces a well-formed completion for a diverged task and involves no defect (#445/#369); the ledger's own arithmetic (unit-tested on `AgentPtyRegistry::retire_delegation_commission`).
 - **Platform coverage:** mac+linux (unix-only — raw-mode shell observer).
 
@@ -4256,10 +4286,10 @@ without depending on the config struct API.
 - **Does not assert:** the no-cwd and mkdir-only variants of the same failure (unit-tested on `write_work_done_summary`); the stale-file READ itself (the pointer's absence is what makes it unreachable); recovery of the file on a later delegation.
 - **Platform coverage:** mac+linux (unix-only — raw-mode shell observer).
 
-##### orchestration/work-done/004 — Run the real work-done CLI from an uncommissioned synthetic worker. One bound Untrusted report is fetched and rendered in the orchestrator pane, labelled unsolicited, with no commissioned summary file.
+##### orchestration/work-done/004 — Run the real work-done CLI from an uncommissioned synthetic worker. One bound Untrusted report is fetched and rendered in the orchestrator pane, labelled as a note that completes no task, with no commissioned summary file.
 - **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
 - **Agent:** none.
-- **Asserts:** Run the real work-done CLI from an uncommissioned synthetic worker. One bound Untrusted report is fetched and rendered in the orchestrator pane, labelled unsolicited, with no commissioned summary file.
+- **Asserts:** Run the real work-done CLI from an uncommissioned synthetic worker. One bound Untrusted report is fetched and rendered in the orchestrator pane, labelled as a note that completes no task, with no commissioned summary file.
 - **Test:** `work_done_004_unsolicited_completion_is_visibly_labelled_in_the_attached_tui` in `tests/e2e_work_done_reporting.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
@@ -4267,7 +4297,7 @@ without depending on the config struct API.
 ##### orchestration/work-done/005 — A `clear = true` delegate whose respawn FAILS releases its commission, so the next uncommissioned `work-done` from that worker is still reported as unsolicited (issue #448 review, round 2).
 - **Layer:** fast integration (real `handle_delegate` + `handle_work_done` against daemon-owned PTYs; `cat` stand-ins).
 - **Agent:** none (raw no-echo `cat` orchestrator observer; the worker's `cat` is live, and the role COMMAND points at a binary that does not exist).
-- **Asserts:** with the `coder` role at `clear = true` and BOTH delegation watches switched off (`worker_response_timeout_minutes = 0`), a role command naming a nonexistent single-word binary makes the respawn dispose of the live worker and then fail deterministically at `spawn_agent`, and the dispatch takes its respawn-error return. In failure order: the orchestrator's inbox receives the respawn-failure report as a daemon notice naming the worker pane and no role, and nothing of it is typed into the orchestrator's pane; the commission is already released when the notice is visible; the worker's following `work-done` is labelled unsolicited, names no filed report, and writes no summary file; and after the user types into the orchestrator a second delegate posts a second, byte-identical notice (PRD #1666 S5).
+- **Asserts:** with the `coder` role at `clear = true` and BOTH delegation watches switched off (`worker_response_timeout_minutes = 0`), a role command naming a nonexistent single-word binary makes the respawn dispose of the live worker and then fail deterministically at `spawn_agent`, and the dispatch takes its respawn-error return. In failure order: the orchestrator's inbox receives the respawn-failure report as a daemon notice naming the worker pane and no role, and nothing of it is typed into the orchestrator's pane; the commission is already released when the notice is visible; the worker's following `work-done` is labelled unsolicited, names no filed report, and writes no summary file; and after the user types into the orchestrator a second delegate posts a second, byte-identical notice (PRD #1666 S5). PRD #1666 part 3, round 5 (plan D10, §8, rewritten on purpose): a report that names no task is a note, and its label is now `This report names no task, so the deck marked no task complete`.
 - **Also asserts:** hold the real dispatch order lock after a non-clearing delegate is admitted, close its worker and release the lock; the unresolved worker receives no inbox task, the orchestrator gets a bound non-delivery notice, and the next completion is unsolicited with no saved summary. Inbox-admission refusal is covered by `inbox/route/008`; the ledger's own-arm expiry arithmetic remains in `commission_ledger_releases_an_undelivered_delegations_commission` and `commission_ledger_keeps_the_queued_commission_by_arm_id`.
 - **Does not assert:** native adapter behavior or real-model completion.
 - **Platform coverage:** mac+linux (unix-only — raw-mode shell observer).
@@ -4284,7 +4314,7 @@ without depending on the config struct API.
 ##### orchestration/work-done/007 — An unsolicited report longer than the inline bound is cut in the feedback but saved in full to a file the feedback names, and no saved report overwrites another (issue #508).
 - **Layer:** fast integration (real `handle_work_done` against daemon-owned PTYs; `cat` stand-ins, no LLM and no `e2e` feature gate).
 - **Agent:** none (raw no-echo `cat` orchestrator observer plus a `cat` worker).
-- **Asserts:** with an earlier delegation's report parked at `.dot-agent-deck/work-done-coder.md` and nothing delegated, the worker reports `work-done` twice, each time with a multi-line markdown report of ~7 KB whose opening and closing sentinels differ. For each report, in failure order: the message posted to the orchestrator's inbox carries the unsolicited label, the `[UNTRUSTED-WORKER-REPORT:` frame and the report's opening (control: delivered at all); the closing sentinel is ABSENT (control: really cut at 4000 characters, as a one-line excerpt); the preface names a saved file under the coordination directory that holds the WHOLE report between the frame's marker lines, lines intact; the two saved files differ; and the parked earlier report is untouched (PRD #1666 S5).
+- **Asserts:** with an earlier delegation's report parked at `.dot-agent-deck/work-done-coder.md` and nothing delegated, the worker reports `work-done` twice, each time with a multi-line markdown report of ~7 KB whose opening and closing sentinels differ. For each report, in failure order: the message posted to the orchestrator's inbox carries the unsolicited label, the `[UNTRUSTED-WORKER-REPORT:` frame and the report's opening (control: delivered at all); the closing sentinel is ABSENT (control: really cut at 4000 characters, as a one-line excerpt); the preface names a saved file under the coordination directory that holds the WHOLE report between the frame's marker lines, lines intact; the two saved files differ; and the parked earlier report is untouched (PRD #1666 S5). PRD #1666 part 3, round 5 (plan D10, §8, rewritten on purpose): a report that names no task is a note, and its label is now `This report names no task, so the deck marked no task complete`.
 - **Why it exists:** #448 stopped an unsolicited completion writing the role-keyed file, which was correct, but left the inlined copy as the only one — so past 4000 characters the rest of the report was in no file anywhere, while the feedback said "the worker still holds the rest", which a worker following its delivery instructions (delete the `--task-file` once the signal lands) does not. Confirmed red on `main` at `9083c6b` with exactly that message, and red again with only the `save_full_report` call removed from `handle_work_done`.
 - **Does not assert:** the Unfiled path's copy (its coordination directory is usually what broke, so the save usually fails and says so — `state::tests::compose_work_done_feedback_bounds_an_oversized_report_and_says_so` pins the wording, and `save_full_report_never_overwrites_and_says_when_it_could_not_save` the failure); the retention sweep eventually removing the file (`is_sweepable_coordination_name` is asserted on the name in that unit test); an orchestrator actually reading the file (an LLM decision).
 - **Platform coverage:** mac+linux (unix-only — raw-mode shell observer).
@@ -4308,7 +4338,7 @@ without depending on the config struct API.
 ##### orchestration/work-done/011 — A delegated worker's completion after an ABANDONED pane close is not reported to the orchestrator as work it never commissioned (issue #505).
 - **Layer:** fast integration (real `handle_delegate` + `handle_work_done` against daemon-owned PTYs, with the registry's own `begin_pane_close` / `finish_pane_close(_, false)` pair — the calls `StopAgent` makes when `close_agent` fails; `cat` stand-ins, no LLM and no `e2e` feature gate).
 - **Agent:** none (raw no-echo `cat` orchestrator observer plus a `cat` worker). Both delegation watches are off (`worker_response_timeout_minutes = 0`) and `roles = []` keeps `clear` unresolved, so the delegate reaches the live worker without a respawn — `002`'s shape, which that test pins as reporting the ordinary pointer.
-- **Asserts:** two arms, each on a fresh harness: the abandoned close is of the WORKER's pane, then of the ORCHESTRATOR's pane. Control first: after the delegate the ledger owes a commission for the worker. After the abandoned close, the worker's `work-done` still reaches the orchestrator's inbox with its report framed as untrusted (control: delivered at all); the delivered text carries NONE of `You did not commission this work`, `most likely tasked directly by a person` or `you have no outstanding delegation`; it DOES carry the reworded unsolicited label; and it names no filed report (PRD #1666 S5).
+- **Asserts:** two arms, each on a fresh harness: the abandoned close is of the WORKER's pane, then of the ORCHESTRATOR's pane. Control first: after the delegate the ledger owes a commission for the worker. After the abandoned close, the worker's `work-done` still reaches the orchestrator's inbox with its report framed as untrusted (control: delivered at all); the delivered text carries NONE of `You did not commission this work`, `most likely tasked directly by a person` or `you have no outstanding delegation`; it DOES carry the reworded unsolicited label; and it names no filed report (PRD #1666 S5). PRD #1666 part 3, round 5 (§8, rewritten on purpose): the report names its task, which the close did not sweep, so it is that task's report, filed and pointed at, and carries no note label.
 - **Why it exists:** a pane close sweeps the commission ledger when it starts and restores nothing when it fails, so a still-delegated completion arrives with no commission on record. Restoring on failure was rejected (a failed close is usually a `NotFound` for an agent that is already gone, and a restored commission would be credited to the pane's successor — `finish_pane_close`'s doc comment); the fix is that the label asserts only what the deck knows.
 - **Does not assert:** a genuinely failed `StopAgent` round trip through the attach socket (the registry pair is the seam it calls, and `close_agent` failing is not reachable deterministically from a test); the #448 arm-refused-mid-close path, which reaches the same label by a different route; what an orchestrator then does with the reworded label (an LLM decision).
 - **Platform coverage:** mac+linux (unix-only — raw-mode shell observer).
@@ -4332,18 +4362,374 @@ without depending on the config struct API.
 ##### orchestration/work-done/014 — An agent that takes the pane id of a worker that EXITED ON ITS OWN does not inherit that worker's delegation commission: its `work-done` is reported as unsolicited and the last commissioned report stays filed (issue #507).
 - **Layer:** fast integration (`tests/work_done_reporting.rs`: real `handle_delegate` + `handle_work_done` against daemon-owned PTYs, and the registry's own `spawn_agent` for the successor — the spawn the daemon's `StartAgent` makes; no `e2e` feature gate).
 - **Agent:** none (raw no-echo `cat` orchestrator observer; the first worker is a shell loop that exits on a trigger file, the successor is `cat`). Both delegation watches are off (`worker_response_timeout_minutes = 0`) and `roles = []` keeps `clear` unresolved, so each delegate reaches the live worker without a respawn.
-- **Asserts:** control first — a delegate answered by the first worker is filed at `.dot-agent-deck/work-done-coder.md` (sentinel `commissioned-report-body-5e2c`) and named once in the orchestrator's inbox. A second delegate's task is then posted to the first worker's inbox and the ledger owes that commission to that agent. The worker's process exits on its own (no `StopAgent`, no `begin_pane_close`), a different agent takes the same pane id and reports `work-done`: the orchestrator's inbox still names the filed report exactly once, receives the successor's report labelled unsolicited with its sentinel, and `work-done-coder.md` still holds the commissioned report (PRD #1666 S5).
+- **Asserts:** control first — a delegate answered by the first worker is filed at `.dot-agent-deck/work-done-coder.md` (sentinel `commissioned-report-body-5e2c`) and named once in the orchestrator's inbox. A second delegate's task is then posted to the first worker's inbox and the ledger owes that commission to that agent. The worker's process exits on its own (no `StopAgent`, no `begin_pane_close`), a different agent takes the same pane id and reports `work-done`: the orchestrator's inbox still names the filed report exactly once, receives the successor's report labelled unsolicited with its sentinel, and `work-done-coder.md` still holds the commissioned report (PRD #1666 S5). PRD #1666 part 3, round 5 (plan D10, §8, rewritten on purpose): a report that names no task is a note, and its label is now `This report names no task, so the deck marked no task complete`.
 - **Why it exists:** the natural-exit sweep deliberately leaves commissions standing, so the predecessor's was still owed (its TTL is 7 days) and the successor's first `work-done` spent it: credited as delegated work and filed over the role's report. Confirmed red on `main` at `c7ef92f9` (a second "has completed their task" pointer, `left: 2`), and red again with only the crediting-time retire disabled. The keep-what-is-queued half and a successor that was itself delegated to are unit-tested (`agent_pty::spawn_tests::commission_ledger_retires_what_only_a_previous_occupant_owed`, `commission_ledger_keeps_the_queued_commission_by_arm_id`, `commission_ledger_retires_a_predecessor_s_commission_beside_the_successor_s_own`); the same scenario through the real binary is `orchestration/work-done/015`.
 - **Does not assert:** a successor that arrives through `pane restart` or a `clear = true` respawn (those retire on replacement, issue #590); the idle-worker and silent-worker watches, which the exit sweep already retires; a successor reporting while a delegate to the pane is still queued, which is credited to that queued commission by design.
 - **Platform coverage:** mac+linux (unix-only — raw-mode shell observer).
 
-##### orchestration/work-done/015 — Complete a commissioned task, delegate again, then let the worker exit naturally and start a successor in the same pane. Its report reaches the orchestrator inbox as uncommissioned work and leaves the earlier commissioned report file intact.
+##### orchestration/work-done/015 — Complete a commissioned task, delegate again, then let the worker exit naturally and start a successor in the same pane. Its report, which names no task, reaches the orchestrator inbox as a note that completes no task and leaves the earlier commissioned report file intact.
 - **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
 - **Agent:** none.
-- **Asserts:** Complete a commissioned task, delegate again, then let the worker exit naturally and start a successor in the same pane. Its report reaches the orchestrator inbox as uncommissioned work and leaves the earlier commissioned report file intact.
+- **Asserts:** Complete a commissioned task, delegate again, then let the worker exit naturally and start a successor in the same pane. Its report, which names no task, reaches the orchestrator inbox as a note that completes no task and leaves the earlier commissioned report file intact.
 - **Test:** `work_done_015_a_successor_in_an_exited_worker_s_pane_is_not_credited_with_its_task` in `tests/e2e_delegate_exited_worker.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/016 — A repeat of an earlier task's report is answered with its first result and touches the newer task nothing.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** After t1 is reported and t2 delegated, t1's identical report answers `already_accepted` with t1's report id, and t2's arm, watch, open entry and the orchestrator's inbox are unchanged.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.1, D4): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/017 — A report with no task id is a note that completes nothing.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** It answers `uncorrelated` to the inbox, the orchestrator gets `note from coder`, and the task stays open with its arm and watch, so the worker still owes its `work-done`.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.1, D10): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/018 — A report from another worker, another generation or another orchestration is refused.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** Each is refused `unknown_task` and the snapshot of arms, watches, open tasks, the orchestrator's inbox, rows, saved files and claims is unchanged.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.1, D9): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/019 — An unknown, malformed or forgotten task id is refused.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** Each is refused `unknown_task` (the forgotten one with the 'does not know task' wording, its tombstone evicted at a bound of 1) and nothing changes.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.1, D2): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/020 — A double report is answered with the first.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** The repeat answers `already_accepted` with the first report id and destination, exit 0, and nothing new is posted, saved or retired.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.1, D4): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/021 — A differing duplicate is not delivered.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** The repeat answers `differs`, the CLI exits 1 saying it was NOT delivered, and the first report stands.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.1, D4): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/022 — An accepted report retires exactly its own task.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** Its own arm, watch and open entry go; a sibling worker's arm, watch and task stay; the orchestrator gets one report naming the task id.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.1, D6): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/023 — A superseded task's report is refused, naming its successor.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** `task_superseded`, the message names the newer task, nothing changes.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.1, D8): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/024 — Unattested task and terminal reports are refused.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** Both are refused `unattested` before anything is read, and nothing changes.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.1, D1): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/025 — A report whose orchestrator was replaced is kept in recovery.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** Two tasks reported after the orchestrator was replaced give two `recipient_exited` rows whose saved files carry the envelope and the report; the successor gets nothing.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.2, D7): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/026 — A failed save changes nothing, and a retry is accepted.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** An injected save failure answers `report_save_failed` with no effect; the same report again is accepted.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.2): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/027 — The orchestrator exiting during the save sends the report to recovery.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** Paused after its save, the orchestrator exits and a successor takes its pane; released, the report is accepted to recovery and a row names the task.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.2, D12): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/028 — An unconsumed report becomes a row when its recipient exits.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** An acknowledged report leaves no row; an unacknowledged one becomes one `recipient_exited`, `never_handed` row.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.2, D13): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/029 — A full store and an oversized report are refused.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** With one file slot taken, `report_store_full` with no effect; over the size limit, `report_too_large`.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.2, D2): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/030 — The task ledger binds each delegated task once, and bounds its tombstones.
+- **Layer:** fast unit (`src/report_recovery.rs`, in-crate; no PTY, no daemon).
+- **Agent:** none.
+- **Asserts:** a bound task is open, live and unclaimed; an id the ledger knows, open or settled, is refused when bound again; a task is settled once; tombstones past the per-instance bound, and past the daemon-wide bound (16 times it) across instances, are evicted oldest first and their ids then read as unknown; an open task is never evicted; a generation's open tasks are found by its pane and agent.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D2, D12): a report names its task, and the ledger is what it is checked against, so a forgotten task must read as unknown rather than be rebound or reconstructed.
+- **Does not assert:** the hub paths that bind, supersede and close tasks (the delegate, exit and work-done tests cover them).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/work-done/031 — A task's debt is retired exactly, and a unit's route is taken by its unit id.
+- **Layer:** fast unit (`src/agent_pty.rs`, `src/dispatch_return.rs`, in-crate; no PTY).
+- **Agent:** none.
+- **Asserts:** retiring a task's debt that names a commission arm the worker does not owe removes nothing, and naming its own arm removes exactly it, where the legacy release falls back to the oldest arm; taking a route for another unit id on the same pane takes nothing, and for its own unit id takes it.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D6): the exit walk, supersede and the commit release a task's own debt; a fallback to the oldest arm would credit a sibling task.
+- **Does not assert:** the idle-worker record half, which the exit tests cover.
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/work-done/032 — The daemon's ranked locks are taken in rank order, and no acquisition form clears poison or panics where it must not.
+- **Layer:** fast unit (`src/lock_rank.rs`, in-crate; no PTY, no daemon).
+- **Agent:** none.
+- **Asserts:** in a debug build, an acquisition out of rank order (R3 under R4, the leaf under a ranked guard, a re-entered rank) panics with the held ranks in its message instead of deadlocking, and a panic under a guard leaves the thread's rank stack consistent for its next acquisition; on a poisoned lock `try_lock` answers `Poisoned` without changing the data, `lock_recovering` and `lock_in_drop(Recover)` hand out the recovered guard, `lock_in_drop(Skip)` answers `None`, `lock` panics, and the lock is still poisoned afterwards; `try_lock` and `lock_in_drop` answer a rank violation without panicking; a guard dropped while its thread's stack is borrowed does nothing and does not panic; `lock_in_drop` in a destructor during an unwind, with a rank violation and a poisoned lock, makes no `tracing` call (a subscriber that panics on any event proves it), counts both skips in `SKIPPED_IN_UNWIND`, and the next ordinary acquisition reports and resets the count.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D6, D15): the report transaction nests R1 → R2 → R3 → R4 → R5, and a destructor that reaches a ranked lock must not panic during an unwind, which would abort the daemon.
+- **Does not assert:** that the daemon's own paths take the locks in order (the whole fast tier runs with the checker active, which is what does); R0 (`AppState`'s `RwLock`), which the checker cannot see; release-build behaviour, where no rank is checked.
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/work-done/033 — The real `work-done --task-id` reports the task its instructions name.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** the worker's fetched task names its id after `--task-id`; the real CLI with that id prints `Reported task <id> to the orchestrator.`; the orchestrator's inbox lists one report whose provenance is that task; a plain follow-up delegate to the worker is accepted.
+- **Test:** `work_done_033_the_real_cli_reports_the_task_its_instructions_name` in `tests/e2e_work_done_reporting.rs`.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.4): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor; the in-crate controls cannot see the real CLI and the real daemon in separate processes.
+- **Does not assert:** a real agent (`orchestration/work-done/037`, lane 2); the desktop app; Windows.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/034 — A real `work-done` without `--task-id` is a note, and the task stays owed.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** the CLI says the report went as a note that completes no task; the orchestrator's copy has `uncorrelated` provenance and the note label; a plain follow-up delegate is refused as busy.
+- **Test:** `work_done_034_a_report_without_a_task_id_is_a_note_and_the_task_stays_owed` in `tests/e2e_work_done_reporting.rs`.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.4): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor; the in-crate controls cannot see the real CLI and the real daemon in separate processes.
+- **Does not assert:** a real agent (`orchestration/work-done/037`, lane 2); the desktop app; Windows.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/035 — A repeated real `work-done --task-id` is answered once and delivered once.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** the same command run twice: the orchestrator lists one report; the second run exits 0 with `Task <id> was already reported; nothing new was sent.`
+- **Test:** `work_done_035_a_repeated_report_is_answered_once_and_delivered_once` in `tests/e2e_work_done_reporting.rs`.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.4): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor; the in-crate controls cannot see the real CLI and the real daemon in separate processes.
+- **Does not assert:** a real agent (`orchestration/work-done/037`, lane 2); the desktop app; Windows.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/036 — A real `work-done` whose save fails reports nothing and keeps the task open.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** with the save fault armed through `DOT_AGENT_DECK_TEST_WORK_DONE_PAUSE_DIR`, the CLI exits 1 with the save-failed sentence and prints nothing on stdout; the orchestrator's inbox is empty; a plain delegate is refused as busy; the same command once the fault is spent is accepted.
+- **Test:** `work_done_036_a_failed_save_reports_nothing_and_keeps_the_task_open` in `tests/e2e_work_done_reporting.rs`.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.4): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor; the in-crate controls cannot see the real CLI and the real daemon in separate processes.
+- **Does not assert:** a real agent (`orchestration/work-done/037`, lane 2); the desktop app; Windows.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/037 — A real worker reports the task it was given, by its id.
+- **Layer:** L2, lane 2 (real binary, attached PTY, a `cat` orchestrator stand-in and an interactive Claude Code worker on Haiku; needs the developer's Claude credential).
+- **Agent:** Claude Code (Haiku).
+- **Asserts:** delegated a directive task with a unique sentinel file, the worker creates the file and reports with `work-done --task-id` as its instructions say; the orchestrator's inbox lists a report whose provenance is that task's id; a plain follow-up delegate to the worker is accepted.
+- **Test:** `work_done_037_a_real_worker_reports_the_task_it_was_given` in `tests/e2e_task_report_live.rs`.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §9, CLAUDE.md rule 4): the accounting a real agent drives — that a real worker follows the footer's `--task-id`, so its task is completed and its debt released.
+- **Does not assert:** the report rendered in an attached client, or a reel clip (round 6); Codex, OpenCode, Pi or Devin workers; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/038 — The answer is written only after the commit.
+- **Layer:** fast unit (`src/daemon.rs` hook-ingestion tests; the real hook loop on a socket, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** Paused after the save, no byte for 300 ms and an injected failure's only line is `report_save_failed`; paused at `work-done-committed`, no byte while the report is in the orchestrator's inbox and the task retired; released, one `accepted` line.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.7, D12 rule 8): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/039 — The answer follows every part of the commit.
+- **Layer:** fast unit (`src/daemon.rs` hook-ingestion tests; the real hook loop on a socket, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** At `work-done-acked` the line is readable and the arm, watch and open task are already gone.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.7): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/040 — The real CLI's answer follows the saved and committed report.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** paused after the save, the CLI is still running and has printed nothing; paused after the commit, it is still running and the orchestrator's inbox already lists the report with that task id; released, stdout is exactly `Reported task <id> to the orchestrator.` and stderr is empty. For a second task, a save failure injected while the save is paused makes the CLI exit 1 with one stderr line, the save-failed sentence, and nothing new is posted.
+- **Test:** `work_done_040_the_answer_follows_the_saved_and_committed_report` in `tests/e2e_work_done_reporting.rs`.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.4): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor; the in-crate controls cannot see the real CLI and the real daemon in separate processes.
+- **Does not assert:** a real agent (`orchestration/work-done/037`, lane 2); the desktop app; Windows.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/041 — A claimed task is not superseded.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** T2 is armed beside the paused t1; t1's commit releases its own arm once; t2's arm and open task are untouched.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.6, D8): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/042 — Supersede first, then the report is refused.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** `task_superseded`, no effect.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.6, D8): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/043 — A claim before the worker exits commits with no exit notice.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** The worker exits during the paused save; released, the report is accepted and the orchestrator holds only the report.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.6, D12 rule 4): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/044 — A report after the worker exited is refused.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** `task_closed`, and the orchestrator was told of the exit exactly once.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.6, D9): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/045 — A save failure after the worker's exit posts the withheld notices once, and plain exits owe what their tasks owe.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** Through the real EOF: a claimed task's 'worker exited' or 'not delivered' notice is withheld at the exit and posted once by the failure, never on success; a newer task's notice at the exit; a failure before the exit leaves the exit's own notice; a plain exit owes an unacknowledged task one 'not delivered' notice and an acknowledged one one 'worker exited' notice; a close owes no 'worker exited' notice and an unacknowledged task's close today's one undeliverable notice.
+- **Asserts (m):** a worker exits owing a task whose own commission arm is already gone, beside a sibling arm armed for another delegate: the exit retires exactly, and the sibling arm is still owed.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.6, D12 rule 4): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Asserts (b, h, k):** with the idle detector off, a failed save after EOF posts its withheld notice once and closes the task; a tracker record with no ledger task and no commission still produces one notice through the real EOF fallback; delegating a second task supersedes the acknowledged first, preventing (k)'s two-open-task precondition, and exit names only the unacknowledged successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/046 — A waiting duplicate follows the first attempt.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** After the first fails, the duplicate is accepted fresh; after the first succeeds, it answers `already_accepted` with the first report id.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.6, D4): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/047 — One generation holds one claim.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** T2's report while t1's is paused answers `report_pending` with no effect.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.6, D12 rule 1): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/048 — A note never reaches a successor or another orchestration.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** A note paused while the orchestrator is replaced is kept in recovery and the successor gets nothing; a note from a pane now in another instance is refused `not_a_worker`, and nothing is sent.
+- **Asserts (d):** a real seated worker's note, held before the role map while it exits and another instance's generation takes its pane (that instance's orchestrator running), is refused `not_a_worker`; neither orchestrator's inbox gets it, and nothing is saved or listed.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.6, §2 step 1): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/049 — A report out of hand-overs survives history pressure and its recipient's exit.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** With one hand-over and one history row, the report's row exists marked `delivery_failed` and its saved file holds the report.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.2, D13): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/050 — A report out of hand-overs survives a close, and a late ack marks it.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** Its row exists after hand-overs run out, a late commit marks it `acknowledged_late`, and it outlives the pane's close.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.2, D13): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/051 — Duplicates are answered only after the mark and the commit.
+- **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** With A paused after the unit mark, A and two duplicates have no answer for 300 ms while the unit reads as reported and the caller holds nothing; released, A is accepted and the duplicates `already_accepted` with A's report id, and the caller holds one report.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.7, D12 rules 8, 10): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/052 — A save outlives its connection.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** The reporting future is dropped during the paused save; released, the claim settles and a repeat answers from it.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.6, D12 rule 2): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/053 — A panicking save task is settled by its supervisor.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins); `src/agent_pty_terminal_tests.rs` for (j).
+- **Agent:** none.
+- **Asserts:** Before staging `report_save_failed`; after staging, after the mark, after the commit and in the helpers `accepted`; a note panicking before the handover `uncorrelated`; a panic inside the commit after the post: unconfirmed, the state torn, the one inserted message, the file kept, a repeat `deck_unavailable`; a failure asked for a staged claim refuses; the store unavailable before the commit: unconfirmed, nothing written, a repeat `deck_unavailable`.
+- **Asserts (round 5 fixes):** (a) in full: a panic before the write or after it and before staging leaves the store's files, bytes, reservations and slots as before the report, a retry is accepted and a restart adopts exactly it; a failed removal leaves an orphaned attempt, adopted `o`; a write that unwinds before it creates its file returns its room once (an unwind after the create, and a failed removal of what it created, are not driven). (h) on the ordinary save and on both supervisor settlements (a save task panicking after staging, rolled forward to `accepted`, and before it, failed to `report_save_failed`), while a helper is held inside the after-section helpers the connection already reads its answer, and a helper panic leaves that answer unchanged. (n) a poisoned record table between attestation and admission: `deck_unavailable`, the task still open, and claims, reply room, reservations and files unchanged. (j) the whole state (reply room, claim, unit entry, ledger, rows, caller inbox, routes, files, mark) is unchanged around the unavailable store. (k) poisoned routes with whole report state: `deck_unavailable`, no task panic, nothing consumed. (l) a save failure with the delegation tracker poisoned writes nothing and reads unconfirmed.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.6, D12 rule 11, D15): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/054 — A close acting on the mark, then a panic, still delivers once.
+- **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** Rolled forward: one report, no `dispatch ended`, the unit completed; a panic before the post leaves the caller nothing and the connection unconfirmed; one after the post leaves the one inserted report.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §6.6, D12 rule 8, D15): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/058 — A delayed task report never writes to, or names, its worker's successor.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub, task ledger and retained store, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** A's task report, held before it reads the role map while A exits with its cleanup held and B takes A's pane in another directory and instance, is accepted for A's task; B's `work-done-coder.md` is unchanged, A's copy is in A's directory, and the retained report's envelope names A's instance and A; the same when A's record is removed while the save is paused.
+- **Why it exists:** PRD #1666 part 3, round 5 fixes (auditor U2-4, reviewer U3-2): the save took the convenience copy's directory and the artifact's instance from the pane's current occupant.
+- **Does not assert:** a real agent; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/059 — A report's broadcast notices carry its provenance.
+- **Layer:** fast unit (`src/agent_pty_report_tests.rs`, in-crate; the real registry, hub and its broadcast channel, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** every `InboxNotice` the hub broadcasts for an accepted task report's message (queued, handed over, handed back, handed over again, acknowledged) carries `provenance: task` with the task id, the report id and the worker's agent id; a deck notice posted beside it carries none.
+- **Why it exists:** PRD #1666 part 3, round 5 fixes (reviewer R30, auditor U3-2, mutant M28): the broadcast's provenance was asserted only on notices a test built itself.
+- **Does not assert:** the `returned` notice an offer moving between generations broadcasts (this schedule hands it to one generation); a client reading it.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/056 — A destructor armed across a dispatch or a respawn does not abort the daemon when it drops during an unwind.
+- **Layer:** fast unit, one child process per case (`src/agent_pty_unwind_tests.rs`; the outer test re-executes its own binary filtered to itself, so an abort reads as a failed status, `SIGABRT`, instead of a hung runner).
+- **Agent:** none.
+- **Asserts:** for the reply-room reservation a dispatch holds across its handling, a respawn's in-flight ticket and a commission-dispatch guard, each dropped during an unwind with an injected payload: once with its lock poisoned and once (debug builds) with a higher rank held on the unwinding thread, the child survives and the injected payload is what escapes; no `tracing` event is emitted during the unwind (a subscriber that panics on any event); poisoned, the reservation gives its room back through the recovering hub and the ticket settles its respawn, while the commission guard skips (it used to panic); with the rank held, each skips and leaves its entry.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D6, D15 rule 5; reviewer R26): the round's new tracker → hub sections can poison a lock these destructors take, and a destructor that panics during an unwind aborts the process.
+- **Asserts (scenario arm, child process, `src/agent_pty_replacement_tests.rs`):** a dispatch whose reply room is armed and whose initial publication is installed unwinds from a panic inside its unit registration's section: the tracker and routes are poisoned and the report state torn; the publication guard skips the poisoned routes once during the unwind; the reply room comes back; the injected payload escapes as an ordinary task panic; an unrelated message is still delivered and acknowledged; the next dispatch is refused before anything starts with the degraded sentence.
+- **Does not assert:** destructors that reach no ranked lock; the registry's own final teardown, which still panics on a poisoned lock and is the documented boundary; the work-done refusal after it (arrives with task-scoped completion).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/work-done/057 — A spawn's reservation, its abandoned-turn release and the holds, close guards and viewer release survive an unwind.
+- **Layer:** fast unit, one child process per case (`src/agent_pty_unwind_tests.rs`).
+- **Agent:** none.
+- **Asserts:** the spawn reservation, the abandoned-turn release, the directory-removal and pane-cleanup holds, the generation and instance close guards, and the helpers behind the pointer-queue clock, a pending post's abandonment and an attach viewer's release, each dropped during an unwind once with its lock poisoned and once (debug) with a higher rank held: the child survives with the injected payload and no `tracing` event; poisoned, the reservation, the holds, the tracker-taking pointer dequeue and the viewer release skip (the last two used to panic), while the abandoned-turn release, the close guards and the post's abandonment recover; with the rank held, each skips.
+- **Why it exists:** auditor U2-2: a spawn that unwinds drops its reservation, whose cleanup reaches the registry and then the hub, inside the same unwind.
+- **Asserts (arm (c), child process, `src/agent_pty_replacement_tests.rs`):** a respawn's successor spawn panics after its fork and before its record is published, inside the replacement window, with the hub's lock poisoned: the reservation gives itself up during the unwind (no pending entry or token left), the window aborts the replacement (the unit ends `RespawnFailed`, one notice), and the injected payload reaches the respawn's caller.
+- **Does not assert:** destructors in files that reach no ranked lock; that no `tracing` event happens anywhere in an unwind whose abort, in ordinary code, logs.
+- **Platform coverage:** mac+linux+windows.
 
 #### orchestration/provenance
 
@@ -4876,10 +5262,10 @@ without depending on the config struct API.
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
 
-##### dispatch/return/003 — Dispatch a single stand-in and send an unrelated pane completion before the unit completes. Only the unit acknowledgement and completion are bound to the caller inbox, and its fetched report appears in the attached pane.
+##### dispatch/return/003 — Dispatch a single stand-in and send an unrelated pane completion before the unit completes; that pane's `work-done --done` is refused with `incompatible_mode`. Only the unit acknowledgement and completion are bound to the caller inbox, and its fetched report appears in the attached pane.
 - **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
 - **Agent:** none.
-- **Asserts:** Dispatch a single stand-in and send an unrelated pane completion before the unit completes. Only the unit acknowledgement and completion are bound to the caller inbox, and its fetched report appears in the attached pane.
+- **Asserts:** Dispatch a single stand-in and send an unrelated pane completion before the unit completes; that pane's `work-done --done` is refused with `incompatible_mode`. Only the unit acknowledgement and completion are bound to the caller inbox, and its fetched report appears in the attached pane.
 - **Test:** `dispatch_return_003_single_completion_routes_while_unknown_pane_stays_inert` in `tests/e2e_dispatch_return.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
@@ -4887,17 +5273,17 @@ without depending on the config struct API.
 ##### dispatch/return/004 — A dispatched unit's completion is refused, with nothing posted and no bytes written, when the caller pane has changed hands before the unit completes (PRD #220 M2.1 / issue #617).
 - **Layer:** fast integration (the real `AppState::handle_work_done` completion path and the inbox's live-agent check against daemon-owned PTYs; no daemon process, git, LLM, credential or `e2e` feature gate).
 - **Agent:** none — the dispatched unit, original caller and successor are raw no-echo `cat` observers. The successor deliberately inherits the caller's `DOT_AGENT_DECK_PANE_ID` while receiving a new registry agent id; readiness markers prove each stub reached raw mode before the test relies on its scrollback.
-- **Asserts:** in failure order, the caller and unit observers are ready; registering the unit retains exactly one return edge; closing the original caller without the deliberate-close sweep and spawning the successor produces a different registry agent id on the same pane; terminal `handle_work_done` consumes the return edge even though delivery is refused; an authorized `GuardedSend::Applied` barrier reaches the successor and its scrollback holds no `dispatch:` text, unit name or report; the caller pane's inbox holds nothing; and the daemon log records the completion refused because its caller is `no longer the live agent`, with `nothing posted` (PRD #1666 S5).
+- **Asserts:** in failure order, the caller and unit observers are ready; registering the unit retains exactly one return edge; closing the original caller without the deliberate-close sweep and spawning the successor produces a different registry agent id on the same pane; terminal `handle_work_done` consumes the return edge even though delivery is refused; an authorized `GuardedSend::Applied` barrier reaches the successor and its scrollback holds no `dispatch:` text, unit name or report; the caller pane's inbox holds nothing; and the daemon log records the completion refused because its caller is `no longer the live agent`, with `nothing posted` (PRD #1666 S5). PRD #1666 part 3, round 5 (plan D7, §8, rewritten on purpose): the completion is not dropped; it is kept as exactly one `dispatch_finished` recovery row naming the gone caller, cause `recipient_exited`, with its saved report.
 - **Why it exists:** the completion sits behind a different path and a much wider race window — the dispatched unit's entire lifetime. A pane id is reusable, so delivery keyed only by that string would submit the old unit's report as a turn to an unrelated successor that may act on it. The test deliberately uses `close_agent` rather than `begin_pane_close` so the retained edge survives until completion and the guarded delivery itself is the only protection under test; bypassing that identity binding leaks the full report into the barriered successor snapshot and makes the absence assertion fail.
 - **Does not assert:** dispatch spawning or callback registration through `handle_dispatch` (`dispatch/return/001-003` own the real CLI boundary), deliberate-close eviction (`dispatch/return/005`), the `Ambiguous` partial-write branch, retry beyond asserting the entry is consumed, or real-agent behavior.
 - **Platform coverage:** mac+linux (unix-only fast test — every observer is a POSIX-shell raw `cat`).
 
-##### dispatch/return/005 — Closing a dispatch caller evicts its retained return edge, so a later unit completion is dropped and logged without reaching any alternate pane (PRD #220 M2.2).
+##### dispatch/return/005 — Closing a dispatch caller orphans its retained return edge, so a later unit completion reaches no alternate pane (PRD #220 M2.2; PRD #1666 part 3, round 5).
 - **Layer:** fast integration (the real `AgentPtyRegistry::begin_pane_close` / `finish_pane_close` lifecycle and `AppState::handle_work_done` against daemon-owned PTYs; no daemon process, git, LLM, credential or `e2e` feature gate).
 - **Agent:** none — raw no-echo `cat` observers stand in for the still-live dispatched unit, the caller that is deliberately closed, and an unrelated alternate recipient. Distinct readiness markers prove all relevant PTYs are live before the close and completion.
-- **Asserts:** in failure order, caller, unit and alternate observers are ready; registering the unit retains exactly one return edge; `begin_pane_close` on the CALLER immediately reduces the retained count to zero before the child is closed; the full close lifecycle completes; the unit's terminal `handle_work_done` returns without panic and does not recreate or reroute an edge; an authorized `GuardedSend::Applied` barrier reaches the unrelated pane; its drained snapshot contains none of the fenced completion turn — neither `dispatch:`, the unit name that would occupy `UNTRUSTED-ROLE-LABEL`, nor the report that would occupy `UNTRUSTED-WORKER-REPORT`; the close log says it dropped dispatch-return entries touching the caller pane; and the late completion is logged under its unit pane by the existing `work-done from unknown pane` path.
-- **Why it exists:** once the caller is gone there is neither a valid recipient nor a promised durable outbox, so keeping its callback would leak daemon memory and leave a pane-reuse hazard waiting for a future occupant. The close sweep must cover entries that point TO the caller as well as entries keyed BY a closing unit. Temporarily skipping `evict_pane` leaves the observable count at one and makes the first post-close assertion fail, proving the test does not pass merely because the eventual guarded write would also refuse a missing pane.
-- **Does not assert:** pane-id hand-over refusal (`dispatch/return/004`), unit-pane close eviction (covered by the registry unit tests), daemon restart or durable outcome storage, exact completion-report wording, or the TUI close dialog.
+- **Asserts:** in failure order, caller, unit and alternate observers are ready; registering the unit retains exactly one return edge; `begin_pane_close` on the CALLER keeps the edge, orphaned, and drops it from the dispatch tree (`dispatch_edges` is empty) before the child is closed; the full close lifecycle completes; the unit's terminal `handle_work_done` consumes the orphaned edge without panic and recreates or reroutes nothing; an authorized `GuardedSend::Applied` barrier reaches the unrelated pane; its drained snapshot contains none of the fenced completion turn — neither `dispatch:`, the unit name that would occupy `UNTRUSTED-ROLE-LABEL`, nor the report that would occupy `UNTRUSTED-WORKER-REPORT`; the close log says it orphaned the caller's routes; and the late completion is logged as refused because its caller is no longer the live agent, with nothing posted. PRD #1666 part 3, round 5 (plan D7, §8, rewritten on purpose): the completion is not dropped; it is kept as exactly one `dispatch_finished` recovery row naming the gone caller, cause `recipient_exited`, with its saved report.
+- **Why it exists:** once the caller is gone there is no valid recipient, and its route must not become a pane-reuse hazard. PRD #1666 part 3, round 5 (plan D7, §8) changed eviction to orphaning: the route is kept so the unit's end is still recorded and its result goes to recovery rather than vanishing, and an orphaned route gives no successor a place in the dispatch tree.
+- **Does not assert:** pane-id hand-over refusal (`dispatch/return/004`), the recovery row the completion becomes once task-scoped completion is active (`dispatch/return/009`), unit-pane close (the registry unit tests), daemon restart, exact completion-report wording, or the TUI close dialog.
 - **Platform coverage:** mac+linux (unix-only fast test — every observer is a POSIX-shell raw `cat`).
 
 ##### dispatch/return/006 — A real dispatched single agent independently signals completion and its discovered sentinel report lands visibly in the real dispatcher's pane (PRD #220 M2.3/M4.2). [reel]
@@ -4927,6 +5313,163 @@ without depending on the config struct API.
 - **Platform coverage:** mac+linux.
 
 #### dispatch/close
+
+##### dispatch/return/009 — A dispatch caller that goes away — closed, exited or replaced by a respawn — orphans its units' routes, and its successor gets no place in the tree.
+- **Layer:** fast unit, in-crate (`src/agent_pty_dispatch_lifecycle_tests.rs`; the real registry, inbox hub and retained store, with `cat` stand-ins for every agent and the daemon's live check installed).
+- **Agent:** none: `cat` stand-ins.
+- **Asserts:** for each of a close of the caller's pane, the caller's own exit and a respawn replacing it: the unit's route is kept and marked orphaned, `dispatch_edges` is empty, and nothing is posted to whoever holds the caller's pane.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D7): a route keyed to a gone caller used to be evicted, which lost the unit's outcome; orphaning keeps it recordable while giving no successor the caller's place.
+- **Does not assert:** the `dispatch_finished` row a later completion becomes (arrives with task-scoped completion).
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/010 — A dispatch result for a caller that exited during the spawn becomes a row naming its own saved file.
+- **Layer:** fast unit, in-crate (`src/agent_pty_dispatch_lifecycle_tests.rs`; the real registry, inbox hub and retained store, with `cat` stand-ins for every agent and the daemon's live check installed).
+- **Agent:** none: `cat` stand-ins.
+- **Asserts:** two start results, retained and posted to a caller that is no longer the pane's agent, give two `dispatch_started` rows with cause `recipient_exited` and `storage: artifact`, each naming its own report id, whose file reads the start text; the pane gets nothing.
+- **Why it exists:** plan §3.2: every dispatch result is saved before it is posted, so a result nobody can take is recoverable.
+- **Does not assert:** the daemon's hook-socket dispatch arm (its admission and reservation are `/018` and `/024`).
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/011 — A `dispatch ended` notice a live caller's full inbox refuses becomes a `recipient_refused` row.
+- **Layer:** fast unit, in-crate (`src/agent_pty_dispatch_lifecycle_tests.rs`; the real registry, inbox hub and retained store, with `cat` stand-ins for every agent and the daemon's live check installed).
+- **Agent:** none: `cat` stand-ins.
+- **Asserts:** with the caller's inbox filled, the unit's exit records `Ended { Exited }`, posts no notice, and leaves one `dispatch_ended` row with cause `recipient_refused` and `storage: none`.
+- **Why it exists:** plan D7: a unit's end is never lost because its caller's inbox was full.
+- **Does not assert:** a dispatch result's own refused post (it rides reserved room).
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/013 — A terminal report paused across its unit's exit reaches the caller once.
+- **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** Accepted; one `dispatch completed`, no `dispatch ended`, the unit `Completed`.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D12 rule 7): a unit's terminal report is decided at the routes' linearization point and reaches the caller once.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/014 — A terminal report paused across its unit's close reaches the caller once.
+- **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** Accepted; one report, no `dispatch ended`.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D12 rule 7): a unit's terminal report is decided at the routes' linearization point and reaches the caller once.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/015 — A terminal report paused across a respawn reaches the caller once.
+- **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** Accepted; the successor's identical report answers `already_accepted` with the first report id.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D12 rule 7): a unit's terminal report is decided at the routes' linearization point and reaches the caller once.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/016 — A failed terminal save after the unit's exit ends the unit.
+- **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** `report_save_failed`, one `dispatch ended`, the unit `Ended` and not marked, no saved file.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D12 rule 9): a unit's terminal report is decided at the routes' linearization point and reaches the caller once.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/017 — A unit that ends without a report tells its caller exactly once — a notice to a live caller, a row for a gone one.
+- **Layer:** fast unit, in-crate (`src/agent_pty_dispatch_lifecycle_tests.rs`; the real registry, inbox hub and retained store, with `cat` stand-ins for every agent and the daemon's live check installed).
+- **Agent:** none: `cat` stand-ins.
+- **Asserts:** for a single unit and an orchestration unit: with the caller already exited, the unit's exit leaves one `dispatch_ended` row (`recipient_exited`, summary saying it exited) and no notice; with the caller live, one `dispatch ended` notice with `dispatch_result` provenance (phase `ended`) and no row; a second termination of the same unit emits nothing more.
+- **Why it exists:** reviewer R9: an acknowledged start followed by the caller's and then the unit's exit used to leave nothing at all.
+- **Does not assert:** what an agent does with the notice.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/018 — Dispatch results are saved files that outlive their rows, and a dispatch the deck cannot keep a result for is refused before anything starts.
+- **Layer:** fast unit, in-crate (`src/agent_pty_dispatch_lifecycle_tests.rs`; the real registry, inbox hub and retained store, with `cat` stand-ins for every agent and the daemon's live check installed).
+- **Agent:** none: `cat` stand-ins.
+- **Asserts:** a failure that started nothing and a start each save a file; with the row bound at 1 the evicted row's file stays and its envelope names the unit and the caller; a store too full for the result refuses with `report_store_full` and a store whose directory was refused with `report_save_failed`, each sentence its own and ending "nothing was started".
+- **Why it exists:** reviewer R6, R14: a row is never the only copy of a result, and room is guaranteed at admission.
+- **Does not assert:** the hook socket's reply line itself (the arm writes the same code and sentence).
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/019 — A differing terminal repeat is not delivered.
+- **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** `differs`, exit 1, one report.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D4): a unit's terminal report is decided at the routes' linearization point and reaches the caller once.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/020 — Termination before the claim answers `task_closed`.
+- **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** Paused before the routes, the unit exits (or is closed); released, `task_closed` with the ended wording, one `dispatch ended`, no claim, no file.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §2 step 2): a unit's terminal report is decided at the routes' linearization point and reaches the caller once.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/021 — A claim before termination still reaches the caller.
+- **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** The claim learns its unit is gone; released, one report, no `dispatch ended`, the route gone.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D12 rule 7): a unit's terminal report is decided at the routes' linearization point and reaches the caller once.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/022 — Terminal retries after the route was consumed.
+- **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** For a single and an orchestration unit: identical repeat `already_accepted`, differing `differs`, after the close still answered through the index, a generation naming no unit `incompatible_mode`; one report.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan §2 step 2): a unit's terminal report is decided at the routes' linearization point and reaches the caller once.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/023 — A `dispatch ended` notice a caller exits without acknowledging is salvaged as a row.
+- **Layer:** fast unit, in-crate (`src/agent_pty_dispatch_lifecycle_tests.rs`; the real registry, inbox hub and retained store, with `cat` stand-ins for every agent and the daemon's live check installed).
+- **Agent:** none: `cat` stand-ins.
+- **Asserts:** posted to a live caller that then exits unacknowledged, the notice becomes a `dispatch_ended` row with its summary and `storage: none`; acknowledged first, it leaves no row.
+- **Why it exists:** reviewer U3-4: the deck's own outcome notices go through the accepted-report ledger like any result.
+- **Does not assert:** an ack through the receipt engine (the store-level ack is used).
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/024 — Dispatch results that cannot be saved are held in a bounded set of slots, retried, and each refusal names only its own cause.
+- **Layer:** fast unit, in-crate (`src/agent_pty_dispatch_lifecycle_tests.rs`; the real registry, inbox hub and retained store, with `cat` stand-ins for every agent and the daemon's live check installed).
+- **Agent:** none: `cat` stand-ins.
+- **Asserts:** with two slots and every write failing: two results are held in memory under their report ids with rows reading `storage: memory`, and a third dispatch is refused with the unsaved-results sentence and no in-flight clause; a retry with writes working saves both (rows read `artifact`) and a new dispatch is admitted; with no failure, two in-flight dispatches make a third refused with the in-flight sentence, which mentions no disk and no restart; one in flight and one held name both causes.
+- **Asserts (lifetimes):** a held result keeps an artifact's lifetime on every path, with the retry's clock moved forward: a caller already gone sets it aside at once, and with the disk still broken it is held after six days and released, room and slot, after seven; acknowledged or set aside and then saved by a retry, its file is acknowledged or recovered (and adopted as such after a restart), and the sweep removes it 24 hours or seven days after the event, not after the retry; acknowledged, or its caller exiting, while a retry is writing it, the same; acknowledged with the disk still broken, released after 24 hours; set aside after its only hand-over and then acknowledged late by the caller's commit, released 24 hours after that acknowledgement.
+- **Why it exists:** reviewer R14, U3-1: the fallback never overflows or replaces a body, and healthy load is never reported as a disk failure. Reviewer R29, auditor U2-1 (round 5 fixes): a held body lost its lifetime when it was set aside at once, when a retry saved it, and when an event landed during the retry's write.
+- **Does not assert:** the hourly retry's timing; a result held across a daemon restart (it is lost, as documented).
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/025 — A close against the unit mark.
+- **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** A forced close before the mark: `UnitEndedFirst`, one report, no `dispatch ended`; a close after the mark: one report.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D12 rule 8): a unit's terminal report is decided at the routes' linearization point and reaches the caller once.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/026 — A respawned unit terminal's replacement settles its unit, route and successor exactly once on each path asserted below, and never takes another occupant of the pane for its successor.
+- **Layer:** fast unit, in-crate (`src/agent_pty_replacement_tests.rs`; the real registry, inbox hub and retained store, `cat` stand-ins, named pauses and fault points; the arms marked "child process" re-execute the test binary so an abort reads as `SIGABRT`).
+- **Agent:** none: `cat` stand-ins.
+- **Asserts:** publish: the route compare-and-sets to B, (P, B) is indexed and B carries the unit pinned, and B's exit ends the unit once (one notice, or one row for an orphaned caller), for a single unit and an orchestration unit; a predecessor's held EOF ends nothing; B killed while the window is paused waits for the publication, then ends the unit once; (f1) a failed spawn ends the unit `RespawnFailed`, its route, publication and leaf unit gone, one notice, nothing closed; (f2), (f3), (f2') a panic after the spawn, before the publish section, or inside the spawn after B is published aborts with B taken from the reserved slot, indexed and closed by its id, the injected payload resumed; (f2s) an exited record on the pane is never indexed or closed; (f7) a competing start makes the reservation refuse, the unit end, and the competitor untouched; (f8) a pane reused after B exited leaves the new occupant untouched while B is closed by id; (f6) a respawn cancelled before `begin` installs nothing; (g) a close during the window ends the unit once and keeps the publication, closed, until publish removes it, resurrecting no route; child process: (f4) a panic inside publish leaves the routes poisoned, the state torn, the route moved by the compare-and-set, the leaf on B, B running, nothing posted or closed, and the inbox still working; (f4') a state torn by another thread with healthy routes makes the abort write nothing; (f4'') an unrelated hub panic leaves the abort working; (f5a) a dropped latch makes B's reader abort; (f5b) a panicking abort leaves B's reader to find what it left. Reports during a replacement (`src/agent_pty_terminal_tests.rs`): (e1) the successor's terminal report before its publish reads `report_pending` and nothing is saved; after it, it is accepted to the original caller once; (e3) a directly started orchestration's orchestrator answers `destination: none` before and after its own respawn.
+- **Asserts (e2, `src/agent_pty_terminal_tests.rs`):** a predecessor A's terminal report held before the routes across a respawn of its pane, for a single and an orchestration unit: released while the replacement is being published, `report_pending`; held again and released after the publish, `task_closed` with the replaced wording; neither consumes a claim, file, mark or post; B's report is then accepted once.
+- **Why it exists:** reviewer R17, R20, R25, R27, auditor U2-1, U3-2: the respawn moves a unit's terminal generation, and its EOF, reports and failure paths must agree on one unit.
+- **Asserts (c, f-claim, g, `src/agent_pty_terminal_tests.rs`):** a successor's claimed report survives its exit during the save; a predecessor's claim survives a failed replacement spawn or a panic after insertion, after spawn or before publication, for both unit kinds and live or orphaned callers, reaching the original caller or recovery once without `dispatch ended`; a closed successor's terminal report reads `task_closed` before and after publication under tombstone pressure, saves nothing and resurrects no route; with the publication closed, an unrelated unindexed generation on the pane and a generation reserved under another ticket read `report_pending` with no report id or destination, whether the unit ended or a predecessor's report completed it, while the successor reads `task_closed` or `already_accepted` with that report's id.
+- **Does not assert:** the torn report state's contents after a panic, which are discarded with it (only the routes, records and leaf are read).
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/027 — A unit that ends before its route is registered is recorded ended, and an instance's contradictory origin is pinned as a conflict.
+- **Layer:** fast unit, in-crate (`src/agent_pty_dispatch_lifecycle_tests.rs`; the real registry, inbox hub and retained store, with `cat` stand-ins for every agent and the daemon's live check installed).
+- **Agent:** none: `cat` stand-ins.
+- **Asserts:** (e) the terminal generation exiting, and (f) its pane being marked closing, while the dispatch is paused before registration: registration records `Ended { Exited }` or `Ended { Closed }`, inserts no route, indexes the generation, and tells the live caller once; (i) a second role of a dispatched instance spawned with origin `Direct` has its origin pinned as `Conflict`. Reports (`src/agent_pty_terminal_tests.rs`): (a), (b) a terminal report paused before the routes and released after the unit's close or exit reads `task_closed`, one `dispatch ended`; (c) one sent while the dispatch is paused before registration reads `report_pending`, and the next after registration is accepted once; (g) one released after its unit was closed and evicted reads `unknown_task`, forgotten wording, with nothing saved or ended twice; (i) an orchestrator whose origin is `Conflict` reads `incompatible_mode`.
+- **Asserts (c, orchestration; h):** an orchestrator's terminal report while its dispatch is paused before registration reads `report_pending`, never `destination: none`, and nothing is saved, claimed or posted; registered, it is accepted to the caller once. (h) for both kinds, G's report attests with no unit and is held before the role map while the dispatch registers U, U is closed and evicted, and a directly started orchestrator takes G's pane: released, the report reads that role map (a probe records it) and is refused `unknown_task` (orchestration) or `incompatible_mode` (single), never `destination: none`, with nothing saved, claimed, marked or posted, one `dispatch ended` and nothing for the successor; the successor's own report reads `destination: none`. (j) a single unit's seatless agent A reports terminal, held before the role map; A exits with its exit cleanup held and a member of another orchestration instance takes its pane: released, the report is accepted for A's unit and the retained report names no instance, never the successor's.
+- **Why it exists:** reviewer R16, auditor U3-3, U3-4, and the second round-5 fix pass's reviewer U3-1: the orders of exit, close, registration, eviction and pane reuse named in the arms above.
+- **Asserts (c', `src/agent_pty_terminal_tests.rs`):** an orchestrator's delayed terminal report released after a role close aborts its paused dispatch reads `unknown_task` with the abandoned wording, never `destination: none`, and saves or posts nothing.
+- **Does not assert:** orders of exit, close and registration other than those the arms name; (d), whose directly started orchestrator is `dispatch/return/026` (e3)'s; a real agent.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/028 — A unit's entry and index outlive no generation that can still attest, and no shorter.
+- **Layer:** fast unit, in-crate (`src/agent_pty_dispatch_lifecycle_tests.rs`; the real registry, inbox hub and retained store, with `cat` stand-ins for every agent and the daemon's live check installed).
+- **Agent:** none: `cat` stand-ins.
+- **Asserts:** with the tombstone knob at 1 (16 units daemon-wide), a dispatched unit whose terminal generation is still registered keeps its entry while 32 other units' are evicted; once its record is removed, the next insertion evicts it.
+- **Why it exists:** plan D2: a generation that can still attest freshly always finds its unit's entry.
+- **Does not assert:** the publication protection (exercised by `/026` (g)); a fresh report presenting the removed token (refused `unattested` before admission).
+- **Platform coverage:** mac+linux.
 
 ##### dispatch/close/001 — A dispatched single-agent card closes on the FIRST confirmed Ctrl+W, instead of surviving until the user closes it a second time (PRD #220 follow-up).
 - **Layer:** L2 PTY-attached (`TuiDeck` on the `minimal` fixture) driving the REAL `dot-agent-deck dispatch --single` CLI, then closing the resulting card through the production Ctrl+W → confirm path.
@@ -5737,12 +6280,19 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Does not assert:** a click on Upgrade in the restored frame (the same `choose` the keys reach), or a resize while an upgrade runs.
 - **Platform coverage:** mac+linux+windows.
 
+##### upgrade/upgrade-dialog/015 — A CLI upgrade's result names the agents' hooks remedy before the TUI restart.
+- **Layer:** L1 (dialog state machine + `TestBackend` at 100×30, insta snapshot `upgrade_dialog_015_hooks_remedy`).
+- **Agent:** none.
+- **Asserts:** after this TUI's CLI is replaced and `RunResult::from_outcome_and_hooks` is given a refresh that left Claude Code's hooks on another copy, the result shows the upgrade line, then the other copy, the `hooks install --agent claude-code` command whole on one row and `Then restart the affected agents.`, and only then the TUI restart line (PRD #1666 part 3, R-3).
+- **Does not assert:** running the refresh (`self_upgrade::agent_hooks` unit tests, `inbox/claude/048`), or the desktop dialog (`local_upgrade_008`–`010`).
+- **Platform coverage:** mac+linux+windows.
+
 #### upgrade/tui-upgrade
 
 ##### upgrade/tui-upgrade/001 — The badge's key opens the dialog, and confirming replaces the running copy's binary with the served release.
-- **Layer:** L2 (lane 1, real TUI under portable-pty, fake release server in the test serving a script that answers only `--version`, as the release, and fails on any other invocation, `e2e`-only seams for the running version, the running executable's path and the release URLs).
+- **Layer:** L2 (lane 1, real TUI under portable-pty, fake release server in the test serving a script that answers `--version`, as the release, and `hooks refresh --json`, records each invocation and fails on any other, `e2e`-only seams for the running version, the running executable's path and the release URLs).
 - **Agent:** none.
-- **Asserts:** the footer shows `dot-agent-deck CLI: update available: v<release> (current: v0.0.1)` and `u to upgrade`; `u` opens `Upgrade to v<release>` with the in-place plan, `Upgrading does not restart the daemon on this machine` (issue #1753), `Build provenance will NOT be checked` and `> Cancel`; the file is untouched until Down + Enter; then it becomes the served bytes, and the dialog shows `Upgraded …`, the provenance result and the restart line; Escape closes it.
+- **Asserts:** the footer shows `dot-agent-deck CLI: update available: v<release> (current: v0.0.1)` and `u to upgrade`; `u` opens `Upgrade to v<release>` with the in-place plan, `Upgrading does not restart the daemon on this machine` (issue #1753), `Build provenance will NOT be checked` and `> Cancel`; the file is untouched until Down + Enter; then it becomes the served bytes, the installed file is last run as `hooks refresh --json`, and the dialog shows `Upgraded …`, the provenance result, the refresh's report (PRD #1666 part 3, R-3) and the restart line; Escape closes it.
 - **Does not assert:** provenance verification with an authenticated `gh`, the desktop app's upgrade, a real GitHub release.
 - **Platform coverage:** mac+linux.
 
@@ -5769,11 +6319,11 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Does not assert:** the confirmation prompt on a terminal (`self_upgrade::cli` unit tests).
 - **Platform coverage:** mac+linux.
 
-##### upgrade/cli-upgrade/002 — `upgrade --yes` replaces a downloaded binary with the checked release.
-- **Layer:** L2 (lane 1, real subprocess, fake release server).
+##### upgrade/cli-upgrade/002 — `upgrade --yes` replaces a downloaded binary with the checked release, then refreshes the agents' hooks from it.
+- **Layer:** L2 (lane 1, real subprocess, fake release server serving a script that records its invocations and answers `hooks refresh --json`).
 - **Agent:** none.
-- **Asserts:** exit 0, `Upgraded <path> to v<release>.`, and the file is the served release byte for byte.
-- **Does not assert:** provenance verification, the non-writable `sudo` path.
+- **Asserts:** exit 0, `Upgraded <path> to v<release>.`, and the file is the served release byte for byte; the installed file was last run as `hooks refresh --json`, once, and its report is printed (PRD #1666 part 3, R-3).
+- **Does not assert:** provenance verification, the non-writable `sudo` path (`upgrade/cli-upgrade/008`), a real `hooks refresh` (`hooks/install/019`, `inbox/claude/048`).
 - **Platform coverage:** mac+linux.
 
 ##### upgrade/cli-upgrade/003 — A checksum mismatch aborts and leaves the old binary.
@@ -5802,6 +6352,13 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Agent:** none.
 - **Asserts:** the stand-in `brew` and its `sleep` are gone after the signal; non-zero exit; `failed: it was cancelled and stopped`, then `Cancelled.` as the last line.
 - **Does not assert:** `SIGTERM` (same handler), a command that cannot be stopped (`self_upgrade` unit tests), Ctrl+C at the confirmation question.
+- **Platform coverage:** mac+linux.
+
+##### upgrade/cli-upgrade/008 — A download staged for a folder the user cannot write refreshes no hooks and says how to, once installed.
+- **Layer:** L2 (lane 1, real subprocess, fake release server serving a script that records its invocations; the install's folder made read-only).
+- **Agent:** none.
+- **Asserts:** the installed file is unchanged; the download was run as `--version` and never as `hooks …`; the output has `Agent hooks were not updated. Once it is installed, update them with:` and `<path> hooks refresh` for the installed path, and no refresh report (PRD #1666 part 3, R-3).
+- **Does not assert:** the privilege prompt (the CLI has none), the TUI and desktop clients (`upgrade/upgrade-dialog/015`, desktop `self_upgrade_034`–`036`). Prints `SKIP:` when run as root, which can write the folder.
 - **Platform coverage:** mac+linux.
 
 ##### upgrade/cli-upgrade/007 — Ctrl+C after the release's `--version` check exited, while its output is still read, leaves the binary.
@@ -7453,9 +8010,10 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Platform coverage:** mac+linux.
 
 ##### scheduler/manager/005 — The delete confirmation stays contained within the modal even for a long schedule name (PRD #127 finding).
-- **Layer:** L2 (same no-L1-seam reason). Drives the real dialog via `S` + `d` and asserts on the rendered vt100 grid.
+- **Layer:** L2 (same no-L1-seam reason). Drives the real dialog via `S` + `d` and asserts on the rendered vt100 grid. Plus L1 `TestBackend` for its tiny-terminal case (issue #1799), through the production `render_frame` and the dialog's key handler.
 - **Agent:** none (fixture global `schedules.toml` via `DOT_AGENT_DECK_SCHEDULES`, one enabled task with a deliberately long name).
 - **Asserts:** after arming delete (`d`) on a long-named row, the confirmation's trailing `(y/n)` prompt — the only `(y/n)` in the app — still renders, proving the message is contained within the modal. Under PRD #144 the confirmation sits on two fixed natural lines (the name line; the `… (y/n)` trailer) and the content-sized modal grows in WIDTH to contain the long name line (clamped to ≤90% of the terminal), so the trailer is never clipped off the right border — superseding the PRD #127 wrap-to-grow-height band-aid.
+- **Asserts (L1, issue #1799, `manager_005_delete_is_refused_while_its_question_is_not_drawn`):** `y` deletes nothing before the question's first frame (input queued behind `d` waits for it), nor in an 80×6 terminal whose frame cuts off the question and its `(y/n)` line, where Escape still cancels; at 80×24, with both lines drawn, `y` deletes the schedule, one whose name carries a combining accent included; a question cancelled and asked again before its frame refuses `y` too.
 - **Does not assert:** the modal's precise content-sized width / clamp fraction; the confirmation wording beyond the `(y/n)` tail and `Delete schedule` prefix.
 - **Platform coverage:** mac+linux.
 
@@ -8030,8 +8588,8 @@ Since PRD #1666 S5 the deck types nothing into the orchestrator: its idle, waiti
 ##### newagent/visibility/002 — A desktop-prepared orchestration surfaces as its own TUI tab with every role.
 - **Layer:** L2 lane 1, PTY-attached (a headless real daemon receives the desktop's own client calls — `DaemonClient::prepare_orchestration`, which chooses the `prepare-orchestration` op this daemon advertises, with an empty task, then one `DaemonClient::start_prepared_role` per role — while or before a real TUI attaches; the control launches the same three-role fixture through the TUI's own form and role loop).
 - **Agent:** none (three `printf …; sleep 600` role stand-ins declared as Claude Code coordinator, OpenCode builder and Pi reviewer — the coordinator's also prints a `CONTEXT_LISTS <role>` line per agent its published coordinator context lists; no credential).
-- **Asserts:** the TUI-native control creates a separate orchestration tab containing `coordinator`, `builder`, and `reviewer`; the client chooses `PrepareSpelling::Orchestration` against this build's daemon (issue #1045), the preparation reports a unique context file inside the project, every configured start is answered rather than withheld, and the desktop path uses the desktop's 32×120 defaults, shares one orchestration id, and preserves role index/name/start-role/cwd/display-title membership, declared agent type and pane id across all prepared starts. Starting before attachment rebuilds the titled tab with all roles. Starting while the TUI is attached creates the same titled tab without a reconnect; switching into it shows `3 agent(s)` and the grouped, role-named `ClaudeCode · coordinator`, `OpenCode · builder`, and `Pi · reviewer` cards, and selecting the coordinator's card shows `CONTEXT_LISTS builder` and `CONTEXT_LISTS reviewer` (and no `CONTEXT_LISTS coordinator`) in its pane — the prepared context is what the role started with. Regression guard: before `9d66ef6b`, the live roles could appear as flat dashboard cards without their orchestration tab.
-- **Does not assert:** the Tauri form itself; the legacy `prepare-workflow` spelling (`project/launch/*` sends that one); coordinator prompt delivery; hook delivery; agent work; role-pane body contents beyond the exact role-card labels, session count and tab strip.
+- **Asserts:** the TUI-native control creates a separate orchestration tab containing `coordinator`, `builder`, and `reviewer`; the client chooses `PrepareSpelling::Orchestration` against this build's daemon (issue #1045), the preparation reports a unique context file inside the project, every configured start is answered rather than withheld, and the desktop path uses the desktop's 32×120 defaults, shares one orchestration id, and preserves role index/name/start-role/cwd/display-title membership, declared agent type and pane id across all prepared starts. Starting before attachment rebuilds the titled tab with all roles. Starting while the TUI is attached creates the same titled tab without a reconnect; switching into it shows `3 agent(s)` and the grouped, role-named `ClaudeCode · coordinator`, `OpenCode · builder`, and `Pi · reviewer` cards, and selecting the coordinator's card shows `CONTEXT_LISTS builder` and `CONTEXT_LISTS reviewer` (and no `CONTEXT_LISTS coordinator`) in its pane — the prepared context is what the role started with. Regression guard: before `9d66ef6b`, the live roles could appear as flat dashboard cards without their orchestration tab. Starting while the attached TUI's event stream is down (issue #1800: the `e2e`-build seams `DOT_AGENT_DECK_E2E_BREAK_STREAM_ON` break it on a plain Pi pane's `Thinking` from the real `agent-event --type running` CLI, and `DOT_AGENT_DECK_E2E_HOLD_STREAM_DOWN` keeps it down while a file exists and writes `<file>.held` once it holds): no tab appears while the stream is held down (precondition), and once it reconnects the titled tab appears and switching into it shows `3/4 agent(s)` (the trigger pane is the fourth) and the same three role-named cards — the resync rebuilds the tab from the deck's agent listing. Before the fix the resync carded only non-role agents, so the tab never appeared.
+- **Does not assert:** the Tauri form itself; the legacy `prepare-workflow` spelling (`project/launch/*` sends that one); coordinator prompt delivery; hook delivery; agent work; role-pane body contents beyond the exact role-card labels, session count and tab strip; a gap caused by a deck restart rather than a broken stream (the stream-gap case holds one process throughout), or a role spawned during a gap into an orchestration whose tab already exists: the unit tests `handshake_013_an_orchestration_with_any_unseen_role_is_surfaced_whole` (which orchestrations the resync queues) and `handshake_013_a_resync_surface_grows_the_existing_tab_and_keeps_the_seeded_card` (the render loop grows the tab and keeps the role's seeded state) pin that, against a scripted daemon rather than a PTY.
 - **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]` — the daemon/harness uses Unix-domain sockets and PTYs).
 
 ##### newagent/visibility/003 — A desktop-stopped plain agent disappears from an already-attached TUI dashboard.
@@ -8163,18 +8721,18 @@ The inbox's pure in-memory data model (`src/inbox.rs`, `src/deck_identity.rs`). 
 - **Does not assert:** the CLI's `--id` option (S2/S11).
 - **Platform coverage:** mac+linux+windows.
 
-##### inbox/core/004 — An unacknowledged fetch is redelivered when its ack-wait passes.
+##### inbox/core/004 — A fetched message has no ack-wait in the store.
 - **Layer:** L1 unit (src/inbox.rs).
 - **Agent:** none.
-- **Asserts:** with the ack-wait set through `DOT_AGENT_DECK_INBOX_ACK_WAIT_MS` (read through an injected lookup), the message stays fetched until its deadline, returns to queued at it, and its next fetch counts a second delivery; `next_deadline` reports the deadline.
-- **Does not assert:** the daemon's timer driving `tick` (S2).
+- **Asserts:** with the ack-wait set through `DOT_AGENT_DECK_INBOX_ACK_WAIT_MS` (read through an injected lookup, which the attempt model uses), a message handed to a receipt receiver gets no store deadline (`next_deadline` is none) and stays fetched far past the ack-wait; positively not handed, it returns to queued with its delivery count kept, and its next hand-out counts a second delivery (PRD #1666 part 3, H5).
+- **Does not assert:** the attempt model's possession and lapse (inbox/attempts/028–033).
 - **Platform coverage:** mac+linux+windows.
 
-##### inbox/core/005 — After `max_deliver` unacknowledged hand-overs a message is undeliverable.
-- **Layer:** L1 unit (src/inbox.rs).
+##### inbox/core/005 — After `max_deliver` hand-outs positively not handed over a message is undeliverable.
+- **Layer:** L1 unit (src/inbox.rs), through the hub's hook receiver.
 - **Agent:** none.
-- **Asserts:** five expired fetches make the message undeliverable for `max_deliver`, the last event says so, and no fetch returns it again.
-- **Does not assert:** the sender's undelivered notice (S5).
+- **Asserts:** five hook hand-outs each reported not handed over make the message undeliverable for `max_deliver` with five deliveries counted, the last broadcast says so, and no further fetch is handed it.
+- **Does not assert:** the sender's undelivered notice (the `inbox_hub` unit tests).
 - **Platform coverage:** mac+linux+windows.
 
 ##### inbox/core/006 — Every bound refuses explicitly and drops nothing.
@@ -8184,18 +8742,18 @@ The inbox's pure in-memory data model (`src/inbox.rs`, `src/deck_identity.rs`). 
 - **Does not assert:** how the refusal reaches the sender over the wire (S2/S5).
 - **Platform coverage:** mac+linux+windows.
 
-##### inbox/core/007 — A fetched message is handed to one consumer until it returns to the queue.
+##### inbox/core/007 — A fetched message is handed to one receiver until it returns to the queue.
 - **Layer:** L1 unit (src/inbox.rs).
 - **Agent:** none.
-- **Asserts:** a second and third consumer get nothing while the message is fetched; a dropped consumer's messages return to queued and are fetched again; a message bound to another agent generation of the pane is not handed over, an unbound one is.
-- **Does not assert:** waiter connections and their EOF handling (S2).
+- **Asserts:** a second and third receiver get nothing while the message is fetched; positively not handed over, it returns to queued and is handed out again; a message bound to another agent generation of the pane is not handed over, an unbound one is.
+- **Does not assert:** receiver connections and their EOF handling (inbox/protocol/007).
 - **Platform coverage:** mac+linux+windows.
 
 ##### inbox/core/008 — Ack outcomes are explicit.
 - **Layer:** L1 unit (src/inbox.rs).
 - **Agent:** none.
-- **Asserts:** another pane's agent and another generation of the same pane get `WrongAgent` with the state unchanged; the owner's ack is `Acknowledged`, a repeat `AlreadyAcknowledged`; an old `d-…` id or an absent id is `Unknown`; a retired message answers `Undeliverable`; fetch-and-ack acknowledges in one step.
-- **Does not assert:** attestation of the acking agent (S2).
+- **Asserts:** another pane's agent and another generation of the same pane get `WrongAgent` with the state unchanged; the owner's ack of a handed-out message is `Acknowledged`, a repeat `AlreadyAcknowledged`; an old `d-…` id or an absent id is `Unknown`; a retired message answers `Undeliverable`.
+- **Does not assert:** attestation of the acking agent (S2), or the hub's `unknown` for a message never handed out (inbox/boundary/071).
 - **Platform coverage:** mac+linux+windows.
 
 ##### inbox/core/009 — An offer goes to exactly one taker.
@@ -8205,10 +8763,10 @@ The inbox's pure in-memory data model (`src/inbox.rs`, `src/deck_identity.rs`). 
 - **Does not assert:** the offerer's notices (S11).
 - **Platform coverage:** mac+linux+windows.
 
-##### inbox/core/010 — An expired or released claim re-offers to someone who has not held it.
+##### inbox/core/010 — An expired, released or not-handed holder never gets the offer again.
 - **Layer:** L1 unit (src/inbox.rs).
 - **Agent:** none.
-- **Asserts:** after a claim expires the offer waits unassigned and goes to the next candidate; after a release it goes to the third; an unacknowledged fetch also excludes its holder; with every candidate excluded it waits unassigned; `offer_candidates` drops excluded holders.
+- **Asserts:** after a claim expires the offer waits unassigned and goes to the next candidate; after a release it goes to the third; a hand-out positively not handed over also excludes its holder; with every candidate excluded it waits unassigned; `offer_candidates` drops excluded holders.
 - **Does not assert:** when the daemon calls `assign_offer` (S11).
 - **Platform coverage:** mac+linux+windows.
 
@@ -8222,7 +8780,7 @@ The inbox's pure in-memory data model (`src/inbox.rs`, `src/deck_identity.rs`). 
 ##### inbox/core/017 — Unfetched offers leave their holder at the undelivered deadline.
 - **Layer:** L1 unit (`tests/inbox_offer_deadlines.rs`), explicit store clock without sleeps.
 - **Agent:** none.
-- **Asserts:** The job stays assigned just before the deadline, returns exactly at undelivered_after, drops the previous holder's count, excludes that holder on reassignment and starts a fresh assignment deadline; fetch and claim replace it with ack wait and claim TTL.
+- **Asserts:** The job stays assigned just before the deadline, returns exactly at undelivered_after, drops the previous holder's count, excludes that holder on reassignment and starts a fresh assignment deadline; a receipt hand-out ends it with no store deadline of its own; a claim installs its TTL, holds just before it and returns the job to its pool at it, both holders excluded.
 - **Does not assert:** Daemon candidate discovery or native delivery.
 - **Platform coverage:** all.
 
@@ -8264,8 +8822,8 @@ The inbox's pure in-memory data model (`src/inbox.rs`, `src/deck_identity.rs`). 
 ##### inbox/core/019 — A late ack after max_deliver is recorded.
 - **Layer:** L1 unit (src/inbox.rs).
 - **Agent:** none.
-- **Asserts:** an ack from the bound agent for a message undeliverable for `max_deliver` answers acknowledged, moves it to acknowledged with one event, and a repeat answers already acknowledged; another agent's ack is refused; a message undeliverable because its agent exited still answers undeliverable; an offer that ran out of hand-overs is not acknowledged.
-- **Does not assert:** the corrections the daemon posts (inbox/route/010 and the `inbox_hub` unit tests).
+- **Asserts:** the store's ack from the bound agent for a message undeliverable for `max_deliver` answers acknowledged, moves it to acknowledged with one event, and a repeat answers already acknowledged; another agent's ack is refused; a message undeliverable because its agent exited still answers undeliverable; an offer that ran out of hand-overs (positively not handed over) is not acknowledged.
+- **Does not assert:** the corrections the daemon posts (`a_commit_after_running_out_of_attempts_corrects_the_sender_and_the_card` and the `inbox_hub` unit tests).
 - **Platform coverage:** mac+linux+windows.
 
 #### inbox/attempts
@@ -8371,7 +8929,7 @@ The pure state model of a deck message's delivery attempts (`src/inbox_attempts.
 - **Platform coverage:** mac+linux+windows.
 
 ##### inbox/attempts/015 — A report without a task id retires nothing.
-- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Layer:** L1 unit (src/report_recovery.rs, the deck's task ledger).
 - **Agent:** none.
 - **Asserts:** a report naming its task retires it once and then answers already reported; reports with no task id are uncorrelated and leave a newer delegated task open; an unknown task id, or one from another pane or generation, is refused.
 - **Does not assert:** the `work-done --task-id` CLI or the rail.
@@ -8731,12 +9289,33 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 - **Does not assert:** the hook process's stdout (inbox/claude/019).
 - **Platform coverage:** mac+linux+windows.
 
+##### inbox/receipt/031 — The receipts gate serves each sender only as its answer names it.
+- **Layer:** Fast (`src/inbox_oneshot.rs`), `serves_receipts` on parsed answers and `Connection::open_receipts_within` against a stand-in deck (PRD #1666 part 3, H4).
+- **Agent:** none.
+- **Asserts:** part 2's answer (`one_shot_receipts` 1, no senders), this deck's (the four senders) and a later deck's naming an unknown sender all serve Claude Code's waiter and hook; Codex's hooks and the CLI are served only where the answer names them, so part 2's deck is `Unsupported` for them; an unknown sender name parses; Codex's notices name `hooks install --agent codex` and never `claude-code`, and Claude Code's are unchanged.
+- **Does not assert:** the callers' handling (`inbox/codex/023`, `inbox/cli/006`).
+- **Platform coverage:** mac+linux.
+
+##### inbox/receipt/032 — Codex's `Stop` goes on with the turn only with blocks it wrote.
+- **Layer:** Fast (`src/inbox_prompt.rs`), `OneShotInjection::print_to` with `Envelope::Block` over a connection pair whose deck refuses or grants each `may` (PRD #1666 part 3, H4).
+- **Agent:** none.
+- **Asserts:** with both grants refused nothing is printed and `continues_turn` is false (the hook reports the turn's Idle); with the first refused one `{"decision":"block"}` line carries the framing and only the second block, `continues_turn` is true and only the second commits; with both granted both are carried and commit.
+- **Does not assert:** the real hook binary reporting or withholding Idle (`inbox/codex/019`), or a write that fails partway (`inbox/receipt/030`).
+- **Platform coverage:** mac+linux.
+
+##### inbox/receipt/033 — A Stop cut at its newline or its flush reports the turn's end.
+- **Layer:** Fast (`src/inbox_prompt.rs`), `OneShotBatch::hand_over` of Codex's `Stop` decision into an in-memory writer that takes a set number of bytes and can fail its flush, and `Ran::continues_turn` (PRD #1666 part 3, round 3's U3, landed in round 4).
+- **Agent:** none.
+- **Asserts:** with every byte but the trailing newline taken, and with every byte taken and the flush failing, the bytes taken parse as a whole `{"decision":"block"}` Codex can read, yet `continues_turn` is false and the block is only possibly handed; with every byte taken and flushed it goes on with the turn and the block is written.
+- **Does not assert:** what a real Codex does with an output that lacks its newline.
+- **Platform coverage:** mac+linux.
+
 #### Protocol and waiter lifecycle
 
 ##### inbox/protocol/001 — Inbox verbs require an attested caller.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), isolated real daemon process and JSON-lines hook socket.
 - **Agent:** none (capability-exporting `cat` stand-in).
-- **Asserts:** attested announce and empty fetch succeed; fetch, ack, list, announce and wait with no token explicitly refuse without exposing messages.
+- **Asserts:** attested announce and an empty receipt fetch (`inbox_receipt_fetch`, as a current `inbox fetch` asks) succeed; that fetch, the old plain fetch, ack, list, announce and wait with no token explicitly refuse without exposing messages.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/protocol/002 — A different attested agent cannot acknowledge a message.
@@ -8751,28 +9330,29 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 - **Asserts:** an old `d-…` id returns Unknown and the CLI refuses to claim an acknowledgement.
 - **Platform coverage:** mac+linux.
 
-##### inbox/protocol/004 — Once hands a batch to the newest waiter and requires explicit ack.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), isolated daemon and two hook-socket waiters of the legacy once path (component `other`; Claude's waiter is on receipts since part 2's H3, inbox/claude/016), which stays until H5 deletes it.
+##### inbox/protocol/004 — A newer once waiter supersedes the older, takes the batch and needs an explicit ack.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), isolated daemon and two hook-socket receipt once waiters (Claude Code's `claude_waiter` at the one-shot integration), the real `ack` CLI, and an old `other` once wait.
 - **Agent:** none (`cat` stand-in).
-- **Asserts:** newest gets the complete rendered block, oldest remains armed, state becomes Fetched, owner ack moves it to Acknowledged, and repeated ack returns AlreadyAcknowledged.
+- **Asserts:** the second waiter supersedes the first at once (`superseded`, armed stays one); the newer gets the complete rendered block naming its delivery attempt, the state becomes Fetched and the superseded waiter gets no batch; an explicit ack moves it to Acknowledged and a repeated ack returns AlreadyAcknowledged; an `other` once wait is refused `unsupported` and a message queued after it stays Queued (PRD #1666 part 3, H5).
 - **Platform coverage:** mac+linux.
 
-##### inbox/protocol/005 — The per-agent waiter cap supersedes the oldest.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), nine hook-socket waiters of the legacy once path (component `other`, until H5).
+##### inbox/protocol/005 — Live hook receivers are bounded at eight and freed by closing.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), nine receipt fetches (`inbox_receipt_fetch`, consumer `cli`) with a one-character budget, eight held open.
 - **Agent:** none (`cat` stand-in).
-- **Asserts:** waiter nine supersedes waiter one, armed stays at eight, and the newest waiter receives the next message.
+- **Asserts:** each of eight held hooks is handed one message and none counts as an armed waiter; a ninth is refused `too_many_hooks`, handed nothing, and its message stays Queued; once one hook closes, a fresh fetch is admitted and handed that message (PRD #1666 part 3, H5, which retired the legacy per-agent waiter cap).
+- **Does not assert:** the deck-wide `MAX_INBOX_WAITERS` (`inbox_hub` unit tests).
 - **Platform coverage:** mac+linux.
 
 ##### inbox/protocol/006 — Idle waiters survive the hook read timeout.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), shortened hook-idle and inbox-keepalive environment overrides, a legacy once waiter (component `other`, until H5).
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), shortened hook-idle and inbox-keepalive environment overrides, Claude Code's receipt once waiter.
 - **Agent:** none (`cat` stand-in).
-- **Asserts:** a waiter emits keepalives beyond several idle windows, remains armed, and receives a subsequent message.
+- **Asserts:** a waiter emits keepalives beyond several idle windows, remains armed, and receives a subsequent message; an ordinary silent hook connection is still closed at the short idle timeout.
 - **Platform coverage:** mac+linux.
 
-##### inbox/protocol/007 — Waiter EOF removes its armed registration.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), real socket closure and InboxList observation, legacy once waiters (component `other`, until H5).
+##### inbox/protocol/007 — Receiver EOF removes its armed registration, and a closed receiver keeps what it may hold.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), real socket closure and InboxList observation, receipt streams in two slots (`opencode_plugin`, `opencode_mini`).
 - **Agent:** none (`cat` stand-in).
-- **Asserts:** armed moves two → one → zero as peers disconnect, and the next message stays Queued.
+- **Asserts:** armed moves two → one → zero as the streams disconnect; a message posted then stays Queued until a fresh stream registers and is handed it; that stream closing while it holds the message leaves it Fetched, not handed back at once.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/protocol/008 — Legacy Unattested status producers cannot access inbox messages.
@@ -8781,22 +9361,22 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 - **Asserts:** fetch and ack refuse without a token even for the legacy Unattested provenance class.
 - **Platform coverage:** mac+linux.
 
-##### inbox/protocol/009 — Waiters leave ordinary hook-ingest slots available.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), forty live legacy once waiters (component `other`, until H5) across five daemon-owned panes.
-- **Agent:** none (five `cat` stand-ins).
-- **Asserts:** list and announce continue answering above the ordinary thirty-two hook-connection limit, and closing the waiters removes their armed registrations.
+##### inbox/protocol/009 — Receivers leave ordinary hook-ingest slots available.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), forty live receipt streams (two slots in each of twenty daemon-owned panes).
+- **Agent:** none (twenty `cat` stand-ins).
+- **Asserts:** list and announce continue answering above the ordinary thirty-two hook-connection limit, and closing the streams removes their armed registrations.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/protocol/011 — An oversized post is saved whole and named.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), attach PostMessage and a byte-budgeted hook-socket fetch.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), attach PostMessage and a byte-budgeted receipt fetch on the hook socket.
 - **Agent:** none (`cat` stand-in).
 - **Asserts:** the fetched block fits 4,800 bytes, names a file instead of carrying the tail, and that owner-only file holds the whole task including the directive at its end.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/protocol/012 — get-seed never fetches for another agent generation.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), stop-agent and a replacement in the same pane, raw get_seed on the hook socket.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), stop-agent and a replacement in the same pane, raw get_seed and receipt fetches on the hook socket.
 - **Agent:** none (two `cat` stand-ins).
-- **Asserts:** the predecessor's token naming the replacement, or naming nobody, gets no seed and leaves the replacement's task Queued; the replacement still fetches it.
+- **Asserts:** the predecessor's token naming the replacement, or naming nobody, gets no seed and leaves the replacement's task Queued; a receipt fetch with the predecessor's token naming the replacement takes nothing; the replacement's own receipt fetch takes the task and its ack settles it.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/protocol/013 — An unattested get-seed hands over no inbox message.
@@ -8805,16 +9385,16 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 - **Asserts:** get_seed without a token, with or without an agent id, gets no seed and the task stays Queued.
 - **Platform coverage:** mac+linux.
 
-##### inbox/protocol/014 — A process outside the agent cannot arm its inbox.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), daemon with component binding on, hook-socket wait and announce from the test process.
+##### inbox/protocol/014 — A process cannot register another process as the agent's receiver.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), daemon with its production admission on, hook-socket wait and announce from the test process.
 - **Agent:** none (`cat` stand-in).
-- **Asserts:** a stream, a once waiter and a Native announcement presenting the pane's token from outside the agent's process tree are each refused as `inbox_not_agent_process`; nothing arms and the task stays Queued.
+- **Asserts:** a stream, a once waiter and a Native announcement presenting the pane's token from outside the agent's process tree and naming the agent's own process as the receiver are each refused as `inbox_component_not_caller`, since that process is not the caller or one of its parents; nothing arms and the task stays Queued.
 - **Platform coverage:** mac+linux.
 
-##### inbox/protocol/015 — A process outside the agent cannot take its mail.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), daemon with component binding on, hook-socket fetch, ack and get_seed from the test process, then the real fetch CLI inside the pane.
-- **Agent:** none (shell stand-in that waits for a fixture sentinel before fetching).
-- **Asserts:** fetch with and without ack and ack presenting the pane's token from outside the agent's process tree are refused as `inbox_not_agent_process`, get_seed answers no seed, and the task stays Queued; the in-pane fetch then prints it and it is Acknowledged.
+##### inbox/protocol/015 — The pane's capability takes and settles its mail from outside the agent's tree.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), daemon with its production admission on, hook-socket receipt fetch, ack and get_seed from the test process, running as the deck's user outside every pane.
+- **Agent:** none (`cat` stand-in).
+- **Asserts:** with the pane's current token, a receipt fetch without ack hands the task over (Fetched), and an explicit ack of its id is accepted (Acknowledged) (PRD #1666 part 3, R-1); get_seed answers no seed with `get_seed_removed` and a second task stays Queued (H5). The refusals of a wrong, missing or earlier capability are `inbox/protocol/022`.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/protocol/016 — A raw event from outside the agent acknowledges nothing.
@@ -8824,9 +9404,9 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 - **Platform coverage:** mac+linux.
 
 ##### inbox/protocol/017 — A connection of unknown ancestry cannot take mail.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), daemon with component binding on; each request goes over a connection a forked child made and then exited from, so its ancestry cannot be read.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), daemon with its production admission on; each request goes over a connection a forked child made and then exited from, so its ancestry cannot be read.
 - **Agent:** none (shell stand-in, `exec`'d as the pane's process, that runs the real `inbox wait --agent pi --stream` once a fixture sentinel appears).
-- **Asserts:** fetch, ack and a once waiter are refused as `inbox_not_agent_process`, get_seed answers no seed, a native announce naming the exited creator is refused as `inbox_not_agent_process` (PR #1735 third review, F1), and the task stays Queued; the in-pane stream waiter then still arms.
+- **Asserts:** fetch, ack and a once waiter are refused as `inbox_peer_unidentified`, get_seed answers no seed, a native announce naming the exited creator is refused as `inbox_peer_unidentified` (PR #1735 third review, F1), and the task stays Queued; the in-pane stream waiter then still arms.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/protocol/018 — A dispatch the deck has no room to answer is refused.
@@ -8839,7 +9419,7 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 - **Layer:** Fast tier (`tests/inbox_process_identity.rs`), the real binary as `daemon serve` with its production binding on; the pane's agent is `xargs`, a program that is not a shell as a real agent is not, running two `/bin/sh -c` hook children, each running the real CLI.
 - **Agent:** none (`xargs` stand-in).
 - **Asserts:** the first hook shell's `inbox announce --agent pi` is accepted (`inbox_list` reports `wake: native`), and the second hook shell's `inbox wait --agent pi --stream` is admitted as the same receiver and takes the queued task. Peer discovery, the parent walk, start times and shell resolution are the platform's own.
-- **Does not assert:** a real agent, Windows, or the refusals of an outside or exited peer (`inbox/protocol/015`–`017`).
+- **Does not assert:** a real agent, Windows, a helper outside the agent's tree (`inbox/protocol/021`), or the refusals of a wrong capability or an exited peer (`inbox/protocol/022`, `/017`).
 - **Platform coverage:** mac+linux; the reason it is in the fast tier is that CI's `build-macos` runs the fast tier.
 
 ##### inbox/protocol/020 — Inbox actions are withheld from a daemon that does not advertise them.
@@ -8849,12 +9429,118 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 - **Does not assert:** the real daemon (inbox/boundary/011).
 - **Platform coverage:** mac+linux.
 
+##### inbox/protocol/021 — A pane-capability holder outside the agent's process tree takes its mail.
+- **Layer:** Fast tier (`tests/inbox_process_identity.rs`), the real binary as `daemon serve` with its production admission on; the pane's agent starts an `xargs` helper in a subshell that exits at once, so the helper is re-parented outside the agent's tree with the pane's environment, as Claude Code's background session host is.
+- **Agent:** none (`/bin/sh` agent stand-in, `xargs` helper running `/bin/sh -c` hook shells).
+- **Asserts:** `ps` shows the helper outside the agent's ancestry; the helper's real `inbox fetch` prints and acknowledges a queued task; the real `hook --agent claude-code`, for a prompt carrying a doorbell, prints the task it names; `inbox announce --agent pi` is accepted (`wake: native`), and a later hook shell's `inbox wait --agent pi --stream` takes the next task.
+- **Does not assert:** a real Claude Code background host (lane 2), Windows, or the refusals (`inbox/protocol/022`).
+- **Platform coverage:** mac+linux; in the fast tier so CI's `build-macos` runs it.
+
+##### inbox/protocol/022 — A wrong, missing or earlier capability takes nothing.
+- **Layer:** Fast tier (`tests/inbox_process_identity.rs`), the real binary as `daemon serve` with its production admission on, hook-socket requests from the test process, outside every pane.
+- **Agent:** none (`cat` stand-ins).
+- **Asserts:** a receipt fetch and an ack for one pane's task carrying another pane's capability are refused `token_names_another_pane`, with no capability `missing_token`, and with the capability of a generation replaced in its pane `unknown_token`, whether they name the earlier or the current agent; every task stays queued; the same outside process with the pane's current capability is refused the old plain fetch (`cli_too_old`, the task still queued), then a receipt fetch hands it the task and its ack settles it.
+- **Does not assert:** a peer running as another user (the `daemon.rs` unit test `a_capability_holder_outside_the_tree_must_be_the_decks_user` pins it, since a test cannot run as two users), or the card notice (`inbox/protocol/023`).
+- **Platform coverage:** mac+linux.
+
+##### inbox/protocol/023 — A refused request of the agent's own shows on its card; another pane's does not.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), daemon with its production admission on; refused requests go over a connection whose creator exited, the rest from the test process; the card state is read from `list-agents`, the snapshot both clients hydrate from.
+- **Agent:** none (`cat` stand-ins).
+- **Asserts:** with a task queued, a fetch carrying the pane's own token over an exited creator's connection is refused `inbox_peer_unidentified` with a remedy in its error, and the agent's record carries `inbox.admission_refused: "inbox_peer_unidentified"`; a request naming a second pane with the first pane's token is refused `token_names_another_pane` and the second pane's record carries no refusal; an admitted receipt fetch with the pane's token, its task then acknowledged, clears the first pane's.
+- **Asserts (PTY-attached):** an actual refused fetch with a queued message renders the refusal cause and restart remedy on a real TUI card, and an admitted fetch clears the notice.
+- **Does not assert:** the orchestrator notice (`inbox/boundary/065`) or the narrow picker (`inbox/status/028`); desktop rendering is covered by `desktop/src/components/InboxAttention.test.tsx` ("shows a refused connection with its cause and remedy first").
+- **Platform coverage:** mac+linux.
+
+##### inbox/protocol/024 — A silent daemon gets no report.
+- **Layer:** fast unit (`src/hook.rs`; the real sender against a scripted daemon socket).
+- **Agent:** none.
+- **Asserts:** No answer within the wait: not confirmed, and no mutation is read.
+- **Asserts (round 5 fixes, auditor U3-6):** a confirmation dripped a byte at a time, each byte inside the wait, is cut at the question's whole wait: not confirmed in well under the drip's total, and no mutation read.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D1): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### inbox/protocol/025 — A wrong answer withholds the report.
+- **Layer:** fast unit (`src/hook.rs`; the real sender against a scripted daemon socket).
+- **Agent:** none.
+- **Asserts:** An empty object, a legacy ack, a null capability: not confirmed, nothing sent.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D1): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### inbox/protocol/026 — Malformed, closed and late answers withhold the report.
+- **Layer:** fast unit (`src/hook.rs`; the real sender against a scripted daemon socket).
+- **Agent:** none.
+- **Asserts:** Each is not confirmed and nothing is sent after it.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D1): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### inbox/protocol/027 — A confirmed report rides the asking connection.
+- **Layer:** fast unit (`src/hook.rs`; the real sender against a scripted daemon socket).
+- **Agent:** none.
+- **Asserts:** One connection carries the question and the report; its answer is what the sender reads.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D1): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### inbox/protocol/028 — A lost answer is unconfirmed.
+- **Layer:** fast unit (`src/hook.rs`; the real sender against a scripted daemon socket).
+- **Agent:** none.
+- **Asserts:** The daemon closes after the report: unconfirmed, sent once.
+- **Asserts (round 5 fixes, auditor U3-6):** a reply dripped a byte at a time past the reply's wait reads unconfirmed at about that wait, with the report sent once.
+- **Asserts (round 5 second fix pass, reviewer U3-3, auditor U3-1):** an 8 MiB report the daemon drains 4 KiB every 20 ms, about 40 s in all, reads unconfirmed well inside 2 s of a 500 ms reply wait: the reply's deadline is checked between writes of at most 16 KiB, so the sender gives up at the first check after it rather than once the daemon has drained the whole report. The one write under way when the deadline passes may still run past it; this schedule measures that overrun within the 2 s ceiling, not a bound for every socket buffer or drain rate.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D1): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### inbox/protocol/029 — The real CLI asks first and reports on the confirming connection.
+- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Agent:** none.
+- **Asserts:** against a stub hook socket that never answers the capability question, the real `work-done --task-id` sends only the question and exits 1 saying the daemon did not confirm it supports task reports; against a stub that confirms version 1, it sends `work_done_task` with the task id and report on the same connection, opens no second connection and sends nothing more, and the stub's `accepted` answer makes it print `Reported task <id> to the orchestrator.` and exit 0.
+- **Test:** `protocol_029_the_real_cli_asks_first_and_reports_on_the_confirming_connection` in `tests/e2e_work_done_reporting.rs`.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D1, §6.5): `/024` and `/027` drive `send_gated` in-crate; this drives the shipped binary's argv path.
+- **Does not assert:** a real daemon (`orchestration/work-done/033`); the other gate outcomes (`inbox/protocol/025`, `/026`, `/028`, `/030`, `/031`).
+- **Platform coverage:** mac+linux.
+
+##### inbox/protocol/030 — Only version 1 confirms.
+- **Layer:** fast unit (`src/hook.rs`; the real sender against a scripted daemon socket).
+- **Agent:** none.
+- **Asserts:** 2, -1 and the string "1" withhold the report.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D1): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### inbox/protocol/031 — Cut reports and unknown dispositions are unconfirmed.
+- **Layer:** fast unit (`src/hook.rs`; the real sender against a scripted daemon socket).
+- **Agent:** none.
+- **Asserts:** A reset mid-report is unconfirmed; an unknown disposition reads `unknown` and the CLI prints the unconfirmed wording for its mode, exit 1.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D1, D5): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### inbox/protocol/032 — `ListOutcomes` is sent only after a fresh advertisement.
+- **Layer:** fast unit (`src/daemon_client.rs`; the real client against a scripted attach daemon).
+- **Agent:** none.
+- **Asserts:** No capability, or another incarnation than the pinned one: no `list-outcomes` frame and unsupported; advertised and matching: asked once.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D10): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### inbox/protocol/033 — The legacy verb is gated by what it reports.
+- **Layer:** fast unit (`src/daemon.rs` hook-ingestion tests; the real hook loop on a socket, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** Under `warn`, a token-less `--done` is refused `unattested` with nothing changed; a token-less report without it is a note, the task stays open and its commission owed.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D1): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
 #### Agent CLI
 
 ##### inbox/cli/001 — In-pane fetch frames the task, acknowledges it and updates list.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), real CLI launched inside a daemon-owned scripted pane.
 - **Agent:** none (shell stand-in that waits for a fixture sentinel before fetching).
-- **Asserts:** list shows Queued before fetch; fetch prints the session framing and complete message block; wire list and CLI list show Acknowledged afterward.
+- **Asserts:** list shows Queued before fetch; fetch prints the session framing and complete message block, its opener naming the attempt it was handed (`delivery 1.1`, PRD #1666 part 3, H4); wire list and CLI list show Acknowledged afterward.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/cli/002 — Claude Once waiter wakes with exit two and stderr.
@@ -8882,6 +9568,27 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 - **Asserts:** the CLI sends exactly one `inbox_fetch`, naming the doorbell's message and not acknowledging; the hook asks `inbox_receipts`, then sends one `inbox_receipt_fetch` naming it with `hook_integration: 1`, no legacy `inbox_fetch` and no `inbox_list`, and prints the fetched block once its `may` is granted.
 - **Platform coverage:** mac+linux.
 #### Fixed doorbell
+
+##### inbox/cli/006 — A model-run fetch is a one-shot receiver that never shows a cap.
+- **Layer:** Fast (`src/inbox_cli.rs`), `fetch_one_shot` against stand-in decks (`inbox_oneshot::tests::stand_in_deck`) and writers that take nothing, a prefix, or everything with a failing flush (PRD #1666 part 3, H4).
+- **Agent:** none.
+- **Asserts:** against a serving deck, plain and `--json` output print two messages and commit both exact attempts; the JSON carries exactly `id`, `subject`, `from` and `text`; neither known cap string is in stdout, stderr or any line sent to the deck; zero bytes reports both `not_handed` and says nothing was printed; a prefix or a failed flush reports `handed`, not committed, and says the output was cut short; a revoke arriving between the grant and the output prints nothing and reports `not_handed`; a silent deck is `CLI_RECEIPTS_TIMED_OUT`, part 2's deck (receipts 1, no CLI named) `CLI_RECEIPTS_UNSUPPORTED`, each sent only the question; a deck that answers the question and never the fetch is `CLI_FETCH_TIMED_OUT`, whose words differ and do not say nothing was taken.
+- **Does not assert:** the real binary against the real daemon (`inbox/codex/020`, `inbox/boundary/054`), or a real spool's records (`inbox/codex/020`).
+- **Platform coverage:** mac+linux.
+
+##### inbox/cli/007 — A fenced-out message leaves `inbox fetch --json` valid JSON.
+- **Layer:** Fast (`src/inbox_cli.rs`), `fetch_one_shot` with `--json` against a stand-in deck handing three messages and refusing chosen grants (PRD #1666 part 3, H4).
+- **Agent:** none.
+- **Asserts:** with the first, the middle or the last grant refused, stdout parses as JSON listing exactly the other two with only `id`, `subject`, `from` and `text`, and the deck is told those two committed and the refused one not handed; with every grant refused, stdout is an empty list and nothing commits.
+- **Does not assert:** a write that fails partway (`inbox/cli/006`), or the real binary against the real daemon (`inbox/codex/020`).
+- **Platform coverage:** mac+linux.
+
+##### inbox/codex/023 — Codex's hooks and `inbox fetch` take nothing from an older daemon.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), the real Codex hook CLI and `inbox fetch` (plain and `--json`) against a stand-in 0.47.0 hook endpoint (answers nothing it cannot decode) and a stand-in part-2 endpoint (`one_shot_receipts` 1 naming no sender, refusing the CLI on the receipt verb, serving any other hook fetch), the e2e-only `DOT_AGENT_DECK_INBOX_TEST_RECEIPTS_WAIT_MS` knob (PRD #1666 part 3, H4).
+- **Agent:** none (`cat` stand-in supplies the pane identity).
+- **Asserts:** Codex's doorbell, committing and Stop hooks and both fetches each ask `inbox_receipts`, send no mail verb, print no message and exit 1; the hooks say the `RECEIPTS_*` notice in Codex's words (`hooks install --agent codex`, never `claude-code`), the fetches the `CLI_*` notice, a timeout at 0.47.0 and not-supported at part 2's; an older binary's fetch (the `none` integration knob) still takes the message afterwards.
+- **Does not assert:** a real 0.47 or part-2 binary.
+- **Platform coverage:** mac+linux.
 
 The typed-delivery entries `orchestration/delegate/040–041` and `orchestration/work-done/010` are retired; their attached draft and arrival-order outcomes now live in `inbox/doorbell/009–012`. `scheduler/dispatch/023` is rewritten in the binary harness. Terminal-report filtering is retained as a control there.
 
@@ -8916,7 +9623,7 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/doorbell/005 — Queued work re-rings on schedule and fetching stops retries.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), real binary and daemon-owned PTY, byte capture and vt100 replay.
 - **Agent:** none (raw Python stand-in; no agent executable or credential).
-- **Asserts:** Accelerated increasing retry intervals reach the repeating final delay, with lower bounds on observed submissions; Fetched stops the schedule before ack and Acknowledged keeps it stopped.
+- **Asserts:** Accelerated increasing retry intervals reach the repeating final delay, with lower bounds on observed submissions; Fetched by a receipt fetch whose receiver stays open stops the schedule before ack and Acknowledged keeps it stopped.
 - **Does not assert:** a real agent editor or real-model response; native agent adapters and producer migration have separate coverage.
 - **Platform coverage:** mac+linux.
 
@@ -9141,11 +9848,11 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 
 #### inbox/boundary
 
-##### inbox/boundary/001 — The legacy ack-wait touches only legacy-owned assignments.
-- **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub served over an in-memory duplex
+##### inbox/boundary/001 — No ack-wait redelivers a receipt hand-out.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub served over an in-memory duplex and its hook receiver.
 - **Agent:** none.
-- **Asserts:** with the ack-wait elapsed, a message `inbox fetch` took is redelivered and a receipt-owned hand-out is not, even with its own ack deadline run out; a receipt receiver never takes the legacy-owned one back.
-- **Does not assert:** a legacy stream, which the deck no longer serves (inbox/boundary/036).
+- **Asserts:** a stream's possessed hand-out stays fetched with one attempt and no store deadline while the ack-wait runs out more than `max_deliver` times over and the clock ticks, and nothing is handed out again; a hook hand-out positively not handed over returns to the queue at once and is handed out again unmarked (PRD #1666 part 3, H5, which removed the legacy ack-wait this pinned against).
+- **Does not assert:** a legacy stream or once wait, which the deck refuses (inbox/boundary/036, /072).
 - **Platform coverage:** all.
 
 ##### inbox/boundary/002 — Returning a reservation removes the attempt's files.
@@ -9316,17 +10023,17 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** a real OpenCode.
 - **Platform coverage:** mac+linux.
 
-##### inbox/boundary/026 — An offer moved from OpenCode to a legacy-fetch worker is not settled by a late receipt.
+##### inbox/boundary/026 — An offer moved from OpenCode to a hook worker is not settled by a late receipt.
 - **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub over an in-memory duplex and a real spool.
 - **Agent:** none.
-- **Asserts:** after the OpenCode worker's positive not-handed witness the job returns to its pool and goes to a Claude worker's hook fetch; a commit receipt the OpenCode watcher publishes later tells the offerer the job also reached its earlier holder, and leaves the Claude copy fetched until its hook acknowledges it.
+- **Asserts:** after the OpenCode worker's positive not-handed witness the job returns to its pool and goes to a Claude worker's `inbox fetch` (a hook receiver); a commit receipt the OpenCode watcher publishes later tells the offerer the job also reached its earlier holder, and leaves the Claude copy fetched until the Claude worker acknowledges it.
 - **Does not assert:** Pi, which is on receipts (inbox/boundary/034).
 - **Platform coverage:** all.
 
-##### inbox/boundary/027 — An offer moved from a legacy-fetch worker to OpenCode is not settled by a late ack.
+##### inbox/boundary/027 — An offer moved from a hook worker to OpenCode is not settled by a late ack.
 - **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub over an in-memory duplex and a real spool.
 - **Agent:** none.
-- **Asserts:** a job a Claude worker's hook fetched, whose ack-wait then ran out, goes to the OpenCode worker's receipt stream; the hook's late acknowledgement claims nothing, the OpenCode copy keeps its one open attempt, and the OpenCode commit claims it.
+- **Asserts:** a job a Claude worker's `inbox fetch` was handed and positively did not hand over goes to the OpenCode worker's receipt stream; the Claude worker's late acknowledgement claims nothing, the OpenCode copy keeps its one open attempt, and the OpenCode commit claims it. A Claude worker that claimed the job and then released it, or let its claim expire, before the job moved to OpenCode gets `wrong_agent` for a later ack, the OpenCode copy stays fetched with one attempt, and the OpenCode worker's ack claims it.
 - **Does not assert:** Pi, which is on receipts (inbox/boundary/035).
 - **Platform coverage:** all.
 
@@ -9349,7 +10056,7 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/boundary/030 — A Pi extension from before the receipt stream is refused.
 - **Layer:** Fast (`src/daemon.rs`), the hub's stream server over an in-memory duplex and the daemon's own fetch and get-seed handlers.
 - **Agent:** none.
-- **Asserts:** a Pi or OpenCode stream without the deck's integration is refused `adapter_too_old`; a Pi generation's plain doorbell fetch and its get-seed are refused the same way; each leaves the message queued and puts the out-of-date notice on the card; a Claude hook's plain doorbell fetch is still served.
+- **Asserts:** a Pi or OpenCode stream without the deck's integration is refused `adapter_too_old`; a Pi generation's plain doorbell fetch and its get-seed are refused the same way; each leaves the message queued and puts the out-of-date notice on the card; a Claude hook's plain doorbell fetch is no adapter's: it is routed to the hooks' one-shot floor as Claude's, and the withdrawn legacy fetch takes nothing (PRD #1666 part 3, H5).
 - **Does not assert:** the clients' rendering of the notice (inbox/status, desktop words test).
 - **Platform coverage:** all.
 
@@ -9493,11 +10200,39 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** a real waiter binary or Claude's settings (inbox/claude/020).
 - **Platform coverage:** mac+linux.
 
+##### inbox/boundary/049 — Every hook receiver below the integration floor is refused before issue.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), `serve_hook` over in-memory duplexes, a real spool (PRD #1666 part 3, H4).
+- **Agent:** none.
+- **Asserts:** Claude Code's prompt hook, Codex's prompt hook and Stop, and a model-run fetch served as Devin's or an unknown agent's hook, each declaring no or a lower `HOOK_INTEGRATION`, are refused `hooks_too_old` with no batch; no attempt is issued and the task stays queued; an agent's own hook raises the `hooks_too_old` notice, a model-run fetch leaves the card without one.
+- **Does not assert:** the daemon's routing to `serve_hook` (`inbox/claude/031`, `inbox/codex/023`).
+- **Platform coverage:** all.
+
+##### inbox/boundary/050 — A fetch that dies after publishing its receipt is settled late.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), `serve_hook` over an in-memory duplex, a real spool (PRD #1666 part 3, H4).
+- **Agent:** none.
+- **Asserts:** a model-run fetch is issued a task, its committed receipt is published on the attempt's own cap, and its connection closes with no control; the clock finds the receipt and the task is acknowledged.
+- **Does not assert:** the sender correction a late commit of an already uncertain task makes.
+- **Platform coverage:** all.
+
 ##### inbox/boundary/051 — A batch line whose newline never went is not handed.
 - **Layer:** Fast (`src/inbox_engine_tests.rs`), `serve_waiter` writing to a scripted writer.
 - **Agent:** none.
 - **Asserts:** a once batch line of which the connection took no byte, or a prefix without its newline, makes its attempt `NotHanded` and the task queued again, handed to the next waiter unmarked; one taken whole whose flush failed leaves the attempt `Fenced` (possibly handed), the message attempting and its inbox copy not queued.
 - **Does not assert:** a real socket's partial writes.
+- **Platform coverage:** mac+linux.
+
+##### inbox/boundary/053 — Hook receivers are request-bound and take no held mail.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), `serve_hook` and a Pi `serve_waiter` stream over in-memory duplexes, a real spool (PRD #1666 part 3, H4).
+- **Agent:** none.
+- **Asserts:** empty Codex prompt, Stop and model-run fetches leave no receiver record; of a Codex Stop and a fetch racing one task exactly one is issued it; a task posted while a hook holds its batch is not pushed to it over five clock passes, and a fetch beside it takes only that task; neither is counted as an armed waiter (`armed`, the doorbell's facts); both commit and settle, and closed hooks are pruned; beside a Pi stream that holds its task, a fetch is issued nothing.
+- **Does not assert:** the `MAX_LIVE_HOOKS` bound itself (`inbox/attempts/031`), or a full stream queue on an interleaving.
+- **Platform coverage:** all.
+
+##### inbox/boundary/054 — A Devin pane's model-run fetch is a one-shot receiver.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_boundary.rs`), real daemon, the real `inbox fetch` CLI run with the pane's identity and receipt spool (PRD #1666 part 3, H4).
+- **Agent:** python stand-in spawned with agent type Devin, which reports Idle through Devin's status hook and has no inbox hooks.
+- **Asserts:** the doorbell is typed and submitted; a fetch whose stdout is closed before its first byte exits non-zero with `CLI_NOTHING_PRINTED` and the task is queued again at once; a second fetch prints the block naming its attempt, and the task is acknowledged by its receipt (`ack_how` `plugin_confirmed`).
+- **Does not assert:** a real Devin, whose live inbox delivery is unverified (#1348).
 - **Platform coverage:** mac+linux.
 
 ##### inbox/boundary/052 — A newer waiter supersedes, and a spent one takes nothing.
@@ -9570,6 +10305,74 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** the warning's text, or the removal of the generation's spool at exit.
 - **Platform coverage:** mac+linux.
 
+##### inbox/boundary/065 — A refused request marks its own card while mail waits, and tells its orchestrator once.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub's `admission_refused` / `admission_admitted` (the daemon's admission outcome), delegates through `post_delegate`, a broadcast receiver.
+- **Agent:** none.
+- **Asserts:** a refusal with nothing waiting shows nothing; once a delegated task waits the summary carries `admission_refused`, an attention update broadcasts it and its orchestrator is told; an admitted request clears it; a refusal starting a new episode posts one more `worker cannot take its messages` notice to the task's orchestrator, naming the task and the cause, however often it repeats; an orchestrator in the worker's own pane is not told; exit clears the state; a generation no longer in its pane records nothing.
+- **Does not assert:** which requests the daemon reports (`inbox/protocol/023`), or the client rendering (`inbox/status/027`, `/028`).
+- **Platform coverage:** all.
+
+##### inbox/boundary/066 — A refusal already open tells each orchestrator that delegates into it, once.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub's `admission_refused` / `admission_admitted` and `post_delegate`.
+- **Agent:** none.
+- **Asserts:** a refusal before anything is delegated tells nobody; a task delegated into the open episode posts one `worker cannot take its messages` notice to its orchestrator, naming the task and the cause; repeated refusals and a second delegation by the same orchestrator post nothing more; a second orchestrator delegating into the episode is told once; after an admission, a new refusal tells the orchestrator whose task waits, once (PRD #1666 part 3, round 1).
+- **Does not assert:** the card notice (`inbox/boundary/065`), or which requests the daemon reports (`inbox/protocol/023`).
+- **Platform coverage:** all.
+
+##### inbox/boundary/067 — Unstamped Claude Code or Codex hook lines name that agent's fix, and hold nothing.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub's `observe_hook_stamp` and `set_agent_hooks_remedy`.
+- **Agent:** none.
+- **Asserts:** with a Claude Code and a Codex `hooks install` command set and a task waiting, a stamped line raises no notice; an unstamped line of either agent's makes the integration notice `hooks_too_old` with that agent's command, the doorbell is not blocked, and a stamped line from the same generation clears it (PRD #1666 part 3, R-3).
+- **Does not assert:** the daemon reading the stamp off a real hook line (`inbox/claude/047`), or the TUI and desktop rendering the notice (`inbox/claude/020`'s notice, part 2's renderers).
+- **Platform coverage:** all.
+
+##### inbox/boundary/068 — Codex's whole hook line stays within 6000 bytes at the edge.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), `serve_hook` for Codex's prompt hook and `Stop` within the room `one_shot_request` asks for, printed through each envelope (PRD #1666 part 3, H4).
+- **Agent:** none.
+- **Asserts:** for each hook, a task whose block with its attempt opener measures exactly that room, and tasks four bytes either side of it, print a JSON line, separator and newline included, of at most Codex's 6000 bytes.
+- **Does not assert:** several blocks in one hand-over (`inbox/codex/018`, `inbox/codex/019`), or Codex reading the line (`inbox/codex/009`, `inbox/codex/011`).
+- **Platform coverage:** mac+linux.
+
+##### inbox/boundary/069 — A body Codex's JSON would cut is saved, and its cut block names the file.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), `body_needs_saving` and `retain_full_body`, then `serve_hook` for Codex's prompt hook and `Stop` within the room each asks for (PRD #1666 part 3, H4).
+- **Agent:** none.
+- **Asserts:** bodies heavy in quotes, backslashes, control characters or a mix of them, within Codex's plain byte budget but not once JSON-escaped, are saved; each hook's block of them is whole or names the saved file and never says only how much did not fit; the longest quote-heavy body that is not saved renders whole in both hooks' room as a marked repeat with the longest attempt opener.
+- **Does not assert:** the daemon's post path refusing a body it cannot save (`an_oversized_body_that_cannot_be_saved_is_refused`).
+- **Platform coverage:** mac+linux.
+
+##### inbox/boundary/070 — An older daemon's inbox listing still decodes.
+- **Layer:** Fast (`src/daemon_protocol.rs`), literal frozen JSON decoded as `AttachResponse`, `InboxListReply` and bare `MessageSummary`, and a frozen copy of 0.47's reader DTOs, nested types and closed enums included (PRD #1666 part 3, H5's ListInbox wire audit).
+- **Agent:** none.
+- **Asserts:** each of the seven `ack_how` spellings (the legacy `prompt_observed`, `hook_handover` and `fetched_by_cli` included) decodes in all three envelopes, and a list of the three legacy values together decodes whole; all five states, all five undeliverable reasons, both sender kinds, both trust levels, null and absent optional fields, and a maximal summary whose text opens like a delivery block decode; the frozen 0.47 reader decodes what this build writes, as an attach answer and as a hook `inbox list` answer, for every state, undeliverable reason and `ack_how` spelling, both senders, each recipient shape, every wake, and a summary with every optional field set and one with none.
+- **Does not assert:** an old binary against this daemon (the cross-version job), or that a handshake across a declared contract break connects.
+- **Platform coverage:** mac+linux.
+
+##### inbox/boundary/071 — An ack of a message never handed out changes nothing.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), `InboxHub::ack` against a queued direct task, an assigned offer and a receipt stream's hand-out (PRD #1666 part 3, H5).
+- **Agent:** none.
+- **Asserts:** an `ack` of a queued task or of an offer assigned but never handed out answers `unknown`, leaves the task queued with no hand-over counted and the offer assigned, unclaimed; a handed-out task's ack is acknowledged once, then already acknowledged, another agent's is the wrong agent's, and an undeliverable message says so.
+- **Platform coverage:** mac+linux.
+
+##### inbox/boundary/072 — A once wait from a hook component is refused.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), `serve_waiter` for Codex's, Devin's and an unknown component's once wait over an in-memory duplex (PRD #1666 part 3, H5).
+- **Agent:** none.
+- **Asserts:** each is refused `unsupported` and the connection ends; nothing arms, the task stays queued with no hand-over counted and no attempt is issued for it.
+- **Platform coverage:** mac+linux.
+
+##### inbox/boundary/073 — Every old way to take mail is refused and takes nothing.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_boundary.rs`), an isolated daemon and raw hook-socket verbs as an older `dot-agent-deck` sends them (PRD #1666 part 3, H5).
+- **Agent:** none (Codex, Devin and bare-command panes running a stand-in).
+- **Asserts:** a plain `inbox_fetch` (with and without `ack`) is refused `cli_too_old`, a doorbell or turn-end hook fetch declaring no integration `hooks_too_old`, a once wait from a hook component `unsupported`, and `get_seed` answers no seed with `get_seed_removed`; each answers at once, the task stays queued with no hand-over counted, the card shows the out-of-date hooks notice naming Codex's own `hooks install` for the Codex pane and no command for the others, and a current receipt fetch from the same pane is then handed the task.
+- **Platform coverage:** mac+linux.
+
+##### inbox/boundary/074 — Report provenance crosses versions.
+- **Layer:** fast unit (`src/daemon_protocol.rs`).
+- **Agent:** none.
+- **Asserts:** 0.47's readers decode a summary and a notice carrying every provenance kind; this build decodes unknown provenance, dispatch phase, outcome phase, cause, delivery, operation and disposition values as `unknown`; an unknown work-done mode is refused `unsupported_mode` with nothing changed.
+- **Why it exists:** PRD #1666 part 3, round 5 (plan D10, §4): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
+- **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
 ##### inbox/status/001 — Human daemon status shows each agent's pending inbox counts and wake path.
 - **Layer:** Unit (`tests/inbox_status.rs`), pure status projection and table rendering.
 - **Agent:** none.
@@ -9594,7 +10397,7 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/status/004 — Attached clients receive each direct-message lifecycle transition as a recognized Inbox broadcast.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_status.rs`), real binary and streaming attach subscription.
 - **Agent:** none (raw Python stand-in; no credential).
-- **Asserts:** Queued → Fetched → Queued (ack-wait run out) → Fetched → Acknowledged (explicit `ack`) and Queued → Undeliverable (agent stop) arrive in order with pane_id, message_id, subject and from_label; BroadcastMsg recognizes and preserves the inbox payload.
+- **Asserts:** Queued → Fetched → Queued (a receipt fetch that reports it printed nothing) → Fetched → Acknowledged (explicit `ack`) and Queued → Undeliverable (agent stop) arrive in order with pane_id, message_id, subject and from_label; BroadcastMsg recognizes and preserves the inbox payload.
 - **Does not assert:** offers, publishes, real agent adapters or frontend rendering.
 - **Platform coverage:** mac+linux.
 
@@ -9755,6 +10558,27 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 
 #### inbox/claude
 
+##### inbox/status/027 — The card says messages can't reach the agent, why and what to do.
+- **Layer:** L1 (`tests/render_dashboard.rs`), TestBackend card render from the daemon's record/resync seam.
+- **Agent:** none.
+- **Asserts:** a snapshot carrying `admission_refused` renders `Messages can't reach this agent: its connection to the deck…` in the shared words, ahead of an out-of-date hooks notice on the same card.
+- **Does not assert:** what raises or clears it (`inbox/protocol/023`), or the whole sentence at a narrow width (`inbox/status/028`).
+- **Platform coverage:** all.
+
+##### inbox/status/028 — Deck messages shows a refused connection whole.
+- **Layer:** L1 (`tests/render_inbox_attention.rs`), the real key handler and picker over a TestBackend.
+- **Agent:** none.
+- **Asserts:** with only a refusal, `i` opens Deck messages and its body holds the whole notice — headline, cause, remedy — at 100 and at 30 columns, the footer offers only `Esc to close`, and `r` sends nothing; beside an uncertain delivery the notice heads the picker and the row still sends Retry.
+- **Does not assert:** the desktop tile (`desktop/src/lib/inboxWords.test.ts`, `AgentTile.test.tsx`).
+- **Platform coverage:** all.
+
+##### inbox/status/029 — A refused connection too long for a short, narrow window says to make it taller.
+- **Layer:** L1 (`tests/render_inbox_attention.rs`), the real key handler and picker over a TestBackend.
+- **Agent:** none.
+- **Asserts:** at 30×12, `i` opens Deck messages with the refusal's headline and, where the remedy does not fit, a closing `make the window taller to read the whole notice`; at 30×40 the whole notice shows and that line does not (PRD #1666 part 3, round 1); at smaller sizes down to 12×8, where the remedy does not fit, a shorter whole line (`make the window taller`, or `… taller`) still says so (round 2).
+- **Does not assert:** scrolling the notice, or the desktop tile, whose list scrolls.
+- **Platform coverage:** all.
+
 ##### inbox/claude/001 — Supported Claude installs one status handler and one day-long native waiter per managed event.
 - **Layer:** Fast CLI (`tests/inbox_claude.rs`), isolated HOME and version stub, no daemon or credential.
 - **Agent:** none.
@@ -9873,6 +10697,27 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** a SessionStart whose event is not yet in when the fetch arrives (inbox/claude/024), or a stale doorbell with no Claude hook event at all, which the deck cannot tell from another agent's.
 - **Platform coverage:** mac+linux.
 
+##### inbox/claude/047 — A pre-inbox hook that never asks for mail is named, and recovers.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), real hook CLI children, the e2e-only `DOT_AGENT_DECK_INBOX_TEST_HOOK_INTEGRATION=pre-inbox` knob (no version stamp, no inbox requests). Extends `inbox/claude/022` (PRD #1666 part 3, R-3).
+- **Agent:** none (synthetic Claude parent; no credential).
+- **Asserts:** a SessionStart from the stand-in prints nothing and the card's notice becomes `hooks_too_old`, with the deck's `hooks install --agent claude-code` command when it composes one; a task posted then is queued, and after the stand-in's Stop the doorbell line naming it is typed while the notice stands (the notice holds no mail), and `dot-agent-deck inbox fetch` run in the pane is handed it and it is acknowledged; a SessionStart from the deck's own hook clears the notice, and a prompt hook given a second task's doorbell line is handed that task, which is acknowledged.
+- **Does not assert:** a genuine 0.46 binary, a hook older than the hook capability token (0.45 and earlier, refused before the deck can tell whose card it is), a real model choosing to run the fetch the doorbell names, or a real Claude reloading its hooks.
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/048 — An upgrade's hook refresh repairs pre-inbox hooks, keeps a live install, and the waiter delivers.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), a stand-in older binary whose `--version` is unreadable, named in an isolated Claude settings file with the status hook only, the real `hooks refresh --json` from the deck's durable copy in HOME. Extends `inbox/claude/020` (PRD #1666 part 3, R-3).
+- **Agent:** none (synthetic Claude parent; no credential).
+- **Asserts:** the stand-in's SessionStart raises `hooks_too_old` while a task waits; with the stand-in live, `hooks refresh` exits non-zero, reports `ok: false`, names the stand-in's path and a `hooks install --agent claude-code` command, and leaves the settings naming the stand-in; with the stand-in removed, `hooks refresh` succeeds, the settings gain the deck's waiter on the durable copy, that waiter is handed the task with exit 2, and the notice is gone.
+- **Does not assert:** a live older install being taken over, or one of the same release being kept as settled (`hooks_refresh` unit tests), the upgrade clients running the refresh (`self_upgrade::agent_hooks` unit tests), or a real Claude.
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/049 — Live: hooks refreshed after an upgrade deliver to a restarted Haiku.
+- **Layer:** L2 lane 2 (`tests/e2e_inbox_claude_live.rs`), the real TUI in a PTY, genuine interactive Haiku panes, the real `hooks refresh --json` from the harness's durable copy (PRD #1666 part 3, R-3).
+- **Agent:** Claude Code (Haiku).
+- **Asserts:** with the settings made a pre-0.47 install (status hooks on a stand-in copy whose `--version` is unreadable, no waiter), a Haiku started under them has the `hooks_too_old` integration notice and `deck hooks run a dot-agent-deck too old` is on its card on screen; with the stand-in removed, `hooks refresh` succeeds with `ok: true` and the settings gain the waiter and lose the stand-in; a Haiku started afterwards arms its waiter, writes a sentinel-writing task's file once, the task is acknowledged after one hand-over with no doorbell, and the card labels it.
+- **Does not assert:** a real 0.46 binary, an upgrade client running the refresh (`self_upgrade::agent_hooks`, `upgrade/upgrade-dialog/015`, desktop `local_upgrade_008`–`010`), or the stale Haiku itself answering a doorbell with `inbox fetch`.
+- **Platform coverage:** mac+linux.
+
 ##### inbox/claude/023 — A raw exact commit needs the attempt's receipt.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), a raw `inbox_committed` sent to the hook socket by the scripted Claude parent itself (inside the agent's process tree), real waiter and hook CLI children, real spool.
 - **Agent:** none (synthetic Claude parent; no credential).
@@ -9880,38 +10725,17 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** a same-user process that reads the caps file and publishes the receipt itself (the accepted same-user trade).
 - **Platform coverage:** mac+linux.
 
-##### inbox/claude/024 — A stale hook waits for the SessionStart connected before it.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), real hook CLI child, the e2e-only `DOT_AGENT_DECK_INBOX_TEST_HOOK_INTEGRATION=none` knob, SessionStart's connection opened by a child process of the pane's scripted Claude (inside the agent's process tree, as Claude's own hooks are) before the hook runs, and its event written after.
+##### inbox/claude/024 — A stale hook is refused without waiting for an earlier SessionStart.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), real hook CLI child, the e2e-only `DOT_AGENT_DECK_INBOX_TEST_HOOK_INTEGRATION=none` knob, SessionStart's connection opened by a child process of the pane's scripted Claude (inside the agent's process tree, as Claude's own hooks are) before the hooks run, and its event written last.
 - **Agent:** none (synthetic Claude parent; no credential).
-- **Asserts:** in a pane with no agent type and nothing announced, a stale prompt hook's fetch that reaches the deck before the earlier SessionStart connection's event is held (the hook has not finished 400 ms later and the pane is still untyped); once that event reports Claude Code the fetch is refused: nothing of the task is printed, the task stays queued and the card's notice is `hooks_too_old` (R2F-R02).
-- **Does not assert:** the 2-second bound running out (an earlier connection that never sends a line), which serves the fetch the legacy way (inbox/claude/025).
-- **Platform coverage:** mac+linux.
-
-##### inbox/claude/025 — A silent earlier connection holds a stale fetch for two seconds, then legacy.
-- **Layer:** Fast (`src/daemon.rs`, `ingest_order_tests`), `route_hook_fetch` over a real registry with a `/bin/sh` agent and an `IngestOrder` whose earlier ticket never settles.
-- **Agent:** none.
-- **Asserts:** a doorbell-hook fetch with no integration from an untyped, unannounced generation is `Undecided`; with an earlier connection whose peer the deck cannot place, or one from the agent's own process tree, it is held for `HOOK_ROUTE_WAIT` (2 s, and less than 3 s more) and then served `Legacy`; with an earlier connection from a process outside the agent's tree it is routed at once; no ticket is left pending (R2-fix3 U2).
-- **Does not assert:** the hook socket's accept loop or a real stale hook binary (inbox/claude/024), or a SessionStart typing the generation within the hold.
-- **Platform coverage:** mac+linux.
-
-##### inbox/claude/027 — A silent peer the deck cannot place outside the tree holds a stale fetch.
-- **Layer:** Fast (`src/daemon.rs`, `ingest_order_tests`), `route_hook_fetch_with` over a real registry with a `/bin/sh` agent, an `IngestOrder` whose earlier ticket never settles, and the production placement (`may_type_generation_with`) over a stand-in parent and start-time lookup.
-- **Agent:** none.
-- **Asserts:** with a 400 ms wait, an earlier connection whose peer is readable and whose walk ends outside the agent's tree routes the fetch at once; one whose ancestry reaches the agent only past the walk's step limit, one whose start time was never read, one whose pid names another process once the walk has answered, and one whose start time cannot be read after the walk each hold the fetch for the whole wait, then it is served `Legacy`; no ticket is left pending (R2-fix4 U2).
-- **Does not assert:** a real process tree, the Windows parent lookup, or a parent that exits during the walk and reparents the peer out of the tree (best-effort placement).
-- **Platform coverage:** mac+linux.
-
-##### inbox/claude/026 — Silent connections wait no more than the pool serves.
-- **Layer:** Fast (`src/daemon.rs`, `question_hold_tests`), the real hook loop (`run_hook_loop_with_limits`) with a pool of two and a 200 ms idle window, its `IngestOrder` read by the test.
-- **Agent:** none.
-- **Asserts:** with ten connections that send nothing, no more than two are ever pending a first message, all ten are accepted in turn as the idle window reclaims each, and none is left pending (R2-fix3 U2).
-- **Does not assert:** a fetch held while the pool is full, or the production pool size.
+- **Asserts:** in a pane with no agent type and nothing announced, a stale prompt hook's fetch is refused while the earlier SessionStart connection has still sent nothing: nothing of the task is printed, the task stays queued and the card's notice is `hooks_too_old`; a current prompt hook in the same pane is then handed the task, also before that event (PRD #1666 part 3, H5 removed the route hold R2F-R02 added).
+- **Does not assert:** which agent's `hooks install` the notice names for an untyped pane (none: inbox/boundary/073 pins that for a bare pane).
 - **Platform coverage:** mac+linux.
 
 ##### inbox/claude/028 — Newer Claude hooks take nothing from an older daemon.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), the real waiter and prompt-hook CLI children against a stand-in 0.47.0 hook endpoint (hands its one message to the first legacy `inbox_wait`/`inbox_fetch`, answers nothing to a verb it cannot decode), the e2e-only `DOT_AGENT_DECK_INBOX_TEST_RECEIPTS_WAIT_MS` knob.
 - **Agent:** none (no credential).
-- **Asserts:** the once-waiter, the prompt hook answering a doorbell and the prompt hook submitting a waiter's whole block each send `inbox_receipts` and nothing that could take or commit mail (no `inbox_wait`, `inbox_fetch`, receipt verb, `inbox_committed` or `ack`), print nothing of the message, exit 1 and say on stderr that the deck did not answer in time (an older daemon does not answer, naming `hooks install --agent claude-code`): `RECEIPTS_TIMED_OUT` for the waiter and the doorbell hook, `RECEIPTS_COMMIT_TIMED_OUT` for the committing hook, which promises nothing queued; none says `RECEIPTS_UNSUPPORTED`'s "most likely older"; a legacy `inbox fetch` afterwards still takes and prints the message (wire audit W03–W06).
+- **Asserts:** the once-waiter, the prompt hook answering a doorbell and the prompt hook submitting a waiter's whole block each send `inbox_receipts` and nothing that could take or commit mail (no `inbox_wait`, `inbox_fetch`, receipt verb, `inbox_committed` or `ack`), print nothing of the message, exit 1 and say on stderr that the deck did not answer in time (an older daemon does not answer, naming `hooks install --agent claude-code`): `RECEIPTS_TIMED_OUT` for the waiter and the doorbell hook, `RECEIPTS_COMMIT_TIMED_OUT` for the committing hook, which promises nothing queued; none says `RECEIPTS_UNSUPPORTED`'s "most likely older"; an older binary's `inbox fetch` afterwards (the `none` integration knob; this build's asks first, `inbox/codex/023`) still takes and prints the message (wire audit W03–W06).
 - **Does not assert:** a real 0.47.0 binary, or the desktop's or TUI's attach refusal (inbox/claude/032).
 - **Platform coverage:** mac+linux.
 
@@ -9932,7 +10756,7 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/claude/031 — The deck answers its receipt support and refuses what the receipt verbs do not serve.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), raw requests from a process inside a scripted Claude parent's tree to the real daemon.
 - **Agent:** none (synthetic Claude parent; no credential).
-- **Asserts:** `inbox_receipts` is answered with `one_shot_receipts` 1; `inbox_receipt_wait` from a Codex component or for a stream, and `inbox_receipt_fetch` from the CLI or bound to a stream, are each refused `unsupported` with no messages, and a task queued beforehand stays queued.
+- **Asserts:** `inbox_receipts` is answered with `one_shot_receipts` 1 and `one_shot_senders` `claude_waiter`, `claude_hooks`, `codex_hooks`, `cli`; `inbox_receipt_wait` from a Codex component or for a stream, and `inbox_receipt_fetch` naming a stream's or the waiter's component or bound to a stream, are each refused `unsupported` with no messages, and a task queued beforehand stays queued. Since PRD #1666 part 3's H4 the CLI's receipt fetch is served (`inbox/codex/020`).
 - **Does not assert:** the served paths, which the real waiter and hook take in inbox/claude/016–/020.
 - **Platform coverage:** mac+linux.
 
@@ -10034,6 +10858,14 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** the stderr and exit status of the real hook (inbox/claude/028, /037, /043).
 - **Platform coverage:** mac+linux.
 
+##### inbox/claude/046 — Claude Code outside the deck's recorded process tree still takes and acknowledges its messages. [reel]
+- **Layer:** L2 real agent, lane 2 (PTY-attached).
+- **Agent:** Claude Code, Haiku.
+- **Asserts:** with the pane's process a `sleep` and Claude Code started by a subshell that exits, `ps` shows Claude outside that process's tree; an idle native waiter armed from Claude's own hook (outside the tree) wakes it for a posted task with no doorbell; the sentinel is appended once, the message is acknowledged after one hand-over and the card shows ✉ (PRD #1666 part 3, R-1).
+- **Test:** `claude_046_live_outside_the_recorded_tree_takes_and_acknowledges` in `tests/e2e_inbox_claude_live.rs`.
+- **Does not assert:** Claude Code's own background session host or `/resume` (a stand-in that keeps the same process relationship and environment), or other agents.
+- **Platform coverage:** mac+linux.
+
 ##### inbox/claude/011 — Idle interactive Haiku wakes natively, acts once and labels the deck task. [reel]
 - **Layer:** L2 real agent, lane 2 (PTY-attached).
 - **Agent:** Claude Code, Haiku.
@@ -10073,17 +10905,17 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** the private unresolved-worker dispatch branch or commission expiry arithmetic; the ledger unit tests retain those arithmetic checks.
 - **Platform coverage:** mac+linux.
 
-##### inbox/route/010 — A late ack after max_deliver corrects the orchestrator.
-- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_route.rs`), real sandbox daemon with ack-wait 1500 ms and `max_deliver` 1.
-- **Agent:** scripted stand-ins; the worker fetches through `inbox fetch` without acknowledging, as a hook does, and later acknowledges through the explicit `ack` route.
-- **Asserts:** the task becomes undeliverable and the orchestrator is told so; the worker's later ack makes it acknowledged and the orchestrator receives a correction naming the task and the worker's role.
-- **Does not assert:** the recipient card's cleared notice (the `inbox_hub` and `state` unit tests).
+##### inbox/route/010 — A late ack after the repeats ran out corrects the orchestrator.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_route.rs`), real sandbox daemon with ack-wait 1500 ms and a 300 ms keepalive.
+- **Agent:** scripted stand-ins; the worker's `inbox fetch` (a receipt fetch, granted and reported possibly handed) exits without confirming, and the worker later acknowledges through the explicit `ack` route.
+- **Asserts:** no receiver takes the marked repeat in time, so the orchestrator is told the task's delivery is uncertain; the worker's later ack makes it acknowledged and the orchestrator receives a correction naming the task and the worker's role.
+- **Does not assert:** a late commit after the task ran out of attempts on not-handed reports, nor the recipient card's cleared notice (`a_commit_after_running_out_of_attempts_corrects_the_sender_and_the_card` in `src/inbox_engine_tests.rs`).
 - **Platform coverage:** mac+linux.
 
 ##### inbox/route/011 — An ack after the "has not reached the worker" notice corrects the orchestrator once.
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_route.rs`), real sandbox daemon with ack-wait 1500 ms, `max_deliver` 100 and the undelivered notice at 3000 ms.
-- **Agent:** scripted stand-ins; the worker fetches through `inbox fetch` without acknowledging and later acknowledges through the explicit `ack` route.
-- **Asserts:** the orchestrator is told the task has not reached the worker; the worker's ack makes it acknowledged and the orchestrator receives one correction naming the task and the worker's role, and no second one.
+- **Agent:** scripted stand-ins; the worker leaves the task queued, then its `inbox fetch` (a receipt fetch) takes it and it acknowledges through the explicit `ack` route.
+- **Asserts:** the orchestrator is told the queued task has not reached the worker; the worker's ack makes it acknowledged and the orchestrator receives one correction naming the task and the worker's role, and no second one.
 - **Does not assert:** the correction after "is undeliverable" (inbox/route/010) or the told-both case (the `inbox_hub` unit tests).
 - **Platform coverage:** mac+linux.
 
@@ -10144,18 +10976,32 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** Cross-version compatibility.
 - **Platform coverage:** mac+linux.
 
-##### inbox/codex/007 — Stop blocks with framed inbox content within 6000 bytes and keeps overflow queued.
-- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`).
-- **Agent:** none (real Codex hook CLI).
-- **Asserts:** Busy Stop emits decision:block with a bounded framed reason, acknowledges handed-over ids, retains overflow and prints no block once empty; no PTY input is used.
-- **Does not assert:** Real Codex compliance with the reason.
+##### inbox/codex/018 — Codex's doorbell prompt hook hands over on receipts within its byte budget.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`), the real Codex hook CLI with the pane's identity and receipt spool (PRD #1666 part 3, H4; replaces inbox/codex/008).
+- **Agent:** none (real Codex hook CLI, wrapped stand-in Codex).
+- **Asserts:** with four token-dense tasks queued, some of them with quotes and backslashes, the doorbell's UserPromptSubmit prints one JSON line of at most 6000 UTF-8 bytes, escaping included, whose additionalContext carries a bounded subset, each block naming its attempt; those are acknowledged by their receipts (`ack_how` `plugin_confirmed`, one delivery) and the rest stay queued, never issued; the human prompt history and the ✉ card label are kept.
+- **Does not assert:** a real Codex reading it (`inbox/codex/009`).
 - **Platform coverage:** mac+linux.
 
-##### inbox/codex/008 — Codex doorbell submission injects and acknowledges content within its byte budget.
-- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`).
-- **Agent:** none (real Codex hook CLI).
-- **Asserts:** Doorbell UserPromptSubmit returns additionalContext within 6000 UTF-8 bytes, acknowledges handed-over ids, retains overflow and preserves human history while labelling the event with ✉.
-- **Does not assert:** A sandboxed model shell fetch; trusted hooks run outside the sandbox.
+##### inbox/codex/019 — Codex's Stop hands over on receipts and keeps overflow unissued.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`), the real Codex hook CLI with the pane's identity and receipt spool (PRD #1666 part 3, H4; replaces inbox/codex/007).
+- **Agent:** none (real Codex hook CLI, wrapped stand-in Codex).
+- **Asserts:** busy Stop prints a `decision: block` JSON line of at most 6000 bytes with a bounded subset, each block naming its attempt, settled by receipt with one delivery; the rest are never issued until later Stops take each once; an empty Stop prints nothing; nothing is typed into the pane.
+- **Does not assert:** real Codex compliance with the reason (`inbox/codex/011`).
+- **Platform coverage:** mac+linux.
+
+##### inbox/codex/020 — With untrusted hooks, a model-run fetch commits on receipts.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`), the real `inbox fetch` CLI with the pane's identity and receipt spool (PRD #1666 part 3, H4).
+- **Agent:** none (no deck hook runs; wrapped stand-in Codex).
+- **Asserts:** the doorbell is typed; a stand-in model's `inbox fetch` prints the framing and the block naming its attempt, exits 0, and the task is settled by its receipt with the card not degraded; with the generation's receipt records directory made read-only, a second fetch still prints and settles its task and the record's `receipts_degraded` names the receipt.
+- **Does not assert:** Codex's real sandbox (`inbox/codex/022`).
+- **Platform coverage:** mac+linux.
+
+##### inbox/codex/021 — Prompt hook off, Stop on: each task is handed over and settled once.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`), the real Codex Stop hook and `inbox fetch` CLI (PRD #1666 part 3, H4).
+- **Agent:** none (wrapped stand-in Codex; its prompt hook is never run).
+- **Asserts:** an idle task reaches the model through the doorbell and a model-run fetch; a busy task through Stop; a Stop and a fetch run at once over two queued tasks print each exactly once between them; every task is settled by its receipt with one delivery.
+- **Does not assert:** a real Codex (`inbox/codex/011`, `/022`).
 - **Platform coverage:** mac+linux.
 
 ### Test harness: Claude Code prompt submission
@@ -10848,12 +11694,12 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
 
-##### inbox/route/003 — Exit a bound worker before fetching its delegated message. The task remains inspectable as Undeliverable and the orchestrator receives a daemon notice naming that exact task id, rather than losing the task or delivering it to another generation.
+##### inbox/route/003 — An exited worker's task stays inspectable and its orchestrator is told; a report whose orchestrator was replaced is kept for recovery, not handed to the successor.
 - **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
 - **Agent:** none.
-- **Asserts:** Exit a bound worker before fetching its delegated message. The task remains inspectable as Undeliverable and the orchestrator receives a daemon notice naming that exact task id, rather than losing the task or delivering it to another generation.
+- **Asserts:** Exit a bound worker before fetching its delegated message. The task remains inspectable as Undeliverable and the orchestrator receives a daemon notice naming that exact task id, rather than losing the task or delivering it to another generation. Then, in a second team, the orchestrator exits and a successor takes its pane before the worker runs the real `work-done --task-id`: the CLI prints that the report was saved to a file under the `report_id` of the `worker_report` row `list-outcomes` lists for that task, points to the troubleshooting section "Saved results and reports", and says the clients cannot show or list saved reports yet, and the successor's inbox stays empty and its fetch gets nothing.
 - **Test:** `route_003_exited_bound_agent_is_undeliverable_and_notifies_sender` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
-- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
+- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds; how a client shows the recovery row (round 6).
 - **Platform coverage:** mac+linux.
 
 ##### inbox/route/004 — Each supported agent starts with one inbox seed, without typed task content.
@@ -10910,6 +11756,14 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Asserts:** busy precondition, no doorbell, TurnEndHook hand-over, visible Blocked by hook text, exact sentinel and acknowledgement.
 - **Does not assert:** multiple-message byte budgets (synthetic /007 and /008).
 - **Cost:** two cheap model turns.
+
+##### inbox/codex/022 — Real Codex with its hooks off delivers through a model-run fetch on receipts.
+- **Layer:** L2 real agent, lane 2 (`tests/e2e_inbox_codex_live.rs`), attached interactive PTY (PRD #1666 part 3, H4).
+- **Agent:** Codex 0.160.0, cheap model from `codex_test_model()`, `--sandbox workspace-write` with network access, every deck hook switched off in Codex's trust records, the build under test first on the pane's `PATH`.
+- **Asserts:** the doorbell rings; Codex's model runs `dot-agent-deck inbox fetch` in its own sandbox and that fetch reaches the deck as a hook receiver (`consumer=Cli` in the deck log; a fetch that never arrives fails as UNVERIFIED, not a pass); the sentinel is written once; the task is settled by its receipt; no deck hook fetched.
+- **Does not assert:** a spool write the sandbox denies (`inbox/codex/020`), or Codex showing a failing hook's stderr.
+- **Cost:** one cheap model turn.
+- **Platform coverage:** mac+linux.
 
 ##### inbox/codex/012 — A draft retained after paste-burst Enter prevents all doorbell input.
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`).
@@ -11667,11 +12521,11 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Does not assert:** Large spill files or invalid claim TTL parsing.
 - **Platform coverage:** mac+linux.
 
-##### inbox/publish/006 — An unrelated process cannot publish or offer with a copied agent capability.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_pubsub.rs`), real daemon with process binding enabled.
+##### inbox/publish/006 — Only the pane's own capability publishes or offers from outside it.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_pubsub.rs`), real daemon with its production admission on, requests from the test process outside every pane.
 - **Agent:** synthetic PTY recorders.
-- **Asserts:** Both publish and offer refuse an outside process with inbox_not_agent_process, mint no delivery and leave subscribers empty.
-- **Does not assert:** Complete/release process binding or platform process-table fallback.
+- **Asserts:** publish and offer naming the orchestrator's pane with a worker's capability are refused `token_names_another_pane`, mint no delivery and leave subscribers empty; with the orchestrator's current capability the same outside process publishes, and both subscribers receive it (PRD #1666 part 3, R-1: the capability and the deck's user make it a member of the pane).
+- **Does not assert:** Complete/release, another OS user (the `daemon.rs` unit test `a_capability_holder_outside_the_tree_must_be_the_decks_user`), or Windows, where the deck does not read the caller's user and the process tree still decides.
 - **Platform coverage:** mac+linux.
 
 #### inbox/offer
@@ -11756,6 +12610,210 @@ Manual merge gate: opt in with `DOT_AGENT_DECK_INBOX_LOAD_TEST=1` only when sche
 - **Asserts:** 20 messages across genuine spawn seed, idle and a sleep-tool turn are acknowledged and acted on, and the actual inbox list CLI lists each as acknowledged, within a 300-second agent window; a message left queued fails it (until 2026-10-14 a queued message passed, so a run with nothing acknowledged was green). Three busy-loop processes per available CPU run throughout and are killed/reaped using captured children in Drop; PSI load context is emitted on success and failure; vt100 bottom rows contain no stranded doorbell line or message opener after settling.
 - **Does not assert:** Persistence across daemon restart, exact model prose, or load-test execution in normal verification; only the scheduled opt-in run exercises the loaded scenario.
 - **Platform coverage:** mac+linux, local credentials only; never CI.
+
+#### inbox/recovery
+
+PRD #1666 part 3, round 5: where the deck keeps a worker's report, or a dispatch's result, when the agent it was for is no longer there to take it.
+
+##### inbox/recovery/001 — Admission refuses a new report at the byte budget or the file count, consuming nothing, and a dispatch at its result slots.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** with a 1000-byte budget and two file slots, reservations within both are admitted; one over the bytes is refused with the byte cause and one over the slots with the file-count cause, neither consuming anything; a released reservation frees its room; with one fallback slot, one dispatch reserves exactly `DISPATCH_RESULT_MAX_FILE` and the next is refused with its in-flight and unsaved counts.
+- **Why it exists:** plan D2: every acceptance and every dispatch reserves its room before anything is consumed, so the deck never acknowledges a report it has nowhere to keep.
+- **Does not assert:** the outcome-row bound and its overflow count (with the recovery index); the refusal sentences (with their callers).
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/002 — A saved report stays while it is pinned, whatever its age.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** a report that is neither acknowledged nor in recovery survives a sweep a hundred days later; once acknowledged it is kept a day less one second, and removed at the day.
+- **Why it exists:** plan D3: a report referenced by a claim, a ledger entry or a listed row is never removed to make room or by age.
+- **Does not assert:** what pins a report (the claims and the ledger).
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/003 — Expiry is measured from the recorded acknowledgement or recovery time, not from the file's mtime.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** an acknowledged report is kept 24 hours from its acknowledgement and one in recovery 7 days from its recovery, each removed at its deadline and not a second before, and the charge falls with each removal.
+- **Why it exists:** plan D14: retention is a promise measured from recorded times.
+- **Does not assert:** dismissal of a row (round 6), which never deletes the file.
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/004 — A live run's files are never touched by another run's startup or sweep, whatever their age.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** with run A live and its files' mtime set to 1970, run B starts and sweeps: B takes nothing over, charges nothing, and A's directory is unchanged.
+- **Why it exists:** reviewer R2: reclaiming by mtime would delete a live run's pinned reports.
+- **Does not assert:** two runs racing on one dead run (`/015`).
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/005 — A report that entered recovery late is kept its full seven days across a restart.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** written on day 0, recovered on day 6, its run ended; the run starting on day 8 adopts it with deadline day 13 and the recovered letter in its name, keeps it through day 12 and removes it on day 13.
+- **Why it exists:** plan D14: the recorded recovery time, not the restart, starts the seven days.
+- **Does not assert:** a forward wall-clock jump, which can shorten it (a stated limit).
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/006 — An acknowledgement that arrives after a restart does not shorten or renew an adopted report's retention.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** a pinned report's run ends; the next run adopts it with seven days from the takeover and the pinned letter; an acknowledgement in the new run changes nothing, and a third run keeps the same name.
+- **Why it exists:** plan D14: the task index is memory-only, so an adopted file's suffix is its whole retention record.
+- **Does not assert:** delivery after a restart, which round 5 does not do.
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/007 — Takeover charges the adopted bytes to the run that took them over.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** the adopted charge equals the inherited files' bytes, a reservation that fits beside them is admitted, and one that would pass the budget with them is refused.
+- **Why it exists:** reviewer R2: restarts must not stack budgets.
+- **Does not assert:** an aggregate bound across live daemons, which the budget is not.
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/008 — Concurrent reservations are all counted, and a report whose removal fails stays charged until a retry removes it.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** 200 reservations from eight threads give a count of 200; a due report whose unlink fails stays, charged and holding its slot, as an orphaned attempt; with the fault lifted the next sweep removes it and frees the charge.
+- **Why it exists:** plan D14: a failed removal never silently drops a charge.
+- **Does not assert:** a removal that keeps failing forever (it is retried each pass).
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/009 — A report its run never listed gets seven days from the first takeover, once.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** a report written before its run's inventory flushed is adopted with seven days from the takeover and the unlisted letter in its name; a restart a day later keeps that name.
+- **Why it exists:** plan D14: a crash before a flush lengthens a promise and never renews it.
+- **Does not assert:** a crash between the write and its directory sync (the write is synced before it is acknowledged).
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/010 — A store directory that already exists open to other users, as a symlink or as a file is refused, never repaired.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** each makes the store unusable, so every reservation (a report's and a dispatch's) answers unusable, and nothing is created, chmodded or written through it.
+- **Why it exists:** plan D3: the store refuses a directory it cannot trust rather than fixing it up.
+- **Does not assert:** another owner's directory (the receipt spool's tests cover the shared check; a test cannot run as two users).
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/011 — Renaming the store's directory after it opened redirects no write and no removal.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** with `retained-reports` renamed away and an impostor tree put at its path holding a due report-looking file, a new report lands in the pinned original and a sweep removes nothing from the impostor.
+- **Why it exists:** plan D3: every operation is relative to a held, verified directory descriptor.
+- **Does not assert:** Windows, whose checks are path-based and not confinement.
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/012 — Report files are exclusive and owner-only, and the envelope is one bounded ASCII line whose attribution a body cannot forge.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** a file is created 0600; a decoy file or a symlink at the name makes the write fail without touching either, and the failed attempt removes nothing; a body forging the magic line and an envelope is read as body, attribution coming from the first two lines; hostile producer labels (newline, CR, quote, brace, a bidi override, C0 controls, a 10 KiB label) give one ASCII line of at most 2 KiB that round-trips to the normalised, cut values and names the cut fields; an orchestration-named pane id stays in `producer_supplied`.
+- **Why it exists:** plan D3: the envelope is the deck's attribution of a report that may outlive every record of it.
+- **Does not assert:** authenticity against a process of the same user, which can write the same format (a stated limit).
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/013 — Every accepted report ends in exactly one of acknowledged, set aside, or still live.
+- **Layer:** fast unit, property (`src/inbox_reports.rs`; a real inbox hub, twelve deterministic seeds of 60 random steps).
+- **Agent:** none.
+- **Asserts:** across random posts of reports with ledger entries, acknowledgements and recipient exits over three agents, every posted report is in exactly one place afterwards: acknowledged (no ledger entry, no row), set aside (a row naming its report, no ledger entry), or live (a ledger entry, no row).
+- **Why it exists:** plan D13: the ledger is settled from the inbox's own events, so no transition the inbox makes may leave a report in two places or none.
+- **Does not assert:** MaxDeliver, cancellation or history trimming (their causes are mapped by the same settlement and pinned elsewhere); the row bound's eviction (the sequences stay below it).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/recovery/014 — Three runs: a live adopter keeps one owner and one deadline per file.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** A writes files and ends; B adopts them and stays live; C starts: every file is in B's directory with a suffix, charged once by B and not by C, C opens nothing of B's and its sweep removes nothing; once B ends, D adopts them under the same names.
+- **Why it exists:** reviewer R12, auditor U2-3: ownership is the directory a file is in.
+- **Does not assert:** a host crash, which depends on the filesystem.
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/015 — A takeover cut short, then two starters at once, leave every file with exactly one owner.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** for k = 0, 1 and all of A's files moved before B's transfer is stopped and B ends, two runs starting together behind a barrier leave every report in exactly one live run's directory, charges summing to the files' sizes, B's adopted names unchanged, and A's lock and inventory gone only once its directory is empty.
+- **Why it exists:** plan D14: a no-replace rename under one exclusive lock is the whole transfer.
+- **Does not assert:** a host crash mid-rename (filesystem-dependent).
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/016 — A corrupt or foreign inventory leaves its run's own files in place, and the inventory writer never writes an older snapshot over a newer one.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** a wrong version, a symlink, a FIFO (refused without blocking), unparsable text, a line over 256 bytes, a header `max_files` over 65,536, more lines than its count, an invalid name and an unknown state each leave the unsuffixed file in place and uncharged while the suffixed file is adopted; an unrecognised name in an owned directory is left alone; the writer given revision n + 1 and then n holds n + 1.
+- **Why it exists:** reviewer U3-5: fail closed on anything the deck did not write.
+- **Does not assert:** every field-level malformation (the reader's own unit cases in `/022`).
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/017 — A dispatch result's whole file fits its 72 KiB limit, cut with a note when it would not.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** a text whose file is exactly the limit is saved whole with no note; one byte more is cut, carries the note and stays within the limit; a dispatch reserves exactly the limit.
+- **Why it exists:** reviewer U3-1, auditor U3-1: the reservation bounds the whole file.
+- **Does not assert:** the dispatch arm that composes it (with that arm).
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/018 — The retained store's directory moves never replace a file and stay in the directories the deck verified.
+- **Layer:** fast unit (`src/platform/trusted_dir.rs` and `src/retained_store_tests.rs`, in-crate; real files in a temporary directory).
+- **Agent:** none.
+- **Asserts:** an injected unsupported-rename error (`ENOSYS` on every move) stops the store's takeover of a dead run, its files left in place, uncharged and unretired. `TrustedDir::rename_into` moves a file between two held directories; refuses with `EEXIST`, leaving both files unchanged, to replace a file at the destination name; refuses a name that is not a single component; after the parent of both directories is renamed away and an impostor tree put in its place, still moves within the pinned originals while the impostor receives nothing; and on an injected unsupported-rename error (`ENOSYS`) returns it with the file still in its source and no second name. `sync` succeeds on a held directory.
+- **Why it exists:** the retained-report store transfers a dead run's files by one no-replace rename between held directories (plan D3, D14), so a file is in exactly one owned directory at every instant and no move can overwrite another run's file.
+- **Does not assert:** Windows, whose checks are path-based and are not confinement; durability across a host crash, which depends on the filesystem.
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/019 — An inventory a correct writer produced is never refused for its size by a successor configured smaller.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** 64 tiny reports with maximum-length ids fill a 64-file cap and the 65th is refused for the file count with bytes to spare; a run capped at 8 reads the predecessor's header and adopts all 64, charging their sizes, and a second restart keeps their names and charges each once; an inventory of 65,536 maximum-length entries reads back whole with every line within 256 bytes; the writer refuses a count over its own cap.
+- **Why it exists:** reviewer R19, auditor U2-2: the file count is what bounds the inventory.
+- **Does not assert:** a writer that bypasses admission (a bug the assertion catches).
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/020 — A dead run is retired only after both directories are durable, and an expired file it cannot remove is taken over for cleanup.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** a failed parent sync of this run's new directory leaves the store unusable; a failed sync of the dead run's directory leaves it unretired, its lock and inventory in place, and the next start retires it; an expired file whose unlink fails is moved here under its past suffix, charged, holding no slot and in no inventory, and removed by the next sweep once unlinks succeed; with the move failing too, it stays and the dead run is not retired.
+- **Why it exists:** reviewer U3-3/U3-4, auditor U3-3: durability before retirement, and no orphan left uncharged.
+- **Does not assert:** a host crash between the syncs.
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/021 — Files inherited for cleanup never take a file slot or enter the inventory.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** a 64-file run's expired files, with every source unlink failing, land in an 8-slot run under past suffixes, charged and uninventoried; it admits 8 own files and refuses the 9th with a valid inventory; the next run adopts both kinds, keeps the past deadlines and charges their sizes, and removes the 64 once unlinks succeed; two dead runs of 64 each are taken over with no slot used and a valid inventory.
+- **Why it exists:** reviewer R22, auditor U3-1: inheritance must not break the writer's count.
+- **Does not assert:** the number of adopted files, which `max_files` does not bound (a stated limit).
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/022 — The adopted charge follows the directory, and a scan that could not read everything never lowers it.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock).
+- **Agent:** none.
+- **Asserts:** three adopted files deleted from outside are uncharged by the next complete sweep and a refused reservation is then admitted; an own file deleted from outside is released and one failing with EACCES keeps its charge; a seeded sum near `u64::MAX` saturates; an EIO on one entry, a stream failing mid-pass or a generation moved mid-pass discards the recount and the next complete pass publishes it; a failed unlink subtracts nothing; two sweeps requested together do not overlap and end at the true total; each source state gets its letter, a second takeover keeps letter and deadline, and a name with an unknown or missing letter is left alone, uncharged; a 300-byte inventory line is refused with the reader's buffer never over 257 bytes, and trailing bytes, a duplicate and a suffixed name make an inventory invalid.
+- **Why it exists:** reviewer U3-3/U3-5, auditor U3-3/U3-5: conservative accounting, complete-scan-only recounts.
+- **Does not assert:** a same-user process writing a file under a valid adopted name, which is charged from the next sweep (a stated limit).
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/023 — A failed write leaves nothing behind that the store does not track, and never blocks a retry of the same report.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, injected owner-only and removal failures).
+- **Agent:** none.
+- **Asserts:** a write whose new file cannot be made owner-only fails with nothing left in the directory and every count back at zero, and a retry with the same id is saved; when the file's own removal after the owner-only failure fails too, the store's removal of that temporary name either succeeds (a plain failure, nothing left) or fails, answering orphaned with the name charged as a stray that the next sweep removes once removals work; a failed write whose temporary file cannot be removed answers orphaned, the file charged its room as a stray with no file slot, refusing a reservation the charge does not leave room for (a zero-byte write's stray included, charged one byte, and so is a saved zero-byte write's link-fallback alias that cannot be removed, so strays are bounded by the byte budget), while the same id is saved again beside it; the next sweep removes the stray once removals work; a stray left when the run ends is removed by the next run's takeover, which retires the run and adopts only the saved reports.
+- **Why it exists:** PR #1898 review (Qodo): `create_new_owner_only` created the file and could then fail setting its mode, leaving an untracked file at the report's own name that blocked a retry. PR #1898 fix review (reviewer R1, auditor U2-A2): a failed removal after that failure was discarded, leaving a temporary file this run neither charged nor retried. PR #1898 fix re-review (U3, both reviewers): a saved empty write's leftover link alias was charged zero bytes.
+- **Does not assert:** a removal that keeps failing (retried each pass); Windows, whose owner-only step is a DACL.
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/024 — The sweep decides to remove a report under the store's lock, so an acknowledgement that renewed it first keeps it.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock, a pause seam inside the sweep).
+- **Agent:** none.
+- **Asserts:** a report in recovery comes due and the sweep is held after nominating it from its snapshot; an acknowledgement renews it, the sweep removes nothing, and the report goes only a day later; a sweep held after it claimed a due report under the lock and before unlinking it shows the report as being removed, an acknowledgement then renews nothing, and the report and its charge are gone.
+- **Why it exists:** PR #1898 review (Greptile): the sweep unlinked on a deadline read from a snapshot taken before it released the lock, so a renewal in between could still lose the report.
+- **Does not assert:** an acknowledgement after the claim being honoured, which it is not: the claim is the decision.
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/025 — A crash mid-write leaves no cut-off report for the next run to adopt.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, a crash seam that stops a write without its cleanup).
+- **Agent:** none.
+- **Asserts:** a run saves one report, dies halfway through writing a second (half its bytes under a temporary name, nothing at its own name) and, with the no-replace rename reported unsupported so the write falls back to a link, dies again just after linking a third to its own name; the next run adopts the first and third, each once and the third with its whole contents, adopts nothing of the second, leaves no temporary name and retires the dead run, its charge equal to the adopted files' sizes.
+- **Why it exists:** PR #1898 review (Qodo): a report was created under its final name and written afterwards, so a crash mid-write left a cut-off file that the next takeover adopted and offered for recovery.
+- **Does not assert:** a host crash, whose effect on unsynced data and links is the filesystem's.
+- **Platform coverage:** mac+linux.
 
 ## Desktop native driver scenarios
 

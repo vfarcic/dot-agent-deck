@@ -2708,6 +2708,29 @@ pub fn auto_install() -> Vec<crate::hook_binary::HookPin> {
     auto_install_reporting().0
 }
 
+/// [`auto_install`] for `hooks refresh` (PRD #1666 part 3, R-3): whether
+/// OpenCode is installed here (a config root exists, as the install asks),
+/// and every integration file it could not write, which [`auto_install`]
+/// only logs. A root that cannot be inspected is a failure, not absence: only
+/// every root confirmed missing leaves OpenCode out.
+pub fn refresh_install() -> crate::hooks_refresh::InstallAttempt {
+    let mut found = false;
+    let mut failed = Vec::new();
+    for root in candidate_roots() {
+        match root.try_exists() {
+            Ok(exists) => found |= exists,
+            Err(e) => failed.push(format!("could not inspect {}: {e}", root.display())),
+        }
+    }
+    if !found && failed.is_empty() {
+        return crate::hooks_refresh::InstallAttempt::Absent;
+    }
+    if found {
+        failed.extend(auto_install_reporting().1);
+    }
+    crate::hooks_refresh::InstallAttempt::Ran { failed }
+}
+
 /// PRD #1666 §11: [`auto_install`], run as an OpenCode generation starts and
 /// before its child does, so the agent loads the integration this deck checks
 /// it against. Returns the pins and every integration file it could not
@@ -6796,6 +6819,7 @@ for (const [s, error] of [["d1", "APIError"], ["d2", "MessageAbortedError"]]) {
         let awaits = dir.path().join("await.jsonl");
         let posts = dir.path().join("posts.json");
         let acks = dir.path().join("acks.jsonl");
+        let release = dir.path().join("release");
         let recorder = dir.path().join("recorder.sh");
         crate::test_isolation::write_script(
             &recorder,
@@ -6805,7 +6829,7 @@ if [ "$1" = "await-answer" ]; then
   IFS= read -r input
   printf '%s\n' "$*|$input" >> '{awaits}'
   case "$input" in
-    *per_hold*) sleep 2; echo '{{"kind":"permission","request_id":"per_hold","body":{{"reply":"once"}}}}' ;;
+    *per_hold*) while [ ! -e '{release}' ]; do sleep 0.05; done; echo '{{"kind":"permission","request_id":"per_hold","body":{{"reply":"once"}}}}' ;;
     *per_fail*) echo '{{"kind":"permission","request_id":"per_fail","body":{{"reply":"once"}}}}' ;;
     *) echo '{{"kind":"question","request_id":"que_1043ff915001MjL9vryfDO6HZX","body":{{"answers":[["Blue"],["Small","Large"]]}}}}' ;;
   esac
@@ -6818,6 +6842,7 @@ fi
                 awaits = awaits.display(),
                 acks = acks.display(),
                 payloads = payloads.display(),
+                release = release.display(),
             ),
         )
         .unwrap();
@@ -6828,11 +6853,17 @@ fi
         let plugin = dir.path().join("dot-agent-deck.mjs");
         std::fs::write(&plugin, plugin_template(&recorder.to_string_lossy())).unwrap();
         let driver = dir.path().join("driver.mjs");
+        // Each step waits for the state it depends on rather than for a fixed
+        // delay, which a loaded machine outran (issue #1846): the held child
+        // must have read its question before OpenCode's own reply stops it.
+        // It answers only once `release` exists, after that reply, and the one
+        // fixed wait left, at the end, gives a child the plugin failed to stop
+        // time to post an answer the posts assertion would catch.
         std::fs::write(
             &driver,
             format!(
                 r#"import plugin from "{plugin}";
-import {{ writeFileSync }} from "fs";
+import {{ existsSync, readFileSync, writeFileSync }} from "fs";
 const posts = [];
 let refuseNext = false;
 const client = {{ _client: {{ post: async (req) => {{
@@ -6846,23 +6877,37 @@ const client = {{ _client: {{ post: async (req) => {{
 }} }} }};
 const hooks = await plugin({{ directory: "/work", client }});
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+const lines = (path) =>
+  existsSync(path) ? readFileSync(path, "utf8").split("\n").filter(Boolean).length : 0;
+const until = async (what, done) => {{
+  for (let i = 0; i < 1600; i += 1) {{
+    if (done()) return;
+    await wait(25);
+  }}
+  throw new Error("timed out waiting for " + what);
+}};
 await hooks.event({{ event: {{ type: "question.asked", properties: {question} }} }});
-for (let i = 0; i < 100 && posts.length === 0; i++) await wait(50);
+await until("the question's reply", () => posts.length > 0);
 const held = {{ ...{permission}, id: "per_hold" }};
 await hooks.event({{ event: {{ type: "permission.asked", properties: held }} }});
-await wait(300);
+await until("the held permission to be handed over", () => lines("{awaits}") >= 2);
 await hooks.event({{ event: {{ type: "permission.replied", properties: {{ sessionID: held.sessionID, requestID: "per_hold", reply: "once" }} }} }});
 await hooks.event({{ event: {{ type: "question.rejected", properties: {{ sessionID: held.sessionID, requestID: "que_rejected" }} }} }});
+writeFileSync("{release}", "");
 refuseNext = true;
 await hooks.event({{ event: {{ type: "permission.asked", properties: {{ ...held, id: "per_fail" }} }} }});
-for (let i = 0; i < 100 && posts.length < 3; i++) await wait(50);
-await wait(2600);
+await until("the refused reply to be posted again", () => posts.length >= 3);
+await until("every child's acknowledgement", () => lines("{acks}") >= 3);
+await wait(500);
 writeFileSync("{posts}", JSON.stringify(posts));
 "#,
                 plugin = plugin.display(),
                 question = fixture("opencode-question-asked.json"),
                 permission = fixture("opencode-permission-asked.json"),
                 posts = posts.display(),
+                awaits = awaits.display(),
+                acks = acks.display(),
+                release = release.display(),
             ),
         )
         .unwrap();

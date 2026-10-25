@@ -1019,3 +1019,53 @@ fn upgrade_dialog_014_restoring_from_the_resize_state_selects_cancel_and_cannot_
     );
     assert_eq!(dialog.handle_key(key(KeyCode::Enter)), Effect::Run(0));
 }
+
+/// Scenario: Upgrade this TUI's own CLI, whose refresh of the agents' hooks left Claude Code's on another live copy (PRD #1666 part 3, R-3). The result shows the upgrade, then names that copy and the exact `hooks install` command to run with the restart it needs, and only then says to restart the TUI.
+#[spec("upgrade/upgrade-dialog/015")]
+#[test]
+fn upgrade_dialog_015_the_result_names_the_hooks_remedy_before_the_tui_restart() {
+    use dot_agent_deck::self_upgrade::PlanLine;
+    let cli = writable_cli();
+    let mut dialog = UpgradeDialog::new(vec![cli.clone()]);
+    render(&mut dialog);
+    dialog.handle_key(key(KeyCode::Down));
+    let mut presses = 0;
+    while dialog.handle_key(key(KeyCode::Enter)) != Effect::Run(0) {
+        presses += 1;
+        assert!(presses < 30, "Upgrade never ran");
+        render(&mut dialog);
+    }
+    let command = format!("{CLI_EXE} hooks install --agent claude-code");
+    let outcome = Outcome::Replaced {
+        path: PathBuf::from(CLI_EXE),
+        version: LATEST.into(),
+        provenance: skipped(),
+        synced: true,
+    };
+    let hooks = vec![
+        PlanLine::Text(
+            "Claude Code's hooks still run another copy, /opt/homebrew/bin/dot-agent-deck.".into(),
+        ),
+        PlanLine::Text("To have them run this copy, run:".into()),
+        PlanLine::Command(command.clone()),
+        PlanLine::Text("Then restart the affected agents.".into()),
+    ];
+    dialog.finish(
+        0,
+        RunResult::from_outcome_and_hooks(&cli, &outcome, hooks, true),
+    );
+    let text = render_at(&mut dialog, 100, 30);
+    let shown = flat(&text);
+    let at = |needle: &str| {
+        shown
+            .find(needle)
+            .unwrap_or_else(|| panic!("missing {needle:?}\n{text}"))
+    };
+    assert!(at(&format!("Upgraded {CLI_EXE}")) < at("still run another copy"));
+    assert!(
+        text.contains(&command),
+        "the command whole on one row\n{text}"
+    );
+    assert!(at("Then restart the affected agents.") < at("Quit the TUI and start it again"));
+    insta::assert_snapshot!("upgrade_dialog_015_hooks_remedy", text);
+}

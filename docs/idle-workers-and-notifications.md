@@ -17,7 +17,7 @@ Each report waits in the orchestrator's inbox and reaches its conversation throu
 | `Task m-… to the worker in role … was cancelled by the user after the deck had handed it over` | You pressed **Cancel** on a task that may already have reached the worker, which may be working on it. | none |
 | `Correction: task m-… to the worker in role …` | A task the orchestrator was told had not arrived, was uncertain, undeliverable or cancelled reached the worker after all. If the task was already given to someone else, it may now be done twice. | none |
 | `A delegated worker is waiting for input` | A worker that has not finished its task has been waiting for input for 30 seconds. | `DOT_AGENT_DECK_WAITING_NOTICE_DEBOUNCE_MS` |
-| `⚠ delegated worker exited without work-done` | The worker's agent exited before it reported. | none |
+| `⚠ delegated worker exited without work-done` | The worker's agent exited before it reported. The report names the tasks it had not reported. | none |
 | `⚠ delegated worker never came up` | A `clear = true` worker restarted for a new task exited before it took the task, so the task was not delivered. | none |
 | `⚠ delegated worker respawn failed` | A `clear = true` worker could not be restarted at all, usually because the role's `command` fails, so the task was not delivered. | none |
 | `⚠ delegated worker blocked by a provider usage limit` | A worker that has not finished its task shows **Blocked**: its provider's usage limit or credits ran out. | none |

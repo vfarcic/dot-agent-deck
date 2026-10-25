@@ -1010,7 +1010,7 @@ reason = "Self-upgrade dialog Relaunch: restarts the app, which would also end t
 file = "desktop/src/components/SelfUpgradeDialog.tsx"
 handler = "onClick"
 code = "() => void copyText(command).catch(() => undefined)"
-reason = "Copies the manual upgrade command to the clipboard for a terminal; not a spoken capability."
+reason = "Copies one command the upgrade dialog shows — the manual upgrade, or the agent-hooks recovery after a CLI upgrade (PRD #1666 part 3, R-3) — to the clipboard. Kept off voice on purpose, not for want of a channel: a voice action could write the clipboard. The dialog can show more than one command at once, each with its own Copy, so a spoken copy would have to pick one by its place in a list, and the step a copy exists for, pasting it into a terminal and running it, is done at the keyboard, where selecting the shown command works as well."
 
 # --- desktop/src/components/SelfUpgradeNotice.tsx ---
 

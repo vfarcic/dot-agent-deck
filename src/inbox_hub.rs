@@ -7,21 +7,21 @@
 //! registry and nothing else.
 //!
 //! **Waiters.** An `inbox wait` connection registers here as armed for one agent
-//! generation (pane plus agent id). A message for an agent with armed waiters is
-//! handed, together with every other queued message for that agent that fits the
-//! component's budget, to the most recently armed one. A `once` waiter is spent by
-//! that hand-over. A `stream` is a receipt receiver's, served by the receipt
-//! engine (`serve_receipt`); one from any other component is refused.
-//! Waiters hold a slot in their own pool ([`MAX_INBOX_WAITERS`]), never one of
-//! the hook-ingest slots, and past [`MAX_WAITERS_PER_AGENT`] for one agent the
-//! oldest is told it was superseded.
+//! generation (pane plus agent id), as a receipt receiver of the engine: a
+//! `stream` from a receipt component (`serve_receipt`), or Claude Code's `once`
+//! waiter (`serve_once`), which a newer one supersedes; a wait from any other
+//! component is refused before it arms. Waiters hold a slot in their own pool
+//! ([`MAX_INBOX_WAITERS`]), never one of the hook-ingest slots.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
+
+/// A held [`InboxHub`] state lock (rank R3, `crate::lock_rank`).
+type HubGuard<'a> = crate::lock_rank::RankedGuard<'a, { crate::lock_rank::R3 }, HubState>;
 use std::time::{Duration, Instant, SystemTime};
 
 use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot};
+use tokio::sync::{Notify, Semaphore, broadcast, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 use crate::event::{
@@ -50,22 +50,12 @@ pub const AGENT_FRAMING: &str = "This session runs inside dot-agent-deck, the wo
 /// Live `inbox wait` connections, daemon-wide.
 pub const MAX_INBOX_WAITERS: usize = 512;
 
-/// Live `inbox wait` connections for one agent generation. Claude arms a new
-/// waiter at every `SessionStart` and `Stop`, and `/clear` piles them up; past
-/// this the oldest is superseded.
-pub const MAX_WAITERS_PER_AGENT: usize = 8;
-
 /// How often an idle waiter is sent a keepalive line.
 pub const DEFAULT_KEEPALIVE: Duration = Duration::from_secs(30);
 
 /// PRD #1666 hardening M4: the default for [`InboxHub::write_deadline`]. A
 /// peer that has not taken one line in this long is not reading.
 pub const DEFAULT_WAITER_WRITE_DEADLINE: Duration = Duration::from_secs(10);
-
-/// Hardening M4: how many signals may wait for one waiter's connection task.
-/// A hand-over is queued only while there is room; a waiter whose queue is
-/// full is not reading, and is disarmed rather than handed more.
-const WAITER_SIGNAL_CAPACITY: usize = 4;
 
 /// Overrides [`DEFAULT_KEEPALIVE`], in milliseconds.
 pub const ENV_KEEPALIVE_MS: &str = "DOT_AGENT_DECK_INBOX_KEEPALIVE_MS";
@@ -134,8 +124,32 @@ pub const HOOK_INTEGRATION: u32 = 1;
 /// answers at least this ([`crate::inbox_oneshot::Connection::open_receipts`]).
 pub const ONE_SHOT_RECEIPTS: u32 = 1;
 
+/// PRD #1666 part 3 (H4): the one-shot senders this daemon serves on the
+/// receipt verbs, answered beside [`ONE_SHOT_RECEIPTS`]. A sender other than
+/// Claude Code's goes on only on a daemon that names it
+/// ([`crate::inbox_oneshot::serves_receipts`]): part 2's answers
+/// `ONE_SHOT_RECEIPTS` and names none.
+pub const ONE_SHOT_SENDERS: &[crate::event::InboxOneShotSender] = &[
+    crate::event::InboxOneShotSender::ClaudeWaiter,
+    crate::event::InboxOneShotSender::ClaudeHooks,
+    crate::event::InboxOneShotSender::CodexHooks,
+    crate::event::InboxOneShotSender::Cli,
+];
+
 #[path = "inbox_engine.rs"]
 mod engine;
+#[path = "inbox_reports.rs"]
+mod reports;
+
+#[path = "inbox_claims.rs"]
+mod claims;
+
+#[cfg(test)]
+pub(crate) use claims::claim_seams;
+pub(crate) use claims::{Admission, ClaimSpec, Claimed, CommitOutcome, FailOutcome};
+#[cfg(test)]
+pub(crate) use reports::seams as report_seams;
+pub(crate) use reports::{AfterSection, RecordView, Registration, ReplacementOutcome};
 #[cfg(test)]
 #[path = "inbox_engine_tests.rs"]
 mod engine_tests;
@@ -285,6 +299,12 @@ pub struct InboxCardNotices {
     /// Delivered messages whose evidence pauses hand-outs (§7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence_paused: Option<usize>,
+    /// PRD #1666 part 3 (R-2): the refusal code the deck gave the agent's own
+    /// request for its messages, while messages wait for it
+    /// ([`InboxHub::admission_refused`]). Additive: a reader that predates it
+    /// skips it, and its absence means no refusal is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_refused: Option<String>,
 }
 
 /// The wire spelling of `component`, for [`InboxSummary::component`].
@@ -297,8 +317,6 @@ fn component_name(component: InboxComponent) -> Option<String> {
 /// What a waiter's connection task is told.
 #[derive(Debug)]
 pub enum WaiterSignal {
-    /// Messages to write; they are already `fetched` by this waiter.
-    Deliver(Vec<InboxDelivery>),
     /// A newer waiter for the same agent took this one's place.
     Superseded,
     /// PRD #1666 §4: one line for a receipt stream to write as it is.
@@ -341,17 +359,8 @@ impl ArmError {
     }
 }
 
-/// A registered waiter, handed back to its connection task.
-pub struct ArmedWaiter {
-    pub conn_id: u64,
-    pub rx: mpsc::Receiver<WaiterSignal>,
-    /// Released when the connection task ends.
-    _slot: OwnedSemaphorePermit,
-}
-
 struct Waiter {
     conn_id: u64,
-    mode: InboxWaitMode,
     component: InboxComponent,
     tx: mpsc::Sender<WaiterSignal>,
 }
@@ -396,10 +405,44 @@ pub enum DelegateEnd {
 /// commission and the idle-worker record its delegate armed — handed back when
 /// the task turns undeliverable because its worker exited, so the debt goes
 /// with the task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DelegateLedger {
     pub commission_arm_id: Option<u64>,
     pub delegation_seq: Option<u64>,
+    /// PRD #1666 part 3, round 5: the worker's orchestration instance, which
+    /// the task ledger binds the task to (plan D2, D12).
+    pub instance: Option<String>,
+}
+
+/// PRD #1666 part 3, round 5 (plan D12 rule 4): how a worker generation's
+/// process ended, as its reader saw it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitKind {
+    /// Nothing had removed its registry record: the agent ended on its own.
+    Natural,
+    /// A close or a respawn removed its record before ending it.
+    Removed,
+}
+
+/// What a worker generation's exit left owing: the debt of the tasks it
+/// held, for the caller to retire exactly, and whether the task ledger
+/// decided its notices.
+#[derive(Debug, Default)]
+pub struct ExitSettlement {
+    pub ledgers: Vec<DelegateLedger>,
+    /// The ledger walked the generation's tasks (the report state was not
+    /// torn), so a tracker record or commission arm left afterwards names no
+    /// ledger task.
+    pub walked: bool,
+}
+
+/// A delegated task the hub took: its id, the signal of its end, and the
+/// debt of the older tasks it superseded, for the caller to release exactly
+/// (plan D8).
+pub struct PostedDelegate {
+    pub id: MessageId,
+    pub ended: oneshot::Receiver<DelegateEnd>,
+    pub superseded: Vec<DelegateLedger>,
 }
 
 /// PRD #1666 S5: a delegated task the deck reports on if it does not reach
@@ -487,10 +530,6 @@ struct HubState {
     exited_ledgers: Vec<DelegateLedger>,
     /// Ids minted for a delegated task that is not yet posted, nor abandoned.
     pending_posts: HashSet<String>,
-    /// PRD #1666 delegate_021: worker panes that acknowledged a delegated task
-    /// and have not reported `work-done` since
-    /// ([`InboxHub::retire_answered_delegates_to`]).
-    received_since_done: HashSet<String>,
     /// PRD #1666 §2.8: where a recipient's card is told a message could not
     /// reach it — the daemon's delivery-notice channel, installed by
     /// [`InboxHub::set_card_notice_sink`]. Nothing is owed while it is unset.
@@ -532,7 +571,68 @@ struct HubState {
     /// dot-agent-deck too old for its messages
     /// ([`crate::hook_binary::remedy_for`]), `None` when the deck can offer
     /// none.
-    hooks_remedy: Option<String>,
+    hooks_remedies: HashMap<crate::event::AgentType, String>,
+    /// PRD #1666 part 3 (R-2): agent generations whose own request for their
+    /// messages the deck refused at admission, with the refusal's code, until
+    /// one of theirs is admitted or they exit. One entry per live generation
+    /// at most: only a request the generation's current capability attests
+    /// sets one ([`InboxHub::admission_refused`]).
+    admission_refused: HashMap<AgentKey, AdmissionEpisode>,
+    /// PRD #1666 part 3, round 5 (plan D15): everything this round adds to
+    /// the hub, reachable only through [`HubState::guarded_section`] and
+    /// [`HubState::guarded_read`], and torn for the rest of the run by a panic
+    /// inside a section that was writing it.
+    reports: crate::guarded::Guarded<crate::report_recovery::ReportState>,
+    /// Whether the torn report state was logged, so it is logged once.
+    torn_logged: bool,
+    /// PRD #1666 part 3, round 5: this run's retained-report store, once the
+    /// daemon opened one ([`InboxHub::set_retained_store`]). Rank R5: taken
+    /// only under this lock or with nothing ranked held.
+    retained: Option<Arc<crate::retained_store::RetainedStore>>,
+}
+
+impl HubState {
+    /// Run `f` as one guarded section over this round's report state
+    /// (`crate::guarded`), handing it the rest of the hub's state too.
+    /// `Err(Torn)` once a panic inside a section tore it; `f` must not reach
+    /// for the report state again, and is handed it instead.
+    fn guarded_section<R>(
+        &mut self,
+        f: impl FnOnce(&mut HubState, &mut crate::report_recovery::ReportState) -> R,
+    ) -> Result<R, crate::guarded::Torn> {
+        crate::guarded::Guarded::section(self, |st| &mut st.reports, f)
+    }
+
+    /// Read this round's report state, unless a section tore it.
+    fn guarded_read<R>(
+        &self,
+        f: impl FnOnce(&crate::report_recovery::ReportState) -> R,
+    ) -> Result<R, crate::guarded::Torn> {
+        self.reports.read(f)
+    }
+
+    /// Log, once per run, that an existing path skipped its guarded part
+    /// because the report state is torn (plan D15 rule 4).
+    fn log_torn_once(&mut self, what: &str) {
+        if !self.torn_logged {
+            self.torn_logged = true;
+            tracing::error!(
+                what,
+                "inbox: the deck's report state was torn by an earlier internal panic; reports \
+                 and dispatch results are no longer recorded until the daemon restarts"
+            );
+        }
+    }
+}
+
+/// PRD #1666 part 3 (R-2): one refusal episode of an agent generation's own
+/// requests for its messages ([`HubState::admission_refused`]).
+struct AdmissionEpisode {
+    /// The code the latest refused request got.
+    code: String,
+    /// The orchestrators told in this episode, each once
+    /// ([`owe_admission_notices`]), whenever their task started waiting.
+    told: Vec<Recipient>,
 }
 
 /// PRD #1666 long-turn delivery: who was told that a message ran out of
@@ -557,8 +657,13 @@ pub struct ReplyReservation {
 
 impl Drop for ReplyReservation {
     fn drop(&mut self) {
-        if let Some(hub) = self.hub.take() {
-            hub.lock().inbox.release_reply();
+        // Recovers a poisoned hub, as every hub path does, and skips a rank
+        // violation rather than panic in an unwind: the room then stays
+        // reserved (PRD #1666 part 3, round 5, C4b).
+        if let Some(hub) = self.hub.take()
+            && let Some(mut st) = hub.lock_in_drop(crate::lock_rank::OnPoison::Recover)
+        {
+            st.inbox.release_reply();
         }
     }
 }
@@ -573,7 +678,7 @@ impl std::fmt::Debug for ReplyReservation {
 
 /// The daemon's inbox and the components armed on it. See the module docs.
 pub struct InboxHub {
-    state: Mutex<HubState>,
+    state: crate::lock_rank::RankedMutex<{ crate::lock_rank::R3 }, HubState>,
     /// PR #1735 fifth review (B-05): this run's list of the saved bodies
     /// [`HubState::spills`] tracks, and the revision it last wrote. Taken
     /// only once the hub's lock is released, so a slow write holds up no
@@ -593,10 +698,29 @@ pub struct InboxHub {
     undelivered_after: Duration,
     /// Hardening M4: how long one write to a waiter's connection may take.
     write_deadline: Duration,
+    /// PRD #1666 part 3, round 5 (§3.2): when held dispatch results were last
+    /// retried on a refused dispatch's behalf, so that happens at most once a
+    /// minute.
+    fallback_retry: std::sync::Mutex<Option<Instant>>,
+    /// Held for one retry pass over the held dispatch results, so two passes
+    /// never take the bodies out at once. Never held with a ranked lock
+    /// already held.
+    fallback_retry_pass: std::sync::Mutex<()>,
     /// Test seam: while set, each once batch's caps-file writes tell the
     /// first end they started and wait for the second before going on.
     #[cfg(test)]
     hold_caps:
+        std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    /// Test seam: the next [`Self::after_section`] runs this first, inside
+    /// the helpers, so a test can block or panic there.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub(crate) after_section_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Test seam: the next fallback retry pass tells the first end once it
+    /// has taken each held body's reserved room out (the bodies stay in the
+    /// hub) and before it writes them, and waits for the second.
+    #[cfg(test)]
+    pub(crate) hold_fallback_retry:
         std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
@@ -687,7 +811,7 @@ impl InboxHub {
     pub fn new(deck: DeckId, limits: InboxLimits, keepalive: Duration) -> Self {
         let (limits_max_deliver, limits_ack_wait) = (limits.max_deliver, limits.ack_wait);
         Self {
-            state: Mutex::new(HubState {
+            state: crate::lock_rank::RankedMutex::new(HubState {
                 spills: crate::inbox_spills::SpillLedger::default(),
                 spills_revision: 0,
                 inbox: Inbox::new(deck, limits),
@@ -706,7 +830,6 @@ impl InboxHub {
                 rings: HashMap::new(),
                 exited_ledgers: Vec::new(),
                 pending_posts: std::collections::HashSet::new(),
-                received_since_done: std::collections::HashSet::new(),
                 card_notice_sink: None,
                 owed_card_notices: Vec::new(),
                 late_acks: HashMap::new(),
@@ -726,7 +849,13 @@ impl InboxHub {
                 spool: None,
                 spool_error: None,
                 action_presses: HashMap::new(),
-                hooks_remedy: None,
+                hooks_remedies: HashMap::new(),
+                admission_refused: HashMap::new(),
+                reports: crate::guarded::Guarded::new(
+                    crate::report_recovery::ReportState::from_env(),
+                ),
+                torn_logged: false,
+                retained: None,
             }),
             spill_manifest: Mutex::new(None),
             changed: Arc::new(Notify::new()),
@@ -736,8 +865,14 @@ impl InboxHub {
             pause_waiter_delivery: false,
             undelivered_after: DEFAULT_UNDELIVERED_NOTICE_AFTER,
             write_deadline: DEFAULT_WAITER_WRITE_DEADLINE,
+            fallback_retry: std::sync::Mutex::new(None),
+            fallback_retry_pass: std::sync::Mutex::new(()),
             #[cfg(test)]
             hold_caps: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            after_section_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            hold_fallback_retry: std::sync::Mutex::new(None),
         }
     }
 
@@ -768,8 +903,27 @@ impl InboxHub {
         hub
     }
 
-    fn lock(&self) -> MutexGuard<'_, HubState> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    /// The hub's state, continuing on it if a thread panicked while it held
+    /// it: every existing hub path recovers (PRD #1666 part 3, round 5, plan
+    /// D15 rule 1).
+    fn lock(&self) -> HubGuard<'_> {
+        self.state.lock_recovering()
+    }
+
+    /// The hub's state for a destructor, or for a helper only destructors
+    /// call: never panics (`crate::lock_rank::RankedMutex::lock_in_drop`).
+    fn lock_in_drop(&self, on_poison: crate::lock_rank::OnPoison) -> Option<HubGuard<'_>> {
+        self.state.lock_in_drop(on_poison)
+    }
+
+    /// PRD #1666 part 3, round 5: this run's retained-report store.
+    pub fn set_retained_store(&self, store: Arc<crate::retained_store::RetainedStore>) {
+        self.lock().retained = Some(store);
+    }
+
+    /// This run's retained-report store, if the daemon opened one.
+    pub fn retained_store(&self) -> Option<Arc<crate::retained_store::RetainedStore>> {
+        self.lock().retained.clone()
     }
 
     /// PRD #1666 S3: broadcast every later state change to attached clients as
@@ -851,7 +1005,7 @@ impl InboxHub {
     /// Post one direct message and hand it straight to an armed waiter if the
     /// recipient has one.
     pub fn post_direct(&self, to: Recipient, content: Content) -> Result<MessageId, PostError> {
-        self.post_with(to, content, Inbox::post_direct, None)
+        self.post_with(to, content, Inbox::post_direct, None, None)
     }
 
     /// [`Self::post_direct`] for a message bound to an agent generation that
@@ -864,7 +1018,7 @@ impl InboxHub {
         content: Content,
         live: &dyn Fn() -> bool,
     ) -> Result<MessageId, PostError> {
-        self.post_with(to, content, Inbox::post_direct, Some(live))
+        self.post_with(to, content, Inbox::post_direct, Some(live), None)
     }
 
     /// PR #1735 second review: [`Inbox::reserve_reply`], held until the
@@ -877,19 +1031,40 @@ impl InboxHub {
         })
     }
 
+    /// TEST: acknowledge `id` in the message store for `agent_id`, as a
+    /// receiver that was handed it would, without the receipt engine — and
+    /// settle the events it raises.
+    #[cfg(test)]
+    pub(crate) fn ack_in_store_for_test(
+        &self,
+        id: &str,
+        pane_id: &str,
+        agent_id: &str,
+    ) -> AckOutcome {
+        let mut st = self.lock();
+        let outcome = st
+            .inbox
+            .ack(Instant::now(), id, pane_id, agent_id, AckHow::Explicit);
+        drain_events(&mut st);
+        outcome
+    }
+
+    /// TEST: poison the hub's state lock, as a panic in a hub path would.
+    #[cfg(test)]
+    pub(crate) fn poison_for_test(self: &Arc<Self>) {
+        let hub = Arc::clone(self);
+        let _ = std::thread::spawn(move || {
+            let _held = hub.lock();
+            panic!("poison the inbox hub's lock on purpose (test)");
+        })
+        .join();
+        assert!(self.state.is_poisoned());
+    }
+
     /// TEST: how many reservations the inbox holds.
     #[cfg(test)]
     pub fn reserved_replies(&self) -> usize {
         self.lock().inbox.reserved_replies()
-    }
-
-    /// TEST: the ack-wait of message `id`, fetched in `pane_id`, runs out and
-    /// the hub ticks: the legacy policy redelivers it, or makes it
-    /// undeliverable at `max_deliver`.
-    #[cfg(test)]
-    pub fn run_out_ack_wait(&self, id: &str, pane_id: &str) {
-        self.lock().inbox.run_out_ack_wait(id, pane_id);
-        self.tick();
     }
 
     /// [`Inbox::admit_reserved_reply`]: the refusal posting `content` under a
@@ -910,7 +1085,7 @@ impl InboxHub {
         to: Recipient,
         content: Content,
     ) -> Result<MessageId, PostError> {
-        self.post_reserved_reply_with(reservation, to, content, None)
+        self.post_reserved_reply_with(reservation, to, content, None, None)
     }
 
     /// [`Self::post_reserved_reply`] checked as [`Self::post_direct_where`] is.
@@ -921,7 +1096,21 @@ impl InboxHub {
         content: Content,
         live: &dyn Fn() -> bool,
     ) -> Result<MessageId, PostError> {
-        self.post_reserved_reply_with(reservation, to, content, Some(live))
+        self.post_reserved_reply_with(reservation, to, content, Some(live), None)
+    }
+
+    /// [`Self::post_reserved_reply_where`] for a report or dispatch result:
+    /// the post enters the accepted-report ledger in its own section (plan
+    /// D13).
+    pub(crate) fn post_reserved_reply_where_recorded(
+        &self,
+        reservation: ReplyReservation,
+        to: Recipient,
+        content: Content,
+        live: &dyn Fn() -> bool,
+        accepted: Option<crate::report_recovery::AcceptedReport>,
+    ) -> Result<MessageId, PostError> {
+        self.post_reserved_reply_with(reservation, to, content, Some(live), accepted)
     }
 
     fn post_reserved_reply_with(
@@ -930,8 +1119,9 @@ impl InboxHub {
         to: Recipient,
         content: Content,
         live: Option<&dyn Fn() -> bool>,
+        accepted: Option<crate::report_recovery::AcceptedReport>,
     ) -> Result<MessageId, PostError> {
-        let id = self.post_with(to, content, Inbox::post_reserved_reply, live)?;
+        let id = self.post_with(to, content, Inbox::post_reserved_reply, live, accepted)?;
         // The post used the reservation's room.
         reservation.hub = None;
         Ok(id)
@@ -940,12 +1130,16 @@ impl InboxHub {
     /// Post under the lock. A message bound to an agent generation goes in
     /// only while `live` — or, without one, the installed
     /// [`Self::set_live_agent_check`] — says that agent still holds its pane.
+    /// PRD #1666 part 3, round 5 (plan D13): with `accepted`, the posted
+    /// message is a report or dispatch result, entered in the accepted-report
+    /// ledger in the same section as the post, before its events are drained.
     fn post_with(
         &self,
         to: Recipient,
         content: Content,
         post: fn(&mut Inbox, Instant, Recipient, Content) -> Result<MessageId, PostError>,
         live: Option<&dyn Fn() -> bool>,
+        accepted: Option<crate::report_recovery::AcceptedReport>,
     ) -> Result<MessageId, PostError> {
         let id = {
             let mut st = self.lock();
@@ -964,7 +1158,29 @@ impl InboxHub {
                 }
             }
             let id = post(&mut st.inbox, Instant::now(), to.clone(), content)?;
-            drain_events(&mut st);
+            match accepted {
+                Some(entry) => {
+                    let store = st.retained.clone();
+                    let recorded = st.guarded_section(|st, reports| {
+                        reports.accepted.insert(id.to_string(), entry);
+                        drain_events_in_section(
+                            st,
+                            reports,
+                            &mut StoreAccess::Take(store.as_deref()),
+                        );
+                    });
+                    if recorded.is_err() {
+                        st.log_torn_once("a posted result");
+                        tracing::error!(
+                            message_id = %id,
+                            "inbox: a result was posted, but the deck's report state is torn, so \
+                             it is not tracked for recovery"
+                        );
+                        drain_events(&mut st);
+                    }
+                }
+                None => drain_events(&mut st),
+            }
             id
         };
         info!(message_id = %id, pane_id = %to.pane_id, "inbox: message posted");
@@ -991,8 +1207,14 @@ impl InboxHub {
 
     /// PRD #1666 S5: the task minted under `id` will not be posted (its
     /// dispatch ended without a worker to post it to).
+    ///
+    /// Reached from `AbandonPostOnDrop`'s destructor, so it takes the hub the
+    /// destructor way (PRD #1666 part 3, round 5, C4b).
     pub fn abandon_post(&self, id: &str) {
-        if self.lock().pending_posts.remove(id) {
+        let removed = self
+            .lock_in_drop(crate::lock_rank::OnPoison::Recover)
+            .is_some_and(|mut st| st.pending_posts.remove(id));
+        if removed {
             self.changed.notify_waiters();
         }
     }
@@ -1085,6 +1307,7 @@ impl InboxHub {
             MintedSpill::default(),
             worker_holds,
         )
+        .map(|posted| (posted.id, posted.ended))
     }
 
     /// [`Self::post_delegate`] into the room `reservation` held for the task
@@ -1106,7 +1329,7 @@ impl InboxHub {
         content: Content,
         spill: MintedSpill,
         worker_holds: &dyn Fn() -> bool,
-    ) -> Result<(MessageId, oneshot::Receiver<DelegateEnd>), PostRefusal> {
+    ) -> Result<PostedDelegate, PostRefusal> {
         self.post_delegate_with(
             Some(reservation),
             worker,
@@ -1126,6 +1349,13 @@ impl InboxHub {
     /// held until the task is retired: its worker's `work-done`, a newer task
     /// superseding it, or the worker exiting, since the worker may still be
     /// working from it after acknowledging the excerpt.
+    ///
+    /// PRD #1666 part 3, round 5 (plan D8, D12): in the same section, the task
+    /// is bound in the task ledger to the worker generation and instance, and
+    /// every older open task of the pane that no report has claimed is
+    /// superseded by it; their debt comes back in [`PostedDelegate`] for the
+    /// caller to release exactly. With the report state torn, the task is
+    /// posted as before round 5, with no ledger entry.
     #[allow(clippy::too_many_arguments)]
     fn post_delegate_with(
         &self,
@@ -1137,9 +1367,11 @@ impl InboxHub {
         content: Content,
         spill: MintedSpill,
         worker_holds: &dyn Fn() -> bool,
-    ) -> Result<(MessageId, oneshot::Receiver<DelegateEnd>), PostRefusal> {
+    ) -> Result<PostedDelegate, PostRefusal> {
         let (tx, rx) = oneshot::channel();
         let mut saved = false;
+        let mut owed = false;
+        let mut superseded_debt = Vec::new();
         let (id, superseded) = {
             let mut st = self.lock();
             let now = Instant::now();
@@ -1177,6 +1409,34 @@ impl InboxHub {
                 reservation.hub = None;
             }
             drain_events(&mut st);
+            if let Some(worker_agent) = worker.agent_id.clone() {
+                let binding = crate::report_recovery::TaskBinding {
+                    worker_pane: worker.pane_id.clone(),
+                    worker_agent,
+                    instance: ledger.instance.clone(),
+                    role: role.to_string(),
+                    orchestrator: orchestrator.clone(),
+                    arm_id: ledger.commission_arm_id,
+                    seq: ledger.delegation_seq,
+                };
+                let task_id = id.to_string();
+                match st.guarded_section(|_, reports| {
+                    // Superseded before the new task is bound, so it never
+                    // supersedes itself.
+                    let debt = supersede_tasks(reports, &binding.worker_pane, Some(&task_id));
+                    if reports.tasks.bind(&task_id, binding).is_err() {
+                        tracing::error!(
+                            message_id = %task_id,
+                            "inbox: a delegated task's id was already bound; it was not \
+                             recorded again"
+                        );
+                    }
+                    debt
+                }) {
+                    Ok(debt) => superseded_debt = debt,
+                    Err(_) => st.log_torn_once("post_delegate"),
+                }
+            }
             st.delegates.insert(
                 id.to_string(),
                 DelegateWatch {
@@ -1193,10 +1453,18 @@ impl InboxHub {
                 st.spills.own_task(path, id.as_str(), bytes, &worker);
                 saved = true;
             }
+            // PRD #1666 part 3, round 1: a task delegated to a worker whose
+            // refusal episode is open tells its orchestrator, once per episode.
+            if let Some(agent) = worker.agent_id.as_ref() {
+                owed = owe_admission_notices(&mut st, &(worker.pane_id.clone(), agent.clone()));
+            }
             (id, superseded)
         };
         if saved {
             self.record_spills(self.lock());
+        }
+        if owed {
+            self.post_owed_notices();
         }
         if superseded > 0 {
             debug!(pane_id = %worker.pane_id, superseded, "inbox: older delegated tasks superseded");
@@ -1207,47 +1475,80 @@ impl InboxHub {
             Some(agent) => self.dispatch_agent(&worker.pane_id, agent),
             None => self.dispatch_pane(&worker.pane_id),
         }
-        Ok((id, rx))
+        Ok(PostedDelegate {
+            id,
+            ended: rx,
+            superseded: superseded_debt,
+        })
     }
 
-    /// PRD #1666 S5: what a worker's `work-done` retires, as superseded, so no
-    /// undelivered notice is posted about a task the worker has answered. A
-    /// `work-done` names no task, so which one it answers is inferred:
-    ///
-    /// * when the worker acknowledged a delegated task since its last
-    ///   `work-done`, the completion answers that task (delegate_021). Only the
-    ///   tasks that reached the worker since — fetched at least once and not
-    ///   acknowledged — are retired with it; a newer task never fetched stays
-    ///   queued and watched, so its orchestrator is still told if it does not
-    ///   reach the worker.
-    /// * otherwise the worker answered a task it took some other way, such as
-    ///   its task file, without acknowledging the message (idle-worker/029),
-    ///   and every task to the pane not yet acknowledged is retired.
-    ///
-    /// Nothing ties a completion to a task, so the worker steers the inference
-    /// for its own pane, and no other (audit A2-3): a second `work-done` after
-    /// the one that answered an acknowledged task takes the second branch and
-    /// retires a newer task the worker never fetched, unreported; and a task
-    /// acknowledged but never completed makes the completion of a later task
-    /// taken from its file take the first branch, which leaves that later task
-    /// queued — its orchestrator may be told it did not reach the worker, and
-    /// it may be handed out again. A `work-done` naming its task id would close
-    /// both; it is not implemented.
-    pub fn retire_answered_delegates_to(&self, pane_id: &str) -> usize {
-        let received = self.lock().received_since_done.remove(pane_id);
-        if received {
-            self.retire_delegates_to(pane_id, |message| message.deliveries > 0)
-        } else {
-            self.retire_delegates_to(pane_id, |_| true)
-        }
+    /// TEST: every message `pane_id` holds, live or settled, as its subject
+    /// and body.
+    #[cfg(test)]
+    pub(crate) fn bodies_for_test(&self, pane_id: &str) -> Vec<(String, String)> {
+        let st = self.lock();
+        st.inbox
+            .list(pane_id)
+            .into_iter()
+            .filter_map(|m| {
+                st.inbox
+                    .get(m.id.as_str(), pane_id)
+                    .map(|full| (m.subject.clone(), full.body.to_string()))
+            })
+            .collect()
+    }
+
+    /// TEST: the delegated tasks whose delivery is watched, by id.
+    #[cfg(test)]
+    pub(crate) fn watched_tasks_for_test(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.lock().delegates.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    /// TEST: lower the task ledger's tombstone bound to `per_instance`.
+    #[cfg(test)]
+    pub(crate) fn set_task_tombstones_for_test(&self, per_instance: usize) {
+        let mut st = self.lock();
+        let _ = st.guarded_section(|_, reports| reports.tasks.set_bound_for_test(per_instance));
+    }
+
+    /// PRD #1666 part 3, round 5: the recovery rows ("Deck notices"), oldest
+    /// first; empty when the report state is torn. What `ListOutcomes`
+    /// answers, for tests and diagnostics.
+    pub fn deck_outcome_rows(&self) -> Vec<crate::report_recovery::DeckOutcome> {
+        self.deck_outcomes()
+            .map(|outcomes| outcomes.outcomes)
+            .unwrap_or_default()
+    }
+
+    /// PRD #1666 part 3, round 5: the delegated tasks still open for any
+    /// generation of `pane_id`, by id. What a worker's task instructions name,
+    /// for tests and diagnostics; empty when the report state is torn.
+    pub fn open_tasks_of(&self, pane_id: &str) -> Vec<String> {
+        self.lock()
+            .guarded_read(|reports| reports.tasks.open_of_pane(pane_id))
+            .unwrap_or_default()
     }
 
     /// PRD #1666 S5: retire every delegated task to `pane_id` that is not yet
     /// acknowledged, as superseded — a newer delegation, or the pane's agent
     /// restarting, has made it moot. Superseded tasks are not reported. A
-    /// worker's `work-done` retires less: [`Self::retire_answered_delegates_to`].
+    /// worker's report retires the one task it names (PRD #1666 part 3,
+    /// round 5, [`retire_reported_task`]).
     pub fn supersede_delegates_to(&self, pane_id: &str) -> usize {
-        self.retire_delegates_to(pane_id, |_| true)
+        let retired = self.retire_delegates_to(pane_id, |_| true);
+        // PRD #1666 part 3, round 5 (plan D8): a restart supersedes the pane's
+        // open tasks in the ledger too, so its old generation's exit owes no
+        // notice for them.
+        let mut st = self.lock();
+        if st
+            .guarded_section(|_, reports| supersede_tasks(reports, pane_id, None))
+            .is_err()
+        {
+            st.log_torn_once("supersede");
+        }
+        retired
     }
 
     /// Retire, as superseded, each watched task to `pane_id` whose live message
@@ -1545,18 +1846,10 @@ impl InboxHub {
                 .inbox
                 .get(&id, &worker.pane_id)
                 .map(|message| message.state.clone());
-            let receipt = st.inbox.get(&id, &worker.pane_id).and_then(|m| m.owner)
-                == Some(crate::inbox::AssignmentOwner::Receipt);
+            // PRD #1666 §6.6: a hand-out is possessed, or its delivery is
+            // uncertain and said so; it is not "not reached".
             let held = match state {
                 Some(MessageState::Queued) => "still queued: the worker has not taken it",
-                // PRD #1666 §6.6: a receipt-owned hand-out is possessed, or
-                // its delivery is uncertain and said so; it is not "not
-                // reached".
-                Some(MessageState::Fetched { .. }) if receipt => continue,
-                Some(MessageState::Fetched { .. }) => {
-                    "fetched by the worker but not acknowledged: it may not have reached the \
-                     agent's session"
-                }
                 _ => continue,
             };
             let key = (
@@ -1586,82 +1879,11 @@ impl InboxHub {
         }
     }
 
-    /// Register a waiter for `agent_id` in `pane_id`. Supersedes the oldest
-    /// waiter past [`MAX_WAITERS_PER_AGENT`], then hands over anything already
-    /// queued.
-    ///
-    /// [`serve_waiter`] arms only once-waiters here: it hands a stream from a
-    /// receipt component to the receipt engine and refuses one from any other
-    /// component before it arms.
-    ///
-    /// Audit F3: the first instance to arm or announce is the generation's
-    /// receiver from then on, whatever is armed at the moment
-    /// ([`HubState::admit_receiver`]).
-    pub fn arm(
-        &self,
-        pane_id: &str,
-        agent_id: &str,
-        mode: InboxWaitMode,
-        component: InboxComponent,
-        instance: Option<u32>,
-    ) -> Result<ArmedWaiter, ArmError> {
-        let slot = Arc::clone(&self.waiter_slots)
-            .try_acquire_owned()
-            .map_err(|_| ArmError::NoSlots)?;
-        let (tx, rx) = mpsc::channel(WAITER_SIGNAL_CAPACITY);
-        let conn_id = {
-            let mut st = self.lock();
-            let key = (pane_id.to_string(), agent_id.to_string());
-            st.admit_receiver(&key, instance)?;
-            let conn_id = st.next_conn;
-            st.next_conn += 1;
-            let list = st.waiters.entry(key).or_default();
-            while list.len() >= MAX_WAITERS_PER_AGENT {
-                let oldest = list.remove(0);
-                debug!(
-                    conn_id = oldest.conn_id,
-                    "inbox: superseding the oldest waiter past the per-agent cap"
-                );
-                let _ = oldest.tx.try_send(WaiterSignal::Superseded);
-            }
-            list.push(Waiter {
-                conn_id,
-                mode,
-                component,
-                tx,
-            });
-            conn_id
-        };
-        debug!(conn_id, ?mode, ?component, "inbox: waiter armed");
-        self.dispatch_agent(pane_id, agent_id);
-        Ok(ArmedWaiter {
-            conn_id,
-            rx,
-            _slot: slot,
-        })
-    }
-
     /// PRD #1666 hardening M3: `pane_id` was closed — no record or
     /// reservation names it any more — so its acknowledged and undeliverable
     /// history goes. Live messages stay (they end through the agent's exit).
     pub fn forget_pane_history(&self, pane_id: &str) {
         self.lock().inbox.forget_pane_history(pane_id);
-    }
-
-    /// Remove waiter `conn_id`, if it is still registered.
-    pub fn disarm(&self, pane_id: &str, agent_id: &str, conn_id: u64) -> bool {
-        let mut st = self.lock();
-        let key = (pane_id.to_string(), agent_id.to_string());
-        let Some(list) = st.waiters.get_mut(&key) else {
-            return false;
-        };
-        let before = list.len();
-        list.retain(|w| w.conn_id != conn_id);
-        let removed = list.len() != before;
-        if list.is_empty() {
-            st.waiters.remove(&key);
-        }
-        removed
     }
 
     /// Live waiters armed for `agent_id` in `pane_id`.
@@ -1768,8 +1990,35 @@ impl InboxHub {
     /// is told — the notices this exit owes are held until the caller runs
     /// [`Self::post_owed_notices`].
     pub fn agent_exited(&self, pane_id: &str, agent_id: &str) -> Vec<DelegateLedger> {
+        self.agent_exited_as(pane_id, agent_id, ExitKind::Natural)
+            .ledgers
+    }
+
+    /// [`Self::agent_exited`], told how the generation ended.
+    ///
+    /// PRD #1666 part 3, round 5 (plan D12 rule 4): the hub decides every
+    /// notice the generation's delegated tasks owe from its task ledger,
+    /// FIRST, before the generation's messages turn undeliverable: a task
+    /// never acknowledged owes its "not delivered" notice; on a natural exit,
+    /// the tasks it acknowledged (or that ran out of hand-overs) owe one
+    /// "worker exited" notice naming them; a close or respawn owes none of
+    /// the latter. Each walked task is closed, and its debt answered.
+    pub fn agent_exited_as(&self, pane_id: &str, agent_id: &str, kind: ExitKind) -> ExitSettlement {
         let mut st = self.lock();
         let now = Instant::now();
+        let mut walked_debt = Vec::new();
+        let walked = match st
+            .guarded_section(|st, reports| walk_exited_tasks(st, reports, pane_id, agent_id, kind))
+        {
+            Ok(debt) => {
+                walked_debt = debt;
+                true
+            }
+            Err(_) => {
+                st.log_torn_once("agent_exited");
+                false
+            }
+        };
         st.inbox.agent_exited(now, pane_id, agent_id);
         let key = (pane_id.to_string(), agent_id.to_string());
         // PRD #1666 §2 T9: the generation's attempts are fenced and its
@@ -1795,7 +2044,6 @@ impl InboxHub {
         for waiter in st.waiters.remove(&key).unwrap_or_default() {
             let _ = waiter.tx.try_send(WaiterSignal::Superseded);
         }
-        st.received_since_done.remove(pane_id);
         // PR #1735 sixth review (B2-02): the exited worker's tasks are retired,
         // so their saved bodies are held no longer.
         st.spills.release_tasks(pane_id, |_, agent| {
@@ -1805,10 +2053,11 @@ impl InboxHub {
             broadcast_wake_stall(&st, pane_id, agent_id, &id, false);
         }
         drain_events(&mut st);
-        let ledgers = std::mem::take(&mut st.exited_ledgers);
+        let mut ledgers = std::mem::take(&mut st.exited_ledgers);
+        ledgers.append(&mut walked_debt);
         drop(st);
         self.changed.notify_one();
-        ledgers
+        ExitSettlement { ledgers, walked }
     }
 
     /// PR #1735 fifth review (R5): the doorbell's verdict that nothing has
@@ -1927,135 +2176,60 @@ impl InboxHub {
         }
     }
 
-    /// Hand `agent_id` its queued messages, rendered, up to `max_chars`; with
-    /// `ack`, acknowledge them in the same step.
-    pub fn fetch(
-        &self,
-        pane_id: &str,
-        agent_id: &str,
-        consumer: Consumer,
-        max_chars: Option<usize>,
-        ack: Option<AckHow>,
-    ) -> Vec<InboxDelivery> {
-        self.fetch_within(
-            pane_id,
-            agent_id,
-            consumer,
-            max_chars.map(InboxBudget::Chars),
-            ack,
-        )
-    }
-
-    /// [`Self::fetch`] within a budget in either unit ([`fitting`] says what
-    /// counts against it).
-    pub fn fetch_within(
-        &self,
-        pane_id: &str,
-        agent_id: &str,
-        consumer: Consumer,
-        budget: Option<InboxBudget>,
-        ack: Option<AckHow>,
-    ) -> Vec<InboxDelivery> {
-        self.fetch_named_within(pane_id, agent_id, consumer, budget, ack, None)
-    }
-
-    /// [`Self::fetch_within`] for a fetch a doorbell started: with `named`,
-    /// nothing is fetched unless message `named` is still queued for the
-    /// agent, decided under the same lock as the fetch, so a doorbell whose
-    /// message another consumer took never pulls newer mail into its turn.
-    pub fn fetch_named_within(
-        &self,
-        pane_id: &str,
-        agent_id: &str,
-        consumer: Consumer,
-        budget: Option<InboxBudget>,
-        ack: Option<AckHow>,
-        named: Option<&str>,
-    ) -> Vec<InboxDelivery> {
-        let deliveries = {
-            let mut st = self.lock();
-            let now = Instant::now();
-            if let Some(id) = named
-                && !queued_for(&st.inbox, pane_id, agent_id).any(|m| m.id.as_str() == id)
-            {
-                return Vec::new();
-            }
-            let count = fitting(&st.inbox, pane_id, agent_id, budget);
-            if count == 0 {
-                return Vec::new();
-            }
-            let fetched = match ack {
-                Some(how) => {
-                    st.inbox
-                        .fetch_acked(now, pane_id, agent_id, consumer, how, Some(count))
-                }
-                None => st
-                    .inbox
-                    .fetch(now, pane_id, agent_id, consumer, Some(count)),
-            };
-            drain_events(&mut st);
-            fetched.iter().map(|m| render_within(m, budget)).collect()
-        };
-        self.changed.notify_one();
-        self.post_owed_notices();
-        deliveries
-    }
-
-    /// PRD #1666 S5: hand `agent_id` its oldest queued message, rendered whole,
-    /// and acknowledge it in the same step — the `get-seed` alias.
-    pub fn fetch_first_acked(
-        &self,
-        pane_id: &str,
-        agent_id: &str,
-        how: AckHow,
-    ) -> Option<InboxDelivery> {
-        let delivery = {
-            let mut st = self.lock();
-            let fetched = st.inbox.fetch_acked(
-                Instant::now(),
-                pane_id,
-                agent_id,
-                Consumer::FetchCli,
-                how,
-                Some(1),
-            );
-            drain_events(&mut st);
-            fetched.first().map(|m| render(m, None))
-        };
-        self.changed.notify_one();
-        self.post_owed_notices();
-        delivery
-    }
-
     /// Acknowledge message `id` for `agent_id` in `pane_id`.
     pub fn ack(&self, id: &str, pane_id: &str, agent_id: &str, how: AckHow) -> AckOutcome {
         let outcome = {
             let mut st = self.lock();
             let now = Instant::now();
             let key = (pane_id.to_string(), agent_id.to_string());
-            // PRD #1666 §13 step 4: a receipt-owned assignment is settled
-            // through its attempt model, never by the legacy ack alone.
-            let receipt_owned = st.inbox.owner_of(id, pane_id, agent_id)
-                == Some(crate::inbox::AssignmentOwner::Receipt);
-            let committed = receipt_owned.then(|| engine::explicit_commit(&mut st, &key, id, now));
-            // C-5: an ack of a message no attempt of which reached the agent
-            // changes nothing, and does not fall through to the legacy ack,
-            // which would acknowledge the inbox copy the model still queues.
-            if committed == Some(engine::ExplicitCommit::Refused) {
-                return AckOutcome::Unknown;
-            }
-            if committed == Some(engine::ExplicitCommit::Committed) {
-                drain_events(&mut st);
-                match st.inbox.get(id, pane_id).map(|m| &m.state) {
-                    Some(MessageState::Claimed { expires, .. }) => AckOutcome::Claimed {
-                        expires_in_ms: expires.saturating_duration_since(now).as_millis() as u64,
-                    },
-                    _ => AckOutcome::Acknowledged,
+            match st.inbox.state_for(id, pane_id, agent_id) {
+                // A repeated ack is answered as one, the model left alone.
+                Some(MessageState::Acknowledged { .. }) => {
+                    return AckOutcome::AlreadyAcknowledged;
                 }
-            } else {
-                let outcome = st.inbox.ack(now, id, pane_id, agent_id, how);
-                drain_events(&mut st);
-                outcome
+                // Only the copy's current recipient settles it: an offer's
+                // previous holder keeps its committed attempt after the offer
+                // moves on, which must not answer its ack as a success. The
+                // store answers `wrong_agent` (or `unknown`), changing nothing.
+                None => return st.inbox.ack(now, id, pane_id, agent_id, how),
+                Some(_) => {}
+            }
+            // PRD #1666 §13 step 4: a hand-out is settled through its attempt
+            // model, never by the store's ack alone.
+            match engine::explicit_commit(&mut st, &key, id, now) {
+                engine::ExplicitCommit::Committed => {
+                    drain_events(&mut st);
+                    match st.inbox.get(id, pane_id).map(|m| &m.state) {
+                        Some(MessageState::Claimed { expires, .. }) => AckOutcome::Claimed {
+                            expires_in_ms: expires.saturating_duration_since(now).as_millis()
+                                as u64,
+                        },
+                        _ => AckOutcome::Acknowledged,
+                    }
+                }
+                // C-5: an ack of a message no attempt of which reached the
+                // agent changes nothing, and does not fall through to the
+                // store's ack, which would acknowledge the inbox copy the
+                // model still queues.
+                engine::ExplicitCommit::Refused => return AckOutcome::Unknown,
+                // PRD #1666 part 3 (H5): nor does an ack of a message the
+                // deck never handed out, still waiting for its agent or
+                // assigned to it as an offer: no fetch is left that could have
+                // shown the agent its body. A settled, claimed or
+                // undeliverable copy the model holds no attempt of answers as
+                // the store does. That is the only way this ack records a
+                // late ack of a copy out of attempts: one the model refused
+                // above answered `unknown`.
+                engine::ExplicitCommit::NoAttempt
+                    if st.inbox.state_for(id, pane_id, agent_id) == Some(&MessageState::Queued) =>
+                {
+                    return AckOutcome::Unknown;
+                }
+                engine::ExplicitCommit::NoAttempt => {
+                    let outcome = st.inbox.ack(now, id, pane_id, agent_id, how);
+                    drain_events(&mut st);
+                    outcome
+                }
             }
         };
         // PRD #1666 S11: an ack claims an offered job, which its offerer is
@@ -2065,22 +2239,6 @@ impl InboxHub {
         self.changed.notify_one();
         self.post_owed_notices();
         outcome
-    }
-
-    /// A consumer whose connection ended before it handed its messages over:
-    /// they are queued again for the agent's other waiters.
-    pub fn requeue_consumer(&self, pane_id: &str, agent_id: &str, consumer: &Consumer) -> usize {
-        let count = {
-            let mut st = self.lock();
-            let count = st.inbox.requeue_consumer(Instant::now(), consumer);
-            drain_events(&mut st);
-            count
-        };
-        self.post_owed_notices();
-        if count > 0 {
-            self.dispatch_agent(pane_id, agent_id);
-        }
-        count
     }
 
     /// Every message the inbox holds, live and recent history, across panes.
@@ -2197,7 +2355,7 @@ impl InboxHub {
     /// Answers whether the manifest now holds this revision or a newer one. A
     /// failed write is logged: it costs only the cleanup of those bodies after
     /// this run ends, and the next record writes the whole ledger again.
-    fn record_spills(&self, mut st: MutexGuard<'_, HubState>) -> bool {
+    fn record_spills(&self, mut st: HubGuard<'_>) -> bool {
         st.spills_revision += 1;
         let revision = st.spills_revision;
         let text = st.spills.manifest_text();
@@ -2399,94 +2557,30 @@ impl InboxHub {
         }
     }
 
-    /// Hand `agent_id`'s queued messages to its most recently armed waiter.
+    /// Hand `agent_id`'s waiting messages to its receipt receivers: the
+    /// receipt engine decides which receiver takes what. A generation with no
+    /// receipt receiver is handed nothing here (its doorbell, or a fetch of
+    /// its own, takes its mail).
     fn dispatch_agent(&self, pane_id: &str, agent_id: &str) {
         if self.pause_waiter_delivery {
             return;
         }
         let mut st = self.lock();
         let key = (pane_id.to_string(), agent_id.to_string());
-        // PRD #1666 §13 step 4: a generation with a receipt receiver is
-        // handed its mail by the receipt engine; the legacy waiters below never
-        // see it.
-        if st.receipts.gens.contains_key(&key) {
-            let mut out = engine::Outbox::new();
-            engine::dispatch(&mut st, &key, Instant::now(), &mut out);
-            drop(st);
-            engine::flush(out);
-            // A batch just staged has a staging deadline, which the ticker
-            // must know before the spool work below can stall (U1, R2-fix3).
-            self.changed.notify_one();
-            // Releasing a batch can reclaim what it held back, whose files
-            // go with the rest of the spool work.
-            self.spool_work();
-            self.changed.notify_one();
+        if !st.receipts.gens.contains_key(&key) {
             return;
         }
-        loop {
-            let Some(waiter) = st.waiters.get(&key).and_then(|list| list.last()) else {
-                return;
-            };
-            let (conn_id, mode, budget) = (
-                waiter.conn_id,
-                waiter.mode,
-                waiter.component.inline_budget(),
-            );
-            // Hardening M4: a waiter whose connection has not taken what it
-            // was already handed is not reading; it is disarmed, and gets
-            // nothing more. Its connection task ends on its write deadline and
-            // puts back what it holds.
-            if waiter.tx.capacity() == 0 {
-                warn!(conn_id, "inbox: disarming a waiter that is not reading");
-                if let Some(list) = st.waiters.get_mut(&key) {
-                    list.retain(|w| w.conn_id != conn_id);
-                    if list.is_empty() {
-                        st.waiters.remove(&key);
-                    }
-                }
-                continue;
-            }
-            let count = fitting(&st.inbox, pane_id, agent_id, Some(budget));
-            if count == 0 {
-                return;
-            }
-            let consumer = match mode {
-                InboxWaitMode::Once => Consumer::Waiter { conn_id },
-                InboxWaitMode::Stream => Consumer::Stream { conn_id },
-            };
-            let now = Instant::now();
-            let fetched = st
-                .inbox
-                .fetch(now, pane_id, agent_id, consumer.clone(), Some(count));
-            drain_events(&mut st);
-            let batch: Vec<InboxDelivery> = fetched
-                .iter()
-                .map(|m| render_within(m, Some(budget)))
-                .collect();
-            let list = st.waiters.get_mut(&key).expect("waiter list checked above");
-            let tx = list.last().expect("waiter checked above").tx.clone();
-            if mode == InboxWaitMode::Once {
-                // Spent: a once waiter carries exactly one hand-over.
-                list.pop();
-                if list.is_empty() {
-                    st.waiters.remove(&key);
-                }
-            }
-            if tx.try_send(WaiterSignal::Deliver(batch)).is_ok() {
-                self.changed.notify_one();
-                return;
-            }
-            // The connection task is gone: forget it, put its batch back, and
-            // try the next waiter.
-            if let Some(list) = st.waiters.get_mut(&key) {
-                list.retain(|w| w.conn_id != conn_id);
-                if list.is_empty() {
-                    st.waiters.remove(&key);
-                }
-            }
-            st.inbox.requeue_consumer(now, &consumer);
-            drain_events(&mut st);
-        }
+        let mut out = engine::Outbox::new();
+        engine::dispatch(&mut st, &key, Instant::now(), &mut out);
+        drop(st);
+        engine::flush(out);
+        // A batch just staged has a staging deadline, which the ticker must
+        // know before the spool work below can stall (U1, R2-fix3).
+        self.changed.notify_one();
+        // Releasing a batch can reclaim what it held back, whose files go
+        // with the rest of the spool work.
+        self.spool_work();
+        self.changed.notify_one();
     }
 }
 
@@ -2684,8 +2778,15 @@ impl InboxHub {
     /// clock goes, and as at an exit its key joins the bounded set of exited
     /// generations, which refuses a delayed edge for it while the key is
     /// still there.
+    ///
+    /// Reached only from destructors, through
+    /// `AgentPtyRegistry::release_abandoned_turns`, so it takes the hub the
+    /// destructor way (PRD #1666 part 3, round 5, C4b): it recovers as every hub
+    /// path does, and skips a rank violation rather than panic in an unwind.
     pub fn turns_abandoned(&self, pane_id: &str, agent_id: &str) {
-        let mut st = self.lock();
+        let Some(mut st) = self.lock_in_drop(crate::lock_rank::OnPoison::Recover) else {
+            return;
+        };
         engine::forget_turns(&mut st, &(pane_id.to_string(), agent_id.to_string()));
     }
 
@@ -3111,16 +3212,55 @@ impl InboxHub {
     /// dot-agent-deck too old for its messages, composed by the daemon at
     /// start from its own install path.
     pub fn set_hooks_remedy(&self, command: Option<String>) {
-        self.lock().hooks_remedy = command;
+        self.set_agent_hooks_remedy(&crate::event::AgentType::ClaudeCode, command);
     }
 
-    /// Part 2 §2.7: a one-shot receiver declared no [`HOOK_INTEGRATION`], or
-    /// a lower one. Nothing is issued; its card names the fix.
-    pub fn refuse_old_hooks(&self, pane_id: &str, agent_id: &str) {
+    /// [`Self::set_hooks_remedy`] for `agent`'s hooks (PRD #1666 part 3,
+    /// R-3: Codex's hooks from before the deck's messages are named too).
+    pub fn set_agent_hooks_remedy(&self, agent: &crate::event::AgentType, command: Option<String>) {
+        let mut st = self.lock();
+        match command {
+            Some(command) => st.hooks_remedies.insert(agent.clone(), command),
+            None => st.hooks_remedies.remove(agent),
+        };
+    }
+
+    /// Part 2 §2.7: a one-shot receiver of `component` declared no
+    /// [`HOOK_INTEGRATION`], or a lower one. Nothing is issued; its card names
+    /// the fix: that agent's own `hooks install`, or none for a component the
+    /// deck cannot tie to an agent (PRD #1666 part 3, H5).
+    pub fn refuse_old_hooks(&self, pane_id: &str, agent_id: &str, component: InboxComponent) {
+        let agent = match component {
+            InboxComponent::ClaudeWaiter | InboxComponent::ClaudeHooks => {
+                Some(crate::event::AgentType::ClaudeCode)
+            }
+            InboxComponent::CodexHooks => Some(crate::event::AgentType::Codex),
+            InboxComponent::DevinHooks => Some(crate::event::AgentType::Devin),
+            _ => None,
+        };
         let mut st = self.lock();
         let key = (pane_id.to_string(), agent_id.to_string());
-        engine::refuse_hooks(&mut st, &key);
+        engine::refuse_hooks(&mut st, &key, agent);
         engine::broadcast_notices(&mut st, &key, Instant::now());
+    }
+
+    /// PRD #1666 part 3 (R-3): a hook line of `agent`'s attested to
+    /// `agent_id`'s generation, `stamped` when it carries the sending deck's
+    /// version ([`crate::hook_binary::HookLineSender::is_reported`]). An
+    /// unstamped one names the hooks too old on the card; a stamped one clears
+    /// that again.
+    pub fn observe_hook_stamp(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        agent: &crate::event::AgentType,
+        stamped: bool,
+    ) {
+        let mut st = self.lock();
+        let key = (pane_id.to_string(), agent_id.to_string());
+        if engine::observe_hook_stamp(&mut st, &key, agent, stamped) {
+            engine::broadcast_notices(&mut st, &key, Instant::now());
+        }
     }
 
     /// Part 2 §1.3: Claude's prompt hook commits the exact attempts a
@@ -3190,6 +3330,49 @@ impl InboxHub {
                     .collect()
             })
         })
+    }
+
+    /// PRD #1666 part 3 (R-2): the deck refused `agent_id`'s own request for
+    /// its messages in `pane_id`, with the refusal `code`. Its card says so
+    /// while messages wait for it ([`InboxCardNotices::admission_refused`]),
+    /// and each orchestrator with a task delegated to it is told once in the
+    /// episode — one whose task starts waiting later in it too
+    /// ([`Self::post_delegate`]). The caller has checked that the
+    /// request's capability attests `agent_id` and that `agent_id` holds the
+    /// pane, so a request naming another agent's pane never reaches this.
+    pub fn admission_refused(&self, pane_id: &str, agent_id: &str, code: &str) {
+        {
+            let mut st = self.lock();
+            if st
+                .live_agent
+                .as_ref()
+                .is_some_and(|live| !live(pane_id, agent_id))
+            {
+                return;
+            }
+            let key = (pane_id.to_string(), agent_id.to_string());
+            st.admission_refused
+                .entry(key.clone())
+                .and_modify(|episode| episode.code = code.to_string())
+                .or_insert_with(|| AdmissionEpisode {
+                    code: code.to_string(),
+                    told: Vec::new(),
+                });
+            owe_admission_notices(&mut st, &key);
+            engine::broadcast_notices(&mut st, &key, Instant::now());
+        }
+        self.post_owed_notices();
+    }
+
+    /// PRD #1666 part 3 (R-2): the deck admitted `agent_id`'s own request for
+    /// its messages in `pane_id`, which ends a refusal episode
+    /// ([`Self::admission_refused`]).
+    pub fn admission_admitted(&self, pane_id: &str, agent_id: &str) {
+        let mut st = self.lock();
+        let key = (pane_id.to_string(), agent_id.to_string());
+        if st.admission_refused.remove(&key).is_some() {
+            engine::broadcast_notices(&mut st, &key, Instant::now());
+        }
     }
 
     /// PRD #1666 §11: a fetch or stream from a component the receipt policy
@@ -3268,6 +3451,7 @@ async fn serve_receipt<R, W, P>(
                 &mut st,
                 &key,
                 component,
+                engine::Registrant::Integration,
                 arm.doorbell_only,
                 arm.resumed,
                 conn_id,
@@ -3280,7 +3464,6 @@ async fn serve_receipt<R, W, P>(
                 list.retain(|w| w.component != component);
                 list.push(Waiter {
                     conn_id,
-                    mode: InboxWaitMode::Stream,
                     component,
                     tx: tx.clone(),
                 });
@@ -3338,11 +3521,6 @@ async fn serve_receipt<R, W, P>(
                 Some(WaiterSignal::Line(reply)) => {
                     if write_line_within(deadline, &mut writer, &*reply).await.is_err() {
                         debug!(conn_id, "inbox: a receipt stream stopped reading");
-                        break;
-                    }
-                }
-                Some(WaiterSignal::Deliver(batch)) => {
-                    if write_line_within(deadline, &mut writer, &InboxWaitReply::messages(batch)).await.is_err() {
                         break;
                     }
                 }
@@ -3430,6 +3608,7 @@ async fn serve_once<R, W>(
                     &mut st,
                     &key,
                     component,
+                    engine::Registrant::Integration,
                     false,
                     false,
                     conn_id,
@@ -3439,7 +3618,6 @@ async fn serve_once<R, W>(
                 );
                 st.waiters.entry(key.clone()).or_default().push(Waiter {
                     conn_id,
-                    mode: InboxWaitMode::Once,
                     component,
                     tx: tx.clone(),
                 });
@@ -3519,8 +3697,6 @@ async fn serve_once<R, W>(
                     break;
                 }
                 Some(WaiterSignal::Close) | None => break,
-                // Only a legacy waiter is handed a batch this way.
-                Some(WaiterSignal::Deliver(_)) => {}
             },
             line = lines.recv() => match line {
                 Some(line) => match serde_json::from_str::<InboxStreamControl>(&line) {
@@ -3542,7 +3718,7 @@ async fn serve_once<R, W>(
 }
 
 /// What a hook receiver's own fetch asked for (part 2 §2.4).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct HookFetch {
     /// The message the doorbell named: nothing is issued unless it is still
     /// waiting.
@@ -3550,15 +3726,28 @@ pub struct HookFetch {
     pub budget: Option<InboxBudget>,
     /// The one-shot integration the hook declared ([`HOOK_INTEGRATION`]).
     pub hook_integration: Option<u32>,
+    /// Who fetches. PRD #1666 part 3 (H4): a model-run `inbox fetch`
+    /// ([`crate::event::InboxFetchConsumer::Cli`]) is served as a hook is,
+    /// but proves nothing about the agent's hooks: it leaves the card's
+    /// integration notices as they are, and one declaring no integration is
+    /// refused without one.
+    pub consumer: crate::event::InboxFetchConsumer,
 }
 
-/// Part 2 §2.4: serve one hook receiver (Claude's prompt hook) until it
-/// ends: register it beside every other receiver of the generation, issue it
-/// what its fetch asked for once, with the caps it publishes its receipts
-/// with, and apply its controls until it closes or its hold runs out. It is
-/// never pushed anything. Below the one-shot integration floor (§2.7)
-/// nothing is registered or issued, and the agent's card names the command
-/// that updates its hooks.
+impl HookFetch {
+    fn cli(&self) -> bool {
+        self.consumer == crate::event::InboxFetchConsumer::Cli
+    }
+}
+
+/// Part 2 §2.4: serve one hook receiver (Claude Code's or Codex's prompt
+/// hook, Codex's `Stop`, or since part 3's H4 a model-run `inbox fetch`)
+/// until it ends: register it beside every other receiver of the generation,
+/// issue it what its fetch asked for once, with the caps it publishes its
+/// receipts with, and apply its controls until it closes or its hold runs
+/// out. It is never pushed anything. Below the one-shot integration floor
+/// (§2.7) nothing is registered or issued, and for an agent's own hook the
+/// card names the command that updates its hooks.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_hook<R, W>(
     hub: Arc<InboxHub>,
@@ -3578,7 +3767,9 @@ pub async fn serve_hook<R, W>(
         .hook_integration
         .is_none_or(|declared| declared < HOOK_INTEGRATION)
     {
-        hub.refuse_old_hooks(&pane_id, &agent_id);
+        if !fetch.cli() {
+            hub.refuse_old_hooks(&pane_id, &agent_id, component);
+        }
         warn!(
             pane_id = %pane_id,
             ?component,
@@ -3621,6 +3812,11 @@ pub async fn serve_hook<R, W>(
                 &mut st,
                 &key,
                 component,
+                if fetch.cli() {
+                    engine::Registrant::Cli
+                } else {
+                    engine::Registrant::Integration
+                },
                 false,
                 false,
                 conn_id,
@@ -3638,6 +3834,11 @@ pub async fn serve_hook<R, W>(
                 &mut st,
                 &key,
                 rx,
+                match fetch.consumer {
+                    crate::event::InboxFetchConsumer::Cli => Consumer::FetchCli,
+                    crate::event::InboxFetchConsumer::TurnEndHook => Consumer::TurnEndHook,
+                    crate::event::InboxFetchConsumer::DoorbellHook => Consumer::DoorbellHook,
+                },
                 fetch.named.as_deref(),
                 fetch.budget,
                 now,
@@ -3711,7 +3912,7 @@ pub async fn serve_hook<R, W>(
                         }
                     }
                     Some(WaiterSignal::Superseded | WaiterSignal::Close) | None => break,
-                    Some(WaiterSignal::Once(_) | WaiterSignal::Deliver(_)) => {}
+                    Some(WaiterSignal::Once(_)) => {}
                 },
                 line = lines.recv() => match line {
                     Some(line) => match serde_json::from_str::<InboxStreamControl>(&line) {
@@ -3778,6 +3979,171 @@ where
     })
     .await;
     crate::inbox_oneshot::classify_frame(bytes, Some(accepted), matches!(wrote, Ok(Ok(()))))
+}
+
+/// TEST: a hook receiver of its own fetch (a model-run `inbox fetch`) that
+/// [`InboxHub::test_hook_fetch`] registered and issued, as [`serve_hook`]
+/// does, with no connection: it holds what it was issued while it stays
+/// open (its hold), until [`InboxHub::test_hook_close`].
+#[cfg(test)]
+pub(crate) struct TestHook {
+    pub key: AgentKey,
+    pub rx: crate::inbox_attempts::Rx,
+    pub conn_id: u64,
+    /// What it was issued, each block naming its attempt.
+    pub deliveries: Vec<InboxDelivery>,
+    _signals: mpsc::Receiver<WaiterSignal>,
+}
+
+#[cfg(test)]
+impl TestHook {
+    /// The attempts it was issued.
+    pub fn attempts(&self) -> Vec<crate::event::InboxAttemptRef> {
+        self.deliveries
+            .iter()
+            .filter_map(|delivery| {
+                let at = delivery.attempt.as_ref()?;
+                Some(crate::event::InboxAttemptRef {
+                    id: delivery.id.clone(),
+                    a: at.a,
+                    e: at.e,
+                })
+            })
+            .collect()
+    }
+
+    /// The ids it was issued.
+    pub fn ids(&self) -> Vec<String> {
+        self.deliveries.iter().map(|d| d.id.clone()).collect()
+    }
+}
+
+#[cfg(test)]
+impl InboxHub {
+    /// TEST: register a hook receiver for `agent_id` in `pane_id` and issue it
+    /// what waits for it within `budget`, as [`serve_hook`] does for a
+    /// model-run `inbox fetch` (PRD #1666 part 3). The fixture that replaced
+    /// the legacy fetch in these tests (H5).
+    pub(crate) fn test_hook_fetch(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        budget: Option<InboxBudget>,
+    ) -> TestHook {
+        self.test_hook_fetch_named(pane_id, agent_id, None, budget)
+    }
+
+    /// TEST: [`Self::test_hook_fetch`] for a doorbell that named `named`:
+    /// nothing is issued unless that message still waits.
+    pub(crate) fn test_hook_fetch_named(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        named: Option<&str>,
+        budget: Option<InboxBudget>,
+    ) -> TestHook {
+        let key = (pane_id.to_string(), agent_id.to_string());
+        let spool = self.generation_spool(pane_id, agent_id);
+        let (tx, signals) = mpsc::channel(engine::RECEIPT_SIGNAL_CAPACITY);
+        let (conn_id, rx, deliveries, out) = {
+            let mut st = self.lock();
+            let conn_id = st.next_conn;
+            st.next_conn += 1;
+            let now = Instant::now();
+            let mut out = engine::Outbox::new();
+            let first = engine::register(
+                &mut st,
+                &key,
+                InboxComponent::Other,
+                engine::Registrant::Cli,
+                false,
+                false,
+                conn_id,
+                tx,
+                spool,
+                now,
+            );
+            let rx = crate::inbox_attempts::Rx(
+                first
+                    .as_ref()
+                    .and_then(|first| first.registered.as_ref())
+                    .map_or(0, |r| r.rx),
+            );
+            let deliveries = engine::hook_fetch(
+                &mut st,
+                &key,
+                rx,
+                Consumer::FetchCli,
+                named,
+                budget,
+                now,
+                &mut out,
+            );
+            (conn_id, rx, deliveries, out)
+        };
+        engine::flush(out);
+        self.after_receipts();
+        self.post_owed_notices();
+        TestHook {
+            key,
+            rx,
+            conn_id,
+            deliveries,
+            _signals: signals,
+        }
+    }
+
+    /// TEST: `hook` positively did not hand what it was issued to its agent
+    /// (it printed nothing).
+    pub(crate) fn test_hook_not_handed(&self, hook: &TestHook) {
+        self.receipt_control(
+            &hook.key,
+            hook.rx,
+            &InboxStreamControl {
+                not_handed: hook.attempts(),
+                ..InboxStreamControl::default()
+            },
+        );
+        self.post_owed_notices();
+    }
+
+    /// TEST: `hook`'s agent started on what it was issued of `ids` (its
+    /// `committed` control).
+    pub(crate) fn test_hook_committed(&self, hook: &TestHook, ids: &[&str]) {
+        self.receipt_control(
+            &hook.key,
+            hook.rx,
+            &InboxStreamControl {
+                committed: hook
+                    .attempts()
+                    .into_iter()
+                    .filter(|at| ids.contains(&at.id.as_str()))
+                    .collect(),
+                ..InboxStreamControl::default()
+            },
+        );
+        self.post_owed_notices();
+    }
+
+    /// TEST: `hook`'s connection ends.
+    pub(crate) fn test_hook_close(&self, hook: TestHook) {
+        self.receipt_closed(&hook.key, hook.rx, hook.conn_id);
+        self.post_owed_notices();
+    }
+
+    /// TEST: what waits for `agent_id` in `pane_id`, taken by a hook receiver
+    /// and acknowledged by the agent (`ack <id>`), as a model-run `inbox
+    /// fetch` followed by its agent's explicit ack settles it. Answers what
+    /// it was issued.
+    pub(crate) fn test_take_acked(&self, pane_id: &str, agent_id: &str) -> Vec<InboxDelivery> {
+        let hook = self.test_hook_fetch(pane_id, agent_id, None);
+        for id in hook.ids() {
+            self.ack(&id, pane_id, agent_id, AckHow::Explicit);
+        }
+        let deliveries = hook.deliveries.clone();
+        self.test_hook_close(hook);
+        deliveries
+    }
 }
 
 impl InboxHub {
@@ -3858,31 +4224,6 @@ fn queued_for<'a>(
     })
 }
 
-/// How many of `agent_id`'s queued messages fit `budget`, in the order a fetch
-/// takes them, and never more than [`crate::inbox_prompt::MAX_IDS`]. Each
-/// block is counted with the [`BLOCK_SEPARATOR`] ahead of it, so a caller that
-/// heads the blocks with framing asks for its budget less the framing and
-/// stays within the whole. At least one when any is queued: a single message
-/// too big for the budget is rendered with its head only.
-fn fitting(inbox: &Inbox, pane_id: &str, agent_id: &str, budget: Option<InboxBudget>) -> usize {
-    let queued = queued_for(inbox, pane_id, agent_id);
-    let Some(budget) = budget else {
-        return queued.count();
-    };
-    let mut used = 0usize;
-    let mut count = 0usize;
-    for message in queued.take(crate::inbox_prompt::MAX_IDS) {
-        let len = budget.measure(&render_within(message, Some(budget)).text)
-            + budget.measure(BLOCK_SEPARATOR);
-        if count > 0 && used + len > budget.limit() {
-            break;
-        }
-        used += len;
-        count += 1;
-    }
-    count
-}
-
 /// How many watched tasks to `pane_id` are still live: those a newer
 /// delegation to the pane retires as it goes in.
 fn live_delegates_locked(st: &HubState, pane_id: &str) -> usize {
@@ -3948,6 +4289,221 @@ fn retire_delegates_locked(
 /// End the watch on delegated task `id`, and the record that its orchestrator
 /// was told it is uncertain: that record only affects a correction made through
 /// the watch, so without the watch it can affect no correction.
+/// PRD #1666 part 3, round 5 (plan D8): supersede every open task of
+/// `pane_id` that no report has claimed, by `by` (the newer task) or by a
+/// restart (`None`), and answer their debt for the caller to release exactly.
+/// A claimed task is not superseded: its report settles it (D12 rule 6).
+fn supersede_tasks(
+    reports: &mut crate::report_recovery::ReportState,
+    pane_id: &str,
+    by: Option<&str>,
+) -> Vec<DelegateLedger> {
+    use crate::report_recovery::{TaskLookup, TaskState, Tombstone};
+    let mut debt = Vec::new();
+    for id in reports.tasks.open_of_pane(pane_id) {
+        if matches!(
+            reports.tasks.lookup(&id),
+            TaskLookup::Open(task) if matches!(task.state, TaskState::Reporting { .. })
+        ) {
+            continue;
+        }
+        if let Some(task) = reports.tasks.settle(
+            &id,
+            Tombstone::Superseded {
+                by: by.map(str::to_string),
+            },
+        ) {
+            debt.push(task_debt(&task));
+        }
+    }
+    debt
+}
+
+/// PRD #1666 part 3, round 5 (plan D12 rule 4): decide the notices generation
+/// `(pane, agent)`'s open tasks owe at its exit, close them, and answer their
+/// debt. A task a report has claimed is left to its claim.
+fn walk_exited_tasks(
+    st: &mut HubState,
+    reports: &mut crate::report_recovery::ReportState,
+    pane_id: &str,
+    agent_id: &str,
+    kind: ExitKind,
+) -> Vec<DelegateLedger> {
+    use crate::report_recovery::{TaskDelivery, TaskState, Tombstone};
+    let mut debt = Vec::new();
+    // The "worker exited" notice, one per orchestrator, naming its tasks.
+    let mut exited: Vec<(Recipient, Vec<String>)> = Vec::new();
+    for id in reports.tasks.open_of_generation(pane_id, agent_id) {
+        let Some(task) = reports.tasks.open_task_mut(&id) else {
+            continue;
+        };
+        // A claimed task (D12 rule 4): the claim decides. Its notices are
+        // withheld on the claim, owed only if its report is not accepted, and
+        // a "worker exited" notice names it alone; its debt goes now, since
+        // the worker is gone whichever way the claim settles.
+        if let TaskState::Reporting { claim_id } = task.state {
+            task.exit_walked = true;
+            let task = task.clone();
+            // Only a message still live gets the exit's `AgentExited` event,
+            // which removes this entry; an acknowledged or ended one gets
+            // none, so it is not recorded.
+            if task.delivery == TaskDelivery::Live {
+                reports.exit_walked.insert(id.clone());
+            }
+            debt.push(task_debt(&task));
+            if let Some(claim) = reports.claims.get_mut(claim_id) {
+                claim.worker_gone.get_or_insert(match kind {
+                    ExitKind::Natural => crate::report_recovery::EndedHow::Exited,
+                    ExitKind::Removed => crate::report_recovery::EndedHow::Closed,
+                });
+                if let Some(orchestrator) = task.binding.orchestrator.clone() {
+                    match task.delivery {
+                        TaskDelivery::Live => claim.withheld.push((
+                            orchestrator,
+                            UNDELIVERED_SUBJECT,
+                            compose_undeliverable_notice(
+                                &id,
+                                &task.binding.role,
+                                UndeliverableReason::AgentExited,
+                            ),
+                        )),
+                        TaskDelivery::Acknowledged | TaskDelivery::Ended
+                            if kind == ExitKind::Natural =>
+                        {
+                            claim.withheld.push((
+                                orchestrator,
+                                WORKER_EXITED_SUBJECT,
+                                crate::state::compose_worker_exited_notice_for_tasks(
+                                    pane_id,
+                                    std::slice::from_ref(&id),
+                                ),
+                            ));
+                        }
+                        TaskDelivery::Acknowledged | TaskDelivery::Ended => {}
+                    }
+                    debug_assert!(claim.withheld.len() <= 2, "a claim withholds at most two");
+                }
+            }
+            continue;
+        }
+        task.exit_walked = true;
+        let Some(task) = reports.tasks.settle(&id, Tombstone::Closed) else {
+            continue;
+        };
+        if task.delivery == TaskDelivery::Live {
+            reports.exit_walked.insert(id.clone());
+        }
+        debt.push(task_debt(&task));
+        let Some(orchestrator) = task.binding.orchestrator.clone() else {
+            continue;
+        };
+        match task.delivery {
+            TaskDelivery::Live => st.owed_notices.push((
+                orchestrator,
+                UNDELIVERED_SUBJECT,
+                compose_undeliverable_notice(
+                    &id,
+                    &task.binding.role,
+                    UndeliverableReason::AgentExited,
+                ),
+            )),
+            TaskDelivery::Acknowledged | TaskDelivery::Ended if kind == ExitKind::Natural => {
+                match exited.iter_mut().find(|(to, _)| *to == orchestrator) {
+                    Some((_, ids)) => ids.push(id),
+                    None => exited.push((orchestrator, vec![id])),
+                }
+            }
+            TaskDelivery::Acknowledged | TaskDelivery::Ended => {}
+        }
+    }
+    for (orchestrator, ids) in exited {
+        st.owed_notices.push((
+            orchestrator,
+            WORKER_EXITED_SUBJECT,
+            crate::state::compose_worker_exited_notice_for_tasks(pane_id, &ids),
+        ));
+    }
+    debt
+}
+
+/// The subject of the notice an orchestrator gets when its worker exits
+/// owing it a `work-done`.
+const WORKER_EXITED_SUBJECT: &str = "worker exited";
+
+/// The commission arm and idle-worker record a task's delegate armed.
+fn task_debt(task: &crate::report_recovery::Task) -> DelegateLedger {
+    DelegateLedger {
+        commission_arm_id: task.binding.arm_id,
+        delegation_seq: task.binding.seq,
+        instance: task.binding.instance.clone(),
+    }
+}
+
+/// PRD #1666 part 3, round 5: what the task ledger said about one event, for
+/// [`settle_delegate`], which runs outside the guarded section.
+#[derive(Default)]
+struct TaskVerdicts {
+    /// Tasks whose worker's exit walk decided their notices.
+    walked: HashSet<String>,
+    /// Whether the ledger could be read at all.
+    readable: bool,
+}
+
+/// PRD #1666 part 3, round 5 (plan D12): record a delegated task's delivery in
+/// the ledger, and note the tasks whose exit the walk already decided.
+fn settle_task(
+    reports: &mut crate::report_recovery::ReportState,
+    event: &InboxEvent,
+    verdicts: &mut TaskVerdicts,
+) {
+    use crate::report_recovery::TaskDelivery;
+    let id = event.message_id.as_str();
+    match event.state {
+        StateName::Acknowledged => {
+            if let Some(task) = reports.tasks.open_task_mut(id) {
+                task.delivery = TaskDelivery::Acknowledged;
+            }
+        }
+        StateName::Undeliverable => match event.undeliverable_reason {
+            Some(UndeliverableReason::AgentExited) => {
+                if reports.exit_walked.remove(id) {
+                    verdicts.walked.insert(id.to_string());
+                } else {
+                    // Its worker's exit did not walk it (bound to another
+                    // generation of the pane): it ended all the same.
+                    let _ = reports
+                        .tasks
+                        .settle(id, crate::report_recovery::Tombstone::Closed);
+                }
+            }
+            Some(UndeliverableReason::Superseded) | None => {}
+            Some(_) => {
+                if let Some(task) = reports.tasks.open_task_mut(id) {
+                    task.delivery = TaskDelivery::Ended;
+                }
+            }
+        },
+        _ => {}
+    }
+}
+
+/// PRD #1666 part 3, round 5 (plan D12 rule 8): what a reported task leaves
+/// behind in the hub, retired with it: its delivery watch (whose end is
+/// signalled), its message if the worker never took it, and the hold on its
+/// saved body.
+fn retire_reported_task(st: &mut HubState, now: Instant, task_id: &str, worker_pane: &str) {
+    if let Some(mut watch) = remove_watch(st, task_id)
+        && let Some(end) = watch.end.take()
+    {
+        let _ = end.send(DelegateEnd::Ended);
+    }
+    let _ = st
+        .inbox
+        .retire(now, task_id, worker_pane, UndeliverableReason::Superseded);
+    st.spills
+        .release_tasks(worker_pane, |message, _| message == task_id);
+}
+
 fn remove_watch(st: &mut HubState, id: &str) -> Option<DelegateWatch> {
     let watch = st.delegates.remove(id)?;
     engine::forget_uncertain(st, id);
@@ -3956,8 +4512,149 @@ fn remove_watch(st: &mut HubState, id: &str) -> Option<DelegateWatch> {
 
 /// Log the inbox's state changes and broadcast each one to attached clients.
 /// An offer back in its pool has no pane to show it on, so it is only logged.
+/// PRD #1666 part 3, round 5: how event settlement reaches the retained
+/// store — taking it, or through a guard the caller already holds (plan D6:
+/// nothing re-takes R5).
+pub(crate) enum StoreAccess<'a, 'b> {
+    Take(Option<&'a crate::retained_store::RetainedStore>),
+    Held(&'a mut crate::retained_store::StoreLock<'b>),
+}
+
+impl StoreAccess<'_, '_> {
+    fn acknowledged(&mut self, report_id: &str, now: crate::retained_store::Now) {
+        match self {
+            StoreAccess::Take(Some(store)) => store.acknowledged(report_id, now),
+            StoreAccess::Take(None) => {}
+            StoreAccess::Held(held) => held.acknowledged(report_id, now),
+        }
+    }
+
+    fn recovered(&mut self, report_id: &str, now: crate::retained_store::Now) {
+        match self {
+            StoreAccess::Take(Some(store)) => store.recovered(report_id, now),
+            StoreAccess::Take(None) => {}
+            StoreAccess::Held(held) => held.recovered(report_id, now),
+        }
+    }
+}
+
+/// PRD #1666 part 3, round 5 (plan D13): settle the accepted-report entry an
+/// inbox event is about, before any other consumer sees the event. A handed
+/// message is marked handed; an acknowledged one releases its entry and
+/// starts its file's 24 hours; one set aside for any reason becomes a
+/// recovery row at once (the daemon stopping only starts its file's 7 days).
+/// A late acknowledgement of a message already set aside marks its row.
+/// Each change checks its target first, keyed by the message id.
+fn settle_accepted_report(
+    reports: &mut crate::report_recovery::ReportState,
+    store: &mut StoreAccess<'_, '_>,
+    event: &InboxEvent,
+    now: crate::retained_store::Now,
+) {
+    let id = event.message_id.as_str();
+    match event.state {
+        StateName::Fetched | StateName::Claimed => {
+            if let Some(entry) = reports.accepted.get_mut(id) {
+                entry.handed = true;
+            }
+        }
+        StateName::Acknowledged => {
+            if let Some(entry) = reports.accepted.remove(id) {
+                if let Some(report) = entry.report_id.as_deref() {
+                    store.acknowledged(report, now);
+                    if let Some(body) = reports.fallback.get_mut(report) {
+                        body.lifetime.acknowledge(now);
+                    }
+                }
+            } else if let Some(report) = reports.outcomes.acknowledged_late(id)
+                && let Some(report) = report.as_deref()
+            {
+                store.acknowledged(report, now);
+                if let Some(body) = reports.fallback.get_mut(report) {
+                    body.lifetime.acknowledge(now);
+                }
+            }
+        }
+        StateName::Undeliverable => {
+            let Some(entry) = reports.accepted.remove(id) else {
+                return;
+            };
+            let reason = event
+                .undeliverable_reason
+                .unwrap_or(UndeliverableReason::AgentExited);
+            let report = entry.report_id.clone();
+            match crate::report_recovery::cause_of(reason) {
+                None => {}
+                Some(cause) => {
+                    if reason == UndeliverableReason::Superseded {
+                        warn!(
+                            message_id = %id,
+                            "inbox: a report was superseded, which no report can be; it is \
+                             set aside as a recovery row"
+                        );
+                        debug_assert!(false, "a report cannot be superseded");
+                    }
+                    reports.outcomes.insert(
+                        entry.into_row(cause, chrono::Utc::now().timestamp_millis()),
+                        Some(id.to_string()),
+                    );
+                }
+            }
+            if let Some(report) = report.as_deref() {
+                store.recovered(report, now);
+                if let Some(body) = reports.fallback.get_mut(report) {
+                    body.lifetime.recover(now);
+                }
+            }
+        }
+        StateName::Queued => {}
+    }
+}
+
 fn drain_events(st: &mut HubState) {
-    for event in st.inbox.drain_events() {
+    let events = st.inbox.drain_events();
+    let mut verdicts = TaskVerdicts::default();
+    if !events.is_empty() {
+        let store = st.retained.clone();
+        let now = crate::retained_store::Now::current();
+        let settled = st.guarded_section(|_, reports| {
+            let mut access = StoreAccess::Take(store.as_deref());
+            for event in &events {
+                settle_accepted_report(reports, &mut access, event, now);
+                settle_task(reports, event, &mut verdicts);
+            }
+        });
+        match settled {
+            Ok(()) => verdicts.readable = true,
+            Err(_) => st.log_torn_once("drain_events"),
+        }
+    }
+    consume_events(st, events, &verdicts);
+}
+
+/// [`drain_events`] for code already inside a guarded section, holding the
+/// report state (and, when it holds it, the retained store): nothing is taken
+/// again (reviewer U3-2).
+fn drain_events_in_section(
+    st: &mut HubState,
+    reports: &mut crate::report_recovery::ReportState,
+    store: &mut StoreAccess<'_, '_>,
+) {
+    let events = st.inbox.drain_events();
+    let now = crate::retained_store::Now::current();
+    let mut verdicts = TaskVerdicts {
+        readable: true,
+        ..TaskVerdicts::default()
+    };
+    for event in &events {
+        settle_accepted_report(reports, store, event, now);
+        settle_task(reports, event, &mut verdicts);
+    }
+    consume_events(st, events, &verdicts);
+}
+
+fn consume_events(st: &mut HubState, events: Vec<InboxEvent>, verdicts: &TaskVerdicts) {
+    for event in events {
         // PR #1735 fifth review (R5): the message a stalled wake was recorded
         // against left the queue, so something took it, and clients are told
         // the stall ended.
@@ -3978,7 +4675,7 @@ fn drain_events(st: &mut HubState) {
             }
         }
         settle_late_ack(st, &event);
-        settle_delegate(st, &event);
+        settle_delegate(st, &event, verdicts);
         remember_max_deliver(st, &event);
         settle_offer(st, &event);
         debug!(
@@ -4008,11 +4705,20 @@ fn drain_events(st: &mut HubState) {
                 attention_update: false,
                 requeued: false,
                 notices: InboxCardNotices::default(),
+                provenance: event.provenance.clone(),
             }));
         }
         let Some(recipient) = event.recipient else {
             continue;
         };
+        // PRD #1666 part 3 (R-2): a refused generation's card names the
+        // refusal only while messages wait for it, so each message arriving
+        // or leaving retells its notices.
+        let refused = recipient
+            .agent_id
+            .as_ref()
+            .map(|agent| (recipient.pane_id.clone(), agent.clone()))
+            .filter(|key| st.admission_refused.contains_key(key));
         // A send with no subscriber is not an error worth reporting.
         let _ = tx.send(BroadcastMsg::Inbox(InboxNotice {
             pane_id: recipient.pane_id,
@@ -4028,7 +4734,11 @@ fn drain_events(st: &mut HubState) {
             attention_update: false,
             requeued: event.requeued,
             notices: InboxCardNotices::default(),
+            provenance: event.provenance.clone(),
         }));
+        if let Some(key) = refused {
+            engine::broadcast_notices(st, &key, Instant::now());
+        }
     }
     // Each was for the retirement drained just now.
     st.cancelled_handed.clear();
@@ -4060,7 +4770,106 @@ fn broadcast_wake_stall(st: &HubState, pane_id: &str, agent_id: &str, id: &str, 
         attention_update: false,
         requeued: false,
         notices: InboxCardNotices::default(),
+        provenance: None,
     }));
+}
+
+/// PRD #1666 part 3 (R-2): whether a message waits for `agent_id` in
+/// `pane_id` — one not yet acknowledged nor undeliverable that it may take.
+fn has_waiting_mail(inbox: &Inbox, pane_id: &str, agent_id: &str) -> bool {
+    inbox.list(pane_id).into_iter().any(|m| {
+        !m.state.is_terminal()
+            && m.recipient
+                .as_ref()
+                .is_some_and(|r| r.admits(pane_id, agent_id))
+    })
+}
+
+/// PRD #1666 part 3 (R-2): owe each orchestrator with a task delegated to
+/// `key`'s generation, while its refusal episode is open, one notice that the
+/// deck refused that worker's request for its messages, with the episode's
+/// latest code. Called on each refusal and each task delegated into the
+/// episode, so an orchestrator whose task starts waiting after the episode
+/// began is told too; one already told in the episode is not told again. An
+/// orchestrator in the worker's own pane is never told: that is the refused
+/// agent itself. Answers whether it owed any.
+fn owe_admission_notices(st: &mut HubState, key: &AgentKey) -> bool {
+    let Some(episode) = st.admission_refused.get(key) else {
+        return false;
+    };
+    let code = episode.code.clone();
+    let mut told: Vec<(Recipient, String, Vec<String>)> = Vec::new();
+    let mut watched: Vec<(&String, &DelegateWatch)> = st
+        .delegates
+        .iter()
+        .filter(|(_, watch)| {
+            watch.worker.pane_id == key.0 && watch.worker.agent_id.as_deref() == Some(&key.1)
+        })
+        .collect();
+    watched.sort_by(|a, b| a.0.cmp(b.0));
+    for (id, watch) in watched {
+        let Some(orchestrator) = watch.orchestrator.as_ref() else {
+            continue;
+        };
+        if orchestrator.pane_id == key.0 || episode.told.contains(orchestrator) {
+            continue;
+        }
+        match told.iter_mut().find(|(to, _, _)| to == orchestrator) {
+            Some((_, _, ids)) => ids.push(id.clone()),
+            None => told.push((orchestrator.clone(), watch.role.clone(), vec![id.clone()])),
+        }
+    }
+    let notices: Vec<_> = told
+        .into_iter()
+        .map(|(to, role, ids)| (to, compose_admission_refused_notice(&role, &ids, &code)))
+        .collect();
+    if let Some(episode) = st.admission_refused.get_mut(key) {
+        episode
+            .told
+            .extend(notices.iter().map(|(to, _)| to.clone()));
+    }
+    let owed = !notices.is_empty();
+    for (to, body) in notices {
+        st.owed_notices.push((to, ADMISSION_REFUSED_SUBJECT, body));
+    }
+    owed
+}
+
+/// PRD #1666 part 3 (R-2): the subject of the notice an orchestrator gets
+/// when the deck refuses a worker's request for its messages.
+pub const ADMISSION_REFUSED_SUBJECT: &str = "worker cannot take its messages";
+
+/// How many task ids [`compose_admission_refused_notice`] names before
+/// counting the rest.
+const ADMISSION_NOTICE_MAX_IDS: usize = 5;
+
+/// PRD #1666 part 3 (R-2): the notice an orchestrator gets when the deck
+/// refused, with `code`, a request of its worker in `role` for its messages,
+/// naming the tasks `ids` it delegated to that worker. Composed by the deck
+/// from fixed words; the role is quoted as untrusted.
+pub fn compose_admission_refused_notice(role: &str, ids: &[String], code: &str) -> String {
+    let named = ids
+        .iter()
+        .take(ADMISSION_NOTICE_MAX_IDS)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = ids.len().saturating_sub(ADMISSION_NOTICE_MAX_IDS);
+    let tasks = if more > 0 {
+        format!("{named} and {more} more")
+    } else {
+        named
+    };
+    let cause = crate::inbox_display::admission_cause(code)
+        .map(|cause| format!(" ({cause})"))
+        .unwrap_or_default();
+    format!(
+        "The worker in role {} cannot take its deck messages: its connection to the deck was \
+         refused{cause}. Your task(s) {tasks} wait in its inbox. Its card tells the user to \
+         restart it from the deck; a restart ends those tasks as not delivered, and you are told \
+         when it does. Decide whether to wait, re-delegate with --supersede, or notify the user.",
+        crate::state::quote_untrusted_role(role),
+    )
 }
 
 /// The subject of a notice that a delegated task did not reach its worker.
@@ -4193,7 +5002,7 @@ fn owe_card_notice(st: &mut HubState, event: &InboxEvent) {
 /// PRD #1666 S5: end the watch on a delegated task once it is acknowledged or
 /// can no longer be, and owe its orchestrator a notice when it turned
 /// undeliverable for any reason but being superseded.
-fn settle_delegate(st: &mut HubState, event: &InboxEvent) {
+fn settle_delegate(st: &mut HubState, event: &InboxEvent, verdicts: &TaskVerdicts) {
     let id = event.message_id.as_str();
     let end = match event.state {
         StateName::Acknowledged => DelegateEnd::Acknowledged(Instant::now()),
@@ -4223,7 +5032,6 @@ fn settle_delegate(st: &mut HubState, event: &InboxEvent) {
             let body = compose_late_ack_notice(id, &watch.role, LateAckReport::NotReached);
             st.owed_notices.push((to, LATE_ACK_SUBJECT, body));
         }
-        st.received_since_done.insert(watch.worker.pane_id);
         return;
     }
     let reason = match event.undeliverable_reason {
@@ -4231,6 +5039,20 @@ fn settle_delegate(st: &mut HubState, event: &InboxEvent) {
         Some(reason) => reason,
     };
     if reason == UndeliverableReason::AgentExited {
+        // PRD #1666 part 3, round 5 (plan D12 rule 4): the worker's exit walk
+        // decided this task's notices and returned its debt, so this is the
+        // one producer that stays silent for it.
+        if verdicts.walked.contains(id) {
+            return;
+        }
+        if verdicts.readable {
+            warn!(
+                message_id = %id,
+                pane_id = %watch.worker.pane_id,
+                "inbox: a delegated task with no ledger entry ended with its worker; its notice \
+                 comes from the watch"
+            );
+        }
         st.exited_ledgers.push(watch.ledger);
     }
     let handed = st.cancelled_handed.remove(id);
@@ -4380,8 +5202,7 @@ fn remember_cancelled_task(st: &mut HubState, id: &str, to: Recipient, role: &st
 /// PRD #1666 long-turn delivery: a message reported undeliverable after
 /// `max_deliver` hand-overs was acknowledged after all ([`Inbox::ack`] records
 /// the late ack). While its record is still held, the orchestrator told it
-/// was undeliverable gets a correction, the worker counts as having received a task
-/// (`received_since_done`), and a card the deck told can be cleared, once no
+/// was undeliverable gets a correction, and a card the deck told can be cleared, once no
 /// other message it was told about is still owed a correction. Without the
 /// record, this function does none of these.
 fn settle_late_ack(st: &mut HubState, event: &InboxEvent) {
@@ -4401,8 +5222,6 @@ fn settle_late_ack(st: &mut HubState, event: &InboxEvent) {
         "inbox: a message reported undeliverable was acknowledged after all"
     );
     if let Some((to, role)) = record.orchestrator {
-        st.received_since_done
-            .insert(record.recipient.pane_id.clone());
         let body = compose_late_ack_notice(
             event.message_id.as_str(),
             &role,
@@ -4561,12 +5380,19 @@ pub fn compose_late_ack_notice(message_id: &str, role: &str, report: LateAckRepo
 }
 
 /// PRD #1666 hardening H4: the smallest hand-over any agent's component gets
-/// once its framing heads it — Codex's byte budget less [`AGENT_FRAMING`]. A
+/// once its framing heads it — Codex's, whose hooks print the whole hand-over
+/// as one JSON line within its byte budget: the JSON-escaped room the tighter
+/// of its two envelopes leaves around [`AGENT_FRAMING`]
+/// ([`crate::inbox_prompt::json_room`]), as each hook asks the deck for it. A
 /// message that renders within it reaches every agent whole.
 pub fn tightest_hand_over() -> InboxBudget {
-    InboxComponent::CodexHooks
-        .inline_budget()
-        .less(AGENT_FRAMING)
+    let limit = InboxComponent::CodexHooks.inline_budget().limit();
+    let room = crate::inbox_prompt::codex_envelopes()
+        .iter()
+        .map(|envelope| crate::inbox_prompt::json_room(limit, envelope, AGENT_FRAMING))
+        .min()
+        .unwrap_or(limit);
+    InboxBudget::JsonBytes(room)
 }
 
 /// Whether [`retain_full_body_minted`] would save `content` for `pane_id`: it
@@ -4599,11 +5425,14 @@ fn fits_every_hand_over(deck: &DeckId, pane_id: &str, content: &Content) -> bool
         history: Vec::new(),
         excluded: Vec::new(),
         assign_deadline: None,
-        owner: None,
+        provenance: None,
     };
-    // Counted with the separator a hand-over puts before each block.
+    // Counted as the tightest hand-over can print it: after the separator it
+    // puts before each block, as a marked repeat whose opener names the
+    // longest attempt there can be.
     let budget = tightest_hand_over().less(BLOCK_SEPARATOR);
-    budget.measure(&render_within(&message, None).text) <= budget.limit()
+    let block = render_marked(&message, None, true, Some((u32::MAX, u32::MAX)));
+    budget.measure(&block.text) <= budget.limit()
 }
 
 /// Audit F5: why a publish or offer resolved from earlier facts was not
@@ -4846,7 +5675,21 @@ pub fn post_reserved_reply_or_notice_to_live(
     content: Content,
     notice: impl FnOnce(&str) -> Content,
 ) -> Result<MessageId, String> {
-    match post_live_keeping(registry, to.clone(), content, Some(reservation)) {
+    post_reserved_reply_or_notice_to_live_recorded(registry, reservation, to, content, notice, None)
+}
+
+/// PRD #1666 part 3, round 5: [`post_reserved_reply_or_notice_to_live`] for
+/// a report or dispatch result, which enters the accepted-report ledger with
+/// its post (plan D13). A notice posted in its place does not.
+pub(crate) fn post_reserved_reply_or_notice_to_live_recorded(
+    registry: &crate::agent_pty::AgentPtyRegistry,
+    reservation: ReplyReservation,
+    to: Recipient,
+    content: Content,
+    notice: impl FnOnce(&str) -> Content,
+    accepted: Option<crate::report_recovery::AcceptedReport>,
+) -> Result<MessageId, String> {
+    match post_live_keeping(registry, to.clone(), content, Some(reservation), accepted) {
         Ok(id) => Ok(id),
         Err((error, Some(reservation))) => {
             post_live(registry, to, notice(&error), Some(reservation))
@@ -4862,7 +5705,7 @@ fn post_live(
     content: Content,
     reservation: Option<ReplyReservation>,
 ) -> Result<MessageId, String> {
-    post_live_keeping(registry, to, content, reservation).map_err(|(error, _)| error)
+    post_live_keeping(registry, to, content, reservation, None).map_err(|(error, _)| error)
 }
 
 /// [`post_live`], answering a refusal of a post its recipient could still take
@@ -4872,6 +5715,7 @@ fn post_live_keeping(
     to: Recipient,
     content: Content,
     reservation: Option<ReplyReservation>,
+    accepted: Option<crate::report_recovery::AcceptedReport>,
 ) -> Result<MessageId, (String, Option<ReplyReservation>)> {
     if let Some(agent) = to.agent_id.as_deref()
         && registry.pane_current_agent_id(&to.pane_id).as_deref() != Some(agent)
@@ -4908,7 +5752,13 @@ fn post_live_keeping(
     // refusal removes the saved body and gives a reservation's room back.
     let live = || registry.pane_current_agent_id(&to.pane_id).as_deref() == to.agent_id.as_deref();
     let id = match reservation {
-        Some(reservation) => hub.post_reserved_reply_where(reservation, to.clone(), content, &live),
+        Some(reservation) => hub.post_reserved_reply_where_recorded(
+            reservation,
+            to.clone(),
+            content,
+            &live,
+            accepted,
+        ),
         None => hub.post_direct_where(to.clone(), content, &live),
     }
     .map_err(|error| (error.to_string(), None))?;
@@ -5152,8 +6002,9 @@ pub fn render_marked(
 /// the hook-ingest pool, until the waiter is spent, superseded or its peer goes
 /// away.
 ///
-/// A stream is served by the receipt engine; one from a component the receipt
-/// policy does not cover is refused `unsupported`.
+/// A stream from a receipt component, and Claude Code's once waiter, are
+/// served by the receipt engine at their floors; any other wait is refused
+/// before it arms.
 ///
 /// `repaint` is called with the agent id when the stream asks for a repaint
 /// (PRD #1666 S8) — only from an [`InboxComponent::OpenCodeMini`] stream; the
@@ -5179,7 +6030,11 @@ pub async fn serve_waiter<R, W, P>(
     // Part 2 §2.4, §2.7: Claude's once-waiter is served by the receipt
     // engine at the one-shot integration floor; below it nothing registers or
     // is issued, and its card names the command that updates the hooks. A
-    // one-shot component never streams.
+    // one-shot component never streams. PRD #1666 part 3 (H5): nor does any
+    // other one-shot component wait: Codex's, Devin's and an unknown
+    // component's hooks are receivers of their own fetch, so a once wait from
+    // one (which only an older dot-agent-deck sends) is refused before
+    // anything arms, and the hook mapping grants none of them a native wake.
     if engine::one_shot_component(component) {
         if mode == InboxWaitMode::Once && component == InboxComponent::ClaudeWaiter {
             if arm
@@ -5189,7 +6044,7 @@ pub async fn serve_waiter<R, W, P>(
                 serve_once(hub, pane_id, agent_id, component, instance, reader, writer).await;
                 return;
             }
-            hub.refuse_old_hooks(&pane_id, &agent_id);
+            hub.refuse_old_hooks(&pane_id, &agent_id, component);
             warn!(
                 pane_id = %pane_id,
                 ?component,
@@ -5205,144 +6060,47 @@ pub async fn serve_waiter<R, W, P>(
             return;
         }
         warn!(pane_id = %pane_id, ?component, ?mode, "inbox: refused a wait a one-shot component cannot make");
+        let why = match mode {
+            InboxWaitMode::Once => crate::inbox_display::WAIT_UNSUPPORTED,
+            InboxWaitMode::Stream => crate::inbox_display::STREAM_UNSUPPORTED,
+        };
         let _ = write_line_within(
             deadline,
             &mut writer,
-            &InboxWaitReply::refused("unsupported", crate::inbox_display::STREAM_UNSUPPORTED),
+            &InboxWaitReply::refused("unsupported", why),
         )
         .await;
         return;
     }
-    // PRD #1666 §13 step 4, §11: a component the receipt policy covers is
-    // served by the receipt engine, at the floor or above; below it nothing
-    // registers and its card says the integration is out of date.
-    if receipt_component(component) {
-        if mode == InboxWaitMode::Stream
-            && arm
-                .adapter_integration
-                .is_some_and(|declared| declared >= ADAPTER_INTEGRATION)
-        {
-            serve_receipt(
-                hub, pane_id, agent_id, component, instance, arm, reader, writer, repaint,
-            )
-            .await;
-            return;
-        }
-        hub.refuse_old_adapter(&pane_id, &agent_id);
-        warn!(
-            pane_id = %pane_id,
-            ?component,
-            declared = ?arm.adapter_integration,
-            "inbox: refused a component whose integration is out of date"
-        );
-        let _ = write_line_within(
-            deadline,
-            &mut writer,
-            &InboxWaitReply::refused("adapter_too_old", crate::inbox_display::ADAPTER_TOO_OLD),
+    // PRD #1666 §13 step 4, §11: every other component is a receipt stream's,
+    // served by the receipt engine at the floor or above; below it nothing
+    // registers and its card says the integration is out of date. Only a
+    // receipt receiver streams, and nothing waits once but Claude Code's
+    // waiter above (part 3, H5 removed the legacy waiter).
+    if mode == InboxWaitMode::Stream
+        && arm
+            .adapter_integration
+            .is_some_and(|declared| declared >= ADAPTER_INTEGRATION)
+    {
+        serve_receipt(
+            hub, pane_id, agent_id, component, instance, arm, reader, writer, repaint,
         )
         .await;
         return;
     }
-    // PRD #1666 step 4: only a receipt receiver streams. A legacy stream's
-    // ack/nack/hold loop went with the last component that used it (Pi's old
-    // extension, refused above), so a stream from any other component is
-    // refused before it arms and its mail stays queued.
-    if mode == InboxWaitMode::Stream {
-        warn!(pane_id = %pane_id, ?component, "inbox: refused a stream from a component that cannot stream");
-        let _ = write_line_within(
-            deadline,
-            &mut writer,
-            &InboxWaitReply::refused("unsupported", crate::inbox_display::STREAM_UNSUPPORTED),
-        )
-        .await;
-        return;
-    }
-    let armed = match hub.arm(&pane_id, &agent_id, mode, component, instance) {
-        Ok(armed) => armed,
-        Err(error) => {
-            let _ = write_line_within(
-                deadline,
-                &mut writer,
-                &InboxWaitReply::refused(error.code(), &error.message()),
-            )
-            .await;
-            return;
-        }
-    };
-    let ArmedWaiter {
-        conn_id, mut rx, ..
-    } = armed;
-    let consumer = match mode {
-        InboxWaitMode::Once => Consumer::Waiter { conn_id },
-        InboxWaitMode::Stream => Consumer::Stream { conn_id },
-    };
-    // Lines from the peer, read on their own task so the select below never
-    // drops a half-read line. Ends (closing the channel) at EOF or an error.
-    let (line_tx, mut lines) = mpsc::channel::<String>(16);
-    let read_task = tokio::spawn(async move {
-        let mut reader = reader;
-        while let Ok(Some(line)) = crate::bounded_read::read_capped_line(
-            &mut reader,
-            crate::bounded_read::MAX_HOOK_LINE_BYTES,
-        )
-        .await
-        {
-            if line_tx.send(line).await.is_err() {
-                break;
-            }
-        }
-    });
-    let mut keepalive = tokio::time::interval(hub.keepalive());
-    keepalive.tick().await;
-    // Whether a Once waiter's hand-over reached its peer: only then is its
-    // batch the peer's to acknowledge rather than the queue's to take back.
-    let mut handed_over = false;
-    loop {
-        tokio::select! {
-            signal = rx.recv() => match signal {
-                Some(WaiterSignal::Deliver(batch)) => {
-                    let ids: Vec<String> = batch.iter().map(|d| d.id.clone()).collect();
-                    if write_line_within(deadline, &mut writer, &InboxWaitReply::messages(batch)).await.is_err() {
-                        debug!(conn_id, "inbox: waiter vanished or stopped reading before its hand-over");
-                        break;
-                    }
-                    info!(conn_id, ?ids, "inbox: messages handed to a waiter");
-                    if mode == InboxWaitMode::Once {
-                        handed_over = true;
-                        break;
-                    }
-                }
-                Some(WaiterSignal::Superseded) => {
-                    let _ = write_line_within(deadline, &mut writer, &InboxWaitReply::superseded()).await;
-                    break;
-                }
-                // Only a receipt receiver is sent these.
-                Some(WaiterSignal::Line(_) | WaiterSignal::Once(_)) => {}
-                Some(WaiterSignal::Close) | None => break,
-            },
-            line = lines.recv() => match line {
-                // A once waiter has nothing to say after its request.
-                Some(_) => {}
-                None => {
-                    debug!(conn_id, "inbox: waiter closed its connection");
-                    break;
-                }
-            },
-            _ = keepalive.tick() => {
-                if write_line_within(deadline, &mut writer, &InboxWaitReply::keepalive()).await.is_err() {
-                    debug!(conn_id, "inbox: keepalive failed; waiter is gone or not reading");
-                    break;
-                }
-            }
-        }
-    }
-    read_task.abort();
-    hub.disarm(&pane_id, &agent_id, conn_id);
-    if !handed_over {
-        // A once batch that never reached its peer goes back to the queue.
-        hub.requeue_consumer(&pane_id, &agent_id, &consumer);
-    }
-    let _ = tokio::time::timeout(deadline, writer.shutdown()).await;
+    hub.refuse_old_adapter(&pane_id, &agent_id);
+    warn!(
+        pane_id = %pane_id,
+        ?component,
+        declared = ?arm.adapter_integration,
+        "inbox: refused a component whose integration is out of date"
+    );
+    let _ = write_line_within(
+        deadline,
+        &mut writer,
+        &InboxWaitReply::refused("adapter_too_old", crate::inbox_display::ADAPTER_TOO_OLD),
+    )
+    .await;
 }
 
 /// [`write_line`], bounded by `deadline` (hardening M4): a peer that does not
@@ -5397,11 +6155,96 @@ mod tests {
             spill_path: None,
             id: None,
             preface: None,
+            provenance: None,
         }
     }
 
     fn hub() -> InboxHub {
         InboxHub::new(deck(), InboxLimits::default(), DEFAULT_KEEPALIVE)
+    }
+
+    /// What `agent` in `pane` would be handed for each waiting message,
+    /// rendered as a fetch renders it within `budget`, without taking it: for
+    /// tests of the rendering alone.
+    fn rendered(
+        hub: &InboxHub,
+        pane: &str,
+        agent: &str,
+        budget: Option<InboxBudget>,
+    ) -> Vec<InboxDelivery> {
+        let st = hub.lock();
+        queued_for(&st.inbox, pane, agent)
+            .map(|message| render_within(message, budget))
+            .collect()
+    }
+
+    /// Claude Code's once waiter on receipts, over an in-memory connection
+    /// ([`serve_waiter`] at the one-shot integration).
+    struct OnceWaiter {
+        lines: tokio::io::Lines<tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+        to: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        serve: tokio::task::JoinHandle<()>,
+    }
+
+    impl OnceWaiter {
+        /// Arm one for `agent` in `pane`, run by process `instance`; answers
+        /// it and its first line (`registered`, or a refusal).
+        async fn open(
+            hub: &Arc<InboxHub>,
+            pane: &str,
+            agent: &str,
+            instance: Option<u32>,
+        ) -> (OnceWaiter, InboxWaitReply) {
+            use tokio::io::AsyncBufReadExt;
+            let (client, server) = tokio::io::duplex(1 << 16);
+            let (read, write) = tokio::io::split(server);
+            let serve = tokio::spawn(serve_waiter(
+                Arc::clone(hub),
+                pane.to_string(),
+                agent.to_string(),
+                InboxWaitMode::Once,
+                InboxComponent::ClaudeWaiter,
+                instance,
+                ReceiptArm {
+                    hook_integration: Some(HOOK_INTEGRATION),
+                    ..ReceiptArm::default()
+                },
+                tokio::io::BufReader::new(read),
+                write,
+                |_: &str| {},
+            ));
+            let (from, to) = tokio::io::split(client);
+            let mut waiter = OnceWaiter {
+                lines: tokio::io::BufReader::new(from).lines(),
+                to,
+                serve,
+            };
+            let first = waiter.next().await.expect("the deck answers the wait");
+            (waiter, first)
+        }
+
+        /// The next line that is not a keepalive; `None` once the deck ended
+        /// the connection.
+        async fn next(&mut self) -> Option<InboxWaitReply> {
+            loop {
+                let line = tokio::time::timeout(Duration::from_secs(5), self.lines.next_line())
+                    .await
+                    .expect("the deck writes in time")
+                    .ok()
+                    .flatten()?;
+                let reply: InboxWaitReply = serde_json::from_str(&line).unwrap();
+                if !reply.keepalive {
+                    return Some(reply);
+                }
+            }
+        }
+
+        async fn close(mut self) {
+            use tokio::io::AsyncWriteExt;
+            let _ = self.to.shutdown().await;
+            drop(self.lines);
+            let _ = tokio::time::timeout(Duration::from_secs(5), self.serve).await;
+        }
     }
 
     /// Audit F3 (a): the first process to arm or announce for an agent
@@ -5412,7 +6255,7 @@ mod tests {
     /// the generation.
     #[tokio::test]
     async fn the_first_receiver_instance_is_pinned_for_the_generation() {
-        let hub = hub();
+        let hub = Arc::new(hub());
         hub.announce(
             "p",
             "a",
@@ -5421,26 +6264,10 @@ mod tests {
             Some(100),
         )
         .unwrap();
-        let once = |instance| {
-            hub.arm(
-                "p",
-                "a",
-                InboxWaitMode::Once,
-                InboxComponent::ClaudeWaiter,
-                instance,
-            )
-            .err()
-        };
-        let again = |instance| {
-            hub.arm(
-                "p",
-                "a",
-                InboxWaitMode::Once,
-                InboxComponent::ClaudeWaiter,
-                instance,
-            )
-        };
-        assert_eq!(once(Some(200)), Some(ArmError::OtherInstance));
+        let refused = ArmError::OtherInstance.code();
+        let (gone, first) = OnceWaiter::open(&hub, "p", "a", Some(200)).await;
+        assert_eq!(first.refused.as_deref(), Some(refused));
+        gone.close().await;
         assert_eq!(
             hub.announce(
                 "p",
@@ -5456,27 +6283,29 @@ mod tests {
             Some(InboxWake::TurnEnd),
             "a refused announcement must not change how the pane is woken"
         );
-        let first = again(Some(100)).expect("the pinned instance arms");
-        let second = again(Some(100)).expect("and arms again");
-        assert!(again(Some(200)).is_err());
-        hub.disarm("p", "a", first.conn_id);
-        hub.disarm("p", "a", second.conn_id);
+        let (first, armed) = OnceWaiter::open(&hub, "p", "a", Some(100)).await;
+        assert!(armed.registered.is_some(), "the pinned instance arms");
+        let (second, armed) = OnceWaiter::open(&hub, "p", "a", Some(100)).await;
+        assert!(armed.registered.is_some(), "and arms again");
+        let (gone, other) = OnceWaiter::open(&hub, "p", "a", Some(200)).await;
+        assert_eq!(other.refused.as_deref(), Some(refused));
+        gone.close().await;
+        first.close().await;
+        second.close().await;
         assert_eq!(hub.armed("p", "a"), 0);
-        assert_eq!(again(Some(200)).err(), Some(ArmError::OtherInstance));
-        assert_eq!(again(None).err(), Some(ArmError::OtherInstance));
+        for instance in [Some(200), None] {
+            let (gone, other) = OnceWaiter::open(&hub, "p", "a", instance).await;
+            assert_eq!(other.refused.as_deref(), Some(refused), "{instance:?}");
+            gone.close().await;
+        }
 
         hub.agent_exited("p", "a");
+        let (successor, armed) = OnceWaiter::open(&hub, "p", "b", Some(200)).await;
         assert!(
-            hub.arm(
-                "p",
-                "b",
-                InboxWaitMode::Once,
-                InboxComponent::ClaudeWaiter,
-                Some(200)
-            )
-            .is_ok(),
+            armed.registered.is_some(),
             "a successor generation pins its own receiver"
         );
+        successor.close().await;
     }
 
     /// PR #1735 second review: a reserved answer's room is the deck's last
@@ -5517,9 +6346,9 @@ mod tests {
         ));
     }
 
-    /// PRD #1666 §2.8: a message handed over the most times allowed, none
-    /// acknowledged, owes its recipient's card a notice through the installed
-    /// sink — once, with the fixed not-delivered text.
+    /// PRD #1666 §2.8: a message handed out the most times allowed, each
+    /// positively not handed over, owes its recipient's card a notice through
+    /// the installed sink — once, with the fixed not-delivered text.
     #[test]
     fn an_undeliverable_message_tells_its_recipients_card() {
         let limits = InboxLimits {
@@ -5539,10 +6368,12 @@ mod tests {
             .post_direct(Recipient::bound("p", "a"), content("task"))
             .unwrap()
             .to_string();
-        hub.fetch("p", "a", Consumer::FetchCli, None, None);
+        let hook = hub.test_hook_fetch("p", "a", None);
         assert!(told.lock().unwrap().is_empty(), "a fetch owes no notice");
-        // Unacknowledged after its one allowed hand-over: undeliverable.
-        hub.run_out_ack_wait(&id, "p");
+        // Positively not handed over on its one allowed hand-over:
+        // undeliverable.
+        hub.test_hook_not_handed(&hook);
+        hub.test_hook_close(hook);
         assert_eq!(
             *told.lock().unwrap(),
             [format!(
@@ -5625,8 +6456,9 @@ mod tests {
             .unwrap();
         hub.post_direct(Recipient::bound("p", "b"), content("other generation"))
             .unwrap();
-        let taken = hub.fetch("p", "a", Consumer::FetchCli, Some(1), None);
-        assert_eq!(taken.len(), 1);
+        let hub = Arc::new(hub);
+        let taken = hub.test_hook_fetch("p", "a", Some(InboxBudget::Chars(1)));
+        assert_eq!(taken.deliveries.len(), 1);
         let s = hub.summary("p", "a");
         assert_eq!((s.queued, s.fetched, s.undeliverable), (1, 1, 0));
         assert_eq!(s.wake, WakePath::Doorbell);
@@ -5634,9 +6466,10 @@ mod tests {
         assert_eq!(s.last_acked_at, None);
 
         assert_eq!(
-            hub.ack(&taken[0].id, "p", "a", AckHow::Explicit),
+            hub.ack(&taken.deliveries[0].id, "p", "a", AckHow::Explicit),
             AckOutcome::Acknowledged
         );
+        hub.test_hook_close(taken);
         assert!(hub.summary("p", "a").last_acked_at.is_some());
 
         // A Native announcement with nothing armed is still the doorbell.
@@ -5661,22 +6494,15 @@ mod tests {
         assert_eq!(s.wake, WakePath::TurnEnd);
         assert_eq!(s.component.as_deref(), Some("codex_hooks"));
 
-        // An armed waiter wins over any announcement, and names itself. A
-        // once-waiter is spent by a hand-over, so nothing is left queued for it.
-        hub.fetch("p", "a", Consumer::FetchCli, None, None);
-        let waiter = hub
-            .arm(
-                "p",
-                "a",
-                InboxWaitMode::Once,
-                InboxComponent::ClaudeWaiter,
-                None,
-            )
-            .unwrap();
+        // An armed waiter wins over any announcement, and names itself.
+        let rest = hub.test_hook_fetch("p", "a", None);
+        hub.test_hook_close(rest);
+        let (waiter, armed) = OnceWaiter::open(&hub, "p", "a", None).await;
+        assert!(armed.registered.is_some());
         let s = hub.summary("p", "a");
         assert_eq!(s.wake, WakePath::Native);
         assert_eq!(s.component.as_deref(), Some("claude_waiter"));
-        assert!(hub.disarm("p", "a", waiter.conn_id));
+        waiter.close().await;
         assert_eq!(hub.summary("p", "a").wake, WakePath::TurnEnd);
 
         // The other generation's message is its own.
@@ -5690,11 +6516,17 @@ mod tests {
     fn every_state_change_is_broadcast_and_an_exit_is_undeliverable() {
         use crate::inbox::{StateName, UndeliverableReason};
         let hub = hub();
-        let (tx, mut rx) = broadcast::channel(16);
+        let (tx, mut rx) = broadcast::channel(64);
         hub.set_broadcast(tx);
-        let mut next = || match rx.try_recv() {
-            Ok(BroadcastMsg::Inbox(notice)) => notice,
-            other => panic!("expected an inbox broadcast, got {other:?}"),
+        let mut next = || loop {
+            match rx.try_recv() {
+                // A receiver's registration repaints the card's notices.
+                Ok(BroadcastMsg::Inbox(notice))
+                    if notice.attention_update || notice.wake_update => {}
+                Ok(BroadcastMsg::Inbox(notice)) => break notice,
+                Ok(_) => continue,
+                other => panic!("expected an inbox broadcast, got {other:?}"),
+            }
         };
         let id = hub
             .post_direct(Recipient::bound("p", "a"), content("hello"))
@@ -5710,9 +6542,10 @@ mod tests {
             "dot-agent-deck (the prompt this session was started with)"
         );
         assert_eq!(posted.state, StateName::Queued);
-        hub.fetch("p", "a", Consumer::FetchCli, None, None);
+        let hook = hub.test_hook_fetch("p", "a", None);
         assert_eq!(next().state, StateName::Fetched);
-        hub.run_out_ack_wait(&id, "p");
+        hub.test_hook_not_handed(&hook);
+        hub.test_hook_close(hook);
         assert_eq!(next().state, StateName::Queued);
 
         let other = hub
@@ -5724,10 +6557,18 @@ mod tests {
         assert_eq!(lost.message_id, id);
         assert_eq!(lost.state, StateName::Undeliverable);
         assert_eq!(lost.reason, Some(UndeliverableReason::AgentExited));
-        assert!(matches!(
-            rx.try_recv(),
-            Err(broadcast::error::TryRecvError::Empty)
-        ));
+        loop {
+            match rx.try_recv() {
+                Ok(BroadcastMsg::Inbox(notice))
+                    if notice.attention_update || notice.wake_update => {}
+                Ok(BroadcastMsg::Inbox(notice)) => panic!("one exit, one change: {notice:?}"),
+                Ok(_) => continue,
+                Err(error) => {
+                    assert_eq!(error, broadcast::error::TryRecvError::Empty);
+                    break;
+                }
+            }
+        }
         let kept = hub.list("p");
         assert!(
             kept.iter()
@@ -5741,18 +6582,22 @@ mod tests {
     #[test]
     fn a_hand_back_is_broadcast_as_one() {
         let hub = hub();
-        let (tx, mut rx) = broadcast::channel(16);
+        let (tx, mut rx) = broadcast::channel(64);
         hub.set_broadcast(tx);
-        let mut next = || match rx.try_recv() {
-            Ok(BroadcastMsg::Inbox(notice)) => (notice.state, notice.requeued),
-            other => panic!("expected an inbox broadcast, got {other:?}"),
+        let mut next = || loop {
+            match rx.try_recv() {
+                Ok(BroadcastMsg::Inbox(notice))
+                    if notice.attention_update || notice.wake_update => {}
+                Ok(BroadcastMsg::Inbox(notice)) => break (notice.state, notice.requeued),
+                Ok(_) => continue,
+                other => panic!("expected an inbox broadcast, got {other:?}"),
+            }
         };
-        let id = hub
-            .post_direct(Recipient::bound("p", "a"), content("hello"))
-            .unwrap()
-            .to_string();
-        hub.fetch("p", "a", Consumer::FetchCli, None, None);
-        hub.run_out_ack_wait(&id, "p");
+        hub.post_direct(Recipient::bound("p", "a"), content("hello"))
+            .unwrap();
+        let hook = hub.test_hook_fetch("p", "a", None);
+        hub.test_hook_not_handed(&hook);
+        hub.test_hook_close(hook);
         use crate::inbox::StateName::{Fetched, Queued};
         assert_eq!(
             [next(), next(), next()],
@@ -5760,80 +6605,82 @@ mod tests {
         );
     }
 
+    /// PRD #1666 part 2 (C-2), part 3 (H5): a newer once waiter supersedes
+    /// the older at once, takes the batch, each block naming its attempt, and
+    /// the older is told and gets none; spent by its batch, the newer leaves
+    /// none armed.
     #[tokio::test]
     async fn newest_once_waiter_takes_the_batch_and_is_spent() {
-        let hub = hub();
-        let mut older = hub
-            .arm(
-                "p",
-                "a",
-                InboxWaitMode::Once,
-                InboxComponent::ClaudeWaiter,
-                None,
-            )
-            .unwrap();
-        let mut newer = hub
-            .arm(
-                "p",
-                "a",
-                InboxWaitMode::Once,
-                InboxComponent::ClaudeWaiter,
-                None,
-            )
-            .unwrap();
+        let hub = Arc::new(hub());
+        let (mut older, armed) = OnceWaiter::open(&hub, "p", "a", None).await;
+        assert!(armed.registered.is_some());
+        let (mut newer, armed) = OnceWaiter::open(&hub, "p", "a", None).await;
+        assert!(armed.registered.is_some());
+        assert!(older.next().await.is_some_and(|reply| reply.superseded));
         let id = hub
             .post_direct(Recipient::bound("p", "a"), content("hello"))
             .unwrap();
-        match newer.rx.try_recv() {
-            Ok(WaiterSignal::Deliver(batch)) => {
-                assert_eq!(batch.len(), 1);
-                assert!(batch[0].text.contains(&format!("{BLOCK_OPENER}{id} from ")));
-                assert!(batch[0].text.contains("hello"));
-            }
-            other => panic!("newest waiter must get the batch: {other:?}"),
-        }
-        assert!(older.rx.try_recv().is_err());
-        assert_eq!(hub.armed("p", "a"), 1);
+        let batch = newer.next().await.and_then(|reply| reply.messages);
+        let batch = batch.expect("the newest waiter gets the batch");
+        assert_eq!(batch.len(), 1);
+        let at = batch[0].attempt.as_ref().expect("a receipt hand-out");
+        assert!(batch[0].text.contains(&format!(
+            "{BLOCK_OPENER}{id} delivery {}.{} from ",
+            at.a, at.e
+        )));
+        assert!(batch[0].text.contains("hello"));
+        assert!(older.next().await.is_none(), "the superseded one ends");
+        assert_eq!(
+            hub.armed("p", "a"),
+            0,
+            "the older was superseded and the newer is spent by its batch"
+        );
+        older.close().await;
+        newer.close().await;
     }
 
-    /// PR #1735 fifth review (N1): Claude's prompt hook acknowledges the ids
-    /// whose openers the prompt carries, so one hand-over must never carry
-    /// more blocks than that hook reads. Seventeen short messages fit a once
-    /// waiter's character budget easily; the waiter's batch, as `inbox wait`
-    /// joins it for Claude, must be recognised id for id, and what did not fit
-    /// stays queued for the next hand-over.
+    /// PR #1735 fifth review (N1), part 2 §1.3: Claude's prompt hook commits
+    /// the exact attempts whose openers the prompt carries, so one hand-over
+    /// must never carry more blocks than that hook reads. Seventeen short
+    /// messages fit a once waiter's character budget easily; the waiter's
+    /// batch, as `inbox wait` joins it for Claude, must be recognised attempt
+    /// for attempt, and what did not fit stays queued for the next hand-over.
     #[tokio::test]
-    async fn a_once_waiters_batch_is_every_id_its_prompt_hook_acknowledges() {
-        let hub = hub();
+    async fn a_once_waiters_batch_is_every_attempt_its_prompt_hook_commits() {
+        let hub = Arc::new(hub());
         for n in 0..17 {
             hub.post_direct(Recipient::bound("p", "a"), content(&format!("note {n}")))
                 .unwrap();
         }
-        let mut waiter = hub
-            .arm(
-                "p",
-                "a",
-                InboxWaitMode::Once,
-                InboxComponent::ClaudeWaiter,
-                None,
-            )
-            .unwrap();
-        let batch = match waiter.rx.try_recv() {
-            Ok(WaiterSignal::Deliver(batch)) => batch,
-            other => panic!("the waiter must get a batch: {other:?}"),
-        };
+        let (mut waiter, armed) = OnceWaiter::open(&hub, "p", "a", None).await;
+        assert!(armed.registered.is_some());
+        let batch = waiter
+            .next()
+            .await
+            .and_then(|reply| reply.messages)
+            .expect("the waiter must get a batch");
         let prompt = batch
             .iter()
             .map(|delivery| delivery.text.as_str())
             .collect::<Vec<_>>()
             .join(BLOCK_SEPARATOR);
-        let handed: Vec<String> = batch.iter().map(|d| d.id.clone()).collect();
+        let handed: Vec<(String, u32, u32)> = batch
+            .iter()
+            .map(|d| {
+                let at = d.attempt.as_ref().unwrap();
+                (d.id.clone(), at.a, at.e)
+            })
+            .collect();
+        let scanned: Vec<(String, u32, u32)> = crate::inbox_prompt::delivered(&prompt)
+            .into_iter()
+            .map(|at| (at.id, at.a, at.e))
+            .collect();
         assert_eq!(
-            crate::inbox_prompt::scan(&prompt).opened,
-            handed,
-            "every id one hand-over carries is one the prompt hook acknowledges"
+            scanned, handed,
+            "every attempt one hand-over carries is one the prompt hook commits"
         );
         assert_eq!(hub.summary("p", "a").queued, 17 - handed.len());
+        waiter.close().await;
     }
 
     /// A registry with one stand-in agent (`cat`) in `pane`, run in `cwd`.
@@ -5929,7 +6776,7 @@ mod tests {
         assert!(!hub.summary("p", "a").wake_stalled);
         hub.set_wake_stalled("p", "a", true);
         while rx.try_recv().is_ok() {}
-        let taken = hub.fetch("p", "a", Consumer::FetchCli, None, Some(AckHow::Explicit));
+        let taken = hub.test_take_acked("p", "a");
         assert!(!taken.is_empty());
         assert!(
             !hub.summary("p", "a").wake_stalled,
@@ -5963,6 +6810,7 @@ mod tests {
         let ledger = || DelegateLedger {
             commission_arm_id: None,
             delegation_seq: None,
+            instance: None,
         };
         let (older, _end) = hub
             .post_delegate(
@@ -6017,6 +6865,7 @@ mod tests {
         let ledger = || DelegateLedger {
             commission_arm_id: None,
             delegation_seq: None,
+            instance: None,
         };
         let (older, mut older_end) = hub
             .post_delegate(
@@ -6186,7 +7035,7 @@ mod tests {
             .push((to.clone(), "owed subject", "owed body".to_string()));
         hub.post_owed_notices();
         assert_eq!(hub.summary("o", "x").queued, 1, "the inbox is full");
-        let taken = hub.fetch("o", "x", Consumer::FetchCli, None, Some(AckHow::Explicit));
+        let taken = hub.test_take_acked("o", "x");
         assert_eq!(taken.len(), 1);
         hub.post_owed_notices();
         let owed: Vec<_> = hub
@@ -6201,37 +7050,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn past_the_cap_the_oldest_is_superseded() {
-        let hub = hub();
-        let mut waiters: Vec<ArmedWaiter> = (0..MAX_WAITERS_PER_AGENT)
-            .map(|_| {
-                hub.arm(
-                    "p",
-                    "a",
-                    InboxWaitMode::Once,
-                    InboxComponent::ClaudeWaiter,
-                    None,
-                )
-                .unwrap()
-            })
-            .collect();
-        let _newest = hub
-            .arm(
-                "p",
-                "a",
-                InboxWaitMode::Once,
-                InboxComponent::ClaudeWaiter,
-                None,
-            )
-            .unwrap();
-        assert!(matches!(
-            waiters[0].rx.try_recv(),
-            Ok(WaiterSignal::Superseded)
-        ));
-        assert_eq!(hub.armed("p", "a"), MAX_WAITERS_PER_AGENT);
-    }
-
     /// PR #1735 review: a fetch a doorbell started takes nothing once the
     /// message that doorbell named is no longer queued — another consumer took
     /// it — even while newer mail waits; while it is queued, the fetch takes
@@ -6242,30 +7060,17 @@ mod tests {
         let named = hub
             .post_direct(Recipient::bound("p", "a"), content("named"))
             .unwrap();
-        let taken = hub.fetch("p", "a", Consumer::FetchCli, None, Some(AckHow::Explicit));
+        let taken = hub.test_take_acked("p", "a");
         assert_eq!(taken.len(), 1);
         let newer = hub
             .post_direct(Recipient::bound("p", "a"), content("newer"))
             .unwrap();
-        let stale = hub.fetch_named_within(
-            "p",
-            "a",
-            Consumer::DoorbellHook,
-            None,
-            None,
-            Some(named.as_str()),
-        );
-        assert!(stale.is_empty(), "{stale:?}");
-        let current = hub.fetch_named_within(
-            "p",
-            "a",
-            Consumer::DoorbellHook,
-            None,
-            None,
-            Some(newer.as_str()),
-        );
-        assert_eq!(current.len(), 1);
-        assert_eq!(current[0].id, newer.to_string());
+        let stale = hub.test_hook_fetch_named("p", "a", Some(named.as_str()), None);
+        assert!(stale.deliveries.is_empty(), "{:?}", stale.deliveries);
+        hub.test_hook_close(stale);
+        let current = hub.test_hook_fetch_named("p", "a", Some(newer.as_str()), None);
+        assert_eq!(current.ids(), vec![newer.to_string()]);
+        hub.test_hook_close(current);
     }
 
     /// PR #1735 review: a waiter whose agent exited is told it was superseded,
@@ -6317,7 +7122,7 @@ mod tests {
             orchestration: None,
         };
         let id = hub.post_direct(Recipient::bound("p", "a"), c).unwrap();
-        let out = hub.fetch("p", "a", Consumer::FetchCli, None, None);
+        let out = rendered(&hub, "p", "a", None);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].text.matches(BLOCK_CLOSER).count(), 1);
         assert!(out[0].text.ends_with(&format!("{BLOCK_CLOSER}{id}]")));
@@ -6344,7 +7149,7 @@ mod tests {
         };
         c.preface = Some("Sent by: the user.".to_string());
         let id = hub.post_direct(Recipient::bound("p", "a"), c).unwrap();
-        let text = &hub.fetch("p", "a", Consumer::FetchCli, None, None)[0].text;
+        let text = &rendered(&hub, "p", "a", None)[0].text;
         let lines: Vec<&str> = text.lines().collect();
         assert!(lines[0].starts_with(&format!("{BLOCK_OPENER}{id} from ")));
         assert_eq!(
@@ -6426,7 +7231,7 @@ mod tests {
         for (c, expected) in cases {
             let hub = hub();
             hub.post_direct(Recipient::bound("p", "a"), c).unwrap();
-            let text = &hub.fetch("p", "a", Consumer::FetchCli, None, None)[0].text;
+            let text = &rendered(&hub, "p", "a", None)[0].text;
             assert_eq!(text.lines().nth(1), Some(expected), "{text}");
         }
     }
@@ -6437,7 +7242,7 @@ mod tests {
         let mut c = content(&"x".repeat(20_000));
         c.spill_path = Some(std::path::PathBuf::from(".dot-agent-deck/task.md"));
         hub.post_direct(Recipient::bound("p", "a"), c).unwrap();
-        let out = hub.fetch("p", "a", Consumer::FetchCli, Some(9_000), None);
+        let out = rendered(&hub, "p", "a", Some(InboxBudget::Chars(9_000)));
         assert_eq!(out.len(), 1);
         assert!(out[0].text.chars().count() < 9_000);
         assert!(
@@ -6573,7 +7378,7 @@ mod tests {
         assert_eq!(hub.owned_spills(), vec![path.clone()]);
         hub.tick();
         assert!(path.exists(), "a live message keeps its file");
-        let taken = hub.fetch("w", "wa", Consumer::FetchCli, None, Some(AckHow::Explicit));
+        let taken = hub.test_take_acked("w", "wa");
         assert_eq!(taken.len(), 1);
         hub.tick();
         assert!(path.exists(), "an acknowledgement alone removes nothing");
@@ -6607,7 +7412,7 @@ mod tests {
             .unwrap()
             .set_modified(std::time::SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60))
             .unwrap();
-        let taken = before.fetch("w", "wa", Consumer::FetchCli, None, Some(AckHow::Explicit));
+        let taken = before.test_take_acked("w", "wa");
         assert_eq!(taken.len(), 1);
         before.tick();
         drop(before);
@@ -6671,8 +7476,8 @@ mod tests {
         let worker = Recipient::bound("w", "wa");
         let (c, spill) = saved_long(&hub, dir.path(), "TASK");
         let task_path = spill.path().unwrap().to_path_buf();
-        let (_task, _end) = delegate_saved(&hub, &worker, c, spill);
-        let taken = hub.fetch("w", "wa", Consumer::FetchCli, None, Some(AckHow::Explicit));
+        let (task, _end) = delegate_saved(&hub, &worker, c, spill);
+        let taken = hub.test_take_acked("w", "wa");
         assert_eq!(taken.len(), 1, "the worker acknowledged its task");
 
         // Other agents' long reports settle, well past the byte bound and
@@ -6689,7 +7494,7 @@ mod tests {
             let id = hub.post_direct(Recipient::bound("o", "oa"), c).unwrap();
             hub.own_spill(spill, &id);
         }
-        hub.fetch("o", "oa", Consumer::FetchCli, None, Some(AckHow::Explicit));
+        hub.test_take_acked("o", "oa");
         hub.tick();
         assert!(
             task_path.exists(),
@@ -6700,7 +7505,7 @@ mod tests {
             "the byte bound reclaimed the reports"
         );
 
-        hub.retire_answered_delegates_to("w");
+        report_task(&hub, "w", &task);
         hub.tick();
         assert!(!task_path.exists(), "its work-done retired the task");
     }
@@ -6716,7 +7521,7 @@ mod tests {
         let (c, spill) = saved_long(&hub, dir.path(), "TASK");
         let path = spill.path().unwrap().to_path_buf();
         let (_task, _end) = delegate_saved(&hub, &worker, c, spill);
-        hub.fetch("w", "wa", Consumer::FetchCli, None, Some(AckHow::Explicit));
+        hub.test_take_acked("w", "wa");
         hub.tick();
         assert!(path.exists(), "held while the worker works");
         hub.agent_exited("w", "another-agent");
@@ -6745,7 +7550,15 @@ mod tests {
             spill,
             &|| true,
         )
+        .map(|posted| (posted.id, posted.ended))
         .unwrap()
+    }
+
+    /// What a worker's report of `task` retires in the hub, as the commit
+    /// retires it (PRD #1666 part 3, round 5).
+    fn report_task(hub: &InboxHub, pane: &str, task: &MessageId) {
+        let mut st = hub.lock();
+        retire_reported_task(&mut st, Instant::now(), task.as_str(), pane);
     }
 
     /// The saved bodies `hub` answers for removal `age` after now, as the
@@ -6810,13 +7623,13 @@ mod tests {
         let worker = Recipient::bound("w", "wa");
         let (c, spill) = saved_long(&hub, dir.path(), "TASK");
         let path = spill.path().unwrap().to_path_buf();
-        let (_task, _end) = delegate_saved(&hub, &worker, c, spill);
+        let (task, _end) = delegate_saved(&hub, &worker, c, spill);
         assert_eq!(
             hub.lock().spills.held_paths(),
             vec![path.clone()],
             "the body is held from the moment the task is accepted"
         );
-        hub.retire_answered_delegates_to("w");
+        report_task(&hub, "w", &task);
         hub.tick();
         let grace = crate::inbox_spills::DEFAULT_SPILL_PROTECTED_GRACE;
         let minute = Duration::from_secs(60);
@@ -6844,7 +7657,7 @@ mod tests {
         let path = spill.path().unwrap().to_path_buf();
         let id = hub.post_direct(Recipient::bound("w", "wa"), c).unwrap();
         hub.own_spill(spill, &id);
-        hub.fetch("w", "wa", Consumer::FetchCli, None, Some(AckHow::Explicit));
+        hub.test_take_acked("w", "wa");
         hub.lock().spills.retention = Duration::ZERO;
         let context = path.parent().unwrap().to_path_buf();
         let mode = |m| std::fs::set_permissions(&context, std::fs::Permissions::from_mode(m));
@@ -6874,7 +7687,7 @@ mod tests {
         let path = spill.path().unwrap().to_path_buf();
         let id = hub.post_direct(Recipient::bound("w", "wa"), c).unwrap();
         hub.own_spill(spill, &id);
-        hub.fetch("w", "wa", Consumer::FetchCli, None, Some(AckHow::Explicit));
+        hub.test_take_acked("w", "wa");
         hub.lock().spills.retention = Duration::ZERO;
         let context = path.parent().unwrap().to_path_buf();
         let mode = |m| std::fs::set_permissions(&context, std::fs::Permissions::from_mode(m));
@@ -6904,7 +7717,7 @@ mod tests {
         let path = spill.path().unwrap().to_path_buf();
         let id = hub.post_direct(Recipient::bound("w", "wa"), c).unwrap();
         hub.own_spill(spill, &id);
-        hub.fetch("w", "wa", Consumer::FetchCli, None, Some(AckHow::Explicit));
+        hub.test_take_acked("w", "wa");
         hub.tick();
         assert!(path.exists(), "within its grace, the bound spares it");
         assert_eq!(hub.owned_spills(), vec![path]);
@@ -6929,7 +7742,7 @@ mod tests {
         hub.post_direct(worker.clone(), content("posted while the task saved"))
             .unwrap();
         let mut room = room;
-        let (task, _end) = hub
+        let task = hub
             .post_reserved_delegate(
                 &mut room,
                 worker.clone(),
@@ -6940,7 +7753,8 @@ mod tests {
                 MintedSpill::default(),
                 &|| true,
             )
-            .unwrap();
+            .unwrap()
+            .id;
         assert_eq!(state_in(&hub, "w", &task), StateName::Queued);
         assert_eq!(hub.list("w").len(), 3, "one over the limit of two");
         let refused = hub.post_direct(worker.clone(), content("one more"));
@@ -6948,7 +7762,7 @@ mod tests {
             matches!(refused, Err(PostError::InboxFull { .. })),
             "{refused:?}"
         );
-        hub.fetch("w", "a", Consumer::FetchCli, None, Some(AckHow::Explicit));
+        hub.test_take_acked("w", "a");
         assert!(
             hub.post_direct(worker, content("after they settled"))
                 .is_ok(),
@@ -6986,13 +7800,7 @@ mod tests {
         let report_path = spill.path().unwrap().to_path_buf();
         let report = hub.post_direct(Recipient::bound("w2", "wa2"), c).unwrap();
         hub.own_spill(spill, &report);
-        hub.fetch(
-            "w2",
-            "wa2",
-            Consumer::FetchCli,
-            None,
-            Some(AckHow::Explicit),
-        );
+        hub.test_take_acked("w2", "wa2");
         hub.lock().spills.retention = Duration::from_secs(3600);
         hub.tick();
         hub.forget_pane_history("w2");
@@ -7127,10 +7935,7 @@ mod tests {
     fn render_one(c: Content, budget: Option<InboxBudget>) -> (MessageId, String) {
         let hub = hub();
         let id = hub.post_direct(Recipient::bound("p", "a"), c).unwrap();
-        let text = hub
-            .fetch_within("p", "a", Consumer::FetchCli, budget, None)
-            .remove(0)
-            .text;
+        let text = rendered(&hub, "p", "a", budget).remove(0).text;
         (id, text)
     }
 
@@ -7227,8 +8032,8 @@ mod tests {
         }
     }
 
-    /// Hardening M6: several blocks rendered for one budget, counted by
-    /// `fitting`, still fit together.
+    /// Hardening M6: several blocks a hook receiver is handed within one
+    /// budget, each counted with its separator, still fit together.
     #[test]
     fn several_truncated_blocks_fit_their_budget_together() {
         let hub = hub();
@@ -7240,7 +8045,9 @@ mod tests {
             .unwrap();
         }
         let budget = InboxBudget::Bytes(6_000);
-        let out = hub.fetch_within("p", "a", Consumer::FetchCli, Some(budget), None);
+        let hook = hub.test_hook_fetch("p", "a", Some(budget));
+        let out = hook.deliveries.clone();
+        hub.test_hook_close(hook);
         let joined: String = out
             .iter()
             .map(|d| format!("{BLOCK_SEPARATOR}{}", d.text))
@@ -7318,49 +8125,6 @@ mod tests {
         .0
     }
 
-    /// PRD #1666 delegate_021: a worker's `work-done` answers the task it
-    /// fetched, not a newer one still queued for it. That newer task stays
-    /// queued and watched, so the orchestrator is told it has not reached the
-    /// worker, and the worker can still fetch it.
-    #[tokio::test]
-    async fn work_done_leaves_a_queued_newer_delegate_owed() {
-        let mut hub = hub();
-        hub.undelivered_after = Duration::ZERO;
-        let first = delegate(&hub, "OLDER-TASK");
-        let fetched = hub.fetch(
-            "w",
-            "wa",
-            Consumer::FetchCli,
-            None,
-            Some(AckHow::FetchedByCli),
-        );
-        assert_eq!(fetched.len(), 1);
-        assert_eq!(state_in(&hub, "w", &first), StateName::Acknowledged);
-        let second = delegate(&hub, "NEWER-TASK-STILL-OWED");
-
-        assert_eq!(hub.retire_answered_delegates_to("w"), 0);
-        assert_eq!(state_in(&hub, "w", &second), StateName::Queued);
-
-        hub.tick();
-        let notices: Vec<_> = hub
-            .list("o")
-            .into_iter()
-            .filter(|m| m.subject == UNDELIVERED_SUBJECT)
-            .collect();
-        assert_eq!(notices.len(), 1, "{notices:?}");
-        let body = hub
-            .fetch("o", "oa", Consumer::FetchCli, None, None)
-            .into_iter()
-            .map(|d| d.text)
-            .collect::<String>();
-        assert!(body.contains(second.as_str()), "{body}");
-        assert!(body.contains("has not reached the worker"), "{body}");
-
-        let taken = hub.fetch("w", "wa", Consumer::FetchCli, None, None);
-        assert_eq!(taken.len(), 1);
-        assert!(taken[0].text.contains("NEWER-TASK-STILL-OWED"));
-    }
-
     /// delegate_023: a task whose worker left after the dispatch last saw it
     /// live — and was swept from the inbox before the post — is not posted to
     /// the departed agent, where no exit sweep would ever end it.
@@ -7383,116 +8147,12 @@ mod tests {
         assert!(hub.lock().delegates.is_empty(), "a watch was left for it");
     }
 
-    /// PRD #1666 S5 (idle-worker/029): a worker that acknowledged no delegated
-    /// task since its last `work-done` answered one it took some other way —
-    /// its task file — so its `work-done` retires a task never fetched, and no
-    /// undelivered notice is posted about it.
-    #[tokio::test]
-    async fn work_done_with_no_task_received_retires_an_unfetched_delegate_silently() {
-        let mut hub = hub();
-        hub.undelivered_after = Duration::from_secs(3600);
-        let task = delegate(&hub, "TASK-READ-FROM-ITS-FILE");
-        assert_eq!(hub.retire_answered_delegates_to("w"), 1);
-        assert_eq!(state_in(&hub, "w", &task), StateName::Undeliverable);
-        hub.undelivered_after = Duration::ZERO;
-        hub.tick();
-        assert!(
-            hub.list("o").is_empty(),
-            "a task the worker answered is not reported"
-        );
-
-        // After a work-done answered an acknowledged task, the next one with
-        // nothing acknowledged in between is back to retiring everything.
-        let first = delegate(&hub, "ACKNOWLEDGED");
-        hub.fetch(
-            "w",
-            "wa",
-            Consumer::FetchCli,
-            None,
-            Some(AckHow::FetchedByCli),
-        );
-        let second = delegate(&hub, "QUEUED");
-        assert_eq!(hub.retire_answered_delegates_to("w"), 0);
-        assert_eq!(state_in(&hub, "w", &first), StateName::Acknowledged);
-        assert_eq!(hub.retire_answered_delegates_to("w"), 1);
-        assert_eq!(state_in(&hub, "w", &second), StateName::Undeliverable);
-    }
-
-    /// PRD #1666 delegate_021, the companion: after an acknowledged task, a
-    /// task the worker fetched and has not acknowledged is retired by its
-    /// `work-done` as superseded — fetched once and handed back to the queue by
-    /// the ack-wait counts too — and no undelivered notice is posted about it.
-    #[tokio::test]
-    async fn work_done_retires_a_fetched_unacknowledged_delegate_silently() {
-        let limits = InboxLimits {
-            ack_wait: Duration::ZERO,
-            ..InboxLimits::default()
-        };
-        let mut hub = InboxHub::new(deck(), limits, DEFAULT_KEEPALIVE);
-        hub.undelivered_after = Duration::from_secs(3600);
-        // Each worker acknowledged an earlier task, so a work-done may be its
-        // answer and retires only what reached the worker since.
-        for (pane, agent) in [("w", "wa"), ("w2", "wa2")] {
-            hub.post_delegate(
-                Recipient::bound(pane, agent),
-                "coder",
-                Some(Recipient::bound("o", "oa")),
-                DelegateLedger::default(),
-                content("EARLIER-TASK"),
-                &|| true,
-            )
-            .unwrap();
-            hub.fetch(
-                pane,
-                agent,
-                Consumer::FetchCli,
-                None,
-                Some(AckHow::FetchedByCli),
-            );
-        }
-        let fetched = delegate(&hub, "FETCHED-TASK");
-        assert_eq!(
-            hub.fetch("w", "wa", Consumer::FetchCli, None, None).len(),
-            1
-        );
-        assert_eq!(state_in(&hub, "w", &fetched), StateName::Fetched);
-        // A second worker's task is fetched and then handed back by the
-        // ack-wait: it reached the worker all the same.
-        let other = hub
-            .post_delegate(
-                Recipient::bound("w2", "wa2"),
-                "coder",
-                Some(Recipient::bound("o", "oa")),
-                DelegateLedger::default(),
-                content("REDELIVERED-TASK"),
-                &|| true,
-            )
-            .unwrap()
-            .0;
-        assert_eq!(
-            hub.fetch("w2", "wa2", Consumer::FetchCli, None, None).len(),
-            1
-        );
-        hub.tick();
-        assert_eq!(state_in(&hub, "w2", &other), StateName::Queued);
-
-        assert_eq!(hub.retire_answered_delegates_to("w"), 1);
-        assert_eq!(hub.retire_answered_delegates_to("w2"), 1);
-        assert_eq!(state_in(&hub, "w", &fetched), StateName::Undeliverable);
-        assert_eq!(state_in(&hub, "w2", &other), StateName::Undeliverable);
-        hub.undelivered_after = Duration::ZERO;
-        hub.tick();
-        assert!(
-            hub.list("o").is_empty(),
-            "a task the worker answered is not reported"
-        );
-    }
-
     /// PRD #1666 long-turn delivery: a delegated task its orchestrator was told
-    /// has not reached the worker, then acknowledged by the worker before the
-    /// deck stops trying, gets one correction naming it. The card was never
-    /// told, so it is not cleared. A task told both "has not reached" and
-    /// "undeliverable" before its late ack is still corrected once.
+    /// has not reached the worker — still queued — and then taken and
+    /// acknowledged by the worker gets one correction naming it. The card was
+    /// never told, so it is not cleared. A task told both "has not reached"
+    /// and "undeliverable" (its one hand-out positively not handed over) before
+    /// its agent's late commit is still corrected once.
     #[tokio::test]
     async fn an_ack_after_the_not_reached_notice_corrects_the_orchestrator_once() {
         let limits = InboxLimits {
@@ -7516,10 +8176,6 @@ mod tests {
         };
 
         let task = delegate(&hub, "TASK-NOT-REACHED");
-        assert_eq!(
-            hub.fetch("w", "wa", Consumer::FetchCli, None, None).len(),
-            1
-        );
         hub.tick();
         let notices = hub.list_with_bodies(Some("o"));
         assert_eq!(notices.len(), 1, "told it has not reached: {notices:?}");
@@ -7530,10 +8186,13 @@ mod tests {
                 .unwrap_or_default()
                 .contains("has not reached the worker")
         );
+        let hook = hub.test_hook_fetch("w", "wa", None);
+        assert_eq!(hook.ids(), vec![task.to_string()]);
         assert_eq!(
-            hub.ack(task.as_str(), "w", "wa", AckHow::ExtensionConfirmed),
+            hub.ack(task.as_str(), "w", "wa", AckHow::Explicit),
             AckOutcome::Acknowledged
         );
+        hub.test_hook_close(hook);
         let notices = hub.list_with_bodies(Some("o"));
         assert_eq!(notices.len(), 2, "one correction: {notices:?}");
         let correction = notices.last().unwrap();
@@ -7553,16 +8212,15 @@ mod tests {
         hub.tick();
         assert_eq!(corrections(&hub), 1);
 
-        // Told both, then acknowledged late: still one correction.
+        // Told both, then committed late: still one correction.
         let task = delegate(&hub, "TASK-TOLD-TWICE");
-        hub.fetch("w", "wa", Consumer::FetchCli, None, None);
         hub.tick();
-        hub.run_out_ack_wait(task.as_str(), "w");
+        let hook = hub.test_hook_fetch("w", "wa", None);
+        hub.test_hook_not_handed(&hook);
         assert_eq!(state_in(&hub, "w", &task), StateName::Undeliverable);
-        assert_eq!(
-            hub.ack(task.as_str(), "w", "wa", AckHow::ExtensionConfirmed),
-            AckOutcome::Acknowledged
-        );
+        hub.test_hook_committed(&hook, &[task.as_str()]);
+        hub.test_hook_close(hook);
+        assert_eq!(state_in(&hub, "w", &task), StateName::Acknowledged);
         hub.tick();
         assert_eq!(corrections(&hub), 2, "one more correction, for this task");
     }
@@ -7580,11 +8238,12 @@ mod tests {
     const CHECK_FIRST: &str =
         "Check the worker's pane before you re-delegate or reassign it, or notify the user.";
 
-    /// PRD #1666 part 2: a task that ran out of hand-overs was handed to the
-    /// worker each time, so its notice says the worker may have it and its
+    /// PRD #1666 part 2: a task that ran out of hand-overs was handed out
+    /// each time, and a commit can still contradict a hand-out reported not
+    /// handed over, so its notice says the worker may have it and its
     /// work-done can still arrive, and tells the orchestrator to check the pane
-    /// first. It promises no later correction: the record a late ack would
-    /// need can be evicted before the ack arrives.
+    /// first. It promises no later correction: the record a late commit would
+    /// need can be evicted before it arrives.
     #[tokio::test]
     async fn a_task_out_of_hand_overs_may_still_be_with_the_worker() {
         let limits = InboxLimits {
@@ -7593,11 +8252,10 @@ mod tests {
         };
         let hub = InboxHub::new(deck(), limits, DEFAULT_KEEPALIVE);
         let task = delegate(&hub, "TASK-OUT-OF-HAND-OVERS");
-        assert_eq!(
-            hub.fetch("w", "wa", Consumer::FetchCli, None, None).len(),
-            1
-        );
-        hub.run_out_ack_wait(task.as_str(), "w");
+        let hook = hub.test_hook_fetch("w", "wa", None);
+        assert_eq!(hook.deliveries.len(), 1);
+        hub.test_hook_not_handed(&hook);
+        hub.test_hook_close(hook);
         assert_eq!(state_in(&hub, "w", &task), StateName::Undeliverable);
         let told = undeliverable_bodies(&hub);
         assert_eq!(told.len(), 1, "{told:?}");
@@ -7625,11 +8283,10 @@ mod tests {
     async fn a_task_whose_worker_exited_may_have_reached_it() {
         let hub = hub();
         let task = delegate(&hub, "TASK-WORKER-EXITED");
-        assert_eq!(
-            hub.fetch("w", "wa", Consumer::FetchCli, None, None).len(),
-            1
-        );
+        let hook = hub.test_hook_fetch("w", "wa", None);
+        assert_eq!(hook.deliveries.len(), 1);
         hub.agent_exited("w", "wa");
+        hub.test_hook_close(hook);
         hub.post_owed_notices();
         assert_eq!(state_in(&hub, "w", &task), StateName::Undeliverable);
         let told = undeliverable_bodies(&hub);
@@ -7799,23 +8456,20 @@ mod tests {
         let report = hub
             .post_direct(Recipient::bound("w", "wa"), content("REPORT-B"))
             .unwrap();
-        assert_eq!(
-            hub.fetch("w", "wa", Consumer::FetchCli, None, None).len(),
-            2
-        );
-        hub.run_out_ack_wait(task.as_str(), "w");
-        hub.run_out_ack_wait(report.as_str(), "w");
+        let hook = hub.test_hook_fetch("w", "wa", None);
+        assert_eq!(hook.deliveries.len(), 2);
+        // Both reported not handed over on their one allowed hand-out.
+        hub.test_hook_not_handed(&hook);
         let notices = hub.list("o");
         assert_eq!(notices.len(), 1, "the orchestrator is told: {notices:?}");
-        assert_eq!(
-            *told.lock().unwrap(),
-            [(task.to_string(), false), (report.to_string(), false)]
-        );
+        let mut first_told = told.lock().unwrap().clone();
+        first_told.sort();
+        let mut expected = vec![(task.to_string(), false), (report.to_string(), false)];
+        expected.sort();
+        assert_eq!(first_told, expected);
 
-        assert_eq!(
-            hub.ack(task.as_str(), "w", "wa", AckHow::ExtensionConfirmed),
-            AckOutcome::Acknowledged
-        );
+        // The agent's commit contradicts that report: it got the task.
+        hub.test_hook_committed(&hook, &[task.as_str()]);
         assert_eq!(state_in(&hub, "w", &task), StateName::Acknowledged);
         let notices = hub.list_with_bodies(Some("o"));
         assert_eq!(notices.len(), 2, "one correction: {notices:?}");
@@ -7832,10 +8486,9 @@ mod tests {
             "the card still shows the report it was told about"
         );
 
-        assert_eq!(
-            hub.ack(report.as_str(), "w", "wa", AckHow::ExtensionConfirmed),
-            AckOutcome::Acknowledged
-        );
+        hub.test_hook_committed(&hook, &[report.as_str()]);
+        hub.test_hook_close(hook);
+        assert_eq!(state_in(&hub, "w", &report), StateName::Acknowledged);
         assert_eq!(
             hub.list("o").len(),
             2,

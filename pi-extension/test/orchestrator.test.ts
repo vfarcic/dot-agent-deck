@@ -121,6 +121,21 @@ describe("row 8: work-done argv", () => {
 		assert.deepEqual(buildWorkDoneArgv("summary", false), ["work-done", "--task", "summary"]);
 	});
 
+	test("names the delegated task with --task-id (PRD #1666 part 3)", () => {
+		assert.deepEqual(buildWorkDoneArgv("added tests", false, "m-abc-0123"), [
+			"work-done",
+			"--task-id",
+			"m-abc-0123",
+			"--task",
+			"added tests",
+		]);
+		assert.deepEqual(buildWorkDoneArgv("a note", false, "  "), ["work-done", "--task", "a note"]);
+	});
+
+	test("refuses a task id together with done", () => {
+		assert.throws(() => buildWorkDoneArgv("x", true, "m-abc-0123"), /task id or done, not both/);
+	});
+
 	test("throws a clear error when the summary is blank", () => {
 		assert.throws(() => buildWorkDoneArgv(""), /work-done summary must be a non-empty string/);
 		assert.throws(() => buildWorkDoneArgv("   "), /work-done summary must be a non-empty string/);

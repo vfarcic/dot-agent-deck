@@ -6,7 +6,7 @@ use dot_agent_deck::inbox_hub::DEFAULT_UNDELIVERED_NOTICE_AFTER;
 use spec::spec;
 use std::time::{Duration, Instant};
 
-/// Scenario: Assign an offer to a worker that never fetches it and advance the store clock to its undelivered deadline. The job must leave that worker, return to its pool, and go to the other subscriber, with a fresh deadline that stops applying once the new holder fetches and claims it.
+/// Scenario: Assign an offer to a worker that never fetches it and advance the store clock to its undelivered deadline. The job must leave that worker, return to its pool, and go to the other subscriber, with a fresh deadline that stops applying once the new holder's receipt receiver is handed it: the store sets a handed-out offer no deadline of its own (its attempt model owns it). The new holder's claim then expires on its TTL, not a moment before, and the job returns to its pool excluding both holders.
 #[spec("inbox/core/017")]
 #[test]
 fn inbox_core_017_unfetched_offer_returns_to_pool_at_undelivered_deadline() {
@@ -61,22 +61,21 @@ fn inbox_core_017_unfetched_offer_returns_to_pool_at_undelivered_deadline() {
         Some(due + DEFAULT_UNDELIVERED_NOTICE_AFTER),
         "new holder needs a fresh assignment deadline"
     );
-    assert_eq!(
+    assert!(
         store
-            .fetch(
+            .take_receipt(
                 due,
+                offered.id.as_str(),
                 &second.pane_id,
                 "agent-second",
                 Consumer::FetchCli,
-                None
             )
-            .len(),
-        1
+            .is_some()
     );
     assert_eq!(
         store.next_deadline(),
-        Some(due + store.limits().ack_wait),
-        "fetch replaces assignment deadline with ack wait"
+        None,
+        "a hand-out ends the assignment deadline and sets the store none of its own"
     );
     store.ack(
         due,
@@ -85,9 +84,22 @@ fn inbox_core_017_unfetched_offer_returns_to_pool_at_undelivered_deadline() {
         "agent-second",
         AckHow::Explicit,
     );
+    let expires = due + store.limits().default_claim_ttl;
     assert_eq!(
         store.next_deadline(),
-        Some(due + store.limits().default_claim_ttl),
+        Some(expires),
         "claim replaces assignment deadline with claim TTL"
+    );
+    store.tick(expires - Duration::from_nanos(1));
+    assert!(
+        store.unassigned_offers().is_empty(),
+        "the claim still holds"
+    );
+    store.tick(expires);
+    assert_eq!(store.unassigned_offers(), vec![offered.id.clone()]);
+    assert_eq!(
+        store.assign_offer(expires, &offered.id, &candidates),
+        None,
+        "both earlier holders are excluded"
     );
 }

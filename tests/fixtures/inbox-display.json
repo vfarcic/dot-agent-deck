@@ -29,6 +29,16 @@
   "hooksTooOld": "this agent's deck hooks run a dot-agent-deck too old for its messages",
   "hooksTooOldUpgrade": "upgrade the dot-agent-deck the hooks run, or run hooks install from the copy you want them to use, then restart the agent",
   "receiptsDegraded": "messages may repeat: the deck cannot record message receipts for this agent",
+  "admissionRefused": "Messages can't reach this agent",
+  "admissionRefusedRemedy": "Restart it from the deck; messages addressed to it are not handed to the restarted agent, so have them sent again.",
+  "admissionCauses": {
+    "inbox_other_user": "a process running as another user asked for them",
+    "inbox_peer_unidentified": "the deck could not identify the process that asked for them",
+    "inbox_component_not_caller": "its integration named a process other than its own",
+    "inbox_nested_agent": "an agent of the same kind running inside it asked for them",
+    "inbox_not_agent_process": "a process outside the agent asked for them",
+    "inbox_receiver_above_agent": "its integration named a process the agent itself runs under"
+  },
   "evidencePaused": "deck messages paused: {n} delivered messages still wait for proof that older copies cannot run; restart the agent to clear them",
   "actionUnsupported": "this deck cannot Retry or Cancel deck messages: upgrade dot-agent-deck",
   "attentionTitle": "Deck messages"

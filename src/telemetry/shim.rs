@@ -48,9 +48,12 @@ pub const PROGRAMS: [&str; 2] = ["codex", "devin"];
 /// The shim directory's name inside the deck's telemetry directory.
 pub const DIR_NAME: &str = "bin";
 
-/// The deck's run id, in the environment of an agent the deck started with
-/// the shim on `PATH`: what a Devin's per-run configuration is named for, so
-/// the daemon removes it when the run ends.
+/// The deck's run id, in the environment of every agent the deck started a
+/// run for, shim or not: what a Devin's per-run configuration is named for, so
+/// the daemon removes it when the run ends, and what a tool the agent runs
+/// joins its spans to the run by when `OTEL_RESOURCE_ATTRIBUTES` was removed
+/// on the way (issue #1893). Blank for an agent the deck started no run for,
+/// so one inherited from another deck's agent does not pass through (#1902).
 pub const RUN_ID_ENV: &str = "DOT_AGENT_DECK_TELEMETRY_RUN_ID";
 
 /// The programs already shimmed in this process tree, `:`-separated: set on

@@ -514,6 +514,9 @@ pub struct DispatchResult {
     pub worktree_dir: PathBuf,
     pub success: bool,
     pub message: String,
+    /// PRD #1666 part 3, round 5: the unit the dispatch started, when it
+    /// started one and a caller was recorded.
+    pub unit_id: Option<String>,
 }
 
 pub struct DispatchContext {
@@ -804,6 +807,7 @@ pub async fn handle_dispatch(
                 worktree_dir: paths.worktree_dir.clone(),
                 success: false,
                 message: format!("dispatch: {e}"),
+                unit_id: None,
             };
         }
     };
@@ -823,6 +827,7 @@ pub async fn handle_dispatch(
                      Wait for it to finish, or dispatch under a different name.",
                     paths.worktree_dir.display()
                 ),
+                unit_id: None,
             };
         }
         // The worktree dir is GONE but its branch survived — `git worktree
@@ -843,6 +848,7 @@ pub async fn handle_dispatch(
                     name = name,
                     clone = clone_dir.display(),
                 ),
+                unit_id: None,
             };
         }
         Err(e) => {
@@ -850,6 +856,7 @@ pub async fn handle_dispatch(
                 worktree_dir: paths.worktree_dir.clone(),
                 success: false,
                 message: format!("dispatch: failed to create worktree: {e}"),
+                unit_id: None,
             };
         }
     }
@@ -941,6 +948,7 @@ pub async fn handle_dispatch(
             DispatchResult {
                 worktree_dir: paths.worktree_dir.clone(),
                 success: true,
+                unit_id: handle.unit_id.clone(),
                 // Report what was ACTUALLY opened, from the spawn's own verdict.
                 // `spawn` → `decide_target` branches on the dispatched worktree's
                 // `.dot-agent-deck.toml`: a repo defining `[[orchestrations]]` gets a
@@ -1016,6 +1024,7 @@ pub async fn handle_dispatch(
                 worktree_dir: paths.worktree_dir,
                 success: false,
                 message: format!("dispatch: spawn failed: {e}{cleanup_note}"),
+                unit_id: None,
             }
         }
     }

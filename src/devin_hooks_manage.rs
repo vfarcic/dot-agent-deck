@@ -195,6 +195,8 @@ fn devin_present_on_path() -> bool {
     };
     std::env::split_paths(&path).any(|dir| {
         let candidate = dir.join("devin");
+        // Any error is absence here, not a failed inspection: a `devin` that
+        // cannot be inspected cannot be run from this `PATH` entry either.
         let Ok(meta) = std::fs::metadata(&candidate) else {
             return false;
         };
@@ -640,45 +642,59 @@ fn durable_binary_path() -> Result<String, String> {
 /// real config dir resolves, and any failure is logged, never fatal. Never prints
 /// to stdout (it runs on the dashboard startup path).
 pub fn auto_install() -> Vec<crate::hook_binary::HookPin> {
+    match startup_install() {
+        Some(Ok(pin)) => vec![pin],
+        Some(Err(e)) => {
+            tracing::warn!("auto-install: {e}");
+            Vec::new()
+        }
+        None => Vec::new(),
+    }
+}
+
+/// [`auto_install`] for `hooks refresh` (PRD #1666 part 3, R-3): whether
+/// Devin is installed here, and what the install could not write, which
+/// [`auto_install`] only logs.
+pub fn refresh_install() -> crate::hooks_refresh::InstallAttempt {
+    let attempt = startup_install();
+    if let Some(Err(e)) = &attempt {
+        tracing::warn!("auto-install: {e}");
+    }
+    crate::hooks_refresh::InstallAttempt::of(attempt)
+}
+
+/// [`auto_install`]'s work: `None` when Devin is not installed here, else
+/// the pin or why the install wrote nothing.
+fn startup_install() -> Option<Result<crate::hook_binary::HookPin, String>> {
     if !devin_present_on_path() {
         tracing::debug!("devin startup install: skipped (devin not on PATH)");
-        return Vec::new();
+        return None;
     }
     let Some(config_dir) = devin_config_dir() else {
         tracing::debug!("devin startup install: skipped (no config dir resolves)");
-        return Vec::new();
+        return None;
     };
+    Some(install_into(&config_dir))
+}
 
-    let binary_path = match durable_binary_path() {
-        Ok(binary_path) => binary_path,
-        Err(e) => {
-            tracing::warn!("auto-install: {e}");
-            return Vec::new();
-        }
-    };
-
-    let named = match auto_install_to(&config_dir, &binary_path) {
-        Ok((changed, named)) => {
-            if changed {
-                crate::agent_hook_config::log_auto_install_change(
-                    "devin",
-                    &config_path(&config_dir),
-                    &named,
-                    "devin startup auto-install",
-                );
-            }
-            named
-        }
-        Err(e) => {
-            tracing::warn!("auto-install: failed to write Devin hooks: {e}");
-            return Vec::new();
-        }
-    };
-    vec![crate::hook_binary::HookPin {
+/// The automatic install into `config_dir`, from this copy's durable path.
+fn install_into(config_dir: &Path) -> Result<crate::hook_binary::HookPin, String> {
+    let binary_path = durable_binary_path()?;
+    let (changed, named) = auto_install_to(config_dir, &binary_path)
+        .map_err(|e| format!("failed to write Devin hooks: {e}"))?;
+    if changed {
+        crate::agent_hook_config::log_auto_install_change(
+            "devin",
+            &config_path(config_dir),
+            &named,
+            "devin startup auto-install",
+        );
+    }
+    Ok(crate::hook_binary::HookPin {
         agent: crate::event::AgentType::Devin,
-        config: config_path(&config_dir),
+        config: config_path(config_dir),
         binary: named,
-    }]
+    })
 }
 
 /// What Devin's hooks are pinned to now, read back from its config without

@@ -407,3 +407,181 @@ fn boundary_025_a_start_refreshes_the_adapter_first_or_says_it_could_not() {
         record_inbox(&daemon, &pane)
     );
 }
+
+/// `dot-agent-deck inbox fetch` as a Devin stand-in pane's model runs it: the
+/// pane's identity, capability and receipt spool.
+fn devin_fetch(daemon: &common::DaemonProc, pane: &Pane) -> std::process::Command {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
+    command
+        .args(["inbox", "fetch"])
+        .env_clear()
+        .env("HOME", &daemon.home)
+        .env("DOT_AGENT_DECK_SOCKET", &daemon.hook_socket)
+        .env("DOT_AGENT_DECK_PANE_ID", &pane.id)
+        .env("DOT_AGENT_DECK_AGENT_ID", &pane.agent)
+        .env("DOT_AGENT_DECK_PANE_CAPABILITY", &pane.token)
+        .stdin(std::process::Stdio::null());
+    if let Some(spool) = pane_env(pane, "DOT_AGENT_DECK_INBOX_SPOOL") {
+        command.env("DOT_AGENT_DECK_INBOX_SPOOL", spool);
+    }
+    command
+}
+
+/// Scenario: Queue a task for an idle stand-in spawned as Devin, which has no inbox hooks: the deck types its doorbell, and the model's `dot-agent-deck inbox fetch` is a one-shot receiver. Run with its stdout already closed, it writes nothing, says so, and the task is back in the queue at once; run again, it prints the block naming its attempt and the task is settled by its receipt.
+#[spec("inbox/boundary/054")]
+#[test]
+fn boundary_054_a_devin_panes_model_run_fetch_is_a_one_shot_receiver() {
+    let daemon = daemon_unbound(&[]);
+    let pane = pane_with(&daemon, "devin-standin", json!({"agent_type":"devin"}));
+    // Devin's own status hook says it is idle; it has no inbox hooks.
+    status(&daemon, &pane, "idle", "devin");
+    let id = enqueue(&daemon, &pane, BODY);
+    ring(&daemon, &pane, &id);
+    let mut closed = devin_fetch(&daemon, &pane)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(closed.stdout.take());
+    let closed = closed.wait_with_output().unwrap();
+    assert!(!closed.status.success(), "{closed:?}");
+    assert!(
+        String::from_utf8_lossy(&closed.stderr)
+            .contains(dot_agent_deck::inbox_cli::CLI_NOTHING_PRINTED),
+        "{closed:?}"
+    );
+    state(&daemon, &pane, &id, "queued");
+    let fetched = devin_fetch(&daemon, &pane).output().unwrap();
+    assert!(fetched.status.success(), "{fetched:?}");
+    let stdout = String::from_utf8_lossy(&fetched.stdout);
+    assert!(
+        stdout.contains(BODY)
+            && stdout.contains(&format!("[dot-agent-deck message {id} delivery ")),
+        "{stdout}"
+    );
+    state(&daemon, &pane, &id, "acknowledged");
+    let summary = listing(&daemon, &pane)["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == id)
+        .cloned()
+        .unwrap();
+    assert_eq!(summary["ack_how"], "plugin_confirmed", "{summary}");
+}
+
+/// Scenario: A deck daemon serves Codex, Devin and bare-command panes, each with a task waiting, and an older dot-agent-deck asks for their mail the old ways: a plain `inbox fetch` (with and without its acknowledge-on-fetch), a doorbell and a turn-end hook fetch declaring no one-shot integration, a once wait from a hook component, and `get-seed`. Each is answered at once with a refusal, takes nothing and acknowledges nothing: the task stays queued with no hand-over counted. An old hook's refusal puts the out-of-date hooks notice on the card, naming Codex's own `hooks install` for the Codex pane and no command where the deck does not know the agent. A current receipt fetch from the same pane is then handed the task.
+#[spec("inbox/boundary/073")]
+#[test]
+fn boundary_073_every_old_way_to_take_mail_is_refused_and_takes_nothing() {
+    let daemon = daemon_unbound(&[]);
+    for (name, extra, command) in [
+        (
+            "old-codex",
+            json!({"agent_type":"codex"}),
+            Some("--agent codex"),
+        ),
+        ("old-devin", json!({"agent_type":"devin"}), None),
+        ("old-bare", json!({}), None),
+    ] {
+        let pane = pane_with(&daemon, name, extra);
+        let id = enqueue(&daemon, &pane, BODY);
+        let untouched = |what: &str| {
+            let listed = listing(&daemon, &pane);
+            let message = listed["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["id"] == id.as_str())
+                .cloned()
+                .unwrap_or(Value::Null);
+            assert_eq!(message["state"], "queued", "{name}: {what}: {listed}");
+            assert_eq!(message["deliveries"], 0, "{name}: {what}: {listed}");
+        };
+        for ack in [false, true] {
+            let mut req = request(&pane, "inbox_fetch");
+            req["consumer"] = json!("cli");
+            req["max_chars"] = json!(65536);
+            req["ack"] = json!(ack);
+            let started = std::time::Instant::now();
+            let reply = hook(&daemon, req);
+            assert_eq!(reply["refused"], "cli_too_old", "{name}: {reply}");
+            assert!(reply.get("messages").is_none(), "{name}: {reply}");
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "{name}: answered at once"
+            );
+            untouched("plain fetch");
+        }
+        for consumer in ["doorbell_hook", "turn_end_hook"] {
+            let mut req = request(&pane, "inbox_fetch");
+            req["consumer"] = json!(consumer);
+            req["max_chars"] = json!(9000);
+            req["ack"] = json!(true);
+            if consumer == "doorbell_hook" {
+                req["doorbell"] = json!(id);
+            }
+            let started = std::time::Instant::now();
+            let reply = hook(&daemon, req);
+            assert_eq!(
+                reply["refused"], "hooks_too_old",
+                "{name} {consumer}: {reply}"
+            );
+            assert!(reply.get("messages").is_none(), "{name}: {reply}");
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "{name}: answered at once"
+            );
+            untouched(consumer);
+        }
+        assert!(
+            common::wait_until(WAIT, || record_inbox(&daemon, &pane)["integration"]
+                == "hooks_too_old"),
+            "{name}: {}",
+            record_inbox(&daemon, &pane)
+        );
+        let named = record_inbox(&daemon, &pane)["integration_command"].clone();
+        match command {
+            Some(agent) => assert!(
+                named.as_str().is_some_and(|c| c.contains(agent)),
+                "{name}: the card names the agent's own hooks install: {named}"
+            ),
+            None => assert!(
+                named.is_null(),
+                "{name}: no command it cannot name: {named}"
+            ),
+        }
+        for component in ["codex_hooks", "other"] {
+            let mut req = request(&pane, "inbox_wait");
+            req["component"] = json!(component);
+            req["component_version"] = json!("synthetic-old");
+            req["mode"] = json!("once");
+            req["pid"] = json!(pane.pid);
+            let reply = line(&mut connect(&daemon, &req));
+            assert_eq!(
+                reply["refused"], "unsupported",
+                "{name} {component}: {reply}"
+            );
+            untouched("once wait");
+        }
+        armed(&daemon, &pane, 0);
+        let reply = hook(&daemon, request(&pane, "get_seed"));
+        assert!(reply["seed"].is_null(), "{name}: {reply}");
+        assert_eq!(reply["refused"], "get_seed_removed", "{name}: {reply}");
+        untouched("get-seed");
+        // A current receipt fetch is served.
+        let mut req = request(&pane, "inbox_receipt_fetch");
+        req["consumer"] = json!("cli");
+        req["hook_integration"] = json!(1);
+        let mut held = connect(&daemon, &req);
+        let reply = line(&mut held);
+        let handed = reply["messages"].as_array().cloned().unwrap_or_default();
+        assert!(
+            handed
+                .iter()
+                .any(|m| m["id"] == id.as_str() && m["a"].is_number()),
+            "{name}: a current fetch is handed the task: {reply}"
+        );
+        state(&daemon, &pane, &id, "fetched");
+    }
+}

@@ -393,7 +393,7 @@ fn is_format_char(c: char) -> bool {
 /// carrying a control or formatting character, which a reader would not see
 /// but a shell would run. A backslash is refused too, because `sha256sum -c`
 /// reads one in a file name as an escape.
-fn shown_path(path: &Path) -> Option<&str> {
+pub(crate) fn shown_path(path: &Path) -> Option<&str> {
     let text = path.to_str()?;
     let clean = !text.is_empty()
         && text.chars().count() <= MAX_SHOWN_PATH_CHARS

@@ -306,6 +306,53 @@ describe("Upgrade on the Local daemon section (issue #1753)", () => {
     expect(deck.upgradeDaemon).not.toHaveBeenCalled();
   });
 
+  /* PRD #1666 part 3 (R-3): what the core says about the agents' hooks follows the CLI's result. */
+  const hooksUpdated = "Claude Code and Codex hooks now run this copy (v0.45.0). Restart agents that were already running so they use them.";
+  const runWith = (result: SelfUpgradeResult) => ({ check: vi.fn(), run: vi.fn(async () => result), relaunch: vi.fn() });
+  const upgradeCli = async (result: SelfUpgradeResult) => {
+    render(<AgentOverview runtime={runtime(createFixtureFleet("upgrade"))} onNavigate={vi.fn()} selfUpgrade={{ check: check(), api: runWith(result) }} />);
+    fireEvent.click(within(group(FIXTURE_DAEMON_ID)).getByTestId("daemon-upgrade"));
+    fireEvent.click(screen.getByTestId("self-upgrade-start"));
+    return screen.findByTestId("self-upgrade-result-cli");
+  };
+
+  /** Scenario: The CLI is upgraded and its hook refresh put every agent's hooks on it: the CLI's result says so after the upgrade line, with the restart running agents need and nothing to copy. */
+  it("local_upgrade_008 a CLI upgrade that refreshed the hooks says so", async () => {
+    const result = await upgradeCli({ ...brewed, lines: [...brewed.lines, { text: hooksUpdated, command: null }] });
+    expect(result).toHaveTextContent("it now reports v0.45.0");
+    expect(result).toHaveTextContent(hooksUpdated);
+    expect(within(result).queryByTestId("self-upgrade-copy")).not.toBeInTheDocument();
+  });
+
+  /** Scenario: The CLI is upgraded but its hooks still run another copy (or could not be checked): the result names the copy and the exact `hooks install` command, which has its Copy button, and says to restart the affected agents. */
+  it("local_upgrade_009 a CLI upgrade whose hooks need attention shows the command to run", async () => {
+    const command = "/opt/homebrew/bin/dot-agent-deck hooks install --agent claude-code";
+    const result = await upgradeCli({ ...brewed, lines: [...brewed.lines,
+      { text: "Claude Code's hooks still run another copy, /home/u/.local/bin/dot-agent-deck.", command: null },
+      { text: "To have them run this copy, run:", command: null },
+      { text: command, command },
+      { text: "Then restart the affected agents.", command: null }] });
+    expect(result).toHaveTextContent("still run another copy");
+    expect(within(result).getByTestId("self-upgrade-command")).toHaveTextContent(command);
+    expect(within(result).getByTestId("self-upgrade-copy")).toBeVisible();
+    expect(result).toHaveTextContent("Then restart the affected agents.");
+  });
+
+  /** Scenario: The CLI is only downloaded, not installed: the result gives the install command, then says the agents' hooks were not updated and gives the `hooks refresh` command to run once it is installed — never a claim that the hooks are ready. */
+  it("local_upgrade_010 a CLI that was only downloaded says its hooks were not updated", async () => {
+    const install = "sudo install -m 0755 /stage/dot-agent-deck /usr/local/bin/dot-agent-deck";
+    const refresh = "/usr/local/bin/dot-agent-deck hooks refresh";
+    const result = await upgradeCli({ copy: "cli", ok: true, installed: false, relaunch: false, lines: [
+      { text: "Downloaded and checked. Install it with:", command: null },
+      { text: install, command: install },
+      { text: "Agent hooks were not updated. Once it is installed, update them with:", command: null },
+      { text: refresh, command: refresh }] });
+    const commands = within(result).getAllByTestId("self-upgrade-command").map((line) => line.textContent);
+    expect(commands).toEqual([install, refresh]);
+    expect(result).toHaveTextContent("Agent hooks were not updated.");
+    expect(result).not.toHaveTextContent("now run this copy");
+  });
+
   /** Scenario: The CLI is current and the local daemon is at the app's release: the Local daemon section offers no Upgrade. */
   it("local_upgrade_005 offers nothing on the Local daemon section while both are current", () => {
     const current: SelfUpgradePlan = { ...cliPlan, action: "up-to-date", actionable: false, confirmQuestion: null, headline: "dot-agent-deck CLI is up to date (v0.45.0)." };

@@ -1,0 +1,12 @@
+---
+source: tests/render_dashboard.rs
+expression: rendered
+---
+┌ 1 ClaudeCode · api-svc ──────────────────────────────── ● Thinking ✉2 queued ┐
+│Dir:  api-svc                                                                 │
+│Messages can't reach this agent: its connection to the deck was refused (an a…│
+│Prmt: move the stats into the border                                          │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└───────────────────────────────────────────────────────── Last: 1h  Tools: 14 ┘

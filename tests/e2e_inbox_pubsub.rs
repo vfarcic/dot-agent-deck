@@ -184,7 +184,8 @@ fn publish_002_same_name_instances_do_not_leak_and_subscribers_get_fenced_conten
             .as_str()
             .expect("framed agent text");
         assert!(
-            text.contains(&format!("[dot-agent-deck message {id} from "))
+            text.contains(&format!("[dot-agent-deck message {id} delivery "))
+                && text.contains(" from ")
                 && text.contains(&format!("[end of dot-agent-deck message {id}]")),
             "message frame: {text}"
         );
@@ -604,16 +605,28 @@ fn returned(socket: &mut std::os::unix::net::UnixStream, previous: &Pane, id: &s
     }
 }
 
-/// Scenario: Start an attested orchestration and copy its orchestrator capability into this unrelated test process. Publishing and offering must explicitly refuse that process, and neither worker may receive a message.
+/// Scenario: Start an attested orchestration and copy its orchestrator capability into this test process, outside every pane but running as the deck's own user. Presenting a worker's capability in the orchestrator's name, publishing and offering are refused and nothing is delivered; presenting the orchestrator's own current capability, the process publishes and both workers receive the announcement.
 #[spec("inbox/publish/006")]
 #[test]
-fn publish_006_a_process_outside_the_agent_cannot_publish_or_offer() {
+fn publish_006_only_the_panes_own_capability_publishes_or_offers_from_outside_it() {
     let daemon = inbox::daemon(&[]);
     let (orch, first, second) = team(&daemon, "process-bound");
     for verb in ["inbox_publish", "inbox_offer"] {
-        let reply = post(&daemon, &orch, verb);
+        let mut req = inbox::request(&orch, verb);
+        req["token"] = json!(first.token);
+        req[if verb == "inbox_publish" {
+            "topic"
+        } else {
+            "pool"
+        }] = json!(if verb == "inbox_publish" {
+            "updates"
+        } else {
+            "review"
+        });
+        req["body"] = json!(BODY);
+        let reply = hook(&daemon, req);
         assert_eq!(
-            reply["refused"], "inbox_not_agent_process",
+            reply["refused"], "token_names_another_pane",
             "{verb}: {reply}"
         );
         assert!(
@@ -623,4 +636,11 @@ fn publish_006_a_process_outside_the_agent_cannot_publish_or_offer() {
     }
     assert!(route::messages(&daemon, &first).is_empty());
     assert!(route::messages(&daemon, &second).is_empty());
+    // PRD #1666 part 3 (R-1): the pane's current capability and the deck's
+    // user make this process a member of the orchestrator's pane, wherever it
+    // sits in the process table.
+    let id = accepted(&post(&daemon, &orch, "inbox_publish"));
+    route::count(&daemon, &first, 1);
+    route::count(&daemon, &second, 1);
+    assert!(contains(&daemon, &first, &id) && contains(&daemon, &second, &id));
 }

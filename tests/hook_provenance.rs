@@ -44,6 +44,18 @@ fn capture_one_line_with_input(args: &[&str], token: Option<&str>, input: Option
         let mut reader = std::io::BufReader::new(stream);
         let mut line = String::new();
         let _ = reader.read_line(&mut line);
+        // PRD #1666 part 3, round 5: `work-done` asks first, and sends its
+        // report only on the connection where the daemon confirmed, so the
+        // stub confirms, then captures the report too and answers it.
+        if line.contains("hook_capabilities") {
+            let mut stream = reader.get_ref().try_clone().expect("clone");
+            let _ = stream.write_all(b"{\"task_scoped_completion\":1}\n");
+            let mut report = String::new();
+            let _ = reader.read_line(&mut report);
+            let _ =
+                stream.write_all(b"{\"disposition\":\"uncorrelated\",\"destination\":\"inbox\"}\n");
+            line.push_str(&report);
+        }
         line
     });
 
@@ -222,11 +234,38 @@ fn cli_against_stub_reply(args: &[&str], reply: Option<&str>) -> std::process::O
 const REFUSAL: &str = r#"{"kind":"signal_ack","accepted":false,"reason":"missing_token","error":"refused: this pane was issued a hook capability token and the message presented none."}"#;
 
 /// The verbs under test, with the arguments that make each one send its signal.
+/// `work-done` left this list with PRD #1666 part 3, round 5: it asks the
+/// daemon first and answers in its own words (`work_done_*` below).
 fn fire_and_forget_invocations() -> Vec<Vec<&'static str>> {
-    vec![
-        vec!["work-done", "--task", "done"],
-        vec!["dispatch", "unit", "--task", "do it"],
-    ]
+    vec![vec!["dispatch", "unit", "--task", "do it"]]
+}
+
+/// PRD #1666 part 3, round 5 (plan D1): the refusal a daemon writes for the
+/// capabilities question of a pane whose token is missing.
+const QUESTION_REFUSAL: &str = r#"{"code":"missing_token","message":"refused: this pane was issued a hook capability token and the message presented none."}"#;
+
+/// The real `work-done` CLI asks a stub daemon its capability question and is
+/// refused at the gate: it exits non-zero, passing on the daemon's sentence
+/// and its code.
+#[test]
+fn work_done_reports_a_refused_question_with_its_code() {
+    let out = cli_against_stub_reply(&["work-done", "--task", "done"], Some(QUESTION_REFUSAL));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("hook capability token"), "{stderr}");
+    assert!(stderr.contains("missing_token"), "{stderr}");
+}
+
+/// Against a daemon that answers nothing to the capability question — one
+/// older than this CLI — `work-done` sends no report, exits non-zero, and says
+/// the daemon did not confirm it supports task reports (PRD #1666 part 3,
+/// round 5, rewritten on purpose: it used to send and exit 0).
+#[test]
+fn work_done_against_a_daemon_that_does_not_answer_sends_nothing() {
+    let out = cli_against_stub_reply(&["work-done", "--task", "done"], None);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("did not confirm"), "{stderr}");
 }
 
 /// The point of the whole change: a refused signal is no longer a clean exit 0.
