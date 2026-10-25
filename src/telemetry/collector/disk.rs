@@ -154,8 +154,10 @@ pub fn disk_usage(root: &Path) -> io::Result<u64> {
 /// subdirectory is opened relative to its parent's open directory without
 /// following a symlink (on Linux with `openat2`, which also
 /// refuses to cross a mount point, falling back to `openat` with
-/// `O_NOFOLLOW` where `openat2` is unavailable), and what is checked is the
-/// directory it opened. So a directory renamed and replaced with a symlink
+/// `O_NOFOLLOW` where `openat2` is unavailable, which enters a directory
+/// only when its mount id shows it on the root's mount, and leaves one
+/// whose mount it cannot tell out of an incomplete figure), and what is
+/// checked is the directory it opened. So a directory renamed and replaced with a symlink
 /// while the walk runs is not followed. It does not enter a directory on
 /// another filesystem than `root`'s: directories' devices are compared, and
 /// files' are not, because on overlayfs a file reports the underlying
@@ -304,8 +306,17 @@ pub fn walk(root: &Path, limits: &Limits<'_>) -> io::Result<Walk> {
         }
         if opened_by == fd::OpenedBy::Fallback {
             let root = *root_mount.get_or_insert_with(|| stack[0].mount_id());
-            if crossed_mount(root, child.mount_id()) {
-                continue;
+            match boundary(root, child.mount_id()) {
+                Boundary::Same => {}
+                // Another mount, which the walk leaves out on purpose, as
+                // `openat2` does on the primary path.
+                Boundary::Crossed => continue,
+                // Not known to be on the root's mount: it is not entered,
+                // and what it holds is missing from the figure.
+                Boundary::Unknown => {
+                    complete = false;
+                    continue;
+                }
             }
         }
         match track(&mut seen, fd::id(&opened), limits.budget.max_tracked) {
@@ -350,14 +361,41 @@ fn track(seen: &mut HashSet<(u64, u64)>, id: (u64, u64), max: usize) -> Tracked 
     }
 }
 
-/// Whether a directory opened by the `openat` fallback is on another mount
-/// than the walk's root, from their mount ids (`statx`'s `STATX_MNT_ID`): the
-/// check `openat2`'s `RESOLVE_NO_XDEV` makes on the primary path, which also
-/// catches a bind mount of the root's own filesystem, where the devices
-/// match. When either id is unknown (a kernel older than 5.8, or `statx`
-/// refused) a crossing is not known, and only the device check applies.
-fn crossed_mount(root: Option<u64>, child: Option<u64>) -> bool {
-    matches!((root, child), (Some(root), Some(child)) if root != child)
+/// Where a directory opened by the `openat` fallback is against the walk's
+/// root's mount.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Boundary {
+    /// On the root's mount: walked.
+    Same,
+    /// On another mount: left out, and the walk stays complete, as on the
+    /// primary path, whose `openat2` refuses to open it.
+    Crossed,
+    /// Not known: left out, and the walk is incomplete. An unknown
+    /// boundary is never taken for the root's own mount.
+    Unknown,
+}
+
+/// The [`Boundary`] of a directory opened by the `openat` fallback, from its
+/// mount id and the root's ([`fd::Dir::mount_id`]): the check `openat2`'s
+/// `RESOLVE_NO_XDEV` makes on the primary path, which also catches a bind
+/// mount of the root's own filesystem, where the devices match.
+fn boundary(root: Option<u64>, child: Option<u64>) -> Boundary {
+    match (root, child) {
+        (Some(root), Some(child)) if root == child => Boundary::Same,
+        (Some(_), Some(_)) => Boundary::Crossed,
+        _ => Boundary::Unknown,
+    }
+}
+
+/// The mount id in the text of `/proc/<pid>/fdinfo/<fd>`: its `mnt_id:`
+/// line, which Linux writes since 3.15.
+#[cfg(any(target_os = "linux", test))]
+fn parse_fdinfo_mount_id(text: &str) -> Option<u64> {
+    text.lines()
+        .find_map(|line| line.strip_prefix("mnt_id:"))?
+        .trim()
+        .parse()
+        .ok()
 }
 
 #[cfg(test)]
@@ -485,13 +523,29 @@ mod fd {
             Ok((Dir::from_fd(fd)?, OpenedBy::Fallback))
         }
 
-        /// The id of the mount the open directory is on (`statx`'s
-        /// `STATX_MNT_ID`, Linux 5.8); `None` where the kernel does not
-        /// report one or refuses `statx`.
-        #[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
+        /// The id of the mount the open directory is on: `statx`'s
+        /// `STATX_MNT_ID` (Linux 5.8), else the `mnt_id:` line of
+        /// `/proc/self/fdinfo/<fd>` (Linux 3.15). `None` when neither
+        /// reports one, such as with `/proc` not mounted.
+        #[cfg(target_os = "linux")]
         pub fn mount_id(&self) -> Option<u64> {
+            self.statx_mount_id().or_else(|| self.fdinfo_mount_id())
+        }
+
+        #[cfg(target_os = "linux")]
+        fn fdinfo_mount_id(&self) -> Option<u64> {
             #[cfg(test)]
-            if NO_MOUNT_ID.with(std::cell::Cell::get) {
+            if NO_FDINFO_MOUNT_ID.with(std::cell::Cell::get) {
+                return None;
+            }
+            let text = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", self.fd.0)).ok()?;
+            super::parse_fdinfo_mount_id(&text)
+        }
+
+        #[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
+        fn statx_mount_id(&self) -> Option<u64> {
+            #[cfg(test)]
+            if NO_STATX_MOUNT_ID.with(std::cell::Cell::get) {
                 return None;
             }
             let mut stx = std::mem::MaybeUninit::<libc::statx>::zeroed();
@@ -515,10 +569,18 @@ mod fd {
             (stx.stx_mask & STATX_MNT_ID != 0).then_some(stx.stx_mnt_id)
         }
 
-        /// Elsewhere no mount id is known.
-        #[cfg(not(all(target_os = "linux", any(target_env = "gnu", target_env = "musl"))))]
-        pub fn mount_id(&self) -> Option<u64> {
+        /// Without the C library's `statx`, `/proc` alone reports it.
+        #[cfg(all(target_os = "linux", not(any(target_env = "gnu", target_env = "musl"))))]
+        fn statx_mount_id(&self) -> Option<u64> {
             None
+        }
+
+        /// Elsewhere no mount id is read: the directory's device stands in
+        /// for it, so there a mount of the root's own device is not told
+        /// apart.
+        #[cfg(not(target_os = "linux"))]
+        pub fn mount_id(&self) -> Option<u64> {
+            self.stat().ok().map(|st| dev(&st))
         }
 
         /// The open directory's own metadata.
@@ -642,8 +704,10 @@ mod fd {
     thread_local! {
         /// A test's `errno` for the next `readdir` to fail with, once.
         pub static READDIR_ERROR: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
-        /// A test's switch to a kernel that reports no mount ids.
-        pub static NO_MOUNT_ID: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// A test's switch to a kernel whose `statx` reports no mount id.
+        pub static NO_STATX_MOUNT_ID: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// A test's switch to a `/proc` whose fdinfo reports no mount id.
+        pub static NO_FDINFO_MOUNT_ID: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     /// The metadata of the entry `name` of the open directory `dir`, a
@@ -1370,61 +1434,106 @@ mod tests {
         }
     }
 
-    /// Finding 8: the fallback's mount check. A directory is known to be on
-    /// another mount only when both mount ids are known and differ.
+    /// Finding 8: the fallback's mount check. A directory is on the root's
+    /// mount, or on another, only when both mount ids are known; otherwise
+    /// its boundary is unknown (R8).
     #[test]
-    fn a_mount_is_crossed_only_when_both_ids_are_known_and_differ() {
-        assert!(crossed_mount(Some(1), Some(2)));
-        assert!(!crossed_mount(Some(1), Some(1)));
-        assert!(!crossed_mount(None, Some(2)));
-        assert!(!crossed_mount(Some(1), None));
-        assert!(!crossed_mount(None, None));
+    fn a_boundary_is_known_only_when_both_ids_are() {
+        assert_eq!(boundary(Some(1), Some(2)), Boundary::Crossed);
+        assert_eq!(boundary(Some(1), Some(1)), Boundary::Same);
+        assert_eq!(boundary(None, Some(2)), Boundary::Unknown);
+        assert_eq!(boundary(Some(1), None), Boundary::Unknown);
+        assert_eq!(boundary(None, None), Boundary::Unknown);
     }
 
-    /// Finding 8: the mount ids the fallback compares are real: a directory
-    /// and its subdirectory share one, and `/proc`, a mount of its own, has
-    /// another than `/`'s. Where the kernel reports none (older than 5.8),
-    /// there is nothing to compare and the test says so.
+    /// R8: the mount id is read from an fdinfo file's `mnt_id:` line.
+    #[test]
+    fn fdinfo_names_the_mount_id() {
+        let fdinfo = "pos:\t0\nflags:\t02304000\nmnt_id:\t29\nino:\t1835009\n";
+        assert_eq!(parse_fdinfo_mount_id(fdinfo), Some(29));
+        assert_eq!(parse_fdinfo_mount_id("mnt_id: 7"), Some(7));
+        assert_eq!(parse_fdinfo_mount_id("pos:\t0\nflags:\t02\n"), None);
+        assert_eq!(parse_fdinfo_mount_id("mnt_id:\tx\n"), None);
+        assert_eq!(parse_fdinfo_mount_id(""), None);
+    }
+
+    /// Run `f` with `statx`'s mount id, fdinfo's, or both, switched off.
+    #[cfg(target_os = "linux")]
+    fn without_mount_ids<T>(statx: bool, fdinfo: bool, f: impl FnOnce() -> T) -> T {
+        fd::NO_STATX_MOUNT_ID.with(|c| c.set(!statx));
+        fd::NO_FDINFO_MOUNT_ID.with(|c| c.set(!fdinfo));
+        let out = f();
+        fd::NO_STATX_MOUNT_ID.with(|c| c.set(false));
+        fd::NO_FDINFO_MOUNT_ID.with(|c| c.set(false));
+        out
+    }
+
+    /// Finding 8 and R8: the mount ids the fallback compares are real, from
+    /// `statx` and from fdinfo alike: a directory and its subdirectory share
+    /// one, and `/proc`, a mount of its own, has another than `/`'s. Where
+    /// `statx` reports none (a kernel older than 5.8), fdinfo still does.
     #[cfg(target_os = "linux")]
     #[test]
     fn mount_ids_tell_mounts_apart() {
         let tmp = tempfile::tempdir().unwrap();
         let root = canonical(&tmp);
         fs::create_dir_all(root.join("sub")).unwrap();
-        let dir = fd::Dir::open_root(&root).unwrap();
-        let Some(id) = dir.mount_id() else {
-            eprintln!("SKIP: this kernel reports no mount id (STATX_MNT_ID)");
-            return;
+        let ids = |statx: bool, fdinfo: bool| {
+            without_mount_ids(statx, fdinfo, || {
+                let dir = fd::Dir::open_root(&root).unwrap();
+                let (sub, _) = dir.open_child(c"sub").unwrap();
+                let slash = fd::Dir::open_root(Path::new("/")).unwrap().mount_id();
+                let proc = fd::Dir::open_root(Path::new("/proc")).unwrap().mount_id();
+                (dir.mount_id(), sub.mount_id(), slash, proc)
+            })
         };
-        let (sub, _) = dir.open_child(c"sub").unwrap();
-        assert_eq!(sub.mount_id(), Some(id));
-        let slash = fd::Dir::open_root(Path::new("/")).unwrap().mount_id();
-        let proc = fd::Dir::open_root(Path::new("/proc")).unwrap().mount_id();
+        let from_fdinfo = ids(false, true);
+        let (dir, sub, slash, proc) = from_fdinfo;
+        assert!(dir.is_some(), "fdinfo reported no mount id");
+        assert_eq!(sub, dir);
         assert!(slash.is_some() && proc.is_some());
-        assert_ne!(slash, proc);
-        assert!(crossed_mount(slash, proc));
+        assert_eq!(boundary(slash, proc), Boundary::Crossed);
+        assert_eq!(boundary(dir, sub), Boundary::Same);
+        let from_statx = ids(true, false);
+        if from_statx.0.is_none() {
+            eprintln!("SKIP (statx half only): this kernel's statx reports no mount id");
+        } else {
+            // Both name the same mounts by the same ids.
+            assert_eq!(from_statx, from_fdinfo);
+        }
+        assert_eq!(ids(false, false), (None, None, None, None));
     }
 
-    /// Finding 8: with the fallback and no mount ids (a kernel older than
-    /// `openat2` and `STATX_MNT_ID` both), the walk still measures a tree
-    /// on one mount the same as the primary path does.
+    /// Finding 8 and R8: on the fallback a tree on one mount measures the
+    /// same as on the primary path, whichever source the mount ids come
+    /// from; with no mount id at all, no subdirectory is entered and the
+    /// walk says it is incomplete rather than guess the boundary.
     #[test]
-    fn the_fallback_without_mount_ids_walks_as_before() {
+    fn the_fallback_enters_only_directories_known_to_be_on_the_roots_mount() {
         let tmp = tempfile::tempdir().unwrap();
         let root = canonical(&tmp).join("wt");
         fs::create_dir_all(root.join("a/b")).unwrap();
         write_allocated(&root.join("a/b/f.bin"), 16 * 1024);
-        let primary = disk_usage(&root).unwrap();
+        let budget = DEFAULT_BUDGET.clone();
+        let cancel = AtomicBool::new(false);
+        let primary = walk(&root, &limits(&budget, &cancel)).unwrap();
+        assert!(primary.complete);
         #[cfg(target_os = "linux")]
         {
             fd::FORCE_OPENAT.with(|c| c.set(true));
-            fd::NO_MOUNT_ID.with(|c| c.set(true));
-            let fallback = disk_usage(&root);
-            fd::NO_MOUNT_ID.with(|c| c.set(false));
-            let checked = disk_usage(&root);
+            let walked = |statx: bool, fdinfo: bool| {
+                without_mount_ids(statx, fdinfo, || {
+                    walk(&root, &limits(&budget, &cancel)).unwrap()
+                })
+            };
+            let with_both = walked(true, true);
+            let fdinfo_only = walked(false, true);
+            let neither = walked(false, false);
             fd::FORCE_OPENAT.with(|c| c.set(false));
-            assert_eq!(fallback.unwrap(), primary);
-            assert_eq!(checked.unwrap(), primary);
+            assert_eq!(with_both, primary);
+            assert_eq!(fdinfo_only, primary);
+            assert!(!neither.complete, "{neither:?}");
+            assert!(neither.bytes < primary.bytes, "{neither:?} vs {primary:?}");
         }
     }
 }

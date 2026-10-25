@@ -133,7 +133,7 @@ impl Discovery {
     /// whose lookup has finished. Then wait, until `until` at the latest,
     /// for the directories in `wanted` that have a lookup outstanding and no
     /// answer yet. A directory of `wanted` that could not be queued is not
-    /// waited for.
+    /// waited for; [`Self::look_up_all`] waits for those too.
     pub fn update(&mut self, cwds: &BTreeSet<PathBuf>, wanted: &BTreeSet<PathBuf>, until: Instant) {
         self.drain();
         self.schedule(cwds);
@@ -143,6 +143,44 @@ impl Discovery {
                     .get(cwd)
                     .is_some_and(|s| s.answer.is_none() && s.outstanding.is_some())
             });
+            let now = Instant::now();
+            if !waiting || now >= until {
+                return;
+            }
+            match self.done_rx.recv_timeout(until - now) {
+                Ok(done) => self.apply(done),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        }
+    }
+
+    /// Look every directory in `cwds` up, and wait until each has answered
+    /// or `until` has passed: `--once`'s single sample, which has no later
+    /// one to look the rest up in. Each directory is queued once, as room
+    /// frees under the bound; one with a lookup already outstanding is
+    /// waited for rather than queued again, and one already answered keeps
+    /// its answer.
+    pub fn look_up_all(&mut self, cwds: &BTreeSet<PathBuf>, until: Instant) {
+        self.drain();
+        self.forget_unused(cwds);
+        let mut unqueued: VecDeque<PathBuf> = cwds
+            .iter()
+            .filter(|cwd| {
+                self.state
+                    .get(*cwd)
+                    .is_none_or(|s| s.outstanding.is_none() && s.answer.is_none())
+            })
+            .cloned()
+            .collect();
+        loop {
+            let room = self.max_outstanding.saturating_sub(self.outstanding());
+            let take = room.min(unqueued.len());
+            self.queue(unqueued.drain(..take).collect());
+            let waiting = !unqueued.is_empty()
+                || cwds
+                    .iter()
+                    .any(|cwd| self.state.get(cwd).is_some_and(|s| s.outstanding.is_some()));
             let now = Instant::now();
             if !waiting || now >= until {
                 return;
@@ -173,11 +211,15 @@ impl Discovery {
         }
     }
 
-    fn schedule(&mut self, cwds: &BTreeSet<PathBuf>) {
-        // A directory no longer in use is forgotten, unless its lookup is
-        // still outstanding: that lookup keeps its place until it finishes.
+    /// Forget the directories not in `cwds`, unless a lookup of one is
+    /// still outstanding: that lookup keeps its place until it finishes.
+    fn forget_unused(&mut self, cwds: &BTreeSet<PathBuf>) {
         self.state
             .retain(|cwd, state| cwds.contains(cwd) || state.outstanding.is_some());
+    }
+
+    fn schedule(&mut self, cwds: &BTreeSet<PathBuf>) {
+        self.forget_unused(cwds);
         let mut due: Vec<(&PathBuf, bool, Option<Instant>)> = Vec::new();
         for cwd in cwds {
             let state = self.state.entry(cwd.clone()).or_default();
@@ -188,18 +230,31 @@ impl Discovery {
         // Never answered first, then the oldest lookup.
         due.sort_by_key(|(_, answered, queued)| (*answered, *queued));
         let room = self.max_outstanding.saturating_sub(self.outstanding());
+        let due: Vec<PathBuf> = due
+            .into_iter()
+            .take(room)
+            .map(|(cwd, _, _)| cwd.clone())
+            .collect();
+        self.queue(due);
+    }
+
+    /// Queue a lookup of each of `cwds`, which have none outstanding.
+    fn queue(&mut self, cwds: Vec<PathBuf>) {
+        if cwds.is_empty() {
+            return;
+        }
         let mut queue = self
             .shared
             .queue
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for (cwd, _, _) in due.into_iter().take(room) {
+        for cwd in cwds {
             self.generation += 1;
-            let state = self.state.get_mut(cwd).expect("entered above");
+            let state = self.state.entry(cwd.clone()).or_default();
             state.outstanding = Some(self.generation);
             state.queued = Some(Instant::now());
             queue.push_back(Job {
-                cwd: cwd.clone(),
+                cwd,
                 generation: self.generation,
             });
         }
@@ -405,6 +460,53 @@ mod tests {
             discovery.toplevel(Path::new("/w/b")),
             Some(&Some(PathBuf::from("/w/b")))
         );
+    }
+
+    /// N1: `--once` looks up every directory, more of them than may be
+    /// outstanding at once: each is queued once as room frees, and the wait
+    /// lasts until the last has answered.
+    #[test]
+    fn looking_up_all_refills_past_the_bound() {
+        let looked_up = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&looked_up);
+        let lookup: LookupFn = Arc::new(move |cwd: &Path| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Some(cwd.to_path_buf())
+        });
+        let mut discovery = Discovery::new(2, 3, lookup).unwrap();
+        let cwds: BTreeSet<PathBuf> = (0..20).map(|i| PathBuf::from(format!("/w/{i}"))).collect();
+        discovery.look_up_all(&cwds, Instant::now() + Duration::from_secs(60));
+        for cwd in &cwds {
+            assert_eq!(discovery.toplevel(cwd), Some(&Some(cwd.clone())), "{cwd:?}");
+        }
+        assert_eq!(looked_up.load(Ordering::SeqCst), cwds.len());
+        assert_eq!(discovery.outstanding(), 0);
+    }
+
+    /// N1: a directory whose lookup is already outstanding is waited for,
+    /// not queued a second time, and the wait ends at `until` while one
+    /// stays stalled.
+    #[test]
+    fn looking_up_all_waits_for_an_outstanding_lookup_once() {
+        let gate = Gate::new();
+        let mut discovery = Discovery::new(1, 2, gate.lookup()).unwrap();
+        let stalled = set(&["/stalled/1"]);
+        discovery.update(&stalled, &set(&[]), Instant::now());
+        let cwds = set(&["/stalled/1", "/w/a", "/w/b", "/w/c"]);
+        let started = Instant::now();
+        discovery.look_up_all(&cwds, started + Duration::from_millis(300));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(discovery.toplevel(Path::new("/stalled/1")), None);
+        gate.release();
+        discovery.look_up_all(&cwds, Instant::now() + Duration::from_secs(60));
+        for cwd in ["/w/a", "/w/b", "/w/c"] {
+            assert_eq!(
+                discovery.toplevel(Path::new(cwd)),
+                Some(&Some(PathBuf::from(cwd)))
+            );
+        }
+        assert_eq!(discovery.toplevel(Path::new("/stalled/1")), Some(&None));
+        assert_eq!(gate.stalled.load(Ordering::SeqCst), 1);
     }
 
     /// The collector's lookup: a working directory's canonical toplevel.

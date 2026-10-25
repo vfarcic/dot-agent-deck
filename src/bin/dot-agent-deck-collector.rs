@@ -5,8 +5,9 @@
 //!
 //! The pure-data core is `dot_agent_deck::telemetry::collector`; this binary
 //! holds the command line and the sampling-and-export loop. In the loop, each
-//! sample runs on a blocking thread, off the async runtime, so a slow `/proc`
-//! read holds up neither a signal nor the runtime's timers.
+//! sample runs on a blocking thread, off the async runtime, and each export
+//! runs alongside the wait for a signal, so neither a slow `/proc` read nor a
+//! slow backend holds up the stop.
 
 use std::process::ExitCode;
 
@@ -27,13 +28,14 @@ mod linux {
     use std::fs;
     use std::io::Write;
     use std::path::PathBuf;
+    use std::pin::Pin;
     use std::process::ExitCode;
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use bytes::Bytes;
     use clap::{Parser, Subcommand};
-    use dot_agent_deck::telemetry::collector::aggregate::{Aggregator, Sample};
+    use dot_agent_deck::telemetry::collector::aggregate::{Aggregator, ProcessSample, Sample};
     use dot_agent_deck::telemetry::collector::config::{Export, Settings};
     use dot_agent_deck::telemetry::collector::discovery::{self, Discovery, FIRST_SIGHT_WAIT};
     use dot_agent_deck::telemetry::collector::disk::{
@@ -59,13 +61,24 @@ mod linux {
 
     /// A failed export is logged at most this often.
     const FAILURE_LOG_EVERY: Duration = Duration::from_secs(60);
-    /// At SIGTERM or SIGINT, how long the final sample waits for the walks
-    /// queued or running then, so that its request carries their figures.
-    const SHUTDOWN_WALK_WAIT: Duration = Duration::from_secs(5);
-    /// At SIGTERM or SIGINT, how long the collector waits for a sample in
-    /// progress and then its final one. Past it, it exits without its final
-    /// request rather than wait on a `/proc` read that does not return.
-    const SHUTDOWN_SAMPLE_LIMIT: Duration = Duration::from_secs(10);
+    /// What shutting down at SIGTERM or SIGINT may take, counted from the
+    /// stop's arrival.
+    #[derive(Debug, Clone, Copy)]
+    struct ShutdownBudget {
+        /// How long the final sample waits for the walks queued or running,
+        /// so that its request carries their figures.
+        walks: Duration,
+        /// When everything left ends: a sample in progress and its export, an
+        /// export in progress, the final sample and the final export. What
+        /// has not finished then is abandoned, rather than wait on a `/proc`
+        /// read or a backend that does not answer.
+        total: Duration,
+    }
+
+    const SHUTDOWN: ShutdownBudget = ShutdownBudget {
+        walks: Duration::from_secs(5),
+        total: Duration::from_secs(10),
+    };
 
     /// Report each agent run's CPU and memory, and each worktree's disk use,
     /// over OTLP, from the standard OTEL_EXPORTER_OTLP_* variables.
@@ -175,17 +188,13 @@ mod linux {
     async fn run(cli: Cli, mut sampler: Sampler, mut sink: Sink) -> ExitCode {
         if cli.once {
             let request = sampler.sample_once();
-            return if sink.emit(&request, true).await == Delivery::Delivered {
+            return if sink.emit(&request, true, None).await == Delivery::Delivered {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::FAILURE
             };
         }
-        use tokio::signal::unix::{SignalKind, signal};
-        let (Ok(mut terminate), Ok(mut interrupt)) = (
-            signal(SignalKind::terminate()),
-            signal(SignalKind::interrupt()),
-        ) else {
+        let Ok(stop) = stop_signal() else {
             eprintln!("dot-agent-deck-collector: cannot install signal handlers");
             return ExitCode::FAILURE;
         };
@@ -194,79 +203,151 @@ mod linux {
             cli.interval,
             sink.describe()
         );
-        let mut pending = PendingTerminals::default();
-        let mut ticker = tokio::time::interval(Duration::from_secs(cli.interval));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // The sampler is lent to a blocking thread for each sample and comes
-        // back with its request. A tick that comes while a sample runs is
-        // skipped.
-        let mut idle = Some(sampler);
-        let mut sampling: Option<JoinHandle<(Sampler, Request)>> = None;
-        loop {
-            tokio::select! {
-                _ = ticker.tick(), if idle.is_some() => {
-                    let mut lent = idle.take().expect("the branch runs only with the sampler idle");
-                    sampling = Some(tokio::task::spawn_blocking(move || {
-                        let request = lent.sample();
-                        (lent, request)
-                    }));
-                }
-                joined = async {
-                    sampling.as_mut().expect("the branch runs only while sampling").await
-                }, if sampling.is_some() => {
-                    sampling = None;
-                    let Ok((returned, request)) = joined else {
-                        eprintln!("dot-agent-deck-collector: a sample failed; exiting");
-                        return ExitCode::FAILURE;
-                    };
-                    idle = Some(returned);
-                    sink.emit_holding(request, &mut pending).await;
-                }
-                _ = terminate.recv() => break,
-                _ = interrupt.recv() => break,
-            }
-        }
-        shutdown(idle, sampling, sink, pending).await
+        let exporter = Exporter {
+            sink,
+            pending: PendingTerminals::default(),
+        };
+        let interval = Duration::from_secs(cli.interval);
+        run_loop(interval, sampler, exporter, stop, SHUTDOWN).await
     }
 
-    /// The final sample and export, at SIGTERM or SIGINT. A sample in
-    /// progress is waited for, its ended runs' last reports held for the
-    /// final request; the final sample then waits up to
-    /// [`SHUTDOWN_WALK_WAIT`] for the walks queued or running. All of it
-    /// ends within [`SHUTDOWN_SAMPLE_LIMIT`] of the signal, or the collector
-    /// exits without its final request.
-    async fn shutdown(
-        idle: Option<Sampler>,
-        sampling: Option<JoinHandle<(Sampler, Request)>>,
-        mut sink: Sink,
-        mut pending: PendingTerminals,
+    /// A future that ends at the first SIGTERM or SIGINT. Both handlers are
+    /// installed before it is returned, so a signal sent after that is not
+    /// missed.
+    fn stop_signal() -> std::io::Result<impl Future<Output = ()>> {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut terminate = signal(SignalKind::terminate())?;
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        Ok(async move {
+            tokio::select! {
+                _ = terminate.recv() => {}
+                _ = interrupt.recv() => {}
+            }
+        })
+    }
+
+    /// What samples: [`Sampler`], or a test's stand-in.
+    trait Sampling: Send + 'static {
+        /// One sample, with the worktrees in use walked in the background.
+        fn sample(&mut self) -> Request;
+        /// The last sample, at shutdown: [`Self::sample`], then a wait until
+        /// `walks_until` for the walks queued or running, so that its
+        /// request carries what they measure.
+        fn sample_final(&mut self, walks_until: Instant) -> Request;
+    }
+
+    /// An export in progress, which hands the [`Exporter`] back when it ends.
+    type Exporting = Pin<Box<dyn Future<Output = Exporter>>>;
+
+    /// What the loop is doing. The sampler and the exporter are each idle
+    /// or lent to the work in progress: a sample on a blocking thread, or the
+    /// export of the request it returned. The next sample starts at a tick
+    /// after that export has ended.
+    enum InProgress<S> {
+        Nothing(S, Exporter),
+        Sampling(JoinHandle<(S, Request)>, Exporter),
+        Exporting(S, Exporting),
+    }
+
+    /// Sample every `interval` and export each request, until `stop` ends;
+    /// then [`shutdown`]. The stop is received, and its instant taken,
+    /// whatever is in progress.
+    async fn run_loop<S: Sampling>(
+        interval: Duration,
+        sampler: S,
+        exporter: Exporter,
+        stop: impl Future<Output = ()>,
+        budget: ShutdownBudget,
     ) -> ExitCode {
-        let stopped = Instant::now();
-        let limit = tokio::time::Instant::from_std(stopped + SHUTDOWN_SAMPLE_LIMIT);
+        tokio::pin!(stop);
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut work = InProgress::Nothing(sampler, exporter);
+        loop {
+            work = match work {
+                InProgress::Nothing(mut sampler, exporter) => tokio::select! {
+                    _ = ticker.tick() => {
+                        let sampling = tokio::task::spawn_blocking(move || {
+                            let request = sampler.sample();
+                            (sampler, request)
+                        });
+                        InProgress::Sampling(sampling, exporter)
+                    }
+                    () = &mut stop => {
+                        let work = InProgress::Nothing(sampler, exporter);
+                        return shutdown(Instant::now(), work, budget).await;
+                    }
+                },
+                InProgress::Sampling(mut sampling, exporter) => tokio::select! {
+                    joined = &mut sampling => {
+                        let Ok((sampler, request)) = joined else {
+                            eprintln!("dot-agent-deck-collector: a sample failed; exiting");
+                            return ExitCode::FAILURE;
+                        };
+                        InProgress::Exporting(sampler, Box::pin(exporter.export(request, None)))
+                    }
+                    () = &mut stop => {
+                        let work = InProgress::Sampling(sampling, exporter);
+                        return shutdown(Instant::now(), work, budget).await;
+                    }
+                },
+                InProgress::Exporting(sampler, mut exporting) => tokio::select! {
+                    exporter = &mut exporting => InProgress::Nothing(sampler, exporter),
+                    () = &mut stop => {
+                        let work = InProgress::Exporting(sampler, exporting);
+                        return shutdown(Instant::now(), work, budget).await;
+                    }
+                },
+            };
+        }
+    }
+
+    /// Shut down after a stop that arrived at `stopped`, with `work` in
+    /// progress. A sample in progress is finished and its request exported,
+    /// since under delta temporality its CPU is in no other request; that
+    /// export, or one already in progress, runs alongside the final sample,
+    /// which waits up to `budget.walks` for the walks queued or running.
+    /// The final request is exported last. All of it ends within
+    /// `budget.total` of `stopped`: each export's deadline is cut to it, and
+    /// what has not finished then is abandoned, the final request with it.
+    async fn shutdown<S: Sampling>(
+        stopped: Instant,
+        work: InProgress<S>,
+        budget: ShutdownBudget,
+    ) -> ExitCode {
+        let deadline = stopped + budget.total;
+        let limit = tokio::time::Instant::from_std(deadline);
         let gave_up = || {
             eprintln!(
-                "dot-agent-deck-collector: the final sample did not finish within {}s of the stop; exiting without it",
-                SHUTDOWN_SAMPLE_LIMIT.as_secs()
+                "dot-agent-deck-collector: shutting down did not finish within {}s of the stop; exiting without the final request",
+                budget.total.as_secs()
             );
             ExitCode::SUCCESS
         };
-        let mut sampler = match (idle, sampling) {
-            (Some(sampler), _) => sampler,
-            (None, Some(running)) => match tokio::time::timeout_at(limit, running).await {
-                Ok(Ok((sampler, request))) => {
-                    pending.hold(&request);
-                    sampler
+        let (mut sampler, earlier): (S, Exporting) = match work {
+            InProgress::Nothing(sampler, exporter) => {
+                (sampler, Box::pin(std::future::ready(exporter)))
+            }
+            InProgress::Exporting(sampler, exporting) => (sampler, exporting),
+            InProgress::Sampling(sampling, exporter) => {
+                match tokio::time::timeout_at(limit, sampling).await {
+                    Ok(Ok((sampler, request))) => {
+                        (sampler, Box::pin(exporter.export(request, Some(deadline))))
+                    }
+                    _ => return gave_up(),
                 }
-                _ => return gave_up(),
-            },
-            (None, None) => return gave_up(),
+            }
         };
-        let walks_until = stopped + SHUTDOWN_WALK_WAIT;
+        let walks_until = (stopped + budget.walks).min(deadline);
         let last = tokio::task::spawn_blocking(move || sampler.sample_final(walks_until));
-        match tokio::time::timeout_at(limit, last).await {
-            Ok(Ok(request)) => sink.emit_holding(request, &mut pending).await,
-            _ => return gave_up(),
-        }
+        let (exporter, last) = tokio::join!(
+            tokio::time::timeout_at(limit, earlier),
+            tokio::time::timeout_at(limit, last)
+        );
+        let (Ok(exporter), Ok(Ok(request))) = (exporter, last) else {
+            return gave_up();
+        };
+        exporter.export(request, Some(deadline)).await;
         ExitCode::SUCCESS
     }
 
@@ -365,21 +446,11 @@ mod linux {
             })
         }
 
-        /// One sample, with the worktrees in use walked in the background.
-        fn sample(&mut self) -> Request {
-            let (sample, in_use) = self.read(Instant::now() + FIRST_SIGHT_WAIT, false);
-            let usage = match &mut self.disks {
-                Some(disks) => disks.update(&in_use),
-                None => Vec::new(),
-            };
-            self.request(&sample, &usage)
-        }
-
         /// One sample, with every worktree in use looked up and walked
         /// before it is sent, all within the walk's time budget.
         fn sample_once(&mut self) -> Request {
             let deadline = Instant::now() + DEFAULT_BUDGET.time;
-            let (sample, in_use) = self.read(deadline, true);
+            let (sample, in_use) = self.read(LookupWait::Every(deadline));
             let usage = match &mut self.disks {
                 Some(disks) => disks.measure_all(&in_use, deadline),
                 None => Vec::new(),
@@ -387,47 +458,51 @@ mod linux {
             self.request(&sample, &usage)
         }
 
-        /// The last sample, at shutdown: [`Self::sample`], then a wait until
-        /// `walks_until` for the walks queued or running, so that its
-        /// request carries what they measure.
-        fn sample_final(&mut self, walks_until: Instant) -> Request {
-            let lookups_until = (Instant::now() + FIRST_SIGHT_WAIT).min(walks_until);
-            let (sample, in_use) = self.read(lookups_until, false);
-            let usage = match &mut self.disks {
-                Some(disks) => {
-                    disks.update(&in_use);
-                    disks.settle(&in_use, walks_until)
-                }
-                None => Vec::new(),
-            };
-            self.request(&sample, &usage)
+        /// [`Self::read_from`] `/proc`.
+        fn read(&mut self, wait: LookupWait) -> (Sample, InUse) {
+            let users = self.users;
+            self.read_from(
+                || reader::read_processes(users, reader::pids()),
+                |pid| fs::read_link(format!("/proc/{pid}/cwd")).ok(),
+                wait,
+            )
         }
 
-        /// Read and account one sample, and find its worktrees: each run
-        /// seen for the first time waits until `until` for the lookups its
-        /// worktree is decided from (`every_lookup`: every lookup of the
-        /// sample waits, as `--once` does). A lookup still outstanding then
-        /// is no worktree for that run, which keeps none (§5.4 of the
-        /// design); the sample waits for nothing else.
-        fn read(&mut self, until: Instant, every_lookup: bool) -> (Sample, InUse) {
-            let processes = reader::read_processes(self.users, reader::pids());
-            let sample = self.aggregator.step(now_unix_nanos(), processes);
-            let cwds = working_directories(&sample);
+        /// Account one sample of `processes`, and find its worktrees from
+        /// each run-attributed process's working directory, `cwd_of` its
+        /// pid. How long the sample waits for lookups is `wait`'s: a lookup
+        /// still outstanding then is no worktree for a run seen for the
+        /// first time, which keeps none (§5.4 of the design); the sample
+        /// waits for nothing else.
+        fn read_from(
+            &mut self,
+            processes: impl FnOnce() -> Vec<ProcessSample>,
+            cwd_of: impl Fn(u32) -> Option<PathBuf>,
+            wait: LookupWait,
+        ) -> (Sample, InUse) {
+            let sample = self.aggregator.step(now_unix_nanos(), processes());
+            let cwds = working_directories(&sample, cwd_of);
             let (members, in_use) = match &mut self.discovery {
                 Some(discovery) => {
                     let all: BTreeSet<PathBuf> = cwds.values().cloned().collect();
-                    let wanted: BTreeSet<PathBuf> = if every_lookup {
-                        all.clone()
-                    } else {
-                        sample
-                            .runs
-                            .iter()
-                            .filter(|run| !self.run_worktrees.is_decided(&run.key()))
-                            .flat_map(|run| &run.members)
-                            .filter_map(|pid| cwds.get(pid).cloned())
-                            .collect()
-                    };
-                    discovery.update(&all, &wanted, until);
+                    match wait {
+                        LookupWait::Every(until) => discovery.look_up_all(&all, until),
+                        LookupWait::FirstSight { cap } => {
+                            let wanted: BTreeSet<PathBuf> = sample
+                                .runs
+                                .iter()
+                                .filter(|run| !self.run_worktrees.is_decided(&run.key()))
+                                .flat_map(|run| &run.members)
+                                .filter_map(|pid| cwds.get(pid).cloned())
+                                .collect();
+                            // The allowance starts once the processes and
+                            // their directories are read, which on a busy
+                            // host can itself take longer than it.
+                            let until = Instant::now() + FIRST_SIGHT_WAIT;
+                            let until = cap.map_or(until, |cap| until.min(cap));
+                            discovery.update(&all, &wanted, until);
+                        }
+                    }
                     worktrees(&cwds, discovery, self.send_paths)
                 }
                 None => (HashMap::new(), InUse::new()),
@@ -496,15 +571,55 @@ mod linux {
         }
     }
 
-    /// Each run-attributed process's working directory, by pid. Reading
-    /// `/proc/<pid>/cwd`'s link names the directory without looking it up
-    /// on its filesystem, so it cannot stall on one that does not answer.
-    fn working_directories(sample: &Sample) -> HashMap<u32, PathBuf> {
+    impl Sampling for Sampler {
+        fn sample(&mut self) -> Request {
+            let (sample, in_use) = self.read(LookupWait::FirstSight { cap: None });
+            let usage = match &mut self.disks {
+                Some(disks) => disks.update(&in_use),
+                None => Vec::new(),
+            };
+            self.request(&sample, &usage)
+        }
+
+        fn sample_final(&mut self, walks_until: Instant) -> Request {
+            let (sample, in_use) = self.read(LookupWait::FirstSight {
+                cap: Some(walks_until),
+            });
+            let usage = match &mut self.disks {
+                Some(disks) => {
+                    disks.update(&in_use);
+                    disks.settle(&in_use, walks_until)
+                }
+                None => Vec::new(),
+            };
+            self.request(&sample, &usage)
+        }
+    }
+
+    /// How long a sample waits for its worktree lookups.
+    #[derive(Debug, Clone, Copy)]
+    enum LookupWait {
+        /// The runs seen for the first time wait for their members' lookups,
+        /// for [`FIRST_SIGHT_WAIT`] from when the lookups start, and never
+        /// past `cap`.
+        FirstSight { cap: Option<Instant> },
+        /// Every lookup is waited for, until this instant: `--once`.
+        Every(Instant),
+    }
+
+    /// Each run-attributed process's working directory, by pid, `cwd_of`
+    /// its pid. In the collector that reads `/proc/<pid>/cwd`'s link, which
+    /// names the directory without looking it up on its filesystem, so it
+    /// cannot stall on one that does not answer.
+    fn working_directories(
+        sample: &Sample,
+        cwd_of: impl Fn(u32) -> Option<PathBuf>,
+    ) -> HashMap<u32, PathBuf> {
         sample
             .runs
             .iter()
             .flat_map(|run| &run.members)
-            .filter_map(|pid| Some((*pid, fs::read_link(format!("/proc/{pid}/cwd")).ok()?)))
+            .filter_map(|pid| Some((*pid, cwd_of(*pid)?)))
             .collect()
     }
 
@@ -555,9 +670,14 @@ mod linux {
             }
         }
 
-        /// Print or send one request.
+        /// Print or send one request, a send ending by `until` if given.
         /// `always_log` reports a failure even within a minute of the last.
-        async fn emit(&mut self, request: &Request, always_log: bool) -> Delivery {
+        async fn emit(
+            &mut self,
+            request: &Request,
+            always_log: bool,
+            until: Option<Instant>,
+        ) -> Delivery {
             match self {
                 Sink::Stdout => {
                     let mut line = encode_json(request);
@@ -569,26 +689,36 @@ mod linux {
                         Delivery::Failed
                     }
                 }
-                Sink::Send(sender) => sender.send(request, always_log).await,
+                Sink::Send(sender) => sender.send(request, always_log, until).await,
             }
         }
+    }
 
-        /// [`Self::emit`] in the loop: the ended runs' last reports that
-        /// earlier requests failed to deliver go along, and this request's
-        /// are held if it fails too. A partially rejected request is not
-        /// retried, so it is not held either.
-        async fn emit_holding(&mut self, mut request: Request, pending: &mut PendingTerminals) {
-            pending.attach(&mut request);
-            if self.emit(&request, false).await == Delivery::Failed {
-                let dropped = pending.failed(&request);
+    /// The loop's exports: where they go, and the ended runs' last reports
+    /// held for a later one.
+    struct Exporter {
+        sink: Sink,
+        pending: PendingTerminals,
+    }
+
+    impl Exporter {
+        /// Export `request`, ending by `until` if given: the ended runs'
+        /// last reports that earlier requests failed to deliver go along,
+        /// and this request's are held if it fails too. A partially rejected
+        /// request is not retried, so it is not held either.
+        async fn export(mut self, mut request: Request, until: Option<Instant>) -> Self {
+            self.pending.attach(&mut request);
+            if self.sink.emit(&request, false, until).await == Delivery::Failed {
+                let dropped = self.pending.failed(&request);
                 if dropped > 0 {
                     eprintln!(
                         "dot-agent-deck-collector: dropped the final figures of {dropped} ended runs held for a later export"
                     );
                 }
             } else {
-                pending.delivered();
+                self.pending.delivered();
             }
+            self
         }
     }
 
@@ -639,10 +769,15 @@ mod linux {
             })
         }
 
-        /// Send `request`, and log a failure (`always_log`: even within a
-        /// minute of the last).
-        async fn send(&mut self, request: &Request, always_log: bool) -> Delivery {
-            let (delivery, report) = self.deliver(request).await;
+        /// Send `request`, ending by `until` if given, and log a failure
+        /// (`always_log`: even within a minute of the last).
+        async fn send(
+            &mut self,
+            request: &Request,
+            always_log: bool,
+            until: Option<Instant>,
+        ) -> Delivery {
+            let (delivery, report) = self.deliver(request, until).await;
             let Some(report) = report else {
                 return delivery;
             };
@@ -663,16 +798,22 @@ mod linux {
         /// or 504, or the backend unreachable or slow) with jittered backoff,
         /// honouring `Retry-After`. The whole send — every attempt, the waits
         /// between them and reading the answer — ends within the export
-        /// timeout and the sampling interval, whichever is shorter
-        /// ([`Attempts`]). Any other answer is final. Returns how it fared
-        /// and, unless it was plainly delivered, what to log.
-        async fn deliver(&self, request: &Request) -> (Delivery, Option<String>) {
+        /// timeout and the sampling interval, whichever is shorter, and by
+        /// `until` when given ([`Attempts`]). Any other answer is final.
+        /// Returns how it fared and, unless it was plainly delivered, what
+        /// to log.
+        async fn deliver(
+            &self,
+            request: &Request,
+            until: Option<Instant>,
+        ) -> (Delivery, Option<String>) {
             let (body, content_type) = if self.json {
                 (encode_json(request), "application/json")
             } else {
                 (encode_protobuf(request), "application/x-protobuf")
             };
-            let mut attempts = Attempts::new(Instant::now(), self.timeout, self.retry_window);
+            let mut attempts =
+                Attempts::new(Instant::now(), self.timeout, self.retry_window).until(until);
             let mut failure = "timed out".to_string();
             let (delivery, report) = loop {
                 let Some(remaining) = attempts.remaining(Instant::now()) else {
@@ -786,6 +927,15 @@ mod linux {
             }
         }
 
+        /// The same, ending by `cap` when it is earlier: the shutdown's
+        /// deadline.
+        fn until(mut self, cap: Option<Instant>) -> Self {
+            if let Some(cap) = cap {
+                self.deadline = self.deadline.min(cap);
+            }
+            self
+        }
+
         /// What is left of the deadline at `now`; `None` once nothing is.
         fn remaining(&self, now: Instant) -> Option<Duration> {
             Some(self.deadline.saturating_duration_since(now)).filter(|left| !left.is_zero())
@@ -882,6 +1032,7 @@ mod linux {
 
     #[cfg(test)]
     mod tests {
+        use dot_agent_deck::telemetry::collector::config::Temporality;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
         use tokio::sync::mpsc;
@@ -1105,16 +1256,17 @@ mod linux {
         }
 
         /// Read one HTTP request: its head, then the `Content-Length` bytes
-        /// of its body. `false` when the client closed or the connection
-        /// failed before the request ended, or its head was not one this
-        /// reads: a sender that gave up early is not this backend's failure.
-        async fn read_request(stream: &mut tokio::net::TcpStream) -> bool {
+        /// of its body, which it returns. `None` when the client closed or
+        /// the connection failed before the request ended, or its head was
+        /// not one this reads: a sender that gave up early is not this
+        /// backend's failure.
+        async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
             let mut seen = Vec::new();
             let mut buf = [0u8; 4096];
             let head_end = loop {
                 match stream.read(&mut buf).await {
                     Ok(n) if n > 0 => seen.extend_from_slice(&buf[..n]),
-                    _ => return false,
+                    _ => return None,
                 }
                 if let Some(at) = seen.windows(4).position(|w| w == b"\r\n\r\n") {
                     break at + 4;
@@ -1128,15 +1280,15 @@ mod linux {
             {
                 None => 0,
                 Some(Ok(length)) => length,
-                Some(Err(_)) => return false,
+                Some(Err(_)) => return None,
             };
             while seen.len() < head_end + length {
                 match stream.read(&mut buf).await {
                     Ok(n) if n > 0 => seen.extend_from_slice(&buf[..n]),
-                    _ => return false,
+                    _ => return None,
                 }
             }
-            true
+            Some(seen[head_end..head_end + length].to_vec())
         }
 
         /// A backend on loopback that gives its one connection `answer`.
@@ -1152,7 +1304,7 @@ mod linux {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     return;
                 };
-                if !read_request(&mut stream).await {
+                if read_request(&mut stream).await.is_none() {
                     return;
                 }
                 let _ = ready.send(()).await;
@@ -1197,9 +1349,10 @@ mod linux {
         async fn send_to(answer: Answer, interval: Duration) -> ((Delivery, Option<String>), bool) {
             let (endpoint, mut requested) = backend(answer).await;
             let sender = sender(endpoint, EXPORT_TIMEOUT, interval);
-            let fared = tokio::time::timeout(BOUND, sender.deliver(&Request { resources: vec![] }))
-                .await
-                .expect("the send outlived its deadline");
+            let fared =
+                tokio::time::timeout(BOUND, sender.deliver(&Request { resources: vec![] }, None))
+                    .await
+                    .expect("the send outlived its deadline");
             (fared, requested.try_recv().is_ok())
         }
 
@@ -1209,6 +1362,280 @@ mod linux {
             let (fared, requested) = send_to(answer, interval).await;
             assert!(requested, "the backend did not get the request: {fared:?}");
             fared
+        }
+
+        /// A backend on loopback that answers every request with an empty
+        /// 200, on as many connections as it is given, and yields each
+        /// request's body.
+        async fn recording_backend() -> (String, mpsc::UnboundedReceiver<Vec<u8>>) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/v1/metrics", listener.local_addr().unwrap());
+            let (bodies, received) = mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let bodies = bodies.clone();
+                    tokio::spawn(async move {
+                        while let Some(body) = read_request(&mut stream).await {
+                            let _ = bodies.send(body);
+                            let answer = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+                            if stream.write_all(answer).await.is_err() {
+                                return;
+                            }
+                        }
+                    });
+                }
+            });
+            (endpoint, received)
+        }
+
+        const CLK_TCK: u64 = 100;
+        const BOOT: u64 = 1_700_000_000;
+        const RUN: &str = "scripted-run";
+
+        fn settings(temporality: Temporality) -> Settings {
+            Settings {
+                service_name: "dot-agent-deck-collector".into(),
+                resource_pairs: Vec::new(),
+                temporality,
+                unknown_temporality: None,
+                label_uids: false,
+            }
+        }
+
+        /// One process of the run `run_id`, having used `ticks` of CPU.
+        fn process(pid: u32, run_id: &str, ticks: u64) -> ProcessSample {
+            use dot_agent_deck::telemetry::collector::aggregate::Environ;
+            use dot_agent_deck::telemetry::collector::identity::RunIdentity;
+            use dot_agent_deck::telemetry::collector::procfs::ProcStat;
+            ProcessSample {
+                pid,
+                uid: 1000,
+                stat: ProcStat {
+                    ppid: 1,
+                    flags: 0,
+                    utime: ticks,
+                    stime: 0,
+                    cutime: 0,
+                    cstime: 0,
+                    starttime: 0,
+                },
+                environ: Environ::Read(Some(RunIdentity {
+                    run_id: run_id.into(),
+                    attributes: Vec::new(),
+                })),
+                pss: None,
+            }
+        }
+
+        /// A stand-in sampler: a real [`Aggregator`] and real requests, over
+        /// one process of [`RUN`] that has used one more second of CPU at
+        /// each sample, with no `/proc` read and nothing to wait for.
+        struct Scripted {
+            aggregator: Aggregator,
+            settings: Settings,
+            ticks: u64,
+            time: u64,
+        }
+
+        impl Scripted {
+            fn new(temporality: Temporality) -> Self {
+                let started = BOOT * 1_000_000_000;
+                Scripted {
+                    aggregator: Aggregator::new(CLK_TCK, BOOT, started),
+                    settings: settings(temporality),
+                    ticks: 0,
+                    time: started,
+                }
+            }
+
+            fn next(&mut self) -> Request {
+                self.ticks += CLK_TCK;
+                self.time += 1_000_000_000;
+                let sample = self
+                    .aggregator
+                    .step(self.time, vec![process(4242, RUN, self.ticks)]);
+                build_request(&sample, &HashMap::new(), &[], &self.settings, None)
+            }
+        }
+
+        impl Sampling for Scripted {
+            fn sample(&mut self) -> Request {
+                self.next()
+            }
+
+            fn sample_final(&mut self, _walks_until: Instant) -> Request {
+                self.next()
+            }
+        }
+
+        fn exporter_to(endpoint: String) -> Exporter {
+            Exporter {
+                sink: Sink::Send(sender(endpoint, EXPORT_TIMEOUT, EXPORT_TIMEOUT)),
+                pending: PendingTerminals::default(),
+            }
+        }
+
+        /// Each `deck.run.cpu.time` point of [`RUN`] in an OTLP/JSON body:
+        /// its temporality and value.
+        fn run_cpu_points(body: &[u8]) -> Vec<(i64, f64)> {
+            let request: serde_json::Value = serde_json::from_slice(body).unwrap();
+            let mut points = Vec::new();
+            for resource in request["resourceMetrics"].as_array().unwrap() {
+                let ours = resource["resource"]["attributes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|a| a["key"] == "deck.run.id" && a["value"]["stringValue"] == RUN);
+                if !ours {
+                    continue;
+                }
+                for scope in resource["scopeMetrics"].as_array().unwrap() {
+                    for metric in scope["metrics"].as_array().unwrap() {
+                        if metric["name"] != "deck.run.cpu.time" {
+                            continue;
+                        }
+                        let sum = &metric["sum"];
+                        let temporality = sum["aggregationTemporality"].as_i64().unwrap();
+                        for point in sum["dataPoints"].as_array().unwrap() {
+                            points.push((temporality, point["asDouble"].as_f64().unwrap()));
+                        }
+                    }
+                }
+            }
+            points
+        }
+
+        /// N2: under delta temporality, a sample in progress when the stop
+        /// comes is exported along with the final one, so the run's delta
+        /// points still add up to all the CPU it used: none of its intervals
+        /// is left out.
+        #[tokio::test]
+        async fn a_sample_in_progress_at_the_stop_is_exported_too() {
+            let (endpoint, mut received) = recording_backend().await;
+            let exporter = exporter_to(endpoint);
+            let mut sampler = Scripted::new(Temporality::Delta);
+            let first = sampler.sample();
+            let exporter = exporter.export(first, None).await;
+            let sampling = tokio::task::spawn_blocking(move || {
+                let request = sampler.sample();
+                (sampler, request)
+            });
+            let budget = ShutdownBudget {
+                walks: Duration::ZERO,
+                total: GENEROUS,
+            };
+            let work = InProgress::Sampling(sampling, exporter);
+            tokio::time::timeout(BOUND, shutdown(Instant::now(), work, budget))
+                .await
+                .expect("the shutdown outlived its bound");
+            let mut points = Vec::new();
+            while let Ok(body) = received.try_recv() {
+                points.extend(run_cpu_points(&body));
+            }
+            assert_eq!(points.len(), 3, "{points:?}");
+            assert!(points.iter().all(|(temporality, _)| *temporality == 1));
+            let total: f64 = points.iter().map(|(_, value)| value).sum();
+            assert!((total - 3.0).abs() < 1e-9, "{points:?}");
+        }
+
+        /// N4: the final export ends at the shutdown's deadline when the
+        /// backend takes the request and never answers, however long the
+        /// export timeout and the interval allow.
+        #[tokio::test]
+        async fn the_final_export_ends_within_the_shutdown_budget() {
+            let (endpoint, mut requested) = backend(Answer::Hold).await;
+            let budget = ShutdownBudget {
+                walks: Duration::from_millis(100),
+                total: Duration::from_secs(2),
+            };
+            let work = InProgress::Nothing(
+                Scripted::new(Temporality::Cumulative),
+                exporter_to(endpoint),
+            );
+            let stopped = Instant::now();
+            tokio::time::timeout(BOUND, shutdown(stopped, work, budget))
+                .await
+                .expect("the shutdown outlived its bound");
+            let took = stopped.elapsed();
+            assert!(took < budget.total + Duration::from_secs(1), "{took:?}");
+            assert!(
+                requested.try_recv().is_ok(),
+                "the final request was never sent"
+            );
+        }
+
+        /// N4, with a real signal: a SIGTERM that arrives while a regular
+        /// export waits on a backend that never answers is received then,
+        /// and the collector's loop ends within the shutdown budget of it,
+        /// not when the export would have given up.
+        #[tokio::test]
+        async fn a_signal_during_an_export_ends_the_loop_within_the_budget() {
+            let (endpoint, mut requested) = backend(Answer::Hold).await;
+            let budget = ShutdownBudget {
+                walks: Duration::from_millis(100),
+                total: Duration::from_secs(2),
+            };
+            let stop = stop_signal().unwrap();
+            let signalled = tokio::spawn(async move {
+                requested
+                    .recv()
+                    .await
+                    .expect("the backend never got the first request");
+                let at = Instant::now();
+                // SAFETY: `kill` has no memory-safety preconditions; the
+                // SIGTERM handler is installed, so it does not end the test.
+                assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGTERM) }, 0);
+                at
+            });
+            let looped = run_loop(
+                EXPORT_TIMEOUT,
+                Scripted::new(Temporality::Cumulative),
+                exporter_to(endpoint),
+                stop,
+                budget,
+            );
+            tokio::time::timeout(BOUND, looped)
+                .await
+                .expect("the loop outlived its bound");
+            let took = signalled.await.unwrap().elapsed();
+            assert!(took < budget.total + Duration::from_secs(1), "{took:?}");
+        }
+
+        /// N4: the shutdown's deadline cuts a send's own, never lengthens it.
+        #[test]
+        fn a_cap_only_shortens_a_sends_deadline() {
+            let start = Instant::now();
+            let s = Duration::from_secs;
+            let capped = Attempts::new(start, s(10), s(15)).until(Some(start + s(3)));
+            assert_eq!(capped.remaining(start), Some(s(3)));
+            let later = Attempts::new(start, s(10), s(15)).until(Some(start + s(30)));
+            assert_eq!(later.remaining(start), Some(s(10)));
+            let none = Attempts::new(start, s(10), s(15)).until(None);
+            assert_eq!(none.remaining(start), Some(s(10)));
+        }
+
+        /// N3: the first-sight allowance starts once the processes are read,
+        /// so a read slower than the allowance still leaves a lookup that
+        /// answers at once time to decide a new run's worktree.
+        #[test]
+        fn the_first_sight_wait_starts_after_a_slow_process_read() {
+            let tmp = tempfile::tempdir().unwrap();
+            fs::create_dir(tmp.path().join(".git")).unwrap();
+            let cli = Cli::parse_from(["dot-agent-deck-collector", "--disk-interval", "0"]);
+            let mut sampler = Sampler::new(&cli, settings(Temporality::Cumulative)).unwrap();
+            let cwd = tmp.path().to_path_buf();
+            let (sample, _) = sampler.read_from(
+                || {
+                    std::thread::sleep(FIRST_SIGHT_WAIT + Duration::from_millis(500));
+                    vec![process(4242, RUN, CLK_TCK)]
+                },
+                |_| Some(cwd.clone()),
+                LookupWait::FirstSight { cap: None },
+            );
+            let expected = worktree_id(&fs::canonicalize(tmp.path()).unwrap());
+            let run = sample.runs[0].key();
+            let decided = sampler.run_worktrees.get().get(&run).map(|w| w.id.clone());
+            assert_eq!(decided, Some(expected));
         }
 
         /// A 200 answer with `body`, declaring `length` bytes of it.
