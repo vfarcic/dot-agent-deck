@@ -87,6 +87,9 @@ impl Codex {
             .with_imported_codex_credentials()
             .with_env("DOT_AGENT_DECK_LOG", "codex-inbox-live.log")
             .with_env("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "30000")
+            // A held task shows its reason after five seconds, not two
+            // minutes (`inbox/codex/009`).
+            .with_env("DOT_AGENT_DECK_INBOX_WAKE_STALL_AFTER_MS", "5000")
             // A `dot-agent-deck` the model runs by name (the doorbell's
             // `inbox fetch`) is the build under test, not one on the host.
             .with_env("PATH", common::path_with_binary_dir())

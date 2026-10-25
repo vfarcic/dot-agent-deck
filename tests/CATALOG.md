@@ -11933,7 +11933,7 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 ##### inbox/codex/010 — Real folder trust holds an inbox message until the user answers.
 - **Layer:** L2 real agent, lane 2 (`tests/e2e_inbox_codex_live.rs`).
 - **Agent:** interactive cheap-model Codex in a fresh untrusted scratch git directory.
-- **Asserts:** the folder selection stays unchanged while the task is queued, no doorbell is rung, and accepting trust permits action and acknowledgement.
+- **Asserts:** the folder selection stays unchanged while the task is queued and no doorbell is rung; after the user accepts trust, Codex's empty composer still gets no doorbell for five seconds and the task stays queued; a prompt sent to Codex then has it act on the task and acknowledge it.
 - **Does not assert:** raw byte counts in a real agent (the synthetic dialog tests pin those).
 - **Cost:** one cheap model turn.
 
@@ -12502,11 +12502,11 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Does not assert:** Killing an unrelated watcher or arbitrary OS process recovery.
 - **Platform coverage:** linux (/proc ancestry).
 
-##### inbox/pi/020 — Real unarmed Pi is held without typing, and a doorbell it is given transforms in place after the receiver sees registration.
-- **Layer:** L2 lane 2 (`tests/e2e_inbox_pi_live.rs`), PTY-attached binary with a watcher whose registration reply is delayed: by a minute for the hold case, and with a labelled `--doorbell-only` fixture for the transform case, which fixes the hand-out route so in-place substitution can be observed and does not exercise the default boot route.
-- **Agent:** Real interactive Pi on `common::pi_test_model()`, isolated configuration.
-- **Asserts:** with nothing armed, a sentinel task delegated to Idle Pi is held: the card names `cannot_type` within 45 seconds, then over ten seconds no `doorbell attempt` or `doorbell rang` is logged, the task stays queued with no delivery, and no sentinel is written. A doorbell line the test composes and submits before the receiver sees registration: registration precedes exactly one integration-2 fetch for that rx, then ordered possession/handed/commit, one native opener/action/delivery and ExtensionConfirmed; no raw doorbell reaches the model and no model tool invokes inbox fetch.
-- **Does not assert:** Automatic scheduler wake or default watcher argv, which chain-smoke/pi/002 retains; the registration-delay knob delays the reply, not daemon registration.
+##### inbox/pi/020 — The deck types nothing into Pi: an unarmed Pi is held, and a doorbell it is given transforms in place after the receiver sees registration.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_opencode.rs`, `pi_020_an_unarmed_pi_is_held_without_typing`, beside OpenCode's hold cases and their shared assertion), daemon-owned PTY with the unprofiled stand-in; L2 lane 2 (`tests/e2e_inbox_pi_live.rs`), PTY-attached binary with a watcher whose registration reply is delayed: by four seconds for the never-typed case, and with a labelled `--doorbell-only` fixture for the transform case, which fixes the hand-out route so in-place substitution can be observed and does not exercise the default boot route.
+- **Agent:** none in lane 1; real interactive Pi on `common::pi_test_model()`, isolated configuration, in lane 2.
+- **Asserts:** lane 1: a pane reporting itself as Pi with nothing armed gets zero bytes past the stall window, its task stays queued with no delivery, and its card names `cannot_type`; a fetch then takes it. Lane 2: the deck logs `doorbell off` with `unmeasured_release` for the real Pi, a delegated sentinel task reaches Pi through its own extension and is acted on once, and no `doorbell attempt` or `doorbell rang` is logged. A doorbell line the test composes and submits before the receiver sees registration: registration precedes exactly one integration-2 fetch for that rx, then ordered possession/handed/commit, one native opener/action/delivery and ExtensionConfirmed; no raw doorbell reaches the model and no model tool invokes inbox fetch.
+- **Does not assert:** a real Pi showing `cannot_type`, which no harness option produces (its extension arms before the stall window, the registration delay holding the reply, not the daemon's registration); automatic scheduler wake or default watcher argv, which chain-smoke/pi/002 retains.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/pi/021 — A real Pi spawn refreshes a stale extension or shows the Pi repair remedy.

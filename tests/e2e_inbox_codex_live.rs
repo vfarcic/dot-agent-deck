@@ -48,7 +48,7 @@ fn codex_009_live_idle_is_held_and_a_prompt_delivers() {
     );
 }
 
-/// Scenario: Queue a task while real Codex displays its folder-trust selection. The dialog must stay on the same choice until the user accepts it, after which Codex must receive, act on and acknowledge the task.
+/// Scenario: Queue a task while real Codex displays its folder-trust selection. The dialog must stay on the same choice until the user accepts it; the deck then still types nothing into Codex, and once the test sends Codex a prompt, Codex must receive, act on and acknowledge the task.
 #[spec("inbox/codex/010")]
 #[test]
 fn codex_010_live_folder_dialog_holds_until_answered() {
@@ -79,7 +79,17 @@ fn codex_010_live_folder_dialog_holds_until_answered() {
         codex.evidence()
     );
     inbox::state(&codex.deck, &codex.pane, &id, "queued");
-    let _input = codex.input("\r");
+    let mut input = codex.input("\r");
+    // The deck types nothing into Codex once the dialog is answered either:
+    // the task waits until Codex is sent a prompt.
+    codex.wait_screen("Ask Codex to do anything");
+    assert!(!common::wait_until(Duration::from_secs(5), || codex
+        .log()
+        .contains("doorbell rang")));
+    inbox::state(&codex.deck, &codex.pane, &id, "queued");
+    input.write("Check for new deck messages and do what they say.");
+    codex.wait_screen("Check for new deck messages");
+    input.write("\r");
     codex.done(&id, name);
 }
 

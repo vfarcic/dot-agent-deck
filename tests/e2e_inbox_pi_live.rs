@@ -268,40 +268,29 @@ fn pi_019_live_killed_watcher_retains_handed_followup_until_commit() {
     );
 }
 
-/// Scenario: Start real Pi with its watcher's registration held back for a minute, so nothing is armed, and delegate a sentinel task to it while it is Idle. The deck types into no Pi release: the agent's card must hold the task as cannot_type, and over a further ten seconds no doorbell is attempted or typed, the task stays queued with no delivery, and no sentinel is written.
+/// Scenario: Start real Pi with its watcher's registration reply held back, and delegate a sentinel task to it while it is Idle. The deck types into no Pi release: its log says so when the agent starts, no doorbell is attempted or typed while the task waits, and the task then reaches Pi through its own extension, which acts on it once.
 #[spec("inbox/pi/020")]
 #[test]
-fn pi_020_live_unarmed_is_held_without_typing() {
+fn pi_020_live_the_deck_types_nothing_into_pi() {
     skip_unless!(live::available());
     let pi = Pi::with_options(Options {
-        register_delay_ms: 60_000,
+        register_delay_ms: 4000,
         ..Options::default()
     });
-    let name = "unarmed-held-41c7e2.txt";
+    assert!(
+        common::wait_until(BUDGET, || pi.log().lines().any(|line| line
+            .contains("doorbell off")
+            && line.contains("unmeasured_release"))),
+        "the deck says it types nothing into Pi; {}",
+        pi.evidence()
+    );
+    let name = "never-typed-41c7e2.txt";
     let id = pi.append_task(name);
+    pi.done(&id, name);
+    let log = pi.log();
     assert!(
-        common::wait_until(Duration::from_secs(45), || {
-            pi.record()["inbox"]["wake_hold"]
-                .to_string()
-                .contains("cannot_type")
-        }),
-        "the card holds the task as cannot_type; {}",
-        pi.evidence()
-    );
-    assert!(
-        !common::wait_until(Duration::from_secs(10), || {
-            let log = pi.log();
-            log.contains("doorbell attempt") || log.contains("doorbell rang")
-        }),
+        !log.contains("doorbell attempt") && !log.contains("doorbell rang"),
         "the deck typed into Pi; {}",
-        pi.evidence()
-    );
-    let message = pi.message(&id);
-    assert_eq!(message["state"], "queued", "{message}; {}", pi.evidence());
-    assert_eq!(message["deliveries"], 0, "{message}; {}", pi.evidence());
-    assert!(
-        !pi.work.join(name).exists(),
-        "no sentinel without a delivery; {}",
         pi.evidence()
     );
 }

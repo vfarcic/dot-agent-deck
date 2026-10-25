@@ -1010,6 +1010,19 @@ fn opencode_010_full_and_mini_unarmed_are_held_without_typing_and_recover_native
     }
 }
 
+/// Scenario: A pane that reports itself as Pi, with no extension armed and the deck's own stand-in unprofiled, is Idle when a task is queued. The deck types into no Pi release: past the stall window the pane has received zero bytes, the task stays queued with no delivery, and the agent's card holds it as cannot_type; a fetch then takes it.
+#[spec("inbox/pi/020")]
+#[test]
+fn pi_020_an_unarmed_pi_is_held_without_typing() {
+    let daemon = daemon_unbound(&[("DOT_AGENT_DECK_INBOX_WAKE_STALL_AFTER_MS", "500")]);
+    let pane = pane_with(&daemon, "unarmed-pi", json!({"profile": false}));
+    status(&daemon, &pane, "idle", "pi");
+    let id = enqueue(&daemon, &pane, BODY);
+    assert_held_cannot_type(&daemon, &pane, &id, "unarmed Pi");
+    fetch(&daemon, &pane, true);
+    state(&daemon, &pane, &id, "acknowledged");
+}
+
 /// The agent's `wake_hold`, as the daemon's agent records show it.
 fn wake_hold(daemon: &impl Endpoint, pane: &Pane) -> serde_json::Value {
     attach(daemon, json!({"op":"list-agents"}))["agent_records"]

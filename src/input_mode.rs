@@ -319,6 +319,13 @@ pub fn monotonic_ns() -> Option<u64> {
     (rc == 0).then(|| ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64)
 }
 
+/// No `CLOCK_MONOTONIC` off Unix: no mode evidence can be dated, so the
+/// doorbell types nothing there.
+#[cfg(not(unix))]
+pub fn monotonic_ns() -> Option<u64> {
+    None
+}
+
 /// What one supervisory tick of [`InputModeWatch`] produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tick {
