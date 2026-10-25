@@ -258,6 +258,21 @@ pub fn unconfirmed(task_id: Option<&str>, terminal: bool) -> String {
     }
 }
 
+/// The rest of a success line whose recipient is gone: the report was saved
+/// as a file, and where to read about it. Round 6's recovery screen does not
+/// ship yet, so this names no screen.
+fn saved_for_recovery(report_id: Option<&str>) -> String {
+    let saved = match report_id {
+        Some(id) => format!("the deck saved the report to a file, report {id}."),
+        None => "the deck saved the report to a file.".to_string(),
+    };
+    format!(
+        "{saved} The TUI and the desktop app cannot show or list saved reports yet; \
+         `dot-agent-deck docs troubleshooting`, section \"Saved results and reports\", says \
+         where the file is."
+    )
+}
+
 /// Where a reply's text goes, and the exit status the CLI uses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliAnswer {
@@ -283,17 +298,18 @@ pub fn cli_answer(reply: &WorkDoneTaskReply, task_id: Option<&str>, terminal: bo
     match reply.disposition {
         WorkDoneDisposition::Accepted => match (task_id, terminal) {
             (Some(id), _) if recovered => ok(format!(
-                "Reported task {id}. Its orchestrator is no longer running, so the deck saved \
-                 the report in Deck notices."
+                "Reported task {id}. Its orchestrator is no longer running, so {}",
+                saved_for_recovery(reply.report_id.as_deref())
             )),
             (Some(id), _) => ok(format!("Reported task {id} to the orchestrator.")),
             (None, true) if reply.destination == Some(Destination::None) => {
                 ok("Reported the orchestration complete.".to_string())
             }
-            (None, true) if recovered => ok("Reported this unit complete. The agent that \
-                 dispatched it is no longer running, so the deck saved the report in Deck \
-                 notices."
-                .to_string()),
+            (None, true) if recovered => ok(format!(
+                "Reported this unit complete. The agent that dispatched it is no longer \
+                 running, so {}",
+                saved_for_recovery(reply.report_id.as_deref())
+            )),
             (None, _) => ok("Reported this unit complete to the agent that dispatched it.".into()),
         },
         WorkDoneDisposition::AlreadyAccepted => match (task_id, reply.differs) {
@@ -306,9 +322,10 @@ pub fn cli_answer(reply: &WorkDoneTaskReply, task_id: Option<&str>, terminal: bo
                 .to_string()),
             (None, true) => err(unit_differs()),
         },
-        WorkDoneDisposition::Uncorrelated if recovered => ok("Sent as a note that completes no \
-             task. Its orchestrator is no longer running, so the deck saved it in Deck notices."
-            .to_string()),
+        WorkDoneDisposition::Uncorrelated if recovered => ok(format!(
+            "Sent as a note that completes no task. Its orchestrator is no longer running, so {}",
+            saved_for_recovery(reply.report_id.as_deref())
+        )),
         WorkDoneDisposition::Uncorrelated => ok("Sent to the orchestrator as a note that \
              completes no task. If you finished a delegated task, run work-done again with \
              --task-id <id> from your task."
@@ -321,5 +338,79 @@ pub fn cli_answer(reply: &WorkDoneTaskReply, task_id: Option<&str>, terminal: bo
             ))
         }
         WorkDoneDisposition::Unknown => err(unconfirmed(task_id, terminal)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn recovered(disposition: WorkDoneDisposition) -> WorkDoneTaskReply {
+        WorkDoneTaskReply {
+            disposition,
+            task_id: None,
+            report_id: Some("0123abcd".to_string()),
+            destination: Some(Destination::Recovery),
+            differs: false,
+            code: None,
+            message: None,
+        }
+    }
+
+    #[test]
+    fn recovered_reports_name_their_id_and_the_troubleshooting_section() {
+        let tail = "the deck saved the report to a file, report 0123abcd. The TUI and the \
+                    desktop app cannot show or list saved reports yet; `dot-agent-deck docs \
+                    troubleshooting`, section \"Saved results and reports\", says where the \
+                    file is.";
+        let cases = [
+            (
+                WorkDoneDisposition::Accepted,
+                Some("m-1"),
+                false,
+                format!("Reported task m-1. Its orchestrator is no longer running, so {tail}"),
+            ),
+            (
+                WorkDoneDisposition::Accepted,
+                None,
+                true,
+                format!(
+                    "Reported this unit complete. The agent that dispatched it is no longer \
+                     running, so {tail}"
+                ),
+            ),
+            (
+                WorkDoneDisposition::Uncorrelated,
+                None,
+                false,
+                format!(
+                    "Sent as a note that completes no task. Its orchestrator is no longer \
+                     running, so {tail}"
+                ),
+            ),
+        ];
+        for (disposition, task, terminal, expected) in cases {
+            let answer = cli_answer(&recovered(disposition), task, terminal);
+            assert_eq!(
+                answer,
+                CliAnswer {
+                    stdout: Some(expected),
+                    stderr: None,
+                    success: true,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_recovered_reply_without_an_id_still_says_it_was_saved() {
+        let mut reply = recovered(WorkDoneDisposition::Accepted);
+        reply.report_id = None;
+        let line = cli_answer(&reply, Some("m-1"), false).stdout.unwrap();
+        assert!(
+            line.contains("so the deck saved the report to a file. The TUI"),
+            "{line}"
+        );
+        assert!(!line.contains("Deck notices"), "{line}");
     }
 }

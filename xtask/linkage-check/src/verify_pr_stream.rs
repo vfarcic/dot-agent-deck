@@ -131,6 +131,9 @@ struct ScanFixture {
     checks: String,
     /// When set, `gh pr view` fails and prints this on stderr.
     view_error: Option<String>,
+    /// When set, the review-status step reads this registry instead of the
+    /// real `.claude/skills/pr-create/reviewers.json` (issue #1256).
+    reviewers_file: Option<String>,
 }
 
 impl Default for ScanFixture {
@@ -149,6 +152,7 @@ impl Default for ScanFixture {
             association: "NONE".to_string(),
             checks: "CI\tpass\t1m\thttps://example.com".to_string(),
             view_error: None,
+            reviewers_file: None,
         }
     }
 }
@@ -248,13 +252,16 @@ impl ScanFixture {
             bin.display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        let out = Command::new("bash")
-            .arg(skill_dir().join("scan.sh"))
+        let mut cmd = Command::new("bash");
+        cmd.arg(skill_dir().join("scan.sh"))
             .arg("999")
             .env("PATH", path)
-            .env("SCAN_STUB_FIXTURES", &fixtures)
-            .output()
-            .expect("run scan.sh");
+            .env("SCAN_STUB_FIXTURES", &fixtures);
+        match &self.reviewers_file {
+            Some(f) => cmd.env("REVIEWERS_FILE", f),
+            None => cmd.env_remove("REVIEWERS_FILE"),
+        };
+        let out = cmd.output().expect("run scan.sh");
 
         Some(String::from_utf8_lossy(&out.stdout).into_owned())
     }
@@ -629,4 +636,58 @@ printf 'a=[%s] b=[%s] c=[%s]\n' "$a" "$b" "$c"
         "an empty middle field shifted the values\nstderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// Issue #1256: the scan reports which review apps have finished on the head.
+/// The fixture PR opened on 2026-08-01 and carries no comments, so Greptile,
+/// which reviews once, has run out its bound and Qodo, which reviews every
+/// push, has not finished yet.
+#[test]
+fn scan_reports_which_review_apps_finished_on_the_head() {
+    let Some(out) = ScanFixture::default().run() else {
+        return;
+    };
+    let recs = records(&out);
+    assert_stream_completed(&recs, &out);
+    assert_eq!(
+        values(&recs, "REVIEWS_AT_HEAD"),
+        vec!["incomplete"],
+        "{out}"
+    );
+    assert_eq!(values(&recs, "REVIEWS_FINISHED"), vec!["none"], "{out}");
+    assert_eq!(
+        values(&recs, "REVIEWS_NOT_FINISHED"),
+        vec!["Qodo, Greptile"],
+        "{out}"
+    );
+    assert_eq!(values(&recs, "REVIEWS_ERROR"), vec!["none"], "{out}");
+}
+
+/// Qodo's and Greptile's findings on PR #1882: a failed review-status step
+/// used to read as "no app has finished". It reads as unknown, with the
+/// reason, and the rest of the scan still completes.
+#[test]
+fn scan_reports_a_failed_review_status_as_unknown_with_its_reason() {
+    let fixture = ScanFixture {
+        reviewers_file: Some("/nonexistent/reviewers.json".to_string()),
+        ..Default::default()
+    };
+    let Some(out) = fixture.run() else {
+        return;
+    };
+    let recs = records(&out);
+    assert_stream_completed(&recs, &out);
+    assert_eq!(values(&recs, "REVIEWS_AT_HEAD"), vec!["unknown"], "{out}");
+    assert_eq!(values(&recs, "REVIEWS_FINISHED"), vec!["unknown"], "{out}");
+    assert_eq!(
+        values(&recs, "REVIEWS_NOT_FINISHED"),
+        vec!["unknown"],
+        "{out}"
+    );
+    let error = values(&recs, "REVIEWS_ERROR");
+    assert!(
+        error.len() == 1 && error[0].contains("cannot read"),
+        "the reason must survive into the stream:\n{out}"
+    );
+    assert!(duplicate_keys(&recs).is_empty(), "{out}");
 }

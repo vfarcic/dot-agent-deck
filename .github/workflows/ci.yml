@@ -329,7 +329,8 @@ jobs:
     # room for all of it while capping a wedged browser at a fraction of the
     # 6-hour runner default. Re-tune downward once honest runs exist; do not
     # raise it to paper over a hang.
-    # On 2026-10-22 browser/apt downloads took 14–20 minutes, exhausting that
+    # On 2026-10-22 the apt downloads of `--with-deps` took 14–20 minutes (the
+    # browser download stayed at seconds; see the install step), exhausting that
     # budget, so allow 25 minutes for install, 15 for the suite (observed 8–12)
     # and 5 for setup/reporting, with separate step limits bounding a hung suite.
     timeout-minutes: 45
@@ -357,31 +358,165 @@ jobs:
       # downloaded (Chromium 187, its headless shell 114, WebKit 95, ffmpeg 2),
       # unpacking to 927 MB, in ~50s.
       #
-      # Deliberately NOT wrapped in `actions/cache`, for two reasons, and the
-      # second is the one a future "let's just cache this to speed CI up" PR
-      # has to argue against. Cost is the weaker one: the repository's cache
-      # budget is shared, and `Swatinem/rust-cache` in four other jobs is what
-      # actually keeps CI fast; adding a several-hundred-megabyte entry here to
-      # save part of a one-minute download risks evicting those.
+      # Deliberately NOT wrapped in `actions/cache`, and since issue #1833 the
+      # reason is cost against benefit, measured. Every slow or timed-out
+      # attempt of this job on `main` on 2026-10-22 and 2026-10-23 (14 of them,
+      # run 39996955663 among them) spent its time in the APT half of
+      # `--with-deps` — 119 MB of .debs from the runner's Ubuntu mirror, at
+      # 85–203 kB/s where the fetch finished — and the ten that hit a time limit
+      # never reached the browser download. The CDN download of the browsers
+      # took 9–12 s in each of the four that did, as in the healthy rerun of
+      # 39996955663. So a browser cache saves at most those seconds, less the
+      # restore of its own several-hundred-megabyte entry, and would have
+      # prevented none of those timeouts. Against that, the repository's cache
+      # is capped at 10 GB and `main`'s set already fills ~9 GB of it (the note
+      # above `jobs:`, issue #1743), so a browser entry of several hundred MB
+      # makes evicting `main`'s Rust caches — what actually keeps CI fast —
+      # more likely. What the timeouts needed was a cache of the apt .debs,
+      # which the steps below add (issue #1864).
       #
-      # The security property is the stronger one. A GitHub Actions cache entry
-      # is writable by a workflow run on ANY branch, so a cached browser
-      # payload keyed by Playwright version would be a cross-branch poisoning
-      # target: a malicious or compromised branch could populate or overwrite
-      # that entry, and a later trusted run would restore those binaries and
-      # then EXECUTE them. Re-downloading from the pinned CDN on every run
-      # removes that write surface entirely. Note what it does NOT do: it does
-      # not make the download independently verified. The pin is a browser
-      # revision number resolved from the lockfile, not a hash of the archive
-      # bytes, so what arrives is trusted on TLS and CDN trust alone. Losing a
-      # cross-branch write path is the whole of what a cache would cost here,
-      # and a speed argument alone does not settle it.
+      # Security does NOT decide it. An earlier version of this note said it
+      # did, on the premise that a run on any branch can write an entry a
+      # trusted run restores; GitHub's cache scoping makes that false:
+      #
+      #   * A `pull_request` run saves under its PR's merge ref, restored by
+      #     that PR's later runs alone. A push to another branch, or a
+      #     `workflow_dispatch` of one, saves under that branch, restored by its
+      #     own later runs and by PRs that target it as their base. A run
+      #     restores from its own ref, its PR's base and the default branch, so
+      #     neither reaches `main` or a sibling branch.
+      #   * `main`'s scope, which every run can restore from, is writable by any
+      #     run on `main`'s ref in any workflow: this file's pushes, and also
+      #     event-triggered workflows such as the issue labeler (`issues`). So
+      #     "saved only from `main`" bounds the writers to code running on the
+      #     default branch, not to this job.
+      #   * A key cannot be overwritten within a scope, but that does not pin the
+      #     content: the first writer of a key owns it (a future Playwright
+      #     version's key included), and once size pressure evicts an entry its
+      #     key can be written again.
+      #   * The Rust caches already carry that exposure: they restore compiled
+      #     dependency artifacts from `main`'s scope, proc-macro libraries that
+      #     rustc loads and runs among them. A browser cache saved only from
+      #     `main` would be another instance of an accepted risk, not a new kind.
+      #
+      # Not caching does not make the download verified either. The pin is a
+      # browser revision resolved from the lockfile, not a hash of the archive
+      # bytes, and nothing in this job checks one, so each run trusts TLS and
+      # the CDN; a cache would swap that for trust in the `main` run that saved
+      # the entry. That is where it differs from the .deb cache below, whose
+      # files are checked against Ubuntu's signed index on every restore:
+      # Playwright publishes no hash a restored browser could be checked
+      # against (its `browsers.json` lists revisions only, at 1.64.1). What
+      # would reverse the decision is the timing: if the
+      # browser download becomes the slow part, a cache restored everywhere and
+      # saved only from `main` (gated like the Rust caches' `save-if`) is
+      # acceptable on the reasoning above.
       #
       # `--with-deps` is for WebKit, not for Chromium: WebKit needs a GTK4 and
       # GStreamer runtime that the runner image does not carry in full. It runs
       # apt, so it is the slowest step here.
+      #
+      # Issue #1864 — the .debs that apt installs are cached, and the index is
+      # not. In the 14 slow or timed-out attempts of this job on `main` on
+      # 2026-10-22 and 2026-10-23, the .deb fetch (119 MB, 189 packages) ran at
+      # 85–203 kB/s in the four that finished it and never finished in the
+      # other ten, while `apt-get update` fetched its 8–12.5 MB of indexes from
+      # the same mirror in about a second in 13 of them (6 s in the other). So
+      # the steps below keep the fast half and skip the slow one: a warm cache
+      # leaves apt only the packages Ubuntu has updated since the entry was
+      # saved.
+      #
+      # apt does NOT verify a .deb that is already in its archive directory: it
+      # checks the size and hands the file to dpkg. In an `ubuntu:24.04`
+      # container a same-size tampered .deb went straight to "Preparing to
+      # unpack", with no "Hash Sum mismatch", and failed only because zstd's
+      # own checksum caught random corruption. A crafted .deb would pass that
+      # check. So the restore step hands apt only the cached files whose SHA-256
+      # matches the one in the index this job has just fetched and apt has
+      # checked against Ubuntu's signature, and drops every other file. apt
+      # fetches the dropped packages from the mirror again, so a bad cache entry
+      # costs time and nothing else. The trust root is the same as an uncached
+      # install, Ubuntu's archive key.
+      #
+      # Saved only from `main`, the rule the Rust caches follow (the note above
+      # `jobs:`, issue #1743): ~119 MB of a budget that `main` already nearly
+      # fills. Each key covers one runner image version and one Playwright
+      # version. A new image restores the previous image's entry by prefix and
+      # fetches only what changed. Rejected alternatives: a retry, because the
+      # slow attempts did not recover (one averaged 85 kB/s over 23 minutes, and
+      # in the three traced file by file the rate fell rather than rose), so a
+      # retry on the same runner would most likely repeat it; Playwright's
+      # container image, which would move the trust to that image and need
+      # another pin kept in lockstep with `@playwright/test`. `.rwx/ci.yml`'s
+      # copy of this job has no cache because it has not needed one: in the 57
+      # RWX runs of that task on those two days it took 407–441 s, and the two
+      # whose logs were read fetched its .debs (195 MB on that image) in 1–2 s.
+      - name: Compute the .deb cache key
+        id: debs-key
+        run: |
+          playwright=$(node -p 'require("./node_modules/@playwright/test/package.json").version')
+          echo "prefix=playwright-debs-${ImageOS:-unknown}-" >> "$GITHUB_OUTPUT"
+          echo "key=playwright-debs-${ImageOS:-unknown}-${ImageVersion:-unknown}-${playwright}" >> "$GITHUB_OUTPUT"
+      - id: debs
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/playwright-debs
+          key: ${{ steps.debs-key.outputs.key }}
+          restore-keys: ${{ steps.debs-key.outputs.prefix }}
+      # The file name is `<package>_<version>_<arch>.deb` with an epoch's `:`
+      # written as `%3a`, which `apt-cache show <package>=<version>` takes back.
+      # A file the index does not list, or lists with another hash, is dropped.
+      - name: Hand apt the cached .debs whose hash the signed index carries
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/playwright-debs"
+          shopt -s nullglob
+          debs=("$dir"/*.deb)
+          if [ "${#debs[@]}" -eq 0 ]; then
+            echo "No cached .debs: apt fetches every one from the mirror."
+            exit 0
+          fi
+          sudo apt-get update -qq
+          kept=0
+          dropped=0
+          for deb in "${debs[@]}"; do
+            IFS=_ read -r pkg ver _ <<< "$(basename "$deb" .deb)"
+            signed=$(apt-cache show "$pkg=${ver//%3a/:}" 2>/dev/null | sed -n 's/^SHA256: //p' || true)
+            if grep -qxF "$(sha256sum "$deb" | cut -d' ' -f1)" <<< "$signed"; then
+              sudo cp "$deb" /var/cache/apt/archives/
+              kept=$((kept + 1))
+            else
+              echo "Dropped $(basename "$deb"): no entry in the signed index carries its SHA-256."
+              dropped=$((dropped + 1))
+            fi
+          done
+          echo "Handed apt $kept cached .debs; dropped $dropped."
       - run: pnpm exec playwright install --with-deps chromium webkit
         timeout-minutes: 25
+      # Rebuilt from what this run installed, so a package nothing installs any
+      # more, a version Ubuntu has replaced or a dropped file is not saved
+      # again. It runs on every ref, so a branch's run shows what `main` would
+      # save; only the save itself is limited to `main`.
+      - name: Collect the .debs this run installed
+        if: steps.debs.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/playwright-debs"
+          rm -rf "$dir"
+          mkdir -p "$dir"
+          shopt -s nullglob
+          for deb in /var/cache/apt/archives/*.deb; do
+            IFS=_ read -r pkg ver _ <<< "$(basename "$deb" .deb)"
+            if [ "$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || true)" = "${ver//%3a/:}" ]; then
+              cp "$deb" "$dir/"
+            fi
+          done
+          echo "Collected $(find "$dir" -name '*.deb' | wc -l) .debs, $(du -sh "$dir" | cut -f1)."
+      - if: steps.debs.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/playwright-debs
+          key: ${{ steps.debs-key.outputs.key }}
       # Playwright transpiles specs without type-checking them, so a type error
       # under `desktop/e2e` would run happily and could pass. This is the gate
       # that makes it an error, and it is fast enough to run before the browsers
@@ -474,19 +609,23 @@ jobs:
           cache: pnpm
           cache-dependency-path: desktop/pnpm-lock.yaml
       # The desktop crate's build set — the same six packages as `build`, whose
-      # comment names the other places that declare it — plus the four this job
+      # comment names the other places that declare it — plus the six this job
       # alone needs at run time: `webkit2gtk-driver` is WebKitWebDriver for the
       # SAME WebKitGTK the app links against, `xvfb` is the display, `xclip`
       # reads that display's clipboard from outside the app for `terminal_002`
       # (issue #1403), and `xdotool` moves the display's focus to and from the
-      # app's window for `terminal_003` (issue #1457).
+      # app's window for `terminal_003` (issue #1457). `fleet_001` (issue
+      # #1356) needs two more: `openssh-server` for the loopback `sshd` its
+      # second deck is reached through, and `libnss-wrapper`, which points the
+      # app's `ssh` at the sandbox's `known_hosts` (`FarDeck` in
+      # `desktop/driver/harness.ts` says why).
       - name: Install driver system dependencies
         timeout-minutes: 25
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
             libayatana-appindicator3-dev librsvg2-dev libxdo-dev libasound2-dev \
-            webkit2gtk-driver xvfb xclip xdotool
+            webkit2gtk-driver xvfb xclip xdotool openssh-server libnss-wrapper
       # From crates.io source with its own lockfile, not a prebuilt binary:
       # tauri-driver publishes none, and a third-party build cache would be a
       # binary this job then executes on trust alone. rust-cache keeps
@@ -624,9 +763,9 @@ jobs:
       #
       # THAT FLAG NOW CARRIES THE WHOLE WEIGHT. Lane 2 does not run in CI at
       # all — no e2e test reaches a real agent there, so no TEST credential is
-      # registered on this repository (the separately credentialed Codex
-      # issue-labeler is out of scope; see the e2e-deterministic job's comment
-      # and docs/develop/issue-labeling.md) — which makes this step the ONLY
+      # registered on this repository (the separately credentialed agent PR
+      # reviewer is out of scope; see the e2e-deterministic job's comment) —
+      # which makes this step the ONLY
       # thing in CI that compiles the lane-2 files. Drop `e2e-live` from this
       # line and they go back to being checked by nothing until a developer
       # runs them.
@@ -748,6 +887,11 @@ jobs:
           # the debug info, which is most of a test build's `target/`: it links
           # faster and leaves a smaller cache entry for the 10 GB repository limit.
           CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      # The patched crossterm's own test (vendor/crossterm/VENDORED.md), which
+      # the step above does not run: the crate is outside the workspace.
+      # `--locked` to the crate's own Cargo.lock, which pins the dev-dependencies
+      # the deck's lock does not carry.
+      - run: cargo test --locked --manifest-path vendor/crossterm/Cargo.toml --lib event::source::unix::mio::tests
       # Issue #564: keep this attempt's results after a job-level re-run
       # overwrites the conclusion. Full rationale on the identical step in
       # `build-macos` below — the masking is a property of re-running any job,
@@ -830,12 +974,15 @@ jobs:
   # replacement for it.
   #
   # That is deliberately NOT the wider claim "no agent credential reaches this
-  # repository's CI", which is false: the Codex issue-labeler
-  # (`issue-labeler.md`, `issue-labeler.lock.yml`, `issue-labeler-batch.yml`)
-  # passes the repository secret OPENAI_API_KEY into a `codex exec` step and
-  # genuinely reaches a real agent. That is a separate feature with its own
-  # threat model — `docs/develop/issue-labeling.md` — and out of scope for the
-  # e2e lanes. Do not cite it as precedent for putting a test key here.
+  # repository's CI", which is false: the agent PR reviewer
+  # (`pr-review-batch.yml` calling `pr-review.lock.yml`) puts the repository
+  # secret ANTHROPIC_API_KEY on a runner and genuinely reaches a real agent:
+  # Claude Code calls the API through the gh-aw firewall's proxy, which keeps
+  # the raw key out of the agent's environment but not off the runner. That is a separate feature with its own design — the
+  # "automated reviewer" section of `docs/develop/governance.md` — started by a
+  # schedule or a manual dispatch rather than by a pull request, and out of
+  # scope for the e2e lanes. Do not cite it as precedent for putting a test key
+  # here.
   #
   # NO AGENT CLI is installed either, and that is deliberate rather than merely
   # unnecessary. `scheduler/cli/002` in tests/e2e_scheduler_cli.rs writes a
@@ -1523,6 +1670,10 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
       - run: cargo install cargo-audit --locked
       - run: cargo audit
+      # `cargo audit` skips the crates under vendor/, which have no registry
+      # source in Cargo.lock; this audits their upstream releases. The script
+      # has why, and what it does not check.
+      - run: scripts/audit-vendored-upstream.sh
 
   # PRD #231 M2: the only check that exercises the root flake.nix. Nothing else
   # in CI evaluates or builds it: the Rust jobs install their toolchain via

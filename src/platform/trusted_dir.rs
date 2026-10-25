@@ -73,6 +73,66 @@ pub(crate) use unix::{DirStream, TrustedDir};
 #[cfg(windows)]
 pub(crate) use windows::{DirStream, TrustedDir};
 
+/// Set a file this module just created owner-only: the one call
+/// `create_new_owner_only` makes after the file exists, with a test seam that
+/// fails it.
+fn owner_only(file: &std::fs::File) -> io::Result<()> {
+    #[cfg(test)]
+    if test_seams::take_owner_only_failure() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "injected owner-only failure",
+        ));
+    }
+    crate::platform::fsperm::set_file_owner_only(file)
+}
+
+/// What `create_new_owner_only` returns when it created its file, could not
+/// set it owner-only, and could not remove it again either: the file is still
+/// at the name, for the caller to account for ([`left_behind`]).
+#[derive(Debug)]
+struct LeftBehind {
+    error: io::Error,
+    removal: io::Error,
+}
+
+impl std::fmt::Display for LeftBehind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}; the file it created could not be removed: {}",
+            self.error, self.removal
+        )
+    }
+}
+
+impl std::error::Error for LeftBehind {}
+
+/// Whether `error`, from `create_new_owner_only`, left its file behind.
+pub(crate) fn left_behind(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<LeftBehind>())
+}
+
+/// `create_new_owner_only`'s rollback after `error`: `remove` removes the file
+/// it created. `error` itself when that works, else `error` marked
+/// [`left_behind`], of the same kind.
+fn roll_back_create(error: io::Error, remove: impl FnOnce() -> io::Result<()>) -> io::Error {
+    #[cfg(test)]
+    let removed = if test_seams::take_rollback_failure() {
+        Err(io::Error::other("injected rollback failure"))
+    } else {
+        remove()
+    };
+    #[cfg(not(test))]
+    let removed = remove();
+    match removed {
+        Ok(()) => error,
+        Err(removal) => io::Error::new(error.kind(), LeftBehind { error, removal }),
+    }
+}
+
 #[cfg(unix)]
 mod unix {
     use std::ffi::{CStr, CString, OsStr, OsString};
@@ -83,7 +143,7 @@ mod unix {
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::path::Path;
 
-    use super::{EntryInfo, EntryKind, plain};
+    use super::{EntryInfo, EntryKind, owner_only, plain, roll_back_create};
     use super::{refused, valid_component};
 
     fn cstr(name: &OsStr) -> io::Result<CString> {
@@ -244,6 +304,9 @@ mod unix {
         }
 
         /// A new owner-only file, refused when the name exists or is a link.
+        /// When its mode cannot be set, the file it just created is removed
+        /// again; when that removal fails too, the error is marked
+        /// [`super::left_behind`] and the file stays at the name.
         pub(crate) fn create_new_owner_only(&self, name: &str) -> io::Result<File> {
             plain(OsStr::new(name))?;
             let c = cstr(OsStr::new(name))?;
@@ -264,7 +327,10 @@ mod unix {
             })?;
             // SAFETY: just opened, owned by nobody else.
             let file = unsafe { File::from_raw_fd(fd) };
-            crate::platform::fsperm::set_file_owner_only(&file)?;
+            if let Err(error) = owner_only(&file) {
+                drop(file);
+                return Err(roll_back_create(error, || self.remove_file(name)));
+            }
             Ok(file)
         }
 
@@ -322,17 +388,24 @@ mod unix {
             {
                 return Err(io::Error::from_raw_os_error(errno));
             }
+            // The system call itself, not glibc's `renameat2` wrapper, which
+            // only glibc 2.28 and later have: the aarch64 release build links
+            // against an older one. A kernel without the call answers
+            // `ENOSYS`, an unsupported rename like any other.
             #[cfg(any(target_os = "linux", target_os = "android"))]
             // SAFETY: live descriptors and valid names; no link is followed.
+            // `renameat2` takes two descriptors, two NUL-terminated paths and
+            // its flags, and returns 0 or -1 with `errno` set.
             cvt(unsafe {
-                libc::renameat2(
+                libc::syscall(
+                    libc::SYS_renameat2,
                     from_fd,
                     f.as_ptr(),
                     to_fd,
                     t.as_ptr(),
-                    libc::RENAME_NOREPLACE as _,
+                    libc::RENAME_NOREPLACE,
                 )
-            })?;
+            } as libc::c_int)?;
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             // SAFETY: as above.
             cvt(unsafe {
@@ -515,7 +588,7 @@ mod windows {
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
-    use super::{EntryInfo, EntryKind, plain};
+    use super::{EntryInfo, EntryKind, owner_only, plain, roll_back_create};
     use super::{refused, valid_component};
 
     /// An open directory handle and the handles of every component above
@@ -684,7 +757,9 @@ mod windows {
         }
 
         /// A new file whose owner-only DACL is set on its handle before
-        /// anything is written.
+        /// anything is written. When the DACL cannot be set, the file is
+        /// removed again; when that removal fails too, the error is marked
+        /// [`super::left_behind`] and the file stays at the name.
         pub(crate) fn create_new_owner_only(&self, name: &str) -> io::Result<File> {
             plain(OsStr::new(name))?;
             let mut options = OpenOptions::new();
@@ -692,7 +767,10 @@ mod windows {
             crate::platform::fsperm::set_create_mode_owner_only(&mut options);
             options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
             let file = self.guarded(|dir| options.open(dir.join(name)))?;
-            crate::platform::fsperm::set_file_owner_only(&file)?;
+            if let Err(error) = owner_only(&file) {
+                drop(file);
+                return Err(roll_back_create(error, || self.remove_file(name)));
+            }
             Ok(file)
         }
 
@@ -851,6 +929,30 @@ pub(crate) mod test_seams {
 
     std::thread_local! {
         static RENAME_INTO_FAILURE: Cell<Option<i32>> = const { Cell::new(None) };
+        static OWNER_ONLY_FAILURE: Cell<bool> = const { Cell::new(false) };
+        static ROLLBACK_FAILURE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// The next `create_new_owner_only` on this thread creates its file and
+    /// then fails to set it owner-only.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn fail_next_owner_only() {
+        OWNER_ONLY_FAILURE.with(|slot| slot.set(true));
+    }
+
+    pub(super) fn take_owner_only_failure() -> bool {
+        OWNER_ONLY_FAILURE.with(Cell::take)
+    }
+
+    /// The next `create_new_owner_only` on this thread whose owner-only step
+    /// fails cannot remove the file it created either.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn fail_next_rollback() {
+        ROLLBACK_FAILURE.with(|slot| slot.set(true));
+    }
+
+    pub(super) fn take_rollback_failure() -> bool {
+        ROLLBACK_FAILURE.with(Cell::take)
     }
 
     /// The next `rename_into` on this thread fails with `errno`, moving

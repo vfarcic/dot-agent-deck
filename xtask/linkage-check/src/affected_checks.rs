@@ -35,6 +35,9 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::{Command, ExitCode};
+use std::time::Instant;
+
+use crate::gate_telemetry;
 
 /// CLAUDE.md rule 2's two commands and rule 5's per-task tier, verbatim, as
 /// argument vectors so `--run` needs no shell.
@@ -156,7 +159,7 @@ pub(crate) const TEXT_CLASSES: &[TextClass] = &[
     TextClass {
         name: "GitHub configuration",
         read_by: "read by xtask/linkage-check (pin_lockstep, release_workflow_wiring, \
-                  gh_aw_lock_consistency, pr_review_verdict, the issue-labeler tests)",
+                  gh_aw_lock_consistency, pr_review_verdict)",
         patterns: &[Pattern::Under(".github/")],
         root_tests: &[],
         root_lib_modules: &[],
@@ -484,16 +487,28 @@ fn changed_paths(root: &Path, base: &str) -> Result<(String, Vec<String>), Strin
 
 const USAGE: &str = "usage: cargo xtask affected-checks [--run] [--base <ref>] [PATH...]";
 
-/// Runs each command in order from `root`, stopping at the first that fails.
-/// No shell is involved: every command is an argument vector.
-fn execute(root: &Path, plan: &[Vec<String>]) -> ExitCode {
+/// Runs each command in order from `root`, stopping at the first that fails,
+/// and records each in `trace`. No shell is involved: every command is an
+/// argument vector.
+fn execute(root: &Path, plan: &[Vec<String>], trace: &mut gate_telemetry::RunTrace) -> ExitCode {
     for command in plan {
         eprintln!("affected-checks: running {}", shell_line(command));
-        match Command::new(&command[0])
+        let (runner, planned) = runner_of(command);
+        let started = Instant::now();
+        let status = Command::new(&command[0])
             .args(&command[1..])
             .current_dir(root)
-            .status()
-        {
+            .status();
+        trace.command(
+            shell_line(planned),
+            runner.name(),
+            started,
+            gate_telemetry::CommandResult {
+                exit_code: status.as_ref().ok().and_then(|s| s.code()),
+                passed: status.as_ref().is_ok_and(|s| s.success()),
+            },
+        );
+        match status {
             Ok(status) if status.success() => {}
             Ok(status) => {
                 eprintln!(
@@ -537,12 +552,61 @@ pub(crate) enum Runner {
     Rwx,
 }
 
+impl Runner {
+    /// The name the telemetry records (issue #1850): `local`, or the runner's
+    /// name as `DAD_REMOTE_EXEC` gives it.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Runner::Local => "local",
+            Runner::Rwx => "rwx",
+        }
+    }
+}
+
 /// What the RWX runner needs, probed only when it was asked for.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct Readiness {
     pub(crate) cli: bool,
     pub(crate) logged_in: bool,
     pub(crate) config: bool,
+}
+
+/// Why a runner `DAD_REMOTE_EXEC` asked for was not used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Fallback {
+    CliMissing,
+    NotLoggedIn,
+    ConfigMissing,
+    UnknownRunner,
+}
+
+impl Fallback {
+    /// The reason as the telemetry records it.
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Fallback::CliMissing => "cli_missing",
+            Fallback::NotLoggedIn => "not_logged_in",
+            Fallback::ConfigMissing => "config_missing",
+            Fallback::UnknownRunner => "unknown_runner",
+        }
+    }
+}
+
+/// Every reason the runner asked for cannot be used; empty when none was asked
+/// for or it is ready.
+pub(crate) fn fallbacks(opt_in: Option<&str>, ready: Readiness) -> Vec<Fallback> {
+    match opt_in.map(str::trim) {
+        None | Some("") => Vec::new(),
+        Some("rwx") => [
+            (!ready.cli).then_some(Fallback::CliMissing),
+            (ready.cli && !ready.logged_in).then_some(Fallback::NotLoggedIn),
+            (!ready.config).then_some(Fallback::ConfigMissing),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+        Some(_) => vec![Fallback::UnknownRunner],
+    }
 }
 
 /// Where the compiling commands run, and a note for the report whenever a remote
@@ -552,14 +616,15 @@ pub(crate) fn choose_runner(opt_in: Option<&str>, ready: Readiness) -> (Runner, 
     match opt_in.map(str::trim) {
         None | Some("") => (Runner::Local, None),
         Some("rwx") => {
-            let missing: Vec<&str> = [
-                (!ready.cli).then_some("the `rwx` CLI is not on PATH"),
-                (ready.cli && !ready.logged_in).then_some("`rwx whoami` fails (not logged in)"),
-                (!ready.config).then_some("`.rwx/sandbox.yml` does not exist"),
-            ]
-            .into_iter()
-            .flatten()
-            .collect();
+            let missing: Vec<&str> = fallbacks(opt_in, ready)
+                .into_iter()
+                .map(|fallback| match fallback {
+                    Fallback::CliMissing => "the `rwx` CLI is not on PATH",
+                    Fallback::NotLoggedIn => "`rwx whoami` fails (not logged in)",
+                    Fallback::ConfigMissing => "`.rwx/sandbox.yml` does not exist",
+                    Fallback::UnknownRunner => unreachable!("`rwx` is a known runner"),
+                })
+                .collect();
             if missing.is_empty() {
                 (
                     Runner::Rwx,
@@ -586,6 +651,51 @@ pub(crate) fn choose_runner(opt_in: Option<&str>, ready: Readiness) -> (Runner, 
     }
 }
 
+/// What the `affected_checks.run` span records about the runner and the plan
+/// (issue #1850), before any command runs.
+pub(crate) fn run_info(
+    opt_in: Option<&str>,
+    ready: Readiness,
+    runner: Runner,
+    paths: &[String],
+    commands: usize,
+) -> gate_telemetry::RunInfo {
+    let requested = opt_in.map(str::trim).filter(|v| !v.is_empty());
+    let reasons: Vec<&str> = fallbacks(opt_in, ready)
+        .into_iter()
+        .map(Fallback::code)
+        .collect();
+    gate_telemetry::RunInfo {
+        requested: requested.unwrap_or("local").to_string(),
+        used: runner.name(),
+        fallback_reason: (!reasons.is_empty()).then(|| reasons.join(",")),
+        plan: if paths.is_empty() {
+            "none"
+        } else if paths
+            .iter()
+            .any(|p| matches!(classify(p), Verdict::Full(_)))
+        {
+            "full"
+        } else {
+            "text"
+        },
+        commands,
+    }
+}
+
+/// The prefix [`for_runner`] puts in front of a command it sends to RWX.
+const RWX_PREFIX: &[&str] = &["rwx", "sandbox", "exec", "--"];
+
+/// Which runner a command of an executed plan runs on, and the command as
+/// planned, without that runner's prefix.
+pub(crate) fn runner_of(command: &[String]) -> (Runner, &[String]) {
+    if command.len() > RWX_PREFIX.len() && command.iter().zip(RWX_PREFIX).all(|(a, b)| a == b) {
+        (Runner::Rwx, &command[RWX_PREFIX.len()..])
+    } else {
+        (Runner::Local, command)
+    }
+}
+
 /// A command that compiles: any `cargo` invocation except `cargo fmt`.
 fn runs_remotely(command: &[String]) -> bool {
     matches!(command, [cargo, sub, ..] if cargo == "cargo" && sub != "fmt")
@@ -600,7 +710,7 @@ pub(crate) fn for_runner(runner: Runner, plan: Vec<Vec<String>>) -> Vec<Vec<Stri
             .into_iter()
             .map(|command| {
                 if runs_remotely(&command) {
-                    let mut wrapped = argv(&["rwx", "sandbox", "exec", "--"]);
+                    let mut wrapped = argv(RWX_PREFIX);
                     wrapped.extend(command);
                     wrapped
                 } else {
@@ -708,6 +818,7 @@ fn stop_sandbox(root: &Path) {
 }
 
 pub(crate) fn run(root: &Path, args: &[String]) -> ExitCode {
+    let began = gate_telemetry::Began::now();
     let mut base = "origin/main".to_string();
     let mut explicit: Vec<String> = Vec::new();
     let mut execute_plan = false;
@@ -763,7 +874,29 @@ pub(crate) fn run(root: &Path, args: &[String]) -> ExitCode {
                 for command in FULL_GATES {
                     println!("{}", shell_line(&argv(command)));
                 }
-                return ExitCode::FAILURE;
+                if !execute_plan {
+                    return ExitCode::FAILURE;
+                }
+                // A `--run` that never got to its commands is still a run:
+                // failed, with no command. The runner is not probed for it.
+                let opt_in = std::env::var(REMOTE_ENV).ok();
+                let mut trace = gate_telemetry::RunTrace::start(
+                    began,
+                    gate_telemetry::RunInfo {
+                        requested: opt_in
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|v| !v.is_empty())
+                            .unwrap_or("local")
+                            .to_string(),
+                        used: Runner::Local.name(),
+                        fallback_reason: None,
+                        plan: "unknown",
+                        commands: 0,
+                    },
+                );
+                trace.fail();
+                return send_trace(ExitCode::FAILURE, trace);
             }
         }
     } else {
@@ -782,7 +915,11 @@ pub(crate) fn run(root: &Path, args: &[String]) -> ExitCode {
     if execute_plan {
         use std::io::Write;
         let _ = std::io::stdout().flush();
-        let status = execute(root, &plan);
+        let mut trace = gate_telemetry::RunTrace::start(
+            began,
+            run_info(opt_in.as_deref(), ready, runner, &paths, plan.len()),
+        );
+        let status = execute(root, &plan, &mut trace);
         let used_sandbox = plan
             .iter()
             .any(|c| c.first().map(String::as_str) == Some("rwx"));
@@ -790,9 +927,28 @@ pub(crate) fn run(root: &Path, args: &[String]) -> ExitCode {
         if used_sandbox && !keep {
             stop_sandbox(root);
         }
-        return status;
+        return send_trace(status, trace);
     }
     ExitCode::SUCCESS
+}
+
+/// Issue #1850: sends the run's spans when the `OTEL_*` variables turn export
+/// on, and returns `status` whatever happens to the send.
+fn send_trace(status: ExitCode, trace: gate_telemetry::RunTrace) -> ExitCode {
+    let config = gate_telemetry::from_process_env();
+    let resource = config
+        .as_ref()
+        .map(|c| c.resource.clone())
+        .unwrap_or_default();
+    let exporter =
+        config.map(|c| Box::new(gate_telemetry::Http(c)) as Box<dyn gate_telemetry::Exporter>);
+    gate_telemetry::report(
+        status,
+        exporter,
+        resource,
+        trace.finish(),
+        gate_telemetry::EXPORT_BOUND,
+    )
 }
 
 #[cfg(test)]
@@ -1649,6 +1805,140 @@ mod tests {
     fn local_leaves_the_plan_unchanged() {
         let local = plan(&paths(&["src/ui.rs"]));
         assert_eq!(for_runner(Runner::Local, local.clone()), local);
+    }
+
+    /// Issue #1850: the run span's runner attributes, for `local`, `rwx` and
+    /// each way a requested runner falls back.
+    #[test]
+    fn the_run_span_says_which_runner_was_asked_for_and_which_ran() {
+        let code = paths(&["src/ui.rs"]);
+        let info = |opt_in: Option<&str>, ready: Readiness| {
+            let (runner, _) = choose_runner(opt_in, ready);
+            let info = run_info(opt_in, ready, runner, &code, 3);
+            (info.requested, info.used, info.fallback_reason)
+        };
+        /// `DAD_REMOTE_EXEC`, the readiness, and the expected requested, used
+        /// and fallback reason.
+        type Case<'a> = (
+            Option<&'a str>,
+            Readiness,
+            (&'a str, &'a str, Option<&'a str>),
+        );
+        let cases: &[Case] = &[
+            (None, Readiness::default(), ("local", "local", None)),
+            (Some("  "), Readiness::default(), ("local", "local", None)),
+            (Some("rwx"), ready(), ("rwx", "rwx", None)),
+            (
+                Some(" rwx "),
+                Readiness {
+                    cli: false,
+                    logged_in: false,
+                    config: false,
+                },
+                ("rwx", "local", Some("cli_missing,config_missing")),
+            ),
+            (
+                Some("rwx"),
+                Readiness {
+                    logged_in: false,
+                    ..ready()
+                },
+                ("rwx", "local", Some("not_logged_in")),
+            ),
+            (
+                Some("rwx"),
+                Readiness {
+                    config: false,
+                    ..ready()
+                },
+                ("rwx", "local", Some("config_missing")),
+            ),
+            (
+                Some("buildkite"),
+                ready(),
+                ("buildkite", "local", Some("unknown_runner")),
+            ),
+        ];
+        for (opt_in, ready, (requested, used, reason)) in cases {
+            let (got_requested, got_used, got_reason) = info(*opt_in, *ready);
+            assert_eq!(
+                (got_requested.as_str(), got_used, got_reason.as_deref()),
+                (*requested, *used, *reason),
+                "{opt_in:?} {ready:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_run_span_says_which_plan_ran() {
+        let kind = |list: &[&str]| {
+            run_info(None, Readiness::default(), Runner::Local, &paths(list), 0).plan
+        };
+        assert_eq!(kind(&[]), "none");
+        assert_eq!(kind(&["docs/telemetry.md"]), "text");
+        assert_eq!(kind(&["docs/telemetry.md", "src/ui.rs"]), "full");
+    }
+
+    #[test]
+    fn a_command_span_names_the_command_as_planned_and_where_it_ran() {
+        let planned = plan(&paths(&["src/ui.rs"]));
+        let executed = for_runner(Runner::Rwx, planned.clone());
+        let split: Vec<(Runner, &[String])> = executed.iter().map(|c| runner_of(c)).collect();
+        assert_eq!(
+            split[0],
+            (Runner::Local, planned[0].as_slice()),
+            "cargo fmt stays local"
+        );
+        assert_eq!(split[1], (Runner::Rwx, planned[1].as_slice()));
+        assert_eq!(split[2], (Runner::Rwx, planned[2].as_slice()));
+        assert_eq!(
+            runner_of(&argv(RWX_PREFIX)),
+            (Runner::Local, argv(RWX_PREFIX).as_slice()),
+            "a bare prefix wraps no command"
+        );
+    }
+
+    /// Issue #1850: `execute` records one span per command it runs, with the
+    /// exit code, and none for a command after the first failure.
+    #[cfg(unix)]
+    #[test]
+    fn execute_records_a_span_per_command_it_runs() {
+        let mut trace = gate_telemetry::RunTrace::start(
+            gate_telemetry::Began::now(),
+            run_info(
+                None,
+                Readiness::default(),
+                Runner::Local,
+                &paths(&["src/ui.rs"]),
+                3,
+            ),
+        );
+        let plan = vec![argv(&["true"]), argv(&["false"]), argv(&["true"])];
+        let root = std::env::temp_dir();
+        assert_eq!(execute(&root, &plan, &mut trace), ExitCode::FAILURE);
+        let spans = trace.finish();
+        let commands: Vec<_> = spans
+            .iter()
+            .filter(|s| s.name == gate_telemetry::SPAN_COMMAND)
+            .map(|s| {
+                (
+                    s.attr("gates.command").cloned(),
+                    s.attr("gates.command.exit_code").cloned(),
+                )
+            })
+            .collect();
+        use gate_telemetry::Value;
+        assert_eq!(
+            commands,
+            [
+                (Some(Value::Str("true".into())), Some(Value::Int(0))),
+                (Some(Value::Str("false".into())), Some(Value::Int(1))),
+            ]
+        );
+        assert_eq!(
+            spans[0].attr("gates.failed_command"),
+            Some(&Value::Str("false".into()))
+        );
     }
 
     #[test]

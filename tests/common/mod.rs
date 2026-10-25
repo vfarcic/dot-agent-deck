@@ -1553,6 +1553,13 @@ impl TuiDeck {
     pub fn resize(&mut self, cols: u16, rows: u16) {
         self.cols = cols;
         self.rows = rows;
+        // Grid first, then the PTY, under one parser lock: the reader thread
+        // cannot parse a byte between the two, so a frame the deck draws for
+        // the new size never lands on the old-size grid. It used to, when the
+        // deck redrew fast enough, and the deck's later frames only send the
+        // cells that changed, so the misplaced ones stayed on the grid.
+        let mut parser = self.parser.lock().unwrap();
+        dot_agent_deck::vt_grid::set_size(parser.screen_mut(), rows, cols);
         self.pty_master
             .resize(PtySize {
                 rows,
@@ -1561,7 +1568,55 @@ impl TuiDeck {
                 pixel_height: 0,
             })
             .expect("resize PTY");
-        dot_agent_deck::vt_grid::set_size(self.parser.lock().unwrap().screen_mut(), rows, cols);
+    }
+
+    /// Resize to `first`, wait until the reader has recorded the clear-screen
+    /// (`ESC [2J`) that starts the deck's redraw for a new size, then resize
+    /// to `second`. ratatui clears the whole screen when it finds the size
+    /// changed and then writes every cell, so the second SIGWINCH is sent
+    /// while that full-frame write is likely still under way; the deck's
+    /// ordinary frames, which it draws every event-loop pass, send only the
+    /// changed cells and the cursor and do not clear the screen. This is
+    /// a race amplifier, not a guarantee: the redraw can finish before the
+    /// second resize is sent. Nor is the clear it waits for proven to be the
+    /// first resize's: the reader puts a chunk on the grid before it appends
+    /// that chunk to the byte history, so a clear from an earlier resize that
+    /// is still between those two steps when this reads its starting offset
+    /// counts too, and the second resize then goes out early. What it amplifies is the moment
+    /// `resize/sigwinch/004` needs, a key sent straight after the second
+    /// resize arriving in the same readiness batch as its SIGWINCH. Decision
+    /// 21: the wait is a poll on the reader's byte history, here rather than
+    /// in a test body.
+    pub fn resize_during_redraw(&mut self, first: (u16, u16), second: (u16, u16)) {
+        const CLEAR_SCREEN: &[u8] = b"\x1b[2J";
+        let mut scan_from = self.byte_history.lock().unwrap().len();
+        self.resize(first.0, first.1);
+        let deadline = Instant::now() + WAIT_TIMEOUT;
+        loop {
+            {
+                let hist = self.byte_history.lock().unwrap();
+                if hist[scan_from..]
+                    .windows(CLEAR_SCREEN.len())
+                    .any(|w| w == CLEAR_SCREEN)
+                {
+                    break;
+                }
+                // Keep the last bytes, which can be the start of a clear
+                // whose end the reader has not recorded yet.
+                scan_from = hist
+                    .len()
+                    .saturating_sub(CLEAR_SCREEN.len() - 1)
+                    .max(scan_from);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the deck did not start a redraw within {WAIT_TIMEOUT:?} of a resize to {}x{}",
+                first.0,
+                first.1
+            );
+            std::thread::sleep(Duration::from_micros(200));
+        }
+        self.resize(second.0, second.1);
     }
 
     /// Quiescence wait: blocks until the deck has emitted no bytes for

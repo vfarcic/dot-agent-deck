@@ -134,6 +134,9 @@ mod devbox_gtk_origin;
 /// repository files, which no compile step reads.
 #[cfg(test)]
 mod dispatch_base;
+/// Issue #1850: the OpenTelemetry spans `affected-checks --run` sends, off
+/// unless the standard `OTEL_*` variables turn them on.
+mod gate_telemetry;
 /// Issues #1774 and #1808: no gh-aw workflow source quotes the API proxy's
 /// credit-exceeded error, frontmatter included, because gh-aw's conclusion job
 /// reads it back from the agent's output as a credit failure. Tests only — the
@@ -150,15 +153,6 @@ mod gh_aw_lock_consistency;
 /// sources. Like `desktop_project_boundary` this carries a live rule — rule 13
 /// in [`RULES`] — as well as its own tests.
 mod git_program_literal;
-/// Issue #603: the adaptive issue labeler's post-agent memory validator. Tests
-/// only — the rule lives in the agentic workflow, and these drive the real
-/// script under `node`.
-#[cfg(test)]
-mod issue_labeler_memory;
-/// The same workflow's `Extract label policy for the agent` setup step. Tests
-/// only — these drive the real script under `python3`.
-#[cfg(test)]
-mod issue_labeler_policy;
 /// Issue #785: `scripts/junit-strip-output.py`, the stripper that makes a JUnit
 /// report from a credential-holding run structurally incapable of carrying test
 /// output before anyone shares it. Since #502 took the credentialed lane out of
@@ -231,6 +225,12 @@ mod release_workflow_wiring;
 #[cfg(test)]
 mod renovate_lock_file_maintenance;
 mod repo_state;
+/// Issue #1256: when the automated review apps have finished, which
+/// `.claude/skills/pr-create/wait-reviews.sh` decides from `reviewers.json`
+/// for every skill that waits on a review. Tests only, and Unix only: the
+/// script is driven under `bash` against an offline `gh` stand-in.
+#[cfg(all(test, unix))]
+mod review_wait;
 /// Issue #906: `scripts/sample-attribution.sh`'s worktree-attribution rule, the
 /// prefix test that decides which worktree a toolchain process is building for.
 /// Tests only — the rule lives in the script, no CI job runs it, and both ways

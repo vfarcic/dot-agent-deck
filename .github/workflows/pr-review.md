@@ -135,9 +135,8 @@ timeout-minutes: 45
 # The PR number is in the GROUP, not only in job-discriminator. With a single
 # shared group, GitHub keeps one pending run per group and CANCELS the rest —
 # which is why every sweep completed exactly two legs and cancelled three.
-# Unlike the labeler, which shares this kind of group because it writes to a
-# shared memory store, a review has no shared state: each leg reads one pull
-# request and writes a verdict for that pull request alone. Per-PR grouping
+# A review has no shared state that would call for one group: each leg reads
+# one pull request and writes a verdict for that pull request alone. Per-PR grouping
 # still prevents two concurrent reviews of the SAME pull request.
 concurrency:
   group: pr-review-${{ github.repository }}-${{ inputs.pr_number }}

@@ -451,9 +451,29 @@ impl InboxHub {
         let message_id = MessageId::generate(st.inbox.deck()).to_string();
         let (pane, agent) = (spec.worker_pane.as_str(), spec.worker_agent.as_str());
         let admitted = st.guarded_section(|st, reports| {
-            // 1. Indexed to a unit that has an entry: its final answer.
+            // 1. Indexed to a unit that has an entry: its final answer. So is
+            //    the successor of a replacement a close settled, before its
+            //    `publish` indexes it to the unit that publication names, so
+            //    it reads the same answer before and after (plan D7, revision
+            //    6). The successor is the generation reserved under that
+            //    publication's ticket, never merely one on its pane: any other
+            //    unindexed generation keeps the publication's pending answer.
             let unit = reports.units.unit_of(pane, agent).map(str::to_string);
-            if let Some(unit) = unit.as_deref() {
+            let answering = unit.clone().or_else(|| {
+                match reports
+                    .publications
+                    .get(&PublishKey::Pane(pane.to_string()))
+                {
+                    Some(crate::report_recovery::Publication::Replacement {
+                        unit,
+                        ticket,
+                        closed: true,
+                        ..
+                    }) if facts.replacement_of == Some(*ticket) => Some(unit.clone()),
+                    _ => None,
+                }
+            });
+            if let Some(unit) = answering.as_deref() {
                 match reports.units.get(unit) {
                     Some(UnitEntry::Completed {
                         report_id,

@@ -139,6 +139,351 @@ fn accepted(completion: Completion) -> crate::event::WorkDoneTaskReply {
     reply
 }
 
+/// Scenario: A respawned unit's successor starts a terminal report and exits during its paused save; the report reaches the caller once. A predecessor's claimed report likewise survives a failed replacement, for single and orchestration units and for live and exited callers, with no dispatch-ended notice competing with the report.
+#[spec("dispatch/return/026")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn return_026_c_f_claim_reports_survive_exit_and_failed_replacement() {
+    for orchestration in [false, true] {
+        for orphaned in [false, true] {
+            for failure in [
+                None,
+                Some(FAULT_SPAWN_FAILS),
+                Some(FAULT_RESPAWN_AFTER_SPAWN),
+                Some(FAULT_RESPAWN_BEFORE_PUBLISH_SECTION),
+                Some(FAULT_SPAWN_AFTER_INSERT),
+            ] {
+                let mut unit = unit(
+                    &format!(
+                        "r026cf-{orchestration}-{orphaned}-{}",
+                        failure.unwrap_or("exit")
+                    ),
+                    orchestration,
+                )
+                .await;
+                if failure.is_none() {
+                    unit.agent = unit
+                        .registry()
+                        .respawn_agent_for_pane(unit.pane(), "cat")
+                        .await
+                        .unwrap();
+                }
+                if orphaned {
+                    let caller = unit
+                        .registry()
+                        .pane_current_agent_id(&unit.caller_pane)
+                        .unwrap();
+                    kill_child(unit.registry(), &caller);
+                    eventually("the caller exits", || {
+                        unit.registry()
+                            .pane_current_agent_id(&unit.caller_pane)
+                            .is_none()
+                    })
+                    .await;
+                }
+                let unit = Arc::new(unit);
+                let (report, release) = paused_report(
+                    &unit,
+                    crate::task_completion::PAUSE_SAVED,
+                    "CLAIMED-REPORT-026",
+                )
+                .await;
+                if let Some(seam) = failure {
+                    unit.registry().inject_fault_for_test(
+                        seam,
+                        if seam == FAULT_SPAWN_FAILS {
+                            TestFault::Fail
+                        } else {
+                            TestFault::Panic("claimed-replacement-failure")
+                        },
+                    );
+                    let respawn = {
+                        let unit = Arc::clone(&unit);
+                        tokio::spawn(async move {
+                            unit.registry()
+                                .respawn_agent_for_pane(unit.pane(), "cat")
+                                .await
+                        })
+                    }
+                    .await;
+                    if seam == FAULT_SPAWN_FAILS {
+                        assert!(respawn.unwrap().is_err());
+                    } else {
+                        assert!(respawn.unwrap_err().is_panic());
+                    }
+                } else {
+                    kill_child(unit.registry(), unit.agent());
+                }
+                eventually("the unit route ends", || unit.route_count() == 0).await;
+                assert_eq!(unit.ended(), 0, "the claim withholds dispatch ended");
+                release.send(()).unwrap();
+                let answer = accepted(report.await.unwrap());
+                assert_eq!(
+                    answer.destination,
+                    Some(if orphaned {
+                        Destination::Recovery
+                    } else {
+                        Destination::Inbox
+                    }),
+                    "orchestration={orchestration}, orphaned={orphaned}, failure={failure:?}; caller={:?}; rows={:?}",
+                    unit.registry().pane_current_agent_id(&unit.caller_pane),
+                    rows(&unit.deck)
+                );
+                assert_eq!(unit.completed(), usize::from(!orphaned));
+                assert_eq!(unit.ended(), 0);
+                let outcomes = rows(&unit.deck);
+                assert_eq!(outcomes.len(), usize::from(orphaned));
+                assert!(
+                    outcomes
+                        .iter()
+                        .all(|row| row.phase
+                            == crate::report_recovery::OutcomePhase::DispatchFinished)
+                );
+                assert_eq!(super::report_tests::store_files(&unit.deck.store).len(), 1);
+            }
+        }
+    }
+}
+
+/// Scenario: A unit is closed while its replacement is paused before publication, and other ended units push against the tombstone bound. The replacement's terminal report says task_closed both before and after publication, with one dispatch-ended notice and no saved report or resurrected route.
+#[spec("dispatch/return/026")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn return_026_g_a_closed_replacements_reports_stay_closed_across_publish() {
+    // SAFETY: nextest runs each test in its own process.
+    unsafe { std::env::set_var(crate::report_recovery::ENV_TOMBSTONES_MAX, "1") };
+    for orchestration in [false, true] {
+        let unit = Arc::new(unit(&format!("r026gr-{orchestration}"), orchestration).await);
+        let (reached, release) = unit
+            .registry()
+            .pause_at_sync_for_test(PAUSE_RESPAWN_BEFORE_PUBLISH);
+        let respawn = {
+            let unit = Arc::clone(&unit);
+            tokio::spawn(async move {
+                unit.registry()
+                    .respawn_agent_for_pane(unit.pane(), "cat")
+                    .await
+            })
+        };
+        tokio::task::spawn_blocking(move || reached.recv_timeout(Duration::from_secs(10)))
+            .await
+            .unwrap()
+            .unwrap();
+        let b = unit.registry().pane_current_agent_id(unit.pane()).unwrap();
+        let facts = unit.facts(&b);
+        drop(unit.registry().begin_pane_close(unit.pane()));
+        let others: Vec<_> = (0..32)
+            .map(|n| {
+                (
+                    format!("pressure-p{n}"),
+                    format!("gone-{n}"),
+                    format!("pressure-u{n}"),
+                )
+            })
+            .collect();
+        let refs: Vec<_> = others
+            .iter()
+            .map(|(p, a, u)| (p.as_str(), a.as_str(), u.as_str()))
+            .collect();
+        unit.registry()
+            .inbox()
+            .insert_ended_units_for_test(unit.registry().as_ref(), &refs);
+        let answer = refused_with(
+            unit.report_from(unit.pane(), &b, facts.clone(), "done")
+                .await,
+            code::TASK_CLOSED,
+        );
+        assert_eq!(answer.destination, None);
+        release.send(()).unwrap();
+        assert_eq!(respawn.await.unwrap().unwrap(), b);
+        let answer = refused_with(
+            unit.report_from(unit.pane(), &b, facts, "done").await,
+            code::TASK_CLOSED,
+        );
+        assert_eq!(answer.destination, None);
+        assert_eq!(unit.ended(), 1);
+        assert_eq!(unit.completed(), 0);
+        assert_eq!(unit.route_count(), 0);
+        assert!(super::report_tests::store_files(&unit.deck.store).is_empty());
+    }
+}
+
+/// The two reporters `/026 (g)`'s fallback must not answer for the unit: an
+/// unrelated generation on the pane, and one reserved under another
+/// replacement's ticket that names the unit. Each reads the replacement's
+/// pending answer while the closed publication stands.
+async fn assert_only_the_successor_reads_the_unit(unit: &Unit, successor: &AttestFacts) {
+    let ticket = successor
+        .replacement_of
+        .expect("B is reserved under a ticket");
+    let not_the_successor = AttestFacts {
+        unit: Some(unit.unit_id()),
+        replacement_of: Some(ticket + 1_000_000),
+        ..successor.clone()
+    };
+    for (agent, facts) in [
+        ("r026g-unrelated", AttestFacts::default()),
+        ("r026g-not-the-successor", not_the_successor),
+    ] {
+        let answer = refused_with(
+            unit.report_from(unit.pane(), agent, facts, "done").await,
+            code::REPORT_PENDING,
+        );
+        assert_eq!(answer.report_id, None, "{agent}: {answer:?}");
+        assert_eq!(answer.destination, None, "{agent}: {answer:?}");
+    }
+}
+
+/// Scenario: A unit's replacement is paused before publication and its pane is closed, once with the unit ended and once after the predecessor's report completed it. Only the replacement's own successor reads the unit's answer; an unrelated generation on the pane and a generation reserved under another ticket are told the report is pending, never given the unit's report id or task_closed.
+#[spec("dispatch/return/026")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn return_026_g_only_the_successor_reads_a_closed_replacements_unit() {
+    for completed in [false, true] {
+        let unit = Arc::new(unit(&format!("r026gs-{completed}"), false).await);
+        let report = if completed {
+            Some(
+                paused_report(
+                    &unit,
+                    crate::task_completion::PAUSE_SAVED,
+                    "PREDECESSOR-026",
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        let (reached, release) = unit
+            .registry()
+            .pause_at_sync_for_test(PAUSE_RESPAWN_BEFORE_PUBLISH);
+        let respawn = {
+            let unit = Arc::clone(&unit);
+            tokio::spawn(async move {
+                unit.registry()
+                    .respawn_agent_for_pane(unit.pane(), "cat")
+                    .await
+            })
+        };
+        tokio::task::spawn_blocking(move || reached.recv_timeout(Duration::from_secs(10)))
+            .await
+            .unwrap()
+            .unwrap();
+        let b = unit.registry().pane_current_agent_id(unit.pane()).unwrap();
+        let facts = unit.facts(&b);
+        let accepted_id = match report {
+            Some((report, release)) => {
+                release.send(()).unwrap();
+                let answer = accepted(report.await.unwrap());
+                assert!(matches!(
+                    unit_entry(&unit.deck, &unit.unit_id()),
+                    Some(UnitEntry::Completed { .. })
+                ));
+                Some(answer.report_id.expect("an accepted report has an id"))
+            }
+            None => None,
+        };
+        drop(unit.registry().begin_pane_close(unit.pane()));
+        assert_only_the_successor_reads_the_unit(&unit, &facts).await;
+        let answer = unit.report_from(unit.pane(), &b, facts, "done").await;
+        match &accepted_id {
+            Some(id) => {
+                let answer = reply(answer);
+                assert_eq!(
+                    answer.disposition,
+                    WorkDoneDisposition::AlreadyAccepted,
+                    "{answer:?}"
+                );
+                assert_eq!(answer.report_id.as_ref(), Some(id));
+            }
+            None => {
+                refused_with(answer, code::TASK_CLOSED);
+            }
+        }
+        release.send(()).unwrap();
+        assert_eq!(respawn.await.unwrap().unwrap(), b);
+        assert_eq!(unit.completed(), usize::from(completed));
+        assert_eq!(unit.ended(), usize::from(!completed));
+    }
+}
+
+/// Scenario: An orchestration dispatch is paused after spawning its roles, and its orchestrator starts a delayed terminal report. A role closes before registration can finish, so the dispatch aborts; released afterwards, the report says unknown_task with the abandoned wording, saves nothing and never claims destination none.
+#[spec("dispatch/return/027")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn return_027_c_prime_an_aborted_publication_refuses_the_delayed_report() {
+    let deck = Arc::new(deck());
+    let caller = spawn_cat(&deck.registry, "r027cp-caller");
+    let (reached, release) = deck.registry.pause_at_for_test("dispatch-publication");
+    let dispatch = {
+        let deck = Arc::clone(&deck);
+        tokio::spawn(async move {
+            dispatch_orchestration(&deck, "r027cp", "r027cp-caller", &caller).await
+        })
+    };
+    reached.await.unwrap();
+    let (pane, agent) = deck
+        .registry
+        .live_pane_agents()
+        .into_iter()
+        .find(|(_, agent)| {
+            deck.registry
+                .attest_facts(agent)
+                .and_then(|f| f.seat)
+                .is_some_and(|s| s.is_orchestrator)
+        })
+        .unwrap();
+    let facts = deck.registry.attest_facts(&agent).unwrap();
+    let (attested, release_report) = deck
+        .registry
+        .pause_at_for_test(crate::task_completion::PAUSE_TERMINAL_RESOLVED);
+    let report = {
+        let deck = Arc::clone(&deck);
+        tokio::spawn(async move {
+            crate::task_completion::complete_with_state(
+                &AppState::default(),
+                &deck.registry,
+                CompletionRequest {
+                    pane_id: pane,
+                    mode: WorkDoneMode::Terminal,
+                    report: "aborted report".to_string(),
+                },
+                &Provenance::Attested {
+                    agent_id: agent,
+                    facts,
+                },
+            )
+            .await
+        })
+    };
+    attested.await.unwrap();
+    let worker = deck
+        .registry
+        .live_pane_agents()
+        .into_iter()
+        .find(|(_, agent)| {
+            deck.registry
+                .attest_facts(agent)
+                .and_then(|f| f.seat)
+                .is_some_and(|s| !s.is_orchestrator)
+        })
+        .unwrap()
+        .1;
+    deck.registry.close_agent(&worker).unwrap();
+    release.send(()).unwrap();
+    let Err(aborted) = dispatch.await else {
+        panic!("the closed role must abort the dispatch");
+    };
+    assert!(
+        aborted.is_panic(),
+        "the test dispatch helper expects success, so abort is a panic"
+    );
+    release_report.send(()).unwrap();
+    let answer = refused_with(report.await.unwrap(), code::UNKNOWN_TASK);
+    assert!(
+        answer.message.as_deref().unwrap().contains("abandoned"),
+        "{answer:?}"
+    );
+    assert_eq!(answer.destination, None);
+    assert!(super::report_tests::store_files(&deck.store).is_empty());
+    assert!(inbox_of(&deck, "r027cp-caller").is_empty());
+}
+
 /// Start a report on its own task, held at `pause`.
 async fn paused_report(
     unit: &Arc<Unit>,

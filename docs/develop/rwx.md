@@ -59,6 +59,8 @@ The local run also failed ten tests that pass serially and on Linux, which is th
 
 It runs locally instead, and prints a note saying why, when the `rwx` CLI is missing, `rwx whoami` fails, `.rwx/sandbox.yml` is absent, or the variable names anything other than `rwx`. An unset variable prints nothing and changes nothing.
 
+With the standard `OTEL_*` variables set, as they are in an agent's shell under a deck with telemetry on, each `--run` also sends a trace recording which runner each command used, why a requested runner fell back, and how long each command took, so time with and without the sandbox can be compared across many runs rather than from one table: [gate-telemetry.md](gate-telemetry.md).
+
 ### For agents
 
 When `DAD_REMOTE_EXEC=rwx` is set, run the commit gates through `cargo xtask affected-checks --run` rather than command by command, and run any other heavy `cargo` command (a filtered `cargo test-e2e`, a build) as `rwx sandbox exec -- <command>`. **Never run lane 2 (`cargo test-e2e-live`) or anything that reaches a real agent in the sandbox**: no agent credential is placed there, and CLAUDE.md rule 5's reasons for keeping credentials off remote runners apply to it as much as to CI.

@@ -16,7 +16,11 @@
 //! - `files/<run>/`, the run's own directory. **The directory a file is in is
 //!   its owner.** `r-<report>.md` is a file this run wrote;
 //!   `r-<report>.d<unix-secs>.<state>.md` is one it adopted from a run that
-//!   ended, whose deadline and last state are fixed in its name.
+//!   ended, whose deadline and last state are fixed in its name;
+//!   `w-<report>.<tag>.part` is a write under way: a report is written and
+//!   `fsync`ed there, then given its own name by a rename that never
+//!   replaces (or a link, where there is none), so the own name never holds
+//!   a cut-off file. A takeover removes every such name it finds.
 //!
 //! # Ownership transfer
 //!
@@ -193,6 +197,26 @@ pub fn own_name(report_id: &str) -> String {
 pub fn parse_own_name(name: &str) -> Option<&str> {
     let id = name.strip_prefix("r-")?.strip_suffix(".md")?;
     valid_report_id(id).then_some(id)
+}
+
+/// The name a report is written under before it is linked to its own
+/// name: `w-<report>.<16 hex>.part`, fresh for every attempt. It is never a
+/// report: a takeover removes it wherever it finds one.
+fn temp_name(report_id: &str) -> io::Result<String> {
+    let mut bytes = [0u8; 8];
+    getrandom::fill(&mut bytes).map_err(io::Error::other)?;
+    let tag: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(format!("w-{report_id}.{tag}.part"))
+}
+
+/// Whether `name` is an attempt's temporary name ([`temp_name`]).
+fn is_temp_name(name: &str) -> bool {
+    name.strip_prefix("w-")
+        .and_then(|rest| rest.strip_suffix(".part"))
+        .and_then(|rest| rest.rsplit_once('.'))
+        .is_some_and(|(id, tag)| {
+            valid_report_id(id) && tag.len() == 16 && tag.bytes().all(|b| b.is_ascii_hexdigit())
+        })
 }
 
 /// The recorded state an adopted file's name carries (D14).
@@ -897,8 +921,9 @@ pub enum WriteFailure {
     /// The write failed and the attempt's file was removed; the room was
     /// returned.
     Io(String),
-    /// The write failed and its file could not be removed: it stays charged,
-    /// keeps its slot, and its removal is retried.
+    /// The write failed and a file it made could not be removed: it stays
+    /// charged and its removal is retried. The own name keeps its slot; a
+    /// temporary name takes none.
     IoOrphaned(String),
 }
 
@@ -913,6 +938,9 @@ pub struct StoreCounts {
     pub in_flight: u32,
     pub unsaved: u32,
     pub adopted_generation: u64,
+    /// Attempts' temporary files whose removal failed ([`StoreState::stray`]).
+    pub stray_files: u32,
+    pub stray_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -947,6 +975,12 @@ struct StoreState {
     in_flight: u32,
     unsaved: u32,
     revision: u64,
+    /// Attempts' temporary files this run could not remove, by name, each
+    /// charged its attempt's bytes until a sweep removes it. Like a file
+    /// inherited for cleanup, one takes no file slot and is in no inventory:
+    /// a run that ends with one leaves it to the next run's takeover, which
+    /// removes every temporary name it finds.
+    stray: HashMap<String, u64>,
 }
 
 impl StoreState {
@@ -954,6 +988,13 @@ impl StoreState {
         self.own_bytes
             .saturating_add(self.adopted_bytes)
             .saturating_add(self.reserved_bytes)
+            .saturating_add(self.stray_bytes())
+    }
+
+    fn stray_bytes(&self) -> u64 {
+        self.stray
+            .values()
+            .fold(0u64, |sum, bytes| sum.saturating_add(*bytes))
     }
 
     fn used_slots(&self) -> u64 {
@@ -1098,6 +1139,7 @@ impl StoreLock<'_> {
 
     /// See [`RetainedStore::reserve`].
     pub fn reserve(&mut self, bytes: u64) -> Result<Reservation, StoreRefusal> {
+        let bytes = bytes.max(1);
         self.store.refuse_unusable()?;
         self.store.admit(&self.st, bytes)?;
         self.st.reserved_bytes += bytes;
@@ -1135,8 +1177,12 @@ impl StoreLock<'_> {
 
 /// A write's reserved room while the write runs: an unwind before the write's
 /// own accounting returns it, through `lock_in_drop`, which never panics. It
-/// does not record a file the write already created; the caller's `discard`
-/// removes one, and one it cannot remove stays uncharged.
+/// does not record a file the write already created. The caller's `discard`
+/// knows only the own name, which an unwind before publication has not
+/// taken: such an unwind leaves the attempt's temporary name, uncharged and
+/// untracked by this run, for the next run's takeover to remove. One after
+/// publication leaves the own name, for `discard`; one that cannot be removed
+/// stays uncharged.
 struct RoomOnUnwind<'a> {
     store: &'a RetainedStore,
     bytes: Option<u64>,
@@ -1214,6 +1260,7 @@ impl RetainedStore {
             in_flight: 0,
             unsaved: 0,
             revision: 0,
+            stray: HashMap::new(),
         };
         let mut store = RetainedStore {
             state: RankedMutex::new(state),
@@ -1346,6 +1393,8 @@ impl RetainedStore {
             in_flight: st.in_flight,
             unsaved: st.unsaved,
             adopted_generation: st.adopted_generation,
+            stray_files: st.stray.len() as u32,
+            stray_bytes: st.stray_bytes(),
         })
     }
 
@@ -1374,7 +1423,13 @@ impl RetainedStore {
         Ok(())
     }
 
-    /// Reserve `bytes` and one file slot, or refuse, consuming nothing.
+    /// Reserve `bytes` and one file slot, or refuse, consuming nothing. A
+    /// reservation is at least one byte. A stray takes no file slot and
+    /// charges at least one byte too: a failed write's its reservation, a
+    /// saved write's leftover alias its file's length or one byte, whichever
+    /// is more. So the byte budget bounds how many there can be. No caller in
+    /// the deck asks for less; a report's and a dispatch result's files are
+    /// sized from nonzero bounds.
     pub fn reserve(&self, bytes: u64) -> Result<Reservation, StoreRefusal> {
         self.refuse_unusable()?;
         self.lock()
@@ -1389,11 +1444,17 @@ impl RetainedStore {
         }
     }
 
-    /// Write `contents` as `report_id`'s own file under `reservation`: created
-    /// owner-only and exclusive, written, `fsync`ed, and its directory synced.
-    /// On success the file is pinned. On failure the attempt's file is
-    /// removed and the room returned, or, when the removal fails, the file
-    /// stays charged as an orphan whose removal the sweep retries.
+    /// Write `contents` as `report_id`'s own file under `reservation`: written
+    /// owner-only and exclusive under a fresh temporary name, `fsync`ed, then
+    /// moved to its own name by a rename that never replaces (a link and an
+    /// unlink of the temporary name where the filesystem has no such rename),
+    /// and the directory synced. So the own name only ever holds a
+    /// whole file, and a crash mid-write leaves a temporary name that the
+    /// next takeover removes, never a cut-off report it would adopt. On
+    /// success the file is pinned. On failure the attempt's files are removed
+    /// and the room returned, or, when a removal fails, what stays is charged
+    /// and its removal retried by the sweep: the own name as an orphan, a
+    /// temporary name as a stray.
     pub fn write(
         &self,
         reservation: Reservation,
@@ -1416,20 +1477,71 @@ impl RetainedStore {
             "a file larger than its reservation"
         );
         let name = own_name(report_id);
-        let mut created = false;
+        let mut temp = None;
+        let mut linked = false;
+        let mut stray = None;
         let written = (|| {
-            let mut file = dirs.mine.create_new_owner_only(&name)?;
-            created = true;
+            let attempt = temp_name(report_id)?;
+            let mut file = match dirs.mine.create_new_owner_only(&attempt) {
+                Ok(file) => file,
+                // Created, but neither made owner-only nor removed: the
+                // cleanup below retries it, and keeps it as a stray.
+                Err(error) if crate::platform::trusted_dir::left_behind(&error) => {
+                    temp = Some(attempt);
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            };
+            temp = Some(attempt.clone());
             #[cfg(test)]
             if self.seams.fail_write.swap(false, Ordering::SeqCst)
                 || self.seams.fail_all_writes.load(Ordering::SeqCst)
             {
                 return Err(io::Error::other("injected write failure"));
             }
+            #[cfg(test)]
+            if self.seams.crash_at(seams::Crash::MidWrite) {
+                file.write_all(&contents[..contents.len() / 2])?;
+                return Err(io::Error::other(seams::CRASHED));
+            }
             file.write_all(contents)?;
             file.sync_all()?;
+            drop(file);
+            match dirs.mine.rename_into(&attempt, &dirs.mine, &name) {
+                Ok(()) => {
+                    temp = None;
+                    linked = true;
+                }
+                // No no-replace rename here: a link, which never replaces
+                // either, then the temporary name, a second name for the
+                // whole file, removed. One that cannot go is kept as a stray.
+                Err(error) if unsupported_rename(&error) => {
+                    dirs.mine.link(&attempt, &name)?;
+                    linked = true;
+                    #[cfg(test)]
+                    if self.seams.crash_at(seams::Crash::AfterLink) {
+                        return Err(io::Error::other(seams::CRASHED));
+                    }
+                    if self.unlink(&dirs.mine, &attempt).is_ok() {
+                        temp = None;
+                    } else {
+                        stray = temp.take();
+                    }
+                }
+                Err(error) => return Err(error),
+            }
             self.sync(&dirs.mine, "mine")
         })();
+        #[cfg(test)]
+        if written
+            .as_ref()
+            .is_err_and(|error| error.to_string() == seams::CRASHED)
+        {
+            // A process that died here runs nothing more: its files stay as
+            // they are, for the next run's takeover. Only the room returns
+            // (the test's store lives on).
+            return Err(WriteFailure::Io(seams::CRASHED.to_string()));
+        }
         room.bytes = None;
         match written {
             Ok(()) => {
@@ -1447,21 +1559,34 @@ impl RetainedStore {
                         },
                     );
                     st.own_bytes = st.own_bytes.saturating_add(bytes);
+                    // A kept alias takes no slot, so it charges at least
+                    // the reservation's floor of one byte.
+                    if let Some(stray) = stray {
+                        st.stray.insert(stray, bytes.max(1));
+                    }
                     st.revision += 1;
                 }
                 Ok(())
             }
             Err(error) => {
                 room.bytes = Some(reservation.bytes);
-                let removed = !created || self.unlink(&dirs.mine, &name).is_ok();
+                let mut stray = stray;
+                if let Some(attempt) = temp
+                    && self.unlink(&dirs.mine, &attempt).is_err()
+                {
+                    stray = Some(attempt);
+                }
+                let removed = !linked || self.unlink(&dirs.mine, &name).is_ok();
                 room.bytes = None;
                 let Ok(mut st) = self.state.try_lock() else {
                     return Err(WriteFailure::Io(error.to_string()));
                 };
                 st.release(reservation.bytes);
-                if removed {
-                    Err(WriteFailure::Io(error.to_string()))
-                } else {
+                let orphaned = !removed || stray.is_some();
+                if let Some(stray) = stray {
+                    st.stray.insert(stray, reservation.bytes);
+                }
+                if !removed {
                     st.own.insert(
                         name,
                         OwnFile {
@@ -1473,7 +1598,11 @@ impl RetainedStore {
                     );
                     st.own_bytes = st.own_bytes.saturating_add(reservation.bytes);
                     st.revision += 1;
+                }
+                if orphaned {
                     Err(WriteFailure::IoOrphaned(error.to_string()))
+                } else {
+                    Err(WriteFailure::Io(error.to_string()))
                 }
             }
         }
@@ -1813,6 +1942,21 @@ impl RetainedStore {
                     left += 1;
                     continue;
                 };
+                // An attempt's temporary name is never a report: a write that
+                // died before linking it left it cut off, and one that died
+                // after left a second name for a file adopted by its own.
+                if is_temp_name(name) {
+                    match self.unlink(theirs, name) {
+                        Ok(()) => report.removed += 1,
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            warn!(run, %error, "retained reports: could not remove an ended run's unfinished write; it is tried again at the next start");
+                            report.failed += 1;
+                            left += 1;
+                        }
+                    }
+                    continue;
+                }
                 // 2. Its fixed deadline and state letter.
                 let decided = if let Some((id, deadline, state)) = parse_adopted_name(name) {
                     Some((id.to_string(), deadline, state))
@@ -1960,29 +2104,50 @@ impl RetainedStore {
         // Own files, each by name.
         for (name, file) in own {
             match self.fstat(&dirs.mine, &name) {
-                Ok(_) if file.due(now) => match self.unlink(&dirs.mine, &name) {
-                    Ok(()) => {
-                        if let Ok(mut st) = self.state.try_lock() {
-                            st.drop_own(&name);
-                        }
-                        report.removed += 1;
+                Ok(_) if file.due(now) => {
+                    // The snapshot only nominates the file. It is decided
+                    // again under the lock and claimed there, as being
+                    // removed: an acknowledgement or recovery that renewed it
+                    // since the snapshot keeps it, and one that comes after
+                    // the claim finds it being removed and renews nothing.
+                    #[cfg(test)]
+                    self.seams.pause(seams::Pause::BeforeClaim);
+                    let claimed = match self.state.try_lock() {
+                        Ok(mut st) => match st.own.get_mut(&name) {
+                            Some(own) if own.due(now) => {
+                                let changed = own.state != OwnState::OrphanUnlink;
+                                own.state = OwnState::OrphanUnlink;
+                                if changed {
+                                    st.revision += 1;
+                                }
+                                true
+                            }
+                            _ => false,
+                        },
+                        Err(_) => false,
+                    };
+                    if !claimed {
+                        continue;
                     }
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        if let Ok(mut st) = self.state.try_lock() {
-                            st.drop_own(&name);
+                    #[cfg(test)]
+                    self.seams.pause(seams::Pause::BeforeUnlink);
+                    match self.unlink(&dirs.mine, &name) {
+                        Ok(()) => {
+                            if let Ok(mut st) = self.state.try_lock() {
+                                st.drop_own(&name);
+                            }
+                            report.removed += 1;
                         }
-                    }
-                    Err(_) => {
-                        if let Ok(mut st) = self.state.try_lock()
-                            && let Some(own) = st.own.get_mut(&name)
-                            && own.state != OwnState::OrphanUnlink
-                        {
-                            own.state = OwnState::OrphanUnlink;
-                            st.revision += 1;
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                            if let Ok(mut st) = self.state.try_lock() {
+                                st.drop_own(&name);
+                            }
                         }
-                        report.failed += 1;
+                        // Claimed, it stays an orphan whose removal the next
+                        // pass retries.
+                        Err(_) => report.failed += 1,
                     }
-                },
+                }
                 Ok(_) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     warn!(
@@ -1994,6 +2159,30 @@ impl RetainedStore {
                     }
                 }
                 Err(_) => report.uncertain += 1,
+            }
+        }
+        // Attempts' temporary files that could not be removed when they were
+        // made.
+        let strays: Vec<String> = match self.state.try_lock() {
+            Ok(st) => st.stray.keys().cloned().collect(),
+            Err(_) => Vec::new(),
+        };
+        for temp in strays {
+            let gone = match self.unlink(&dirs.mine, &temp) {
+                Ok(()) => {
+                    report.removed += 1;
+                    true
+                }
+                Err(error) => {
+                    let gone = error.kind() == io::ErrorKind::NotFound;
+                    if !gone {
+                        report.failed += 1;
+                    }
+                    gone
+                }
+            };
+            if gone && let Ok(mut st) = self.state.try_lock() {
+                st.stray.remove(&temp);
             }
         }
         // Adopted files, streamed: removed by their suffix, and recounted.
@@ -2172,15 +2361,43 @@ fn collect_names(dir: &TrustedDir) -> io::Result<Vec<std::ffi::OsString>> {
 #[cfg(test)]
 mod seams {
     use std::collections::{HashMap, HashSet};
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, Ordering};
+    use std::sync::{Arc, Barrier, Mutex};
 
     use super::StoreState;
     use crate::lock_rank::{R5, RankedMutex};
 
+    /// The message of the error a simulated crash returns.
+    pub(super) const CRASHED: &str = "injected crash";
+
+    /// Where a write simulates its process dying, leaving its files as they
+    /// are.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Crash {
+        /// Half the report written to its temporary name.
+        MidWrite = 1,
+        /// Linked to its own name, the temporary name not yet removed: the
+        /// fallback where the filesystem has no no-replace rename.
+        AfterLink = 2,
+    }
+
+    /// Where a sweep can be held while a test acts.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    pub(super) enum Pause {
+        /// A due own file nominated from the snapshot, before the lock.
+        BeforeClaim,
+        /// Claimed under the lock, before its unlink.
+        BeforeUnlink,
+    }
+
     #[derive(Default)]
     pub(super) struct Seams {
         pub(super) fail_write: AtomicBool,
+        /// The next write's [`Crash`] point, 0 for none.
+        pub(super) crash: AtomicU8,
+        /// A barrier the sweep meets twice at a [`Pause`]: once on arriving,
+        /// once to go on.
+        pub(super) pauses: Mutex<HashMap<Pause, Arc<Barrier>>>,
         pub(super) fail_all_writes: AtomicBool,
         pub(super) fail_unlink: AtomicBool,
         /// A persistent errno for every move, 0 for none.
@@ -2205,6 +2422,29 @@ mod seams {
     }
 
     impl Seams {
+        /// Whether this write crashes at `at`: once, then the seam is off.
+        pub(super) fn crash_at(&self, at: Crash) -> bool {
+            self.crash
+                .compare_exchange(at as u8, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        }
+
+        /// Arm a pause at `at`, once: the sweep and the test each meet the
+        /// returned barrier twice.
+        pub(super) fn pause_at(&self, at: Pause) -> Arc<Barrier> {
+            let barrier = Arc::new(Barrier::new(2));
+            self.pauses.lock().unwrap().insert(at, Arc::clone(&barrier));
+            barrier
+        }
+
+        pub(super) fn pause(&self, at: Pause) {
+            let armed = self.pauses.lock().unwrap().remove(&at);
+            if let Some(barrier) = armed {
+                barrier.wait();
+                barrier.wait();
+            }
+        }
+
         pub(super) fn note_taken(&self, run: &str) {
             self.taken.lock().unwrap().push(run.to_string());
         }

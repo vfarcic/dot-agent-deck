@@ -287,15 +287,21 @@ pub struct Seat {
 }
 
 /// PRD #1666 part 3, round 5 (plan D12): the facts a generation's token
-/// attests with, pinned on its record from its spawn reservation. `seat` is
-/// written once, at the reservation; `unit` goes from `None` to `Some` once,
-/// when the generation becomes a dispatched unit's terminal. A request carries
-/// them as they were when its token attested, whatever is closed, evicted or
-/// reused later.
+/// attests with, pinned on its record from its spawn reservation. `seat` and
+/// `replacement_of` are written once, at the reservation; `unit` goes from
+/// `None` to `Some` once, when the generation becomes a dispatched unit's
+/// terminal. A request carries them as they were when its token attested,
+/// whatever is closed, evicted or reused later.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AttestFacts {
     pub seat: Option<Seat>,
     pub unit: Option<String>,
+    /// PRD #1666 part 3, round 5 (plan D7): the replacement ticket this
+    /// generation was reserved under, when it is a respawned unit terminal's
+    /// successor. Tickets come from a daemon-wide wrapping `u64` counter that
+    /// starts at 1, so a daemon's first 2^64 draws are all distinct and it
+    /// names that one replacement; only a wraparound past them repeats one.
+    pub replacement_of: Option<u64>,
 }
 
 /// What the daemon's registry has to answer for [`classify`] to decide.

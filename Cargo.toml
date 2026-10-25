@@ -9,6 +9,9 @@ members = [
     "xtask/site",
     "xtask/spec",
 ]
+# The patched crossterm below is a path dependency inside the workspace root,
+# which cargo would otherwise make a member and lint as our own code.
+exclude = ["vendor/crossterm"]
 
 # Issue #451 — the minimum supported Rust toolchain, inherited by every member
 # through `rust-version.workspace = true`. Without it, a build on an older
@@ -53,9 +56,12 @@ ratatui = "0.30"
 # hand, and re-read `ctrl_c0_byte`'s contract, before bumping it. (The
 # `keyevent_ctrl_c0_matches_crossterm_decoder` round-trip test catches an
 # encoder/decoder mismatch under `cargo test-fast`, but not a stale line
-# reference.) NOTE: ratatui 0.30 pulls crossterm 0.29 in via `ratatui-crossterm`;
-# the two coexist because 0.28/0.29 are semver-incompatible, and this pin binds
-# only OUR direct dependency — the one `src/ui.rs` reads events from.
+# reference.) ratatui 0.30 also depends on crossterm, through
+# `ratatui-crossterm`. Both requirements resolve to the one patched copy that
+# `[patch.crates-io]` below supplies, so a bump also means re-applying or
+# dropping that patch: a version the patch does not supply makes cargo use the
+# registry crate with only a warning, which `tests/vendored_crossterm.rs`
+# turns into a failure.
 crossterm = "=0.29.0"
 clap = { version = "4", features = ["derive"] }
 toml = "1.0"
@@ -233,9 +239,9 @@ e2e = []
 # NOTHING IN CI ENABLES THIS FEATURE'S TESTS TO RUN, and that is the decision
 # rather than an omission: no e2e test reaches a real agent in CI, so no TEST
 # credential is registered on this repository. (Narrow claim on purpose — the
-# Codex issue-labeler is a separately credentialed workflow that does put a
+# agent PR reviewer is a separately credentialed workflow that does put a
 # repository secret on a runner and does reach a real agent; see
-# `docs/develop/issue-labeling.md`. It is out of scope for the e2e tier.) The
+# `docs/develop/governance.md`. It is out of scope for the e2e tier.) The
 # line the feature draws is exactly "reaches a real agent", which is wider than
 # "reads a key" — on a developer box the agent CLIs are pre-authenticated, so
 # spawning `claude` spends a credential with no environment variable
@@ -283,3 +289,12 @@ opt-level = 3
 # settings.
 [profile.dev.package.vt100]
 opt-level = 3
+
+# crossterm 0.29.0 with its Unix event source fixed to handle a whole readiness
+# batch: upstream stranded keys typed right after a terminal resize until the
+# next keystroke. Replaces the registry crate for every dependent, ratatui's
+# included. vendor/crossterm/VENDORED.md has the change, why no release or
+# feature avoids it, when to drop it, and what keeps it applied and audited
+# (`tests/vendored_crossterm.rs`, `scripts/audit-vendored-upstream.sh`).
+[patch.crates-io]
+crossterm = { path = "vendor/crossterm" }
