@@ -774,7 +774,7 @@ fn inbox_hold_card(extra: serde_json::Value) -> String {
     buffer_to_text(&buffer)
 }
 
-/// Scenario: The daemon says why it holds the doorbell for an idle agent's one waiting message, whose wake has also stalled: a possible draft, a possible prompt, an unfinished paste. Each card shows the reason with the count on its notice row, in the words the desktop uses, and its status line keeps the count without the stall's "send it a prompt". A reason a newer daemon names that this build does not know shows the stall's words, as does a summary from a daemon older than the field.
+/// Scenario: The daemon says why it holds the doorbell for an idle agent's one waiting message, whose wake has also stalled: a possible draft, a possible prompt, an unfinished paste, a release or input the deck can't type into, an Enter the agent did not take, the deck's line possibly left in the input, and a dialog that may have taken its keys. Each card shows the reason with the count on its notice row, in the words the desktop uses, and its status line keeps the count without the stall's "send it a prompt". With nothing waiting, the last two still warn in their own words, and the others say nothing. A reason a newer daemon names that this build does not know shows the stall's words, as does a summary from a daemon older than the field.
 #[spec("inbox/status/030")]
 #[test]
 fn status_030_card_says_why_the_doorbell_holds() {
@@ -785,7 +785,15 @@ fn status_030_card_says_why_the_doorbell_holds() {
         words["wakeStalled"].as_str().unwrap(),
         words["wakeStalledHint"].as_str().unwrap()
     );
-    for hold in ["possible_draft", "awaiting_prompt", "paste_open"] {
+    for hold in [
+        "possible_draft",
+        "awaiting_prompt",
+        "paste_open",
+        "cannot_type",
+        "not_taken",
+        "uncertain_input",
+        "dialog_during_ring",
+    ] {
         let rendered = inbox_hold_card(serde_json::json!({
             "wake_stalled": true, "wake_hold": hold
         }));
@@ -802,9 +810,24 @@ fn status_030_card_says_why_the_doorbell_holds() {
             insta::assert_snapshot!(rendered);
         }
     }
+    for hold in ["uncertain_input", "dialog_during_ring", "cannot_type"] {
+        let rendered = inbox_hold_card(serde_json::json!({
+            "queued": 0, "wake_hold": hold
+        }));
+        match words["wakeHoldsAlone"][hold].as_str() {
+            Some(alone) => assert!(
+                rendered.contains(alone),
+                "{hold} with nothing waiting must say {alone:?}:\n{rendered}"
+            ),
+            None => assert!(
+                !rendered.contains(words["wakeHolds"][hold].as_str().unwrap()),
+                "{hold} says nothing with nothing waiting:\n{rendered}"
+            ),
+        }
+    }
     for (extra, why) in [
         (
-            serde_json::json!({"wake_hold": "dialog_during_ring"}),
+            serde_json::json!({"wake_hold": "a_newer_reason"}),
             "a reason this build does not know",
         ),
         (

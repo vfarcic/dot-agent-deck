@@ -37,6 +37,24 @@ pub const WAKE_HOLD_AWAITING_PROMPT: &str =
     "not yet taken: the agent may be waiting at a prompt. Check its pane.";
 /// The card's words for [`WakeHold::PasteOpen`].
 pub const WAKE_HOLD_PASTE_OPEN: &str = "waiting: a paste into its input has not finished.";
+/// The card's words for [`WakeHold::CannotType`].
+pub const WAKE_HOLD_CANNOT_TYPE: &str = "waiting for the agent to fetch it. Send it a prompt.";
+/// The card's words for [`WakeHold::NotTaken`].
+pub const WAKE_HOLD_NOT_TAKEN: &str =
+    "waiting: the agent did not take the deck's Enter. Send it a prompt.";
+/// The card's words for [`WakeHold::UncertainInput`] while messages wait.
+pub const WAKE_HOLD_UNCERTAIN_INPUT: &str =
+    "waiting: the deck's notice may be in its input. Check it before Enter.";
+/// The card's words for [`WakeHold::DialogDuringRing`] while messages wait.
+pub const WAKE_HOLD_DIALOG_DURING_RING: &str =
+    "waiting: a dialog may have taken the deck's keys. Check its pane.";
+/// [`WAKE_HOLD_UNCERTAIN_INPUT`]'s words with nothing waiting: the warning
+/// stands on its own.
+pub const WAKE_HOLD_UNCERTAIN_INPUT_ALONE: &str =
+    "The deck's notice may be in its input. Check it before pressing Enter.";
+/// [`WAKE_HOLD_DIALOG_DURING_RING`]'s words with nothing waiting.
+pub const WAKE_HOLD_DIALOG_DURING_RING_ALONE: &str =
+    "A dialog may have taken the deck's keys. Check the agent's pane.";
 
 /// The card notice for a message handed to the agent the most times allowed,
 /// none acknowledged. Fixed text, as every delivery notice is
@@ -284,6 +302,19 @@ pub enum WakeHold {
     AwaitingPrompt,
     /// A paste into the agent's input has not finished.
     PasteOpen,
+    /// The deck won't type its notice into this agent: its release is not
+    /// one the deck has measured, its input mode is not proven, or there is
+    /// no way to see that the line was submitted.
+    CannotType,
+    /// The deck typed its notice and the agent did not take its Enter; the
+    /// deck took its line back and rings no more this episode.
+    NotTaken,
+    /// The deck's notice line may still be in the agent's input: shown even
+    /// with nothing waiting.
+    UncertainInput,
+    /// A dialog opened while the deck was typing, and may have received its
+    /// keys: shown even with nothing waiting.
+    DialogDuringRing,
     /// A reason a newer deck names that this build does not know. A client
     /// shows it with [`WAKE_STALLED`]'s words; this build never sends it.
     #[serde(other)]
@@ -298,7 +329,22 @@ impl WakeHold {
             WakeHold::PossibleDraft => Some(WAKE_HOLD_POSSIBLE_DRAFT),
             WakeHold::AwaitingPrompt => Some(WAKE_HOLD_AWAITING_PROMPT),
             WakeHold::PasteOpen => Some(WAKE_HOLD_PASTE_OPEN),
+            WakeHold::CannotType => Some(WAKE_HOLD_CANNOT_TYPE),
+            WakeHold::NotTaken => Some(WAKE_HOLD_NOT_TAKEN),
+            WakeHold::UncertainInput => Some(WAKE_HOLD_UNCERTAIN_INPUT),
+            WakeHold::DialogDuringRing => Some(WAKE_HOLD_DIALOG_DURING_RING),
             WakeHold::Unknown => None,
+        }
+    }
+
+    /// The words with nothing waiting, for the two warnings shown even
+    /// then; `None` for every other hold, which shows only while messages
+    /// wait.
+    pub fn alone_words(self) -> Option<&'static str> {
+        match self {
+            WakeHold::UncertainInput => Some(WAKE_HOLD_UNCERTAIN_INPUT_ALONE),
+            WakeHold::DialogDuringRing => Some(WAKE_HOLD_DIALOG_DURING_RING_ALONE),
+            _ => None,
         }
     }
 
@@ -312,6 +358,16 @@ impl WakeHold {
             ),
             WakeHold::AwaitingPrompt => Some("the worker may be waiting at a prompt in its pane"),
             WakeHold::PasteOpen => Some("a paste into the worker's input has not finished"),
+            WakeHold::CannotType => Some(
+                "the deck can't type its notice into the worker's input, so the worker takes its messages when it is sent a prompt in its pane",
+            ),
+            WakeHold::NotTaken => Some(
+                "the worker did not take the deck's Enter, so it takes its messages when it is sent a prompt in its pane",
+            ),
+            WakeHold::UncertainInput => Some("the deck's notice line may be in the worker's input"),
+            WakeHold::DialogDuringRing => Some(
+                "a dialog opened in the worker's pane while the deck was typing, and may have received the deck's keys",
+            ),
             WakeHold::Unknown => None,
         }
     }
@@ -321,6 +377,10 @@ impl WakeHold {
             WakeHold::PossibleDraft => 1,
             WakeHold::AwaitingPrompt => 2,
             WakeHold::PasteOpen => 3,
+            WakeHold::CannotType => 4,
+            WakeHold::NotTaken => 5,
+            WakeHold::UncertainInput => 6,
+            WakeHold::DialogDuringRing => 7,
             WakeHold::Unknown => 9,
         }
     }
@@ -331,6 +391,10 @@ impl WakeHold {
             1 => Some(Some(WakeHold::PossibleDraft)),
             2 => Some(Some(WakeHold::AwaitingPrompt)),
             3 => Some(Some(WakeHold::PasteOpen)),
+            4 => Some(Some(WakeHold::CannotType)),
+            5 => Some(Some(WakeHold::NotTaken)),
+            6 => Some(Some(WakeHold::UncertainInput)),
+            7 => Some(Some(WakeHold::DialogDuringRing)),
             9 => Some(Some(WakeHold::Unknown)),
             _ => None,
         }
@@ -449,7 +513,7 @@ impl CardInbox {
         if self.not_started > 1 {
             return Some(format!("{GLYPH} {} {NOT_STARTED}", self.not_started));
         }
-        if self.hold_in_notice() {
+        if self.hold_in_notice() && self.pending > 0 {
             return self.short_text();
         }
         if self.pending > 0 && (self.stalled || self.hold == Some(WakeHold::Unknown)) {
@@ -511,11 +575,17 @@ impl CardInbox {
     /// PRD #1666 part 3, round 5-wake (plan §5.2): why the deck holds the
     /// doorbell, with the pending count, while messages wait:
     /// `✉2 waiting: there may be an unsent draft in its input. Send or clear
-    /// it.`. `None` with nothing pending or for a hold this build does not
-    /// know.
+    /// it.`. With nothing pending, only the two warnings that stand on their
+    /// own (the deck's line may be in the input, a dialog may have taken its
+    /// keys); `None` otherwise and for a hold this build does not know.
     pub fn hold_text(&self) -> Option<String> {
-        let words = self.hold?.words()?;
-        (self.pending > 0).then(|| format!("{GLYPH}{} {words}", self.pending))
+        let hold = self.hold?;
+        let words = hold.words()?;
+        if self.pending > 0 {
+            Some(format!("{GLYPH}{} {words}", self.pending))
+        } else {
+            hold.alone_words().map(str::to_string)
+        }
     }
 
     /// Whether the notice row is the hold's ([`Self::notice_text`] reaches
@@ -622,17 +692,29 @@ mod tests {
             ("possible_draft", WakeHold::PossibleDraft),
             ("awaiting_prompt", WakeHold::AwaitingPrompt),
             ("paste_open", WakeHold::PasteOpen),
+            ("cannot_type", WakeHold::CannotType),
+            ("not_taken", WakeHold::NotTaken),
+            ("uncertain_input", WakeHold::UncertainInput),
+            ("dialog_during_ring", WakeHold::DialogDuringRing),
         ] {
             assert_eq!(
                 serde_json::to_value(hold).unwrap(),
                 serde_json::json!(value)
             );
             assert_eq!(words["wakeHolds"][value], hold.words().unwrap(), "{value}");
+            match hold.alone_words() {
+                Some(alone) => assert_eq!(words["wakeHoldsAlone"][value], alone, "{value}"),
+                None => assert!(words["wakeHoldsAlone"][value].is_null(), "{value}"),
+            }
         }
         assert_eq!(
             words["wakeHolds"].as_object().map(|holds| holds.len()),
-            Some(3),
+            Some(7),
             "the fixture lists every hold the deck names"
+        );
+        assert_eq!(
+            words["wakeHoldsAlone"].as_object().map(|holds| holds.len()),
+            Some(2)
         );
         assert_eq!(words["uncertain"], UNCERTAIN);
         assert_eq!(words["uncertainMany"], UNCERTAIN_MANY);
@@ -793,7 +875,7 @@ mod tests {
             "1,0,0,0,0,0,x",
             "1,0,0,1,0,0,-,0,2",
             "1,0,0,1,0,0,-,0,x",
-            "1,0,0,0,0,0,-,0,0,4",
+            "1,0,0,0,0,0,-,0,0,8",
             "1,0,0,0,0,0,-,0,0,x",
         ] {
             assert_eq!(CardInbox::decode(bad), None, "{bad}");
@@ -805,13 +887,18 @@ mod tests {
     /// count and the line keeps the count alone, so the stall's remedy never
     /// sits beside the hold's; a reason it does not know keeps the stall's
     /// words; a notice row another notice takes leaves the line as it was;
-    /// and with nothing pending there is no hold to show.
+    /// and with nothing pending only the deck's-line and dialog warnings
+    /// still show, in their own words, beside the line as it is.
     #[test]
     fn a_hold_takes_the_notice_row_and_leaves_the_line_the_count() {
         for (hold, words) in [
             (WakeHold::PossibleDraft, WAKE_HOLD_POSSIBLE_DRAFT),
             (WakeHold::AwaitingPrompt, WAKE_HOLD_AWAITING_PROMPT),
             (WakeHold::PasteOpen, WAKE_HOLD_PASTE_OPEN),
+            (WakeHold::CannotType, WAKE_HOLD_CANNOT_TYPE),
+            (WakeHold::NotTaken, WAKE_HOLD_NOT_TAKEN),
+            (WakeHold::UncertainInput, WAKE_HOLD_UNCERTAIN_INPUT),
+            (WakeHold::DialogDuringRing, WAKE_HOLD_DIALOG_DURING_RING),
         ] {
             let held = CardInbox {
                 pending: 2,
@@ -827,7 +914,11 @@ mod tests {
                 ..held.clone()
             };
             assert_eq!(empty.full_text().as_deref(), Some("✉ delivered"));
-            assert_eq!(empty.notice_text(), None);
+            assert_eq!(
+                empty.notice_text().as_deref(),
+                hold.alone_words(),
+                "{hold:?}: only the two warnings stand alone"
+            );
             let behind = CardInbox {
                 held_long: 1,
                 ..held.clone()
@@ -849,7 +940,7 @@ mod tests {
         );
         assert_eq!(unknown.notice_text(), None);
         assert_eq!(
-            serde_json::from_value::<WakeHold>(serde_json::json!("dialog_during_ring")).unwrap(),
+            serde_json::from_value::<WakeHold>(serde_json::json!("a_newer_reason")).unwrap(),
             WakeHold::Unknown
         );
     }

@@ -9,7 +9,15 @@
   "wakeHolds": {
     "possible_draft": "waiting: there may be an unsent draft in its input. Send or clear it.",
     "awaiting_prompt": "not yet taken: the agent may be waiting at a prompt. Check its pane.",
-    "paste_open": "waiting: a paste into its input has not finished."
+    "paste_open": "waiting: a paste into its input has not finished.",
+    "cannot_type": "waiting for the agent to fetch it. Send it a prompt.",
+    "not_taken": "waiting: the agent did not take the deck's Enter. Send it a prompt.",
+    "uncertain_input": "waiting: the deck's notice may be in its input. Check it before Enter.",
+    "dialog_during_ring": "waiting: a dialog may have taken the deck's keys. Check its pane."
+  },
+  "wakeHoldsAlone": {
+    "uncertain_input": "The deck's notice may be in its input. Check it before pressing Enter.",
+    "dialog_during_ring": "A dialog may have taken the deck's keys. Check the agent's pane."
   },
   "uncertain": "delivery uncertain",
   "uncertainMany": "deliveries uncertain",

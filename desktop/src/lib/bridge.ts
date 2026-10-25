@@ -2433,7 +2433,15 @@ function inboxFromDto(inbox: NonNullable<DesktopAgentDto["inbox"]>): AgentInbox 
 const ATTENTION_KINDS = new Set(["uncertain", "out_of_attempts", "held_long", "not_started"]);
 const INTEGRATION_NOTICES = new Set(["cli_too_old", "adapter_too_old", "not_armed", "refresh_failed", "refresh_failed_pi", "hooks_too_old"]);
 /** PRD #1666 part 3, round 5-wake: the holds this build names; any other reads as `unknown`. */
-const WAKE_HOLDS = new Set(["possible_draft", "awaiting_prompt", "paste_open"]);
+const WAKE_HOLDS = new Set([
+  "possible_draft",
+  "awaiting_prompt",
+  "paste_open",
+  "cannot_type",
+  "not_taken",
+  "uncertain_input",
+  "dialog_during_ring",
+]);
 
 /** PRD #1666 §6.5: the listed items the crate sent, an unknown kind dropped. */
 function attentionFromDto(items: NonNullable<NonNullable<DesktopAgentDto["inbox"]>["attention"]>): InboxAttentionItem[] {

@@ -29,7 +29,19 @@ export const INBOX_WORDS = {
     possible_draft: "waiting: there may be an unsent draft in its input. Send or clear it.",
     awaiting_prompt: "not yet taken: the agent may be waiting at a prompt. Check its pane.",
     paste_open: "waiting: a paste into its input has not finished.",
+    cannot_type: "waiting for the agent to fetch it. Send it a prompt.",
+    not_taken: "waiting: the agent did not take the deck's Enter. Send it a prompt.",
+    uncertain_input: "waiting: the deck's notice may be in its input. Check it before Enter.",
+    dialog_during_ring: "waiting: a dialog may have taken the deck's keys. Check its pane.",
   },
+  /**
+   * The two holds that warn even with nothing waiting, in the words they
+   * take then.
+   */
+  wakeHoldsAlone: {
+    uncertain_input: "The deck's notice may be in its input. Check it before pressing Enter.",
+    dialog_during_ring: "A dialog may have taken the deck's keys. Check the agent's pane.",
+  } as Partial<Record<string, string>>,
   uncertain: "delivery uncertain",
   uncertainMany: "deliveries uncertain",
   uncertainReason: "a deck message may or may not have reached this agent. Retry sends it again marked as a possible repeat; Cancel stops delivering it.",
@@ -98,12 +110,15 @@ const heldLongCount = (inbox: AgentInbox) => countOf(inbox, ["held_long"]);
 /**
  * PRD #1666 part 3, round 5-wake: why the deck holds the doorbell, with the
  * pending count, while messages wait (`✉2 waiting: there may be an unsent
- * draft in its input. Send or clear it.`); nothing with none pending or for a
- * hold this build does not know. The TUI's card prints the same row.
+ * draft in its input. Send or clear it.`). With none pending, only the two
+ * warnings that stand on their own (the deck's line may be in the input, a
+ * dialog may have taken its keys); nothing otherwise, or for a hold this
+ * build does not know. The TUI's card prints the same row.
  */
 function inboxHoldText(inbox: AgentInbox): string | undefined {
   const pending = inbox.queued + inbox.fetched;
-  if (pending <= 0 || inbox.wakeHold === undefined || inbox.wakeHold === "unknown") return undefined;
+  if (inbox.wakeHold === undefined || inbox.wakeHold === "unknown") return undefined;
+  if (pending <= 0) return INBOX_WORDS.wakeHoldsAlone[inbox.wakeHold];
   return `${INBOX_WORDS.glyph}${pending} ${INBOX_WORDS.wakeHolds[inbox.wakeHold]}`;
 }
 
@@ -138,7 +153,7 @@ export function inboxBadge(inbox: AgentInbox | undefined): string | undefined {
   if (notStarted === 1) return `${INBOX_WORDS.glyph} ${INBOX_WORDS.notStarted}`;
   if (notStarted > 1) return `${INBOX_WORDS.glyph} ${notStarted} ${INBOX_WORDS.notStarted}`;
   const pending = inbox.queued + inbox.fetched;
-  if (holdInNotice(inbox)) return `${INBOX_WORDS.glyph}${pending}`;
+  if (holdInNotice(inbox) && pending > 0) return `${INBOX_WORDS.glyph}${pending}`;
   if (pending > 0 && (inbox.wakeStalled || inbox.wakeHold === "unknown")) {
     return `${INBOX_WORDS.glyph}${pending} ${INBOX_WORDS.wakeStalled}: ${INBOX_WORDS.wakeStalledHint}`;
   }

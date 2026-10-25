@@ -4168,7 +4168,7 @@ mod tests {
             ("possible_draft", "possible_draft"),
             ("awaiting_prompt", "awaiting_prompt"),
             ("paste_open", "paste_open"),
-            ("dialog_during_ring", "unknown"),
+            ("a_newer_reason", "unknown"),
         ] {
             let mut record = fixture_record();
             record.inbox = Some(

@@ -20715,7 +20715,7 @@ mod tests {
         for (summary, why) in [
             (
                 serde_json::json!({"queued": 1, "fetched": 0, "undeliverable": 0,
-                    "wake": "doorbell", "wake_hold": "dialog_during_ring"}),
+                    "wake": "doorbell", "wake_hold": "a_newer_reason"}),
                 "a reason a newer deck names",
             ),
             (
