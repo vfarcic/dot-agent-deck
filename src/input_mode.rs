@@ -2,8 +2,8 @@
 //! its input byte by byte with no kernel echo, taken from the line discipline
 //! of the PTY the agent actually reads.
 //!
-//! For a wrapped agent (Codex) that PTY is the wrapper's inner one, which only
-//! the wrapper can read. So the wrapper samples `ICANON` and `ECHO` there on
+//! For a wrapped agent (Codex) that PTY is the wrapper's inner one, whose
+//! master the wrapper holds. So the wrapper samples `ICANON` and `ECHO` there on
 //! every supervisory tick, stamping each sample with `CLOCK_MONOTONIC` before
 //! and after the read, and reports it on the hook socket (`input_mode`). The
 //! daemon keeps, per generation, an [`InputModeStore`]: the observer the first
@@ -446,92 +446,186 @@ impl VerdictCache {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Exchange {
     /// The report was written, after a probe on this connection when
-    /// `probed`; the daemon's answer, when one came.
+    /// `probed`; the daemon's answer, when one came before the deadline.
     Sent { probed: bool, ack: Option<String> },
     /// The daemon's verdict is Unsupported: no report written.
     Withheld { probed: bool },
-    /// The connection ended (EOF, a reset, a failed write) before an
-    /// answer: no verdict recorded.
+    /// The connection ended (EOF, a reset, a failed write) or the deadline
+    /// passed before a whole answer. This connection recorded no verdict,
+    /// except that a report whose write failed after its probe was answered
+    /// (`report_write_failed`) leaves the Supported verdict that answer
+    /// recorded.
     Ended { why: &'static str },
     /// The daemon's identity could not be read: nothing written.
     IdentityUnreadable,
+    /// The process at the other end runs as another user: nothing written.
+    ForeignPeer,
+    /// The connection's next read or write could not be bounded by the
+    /// deadline: nothing more written, no verdict recorded.
+    Unbounded,
 }
 
 /// The longest answer line [`exchange`] reads.
 const EXCHANGE_MAX_LINE: usize = 64 * 1024;
 
-/// One line from `conn`: `Ok(None)` at EOF before a newline, an error for a
-/// failed read or a timeout.
-fn read_line(conn: &mut impl std::io::Read) -> std::io::Result<Option<String>> {
+/// How long the daemon must have stayed silent on a probe, with the
+/// connection open, for that to record Unsupported. A probe sent with less
+/// of [`MODE_SEND_TIMEOUT`] left (a slow connect used the rest) records
+/// nothing, and the next connection asks again.
+pub const MODE_PROBE_SILENCE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// A connection whose next read and write [`exchange`] can bound.
+pub trait BoundedConn: std::io::Read + std::io::Write {
+    /// Make the next read and the next write give up after `left`.
+    fn bound(&mut self, left: std::time::Duration) -> std::io::Result<()>;
+}
+
+#[cfg(unix)]
+impl BoundedConn for std::os::unix::net::UnixStream {
+    fn bound(&mut self, left: std::time::Duration) -> std::io::Result<()> {
+        self.set_read_timeout(Some(left))?;
+        self.set_write_timeout(Some(left))
+    }
+}
+
+/// Why a read or write of one line stopped.
+#[derive(Debug)]
+enum LineFail {
+    /// The deadline passed (or the socket's timeout, which is what was left
+    /// of it), after `got` bytes of the line.
+    Deadline { got: usize },
+    /// The bound could not be installed.
+    Unbounded,
+    /// The line was longer than [`EXCHANGE_MAX_LINE`].
+    TooLong,
+    /// Any other failure: a reset, a failed write.
+    Io,
+}
+
+/// Bound `conn`'s next read and write by what is left until `deadline`.
+fn arm<C: BoundedConn>(conn: &mut C, deadline: std::time::Instant) -> Result<(), LineFail> {
+    match deadline.checked_duration_since(std::time::Instant::now()) {
+        Some(left) if !left.is_zero() => conn.bound(left).map_err(|_| LineFail::Unbounded),
+        _ => Err(LineFail::Deadline { got: 0 }),
+    }
+}
+
+/// One line from `conn` by `deadline`: `Ok(None)` at EOF before a newline.
+/// Each read is bounded by what is left of the deadline, so a peer that
+/// drips its answer cannot stretch the whole line past it.
+fn read_line<C: BoundedConn>(
+    conn: &mut C,
+    deadline: std::time::Instant,
+) -> Result<Option<String>, LineFail> {
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
     loop {
+        arm(conn, deadline).map_err(|fail| match fail {
+            LineFail::Deadline { .. } => LineFail::Deadline { got: line.len() },
+            other => other,
+        })?;
         match conn.read(&mut byte) {
             Ok(0) => return Ok(None),
             Ok(_) if byte[0] == b'\n' => {
                 return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
             }
-            Ok(_) if line.len() >= EXCHANGE_MAX_LINE => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "answer line too long",
-                ));
-            }
+            Ok(_) if line.len() >= EXCHANGE_MAX_LINE => return Err(LineFail::TooLong),
             Ok(_) => line.push(byte[0]),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(LineFail::Deadline { got: line.len() });
+            }
+            Err(_) => return Err(LineFail::Io),
         }
     }
 }
 
-fn write_line(conn: &mut impl std::io::Write, line: &str) -> std::io::Result<()> {
-    conn.write_all(format!("{line}\n").as_bytes())?;
-    conn.flush()
+/// Write `line` and a newline to `conn` by `deadline`, each write bounded by
+/// what is left of it.
+fn write_line<C: BoundedConn>(
+    conn: &mut C,
+    line: &str,
+    deadline: std::time::Instant,
+) -> Result<(), LineFail> {
+    let bytes = format!("{line}\n");
+    let mut rest = bytes.as_bytes();
+    while !rest.is_empty() {
+        arm(conn, deadline)?;
+        match conn.write(rest) {
+            Ok(0) => return Err(LineFail::Io),
+            Ok(n) => rest = &rest[n..],
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(LineFail::Deadline { got: 0 });
+            }
+            Err(_) => return Err(LineFail::Io),
+        }
+    }
+    conn.flush().map_err(|_| LineFail::Io)
 }
 
 /// One connection's part of the carrier (plan §1.3), with the daemon at its
-/// other end already identified (`None`: unreadable). A cached verdict
-/// decides at once; otherwise one `probe` line asks, and the answer is
-/// recorded and decides, with the `report` line written on the same
-/// connection only for `input_mode_report: Some(1)`. A reply without it, a
-/// refusal, a malformed line and no answer within the connection's read
-/// timeout record Unsupported; a connection that ends records nothing.
-/// Returns what happened and the identity evicted to record a verdict.
-pub fn exchange<C: std::io::Read + std::io::Write>(
+/// other end already identified (`None`: unreadable), every read and write
+/// done by `deadline`. A cached verdict decides at once; otherwise one
+/// `probe` line asks, and the answer is recorded and decides, with the
+/// `report` line written on the same connection only for
+/// `input_mode_report: Some(1)`. A reply without it, a refusal, a malformed
+/// line, and silence through the deadline after a probe written with at
+/// least [`MODE_PROBE_SILENCE`] of it left record Unsupported. A connection
+/// that ends, an answer cut off by the deadline, a probe written later than
+/// that, and a connection whose reads or writes cannot be bounded record
+/// nothing. Returns what happened and the identity evicted to record a
+/// verdict.
+pub fn exchange<C: BoundedConn>(
     conn: &mut C,
     identity: Option<DaemonIdentity>,
     cache: &mut VerdictCache,
     probe: &str,
     report: &str,
+    deadline: std::time::Instant,
 ) -> (Exchange, Option<DaemonIdentity>) {
     let Some(identity) = identity else {
         return (Exchange::IdentityUnreadable, None);
     };
-    let send = |conn: &mut C, probed| {
-        if write_line(conn, report).is_err() {
-            return Exchange::Ended {
-                why: "report_write_failed",
-            };
-        }
-        Exchange::Sent {
+    let send = |conn: &mut C, probed| match write_line(conn, report, deadline) {
+        Err(LineFail::Unbounded) => Exchange::Unbounded,
+        Err(_) => Exchange::Ended {
+            why: "report_write_failed",
+        },
+        Ok(()) => Exchange::Sent {
             probed,
-            ack: read_line(conn).ok().flatten(),
-        }
+            ack: read_line(conn, deadline).ok().flatten(),
+        },
     };
     match cache.get(identity) {
         Some(Verdict::Supported) => return (send(conn, false), None),
         Some(Verdict::Unsupported) => return (Exchange::Withheld { probed: false }, None),
         None => {}
     }
-    if write_line(conn, probe).is_err() {
-        return (
-            Exchange::Ended {
-                why: "probe_write_failed",
-            },
-            None,
-        );
+    match write_line(conn, probe, deadline) {
+        Ok(()) => {}
+        Err(LineFail::Unbounded) => return (Exchange::Unbounded, None),
+        Err(_) => {
+            return (
+                Exchange::Ended {
+                    why: "probe_write_failed",
+                },
+                None,
+            );
+        }
     }
-    let supported = match read_line(conn) {
+    let asked = std::time::Instant::now();
+    let supported = match read_line(conn, deadline) {
         Ok(Some(answer)) => {
             serde_json::from_str::<crate::event::HookCapabilitiesReply>(answer.trim())
                 .ok()
@@ -540,16 +634,15 @@ pub fn exchange<C: std::io::Read + std::io::Write>(
                 })
         }
         Ok(None) => return (Exchange::Ended { why: "eof" }, None),
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-            ) =>
+        Err(LineFail::Deadline { got: 0 })
+            if deadline.saturating_duration_since(asked) >= MODE_PROBE_SILENCE =>
         {
             false
         }
-        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => false,
-        Err(_) => return (Exchange::Ended { why: "reset" }, None),
+        Err(LineFail::Deadline { .. }) => return (Exchange::Ended { why: "deadline" }, None),
+        Err(LineFail::TooLong) => false,
+        Err(LineFail::Unbounded) => return (Exchange::Unbounded, None),
+        Err(LineFail::Io) => return (Exchange::Ended { why: "reset" }, None),
     };
     if supported {
         let evicted = cache.record(identity, Verdict::Supported);
@@ -560,10 +653,19 @@ pub fn exchange<C: std::io::Read + std::io::Write>(
     }
 }
 
-/// The two reads that identify the daemon at the other end of a connection,
-/// injectable for tests.
+/// How the sender reaches and identifies the daemon at the other end of a
+/// connection, injectable for tests.
 #[cfg(unix)]
 pub struct IdentityLookups {
+    /// Connect within the budget. The platform's is the checked IPC client
+    /// ([`crate::platform::ipc::IpcClient::connect_timeout`]), which bounds
+    /// the connect and refuses a listener another user runs.
+    pub connect: fn(
+        &std::path::Path,
+        std::time::Duration,
+    ) -> std::io::Result<std::os::unix::net::UnixStream>,
+    /// The connected peer's uid, read again before the first byte is written.
+    pub peer_uid: fn(&std::os::unix::net::UnixStream) -> Option<u32>,
     pub peer_pid: fn(&std::os::unix::net::UnixStream) -> Option<u32>,
     pub started: fn(u32) -> Option<u64>,
 }
@@ -571,6 +673,14 @@ pub struct IdentityLookups {
 #[cfg(unix)]
 impl IdentityLookups {
     pub const PLATFORM: Self = Self {
+        connect: |path, budget| {
+            crate::platform::ipc::IpcClient::connect_timeout(path, budget)
+                .map(crate::platform::ipc::IpcClient::into_std)
+        },
+        peer_uid: |stream| {
+            use std::os::fd::AsRawFd;
+            crate::platform::peercred::peer_uid_raw(stream.as_raw_fd()).ok()
+        },
         peer_pid: |stream| {
             use std::os::fd::AsRawFd;
             crate::platform::peercred::peer_pid_raw(stream.as_raw_fd()).ok()
@@ -620,18 +730,26 @@ impl ReportTarget {
         .unwrap_or_default()
     }
 
-    /// Connect, identify the daemon and carry `sample`, each read and write
-    /// bounded by [`MODE_SEND_TIMEOUT`]. `None` when no daemon answered the
-    /// connect.
+    /// Connect, check the peer is this user, identify the daemon and carry
+    /// `sample`, the whole of it (connect, probe, report and answers) bounded
+    /// by one [`MODE_SEND_TIMEOUT`] deadline. `None` when no daemon answered
+    /// the connect within it (a missing or stale socket, a full accept
+    /// queue, a listener another user runs).
     pub fn send(
         &self,
         sample: &ModeSample,
         cache: &mut VerdictCache,
         lookups: &IdentityLookups,
     ) -> Option<(Exchange, Option<DaemonIdentity>, Option<DaemonIdentity>)> {
-        let mut stream = std::os::unix::net::UnixStream::connect(&self.socket).ok()?;
-        let _ = stream.set_read_timeout(Some(MODE_SEND_TIMEOUT));
-        let _ = stream.set_write_timeout(Some(MODE_SEND_TIMEOUT));
+        let deadline = std::time::Instant::now() + MODE_SEND_TIMEOUT;
+        let mut stream = (lookups.connect)(
+            &self.socket,
+            deadline.saturating_duration_since(std::time::Instant::now()),
+        )
+        .ok()?;
+        if (lookups.peer_uid)(&stream) != Some(crate::platform::paths::current_uid()) {
+            return Some((Exchange::ForeignPeer, None, None));
+        }
         let identity = lookups.identify(&stream);
         let (outcome, evicted) = exchange(
             &mut stream,
@@ -639,6 +757,7 @@ impl ReportTarget {
             cache,
             &self.probe_line(),
             &self.report_line(sample),
+            deadline,
         );
         Some((outcome, identity, evicted))
     }
@@ -647,11 +766,20 @@ impl ReportTarget {
 /// The wrapper's sender thread with its latest-wins slot (the `LatestSend`
 /// pattern): the tick posts, the thread carries the newest sample waiting,
 /// dropping one already older than [`MODE_MAX_AGE_NS`] when its turn comes.
+/// Each send ends by its deadline, so a closed sender's thread ends within
+/// one [`MODE_SEND_TIMEOUT`] of [`Self::close`].
 #[cfg(unix)]
 pub struct ModeSender {
     slot: std::sync::Mutex<Option<ModeSample>>,
     ready: std::sync::Condvar,
     closed: std::sync::atomic::AtomicBool,
+    /// Set as the thread ends.
+    ended: std::sync::atomic::AtomicBool,
+    /// A test's hold on the thread's next turn: it says which sample it
+    /// took, then waits to be let go before sending it.
+    #[cfg(test)]
+    turn_gate:
+        std::sync::Mutex<Option<(std::sync::mpsc::Sender<u64>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 #[cfg(unix)]
@@ -661,11 +789,15 @@ impl ModeSender {
             slot: std::sync::Mutex::new(None),
             ready: std::sync::Condvar::new(),
             closed: std::sync::atomic::AtomicBool::new(false),
+            ended: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            turn_gate: std::sync::Mutex::new(None),
         });
         let worker = std::sync::Arc::clone(&sender);
         std::thread::spawn(move || {
             let mut cache = VerdictCache::default();
             let mut unreadable_streak = 0u64;
+            let mut foreign_streak = 0u64;
             while let Some(sample) = worker.next() {
                 let fresh = monotonic_ns().is_some_and(|now| {
                     now.saturating_sub(sample.sampled_mono_ns) <= MODE_MAX_AGE_NS
@@ -676,6 +808,18 @@ impl ModeSender {
                         "wrap input mode: report stale at its turn, dropped"
                     );
                     continue;
+                }
+                #[cfg(test)]
+                {
+                    let gate = worker
+                        .turn_gate
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .take();
+                    if let Some((at, go)) = gate {
+                        let _ = at.send(sample.seq);
+                        let _ = go.recv();
+                    }
                 }
                 let Some((outcome, identity, evicted)) = target.send(&sample, &mut cache, &lookups)
                 else {
@@ -688,7 +832,24 @@ impl ModeSender {
                         "wrap input mode: daemon verdict evicted"
                     );
                 }
+                if !matches!(outcome, Exchange::ForeignPeer) && foreign_streak > 0 {
+                    foreign_streak = 0;
+                }
                 match (&outcome, identity) {
+                    (Exchange::ForeignPeer, _) => {
+                        if foreign_streak == 0 {
+                            tracing::warn!(
+                                "wrap input mode: the process at the daemon's socket runs as another user; report withheld"
+                            );
+                        }
+                        foreign_streak += 1;
+                        continue;
+                    }
+                    (Exchange::Unbounded, _) => {
+                        tracing::info!(
+                            "wrap input mode: the connection could not be bounded; report withheld"
+                        );
+                    }
                     (Exchange::IdentityUnreadable, _) => {
                         if unreadable_streak == 0 {
                             tracing::info!(
@@ -729,7 +890,7 @@ impl ModeSender {
                             pid = id.pid,
                             start = id.start,
                             why,
-                            "wrap input mode: connection ended; no verdict recorded"
+                            "wrap input mode: connection ended before an answer"
                         );
                     }
                     _ => {}
@@ -742,8 +903,27 @@ impl ModeSender {
                     unreadable_streak = 0;
                 }
             }
+            worker
+                .ended
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         });
         sender
+    }
+
+    /// Whether the thread has ended.
+    pub fn ended(&self) -> bool {
+        self.ended.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Hold the thread's next turn: the returned receiver says which sample
+    /// it took (once fresh), and it sends nothing until the returned sender
+    /// lets it go.
+    #[cfg(test)]
+    fn hold_next_turn(&self) -> (std::sync::mpsc::Receiver<u64>, std::sync::mpsc::Sender<()>) {
+        let (at_tx, at_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        *self.turn_gate.lock().unwrap_or_else(|p| p.into_inner()) = Some((at_tx, go_rx));
+        (at_rx, go_tx)
     }
 
     /// Wait for the next sample, or `None` once closed.

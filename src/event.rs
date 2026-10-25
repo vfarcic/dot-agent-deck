@@ -1670,8 +1670,9 @@ pub enum DaemonMessage {
     #[serde(rename = "hook_capabilities")]
     HookCapabilities(HookCapabilitiesRequest),
     /// PRD #1666 part 3, round 5-wake (plan §1.3): a wrapper's sample of its
-    /// agent's line discipline, sent only on a connection whose daemon
-    /// answered `input_mode_report` on that same connection. The daemon
+    /// agent's line discipline, sent only on a connection to a daemon identity
+    /// (pid and start time) that answered `input_mode_report`, on that
+    /// connection or an earlier one to the same identity. The daemon
     /// stores it in the generation's input-mode evidence and nothing else, and
     /// answers one [`SignalAck`].
     #[serde(rename = "input_mode")]
@@ -4257,8 +4258,8 @@ pub struct HookCapabilitiesReply {
     pub task_scoped_completion: Option<u32>,
     /// PRD #1666 part 3, round 5-wake (plan §1.3): this daemon stores
     /// `input_mode` reports ([`crate::input_mode::INPUT_MODE_REPORT`]). A
-    /// wrapper sends them only to a daemon that answered this on the same
-    /// connection.
+    /// wrapper sends them only to the daemon identity (pid and start time)
+    /// that answered this, on any connection to that identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_mode_report: Option<u32>,
     /// On a refusal (the provenance gate), its stable code and sentence.

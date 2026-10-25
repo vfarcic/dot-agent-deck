@@ -16236,7 +16236,7 @@ mod hook_provenance_audit_tests {
         registry.shutdown_all();
     }
 
-    /// Scenario: A stand-in for an older wrapper reports a session start and an idle status for its pane on the real hook socket, and sends neither a capabilities probe nor any input-mode report. Each event is broadcast once and the card reads Idle, and the generation's input-mode store stays empty, so its evidence reads `input_mode_unverified`.
+    /// Scenario: A stand-in for an older wrapper reports a session start and an idle status for its pane on the real hook socket, and sends neither a capabilities probe nor any input-mode report. Each event is broadcast once and the card reads Idle, the generation's input-mode store stays empty, so its evidence reads `input_mode_unverified`, and the doorbell's hold clock reads as it does with no evidence at all: the generation is admitted and no stall is raised.
     #[spec("inbox/doorbell/052")]
     #[tokio::test]
     async fn doorbell_052_an_older_wrapper_leaves_the_evidence_unverified() {
@@ -16261,6 +16261,15 @@ mod hook_provenance_audit_tests {
             store.usable(now).map_err(|clause| clause.as_str()),
             Err("input_mode_unverified")
         );
+        assert!(
+            deck.state
+                .read()
+                .await
+                .doorbell_admission(&agent, PANE)
+                .is_some(),
+            "the doorbell still admits the generation"
+        );
+        assert!(!registry.inbox().wake_stalled(PANE, &agent));
         deck.handle.abort();
         registry.shutdown_all();
     }

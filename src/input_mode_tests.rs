@@ -155,6 +155,7 @@ struct Scripted {
     reads: VecDeque<Step>,
     written: Vec<u8>,
     writes_fail: bool,
+    bound_fails: bool,
 }
 
 impl Scripted {
@@ -163,6 +164,7 @@ impl Scripted {
             reads: reads.into(),
             written: Vec::new(),
             writes_fail: false,
+            bound_fails: false,
         }
     }
 
@@ -201,6 +203,15 @@ impl Read for Scripted {
     }
 }
 
+impl BoundedConn for Scripted {
+    fn bound(&mut self, _left: Duration) -> std::io::Result<()> {
+        if self.bound_fails {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
+        Ok(())
+    }
+}
+
 impl Write for Scripted {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if self.writes_fail {
@@ -223,17 +234,22 @@ fn id(pid: u32, start: u64) -> Option<DaemonIdentity> {
     Some(DaemonIdentity { pid, start })
 }
 
+/// A whole send's deadline from now.
+fn soon() -> Instant {
+    Instant::now() + MODE_SEND_TIMEOUT
+}
+
 /// Scenario: Carry a report on scripted connections to daemons the wrapper has not met: one answers `input_mode_report: 1`, others answer without the field, with a refusal, with a malformed line, or not at all while the connection stays open. Only the first gets the report, on the same connection after the probe; each of the others gets the probe alone and is remembered as unsupported, and a later connection to it carries nothing at all; the supported one's next connection carries the report with no probe.
 #[spec("inbox/doorbell/052")]
 #[test]
 fn doorbell_052_the_probes_answer_decides_and_is_remembered() {
     let mut cache = VerdictCache::default();
     let mut conn = Scripted::answering(SUPPORTED);
-    let (outcome, _) = exchange(&mut conn, id(1, 1), &mut cache, PROBE, REPORT);
+    let (outcome, _) = exchange(&mut conn, id(1, 1), &mut cache, PROBE, REPORT, soon());
     assert!(matches!(outcome, Exchange::Sent { probed: true, .. }));
     assert_eq!(conn.lines(), vec![PROBE, REPORT]);
     let mut conn = Scripted::new(vec![]);
-    let (outcome, _) = exchange(&mut conn, id(1, 1), &mut cache, PROBE, REPORT);
+    let (outcome, _) = exchange(&mut conn, id(1, 1), &mut cache, PROBE, REPORT, soon());
     assert!(matches!(outcome, Exchange::Sent { probed: false, .. }));
     assert_eq!(conn.lines(), vec![REPORT], "no second probe");
 
@@ -251,11 +267,11 @@ fn doorbell_052_the_probes_answer_decides_and_is_remembered() {
             Some(line) => Scripted::answering(line),
             None => Scripted::new(vec![]),
         };
-        let (outcome, _) = exchange(&mut conn, id(pid, 1), &mut cache, PROBE, REPORT);
+        let (outcome, _) = exchange(&mut conn, id(pid, 1), &mut cache, PROBE, REPORT, soon());
         assert_eq!(outcome, Exchange::Withheld { probed: true }, "daemon {pid}");
         assert_eq!(conn.lines(), vec![PROBE], "daemon {pid}");
         let mut again = Scripted::new(vec![]);
-        let (outcome, _) = exchange(&mut again, id(pid, 1), &mut cache, PROBE, REPORT);
+        let (outcome, _) = exchange(&mut again, id(pid, 1), &mut cache, PROBE, REPORT, soon());
         assert_eq!(outcome, Exchange::Withheld { probed: false });
         assert!(again.written.is_empty(), "daemon {pid}: nothing written");
     }
@@ -267,7 +283,7 @@ fn doorbell_052_the_probes_answer_decides_and_is_remembered() {
 fn doorbell_052_an_ended_connection_records_no_verdict() {
     let mut cache = VerdictCache::default();
     let ended = |cache: &mut VerdictCache, mut conn: Scripted, pid| {
-        let (outcome, _) = exchange(&mut conn, id(pid, 1), cache, PROBE, REPORT);
+        let (outcome, _) = exchange(&mut conn, id(pid, 1), cache, PROBE, REPORT, soon());
         outcome
     };
     assert_eq!(
@@ -293,16 +309,43 @@ fn doorbell_052_an_ended_connection_records_no_verdict() {
     assert!(cache.is_empty(), "no verdict recorded");
     for pid in 1..=3 {
         let mut conn = Scripted::answering(SUPPORTED);
-        let (outcome, _) = exchange(&mut conn, id(pid, 1), &mut cache, PROBE, REPORT);
+        let (outcome, _) = exchange(&mut conn, id(pid, 1), &mut cache, PROBE, REPORT, soon());
         assert!(
             matches!(outcome, Exchange::Sent { probed: true, .. }),
             "daemon {pid} is probed again"
         );
     }
     let mut conn = Scripted::answering(SUPPORTED);
-    let (outcome, _) = exchange(&mut conn, None, &mut cache, PROBE, REPORT);
+    let (outcome, _) = exchange(&mut conn, None, &mut cache, PROBE, REPORT, soon());
     assert_eq!(outcome, Exchange::IdentityUnreadable);
     assert!(conn.written.is_empty());
+}
+
+/// Scenario: A connection whose reads and writes cannot be bounded, a probe answer cut off by the deadline after its first bytes, and silence after a probe written with less than the silence window of the deadline left. None of them records a verdict, and the unbounded one writes nothing; silence with the whole window left records Unsupported (the control).
+#[spec("inbox/doorbell/052")]
+#[test]
+fn doorbell_052_a_cut_off_or_unbounded_exchange_records_no_verdict() {
+    let mut cache = VerdictCache::default();
+    let mut unbounded = Scripted::answering(SUPPORTED);
+    unbounded.bound_fails = true;
+    let (outcome, _) = exchange(&mut unbounded, id(1, 1), &mut cache, PROBE, REPORT, soon());
+    assert_eq!(outcome, Exchange::Unbounded);
+    assert!(unbounded.written.is_empty());
+
+    let mut cut = Scripted::new(vec![Step::Data(br#"{"input_mode_rep"#.to_vec())]);
+    let (outcome, _) = exchange(&mut cut, id(2, 1), &mut cache, PROBE, REPORT, soon());
+    assert_eq!(outcome, Exchange::Ended { why: "deadline" });
+    assert_eq!(cut.lines(), vec![PROBE], "the probe alone");
+
+    let late = Instant::now() + MODE_PROBE_SILENCE / 2;
+    let mut silent = Scripted::new(vec![]);
+    let (outcome, _) = exchange(&mut silent, id(3, 1), &mut cache, PROBE, REPORT, late);
+    assert_eq!(outcome, Exchange::Ended { why: "deadline" });
+    assert!(cache.is_empty(), "no verdict recorded");
+
+    let mut silent = Scripted::new(vec![]);
+    let (outcome, _) = exchange(&mut silent, id(3, 1), &mut cache, PROBE, REPORT, soon());
+    assert_eq!(outcome, Exchange::Withheld { probed: true });
 }
 
 /// Scenario: The wrapper meets daemon A, then B, then A again while A is still remembered, then a daemon with A's pid and a new start time, then enough others to fill its memory. A is not probed again on its return; A's pid with a new start time is a daemon of its own and is probed; the ninth identity evicts the least recently used one, which is probed again when it comes back.
@@ -312,7 +355,7 @@ fn doorbell_052_verdicts_are_kept_per_identity() {
     let mut cache = VerdictCache::default();
     let probed = |cache: &mut VerdictCache, identity| {
         let mut conn = Scripted::answering(SUPPORTED);
-        let (outcome, evicted) = exchange(&mut conn, identity, cache, PROBE, REPORT);
+        let (outcome, evicted) = exchange(&mut conn, identity, cache, PROBE, REPORT, soon());
         let Exchange::Sent { probed, .. } = outcome else {
             panic!("{outcome:?}");
         };
@@ -397,6 +440,8 @@ fn fake_daemon_process() {
 struct FakeDaemonProcess {
     child: std::process::Child,
     log: PathBuf,
+    name: String,
+    answer: String,
 }
 
 impl FakeDaemonProcess {
@@ -431,7 +476,12 @@ impl FakeDaemonProcess {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
-        Self { child, log }
+        Self {
+            child,
+            log,
+            name: name.to_string(),
+            answer: answer.to_string(),
+        }
     }
 
     /// How many probe lines and report lines it has read.
@@ -459,25 +509,43 @@ impl Drop for FakeDaemonProcess {
     }
 }
 
+/// A fresh raw sample numbered `seq`.
+fn fresh(seq: u64) -> ModeSample {
+    let at = monotonic_ns().unwrap();
+    ModeSample {
+        seq,
+        icanon: false,
+        echo: false,
+        sampled_mono_ns: at,
+        sample_done_mono_ns: at + 1,
+    }
+}
+
 /// Post a fresh raw sample to `sender` every 50 ms for `span`, numbering
 /// from `*seq`.
 fn feed(sender: &ModeSender, seq: &mut u64, span: Duration) {
     let until = Instant::now() + span;
     while Instant::now() < until {
         *seq += 1;
-        let at = monotonic_ns().unwrap();
-        sender.post(ModeSample {
-            seq: *seq,
-            icanon: false,
-            echo: false,
-            sampled_mono_ns: at,
-            sample_done_mono_ns: at + 1,
-        });
+        sender.post(fresh(*seq));
         std::thread::sleep(Duration::from_millis(50));
     }
 }
 
-/// Scenario: A wrapper's real sender posts a fresh sample every 50 ms to one socket path while the daemon behind it is replaced, each a separate process: A, which serves the reports; then B1, which answers the probe without the field; B2, which never answers; B3, which reads lines as a daemon from before the probe would; then C, which serves them. The wrapper keeps posting through every replacement, so a sample is waiting or in flight as each one happens. A and C each read exactly one probe and then a stream of reports; each B reads exactly one probe and no report, however many ticks pass, so A's verdict never reaches them and theirs never reaches C.
+impl FakeDaemonProcess {
+    /// Whether it has read the report numbered `seq`.
+    fn reported(&self, seq: u64) -> bool {
+        std::fs::read_to_string(&self.log)
+            .unwrap_or_default()
+            .lines()
+            .any(|line| {
+                line.contains(r#""message_type":"input_mode""#)
+                    && line.contains(&format!(r#""seq":{seq},"#))
+            })
+    }
+}
+
+/// Scenario: A wrapper's real sender posts fresh samples to one socket path while the daemon behind it is replaced, each a separate process: A, which serves the reports; then B1, which answers the probe without the field; B2, which never answers; B3, which reads lines as a daemon from before the probe would; then C, which serves them. At each replacement the sender is held at its turn with one report in hand and a newer one waiting in its slot, the old daemon is stopped, the new one started, and then the sender is let go. A and C each read exactly one probe and then a stream of reports, C's including the one held across its replacement; each B reads exactly one probe and no report, the held one included, however many ticks pass, so A's verdict never reaches them and theirs never reaches C.
 #[spec("inbox/doorbell/052")]
 #[test]
 fn doorbell_052_a_replaced_daemon_is_probed_afresh() {
@@ -492,21 +560,307 @@ fn doorbell_052_a_replaced_daemon_is_probed_afresh() {
         IdentityLookups::PLATFORM,
     );
     let mut seq = 0;
-    let a = FakeDaemonProcess::start(dir.path(), &sock, "a", "supported");
+    let mut current = FakeDaemonProcess::start(dir.path(), &sock, "a", "supported");
     feed(&sender, &mut seq, Duration::from_millis(1200));
-    let (probes, reports) = a.stop();
-    assert_eq!(probes, 1, "A: one probe");
-    assert!(reports >= 3, "A: reports flow ({reports})");
-    for (name, answer) in [("b1", "no_field"), ("b2", "silent"), ("b3", "old")] {
-        let b = FakeDaemonProcess::start(dir.path(), &sock, name, answer);
+    for (name, answer) in [
+        ("b1", "no_field"),
+        ("b2", "silent"),
+        ("b3", "old"),
+        ("c", "supported"),
+    ] {
+        let (at, go) = sender.hold_next_turn();
+        seq += 1;
+        sender.post(fresh(seq));
+        let held = at
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the sender reaches its turn");
+        seq += 1;
+        sender.post(fresh(seq));
+        let previous_name = current.name.clone();
+        let previous_answer = current.answer.clone();
+        let (probes, reports) = current.stop();
+        match previous_answer.as_str() {
+            "supported" => {
+                assert_eq!(probes, 1, "{previous_name}: one probe");
+                assert!(reports >= 3, "{previous_name}: reports flow ({reports})");
+            }
+            _ => assert_eq!(
+                (probes, reports),
+                (1, 0),
+                "{previous_name} ({previous_answer})"
+            ),
+        }
+        current = FakeDaemonProcess::start(dir.path(), &sock, name, answer);
+        go.send(()).expect("let the sender go");
         feed(&sender, &mut seq, Duration::from_millis(1800));
-        let (probes, reports) = b.stop();
-        assert_eq!((probes, reports), (1, 0), "{name} ({answer})");
+        if answer == "supported" {
+            assert!(
+                current.reported(held),
+                "{name}: the report held across the replacement"
+            );
+        } else {
+            assert!(!current.reported(held), "{name}: the held report");
+        }
     }
-    let c = FakeDaemonProcess::start(dir.path(), &sock, "c", "supported");
-    feed(&sender, &mut seq, Duration::from_millis(1200));
-    let (probes, reports) = c.stop();
+    let (probes, reports) = current.stop();
     assert_eq!(probes, 1, "C: one probe for many connections");
     assert!(reports >= 3, "C: reports flow ({reports})");
     sender.close();
+}
+
+/// Bind a listener at `path` that runs `serve` on a thread per connection.
+fn endpoint(
+    path: &std::path::Path,
+    serve: impl Fn(std::os::unix::net::UnixStream) + Send + Sync + 'static,
+) {
+    let listener = std::os::unix::net::UnixListener::bind(path).expect("bind");
+    let serve = std::sync::Arc::new(serve);
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(conn) = conn else { return };
+            let serve = std::sync::Arc::clone(&serve);
+            std::thread::spawn(move || serve(conn));
+        }
+    });
+}
+
+/// Read one line from `conn`, byte by byte.
+fn read_one_line(conn: &mut std::os::unix::net::UnixStream) -> Option<String> {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match conn.read(&mut byte) {
+            Ok(0) | Err(_) => return None,
+            Ok(_) if byte[0] == b'\n' => return Some(String::from_utf8_lossy(&line).into()),
+            Ok(_) => line.push(byte[0]),
+        }
+    }
+}
+
+/// Write `text` to `conn` one byte every `every`, stopping at a failed write.
+fn drip(conn: &mut std::os::unix::net::UnixStream, text: &str, every: Duration) {
+    for byte in text.bytes() {
+        std::thread::sleep(every);
+        if conn.write_all(&[byte]).is_err() {
+            return;
+        }
+    }
+}
+
+fn target(socket: &std::path::Path) -> ReportTarget {
+    ReportTarget {
+        socket: socket.to_path_buf(),
+        pane_id: "pane-bounded".to_string(),
+        token: Some("token".to_string()),
+    }
+}
+
+/// What [`ReportTarget::send`] returns.
+type SendResult = Option<(Exchange, Option<DaemonIdentity>, Option<DaemonIdentity>)>;
+
+/// `target.send` on its own thread: how long it took and what it returned,
+/// or `None` if it had not returned after ten seconds.
+fn timed_send(target: ReportTarget, lookups: IdentityLookups) -> Option<(Duration, SendResult)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        let mut cache = VerdictCache::default();
+        let sent = target.send(&fresh(1), &mut cache, &lookups);
+        let _ = tx.send((started.elapsed(), sent));
+    });
+    rx.recv_timeout(Duration::from_secs(10)).ok()
+}
+
+/// How long past [`MODE_SEND_TIMEOUT`] a bounded send may take here: the
+/// scheduling of a loaded test machine, not the protocol.
+const SLACK: Duration = Duration::from_millis(700);
+
+/// Scenario: Send a report to a listener whose accept queue is full and that never accepts, to a daemon that drips its probe answer one byte every 100 ms, and to one that answers the probe at once and drips its acknowledgement. Each send returns within the send timeout (plus scheduling slack), instead of parking in the connect or reading a byte at a time for as long as the peer keeps dripping: no daemon for the full queue, no verdict for the cut-off answer, and the report sent with no acknowledgement for the dripped one.
+#[spec("inbox/doorbell/052")]
+#[test]
+fn doorbell_052_one_deadline_bounds_the_whole_send() {
+    let saturated = crate::platform::ipc::SaturatedListener::new();
+    let (took, sent) = timed_send(target(&saturated.path), IdentityLookups::PLATFORM)
+        .expect("the send parked in connect");
+    assert!(sent.is_none(), "{sent:?}");
+    assert!(took < MODE_SEND_TIMEOUT + SLACK, "{took:?}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let answer = dir.path().join("answer.sock");
+    endpoint(&answer, |mut conn| {
+        let _ = read_one_line(&mut conn);
+        drip(
+            &mut conn,
+            &format!("{SUPPORTED}\n"),
+            Duration::from_millis(100),
+        );
+    });
+    let (took, sent) =
+        timed_send(target(&answer), IdentityLookups::PLATFORM).expect("the send never returned");
+    let (outcome, identity, _) = sent.expect("connected");
+    assert!(identity.is_some());
+    assert_eq!(outcome, Exchange::Ended { why: "deadline" });
+    assert!(took < MODE_SEND_TIMEOUT + SLACK, "{took:?}");
+
+    let ack = dir.path().join("ack.sock");
+    endpoint(&ack, |mut conn| {
+        let _ = read_one_line(&mut conn);
+        let _ = conn.write_all(format!("{SUPPORTED}\n").as_bytes());
+        let _ = read_one_line(&mut conn);
+        drip(
+            &mut conn,
+            &format!(
+                "{}\n",
+                serde_json::to_string(&crate::event::SignalAck::accepted()).unwrap()
+            ),
+            Duration::from_millis(100),
+        );
+    });
+    let (took, sent) =
+        timed_send(target(&ack), IdentityLookups::PLATFORM).expect("the send never returned");
+    let (outcome, _, _) = sent.expect("connected");
+    assert_eq!(
+        outcome,
+        Exchange::Sent {
+            probed: true,
+            ack: None
+        }
+    );
+    assert!(took < MODE_SEND_TIMEOUT + SLACK, "{took:?}");
+}
+
+/// Scenario: A listener records every byte it reads. A send whose peer credentials read as another user writes nothing to it, not even the probe that carries the pane's token; the same send with the peer read as this user writes the probe (the control).
+#[spec("inbox/doorbell/052")]
+#[test]
+fn doorbell_052_a_foreign_peer_gets_no_byte() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hook.sock");
+    let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    endpoint(&path, {
+        let received = std::sync::Arc::clone(&received);
+        move |mut conn| {
+            let _ = conn.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = conn.read(&mut buf) {
+                if n == 0 {
+                    return;
+                }
+                received.lock().unwrap().extend_from_slice(&buf[..n]);
+            }
+        }
+    });
+    let foreign = IdentityLookups {
+        peer_uid: |_| Some(crate::platform::paths::current_uid().wrapping_add(1)),
+        ..IdentityLookups::PLATFORM
+    };
+    let (_, sent) = timed_send(target(&path), foreign).expect("the send never returned");
+    assert_eq!(
+        sent.map(|(outcome, _, _)| outcome),
+        Some(Exchange::ForeignPeer)
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        received.lock().unwrap().is_empty(),
+        "bytes reached a foreign peer: {:?}",
+        String::from_utf8_lossy(&received.lock().unwrap())
+    );
+    let unreadable = IdentityLookups {
+        peer_uid: |_| None,
+        ..IdentityLookups::PLATFORM
+    };
+    let (_, sent) = timed_send(target(&path), unreadable).expect("the send never returned");
+    assert_eq!(
+        sent.map(|(outcome, _, _)| outcome),
+        Some(Exchange::ForeignPeer)
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(received.lock().unwrap().is_empty());
+
+    let _ = timed_send(target(&path), IdentityLookups::PLATFORM).expect("the send never returned");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !String::from_utf8_lossy(&received.lock().unwrap()).contains("hook_capabilities") {
+        assert!(
+            Instant::now() < deadline,
+            "the control's probe never arrived"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Scenario: A wrapper's real sender reports to a daemon that answers its probe and then drips every acknowledgement a byte every 100 ms; then that daemon's socket is replaced by one that acknowledges at once. Reports reach the replacement within a few send timeouts, so no dripping connection holds the sender. Closed while it waits on a dripped acknowledgement, the sender's thread ends within one send timeout.
+#[spec("inbox/doorbell/052")]
+#[test]
+fn doorbell_052_a_dripping_daemon_does_not_hold_the_sender() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("hook.sock");
+    let ack_line = format!(
+        "{}\n",
+        serde_json::to_string(&crate::event::SignalAck::accepted()).unwrap()
+    );
+    let dripping = |path: &std::path::Path| {
+        let reports = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        endpoint(path, {
+            let ack_line = ack_line.clone();
+            let reports = std::sync::Arc::clone(&reports);
+            move |mut conn| {
+                while let Some(line) = read_one_line(&mut conn) {
+                    if line.contains("hook_capabilities") {
+                        let _ = conn.write_all(format!("{SUPPORTED}\n").as_bytes());
+                    } else {
+                        reports.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        drip(&mut conn, &ack_line, Duration::from_millis(100));
+                    }
+                }
+            }
+        });
+        reports
+    };
+    let reports_at_a = dripping(&sock);
+    let sender = ModeSender::spawn(target(&sock), IdentityLookups::PLATFORM);
+    let mut seq = 0;
+    feed(&sender, &mut seq, Duration::from_millis(1500));
+    assert!(reports_at_a.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+
+    std::fs::remove_file(&sock).unwrap();
+    let reports_at_b = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    endpoint(&sock, {
+        let reports_at_b = std::sync::Arc::clone(&reports_at_b);
+        let ack_line = ack_line.clone();
+        move |mut conn| {
+            while let Some(line) = read_one_line(&mut conn) {
+                if line.contains("hook_capabilities") {
+                    let _ = conn.write_all(format!("{SUPPORTED}\n").as_bytes());
+                } else {
+                    reports_at_b.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = conn.write_all(ack_line.as_bytes());
+                }
+            }
+        }
+    });
+    feed(&sender, &mut seq, 4 * MODE_SEND_TIMEOUT);
+    assert!(
+        reports_at_b.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "no report reached the replacement"
+    );
+    sender.close();
+
+    let drip_sock = dir.path().join("drip.sock");
+    let reports = dripping(&drip_sock);
+    let sender = ModeSender::spawn(target(&drip_sock), IdentityLookups::PLATFORM);
+    seq += 1;
+    sender.post(fresh(seq));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while reports.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline, "the report never arrived");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    sender.close();
+    let deadline = Instant::now() + MODE_SEND_TIMEOUT + SLACK;
+    while !sender.ended() {
+        assert!(
+            Instant::now() < deadline,
+            "the sender's thread outlived its send"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }

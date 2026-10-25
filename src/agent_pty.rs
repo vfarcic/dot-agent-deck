@@ -10425,10 +10425,12 @@ impl AgentPtyRegistry {
     /// PRD #1666 part 3, round 5-wake (plan §1.3): store a wrapper's input-mode
     /// sample for `agent_id`, the generation the report's token attests, from
     /// `peer`, the process at the other end of the connection. Accepted only
-    /// from a peer in the session the generation's PTY child leads (the
-    /// wrapper's; the agent and anything it starts are in sessions of their
-    /// own), on the daemon's clock (Linux: the same time namespace), and then
-    /// as [`crate::input_mode::InputModeStore::accept`] decides.
+    /// from a peer in the session the generation's PTY child leads, the
+    /// pane's outer session: the wrapper's, and any other process there that
+    /// holds the generation's token. That is the same-user boundary the deck
+    /// accepts, not proof that the sender holds the pane's inner PTY. Then on
+    /// the daemon's clock (Linux: the same time namespace), and as
+    /// [`crate::input_mode::InputModeStore::accept`] decides.
     pub fn accept_input_mode(
         &self,
         agent_id: &str,
