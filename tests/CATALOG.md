@@ -12800,7 +12800,7 @@ PRD #1666 part 3, round 5: where the deck keeps a worker's report, or a dispatch
 ##### inbox/recovery/025 — A crash mid-write leaves no cut-off report for the next run to adopt.
 - **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, a crash seam that stops a write without its cleanup).
 - **Agent:** none.
-- **Asserts:** a run saves one report, dies halfway through writing a second (half its bytes under a temporary name, nothing at its own name) and dies again just after linking a third to its own name; the next run adopts the first and third, each once and the third with its whole contents, adopts nothing of the second, leaves no temporary name and retires the dead run, its charge equal to the adopted files' sizes.
+- **Asserts:** a run saves one report, dies halfway through writing a second (half its bytes under a temporary name, nothing at its own name) and, with the no-replace rename reported unsupported so the write falls back to a link, dies again just after linking a third to its own name; the next run adopts the first and third, each once and the third with its whole contents, adopts nothing of the second, leaves no temporary name and retires the dead run, its charge equal to the adopted files' sizes.
 - **Why it exists:** PR #1898 review (Qodo): a report was created under its final name and written afterwards, so a crash mid-write left a cut-off file that the next takeover adopted and offered for recovery.
 - **Does not assert:** a host crash, whose effect on unsynced data and links is the filesystem's.
 - **Platform coverage:** mac+linux.

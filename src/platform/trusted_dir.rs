@@ -880,6 +880,7 @@ pub(crate) mod test_seams {
 
     /// The next `create_new_owner_only` on this thread creates its file and
     /// then fails to set it owner-only.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn fail_next_owner_only() {
         OWNER_ONLY_FAILURE.with(|slot| slot.set(true));
     }

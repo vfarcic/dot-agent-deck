@@ -18,8 +18,9 @@
 //!   `r-<report>.d<unix-secs>.<state>.md` is one it adopted from a run that
 //!   ended, whose deadline and last state are fixed in its name;
 //!   `w-<report>.<tag>.part` is a write under way: a report is written and
-//!   `fsync`ed there, then linked to its own name, so the own name never
-//!   holds a cut-off file. A takeover removes every such name it finds.
+//!   `fsync`ed there, then given its own name by a rename that never
+//!   replaces (or a link, where there is none), so the own name never holds
+//!   a cut-off file. A takeover removes every such name it finds.
 //!
 //! # Ownership transfer
 //!
@@ -1434,8 +1435,9 @@ impl RetainedStore {
 
     /// Write `contents` as `report_id`'s own file under `reservation`: written
     /// owner-only and exclusive under a fresh temporary name, `fsync`ed, then
-    /// linked to its own name, which must not exist yet, the temporary name
-    /// removed and the directory synced. So the own name only ever holds a
+    /// moved to its own name by a rename that never replaces (a link and an
+    /// unlink of the temporary name where the filesystem has no such rename),
+    /// and the directory synced. So the own name only ever holds a
     /// whole file, and a crash mid-write leaves a temporary name that the
     /// next takeover removes, never a cut-off report it would adopt. On
     /// success the file is pinned. On failure the attempt's files are removed
@@ -1485,18 +1487,28 @@ impl RetainedStore {
             file.write_all(contents)?;
             file.sync_all()?;
             drop(file);
-            dirs.mine.link(&attempt, &name)?;
-            linked = true;
-            #[cfg(test)]
-            if self.seams.crash_at(seams::Crash::AfterLink) {
-                return Err(io::Error::other(seams::CRASHED));
-            }
-            // The whole file has its own name now; the temporary one is a
-            // second name for it. One that cannot go is kept as a stray.
-            if self.unlink(&dirs.mine, &attempt).is_ok() {
-                temp = None;
-            } else {
-                stray = temp.take();
+            match dirs.mine.rename_into(&attempt, &dirs.mine, &name) {
+                Ok(()) => {
+                    temp = None;
+                    linked = true;
+                }
+                // No no-replace rename here: a link, which never replaces
+                // either, then the temporary name, a second name for the
+                // whole file, removed. One that cannot go is kept as a stray.
+                Err(error) if unsupported_rename(&error) => {
+                    dirs.mine.link(&attempt, &name)?;
+                    linked = true;
+                    #[cfg(test)]
+                    if self.seams.crash_at(seams::Crash::AfterLink) {
+                        return Err(io::Error::other(seams::CRASHED));
+                    }
+                    if self.unlink(&dirs.mine, &attempt).is_ok() {
+                        temp = None;
+                    } else {
+                        stray = temp.take();
+                    }
+                }
+                Err(error) => return Err(error),
             }
             self.sync(&dirs.mine, "mine")
         })();
@@ -2342,7 +2354,8 @@ mod seams {
     pub(super) enum Crash {
         /// Half the report written to its temporary name.
         MidWrite = 1,
-        /// Linked to its own name, the temporary name not yet removed.
+        /// Linked to its own name, the temporary name not yet removed: the
+        /// fallback where the filesystem has no no-replace rename.
         AfterLink = 2,
     }
 

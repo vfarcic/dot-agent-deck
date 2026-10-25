@@ -1377,7 +1377,7 @@ fn recovery_024_a_sweep_decides_under_the_lock() {
     assert_eq!(counts(&store).own_bytes, 0);
 }
 
-/// Scenario: A run saves one report whole, then dies halfway through writing a second, and dies again just after linking a third to its name. The next run adopts the whole report and the linked one, each once and with its whole contents, adopts nothing of the cut-off write, removes both temporary files and retires the dead run.
+/// Scenario: A run saves one report whole, then dies halfway through writing a second, and, on a filesystem without a no-replace rename, dies again just after linking a third to its name. The next run adopts the whole report and the linked one, each once and with its whole contents, adopts nothing of the cut-off write, removes both temporary files and retires the dead run.
 #[spec("inbox/recovery/025")]
 #[test]
 fn recovery_025_a_crash_mid_write_leaves_no_cut_off_report() {
@@ -1408,8 +1408,10 @@ fn recovery_025_a_crash_mid_write_leaves_no_cut_off_report() {
     );
     assert!(!a.dir().join(own_name("cut")).exists());
 
+    // Where the filesystem has no no-replace rename, the write links instead.
     let linked = contents("linked");
     let room = a.reserve(linked.len() as u64).unwrap();
+    crate::platform::trusted_dir::test_seams::fail_next_rename_into(libc::ENOSYS);
     a.seams
         .crash
         .store(seams::Crash::AfterLink as u8, Ordering::SeqCst);
