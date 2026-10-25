@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use dot_agent_deck::doorbell_activation::{
     Activation, DialogKeys, FirstModal, KeyEffect, LatchedRelease, Measurement, NoGo,
-    ReleaseRecord, SETTLE_CAP, activation, parse_unrecorded_claude_releases,
-    without_unrecorded_claude,
+    RELEASE_RECORDS, ReleaseRecord, SETTLE_CAP, activation, exact_verdict,
+    parse_unrecorded_claude_releases, without_unrecorded_claude,
 };
 use dot_agent_deck::event::AgentType;
 use semver::Version;
@@ -636,4 +636,42 @@ fn doorbell_053_exclusion_only_ever_disables() {
         }
     }
     assert_eq!(tables, 125 * 9);
+}
+
+/// Scenario: Ask the table about each release the deck carries a record for, as it ships. Claude Code 2.1.310 is Go, unstaged; both Codex releases are first_stage_commits, held because `n` in the line's fixed head answers their folder-trust dialog; and every record has its parser cost verified.
+#[spec("inbox/doorbell/053")]
+#[test]
+fn doorbell_053_the_shipped_records_verdicts() {
+    for record in &RELEASE_RECORDS {
+        assert!(
+            matches!(record.parser_cost, Measurement::Verified(())),
+            "{:?} {}",
+            record.agent,
+            record.release
+        );
+        let verdict = exact_verdict(record);
+        match (&record.agent, record.release.to_string().as_str()) {
+            (AgentType::ClaudeCode, "2.1.310") => assert!(
+                matches!(verdict, Activation::Go { staged: false, .. }),
+                "{verdict:?}"
+            ),
+            (AgentType::Codex, "0.164.0" | "0.160.0") => assert_eq!(
+                verdict,
+                Activation::NoGo(NoGo::FirstStageCommits {
+                    dialog: "trust".into(),
+                    key: b'n'
+                })
+            ),
+            other => panic!("a record this test does not know: {other:?}"),
+        }
+    }
+    assert_eq!(
+        activation(
+            &RELEASE_RECORDS,
+            &CLAUDE,
+            &LatchedRelease::Known(v("2.1.310")),
+            &[]
+        ),
+        exact_verdict(&RELEASE_RECORDS[2])
+    );
 }

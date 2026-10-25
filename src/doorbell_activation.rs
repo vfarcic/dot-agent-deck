@@ -801,10 +801,15 @@ const CODEX_0160_DIALOGS: &[DialogKeys<'static>] = &[
 
 /// The records the doorbell's admission reads. Each field says what was
 /// measured; a field left unverified keeps its release from being typed into
-/// until the measurement that verifies it is recorded. `parser_cost` is one:
-/// the release scanner and the evidence parser are measured on the real push
-/// path when the doorbell's admission is switched on, so no release is `Go`
-/// before then.
+/// until the measurement that verifies it is recorded. `parser_cost` is the
+/// release scanner's and the evidence parser's cost on the real push path,
+/// with their work budgets (Q25), replayed from every release's recorded
+/// launches at 50 × 200 and 80 × 300 (`src/agent_pty_scanner_budget.rs`):
+/// at most 501 µs added to a push's lock hold and 5.0 ms of scanner CPU per
+/// generation, no work limit reached (`docs/develop/doorbell-admission.md`).
+/// Of the three, only Claude Code 2.1.310 is `Go`: both Codex releases are
+/// `first_stage_commits`, since `n`, in the line's fixed head, answers their
+/// folder-trust dialog.
 pub static RELEASE_RECORDS: [ReleaseRecord<'static>; 3] = [
     // Codex 0.164.0, the release current at measurement. Echo: the exact line
     // in the composer 30 of 30 (20 at 50 × 200, 10 at 24 × 80; ≤ 62 ms after
@@ -835,7 +840,7 @@ pub static RELEASE_RECORDS: [ReleaseRecord<'static>; 3] = [
         }),
         input_mode: Measurement::Verified(()),
         release_recogniser: Measurement::Verified(()),
-        parser_cost: Measurement::Unverified,
+        parser_cost: Measurement::Verified(()),
         placeholder_empty: Measurement::Verified(()),
         delete_key: Measurement::Verified(()),
         transcript_echo: Measurement::Verified(()),
@@ -863,7 +868,7 @@ pub static RELEASE_RECORDS: [ReleaseRecord<'static>; 3] = [
         }),
         input_mode: Measurement::Verified(()),
         release_recogniser: Measurement::Verified(()),
-        parser_cost: Measurement::Unverified,
+        parser_cost: Measurement::Verified(()),
         placeholder_empty: Measurement::Verified(()),
         delete_key: Measurement::Verified(()),
         transcript_echo: Measurement::Verified(()),
@@ -888,7 +893,7 @@ pub static RELEASE_RECORDS: [ReleaseRecord<'static>; 3] = [
         first_modal: Measurement::Verified(FirstModal::NoneObserved { launches: 10 }),
         input_mode: Measurement::Verified(()),
         release_recogniser: Measurement::Verified(()),
-        parser_cost: Measurement::Unverified,
+        parser_cost: Measurement::Verified(()),
         placeholder_empty: Measurement::Failed,
         delete_key: Measurement::Verified(()),
         transcript_echo: Measurement::Verified(()),
