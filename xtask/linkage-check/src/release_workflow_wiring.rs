@@ -5,8 +5,8 @@
 //!
 //! - `desktop-bundle` hangs off `prepare`, **not** `build`, so it runs
 //!   concurrently with the CLI matrix and adds nothing to the critical path;
-//! - `finalize` — the job that creates the GitHub Release and uploads the five
-//!   CLI assets — does **not** list either desktop job in `needs:`, so a
+//! - `finalize` — the job that creates the GitHub Release and uploads the CLI
+//!   assets — does **not** list either desktop job in `needs:`, so a
 //!   bundler that fails, hangs or is skipped cannot delay or break an ordinary
 //!   release;
 //! - `finalize`'s artifact download is constrained by `pattern:`, because
@@ -1233,7 +1233,7 @@ fn finalize_does_not_wait_on_the_desktop_jobs() {
             "`finalize` lists `{forbidden}` in needs: {finalize:?}.\n\
              This is the single property that keeps a desktop bundler failure \
              off the CLI release: `finalize` creates the GitHub Release and \
-             uploads the five CLI assets, so making it wait on a Tauri bundle \
+             uploads the CLI assets, so making it wait on a Tauri bundle \
              means a broken bundler delays — or blocks — an ordinary tag. PRD \
              #740 Decision 4."
         );
@@ -2448,7 +2448,7 @@ fn downloads_artifact(block: &str, name: &str) -> bool {
     })
 }
 
-/// Issue #1152: a full release publishes eight assets and the subject
+/// Issue #1152: a full release published eight assets and the subject
 /// collection used to match six of them. The two it missed were the checksum
 /// manifests -- which is the worst pair to miss, because a manifest is a list
 /// of hashes a user leans on to validate everything else, so an unattested one
@@ -2805,7 +2805,8 @@ fn run_subjects(files: &[&str], desktop_result: &str) -> Option<SubjectsRun> {
     })
 }
 
-/// The eight assets a full release publishes are the eight subjects attested.
+/// The ten assets a full release publishes are the ten subjects attested: the
+/// eight of issue #1152 plus PRD #1859's two Linux collector binaries.
 ///
 /// This is the assertion issue #1152 is actually about. The subject collection
 /// matched six of them, and the two it missed were the checksum manifests — the
@@ -2818,6 +2819,8 @@ fn a_full_release_attests_every_asset_it_publishes() {
         "dist/dot-agent-deck-linux-arm64",
         "dist/dot-agent-deck-darwin-amd64",
         "dist/dot-agent-deck-darwin-arm64",
+        "dist/dot-agent-deck-collector-linux-amd64",
+        "dist/dot-agent-deck-collector-linux-arm64",
         "dist/checksums.txt",
         "dist-desktop/dot-agent-deck-desktop-alpha-linux-amd64.deb",
         "dist-desktop/dot-agent-deck-desktop-alpha-macos-arm64.dmg",

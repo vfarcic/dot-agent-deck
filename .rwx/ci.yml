@@ -356,7 +356,12 @@ tasks:
     run: |
       sudo apt-get update
       # openssh-server and libnss-wrapper: fleet_001's far deck (issue #1356).
-      sudo apt-get install -y webkit2gtk-driver xvfb xclip xdotool openssh-server libnss-wrapper
+      # UCF_FORCE_CONFFMISS: a restored ci-desktop-driver-v1 tool cache can
+      # carry ucf's record of /etc/ssh/sshd_config without the file itself,
+      # and ucf then refuses to recreate the "deleted" file, which fails
+      # openssh-server's postinst (PR #1915's run 01a173dc7cf1, and three
+      # others on 2026-10-25). This makes ucf write it, as a clean install does.
+      sudo env UCF_FORCE_CONFFMISS=1 apt-get install -y webkit2gtk-driver xvfb xclip xdotool openssh-server libnss-wrapper
       cargo install tauri-driver --locked --version "$TAURI_DRIVER_VERSION"
       # `cargo install` puts it in Cargo's bin dir, which is not on PATH here.
       export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"

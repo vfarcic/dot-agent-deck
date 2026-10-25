@@ -53,6 +53,10 @@
 #[cfg(test)]
 mod accounting;
 pub mod ci;
+/// PRD #1859: the core of `dot-agent-deck-collector`, a separate binary
+/// (`src/bin/dot-agent-deck-collector.rs`). Nothing in the deck calls it.
+#[cfg(unix)]
+pub mod collector;
 pub mod config;
 pub mod exporter;
 pub mod input;

@@ -20,6 +20,50 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 
 ### Telemetry export (PRD #1741)
 
+#### telemetry/resources
+
+##### telemetry/resources/001 — Detached work keeps its run identity in resource exports.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_resource_collector.rs`).
+- **Agent:** synthetic Python stand-in with a double-forked CPU-burning grandchild; no real agent.
+- **Asserts:** the grandchild is reparented; only it performs a file-triggered CPU burn between samples, and the HTTP/JSON run's CPU growth covers that measured burn within two clock ticks. The run reports named anon/file/shmem PSS with positive anon PSS and shares deck.run.id with the actual agent.run span at the same receiver. With disk metrics disabled, worktree identity stays stable and working-directory paths are absent by default and present as deck.worktree.path after explicit opt-in.
+- **Does not assert:** work that exits between samples, exact whole-host CPU totals, cgroup accuracy, protobuf encoding or a hosted backend.
+- **Platform coverage:** Linux.
+
+##### telemetry/resources/002 — Unattributed CPU growth covers a cleared detached burn.
+- **Layer:** L2 process integration, lane 1 (`tests/e2e_resource_collector.rs`).
+- **Agent:** synthetic double-forked Python burner with a cleared environment; no real agent.
+- **Asserts:** the fixture is reparented and has no OTEL_RESOURCE_ATTRIBUTES. A continuously sampled, shared unattributed bucket has no deck.run.id, live processes, positive anon PSS and named anon/file/shmem points; its cumulative CPU growth across a file-triggered fixture burn covers the measured burn within two clock ticks.
+- **Does not assert:** exact unattributed totals, fixture-specific memory or exclusive process membership: unrelated host processes can contribute CPU and PSS to the same bucket and metrics intentionally omit pids. Does not cover cleared-environment children that remain in a run's ancestry.
+- **Platform coverage:** Linux.
+
+##### telemetry/resources/003 — Runs sharing a worktree share one disk series.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_resource_collector.rs`).
+- **Agent:** two synthetic shell/cat runs started by the real deck daemon; no real agent.
+- **Asserts:** distinct deck.run.id resources carry the same deck.worktree.id returned by the collector's worktree-id command, and exactly one deck.worktree.disk.usage series grows by at least the allocated blocks of an 8 MiB ballast file added between samples.
+- **Does not assert:** background disk-walk cadence, hardlink or nested-repository traversal, exact total disk usage or disk attribution per run.
+- **Platform coverage:** Linux.
+
+##### telemetry/resources/004 — Real interactive Haiku resource figures join the deck run. [reel]
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_resource_collector_live.rs`), developer machine only.
+- **Agent:** real interactive Claude Code on pinned Haiku with imported isolated credentials, onboarding and project trust.
+- **Asserts:** a directive visibly advances Thinking → Working/Bash → Idle and copies a uniquely named sentinel fixture while the collector runs. At least two samples arrive, with cumulative CPU growing above a pre-task baseline; named anon/file/shmem PSS points (positive anon, file and shmem may be zero) carry the same deck.run.id as the completed agent.run span.
+- **Does not assert:** native Claude telemetry, exact CPU or memory values, hosted-backend ingestion, cgroup accuracy or non-Linux collection.
+- **Platform coverage:** Linux.
+
+##### telemetry/resources/005 — Terminal run gauges keep their live resource identity.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_resource_collector.rs`).
+- **Agent:** synthetic warm-up and measured shell/cat runs started by the real deck daemon; no real agent.
+- **Asserts:** collectors with and without path opt-in first export the warm-up worktree's disk series, proving discovery has answered before the measured run starts, then export that run's live and terminal samples after pane close. Complete resource attributes remain identical, including deck.worktree.id and the opted-in canonical path; terminal process count and all three named PSS gauges are zero, and cumulative CPU does not decrease.
+- **Does not assert:** worktree changes during a live run, successful delivery after export failures, or CPU in the final unsampled interval.
+- **Platform coverage:** Linux.
+
+##### telemetry/resources/006 — OTLP partial rejection fails once without leaking backend text.
+- **Layer:** L2 process integration, lane 1 (`tests/e2e_resource_collector.rs`).
+- **Agent:** none; standalone collector and loopback HTTP receiver.
+- **Asserts:** HTTP 200 JSON and protobuf partial-success responses rejecting 100 points cause --once to exit non-zero, report rejected and 100 on stderr, omit the unique backend errorMessage sentinel, and make exactly one request to /v1/metrics with the selected content type.
+- **Does not assert:** retry policy for transport failures, malformed responses, or hosted-backend behavior.
+- **Platform coverage:** Linux.
+
 #### telemetry/otlp
 
 ##### telemetry/otlp/001 — No telemetry configuration leaves export and agent enablement off.
