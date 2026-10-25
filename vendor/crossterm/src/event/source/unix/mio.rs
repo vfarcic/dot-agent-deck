@@ -101,6 +101,9 @@ impl EventSource for UnixInternalEventSource {
             for token in self.events.iter().map(|x| x.token()) {
                 match token {
                     TTY_TOKEN => {
+                        // Events an earlier token in this batch queued (a
+                        // Resize) must not end the read below.
+                        let queued_before = self.parser.internal_events.len();
                         loop {
                             match self.tty_fd.read(&mut self.tty_buffer) {
                                 Ok(read_count) => {
@@ -123,10 +126,13 @@ impl EventSource for UnixInternalEventSource {
                                 }
                             };
 
-                            // Stop where upstream returned. The terminal
-                            // descriptor is blocking, so reading on until
-                            // `WouldBlock` would wait for the user's next key.
-                            if !self.parser.internal_events.is_empty() {
+                            // Stop where upstream returned: once these reads
+                            // have parsed an event. The terminal descriptor is
+                            // blocking, so reading on until `WouldBlock` would
+                            // wait for the user's next key; stopping before an
+                            // event, say halfway through a paste longer than the
+                            // buffer, would strand the rest until the next edge.
+                            if self.parser.internal_events.len() > queued_before {
                                 break;
                             }
                         }
@@ -140,7 +146,7 @@ impl EventSource for UnixInternalEventSource {
                             // not a really long time from the absolute time point of view, but
                             // it's a really long time from the mio, async-std/tokio executor, ...
                             // point of view.
-                            match crate::terminal::size() {
+                            match terminal_size() {
                                 Ok(new_size) => self.parser.internal_events.push_back(
                                     InternalEvent::Event(Event::Resize(new_size.0, new_size.1)),
                                 ),
@@ -177,6 +183,26 @@ impl EventSource for UnixInternalEventSource {
     fn waker(&self) -> Waker {
         self.waker.clone()
     }
+}
+
+// dot-agent-deck patch (see VENDORED.md): the SIGWINCH arm measures the
+// terminal through this, so the tests can give it a size or a failure.
+#[cfg(not(test))]
+fn terminal_size() -> io::Result<(u16, u16)> {
+    crate::terminal::size()
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_TERMINAL_SIZE: std::cell::Cell<Option<(u16, u16)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn terminal_size() -> io::Result<(u16, u16)> {
+    TEST_TERMINAL_SIZE
+        .with(|size| size.get())
+        .ok_or_else(|| io::Error::other("no terminal in this test"))
 }
 
 //
@@ -256,24 +282,11 @@ mod tests {
 
     use rustix::fd::OwnedFd;
 
-    use super::{EventSource, UnixInternalEventSource};
+    use super::{EventSource, UnixInternalEventSource, TEST_TERMINAL_SIZE, TTY_BUFFER_SIZE};
     use crate::{
-        event::{Event, InternalEvent, KeyCode},
+        event::{Event, InternalEvent, KeyCode, KeyEvent, KeyModifiers},
         terminal::sys::file_descriptor::FileDesc,
     };
-
-    /// Reads until `wanted` is seen or a read comes back empty. A resize may
-    /// surface as `Err` here, because there is no terminal to measure.
-    fn saw(source: &mut UnixInternalEventSource, wanted: fn(&InternalEvent) -> bool) -> bool {
-        for _ in 0..8 {
-            match source.try_read(Some(Duration::from_millis(200))) {
-                Ok(Some(event)) if wanted(&event) => return true,
-                Ok(Some(_)) | Err(_) => continue,
-                Ok(None) => return false,
-            }
-        }
-        false
-    }
 
     fn source() -> (UnixInternalEventSource, UnixStream) {
         // Blocking, like a real terminal: a read with nothing left to read
@@ -283,35 +296,70 @@ mod tests {
         (UnixInternalEventSource::from_file_descriptor(fd).unwrap(), writer)
     }
 
-    /// Both orders run in one test, because a SIGWINCH reaches every live
-    /// source in the process and would satisfy a concurrent test's wait.
+    /// Everything the source delivers, in order, until a read times out with
+    /// nothing; an error is recorded by its message. Nothing more is written
+    /// meanwhile, so whatever is left unread stays missing from the result.
+    fn delivered(source: &mut UnixInternalEventSource) -> Vec<Result<InternalEvent, String>> {
+        let mut seen = Vec::new();
+        for _ in 0..16 {
+            match source.try_read(Some(Duration::from_millis(200))) {
+                Ok(Some(event)) => seen.push(Ok(event)),
+                Ok(None) => return seen,
+                Err(e) => seen.push(Err(e.to_string())),
+            }
+        }
+        panic!("the source kept delivering: {seen:?}");
+    }
+
+    fn key(c: char) -> Result<InternalEvent, String> {
+        Ok(InternalEvent::Event(Event::Key(KeyEvent::new(
+            KeyCode::Char(c),
+            KeyModifiers::NONE,
+        ))))
+    }
+
+    fn resize() -> Result<InternalEvent, String> {
+        Ok(InternalEvent::Event(Event::Resize(80, 24)))
+    }
+
+    /// Every case runs in one test, because a SIGWINCH reaches every live
+    /// source in the process and would add a resize to a concurrent test's.
     #[test]
-    fn a_sigwinch_and_input_in_one_batch_are_both_delivered() {
-        let is_key = |e: &InternalEvent| {
-            matches!(e, InternalEvent::Event(Event::Key(k)) if k.code == KeyCode::Char('a'))
-        };
-        let is_resize = |e: &InternalEvent| matches!(e, InternalEvent::Event(Event::Resize(..)));
+    fn a_sigwinch_and_input_in_one_batch_are_both_delivered_once_in_order() {
+        let sigwinch = || signal_hook::low_level::raise(signal_hook::consts::SIGWINCH).unwrap();
+        TEST_TERMINAL_SIZE.with(|size| size.set(Some((80, 24))));
 
         // SIGWINCH first: upstream returned for the signal and stranded the key.
         let (mut s, mut w) = source();
-        signal_hook::low_level::raise(signal_hook::consts::SIGWINCH).unwrap();
+        sigwinch();
         w.write_all(b"a").unwrap();
-        assert!(saw(&mut s, is_key), "the key after a SIGWINCH was stranded");
+        assert_eq!(delivered(&mut s), [resize(), key('a')]);
 
-        // Input first: upstream returned the key and lost the SIGWINCH. Without a
-        // terminal the resize surfaces as an error, so either counts.
+        // Input first: upstream returned the key and lost the SIGWINCH.
         let (mut s, mut w) = source();
         w.write_all(b"a").unwrap();
-        signal_hook::low_level::raise(signal_hook::consts::SIGWINCH).unwrap();
-        let mut resized = false;
-        for _ in 0..8 {
-            match s.try_read(Some(Duration::from_millis(200))) {
-                Ok(Some(event)) if is_resize(&event) => resized = true,
-                Err(_) => resized = true,
-                Ok(Some(_)) => {}
-                Ok(None) => break,
-            }
-        }
-        assert!(resized, "the SIGWINCH after a key was lost");
+        sigwinch();
+        assert_eq!(delivered(&mut s), [key('a'), resize()]);
+
+        // SIGWINCH first, then a paste that takes several reads: the queued
+        // resize must not end the reading before the paste is complete.
+        let body = "x".repeat(TTY_BUFFER_SIZE * 2 + 100);
+        let (mut s, mut w) = source();
+        sigwinch();
+        w.write_all(format!("\x1b[200~{body}\x1b[201~").as_bytes())
+            .unwrap();
+        let paste = Ok(InternalEvent::Event(Event::Paste(body)));
+        assert_eq!(delivered(&mut s), [resize(), paste]);
+
+        // A failed measurement is returned after the batch, and the key read
+        // in the same batch is still delivered.
+        TEST_TERMINAL_SIZE.with(|size| size.set(None));
+        let (mut s, mut w) = source();
+        w.write_all(b"a").unwrap();
+        sigwinch();
+        assert_eq!(
+            delivered(&mut s),
+            [Err("no terminal in this test".to_string()), key('a')]
+        );
     }
 }
