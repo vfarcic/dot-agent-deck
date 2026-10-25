@@ -287,7 +287,7 @@ The deck's spans say what each run did, not what it cost the machine. A separate
 
 The collector runs on its own, beside the deck rather than inside it. You start it, one per machine, and it covers every deck you run there as the same user; the deck does not start it, and it changes nothing about how the deck or its agents behave. Its figures appear in your backend only: the TUI and the desktop app do not show them.
 
-**It works on Linux only.** On macOS it prints `only Linux is supported` and exits; [macOS](#macos) says why.
+**It works on Linux only.** On macOS it prints `only Linux is supported` and exits; [macOS](#macos) says what still works there.
 
 ### Install the collector
 
@@ -354,9 +354,10 @@ The log starts with a line naming the endpoint's host it sends to (never your he
 | --- | --- |
 | `--interval <seconds>` | How often to sample CPU and memory, from 1 to 3600 (default 15). |
 | `--disk-interval <seconds>` | How often to measure each worktree a run is working in (default 300). `0` turns disk figures off. |
-| `--once` | Take one sample, measure every worktree in use, send it and exit. Exits with status 1 if the send failed. |
+| `--once` | Take one sample, measure every worktree in use, send it and exit. Exits with status 1 if the send failed or the backend rejected part of it. |
 | `--stdout` | Print each sample as one line of OTLP/JSON instead of sending it. Needs no endpoint. |
 | `--send-worktree-paths` | Also send each worktree's path as `deck.worktree.path`. Off by default. |
+| `--all-users` | Collect the processes of every user it can read, not only its own user's, and label each run with its numeric user id, `deck.run.uid`. Seeing other users' processes needs root; [Whose processes](#whose-processes) says what that sends. |
 | `worktree-id <path>` | Print the `deck.worktree.id` of the worktree that holds `<path>`, to tell which worktree an id in your backend is. |
 
 It reads the standard OpenTelemetry variables, with the metrics form of each taking the place of the general one:
@@ -366,13 +367,20 @@ It reads the standard OpenTelemetry variables, with the metrics form of each tak
 | `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, or `OTEL_EXPORTER_OTLP_ENDPOINT` | Where to send. The general one gets `/v1/metrics` added, the metrics one is used as written. |
 | `OTEL_EXPORTER_OTLP_METRICS_HEADERS`, or `OTEL_EXPORTER_OTLP_HEADERS` | Headers to send, usually your API key. |
 | `OTEL_EXPORTER_OTLP_METRICS_PROTOCOL`, or `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf` (the default) or `http/json`. With `grpc` the collector exits with an error: point it at your backend's HTTP endpoint. |
-| `OTEL_EXPORTER_OTLP_METRICS_TIMEOUT`, or `OTEL_EXPORTER_OTLP_TIMEOUT` | How long one send may take, in milliseconds (default 10000). |
+| `OTEL_EXPORTER_OTLP_METRICS_TIMEOUT`, or `OTEL_EXPORTER_OTLP_TIMEOUT` | How long one send may take, retries included, in milliseconds (default 10000). `0`, or anything that is not a number, means the default, as for the deck. |
 | `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` | `cumulative` (the default) sends each run's CPU as a running total; `delta` or `lowmemory` sends what it used since the previous sample. |
 | `OTEL_SERVICE_NAME` | The service name (default `dot-agent-deck-collector`). |
 | `OTEL_RESOURCE_ATTRIBUTES` | Your own `key=value` pairs, added to everything it sends. Keys starting with `deck.` are dropped, so a collector started from inside a deck pane does not label every figure with that pane's run. |
 | `OTEL_SDK_DISABLED=true`, or `OTEL_METRICS_EXPORTER=none` | The collector sends nothing and exits. |
 
-A send that fails, because the backend is down or turns it away, is dropped and logged at most once a minute; the collector carries on. With cumulative CPU, the next send that gets through carries the full totals, so a dropped sample leaves a gap in the series, not a wrong total.
+A send that fails because the backend is busy or cannot be reached (HTTP 429, 502, 503 or 504, no connection, or no answer in time) is tried again, waiting a little longer each time, and at least as long as the backend asks in a `Retry-After` header, while within the timeout above and the sampling interval. A send that still fails, or that the backend turns away with another status, is dropped and logged at most once a minute; the collector carries on. What a dropped sample costs:
+
+- **A run that is still running** loses no CPU with cumulative CPU (the default): its next send that gets through carries its full CPU total, so the dropped sample is a gap in the series, not a wrong total.
+- **A run that ended** is sent once with its final figures. If that send is dropped, those figures go again with every later sample until one gets through. Up to 1024 ended runs are kept this way; past that the oldest are dropped, and the log says how many.
+- **With `delta` or `lowmemory` temporality**, the CPU a dropped sample carried is lost.
+- **Memory, process counts and disk** in a dropped sample are lost; the next sample carries current figures.
+
+When the backend accepts a send but reports that it rejected some of the data points in it, the collector logs how many it rejected, never the backend's own message, and does not send them again. With `--once`, it then exits with status 1.
 
 ### Read the figures
 
@@ -380,7 +388,7 @@ Everything the collector sends has `service.name` (`dot-agent-deck-collector`), 
 
 | `deck.attribution` | Which processes | Attributes |
 | --- | --- | --- |
-| `run` | The processes of one run: the agent and everything it started, including a process that detached from it. | `deck.run.id`, and the run's `deck.pane.id`, `deck.agent`, `deck.role`, `deck.orchestration.name` and `deck.orchestration.id` where it has them, as on its `agent.run` span; `deck.worktree.id` when the run works in a git worktree. |
+| `run` | The processes of one run: the agent and everything it started, including a process that detached from it. | `deck.run.id`, and the run's `deck.pane.id`, `deck.agent`, `deck.role`, `deck.orchestration.name` and `deck.orchestration.id` where it has them, as on its `agent.run` span; `deck.worktree.id` when the run works in a git worktree; with `--all-users`, `deck.run.uid`. |
 | `unattributed` | Your other processes: the deck's daemon, your shell, editors, and work started with its environment cleared that left a run's processes. Sent with every sample, even when empty. | none beyond the ones above |
 | (none) | A worktree's disk space, one resource per worktree. | `deck.worktree.id` |
 
@@ -389,11 +397,15 @@ Everything the collector sends has `service.name` (`dot-agent-deck-collector`), 
 | `deck.run.cpu.time` | seconds | The CPU time the run's processes have used, including processes that have already finished. A running total; its rate is how many cores the run keeps busy. |
 | `deck.run.memory.pss` | bytes | The run's proportional memory, as three points with `deck.memory.kind` = `anon`, `file` and `shmem`. Their sum is the run's whole proportional memory. |
 | `deck.run.processes` | processes | How many processes the run has right now. |
-| `deck.worktree.disk.usage` | bytes | The disk space allocated under the worktree, measured every `--disk-interval`. |
+| `deck.worktree.disk.usage` | bytes | The disk space allocated under the worktree, measured every `--disk-interval`. A measurement that stopped at the collector's limits (below) carries `deck.worktree.disk.complete` = `false`. |
 
 **Proportional memory** splits each page of memory that several processes share among them, so adding it up over a run's processes counts each page once. Resident memory, what most process monitors show, counts a shared page in full for every process that maps it, so a sum of it over a run overstates the run's memory, often two to four times. Of the three kinds, `anon` is memory the run's processes own (heap and stacks) and is the closest figure to what the run costs the machine. `file` is their share of mapped files, mostly program code and shared libraries that every copy of a tool shares and the kernel can drop and reload; `shmem` is shared memory.
 
-**Disk is per worktree, not per run**, because several runs usually work in the same worktree. A run's resource names the worktree it works in, in `deck.worktree.id`, and the worktree's disk figure is sent once, however many runs use it, and only while a run is working in it. It counts the files under the worktree's top directory, build output included, each once. A git repository or worktree nested inside it is measured on its own. A main checkout's figure includes its `.git` directory, which holds the history of its linked worktrees too. `deck.worktree.id` is a pseudonym computed from the worktree's path: run `dot-agent-deck-collector worktree-id <path>` to see which id a path has.
+**Disk is per worktree, not per run**, because several runs usually work in the same worktree. A run's resource names the worktree it works in, in `deck.worktree.id`: the worktree its agent was in when the collector first saw the run, which stays the run's worktree for the rest of the run. The worktree's disk figure is sent once, however many runs use it, and only while a run is working in it. It counts the files under the worktree's top directory, build output included, each once. It does not count what lies outside the worktree or on another mounted filesystem: it does not follow symlinks, and it does not enter a directory where another filesystem is mounted. A git repository or worktree nested inside it is measured on its own. A main checkout's figure includes its `.git` directory, which holds the history of its linked worktrees too.
+
+**Very large worktrees.** One measurement of a worktree stops after 10 minutes, 4 million entries, or a million directories and hard-linked files, whichever comes first, and does not go more than 64 directories deep. When it stops early or leaves something out that way, the figure it sends is what it counted, a lower bound, with `deck.worktree.disk.complete` = `false`, and the log names the worktree's id. The largest worktree measured while building the collector, 99 GB in 117,000 entries, took 27 seconds.
+
+**`deck.worktree.id` is computed from the worktree's path**, a SHA-256 hash of it: run `dot-agent-deck-collector worktree-id <path>` to see which id a path has. It keeps the path itself out of your backend, but it is not a secret. Anyone who can guess a path can compute its id and recognise it, and the same path on two machines has the same id.
 
 **A run that ended** is sent once more with its final CPU, zero processes and zero memory, then no more.
 
@@ -403,21 +415,28 @@ To see what one run cost, take its `deck.run.id` from its `agent.run` span and f
 
 The collector looks at your processes every `--interval` seconds, so it sees what is running at those moments:
 
-- **Work that stays among the run's processes is counted, whatever the interval**: commands the agent runs, builds and tests, and their short-lived children. Checked against an exact per-run measurement, the CPU figures agreed to within 0.1 s, including a 48-second cold `cargo build`, at any interval from 1 to 30 seconds.
+- **Work that stays among the run's processes is counted**: commands the agent runs, builds and tests, and their short-lived children. In the workloads measured (a 4-second CPU burst, 300 short commands, and cold `cargo build`s of about 48 seconds), the CPU figures agreed with an exact per-run measurement to within 0.1 s at every interval tried, from 1 to 30 seconds, with one exception below.
+- **Sampling can also overcount.** On one of three cold builds at a 1-second interval, the run's CPU came to 48.8 s against 46.9 s measured, 4% high: a process that finished while a sample was being read was counted twice. It did not happen at 2 seconds or slower.
 - **Work that detaches from the run and finishes between two samples is undercounted.** A process that double-forks away from the agent keeps counting toward the run while it is alive at a sample, but what it uses after the last sample that saw it is lost. In measurements, a 4-second burst of detached work was counted 77% at a 1-second interval and 22% on average at the default 15 seconds, and many sub-second detached commands about 5%. A shorter `--interval` catches more of it, at a higher cost.
 - **The last interval of a run** is lost when its agent exits: up to `--interval` seconds' worth of its CPU.
 - **Work started with its environment cleared that also detaches** is counted in the unattributed figures, or, when it finishes between samples, not at all.
-- **Other users' processes** are not seen unless the collector runs as root. Files on a tmpfs, such as `/tmp` on many systems, are not part of any worktree's disk figure.
+- **Other users' processes** are not collected unless you pass `--all-users`, and seeing them needs root.
 
 **What it costs.** On a busy machine (16 cores, load average 60 to 85, about 500 processes, 150 to 300 of them the collector's user's, 14 runs), one sample took about 0.2 seconds of CPU, most of it spent reading each process's memory figures: 1.4% of one core at the default 15-second interval, and about 19% at `--interval 1`. Its own memory stayed under 6 MB while sampling. Measuring disk comes on top, every `--disk-interval`, and depends on the size of the worktrees in use: on the same machine, nine worktrees holding 185 GB took 26 seconds the first time and 2.3 seconds once the file system had them cached, with 16 MB of memory. The service above runs it at a lower priority (`Nice=10`), so it gives way to your agents when the machine is busy.
 
 ### What it sends
 
-The collector sends numbers, the ids and attributes above, and nothing else. It never sends process names, command lines, process ids, user names, file names, the contents of any environment beyond the run attributes listed above, or paths. With `--send-worktree-paths` it adds each worktree's path, `deck.worktree.path`, to the worktree's resource and to the resource of each run working in it. Your `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` are sent as you wrote them, as the deck sends them.
+The collector sends numbers, the ids and attributes above, and nothing else. It never sends process names, command lines, process ids, user names, file names, the contents of any environment beyond the run attributes listed above, or paths. With `--all-users` it adds each run's numeric user id. With `--send-worktree-paths` it adds each worktree's path, `deck.worktree.path`, to the worktree's resource and to the resource of each run working in it. Your `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` are sent as you wrote them, as the deck sends them.
+
+### Whose processes
+
+By default the collector looks only at processes of the user it runs as, which is what the service above does. With `--all-users`, run as root, it collects every user's processes: their runs' ids, panes, agents, roles, orchestration names and worktree ids go to your backend too, and so does the work of users who did not set up the collector. Two users' runs are never added together, even when they carry the same `deck.run.id`; `deck.run.uid` tells them apart.
+
+The collector learns which run a process belongs to from the run attributes the deck puts in the process's environment, and a process can change its own environment. So any process can claim to belong to a run of its user, or to none. The figures tell you where your agents' work went; they are not proof against a process that sets out to be counted somewhere else.
 
 ### macOS
 
-macOS is not supported. The collector needs two things that Linux provides for every process through `/proc`: the process's environment, which says which run it belongs to, and its proportional memory. macOS has no `/proc`, does not report a proportional memory figure for a process, and restricts reading another process's environment, so the collector exits there with `only Linux is supported`. On a Mac, the deck's spans and the agents' own telemetry still work; only the per-run CPU, memory and disk figures are missing.
+macOS is not supported: the collector exits there with `only Linux is supported`. On a Mac, the per-run CPU, memory, process and disk figures are not available. The deck's spans and the agents' own telemetry still work as on Linux.
 
 ## Trim what is sent
 
