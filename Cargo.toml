@@ -233,9 +233,9 @@ e2e = []
 # NOTHING IN CI ENABLES THIS FEATURE'S TESTS TO RUN, and that is the decision
 # rather than an omission: no e2e test reaches a real agent in CI, so no TEST
 # credential is registered on this repository. (Narrow claim on purpose — the
-# Codex issue-labeler is a separately credentialed workflow that does put a
+# agent PR reviewer is a separately credentialed workflow that does put a
 # repository secret on a runner and does reach a real agent; see
-# `docs/develop/issue-labeling.md`. It is out of scope for the e2e tier.) The
+# `docs/develop/governance.md`. It is out of scope for the e2e tier.) The
 # line the feature draws is exactly "reaches a real agent", which is wider than
 # "reads a key" — on a developer box the agent CLIs are pre-authenticated, so
 # spawning `claude` spends a credential with no environment variable

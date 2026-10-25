@@ -20,7 +20,9 @@
 //! request. One value is read from an event's text, and only through a filter:
 //! a shell command's program and first word ([`operation::classify`]),
 //! each kept only when it has the shape of a command word, and never the first
-//! word of a program that prints or searches text. No other value on a span is
+//! word of a program that prints or searches text, and the same two of each
+//! later command of a chained line and of the command a known wrapper runs
+//! ([`operation::describe`]). No other value on a span is
 //! read from an event: the rest come from the
 //! spawn (its ids, role and orchestration), the deck's own counts and enum
 //! names, the configuration and host, and the git probes (a commit hash and the
@@ -45,6 +47,11 @@
 //! shim that switches on Codex's and Devin's own telemetry runs there
 //! ([`shim::run_if_invoked`]).
 
+/// PRD #633's execution-accounting prototype, compiled for tests only: no
+/// product path calls it, and wiring it (and dropping this `cfg(test)`) is
+/// the follow-up PRD's first step.
+#[cfg(test)]
+mod accounting;
 pub mod ci;
 pub mod config;
 pub mod exporter;
@@ -228,7 +235,7 @@ pub fn observe_pane_input(
 
 /// `deck.telemetry.schema_version`: bumped whenever the attribute set changes
 /// in a way that makes data recorded before and after it incomparable.
-pub const SCHEMA_VERSION: &str = "1";
+pub const SCHEMA_VERSION: &str = "2";
 
 /// The service name a span batch carries when `OTEL_SERVICE_NAME` is unset.
 pub const DEFAULT_SERVICE_NAME: &str = "dot-agent-deck";
@@ -289,6 +296,9 @@ pub enum AttrKey {
     InterventionKind,
     OperationProgram,
     OperationWord,
+    OperationCommands,
+    OperationWrappedProgram,
+    OperationWrappedWord,
     OperationsCount,
     CiFrom,
     CiTo,
@@ -331,6 +341,9 @@ impl AttrKey {
         AttrKey::InterventionKind,
         AttrKey::OperationProgram,
         AttrKey::OperationWord,
+        AttrKey::OperationCommands,
+        AttrKey::OperationWrappedProgram,
+        AttrKey::OperationWrappedWord,
         AttrKey::OperationsCount,
         AttrKey::CiFrom,
         AttrKey::CiTo,
@@ -371,6 +384,9 @@ impl AttrKey {
             AttrKey::InterventionKind => "deck.intervention.kind",
             AttrKey::OperationProgram => "deck.operation.program",
             AttrKey::OperationWord => "deck.operation.word",
+            AttrKey::OperationCommands => "deck.operation.commands",
+            AttrKey::OperationWrappedProgram => "deck.operation.wrapped.program",
+            AttrKey::OperationWrappedWord => "deck.operation.wrapped.word",
             AttrKey::OperationsCount => "deck.operations.count",
             AttrKey::CiFrom => "deck.ci.from",
             AttrKey::CiTo => "deck.ci.to",

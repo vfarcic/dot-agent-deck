@@ -247,8 +247,41 @@ if [ "${awaiting:-0}" != "0" ] && [ "${awaiting:-unknown}" != "unknown" ]; then
   emit APPROVE_WITH "gh api --method POST repos/{owner}/{repo}/actions/runs/<run_id>/approve"
 fi
 
-# Rule 8: the findings live ONLY in the inline review comments. A green
-# `Greptile Review` check-run is NOT the review.
+# Issue #1256: which automated review apps have finished on this head, as
+# pr-create's wait-reviews.sh decides it from reviewers.json. `--no-wait`,
+# because this phase reports and never waits. One record per outcome, not per
+# app: a key appears once in this stream (stream.sh). When the script fails, or
+# ends without a verdict, the lists read `unknown` rather than `none` and
+# REVIEWS_ERROR says why (Qodo's and Greptile's findings on PR #1882): an empty
+# list from a failed read looks exactly like "no app has finished".
+review_done=""
+review_not_done=""
+reviews_at_head=""
+reviews_error=""
+review_out=$(bash "$(dirname "${BASH_SOURCE[0]}")/../pr-create/wait-reviews.sh" --no-wait "$pr" 2>/dev/null)
+review_status=$?
+while IFS= read -r line; do
+  case "$line" in
+    DONE=*) entry="${line#DONE=}"; review_done="${review_done:+${review_done}, }${entry%% *}" ;;
+    PENDING=* | TIMED_OUT=*) entry="${line#*=}"; review_not_done="${review_not_done:+${review_not_done}, }${entry%% *}" ;;
+    REVIEWS=*) reviews_at_head="${line#REVIEWS=}" ;;
+    ERROR=*) reviews_error="${line#ERROR=}" ;;
+  esac
+done <<<"$review_out"
+if [ "$review_status" -ne 0 ] || [ -z "$reviews_at_head" ]; then
+  emit REVIEWS_AT_HEAD unknown
+  emit REVIEWS_FINISHED unknown
+  emit REVIEWS_NOT_FINISHED unknown
+  emit REVIEWS_ERROR "${reviews_error:-wait-reviews.sh exited ${review_status} without a verdict}"
+else
+  emit REVIEWS_AT_HEAD "$reviews_at_head"
+  emit REVIEWS_FINISHED "${review_done:-none}"
+  emit REVIEWS_NOT_FINISHED "${review_not_done:-none}"
+  emit REVIEWS_ERROR none
+fi
+
+# Rule 8: the findings live ONLY in the inline review comments, for every app.
+# A finished review, or a green `Greptile Review` check-run, is NOT the review.
 inline=$(gh api "repos/{owner}/{repo}/pulls/${pr}/comments" --paginate --jq '.[].id' 2>/dev/null | wc -l | tr -d ' ')
 emit INLINE_REVIEW_COMMENTS "${inline:-unknown}"
 emit READ_INLINE_WITH "gh api repos/{owner}/{repo}/pulls/${pr}/comments --paginate"

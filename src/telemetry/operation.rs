@@ -34,6 +34,16 @@
 //! argument are not read. The one quoted word read is a shell's `-c` script:
 //! a single `'…'` or `"…"` with no quote, `$`, backtick or `\` inside
 //! (`unquote`), whose inside is read by this same rule.
+//!
+//! **[`describe`] reads on past the first command**, by the same rule applied
+//! to each segment in turn: it keeps every command of the line, at most
+//! [`MAX_COMMANDS`], and the command one of [`WRAPPERS`] runs. A segment that
+//! declines ends the list, and so does one with a word in it that could hide
+//! where the next segment starts: every word of a segment before the next one
+//! is read, and must be a simple word, a simple word with a `=` in it, one of
+//! [`PLAIN_REDIRECTIONS`] or a quoted string `unquote` reads (`is_plain_word`).
+//! Those words are read and not kept: only each command's program and word
+//! are, as [`classify`] keeps them.
 
 /// What [`classify`] keeps of a command.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -45,6 +55,57 @@ pub struct Operation {
     /// [`WORDLESS_PROGRAMS`].
     pub word: Option<String>,
 }
+
+/// What [`describe`] keeps of a command line.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Description {
+    /// The first command, as [`classify`] gives it.
+    pub operation: Operation,
+    /// Every command of the line in order, the first one included, each as
+    /// [`classify`] would give it on its own, up to the first that declines
+    /// and at most [`MAX_COMMANDS`]. Each has a program.
+    pub commands: Vec<Operation>,
+    /// The command the first command runs when that one is a wrapper on
+    /// [`WRAPPERS`], read as a command of its own.
+    pub wrapped: Operation,
+}
+
+impl Description {
+    fn of(operation: Operation) -> Self {
+        Description {
+            commands: operation
+                .program
+                .is_some()
+                .then(|| operation.clone())
+                .into_iter()
+                .collect(),
+            operation,
+            wrapped: Operation::default(),
+        }
+    }
+
+    /// The commands as one value: each its program, or its program and word
+    /// with a space between, joined with `,` — `cargo fmt,cargo xtask`.
+    /// `None` when there is none. Neither a space nor a `,` is in a command
+    /// word, so the value reads back unambiguously.
+    pub fn commands_value(&self) -> Option<String> {
+        let commands: Vec<String> = self
+            .commands
+            .iter()
+            .filter_map(|command| {
+                let program = command.program.as_deref()?;
+                Some(match &command.word {
+                    Some(word) => format!("{program} {word}"),
+                    None => program.to_string(),
+                })
+            })
+            .collect();
+        (!commands.is_empty()).then(|| commands.join(","))
+    }
+}
+
+/// The most commands [`describe`] keeps of one line.
+pub const MAX_COMMANDS: usize = 8;
 
 /// The tool names agents give their shell tool: Claude Code's `Bash`,
 /// OpenCode's and Pi's `bash`, Codex's `shell` (and the names its newer
@@ -71,10 +132,18 @@ pub fn is_shell_tool(tool_name: Option<&str>) -> bool {
 /// Classify the command a shell tool call reported, read as its tool reports
 /// it: [`classify_joined_argv`] for [`JOINED_ARGV_TOOL`], else [`classify`].
 pub fn classify_tool(tool_name: Option<&str>, command: Option<&str>) -> Operation {
+    describe_tool(tool_name, command).operation
+}
+
+/// Describe the command a shell tool call reported, read as its tool reports
+/// it: a joined argv ([`JOINED_ARGV_TOOL`]) gives at most the one command
+/// [`classify_joined_argv`] names, and no wrapped command; any other is read by
+/// [`describe`].
+pub fn describe_tool(tool_name: Option<&str>, command: Option<&str>) -> Description {
     if tool_name == Some(JOINED_ARGV_TOOL) {
-        classify_joined_argv(command)
+        Description::of(classify_joined_argv(command))
     } else {
-        classify(command)
+        describe(command)
     }
 }
 
@@ -265,6 +334,33 @@ const NICE: Options = Options {
     numbers: true,
 };
 
+/// A program with no options.
+const NO_OPTIONS: Options = Options {
+    short_values: "",
+    short_flags: "",
+    long_values: &[],
+    long_flags: &[],
+    numbers: false,
+};
+
+/// GNU `timeout`.
+const TIMEOUT: Options = Options {
+    short_values: "ks",
+    short_flags: "fpv",
+    long_values: &["kill-after", "signal"],
+    long_flags: &["foreground", "preserve-status", "verbose"],
+    numbers: false,
+};
+
+/// `docker exec`.
+const DOCKER_EXEC: Options = Options {
+    short_values: "euw",
+    short_flags: "dit",
+    long_values: &["detach-keys", "env", "env-file", "user", "workdir"],
+    long_flags: &["detach", "interactive", "privileged", "tty"],
+    numbers: false,
+};
+
 /// The longest command word kept.
 pub const MAX_WORD_CHARS: usize = 32;
 
@@ -303,6 +399,27 @@ fn is_simple_assignment(word: &str) -> bool {
     })
 }
 
+/// Redirections written as one word that name no file but `/dev/null`.
+pub const PLAIN_REDIRECTIONS: &[&str] = &[
+    "2>&1",
+    "1>&2",
+    ">&2",
+    ">/dev/null",
+    "2>/dev/null",
+    "&>/dev/null",
+];
+
+/// A word the shell ends where [`segments`] ends it, so that the segment after
+/// it starts where `segments` says: a simple word, one with a `=` in it, one of
+/// [`PLAIN_REDIRECTIONS`], or one quoted string `unquote` reads.
+fn is_plain_word(word: &str) -> bool {
+    let simple_or_equals = !word.is_empty()
+        && word.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || SIMPLE_WORD_PUNCTUATION.contains(&b) || b == b'='
+        });
+    simple_or_equals || PLAIN_REDIRECTIONS.contains(&word) || unquote(word).is_some()
+}
+
 /// The inside of `word` when it is one quoted string, `'…'` or `"…"`, with no
 /// quote, `$`, backtick or `\` inside: the shell reads it literally either way.
 fn unquote(word: &str) -> Option<&str> {
@@ -315,8 +432,14 @@ fn unquote(word: &str) -> Option<&str> {
 /// Classify the command a shell tool call reported. `None` for no text gives
 /// an operation with neither program nor word.
 pub fn classify(command: Option<&str>) -> Operation {
+    describe(command).operation
+}
+
+/// [`classify`], and every command of the first line after the first, and the
+/// command a wrapper runs: see [`Description`].
+pub fn describe(command: Option<&str>) -> Description {
     let line = command.and_then(|c| c.lines().next()).unwrap_or("");
-    classify_line(line)
+    describe_line(line, true)
 }
 
 /// [`classify`] for a command reported as an argv joined with single spaces,
@@ -363,23 +486,44 @@ pub fn classify_joined_argv(command: Option<&str>) -> Operation {
     named(program, &[])
 }
 
-fn classify_line(line: &str) -> Operation {
-    segments(line)
-        .iter()
-        .find_map(|segment| classify_words(segment))
-        .unwrap_or(Operation::default())
+/// `wrappers`: whether a wrapper's command is read. It is not for a command a
+/// wrapper runs, whose own wrapped command is not kept, so a line of nested
+/// wrappers is read one level deep, however many it holds.
+fn describe_line(line: &str, wrappers: bool) -> Description {
+    let mut out = Description::default();
+    for segment in segments(line) {
+        let Some(read) = read_segment(&segment, wrappers) else {
+            continue;
+        };
+        if out.commands.is_empty() {
+            out.operation = read.operation;
+            out.wrapped = read.wrapped;
+        }
+        if read.commands.is_empty() {
+            break;
+        }
+        let room = MAX_COMMANDS - out.commands.len();
+        out.commands.extend(read.commands.into_iter().take(room));
+        // The next segment starts where this one's last word ends only when
+        // the shell ends each of its words where `segments` does.
+        if out.commands.len() == MAX_COMMANDS || !segment.iter().all(|w| is_plain_word(w)) {
+            break;
+        }
+    }
+    out
 }
 
-/// Classify one segment's words. `None` when the segment only sets up the
-/// next one.
-fn classify_words(segment: &[&str]) -> Option<Operation> {
+/// Read one segment's words. `None` when the segment only sets up the next
+/// one; a description with no command when it declines. `wrappers` as for
+/// [`describe_line`].
+fn read_segment(segment: &[&str], wrappers: bool) -> Option<Description> {
     let Some(words) = command_words(segment) else {
-        return Some(Operation::default());
+        return Some(Description::default());
     };
     let program = program_name(words.first()?);
     let rest = &words[1..];
     if UNSUPPORTED_PROGRAMS.contains(&program) {
-        return Some(Operation::default());
+        return Some(Description::default());
     }
     if SETUP_PROGRAMS.contains(&program) {
         // All of its words are read: a quote or a substitution in one could
@@ -387,13 +531,13 @@ fn classify_words(segment: &[&str]) -> Option<Operation> {
         let plain = rest
             .iter()
             .all(|w| is_simple_word(w) || is_simple_assignment(w));
-        return (!plain).then(Operation::default);
+        return (!plain).then(Description::default);
     }
     if SHELLS.contains(&program) {
         return Some(match shell_operand(rest) {
-            None => Operation::default(),
-            Some(ShellInput::File(at)) => named(program, &rest[at..]),
-            Some(ShellInput::Stdin) => named(program, &[]),
+            None => Description::default(),
+            Some(ShellInput::File(at)) => Description::of(named(program, &rest[at..])),
+            Some(ShellInput::Stdin) => Description::of(named(program, &[])),
             // A quoted script holds no quote, so a script inside it is one
             // simple word: the nesting ends there.
             Some(ShellInput::Command(at)) => match rest.get(at).and_then(|&script| {
@@ -401,12 +545,138 @@ fn classify_words(segment: &[&str]) -> Option<Operation> {
                     .filter(|s| is_simple_word(s))
                     .or_else(|| unquote(script))
             }) {
-                Some(script) => classify_line(script),
-                None => Operation::default(),
+                Some(script) => describe_line(script, wrappers),
+                None => Description::default(),
             },
         });
     }
-    Some(named(program, rest))
+    let mut description = Description::of(named(program, rest));
+    if wrappers && !description.commands.is_empty() {
+        description.wrapped = wrapped_start(program, rest)
+            .and_then(|at| read_segment(&rest[at..], false))
+            .map(|wrapped| wrapped.operation)
+            .unwrap_or_default();
+    }
+    Some(description)
+}
+
+/// Where a wrapper on [`WRAPPERS`] starts the command it runs.
+enum WrappedAt {
+    /// After its options, as these read them, and this many operands:
+    /// `timeout 600 cargo test`, `docker exec box cargo test`.
+    Operands(&'static Options, usize),
+    /// After the first of these words, `--` in `kubectl exec pod -- make`.
+    /// Every word before it must be an option when `operands` is false.
+    After {
+        markers: &'static [&'static str],
+        operands: bool,
+    },
+}
+
+/// A program that runs a command given as its arguments, and where that
+/// command starts, so the span can say what it ran.
+struct Wrapper {
+    program: &'static str,
+    /// The first argument, for a wrapper that is one of a program's
+    /// subcommands.
+    subcommand: Option<&'static str>,
+    at: WrappedAt,
+}
+
+/// The wrappers whose command [`describe`] reads. Each is listed only where
+/// the command's place in the arguments is certain; a wrapper not listed is
+/// described as itself only.
+const WRAPPERS: &[Wrapper] = &[
+    Wrapper {
+        program: "timeout",
+        subcommand: None,
+        at: WrappedAt::Operands(&TIMEOUT, 1),
+    },
+    Wrapper {
+        program: "nohup",
+        subcommand: None,
+        at: WrappedAt::Operands(&NO_OPTIONS, 0),
+    },
+    Wrapper {
+        program: "docker",
+        subcommand: Some("exec"),
+        at: WrappedAt::Operands(&DOCKER_EXEC, 1),
+    },
+    Wrapper {
+        program: "kubectl",
+        subcommand: Some("exec"),
+        at: WrappedAt::After {
+            markers: &["--"],
+            operands: true,
+        },
+    },
+    Wrapper {
+        program: "nix",
+        subcommand: Some("develop"),
+        at: WrappedAt::After {
+            markers: &["-c", "--command"],
+            operands: true,
+        },
+    },
+    Wrapper {
+        program: "nix",
+        subcommand: Some("shell"),
+        at: WrappedAt::After {
+            markers: &["-c", "--command"],
+            operands: true,
+        },
+    },
+    // `devbox run <script> -- <args>` passes `<args>` to a script, so only a
+    // `--` with nothing but options before it starts a command.
+    Wrapper {
+        program: "devbox",
+        subcommand: Some("run"),
+        at: WrappedAt::After {
+            markers: &["--"],
+            operands: false,
+        },
+    },
+];
+
+/// Options that print help or a version and run nothing.
+const INFO_OPTIONS: &[&str] = &["-h", "--help", "--version"];
+
+/// Where in `args` the command `program` wraps starts. `None` when `program`
+/// is not on [`WRAPPERS`], a word before that command is not simple, is one of
+/// [`INFO_OPTIONS`] or is not one the wrapper is known to take, or there is no
+/// command.
+fn wrapped_start(program: &str, args: &[&str]) -> Option<usize> {
+    let wrapper = WRAPPERS.iter().find(|w| {
+        w.program == program
+            && w.subcommand
+                .is_none_or(|subcommand| args.first() == Some(&subcommand))
+    })?;
+    let skip = usize::from(wrapper.subcommand.is_some());
+    let args_after = &args[skip..];
+    let at = match &wrapper.at {
+        WrappedAt::Operands(options, count) => {
+            let len = options_len(args_after, options)?;
+            let operands = args_after.get(len..len + count)?;
+            if !operands
+                .iter()
+                .all(|w| is_simple_word(w) && !w.starts_with('-'))
+            {
+                return None;
+            }
+            len + count
+        }
+        WrappedAt::After { markers, operands } => {
+            let at = args_after.iter().position(|w| markers.contains(w))?;
+            if !args_after[..at].iter().all(|w| {
+                is_simple_word(w) && !INFO_OPTIONS.contains(w) && (*operands || w.starts_with('-'))
+            }) {
+                return None;
+            }
+            at + 1
+        }
+    };
+    let start = skip + at;
+    (start < args.len()).then_some(start)
 }
 
 /// An operation running `program` with `args`, its words filtered. No
@@ -1409,6 +1679,288 @@ mod tests {
         assert_eq!(
             classify(Some("bash -s -c 'make ci'")),
             expected("make", Some("ci"))
+        );
+    }
+
+    fn commands(command: &str) -> Option<String> {
+        describe(Some(command)).commands_value()
+    }
+
+    fn wrapped(command: &str) -> Operation {
+        describe(Some(command)).wrapped
+    }
+
+    /// Every command of a chained line is described, in order, each by the
+    /// rule the first one is; the first stays `program` and `word`.
+    #[test]
+    fn a_chain_describes_each_command() {
+        for (command, expected) in [
+            (
+                "cargo fmt && cargo xtask affected-checks --run",
+                "cargo fmt,cargo xtask",
+            ),
+            ("cd repo && cargo fmt && cargo test", "cargo fmt,cargo test"),
+            ("cargo fmt && cd x && cargo test", "cargo fmt,cargo test"),
+            ("cargo test 2>&1 | tail -n 5", "cargo test,tail"),
+            ("cargo test >/dev/null && make ci", "cargo test,make ci"),
+            (
+                "cargo build; npm run lint || make ci",
+                "cargo build,npm run,make ci",
+            ),
+            ("grep -r hunter2 src | wc -l", "grep,wc"),
+            ("cargo test --features=e2e && make ci", "cargo test,make ci"),
+            // A quoted string after the word is read, not kept, and the
+            // separator inside it is not one.
+            (
+                "git commit -m 'Fix it; hunter2 run' && git push",
+                "git commit,git push",
+            ),
+            (
+                "cargo fmt && echo done \"a && hunter2 run\" && make ci",
+                "cargo fmt,echo,make ci",
+            ),
+            (
+                "bash -c 'cargo fmt && cargo test' && make ci",
+                "cargo fmt,cargo test,make ci",
+            ),
+            ("cargo test", "cargo test"),
+            ("ls", "ls"),
+        ] {
+            assert_eq!(commands(command).as_deref(), Some(expected), "{command}");
+        }
+        let chain = describe(Some("cargo fmt && cargo xtask affected-checks --run"));
+        assert_eq!(chain.operation, expected("cargo", Some("fmt")));
+        assert_eq!(
+            chain.commands,
+            [
+                expected("cargo", Some("fmt")),
+                expected("cargo", Some("xtask"))
+            ]
+        );
+    }
+
+    /// A segment that declines ends the list, and so does a word that could
+    /// hide where the next segment starts: nothing after either is read.
+    #[test]
+    fn a_declining_segment_ends_the_chain() {
+        for (command, expected) in [
+            ("cargo fmt && 'my tool' run && make ci", Some("cargo fmt")),
+            (
+                "cargo fmt && X=$(cat /x/sentinelvalue) cargo test && make ci",
+                Some("cargo fmt"),
+            ),
+            (
+                "cargo fmt && eval sentinelvalue && make ci",
+                Some("cargo fmt"),
+            ),
+            ("cargo fmt && Rscript x && make ci", Some("cargo fmt")),
+            ("cargo fmt && cd \"$DIR\" && hunter2 run", Some("cargo fmt")),
+            (
+                "cargo fmt && cargo test $X && hunter2 run",
+                Some("cargo fmt,cargo test"),
+            ),
+            // The quote opens in a word after the first argument: the shell
+            // reads `; hunter2 run; y` as part of one argument.
+            ("make ci x'; hunter2 run; y'", Some("make ci")),
+            ("cargo fmt # note && hunter2 run", Some("cargo fmt")),
+            ("cargo build & hunter2 run", Some("cargo build")),
+            ("cargo fmt >| out; hunter2 run", Some("cargo fmt")),
+            ("cargo fmt > out.txt && hunter2 run", Some("cargo fmt")),
+            ("cargo fmt |& hunter2 run", Some("cargo fmt")),
+            ("cargo fmt 2>err.log && hunter2 run", Some("cargo fmt")),
+            ("echo done \"it's\" && hunter2 run", Some("echo")),
+            // A quoted first argument declines, as it does for `classify`.
+            ("echo \"a\" && hunter2 run", None),
+            (
+                "cargo fmt && bash -c 'cd x' && hunter2 run",
+                Some("cargo fmt"),
+            ),
+            ("cargo fmt && \\", Some("cargo fmt")),
+            ("cd 'my dir' && cargo test", None),
+            ("'my tool' run && cargo test", None),
+        ] {
+            assert_eq!(commands(command).as_deref(), expected, "{command}");
+            assert!(
+                !commands(command).unwrap_or_default().contains("hunter2"),
+                "{command}"
+            );
+        }
+    }
+
+    /// A wrapper's command is read one level deep: the wrapped command's own
+    /// wrapper is not followed, so a long run of wrappers costs no more.
+    #[test]
+    fn nested_wrappers_are_read_one_level_deep() {
+        assert_eq!(
+            wrapped("timeout 5 nohup cargo test"),
+            expected("nohup", Some("cargo"))
+        );
+        assert_eq!(
+            wrapped("bash -c 'timeout 5 cargo test'"),
+            expected("cargo", Some("test"))
+        );
+        let deep = format!("{}cargo test", "nohup ".repeat(100_000));
+        assert_eq!(wrapped(&deep), expected("nohup", Some("nohup")));
+        assert_eq!(
+            describe(Some(&deep)).operation,
+            expected("nohup", Some("nohup"))
+        );
+    }
+
+    #[test]
+    fn a_chain_keeps_at_most_max_commands() {
+        let line = (0..MAX_COMMANDS + 3)
+            .map(|i| format!("make t{i}"))
+            .collect::<Vec<_>>()
+            .join(" && ");
+        let described = describe(Some(&line));
+        assert_eq!(described.commands.len(), MAX_COMMANDS);
+        assert_eq!(
+            described.commands[MAX_COMMANDS - 1],
+            expected("make", Some("t7"))
+        );
+        let script = format!("bash -c '{line}' && make last");
+        assert_eq!(describe(Some(&script)).commands.len(), MAX_COMMANDS);
+    }
+
+    /// A wrapper on the list gives the command it runs, read as a command of
+    /// its own; the program and word stay the wrapper's.
+    #[test]
+    fn a_wrapper_gives_the_command_it_runs() {
+        for (command, expected) in [
+            ("timeout 600 cargo test", expected("cargo", Some("test"))),
+            (
+                "timeout -s KILL -k 5 10m cargo build",
+                expected("cargo", Some("build")),
+            ),
+            (
+                "timeout --preserve-status 10 make ci",
+                expected("make", Some("ci")),
+            ),
+            (
+                "nohup cargo build --release",
+                expected("cargo", Some("build")),
+            ),
+            (
+                "docker exec -it box cargo test",
+                expected("cargo", Some("test")),
+            ),
+            (
+                "docker exec -u root -w /app box make ci",
+                expected("make", Some("ci")),
+            ),
+            (
+                "kubectl exec -it pod -c app -- sh -c 'make ci'",
+                expected("make", Some("ci")),
+            ),
+            (
+                "kubectl exec pod -- cat /x/sentinelvalue",
+                expected("cat", None),
+            ),
+            ("nix develop -c cargo test", expected("cargo", Some("test"))),
+            (
+                "nix develop --command make ci",
+                expected("make", Some("ci")),
+            ),
+            ("nix shell -c make ci", expected("make", Some("ci"))),
+            ("devbox run -- cargo test", expected("cargo", Some("test"))),
+            ("devbox run --pure -- make ci", expected("make", Some("ci"))),
+            (
+                "timeout 5 env FOO=1 cargo test",
+                expected("cargo", Some("test")),
+            ),
+            (
+                "timeout 5 bash -c 'cargo test'",
+                expected("cargo", Some("test")),
+            ),
+            ("timeout 5 grep hunter2 x", expected("grep", None)),
+            (
+                "cd x && sudo timeout 5 cargo test",
+                expected("cargo", Some("test")),
+            ),
+        ] {
+            assert_eq!(wrapped(command), expected, "{command}");
+        }
+        let described = describe(Some("timeout 600 cargo test"));
+        assert_eq!(described.operation, expected("timeout", Some("600")));
+        assert_eq!(described.commands, [expected("timeout", Some("600"))]);
+        assert_eq!(
+            describe(Some("docker exec -it box cargo test")).operation,
+            expected("docker", Some("exec"))
+        );
+    }
+
+    /// A wrapper not on the list, an option or operand it is not known to
+    /// take, or a wrapped command that declines gives no wrapped command.
+    #[test]
+    fn an_unknown_or_unclear_wrapper_gives_no_wrapped_command() {
+        for command in [
+            "rwx sandbox exec -- cargo test",
+            "cargo run -- sentinelvalue",
+            "npm run test -- sentinelvalue",
+            "timeout --signal=KILL 10 cargo test",
+            "timeout --bogus 10 cargo test",
+            "timeout 5",
+            "timeout -k",
+            "docker exec -e FOO=1 box cargo test",
+            "docker exec --bogus box cargo test",
+            "docker run box cargo test",
+            "kubectl exec pod",
+            "kubectl exec 'my pod' -- make ci",
+            "kubectl exec pod --",
+            "kubectl -n ns exec pod -- make ci",
+            "nix develop .#ci -c cargo test",
+            "nix build -c cargo test",
+            "devbox run test -- sentinelvalue",
+            "devbox run -- ",
+            "timeout 5 'my tool' run",
+            "timeout 5 eval sentinelvalue",
+            "timeout 5 cd x",
+            "timeout 5 X=$(cat /x/sentinelvalue) cargo",
+            // Help runs nothing.
+            "devbox run --help -- cargo test",
+            "kubectl exec pod -h -- cargo test",
+            "nix develop --version -c cargo test",
+            "timeout --help 5 cargo test",
+            // Only the first command's wrapper is read.
+            "cargo fmt && timeout 5 cargo test",
+        ] {
+            assert_eq!(wrapped(command), Operation::default(), "{command}");
+        }
+    }
+
+    /// A joined argv names one program at most, so it has no chain and no
+    /// wrapped command.
+    #[test]
+    fn a_joined_argv_describes_its_program_only() {
+        for (command, program) in [
+            ("/bin/sh -lc cargo fmt && cargo test", Some("cargo")),
+            ("timeout 5 cargo test", Some("timeout")),
+            ("/bin/sh -lc cd x && cargo test", None),
+        ] {
+            let described = describe_tool(Some(JOINED_ARGV_TOOL), Some(command));
+            assert_eq!(described.operation, op(program, None), "{command}");
+            assert_eq!(described.commands_value().as_deref(), program, "{command}");
+            assert_eq!(described.wrapped, Operation::default(), "{command}");
+        }
+        assert_eq!(
+            describe_tool(Some("Bash"), Some("cargo fmt && cargo test")).commands_value(),
+            Some("cargo fmt,cargo test".to_string())
+        );
+    }
+
+    #[test]
+    fn commands_value_joins_programs_and_words() {
+        assert_eq!(describe(None).commands_value(), None);
+        assert_eq!(describe(Some("cd x")).commands_value(), None);
+        assert_eq!(
+            Description {
+                commands: vec![expected("cargo", Some("fmt")), expected("tail", None)],
+                ..Description::default()
+            }
+            .commands_value()
+            .as_deref(),
+            Some("cargo fmt,tail")
         );
     }
 

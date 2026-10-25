@@ -423,6 +423,7 @@ mod tests {
             max_per_run: 3,
             label: None,
             query: None,
+            claim: Default::default(),
         });
         let err = add(&mut tasks, args).expect_err("shape + repo must be refused");
         assert!(
@@ -597,6 +598,7 @@ mod tests {
                 max_per_run: 2,
                 label: Some("agent-eligible".to_string()),
                 query: Some("is:open label:bug".to_string()),
+                claim: Default::default(),
             }),
         }
     }
@@ -669,6 +671,7 @@ mod tests {
             max_per_run: 1,
             label: Some("-rf".to_string()),
             query: None,
+            claim: Default::default(),
         });
         assert!(add(&mut tasks, args).is_err());
         assert!(tasks.is_empty());

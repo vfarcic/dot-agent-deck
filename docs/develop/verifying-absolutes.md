@@ -8,7 +8,7 @@ CLAUDE.md rule 17 is the policy: verify an absolute claim about how the system b
 
 | claim as written | what was true |
 | --- | --- |
-| "no agent credential reaches CI" | the Codex issue-labeler holds `OPENAI_API_KEY` on a runner |
+| "no agent credential reaches CI" | the Codex issue-labeler held `OPENAI_API_KEY` on a runner (it was removed on 2026-10-24; the agent PR reviewer's `ANTHROPIC_API_KEY` keeps the claim false) |
 | "NO SECRETS IN THIS JOB" (a `ci.yml` comment) | `actions/checkout` brings the automatic `GITHUB_TOKEN` and persists it into `.git/config` |
 | "NOTHING ELSE DOES EITHER" / "the ONLY place anyone will" | the `test-e2e-live` alias and `bacon test-e2e-live`, locally |
 | "the union can ONLY add redactions" | non-monotonic under a known matcher gap — enlarging the set can *reduce* protection |
