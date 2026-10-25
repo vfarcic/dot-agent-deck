@@ -25,7 +25,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### telemetry/resources/001 — Detached work keeps its run identity in resource exports.
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_resource_collector.rs`).
 - **Agent:** synthetic Python stand-in with a double-forked CPU-burning grandchild; no real agent.
-- **Asserts:** the grandchild is reparented; only it performs a file-triggered CPU burn between samples, and the HTTP/JSON run's CPU growth covers that measured burn within two clock ticks. The run reports named anon/file/shmem PSS with positive anon PSS and shares deck.run.id with the actual agent.run span at the same receiver. Working-directory paths are absent by default and present as deck.worktree.path after explicit opt-in.
+- **Asserts:** the grandchild is reparented; only it performs a file-triggered CPU burn between samples, and the HTTP/JSON run's CPU growth covers that measured burn within two clock ticks. The run reports named anon/file/shmem PSS with positive anon PSS and shares deck.run.id with the actual agent.run span at the same receiver. With disk metrics disabled, worktree identity stays stable and working-directory paths are absent by default and present as deck.worktree.path after explicit opt-in.
 - **Does not assert:** work that exits between samples, exact whole-host CPU totals, cgroup accuracy, protobuf encoding or a hosted backend.
 - **Platform coverage:** Linux.
 

@@ -143,7 +143,7 @@ fn environment_run(path: &Path) -> String {
     run
 }
 
-/// Scenario: Open a stand-in pane that double-forks a grandchild, leaving it reparented but still carrying the deck's run identity. Sample before and after triggering only the grandchild to burn CPU, require the run's CPU growth to cover that burn, then join its PSS and identity to the actual agent.run span; paths appear only after explicit opt-in.
+/// Scenario: Open a stand-in pane that double-forks a grandchild, leaving it reparented but still carrying the deck's run identity. With disk metrics disabled, sample before and after triggering only the grandchild to burn CPU, require the run's CPU growth to cover that burn, then join its PSS and identity to the actual agent.run span; worktree identity remains stable and paths appear only after explicit opt-in.
 #[spec("telemetry/resources/001")]
 #[test]
 fn resources_001_detached_cpu_joins_run_and_paths_are_opt_in() {
@@ -175,9 +175,14 @@ fn resources_001_detached_cpu_joins_run_and_paths_are_opt_in() {
         .into_iter()
         .next()
         .unwrap();
-    let metrics = receiver.sample(false);
+    let metrics = receiver.sample(false, false);
     let run = run_resource(&metrics, &run_id);
     assert_figures(run, ready["cpu"].as_f64().unwrap());
+    let worktree = attribute(&run["resource"], "deck.worktree.id");
+    assert!(
+        !worktree.is_empty(),
+        "disk-disabled sample keeps worktree id"
+    );
     assert_eq!(
         attribute(&run["resource"], "deck.pane.id"),
         agent.pane_id_env.as_deref().unwrap()
@@ -198,7 +203,14 @@ fn resources_001_detached_cpu_joins_run_and_paths_are_opt_in() {
             .all(|entry| attribute(&entry["resource"], "deck.worktree.path").is_empty())
     );
     let burn = detached.burn();
-    let opted_in = receiver.sample(true);
+    let opted_in = receiver.sample(true, false);
+    assert_eq!(
+        attribute(
+            &run_resource(&opted_in, &run_id)["resource"],
+            "deck.worktree.id"
+        ),
+        worktree
+    );
     let growth = cpu(run_resource(&opted_in, &run_id)) - cpu(run);
     assert!(
         growth >= burn - 0.02,
@@ -346,7 +358,7 @@ fn resources_003_shared_worktree_has_one_disk_series() {
     assert!(output.status.success());
     let worktree = String::from_utf8(output.stdout).unwrap().trim().to_string();
     assert_eq!(worktree.len(), 32);
-    let metrics = receiver.sample(false);
+    let metrics = receiver.sample(false, true);
     for run_id in [&first, &second] {
         assert_eq!(
             attribute(
@@ -375,7 +387,7 @@ fn resources_003_shared_worktree_has_one_disk_series() {
     };
     let before = disk_bytes(&metrics);
     std::fs::write(&ballast, vec![0x5a; 8 * 1024 * 1024]).unwrap();
-    let after = disk_bytes(&receiver.sample(false));
+    let after = disk_bytes(&receiver.sample(false, true));
     use std::os::unix::fs::MetadataExt;
     let allocated = std::fs::metadata(ballast).unwrap().blocks() * 512;
     assert!(

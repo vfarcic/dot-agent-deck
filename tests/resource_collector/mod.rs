@@ -133,19 +133,23 @@ impl Receiver {
             .collect()
     }
 
-    pub fn sample(&self, paths: bool) -> Vec<Value> {
+    pub fn sample(&self, paths: bool, disk: bool) -> Vec<Value> {
         let before = self.requests().len();
         let mut command = collector(self);
         command.arg("--once");
+        if !disk {
+            command.args(["--disk-interval", "0"]);
+        }
         if paths {
             command.arg("--send-worktree-paths");
         }
-        // --once waits for the worktrees of other live deck runs on this host,
-        // too. The measured cold walk is already 27 seconds; two collectors
-        // sharing a busy host exceeded the old 30-second fixture deadline.
+        // With disk enabled, --once waits for the worktrees of other live deck
+        // runs on this host, too. The measured cold walk is already 27 seconds;
+        // two collectors sharing a busy host exceeded the old 30-second deadline.
         // Keep two samples inside nextest's 180-second test deadline while
         // allowing these disk walks more time than the small fixture commands.
-        let output = bounded_output_with_timeout(command, Duration::from_secs(75));
+        let timeout = Duration::from_secs(if disk { 75 } else { 30 });
+        let output = bounded_output_with_timeout(command, timeout);
         assert!(
             output.status.success(),
             "collector --once must export resource metrics; status={}; stderr={}",
