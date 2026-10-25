@@ -40,13 +40,17 @@ pub enum Environ {
     Read(Option<RunIdentity>),
     /// Not read, because [`Aggregator::environ_settled`] said it need not be.
     NotRead,
+    /// Not readable: a process of the collector's own user that made itself
+    /// non-dumpable, whose environment and memory figures only root may
+    /// read. It names no run of its own and can take only its parent's.
+    Unreadable,
 }
 
 /// One visible process in a sample.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessSample {
     pub pid: u32,
-    /// The user the process runs as (the owner of `/proc/<pid>`).
+    /// The effective user the process runs as (`/proc/<pid>/status`).
     pub uid: u32,
     pub stat: ProcStat,
     pub environ: Environ,
@@ -175,10 +179,14 @@ impl Aggregator {
         }
     }
 
-    /// Whether the process `(pid, starttime)` is attributed by its own
-    /// environment already, so the reader need not read its environment again.
-    pub fn environ_settled(&self, pid: u32, starttime: u64) -> bool {
-        self.tracked.get(&(pid, starttime)).is_some_and(|t| t.own)
+    /// Whether the process `(pid, starttime)`, now running as `uid`, is
+    /// attributed by its own environment already, so the reader need not read
+    /// its environment again. A process whose user changed is not: what it
+    /// was attributed to does not carry over.
+    pub fn environ_settled(&self, pid: u32, starttime: u64, uid: u32) -> bool {
+        self.tracked
+            .get(&(pid, starttime))
+            .is_some_and(|t| t.own && t.uid == uid)
     }
 
     fn ticks_to_seconds(&self, ticks: u64) -> f64 {
@@ -453,7 +461,7 @@ mod tests {
             self
         }
         fn sample(&self, agg: &Aggregator) -> ProcessSample {
-            let environ = if agg.environ_settled(self.pid, self.start) {
+            let environ = if agg.environ_settled(self.pid, self.start, self.uid) {
                 Environ::NotRead
             } else {
                 Environ::Read(self.run.map(identity))
@@ -661,11 +669,13 @@ mod tests {
     #[test]
     fn an_own_environment_is_read_once_and_is_sticky() {
         let mut agg = Aggregator::new(CLK, BOOT, STARTED);
-        assert!(!agg.environ_settled(10, 500));
+        assert!(!agg.environ_settled(10, 500, 1000));
         step(&mut agg, 0, &[p(10, 1, 500, Some("r1"))]);
-        assert!(agg.environ_settled(10, 500));
+        assert!(agg.environ_settled(10, 500, 1000));
         // A reused pid is a new process.
-        assert!(!agg.environ_settled(10, 501));
+        assert!(!agg.environ_settled(10, 501, 1000));
+        // One that now runs as another user is read again.
+        assert!(!agg.environ_settled(10, 500, 0));
         // It exec'd with a cleared environment: it is still the run's.
         let s = step(&mut agg, 15, &[p(10, 1, 500, None).cpu(10, 0)]);
         assert_eq!(run(&s, "r1").figures.processes, 1);

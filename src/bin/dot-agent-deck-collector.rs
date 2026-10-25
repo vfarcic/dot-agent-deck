@@ -25,26 +25,23 @@ mod linux {
     use std::collections::HashMap;
     use std::fs;
     use std::io::Write;
-    use std::os::unix::fs::MetadataExt;
     use std::path::PathBuf;
     use std::process::ExitCode;
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use clap::{Parser, Subcommand};
-    use dot_agent_deck::telemetry::collector::aggregate::{
-        Aggregator, Environ, ProcessSample, Sample,
-    };
+    use dot_agent_deck::telemetry::collector::aggregate::{Aggregator, Sample};
     use dot_agent_deck::telemetry::collector::config::{Export, Settings};
     use dot_agent_deck::telemetry::collector::disk::{
         self, DEFAULT_BUDGET, canonical_toplevel, git_toplevel, worktree_id,
     };
-    use dot_agent_deck::telemetry::collector::identity::run_identity;
     use dot_agent_deck::telemetry::collector::otlp::{
         PendingTerminals, Request, RunWorktrees, WorktreeRef, WorktreeUsage, build_request,
         encode_json, encode_protobuf,
     };
-    use dot_agent_deck::telemetry::collector::procfs::{ProcStat, Pss, parse_boot_time};
+    use dot_agent_deck::telemetry::collector::procfs::parse_boot_time;
+    use dot_agent_deck::telemetry::collector::reader::{self, Users};
     use dot_agent_deck::telemetry::collector::walks::{InUse, MAX_OUTSTANDING, WORKERS, Walks};
     use dot_agent_deck::telemetry::config::{Protocol, process_env, redacted_endpoint};
     use dot_agent_deck::telemetry::exporter::{
@@ -213,10 +210,9 @@ mod linux {
         settings: Settings,
         host: Option<String>,
         send_paths: bool,
-        /// The collector's own user, the only one it collects without
-        /// `--all-users`.
-        uid: u32,
-        all_users: bool,
+        /// The collector's own effective user, the only one it collects
+        /// without `--all-users`.
+        users: Users,
         run_worktrees: RunWorktrees,
         disks: Option<Walks>,
         last_incomplete_log: Option<Instant>,
@@ -266,8 +262,10 @@ mod linux {
                 settings,
                 host: host_name(),
                 send_paths: cli.send_worktree_paths,
-                uid,
-                all_users: cli.all_users,
+                users: Users {
+                    own: uid,
+                    all: cli.all_users,
+                },
                 run_worktrees: RunWorktrees::default(),
                 disks,
                 last_incomplete_log: None,
@@ -295,7 +293,7 @@ mod linux {
         }
 
         fn read(&mut self) -> (Sample, InUse) {
-            let processes = read_processes(&self.aggregator, self.uid, self.all_users);
+            let processes = reader::read_processes(&self.aggregator, self.users, reader::pids());
             let sample = self.aggregator.step(now_unix_nanos(), processes);
             let (members, in_use) = worktrees(&sample, self.send_paths);
             self.run_worktrees
@@ -336,65 +334,6 @@ mod linux {
                 );
             }
         }
-    }
-
-    /// Every visible process, read in the order that keeps a child's reaping
-    /// mid-sample least likely to be counted twice: every `stat` first, then
-    /// the environments that are not settled yet, then `smaps_rollup`. Only
-    /// the processes of user `uid` are read, unless `all_users`.
-    fn read_processes(aggregator: &Aggregator, uid: u32, all_users: bool) -> Vec<ProcessSample> {
-        let Ok(entries) = fs::read_dir("/proc") else {
-            return Vec::new();
-        };
-        let mut stats = Vec::new();
-        for entry in entries.flatten() {
-            let Some(pid) = entry
-                .file_name()
-                .to_str()
-                .and_then(|name| name.parse::<u32>().ok())
-            else {
-                continue;
-            };
-            if let Ok(text) = fs::read_to_string(format!("/proc/{pid}/stat"))
-                && let Some(stat) = ProcStat::parse(&text)
-                && !stat.is_kernel_thread()
-            {
-                stats.push((pid, stat));
-            }
-        }
-        let mut visible = Vec::with_capacity(stats.len());
-        for (pid, stat) in stats {
-            // The owner of `/proc/<pid>` is the user the process runs as.
-            let Ok(owner) = fs::metadata(format!("/proc/{pid}")).map(|m| m.uid()) else {
-                continue;
-            };
-            if !all_users && owner != uid {
-                continue;
-            }
-            let environ = if aggregator.environ_settled(pid, stat.starttime) {
-                Environ::NotRead
-            } else {
-                // A process whose environment cannot be read (another
-                // user's) is not visible, and counted nowhere.
-                match fs::read(format!("/proc/{pid}/environ")) {
-                    Ok(bytes) => Environ::Read(run_identity(&bytes)),
-                    Err(_) => continue,
-                }
-            };
-            visible.push((pid, owner, stat, environ));
-        }
-        visible
-            .into_iter()
-            .map(|(pid, owner, stat, environ)| ProcessSample {
-                pid,
-                uid: owner,
-                stat,
-                environ,
-                pss: fs::read_to_string(format!("/proc/{pid}/smaps_rollup"))
-                    .ok()
-                    .and_then(|text| Pss::parse_smaps_rollup(&text)),
-            })
-            .collect()
     }
 
     /// The worktree of each run-attributed process that is in one, by pid,
@@ -538,8 +477,10 @@ mod linux {
 
         /// Send `request`, retrying a transient failure (HTTP 429, 502, 503
         /// or 504, or the backend unreachable or slow) with jittered backoff,
-        /// honouring `Retry-After`, while within the export timeout and the
-        /// sampling interval. Any other answer is final.
+        /// honouring `Retry-After`. The whole send — every attempt, the waits
+        /// between them and reading the answer — ends within the export
+        /// timeout and the sampling interval, whichever is shorter. Any other
+        /// answer is final.
         async fn send(&mut self, request: &Request, always_log: bool) -> Delivery {
             let (body, content_type) = if self.json {
                 (encode_json(request), "application/json")
@@ -548,9 +489,8 @@ mod linux {
             };
             let start = Instant::now();
             let deadline = start
-                .checked_add(self.timeout)
+                .checked_add(self.timeout.min(self.retry_window))
                 .unwrap_or_else(|| start + Duration::from_secs(86_400));
-            let window = self.timeout.min(self.retry_window);
             let mut backoff = RETRY_INITIAL_BACKOFF;
             let mut failure = "timed out".to_string();
             let (delivery, report) = loop {
@@ -568,7 +508,14 @@ mod linux {
                     .await;
                 let asked = match result {
                     Ok(response) if response.status().is_success() => {
-                        let body = bounded_body(response, MAX_RESPONSE_BODY).await;
+                        // Delivered whatever happens next; an answer that
+                        // does not arrive in time reports no rejection.
+                        let body = tokio::time::timeout(
+                            deadline.saturating_duration_since(Instant::now()),
+                            bounded_body(response, MAX_RESPONSE_BODY),
+                        )
+                        .await
+                        .unwrap_or_default();
                         let partial = if self.json {
                             decode_metrics_partial_success_json(&body)
                         } else {
@@ -620,7 +567,7 @@ mod linux {
                 // below the backoff.
                 let backoff_wait = jittered(backoff);
                 let wait = asked.map_or(backoff_wait, |asked| asked.max(backoff_wait));
-                if wait >= window.saturating_sub(start.elapsed()) {
+                if wait >= deadline.saturating_duration_since(Instant::now()) {
                     break (Delivery::Failed, format!(" failed: {failure}"));
                 }
                 tokio::time::sleep(wait).await;
@@ -637,6 +584,96 @@ mod linux {
                 );
             }
             delivery
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        use super::*;
+
+        /// A backend on loopback that answers its `n`-th connection (from 0)
+        /// with `answers[n]`, or holds the connection open and never answers
+        /// past the end of `answers`. Returns its endpoint and how many
+        /// connections it took.
+        async fn backend(answers: &'static [&'static str]) -> (String, Arc<AtomicUsize>) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/v1/metrics", listener.local_addr().unwrap());
+            let taken = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&taken);
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let n = counter.fetch_add(1, Ordering::SeqCst);
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 4096];
+                        let _ = stream.read(&mut buf).await;
+                        match answers.get(n) {
+                            Some(answer) => {
+                                let _ = stream.write_all(answer.as_bytes()).await;
+                                let _ = stream.shutdown().await;
+                            }
+                            None => tokio::time::sleep(Duration::from_secs(60)).await,
+                        }
+                    });
+                }
+            });
+            (endpoint, taken)
+        }
+
+        fn sender(endpoint: String, timeout: Duration, interval: Duration) -> Sender {
+            let export = Export {
+                endpoint,
+                headers: Vec::new(),
+                protocol: Protocol::HttpJson,
+                timeout,
+            };
+            Sender::new(export, interval).unwrap()
+        }
+
+        const UNAVAILABLE: &str =
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+        /// U3: a backend that never answers holds the send for the sampling
+        /// interval, not for the longer export timeout.
+        #[tokio::test]
+        async fn a_slow_first_attempt_ends_within_the_interval() {
+            let (endpoint, taken) = backend(&[]).await;
+            let mut sender = sender(
+                endpoint,
+                Duration::from_secs(10),
+                Duration::from_millis(500),
+            );
+            let start = Instant::now();
+            let delivery = sender.send(&Request { resources: vec![] }, false).await;
+            let took = start.elapsed();
+            assert_eq!(delivery, Delivery::Failed);
+            assert_eq!(taken.load(Ordering::SeqCst), 1);
+            assert!(took >= Duration::from_millis(450), "{took:?}");
+            assert!(took < Duration::from_secs(2), "{took:?}");
+        }
+
+        /// U3: a retry after a transient answer gets only what is left of
+        /// the interval, not a fresh export timeout.
+        #[tokio::test]
+        async fn a_slow_retry_ends_within_the_interval() {
+            let (endpoint, taken) = backend(&[UNAVAILABLE]).await;
+            // The first backoff is at most a second, so the retry starts
+            // inside this interval.
+            let mut sender = sender(endpoint, Duration::from_secs(10), Duration::from_secs(2));
+            let start = Instant::now();
+            let delivery = sender.send(&Request { resources: vec![] }, false).await;
+            let took = start.elapsed();
+            assert_eq!(delivery, Delivery::Failed);
+            assert_eq!(taken.load(Ordering::SeqCst), 2, "the retry was made");
+            assert!(took >= Duration::from_millis(1900), "{took:?}");
+            assert!(took < Duration::from_secs(4), "{took:?}");
         }
     }
 }

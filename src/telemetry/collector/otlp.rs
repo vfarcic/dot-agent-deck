@@ -5,7 +5,7 @@
 //! resource, so `deck.run.id` sits on the resource exactly as it does in the
 //! agents' own telemetry, and a backend joins the two on it.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde_json::{Value, json};
 
@@ -259,19 +259,24 @@ pub fn build_request(
     Request { resources }
 }
 
-/// Each run's worktree, fixed the first time the run is seen with one: the
-/// worktree of its oldest live process that has one. It does not move when
-/// that process exits or another changes directory, and it is kept through
-/// the run's last report, so every point of a run, its terminal ones
-/// included, carries the same resource attributes.
+/// Each run's worktree, decided at the first sample that sees the run: the
+/// worktree of its oldest live process that has one, or none when none of
+/// them is in a worktree then. It does not change after that — not when that
+/// process exits, another changes directory, or a run that had none enters a
+/// worktree — and it is kept through the run's last report, so every point
+/// of a run, its terminal ones included, carries the same resource
+/// attributes.
 #[derive(Debug, Default)]
 pub struct RunWorktrees {
     map: HashMap<RunKey, WorktreeRef>,
+    /// Every run whose worktree is decided, those with none included.
+    decided: HashSet<RunKey>,
 }
 
 impl RunWorktrees {
-    /// Give each run in `sample` that has no worktree yet the first one
-    /// `worktree_of` names for its members, oldest first.
+    /// Decide the worktree of each run in `sample` seen for the first time:
+    /// the first one `worktree_of` names for its members, oldest first, or
+    /// none.
     pub fn update(
         &mut self,
         sample: &Sample,
@@ -279,12 +284,13 @@ impl RunWorktrees {
     ) {
         for run in &sample.runs {
             let key = run.key();
-            if self.map.contains_key(&key) {
+            if self.decided.contains(&key) {
                 continue;
             }
             if let Some(worktree) = run.members.iter().find_map(|pid| worktree_of(*pid)) {
-                self.map.insert(key, worktree);
+                self.map.insert(key.clone(), worktree);
             }
+            self.decided.insert(key);
         }
     }
 
@@ -296,6 +302,7 @@ impl RunWorktrees {
     pub fn forget_ended(&mut self, sample: &Sample) {
         for run in sample.runs.iter().filter(|r| r.ended) {
             self.map.remove(&run.key());
+            self.decided.remove(&run.key());
         }
     }
 }
@@ -310,32 +317,45 @@ pub const MAX_PENDING_TERMINALS: usize = 1024;
 /// its next report carries its running total.
 #[derive(Debug, Default)]
 pub struct PendingTerminals {
+    /// Oldest first.
     held: VecDeque<ResourceMetrics>,
+    /// Where [`Self::attach`] put the held resources in the request it was
+    /// last given: everything before it is the request's own.
+    attached_at: Option<usize>,
     /// Terminal resources dropped because more than
     /// [`MAX_PENDING_TERMINALS`] were held.
     pub dropped: u64,
 }
 
 impl PendingTerminals {
-    /// Add the held terminal resources to `request`.
-    pub fn attach(&self, request: &mut Request) {
+    /// Add the held terminal resources to the end of `request`.
+    pub fn attach(&mut self, request: &mut Request) {
+        self.attached_at = Some(request.resources.len());
         request.resources.extend(self.held.iter().cloned());
     }
 
     /// `request`, with what [`Self::attach`] added, was delivered.
     pub fn delivered(&mut self) {
         self.held.clear();
+        self.attached_at = None;
     }
 
-    /// `request`, with what [`Self::attach`] added, was not delivered: hold
-    /// its terminal resources, newest kept; returns how many were dropped.
+    /// `request` was not delivered: hold its own terminal resources after
+    /// those already held (which [`Self::attach`] added to it, or did not),
+    /// and drop the oldest past [`MAX_PENDING_TERMINALS`]; returns how many
+    /// were dropped.
     pub fn failed(&mut self, request: &Request) -> u64 {
-        self.held = request
-            .resources
-            .iter()
-            .filter(|r| r.terminal)
-            .cloned()
-            .collect();
+        let own = self
+            .attached_at
+            .take()
+            .unwrap_or(request.resources.len())
+            .min(request.resources.len());
+        self.held.extend(
+            request.resources[..own]
+                .iter()
+                .filter(|r| r.terminal)
+                .cloned(),
+        );
         let excess = self.held.len().saturating_sub(MAX_PENDING_TERMINALS);
         self.held.drain(..excess);
         self.dropped += excess as u64;
@@ -1070,6 +1090,98 @@ mod tests {
         assert_eq!(pending.failed(&many), 3);
         assert_eq!(pending.len(), MAX_PENDING_TERMINALS);
         assert_eq!(pending.dropped, 3);
+    }
+
+    /// R1/U5: a run first seen in no worktree keeps none, even when it
+    /// enters one later, so its live and terminal points share one identity.
+    #[test]
+    fn a_run_first_seen_in_no_worktree_keeps_none() {
+        let settings = settings(Temporality::Cumulative);
+        let mut runs = RunWorktrees::default();
+        runs.update(&sample(), |_| None);
+        let before = build_request(&sample(), runs.get(), &[], &settings, None);
+        // It enters a worktree.
+        runs.update(&sample(), |_| Some(worktree(None)));
+        let after = build_request(&sample(), runs.get(), &[], &settings, None);
+        let last = ended(sample());
+        runs.update(&last, |_| Some(worktree(None)));
+        let terminal = build_request(&last, runs.get(), &[], &settings, None);
+        assert!(terminal.resources[0].terminal);
+        for request in [&after, &terminal] {
+            assert_eq!(
+                request.resources[0].attributes,
+                before.resources[0].attributes
+            );
+        }
+        assert!(
+            !before.resources[0]
+                .attributes
+                .iter()
+                .any(|(k, _)| k == "deck.worktree.id")
+        );
+        // Once the run has ended, a new run with its key is decided afresh.
+        runs.forget_ended(&last);
+        runs.update(&sample(), |_| Some(worktree(None)));
+        assert_eq!(runs.get().get(&run_1()), Some(&worktree(None)));
+    }
+
+    /// U4: past the bound, the oldest held terminal report is dropped, not
+    /// the one that just ended, across several failed requests.
+    #[test]
+    fn held_terminals_overflow_drops_the_oldest() {
+        let settings = settings(Temporality::Cumulative);
+        let template = build_request(&ended(sample()), &HashMap::new(), &[], &settings, None)
+            .resources[0]
+            .clone();
+        let terminal = |name: &str| {
+            let mut resource = template.clone();
+            for (key, value) in &mut resource.attributes {
+                if key == "deck.run.id" {
+                    *value = name.to_string();
+                }
+            }
+            resource
+        };
+        let run_ids = |request: &Request| -> Vec<String> {
+            request
+                .resources
+                .iter()
+                .filter(|r| r.terminal)
+                .filter_map(|r| {
+                    r.attributes
+                        .iter()
+                        .find(|(k, _)| k == "deck.run.id")
+                        .map(|(_, v)| v.clone())
+                })
+                .collect()
+        };
+        let mut no_runs = sample();
+        no_runs.runs.clear();
+        let empty = || build_request(&no_runs, &HashMap::new(), &[], &settings, None);
+
+        let mut pending = PendingTerminals::default();
+        let mut first = empty();
+        first
+            .resources
+            .extend((0..MAX_PENDING_TERMINALS).map(|i| terminal(&format!("old-{i}"))));
+        pending.attach(&mut first);
+        assert_eq!(pending.failed(&first), 0);
+        assert_eq!(pending.len(), MAX_PENDING_TERMINALS);
+
+        for name in ["new-1", "new-2"] {
+            let mut next = empty();
+            next.resources.push(terminal(name));
+            pending.attach(&mut next);
+            assert_eq!(pending.failed(&next), 1);
+        }
+        assert_eq!(pending.dropped, 2);
+        let mut last = empty();
+        pending.attach(&mut last);
+        let held = run_ids(&last);
+        assert_eq!(held.len(), MAX_PENDING_TERMINALS);
+        assert_eq!(held.first().map(String::as_str), Some("old-2"));
+        assert_eq!(&held[held.len() - 2..], ["new-1", "new-2"]);
+        assert!(!held.iter().any(|id| id == "old-0" || id == "old-1"));
     }
 
     /// A2: a walk that stopped at a limit says so on its point; with

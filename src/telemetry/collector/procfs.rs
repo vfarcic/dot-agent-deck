@@ -109,6 +109,16 @@ impl Pss {
     }
 }
 
+/// The effective user a process runs as: the second value of the `Uid:`
+/// line of `/proc/<pid>/status` (real, effective, saved, filesystem). Not the
+/// owner of `/proc/<pid>`, which is root for a process that made itself
+/// non-dumpable, whatever user it runs as. `None` when the line is missing
+/// or malformed.
+pub fn parse_effective_uid(status: &str) -> Option<u32> {
+    let values = status.lines().find_map(|line| line.strip_prefix("Uid:"))?;
+    values.split_whitespace().nth(1)?.parse().ok()
+}
+
 /// `btime` from `/proc/stat`: the boot time, in seconds since the epoch.
 pub fn parse_boot_time(proc_stat: &str) -> Option<u64> {
     proc_stat
@@ -189,6 +199,20 @@ mod tests {
         assert_eq!(pss.total(), 900 * 1024);
         assert_eq!(Pss::parse_smaps_rollup("Rss: 1 kB\nPss: 1 kB\n"), None);
         assert_eq!(Pss::parse_smaps_rollup(""), None);
+    }
+
+    #[test]
+    fn parses_the_effective_uid_from_status() {
+        let status = "Name:\tsh\nUmask:\t0022\nState:\tS (sleeping)\nTgid:\t4242\n\
+            Pid:\t4242\nPPid:\t1\nUid:\t1000\t0\t0\t0\nGid:\t1000\t1000\t1000\t1000\n";
+        assert_eq!(parse_effective_uid(status), Some(0));
+        assert_eq!(
+            parse_effective_uid("Uid:\t1000\t1001\t1002\t1003\n"),
+            Some(1001)
+        );
+        assert_eq!(parse_effective_uid("Name:\tsh\n"), None);
+        assert_eq!(parse_effective_uid("Uid:\t1000\n"), None);
+        assert_eq!(parse_effective_uid("Uid:\t1000\tx\t0\t0\n"), None);
     }
 
     #[test]

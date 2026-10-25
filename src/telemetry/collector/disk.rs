@@ -11,7 +11,6 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -109,10 +108,13 @@ pub fn disk_usage(root: &Path) -> io::Result<u64> {
 /// The disk `root` holds: `st_blocks × 512` (allocated bytes, which is what
 /// fills a disk) over `root` and everything under it, directories included,
 /// with each inode counted once. Fails only when `root` itself cannot be
-/// opened, which includes `root` being reached through a symlink: it is
-/// expected canonical ([`canonical_toplevel`]).
+/// opened, which includes `root` being reached through a symlink, in its last
+/// component or any other: it is expected canonical ([`canonical_toplevel`]).
 ///
-/// The walk goes through open directories rather than paths: each
+/// The walk goes through open directories rather than paths: the root is
+/// opened refusing a symlink in any component (on Linux with `openat2`,
+/// falling back to opening it one component at a time, each relative to the
+/// directory opened before it, with `O_NOFOLLOW`), and each
 /// subdirectory is opened relative to its parent's open directory without
 /// following a symlink (on Linux with `openat2`, which also
 /// refuses to cross a mount point, falling back to `openat` with
@@ -131,15 +133,26 @@ pub fn walk(root: &Path, limits: &Limits<'_>) -> io::Result<Walk> {
     let root_dir = match fd::Dir::open_root(root) {
         Ok(dir) => dir,
         Err(e) if e.raw_os_error() == Some(libc::ENOTDIR) => {
-            // A file as `root`: what it holds itself. A symlink is refused
-            // here too (`O_NOFOLLOW` with `O_DIRECTORY` reports one as not a
-            // directory).
-            let meta = fs::symlink_metadata(root)?;
-            if meta.is_dir() || meta.file_type().is_symlink() {
+            // A file as `root`: what it holds itself, looked at through its
+            // parent opened the same way, so no component is followed. A
+            // symlink is refused here too (`O_NOFOLLOW` with `O_DIRECTORY`
+            // reports one as not a directory).
+            let (Some(parent), Some(name)) = (root.parent(), root.file_name()) else {
+                return Err(e);
+            };
+            let parent = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            let name = std::ffi::CString::new(name.as_bytes())
+                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+            let st = fd::Dir::open_root(parent)?.stat_at(&name)?;
+            if fd::is_dir(&st) || fd::is_symlink(&st) {
                 return Err(e);
             }
             return Ok(Walk {
-                bytes: meta.blocks() * 512,
+                bytes: fd::bytes(&st),
                 complete: true,
             });
         }
@@ -197,8 +210,14 @@ pub fn walk(root: &Path, limits: &Limits<'_>) -> io::Result<Walk> {
                 // A directory it may not enter still holds its own blocks; a
                 // symlink, a mount point or a vanished entry holds none here.
                 let denied = matches!(e.raw_os_error(), Some(libc::EACCES | libc::EPERM));
-                if denied && fd::dev(&st) == device && seen.insert(fd::id(&st)) {
-                    total += fd::bytes(&st);
+                if denied && fd::dev(&st) == device {
+                    if seen.len() >= limits.budget.max_tracked {
+                        complete = false;
+                        break;
+                    }
+                    if seen.insert(fd::id(&st)) {
+                        total += fd::bytes(&st);
+                    }
                 }
                 continue;
             }
@@ -252,12 +271,21 @@ mod fd {
     use std::ffi::{CStr, CString};
     use std::io;
     use std::os::unix::ffi::OsStrExt;
-    use std::path::Path;
+    use std::path::{Component, Path};
 
     const OPEN_DIR: libc::c_int =
         libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
 
     struct Fd(libc::c_int);
+
+    impl Fd {
+        /// The descriptor, which the caller now owns.
+        fn into_raw(self) -> libc::c_int {
+            let fd = self.0;
+            std::mem::forget(self);
+            fd
+        }
+    }
 
     impl Drop for Fd {
         fn drop(&mut self) {
@@ -309,18 +337,39 @@ mod fd {
             Ok(Dir { stream, fd })
         }
 
-        /// `root`, opened as a directory, its last component not followed
-        /// when it is a symlink; on Linux, no component of it followed.
+        /// `root`, opened as a directory, no component of it followed when
+        /// it is a symlink.
         pub fn open_root(root: &Path) -> io::Result<Dir> {
-            let path = CString::new(root.as_os_str().as_bytes())
-                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
             #[cfg(target_os = "linux")]
-            if let Some(opened) = openat2(libc::AT_FDCWD, &path, RESOLVE_NO_SYMLINKS) {
-                return Dir::from_fd(opened?);
+            {
+                let path = CString::new(root.as_os_str().as_bytes())
+                    .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+                if let Some(opened) = openat2(libc::AT_FDCWD, &path, RESOLVE_NO_SYMLINKS) {
+                    return Dir::from_fd(opened?);
+                }
             }
-            // SAFETY: `path` is a NUL-terminated string.
-            let fd = check(unsafe { libc::open(path.as_ptr(), OPEN_DIR) })?;
-            Dir::from_fd(fd)
+            // One component at a time, each opened relative to the
+            // directory opened before it, so a symlink anywhere in the path,
+            // put there at any time, is refused rather than followed.
+            let start = if root.has_root() { c"/" } else { c"." };
+            // SAFETY: `start` is a NUL-terminated string.
+            let mut dir = Fd(check(unsafe { libc::open(start.as_ptr(), OPEN_DIR) })?);
+            for component in root.components() {
+                let name = match component {
+                    Component::RootDir | Component::CurDir => continue,
+                    Component::Normal(name) => CString::new(name.as_bytes())
+                        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?,
+                    // A canonical path has neither.
+                    Component::ParentDir | Component::Prefix(_) => {
+                        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+                    }
+                };
+                // SAFETY: `name` is a NUL-terminated string and `dir` is open.
+                dir = Fd(check(unsafe {
+                    libc::openat(dir.0, name.as_ptr(), OPEN_DIR)
+                })?);
+            }
+            Dir::from_fd(dir.into_raw())
         }
 
         /// The subdirectory `name`, opened relative to this one without
@@ -479,10 +528,16 @@ mod fd {
     pub fn is_dir(st: &libc::stat) -> bool {
         st.st_mode & libc::S_IFMT == libc::S_IFDIR
     }
+
+    pub fn is_symlink(st: &libc::stat) -> bool {
+        st.st_mode & libc::S_IFMT == libc::S_IFLNK
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::MetadataExt;
+
     use super::*;
 
     fn usage_of(path: &Path) -> u64 {
@@ -707,6 +762,91 @@ mod tests {
             );
             assert!(result.is_err(), "{result:?}");
         });
+    }
+
+    /// A1/U1: a root reached through an ancestor that was replaced with a
+    /// symlink after the root was found fails the walk, on both open paths,
+    /// rather than measuring where the symlink points.
+    #[test]
+    fn a_root_whose_ancestor_is_swapped_for_a_symlink_is_not_walked() {
+        each_open_path(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let base = canonical(&tmp);
+            let parent = base.join("parent");
+            let root = parent.join("wt");
+            fs::create_dir_all(root.join(".git")).unwrap();
+            let outside = base.join("outside");
+            fs::create_dir_all(outside.join("wt/.git")).unwrap();
+            write_allocated(&outside.join("wt/secret.bin"), 512 * 1024);
+            let (swap, moved, target, whole) = (
+                parent.clone(),
+                base.join("moved"),
+                outside.clone(),
+                root.clone(),
+            );
+            let result = with_hook(
+                move |name| {
+                    if Path::new(name) == whole {
+                        fs::rename(&swap, &moved).unwrap();
+                        std::os::unix::fs::symlink(&target, &swap).unwrap();
+                    }
+                },
+                || disk_usage(&root),
+            );
+            assert!(
+                fs::symlink_metadata(&parent)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "the hook ran"
+            );
+            assert!(result.is_err(), "{result:?}");
+        });
+    }
+
+    /// U6: a directory the walk may not enter is held to the same inode
+    /// budget as one it enters, and a walk that reaches the budget there is
+    /// incomplete.
+    #[test]
+    fn denied_directories_count_against_the_inode_budget() {
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("SKIP: root may enter any directory");
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = canonical(&tmp).join("wt");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        let locked: Vec<PathBuf> = (0..4).map(|i| root.join(format!("locked{i}"))).collect();
+        for dir in &locked {
+            fs::create_dir(dir).unwrap();
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        let cancel = AtomicBool::new(false);
+        let full = walk(&root, &limits(&DEFAULT_BUDGET, &cancel));
+        let small = Budget {
+            max_tracked: 3,
+            ..DEFAULT_BUDGET
+        };
+        let partial = walk(&root, &limits(&small, &cancel));
+        for dir in &locked {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let (full, partial) = (full.unwrap(), partial.unwrap());
+        assert!(full.complete, "{full:?}");
+        // The root, `.git` and the locked directories, each counted.
+        assert_eq!(full.bytes, {
+            let n: u64 = [root.clone(), root.join(".git")]
+                .iter()
+                .chain(&locked)
+                .map(|p| usage_of(p))
+                .sum();
+            n
+        });
+        assert!(!partial.complete, "{partial:?}");
+        // A directory holds no blocks on tmpfs, so both can be 0.
+        assert!(partial.bytes <= full.bytes, "{partial:?} vs {full:?}");
     }
 
     /// A2: each limit of a walk's budget stops it, and says so.

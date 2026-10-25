@@ -10,11 +10,11 @@
 //! once whether it is seen alive or only through its parent's reaped-children
 //! time ([`aggregate`]).
 //!
-//! This module holds what can be tested without a live `/proc`: the parsers
-//! ([`procfs`]), the attribution and accounting state machine ([`aggregate`]),
-//! worktree identity and the disk walk ([`disk`]), the pool the walks run on
-//! ([`walks`]), the configuration ([`config`]) and the OTLP encodings
-//! ([`otlp`]). Reading `/proc` and exporting belong to the binary
+//! This module holds the parsers ([`procfs`]), the `/proc` reader
+//! ([`reader`], Linux only), the attribution and accounting state machine
+//! ([`aggregate`]), worktree identity and the disk walk ([`disk`]), the pool
+//! the walks run on ([`walks`]), the configuration ([`config`]) and the OTLP
+//! encodings ([`otlp`]). The sampling loop and exporting belong to the binary
 //! (`src/bin/dot-agent-deck-collector.rs`).
 
 pub mod aggregate;
@@ -23,6 +23,8 @@ pub mod disk;
 pub mod identity;
 pub mod otlp;
 pub mod procfs;
+#[cfg(target_os = "linux")]
+pub mod reader;
 pub mod walks;
 
 /// The instrumentation scope, and the default `service.name`.
