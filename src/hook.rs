@@ -2524,21 +2524,58 @@ fn arm_gated(
     deadline: std::time::Instant,
 ) -> std::io::Result<()> {
     match deadline.checked_duration_since(std::time::Instant::now()) {
-        Some(left) if !left.is_zero() => match client.set_timeouts(left) {
-            // macOS refuses a socket option on a connection that can neither
-            // send nor receive any more (`EINVAL`), which is where a daemon
-            // that answered and closed leaves it. A read there returns what is
-            // buffered and then end of file, and a write fails, without
-            // blocking, so the deadline still holds.
-            #[cfg(target_os = "macos")]
-            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => Ok(()),
-            result => result,
-        },
+        Some(left) if !left.is_zero() => {
+            timeouts_set(client.set_timeouts(left), || peer_hung_up(client))
+        }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             "the wait is over",
         )),
     }
+}
+
+/// What a failed attempt to set a gated connection's timeouts means.
+///
+/// XNU's `sosetopt` answers `EINVAL` to a socket option on a socket whose
+/// receive and send sides are both shut, which is where a daemon that
+/// answered and closed leaves the connection on macOS. Only there, and only
+/// when the connection also reports the hang-up (`hung_up`, `POLLHUP`), is
+/// that error let through: a read then returns what is buffered and then end
+/// of file, and a write fails, without blocking, so the deadline still
+/// holds. `EINVAL` on a connection that has not hung up, any other error,
+/// and every error on another platform stand.
+#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+fn timeouts_set(
+    result: std::io::Result<()>,
+    hung_up: impl FnOnce() -> bool,
+) -> std::io::Result<()> {
+    match result {
+        #[cfg(target_os = "macos")]
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) && hung_up() => Ok(()),
+        result => result,
+    }
+}
+
+/// Whether the far end of `client` has hung up: `poll(2)` reports `POLLHUP`
+/// on it now.
+#[cfg(unix)]
+fn peer_hung_up(client: &crate::platform::ipc::IpcClient) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut fds = libc::pollfd {
+        fd: client.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `fds` is one live `pollfd` on this stack frame, and its fd is
+    // the socket `client` owns for the whole call; a zero timeout returns at
+    // once.
+    let ready = unsafe { libc::poll(&mut fds, 1, 0) };
+    ready > 0 && fds.revents & libc::POLLHUP != 0
+}
+
+#[cfg(not(unix))]
+fn peer_hung_up(_client: &crate::platform::ipc::IpcClient) -> bool {
+    false
 }
 
 /// The most [`write_gated`] hands one write call. A blocking write to a
@@ -7454,6 +7491,61 @@ mod gated_send_tests {
             lines[0].len(),
             2,
             "the question, then the report: {lines:?}"
+        );
+    }
+
+    /// A timeout that could not be set: let through only as macOS's `EINVAL`
+    /// on a connection that has hung up. The same `EINVAL` on a live
+    /// connection, another error, and any error elsewhere fail.
+    #[test]
+    fn a_timeout_error_stands_unless_macos_says_the_peer_hung_up() {
+        let einval = || Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+        assert!(timeouts_set(Ok(()), || false).is_ok());
+        assert!(
+            timeouts_set(einval(), || false).is_err(),
+            "a live connection"
+        );
+        assert!(
+            timeouts_set(Err(std::io::Error::from_raw_os_error(libc::EBADF)), || true).is_err()
+        );
+        assert_eq!(
+            timeouts_set(einval(), || true).is_ok(),
+            cfg!(target_os = "macos"),
+            "a hung-up connection"
+        );
+    }
+
+    /// The hang-up the macOS exception asks for: none on a connection whose
+    /// peer is still there, reported once the peer has closed, with an
+    /// answer still buffered.
+    #[cfg(unix)]
+    #[test]
+    fn a_closed_peer_reads_as_hung_up_and_a_live_one_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hung.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let client =
+            crate::platform::ipc::IpcClient::connect_timeout(&path, Duration::from_secs(5))
+                .unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        assert!(!peer_hung_up(&client), "a live connection");
+        peer.write_all(b"answer\n").unwrap();
+        drop(peer);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !peer_hung_up(&client) {
+            assert!(std::time::Instant::now() < deadline, "no hang-up reported");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut client = client;
+        assert_eq!(
+            read_gated_line(
+                &mut client,
+                std::time::Instant::now() + Duration::from_secs(1)
+            )
+            .unwrap()
+            .as_deref(),
+            Some("answer"),
+            "the buffered answer is still read"
         );
     }
 
