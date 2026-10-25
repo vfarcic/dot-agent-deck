@@ -4843,6 +4843,95 @@ mod tests {
         assert!(worktree_is_dirty(&tmp.path().join("gone")).await.is_err());
     }
 
+    /// Issue #1888: a repository whose shared `.git` carries a `post-checkout`
+    /// hook and a `core.fsmonitor` command, as a dispatched agent can plant
+    /// them. Plain git runs both (the control proves the traps are armed); the
+    /// deck's own `worktree add` and `status --porcelain` run neither, and
+    /// still answer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planted_hooks_and_fsmonitor_never_run_from_the_decks_git() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("repo-dispatch-x");
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
+
+        let marker = tmp.path().join("MARKER");
+        let trap = |path: &Path| {
+            crate::test_isolation::write_script(
+                path,
+                format!("#!/bin/sh\necho \"$0\" >> '{}'\nexit 1\n", marker.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let hooks = repo.join(".git").join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        trap(&hooks.join("post-checkout"));
+        let fsmonitor = tmp.path().join("fsmonitor.sh");
+        trap(&fsmonitor);
+        let git = |dir: &Path, args: &[&str]| {
+            crate::git_env::fixture_git_with_hooks(dir, tmp.path())
+                .args(args)
+                .output()
+                .expect("git available")
+        };
+        let config = git(
+            &repo,
+            &["config", "core.fsmonitor", &fsmonitor.to_string_lossy()],
+        );
+        assert!(config.status.success(), "{config:?}");
+
+        // The control: plain git with this repository runs both traps. The
+        // add's own status is the hook's, which fails on purpose.
+        let control = tmp.path().join("repo-control");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "control",
+                &control.to_string_lossy(),
+            ],
+        );
+        let fired = std::fs::read_to_string(&marker).unwrap_or_default();
+        assert!(
+            fired.contains("post-checkout"),
+            "hook trap armed: {fired:?}"
+        );
+        std::fs::remove_file(&marker).unwrap();
+        git(&wt, &["status", "--porcelain"]);
+        let fired = std::fs::read_to_string(&marker).unwrap_or_default();
+        assert!(
+            fired.contains("fsmonitor.sh"),
+            "fsmonitor trap armed: {fired:?}"
+        );
+        std::fs::remove_file(&marker).unwrap();
+
+        let created = tmp.path().join("repo-dispatch-y");
+        let outcome = create_worktree_from(
+            &repo,
+            &created,
+            "agent/y",
+            false,
+            Creator::dispatch("unit"),
+            None,
+        )
+        .await;
+        assert_eq!(outcome, Ok(WorktreeCreation::Created));
+        assert_eq!(worktree_is_dirty(&created).await, Ok(false));
+        std::fs::write(created.join("scratch.txt"), "work").unwrap();
+        assert_eq!(worktree_is_dirty(&created).await, Ok(true));
+        assert!(
+            !marker.exists(),
+            "the deck's git ran a planted program: {}",
+            std::fs::read_to_string(&marker).unwrap_or_default()
+        );
+    }
+
     #[test]
     fn take_worktree_none_for_unrecorded_path() {
         let reg = new_worktree_registry();
