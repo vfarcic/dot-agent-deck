@@ -9962,6 +9962,13 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** an admission using the latch, or the `cannot_type` and controller-notice halves (activation).
 - **Platform coverage:** mac+linux.
 
+##### inbox/doorbell/057 — The status's WAKE and the overdue notice name one route, from the generation's typed-fallback verdict.
+- **Layer:** Fast (`src/inbox_hub.rs`, a real hub with notices due at once and a real once-waiter; `src/agent_pty.rs`, the real `attach_inbox_summaries` over the registry's hub).
+- **Agent:** none.
+- **Asserts:** with nothing armed and the typed fallback refused, the snapshot's wake is `none` and the overdue notice reads `Wake path: none` with the refused wording and no promise of the doorbell, while with it available both read `doorbell` and today's wording; refused with a native waiter armed, the wake is `native` and a delegated task is handed to the waiter, and the native notice wording is unchanged; refused with a turn-end announcement, `turn-end` with the refused wording and without "the doorbell rings while it is idle", and today's turn-end wording when available; a verdict that changes after the notice shows in the next snapshot while the notice keeps the route it was told; the verdict goes when its generation exits, and a successor in the pane reads `doorbell` until its own refusal, then `none`. At the record boundary, a record with no live status reads `none` whatever the verdict, and a reporting record reads `doorbell`, `none` once refused and `doorbell` again when available.
+- **Does not assert:** the re-projection publisher writing the verdict, or a publisher request held at a gate while the inputs change (activation).
+- **Platform coverage:** all.
+
 #### inbox/boundary
 
 ##### inbox/boundary/001 — No ack-wait redelivers a receipt hand-out.

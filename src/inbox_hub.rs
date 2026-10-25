@@ -212,8 +212,9 @@ pub enum WakePath {
     TurnEnd,
     /// Nothing is armed, so the deck rings the doorbell when the agent is idle.
     Doorbell,
-    /// Nothing is armed and the agent has reported no status, so the doorbell
-    /// has no idle moment to ring at.
+    /// Nothing is armed, and either the agent has reported no status or the
+    /// deck won't type the doorbell into this generation, so the doorbell
+    /// won't ring (PRD #1666 part 3, round 5-wake, Q16).
     None,
 }
 
@@ -520,6 +521,13 @@ struct HubState {
     /// their waiting messages, with the oldest of those messages
     /// ([`InboxHub::set_wake_stalled`]). Gone once that message is taken.
     wake_stalled: HashMap<AgentKey, String>,
+    /// PRD #1666 part 3, round 5-wake (Q16, Q18): the generations the deck
+    /// won't type the doorbell into, with the clause: their activation is
+    /// NoGo, or a clause that holds for the rest of the generation. Written
+    /// only by the doorbell's re-projection publisher
+    /// ([`InboxHub::set_typed_fallback`]); read by [`wake_of`], so the
+    /// status's WAKE and the overdue notice agree.
+    typed_refused: HashMap<AgentKey, &'static str>,
     /// PRD #1666 part 3, round 5-wake (plan §5): why the doorbell holds for
     /// an agent generation's waiting messages, with the message the hold was
     /// last told against ([`InboxHub::set_wake_hold`]).
@@ -835,6 +843,7 @@ impl InboxHub {
                 owed_notices: Vec::new(),
                 owed_retry_at: None,
                 wake_stalled: HashMap::new(),
+                typed_refused: HashMap::new(),
                 wake_hold: HashMap::new(),
                 live_agent: None,
                 offers: HashMap::new(),
@@ -1868,23 +1877,22 @@ impl InboxHub {
                 worker.pane_id.clone(),
                 worker.agent_id.clone().unwrap_or_default(),
             );
-            let wake = if st.waiters.get(&key).is_some_and(|list| !list.is_empty()) {
-                WakePath::Native
-            } else if st
-                .announced
-                .get(&key)
-                .is_some_and(|a| a.wake == InboxWake::TurnEnd)
-            {
-                WakePath::TurnEnd
-            } else {
-                WakePath::Doorbell
-            };
+            let wake = wake_of(st, &key);
+            let typed_refused = st.typed_refused.contains_key(&key);
             let rings = st.rings.get(&key).copied().unwrap_or(0);
             // PRD #1666 part 3, round 5-wake (plan §5.3): why the doorbell
             // holds, as it stands when the notice is composed. The notice is
             // composed once, so a later change is not sent.
             let hold = st.wake_hold.get(&key).map(|(hold, _)| *hold);
-            let body = compose_undelivered_notice(&id, &watch.role, held, wake, rings, hold);
+            let body = compose_undelivered_notice(
+                &id,
+                &watch.role,
+                held,
+                wake,
+                typed_refused,
+                rings,
+                hold,
+            );
             let orchestrator = watch.orchestrator.clone();
             if let Some(watch) = st.delegates.get_mut(&id) {
                 watch.notified = true;
@@ -2067,6 +2075,7 @@ impl InboxHub {
         });
         let stall = st.wake_stalled.remove(&key);
         let hold = st.wake_hold.remove(&key).map(|(_, id)| id);
+        st.typed_refused.remove(&key);
         if let Some(id) = stall.or(hold) {
             broadcast_wake(&st, pane_id, agent_id, &id);
         }
@@ -2108,6 +2117,33 @@ impl InboxHub {
         };
         info!(pane_id, agent_id, message_id = %id, stalled, "inbox: wake stalled");
         broadcast_wake(&st, pane_id, agent_id, &id);
+    }
+
+    /// PRD #1666 part 3, round 5-wake (Q16, Q18): whether the deck will type
+    /// the doorbell into `agent_id`'s generation in `pane_id`: `refused` is
+    /// the clause that holds it (its activation is NoGo, or a clause that
+    /// holds for the rest of the generation), `None` when the doorbell may
+    /// type. Only the doorbell's re-projection publisher calls this, with no
+    /// other lock held. Read by the snapshot's WAKE and by the overdue notice
+    /// ([`wake_of`]); no broadcast carries it. A generation with no entry is
+    /// not refused. The entry goes when the agent exits. Returns whether it
+    /// changed.
+    pub fn set_typed_fallback(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        refused: Option<&'static str>,
+    ) -> bool {
+        let mut st = self.state.lock();
+        let key = (pane_id.to_string(), agent_id.to_string());
+        let changed = match refused {
+            Some(clause) => st.typed_refused.insert(key, clause) != Some(clause),
+            None => st.typed_refused.remove(&key).is_some(),
+        };
+        if changed {
+            debug!(pane_id, agent_id, ?refused, "inbox: typed fallback");
+        }
+        changed
     }
 
     /// PRD #1666 part 3, round 5-wake (plan §5): the doorbell's account of
@@ -2655,6 +2691,26 @@ impl InboxHub {
 }
 
 /// [`InboxHub::summary`], under a lock the caller holds.
+/// PRD #1666 part 3, round 5-wake (Q16): the one choice of a generation's
+/// wake path, for both its summary and the overdue notice. In order: an armed
+/// waiter is native; a turn-end announcement is turn-end; a generation the
+/// deck won't type the doorbell into is none; otherwise the doorbell.
+fn wake_of(st: &HubState, key: &AgentKey) -> WakePath {
+    if st.waiters.get(key).is_some_and(|list| !list.is_empty()) {
+        WakePath::Native
+    } else if st
+        .announced
+        .get(key)
+        .is_some_and(|a| a.wake == InboxWake::TurnEnd)
+    {
+        WakePath::TurnEnd
+    } else if st.typed_refused.contains_key(key) {
+        WakePath::None
+    } else {
+        WakePath::Doorbell
+    }
+}
+
 fn summary_of(st: &HubState, pane_id: &str, agent_id: &str) -> InboxSummary {
     let key = (pane_id.to_string(), agent_id.to_string());
     let now = Instant::now();
@@ -2691,13 +2747,10 @@ fn summary_of(st: &HubState, pane_id: &str, agent_id: &str) -> InboxSummary {
             .ok()
             .map(|ago| chrono::Utc::now() - ago)
     });
+    summary.wake = wake_of(st, &key);
     if let Some(waiter) = st.waiters.get(&key).and_then(|list| list.last()) {
-        summary.wake = WakePath::Native;
         summary.component = component_name(waiter.component);
     } else if let Some(announced) = st.announced.get(&key) {
-        if announced.wake == InboxWake::TurnEnd {
-            summary.wake = WakePath::TurnEnd;
-        }
         summary.component = component_name(announced.component);
     }
     summary
@@ -5325,21 +5378,32 @@ fn settle_late_ack(st: &mut HubState, event: &InboxEvent) {
 /// PRD #1666 S5: the notice an orchestrator gets when a task it delegated is
 /// still unacknowledged past [`ENV_UNDELIVERED_NOTICE_AFTER_MS`]. `hold` is
 /// why the doorbell holds for the worker when it is composed, if the deck
-/// says (PRD #1666 part 3, round 5-wake).
+/// says (PRD #1666 part 3, round 5-wake). `typed_refused` says the deck won't
+/// type the doorbell into the worker's generation (Q16): its wake route is
+/// then told without the doorbell's promise.
 pub fn compose_undelivered_notice(
     message_id: &str,
     role: &str,
     held: &str,
     wake: WakePath,
+    typed_refused: bool,
     rings: u32,
     hold: Option<crate::inbox_display::WakeHold>,
 ) -> String {
-    let path = match wake {
-        WakePath::Native => "an inbox component is armed for the worker and hands messages over",
-        WakePath::TurnEnd => {
+    let path = match (wake, typed_refused) {
+        (WakePath::Native, _) => {
+            "an inbox component is armed for the worker and hands messages over"
+        }
+        (WakePath::TurnEnd, false) => {
             "the worker takes messages at the end of its turns, and the doorbell rings while it is idle"
         }
-        WakePath::Doorbell | WakePath::None => {
+        (WakePath::TurnEnd, true) => {
+            "the worker takes messages at the end of its turns; the deck can't ring the doorbell for it now, so while it is idle it takes them only when it is sent a prompt in its pane"
+        }
+        (WakePath::None, true) => {
+            "nothing is armed for the worker and the deck can't ring the doorbell for it now; it takes its messages when it is sent a prompt in its pane"
+        }
+        (WakePath::Doorbell | WakePath::None, _) => {
             "nothing is armed for the worker, so the deck rings the doorbell whenever it reports idle"
         }
     };
@@ -6981,6 +7045,129 @@ mod tests {
             "the reason it was composed with: {}",
             bodies[0]
         );
+    }
+
+    /// Scenario: A worker's task goes overdue under each wake route and typed-fallback verdict: nothing armed with the fallback refused and available, a native waiter armed, a turn-end announcement with the fallback refused and available, a verdict that changes after a notice went, and a generation that exits and is followed by another in its pane. The snapshot's wake and the overdue notice the hub posts name the same route every time; a refused fallback reads none with no promise of the doorbell, a working native or turn-end route still shows, an announced notice keeps the route it was told, and the verdict goes with its generation.
+    #[spec("inbox/doorbell/057")]
+    #[tokio::test]
+    async fn doorbell_057_the_status_and_the_notice_report_one_route() {
+        const REFUSED_NONE: &str = "Wake path: none, nothing is armed for the worker and the deck can't ring the doorbell for it now; it takes its messages when it is sent a prompt in its pane";
+        const DOORBELL: &str = "Wake path: doorbell, nothing is armed for the worker, so the deck rings the doorbell whenever it reports idle";
+        const TURN_END: &str = "Wake path: turn-end, the worker takes messages at the end of its turns, and the doorbell rings while it is idle";
+        const TURN_END_REFUSED: &str = "Wake path: turn-end, the worker takes messages at the end of its turns; the deck can't ring the doorbell for it now, so while it is idle it takes them only when it is sent a prompt in its pane";
+        const NATIVE: &str =
+            "Wake path: native, an inbox component is armed for the worker and hands messages over";
+        let told = |hub: &InboxHub| -> Vec<String> {
+            hub.list_with_bodies(Some("o"))
+                .into_iter()
+                .filter(|m| m.subject == UNDELIVERED_SUBJECT)
+                .filter_map(|m| m.text)
+                .collect()
+        };
+        let fresh = || {
+            let mut hub = hub();
+            hub.undelivered_after = Duration::ZERO;
+            hub
+        };
+        // (a) Refused, nothing armed: none, and no doorbell promised.
+        let hub = fresh();
+        assert!(hub.set_typed_fallback("w", "wa", Some("unmeasured_release")));
+        assert!(!hub.set_typed_fallback("w", "wa", Some("unmeasured_release")));
+        delegate(&hub, "TASK-REFUSED");
+        assert_eq!(hub.summary("w", "wa").wake, WakePath::None);
+        hub.tick();
+        let bodies = told(&hub);
+        assert_eq!(bodies.len(), 1);
+        assert!(bodies[0].contains(REFUSED_NONE), "{}", bodies[0]);
+        assert!(!bodies[0].contains("rings the doorbell"), "{}", bodies[0]);
+        // (b) Control: the fallback available.
+        let hub = fresh();
+        delegate(&hub, "TASK-AVAILABLE");
+        assert_eq!(hub.summary("w", "wa").wake, WakePath::Doorbell);
+        hub.tick();
+        assert!(told(&hub)[0].contains(DOORBELL), "{}", told(&hub)[0]);
+        // (c) Refused with a native waiter armed: native in both, and a
+        // message goes to that waiter.
+        let hub = Arc::new(fresh());
+        hub.set_typed_fallback("w", "wa", Some("unmeasured_release"));
+        let (mut waiter, armed) = OnceWaiter::open(&hub, "w", "wa", None).await;
+        assert!(armed.registered.is_some());
+        assert_eq!(hub.summary("w", "wa").wake, WakePath::Native);
+        delegate(&hub, "TASK-NATIVE");
+        let handed = waiter.next().await.expect("the waiter is handed the task");
+        assert!(
+            serde_json::to_string(&handed)
+                .unwrap()
+                .contains("TASK-NATIVE"),
+            "handed natively, not held: {handed:?}"
+        );
+        waiter.close().await;
+        let native =
+            compose_undelivered_notice("m", "coder", "queued", WakePath::Native, true, 0, None);
+        assert!(native.contains(NATIVE), "{native}");
+        // (d) Refused with a turn-end announcement: turn-end, without the
+        // idle doorbell's promise.
+        let hub = fresh();
+        hub.set_typed_fallback("w", "wa", Some("unmeasured_release"));
+        hub.announce(
+            "w",
+            "wa",
+            InboxWake::TurnEnd,
+            InboxComponent::CodexHooks,
+            None,
+        )
+        .unwrap();
+        delegate(&hub, "TASK-TURN-END-REFUSED");
+        assert_eq!(hub.summary("w", "wa").wake, WakePath::TurnEnd);
+        hub.tick();
+        let body = &told(&hub)[0];
+        assert!(body.contains(TURN_END_REFUSED), "{body}");
+        assert!(
+            !body.contains("the doorbell rings while it is idle"),
+            "{body}"
+        );
+        // (e) Control: turn-end with the fallback available.
+        let hub = fresh();
+        hub.announce(
+            "w",
+            "wa",
+            InboxWake::TurnEnd,
+            InboxComponent::CodexHooks,
+            None,
+        )
+        .unwrap();
+        delegate(&hub, "TASK-TURN-END");
+        hub.tick();
+        assert!(told(&hub)[0].contains(TURN_END), "{}", told(&hub)[0]);
+        // (g) The verdict changes after the notice: the next snapshot shows
+        // it, and the notice keeps the route it was told.
+        let hub = fresh();
+        hub.set_typed_fallback("w", "wa", Some("unknown_release"));
+        delegate(&hub, "TASK-LATCHED-LATER");
+        hub.tick();
+        assert!(hub.set_typed_fallback("w", "wa", None));
+        assert_eq!(hub.summary("w", "wa").wake, WakePath::Doorbell);
+        hub.tick();
+        let bodies = told(&hub);
+        assert_eq!(bodies.len(), 1, "composed once");
+        assert!(bodies[0].contains(REFUSED_NONE), "{}", bodies[0]);
+        // (h) The generation exits: its entry goes; a successor with its own
+        // refusal reads none, one with none reads doorbell.
+        let hub = fresh();
+        hub.set_typed_fallback("w", "wa", Some("unmeasured_release"));
+        hub.agent_exited_as("w", "wa", ExitKind::Natural);
+        hub.post_direct(Recipient::bound("w", "wb"), content("for wb"))
+            .unwrap();
+        assert_eq!(hub.summary("w", "wb").wake, WakePath::Doorbell);
+        hub.post_direct(Recipient::bound("w", "wa"), content("late for wa"))
+            .ok();
+        assert_ne!(
+            hub.summary("w", "wa").wake,
+            WakePath::None,
+            "the exited generation's refusal is gone"
+        );
+        hub.set_typed_fallback("w", "wb", Some("unknown_release"));
+        assert_eq!(hub.summary("w", "wb").wake, WakePath::None);
     }
 
     /// PR #1735 fifth review (R5): a stalled wake is recorded against the

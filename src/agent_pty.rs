@@ -22169,6 +22169,58 @@ mod spawn_tests {
         }
     }
 
+    /// Scenario: Two generations' records are stamped from the real hub: one whose typed fallback is available but which has reported no status, and one that reports a status, first with the fallback available and then refused. The first reads none through the record boundary's own rule; the second reads doorbell, then none once refused, then doorbell again when it is available again.
+    #[spec("inbox/doorbell/057")]
+    #[test]
+    fn doorbell_057_the_record_boundary_keeps_none_for_no_status() {
+        let registry = AgentPtyRegistry::new();
+        let seed = |agent: &str| crate::inbox::Content {
+            from: crate::inbox::Sender::Deck {
+                reason: "seed".to_string(),
+            },
+            subject: "s".to_string(),
+            body: format!("for {agent}"),
+            body_trust: crate::inbox::BodyTrust::Trusted,
+            spill_path: None,
+            id: None,
+            preface: None,
+            provenance: None,
+        };
+        for agent in ["1", "2"] {
+            registry
+                .inbox()
+                .post_direct(crate::inbox::Recipient::bound("p", agent), seed(agent))
+                .unwrap();
+        }
+        let wakes = |registry: &AgentPtyRegistry| {
+            let mut records = vec![
+                AgentRecord {
+                    id: "1".into(),
+                    pane_id_env: Some("p".into()),
+                    ..typed_record(None, None)
+                },
+                AgentRecord {
+                    id: "2".into(),
+                    pane_id_env: Some("p".into()),
+                    ..typed_record(None, Some(None))
+                },
+            ];
+            attach_inbox_summaries(registry, &mut records);
+            records
+                .iter()
+                .map(|r| r.inbox.as_ref().unwrap().wake)
+                .collect::<Vec<_>>()
+        };
+        use crate::inbox_hub::WakePath;
+        assert_eq!(wakes(&registry), [WakePath::None, WakePath::Doorbell]);
+        registry
+            .inbox()
+            .set_typed_fallback("p", "2", Some("unmeasured_release"));
+        assert_eq!(wakes(&registry), [WakePath::None, WakePath::None]);
+        registry.inbox().set_typed_fallback("p", "2", None);
+        assert_eq!(wakes(&registry), [WakePath::None, WakePath::Doorbell]);
+    }
+
     /// PRD #1666 S3: a record with a pane gets its generation's summary; one
     /// that has reported no status reads `none` instead of `doorbell`; one with
     /// no pane gets no summary at all.
