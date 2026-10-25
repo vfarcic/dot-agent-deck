@@ -12951,6 +12951,7 @@ mod tests {
             reason: Some(crate::inbox::UndeliverableReason::AgentExited),
             returned: false,
             wake_stalled: false,
+            wake_hold: None,
             wake_update: false,
             attention_update: false,
             requeued: false,

@@ -3181,6 +3181,14 @@ pub struct InboxNotice {
     /// from them and the summary alone. Additive, as `wake_stalled` is.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub wake_update: bool,
+    /// PRD #1666 part 3, round 5-wake (plan §5.2): with [`Self::wake_update`],
+    /// why the deck holds the doorbell for this pane's agent's waiting
+    /// messages now, if it says. Every wake update a deck that knows this
+    /// field sends carries both it and the current [`Self::wake_stalled`], so a
+    /// client that reads only the stall keeps it right. Additive: a client
+    /// that does not know it ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_hold: Option<crate::inbox_display::WakeHold>,
     /// PRD #1666 §6.5: this notice carries the pane's whole card notices
     /// ([`Self::notices`]) and nothing else, as [`Self::wake_update`] carries
     /// the wake stall: a client replaces what it holds for the pane with

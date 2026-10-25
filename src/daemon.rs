@@ -7898,6 +7898,7 @@ mod quota_admission_tests {
                 wake: crate::inbox_hub::WakePath::Doorbell,
                 component: None,
                 wake_stalled: false,
+                wake_hold: None,
                 notices: crate::inbox_hub::InboxCardNotices {
                     integration: Some(crate::inbox_display::IntegrationNotice::RefreshFailedPi),
                     ..Default::default()

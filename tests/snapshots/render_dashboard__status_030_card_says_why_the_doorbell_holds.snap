@@ -1,0 +1,12 @@
+---
+source: tests/render_dashboard.rs
+expression: rendered
+---
+┌ 1 ClaudeCode · api-svc ─────────────────────────────────────────── ● Idle ✉1 ┐
+│Dir:  api-svc                                                                 │
+│✉1 waiting: there may be an unsent draft in its input. Send or clear it.      │
+│Prmt: move the stats into the border                                          │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└───────────────────────────────────────────────────────── Last: 1h  Tools: 14 ┘

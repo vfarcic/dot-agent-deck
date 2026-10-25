@@ -5,9 +5,12 @@
 //! state (CLAUDE.md rule 22): `✉2 queued` while messages wait, `✉2 waiting to
 //! wake: send it a prompt` once they have waited too long for an agent that is
 //! not working, `✉ delivered` once the agent has acknowledged one and nothing
-//! is pending, and `not delivered` for a message that could not reach it. The desktop's copy of the
-//! words is `desktop/src/lib/inboxWords.ts`; `tests/fixtures/inbox-display.json`
-//! pins both to the same values, so a word changes in all three places at once.
+//! is pending, and `not delivered` for a message that could not reach it.
+//! While the deck holds the doorbell for a reason it names ([`WakeHold`]),
+//! the line keeps the count (`✉2`) and the notice row says why. The desktop's
+//! copy of the words is `desktop/src/lib/inboxWords.ts`;
+//! `tests/fixtures/inbox-display.json` pins both to the same values, so a word
+//! changes in all three places at once.
 
 /// Prefixes the card's pending count (`✉2`) and a deck message's prompt line.
 pub const GLYPH: &str = "✉";
@@ -25,6 +28,15 @@ pub const WAKE_STALLED: &str = "waiting to wake";
 /// What the user can do about [`WAKE_STALLED`]: a prompt starts a turn, and
 /// every agent takes its messages at a turn's start or end.
 pub const WAKE_STALLED_HINT: &str = "send it a prompt";
+/// PRD #1666 part 3, round 5-wake (plan §5.2): the card's words for
+/// [`WakeHold::PossibleDraft`], after the glyph and the pending count.
+pub const WAKE_HOLD_POSSIBLE_DRAFT: &str =
+    "waiting: there may be an unsent draft in its input. Send or clear it.";
+/// The card's words for [`WakeHold::AwaitingPrompt`].
+pub const WAKE_HOLD_AWAITING_PROMPT: &str =
+    "not yet taken: the agent may be waiting at a prompt. Check its pane.";
+/// The card's words for [`WakeHold::PasteOpen`].
+pub const WAKE_HOLD_PASTE_OPEN: &str = "waiting: a paste into its input has not finished.";
 
 /// The card notice for a message handed to the agent the most times allowed,
 /// none acknowledged. Fixed text, as every delivery notice is
@@ -257,6 +269,74 @@ impl IntegrationNotice {
     }
 }
 
+/// PRD #1666 part 3, round 5-wake (plan §5.1–§5.2): why the deck is holding
+/// the doorbell for an agent's waiting messages, as the snapshot and both
+/// clients name it. The doorbell publishes one once a hold has lasted
+/// [`crate::doorbell::DoorbellConfig::wake_stall_after`] of the agent not
+/// working ([`crate::doorbell::HoldEpisode`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WakeHold {
+    /// The user may have an unsent draft in the agent's input.
+    PossibleDraft,
+    /// The agent may be waiting at a prompt: it reported it waits for input,
+    /// or the deck's last try found no screen it could type into.
+    AwaitingPrompt,
+    /// A paste into the agent's input has not finished.
+    PasteOpen,
+    /// A reason a newer deck names that this build does not know. A client
+    /// shows it with [`WAKE_STALLED`]'s words; this build never sends it.
+    #[serde(other)]
+    Unknown,
+}
+
+impl WakeHold {
+    /// The card's words, after the glyph and the pending count; `None` for
+    /// [`WakeHold::Unknown`], which keeps [`WAKE_STALLED`]'s words.
+    pub fn words(self) -> Option<&'static str> {
+        match self {
+            WakeHold::PossibleDraft => Some(WAKE_HOLD_POSSIBLE_DRAFT),
+            WakeHold::AwaitingPrompt => Some(WAKE_HOLD_AWAITING_PROMPT),
+            WakeHold::PasteOpen => Some(WAKE_HOLD_PASTE_OPEN),
+            WakeHold::Unknown => None,
+        }
+    }
+
+    /// What the overdue notice tells an orchestrator about the hold
+    /// ([`crate::inbox_hub::compose_undelivered_notice`]); `None` for
+    /// [`WakeHold::Unknown`].
+    pub fn notice_clause(self) -> Option<&'static str> {
+        match self {
+            WakeHold::PossibleDraft => Some(
+                "the worker's pane may have an unsent draft in its input, which the user can send or clear",
+            ),
+            WakeHold::AwaitingPrompt => Some("the worker may be waiting at a prompt in its pane"),
+            WakeHold::PasteOpen => Some("a paste into the worker's input has not finished"),
+            WakeHold::Unknown => None,
+        }
+    }
+
+    fn code(self) -> u8 {
+        match self {
+            WakeHold::PossibleDraft => 1,
+            WakeHold::AwaitingPrompt => 2,
+            WakeHold::PasteOpen => 3,
+            WakeHold::Unknown => 9,
+        }
+    }
+
+    fn from_code(code: u8) -> Option<Option<Self>> {
+        match code {
+            0 => Some(None),
+            1 => Some(Some(WakeHold::PossibleDraft)),
+            2 => Some(Some(WakeHold::AwaitingPrompt)),
+            3 => Some(Some(WakeHold::PasteOpen)),
+            9 => Some(Some(WakeHold::Unknown)),
+            _ => None,
+        }
+    }
+}
+
 /// PRD #1666 §6.4: what one listed item asks the user to decide.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -342,14 +422,19 @@ pub struct CardInbox {
     /// PRD #1666 part 3 (R-2): the refusal code of this agent's own request
     /// for its deck messages, while messages wait for it.
     pub admission_refused: Option<String>,
+    /// PRD #1666 part 3, round 5-wake: why the deck holds the doorbell for
+    /// the waiting messages, once it says so ([`WakeHold`]).
+    pub hold: Option<WakeHold>,
 }
 
 impl CardInbox {
     /// The card's inbox line, the same words in both clients:
     /// `✉ delivery uncertain` (`✉ 3 deliveries uncertain`) while deliveries
     /// are uncertain, then `✉ may not have reached the agent` (`✉ 2 may not
-    /// have reached the agent`), then `✉2 queued`, `✉2 waiting to wake: send
-    /// it a prompt`, `✉ delivered`, or nothing. What the card says beside it is
+    /// have reached the agent`), then `✉2` alone while the notice row says why
+    /// the deck holds the doorbell ([`Self::hold_text`]), `✉2 waiting to wake:
+    /// send it a prompt` (also for a hold this build does not know), `✉2
+    /// queued`, `✉ delivered`, or nothing. What the card says beside it is
     /// [`Self::notice_text`].
     pub fn full_text(&self) -> Option<String> {
         if self.uncertain == 1 {
@@ -364,7 +449,10 @@ impl CardInbox {
         if self.not_started > 1 {
             return Some(format!("{GLYPH} {} {NOT_STARTED}", self.not_started));
         }
-        if self.pending > 0 && self.stalled {
+        if self.hold_in_notice() {
+            return self.short_text();
+        }
+        if self.pending > 0 && (self.stalled || self.hold == Some(WakeHold::Unknown)) {
             Some(format!(
                 "{GLYPH}{} {WAKE_STALLED}: {WAKE_STALLED_HINT}",
                 self.pending
@@ -412,9 +500,34 @@ impl CardInbox {
         if self.held_long > 0 {
             return Some(HELD_LONG.to_string());
         }
+        if let Some(text) = self.hold_text() {
+            return Some(text);
+        }
         self.receipts_degraded
             .as_deref()
             .map(receipts_degraded_text)
+    }
+
+    /// PRD #1666 part 3, round 5-wake (plan §5.2): why the deck holds the
+    /// doorbell, with the pending count, while messages wait:
+    /// `✉2 waiting: there may be an unsent draft in its input. Send or clear
+    /// it.`. `None` with nothing pending or for a hold this build does not
+    /// know.
+    pub fn hold_text(&self) -> Option<String> {
+        let words = self.hold?.words()?;
+        (self.pending > 0).then(|| format!("{GLYPH}{} {words}", self.pending))
+    }
+
+    /// Whether the notice row is the hold's ([`Self::notice_text`] reaches
+    /// [`Self::hold_text`]), so the inbox line keeps only the count.
+    fn hold_in_notice(&self) -> bool {
+        self.hold_text().is_some()
+            && self.admission_refused.is_none()
+            && self.integration.is_none()
+            && self.evidence_paused.is_none()
+            && self.uncertain == 0
+            && self.not_started == 0
+            && self.held_long == 0
     }
 
     /// The line a narrow card keeps: the pending count alone (`✉2`), and
@@ -427,7 +540,7 @@ impl CardInbox {
     /// [`CARD_INBOX_DEGRADED_METADATA_KEY`]).
     pub fn encode(&self) -> String {
         format!(
-            "{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{}",
             self.pending,
             u8::from(self.delivered),
             u8::from(self.stalled),
@@ -438,12 +551,13 @@ impl CardInbox {
                 .map_or_else(|| "-".to_string(), |n| n.to_string()),
             self.not_started,
             self.out_of_attempts,
+            self.hold.map_or(0, WakeHold::code),
         )
     }
 
-    /// Reads [`Self::encode`]'s value, and the two-, three-, seven- and
-    /// eight-field values written before the later fields existed; `None` for
-    /// anything else, out-of-attempts counts above the uncertain one
+    /// Reads [`Self::encode`]'s value, and the two-, three-, seven-, eight-
+    /// and nine-field values written before the later fields existed; `None`
+    /// for anything else, out-of-attempts counts above the uncertain one
     /// included.
     pub fn decode(value: &str) -> Option<Self> {
         let flag = |text: &str| match text {
@@ -452,7 +566,7 @@ impl CardInbox {
             _ => None,
         };
         let parts: Vec<&str> = value.split(',').collect();
-        if !matches!(parts.len(), 2 | 3 | 7 | 8 | 9) {
+        if !matches!(parts.len(), 2 | 3 | 7 | 8 | 9 | 10) {
             return None;
         }
         let mut inbox = Self {
@@ -481,6 +595,9 @@ impl CardInbox {
                 return None;
             }
         }
+        if let Some(text) = parts.get(9) {
+            inbox.hold = WakeHold::from_code(text.parse().ok()?)?;
+        }
         Some(inbox)
     }
 }
@@ -501,6 +618,22 @@ mod tests {
         assert_eq!(words["workDone"], WORK_DONE);
         assert_eq!(words["wakeStalled"], WAKE_STALLED);
         assert_eq!(words["wakeStalledHint"], WAKE_STALLED_HINT);
+        for (value, hold) in [
+            ("possible_draft", WakeHold::PossibleDraft),
+            ("awaiting_prompt", WakeHold::AwaitingPrompt),
+            ("paste_open", WakeHold::PasteOpen),
+        ] {
+            assert_eq!(
+                serde_json::to_value(hold).unwrap(),
+                serde_json::json!(value)
+            );
+            assert_eq!(words["wakeHolds"][value], hold.words().unwrap(), "{value}");
+        }
+        assert_eq!(
+            words["wakeHolds"].as_object().map(|holds| holds.len()),
+            Some(3),
+            "the fixture lists every hold the deck names"
+        );
         assert_eq!(words["uncertain"], UNCERTAIN);
         assert_eq!(words["uncertainMany"], UNCERTAIN_MANY);
         assert_eq!(words["uncertainReason"], UNCERTAIN_REASON);
@@ -625,6 +758,17 @@ mod tests {
                 integration: Some(IntegrationNotice::RefreshFailed),
                 ..CardInbox::default()
             },
+            CardInbox {
+                pending: 2,
+                stalled: true,
+                hold: Some(WakeHold::PossibleDraft),
+                ..CardInbox::default()
+            },
+            CardInbox {
+                pending: 1,
+                hold: Some(WakeHold::Unknown),
+                ..CardInbox::default()
+            },
         ] {
             assert_eq!(CardInbox::decode(&inbox.encode()), Some(inbox.clone()));
         }
@@ -649,9 +793,65 @@ mod tests {
             "1,0,0,0,0,0,x",
             "1,0,0,1,0,0,-,0,2",
             "1,0,0,1,0,0,-,0,x",
+            "1,0,0,0,0,0,-,0,0,4",
+            "1,0,0,0,0,0,-,0,0,x",
         ] {
             assert_eq!(CardInbox::decode(bad), None, "{bad}");
         }
+    }
+
+    /// PRD #1666 part 3, round 5-wake: while the deck holds the doorbell for
+    /// a reason this build knows, the notice row says why with the pending
+    /// count and the line keeps the count alone, so the stall's remedy never
+    /// sits beside the hold's; a reason it does not know keeps the stall's
+    /// words; a notice row another notice takes leaves the line as it was;
+    /// and with nothing pending there is no hold to show.
+    #[test]
+    fn a_hold_takes_the_notice_row_and_leaves_the_line_the_count() {
+        for (hold, words) in [
+            (WakeHold::PossibleDraft, WAKE_HOLD_POSSIBLE_DRAFT),
+            (WakeHold::AwaitingPrompt, WAKE_HOLD_AWAITING_PROMPT),
+            (WakeHold::PasteOpen, WAKE_HOLD_PASTE_OPEN),
+        ] {
+            let held = CardInbox {
+                pending: 2,
+                stalled: true,
+                hold: Some(hold),
+                ..CardInbox::default()
+            };
+            assert_eq!(held.full_text().as_deref(), Some("✉2"), "{hold:?}");
+            assert_eq!(held.notice_text(), Some(format!("✉2 {words}")), "{hold:?}");
+            let empty = CardInbox {
+                pending: 0,
+                delivered: true,
+                ..held.clone()
+            };
+            assert_eq!(empty.full_text().as_deref(), Some("✉ delivered"));
+            assert_eq!(empty.notice_text(), None);
+            let behind = CardInbox {
+                held_long: 1,
+                ..held.clone()
+            };
+            assert_eq!(behind.notice_text().as_deref(), Some(HELD_LONG));
+            assert_eq!(
+                behind.full_text().as_deref(),
+                Some("✉2 waiting to wake: send it a prompt")
+            );
+        }
+        let unknown = CardInbox {
+            pending: 1,
+            hold: Some(WakeHold::Unknown),
+            ..CardInbox::default()
+        };
+        assert_eq!(
+            unknown.full_text().as_deref(),
+            Some("✉1 waiting to wake: send it a prompt")
+        );
+        assert_eq!(unknown.notice_text(), None);
+        assert_eq!(
+            serde_json::from_value::<WakeHold>(serde_json::json!("dialog_during_ring")).unwrap(),
+            WakeHold::Unknown
+        );
     }
 
     /// The line says uncertain first; the notice row says, in a fixed order,

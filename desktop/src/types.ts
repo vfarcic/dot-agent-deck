@@ -70,6 +70,11 @@ export type AgentInbox = {
   component?: string;
   /** PR #1735 fifth review (R5): nothing has woken the agent for its waiting messages. */
   wakeStalled?: boolean;
+  /**
+   * PRD #1666 part 3, round 5-wake: why the deck holds the doorbell for the
+   * waiting messages; `unknown` for a reason a newer deck names.
+   */
+  wakeHold?: WakeHold;
   /** PRD #1666 §6.5: the deck messages waiting on the user's Retry or Cancel. */
   attention?: InboxAttentionItem[];
   /** PRD #1666 §11: why the agent's integration takes no deck messages yet. */
@@ -83,6 +88,8 @@ export type AgentInbox = {
   /** PRD #1666 part 3 (R-2): the refusal code the deck gave the agent's own request for its waiting messages. */
   admissionRefused?: string;
 };
+/** PRD #1666 part 3, round 5-wake: the daemon's `WakeHold` wire values. */
+export type WakeHold = "possible_draft" | "awaiting_prompt" | "paste_open" | "unknown";
 /**
  * PRD #1666 §6.4: one deck message an agent card lists for the user to decide
  * on. `revision` is what Retry and Cancel compare on, so a second client

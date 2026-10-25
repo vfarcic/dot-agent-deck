@@ -737,6 +737,89 @@ fn status_012_card_says_a_stalled_wake_and_what_to_do() {
     insta::assert_snapshot!(rendered);
 }
 
+/// A Normal card at 80 columns for an idle agent whose daemon summary has one
+/// queued message, with `extra` merged into the summary.
+fn inbox_hold_card(extra: serde_json::Value) -> String {
+    let mut session = card_stats_session("/home/dev/api-svc");
+    session.status = SessionStatus::Idle;
+    let mut inbox = serde_json::json!({
+        "queued": 1, "fetched": 0, "undeliverable": 0,
+        "last_acked_at": null, "wake": "doorbell", "component": null
+    });
+    for (key, value) in extra.as_object().unwrap() {
+        inbox[key] = value.clone();
+    }
+    let record: dot_agent_deck::agent_pty::AgentRecord =
+        serde_json::from_value(serde_json::json!({
+            "id": "agent-card-stats", "pane_id_env": "pane-card-stats",
+            "live": session.live_snapshot(), "inbox": inbox
+        }))
+        .expect("the daemon's AgentRecord wire shape with a wake hold");
+    let mut state = AppState::default();
+    state.register_pane("pane-card-stats".to_string());
+    state.sessions.insert(session.session_id.clone(), session);
+    state.resync_after_event_gap(&[record]);
+    let session = state.sessions.remove("sess-card-stats").unwrap();
+    let buffer = render_card_to_buffer(
+        &session,
+        Some("api-svc"),
+        Some(1),
+        CardDensityKind::Normal,
+        0,
+        render_now(),
+        false,
+        80,
+        CardDensityKind::Normal.rendered_height(),
+    );
+    buffer_to_text(&buffer)
+}
+
+/// Scenario: The daemon says why it holds the doorbell for an idle agent's one waiting message, whose wake has also stalled: a possible draft, a possible prompt, an unfinished paste. Each card shows the reason with the count on its notice row, in the words the desktop uses, and its status line keeps the count without the stall's "send it a prompt". A reason a newer daemon names that this build does not know shows the stall's words, as does a summary from a daemon older than the field.
+#[spec("inbox/status/030")]
+#[test]
+fn status_030_card_says_why_the_doorbell_holds() {
+    let words = inbox_display_words();
+    let glyph = words["glyph"].as_str().unwrap();
+    let stalled_line = format!(
+        "{glyph}1 {}: {}",
+        words["wakeStalled"].as_str().unwrap(),
+        words["wakeStalledHint"].as_str().unwrap()
+    );
+    for hold in ["possible_draft", "awaiting_prompt", "paste_open"] {
+        let rendered = inbox_hold_card(serde_json::json!({
+            "wake_stalled": true, "wake_hold": hold
+        }));
+        let line = format!("{glyph}1 {}", words["wakeHolds"][hold].as_str().unwrap());
+        assert!(
+            rendered.contains(&line),
+            "{hold} must say {line:?}:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains(words["wakeStalled"].as_str().unwrap()),
+            "{hold}: the stall's words never sit beside the hold's:\n{rendered}"
+        );
+        if hold == "possible_draft" {
+            insta::assert_snapshot!(rendered);
+        }
+    }
+    for (extra, why) in [
+        (
+            serde_json::json!({"wake_hold": "dialog_during_ring"}),
+            "a reason this build does not know",
+        ),
+        (
+            serde_json::json!({"wake_stalled": true}),
+            "a daemon older than the field",
+        ),
+    ] {
+        let rendered = inbox_hold_card(extra);
+        assert!(
+            rendered.contains(&stalled_line),
+            "{why} must say {stalled_line:?}:\n{rendered}"
+        );
+    }
+}
+
 /// PRD #1666 §6.5: a card whose daemon summary carries `notices` (the attention
 /// items, the integration notice, failed receipts, paused hand-outs) beside
 /// one fetched message, rendered at the Normal density's 80 columns.

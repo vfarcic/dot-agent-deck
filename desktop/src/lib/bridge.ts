@@ -51,6 +51,7 @@ import type { HandoffEdge,
   PromptKeys,
   RuntimeMode,
   TerminalChunk,
+  WakeHold,
   WorkflowStage,
 } from "../types";
 
@@ -375,6 +376,8 @@ export interface DesktopAgentDto {
     component?: string;
     /** PR #1735 fifth review (R5): nothing has woken the agent for its waiting messages. */
     wakeStalled?: boolean;
+    /** PRD #1666 part 3, round 5-wake: why the deck holds the doorbell, the daemon's wire value. */
+    wakeHold?: string;
     /** PRD #1666 §6.5: deck messages waiting on the user's Retry or Cancel. */
     attention?: Array<{ messageId: string; revision: number; kind: string; fromLabel: string; subject: string; taskId?: string }>;
     integration?: string;
@@ -2415,6 +2418,9 @@ function inboxFromDto(inbox: NonNullable<DesktopAgentDto["inbox"]>): AgentInbox 
     wake: inbox.wake,
     ...(inbox.component ? { component: inbox.component } : {}),
     ...(inbox.wakeStalled === true ? { wakeStalled: true } : {}),
+    ...(typeof inbox.wakeHold === "string"
+      ? { wakeHold: WAKE_HOLDS.has(inbox.wakeHold) ? inbox.wakeHold as WakeHold : "unknown" as const }
+      : {}),
     ...(attention.length > 0 ? { attention } : {}),
     ...(integration ? { integration } : {}),
     ...(integration && typeof inbox.integrationCommand === "string" ? { integrationCommand: displayText(inbox.integrationCommand, DISPLAY_LIMITS.prompt) } : {}),
@@ -2426,6 +2432,8 @@ function inboxFromDto(inbox: NonNullable<DesktopAgentDto["inbox"]>): AgentInbox 
 
 const ATTENTION_KINDS = new Set(["uncertain", "out_of_attempts", "held_long", "not_started"]);
 const INTEGRATION_NOTICES = new Set(["cli_too_old", "adapter_too_old", "not_armed", "refresh_failed", "refresh_failed_pi", "hooks_too_old"]);
+/** PRD #1666 part 3, round 5-wake: the holds this build names; any other reads as `unknown`. */
+const WAKE_HOLDS = new Set(["possible_draft", "awaiting_prompt", "paste_open"]);
 
 /** PRD #1666 §6.5: the listed items the crate sent, an unknown kind dropped. */
 function attentionFromDto(items: NonNullable<NonNullable<DesktopAgentDto["inbox"]>["attention"]>): InboxAttentionItem[] {

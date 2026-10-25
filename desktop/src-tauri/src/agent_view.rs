@@ -616,6 +616,7 @@ mod tests {
             reason: None,
             returned: false,
             wake_stalled: false,
+            wake_hold: None,
             wake_update: false,
             attention_update: true,
             requeued: false,
@@ -634,6 +635,7 @@ mod tests {
             wake: dot_agent_deck::inbox_hub::WakePath::Doorbell,
             component: None,
             wake_stalled: false,
+            wake_hold: None,
             notices,
         });
         view.install(listing(vec![record("7", "pane-7"), spawned]), now);

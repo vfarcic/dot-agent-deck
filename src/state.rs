@@ -6611,6 +6611,10 @@ struct PaneInbox {
     /// agent for its waiting messages. Set from the summary and from the deck's
     /// wake-stall notices alone (B-03, B-04), which report its end as well.
     stalled: bool,
+    /// PRD #1666 part 3, round 5-wake: why the deck holds the doorbell for
+    /// the waiting messages, from the summary and from every wake update,
+    /// which carries it whole.
+    hold: Option<crate::inbox_display::WakeHold>,
     /// PRD #1666 §6.5: the items waiting on the user and the card's notices,
     /// from the summary and from each attention notice, which carries them
     /// whole.
@@ -6660,6 +6664,7 @@ impl PaneInbox {
             seen: HashMap::new(),
             delivered: summary.last_acked_at.is_some(),
             stalled: summary.wake_stalled,
+            hold: summary.wake_hold,
             notices: summary.notices.clone(),
         }
     }
@@ -6716,8 +6721,10 @@ impl PaneInbox {
             self.notices = notice.notices.clone();
         } else if notice.wake_update {
             // PR #1735 fifth review (B-03): the agent's wake stall changed and
-            // the message it names did not, so nothing is counted.
+            // the message it names did not, so nothing is counted. Round
+            // 5-wake: it carries the hold too, as it stands.
             self.stalled = notice.wake_stalled;
+            self.hold = notice.wake_hold;
         } else {
             // PRD #1666 S11: an offered job that left this pane is settled here
             // without having been delivered; `state` is the job's, not the pane's.
@@ -6758,6 +6765,7 @@ impl PaneInbox {
             pending: self.baseline + new,
             delivered: self.delivered,
             stalled: self.stalled,
+            hold: self.hold,
             uncertain: count(AttentionKind::uncertain),
             out_of_attempts: count(|kind| kind == AttentionKind::OutOfAttempts),
             not_started: count(|kind| kind == AttentionKind::NotStarted),
@@ -20001,6 +20009,7 @@ mod tests {
             reason: None,
             returned: false,
             wake_stalled: false,
+            wake_hold: None,
             wake_update: false,
             attention_update: false,
             requeued: false,
@@ -20046,6 +20055,7 @@ mod tests {
                 wake: crate::inbox_hub::WakePath::Doorbell,
                 component: None,
                 wake_stalled: false,
+                wake_hold: None,
                 notices: Default::default(),
             },
         );
@@ -20094,6 +20104,7 @@ mod tests {
             wake: crate::inbox_hub::WakePath::Doorbell,
             component: None,
             wake_stalled: false,
+            wake_hold: None,
             notices: crate::inbox_hub::InboxCardNotices {
                 integration,
                 ..Default::default()
@@ -20209,6 +20220,7 @@ mod tests {
         };
         let carried = crate::inbox_hub::InboxSummary {
             wake_stalled: true,
+            wake_hold: None,
             notices: notices.clone(),
             ..held_summary(1, None)
         };
@@ -20222,6 +20234,7 @@ mod tests {
             crate::event::InboxNotice {
                 wake_update: true,
                 wake_stalled: true,
+                wake_hold: None,
                 ..inbox_notice("pane-q", "m-1", Queued)
             },
         ];
@@ -20543,6 +20556,7 @@ mod tests {
                 wake: crate::inbox_hub::WakePath::Native,
                 component: None,
                 wake_stalled: false,
+                wake_hold: None,
                 notices: Default::default(),
             },
         );
@@ -20622,6 +20636,7 @@ mod tests {
                 wake: crate::inbox_hub::WakePath::Doorbell,
                 component: None,
                 wake_stalled: true,
+                wake_hold: None,
                 notices: Default::default(),
             },
         );
@@ -20654,6 +20669,69 @@ mod tests {
             if let BroadcastMsg::Inbox(notice) = msg {
                 state.apply_inbox_notice(&notice);
             }
+        }
+    }
+
+    /// Scenario: Attach a TUI card to a real inbox whose agent has one waiting message, then have the deck say the wake stalled and the doorbell holds for a possible draft, change the reason, and stop holding. The card's line keeps the count and its notice row says why while the deck holds, and goes back to the stall's words when it stops. A summary from a newer deck naming a reason this build does not know reads as the stall's words, and one from an older deck with no reason at all reads as it always did.
+    #[spec("inbox/status/034")]
+    #[test]
+    fn status_034_a_card_follows_the_hold_and_reads_older_and_newer_decks() {
+        use crate::inbox::Recipient;
+        use crate::inbox_display::WakeHold;
+        let hub = crate::inbox_hub::InboxHub::new(
+            crate::inbox::DeckId::parse("k3xzq2ab").unwrap(),
+            crate::inbox::InboxLimits::default(),
+            crate::inbox_hub::DEFAULT_KEEPALIVE,
+        );
+        hub.post_direct(
+            Recipient::bound("pane-q", "agent-q"),
+            crate::inbox::Content::from_deck("seed", "task", "do it"),
+        )
+        .unwrap();
+        let (mut state, mut rx) = attached_card(&hub);
+        let card = |state: &AppState| state.sessions["gen-q"].card_inbox().unwrap();
+        hub.set_wake_stalled("pane-q", "agent-q", true);
+        hub.set_wake_hold("pane-q", "agent-q", Some(WakeHold::PossibleDraft));
+        follow_notices(&mut state, &mut rx);
+        assert_eq!(card(&state).full_text().as_deref(), Some("✉1"));
+        assert_eq!(
+            card(&state).notice_text().as_deref(),
+            Some("✉1 waiting: there may be an unsent draft in its input. Send or clear it.")
+        );
+        hub.set_wake_hold("pane-q", "agent-q", Some(WakeHold::AwaitingPrompt));
+        follow_notices(&mut state, &mut rx);
+        assert_eq!(
+            card(&state).notice_text().as_deref(),
+            Some("✉1 not yet taken: the agent may be waiting at a prompt. Check its pane.")
+        );
+        hub.set_wake_hold("pane-q", "agent-q", None);
+        follow_notices(&mut state, &mut rx);
+        assert_eq!(
+            card(&state).full_text().as_deref(),
+            Some("✉1 waiting to wake: send it a prompt")
+        );
+        assert_eq!(card(&state).notice_text(), None);
+
+        for (summary, why) in [
+            (
+                serde_json::json!({"queued": 1, "fetched": 0, "undeliverable": 0,
+                    "wake": "doorbell", "wake_hold": "dialog_during_ring"}),
+                "a reason a newer deck names",
+            ),
+            (
+                serde_json::json!({"queued": 1, "fetched": 0, "undeliverable": 0,
+                    "wake": "doorbell", "wake_stalled": true}),
+                "an older deck's stalled summary",
+            ),
+        ] {
+            let summary: crate::inbox_hub::InboxSummary = serde_json::from_value(summary).unwrap();
+            state.apply_inbox_summary("pane-q", "agent-q", &summary);
+            assert_eq!(
+                card(&state).full_text().as_deref(),
+                Some("✉1 waiting to wake: send it a prompt"),
+                "{why}"
+            );
+            assert_eq!(card(&state).notice_text(), None, "{why}");
         }
     }
 

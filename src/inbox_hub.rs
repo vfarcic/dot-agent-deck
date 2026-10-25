@@ -257,6 +257,13 @@ pub struct InboxSummary {
     /// daemon's answer, and while false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub wake_stalled: bool,
+    /// PRD #1666 part 3, round 5-wake (plan §5.2): why the deck holds the
+    /// doorbell for the waiting messages ([`InboxHub::set_wake_hold`]).
+    /// Absent from an older daemon's answer, and while there is none; a
+    /// reason this build does not know reads as
+    /// [`crate::inbox_display::WakeHold::Unknown`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_hold: Option<crate::inbox_display::WakeHold>,
     /// PRD #1666 §6.5: what the card lists and warns of beside its counts.
     /// Every field is additive and absent while empty.
     #[serde(flatten, default)]
@@ -513,6 +520,10 @@ struct HubState {
     /// their waiting messages, with the oldest of those messages
     /// ([`InboxHub::set_wake_stalled`]). Gone once that message is taken.
     wake_stalled: HashMap<AgentKey, String>,
+    /// PRD #1666 part 3, round 5-wake (plan §5): why the doorbell holds for
+    /// an agent generation's waiting messages, with the message the hold was
+    /// last told against ([`InboxHub::set_wake_hold`]).
+    wake_hold: HashMap<AgentKey, (crate::inbox_display::WakeHold, String)>,
     /// Whether a bound recipient's agent still holds its pane, asked under
     /// this lock right before a message for it goes in
     /// ([`InboxHub::set_live_agent_check`]); unset, every post is taken as
@@ -824,6 +835,7 @@ impl InboxHub {
                 owed_notices: Vec::new(),
                 owed_retry_at: None,
                 wake_stalled: HashMap::new(),
+                wake_hold: HashMap::new(),
                 live_agent: None,
                 offers: HashMap::new(),
                 pooled: Arc::new(Notify::new()),
@@ -1868,7 +1880,11 @@ impl InboxHub {
                 WakePath::Doorbell
             };
             let rings = st.rings.get(&key).copied().unwrap_or(0);
-            let body = compose_undelivered_notice(&id, &watch.role, held, wake, rings);
+            // PRD #1666 part 3, round 5-wake (plan §5.3): why the doorbell
+            // holds, as it stands when the notice is composed. The notice is
+            // composed once, so a later change is not sent.
+            let hold = st.wake_hold.get(&key).map(|(hold, _)| *hold);
+            let body = compose_undelivered_notice(&id, &watch.role, held, wake, rings, hold);
             let orchestrator = watch.orchestrator.clone();
             if let Some(watch) = st.delegates.get_mut(&id) {
                 watch.notified = true;
@@ -2049,8 +2065,10 @@ impl InboxHub {
         st.spills.release_tasks(pane_id, |_, agent| {
             agent.is_none_or(|agent| agent == agent_id)
         });
-        if let Some(id) = st.wake_stalled.remove(&key) {
-            broadcast_wake_stall(&st, pane_id, agent_id, &id, false);
+        let stall = st.wake_stalled.remove(&key);
+        let hold = st.wake_hold.remove(&key).map(|(_, id)| id);
+        if let Some(id) = stall.or(hold) {
+            broadcast_wake(&st, pane_id, agent_id, &id);
         }
         drain_events(&mut st);
         let mut ledgers = std::mem::take(&mut st.exited_ledgers);
@@ -2089,7 +2107,56 @@ impl InboxHub {
             }
         };
         info!(pane_id, agent_id, message_id = %id, stalled, "inbox: wake stalled");
-        broadcast_wake_stall(&st, pane_id, agent_id, &id, stalled);
+        broadcast_wake(&st, pane_id, agent_id, &id);
+    }
+
+    /// PRD #1666 part 3, round 5-wake (plan §5): the doorbell's account of
+    /// why it holds for `agent_id` in `pane_id`'s waiting messages (`hold`),
+    /// or that it says nothing now (`None`). Recorded against the oldest
+    /// message queued for it, shown in its summary, and broadcast in a wake
+    /// update that also carries the current wake stall, so both clients show
+    /// the reason. A hold with nothing queued is no hold. Cleared by the
+    /// doorbell or by the agent exiting.
+    pub fn set_wake_hold(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        hold: Option<crate::inbox_display::WakeHold>,
+    ) {
+        let mut st = self.lock();
+        let key = (pane_id.to_string(), agent_id.to_string());
+        let before = st.wake_hold.get(&key).map(|(hold, _)| *hold);
+        if before == hold {
+            return;
+        }
+        let oldest = queued_for(&st.inbox, pane_id, agent_id)
+            .next()
+            .map(|m| m.id.to_string());
+        let (id, now) = match (hold, oldest) {
+            (Some(hold), Some(oldest)) => {
+                st.wake_hold.insert(key, (hold, oldest.clone()));
+                (oldest, Some(hold))
+            }
+            _ => match st.wake_hold.remove(&key) {
+                Some((_, id)) => (id, None),
+                None => return,
+            },
+        };
+        info!(pane_id, agent_id, message_id = %id, ?before, ?now, "inbox: wake hold");
+        broadcast_wake(&st, pane_id, agent_id, &id);
+    }
+
+    /// Why the doorbell holds for `agent_id` in `pane_id`, as recorded
+    /// ([`Self::set_wake_hold`]).
+    pub fn wake_hold(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+    ) -> Option<crate::inbox_display::WakeHold> {
+        self.lock()
+            .wake_hold
+            .get(&(pane_id.to_string(), agent_id.to_string()))
+            .map(|(hold, _)| *hold)
     }
 
     /// Whether `agent_id` in `pane_id` is recorded as waiting to wake
@@ -2597,6 +2664,7 @@ fn summary_of(st: &HubState, pane_id: &str, agent_id: &str) -> InboxSummary {
         wake: WakePath::Doorbell,
         component: None,
         wake_stalled: st.wake_stalled.contains_key(&key),
+        wake_hold: st.wake_hold.get(&key).map(|(hold, _)| *hold),
         notices: engine::notices(st, &key, now),
     };
     let mut last_acked: Option<Instant> = None;
@@ -4665,13 +4733,7 @@ fn consume_events(st: &mut HubState, events: Vec<InboxEvent>, verdicts: &TaskVer
             let key = (recipient.pane_id.clone(), agent.clone());
             if st.wake_stalled.get(&key).map(String::as_str) == Some(event.message_id.as_str()) {
                 st.wake_stalled.remove(&key);
-                broadcast_wake_stall(
-                    st,
-                    &recipient.pane_id,
-                    agent,
-                    event.message_id.as_str(),
-                    false,
-                );
+                broadcast_wake(st, &recipient.pane_id, agent, event.message_id.as_str());
             }
         }
         settle_late_ack(st, &event);
@@ -4701,6 +4763,7 @@ fn consume_events(st: &mut HubState, events: Vec<InboxEvent>, verdicts: &TaskVer
                 reason: event.undeliverable_reason,
                 returned: true,
                 wake_stalled: false,
+                wake_hold: None,
                 wake_update: false,
                 attention_update: false,
                 requeued: false,
@@ -4730,6 +4793,7 @@ fn consume_events(st: &mut HubState, events: Vec<InboxEvent>, verdicts: &TaskVer
             reason: event.undeliverable_reason,
             returned: false,
             wake_stalled: false,
+            wake_hold: None,
             wake_update: false,
             attention_update: false,
             requeued: event.requeued,
@@ -4744,14 +4808,19 @@ fn consume_events(st: &mut HubState, events: Vec<InboxEvent>, verdicts: &TaskVer
     st.cancelled_handed.clear();
 }
 
-/// PR #1735 fifth review (B-03, B-04): tell attached clients that `agent_id`'s
-/// wake stall in `pane_id` is now `stalled`, in a notice that names `id`, the
-/// message it was recorded against, and changes nothing else
-/// ([`InboxNotice::wake_update`]).
-fn broadcast_wake_stall(st: &HubState, pane_id: &str, agent_id: &str, id: &str, stalled: bool) {
+/// PR #1735 fifth review (B-03, B-04): tell attached clients `agent_id`'s
+/// wake stall in `pane_id` and, since PRD #1666 part 3's round 5-wake, why the
+/// doorbell holds for it, both as they stand now, in a notice that names `id`,
+/// the message the change was recorded against, and changes nothing else
+/// ([`InboxNotice::wake_update`]). Carrying both in every such notice keeps a
+/// client that reads only the stall from clearing it on a hold's change.
+fn broadcast_wake(st: &HubState, pane_id: &str, agent_id: &str, id: &str) {
     let Some(tx) = st.broadcast.as_ref() else {
         return;
     };
+    let key = (pane_id.to_string(), agent_id.to_string());
+    let stalled = st.wake_stalled.contains_key(&key);
+    let hold = st.wake_hold.get(&key).map(|(hold, _)| *hold);
     let message = st.inbox.get(id, pane_id);
     let _ = tx.send(BroadcastMsg::Inbox(InboxNotice {
         pane_id: pane_id.to_string(),
@@ -4766,6 +4835,7 @@ fn broadcast_wake_stall(st: &HubState, pane_id: &str, agent_id: &str, id: &str, 
         reason: None,
         returned: false,
         wake_stalled: stalled,
+        wake_hold: hold,
         wake_update: true,
         attention_update: false,
         requeued: false,
@@ -5250,13 +5320,16 @@ fn settle_late_ack(st: &mut HubState, event: &InboxEvent) {
 }
 
 /// PRD #1666 S5: the notice an orchestrator gets when a task it delegated is
-/// still unacknowledged past [`ENV_UNDELIVERED_NOTICE_AFTER_MS`].
+/// still unacknowledged past [`ENV_UNDELIVERED_NOTICE_AFTER_MS`]. `hold` is
+/// why the doorbell holds for the worker when it is composed, if the deck
+/// says (PRD #1666 part 3, round 5-wake).
 pub fn compose_undelivered_notice(
     message_id: &str,
     role: &str,
     held: &str,
     wake: WakePath,
     rings: u32,
+    hold: Option<crate::inbox_display::WakeHold>,
 ) -> String {
     let path = match wake {
         WakePath::Native => "an inbox component is armed for the worker and hands messages over",
@@ -5267,12 +5340,16 @@ pub fn compose_undelivered_notice(
             "nothing is armed for the worker, so the deck rings the doorbell whenever it reports idle"
         }
     };
+    let holding = hold
+        .and_then(crate::inbox_display::WakeHold::notice_clause)
+        .map(|clause| format!(" The deck is holding the doorbell now: {clause}."))
+        .unwrap_or_default();
     format!(
         "Task {message_id} to the worker in role {} has not reached the worker: it is {held}. \
-         Wake path: {}, {path}; the doorbell has rung {rings} time(s) for it so far. The deck \
-         keeps the task and keeps trying. Check the worker's pane; `dot-agent-deck inbox list \
-         --all` shows where the task is. Decide whether to wait, re-delegate with --supersede, \
-         or notify the user.",
+         Wake path: {}, {path}; the doorbell has rung {rings} time(s) for it so far.{holding} \
+         The deck keeps the task and keeps trying. Check the worker's pane; `dot-agent-deck \
+         inbox list --all` shows where the task is. Decide whether to wait, re-delegate with \
+         --supersede, or notify the user.",
         crate::state::quote_untrusted_role(role),
         wake.label(),
     )
@@ -6740,6 +6817,151 @@ mod tests {
                     .count()
             })
             .unwrap_or(0)
+    }
+
+    /// Scenario: The doorbell says why it holds for an agent whose wake has already stalled, changes the reason, then the message the stall was told against is taken and the agent exits. Every wake update the deck broadcasts carries both the stall and the reason as they stand, so a released client that reads only the stall keeps it while the reason changes; the summary says the same; the stall ending keeps the reason; the exit clears both in one update; and a hold asked for with nothing queued records nothing.
+    #[spec("inbox/status/034")]
+    #[test]
+    fn status_034_every_wake_update_carries_the_stall_and_the_hold() {
+        use crate::inbox_display::WakeHold;
+        /// The notice as a released client decodes it: no `wake_hold`.
+        #[derive(serde::Deserialize)]
+        struct ReleasedNotice {
+            #[serde(default)]
+            wake_stalled: bool,
+            #[serde(default)]
+            wake_update: bool,
+        }
+        let hub = hub();
+        let (tx, mut rx) = broadcast::channel(16);
+        hub.set_broadcast(tx);
+        hub.set_wake_hold("p", "a", Some(WakeHold::PossibleDraft));
+        assert_eq!(hub.wake_hold("p", "a"), None, "nothing queued, no hold");
+        assert!(rx.try_recv().is_err(), "nothing to tell");
+        let oldest = hub
+            .post_direct(Recipient::bound("p", "a"), content("first"))
+            .unwrap();
+        hub.post_direct(Recipient::bound("p", "a"), content("second"))
+            .unwrap();
+        hub.set_wake_stalled("p", "a", true);
+        while rx.try_recv().is_ok() {}
+        let next = |rx: &mut broadcast::Receiver<BroadcastMsg>| match rx.try_recv() {
+            Ok(BroadcastMsg::Inbox(notice)) => notice,
+            other => panic!("a wake update is broadcast: {other:?}"),
+        };
+        for hold in [WakeHold::PossibleDraft, WakeHold::AwaitingPrompt] {
+            hub.set_wake_hold("p", "a", Some(hold));
+            let notice = next(&mut rx);
+            assert!(notice.wake_update && notice.wake_stalled, "{notice:?}");
+            assert_eq!(notice.wake_hold, Some(hold));
+            assert_eq!(notice.message_id, oldest.to_string());
+            let released: ReleasedNotice =
+                serde_json::from_value(serde_json::to_value(&notice).unwrap()).unwrap();
+            assert!(
+                released.wake_update && released.wake_stalled,
+                "a released client keeps the stall on a hold's update"
+            );
+            let summary = hub.summary("p", "a");
+            assert!(summary.wake_stalled);
+            assert_eq!(summary.wake_hold, Some(hold));
+        }
+        hub.set_wake_hold("p", "a", Some(WakeHold::AwaitingPrompt));
+        assert!(
+            rx.try_recv().is_err(),
+            "an unchanged hold is not told again"
+        );
+        let hook = hub.test_hook_fetch_named("p", "a", Some(oldest.as_str()), None);
+        hub.test_hook_close(hook);
+        let ended = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|msg| match msg {
+                BroadcastMsg::Inbox(notice) if notice.wake_update => Some(notice),
+                _ => None,
+            })
+            .last()
+            .expect("the stall's end is broadcast");
+        assert!(!ended.wake_stalled);
+        assert_eq!(
+            ended.wake_hold,
+            Some(WakeHold::AwaitingPrompt),
+            "the hold stays"
+        );
+        hub.agent_exited("p", "a");
+        let exited = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|msg| match msg {
+                BroadcastMsg::Inbox(notice) if notice.wake_update => Some(notice),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(exited.len(), 1, "{exited:?}");
+        assert!(!exited[0].wake_stalled && exited[0].wake_hold.is_none());
+        assert_eq!(hub.wake_hold("p", "a"), None);
+    }
+
+    /// Scenario: A delegated task is overdue while the doorbell holds for its worker because of a possible draft. The orchestrator's notice says so; the reason changing afterwards sends nothing more; a task overdue while nothing holds says nothing about a hold; a notice composed while the orchestrator's inbox is full keeps the reason it was composed with when it is posted later, though the reason changed meanwhile; and the orchestrator's own waiting notices, held themselves, never get a notice of their own.
+    #[spec("inbox/status/033")]
+    #[test]
+    fn status_033_the_overdue_notice_says_why_the_doorbell_holds() {
+        use crate::inbox_display::WakeHold;
+        const DRAFT: &str = "The deck is holding the doorbell now: the worker's pane may have an unsent draft in its input, which the user can send or clear.";
+        const PROMPT: &str = "The deck is holding the doorbell now: the worker may be waiting at a prompt in its pane.";
+        let told = |hub: &InboxHub| -> Vec<String> {
+            hub.list_with_bodies(Some("o"))
+                .into_iter()
+                .filter(|m| m.subject == UNDELIVERED_SUBJECT)
+                .filter_map(|m| m.text)
+                .collect()
+        };
+        let mut hub = hub();
+        hub.undelivered_after = Duration::ZERO;
+        let task = delegate(&hub, "TASK-HELD-BY-A-DRAFT");
+        hub.set_wake_hold("w", "wa", Some(WakeHold::PossibleDraft));
+        hub.tick();
+        let bodies = told(&hub);
+        assert_eq!(bodies.len(), 1, "{bodies:?}");
+        assert!(
+            bodies[0].contains(task.as_str()) && bodies[0].contains(DRAFT),
+            "{}",
+            bodies[0]
+        );
+        hub.set_wake_hold("w", "wa", Some(WakeHold::AwaitingPrompt));
+        hub.tick();
+        assert_eq!(told(&hub).len(), 1, "a changed reason sends nothing more");
+        // The orchestrator holds that notice, and its own doorbell holds too: a
+        // notice is never watched, so nothing is said of it.
+        hub.set_wake_hold("o", "oa", Some(WakeHold::PossibleDraft));
+        hub.tick();
+        assert_eq!(told(&hub).len(), 1, "no notice for a notice");
+
+        let mut hub = InboxHub::new(deck(), InboxLimits::default(), DEFAULT_KEEPALIVE);
+        hub.undelivered_after = Duration::ZERO;
+        delegate(&hub, "TASK-NOT-HELD");
+        hub.tick();
+        let bodies = told(&hub);
+        assert_eq!(bodies.len(), 1, "{bodies:?}");
+        assert!(!bodies[0].contains("holding the doorbell"), "{}", bodies[0]);
+
+        let limits = InboxLimits {
+            max_per_recipient: 1,
+            ..InboxLimits::default()
+        };
+        let mut hub = InboxHub::new(deck(), limits, DEFAULT_KEEPALIVE);
+        hub.undelivered_after = Duration::ZERO;
+        hub.post_direct(Recipient::bound("o", "oa"), content("filler"))
+            .unwrap();
+        delegate(&hub, "TASK-TOLD-LATE");
+        hub.set_wake_hold("w", "wa", Some(WakeHold::AwaitingPrompt));
+        hub.tick();
+        assert!(told(&hub).is_empty(), "the orchestrator's inbox is full");
+        hub.set_wake_hold("w", "wa", Some(WakeHold::PossibleDraft));
+        assert_eq!(hub.test_take_acked("o", "oa").len(), 1);
+        hub.post_owed_notices();
+        let bodies = told(&hub);
+        assert_eq!(bodies.len(), 1, "posted once there is room: {bodies:?}");
+        assert!(
+            bodies[0].contains(PROMPT) && !bodies[0].contains(DRAFT),
+            "the reason it was composed with: {}",
+            bodies[0]
+        );
     }
 
     /// PR #1735 fifth review (R5): a stalled wake is recorded against the

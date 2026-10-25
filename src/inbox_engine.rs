@@ -2049,6 +2049,7 @@ fn send_notices(st: &HubState, key: &AgentKey, notices: InboxCardNotices) {
         reason: None,
         returned: false,
         wake_stalled: false,
+        wake_hold: None,
         wake_update: false,
         attention_update: true,
         requeued: false,

@@ -427,6 +427,136 @@ impl StallClock {
     }
 }
 
+/// PRD #1666 part 3, round 5-wake (plan §5.1): what the doorbell's hold reason
+/// for one agent generation is decided from on a tick.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HoldFacts {
+    /// Messages are queued for the generation.
+    pub queued: bool,
+    /// A native component is armed or inside its arm grace, or an
+    /// integration notice owns the card ([`ring_still_admitted`] says no).
+    pub receiver: bool,
+    /// The agent reports a status other than Idle and waiting for input:
+    /// working, compacting, blocked, an error, or none yet.
+    pub working: bool,
+    /// The agent reports it waits for input (a dialog, a permission prompt).
+    pub waiting_for_input: bool,
+    /// A paste into the pane has not finished.
+    pub paste_open: bool,
+    /// The user may have an unsent draft in the pane.
+    pub draft: bool,
+    /// The doorbell's last try found no screen it could type into
+    /// ([`DoorbellWrite::NoComposer`]).
+    pub unrecognised: bool,
+    /// How many of the agent's turns have ended in the pane.
+    pub turns: u64,
+}
+
+/// What a hold does to its episode's clock ([`HoldEpisode`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldClock {
+    /// Nothing is queued: the episode ends.
+    Reset,
+    /// Something the user can already see explains the wait.
+    Paused,
+    Runs,
+}
+
+/// PRD #1666 part 3, round 5-wake (plan §5.1): the obstacle in front of the
+/// doorbell, as the reason a card would show and what it does to the
+/// episode's clock. The first row that holds wins: nothing queued; a native
+/// component armed or due, or an integration notice on the card; the agent
+/// working; the agent waiting for input (`awaiting_prompt`); an open paste
+/// (`paste_open`); an unsent draft (`possible_draft`); the last try finding
+/// no screen to type into (`awaiting_prompt`); otherwise no reason, the clock
+/// running.
+pub fn obstacle(facts: &HoldFacts) -> (Option<crate::inbox_display::WakeHold>, HoldClock) {
+    use crate::inbox_display::WakeHold;
+    if !facts.queued {
+        (None, HoldClock::Reset)
+    } else if facts.receiver || facts.working {
+        (None, HoldClock::Paused)
+    } else if facts.waiting_for_input {
+        (Some(WakeHold::AwaitingPrompt), HoldClock::Runs)
+    } else if facts.paste_open {
+        (Some(WakeHold::PasteOpen), HoldClock::Runs)
+    } else if facts.draft {
+        (Some(WakeHold::PossibleDraft), HoldClock::Runs)
+    } else if facts.unrecognised {
+        (Some(WakeHold::AwaitingPrompt), HoldClock::Runs)
+    } else {
+        (None, HoldClock::Runs)
+    }
+}
+
+/// PRD #1666 part 3, round 5-wake (plan §5.1): one hold episode of an agent
+/// generation, and the reason it last published. An episode ends when the
+/// queue empties or one of the agent's turns ends; a new generation has its
+/// own. Its clock counts only the time the obstacle lets it run, so busy time
+/// is excluded, and a reason is published once that passes the stall window;
+/// a reason that changes inside the episode replaces the published one
+/// without restarting the clock, and taking one of several queued messages
+/// leaves the episode running.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HoldEpisode {
+    turns: Option<u64>,
+    ran: Duration,
+    running_since: Option<Instant>,
+    published: Option<crate::inbox_display::WakeHold>,
+}
+
+impl HoldEpisode {
+    /// One tick. Returns the reason to publish when it differs from the one
+    /// published last (`Some(None)` clears it).
+    pub fn observe(
+        &mut self,
+        facts: &HoldFacts,
+        now: Instant,
+        after: Duration,
+    ) -> Option<Option<crate::inbox_display::WakeHold>> {
+        let (reason, clock) = obstacle(facts);
+        if clock == HoldClock::Reset || self.turns.is_some_and(|turns| turns != facts.turns) {
+            self.ran = Duration::ZERO;
+            self.running_since = None;
+        }
+        self.turns = Some(facts.turns);
+        if clock == HoldClock::Runs {
+            self.running_since.get_or_insert(now);
+        } else if let Some(since) = self.running_since.take() {
+            self.ran += now.saturating_duration_since(since);
+        }
+        let elapsed = self.ran
+            + self
+                .running_since
+                .map_or(Duration::ZERO, |since| now.saturating_duration_since(since));
+        let shown = if elapsed >= after { reason } else { None };
+        if shown == self.published {
+            return None;
+        }
+        self.published = shown;
+        Some(shown)
+    }
+}
+
+/// PRD #1666 part 3, round 5-wake: whether the doorbell's last try found no
+/// screen it could type into, after a write that ended in `outcome`: a try
+/// that found none holds as `awaiting_prompt` until a write goes in, and an
+/// outcome that wrote nothing for another reason leaves it as it was
+/// (`before`).
+fn unrecognised_after(outcome: DoorbellWrite, before: bool) -> bool {
+    match outcome {
+        DoorbellWrite::NoComposer => true,
+        DoorbellWrite::Written
+        | DoorbellWrite::Flushed
+        | DoorbellWrite::Failed
+        | DoorbellWrite::Cancelled { .. } => false,
+        DoorbellWrite::DraftPending
+        | DoorbellWrite::NotOwner
+        | DoorbellWrite::NotReading
+        | DoorbellWrite::NotAdmitted => before,
+    }
+}
+
 /// Whether an agent in `status` is doing something the user can already see,
 /// so its messages waiting is not a stalled wake: working, compacting,
 /// waiting on the user's answer, or blocked by a usage limit.
@@ -525,6 +655,11 @@ struct Slot {
     busy: bool,
     /// PR #1735 fifth review (R5).
     stall: StallClock,
+    /// PRD #1666 part 3, round 5-wake.
+    hold: HoldEpisode,
+    /// The last write found no screen it could type into
+    /// ([`DoorbellWrite::NoComposer`]), and none has gone in since.
+    unrecognised: bool,
 }
 
 // Test-only cancellation cleanup: a seam timeout/panic must not strand a
@@ -645,7 +780,12 @@ async fn run_tick(
     // apart from the Idle its card presents. One with none is rung only
     // through its agent's composer gate, and the writer checks what is left on
     // screen.
-    let admissions: Vec<(Option<crate::state::DoorbellAdmission>, DoorbellReady, bool)> = {
+    type Admission = (
+        Option<crate::state::DoorbellAdmission>,
+        DoorbellReady,
+        Option<crate::state::SessionStatus>,
+    );
+    let admissions: Vec<Admission> = {
         let state = state.read().await;
         keys.iter()
             .map(|(pane, agent)| {
@@ -657,20 +797,22 @@ async fn run_tick(
                 (
                     state.doorbell_admission(agent, pane),
                     ready,
-                    status_explains_waiting(state.agent_status(agent, pane).as_ref()),
+                    state.agent_status(agent, pane),
                 )
             })
             .collect()
     };
     #[cfg(not(feature = "e2e"))]
     let now = Instant::now();
-    for ((pane, agent), (admission, ready, explained)) in keys.into_iter().zip(admissions) {
+    for ((pane, agent), (admission, ready, status)) in keys.into_iter().zip(admissions) {
+        let explained = status_explains_waiting(status.as_ref());
+        let input = registry.pane_input_hold(&pane);
         let facts = Facts {
             inbox: hub.doorbell_facts(&pane, &agent),
             idle: admission.is_some()
                 && (!matches!(ready, DoorbellReady::Unproven)
                     || registry.has_doorbell_composer(&agent)),
-            draft: registry.draft_pending(&pane),
+            draft: input.paste_open || input.draft,
         };
         let (action, stranded) = {
             let mut slots = slots.lock().unwrap_or_else(|e| e.into_inner());
@@ -685,6 +827,26 @@ async fn run_tick(
                 StallChange::Raise => hub.set_wake_stalled(&pane, &agent, true),
                 StallChange::Clear => hub.set_wake_stalled(&pane, &agent, false),
                 StallChange::Nothing => {}
+            }
+            let hold = HoldFacts {
+                queued: !facts.inbox.queued.is_empty(),
+                receiver: !ring_still_admitted(&facts.inbox, config, now),
+                working: !matches!(
+                    status,
+                    Some(
+                        crate::state::SessionStatus::Idle
+                            | crate::state::SessionStatus::WaitingForInput
+                    )
+                ),
+                waiting_for_input: status == Some(crate::state::SessionStatus::WaitingForInput),
+                paste_open: input.paste_open,
+                draft: input.draft,
+                unrecognised: slot.unrecognised,
+                turns: input.turns,
+            };
+            if let Some(shown) = slot.hold.observe(&hold, now, config.wake_stall_after) {
+                info!(pane_id = %pane, agent_id = %agent, hold = ?shown, ?hold, "doorbell hold");
+                hub.set_wake_hold(&pane, &agent, shown);
             }
             if slot.busy {
                 continue;
@@ -778,6 +940,7 @@ async fn run_tick(
                 return;
             };
             slot.busy = false;
+            slot.unrecognised = unrecognised_after(outcome, slot.unrecognised);
             match (outcome, &action) {
                 // A ring that failed part-way may still sit in the box, so it
                 // is treated as rung: the next one flushes it first. A ring
@@ -945,6 +1108,191 @@ mod tests {
                 StallChange::Nothing,
                 "an agent at work is never shown as waiting to wake"
             );
+        }
+    }
+
+    fn held(queued: bool) -> HoldFacts {
+        HoldFacts {
+            queued,
+            ..HoldFacts::default()
+        }
+    }
+
+    /// Scenario: Walk one agent's hold episode through the doorbell's obstacle table with a 120 s window: a message waits while the agent reports it waits for input, before any ring was tried; the agent then works a while, its draft and an open paste come and go, a second message is taken, a turn ends and the queue empties. The reason appears only once the not-working time passes the window, the working time does not count, a changed reason replaces the shown one without starting the count again, an ended turn and an empty queue start it over, and an armed component or a working agent shows none.
+    #[spec("inbox/doorbell/041")]
+    #[test]
+    fn doorbell_041_a_hold_reason_shows_once_its_episode_passes_the_window() {
+        use crate::inbox_display::WakeHold;
+        let after = Duration::from_secs(120);
+        let t0 = Instant::now();
+        let at = |s| t0 + Duration::from_secs(s);
+        let mut episode = HoldEpisode::default();
+        let waiting = HoldFacts {
+            waiting_for_input: true,
+            ..held(true)
+        };
+        // First-ever WaitingForInput, before any ring was tried.
+        assert_eq!(episode.observe(&waiting, at(0), after), None);
+        assert_eq!(episode.observe(&waiting, at(119), after), None);
+        assert_eq!(
+            episode.observe(&waiting, at(120), after),
+            Some(Some(WakeHold::AwaitingPrompt))
+        );
+        assert_eq!(
+            episode.observe(&waiting, at(121), after),
+            None,
+            "shown once"
+        );
+        // Working hides it and stops the clock; idle again with a draft shows
+        // the draft at once, the episode's clock already past the window.
+        let working = HoldFacts {
+            working: true,
+            ..held(true)
+        };
+        assert_eq!(episode.observe(&working, at(130), after), Some(None));
+        assert_eq!(episode.observe(&working, at(900), after), None);
+        let draft = HoldFacts {
+            draft: true,
+            ..held(true)
+        };
+        assert_eq!(
+            episode.observe(&draft, at(901), after),
+            Some(Some(WakeHold::PossibleDraft))
+        );
+        // A paste open as well wins over the draft; closing it goes back.
+        let paste = HoldFacts {
+            paste_open: true,
+            ..draft
+        };
+        assert_eq!(
+            episode.observe(&paste, at(902), after),
+            Some(Some(WakeHold::PasteOpen))
+        );
+        assert_eq!(
+            episode.observe(&draft, at(903), after),
+            Some(Some(WakeHold::PossibleDraft)),
+            "a reason flapping inside the episode never restarts its clock"
+        );
+        // Taking one of two queued messages leaves the episode as it is:
+        // `queued` stays true, and nothing is said again.
+        assert_eq!(episode.observe(&draft, at(904), after), None);
+        // A component arming shows nothing.
+        let armed = HoldFacts {
+            receiver: true,
+            ..draft
+        };
+        assert_eq!(episode.observe(&armed, at(905), after), Some(None));
+        assert_eq!(
+            episode.observe(&draft, at(906), after),
+            Some(Some(WakeHold::PossibleDraft))
+        );
+        // An ended turn starts a new episode: nothing until the window passes
+        // again.
+        let next_turn = HoldFacts { turns: 1, ..draft };
+        assert_eq!(episode.observe(&next_turn, at(907), after), Some(None));
+        assert_eq!(episode.observe(&next_turn, at(1026), after), None);
+        assert_eq!(
+            episode.observe(&next_turn, at(1027), after),
+            Some(Some(WakeHold::PossibleDraft))
+        );
+        // The queue empties: the episode ends, and mail arriving later starts
+        // a new one from zero.
+        let empty = HoldFacts {
+            queued: false,
+            ..next_turn
+        };
+        assert_eq!(episode.observe(&empty, at(1028), after), Some(None));
+        assert_eq!(episode.observe(&next_turn, at(1029), after), None);
+        assert_eq!(episode.observe(&next_turn, at(1148), after), None);
+        assert_eq!(
+            episode.observe(&next_turn, at(1149), after),
+            Some(Some(WakeHold::PossibleDraft))
+        );
+    }
+
+    /// Scenario: Check the obstacle table row by row: each fact that holds a ring maps to its reason in priority order, an armed component and a working agent show none with the clock stopped, nothing queued ends the episode, and a pane with nothing in the way runs the clock with no reason. Then check that a try that found no screen to type into holds as awaiting a prompt until a write goes in, and that a try that wrote nothing for another reason leaves that as it was.
+    #[spec("inbox/doorbell/041")]
+    #[test]
+    fn doorbell_041_the_obstacle_table_takes_the_first_row_that_holds() {
+        use crate::inbox_display::WakeHold;
+        let all = HoldFacts {
+            queued: true,
+            receiver: true,
+            working: true,
+            waiting_for_input: true,
+            paste_open: true,
+            draft: true,
+            unrecognised: true,
+            turns: 0,
+        };
+        assert_eq!(
+            obstacle(&HoldFacts {
+                queued: false,
+                ..all
+            }),
+            (None, HoldClock::Reset)
+        );
+        assert_eq!(obstacle(&all), (None, HoldClock::Paused));
+        let all = HoldFacts {
+            receiver: false,
+            ..all
+        };
+        assert_eq!(obstacle(&all), (None, HoldClock::Paused));
+        let all = HoldFacts {
+            working: false,
+            ..all
+        };
+        assert_eq!(
+            obstacle(&all),
+            (Some(WakeHold::AwaitingPrompt), HoldClock::Runs)
+        );
+        let all = HoldFacts {
+            waiting_for_input: false,
+            ..all
+        };
+        assert_eq!(obstacle(&all), (Some(WakeHold::PasteOpen), HoldClock::Runs));
+        let all = HoldFacts {
+            paste_open: false,
+            ..all
+        };
+        assert_eq!(
+            obstacle(&all),
+            (Some(WakeHold::PossibleDraft), HoldClock::Runs)
+        );
+        let all = HoldFacts {
+            draft: false,
+            ..all
+        };
+        assert_eq!(
+            obstacle(&all),
+            (Some(WakeHold::AwaitingPrompt), HoldClock::Runs)
+        );
+        let all = HoldFacts {
+            unrecognised: false,
+            ..all
+        };
+        assert_eq!(obstacle(&all), (None, HoldClock::Runs));
+
+        assert!(unrecognised_after(DoorbellWrite::NoComposer, false));
+        for wrote in [
+            DoorbellWrite::Written,
+            DoorbellWrite::Flushed,
+            DoorbellWrite::Failed,
+            DoorbellWrite::Cancelled {
+                steps_written: 1,
+                line_typed: false,
+            },
+        ] {
+            assert!(!unrecognised_after(wrote, true), "{wrote:?}");
+        }
+        for nothing in [
+            DoorbellWrite::DraftPending,
+            DoorbellWrite::NotOwner,
+            DoorbellWrite::NotReading,
+            DoorbellWrite::NotAdmitted,
+        ] {
+            assert!(unrecognised_after(nothing, true), "{nothing:?}");
+            assert!(!unrecognised_after(nothing, false), "{nothing:?}");
         }
     }
 

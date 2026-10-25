@@ -834,6 +834,7 @@ mod tests {
             wake: WakePath::Doorbell,
             component: None,
             wake_stalled: false,
+            wake_hold: None,
             notices: InboxCardNotices {
                 integration,
                 ..Default::default()
@@ -849,6 +850,7 @@ mod tests {
             reason: None,
             returned: false,
             wake_stalled: false,
+            wake_hold: None,
             wake_update: false,
             attention_update: false,
             requeued: false,

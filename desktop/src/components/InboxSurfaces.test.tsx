@@ -68,6 +68,29 @@ describe("inbox cards and handoff rail (S13)", () => {
     );
   });
 
+  /// Scenario: inbox/status/030 — the daemon says why it holds the doorbell for an idle agent's waiting message whose wake also stalled: a possible draft, a possible prompt, an unfinished paste. The tile's notice row says why with the count, in the words the TUI uses, and its badge keeps the count without the stall's words.
+  it.each(["possible_draft", "awaiting_prompt", "paste_open"] as const)("shows why the doorbell holds (%s) on the agent card", (hold) => {
+    const dto = snapshot(1, 0, true);
+    Object.assign(dto.agents[0].inbox!, { wakeHold: hold });
+    render(card(mapDesktopSnapshot(dto).agents[0]));
+    const tile = screen.getByRole("article", { name: "Coder" });
+    expect(tile).toHaveTextContent(`${words.glyph}1 ${words.wakeHolds[hold]}`);
+    expect(tile).not.toHaveTextContent(words.wakeStalled);
+  });
+
+  /// Scenario: inbox/status/034 — a reason a newer daemon names that this build does not know shows the stall's words, as an older daemon's summary without the field does.
+  it.each<[Record<string, unknown>, string]>([
+    [{ wakeHold: "dialog_during_ring" }, "a reason this build does not know"],
+    [{ wakeStalled: true }, "a daemon older than the field"],
+  ])("shows the stall's words for %o (%s)", (extra, _why) => {
+    const dto = snapshot(1, 0, false);
+    Object.assign(dto.agents[0].inbox!, extra);
+    render(card(mapDesktopSnapshot(dto).agents[0]));
+    expect(screen.getByRole("article", { name: "Coder" })).toHaveTextContent(
+      `${words.glyph}1 ${words.wakeStalled}: ${words.wakeStalledHint}`,
+    );
+  });
+
   /// Scenario: Acknowledged messages leave no pending badge on the card.
   it("omits the pending envelope when queued and fetched are zero", () => {
     render(card(mapDesktopSnapshot(snapshot()).agents[0]));

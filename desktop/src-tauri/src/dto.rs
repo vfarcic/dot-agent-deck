@@ -828,6 +828,11 @@ pub struct DesktopInbox {
     /// messages, so the tile shows them as waiting to wake.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub wake_stalled: bool,
+    /// PRD #1666 part 3, round 5-wake: why the deck holds the doorbell for the
+    /// waiting messages (`possible_draft`, `awaiting_prompt`, `paste_open`),
+    /// the daemon's wire value; `unknown` for one this build does not know.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wake_hold: Option<String>,
     /// PRD #1666 §6.5: the deck messages waiting on the user's Retry or
     /// Cancel. Sender and subject are display copies.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -2292,6 +2297,11 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
             .unwrap_or_else(|| "none".to_string()),
         component: summary.component.as_deref().map(safe_display_text),
         wake_stalled: summary.wake_stalled,
+        wake_hold: summary.wake_hold.and_then(|hold| {
+            serde_json::to_value(hold)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+        }),
         attention: summary
             .notices
             .attention
@@ -4134,6 +4144,7 @@ mod tests {
             wake: dot_agent_deck::inbox_hub::WakePath::Doorbell,
             component: None,
             wake_stalled: false,
+            wake_hold: None,
             notices: Default::default(),
         });
         let value = serde_json::to_value(map_agent(record)).unwrap();
@@ -4148,6 +4159,38 @@ mod tests {
             value["inbox"].get("attention").is_none(),
             "absent while empty"
         );
+    }
+
+    /// Scenario: Map daemon records whose inbox summary says why the doorbell holds into the desktop DTO: each reason this build knows keeps its wire spelling for the tile, one a newer daemon names reads as `unknown`, and a summary with no reason sends none.
+    #[test]
+    fn agent_mapping_carries_why_the_doorbell_holds() {
+        for (wire, mapped) in [
+            ("possible_draft", "possible_draft"),
+            ("awaiting_prompt", "awaiting_prompt"),
+            ("paste_open", "paste_open"),
+            ("dialog_during_ring", "unknown"),
+        ] {
+            let mut record = fixture_record();
+            record.inbox = Some(
+                serde_json::from_value(serde_json::json!({
+                    "queued": 1, "fetched": 0, "undeliverable": 0, "wake": "doorbell",
+                    "wake_stalled": true, "wake_hold": wire
+                }))
+                .unwrap(),
+            );
+            let value = serde_json::to_value(map_agent(record)).unwrap();
+            assert_eq!(value["inbox"]["wakeHold"], mapped, "{wire}");
+            assert_eq!(value["inbox"]["wakeStalled"], true, "{wire}");
+        }
+        let mut record = fixture_record();
+        record.inbox = Some(
+            serde_json::from_value(serde_json::json!({
+                "queued": 1, "fetched": 0, "undeliverable": 0, "wake": "doorbell"
+            }))
+            .unwrap(),
+        );
+        let value = serde_json::to_value(map_agent(record)).unwrap();
+        assert!(value["inbox"].get("wakeHold").is_none(), "{value}");
     }
 
     /// Scenario: Map a daemon record whose inbox summary lists an uncertain delivery, an integration notice, failed receipts, paused hand-outs and a refused request of the agent's own into the desktop DTO; each survives, by its wire spelling, for the tile's notice row and its Retry and Cancel rows.

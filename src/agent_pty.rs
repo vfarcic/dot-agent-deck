@@ -3828,6 +3828,18 @@ where
 /// that prefix once and disambiguates on the fifth.
 const PASTE_MARKER_PREFIX: &[u8] = b"\x1b[20";
 
+/// PRD #1666 part 3, round 5-wake: what a pane's input shows the doorbell's
+/// hold reason ([`AgentPtyRegistry::pane_input_hold`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PaneInputHold {
+    /// A bracketed paste into the pane has started and not ended.
+    pub paste_open: bool,
+    /// The user has sent input since their last submit or clear.
+    pub draft: bool,
+    /// How many of the pane's agent's turns have ended on this stream.
+    pub turns: u64,
+}
+
 /// Issue #424 S1 (both reviewers): where one pane's user-input stream is, as far
 /// as telling a submission apart from a draft needs to know.
 ///
@@ -4157,6 +4169,18 @@ impl PaneInputState {
         self.input
             .get(pane_id_env)
             .is_some_and(|stream| stream.in_paste || stream.draft.pending())
+    }
+
+    /// PRD #1666 part 3, round 5-wake: what [`Self::draft_pending`] joins,
+    /// apart, with the pane's turn count.
+    fn input_hold(&self, pane_id_env: &str) -> PaneInputHold {
+        self.input
+            .get(pane_id_env)
+            .map_or_else(PaneInputHold::default, |stream| PaneInputHold {
+                paste_open: stream.in_paste,
+                draft: stream.draft.pending(),
+                turns: stream.turns,
+            })
     }
 
     /// PRD #1666: apply a turn edge the agent in `pane_id_env` reported. The
@@ -10377,6 +10401,13 @@ impl AgentPtyRegistry {
     /// [`crate::draft_deferral::DraftTracker`] for what sets and clears it.
     pub fn draft_pending(&self, pane_id_env: &str) -> bool {
         self.pane_input.lock().unwrap().draft_pending(pane_id_env)
+    }
+
+    /// PRD #1666 part 3, round 5-wake (plan §5.1): the pane's open paste and
+    /// unsent draft, told apart, and how many of its agent's turns have
+    /// ended, for the doorbell's hold reason and episode.
+    pub fn pane_input_hold(&self, pane_id_env: &str) -> PaneInputHold {
+        self.pane_input.lock().unwrap().input_hold(pane_id_env)
     }
 
     /// PRD #1666 part 3, round 5-wake (plan §2.1′): admit one human operation
@@ -24686,6 +24717,116 @@ mod spawn_tests {
             String::from_utf8_lossy(&log.lock().unwrap()),
             "",
             "no automatic byte may reach a pane showing a dialog"
+        );
+    }
+
+    /// Scenario: Run the real doorbell tick, with a 150 ms window, over a pane whose agent reports it waits for input while a message waits for it. The deck's inbox then says the doorbell holds because the agent may be waiting at a prompt, still so once a paste opens in the pane; once the agent is idle it says the paste is unfinished, once the paste closes it says there may be a draft, while the agent works it says nothing, and once the message is taken it says nothing either, the draft still there. The summary both clients read carries the same reason, and no doorbell byte reaches the pane.
+    #[spec("inbox/doorbell/041")]
+    #[tokio::test]
+    async fn doorbell_041_the_tick_tells_the_inbox_why_it_holds() {
+        use crate::inbox_display::WakeHold;
+        const PANE: &str = "round5wake-041-pane";
+        // A real pane, so the input it records is keyed by its pane id.
+        let (registry, agent, gate, log, _notices, _displaced) = gated_pane(PANE, true).await;
+        gate.release();
+        let state: crate::state::SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let event = |event_type| crate::event::AgentEvent {
+            session_id: "r5w-041-session".into(),
+            agent_type: crate::event::AgentType::ClaudeCode,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some(PANE.into()),
+            agent_id: Some(agent.clone()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            background: None,
+            background_revision: None,
+        };
+        for kind in [
+            crate::event::EventType::SessionStart,
+            crate::event::EventType::WaitingForInput,
+        ] {
+            state.write().await.apply_event(event(kind));
+        }
+        registry
+            .inbox()
+            .post_direct(
+                crate::inbox::Recipient::bound(PANE, &agent),
+                crate::inbox::Content::from_deck("seed", "task", "do it"),
+            )
+            .unwrap();
+        let config = crate::doorbell::DoorbellConfig {
+            tick: Duration::from_millis(20),
+            schedule: vec![Duration::from_secs(60)],
+            arm_grace: Duration::from_millis(1),
+            wake_stall_after: Duration::from_millis(150),
+        };
+        let bell = crate::doorbell::spawn(registry.clone(), state.clone(), config);
+        let held = |want: Option<WakeHold>| {
+            let registry = registry.clone();
+            let agent = agent.clone();
+            async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                while registry.inbox().wake_hold(PANE, &agent) != want {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "the inbox never said {want:?}; it says {:?}, the pane's input {:?}, its queue {:?}",
+                        registry.inbox().wake_hold(PANE, &agent),
+                        registry.pane_input_hold(PANE),
+                        registry.inbox().doorbell_facts(PANE, &agent),
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert_eq!(registry.inbox().summary(PANE, &agent).wake_hold, want);
+            }
+        };
+        held(Some(WakeHold::AwaitingPrompt)).await;
+
+        // The paste opens while the agent still waits for input, so no ring
+        // can go in before it once the agent is idle.
+        let writer = registry.agent_writer(&agent).unwrap();
+        writer
+            .lock()
+            .await
+            .write_user(b"\x1b[200~half a paste")
+            .await
+            .unwrap();
+        held(Some(WakeHold::AwaitingPrompt)).await;
+        state
+            .write()
+            .await
+            .apply_event(event(crate::event::EventType::Idle));
+        held(Some(WakeHold::PasteOpen)).await;
+        writer.lock().await.write_user(b"\x1b[201~").await.unwrap();
+        held(Some(WakeHold::PossibleDraft)).await;
+
+        state
+            .write()
+            .await
+            .apply_event(event(crate::event::EventType::Thinking));
+        held(None).await;
+        state
+            .write()
+            .await
+            .apply_event(event(crate::event::EventType::Idle));
+        held(Some(WakeHold::PossibleDraft)).await;
+
+        let hook = registry.inbox().test_hook_fetch(PANE, &agent, None);
+        assert_eq!(hook.deliveries.len(), 1);
+        held(None).await;
+        assert!(registry.draft_pending(PANE), "the draft is still there");
+        bell.abort();
+        assert_eq!(
+            String::from_utf8_lossy(&log.lock().unwrap()),
+            "\x1b[200~half a paste\x1b[201~",
+            "only the user's bytes reached the pane"
         );
     }
 

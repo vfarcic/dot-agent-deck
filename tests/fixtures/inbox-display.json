@@ -6,6 +6,11 @@
   "workDone": "work-done",
   "wakeStalled": "waiting to wake",
   "wakeStalledHint": "send it a prompt",
+  "wakeHolds": {
+    "possible_draft": "waiting: there may be an unsent draft in its input. Send or clear it.",
+    "awaiting_prompt": "not yet taken: the agent may be waiting at a prompt. Check its pane.",
+    "paste_open": "waiting: a paste into its input has not finished."
+  },
   "uncertain": "delivery uncertain",
   "uncertainMany": "deliveries uncertain",
   "uncertainReason": "a deck message may or may not have reached this agent. Retry sends it again marked as a possible repeat; Cancel stops delivering it.",

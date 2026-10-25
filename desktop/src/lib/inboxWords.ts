@@ -21,6 +21,15 @@ export const INBOX_WORDS = {
   wakeStalled: "waiting to wake",
   /** What the user can do about `wakeStalled`. */
   wakeStalledHint: "send it a prompt",
+  /**
+   * PRD #1666 part 3, round 5-wake: why the deck holds the doorbell, after the
+   * glyph and the pending count, by the daemon's wire value.
+   */
+  wakeHolds: {
+    possible_draft: "waiting: there may be an unsent draft in its input. Send or clear it.",
+    awaiting_prompt: "not yet taken: the agent may be waiting at a prompt. Check its pane.",
+    paste_open: "waiting: a paste into its input has not finished.",
+  },
   uncertain: "delivery uncertain",
   uncertainMany: "deliveries uncertain",
   uncertainReason: "a deck message may or may not have reached this agent. Retry sends it again marked as a possible repeat; Cancel stops delivering it.",
@@ -87,13 +96,38 @@ const notStartedCount = (inbox: AgentInbox) => countOf(inbox, ["not_started"]);
 const heldLongCount = (inbox: AgentInbox) => countOf(inbox, ["held_long"]);
 
 /**
+ * PRD #1666 part 3, round 5-wake: why the deck holds the doorbell, with the
+ * pending count, while messages wait (`✉2 waiting: there may be an unsent
+ * draft in its input. Send or clear it.`); nothing with none pending or for a
+ * hold this build does not know. The TUI's card prints the same row.
+ */
+function inboxHoldText(inbox: AgentInbox): string | undefined {
+  const pending = inbox.queued + inbox.fetched;
+  if (pending <= 0 || inbox.wakeHold === undefined || inbox.wakeHold === "unknown") return undefined;
+  return `${INBOX_WORDS.glyph}${pending} ${INBOX_WORDS.wakeHolds[inbox.wakeHold]}`;
+}
+
+/** Whether the notice row is the hold's, so the badge keeps only the count. */
+function holdInNotice(inbox: AgentInbox): boolean {
+  return inboxHoldText(inbox) !== undefined
+    && inbox.admissionRefused === undefined
+    && inbox.integration === undefined
+    && inbox.evidencePaused === undefined
+    && uncertainCount(inbox) === 0
+    && notStartedCount(inbox) === 0
+    && heldLongCount(inbox) === 0;
+}
+
+/**
  * The card's inbox line (PRD #1666 §2.8): `✉ delivery uncertain` while
  * deliveries are uncertain, then `✉ may not have reached the agent` (G3), then
- * `✉2 queued` while messages are queued
- * or taken but not acknowledged, `✉2 waiting to wake: send it a prompt` while
- * the deck reports nothing has woken the agent for them, `✉ delivered` once the
- * agent has acknowledged one and nothing is pending, and nothing for an inbox
- * that has held neither. The TUI's card prints the same line.
+ * `✉2` alone while the notice row says why the deck holds the doorbell
+ * (`inboxHoldText`), `✉2 waiting to wake: send it a prompt` while the deck
+ * reports nothing has woken the agent for them (and for a hold this build does
+ * not know), `✉2 queued` while messages are queued or taken but not
+ * acknowledged, `✉ delivered` once the agent has acknowledged one and nothing
+ * is pending, and nothing for an inbox that has held neither. The TUI's card
+ * prints the same line.
  */
 export function inboxBadge(inbox: AgentInbox | undefined): string | undefined {
   if (!inbox) return undefined;
@@ -104,7 +138,8 @@ export function inboxBadge(inbox: AgentInbox | undefined): string | undefined {
   if (notStarted === 1) return `${INBOX_WORDS.glyph} ${INBOX_WORDS.notStarted}`;
   if (notStarted > 1) return `${INBOX_WORDS.glyph} ${notStarted} ${INBOX_WORDS.notStarted}`;
   const pending = inbox.queued + inbox.fetched;
-  if (pending > 0 && inbox.wakeStalled) {
+  if (holdInNotice(inbox)) return `${INBOX_WORDS.glyph}${pending}`;
+  if (pending > 0 && (inbox.wakeStalled || inbox.wakeHold === "unknown")) {
     return `${INBOX_WORDS.glyph}${pending} ${INBOX_WORDS.wakeStalled}: ${INBOX_WORDS.wakeStalledHint}`;
   }
   if (pending > 0) return `${INBOX_WORDS.glyph}${pending} ${INBOX_WORDS.queued}`;
@@ -118,7 +153,8 @@ export function inboxBadge(inbox: AgentInbox | undefined): string | undefined {
  * nothing yet, paused hand-outs, what an uncertain delivery means (what running
  * out of attempts means, when every uncertain one has: its row offers no
  * Retry), what a message the agent may not have received means, held_long
- * attention, failed receipt storage. The TUI's card prints the same row.
+ * attention, why the deck holds the doorbell (part 3, round 5-wake), failed
+ * receipt storage. The TUI's card prints the same row.
  */
 export function inboxNotice(inbox: AgentInbox | undefined): string | undefined {
   if (!inbox) return undefined;
@@ -139,6 +175,8 @@ export function inboxNotice(inbox: AgentInbox | undefined): string | undefined {
   if (outOfAttemptsCount(inbox) > 0) return INBOX_WORDS.outOfAttempts;
   if (notStartedCount(inbox) > 0) return INBOX_WORDS.notStartedReason;
   if (heldLongCount(inbox) > 0) return INBOX_WORDS.heldLong;
+  const hold = inboxHoldText(inbox);
+  if (hold !== undefined) return hold;
   if (inbox.receiptsDegraded !== undefined) return `${INBOX_WORDS.receiptsDegraded} (${inbox.receiptsDegraded})`;
   return undefined;
 }

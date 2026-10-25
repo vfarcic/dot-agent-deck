@@ -9850,6 +9850,13 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** a live agent's screen (the captures are replayed), a release other than those captured, or how the doorbell uses these verdicts (inert until activation).
 - **Platform coverage:** mac+linux.
 
+##### inbox/doorbell/041 — The doorbell says why it holds an agent's waiting messages once the hold has lasted.
+- **Layer:** Fast (`src/doorbell.rs`, pure over the obstacle table and the hold episode; `src/agent_pty.rs`, `spawn_tests`, the real doorbell tick over a real `cat` pane, its writer and the real inbox).
+- **Agent:** none.
+- **Asserts:** the first obstacle that holds decides: nothing queued ends the episode; a native component armed or due, an integration notice on the card, or an agent working (any status but Idle and waiting for input) shows nothing and stops the episode's clock; the agent waiting for input is `awaiting_prompt`, an open paste `paste_open`, an unsent draft `possible_draft`, a last try that found no screen to type into `awaiting_prompt` until a write goes in (a try that wrote nothing for another reason leaves that as it was), otherwise no reason with the clock running. A reason shows only once the episode's running time passes the stall window, first-ever waiting for input included, before any ring; working time does not count; a reason changing inside the episode replaces the shown one without starting the count again; taking one of several queued messages leaves the episode running; an ended turn or an empty queue starts it over. Through the real tick the deck's inbox and the summary both clients read carry the same reason as the agent waits for input, gets an open paste, then a draft, works and stops working, and say nothing once the message is taken although the draft stays; only the user's bytes reach the pane.
+- **Does not assert:** the reasons of the typed doorbell itself (`cannot_type`, `not_taken`, `uncertain_input`, `dialog_during_ring`) or the settle window, which arrive with activation; the clients' words (`inbox/status/030`); the controller notice (`inbox/status/033`).
+- **Platform coverage:** mac+linux.
+
 ##### inbox/doorbell/044 — A layout edge makes the deck's view of a pane dirty until the agent redraws for the width in force.
 - **Layer:** Fast (`src/agent_pty.rs`, `spawn_tests`, the bus's own edge and push paths; `tests/doorbell_evidence_state.rs`, recorded Codex 0.164.0, Codex 0.160.0 and Claude Code 2.1.310 runs replayed read by read, a byte at a time and at pseudo-random cuts, and synthesized redraws through the evidence state).
 - **Agent:** none at test time; Claude Code- and Codex-shaped frames, and recorded Codex 0.164.0 (start-up and after a first prompt), Codex 0.160.0 and Claude Code 2.1.310 runs, each with ten resizes and ten one-column nudges.
@@ -10637,6 +10644,27 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Agent:** none.
 - **Asserts:** at 30×12, `i` opens Deck messages with the refusal's headline and, where the remedy does not fit, a closing `make the window taller to read the whole notice`; at 30×40 the whole notice shows and that line does not (PRD #1666 part 3, round 1); at smaller sizes down to 12×8, where the remedy does not fit, a shorter whole line (`make the window taller`, or `… taller`) still says so (round 2).
 - **Does not assert:** scrolling the notice, or the desktop tile, whose list scrolls.
+- **Platform coverage:** all.
+
+##### inbox/status/030 — A card says why the deck holds the doorbell for its waiting messages, in both clients' words.
+- **Layer:** L1 (`tests/render_dashboard.rs`), TestBackend card render from the daemon's record seam; desktop component (`desktop/src/components/InboxSurfaces.test.tsx`).
+- **Agent:** none.
+- **Asserts:** for an idle agent with one waiting message and a stalled wake, a summary naming `possible_draft`, `awaiting_prompt` or `paste_open` puts `✉1` and that reason's words (`waiting: there may be an unsent draft in its input. Send or clear it.`, `not yet taken: the agent may be waiting at a prompt. Check its pane.`, `waiting: a paste into its input has not finished.`) on the card's notice row, and the status line keeps the count without the stall's `waiting to wake`; the desktop tile shows the same from the same shared words (`tests/fixtures/inbox-display.json`). A reason this build does not know, and a summary from a daemon older than the field with its wake stalled, show `✉1 waiting to wake: send it a prompt`.
+- **Does not assert:** when the doorbell names a reason (`inbox/doorbell/041`), the reasons activation adds, or a narrow card's row budget.
+- **Platform coverage:** all.
+
+##### inbox/status/033 — The overdue notice tells the orchestrator why the doorbell holds, as it stood when the notice was composed.
+- **Layer:** Fast (`src/inbox_hub.rs`), the real inbox with a zero overdue window.
+- **Agent:** none.
+- **Asserts:** a delegated task overdue while the doorbell holds for its worker because of a possible draft gets one notice saying `The deck is holding the doorbell now:` and why; the reason changing afterwards sends nothing more; a task overdue while nothing holds says nothing of a hold; a notice composed while the orchestrator's inbox is full is posted once there is room with the reason it was composed with, although the reason changed meanwhile; the orchestrator's own waiting notices, its doorbell held too, never get a notice of their own.
+- **Does not assert:** how the orchestrator acts on it, or the route sentence's wording for generations activation refuses.
+- **Platform coverage:** all.
+
+##### inbox/status/034 — The hold reason crosses versions: older readers keep the stall, newer reasons read as unknown.
+- **Layer:** Fast (`src/inbox_hub.rs`, `src/state.rs`, `desktop/src-tauri/src/dto.rs`); desktop component (`desktop/src/components/InboxSurfaces.test.tsx`).
+- **Agent:** none.
+- **Asserts:** every wake update the inbox broadcasts carries the current stall and the current reason, so the notice decoded as a released client decodes it (no `wake_hold`) keeps `wake_stalled` true while the reason changes; an unchanged reason is not told again, a hold asked for with nothing queued records nothing, the stall ending keeps the reason, and the agent exiting clears both in one update. A TUI card attached to the real inbox follows the reason from those updates, keeping the count on its line and the reason on its notice row, and returns to the stall's words when the hold ends; a summary naming a reason this build does not know, and one from an older daemon with no reason, read as the stall's words in the TUI and the desktop tile. The desktop DTO carries each known reason by its wire spelling, an unknown one as `unknown`, and none when the summary has none.
+- **Does not assert:** a released binary run against this one (the cross-version job), or orchestrator attention, which arrives later.
 - **Platform coverage:** all.
 
 ##### inbox/claude/001 — Supported Claude installs one status handler and one day-long native waiter per managed event.
