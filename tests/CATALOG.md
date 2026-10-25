@@ -12777,6 +12777,30 @@ PRD #1666 part 3, round 5: where the deck keeps a worker's report, or a dispatch
 - **Does not assert:** a same-user process writing a file under a valid adopted name, which is charged from the next sweep (a stated limit).
 - **Platform coverage:** mac+linux.
 
+##### inbox/recovery/023 — A failed write leaves nothing behind that the store does not track, and never blocks a retry of the same report.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, injected owner-only and removal failures).
+- **Agent:** none.
+- **Asserts:** a write whose new file cannot be made owner-only fails with nothing left in the directory and every count back at zero, and a retry with the same id is saved; a failed write whose temporary file cannot be removed answers orphaned, the file charged its room as a stray with no file slot, refusing a reservation the charge does not leave room for, while the same id is saved again beside it; the next sweep removes the stray once removals work; a stray left when the run ends is removed by the next run's takeover, which retires the run and adopts only the saved reports.
+- **Why it exists:** PR #1898 review (Qodo): `create_new_owner_only` created the file and could then fail setting its mode, leaving an untracked file at the report's own name that blocked a retry.
+- **Does not assert:** a removal that keeps failing (retried each pass); Windows, whose owner-only step is a DACL.
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/024 — The sweep decides to remove a report under the store's lock, so an acknowledgement that renewed it first keeps it.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, an injected clock, a pause seam inside the sweep).
+- **Agent:** none.
+- **Asserts:** a report in recovery comes due and the sweep is held after nominating it from its snapshot; an acknowledgement renews it, the sweep removes nothing, and the report goes only a day later; a sweep held after it claimed a due report under the lock and before unlinking it shows the report as being removed, an acknowledgement then renews nothing, and the report and its charge are gone.
+- **Why it exists:** PR #1898 review (Greptile): the sweep unlinked on a deadline read from a snapshot taken before it released the lock, so a renewal in between could still lose the report.
+- **Does not assert:** an acknowledgement after the claim being honoured, which it is not: the claim is the decision.
+- **Platform coverage:** mac+linux.
+
+##### inbox/recovery/025 — A crash mid-write leaves no cut-off report for the next run to adopt.
+- **Layer:** fast unit (`src/retained_store_tests.rs`, in-crate; real files in a temporary state directory, a crash seam that stops a write without its cleanup).
+- **Agent:** none.
+- **Asserts:** a run saves one report, dies halfway through writing a second (half its bytes under a temporary name, nothing at its own name) and dies again just after linking a third to its own name; the next run adopts the first and third, each once and the third with its whole contents, adopts nothing of the second, leaves no temporary name and retires the dead run, its charge equal to the adopted files' sizes.
+- **Why it exists:** PR #1898 review (Qodo): a report was created under its final name and written afterwards, so a crash mid-write left a cut-off file that the next takeover adopted and offered for recovery.
+- **Does not assert:** a host crash, whose effect on unsynced data and links is the filesystem's.
+- **Platform coverage:** mac+linux.
+
 ## Desktop native driver scenarios
 
 These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[spec]` scanner, and run in CI's advisory `desktop-driver` job. `docs/develop/desktop-gui.md` ("The driver tier") describes the harness.

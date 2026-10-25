@@ -73,6 +73,20 @@ pub(crate) use unix::{DirStream, TrustedDir};
 #[cfg(windows)]
 pub(crate) use windows::{DirStream, TrustedDir};
 
+/// Set a file this module just created owner-only: the one call
+/// `create_new_owner_only` makes after the file exists, with a test seam that
+/// fails it.
+fn owner_only(file: &std::fs::File) -> io::Result<()> {
+    #[cfg(test)]
+    if test_seams::take_owner_only_failure() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "injected owner-only failure",
+        ));
+    }
+    crate::platform::fsperm::set_file_owner_only(file)
+}
+
 #[cfg(unix)]
 mod unix {
     use std::ffi::{CStr, CString, OsStr, OsString};
@@ -83,7 +97,7 @@ mod unix {
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::path::Path;
 
-    use super::{EntryInfo, EntryKind, plain};
+    use super::{EntryInfo, EntryKind, owner_only, plain};
     use super::{refused, valid_component};
 
     fn cstr(name: &OsStr) -> io::Result<CString> {
@@ -244,6 +258,8 @@ mod unix {
         }
 
         /// A new owner-only file, refused when the name exists or is a link.
+        /// When its mode cannot be set, the file it just created is removed
+        /// again, so a failure leaves nothing at the name.
         pub(crate) fn create_new_owner_only(&self, name: &str) -> io::Result<File> {
             plain(OsStr::new(name))?;
             let c = cstr(OsStr::new(name))?;
@@ -264,7 +280,11 @@ mod unix {
             })?;
             // SAFETY: just opened, owned by nobody else.
             let file = unsafe { File::from_raw_fd(fd) };
-            crate::platform::fsperm::set_file_owner_only(&file)?;
+            if let Err(error) = owner_only(&file) {
+                drop(file);
+                let _ = self.remove_file(name);
+                return Err(error);
+            }
             Ok(file)
         }
 
@@ -515,7 +535,7 @@ mod windows {
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
-    use super::{EntryInfo, EntryKind, plain};
+    use super::{EntryInfo, EntryKind, owner_only, plain};
     use super::{refused, valid_component};
 
     /// An open directory handle and the handles of every component above
@@ -692,7 +712,11 @@ mod windows {
             crate::platform::fsperm::set_create_mode_owner_only(&mut options);
             options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
             let file = self.guarded(|dir| options.open(dir.join(name)))?;
-            crate::platform::fsperm::set_file_owner_only(&file)?;
+            if let Err(error) = owner_only(&file) {
+                drop(file);
+                let _ = self.remove_file(name);
+                return Err(error);
+            }
             Ok(file)
         }
 
@@ -851,6 +875,17 @@ pub(crate) mod test_seams {
 
     std::thread_local! {
         static RENAME_INTO_FAILURE: Cell<Option<i32>> = const { Cell::new(None) };
+        static OWNER_ONLY_FAILURE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// The next `create_new_owner_only` on this thread creates its file and
+    /// then fails to set it owner-only.
+    pub(crate) fn fail_next_owner_only() {
+        OWNER_ONLY_FAILURE.with(|slot| slot.set(true));
+    }
+
+    pub(super) fn take_owner_only_failure() -> bool {
+        OWNER_ONLY_FAILURE.with(Cell::take)
     }
 
     /// The next `rename_into` on this thread fails with `errno`, moving

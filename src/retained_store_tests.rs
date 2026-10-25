@@ -1,4 +1,4 @@
-//! `inbox/recovery/001`–`/012` and `/014`–`/022`: the retained-report store
+//! `inbox/recovery/001`–`/012` and `/014`–`/025`: the retained-report store
 //! (PRD #1666 part 3, round 5, plan D2, D3, D14).
 #![cfg(unix)]
 
@@ -1165,14 +1165,12 @@ fn recovery_022_the_adopted_sum_follows_the_directory_conservatively() {
     a.recovered("recovered", start);
     a.flush_inventory().unwrap();
     put(&a, "unlisted", "u", start);
-    let room = a.reserve(10).unwrap();
+    // A saved file whose removal failed: an orphan under its own name.
+    put(&a, "orphan", "o", start);
     a.seams.fail_unlink.store(true, Ordering::SeqCst);
-    a.seams.fail_write.store(true, Ordering::SeqCst);
-    assert!(matches!(
-        a.write(room, "orphan", b"o", start),
-        Err(WriteFailure::IoOrphaned(_))
-    ));
+    a.discard("orphan");
     a.seams.fail_unlink.store(false, Ordering::SeqCst);
+    assert_eq!(a.own_state("orphan"), Some(OwnState::OrphanUnlink));
     // List the orphan, but not `unlisted`'s later state.
     let entries: Vec<InventoryEntry> = a
         .state
@@ -1240,4 +1238,203 @@ fn recovery_022_the_adopted_sum_follows_the_directory_conservatively() {
     ] {
         assert!(read_inventory(bad.as_bytes(), "r").is_err(), "{bad}");
     }
+}
+
+/// An attempt's temporary names in `dir`.
+fn temps_in(dir: &Path) -> Vec<String> {
+    names_in(dir)
+        .into_iter()
+        .filter(|name| is_temp_name(name))
+        .collect()
+}
+
+/// Scenario: A write whose new file cannot be made owner-only fails and leaves nothing behind, so a retry with the same report id is saved. A write that fails and whose temporary file cannot be removed reports an orphaned attempt: the temporary file stays charged its room without taking a file slot or blocking the same id, the next sweep removes it once removals work, and one left when the run ends is removed by the next run's takeover, which retires the run.
+#[spec("inbox/recovery/023")]
+#[test]
+fn recovery_023_a_failed_write_leaves_nothing_untracked() {
+    let root = crate::test_temp::tempdir().unwrap();
+    let start = t0();
+    let store = open(root.path(), StoreConfig::default(), start);
+
+    crate::platform::trusted_dir::test_seams::fail_next_owner_only();
+    let room = store.reserve(64).unwrap();
+    assert!(matches!(
+        store.write(room, "perm", b"body", start),
+        Err(WriteFailure::Io(_))
+    ));
+    assert_eq!(names_in(store.dir()), Vec::<String>::new());
+    assert_eq!(counts(&store), StoreCounts::default());
+    put(&store, "perm", "retried", start);
+    assert_eq!(names_in(store.dir()), vec!["r-perm.md"]);
+
+    let room = store.reserve(64).unwrap();
+    store.seams.fail_unlink.store(true, Ordering::SeqCst);
+    store.seams.fail_write.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        store.write(room, "stray", b"body", start),
+        Err(WriteFailure::IoOrphaned(_))
+    ));
+    store.seams.fail_unlink.store(false, Ordering::SeqCst);
+    let stray = temps_in(store.dir());
+    assert_eq!(stray.len(), 1, "{:?}", names_in(store.dir()));
+    assert!(stray[0].starts_with("w-stray."));
+    assert_eq!(store.own_state("stray"), None);
+    let held = counts(&store);
+    assert_eq!((held.stray_files, held.stray_bytes), (1, 64));
+    assert_eq!(held.own_files, 1, "a stray takes no file slot");
+    assert_eq!(held.reserved_bytes, 0);
+    let tight_root = crate::test_temp::tempdir().unwrap();
+    let tight = open(tight_root.path(), config(64, 100), start);
+    let room = tight.reserve(64).unwrap();
+    tight.seams.fail_unlink.store(true, Ordering::SeqCst);
+    tight.seams.fail_write.store(true, Ordering::SeqCst);
+    assert!(tight.write(room, "full", b"body", start).is_err());
+    tight.seams.fail_unlink.store(false, Ordering::SeqCst);
+    assert!(
+        matches!(tight.reserve(1), Err(StoreRefusal::Bytes { .. })),
+        "a stray's room stays charged"
+    );
+    drop(tight);
+    put(&store, "stray", "the same id again", start);
+    assert_eq!(store.own_state("stray"), Some(OwnState::Pinned));
+    let swept = store.sweep(start);
+    assert_eq!(swept.removed, 1);
+    assert_eq!(temps_in(store.dir()), Vec::<String>::new());
+    assert_eq!(
+        (counts(&store).stray_files, counts(&store).stray_bytes),
+        (0, 0)
+    );
+
+    // A stray the run ends with is the next run's to remove.
+    let room = store.reserve(64).unwrap();
+    store.seams.fail_unlink.store(true, Ordering::SeqCst);
+    store.seams.fail_write.store(true, Ordering::SeqCst);
+    assert!(store.write(room, "left", b"body", start).is_err());
+    store.seams.fail_unlink.store(false, Ordering::SeqCst);
+    store.flush_inventory().unwrap();
+    let run = store.run_id().to_string();
+    drop(store);
+    let next = open(root.path(), StoreConfig::default(), on(start, 1));
+    let mut adopted: Vec<String> = names_in(next.dir()).iter().map(|n| report_of(n)).collect();
+    adopted.sort();
+    assert_eq!(adopted, vec!["perm", "stray"]);
+    assert_eq!(temps_in(next.dir()), Vec::<String>::new());
+    assert!(
+        !files_root(root.path()).join(&run).exists(),
+        "the run is retired"
+    );
+    assert_eq!(counts(&next).adopted_bytes, size_sum(next.dir()));
+}
+
+/// Scenario: A report in recovery comes due and a sweep nominates it, then is held before it decides; an acknowledgement arrives and renews it, and the sweep keeps it, removing it only a day later. Another sweep is held after it claimed a due report and before removing it; an acknowledgement then renews nothing, and the report is removed.
+#[spec("inbox/recovery/024")]
+#[test]
+fn recovery_024_a_sweep_decides_under_the_lock() {
+    let root = crate::test_temp::tempdir().unwrap();
+    let start = t0();
+    let store = open(root.path(), StoreConfig::default(), start);
+    put(&store, "late", "renewed while the sweep looked", start);
+    store.recovered("late", start);
+    let due = on(start, 7);
+    let pause = store.seams.pause_at(seams::Pause::BeforeClaim);
+    let sweeper = {
+        let store = Arc::clone(&store);
+        std::thread::spawn(move || store.sweep(due))
+    };
+    pause.wait();
+    store.acknowledged("late", due);
+    pause.wait();
+    let report = sweeper.join().unwrap();
+    assert_eq!(report.removed, 0, "{report:?}");
+    assert_eq!(names_in(store.dir()), vec!["r-late.md"]);
+    assert!(matches!(
+        store.own_state("late"),
+        Some(OwnState::Acknowledged(_))
+    ));
+    assert_eq!(
+        store.sweep(due.plus(DAY - Duration::from_secs(1))).removed,
+        0
+    );
+    assert_eq!(store.sweep(due.plus(DAY)).removed, 1);
+    assert_eq!(names_in(store.dir()), Vec::<String>::new());
+
+    put(&store, "claimed", "removed once claimed", start);
+    store.acknowledged("claimed", start);
+    let due = on(start, 1);
+    let pause = store.seams.pause_at(seams::Pause::BeforeUnlink);
+    let sweeper = {
+        let store = Arc::clone(&store);
+        std::thread::spawn(move || store.sweep(due))
+    };
+    pause.wait();
+    assert_eq!(store.own_state("claimed"), Some(OwnState::OrphanUnlink));
+    store.acknowledged("claimed", due);
+    assert_eq!(store.own_state("claimed"), Some(OwnState::OrphanUnlink));
+    pause.wait();
+    assert_eq!(sweeper.join().unwrap().removed, 1);
+    assert_eq!(store.own_state("claimed"), None);
+    assert_eq!(names_in(store.dir()), Vec::<String>::new());
+    assert_eq!(counts(&store).own_bytes, 0);
+}
+
+/// Scenario: A run saves one report whole, then dies halfway through writing a second, and dies again just after linking a third to its name. The next run adopts the whole report and the linked one, each once and with its whole contents, adopts nothing of the cut-off write, removes both temporary files and retires the dead run.
+#[spec("inbox/recovery/025")]
+#[test]
+fn recovery_025_a_crash_mid_write_leaves_no_cut_off_report() {
+    let root = crate::test_temp::tempdir().unwrap();
+    let start = t0();
+    let a = open(root.path(), StoreConfig::default(), start);
+    put(&a, "whole", "saved before the crash", start);
+    a.flush_inventory().unwrap();
+    let contents = |id: &str| {
+        compose_file(
+            &envelope(id),
+            &crate::state::frame_untrusted_report_for_file("a report long enough to cut in half"),
+        )
+    };
+
+    let cut = contents("cut");
+    let room = a.reserve(cut.len() as u64).unwrap();
+    a.seams
+        .crash
+        .store(seams::Crash::MidWrite as u8, Ordering::SeqCst);
+    assert!(a.write(room, "cut", &cut, start).is_err());
+    let temps = temps_in(a.dir());
+    assert_eq!(temps.len(), 1);
+    assert_eq!(
+        std::fs::metadata(a.dir().join(&temps[0])).unwrap().len(),
+        (cut.len() / 2) as u64,
+        "the crash left a cut-off file"
+    );
+    assert!(!a.dir().join(own_name("cut")).exists());
+
+    let linked = contents("linked");
+    let room = a.reserve(linked.len() as u64).unwrap();
+    a.seams
+        .crash
+        .store(seams::Crash::AfterLink as u8, Ordering::SeqCst);
+    assert!(a.write(room, "linked", &linked, start).is_err());
+    assert_eq!(temps_in(a.dir()).len(), 2);
+    assert_eq!(
+        std::fs::read(a.dir().join(own_name("linked"))).unwrap(),
+        linked
+    );
+    let a_run = a.run_id().to_string();
+    drop(a);
+
+    let b = open(root.path(), StoreConfig::default(), on(start, 1));
+    let names = names_in(b.dir());
+    let mut reports: Vec<String> = names.iter().map(|n| report_of(n)).collect();
+    reports.sort();
+    assert_eq!(reports, vec!["linked", "whole"], "{names:?}");
+    let linked_name = names.iter().find(|n| report_of(n) == "linked").unwrap();
+    assert_eq!(std::fs::read(b.dir().join(linked_name)).unwrap(), linked);
+    assert_eq!(temps_in(b.dir()), Vec::<String>::new());
+    assert!(
+        every_file(root.path())
+            .iter()
+            .all(|(run, _)| run == b.run_id())
+    );
+    assert!(!runs_root(root.path()).join(lock_name(&a_run)).exists());
+    assert_eq!(counts(&b).adopted_bytes, size_sum(b.dir()));
 }
