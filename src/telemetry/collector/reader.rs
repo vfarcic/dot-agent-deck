@@ -97,9 +97,9 @@ fn denied(e: &io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::fs::MetadataExt;
-    use std::process::Command;
     use std::time::{Duration, Instant};
 
     use super::*;
@@ -126,11 +126,12 @@ mod tests {
     struct KillPidfd(OwnedFd);
 
     impl KillPidfd {
-        /// A pidfd for `pid`, taken before anything waits on it.
-        fn open(pid: u32) -> KillPidfd {
+        /// A pidfd for `pid`, which the caller knows names the process it
+        /// means: the guard kills whatever process the pidfd names.
+        fn open(pid: libc::pid_t) -> KillPidfd {
             // SAFETY: `pidfd_open` takes a pid and flags and returns a new
             // descriptor or -1.
-            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
             assert!(fd >= 0, "pidfd_open: {}", io::Error::last_os_error());
             // SAFETY: `fd` is a descriptor this test now owns.
             KillPidfd(unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) })
@@ -158,6 +159,17 @@ mod tests {
         }
     }
 
+    /// Whether this process holds `CAP_SYS_PTRACE` in its effective set
+    /// (bit 19 of `CapEff:` in its `status`).
+    fn has_cap_sys_ptrace() -> bool {
+        let status = fs::read_to_string("/proc/self/status").unwrap();
+        let eff = status
+            .lines()
+            .find_map(|line| line.strip_prefix("CapEff:"))
+            .unwrap();
+        u64::from_str_radix(eff.trim(), 16).unwrap() & (1 << 19) != 0
+    }
+
     fn own_uid() -> u32 {
         // SAFETY: `geteuid` has no preconditions and cannot fail.
         unsafe { libc::geteuid() }
@@ -171,13 +183,6 @@ mod tests {
     fn aggregator() -> Aggregator {
         let boot = parse_boot_time(&fs::read_to_string("/proc/stat").unwrap()).unwrap();
         Aggregator::new(clk_tck(), boot, 0)
-    }
-
-    /// Clock ticks since boot, rounded down, as `stat`'s `starttime` counts.
-    fn ticks_since_boot() -> u64 {
-        let uptime = fs::read_to_string("/proc/uptime").unwrap();
-        let seconds: f64 = uptime.split_whitespace().next().unwrap().parse().unwrap();
-        (seconds * clk_tck() as f64) as u64
     }
 
     /// Wait for `ready` to hold. The bound is generous: it only decides how
@@ -194,16 +199,10 @@ mod tests {
         ProcStat::parse(&fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
     }
 
-    /// Whether `pid`'s environment holds `needle`; `false` when it cannot be
-    /// read.
-    fn environ_holds(pid: u32, needle: &[u8]) -> bool {
-        fs::read(format!("/proc/{pid}/environ"))
-            .is_ok_and(|env| env.windows(needle.len()).any(|w| w == needle))
-    }
-
     /// U2/V5: a process of the collector's own user that made itself
-    /// non-dumpable has a root-owned `/proc/<pid>` and an environment only
-    /// root may read; it is still the collector's user's, and is read.
+    /// non-dumpable has a root-owned `/proc/<pid>` and an environment that
+    /// another process of its user may not read; it is still the
+    /// collector's user's, and is read.
     #[test]
     fn a_non_dumpable_process_of_the_own_user_is_read_as_that_user() {
         let mut fds = [0 as libc::c_int; 2];
@@ -248,8 +247,15 @@ mod tests {
         assert_eq!(read.len(), 1, "{read:?}");
         assert_eq!(read[0].pid, pid);
         assert_eq!(read[0].uid, own);
-        if own == 0 {
-            // Root may read any environment, a non-dumpable one included.
+        // Another process of its user without `CAP_SYS_PTRACE` is refused
+        // its environment (as uid 1000 on the dev box and in RWX). Whether
+        // root, or a holder of that capability, is refused varies (root
+        // without it read the environment in RWX, and a security module
+        // can refuse one with it), so there the expected result is what
+        // reading it directly gives.
+        let readable =
+            (own == 0 || has_cap_sys_ptrace()) && fs::read(format!("/proc/{pid}/environ")).is_ok();
+        if readable {
             assert!(matches!(read[0].environ, Environ::Read(_)), "{read:?}");
         } else {
             assert_eq!(read[0].environ, Environ::Unreadable);
@@ -268,46 +274,93 @@ mod tests {
     #[test]
     fn a_cleared_reparented_process_is_counted_unattributed() {
         let marker = format!("deck.run.id=reader-test-{}", std::process::id());
-        let launched = ticks_since_boot();
-        let out = Command::new("/bin/sh")
-            .arg("-c")
-            .arg("(env -i /bin/sh -c 'while :; do :; done' </dev/null >/dev/null 2>&1 & echo $!)")
-            .env("OTEL_RESOURCE_ATTRIBUTES", &marker)
-            .output()
-            .unwrap();
-        let pid: u32 = String::from_utf8(out.stdout)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        let burner = KillPidfd::open(pid);
-        // The pidfd is the burner's, not a later process's on the same pid:
-        // the process read here started after the launch, and was still the
-        // pidfd's after the read.
-        let started = stat_of(pid).map(|s| s.starttime);
-        assert!(burner.signal(0), "the burner exited");
-        assert!(
-            started.is_some_and(|t| t + 1 >= launched),
-            "{started:?} vs {launched}"
+        // The burner starts as a shell holding the run's label and execs,
+        // through `env -i`, a shell with an empty environment. Everything
+        // the forked children use is allocated before the fork.
+        let sh = CString::new("/bin/sh").unwrap();
+        let script = CString::new("exec env -i /bin/sh -c 'while :; do :; done'").unwrap();
+        let argv = [
+            c"sh".as_ptr(),
+            c"-c".as_ptr(),
+            script.as_ptr(),
+            std::ptr::null(),
+        ];
+        let label = CString::new(format!("OTEL_RESOURCE_ATTRIBUTES={marker}")).unwrap();
+        let mut path = b"PATH=".to_vec();
+        path.extend_from_slice(
+            std::env::var_os("PATH")
+                .unwrap_or_else(|| "/usr/bin:/bin".into())
+                .as_encoded_bytes(),
         );
-        // Ready once its parent is not a process of the run (both shells
-        // have exited and it was reparented), it is the final shell with the
-        // cleared environment (not the `env` it ran through), and it has
-        // used a tick of CPU.
+        let path = CString::new(path).unwrap();
+        let envp = [label.as_ptr(), path.as_ptr(), std::ptr::null()];
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `fds` has room for the two descriptors.
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        // SAFETY: each descriptor is open and owned only here.
+        let (told, tell) = unsafe { (OwnedFd::from_raw_fd(fds[0]), fds[1]) };
+        // The launcher forks the burner, tells its pid, and waits to be
+        // killed without ever reaping it, so until the launcher exits that
+        // pid names the burner and no other process.
+        // SAFETY: the forked children make syscalls only and never return
+        // into Rust; the parent kills and reaps the launcher.
+        let launcher = unsafe { libc::fork() };
+        assert!(launcher >= 0, "fork failed");
+        if launcher == 0 {
+            // SAFETY: the forked child, calling async-signal-safe syscalls.
+            unsafe {
+                // An ignored SIGCHLD would reap the burner when it exits.
+                libc::signal(libc::SIGCHLD, libc::SIG_DFL);
+                let burner = libc::fork();
+                if burner == 0 {
+                    libc::execve(sh.as_ptr(), argv.as_ptr(), envp.as_ptr());
+                    libc::_exit(127);
+                }
+                libc::write(tell, (&burner as *const libc::pid_t).cast(), 4);
+                loop {
+                    libc::pause();
+                }
+            }
+        }
+        let launcher = KillChild(launcher);
+        // SAFETY: the parent's copy of the write end, closed once.
+        unsafe { libc::close(tell) };
+        let mut pid: libc::pid_t = 0;
+        // SAFETY: `pid` has room for four bytes and `told` is open.
+        let n = unsafe { libc::read(told.as_raw_fd(), (&mut pid as *mut libc::pid_t).cast(), 4) };
+        assert!(n == 4 && pid > 0, "the launcher did not start the burner");
+        // The launcher is still running (it exits only once killed), so the
+        // burner, its unreaped child, still holds `pid`: the pidfd is the
+        // burner's.
+        let burner = KillPidfd::open(pid);
+        // SAFETY: a non-blocking wait on a child that has not been reaped.
+        let waited = unsafe { libc::waitpid(launcher.0, std::ptr::null_mut(), libc::WNOHANG) };
+        if waited != 0 {
+            // Then neither the pidfd nor the launcher's pid is known to name
+            // the process meant, so neither guard may kill.
+            std::mem::forget(burner);
+            std::mem::forget(launcher);
+            panic!("the launcher exited before the pidfd was taken ({waited})");
+        }
+        // The burner leaves the tree: its parent exits and is reaped.
+        let launcher_pid = launcher.0 as u32;
+        drop(launcher);
+        let pid = pid as u32;
+        // Ready once it is the final shell with the cleared environment
+        // (not the shell or `env` it ran through), and it has used a tick
+        // of CPU.
         let shell = fs::canonicalize("/bin/sh").unwrap();
         let marker = marker.as_bytes();
-        wait_for("the burner to be reparented, cleared and running", || {
-            let Some(stat) = stat_of(pid) else {
-                return false;
-            };
-            stat.total_ticks() > 0
-                && !environ_holds(stat.ppid, marker)
+        wait_for("the burner to be cleared and running", || {
+            stat_of(pid).is_some_and(|stat| stat.total_ticks() > 0)
                 && fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|exe| exe == shell)
                 && fs::read(format!("/proc/{pid}/environ"))
                     .is_ok_and(|env| !env.windows(marker.len()).any(|w| w == marker))
         });
         assert!(burner.signal(0), "the burner exited");
-        assert_ne!(stat_of(pid).unwrap().ppid, std::process::id());
+        let ppid = stat_of(pid).unwrap().ppid;
+        assert_ne!(ppid, launcher_pid);
+        assert_ne!(ppid, std::process::id());
 
         let mut aggregator = aggregator();
         let users = Users {

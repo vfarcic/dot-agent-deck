@@ -525,53 +525,8 @@ mod linux {
                 let asked = match result {
                     Ok(response) if response.status().is_success() => {
                         let within = attempts.remaining(Instant::now()).unwrap_or_default();
-                        // An answer that does not arrive whole in time may
-                        // have rejected points nobody will know about, so it
-                        // is a failure: `--once` fails and the ended runs'
-                        // reports stay held. It is not retried, since the
-                        // backend may have kept the request.
-                        let body = match read_body(response, MAX_RESPONSE_BODY, within).await {
-                            Body::Read(body) => body,
-                            Body::TimedOut => {
-                                break (
-                                    Delivery::Failed,
-                                    " failed: the backend's answer did not arrive in time"
-                                        .to_string(),
-                                );
-                            }
-                            Body::Failed => {
-                                break (
-                                    Delivery::Failed,
-                                    " failed: the backend's answer could not be read".to_string(),
-                                );
-                            }
-                        };
-                        let partial = if self.json {
-                            decode_metrics_partial_success_json(&body)
-                        } else {
-                            decode_partial_success_protobuf(&body)
-                        };
-                        // The backend's own message is never logged: it can
-                        // echo the configured headers' values.
-                        match partial {
-                            Some(p) if p.rejected > 0 => {
-                                break (
-                                    Delivery::PartiallyRejected,
-                                    format!(
-                                        ": the backend rejected {} of the request's {} data points",
-                                        p.rejected,
-                                        request.data_points()
-                                    ),
-                                );
-                            }
-                            Some(p) if !p.error_message.is_empty() => {
-                                break (
-                                    Delivery::Delivered,
-                                    ": the backend accepted the request with a warning".to_string(),
-                                );
-                            }
-                            _ => return (Delivery::Delivered, None),
-                        }
+                        let body = read_body(response, MAX_RESPONSE_BODY, within).await;
+                        return answered(body, self.json, request.data_points());
                     }
                     Ok(response) if is_retryable_status(response.status().as_u16()) => {
                         failure = format!("HTTP {}", response.status().as_u16());
@@ -599,6 +554,50 @@ mod linux {
                 tokio::time::sleep(wait).await;
             };
             (delivery, Some(report))
+        }
+    }
+
+    /// How a send fared from its 2xx answer's `body`, and, unless it was
+    /// plainly delivered, what to log. `json`: the protocol the answer is
+    /// in; `data_points`: how many the request carried.
+    fn answered(body: Body, json: bool, data_points: usize) -> (Delivery, Option<String>) {
+        // An answer that does not arrive whole in time, or is too large to
+        // read whole, may have rejected points nobody will know about, so it
+        // is a failure: `--once` fails and the ended runs' reports stay
+        // held. It is not retried, since the backend may have kept the
+        // request.
+        let failed = |why: &str| {
+            (
+                Delivery::Failed,
+                Some(format!(" failed: the backend's answer {why}")),
+            )
+        };
+        let body = match body {
+            Body::Read(body) => body,
+            Body::TimedOut => return failed("did not arrive in time"),
+            Body::Failed => return failed("could not be read"),
+            Body::TooLarge => return failed("was too large to read"),
+        };
+        let partial = if json {
+            decode_metrics_partial_success_json(&body)
+        } else {
+            decode_partial_success_protobuf(&body)
+        };
+        // The backend's own message is never logged: it can echo the
+        // configured headers' values.
+        match partial {
+            Some(p) if p.rejected > 0 => (
+                Delivery::PartiallyRejected,
+                Some(format!(
+                    ": the backend rejected {} of the request's {data_points} data points",
+                    p.rejected
+                )),
+            ),
+            Some(p) if !p.error_message.is_empty() => (
+                Delivery::Delivered,
+                Some(": the backend accepted the request with a warning".to_string()),
+            ),
+            _ => (Delivery::Delivered, None),
         }
     }
 
@@ -652,31 +651,62 @@ mod linux {
     /// How reading a 2xx answer's body ended.
     #[derive(Debug, PartialEq, Eq)]
     enum Body {
-        /// The body, or its first `max` bytes: an empty one is a body too.
+        /// The whole body, its end seen: an empty one is a body too.
         Read(Vec<u8>),
+        /// More than the bytes the collector keeps arrived.
+        TooLarge,
+        /// The body's end did not arrive in time.
         TimedOut,
         /// The connection failed while the body was read.
         Failed,
     }
 
-    /// At most `max` bytes of `response`'s body, read within `within`.
-    /// Unlike the deck exporter's `bounded_body`, a body that fails or does
-    /// not arrive in time is reported as such, not read as an empty one.
-    async fn read_body(mut response: reqwest::Response, max: usize, within: Duration) -> Body {
+    /// What one read of a body yields.
+    #[derive(Debug)]
+    enum Chunk {
+        Data(Vec<u8>),
+        End,
+        TimedOut,
+        Failed,
+    }
+
+    /// A body's chunks, in the order they arrive: a response's, or a
+    /// test's script.
+    trait Chunks {
+        fn next_chunk(&mut self) -> impl Future<Output = Chunk> + Send;
+    }
+
+    impl Chunks for reqwest::Response {
+        async fn next_chunk(&mut self) -> Chunk {
+            match self.chunk().await {
+                Ok(Some(chunk)) => Chunk::Data(chunk.to_vec()),
+                Ok(None) => Chunk::End,
+                Err(e) if e.is_timeout() => Chunk::TimedOut,
+                Err(_) => Chunk::Failed,
+            }
+        }
+    }
+
+    /// The whole body `chunks` yields, read within `within`, when it is at
+    /// most `max` bytes. A body is whole once its end is seen, so one that
+    /// fills `max` exactly is read on until its end arrives, and fails when
+    /// that end stalls or breaks; one that goes past `max`, inside a chunk
+    /// or with a later one, is `TooLarge`, and no more than `max` bytes of
+    /// it are kept. Unlike the deck exporter's `bounded_body`, a body that
+    /// fails or does not arrive in time is reported as such, not read as an
+    /// empty one.
+    async fn read_body(mut chunks: impl Chunks, max: usize, within: Duration) -> Body {
         let read = async move {
             let mut body = Vec::new();
-            while body.len() < max {
-                match response.chunk().await {
-                    Ok(Some(chunk)) => {
-                        let room = max - body.len();
-                        body.extend_from_slice(&chunk[..chunk.len().min(room)]);
-                    }
-                    Ok(None) => break,
-                    Err(e) if e.is_timeout() => return Body::TimedOut,
-                    Err(_) => return Body::Failed,
+            loop {
+                match chunks.next_chunk().await {
+                    Chunk::Data(chunk) if chunk.len() > max - body.len() => return Body::TooLarge,
+                    Chunk::Data(chunk) => body.extend_from_slice(&chunk),
+                    Chunk::End => return Body::Read(body),
+                    Chunk::TimedOut => return Body::TimedOut,
+                    Chunk::Failed => return Body::Failed,
                 }
             }
-            Body::Read(body)
         };
         tokio::time::timeout(within, read)
             .await
@@ -763,16 +793,148 @@ mod linux {
             );
         }
 
+        /// A body that yields these chunks, in order, and then nothing
+        /// more: a body whose end never arrives.
+        struct Script(std::collections::VecDeque<Chunk>);
+
+        impl Chunks for Script {
+            async fn next_chunk(&mut self) -> Chunk {
+                match self.0.pop_front() {
+                    Some(chunk) => chunk,
+                    None => std::future::pending().await,
+                }
+            }
+        }
+
+        /// Far longer than any body below takes to read: a read that ends
+        /// within it ended on its chunks, not on the time.
+        const GENEROUS: Duration = Duration::from_secs(30);
+        /// For a body whose end never arrives: nothing has to happen within
+        /// it, so it can be short.
+        const STALL: Duration = Duration::from_millis(20);
+        const CAP: usize = 8;
+
+        async fn read(chunks: impl IntoIterator<Item = Chunk>, within: Duration) -> Body {
+            read_body(Script(chunks.into_iter().collect()), CAP, within).await
+        }
+
+        fn data(bytes: &[u8]) -> Chunk {
+            Chunk::Data(bytes.to_vec())
+        }
+
+        /// V1/W1: a body is read whole once its end arrives, an empty one
+        /// and one that fills the cap exactly included.
+        #[tokio::test]
+        async fn a_body_is_read_whole_once_its_end_arrives() {
+            let whole = read([data(b"abc"), data(b""), data(b"de"), Chunk::End], GENEROUS);
+            assert_eq!(whole.await, Body::Read(b"abcde".to_vec()));
+            assert_eq!(read([Chunk::End], GENEROUS).await, Body::Read(vec![]));
+            let full = read([data(b"abcd"), data(b"efgh"), Chunk::End], GENEROUS);
+            assert_eq!(full.await, Body::Read(b"abcdefgh".to_vec()));
+        }
+
+        /// W1: a body that fills the cap and then stalls or breaks before
+        /// its end is not read whole, and neither is one that stops short of
+        /// the cap.
+        #[tokio::test]
+        async fn a_body_that_stalls_or_breaks_at_the_cap_is_not_read() {
+            assert_eq!(read([data(b"abcdefgh")], STALL).await, Body::TimedOut);
+            let broken = read([data(b"abcdefgh"), Chunk::Failed], GENEROUS);
+            assert_eq!(broken.await, Body::Failed);
+            let timed_out = read([data(b"abcdefgh"), Chunk::TimedOut], GENEROUS);
+            assert_eq!(timed_out.await, Body::TimedOut);
+            assert_eq!(read([data(b"abc")], STALL).await, Body::TimedOut);
+            assert_eq!(
+                read([data(b"abc"), Chunk::Failed], GENEROUS).await,
+                Body::Failed
+            );
+        }
+
+        /// W1: a body that goes past the cap is too large, whether it does
+        /// so inside one chunk or with a chunk after the cap is full, and
+        /// whatever follows.
+        #[tokio::test]
+        async fn a_body_past_the_cap_is_too_large() {
+            assert_eq!(read([data(b"abcdefghi")], GENEROUS).await, Body::TooLarge);
+            let across = read([data(b"abcdefg"), data(b"hi"), Chunk::End], GENEROUS);
+            assert_eq!(across.await, Body::TooLarge);
+            let after = read([data(b"abcdefgh"), data(b"i")], GENEROUS);
+            assert_eq!(after.await, Body::TooLarge);
+        }
+
+        const REJECTION: &str = "{\"partialSuccess\":{\"rejectedDataPoints\":\"1\"}}";
+
+        /// V1/W1: how each way a 2xx answer's body ends decides the send.
+        #[test]
+        fn a_send_fares_as_its_answer_reads() {
+            let failed = |why: &str| {
+                (
+                    Delivery::Failed,
+                    Some(format!(" failed: the backend's answer {why}")),
+                )
+            };
+            assert_eq!(
+                answered(Body::Read(vec![]), true, 3),
+                (Delivery::Delivered, None)
+            );
+            assert_eq!(
+                answered(Body::Read(REJECTION.into()), true, 3),
+                (
+                    Delivery::PartiallyRejected,
+                    Some(": the backend rejected 1 of the request's 3 data points".to_string())
+                )
+            );
+            let warned = answered(
+                Body::Read(b"{\"partialSuccess\":{\"errorMessage\":\"slow down\"}}".to_vec()),
+                true,
+                3,
+            );
+            assert_eq!(
+                warned,
+                (
+                    Delivery::Delivered,
+                    Some(": the backend accepted the request with a warning".to_string())
+                )
+            );
+            assert_eq!(
+                answered(Body::TimedOut, true, 3),
+                failed("did not arrive in time")
+            );
+            assert_eq!(answered(Body::Failed, true, 3), failed("could not be read"));
+            assert_eq!(
+                answered(Body::TooLarge, true, 3),
+                failed("was too large to read")
+            );
+        }
+
+        /// W1: a partial rejection too large to read whole fails the send
+        /// rather than counting as delivered.
+        #[tokio::test]
+        async fn an_oversized_partial_rejection_is_not_delivered() {
+            let mut answer = REJECTION.trim_end_matches("}}").to_string();
+            answer.push_str(",\"errorMessage\":\"");
+            answer.push_str(&"x".repeat(MAX_RESPONSE_BODY));
+            answer.push_str("\"}}");
+            let body = read_body(
+                Script([data(answer.as_bytes()), Chunk::End].into()),
+                MAX_RESPONSE_BODY,
+                GENEROUS,
+            )
+            .await;
+            assert_eq!(body, Body::TooLarge);
+            assert_eq!(answered(body, true, 1).0, Delivery::Failed);
+        }
+
         /// What a loopback backend does on one connection, after reading
         /// the whole request.
-        #[derive(Clone, Copy)]
+        #[derive(Clone)]
         enum Answer {
             /// Write nothing and keep the connection open.
             Hold,
             /// Write this, then keep the connection open.
-            WriteThenHold(&'static str),
+            WriteThenHold(Vec<u8>),
             /// Write this, then close the connection.
-            WriteThenClose(&'static str),
+            WriteThenClose(Vec<u8>),
         }
 
         /// Read one HTTP request: its head, then the `Content-Length` bytes
@@ -816,11 +978,11 @@ mod linux {
                 let hold = match answer {
                     Answer::Hold => true,
                     Answer::WriteThenHold(bytes) => {
-                        let _ = stream.write_all(bytes.as_bytes()).await;
+                        let _ = stream.write_all(&bytes).await;
                         true
                     }
                     Answer::WriteThenClose(bytes) => {
-                        let _ = stream.write_all(bytes.as_bytes()).await;
+                        let _ = stream.write_all(&bytes).await;
                         false
                     }
                 };
@@ -843,14 +1005,14 @@ mod linux {
 
         /// Far past every deadline below, and far short of the export
         /// timeout: a send that ends within it was bounded by its deadline.
-        const BOUND: Duration = Duration::from_secs(30);
+        const BOUND: Duration = Duration::from_secs(120);
         const EXPORT_TIMEOUT: Duration = Duration::from_secs(600);
 
-        /// Send an empty request to `answer`'s backend with a one-second
-        /// interval, after the backend has the request, within [`BOUND`].
-        async fn deliver_to(answer: Answer) -> (Delivery, Option<String>) {
+        /// Send an empty request to `answer`'s backend with an `interval`
+        /// deadline, after the backend has the request, within [`BOUND`].
+        async fn deliver_to(answer: Answer, interval: Duration) -> (Delivery, Option<String>) {
             let (endpoint, mut requested) = backend(answer).await;
-            let sender = sender(endpoint, EXPORT_TIMEOUT, Duration::from_secs(1));
+            let sender = sender(endpoint, EXPORT_TIMEOUT, interval);
             let send =
                 tokio::spawn(async move { sender.deliver(&Request { resources: vec![] }).await });
             tokio::time::timeout(BOUND, requested.recv())
@@ -863,52 +1025,55 @@ mod linux {
                 .unwrap()
         }
 
+        /// A 200 answer with `body`, declaring `length` bytes of it.
+        fn ok(length: usize, body: &[u8]) -> Vec<u8> {
+            let mut answer = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {length}\r\n\r\n"
+            )
+            .into_bytes();
+            answer.extend_from_slice(body);
+            answer
+        }
+
         /// U3/V3 smoke test: a backend that takes the request and never
         /// answers holds the send for the sampling interval, not for the
-        /// longer export timeout.
+        /// longer export timeout. Whatever stage the one-second deadline
+        /// ends it in, it fails as timed out.
         #[tokio::test]
         async fn an_unanswered_send_ends_at_its_deadline() {
-            let (delivery, report) = deliver_to(Answer::Hold).await;
+            let (delivery, report) = deliver_to(Answer::Hold, Duration::from_secs(1)).await;
             assert_eq!(delivery, Delivery::Failed);
             assert_eq!(report.as_deref(), Some(" failed: timed out"));
         }
 
-        /// V1: a 2xx answer whose body stalls, here part-way through a
-        /// partial rejection, is not delivered, and ends at the deadline.
+        /// V1/W1: a 2xx answer whose connection closes before its body
+        /// ends, part-way through or with exactly the bytes the collector
+        /// keeps, is not delivered.
         #[tokio::test]
-        async fn a_success_whose_body_stalls_is_not_delivered() {
-            const STALLED: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 200\r\n\r\n{\"partialSuccess\":{\"rejectedDataPoints\":\"1\"";
-            let (delivery, report) = deliver_to(Answer::WriteThenHold(STALLED)).await;
-            assert_eq!(delivery, Delivery::Failed);
-            assert_eq!(
-                report.as_deref(),
-                Some(" failed: the backend's answer did not arrive in time")
-            );
+        async fn a_success_whose_body_is_cut_short_is_not_delivered() {
+            let cut = ok(200, b"{\"partialSuccess\":");
+            let at_cap = ok(MAX_RESPONSE_BODY + 1, &vec![b' '; MAX_RESPONSE_BODY]);
+            for answer in [cut, at_cap] {
+                let (delivery, report) = deliver_to(Answer::WriteThenClose(answer), GENEROUS).await;
+                assert_eq!(delivery, Delivery::Failed);
+                assert_eq!(
+                    report.as_deref(),
+                    Some(" failed: the backend's answer could not be read")
+                );
+            }
         }
 
-        /// V1: a 2xx answer whose connection fails mid-body is not
-        /// delivered, while a 2xx with an empty body is.
+        /// V1: a 2xx answer with an empty body is delivered, and a partial
+        /// rejection that arrives whole is reported.
         #[tokio::test]
-        async fn a_success_whose_body_fails_is_not_delivered() {
-            const CUT: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 200\r\n\r\n{\"partialSuccess\":";
-            let (delivery, report) = deliver_to(Answer::WriteThenClose(CUT)).await;
-            assert_eq!(delivery, Delivery::Failed);
+        async fn whole_answers_are_delivered_or_reported() {
+            let empty = Answer::WriteThenHold(ok(0, b""));
             assert_eq!(
-                report.as_deref(),
-                Some(" failed: the backend's answer could not be read")
+                deliver_to(empty, GENEROUS).await,
+                (Delivery::Delivered, None)
             );
-
-            const EMPTY: &str = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
-            let (delivery, report) = deliver_to(Answer::WriteThenHold(EMPTY)).await;
-            assert_eq!((delivery, report), (Delivery::Delivered, None));
-        }
-
-        /// V1: a partial rejection that arrives whole within the deadline is
-        /// still reported.
-        #[tokio::test]
-        async fn a_partial_rejection_in_time_is_reported() {
-            const REJECTED: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 45\r\n\r\n{\"partialSuccess\":{\"rejectedDataPoints\":\"1\"}}";
-            let (delivery, _) = deliver_to(Answer::WriteThenHold(REJECTED)).await;
+            let rejected = Answer::WriteThenHold(ok(REJECTION.len(), REJECTION.as_bytes()));
+            let (delivery, _) = deliver_to(rejected, GENEROUS).await;
             assert_eq!(delivery, Delivery::PartiallyRejected);
         }
     }
