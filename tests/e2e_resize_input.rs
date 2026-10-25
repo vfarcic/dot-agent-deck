@@ -11,8 +11,9 @@
 //! narrow: the SIGWINCH and the keys have to be waiting together when the event
 //! loop next polls, which is what a resize landing while the deck is still
 //! drawing the previous one produces. So each keystroke here follows two
-//! resizes, the second sent once the deck has written output after the first,
-//! which makes that overlap likely rather than certain.
+//! resizes, the second sent once the reader has recorded output after the
+//! first resize call, which can be older buffered output, so the overlap is
+//! likely rather than certain.
 //!
 //! What it watches is filter-mode text, which only grows, so each key has a
 //! check of its own that no earlier key can satisfy.
@@ -39,11 +40,11 @@ const BLOCKS: [&str; 4] = [
 const KEY_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Scenario: Launch the deck on an empty dashboard and open the filter with
-/// `/`. Then, sixty times, resize the terminal, resize it again once the deck
-/// has written output, and type one character straight after the second resize;
-/// every character must appear in the filter prompt without the test sending
-/// any further byte. The filter is closed with Esc and reopened every fifteen
-/// characters.
+/// `/`. Then, sixty times, resize the terminal, resize it again once the reader
+/// has recorded output after that call, and type one character straight after
+/// the second resize; every character must appear in the filter prompt without
+/// the test sending any further byte. The filter is closed with Esc and
+/// reopened every fifteen characters.
 #[spec("resize/sigwinch/004")]
 #[test]
 fn sigwinch_004_keys_right_after_a_resize_arrive_without_more_input() {
