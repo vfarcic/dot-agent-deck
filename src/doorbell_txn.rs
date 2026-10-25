@@ -683,16 +683,26 @@ pub struct JobClaim {
 }
 
 impl JobClaim {
-    /// The writer, before the job's first byte: `true` when it may write the
-    /// job, `false` when the job was taken back and is dropped unwritten.
+    /// The writer, before the job's first byte: `true` when this call moved
+    /// the job from queued to started, so the writer may write it; `false`
+    /// when it was no longer queued, because it was taken back (drop it
+    /// unwritten) or an earlier `start` already started it.
     pub fn start(&self) -> bool {
         self.state
             .compare_exchange(JOB_QUEUED, JOB_STARTED, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
 
-    /// The transaction's take-back: `true` when the job will never be
-    /// written, `false` when the writer started it first.
+    /// The take-back: `true` when this call moved the job from queued to
+    /// withdrawn, so it will never be written; `false` when it was no longer
+    /// queued, because the writer started it or an earlier `withdraw`
+    /// already took it back.
+    ///
+    /// `false` names the writer only when this is the job's sole withdrawer
+    /// and its first call, which is how [`Txn`] uses it: a fresh claim per
+    /// enqueue, one `withdraw` consuming it. A second withdrawer on the same
+    /// word, such as the writer's timeout or drop guard once activation
+    /// shares it, breaks that premise and must be reconciled with it.
     pub fn withdraw(&self) -> bool {
         self.state
             .compare_exchange(
@@ -1120,7 +1130,9 @@ impl<'c> Txn<'c> {
     /// Take back the queued job, if the writer has not reported it started:
     /// a compare-and-swap on its claim, settled here. Withdrawn, it can never
     /// be written; claimed by the writer first, it is a started job, and a
-    /// line's first byte may be in.
+    /// line's first byte may be in. Reading a lost withdrawal as the writer's
+    /// claim holds because this is the claim's one withdrawer and it calls
+    /// once ([`JobClaim::withdraw`]).
     fn take_back(&mut self) {
         let Owned::Queued(kind) = self.job else {
             return;
@@ -1135,6 +1147,10 @@ impl<'c> Txn<'c> {
 
     fn finish(&mut self, end: End, now: Instant) -> Vec<Action> {
         match end {
+            // The same, reached at or after the deadline (a lost admission
+            // is handled before the deadline check): nothing is left to wait
+            // for, so the deadline's ending runs in this step.
+            End::NotTyped(_) if self.wrote && now >= self.deadline => self.expire(now),
             // The line's job started before its take-back: this is a
             // cancellation after the first byte (plan §3.2), acted on once
             // the echo can say whether the line is the deck's alone.

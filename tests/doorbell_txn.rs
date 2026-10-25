@@ -1405,6 +1405,54 @@ fn doorbell_049_a_take_back_racing_the_writer_never_holds_past_the_deadline() {
     ends_by_deadline(&retiring, start);
 }
 
+/// Scenario: The writer claims the queued line and its reports never arrive, and the admission is lost at the deadline itself, or a millisecond after it. That one call suspends the attempt and releases the writer, with no further tick needed.
+#[spec("inbox/doorbell/049")]
+#[test]
+fn doorbell_049_an_admission_lost_at_the_deadline_releases_in_that_step() {
+    for late in [Duration::ZERO, Duration::from_millis(1)] {
+        // Driven call by call rather than through `run`, whose same-time
+        // frame after a scheduled change would hide a second step.
+        let mut world = World::new();
+        let admission = world.admission();
+        let start = world.now;
+        let (cell, ring, counter) = (
+            Arc::clone(&world.cell),
+            Arc::clone(&world.ring),
+            Arc::clone(&world.counter),
+        );
+        let mut txn = admit(
+            &admission,
+            &counter,
+            &ring,
+            &cell,
+            draws(),
+            &id(),
+            world.caps,
+            start,
+        )
+        .expect("admitted");
+        let line = txn.line().to_string();
+        let actions = txn.start(&mut world, start);
+        let claim = match actions.as_slice() {
+            [Action::Enqueue(Job::Line(queued), claim)] if *queued == line => Arc::clone(claim),
+            other => panic!("expected the line's enqueue, got {other:?}"),
+        };
+        // The writer wins the claim; its reports are withheld.
+        assert!(claim.start());
+
+        let actions = txn.on(Event::AdmissionLost, &mut world, start + TXN_MAX + late);
+        assert_eq!(
+            actions,
+            vec![
+                Action::Reproject,
+                Action::Release(Outcome::Unresolved(Cause::Deadline))
+            ],
+            "lost at the deadline + {late:?}"
+        );
+        assert_eq!(cell.load(), Latch::Suspended(1, Cause::Deadline));
+    }
+}
+
 /// Scenario: The seam's locks stay contended. Its retry loop never tries at or after the deadline and enqueues nothing; a transaction whose Enter seam never gets its locks is released by the deadline with its cell already suspended.
 #[spec("inbox/doorbell/049")]
 #[test]
