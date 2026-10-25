@@ -18,7 +18,8 @@
 #
 # KEPT DELIBERATELY, not temporary. It runs for PRs that touch the build inputs
 # listed under `paths:` below (the root manifest, the lockfile, the vendored
-# crates, the cargo configuration, a toolchain file, this file), so it costs
+# crates, the cargo configuration and its host linker scripts, a toolchain file,
+# this file), so it costs
 # nothing on PRs that touch none of them. A change to the dependency graph — the
 # thing that can break a C-library cross-build — normally moves the lockfile;
 # many changes to those paths move no graph at all (a vendored crate's docs,
@@ -44,10 +45,12 @@ on:
   #
   # Scoped to PRs that touch the manifest, the lockfile, the crates under
   # `vendor/` (they are compiled into the binary), the cargo configuration (its
-  # host-target `linker` also links the build scripts the cross build compiles), a
+  # host-target `linker` also links the build scripts the cross build compiles),
+  # that linker (`scripts/link-gate.sh`) and the `scripts/build-gate.sh` it runs, a
   # toolchain file (it would override the toolchain this job installs) or this
   # file, so it does not add ~10 minutes of cross-compilation to every unrelated
-  # PR. `scripts/ci-changes.sh`'s `cargo` case is the same list for RWX.
+  # PR. `scripts/ci-changes.sh`'s `cargo` case holds these paths for RWX, plus
+  # `.rwx/ci.yml`, which defines RWX's copy of this check.
   workflow_dispatch:
   pull_request:
     paths:
@@ -55,6 +58,8 @@ on:
       - "Cargo.lock"
       - "vendor/**"
       - ".cargo/**"
+      - "scripts/link-gate.sh"
+      - "scripts/build-gate.sh"
       - "rust-toolchain"
       - "rust-toolchain.toml"
       - ".github/workflows/aarch64-crossbuild-check.yml"
