@@ -17,9 +17,9 @@
 # `release.yml`'s, this job stops predicting the leg it exists to predict.
 #
 # KEPT DELIBERATELY, not temporary. It is scoped to PRs that touch `Cargo.toml` /
-# `Cargo.lock` / this file, so it costs nothing on unrelated PRs and fires exactly
-# when the dependency graph — the thing that can break a C-library cross-build —
-# actually changed. It is the only pre-tag coverage of that leg.
+# `Cargo.lock` / `vendor/` / this file, so it costs nothing on unrelated PRs and
+# fires exactly when the dependency graph — the thing that can break a C-library
+# cross-build — actually changed. It is the only pre-tag coverage of that leg.
 #
 # It cannot be replaced by a local check: a devbox/Nix toolchain makes `cross`
 # derive an invalid rustup toolchain name from `rustc --print sysroot`, a failure
@@ -38,13 +38,15 @@ on:
   # lets the check actually run on this branch's PR — which is the only moment it
   # is needed, since the point is to prove the aarch64 leg BEFORE tagging.
   #
-  # Scoped to PRs that touch the dependency graph or this file, so it does not
+  # Scoped to PRs that touch the dependency graph (the crates under `vendor/`
+  # included: they are compiled into the binary) or this file, so it does not
   # add ~10 minutes of cross-compilation to every unrelated PR.
   workflow_dispatch:
   pull_request:
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
+      - "vendor/**"
       - ".github/workflows/aarch64-crossbuild-check.yml"
 
 permissions:
