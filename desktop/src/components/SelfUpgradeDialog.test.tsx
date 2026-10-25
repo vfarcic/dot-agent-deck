@@ -480,4 +480,15 @@ describe("SelfUpgradeDialog", () => {
     act(() => { topmostOverlayClose()?.(); });
     expect(onClose).toHaveBeenLastCalledWith({ installed: false });
   });
+
+  /** Scenario: issue #1839 — an upgrade's result names the installed path, and that path carries a bidi override; the dialog shows the line with the rest of the path intact and the override removed, as the bridge's own result already arrives (`self_upgrade_037`). */
+  it("self_upgrade_dialog_019 shows a result's path without a bidi control", async () => {
+    const { api, finish } = controlledApi();
+    render(<SelfUpgradeDialog copies={["cli"]} check={checkOf(APP_SWAP, CLI_BREW)} api={api} onClose={vi.fn()} />);
+    fireEvent.click(screen.getByTestId("self-upgrade-start"));
+    await finish({ copy: "cli", ok: true, installed: true, relaunch: false, lines: [{ text: "Upgraded /home/u/‮etats/dot-agent-deck to v0.47.0.", command: null }] });
+    const result = screen.getByTestId("self-upgrade-result-cli");
+    expect(result).toHaveTextContent("Upgraded /home/u/etats/dot-agent-deck to v0.47.0.");
+    expect(result.textContent).not.toMatch(/[؜‎‏‪-‮⁦-⁩]/);
+  });
 });

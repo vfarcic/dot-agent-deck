@@ -9119,6 +9119,20 @@ The pure state model of a deck message's delivery attempts (`src/inbox_attempts.
 - **Does not assert:** the engine's clock calling `tick_turn` (inbox/boundary/056 drives the clock with injected instants).
 - **Platform coverage:** mac+linux+windows.
 
+##### inbox/attempts/036 — A record is spent once its message ended and its evidence was reclaimed.
+- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Agent:** none.
+- **Asserts:** a settled message's record is `spent` and `forget` drops it once, a live one's is not; a cancelled message whose once-waiter attempt is `HandedInert` is not spent until that attempt's late commit raises `DeliveredAfterAll`, after which it is (issue #1816).
+- **Does not assert:** when the hub's engine drops a spent record, which also waits for the inbox to drop its copy (inbox/boundary/075).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/attempts/037 — A reused id takes no late commit of a dropped record.
+- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Agent:** none.
+- **Asserts:** after a settled record is dropped, a record created for the same id starts its assignment above the dropped one's, so the old `(a, e)`'s commit answers `Unknown` and leaves the new message attempting; its own attempt's commit settles it; any record created afterwards also starts above the dropped assignment (issue #1816).
+- **Does not assert:** the inbox accepting the reused id, which needs its dedup window and history to have let the old one go.
+- **Platform coverage:** mac+linux+windows.
+
 #### inbox/receipt
 
 The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the daemon's locked instance namespace under `<state_dir>/inbox-spool`, trusted one-component-at-a-time traversal from the state-directory anchor, immutable `Handed`/`Committed` bearer records, bounded resumable scans streamed to the cap-based evidence store, the exact lookup before absence, and the resumable sibling reaper, plus `platform::lock::try_lock_file`. It is library-only: nothing in the daemon calls it yet, records are published and read, nothing is pruned and no suppression decision is drawn from them.
@@ -10415,6 +10429,13 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Asserts:** 0.47's readers decode a summary and a notice carrying every provenance kind; this build decodes unknown provenance, dispatch phase, outcome phase, cause, delivery, operation and disposition values as `unknown`; an unknown work-done mode is refused `unsupported_mode` with nothing changed.
 - **Why it exists:** PRD #1666 part 3, round 5 (plan D10, §4): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
 - **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### inbox/boundary/075 — A long-lived generation keeps only the delivery records the inbox lists.
+- **Layer:** fast unit (`src/inbox_engine_tests.rs`), the hub's own entry points with an OpenCode receipt stream over an in-memory duplex.
+- **Agent:** none.
+- **Asserts:** with the pane's history held to two ended messages, six messages handed to one generation and committed in turn leave its attempt model holding at most two records after each, at the end exactly the two the inbox still lists; a Cancel on one of those is still answered `already_settled` (issue #1816).
+- **Does not assert:** a record kept while an attempt still holds evidence (inbox/attempts/036); the `uncertain_told` bound (`told_markers_stay_within_the_live_watches_over_many_tasks`, unannotated).
 - **Platform coverage:** mac+linux.
 
 ##### inbox/status/001 — Human daemon status shows each agent's pending inbox counts and wake path.
