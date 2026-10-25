@@ -36,6 +36,9 @@ name = "dot-agent-deck"
 version = "0.1.0"
 edition = "2024"
 rust-version.workspace = true
+# PRD #1859: `src/bin/dot-agent-deck-collector.rs` is this package's second
+# binary, so a bare `cargo run` needs telling which one is the deck.
+default-run = "dot-agent-deck"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
