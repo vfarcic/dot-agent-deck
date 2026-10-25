@@ -4214,7 +4214,7 @@ mod tests {
 
     /// The stall window the busy-holder tests wait with: each window has to
     /// see one of the holder's publishes, or the holder reads as stuck. It is
-    /// shared so the two tests cannot drift apart, and load-scaled from twice
+    /// shared so the three tests cannot drift apart, and load-scaled from twice
     /// the 452 ms the slowest [`publish_by_appending`] took under load. A flat
     /// 500 ms failed both tests on a 16-CPU dev box at load average ~30
     /// (2026-10-13); at that load the factor alone brings this window to about
@@ -4359,7 +4359,9 @@ mod tests {
         let dir = crate::test_temp::tempdir().expect("lock tempdir");
         let dest = dir.path().join("config.toml");
         std::fs::write(&dest, b"").expect("seed destination");
-        let stall = crate::test_budget::load_scaled(std::time::Duration::from_millis(400));
+        // Sized as in the busy-holder tests above, for the same reason: each
+        // full window has to see a publish land (#1728).
+        let stall = busy_holder_stall();
         // Windows end at `stall`, `2 * stall` and, cut short, the ceiling.
         let ceiling = stall.mul_f64(2.4);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -4372,12 +4374,18 @@ mod tests {
                 let _lock = lock_config(&dest).expect("holder takes the lock");
                 locked.send(()).expect("signal the lock is held");
                 let started = started_at.recv().expect("the wait's start");
-                // One publish in the middle of each of the first two windows,
-                // then none: the last is half a window before the third
-                // starts, and 0.9 of a window before the ceiling.
-                for at in [0.5, 1.5] {
-                    let when = started + stall.mul_f64(at);
-                    std::thread::sleep(when.saturating_duration_since(std::time::Instant::now()));
+                // Publish every 25 ms for the first one and a half windows,
+                // then none. A single publish in the middle of each window
+                // left an append half a window to land, and one that outlasted
+                // it read as a stuck holder (#1728); with a steady stream, a
+                // full window misses every publish only if one append outlasts
+                // most of it. Going quiet half a window before the third
+                // starts keeps that cut-short window empty, and a first look
+                // late enough to miss the stream entirely starts a window that
+                // the ceiling cuts short too.
+                let quiet_at = started + stall.mul_f64(1.5);
+                while std::time::Instant::now() < quiet_at {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
                     publish_by_appending(&dest);
                 }
                 while !stop.load(std::sync::atomic::Ordering::SeqCst) {
