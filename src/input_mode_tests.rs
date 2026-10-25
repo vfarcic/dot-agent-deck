@@ -156,6 +156,8 @@ struct Scripted {
     written: Vec<u8>,
     writes_fail: bool,
     bound_fails: bool,
+    /// How many bounds succeed before every later one fails, when set.
+    bounds_left: Option<usize>,
 }
 
 impl Scripted {
@@ -165,6 +167,7 @@ impl Scripted {
             written: Vec::new(),
             writes_fail: false,
             bound_fails: false,
+            bounds_left: None,
         }
     }
 
@@ -208,7 +211,14 @@ impl BoundedConn for Scripted {
         if self.bound_fails {
             return Err(std::io::ErrorKind::InvalidInput.into());
         }
-        Ok(())
+        match &mut self.bounds_left {
+            Some(0) => Err(std::io::ErrorKind::InvalidInput.into()),
+            Some(left) => {
+                *left -= 1;
+                Ok(())
+            }
+            None => Ok(()),
+        }
     }
 }
 
@@ -346,6 +356,60 @@ fn doorbell_052_a_cut_off_or_unbounded_exchange_records_no_verdict() {
     let mut silent = Scripted::new(vec![]);
     let (outcome, _) = exchange(&mut silent, id(3, 1), &mut cache, PROBE, REPORT, soon());
     assert_eq!(outcome, Exchange::Withheld { probed: true });
+}
+
+/// Scenario: A daemon answers the probe `input_mode_report: 1`, and then the connection's bound fails: once before the report's write, once before the acknowledgement's read. The first writes the probe alone and ends unbounded, the second writes the probe and the report and reads no acknowledgement; both keep the Supported verdict the answer recorded, so the daemon's next connection carries the report with no probe.
+#[spec("inbox/doorbell/052")]
+#[test]
+fn doorbell_052_a_bound_failing_after_the_answer_keeps_the_verdict() {
+    // The probe's write takes one bound and its answer one per byte read.
+    let answered = 1 + SUPPORTED.len() + 1;
+    for (pid, bounds, outcome, lines) in [
+        (1, answered, Exchange::Unbounded, vec![PROBE]),
+        (
+            2,
+            answered + 1,
+            Exchange::Sent {
+                probed: true,
+                ack: None,
+            },
+            vec![PROBE, REPORT],
+        ),
+    ] {
+        let mut cache = VerdictCache::default();
+        let mut conn = Scripted::new(vec![
+            Step::Data(format!("{SUPPORTED}\n").into_bytes()),
+            Step::Data(b"{}\n".to_vec()),
+        ]);
+        conn.bounds_left = Some(bounds);
+        let (got, _) = exchange(&mut conn, id(pid, 1), &mut cache, PROBE, REPORT, soon());
+        assert_eq!(got, outcome, "daemon {pid}");
+        assert_eq!(conn.lines(), lines, "daemon {pid}");
+        assert_eq!(
+            cache.get(DaemonIdentity { pid, start: 1 }),
+            Some(Verdict::Supported),
+            "daemon {pid}"
+        );
+        let mut next = Scripted::new(vec![]);
+        let (got, _) = exchange(&mut next, id(pid, 1), &mut cache, PROBE, REPORT, soon());
+        assert!(
+            matches!(got, Exchange::Sent { probed: false, .. }),
+            "daemon {pid}: {got:?}"
+        );
+        assert_eq!(next.lines(), vec![REPORT], "daemon {pid}");
+    }
+    // A bound that fails on the cached path writes nothing and keeps it too.
+    let mut cache = VerdictCache::default();
+    cache.record(DaemonIdentity { pid: 3, start: 1 }, Verdict::Supported);
+    let mut conn = Scripted::new(vec![]);
+    conn.bound_fails = true;
+    let (got, _) = exchange(&mut conn, id(3, 1), &mut cache, PROBE, REPORT, soon());
+    assert_eq!(got, Exchange::Unbounded);
+    assert!(conn.written.is_empty());
+    assert_eq!(
+        cache.get(DaemonIdentity { pid: 3, start: 1 }),
+        Some(Verdict::Supported)
+    );
 }
 
 /// Scenario: The wrapper meets daemon A, then B, then A again while A is still remembered, then a daemon with A's pid and a new start time, then enough others to fill its memory. A is not probed again on its return; A's pid with a new start time is a daemon of its own and is probed; the ninth identity evicts the least recently used one, which is probed again when it comes back.
@@ -727,6 +791,81 @@ fn doorbell_052_one_deadline_bounds_the_whole_send() {
         }
     );
     assert!(took < MODE_SEND_TIMEOUT + SLACK, "{took:?}");
+}
+
+/// The platform connect after a pause that leaves less than
+/// [`MODE_PROBE_SILENCE`] of the send's deadline.
+fn slow_connect(
+    path: &std::path::Path,
+    budget: Duration,
+) -> std::io::Result<std::os::unix::net::UnixStream> {
+    let pause = MODE_SEND_TIMEOUT - MODE_PROBE_SILENCE + Duration::from_millis(100);
+    std::thread::sleep(pause);
+    (IdentityLookups::PLATFORM.connect)(path, budget.saturating_sub(pause))
+}
+
+/// Scenario: A daemon reads each probe and then stays silent with the connection open, and every connect to it takes long enough to leave less than the silence window of the send's deadline. Each send ends at its deadline within the send timeout (plus scheduling slack) and records no verdict, so the next send probes the same daemon again; a send whose connect leaves the whole window records Unsupported (the control). And a daemon that does serve reports but answers its probe only after the deadline is recorded Unsupported: the window keeps the wrapper from judging too early, not from misjudging a slow live daemon.
+#[spec("inbox/doorbell/052")]
+#[test]
+fn doorbell_052_silence_after_a_slow_connect_is_asked_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let silent = dir.path().join("silent.sock");
+    let probes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = std::sync::Arc::clone(&probes);
+    endpoint(&silent, move |mut conn| {
+        if read_one_line(&mut conn).is_some() {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        // Silent, the connection open until the wrapper closes it.
+        let _ = read_one_line(&mut conn);
+    });
+    let slow = IdentityLookups {
+        connect: slow_connect,
+        ..IdentityLookups::PLATFORM
+    };
+    let mut cache = VerdictCache::default();
+    for round in 1..=2 {
+        let started = Instant::now();
+        let sent = target(&silent).send(&fresh(round), &mut cache, &slow);
+        let took = started.elapsed();
+        let (outcome, identity, _) = sent.expect("connected");
+        assert!(identity.is_some());
+        assert_eq!(
+            outcome,
+            Exchange::Ended { why: "deadline" },
+            "round {round}"
+        );
+        assert!(took < MODE_SEND_TIMEOUT + SLACK, "round {round}: {took:?}");
+        assert!(cache.is_empty(), "round {round}: no verdict recorded");
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while probes.load(std::sync::atomic::Ordering::SeqCst) < 2 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        probes.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "each send probed"
+    );
+    let sent = target(&silent).send(&fresh(3), &mut cache, &IdentityLookups::PLATFORM);
+    let (outcome, _, _) = sent.expect("connected");
+    assert_eq!(outcome, Exchange::Withheld { probed: true });
+
+    let late = dir.path().join("late.sock");
+    endpoint(&late, |mut conn| {
+        let _ = read_one_line(&mut conn);
+        std::thread::sleep(MODE_SEND_TIMEOUT + Duration::from_millis(200));
+        let _ = conn.write_all(format!("{SUPPORTED}\n").as_bytes());
+    });
+    let mut cache = VerdictCache::default();
+    let sent = target(&late).send(&fresh(4), &mut cache, &IdentityLookups::PLATFORM);
+    let (outcome, identity, _) = sent.expect("connected");
+    assert_eq!(outcome, Exchange::Withheld { probed: true });
+    assert_eq!(
+        cache.get(identity.expect("identified")),
+        Some(Verdict::Unsupported),
+        "a slow live daemon is recorded Unsupported"
+    );
 }
 
 /// Scenario: A listener records every byte it reads. A send whose peer credentials read as another user writes nothing to it, not even the probe that carries the pane's token; the same send with the peer read as this user writes the probe (the control).

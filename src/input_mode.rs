@@ -451,17 +451,24 @@ pub enum Exchange {
     /// The daemon's verdict is Unsupported: no report written.
     Withheld { probed: bool },
     /// The connection ended (EOF, a reset, a failed write) or the deadline
-    /// passed before a whole answer. This connection recorded no verdict,
-    /// except that a report whose write failed after its probe was answered
-    /// (`report_write_failed`) leaves the Supported verdict that answer
-    /// recorded.
+    /// passed before a whole answer. A probe was written unless the probe's
+    /// own write failed (`probe_write_failed`). This connection recorded no
+    /// verdict, except that a report whose write failed after its probe was
+    /// answered (`report_write_failed`) leaves the Supported verdict that
+    /// answer recorded.
     Ended { why: &'static str },
     /// The daemon's identity could not be read: nothing written.
     IdentityUnreadable,
     /// The process at the other end runs as another user: nothing written.
     ForeignPeer,
     /// The connection's next read or write could not be bounded by the
-    /// deadline: nothing more written, no verdict recorded.
+    /// deadline, and nothing more was written. When that was the probe's
+    /// write or the read of its answer, no verdict was recorded; when it was
+    /// the report's write, the Supported verdict that let the report go stays
+    /// recorded (answered after a probe written on this connection, or
+    /// remembered from an earlier one). A failed bound on the
+    /// acknowledgement's read is not this: the report was written, and the
+    /// exchange is [`Exchange::Sent`] with no acknowledgement.
     Unbounded,
 }
 
@@ -469,9 +476,15 @@ pub enum Exchange {
 const EXCHANGE_MAX_LINE: usize = 64 * 1024;
 
 /// How long the daemon must have stayed silent on a probe, with the
-/// connection open, for that to record Unsupported. A probe sent with less
-/// of [`MODE_SEND_TIMEOUT`] left (a slow connect used the rest) records
-/// nothing, and the next connection asks again.
+/// connection open, for that to record Unsupported: a fail-closed trade of
+/// availability, so the wrapper does not judge a daemon after too little
+/// observation. It does not tell a slow live daemon from one that does not
+/// support reports: a supporting daemon whose answer's first byte comes after
+/// the deadline is still recorded Unsupported, and stays so while its
+/// identity is remembered. A probe sent with less than this
+/// left (a slow connect used the rest) records nothing, so a silent daemon
+/// whose connects keep using the rest is probed again on each connection,
+/// each probe bounded by its send's deadline.
 pub const MODE_PROBE_SILENCE: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// A connection whose next read and write [`exchange`] can bound.
@@ -582,10 +595,12 @@ fn write_line<C: BoundedConn>(
 /// `input_mode_report: Some(1)`. A reply without it, a refusal, a malformed
 /// line, and silence through the deadline after a probe written with at
 /// least [`MODE_PROBE_SILENCE`] of it left record Unsupported. A connection
-/// that ends, an answer cut off by the deadline, a probe written later than
-/// that, and a connection whose reads or writes cannot be bounded record
-/// nothing. Returns what happened and the identity evicted to record a
-/// verdict.
+/// that ends before the probe is answered, an answer cut off by the
+/// deadline, silence after a probe written later than that, and a bound that
+/// fails before the answer is read record nothing; after a Supported answer
+/// the verdict stays recorded whatever happens to the report and its
+/// acknowledgement. Returns what happened and the identity evicted to record
+/// a verdict.
 pub fn exchange<C: BoundedConn>(
     conn: &mut C,
     identity: Option<DaemonIdentity>,
