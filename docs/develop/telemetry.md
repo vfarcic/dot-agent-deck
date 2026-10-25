@@ -2,6 +2,8 @@
 
 How the deck's OpenTelemetry export (PRD #1741) decides two things the user page, [`docs/telemetry.md`](../telemetry.md), describes only by their result: what an `agent.operation` span says about a shell command, and which `codex` or `devin` the `PATH` shim adds to.
 
+The design and measurements of the separate resource collector (PRD #1859) are in [The per-run resource collector](#the-per-run-resource-collector-prd-1859).
+
 What each agent can report beyond these spans (tokens, cost, quota, outcomes), and the record and outcome taxonomy PRD #633 proposes from real runs, are in [Execution accounting](execution-accounting.md).
 
 ## From a command line to `deck.operation.program` and `deck.operation.word`
@@ -50,3 +52,69 @@ Each Devin configuration file is named `devin-<run>-<pid>.json`, for the Devin's
 ## Querying the telemetry from Claude Code
 
 The repository's `.mcp.json` declares Honeycomb's hosted MCP server for the US region (`https://mcp.honeycomb.io/mcp`), so a Claude Code session in this repo can query the shared Honeycomb environment that receives the deck's telemetry. The server is remote, so it starts no local process. The file holds no credentials: run `/mcp` once in Claude Code to sign in through the browser with your own Honeycomb account, and the Honeycomb team needs Honeycomb Intelligence enabled for the server to answer. A team in the EU region uses `https://mcp.eu1.honeycomb.io/mcp` instead. Of the agents the deck supports, only Claude Code reads `.mcp.json`; the others need the server added in their own configuration.
+
+## The per-run resource collector (PRD #1859)
+
+`dot-agent-deck-collector` is the second binary of the root package (`src/bin/dot-agent-deck-collector.rs`), with its pure-data core in `src/telemetry/collector/`. It is a separate process that reads `/proc`: nothing in the daemon, the protocol, the spawn path or either client knows it exists. The user page's [CPU, memory and disk per run](../telemetry.md#cpu-memory-and-disk-per-run) says what it sends and how to run it; this section is the design and the measurements behind it.
+
+### Design
+
+- **Attribution** (`aggregate.rs`). A process belongs to the run named by the `deck.run.id` in the first `OTEL_RESOURCE_ATTRIBUTES` entry of its `/proc/<pid>/environ`, decoded with the deck's own decoder (`telemetry::resource::parse_resource_attributes`). Failing that, it takes its parent's run in the same sample; failing that, it is unattributed and is looked at again every sample. Both kinds of attribution are sticky per `(pid, starttime)`, so a process that double-forks keeps its run, and a process that loses its parent keeps the run it inherited. The five other identity keys (`deck.pane.id`, `deck.agent`, `deck.role`, `deck.orchestration.name`, `deck.orchestration.id`) are copied from the run's oldest own-environment process; no other key from any process's environment is sent (`identity.rs`).
+- **CPU** is credited per process, `utime + stime + cutime + cstime`: its whole total at first sight, its increase afterwards; and a process that vanished has its last-seen total taken back from its nearest surviving ancestor, capped by that ancestor's increase in children time, because the ancestor reaped it and its `cutime` now holds all of it. That is what makes in-tree short-lived work exact at any cadence.
+- **Memory** is `smaps_rollup`'s `Pss_Anon`, `Pss_File` and `Pss_Shmem`, sent as three points of one gauge rather than one sum, because only `Pss_Anon` tracks a cgroup's own memory (below).
+- **Read order** per sample: every `stat` first, then the environments that are not settled, then `smaps_rollup`, then the `cwd` of run-attributed processes. Reading every `stat` in one pass keeps short the window in which a child reaped mid-sample is counted twice.
+- **Worktrees** (`disk.rs`). A process's worktree is the nearest ancestor of its `cwd` holding a `.git` entry; `deck.worktree.id` is the first 16 bytes of SHA-256 over its canonical path, a pseudonym rather than a secret (`worktree-id` computes it for a user). The disk walk sums `st_blocks × 512` per inode once, does not follow symlinks, compares only directories' devices (overlayfs reports a file's underlying device), and skips nested repositories. In the loop each worktree in use is walked on its own thread at most every `--disk-interval`, and a request carries the last completed walk; `--once` walks them all in parallel before it sends.
+- **Export** is OTLP over HTTP, protobuf or JSON, with the same `OTEL_*` resolution rules as the deck's exporter, the `METRICS` form of each variable replacing the general one. The protobuf encoder (`collector/otlp.rs`) reuses the deck's wire helpers in `telemetry/otlp.rs`, and a unit test decodes it back and compares it with the JSON encoding. No redirect is followed, and a failed send is dropped and logged at most once a minute; cumulative temporality makes a dropped request cost a gap, not a wrong total.
+
+### Why environment grouping and not a cgroup per run
+
+A cgroup per run would be the ground truth, and it is what the measurements below compare against. It is not built because it changes how the deck starts agents, and it needs a delegated cgroup subtree, which the daemon's session scope does not have (the live daemon ran in a non-delegated `session-<n>.scope`, as #1692 also found). Environment grouping needs neither, matches the cgroup for everything that stays in the run's process tree, and keeps double-forked processes that keep their environment, which a parent-pid walk (#1692) lost. The ancestry fallback is required, not a refinement: on the live box, 25% of run processes carried no run id of their own (harnesses and tools that replace the environment). Moving to a cgroup per run is #1897.
+
+### Measurements
+
+Measured 2026-10-25 on the shared dev box (16 cores, 62 GiB, cgroup v2), with other decks and units running. Ground truth: each workload in its own `systemd-run --user --scope`, its `cpu.stat`, `memory.current` and `memory.stat` read at the end. The environment-grouping figures came from a prototype of exactly the algorithm above, replayed at every cadence and phase offset (min / mean / max across phases where they differ).
+
+| Workload | cgroup CPU | env @1 s | env @15 s | env @30 s |
+| --- | --- | --- | --- | --- |
+| 4 s burn | 4.04 s | 4.02 | 4.02 | 4.02 |
+| 4 s burn under `setsid` | 4.01 s | 3.99 | 3.99 | 3.99 |
+| 4 s burn under `env -i`, in the tree | 4.04 s | 4.03 | 4.03 | 4.03 |
+| 300 short commands, in the tree | 9.03 s | 9.02 | 9.02 | 9.02 |
+| cold `cargo build` (15 crates) | 47.69 s | 47.68 | 47.68 | 47.68 |
+| 4 s burn double-forked `( setsid … & )` | 4.00 s | 3.08 | 0.01 / 0.88 / 3.08 | 0.01 / 0.88 / 3.08 |
+| 300 short double-forked commands | 6.02 s | 0.26 | 0.26 | 0.26 |
+| 4 s burn `( setsid env -i … & )` | 4.03 s | 0.02 | 0.02 | 0.02 |
+| 20 s run whose root exits at the end | 10.24 s | 10.17 | 3.07 / 6.58 / 10.17 | 0.00 / 4.77 / 10.17 |
+
+- **In the tree, cadence does not matter**: the cgroup and the environment grouping agree to within 0.1 s, because a reaped child's time is in its parent's `cutime`.
+- **The undercount is short-lived detached work**: a double-forked process is counted while it is alive at a sample; what it uses after its last sighting is reaped outside the run. Short double-forked commands were 4–5% seen at any cadence. The lost time lands in no bucket the collector can see (the user's systemd manager reaps it, and its environment is not readable), the unattributed one included.
+- **The run's last interval** is reaped by the deck daemon when the agent exits, so a run loses up to one interval of CPU.
+- **A double count** of +4% appeared once, on a cold build at 1 s, when a child was reaped while the sample was being read; not at 2 s or slower.
+
+| Memory, at the cgroup's reading | Σ PSS | Σ `Pss_Anon` | Σ RSS | cgroup `memory.current` | cgroup `anon` |
+| --- | --- | --- | --- | --- | --- |
+| 400 MiB written, 3 forked children sharing it | 460.4 MB | 454.2 MB | 1712.6 MB | 429.3 MB | 424.5 MB |
+| cold `cargo build`, mid-build | 728.6 MB | 502.4 MB | 1169.3 MB | 547.9 MB | 502.7 MB |
+
+`Pss_Anon` matched the cgroup's `anon` to within 0.1% for the build (+7% for the fork case, read while the children exited). `Pss_File` is mostly shared libraries the kernel charged to whichever cgroup touched them first, so total PSS ran about a third above `memory.current`. Summed RSS ran 2–4× high.
+
+### The collector's own cost
+
+Measured on the release build, on the same box while it was very busy: 16 cores at load average 60–86, 509–667 pids, 148–310 of them visible to the user, 14 live runs.
+
+| What | Figure |
+| --- | --- |
+| CPU per sample, steady state (`--interval 1`, 120 samples) | 187 ms; 18.7% of a core |
+| CPU per sample at the default 15 s (`--disk-interval 0`, 12 samples over 181 s) | 211 ms, 94% of it system time; 1.40% of a core |
+| One `--once` sample, wall clock, fresh process (30 runs) | p50 367 ms, p95 552 ms, max 649 ms |
+| Resident memory while sampling | 5.4–5.6 MB (PSS 3.3 MB) |
+| `--once` with disk: 9 worktrees in use, 0.07–98.9 GB, 185 GB in all | 25.9 s wall cold (0.9 s user, 3.3 s system), 2.3 s warm (0.7 s, 1.6 s); 15–16 MB peak resident |
+
+System time dominates because `smaps_rollup` walks each target's mappings under its `mmap_lock`; the Python prototype found it three-quarters of a sample's cost on a quieter box (156 ms per sample, 404 pids). At the default interval that is about 1.4% of one core, so the default stays at 15 s; the systemd unit on the user page also sets `Nice=10`. The disk walk's cost is the size of the worktrees in use, which is why walks run on their own threads and on their own, slower interval.
+
+### Packaging
+
+- **GitHub release**: the `build` job's Linux legs upload `dot-agent-deck-collector-linux-amd64` and `-linux-arm64` as artifacts named `dot-agent-deck-collector-<suffix>`, which `finalize`'s `dot-agent-deck-*` pattern brings into `dist/`, `checksums.txt` and `attest`. The macOS legs build the collector too (it is a target of the package) but do not publish it, because there it is the stub that exits 3.
+- **Nix**: crane's `installFromCargoBuildLog` installs every non-test executable the build log reports for a workspace member, so the package installs `bin/dot-agent-deck-collector` with no change to `flake.nix`.
+- **Homebrew**: the formula installs one binary per platform and does not carry the collector; the user page points Homebrew users at the release binary.
+- **`dot-agent-deck upgrade`** replaces the deck's binary only.
