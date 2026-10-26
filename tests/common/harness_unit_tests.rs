@@ -6454,15 +6454,15 @@ fn a_missing_sentinel_found_elsewhere_is_reported_as_misplaced() {
 /// Scenario: A `PATH` holding a deck's telemetry shim directory, as the deck
 /// installs one, loses that entry when the harness contains it. A directory
 /// holding a `codex` that is not a shim script, or a shim beside another
-/// program, or an unreadable `codex`, is kept, and relative entries are
-/// dropped as before.
+/// program (a hidden one included), or an unreadable `codex`, is kept, and
+/// relative entries are dropped as before.
 #[cfg(unix)]
 #[test]
 fn contain_path_drops_a_deck_telemetry_shim_directory_and_nothing_like_it() {
     use dot_agent_deck::telemetry::shim;
     use std::os::unix::fs::PermissionsExt;
 
-    let root = tempfile::tempdir().expect("scratch root");
+    let root = harness_tempdir().expect("scratch root");
     let executable = |path: &Path, body: &str| {
         std::fs::write(path, body).expect("write a program");
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
@@ -6483,6 +6483,14 @@ fn contain_path_drops_a_deck_telemetry_shim_directory_and_nothing_like_it() {
     std::fs::copy(shim_dir.join("codex"), mixed.join("codex")).unwrap();
     executable(&mixed.join("git"), "#!/bin/sh\n");
 
+    // A hidden program is reachable by name too; only the installer's own
+    // `.<program>.<pid>` staging files are not.
+    let hidden = root.path().join("hidden");
+    std::fs::create_dir(&hidden).unwrap();
+    std::fs::copy(shim_dir.join("codex"), hidden.join("codex")).unwrap();
+    executable(&hidden.join(".helper"), "#!/bin/sh\n");
+    std::fs::write(shim_dir.join(".codex.4242"), "").unwrap();
+
     let unreadable = root.path().join("unreadable");
     std::fs::create_dir(&unreadable).unwrap();
     std::fs::copy(shim_dir.join("codex"), unreadable.join("codex")).unwrap();
@@ -6501,6 +6509,7 @@ fn contain_path_drops_a_deck_telemetry_shim_directory_and_nothing_like_it() {
         shim_dir.as_path(),
         real.as_path(),
         mixed.as_path(),
+        hidden.as_path(),
         Path::new(""),
         Path::new("bin"),
         unreadable.as_path(),
@@ -6511,7 +6520,7 @@ fn contain_path_drops_a_deck_telemetry_shim_directory_and_nothing_like_it() {
     // A process that can read any file (root) reads the unreadable script as
     // a shim, so that one entry's fate depends on who runs the test.
     let unreadable_kept = std::fs::read(unreadable.join("codex")).is_err();
-    let mut expected = vec![real, mixed];
+    let mut expected = vec![real, mixed, hidden];
     if unreadable_kept {
         expected.push(unreadable);
     }

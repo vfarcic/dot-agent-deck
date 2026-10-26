@@ -5552,7 +5552,13 @@ pub fn is_deck_telemetry_shim_dir(dir: &Path) -> bool {
             return false;
         };
         // `install` stages each script as `.<name>.<pid>` beside its final name.
-        if name.starts_with('.') {
+        // Any other hidden file is a program a lookup by name can reach.
+        let staged = name.strip_prefix('.').and_then(|rest| rest.split_once('.'));
+        if staged.is_some_and(|(program, pid)| {
+            shim::PROGRAMS.contains(&program)
+                && !pid.is_empty()
+                && pid.bytes().all(|b| b.is_ascii_digit())
+        }) {
             continue;
         }
         if !shim::PROGRAMS.contains(&name) || !is_deck_telemetry_shim_script(&entry.path()) {
