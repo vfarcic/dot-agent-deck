@@ -27,6 +27,9 @@ struct Codex {
     /// The receipt spool the deck pinned for the pane, as its environment
     /// names it: what the agent's hooks and its model-run `inbox fetch` see.
     spool: Option<String>,
+    /// The deck's log (`DOT_AGENT_DECK_LOG`), which names why the doorbell
+    /// types nothing into a generation (`doorbell off`, with its clause).
+    log: std::path::PathBuf,
     _bin: tempfile::TempDir,
 }
 
@@ -106,7 +109,12 @@ while True:
 "#).unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
         let path = format!("{}:/usr/bin:/bin", bin.path().display());
-        let mut env = vec![("PATH", path.as_str())];
+        let log = bin.path().join("deck.log");
+        let log_env = log.to_str().expect("a UTF-8 log path").to_string();
+        let mut env = vec![
+            ("PATH", path.as_str()),
+            ("DOT_AGENT_DECK_LOG", log_env.as_str()),
+        ];
         env.extend_from_slice(extra);
         // The tests run Codex's hooks and fetch from the test process, outside
         // the stand-in pane's agent; inbox/protocol/014 and /015 pin the binding.
@@ -117,8 +125,41 @@ while True:
             pane,
             daemon,
             spool,
+            log,
             _bin: bin,
         }
+    }
+
+    /// The clause of each `doorbell off` line the deck logged for this
+    /// pane's current agent.
+    fn held_as(&self) -> Vec<String> {
+        let agent = format!("agent_id=\"{}\"", self.pane.agent);
+        std::fs::read_to_string(&self.log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains("doorbell off") && line.contains(&agent))
+            .filter_map(|line| {
+                let at = line.find("clause=")? + "clause=".len();
+                Some(
+                    line[at..]
+                        .split(|c: char| c.is_whitespace())
+                        .next()?
+                        .trim_matches('"')
+                        .to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// The deck logged `clause` as why it types nothing into this pane's
+    /// current agent, and no other clause.
+    fn held_for(&self, clause: &str) {
+        assert!(
+            common::wait_until(WAIT, || !self.held_as().is_empty()),
+            "the deck must log why it types nothing: {}",
+            std::fs::read_to_string(&self.log).unwrap_or_default()
+        );
+        assert_eq!(self.held_as(), vec![clause.to_string()]);
     }
 
     fn start(daemon: &common::DaemonProc, text: &str, program: &std::path::Path) -> Pane {
@@ -298,34 +339,37 @@ while True:
     }
 }
 
-/// Scenario: Start wrapped synthetic Codex in raw mode on the measured update-now dialog and queue a task. The dialog must receive zero bytes, including bare carriage returns, while it remains on screen.
+/// Scenario: Start wrapped synthetic Codex in raw mode on the measured update-now dialog, drawn with no release header the deck can read, and queue a task. The dialog must receive zero bytes, including bare carriage returns, while it remains on screen, and the deck must log that it types nothing into a generation whose release it cannot read (`unknown_release`); the same dialog on a generation the deck does type into is `inbox/codex/027`.
 #[spec("inbox/codex/001")]
 #[test]
 fn codex_001_update_dialog_receives_zero_bytes() {
     let codex = Codex::new(UPDATE);
     codex.queued(BODY);
     codex.no_bytes();
+    codex.held_for("unknown_release");
 }
 
-/// Scenario: Start wrapped synthetic Codex on its folder-trust dialog and queue a task. Raw-input readiness must not type a doorbell or carriage return into that dialog.
+/// Scenario: Start wrapped synthetic Codex on its folder-trust dialog, drawn with no release header the deck can read, and queue a task. Raw-input readiness must not type a doorbell or carriage return into that dialog, and the deck must log `unknown_release` as why; the same dialog on a generation the deck does type into is `inbox/codex/027`.
 #[spec("inbox/codex/002")]
 #[test]
 fn codex_002_folder_dialog_receives_zero_bytes() {
     let codex = Codex::new(FOLDER);
     codex.queued(BODY);
     codex.no_bytes();
+    codex.held_for("unknown_release");
 }
 
-/// Scenario: Start wrapped synthetic Codex on the hooks-review screen and queue a task. The deck must leave the review selection untouched by sending zero input bytes.
+/// Scenario: Start wrapped synthetic Codex on the hooks-review screen, drawn with no release header the deck can read, and queue a task. The deck must leave the review selection untouched by sending zero input bytes, and log `unknown_release` as why; the same dialog on a generation the deck does type into is `inbox/codex/027`.
 #[spec("inbox/codex/003")]
 #[test]
 fn codex_003_hooks_dialog_receives_zero_bytes() {
     let codex = Codex::new(HOOKS);
     codex.queued(BODY);
     codex.no_bytes();
+    codex.held_for("unknown_release");
 }
 
-/// Scenario: Paint an unknown startup dialog in wrapped synthetic Codex and queue a task, then paint its recognised empty composer. The deck types into no Codex release (its first stage commits what it types), so the pane must receive zero bytes on the dialog and on the composer, and the task must wait queued until a receiver takes it.
+/// Scenario: Paint an unknown startup dialog in wrapped synthetic Codex, with no release header the deck can read, and queue a task, then paint its recognised empty composer. The deck types nothing into a generation whose release it cannot read, so the pane must receive zero bytes on the dialog and on the composer, the deck must log `unknown_release` as why, and the task must wait queued until a receiver takes it.
 #[spec("inbox/codex/004")]
 #[test]
 fn codex_004_codex_gets_no_byte_on_a_dialog_or_its_composer() {
@@ -334,6 +378,7 @@ fn codex_004_codex_gets_no_byte_on_a_dialog_or_its_composer() {
     codex.no_bytes();
     codex.paint(COMPOSER);
     codex.no_bytes();
+    codex.held_for("unknown_release");
     state(&codex.daemon, &codex.pane, &id, "queued");
     fetch(&codex.daemon, &codex.pane, true);
     state(&codex.daemon, &codex.pane, &id, "acknowledged");
@@ -344,7 +389,7 @@ fn codex_004_codex_gets_no_byte_on_a_dialog_or_its_composer() {
     );
 }
 
-/// Scenario: Start wrapped synthetic Codex directly at its empty composer before any own hook fires and queue a task, then report its own SessionStart. The pane must receive zero bytes either way: no doorbell, no launch-command prompt and no body.
+/// Scenario: Start wrapped synthetic Codex directly at its empty composer, with no release header the deck can read, before any own hook fires and queue a task, then report its own SessionStart. The pane must receive zero bytes either way (no doorbell, no launch-command prompt and no body), and the deck must log `unknown_release` as why: its own hook supplies no release.
 #[spec("inbox/codex/005")]
 #[test]
 fn codex_005_an_empty_composer_gets_no_byte_before_or_after_its_first_hook() {
@@ -353,10 +398,11 @@ fn codex_005_an_empty_composer_gets_no_byte_before_or_after_its_first_hook() {
     codex.no_bytes();
     codex.run_hook("SessionStart", None);
     codex.no_bytes();
+    codex.held_for("unknown_release");
     state(&codex.daemon, &codex.pane, &id, "queued");
 }
 
-/// Scenario: Start the synthetic Codex at its empty composer under a name the deck does not recognise and with no agent type, then let its own hooks report it as Codex and queue a task. The deck learns the type from the hooks and still types nothing: zero bytes reach the pane, the task waits queued, and the agent's WAKE names its hooks' turn-end route, not the doorbell.
+/// Scenario: Start the synthetic Codex at its empty composer, with no release header the deck can read, under a name the deck does not recognise and with no agent type, then let its own hooks report it as Codex and queue a task. The deck learns the type from the hooks: it logs `unmeasured_release` while the type is unknown and `unknown_release` once its hooks name Codex, so what holds it then is the missing release, not the absent spawn type. Zero bytes reach the pane, the task waits queued, and the agent's WAKE names its hooks' turn-end route, not the doorbell.
 #[spec("inbox/codex/024")]
 #[test]
 fn codex_024_a_pane_its_hooks_call_codex_gets_no_byte() {
@@ -378,6 +424,12 @@ fn codex_024_a_pane_its_hooks_call_codex_gets_no_byte() {
     codex.run_hook("Stop", None);
     let id = codex.queued(BODY);
     codex.no_bytes();
+    assert!(
+        common::wait_until(WAIT, || codex.held_as().len() == 2),
+        "{:?}",
+        codex.held_as()
+    );
+    assert_eq!(codex.held_as(), ["unmeasured_release", "unknown_release"]);
     state(&codex.daemon, &codex.pane, &id, "queued");
     // Codex's own hooks take its messages at the end of its turns, and
     // that is the route WAKE names, not the doorbell.
@@ -388,7 +440,7 @@ fn codex_024_a_pane_its_hooks_call_codex_gets_no_byte() {
     );
 }
 
-/// Scenario: Report Codex's own busy hook, replace its screen with an unfamiliar mid-session screen and queue a task. Its own Idle must type nothing, and neither must its recognised composer drawn after, since the deck types into no Codex release; restarting in the same pane on a startup dialog must keep every byte out of that dialog.
+/// Scenario: Report Codex's own busy hook on a generation with no release header the deck can read, replace its screen with an unfamiliar mid-session screen and queue a task. Its own Idle must type nothing, and neither must its recognised composer drawn after, the deck logging `unknown_release` as why; restarting in the same pane on a startup dialog must keep every byte out of that dialog.
 #[spec("inbox/codex/006")]
 #[test]
 fn codex_006_own_hook_gates_status_and_restart_resets_guard() {
@@ -408,9 +460,10 @@ fn codex_006_own_hook_gates_status_and_restart_resets_guard() {
     let mut response = Vec::new();
     std::io::Read::read_to_end(&mut socket, &mut response).unwrap();
     codex.no_bytes();
-    // Nor does its recognised composer: the deck types into no Codex release.
+    // Nor does its recognised composer: its release was never read.
     codex.paint(COMPOSER);
     codex.no_bytes();
+    codex.held_for("unknown_release");
     state(&codex.daemon, &codex.pane, &id, "queued");
     assert_eq!(
         attach(

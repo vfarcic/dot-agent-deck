@@ -18,7 +18,9 @@
 //! 1. the release is not latched → `unknown_release` (or the latch's own
 //!    clause, `release_conflict`, `scanner_geometry` or `scanner_budget`);
 //! 2. a record exists for exactly this release → that record decides, and it
-//!    never falls through to inheritance;
+//!    never falls through to inheritance ([`exact_verdict`]: the required
+//!    measurements, then no first-stage byte committing in any measured
+//!    dialog, then `head_echo` when the line is staged, then the settle cap);
 //! 3. the agent is not Codex, the release is a pre-release, or no record is
 //!    older → `unmeasured_release`;
 //! 4. the release's tripwire is set → `release_tripwire`;
@@ -158,6 +160,12 @@ pub struct ReleaseRecord<'a> {
     pub input_mode: Measurement<()>,
     pub release_recogniser: Measurement<()>,
     pub parser_cost: Measurement<()>,
+    // Required when the line is staged (Q27): the token head alone, typed in
+    // one write, echoed exactly in the composer within the echo wait, and the
+    // rest typed after that echo, submitted and withdrawn as the transaction
+    // does it. A release whose line is not staged never types a head alone,
+    // so its record needs none.
+    pub head_echo: Measurement<()>,
     // Capability only.
     pub placeholder_empty: Measurement<()>,
     pub delete_key: Measurement<()>,
@@ -257,29 +265,34 @@ pub enum LatchedRelease {
     ScannerBudget,
 }
 
-/// The bytes of the line's first stage that are the same on every ring: the
-/// token's parentheses and [`crate::doorbell::LINE_PREFIX`]. The token's own
-/// letters are not checked here: the token is drawn from keys inert in every
-/// measured dialog (plan §1.2, §4.3).
-fn first_stage_bytes() -> impl Iterator<Item = u8> {
+/// Every byte the line's first stage can contain (Q27): the token head
+/// `(xxxxxx)`, its parentheses and [`crate::doorbell_txn::TOKEN_ALPHABET`].
+/// The token's letters are checked against each record's dialogs like the
+/// parentheses, so a record in which one of them commits is
+/// `first_stage_commits` rather than typed into on a promise.
+pub fn first_stage_bytes() -> impl Iterator<Item = u8> {
     b"()"
         .iter()
+        .chain(crate::doorbell_txn::TOKEN_ALPHABET.iter())
         .copied()
-        .chain(crate::doorbell::LINE_PREFIX.bytes())
 }
 
-/// The bytes after the first stage: a message id's alphabet (`m-`, base-32
-/// letters and digits, `-`, hex digits) and [`crate::doorbell::LINE_SUFFIX`].
+/// The bytes after the first stage: [`crate::doorbell::LINE_PREFIX`], a
+/// message id's alphabet (`m-`, base-32 letters and digits, `-`, hex digits)
+/// and [`crate::doorbell::LINE_SUFFIX`].
 fn later_stage_bytes() -> impl Iterator<Item = u8> {
-    (b'a'..=b'z')
+    crate::doorbell::LINE_PREFIX
+        .bytes()
+        .chain(b'a'..=b'z')
         .chain(b'0'..=b'9')
         .chain(std::iter::once(b'-'))
         .chain(crate::doorbell::LINE_SUFFIX.bytes())
 }
 
 /// Rule 2 for one record: `Go` when every required measurement is verified,
-/// no first-stage byte commits in any of its dialogs and its own settle window
-/// is within the cap; the first failing requirement otherwise.
+/// no first-stage byte commits in any of its dialogs, `head_echo` is verified
+/// if a later-stage byte commits in one (the line is then staged), and its own
+/// settle window is within the cap; the first failing requirement otherwise.
 pub fn exact_verdict<'a>(record: &ReleaseRecord<'a>) -> Activation<'a> {
     fn need<T>(m: &Measurement<T>, name: &'static str) -> Result<(), NoGo> {
         match m {
@@ -317,6 +330,9 @@ pub fn exact_verdict<'a>(record: &ReleaseRecord<'a>) -> Activation<'a> {
     let staged = dialogs
         .iter()
         .any(|d| later_stage_bytes().any(|key| d.effect(key) == Some(KeyEffect::Commits)));
+    if staged && let Err(no_go) = need(&record.head_echo, "head_echo") {
+        return Activation::NoGo(no_go);
+    }
     let first_modal = record
         .first_modal
         .verified()
@@ -807,9 +823,10 @@ const CODEX_0160_DIALOGS: &[DialogKeys<'static>] = &[
 /// launches at 50 × 200 and 80 × 300 (`src/agent_pty_scanner_budget.rs`):
 /// at most 501 µs added to a push's lock hold and 5.0 ms of scanner CPU per
 /// generation, no work limit reached (`docs/develop/doorbell-admission.md`).
-/// Of the three, only Claude Code 2.1.310 is `Go`: both Codex releases are
-/// `first_stage_commits`, since `n`, in the line's fixed head, answers their
-/// folder-trust dialog.
+/// Of the three, only Claude Code 2.1.310 is `Go`: both Codex releases stage
+/// the line (a digit of a message id answers their update dialog, `n` their
+/// folder-trust dialog), and neither records `head_echo` yet, so both are
+/// `missing_measurement`.
 pub static RELEASE_RECORDS: [ReleaseRecord<'static>; 3] = [
     // Codex 0.164.0, the release current at measurement. Echo: the exact line
     // in the composer 30 of 30 (20 at 50 × 200, 10 at 24 × 80; ≤ 62 ms after
@@ -841,6 +858,7 @@ pub static RELEASE_RECORDS: [ReleaseRecord<'static>; 3] = [
         input_mode: Measurement::Verified(()),
         release_recogniser: Measurement::Verified(()),
         parser_cost: Measurement::Verified(()),
+        head_echo: Measurement::Absent,
         placeholder_empty: Measurement::Verified(()),
         delete_key: Measurement::Verified(()),
         transcript_echo: Measurement::Verified(()),
@@ -869,6 +887,7 @@ pub static RELEASE_RECORDS: [ReleaseRecord<'static>; 3] = [
         input_mode: Measurement::Verified(()),
         release_recogniser: Measurement::Verified(()),
         parser_cost: Measurement::Verified(()),
+        head_echo: Measurement::Absent,
         placeholder_empty: Measurement::Verified(()),
         delete_key: Measurement::Verified(()),
         transcript_echo: Measurement::Verified(()),
@@ -894,6 +913,8 @@ pub static RELEASE_RECORDS: [ReleaseRecord<'static>; 3] = [
         input_mode: Measurement::Verified(()),
         release_recogniser: Measurement::Verified(()),
         parser_cost: Measurement::Verified(()),
+        // Nothing commits in any dialog, so the line is never staged.
+        head_echo: Measurement::Absent,
         placeholder_empty: Measurement::Failed,
         delete_key: Measurement::Verified(()),
         transcript_echo: Measurement::Verified(()),

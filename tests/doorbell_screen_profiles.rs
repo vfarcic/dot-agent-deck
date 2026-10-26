@@ -686,10 +686,11 @@ fn doorbell_036_strict_withdrawal_refusals() {
     );
 }
 
-/// Scenario: Take each recorded Codex release's measured key effects and ask the table about a record whose every other measurement is verified. A key of the line's fixed head that commits in the folder-trust dialog holds the release as first_stage_commits naming that dialog and key; without that dialog, the digits that commit in the update dialog make the release Go and staged.
+/// Scenario: Take each recorded Codex release's measured key effects and ask the table about a record whose every other measurement is verified, its head echo included. Every byte of the line's first stage, the token head `(xxxxxx)`, is inert in every dialog, so the release is Go and staged with a first stage of eight characters; the same record with a token letter made to commit in folder trust is first_stage_commits naming that dialog and key, and without its head echo it is missing_measurement.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_go_no_go_over_measured_key_effects() {
+    use dot_agent_deck::doorbell_activation::{DialogKeys, KeyEffect, first_stage_bytes};
     for record in RELEASE_RECORDS
         .iter()
         .filter(|r| r.agent == AgentType::Codex)
@@ -713,7 +714,7 @@ fn doorbell_036_go_no_go_over_measured_key_effects() {
                 );
             }
         }
-        let complete = |key_effects| ReleaseRecord {
+        let complete = |key_effects, head_echo| ReleaseRecord {
             ready_composer: Measurement::Verified(()),
             echo: Measurement::Verified(()),
             submit_route: Measurement::Verified(()),
@@ -722,30 +723,156 @@ fn doorbell_036_go_no_go_over_measured_key_effects() {
             input_mode: Measurement::Verified(()),
             release_recogniser: Measurement::Verified(()),
             parser_cost: Measurement::Verified(()),
+            head_echo,
             ..record.clone()
         };
-        assert_eq!(
-            exact_verdict(&complete(Measurement::Verified(dialogs))),
-            Activation::NoGo(NoGo::FirstStageCommits {
-                dialog: "trust".into(),
-                key: b'n'
-            }),
-            "{}",
-            record.release
-        );
-        let without_trust: Vec<_> = dialogs
-            .iter()
-            .filter(|d| d.dialog != "trust")
-            .copied()
-            .collect();
+        assert_eq!(first_stage_bytes().count(), TOKEN_HEAD_ALPHABET);
         assert!(
             matches!(
-                exact_verdict(&complete(Measurement::Verified(&without_trust))),
+                exact_verdict(&complete(
+                    Measurement::Verified(dialogs),
+                    Measurement::Verified(())
+                )),
                 Activation::Go { staged: true, .. }
             ),
             "{}",
             record.release
         );
+        assert_eq!(
+            exact_verdict(&complete(
+                Measurement::Verified(dialogs),
+                Measurement::Absent
+            )),
+            Activation::NoGo(NoGo::MissingMeasurement("head_echo")),
+            "{}",
+            record.release
+        );
+        // `first_stage_commits` still holds a release whose dialog commits on
+        // a token letter.
+        let trust: Vec<(u8, KeyEffect)> = dialogs
+            .iter()
+            .find(|d| d.dialog == "trust")
+            .expect("folder trust measured")
+            .keys
+            .iter()
+            .map(|&(k, e)| (k, if k == b'p' { KeyEffect::Commits } else { e }))
+            .collect();
+        let edited: Vec<DialogKeys<'_>> = dialogs
+            .iter()
+            .map(|d| {
+                if d.dialog == "trust" {
+                    DialogKeys {
+                        dialog: "trust",
+                        keys: &trust,
+                    }
+                } else {
+                    *d
+                }
+            })
+            .collect();
+        assert_eq!(
+            exact_verdict(&complete(
+                Measurement::Verified(&edited),
+                Measurement::Verified(())
+            )),
+            Activation::NoGo(NoGo::FirstStageCommits {
+                dialog: "trust".into(),
+                key: b'p'
+            }),
+            "{}",
+            record.release
+        );
+    }
+}
+
+/// The bytes the token head can contain: two parentheses and sixteen letters.
+const TOKEN_HEAD_ALPHABET: usize = 18;
+
+/// Scenario: Replay the staged composer series recorded on Codex 0.164.0 and 0.160.0 at 24 × 80 through the frame builder the transaction reads. On every trial the screen after the head's one write shows only the placeholder or a prefix of the head until the composer holds exactly the eight-character head with the cursor after it, and no dialog; after the rest's write it shows only prefixes of the line until it holds exactly the whole line; after the Enter a frame shows the line as a user message with the composer no longer holding it. On every head-only trial the composer holds exactly the head, and after the eight deletes it shows the placeholder again.
+#[spec("inbox/doorbell/036")]
+#[test]
+fn doorbell_036_the_staged_head_reads_through_the_profile() {
+    use dot_agent_deck::doorbell_screen::{TOKEN_HEAD_CHARS, frame};
+    for (stem, release) in [
+        ("codex-inbox/r5wake/codex-0.164.0-staged-24x80", "0.164.0"),
+        ("codex-inbox/r5wake/codex-0.160.0-staged-24x80", "0.160.0"),
+    ] {
+        let trace = fixture(stem);
+        assert_eq!(
+            latched(&trace),
+            (AgentType::Codex, Version::parse(release).unwrap())
+        );
+        let trials: Vec<&String> = trace
+            .lines
+            .iter()
+            .filter(|l| l.chars().count() > TOKEN_HEAD_CHARS)
+            .collect();
+        let heads: Vec<&String> = trace
+            .lines
+            .iter()
+            .filter(|l| l.chars().count() == TOKEN_HEAD_CHARS)
+            .collect();
+        assert_eq!((trials.len(), heads.len()), (10, 3), "{stem}");
+        let read = |grid: &Grid, line: &str| frame(&CODEX_PROFILE, grid, 1, true, Some(line));
+        for (i, line) in trials.iter().enumerate() {
+            let n = i + 1;
+            let head = &line[..TOKEN_HEAD_CHARS];
+            let typed_head = trace.points[&format!("mark:trial-{n}")];
+            let typed_rest = trace.points[&format!("mark:rest-{n}")];
+            let arriving = trace.reads_between(typed_head, typed_rest);
+            for grid in &arriving {
+                let f = read(grid, line);
+                assert!(f.dialog.is_none(), "{stem} trial {n}: a dialog");
+                if let Some(c) = &f.composer {
+                    assert!(
+                        c.placeholder || head.starts_with(c.text.as_str()),
+                        "{stem} trial {n}: {:?} before the head's echo",
+                        c.text
+                    );
+                }
+            }
+            let echoed = read(&trace.grid_upto(typed_rest), line);
+            assert!(
+                echoed.holds_exactly(head),
+                "{stem} trial {n}: the head's echo {echoed:?}"
+            );
+            for grid in trace.reads_between(typed_rest, trace.points[&format!("typed-{n:02}")]) {
+                if let Some(c) = &read(&grid, line).composer {
+                    assert!(
+                        line.starts_with(c.text.as_str()),
+                        "{stem} trial {n}: {:?} before the line's echo",
+                        c.text
+                    );
+                }
+            }
+            assert!(
+                read(&trace.grid(&format!("typed-{n:02}")), line).holds_exactly(line),
+                "{stem} trial {n}: the line's echo"
+            );
+            let submitted = trace
+                .reads_between(
+                    trace.points[&format!("mark:cr-{n}")],
+                    trace.points[&format!("after-{n:02}")],
+                )
+                .iter()
+                .map(|grid| read(grid, line))
+                .any(|f| f.user_cells == vec![line.to_string()] && !f.holds_exactly(line));
+            assert!(submitted, "{stem} trial {n}: the line as a user message");
+        }
+        for (i, head) in heads.iter().enumerate() {
+            let n = i + 1;
+            let before = read(
+                &trace.grid_upto(trace.points[&format!("mark:deletes-{n}")]),
+                head,
+            );
+            assert!(before.holds_exactly(head), "{stem} delete {n}: {before:?}");
+            let after = read(&trace.grid(&format!("deleted-{n:02}")), head);
+            assert!(after.empty_and_ready(), "{stem} delete {n}: {after:?}");
+            assert!(
+                after.composer.as_ref().is_some_and(|c| c.placeholder),
+                "{stem} delete {n}: the placeholder"
+            );
+        }
     }
 }
 

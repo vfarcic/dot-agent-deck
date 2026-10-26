@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use dot_agent_deck::doorbell_activation::{
     Activation, DialogKeys, FirstModal, KeyEffect, LatchedRelease, Measurement, NoGo,
-    RELEASE_RECORDS, ReleaseRecord, SETTLE_CAP, activation, exact_verdict,
+    RELEASE_RECORDS, ReleaseRecord, SETTLE_CAP, activation, exact_verdict, first_stage_bytes,
     parse_unrecorded_claude_releases, without_unrecorded_claude,
 };
 use dot_agent_deck::event::AgentType;
@@ -49,6 +49,7 @@ fn complete(agent: AgentType, release: &str, first_modal_secs: u64) -> ReleaseRe
         input_mode: Measurement::Verified(()),
         release_recogniser: Measurement::Verified(()),
         parser_cost: Measurement::Verified(()),
+        head_echo: Measurement::Verified(()),
         placeholder_empty: Measurement::Verified(()),
         delete_key: Measurement::Verified(()),
         transcript_echo: Measurement::Absent,
@@ -210,25 +211,48 @@ fn doorbell_053_unlatched_releases_and_capabilities() {
     ));
 }
 
-/// Scenario: Give a complete record one dialog in which a byte of the line's fixed head commits, then one in which only a message-id digit commits, then one whose own first-dialog time puts its settle window over the cap. The first is held as first_stage_commits naming the dialog and key, the second is Go and staged, the third is held as settle_over_cap.
+/// Scenario: Give a complete record one dialog in which a token letter commits, one in which a parenthesis does, then one in which only a byte of the line's fixed text after the token (`n`) commits, then one in which only a message-id digit commits, then one whose own first-dialog time puts its settle window over the cap. The first two are held as first_stage_commits naming the dialog and key, the next two are Go and staged, the last is held as settle_over_cap.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_key_effects_and_own_settle() {
-    const HEAD_COMMITS: &[(u8, KeyEffect)] = &[(b'd', KeyEffect::Commits)];
-    const HEAD: &[DialogKeys<'static>] = &[DialogKeys {
-        dialog: "update",
-        keys: HEAD_COMMITS,
+    for key in *b"d()z" {
+        let keys = [(key, KeyEffect::Commits)];
+        let dialogs = [DialogKeys {
+            dialog: "update",
+            keys: &keys,
+        }];
+        let record = ReleaseRecord {
+            key_effects: Measurement::Verified(&dialogs),
+            ..complete(CODEX, "0.164.0", 2)
+        };
+        assert_eq!(
+            no_go(&verdict(&[record], &CODEX, "0.164.0")),
+            Some(NoGo::FirstStageCommits {
+                dialog: "update".into(),
+                key
+            }),
+            "{}",
+            key as char
+        );
+    }
+    // `n` is in the line's fixed text (" dot-agent-deck: message "), which is
+    // typed after the token head: it stages the line.
+    const PREFIX_COMMITS: &[(u8, KeyEffect)] = &[(b'n', KeyEffect::Commits)];
+    const PREFIX: &[DialogKeys<'static>] = &[DialogKeys {
+        dialog: "trust",
+        keys: PREFIX_COMMITS,
     }];
     let record = ReleaseRecord {
-        key_effects: Measurement::Verified(HEAD),
+        key_effects: Measurement::Verified(PREFIX),
         ..complete(CODEX, "0.164.0", 2)
     };
     assert_eq!(
-        no_go(&verdict(&[record], &CODEX, "0.164.0")),
-        Some(NoGo::FirstStageCommits {
-            dialog: "update".into(),
-            key: b'd'
-        })
+        verdict(&[record], &CODEX, "0.164.0"),
+        Activation::Go {
+            profile: "test-profile",
+            staged: true,
+            settle: Duration::from_secs(3),
+        }
     );
     const DIGIT_COMMITS: &[(u8, KeyEffect)] =
         &[(b'1', KeyEffect::Commits), (b'd', KeyEffect::Moves)];
@@ -638,7 +662,96 @@ fn doorbell_053_exclusion_only_ever_disables() {
     assert_eq!(tables, 125 * 9);
 }
 
-/// Scenario: Ask the table about each release the deck carries a record for, as it ships. Claude Code 2.1.310 is Go, unstaged; both Codex releases are first_stage_commits, held because `n` in the line's fixed head answers their folder-trust dialog; and every record has its parser cost verified.
+/// Scenario: Give a staged record (a message-id digit commits in its dialog) each state of its head-echo measurement, and an unstaged record no head-echo measurement at all; then make a staged record the newest source of an inherited release. The staged record is Go only with its head echo verified, held as missing_measurement or unverified_measurement naming head_echo otherwise and unmeasured_release when unraisable; the unstaged record is Go without one; and an inherited release whose source lacks it is inherit_source_incomplete.
+#[spec("inbox/doorbell/053")]
+#[test]
+fn doorbell_053_a_staged_line_needs_its_head_echo_measured() {
+    const DIGIT_COMMITS: &[(u8, KeyEffect)] = &[(b'1', KeyEffect::Commits)];
+    const DIGIT: &[DialogKeys<'static>] = &[DialogKeys {
+        dialog: "update",
+        keys: DIGIT_COMMITS,
+    }];
+    let staged = |head_echo| ReleaseRecord {
+        key_effects: Measurement::Verified(DIGIT),
+        head_echo,
+        ..complete(CODEX, "0.164.0", 2)
+    };
+    for (head_echo, want) in [
+        (
+            Measurement::Absent,
+            Some(NoGo::MissingMeasurement("head_echo")),
+        ),
+        (
+            Measurement::Unverified,
+            Some(NoGo::UnverifiedMeasurement("head_echo")),
+        ),
+        (
+            Measurement::Failed,
+            Some(NoGo::UnverifiedMeasurement("head_echo")),
+        ),
+        (Measurement::Unraisable, Some(NoGo::UnmeasuredRelease)),
+        (Measurement::Verified(()), None),
+    ] {
+        let got = verdict(&[staged(head_echo)], &CODEX, "0.164.0");
+        assert_eq!(no_go(&got), want, "{head_echo:?}");
+        if want.is_none() {
+            assert!(
+                matches!(got, Activation::Go { staged: true, .. }),
+                "{got:?}"
+            );
+        }
+    }
+    // Unstaged: the head is never typed alone, so nothing is needed.
+    let unstaged = ReleaseRecord {
+        head_echo: Measurement::Absent,
+        ..complete(CODEX, "0.164.0", 2)
+    };
+    assert!(matches!(
+        verdict(&[unstaged], &CODEX, "0.164.0"),
+        Activation::Go { staged: false, .. }
+    ));
+    // A source without it does not lend its profile.
+    let records = [staged(Measurement::Absent)];
+    assert_eq!(
+        no_go(&verdict(&records, &CODEX, "0.165.0")),
+        Some(NoGo::InheritSourceIncomplete)
+    );
+    let records = [staged(Measurement::Verified(()))];
+    assert!(matches!(
+        verdict(&records, &CODEX, "0.165.0"),
+        Activation::Inherited { staged: true, .. }
+    ));
+}
+
+/// Scenario: For every dialog of every release record the deck carries, now and in any later edit of the table, look up each byte the line's first stage can contain: both parentheses and every letter of the token alphabet. Each must be classified, and classified inert: a record in which one of them commits, moves, edits or dismisses, or is left unmeasured, fails this test.
+#[spec("inbox/doorbell/053")]
+#[test]
+fn doorbell_053_every_recorded_dialog_leaves_the_token_head_inert() {
+    let first_stage: Vec<u8> = first_stage_bytes().collect();
+    assert_eq!(first_stage.len(), 18, "two parentheses and sixteen letters");
+    for record in &RELEASE_RECORDS {
+        let Measurement::Verified(dialogs) = record.key_effects else {
+            continue;
+        };
+        for dialog in dialogs {
+            for key in &first_stage {
+                let effect = dialog.keys.iter().find(|(k, _)| k == key).map(|(_, e)| *e);
+                assert_eq!(
+                    effect,
+                    Some(KeyEffect::Inert),
+                    "{:?} {} `{}`: {:?} in {}",
+                    record.agent,
+                    record.release,
+                    *key as char,
+                    effect,
+                    dialog.dialog
+                );
+            }
+        }
+    }
+}
+
+/// Scenario: Ask the table about each release the deck carries a record for, as it ships. Claude Code 2.1.310 is Go, unstaged; both Codex releases stage the line and are held as missing_measurement until their head echo is recorded; and every record has its parser cost verified.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_the_shipped_records_verdicts() {
@@ -657,10 +770,7 @@ fn doorbell_053_the_shipped_records_verdicts() {
             ),
             (AgentType::Codex, "0.164.0" | "0.160.0") => assert_eq!(
                 verdict,
-                Activation::NoGo(NoGo::FirstStageCommits {
-                    dialog: "trust".into(),
-                    key: b'n'
-                })
+                Activation::NoGo(NoGo::MissingMeasurement("head_echo"))
             ),
             other => panic!("a record this test does not know: {other:?}"),
         }

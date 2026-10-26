@@ -382,10 +382,8 @@ impl AgentPtyRegistry {
             hook_route: hook_route
                 && matches!(agent, Some(AgentType::ClaudeCode | AgentType::Codex)),
             transcript_route: record.transcript_echo.verified().is_some(),
-            staged_head: staged.then(|| {
-                crate::doorbell_screen::TOKEN_HEAD_CHARS
-                    + crate::doorbell::LINE_PREFIX.chars().count()
-            }),
+            // Q27: the first stage is the token head alone.
+            staged_head: staged.then_some(crate::doorbell_screen::TOKEN_HEAD_CHARS),
         };
         #[cfg(test)]
         let settle = self

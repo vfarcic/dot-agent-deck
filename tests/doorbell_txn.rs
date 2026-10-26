@@ -8,11 +8,12 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use dot_agent_deck::doorbell_screen::TOKEN_HEAD_CHARS;
 use dot_agent_deck::doorbell_txn::{
     Action, Admission, AttemptCounter, AttemptRing, Caps, Cause, ComposerView, Event, Frame, Job,
     JobClaim, Latch, LatchCell, NotTyped, Outcome, Publisher, Resolution, RingToken, Seam,
-    SeamRead, Shown, TOKEN_DRAWS, TXN_MAX, Txn, admit, hook_evidence, pick_token, project,
-    ring_entry, seam_until,
+    SeamRead, Shown, TOKEN_ALPHABET, TOKEN_DRAWS, TXN_MAX, Txn, admit, hook_evidence, pick_token,
+    project, ring_entry, seam_until,
 };
 use dot_agent_deck::inbox::MessageId;
 use spec::spec;
@@ -110,6 +111,12 @@ struct World {
     at: Vec<(Duration, Change)>,
     /// A change made after admission and before the first seam.
     after_admission: Option<Change>,
+    /// Changes made just before the n-th seam read (0-based): the screen
+    /// moving between the frame a step decided on and its seam.
+    before_seam: Vec<(usize, Change)>,
+    seams: usize,
+    /// When each job reached the writer, from the start.
+    job_at: Vec<Duration>,
     jobs: usize,
     start: Instant,
     cell: Arc<LatchCell>,
@@ -163,6 +170,9 @@ impl World {
             before_job: Vec::new(),
             at: Vec::new(),
             after_admission: None,
+            before_seam: Vec::new(),
+            seams: 0,
+            job_at: Vec::new(),
             jobs: 0,
             start: now,
             cell: Arc::default(),
@@ -250,6 +260,7 @@ impl World {
     fn apply(&mut self, job: &Job, claim: Arc<JobClaim>) {
         let n = self.jobs;
         self.jobs += 1;
+        self.job_at.push(self.now - self.start);
         let changes: Vec<Change> = {
             let (now, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.before_job)
                 .into_iter()
@@ -388,6 +399,15 @@ impl World {
 
 impl Seam for World {
     fn read(&mut self) -> Option<SeamRead> {
+        let n = self.seams;
+        self.seams += 1;
+        let (now, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.before_seam)
+            .into_iter()
+            .partition(|(at, _)| *at == n);
+        self.before_seam = later;
+        for (_, change) in now {
+            change(self);
+        }
         (!self.contended).then(|| SeamRead {
             watermark: self.watermark,
             job_mark: self.job_mark,
@@ -1977,4 +1997,284 @@ fn doorbell_046_a_delayed_reprojection_shows_only_the_current_state() {
             ("p".to_string(), None)
         ]
     );
+}
+
+// ------------------------------------------------------------------------
+// The staged line at the token head (Q27)
+
+/// A staged world: the first stage is the 8-character token head alone.
+fn staged() -> World {
+    let mut world = World::new();
+    world.caps.staged_head = Some(TOKEN_HEAD_CHARS);
+    world
+}
+
+fn head_of(line: &str) -> &str {
+    &line[..TOKEN_HEAD_CHARS]
+}
+
+/// Scenario: Type a staged line into a model agent whose screen shows the head's echo only 300 ms after the head was written. The first job is exactly the token head `(xxxxxx)`, every byte of it from the parentheses and the token alphabet; the rest goes in only once the head's echo is on screen, then one Enter, and the attempt is Submitted. An unstaged line is one job.
+#[spec("inbox/doorbell/058")]
+#[test]
+fn doorbell_058_the_first_stage_is_the_token_head_and_the_rest_waits_for_its_echo() {
+    let mut world = staged();
+    world.before_job.push((
+        0,
+        Box::new(|w| {
+            w.stale = Some(String::new());
+            w.at.push((Duration::from_millis(300), Box::new(|w| w.stale = None)));
+        }),
+    ));
+    let (outcome, line) = run(&mut world);
+    assert_eq!(outcome, Ok(Outcome::Submitted));
+    let head = head_of(&line);
+    assert_eq!(
+        world.pane,
+        vec![
+            head.to_string(),
+            line[TOKEN_HEAD_CHARS..].to_string(),
+            "<CR>".to_string()
+        ]
+    );
+    assert!(head.starts_with('(') && head.ends_with(')'));
+    assert!(
+        head.bytes()
+            .all(|b| b == b'(' || b == b')' || TOKEN_ALPHABET.contains(&b)),
+        "{head}"
+    );
+    assert!(
+        world.job_at[1] >= Duration::from_millis(300),
+        "the rest waited for the head's echo: {:?}",
+        world.job_at
+    );
+
+    let mut unstaged = World::new();
+    let (outcome, line) = run(&mut unstaged);
+    assert_eq!(outcome, Ok(Outcome::Submitted));
+    assert_eq!(unstaged.pane, vec![line, "<CR>".to_string()]);
+}
+
+/// Scenario: A dialog opens as the token head is written, so the head's bytes reach the dialog; separately, a dialog opens after the head's echo was seen and before the rest's seam; separately, the composer shows another token there. Each ends Unresolved with only the head written: no rest, no Enter and no delete.
+#[spec("inbox/doorbell/058")]
+#[test]
+fn doorbell_058_a_dialog_or_a_changed_frame_at_the_head_gets_nothing_more() {
+    let mut with_head = staged();
+    with_head
+        .before_job
+        .push((0, Box::new(|w| w.dialog = Some("trust"))));
+    let (outcome, line) = run(&mut with_head);
+    assert_eq!(outcome, Ok(Outcome::Unresolved(Cause::DialogAfterTyping)));
+    assert_eq!(with_head.pane, vec![head_of(&line).to_string()]);
+    assert_eq!(with_head.dialog_took, vec![head_of(&line).to_string()]);
+
+    // The head's echo was seen (seam 0 is the head's, seam 1 the rest's).
+    let mut at_seam = staged();
+    at_seam
+        .before_seam
+        .push((1, Box::new(|w| w.dialog = Some("trust"))));
+    let (outcome, line) = run(&mut at_seam);
+    assert_eq!(outcome, Ok(Outcome::Unresolved(Cause::DialogAfterTyping)));
+    assert_eq!(at_seam.pane, vec![head_of(&line).to_string()]);
+    assert!(at_seam.dialog_took.is_empty());
+
+    let mut other = staged();
+    other
+        .before_seam
+        .push((1, Box::new(|w| w.stale = Some("(zzzzzz)".to_string()))));
+    let (outcome, line) = run(&mut other);
+    assert!(matches!(outcome, Ok(Outcome::Unresolved(_))), "{outcome:?}");
+    assert_eq!(other.pane, vec![head_of(&line).to_string()]);
+}
+
+/// Scenario: After the token head is written, the screen never shows it, shows another token's head, or shows only part of the head; then, separately, part of the head first and the whole head 200 ms later. The first three end Unresolved with only the head written and nothing deleted; the last carries on to the rest and is Submitted.
+#[spec("inbox/doorbell/058")]
+#[test]
+fn doorbell_058_a_head_echo_missing_or_not_the_deck_s_types_nothing_more() {
+    for shown in ["", "(zzzzzz)", "(pt"] {
+        let mut world = staged();
+        let screen = shown.to_string();
+        world
+            .before_job
+            .push((0, Box::new(move |w| w.stale = Some(screen))));
+        let (outcome, line) = run(&mut world);
+        assert_eq!(
+            outcome,
+            Ok(Outcome::Unresolved(Cause::EchoMismatch)),
+            "{shown:?}"
+        );
+        assert_eq!(world.pane, vec![head_of(&line).to_string()], "{shown:?}");
+    }
+
+    let mut arriving = staged();
+    arriving.before_job.push((
+        0,
+        Box::new(|w| {
+            w.stale = Some(w.composer.chars().take(3).collect());
+            w.at.push((Duration::from_millis(200), Box::new(|w| w.stale = None)));
+        }),
+    ));
+    let (outcome, line) = run(&mut arriving);
+    assert_eq!(outcome, Ok(Outcome::Submitted));
+    assert_eq!(arriving.pane.len(), 3, "{:?}", arriving.pane);
+    assert_eq!(arriving.pane[0], head_of(&line));
+}
+
+/// Scenario: The writer takes 1 to 7 bytes of the token head, then none of it; then all of it with its flush failing; then the whole head with the admission lost while its echo is awaited. Part of a head is never deleted and nothing more is written (Unresolved); none of it is nothing written; a whole head is withdrawn with eight deletes and the placeholder's confirmation (Withdrawn), and the rest is never typed.
+#[spec("inbox/doorbell/058")]
+#[test]
+fn doorbell_058_part_of_a_head_is_never_deleted_and_a_whole_one_is_withdrawn() {
+    for took in 1..TOKEN_HEAD_CHARS {
+        let mut world = staged();
+        world.writes.push_back(Write::Partial(took));
+        let (outcome, line) = run(&mut world);
+        assert_eq!(
+            outcome,
+            Ok(Outcome::Unresolved(Cause::PartialWrite)),
+            "{took}"
+        );
+        assert_eq!(world.pane, vec![line[..took].to_string()], "{took}");
+    }
+    let mut none = staged();
+    none.writes.push_back(Write::Partial(0));
+    let (outcome, _) = run(&mut none);
+    assert_eq!(outcome, Ok(Outcome::NothingWritten(NotTyped::WriteFailed)));
+
+    let mut flush = staged();
+    flush.writes.push_back(Write::FlushError);
+    let (outcome, line) = run(&mut flush);
+    assert_eq!(outcome, Ok(Outcome::Withdrawn));
+    assert_eq!(
+        flush.pane,
+        vec![head_of(&line).to_string(), "<DEL×8>".to_string()]
+    );
+
+    let mut lost = staged();
+    lost.before_job.push((
+        0,
+        Box::new(|w| {
+            w.stale = Some(String::new());
+            w.at.push((
+                Duration::from_millis(100),
+                Box::new(|w| w.events.push_back(Event::AdmissionLost)),
+            ));
+            w.at.push((Duration::from_millis(200), Box::new(|w| w.stale = None)));
+        }),
+    ));
+    let (outcome, line) = run(&mut lost);
+    assert_eq!(outcome, Ok(Outcome::Withdrawn));
+    assert_eq!(
+        lost.pane,
+        vec![head_of(&line).to_string(), "<DEL×8>".to_string()],
+        "the rest is never typed after the admission is lost"
+    );
+    assert_eq!(
+        lost.cell_at_release,
+        Some(Latch::Resolved(1, Resolution::Withdrawn))
+    );
+}
+
+/// Scenario: With the token head written and echoed, the rest's job stays queued until the deadline; separately, the writer claims it at the deadline and its reports arrive after; separately, its end is the first the transaction hears of it, at the deadline or a millisecond after, whether the writer took its bytes or none. The queued rest is taken back and never written; every case releases by the deadline with the cell suspended, never as nothing written, since the head is in.
+#[spec("inbox/doorbell/058")]
+#[test]
+fn doorbell_058_the_rest_s_claim_at_the_head_boundary() {
+    let mut queued = staged();
+    queued.writes.extend([Write::Whole, Write::NeverStarts]);
+    let start = queued.now;
+    let (outcome, line) = run(&mut queued);
+    assert_eq!(outcome, Ok(Outcome::Unresolved(Cause::Deadline)));
+    assert_eq!(queued.pane, vec![head_of(&line).to_string()]);
+    assert_eq!(
+        queued.taken_back,
+        vec![Job::Line(line[TOKEN_HEAD_CHARS..].to_string())]
+    );
+    assert_eq!(
+        queued.cell_at_release,
+        Some(Latch::Suspended(1, Cause::Deadline))
+    );
+    assert!(queued.released_at.unwrap() <= start + TXN_MAX);
+
+    let mut claimed = staged();
+    claimed.writes.extend([Write::Whole, Write::NeverStarts]);
+    writer_claims(&mut claimed, TXN_MAX, TXN_MAX + Duration::from_secs(1));
+    let start = claimed.now;
+    let (outcome, line) = run(&mut claimed);
+    assert_eq!(outcome, Ok(Outcome::Unresolved(Cause::Deadline)));
+    assert_eq!(
+        claimed.pane,
+        vec![
+            head_of(&line).to_string(),
+            line[TOKEN_HEAD_CHARS..].to_string()
+        ]
+    );
+    assert_eq!(
+        claimed.cell_at_release,
+        Some(Latch::Suspended(1, Cause::Deadline))
+    );
+    assert!(claimed.released_at.unwrap() <= start + TXN_MAX);
+    assert!(!claimed.pane.iter().any(|w| w.ends_with("(late)")));
+
+    // Driven call by call: the rest's end is first heard at the deadline.
+    for late in [Duration::ZERO, Duration::from_millis(1)] {
+        for took in [true, false] {
+            let mut world = staged();
+            let start = world.now;
+            let (cell, ring, counter) = (
+                Arc::clone(&world.cell),
+                Arc::clone(&world.ring),
+                Arc::clone(&world.counter),
+            );
+            let mut txn = admit(
+                &world.admission(),
+                &counter,
+                &ring,
+                &cell,
+                draws(),
+                &id(),
+                world.caps,
+                start,
+            )
+            .expect("admitted");
+            let actions = txn.start(&mut world, start);
+            let Some(Action::Enqueue(Job::Line(head), claim)) = actions.into_iter().next() else {
+                panic!("the head is queued first");
+            };
+            assert_eq!(head.chars().count(), TOKEN_HEAD_CHARS);
+            assert!(claim.start());
+            world.type_into_composer(&head);
+            let t = start + Duration::from_millis(5);
+            let _ = txn.on(
+                Event::JobEnded {
+                    accepted: head.len(),
+                    ok: true,
+                },
+                &mut world,
+                t,
+            );
+            let actions = txn.on(Event::Frame(world.frame()), &mut world, t);
+            let Some(Action::Enqueue(Job::Line(rest), claim)) = actions
+                .into_iter()
+                .find(|a| matches!(a, Action::Enqueue(..)))
+            else {
+                panic!("the rest is queued on the head's echo");
+            };
+            assert!(claim.start(), "the writer takes the rest");
+            let accepted = if took { rest.len() } else { 0 };
+            let at = txn.deadline() + late;
+            let actions = txn.on(Event::JobEnded { accepted, ok: took }, &mut world, at);
+            assert!(
+                !actions.iter().any(|a| matches!(a, Action::Enqueue(..))),
+                "late {late:?}, took {took}: nothing more is queued: {actions:?}"
+            );
+            let released = actions.iter().find_map(|a| match a {
+                Action::Release(outcome) => Some(*outcome),
+                _ => None,
+            });
+            assert_eq!(
+                released,
+                Some(Outcome::Unresolved(Cause::Deadline)),
+                "late {late:?}, took {took}"
+            );
+            assert_eq!(cell.load(), Latch::Suspended(1, Cause::Deadline));
+        }
+    }
 }

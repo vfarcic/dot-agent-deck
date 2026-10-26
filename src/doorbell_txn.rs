@@ -607,7 +607,8 @@ pub struct Caps {
     pub hook_route: bool,
     /// The transcript shows the submitted line as a user message.
     pub transcript_route: bool,
-    /// Typed in two stages, the first this many characters (plan §4.3).
+    /// Typed in two stages, the first this many characters: the token head
+    /// (plan §4.3 as amended by Q27).
     pub staged_head: Option<usize>,
 }
 
@@ -1102,6 +1103,11 @@ impl<'c> Txn<'c> {
             return self.end(End::Expire, now);
         }
         match (self.phase, event) {
+            // The rest's seam is being retried: a cancellation since the
+            // head's echo is handled as one during it.
+            (Phase::Typing(stage), _) if stage > 0 && self.cancels_at_head() => {
+                self.cancel_after_head(seam, now)
+            }
             (Phase::Typing(stage), _) => self.try_line(stage, seam, now),
             (Phase::LineJob(stage), Event::JobEnded { accepted, ok }) => {
                 self.line_ended(stage, accepted, ok, seam, now)
@@ -1112,7 +1118,7 @@ impl<'c> Txn<'c> {
             (Phase::HeadEcho | Phase::Echo, Event::ModeChanged) if self.wrote => {
                 self.unresolve(Cause::ModeChanged, seam, now)
             }
-            (Phase::HeadEcho, _) => self.head_echo(seam, now),
+            (Phase::HeadEcho, _) => self.after_head(seam, now),
             (Phase::Echo | Phase::PreCr, _) if self.admission_lost => {
                 self.admission_lost = false;
                 self.cancel_after_line(seam, now)
@@ -1414,11 +1420,28 @@ impl<'c> Txn<'c> {
         }
         if stage + 1 < stages.len() {
             self.enter(Phase::HeadEcho, now);
-            return self.head_echo(seam, now);
+            return self.after_head(seam, now);
         }
         self.line_done_at = Some(now);
         self.enter(Phase::Echo, now);
         self.echo(seam, now)
+    }
+
+    /// The staged head is written. A cancellation while its echo is awaited
+    /// means the rest is never typed and the head is withdrawn once its echo
+    /// shows it is the deck's alone; a profile that cannot withdraw finishes
+    /// the line and handles the cancellation after it, as for an unstaged
+    /// line.
+    fn after_head(&mut self, seam: &mut dyn Seam, now: Instant) -> Vec<Action> {
+        if self.cancels_at_head() {
+            self.cancel_after_head(seam, now)
+        } else {
+            self.head_echo(seam, now)
+        }
+    }
+
+    fn cancels_at_head(&self) -> bool {
+        self.admission_lost && self.caps.delete_key && self.caps.placeholder
     }
 
     /// Waits for the staged head's echo, then types the rest.
@@ -1432,6 +1455,26 @@ impl<'c> Txn<'c> {
         if self.frame.holds_prefix(&self.line, self.accepted) {
             self.enter(Phase::Typing(1), now);
             return self.try_line(1, seam, now);
+        }
+        if now >= self.phase_since + ECHO_WAIT {
+            return self.unresolve(Cause::EchoMismatch, seam, now);
+        }
+        vec![Action::WakeAt(self.next_wake(now))]
+    }
+
+    /// [`Self::head_echo`] after a cancellation: on the head's exact echo the
+    /// head is withdrawn under the strict recogniser instead of the rest
+    /// being typed; with no such echo within [`ECHO_WAIT`], `Unresolved`.
+    fn cancel_after_head(&mut self, seam: &mut dyn Seam, now: Instant) -> Vec<Action> {
+        if !self.frame.clean || self.frame.epoch != self.epoch {
+            return self.edge(now);
+        }
+        if self.frame.dialog.is_some() {
+            return self.unresolve(Cause::DialogAfterTyping, seam, now);
+        }
+        if self.frame.holds_prefix(&self.line, self.accepted) {
+            self.admission_lost = false;
+            return self.unresolve(Cause::EchoMismatch, seam, now);
         }
         if now >= self.phase_since + ECHO_WAIT {
             return self.unresolve(Cause::EchoMismatch, seam, now);
