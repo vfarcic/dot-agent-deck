@@ -51,6 +51,8 @@ pub mod doorbell_screen;
 pub mod doorbell_txn;
 // PRD #1589: the record of dispatched units the `close` verb is authorized from.
 pub mod dispatched_units;
+// PRD #1666 part 3 round 5-wake (R6-4): an agent's input box, followed from its PTY input.
+pub mod composer_model;
 // Issue #544: the per-pane unsent-draft bit the doorbell reads before it writes.
 pub mod draft_deferral;
 pub mod embedded_pane;

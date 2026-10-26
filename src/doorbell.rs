@@ -284,6 +284,58 @@ pub fn ring_still_admitted(inbox: &DoorbellFacts, config: &DoorbellConfig, now: 
             .is_none_or(|at| now >= at + config.arm_grace)
 }
 
+/// PRD #1666 hardening H3: what a ring re-asks before admission and while
+/// its transaction holds the pane's writer. The same admission
+/// (`admission`, decided by the tick: nothing happened to the pane since)
+/// and, for a ring, still no native component armed or inside the arm grace
+/// of an announcement. Part 2 (`inbox/doorbell/031`): and the message the
+/// ring names (`selected`) still queued for this generation, from a fresh
+/// query each time.
+///
+/// Part 3, round 5-wake (plan §2.3): the check never waits on the hub's lock.
+/// The ring holds the writer, and the hub's holders can themselves wait on
+/// other locks, so a blocking read could hold the writer past the
+/// transaction's deadline, which bounds only what the check awaits. The hub
+/// is read with [`crate::inbox_hub::InboxHub::try_doorbell_facts`]; while it is
+/// contended the check sleeps and asks again, the app state included, until
+/// it answers or the ring's own deadline gives up on it. No guard is held
+/// across an await.
+pub(crate) fn ring_admission_check(
+    state: SharedState,
+    registry: Arc<AgentPtyRegistry>,
+    pane: &str,
+    agent: &str,
+    config: &DoorbellConfig,
+    selected: &str,
+    admission: Option<crate::state::DoorbellAdmission>,
+) -> impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> + Send + Sync + use<>
+{
+    let (pane, agent, selected) = (pane.to_string(), agent.to_string(), selected.to_string());
+    let config = config.clone();
+    move || {
+        let state = Arc::clone(&state);
+        let registry = Arc::clone(&registry);
+        let (pane, agent, selected) = (pane.clone(), agent.clone(), selected.clone());
+        let config = config.clone();
+        Box::pin(async move {
+            loop {
+                let now = state.read().await.doorbell_admission(&agent, &pane);
+                if !admission
+                    .zip(now)
+                    .is_some_and(|(decided, now)| decided.still_holds(&now))
+                {
+                    return false;
+                }
+                if let Some(facts) = registry.inbox().try_doorbell_facts(&pane, &agent) {
+                    return facts.queued.contains(&selected)
+                        && ring_still_admitted(&facts, &config, Instant::now());
+                }
+                tokio::time::sleep(crate::doorbell_txn::SEAM_RETRY).await;
+            }
+        })
+    }
+}
+
 /// PR #1735 fifth review (R5): whether an agent generation's waiting
 /// messages have waited past [`DoorbellConfig::wake_stall_after`] with
 /// nothing waking the agent for them.
@@ -919,39 +971,15 @@ async fn run_tick(
             if rering {
                 pause_rering_for_test(&pane, "decided").await;
             }
-            // PRD #1666 hardening H3: re-asked before admission and while the
-            // transaction holds the writer. The same admission (nothing
-            // happened to the pane since this tick) and, for a ring, still no
-            // native component armed or inside the arm grace of an
-            // announcement. Part 2 (`inbox/doorbell/031`): and the message
-            // this ring names still queued for this generation, from a fresh
-            // query each time. The query takes and drops the hub's lock;
-            // nothing here holds it across the writer's waits.
-            let still_admitted = {
-                let state = Arc::clone(&state);
-                let registry = Arc::clone(&registry);
-                let (pane, agent) = (pane.clone(), agent.clone());
-                let config = config.clone();
-                let selected = id.clone();
-                move || {
-                    let state = Arc::clone(&state);
-                    let registry = Arc::clone(&registry);
-                    let (pane, agent) = (pane.clone(), agent.clone());
-                    let config = config.clone();
-                    let selected = selected.clone();
-                    async move {
-                        let now = state.read().await.doorbell_admission(&agent, &pane);
-                        admission
-                            .zip(now)
-                            .is_some_and(|(decided, now)| decided.still_holds(&now))
-                            && {
-                                let facts = registry.inbox().doorbell_facts(&pane, &agent);
-                                facts.queued.contains(&selected)
-                                    && ring_still_admitted(&facts, &config, Instant::now())
-                            }
-                    }
-                }
-            };
+            let still_admitted = ring_admission_check(
+                Arc::clone(&state),
+                Arc::clone(&registry),
+                &pane,
+                &agent,
+                &config,
+                &id,
+                admission,
+            );
             let Some(message) = crate::inbox::MessageId::parse(&id) else {
                 warn!(pane_id = %pane, agent_id = %agent, message_id = %id, "doorbell: a queued id that does not parse");
                 return;

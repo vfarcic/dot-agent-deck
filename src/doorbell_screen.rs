@@ -229,6 +229,10 @@ pub struct Composer {
     pub dim: bool,
     /// The cursor sits right after the text.
     pub cursor_at_end: bool,
+    /// The composer's region holds something its text does not show: a
+    /// line with nothing visible on it among others, or a blank the agent
+    /// wrote into an otherwise empty box. Never empty, never the deck's line.
+    pub hidden: bool,
 }
 
 /// The measured screen of one agent, across the releases its record lists.
@@ -261,6 +265,9 @@ impl ScreenProfile {
     /// The composer's content against `line`.
     pub fn holds(&self, grid: &Grid, line: &str) -> Option<ComposerText> {
         let composer = (self.composer)(grid)?;
+        if composer.hidden {
+            return Some(ComposerText::Other);
+        }
         if composer.text.is_empty() || (composer.dim && (self.placeholder)(&composer.text)) {
             return Some(ComposerText::Empty {
                 placeholder: !composer.text.is_empty(),
@@ -283,9 +290,11 @@ impl ScreenProfile {
         Some(ComposerText::Other)
     }
 
-    /// The empty ready composer, with no dialog over it: what the doorbell
-    /// needs before it types (step 2). A blank one only with the cursor where
-    /// an empty composer keeps it, as [`crate::doorbell_txn::Frame`] reads it.
+    /// The empty ready composer, with no dialog over it, as far as the screen
+    /// shows: a blank one only with the cursor where an empty composer keeps
+    /// it and nothing hidden in its region, as [`crate::doorbell_txn::Frame`]
+    /// reads it. Not what the doorbell admits on alone: blanks the agent does
+    /// not draw look the same, so the frame's input proof decides with it.
     pub fn empty_and_ready(&self, grid: &Grid) -> bool {
         grid.cols >= self.min_cols
             && (self.dialog)(grid).is_none()
@@ -497,6 +506,7 @@ fn codex_composer(grid: &Grid) -> Option<Composer> {
         text,
         dim: any && dim,
         cursor_at_end,
+        hidden: false,
     })
 }
 
@@ -654,15 +664,30 @@ fn claude_composer(grid: &Grid) -> Option<Composer> {
     let close = (prompt_row + 1..grid.rows).find(|&r| claude_rule(grid, r))?;
     let mut text = grid.text_from(prompt_row, CLAUDE_INDENT);
     let mut last_row = prompt_row;
+    // Every row up to the closing rule: Claude Code draws one row or more
+    // for each line of its input, and a line with nothing visible on it
+    // (blank, or only spaces, which it does not draw) is a row of nothing,
+    // with whatever follows it still below. So a blank row is hidden content
+    // when text follows it, or when nothing else is drawn; a blank row after
+    // the text is read as before.
+    let mut blank_line = text.is_empty() && close > prompt_row + 1;
+    let mut gap = text.is_empty();
     for row in prompt_row + 1..close {
         let next = grid.text_from(row, 0);
         if next.trim().is_empty() {
-            break;
+            gap = true;
+            continue;
         }
-        text.push(' ');
+        blank_line |= gap;
+        if !text.is_empty() {
+            text.push(' ');
+        }
         text.push_str(next.trim());
         last_row = row;
     }
+    // A blank written into an empty box: every measured empty composer
+    // (fresh, cleared, after a task, resized) wrote nothing past the indent.
+    let written_blank = text.is_empty() && grid.written_extent(prompt_row) > CLAUDE_INDENT;
     let mut dim = true;
     let mut any = false;
     for r in prompt_row..=last_row {
@@ -690,6 +715,7 @@ fn claude_composer(grid: &Grid) -> Option<Composer> {
         text,
         dim: any && dim,
         cursor_at_end,
+        hidden: blank_line || written_blank,
     })
 }
 
@@ -852,6 +878,7 @@ fn standin_composer(grid: &Grid) -> Option<Composer> {
         cursor_at_end: grid.cursor == (last_row, end_col),
         text,
         dim,
+        hidden: false,
     })
 }
 
@@ -1052,10 +1079,13 @@ pub fn frame(
                     .any(|c| c.inverse && !c.text.trim().is_empty())
             });
             ComposerView {
-                placeholder: composer.dim && (profile.placeholder)(&composer.text),
+                placeholder: !composer.hidden
+                    && composer.dim
+                    && (profile.placeholder)(&composer.text),
                 text: composer.text,
                 cursor_at_end: composer.cursor_at_end,
                 selection,
+                hidden: composer.hidden,
             }
         });
     let user_cells = line
@@ -1069,6 +1099,7 @@ pub fn frame(
         composer,
         user_cells,
         text,
+        input: Default::default(),
     }
 }
 

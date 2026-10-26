@@ -191,6 +191,7 @@ impl World {
             text,
             cursor_at_end: self.cursor_at_end,
             selection: self.selection,
+            hidden: false,
         });
         Frame {
             epoch: self.epoch,
@@ -199,6 +200,7 @@ impl World {
             composer,
             user_cells: self.user_cells.clone(),
             text: self.user_cells.join("\n"),
+            input: Default::default(),
         }
     }
 

@@ -3814,7 +3814,9 @@ const PASTE_MARKER_PREFIX: &[u8] = b"\x1b[20";
 pub struct PaneInputHold {
     /// A bracketed paste into the pane has started and not ended.
     pub paste_open: bool,
-    /// The user has sent input since their last submit or clear.
+    /// The user has sent input since their last submit or clear, or the
+    /// input box is not proven empty by the bytes written into it
+    /// ([`crate::composer_model::InputProof`]).
     pub draft: bool,
     /// How many of the pane's agent's turns have ended on this stream.
     pub turns: u64,
@@ -3880,6 +3882,10 @@ struct PaneInputStream {
     /// two can never disagree about what a byte did. See
     /// [`crate::draft_deferral::DraftTracker`].
     draft: crate::draft_deferral::DraftTracker,
+    /// PRD #1666 part 3, round 5-wake (R6-4): what the input box holds, as
+    /// far as the same bytes say. Fed with the draft bit, every byte, so the
+    /// two read one stream. See [`crate::composer_model::ComposerModel`].
+    composer: crate::composer_model::ComposerModel,
     /// PRD #1666 (r8k R8G-02): the pane's own agent reported a turn starting
     /// ([`TurnEdge::Started`]) and has not reported it ended since. Only an
     /// Idle that ends such a turn releases anything, so a repeated Idle, or
@@ -3921,6 +3927,7 @@ impl PaneInputStream {
         let in_paste = self.in_paste;
         let submits = self.scan_submit(byte);
         self.draft.feed_byte(byte, submits, in_paste, origin);
+        self.composer.feed_byte(byte, submits, in_paste);
         submits
     }
 
@@ -3983,6 +3990,31 @@ impl DraftTestStream {
 
     pub(crate) fn draft(&self) -> &crate::draft_deferral::DraftTracker {
         &self.0.draft
+    }
+
+    pub(crate) fn composer(&self) -> &crate::composer_model::ComposerModel {
+        &self.0.composer
+    }
+
+    /// The pane's own agent reported a turn starting, as
+    /// [`PaneInputState::note_turn`] applies it.
+    pub(crate) fn turn_started(&mut self) {
+        if !self.0.busy {
+            self.0.composer.turn_started();
+        }
+        self.0.busy = true;
+    }
+
+    /// The agent reported Idle after working.
+    pub(crate) fn turn_ended(&mut self) {
+        self.0.busy = false;
+    }
+
+    /// The doorbell's verified submit, as [`PaneInputState::reconcile_deck_submit`]
+    /// applies it.
+    pub(crate) fn reconcile_deck_submit_for_test(&mut self) {
+        self.0.draft.reconcile_deck_submit();
+        self.0.composer.reconcile_deck_submit();
     }
 }
 
@@ -4099,6 +4131,7 @@ impl PaneInputState {
     fn reconcile_deck_submit(&mut self, pane_id_env: &str) {
         if let Some(stream) = self.input.get_mut(pane_id_env) {
             stream.draft.reconcile_deck_submit();
+            stream.composer.reconcile_deck_submit();
         }
     }
 
@@ -4175,8 +4208,20 @@ impl PaneInputState {
             .get(pane_id_env)
             .map_or_else(PaneInputHold::default, |stream| PaneInputHold {
                 paste_open: stream.in_paste,
-                draft: stream.draft.pending(),
+                draft: stream.draft.pending()
+                    || stream.composer.proof() != crate::composer_model::InputProof::Empty,
                 turns: stream.turns,
+            })
+    }
+
+    /// PRD #1666 part 3, round 5-wake (R6-4): what the bytes written into
+    /// `pane_id_env` say its input box holds; empty for a pane nothing was
+    /// written to.
+    fn input_proof(&self, pane_id_env: &str) -> crate::composer_model::InputProof {
+        self.input
+            .get(pane_id_env)
+            .map_or(crate::composer_model::InputProof::Empty, |stream| {
+                stream.composer.proof()
             })
     }
 
@@ -4189,7 +4234,13 @@ impl PaneInputState {
         }
         match edge {
             TurnEdge::Started => {
-                self.input.entry(pane_id_env.to_string()).or_default().busy = true;
+                let stream = self.input.entry(pane_id_env.to_string()).or_default();
+                // A turn starting, not one already under way: an `Enter`
+                // the composer model has not confirmed submitted the box.
+                if !stream.busy {
+                    stream.composer.turn_started();
+                }
+                stream.busy = true;
             }
             TurnEdge::Ended => {
                 if let Some(stream) = self.input.get_mut(pane_id_env)
@@ -23278,6 +23329,20 @@ mod spawn_tests {
 
     /// Claude Code's screen at [`EDITOR_ROWS`] rows and `cols` columns.
     fn claude_screen(composer: &str, transcript: &[String], dialog: bool, cols: usize) -> Vec<u8> {
+        claude_screen_at(composer, composer.chars().count(), transcript, dialog, cols)
+    }
+
+    /// [`claude_screen`] with the cursor `cursor` characters into the
+    /// composer. A composer of blanks draws no character, as Claude Code
+    /// 2.1.310 draws typed spaces: it only moves the cursor (measured
+    /// 2026-10-26).
+    fn claude_screen_at(
+        composer: &str,
+        cursor: usize,
+        transcript: &[String],
+        dialog: bool,
+        cols: usize,
+    ) -> Vec<u8> {
         let rule = "─".repeat(cols);
         let mut out = String::from("\x1b[2J\x1b[H\x1b[2;12HClaude Code v2.1.310\r");
         for (i, message) in transcript.iter().enumerate() {
@@ -23293,12 +23358,12 @@ mod spawn_tests {
         out.push_str(&format!("\x1b[25;1H{rule}\x1b[26;1H❯\u{a0}"));
         if composer.is_empty() {
             out.push_str("\x1b[2mTry \"fix the bug\"\x1b[22m");
-        } else {
+        } else if !composer.trim().is_empty() {
             out.push_str(composer);
         }
         out.push_str(&format!(
             "\x1b[27;1H{rule}\x1b[28;3H? for shortcuts\x1b[26;{}H",
-            3 + composer.chars().count()
+            3 + cursor
         ));
         out.into_bytes()
     }
@@ -23406,6 +23471,10 @@ mod spawn_tests {
                 std::thread::spawn(move || {
                     let mut seen = 0usize;
                     let mut composer = String::new();
+                    // The cursor, in characters into the composer, and how
+                    // much of an `ESC [ C`/`ESC [ D` arrow has arrived.
+                    let mut cursor = 0usize;
+                    let mut arrow = 0u8;
                     let mut transcript: Vec<String> = Vec::new();
                     while !stop.load(Ordering::SeqCst) {
                         let bytes = std::fs::read(&typed).unwrap_or_default();
@@ -23415,8 +23484,39 @@ mod spawn_tests {
                                 (c.on_enter, c.drawing, c.dialog_at, c.cols)
                             };
                             for &b in &bytes[seen..] {
+                                let at = |cursor: usize, composer: &str| {
+                                    composer
+                                        .char_indices()
+                                        .nth(cursor)
+                                        .map_or(composer.len(), |(i, _)| i)
+                                };
+                                match (arrow, b) {
+                                    (0, 0x1b) | (1, b'[') => {
+                                        arrow += 1;
+                                        continue;
+                                    }
+                                    (2, b'D') => {
+                                        arrow = 0;
+                                        cursor = cursor.saturating_sub(1);
+                                        continue;
+                                    }
+                                    (2, b'C') => {
+                                        arrow = 0;
+                                        cursor = (cursor + 1).min(composer.chars().count());
+                                        continue;
+                                    }
+                                    // Any other CSI sequence edits nothing.
+                                    (2, 0x40..=0x7e) => {
+                                        arrow = 0;
+                                        continue;
+                                    }
+                                    (2, _) => continue,
+                                    (0, _) => {}
+                                    _ => arrow = 0,
+                                }
                                 match b {
                                     b'\r' if on_enter != OnEnter::Drop => {
+                                        cursor = 0;
                                         let line = std::mem::take(&mut composer);
                                         if on_enter == OnEnter::Submit
                                             && let Some(token) = line
@@ -23434,11 +23534,22 @@ mod spawn_tests {
                                         transcript.push(line);
                                     }
                                     b'\r' => {}
-                                    0x7f => {
-                                        composer.pop();
+                                    0x7f if cursor > 0 => {
+                                        cursor -= 1;
+                                        composer.remove(at(cursor, &composer));
                                     }
-                                    0x15 => composer.clear(),
-                                    b if b >= 0x20 => composer.push(char::from(b)),
+                                    0x7f => {}
+                                    // Ctrl+U kills what is before the cursor.
+                                    0x15 => {
+                                        composer.replace_range(..at(cursor, &composer), "");
+                                        cursor = 0;
+                                    }
+                                    0x01 => cursor = 0,
+                                    0x05 => cursor = composer.chars().count(),
+                                    b if b >= 0x20 => {
+                                        composer.insert(at(cursor, &composer), char::from(b));
+                                        cursor += 1;
+                                    }
                                     _ => {}
                                 }
                             }
@@ -23448,12 +23559,20 @@ mod spawn_tests {
                                 control.lock().unwrap().drawing = Drawing::Dialog;
                             }
                             match drawing {
-                                Drawing::Composer => {
-                                    bus.push(claude_screen(&composer, &transcript, false, cols))
-                                }
-                                Drawing::Dialog => {
-                                    bus.push(claude_screen(&composer, &transcript, true, cols))
-                                }
+                                Drawing::Composer => bus.push(claude_screen_at(
+                                    &composer,
+                                    cursor,
+                                    &transcript,
+                                    false,
+                                    cols,
+                                )),
+                                Drawing::Dialog => bus.push(claude_screen_at(
+                                    &composer,
+                                    cursor,
+                                    &transcript,
+                                    true,
+                                    cols,
+                                )),
                                 Drawing::Frozen => {}
                             }
                         }
@@ -23902,6 +24021,322 @@ mod spawn_tests {
             "only the user's spaces reached the pane"
         );
         registry.shutdown_all();
+    }
+
+    /// The doorbell tick's own admission check for the model editor's queued
+    /// message, as the tick builds it, and the message it names.
+    async fn production_check(
+        editor: &ModelEditor,
+        state: &crate::state::SharedState,
+    ) -> (
+        impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        + Send
+        + Sync
+        + 'static,
+        crate::inbox::MessageId,
+    ) {
+        let selected = editor
+            .registry
+            .inbox()
+            .doorbell_facts(&editor.pane, &editor.id)
+            .queued
+            .first()
+            .cloned()
+            .expect("a message waits");
+        let admission = state
+            .read()
+            .await
+            .doorbell_admission(&editor.id, &editor.pane);
+        assert!(admission.is_some(), "the pane is admitted");
+        let check = crate::doorbell::ring_admission_check(
+            Arc::clone(state),
+            Arc::clone(&editor.registry),
+            &editor.pane,
+            &editor.id,
+            &tick_config(Duration::from_secs(60)),
+            &selected,
+            admission,
+        );
+        (check, crate::inbox::MessageId::parse(&selected).unwrap())
+    }
+
+    /// Hold the inbox hub's lock from another OS thread for `hold`, from
+    /// before this returns.
+    fn hold_hub(registry: &Arc<AgentPtyRegistry>, hold: Duration) -> std::thread::JoinHandle<()> {
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let registry = Arc::clone(registry);
+        let holder = std::thread::spawn(move || {
+            registry.inbox().with_state_held_for_test(|| {
+                held_tx.send(()).unwrap();
+                std::thread::sleep(hold);
+            });
+        });
+        held_rx.recv().unwrap();
+        holder
+    }
+
+    /// Scenario: Plan §2.3's deadline with the doorbell tick's real admission check, the one that reads the inbox. A test thread holds the inbox hub's lock (a) from before the ring until past its deadline, and (b) from just after the ring's line is typed into a model editor that stops drawing until past its deadline. Each ring returns by the deadline with the writer free while the hub is still held: (a) with nothing written (deadline) and no byte in the pane, (b) unresolved with the cell suspended, the line in the pane and no Enter after it. (c) A hold released well before the deadline lets the ring submit. (d) A hold during which the agent reports working refuses the ring once the hub is free (not admitted), nothing written.
+    #[spec("inbox/doorbell/050")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_050_the_real_admission_check_never_holds_the_writer_on_the_hub() {
+        use crate::doorbell_txn::{Latch, NotTyped, Outcome, TXN_MAX};
+        let bound = TXN_MAX + Duration::from_millis(500);
+        let hold = TXN_MAX + Duration::from_millis(1500);
+        let writer_free = |registry: &Arc<AgentPtyRegistry>, editor: &ModelEditor| {
+            registry
+                .agent_writer(&editor.id)
+                .unwrap()
+                .try_lock()
+                .is_ok()
+        };
+        let ring = |editor: &ModelEditor, check, message| {
+            let registry = Arc::clone(&editor.registry);
+            let (pane, id) = (editor.pane.clone(), editor.id.clone());
+            tokio::spawn(async move {
+                let started = Instant::now();
+                let report = registry
+                    .ring_doorbell(&pane, &id, message, true, check)
+                    .await;
+                (report, started.elapsed())
+            })
+        };
+
+        // (a) The hub held from before the ring.
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-hub-before", OnEnter::Submit);
+        let state = idle_with_mail(&editor).await;
+        let (check, message) = production_check(&editor, &state).await;
+        let holder = hold_hub(&registry, hold);
+        let (report, took) = tokio::time::timeout(
+            TXN_MAX + Duration::from_secs(5),
+            ring(&editor, check, message),
+        )
+        .await
+        .expect("the ring hung past its deadline")
+        .unwrap();
+        assert!(!holder.is_finished(), "the hub is still held");
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::NothingWritten(NotTyped::Deadline)),
+            "{report:?}"
+        );
+        assert!(took <= bound, "the writer was held for {took:?}");
+        assert!(writer_free(&registry, &editor), "the writer is free");
+        assert!(editor.typed().is_empty(), "{:?}", editor.typed());
+        holder.join().unwrap();
+        registry.shutdown_all();
+
+        // (b) The hub held from just after the line.
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-hub-after", OnEnter::Submit);
+        let state = idle_with_mail(&editor).await;
+        let (check, message) = production_check(&editor, &state).await;
+        editor.control.lock().unwrap().drawing = Drawing::Frozen;
+        let pending = ring(&editor, check, message);
+        typed_until(&editor, line_in).await;
+        let holder = hold_hub(&registry, hold);
+        let (report, took) = tokio::time::timeout(TXN_MAX + Duration::from_secs(5), pending)
+            .await
+            .expect("the ring hung past its deadline")
+            .unwrap();
+        assert!(!holder.is_finished(), "the hub is still held");
+        assert!(
+            matches!(report.outcome, RingOutcome::Txn(Outcome::Unresolved(_))),
+            "{report:?}"
+        );
+        assert!(took <= bound, "the writer was held for {took:?}");
+        assert!(writer_free(&registry, &editor), "the writer is free");
+        assert!(
+            matches!(editor.cell(), Latch::Suspended(..)),
+            "{:?}",
+            editor.cell()
+        );
+        let typed = editor.typed();
+        let line = typed_line(&typed).expect("the line was typed");
+        assert_eq!(typed, line.into_bytes(), "no Enter after the line");
+        holder.join().unwrap();
+        registry.shutdown_all();
+
+        // (c) A short hold: the check asks again and the ring goes.
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-hub-short", OnEnter::Submit);
+        let state = idle_with_mail(&editor).await;
+        let (check, message) = production_check(&editor, &state).await;
+        let holder = hold_hub(&registry, Duration::from_millis(300));
+        let (report, _) = ring(&editor, check, message).await.unwrap();
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::Submitted),
+            "{report:?}"
+        );
+        holder.join().unwrap();
+        registry.shutdown_all();
+
+        // (d) The pane changes while the hub is held: asked again, the app
+        // state refuses the ring.
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-hub-changed", OnEnter::Submit);
+        let state = idle_with_mail(&editor).await;
+        let (check, message) = production_check(&editor, &state).await;
+        let holder = hold_hub(&registry, Duration::from_millis(600));
+        let pending = ring(&editor, check, message);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        state.write().await.apply_event(crate::event::AgentEvent {
+            session_id: format!("{}-session", editor.pane),
+            agent_type: crate::event::AgentType::ClaudeCode,
+            event_type: crate::event::EventType::Thinking,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some(editor.pane.clone()),
+            agent_id: Some(editor.id.clone()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            background: None,
+            background_revision: None,
+        });
+        let (report, _) = pending.await.unwrap();
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::NothingWritten(NotTyped::NotAdmitted)),
+            "{report:?}"
+        );
+        assert!(editor.typed().is_empty(), "{:?}", editor.typed());
+        holder.join().unwrap();
+        registry.shutdown_all();
+    }
+
+    /// Wait (bounded) until the model editor's composer shows no text with
+    /// the cursor `cursor` characters in.
+    async fn blank_with_cursor_at(editor: &ModelEditor, cursor: u16) {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let shown = editor.bus.clean_frame().and_then(|grid| {
+                (crate::doorbell_screen::CLAUDE_PROFILE.composer)(&grid).map(|c| (c, grid.cursor))
+            });
+            if shown
+                .as_ref()
+                .is_some_and(|(c, at)| c.text.is_empty() && !c.dim && at.1 == 2 + cursor)
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "never drawn blank at {cursor}: {shown:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    /// Scenario: The user leaves blanks in a Claude Code 2.1.310 model editor's composer that its screen cannot show, drawn as Claude Code draws them (no character, the cursor moved): three spaces with the cursor moved back to the start by Left or Ctrl+A, a space left in front of the cursor after Backspace at the start, and a line break the editor does not draw. Each time the composer looks exactly empty, yet the deck types nothing into it (nothing written: no empty composer), and while a message waits the card says there may be an unsent draft. Moving to the end and clearing lets the next ring type its line once; Right, and a word typed and backspaced away, in an empty composer leave the ring free to go.
+    #[spec("inbox/doorbell/050")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_050_blanks_the_screen_cannot_show_hold_the_ring() {
+        use crate::doorbell_txn::{NotTyped, Outcome};
+        use crate::inbox_display::WakeHold;
+        for (case, keys, cursor) in [
+            ("spaces then Left", &b"   \x1b[D\x1b[D\x1b[D"[..], Some(0)),
+            ("spaces then Ctrl+A", &b"   \x01"[..], Some(0)),
+            ("a space, Ctrl+A, Backspace", &b" \x01\x7f"[..], Some(0)),
+            ("a line break", &b"\n"[..], None),
+        ] {
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let editor = ModelEditor::spawn(
+                &registry,
+                &format!("pane-ring-blank-{}", case.len()),
+                OnEnter::Submit,
+            );
+            registry
+                .write_user_bytes(&editor.pane, &editor.id, keys)
+                .await
+                .unwrap();
+            match cursor {
+                Some(cursor) => blank_with_cursor_at(&editor, cursor).await,
+                // The editor does not draw a line break: still its empty
+                // composer, placeholder and all.
+                None => editor.wait_drawn(""),
+            }
+            let report = editor.ring().await;
+            assert_eq!(
+                report.outcome,
+                RingOutcome::Txn(Outcome::NothingWritten(NotTyped::AwaitingPrompt)),
+                "{case}: {report:?}"
+            );
+            let state = idle_with_mail(&editor).await;
+            let bell = crate::doorbell::spawn(
+                registry.clone(),
+                state,
+                tick_config(Duration::from_millis(150)),
+            );
+            until("possible_draft", || {
+                shown_hold(&editor) == Some(WakeHold::PossibleDraft)
+            })
+            .await;
+            bell.abort();
+            assert_eq!(editor.typed(), keys, "{case}: only the user's keys");
+            // Clear from the end: the next ring types its line once.
+            registry
+                .write_user_bytes(&editor.pane, &editor.id, b"\x05\x15")
+                .await
+                .unwrap();
+            if case == "a line break" {
+                // The break is before the cursor's line: Backspace joins it.
+                registry
+                    .write_user_bytes(&editor.pane, &editor.id, b"\x7f")
+                    .await
+                    .unwrap();
+            }
+            editor.wait_drawn("");
+            let report = editor.ring().await;
+            assert_eq!(
+                report.outcome,
+                RingOutcome::Txn(Outcome::Submitted),
+                "{case}: {report:?}"
+            );
+            let typed = editor.typed();
+            let line = typed_line(&typed).expect("the line was typed");
+            assert_eq!(
+                typed
+                    .windows(line.len())
+                    .filter(|w| *w == line.as_bytes())
+                    .count(),
+                1,
+                "{case}: the line once"
+            );
+            registry.shutdown_all();
+        }
+        // Keys that edit nothing in an empty composer do not hold it.
+        for (case, keys) in [
+            ("Right", &b"\x1b[C"[..]),
+            ("typed and backspaced", &b"draft\x7f\x7f\x7f\x7f\x7f"[..]),
+        ] {
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let editor = ModelEditor::spawn(
+                &registry,
+                &format!("pane-ring-clean-{}", case.len()),
+                OnEnter::Submit,
+            );
+            registry
+                .write_user_bytes(&editor.pane, &editor.id, keys)
+                .await
+                .unwrap();
+            assert!(
+                registry.draft_pending(&editor.pane),
+                "{case}: the draft bit is set"
+            );
+            editor.wait_drawn("");
+            let report = editor.ring().await;
+            assert_eq!(
+                report.outcome,
+                RingOutcome::Txn(Outcome::Submitted),
+                "{case}: {report:?}"
+            );
+            registry.shutdown_all();
+        }
     }
 
     /// Scenario: The model editor stops drawing, so the deck's line is typed and never echoed and the attempt will end suspended; while that ring holds the writer, a second ring for the same generation is started and waits for the writer. Once the first ring releases the writer with the cell suspended, the second is not admitted (suspended) and types nothing: the pane holds only the first line.

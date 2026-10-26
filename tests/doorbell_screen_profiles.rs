@@ -473,6 +473,126 @@ fn doorbell_036_a_blank_draft_in_the_claude_composer_is_not_empty() {
     }
 }
 
+/// Scenario: Take the recorded Claude Code 2.1.310 session at its cleared composer and redraw it the way a real 2.1.310 session draws blanks it holds (measured 2026-10-26: typed spaces write no cell, the cursor only moves; a line of nothing is a row of nothing): three spaces with the cursor moved back to the start, the same spaces written as cells, a blank line with text below it and the cursor back on the first row, a line of spaces under the prompt row, and a letter, a blank line and more text with the cursor after the letter. The first looks exactly like the empty composer, so the frame is ready only while the input says the box is empty, never when it says a draft or cannot say; the next three are not empty whatever the input says, and the last does not hold the letter alone. Every recorded empty composer (fresh, cleared, deleted, resized, nudged) stays ready with the input proving it empty, the placeholder alone is ready while the input cannot say, and none is ready with the input saying a draft. The redraws are synthesized on the real capture; the measured session's own bytes are not committed.
+#[spec("inbox/doorbell/036")]
+#[test]
+fn doorbell_036_blanks_and_blank_lines_the_claude_screen_cannot_show() {
+    use dot_agent_deck::composer_model::InputProof;
+    use dot_agent_deck::doorbell_screen::frame;
+    let trace = fixture("claude-inbox/r5wake/claude-2.1.310-composer-24x80");
+    let p = &CLAUDE_PROFILE;
+    let at = trace.points["cleared-01"];
+    let with = |extra: &[u8]| {
+        let mut bytes = trace.bytes[..at].to_vec();
+        bytes.extend_from_slice(extra);
+        Grid::parse(&bytes, trace.rows, trace.cols)
+    };
+    let ready = |grid: &Grid, input: InputProof| {
+        let mut f = frame(p, grid, 0, true, None);
+        f.input = input;
+        f.empty_and_ready()
+    };
+    // The cleared composer: prompt on row 22 (one-based), its rules on 21
+    // and 23. Three spaces, then Left three times, as Claude Code redraws
+    // them: the cursor moved out and back, nothing written.
+    let moved_back = with(b"\x1b[22;6H\x1b[22;3H");
+    let composer = (p.composer)(&moved_back).expect("the composer");
+    assert_eq!(composer.text, "");
+    assert!(composer.cursor_at_end && !composer.hidden);
+    assert_eq!(
+        moved_back.cells,
+        with(b"").cells,
+        "the screen cannot tell the blanks from the empty composer"
+    );
+    assert!(
+        p.empty_and_ready(&moved_back),
+        "the screen alone says empty"
+    );
+    assert!(ready(&moved_back, InputProof::Empty));
+    assert!(
+        !ready(&moved_back, InputProof::Draft),
+        "the input says a draft"
+    );
+    assert!(
+        !ready(&moved_back, InputProof::Unknown),
+        "no placeholder to prove it"
+    );
+    let rule = "\u{2500}".repeat(usize::from(trace.cols));
+    for (case, extra) in [
+        ("spaces written as cells", "   \x1b[3D".to_string()),
+        (
+            "a blank line with text below it",
+            format!(
+                "\x1b[19;1H{rule}\x1b[20;1H\u{276f}\u{a0}\x1b[K\x1b[21;1H\x1b[K\x1b[22;1H  abc\x1b[K\x1b[20;3H"
+            ),
+        ),
+        (
+            "a line of spaces under the prompt row",
+            format!("\x1b[20;1H{rule}\x1b[21;1H\u{276f}\u{a0}\x1b[K\x1b[22;1H\x1b[K\x1b[21;3H"),
+        ),
+    ] {
+        let grid = with(extra.as_bytes());
+        let composer = (p.composer)(&grid).expect("the composer is still drawn");
+        assert!(composer.hidden, "{case}: {composer:?}");
+        assert_eq!(
+            grid.cursor,
+            (composer.prompt_row, 2),
+            "{case}: the cursor is back at the start"
+        );
+        assert_eq!(p.holds(&grid, "\u{0}"), Some(ComposerText::Other), "{case}");
+        assert!(!p.empty_and_ready(&grid), "{case}");
+        assert!(!ready(&grid, InputProof::Empty), "{case}");
+    }
+    // Text, a blank line and more text, the cursor after the first: not the
+    // first line alone.
+    let gapped = with(
+        format!(
+            "\x1b[19;1H{rule}\x1b[20;1H\u{276f}\u{a0}x\x1b[K\x1b[21;1H\x1b[K\x1b[22;1H  abc\x1b[K\x1b[20;4H"
+        )
+        .as_bytes(),
+    );
+    let composer = (p.composer)(&gapped).expect("the composer");
+    assert!(composer.hidden, "{composer:?}");
+    assert_eq!(p.holds(&gapped, "x"), Some(ComposerText::Other));
+    assert!(!frame(p, &gapped, 0, true, None).holds_exactly("x"));
+    // Positive controls: every recorded empty composer.
+    let mut empties = 0;
+    for stem in [
+        "claude-inbox/r5wake/claude-2.1.310-composer-24x80",
+        "claude-inbox/r5wake/claude-2.1.310-layout-50x200",
+        "claude-inbox/r5wake/claude-2.1.310-start-50x200",
+    ] {
+        let trace = fixture(stem);
+        let mut points: Vec<(&String, &usize)> = trace
+            .points
+            .iter()
+            .filter(|(name, _)| {
+                ["empty", "cleared-", "deleted-", "resize-", "nudge-", "end"]
+                    .iter()
+                    .any(|p| name.starts_with(p))
+            })
+            .collect();
+        points.sort();
+        for (name, &end) in points {
+            let grid = trace.grid_upto(end);
+            if !(p.ready)(&grid) || grid.cols < p.min_cols {
+                // A resize to a size the profile does not cover.
+                continue;
+            }
+            let placeholder = p.placeholder_empty(&grid);
+            assert!(ready(&grid, InputProof::Empty), "{stem} {name}");
+            assert_eq!(
+                ready(&grid, InputProof::Unknown),
+                placeholder,
+                "{stem} {name}: only the placeholder proves it while the input cannot"
+            );
+            assert!(!ready(&grid, InputProof::Draft), "{stem} {name}");
+            empties += 1;
+        }
+    }
+    assert!(empties >= 40, "the controls ran: {empties}");
+}
+
 /// Scenario: Read Codex 0.164.0's recorded update, folder-trust and hooks-review dialogs, its composer, and frames whose transcript merely mentions "update", "Update now", "login" or "trust". The three dialogs are recognised by name; the composer and the transcript mentions give no dialog verdict; an unknown title with the dialog's shape is unrecognised.
 #[spec("inbox/doorbell/036")]
 #[test]

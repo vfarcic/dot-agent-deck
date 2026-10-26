@@ -537,6 +537,9 @@ pub struct ComposerView {
     pub placeholder: bool,
     /// Part of the composer is highlighted.
     pub selection: bool,
+    /// The composer's region holds something its text does not show
+    /// ([`crate::doorbell_screen::Composer::hidden`]).
+    pub hidden: bool,
 }
 
 /// What the evidence state and the profile's recognisers show of one frame.
@@ -555,28 +558,41 @@ pub struct Frame {
     pub user_cells: Vec<String>,
     /// The frame's cells as text, for the token's redraw rule.
     pub text: String,
+    /// What the bytes written into the pane say its input box holds, read
+    /// with the frame (R6-4). The screen cannot show blanks the agent does
+    /// not draw, so a blank composer is empty only when this says so too.
+    pub input: crate::composer_model::InputProof,
 }
 
 impl Frame {
     /// The empty ready composer and no dialog (step 2).
     ///
-    /// A blank composer counts only with the cursor where an empty one keeps
-    /// it: the text drops trailing blanks, so spaces the user typed, or a row
-    /// before blank continuation rows, read as no text with the cursor past
-    /// it.
+    /// The screen and the input written into the pane both have to say so
+    /// (R6-4). A blank composer counts only with the cursor where an empty
+    /// one keeps it and nothing hidden in its region, and only while the
+    /// input proves the box empty: spaces with the cursor moved back to the
+    /// start draw exactly the empty composer. The agent's placeholder is
+    /// drawn only over an empty box, so it is proof enough while the input
+    /// cannot say; it does not outweigh input that says the box holds
+    /// something, since the frame may predate that input.
     pub fn empty_and_ready(&self) -> bool {
+        use crate::composer_model::InputProof;
         self.dialog.is_none()
-            && self
-                .composer
-                .as_ref()
-                .is_some_and(|c| c.placeholder || (c.text.is_empty() && c.cursor_at_end))
+            && self.composer.as_ref().is_some_and(|c| {
+                let blank = !c.hidden && c.text.is_empty() && c.cursor_at_end;
+                match self.input {
+                    InputProof::Empty => c.placeholder || blank,
+                    InputProof::Unknown => c.placeholder,
+                    InputProof::Draft => false,
+                }
+            })
     }
 
     /// The composer holds exactly `text`, the cursor right after it.
     pub fn holds_exactly(&self, text: &str) -> bool {
         self.composer
             .as_ref()
-            .is_some_and(|c| !c.placeholder && c.text == text && c.cursor_at_end)
+            .is_some_and(|c| !c.placeholder && !c.hidden && c.text == text && c.cursor_at_end)
     }
 
     /// The composer holds a strict prefix of `line` of `chars` characters,
@@ -584,6 +600,7 @@ impl Frame {
     fn holds_prefix(&self, line: &str, chars: usize) -> bool {
         self.composer.as_ref().is_some_and(|c| {
             !c.placeholder
+                && !c.hidden
                 && c.cursor_at_end
                 && c.text.chars().count() == chars
                 && line.starts_with(c.text.as_str())

@@ -2315,7 +2315,32 @@ impl InboxHub {
     /// messages (only those this agent generation may take), its armed waiters
     /// and its announcement.
     pub fn doorbell_facts(&self, pane_id: &str, agent_id: &str) -> DoorbellFacts {
-        let st = self.lock();
+        Self::doorbell_facts_in(&self.lock(), pane_id, agent_id)
+    }
+
+    /// PRD #1666 part 3, round 5-wake: [`Self::doorbell_facts`] without
+    /// waiting for the hub's lock, `None` while another thread holds it. For
+    /// the doorbell's admission check, which runs while a ring holds the
+    /// pane's writer and so must not wait on a lock whose holders can
+    /// themselves wait on other locks (plan §2.3). A poisoned hub is read as
+    /// every hub path reads it, recovered.
+    pub fn try_doorbell_facts(&self, pane_id: &str, agent_id: &str) -> Option<DoorbellFacts> {
+        let st = self
+            .state
+            .try_lock_now(crate::lock_rank::OnPoison::Recover)
+            .ok()?;
+        Some(Self::doorbell_facts_in(&st, pane_id, agent_id))
+    }
+
+    /// Test seam: run `hold` with the hub's lock held on this thread.
+    #[cfg(test)]
+    pub(crate) fn with_state_held_for_test(&self, hold: impl FnOnce()) {
+        let _st = self.lock();
+        hold();
+    }
+
+    /// [`Self::doorbell_facts`] over a held hub.
+    fn doorbell_facts_in(st: &HubState, pane_id: &str, agent_id: &str) -> DoorbellFacts {
         let key = (pane_id.to_string(), agent_id.to_string());
         let mut queued: Vec<String> = st
             .inbox
@@ -2331,7 +2356,7 @@ impl InboxHub {
             .collect();
         // PRD #1666 §6: a scheduled repeat waiting for a receiver is waiting
         // mail too, so the doorbell (and the stalled-wake notice) cover it.
-        for id in engine::candidates(&st, &key) {
+        for id in engine::candidates(st, &key) {
             if !queued.contains(&id) {
                 queued.push(id);
             }

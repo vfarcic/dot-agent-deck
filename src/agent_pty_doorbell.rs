@@ -155,6 +155,9 @@ fn frame_of(
 /// the transaction decided on it, then dropped.
 struct DaemonSeam<'g> {
     generation: &'g Generation,
+    /// Every pane's input state, read for the input proof by `try_lock` and
+    /// not held: the seam's ledger hold already keeps human operations out.
+    pane_input: &'g Mutex<PaneInputState>,
     profile: &'static crate::doorbell_screen::ScreenProfile,
     line: String,
     #[allow(clippy::type_complexity)]
@@ -177,11 +180,19 @@ impl txn::Seam for DaemonSeam<'_> {
         let ledger = self.generation.ledger.try_hold()?;
         let bus = self.generation.bus.state.try_lock().ok()?;
         let mode = self.generation.mode.try_lock().ok()?;
+        let input = self
+            .pane_input
+            .try_lock()
+            .ok()?
+            .input_proof(&self.generation.pane_id);
         let marks = ledger.marks();
         let read = txn::SeamRead {
             watermark: marks.watermark,
             job_mark: marks.job_mark,
-            frame: frame_of(&bus, self.profile, Some(&self.line)),
+            frame: txn::Frame {
+                input,
+                ..frame_of(&bus, self.profile, Some(&self.line))
+            },
             mode: self.generation.mode_now(&mode),
             open: self.generation.open(),
         };
@@ -404,15 +415,24 @@ impl AgentPtyRegistry {
     /// Admission's reads (plan §1.1 step 1), each lock by `try_lock`: `None`
     /// while any is contended, since the caller holds the writer. The
     /// ledger, the bus state and the mode store are held together, in the
-    /// final seam's order, so the frame, the mode and the ledger's marks are
+    /// final seam's order, and the pane input state is read while they are,
+    /// so the frame, the input proof, the mode and the ledger's marks are
     /// one moment.
     fn admission_reads(&self, generation: &Generation, hook_route: bool) -> Option<AdmissionReads> {
         let typing = self.doorbell_typing_now(generation, hook_route)?;
         let ledger = generation.ledger.try_hold()?;
         let state = generation.bus.state.try_lock().ok()?;
         let store = generation.mode.try_lock().ok()?;
+        let input = self
+            .pane_input
+            .try_lock()
+            .ok()?
+            .input_proof(&generation.pane_id);
         let frame = match &typing {
-            Ok(typing) => frame_of(&state, typing.profile, None),
+            Ok(typing) => txn::Frame {
+                input,
+                ..frame_of(&state, typing.profile, None)
+            },
             Err(_) => txn::Frame::default(),
         };
         let reads = AdmissionReads {
@@ -483,8 +503,16 @@ impl AgentPtyRegistry {
             return true;
         };
         if !generation.doorbell.wrapped() {
-            let ready = frame_of(&generation.bus.state.lock().unwrap(), typing.profile, None)
-                .empty_and_ready();
+            let input = self
+                .pane_input
+                .lock()
+                .unwrap()
+                .input_proof(&generation.pane_id);
+            let ready = txn::Frame {
+                input,
+                ..frame_of(&generation.bus.state.lock().unwrap(), typing.profile, None)
+            }
+            .empty_and_ready();
             if ready {
                 generation.doorbell.note_ready_frame(now);
             }
@@ -607,9 +635,12 @@ impl AgentPtyRegistry {
             return RingReport::before_admission(RingOutcome::Suspended);
         }
         let mut evidence = self.subscribe_doorbell_evidence(&pane);
-        // Step 1: admission, with nothing written yet. Every read is bounded
-        // by `D`: the locks by `try_lock`, retried, and the awaits by what is
-        // left of the budget.
+        // Step 1: admission, with nothing written yet. The generation's
+        // locks and the pane input state are read by `try_lock` and retried
+        // until `D`, the admission check reads the hub the same way, and the
+        // awaits wait at most for what is left of `D`. Leaf locks on the way
+        // (the evidence channel map, the tripwire list) are waited on, and
+        // `D` does not bound that wait.
         let drained = within_real_time(Duration::from_millis(100).min(left()), guard.until_idle())
             .await
             .is_some();
@@ -870,15 +901,24 @@ impl AgentPtyRegistry {
         // verified submit reconciles a stale draft bit, under the writer
         // (plan §1.4).
         // The ledger by `try_lock`: contended, a human operation is moving
-        // through it, so the bit is not the deck's to clear.
+        // through it, so the bit is not the deck's to clear. The pane input
+        // state by `try_lock` too: every pane's writes parse their bytes
+        // under it, so it is not waited on under the writer; contended, the
+        // bit stays as it was, which holds a later ring rather than letting
+        // one through.
         if outcome == txn::Outcome::Submitted
             && generation
                 .ledger
                 .try_hold()
                 .is_some_and(|ledger| ledger.marks().job_mark == txn.j0())
+            && let Ok(mut input) = self.pane_input.try_lock()
         {
-            self.pane_input.lock().unwrap().reconcile_deck_submit(&pane);
+            input.reconcile_deck_submit(&pane);
         }
+        // A dialog's tripwire fans out to every live generation through the
+        // registry's lock, whose holders can wait on other locks: done once
+        // the writer is released, below.
+        let mut tripped: Option<&'static str> = None;
         if let txn::Outcome::Unresolved(cause) = outcome {
             tracing::warn!(
                 target: "doorbell",
@@ -889,10 +929,8 @@ impl AgentPtyRegistry {
                 cell = ?generation.doorbell.cell().load(),
                 "doorbell unresolved"
             );
-            if cause.is_dialog()
-                && let Some(dialog) = txn.last_dialog()
-            {
-                self.trip_on_dialog(&typing, dialog);
+            if cause.is_dialog() {
+                tripped = txn.last_dialog();
             }
             let left = txn.deadline().saturating_duration_since(Instant::now());
             if !left.is_zero() {
@@ -919,6 +957,9 @@ impl AgentPtyRegistry {
         drop(job);
         drop(guard);
         self.doorbell_txn_end(&agent);
+        if let Some(dialog) = tripped {
+            self.trip_on_dialog(&typing, dialog);
+        }
         report
     }
 
@@ -942,6 +983,7 @@ impl AgentPtyRegistry {
     ) -> (Option<Instant>, Option<txn::Outcome>) {
         let mut seam = DaemonSeam {
             generation,
+            pane_input: &self.pane_input,
             profile,
             line: line.to_string(),
             held: None,
