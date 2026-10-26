@@ -76,9 +76,15 @@ pub fn deck_attention_text(named: Option<(&str, &str)>, others: usize) -> Option
             "{GLYPH} {name}: {words} · {others} {ATTENTION_OTHER_HELD}"
         )),
         Some((name, words)) => Some(format!("{GLYPH} {name}: {words}")),
-        None if others > 0 => Some(format!("{GLYPH} {others} {ATTENTION_HELD}")),
-        None => None,
+        None => deck_attention_count(others),
     }
+}
+
+/// [`deck_attention_text`] counting every one of the `held` recipients and
+/// naming none (`✉ 2 held`): its words when no orchestrator is held, and what
+/// the TUI shows in their place on a row too narrow for them.
+pub fn deck_attention_count(held: usize) -> Option<String> {
+    (held > 0).then(|| format!("{GLYPH} {held} {ATTENTION_HELD}"))
 }
 
 /// The card notice for a message handed to the agent the most times allowed,

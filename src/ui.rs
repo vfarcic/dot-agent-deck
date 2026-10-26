@@ -1893,6 +1893,9 @@ struct UiState {
     /// the daemon's inbox accounts, so it survives tab switches and a
     /// reattach and is cleared by nothing the user does in the TUI.
     deck_attention: Option<String>,
+    /// [`Self::deck_attention`]'s short form ([`deck_attention_short`]),
+    /// shown instead of it on a row too narrow for it.
+    deck_attention_short: Option<String>,
     /// Whether this frame draws [`Self::deck_attention`] in the tab strip,
     /// set by `render_frame` before the card grid reads it.
     deck_attention_in_tab_bar: bool,
@@ -2474,6 +2477,7 @@ impl UiState {
             pane_names: HashMap::new(),
             pane_display_names: HashMap::new(),
             deck_attention: None,
+            deck_attention_short: None,
             deck_attention_in_tab_bar: false,
             renamed_from: HashMap::new(),
             pane_declared_agent: HashMap::new(),
@@ -13757,6 +13761,7 @@ pub fn run_tui(
             .collect();
         // PRD #1666 part 3, round 5-wake (Q6): the deck-wide attention item.
         ui.deck_attention = deck_attention(&snapshot, tab_manager.tabs());
+        ui.deck_attention_short = deck_attention_short(&snapshot);
         let tab_bar_info = TabBarInfo {
             show: tab_manager.show_tab_bar(),
             labels: tab_bar_labels,
@@ -15809,7 +15814,8 @@ fn deck_title_line(
     showing: usize,
     total_sessions: usize,
     scroll_hint: &str,
-    attention: Option<&str>,
+    attention: Option<(&str, &str)>,
+    width: u16,
 ) -> Line<'static> {
     let title_text = if showing < total_sessions {
         format!("— {showing}/{total_sessions} agent(s)")
@@ -15838,11 +15844,22 @@ fn deck_title_line(
         ));
     }
     // PRD #1666 part 3, round 5-wake (Q6): with no tab strip to carry it.
-    if let Some(attention) = attention {
-        spans.push(Span::styled(
-            format!("  {attention}"),
-            deck_attention_style(),
-        ));
+    // After the title when the row has room for its words, or its short form;
+    // otherwise its short form leads the row, so the title is what is clipped.
+    if let Some((attention, short)) = attention {
+        let room = width
+            .saturating_sub(u16::try_from(Line::from(spans.clone()).width()).unwrap_or(u16::MAX));
+        let short_width = u16::try_from(Span::raw(short).width()).unwrap_or(u16::MAX);
+        if attention_words_fit(attention, room) {
+            spans.push(Span::styled(
+                format!("  {attention}"),
+                deck_attention_style(),
+            ));
+        } else if room >= short_width.saturating_add(2) {
+            spans.push(Span::styled(format!("  {short}"), deck_attention_style()));
+        } else {
+            spans.insert(0, Span::styled(format!("{short} "), deck_attention_style()));
+        }
     }
     Line::from(spans)
 }
@@ -15871,6 +15888,39 @@ fn deck_attention(state: &AppState, tabs: &[Tab]) -> Option<String> {
     crate::inbox_display::deck_attention_text(named, others)
 }
 
+/// The attention item the deck's title row carries, words and short form:
+/// only when this frame's tab strip does not.
+fn title_attention(ui: &UiState) -> Option<(&str, &str)> {
+    let attention = ui
+        .deck_attention
+        .as_deref()
+        .filter(|_| !ui.deck_attention_in_tab_bar)?;
+    Some((
+        attention,
+        ui.deck_attention_short.as_deref().unwrap_or(attention),
+    ))
+}
+
+/// [`deck_attention`]'s short form for a narrow row: the glyph and how many
+/// recipients the deck holds the doorbell for, naming none (`✉ 2 held`).
+fn deck_attention_short(state: &AppState) -> Option<String> {
+    crate::inbox_display::deck_attention_count(state.held_inbox_panes().len())
+}
+
+/// The columns, after its two-column gap, below which [`deck_attention`]'s
+/// words give way to [`deck_attention_short`]'s: enough for the glyph, a role
+/// name and the start of its hold's words. Above it the words are clipped at
+/// the row's end; below it a clipped sentence would name less than the count.
+const ATTENTION_WORDS_MIN_COLUMNS: u16 = 16;
+
+/// Whether `attention`'s words, rather than its short form, take `room`
+/// columns after a two-column gap: they fit whole there, or leave
+/// [`ATTENTION_WORDS_MIN_COLUMNS`] of themselves.
+fn attention_words_fit(attention: &str, room: u16) -> bool {
+    let words = u16::try_from(Span::raw(attention).width()).unwrap_or(u16::MAX);
+    room.saturating_sub(2) >= words.min(ATTENTION_WORDS_MIN_COLUMNS)
+}
+
 /// Attention reads as attention, not chrome: the colour the overflow hint
 /// takes for the same reason.
 fn deck_attention_style() -> Style {
@@ -15881,24 +15931,40 @@ fn deck_attention_style() -> Style {
 
 /// The columns of a `row_width` tab strip kept free of tabs for `attention`:
 /// the item and its two-column gap, at most half the row, so neither the tabs
-/// nor the item can crowd the other off it.
-fn deck_attention_reserve(attention: &str, row_width: u16) -> u16 {
-    let wanted = u16::try_from(Span::raw(attention).width())
-        .unwrap_or(u16::MAX)
-        .saturating_add(2);
-    wanted.min(row_width / 2)
+/// nor the item can crowd the other off it; but never less than `short` and
+/// one column before it, however narrow the row, so the item is always there.
+fn deck_attention_reserve(attention: &str, short: &str, row_width: u16) -> u16 {
+    let width = |text: &str| u16::try_from(Span::raw(text).width()).unwrap_or(u16::MAX);
+    let wanted = width(attention).saturating_add(2);
+    let least = width(short).saturating_add(1);
+    wanted.min(row_width / 2).max(least).min(row_width)
 }
 
-/// Draw `attention` on the tab strip's row `area`, two columns after `after`
-/// (where the tabs end), clipped at the row's end.
-fn draw_deck_attention(buf: &mut ratatui::buffer::Buffer, area: Rect, after: u16, attention: &str) {
+/// Draw `attention` on the tab strip's row `area` after `after` (where the
+/// tabs end), clipped at the row's end: its words two columns after the tabs,
+/// or, when the row leaves them too little room, `short` with as much of the
+/// gap as the row has.
+fn draw_deck_attention(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    after: u16,
+    attention: &str,
+    short: &str,
+) {
     let end = area.x.saturating_add(area.width);
-    let x = after.saturating_add(2);
+    let room = end.saturating_sub(after);
+    let (text, gap) = if attention_words_fit(attention, room) {
+        (attention, 2)
+    } else {
+        let width = u16::try_from(Span::raw(short).width()).unwrap_or(u16::MAX);
+        (short, room.saturating_sub(width).min(2))
+    };
+    let x = after.saturating_add(gap);
     if x < end {
         buf.set_span(
             x,
             area.y,
-            &Span::styled(attention.to_string(), deck_attention_style()),
+            &Span::styled(text.to_string(), deck_attention_style()),
             end - x,
         );
     }
@@ -16066,16 +16132,17 @@ mod deck_attention_tests {
             Rect::new(0, 0, 30, 1),
             10,
             "✉ captain: held for a reason",
+            "✉ 1 held",
         );
         let row: String = (0..30).map(|x| buf[(x, 0)].symbol().to_string()).collect();
         assert_eq!(row, "            ✉ captain: held fo");
-        let title: String = deck_title_line(1, 1, "", Some("✉ 2 held"))
+        let title: String = deck_title_line(1, 1, "", Some(("✉ 2 held", "✉ 2 held")), 80)
             .spans
             .iter()
             .map(|span| span.content.to_string())
             .collect();
         assert!(title.ends_with("  ✉ 2 held"), "{title}");
-        let plain: String = deck_title_line(1, 1, "", None)
+        let plain: String = deck_title_line(1, 1, "", None, 80)
             .spans
             .iter()
             .map(|span| span.content.to_string())
@@ -16087,19 +16154,39 @@ mod deck_attention_tests {
     /// tabs and `attention` held, through `compute_frame_layout` and
     /// `render_frame`; return the strip's row and every tab's header rect.
     fn crowded_strip(labels: &[&str], attention: &str, width: u16) -> (String, Vec<(usize, Rect)>) {
+        frame_top_row(labels, attention, "✉ 2 held", width, true, 0)
+    }
+
+    /// [`crowded_strip`] with `short` as the item's short form, with the tab
+    /// strip shown or not (`strip`), and with `sessions` agents on the deck:
+    /// the frame's top row, which without a strip is the deck's title row.
+    fn frame_top_row(
+        labels: &[&str],
+        attention: &str,
+        short: &str,
+        width: u16,
+        strip: bool,
+        sessions: usize,
+    ) -> (String, Vec<(usize, Rect)>) {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
         let ctrl = EmbeddedPaneController::for_render_seam_without_panes();
         let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
         ui.deck_attention = Some(attention.to_string());
-        let state = AppState::default();
+        ui.deck_attention_short = Some(short.to_string());
+        let mut state = AppState::default();
+        for n in 0..sessions {
+            let mut session = super::tests::make_session(SessionStatus::Idle);
+            session.session_id = format!("s-{n}");
+            state.sessions.insert(session.session_id.clone(), session);
+        }
         let tab_view = ActiveTabView::Dashboard {
             exclude_pane_ids: vec![],
             zoomed: false,
         };
         let tab_bar = TabBarInfo {
-            show: true,
+            show: strip,
             labels: labels.iter().map(|label| label.to_string()).collect(),
             active_index: 0,
             orchestration_statuses: vec![],
@@ -16171,6 +16258,58 @@ mod deck_attention_tests {
         // A short item takes only its own width, leaving the tabs the rest.
         let (row, _) = crowded_strip(&labels, "✉ 2 held", 80);
         assert!(row.contains("✉ 2 held"), "{row}");
+    }
+
+    /// Scenario: a deck holding its orchestrator is drawn at narrow widths, with four tabs and with only the Dashboard tab, whose title row then carries the item, or, with no agents on the deck, its top row. At every width the item is still on the top row: its words where they fit, otherwise its short form, `✉ 2 held`.
+    #[test]
+    fn deck_attention_stays_on_a_narrow_row() {
+        let attention = format!("✉ captain: {WAKE_HOLD_POSSIBLE_DRAFT} · 1 other held");
+        let labels = [
+            "Dashboard",
+            "release-train-alpha1",
+            "release-train-bravo2",
+            "release-train-delta3",
+        ];
+        // A crowded strip so narrow that the gap used to take all the room
+        // kept for the item.
+        for width in [4, 6, 10, 16, 24] {
+            let (row, _) = frame_top_row(&labels, &attention, "✉ 2 held", width, true, 1);
+            assert!(row.contains('✉'), "{width}: {row:?}");
+        }
+        let (row, headers) = frame_top_row(&labels, &attention, "✉ 2 held", 24, true, 1);
+        assert!(!headers.is_empty(), "the strip carries it: {row:?}");
+        assert!(row.contains("✉ 2 held"), "the short form, whole: {row:?}");
+        // However narrow the strip, it keeps room for the whole short form
+        // and a column before it, rather than half the row.
+        assert_eq!(deck_attention_reserve(&attention, "✉ 2 held", 12), 9);
+        assert_eq!(deck_attention_reserve(&attention, "✉ 2 held", 4), 4);
+        assert_eq!(deck_attention_reserve(&attention, "✉ 2 held", 80), 40);
+        let mut buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 12, 1));
+        draw_deck_attention(&mut buf, Rect::new(0, 0, 12, 1), 3, &attention, "✉ 2 held");
+        let row: String = (0..12).map(|x| buf[(x, 0)].symbol().to_string()).collect();
+        assert_eq!(row, "    ✉ 2 held");
+        // No strip: the title's own text used to fill a 30-column row first.
+        let title =
+            |width| frame_top_row(&["Dashboard"], &attention, "✉ 2 held", width, false, 1).0;
+        let row = title(30);
+        assert!(row.starts_with("✉ 2 held "), "{row:?}");
+        assert!(row.contains("dot-agent-deck"), "{row:?}");
+        assert!(title(40).contains("agent(s)  ✉ 2 held"), "{:?}", title(40));
+        // Wide enough, the words, after the title.
+        assert!(
+            title(120).contains("agent(s)  ✉ captain: waiting"),
+            "{:?}",
+            title(120)
+        );
+        // No agents on the deck, so no title row: the item is the top row.
+        let empty =
+            |width| frame_top_row(&["Dashboard"], &attention, "✉ 2 held", width, false, 0).0;
+        assert!(empty(10).starts_with(" ✉ 2 held"), "{:?}", empty(10));
+        assert!(
+            empty(30).starts_with(" ✉ captain: waiting"),
+            "{:?}",
+            empty(30)
+        );
     }
 }
 
@@ -16258,9 +16397,8 @@ fn render_card_grid(
         sessions.len(),
         total_sessions,
         &scroll_indicator(hidden_above, hidden_below),
-        ui.deck_attention
-            .as_deref()
-            .filter(|_| !ui.deck_attention_in_tab_bar),
+        title_attention(ui),
+        area.width,
     ));
 
     let mut constraints: Vec<Constraint> = vec![Constraint::Length(1)]; // title
@@ -16553,10 +16691,17 @@ fn render_frame(
         // the tabs on their row, clipped at its end. Its room is reserved
         // before the tabs are fitted, so a crowded strip narrows its labels
         // instead of pushing the item off the row.
-        let attention = ui.deck_attention.as_deref();
+        let attention = ui.deck_attention.as_deref().map(|attention| {
+            (
+                attention,
+                ui.deck_attention_short.as_deref().unwrap_or(attention),
+            )
+        });
         let tabs_rect = Rect {
             width: tab_bar_rect.width
-                - attention.map_or(0, |text| deck_attention_reserve(text, tab_bar_rect.width)),
+                - attention.map_or(0, |(attention, short)| {
+                    deck_attention_reserve(attention, short, tab_bar_rect.width)
+                }),
             ..tab_bar_rect
         };
         let strip = render_tab_strip(
@@ -16571,8 +16716,14 @@ fn render_frame(
             .headers
             .last()
             .map_or(tab_bar_rect.x, |(_, rect)| rect.x + rect.width);
-        if let Some(attention) = attention {
-            draw_deck_attention(frame.buffer_mut(), tab_bar_rect, after_tabs, attention);
+        if let Some((attention, short)) = attention {
+            draw_deck_attention(
+                frame.buffer_mut(),
+                tab_bar_rect,
+                after_tabs,
+                attention,
+                short,
+            );
         }
         ui.deck_attention_in_tab_bar = true;
         ui.tab_header_rects = strip.headers;
@@ -16655,6 +16806,22 @@ fn render_frame(
             .style(text_primary())
             .centered();
             frame.render_widget(msg, vertical[1]);
+            // PRD #1666 part 3, round 5-wake (Q6): a deck with no title row
+            // and no tab strip carries the attention item on its top row.
+            if let Some((attention, short)) = title_attention(ui) {
+                let text = if attention_words_fit(attention, dashboard_area.width) {
+                    attention
+                } else {
+                    short
+                };
+                frame.render_widget(
+                    Paragraph::new(Span::styled(format!(" {text}"), deck_attention_style())),
+                    Rect {
+                        height: 1,
+                        ..dashboard_area
+                    },
+                );
+            }
         }
         let ctx_buttons = dashboard_context_buttons(&ui.keybindings, !filtered.is_empty());
         render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
@@ -16697,9 +16864,8 @@ fn render_frame(
                 showing,
                 total_sessions,
                 "",
-                ui.deck_attention
-                    .as_deref()
-                    .filter(|_| !ui.deck_attention_in_tab_bar),
+                title_attention(ui),
+                dashboard_area.width,
             ));
             let vertical = Layout::vertical([
                 Constraint::Length(1),
@@ -35111,7 +35277,7 @@ mod tests {
     // Bell transition detection tests
     // -----------------------------------------------------------------------
 
-    fn make_session(status: SessionStatus) -> SessionState {
+    pub(super) fn make_session(status: SessionStatus) -> SessionState {
         SessionState {
             session_id: String::new(),
             agent_type: AgentType::ClaudeCode,

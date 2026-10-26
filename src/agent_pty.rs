@@ -2557,15 +2557,19 @@ pub enum Termination {
     },
     /// The output stream ended and the child had not exited by the bound.
     ConnectionEnded { read_end: ReadEnd },
-    /// The generation was removed and a successor holds its pane.
+    /// The generation was removed by a respawn that published its successor
+    /// in the pane.
     Replaced,
-    /// The generation was removed and nothing holds its pane.
+    /// The generation was removed by a close or the deck's shutdown.
     Closed,
     /// The generation was removed by a respawn that had published no
     /// successor by the bound: the replacement may still come, or fail.
     ReplacementPending,
     /// The generation was removed by a respawn that ended with no successor.
     ReplacementFailed,
+    /// The registry did not hold the generation when its output ended, and
+    /// nothing recorded removing it.
+    Unknown,
 }
 
 impl std::fmt::Display for Termination {
@@ -2596,6 +2600,7 @@ impl std::fmt::Display for Termination {
             Termination::Closed => write!(f, "closed"),
             Termination::ReplacementPending => write!(f, "replacement_pending"),
             Termination::ReplacementFailed => write!(f, "replacement_failed"),
+            Termination::Unknown => write!(f, "unknown"),
         }
     }
 }
@@ -2617,9 +2622,9 @@ impl Termination {
             Termination::Replaced => PaneTermination::Replaced,
             Termination::Closed => PaneTermination::Closed,
             // Neither says the pane was replaced or closed: only that it ended.
-            Termination::ReplacementPending | Termination::ReplacementFailed => {
-                PaneTermination::Unknown
-            }
+            Termination::ReplacementPending
+            | Termination::ReplacementFailed
+            | Termination::Unknown => PaneTermination::Unknown,
         }
     }
 }
@@ -2647,9 +2652,78 @@ impl ReadEnd {
 /// for the respawn that removed its generation: one bound for both.
 const TERMINATION_WAIT: Duration = Duration::from_millis(200);
 
-/// The respawns that ended with no successor whose capture has not read them
-/// yet ([`RegistryInner::unreplaced_respawns`]), oldest dropped first.
-const MAX_UNREPLACED_RESPAWNS: usize = 64;
+/// PRD #1666 part 3, round 5-wake (plan rev 2 §6): what removed a generation
+/// from the registry, and how the respawn that removed it, if one did, came
+/// out. Shared by the generation's record, its reader and the
+/// [`RespawnTicket`] of a respawn that lifted it out, and written under the
+/// lock hold that removes the record or publishes its successor, so the
+/// reader's capture ([`AgentPtyRegistry::capture_termination`]) reads the
+/// generation's own evidence for as long as the reader lives, however many
+/// other generations end meanwhile. Empty while nothing has removed it.
+#[derive(Debug, Default)]
+pub(crate) struct RemovalEvidence(AtomicU8);
+
+/// What [`RemovalEvidence`] records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Removal {
+    /// A close or shutdown removed the generation.
+    Closed,
+    /// A respawn lifted it out and has not yet published a successor or
+    /// returned.
+    Respawning,
+    /// The respawn published its successor in the pane.
+    Replaced,
+    /// The respawn returned without publishing one.
+    ReplacementFailed,
+}
+
+impl RemovalEvidence {
+    // 0, the default, is nothing recorded.
+    const CLOSED: u8 = 1;
+    const RESPAWNING: u8 = 2;
+    const REPLACED: u8 = 3;
+    const REPLACEMENT_FAILED: u8 = 4;
+
+    fn get(&self) -> Option<Removal> {
+        match self.0.load(Ordering::SeqCst) {
+            Self::CLOSED => Some(Removal::Closed),
+            Self::RESPAWNING => Some(Removal::Respawning),
+            Self::REPLACED => Some(Removal::Replaced),
+            Self::REPLACEMENT_FAILED => Some(Removal::ReplacementFailed),
+            _ => None,
+        }
+    }
+
+    /// A close or shutdown removed the generation.
+    fn closed(&self) {
+        self.0.store(Self::CLOSED, Ordering::SeqCst);
+    }
+
+    /// A respawn lifted the generation out.
+    fn respawning(&self) {
+        self.0.store(Self::RESPAWNING, Ordering::SeqCst);
+    }
+
+    /// The respawn that lifted it out published its successor.
+    fn replaced(&self) {
+        let _ = self.0.compare_exchange(
+            Self::RESPAWNING,
+            Self::REPLACED,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
+
+    /// The respawn returned: without a successor, unless one was published.
+    fn respawn_returned(&self) {
+        let _ = self.0.compare_exchange(
+            Self::RESPAWNING,
+            Self::REPLACEMENT_FAILED,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
+}
 
 /// Reader-thread loop: pull bytes from the PTY master and publish them to
 /// the bus. Exits cleanly when the PTY returns EOF (the child was killed or
@@ -2733,6 +2807,7 @@ fn pump_reader(
     mut reader: Box<dyn std::io::Read + Send>,
     bus: Arc<AgentBus>,
     exited: Arc<AtomicBool>,
+    removal: Arc<RemovalEvidence>,
     change_notify: Arc<Notify>,
     registry: Weak<AgentPtyRegistry>,
     agent_id: String,
@@ -2812,12 +2887,8 @@ fn pump_reader(
     // wrapper, and through it the command it ran, or the pane command) and
     // the stream, never the agent below them.
     let termination = registry.upgrade().map(|registry| {
-        let termination = registry.capture_termination(
-            &agent_id,
-            pane_id_env.as_deref(),
-            registered_at_eof,
-            read_end,
-        );
+        let termination =
+            registry.capture_termination(&agent_id, &removal, registered_at_eof, read_end);
         tracing::info!(
             target: "pane_reader",
             agent_id = %agent_id,
@@ -3076,6 +3147,11 @@ pub struct RunningAgent {
     pub bus: Arc<AgentBus>,
     /// PRD #1666 part 3, round 5-wake: what the deck started in the pane.
     pub child_role: ChildRole,
+    /// PRD #1666 part 3, round 5-wake: when the deck's child started, read as
+    /// it was spawned, so a later process given its pid is not taken for it
+    /// ([`AgentPtyRegistry::child_identity`]). `None` when it could not be
+    /// read.
+    pub child_started: Option<u64>,
     /// PRD #1666 part 3, round 5-wake (plan rev 2 §6): the wrapper's report
     /// of how the command it ran in the pane exited
     /// ([`crate::event::WRAPPER_CHILD_EXIT_METADATA_KEY`]), once it sent one.
@@ -3083,6 +3159,10 @@ pub struct RunningAgent {
     /// accepted from the generation's own child, under the same-user trust
     /// boundary (`crate::hook_provenance`), not one only the wrapper can make.
     pub wrapper_child_exit: Option<String>,
+    /// PRD #1666 part 3, round 5-wake (plan rev 2 §6): what removed this
+    /// generation, shared with its reader, which reads it once the stream
+    /// ends.
+    pub(crate) removal: Arc<RemovalEvidence>,
     /// PRD #1666 part 3, round 5-wake (plan §1.3): the generation's
     /// input-mode evidence, from its wrapper's reports.
     pub input_mode: Arc<Mutex<crate::input_mode::InputModeStore>>,
@@ -5448,7 +5528,7 @@ enum Admission<'a> {
     Fresh,
     /// Holding the ticket is the proof the respawn is counted in flight.
     Respawn {
-        _ticket: &'a RespawnTicket<'a>,
+        ticket: &'a RespawnTicket<'a>,
         /// PRD #1666 part 3, round 5 (plan D7): the replacement this respawn
         /// is, when it replaces a dispatched unit's terminal generation.
         replacement: Option<&'a ReplacementTicket>,
@@ -5458,6 +5538,13 @@ enum Admission<'a> {
 impl<'a> Admission<'a> {
     fn is_admitted_respawn(&self) -> bool {
         matches!(self, Self::Respawn { .. })
+    }
+
+    fn respawn_ticket(&self) -> Option<&'a RespawnTicket<'a>> {
+        match self {
+            Self::Respawn { ticket, .. } => Some(*ticket),
+            Self::Fresh => None,
+        }
     }
 
     fn replacement(&self) -> Option<&'a ReplacementTicket> {
@@ -6657,10 +6744,18 @@ pub struct RespawnsInFlight;
 struct RespawnTicket<'a> {
     registry: &'a AgentPtyRegistry,
     agent_id: String,
+    /// PRD #1666 part 3, round 5-wake: the old generation's removal evidence,
+    /// which says whether this respawn published a successor once it returns.
+    removal: Arc<RemovalEvidence>,
 }
 
 impl Drop for RespawnTicket<'_> {
     fn drop(&mut self) {
+        // PRD #1666 part 3, round 5-wake: a respawn that returns without having
+        // published a successor failed to replace the generation, which the
+        // generation's capture reads. Before the lock, which a rank violation
+        // skips below.
+        self.removal.respawn_returned();
         // PRD #1666 part 3, round 5 (C4b): recovers a poisoned lock, as it
         // always has, and skips a rank violation instead of panicking in an
         // unwind (`crate::lock_rank::RankedMutex::lock_in_drop`).
@@ -6673,23 +6768,7 @@ impl Drop for RespawnTicket<'_> {
         };
         inner.respawns_in_flight = inner.respawns_in_flight.saturating_sub(1);
         inner.respawning_dirs.remove(&self.agent_id);
-        // PRD #1666 part 3, round 5-wake: a respawn that returns with nothing
-        // in its pane failed to replace the generation, which its capture
-        // reads (`unreplaced_respawns`).
-        if let Some(pane) = inner
-            .respawning_members
-            .remove(&self.agent_id)
-            .and_then(|record| record.pane_id_env)
-            && !inner
-                .agents
-                .values()
-                .any(|agent| agent.pane_id_env.as_deref() == Some(pane.as_str()))
-        {
-            if inner.unreplaced_respawns.len() >= MAX_UNREPLACED_RESPAWNS {
-                inner.unreplaced_respawns.pop_front();
-            }
-            inner.unreplaced_respawns.push_back(self.agent_id.clone());
-        }
+        inner.respawning_members.remove(&self.agent_id);
         // Every settle, not only the last: a close waits for the respawns of
         // ONE instance (PRD #1589), and re-reads what it waits for on each
         // wake, as `freeze_admission` re-reads the count.
@@ -7936,15 +8015,6 @@ struct RegistryInner {
     /// orchestration whose only remaining role is mid-respawn has no record,
     /// and is not therefore gone.
     respawning_members: HashMap<String, AgentRecord>,
-    /// PRD #1666 part 3, round 5-wake (plan rev 2 §6): generations a respawn
-    /// removed and then returned without a successor for, until the removed
-    /// generation's capture reads its own entry
-    /// ([`AgentPtyRegistry::capture_termination`]). Recorded by
-    /// [`RespawnTicket`], so a capture that runs after the ticket is gone
-    /// still tells a failed respawn from a close. Bounded
-    /// ([`MAX_UNREPLACED_RESPAWNS`]): an entry no capture reads, because its
-    /// capture had already ended at its bound, is dropped oldest first.
-    unreplaced_respawns: VecDeque<String>,
     /// Issue #454 round-3 review (blocker 1): panes whose SCOPED CLEANUP is
     /// currently in progress, keyed by pane id.
     ///
@@ -8467,7 +8537,6 @@ impl AgentPtyRegistry {
                 ended_instances: VecDeque::new(),
                 respawning_dirs: HashMap::new(),
                 respawning_members: HashMap::new(),
-                unreplaced_respawns: VecDeque::new(),
                 cleanup_holds: HashSet::new(),
                 exit_waiters: HashMap::new(),
             }),
@@ -11005,18 +11074,17 @@ impl AgentPtyRegistry {
     /// `agent_id`'s output. A generation the registry still held at its EOF
     /// (`registered_at_eof`) ended on its own: its child's status, polled for
     /// up to [`TERMINATION_WAIT`], or the stream's end when the child has not
-    /// exited by then. A removed one was replaced when a successor holds its
-    /// pane, closed when no respawn removed it, and otherwise ended with its
-    /// replacement unconfirmed.
+    /// exited by then. A removed one says what its own `removal` evidence
+    /// records: replaced, closed, or a replacement pending or failed; and
+    /// unknown when nothing recorded removing it.
     fn capture_termination(
         &self,
         agent_id: &str,
-        pane_id_env: Option<&str>,
+        removal: &RemovalEvidence,
         registered_at_eof: bool,
         read_end: ReadEnd,
     ) -> Termination {
-        let termination =
-            self.observe_termination(agent_id, pane_id_env, registered_at_eof, read_end);
+        let termination = self.observe_termination(agent_id, removal, registered_at_eof, read_end);
         #[cfg(test)]
         self.terminations
             .lock()
@@ -11031,14 +11099,15 @@ impl AgentPtyRegistry {
     /// over the wrapper's own status, which is used, as the deck's, only when
     /// no report came by the bound; a pane command's status is the deck's.
     /// Neither by the bound is the connection ending. A generation removed
-    /// first was replaced once another holds its pane; closed when no respawn
-    /// removed it; and, when a respawn did, pending while it has published no
-    /// successor by the bound, failed once it ended without one. The bound is
-    /// one [`TERMINATION_WAIT`] for the whole capture, removal included.
+    /// first was replaced when the respawn that removed it published its
+    /// successor, closed when a close or shutdown removed it, pending while
+    /// the respawn has done neither by the bound, and failed once it returned
+    /// without a successor. The bound is one [`TERMINATION_WAIT`] for the
+    /// whole capture, removal included.
     fn observe_termination(
         &self,
         agent_id: &str,
-        pane_id_env: Option<&str>,
+        removal: &RemovalEvidence,
         registered_at_eof: bool,
         read_end: ReadEnd,
     ) -> Termination {
@@ -11096,40 +11165,20 @@ impl AgentPtyRegistry {
                 }
             }
         }
-        // A respawn lifts the generation out before it kills it, and counts it
-        // as respawning until it returns: a successor published by then is the
-        // replacement, and one that returned without a successor left a record
-        // in `unreplaced_respawns` (`RespawnTicket`). Only a published
-        // successor reads as replaced.
+        // The evidence is written under the lock hold that removed the record,
+        // which `registered_at_eof` read after, so a removed generation's is
+        // already there; only a respawn's outcome can still be to come.
         loop {
-            let (successor, respawning, unreplaced) = {
-                let mut inner = self.inner.lock();
-                let successor = pane_id_env.is_some_and(|pane| {
-                    inner.agents.iter().any(|(id, agent)| {
-                        id != agent_id
-                            && agent.pane_id_env.as_deref() == Some(pane)
-                            && !agent.exited.load(Ordering::SeqCst)
-                    })
-                });
-                let unreplaced = inner
-                    .unreplaced_respawns
-                    .iter()
-                    .position(|id| id == agent_id)
-                    .and_then(|at| inner.unreplaced_respawns.remove(at))
-                    .is_some();
-                let respawning = inner.respawning_members.contains_key(agent_id);
-                (successor, respawning, unreplaced)
-            };
-            if successor {
-                return Termination::Replaced;
-            } else if unreplaced {
-                return Termination::ReplacementFailed;
-            } else if !respawning {
-                return Termination::Closed;
-            } else if Instant::now() >= deadline {
-                return Termination::ReplacementPending;
+            match removal.get() {
+                Some(Removal::Replaced) => return Termination::Replaced,
+                Some(Removal::Closed) => return Termination::Closed,
+                Some(Removal::ReplacementFailed) => return Termination::ReplacementFailed,
+                None => return Termination::Unknown,
+                Some(Removal::Respawning) if Instant::now() >= deadline => {
+                    return Termination::ReplacementPending;
+                }
+                Some(Removal::Respawning) => std::thread::sleep(Duration::from_millis(10)),
             }
-            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -12031,6 +12080,13 @@ impl AgentPtyRegistry {
             None
         };
         let guard = PtyGuard::new(spawn_with_dir(opts, dir)?);
+        // PRD #1666 part 3, round 5-wake: before anything can reap the child,
+        // so the pid is still its own, and outside the registry lock.
+        let child_started = guard
+            .pty
+            .as_ref()
+            .and_then(|pty| pty.child.process_id())
+            .and_then(crate::platform::proc::process_start_of);
         #[cfg(test)]
         {
             let pause = self.publish_pause.lock().unwrap().take();
@@ -12231,6 +12287,8 @@ impl AgentPtyRegistry {
         let bus_for_thread = bus.clone();
         let exited = Arc::new(AtomicBool::new(false));
         let exited_for_thread = exited.clone();
+        let removal = Arc::new(RemovalEvidence::default());
+        let removal_for_thread = Arc::clone(&removal);
         let notify_for_thread = self.change_notify.clone();
         // The reader thread needs a registry handle, its own
         // agent id, and the pane's id so its EOF branch can retire any armed
@@ -12267,6 +12325,7 @@ impl AgentPtyRegistry {
                 reader,
                 bus_for_thread,
                 exited_for_thread,
+                removal_for_thread,
                 notify_for_thread,
                 registry_for_thread,
                 agent_id_for_thread,
@@ -12328,7 +12387,9 @@ impl AgentPtyRegistry {
             pane_retired,
             bus,
             child_role,
+            child_started,
             wrapper_child_exit: None,
+            removal,
             input_mode: Arc::default(),
             ingress: crate::ingress_ledger::IngressLedger::new(),
             doorbell,
@@ -12393,6 +12454,12 @@ impl AgentPtyRegistry {
             agent.spawn_env.clone(),
         );
         inner.agents.insert(id.clone(), agent);
+        // PRD #1666 part 3, round 5-wake: a respawn's successor is published,
+        // so the generation it lifted out was replaced, under the lock hold
+        // that publishes it.
+        if let Some(ticket) = admission.respawn_ticket() {
+            ticket.removal.replaced();
+        }
         // PRD #1741: under the lock that published the agent, so its reader's
         // EOF, which checks registration under it, is ordered after this.
         crate::telemetry::commit_spawn(telemetry_run);
@@ -12673,6 +12740,7 @@ impl AgentPtyRegistry {
                 .agents
                 .remove(id)
                 .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?;
+            agent.removal.closed();
             // Before the pane-state lock below — see [`PaneWriter::retired`].
             agent.pane_retired.store(true, Ordering::SeqCst);
             // PRD #1666 part 3, round 5-wake: the retired generation's ledger
@@ -12980,6 +13048,9 @@ impl AgentPtyRegistry {
                 .remove(&agent_id)
                 .expect("agent_id was just located inside the same lock hold");
             let removed_record = Self::cleanup_record(&agent_id, &removed);
+            // PRD #1666 part 3, round 5-wake: under the lock hold that lifts the
+            // record out; the ticket settles it.
+            removed.removal.respawning();
             // Issue #542: the old generation's launcher standing leaves with
             // it. The pane-keyed clocks stay — the pane is not going away, and
             // `spawn_agent` resets what a new occupant must not inherit. The
@@ -13016,6 +13087,7 @@ impl AgentPtyRegistry {
         let in_flight = RespawnTicket {
             registry: self,
             agent_id,
+            removal: Arc::clone(&removed.removal),
         };
         #[cfg(test)]
         {
@@ -13095,8 +13167,11 @@ impl AgentPtyRegistry {
             // starts its own.
             doorbell: _,
             child_role: _,
+            child_started: _,
             // The replacement's wrapper reports its own child's exit.
             wrapper_child_exit: _,
+            // Held by the ticket above, which settles it.
+            removal: _,
             // The replacement's evidence starts empty.
             input_mode: _,
             // PRD #745 M11: deliberately dropped rather than carried over. The
@@ -13269,7 +13344,7 @@ impl AgentPtyRegistry {
                 opts,
                 verified_dir.as_ref(),
                 Admission::Respawn {
-                    _ticket: &in_flight,
+                    ticket: &in_flight,
                     replacement: replacement.as_ref(),
                 },
             )?;
@@ -15002,6 +15077,17 @@ impl AgentPtyRegistry {
         inner.agents.get(id).and_then(|a| a.child.process_id())
     }
 
+    /// PRD #1666 part 3, round 5-wake: the pid of `id`'s child and when that
+    /// child started, read as it was spawned ([`RunningAgent::child_started`]),
+    /// so a caller can tell the child from a later process reusing its pid.
+    pub(crate) fn child_identity(&self, id: &str) -> Option<(u32, Option<u64>)> {
+        let inner = self.inner.lock();
+        inner
+            .agents
+            .get(id)
+            .and_then(|a| Some((a.child.process_id()?, a.child_started)))
+    }
+
     /// All currently-owned agent ids, sorted ascending.
     pub fn agent_ids(&self) -> Vec<String> {
         self.agent_records().into_iter().map(|r| r.id).collect()
@@ -15838,7 +15924,9 @@ impl AgentPtyRegistry {
                 pane_retired,
                 bus: Arc::new(AgentBus::new()),
                 child_role: ChildRole::PaneCommand,
+                child_started: None,
                 wrapper_child_exit: None,
+                removal: Arc::default(),
                 input_mode: Arc::default(),
                 ingress: crate::ingress_ledger::IngressLedger::new(),
                 doorbell: Arc::new(crate::doorbell_generation::GenerationDoorbell::new(
@@ -17401,7 +17489,14 @@ impl AgentPtyRegistry {
     pub fn shutdown_all(&self) {
         let agents: Vec<RunningAgent> = {
             let mut inner = self.inner.lock();
-            inner.agents.drain().map(|(_, a)| a).collect()
+            inner
+                .agents
+                .drain()
+                .map(|(_, agent)| {
+                    agent.removal.closed();
+                    agent
+                })
+                .collect()
         };
         Self::force_kill_and_reap_all(agents);
         // Wake the idle monitor if it's parked on `change_notify` — the
@@ -17430,7 +17525,14 @@ impl AgentPtyRegistry {
         }
         let mut agents: Vec<RunningAgent> = {
             let mut inner = self.inner.lock();
-            inner.agents.drain().map(|(_, a)| a).collect()
+            inner
+                .agents
+                .drain()
+                .map(|(_, agent)| {
+                    agent.removal.closed();
+                    agent
+                })
+                .collect()
         };
 
         // Phase 1: SIGTERM each child's process group. Some shells

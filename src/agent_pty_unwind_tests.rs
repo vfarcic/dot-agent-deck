@@ -168,6 +168,7 @@ fn work_done_056_respawn_ticket_drop_survives_an_unwind() {
             RespawnTicket {
                 registry: Arc::as_ref(registry),
                 agent_id: "unwind-agent".into(),
+                removal: Arc::default(),
             }
         },
         poison_registry,

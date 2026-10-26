@@ -2855,6 +2855,11 @@ fn strip_question_metadata(event: &mut AgentEvent) {
 /// dropped, and the capture keeps the outer wrapper's, or the deck's own
 /// status. `peer` is the connecting process as the hook socket accepted it.
 ///
+/// The peer is the child only when its pid and its start time, read when the
+/// connection was accepted, are the child's as the deck spawned it, so a
+/// process that later reuses a reaped child's pid is not taken for it; a start
+/// time either side could not read drops the report.
+///
 /// This tells the deck's child from its descendants. It does not authenticate
 /// the report: a process running as the deck's user can still impersonate the
 /// wrapper, which is inside the accepted trust boundary
@@ -2875,8 +2880,14 @@ fn keep_wrapper_report_from_own_child(
         .agent_id
         .as_deref()
         .or(attested_agent)
-        .and_then(|generation| registry.child_pid(generation));
-    if own_child.is_none() || peer.map(|peer| peer.pid) != own_child {
+        .and_then(|generation| registry.child_identity(generation));
+    let from_own_child = match (own_child, peer) {
+        (Some((pid, Some(started))), Some(peer)) => {
+            peer.pid == pid && peer.started == Some(started)
+        }
+        _ => false,
+    };
+    if !from_own_child {
         event
             .metadata
             .remove(crate::event::WRAPPER_CHILD_EXIT_METADATA_KEY);
@@ -9505,7 +9516,7 @@ mod hook_ingestion_tests {
         registry.shutdown_all();
     }
 
-    /// Scenario: PRD #1666 part 3, round 5-wake. A wrapped generation's final event names how the wrapper's command exited. The report is kept when the deck's own child sent it, and dropped when anything else did: a `dot-agent-deck wrap` nested below it (another pid with the same pane, generation and token), a connection whose sender cannot be read, or a generation the registry does not hold.
+    /// Scenario: PRD #1666 part 3, round 5-wake. A wrapped generation's final event names how the wrapper's command exited. The report is kept when the deck's own child sent it, and dropped when anything else did: a `dot-agent-deck wrap` nested below it (another pid with the same pane, generation and token), a later process given the child's pid (the same pid, started at another time), a connection whose sender or start time cannot be read, or a generation the registry does not hold.
     #[spec("inbox/status/032")]
     #[test]
     fn status_032_only_the_decks_own_child_reports_its_commands_exit() {
@@ -9519,10 +9530,11 @@ mod hook_ingestion_tests {
             })
             .expect("spawn");
         let child = registry.child_pid(&generation).expect("child pid");
-        let peer = |pid| {
+        let born = crate::platform::proc::process_start_of(child).expect("child start time");
+        let peer = |pid, started| {
             Some(AcceptedPeer {
                 pid,
-                started: None,
+                started,
                 same_user: Some(true),
             })
         };
@@ -9540,11 +9552,25 @@ mod hook_ingestion_tests {
                 .metadata
                 .contains_key(crate::event::WRAPPER_CHILD_EXIT_METADATA_KEY)
         };
-        assert!(kept(peer(child), &generation), "the deck's own child");
-        assert!(!kept(peer(child + 1), &generation), "a nested wrapper");
+        assert!(
+            kept(peer(child, Some(born)), &generation),
+            "the deck's own child"
+        );
+        assert!(
+            !kept(peer(child + 1, Some(born)), &generation),
+            "a nested wrapper"
+        );
+        assert!(
+            !kept(peer(child, Some(born + 1)), &generation),
+            "a later process reusing the child's pid"
+        );
+        assert!(
+            !kept(peer(child, None), &generation),
+            "a sender whose start time could not be read"
+        );
         assert!(!kept(None, &generation), "an unreadable sender");
         assert!(
-            !kept(peer(child), "another-generation"),
+            !kept(peer(child, Some(born)), "another-generation"),
             "another generation"
         );
         registry.shutdown_all();
