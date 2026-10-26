@@ -8400,12 +8400,12 @@ Since PRD #1666 S5 the deck types nothing into the orchestrator: its idle, waiti
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
 
-##### scheduler/idle-worker/027 — Supersede an unacknowledged task with a newer one. The newer task starts no idle clock until its own acknowledgement, then one bound idle notice reaches the orchestrator inbox.
+##### scheduler/idle-worker/027 — Supersede an unacknowledged task with a newer one. The newer task starts no idle clock until its own acknowledgement; inbox samples completed within 250 ms of the acknowledgement request remain silent, then one bound idle notice reaches the orchestrator inbox.
 - **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
 - **Agent:** none.
-- **Asserts:** Supersede an unacknowledged task with a newer one. The newer task starts no idle clock until its own acknowledgement, then one bound idle notice reaches the orchestrator inbox.
+- **Asserts:** Supersede an unacknowledged task with a newer one. The newer task starts no idle clock until its own acknowledgement; inbox samples completed within 250 ms of the acknowledgement request remain silent, then one bound idle notice reaches the orchestrator inbox.
 - **Test:** `idle_worker_027_queued_delegate_clocks_start_after_its_pointer` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
-- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
+- **Does not assert:** silence during intervals missed by a delayed observer or exact daemon timer arithmetic; real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
 
 ##### scheduler/idle-worker/028 — Acknowledge a task and report work-done before its idle timeout. The orchestrator receives the completion in its inbox and never a stale idle-worker notice.
