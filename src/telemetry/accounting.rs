@@ -42,6 +42,10 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
 
+pub mod claude;
+pub mod locate;
+pub mod usage_file;
+
 use super::AttrKey;
 use super::ci::CiState;
 use super::span::AttrValue;
@@ -106,6 +110,10 @@ pub enum Unavailable {
     RunNotEnded,
     /// The run serves no known work item.
     NoWorkItem,
+    /// The agent's record is there but not in a shape the reader knows, as
+    /// after an upgrade changed an undocumented format: the reader gives up
+    /// on the value rather than guess it.
+    UnrecognizedFormat,
 }
 
 impl Unavailable {
@@ -121,6 +129,7 @@ impl Unavailable {
             Unavailable::QuotaDecreased => "quota_decreased",
             Unavailable::RunNotEnded => "run_not_ended",
             Unavailable::NoWorkItem => "no_work_item",
+            Unavailable::UnrecognizedFormat => "unrecognized_format",
         }
     }
 }
@@ -323,11 +332,13 @@ impl RunTermination {
 }
 
 /// A run's termination with the kind of its failure, when the agent named one
-/// (`error.type`).
+/// (`error.type`), and the HTTP status of the provider's response that failed
+/// it, when the agent recorded one (`http.response.status_code`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Termination {
     pub outcome: RunTermination,
     pub error_type: Option<Ident>,
+    pub http_status: Option<u16>,
 }
 
 /// What an agent's own record says about its last turn. It is the last
@@ -336,9 +347,11 @@ pub struct Termination {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentTurnEnd {
     Completed,
-    /// `kind` is the agent's error identifier, never its message.
+    /// `kind` is the agent's error identifier, never its message; `status`
+    /// the HTTP status of the provider's response, when the agent kept one.
     Failed {
         kind: Option<Ident>,
+        status: Option<u16>,
     },
     Interrupted,
     /// The record ends inside a turn, for example on a reply that asked for a
@@ -379,11 +392,13 @@ pub fn run_termination(end: Option<EndReason>, agent: Option<&AgentTurnEnd>) -> 
     let of = |outcome| Termination {
         outcome,
         error_type: None,
+        http_status: None,
     };
     match agent {
-        Some(AgentTurnEnd::Failed { kind }) => Field::ProviderReported(Termination {
+        Some(AgentTurnEnd::Failed { kind, status }) => Field::ProviderReported(Termination {
             outcome: RunTermination::Failed,
             error_type: kind.clone(),
+            http_status: *status,
         }),
         Some(AgentTurnEnd::Interrupted) => Field::ProviderReported(of(RunTermination::Interrupted)),
         Some(AgentTurnEnd::Completed) => Field::ProviderReported(of(RunTermination::Completed)),
@@ -395,6 +410,70 @@ pub fn run_termination(end: Option<EndReason>, agent: Option<&AgentTurnEnd>) -> 
         Some(AgentTurnEnd::MidTurn | AgentTurnEnd::Unknown) | None => {
             Field::Measured(of(RunTermination::Unknown))
         }
+    }
+}
+
+/// How a run of an arbitrary command ended, from what the deck itself saw
+/// (measured): an exit status of 0 completed it, any other failed it
+/// (`error.type` `nonzero_exit`), a pane the deck closed or a daemon that shut
+/// down interrupted it, and an exit with no status (a signal) or an end the
+/// deck could not tell is unknown. An agent's exit status says nothing about
+/// its turns, which is why [`run_termination`] does not read it.
+pub fn command_termination(end: Option<EndReason>, exit_code: Option<i32>) -> Field<Termination> {
+    let outcome = match (end, exit_code) {
+        (None, _) => return Field::Unavailable(Unavailable::RunNotEnded),
+        (Some(EndReason::Exited), Some(0)) => RunTermination::Completed,
+        (Some(EndReason::Exited), Some(_)) => {
+            return Field::Measured(Termination {
+                outcome: RunTermination::Failed,
+                error_type: Ident::new("nonzero_exit"),
+                http_status: None,
+            });
+        }
+        (Some(EndReason::Closed | EndReason::DaemonShutdown), _) => RunTermination::Interrupted,
+        (Some(EndReason::Exited | EndReason::Unknown), _) => RunTermination::Unknown,
+    };
+    Field::Measured(Termination {
+        outcome,
+        error_type: None,
+        http_status: None,
+    })
+}
+
+/// Where the deck reads a run's usage and last turn from, per agent (the
+/// design in `docs/develop/telemetry.md`, "Usage and how a run ended"). The
+/// agents' own OpenTelemetry goes from each agent straight to the user's
+/// backend, so the deck reads none of it; each source below is a local
+/// record of the agent's own usage figures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageSource {
+    /// Claude Code's transcript, at the path [`locate::claude_transcript`]
+    /// builds from the session id and directory its hooks report; read with
+    /// [`claude::ClaudeTranscriptReader`].
+    ClaudeTranscript,
+    /// Codex's rollout, at the path its hooks report, once
+    /// [`locate::admit_codex_rollout`] admits it; read with
+    /// [`CodexUsageReader`].
+    CodexRollout,
+    /// The deck's own usage file for the run, which the deck's Pi extension
+    /// and OpenCode plugin append each reply's usage to; read with
+    /// [`usage_file::UsageFileReader`].
+    UsageFile,
+    /// None: the run's usage is [`Unavailable::NoChannel`] ([`no_usage_channel`]).
+    NoChannel,
+}
+
+/// The [`UsageSource`] for a run of `agent`. Devin's own telemetry is
+/// documented to carry token counts, but the deck receives none of it and
+/// found no local record of Devin's usage, so a Devin run has no channel;
+/// nor has an arbitrary command.
+pub fn usage_source(agent: &crate::event::AgentType) -> UsageSource {
+    use crate::event::AgentType;
+    match agent {
+        AgentType::ClaudeCode => UsageSource::ClaudeTranscript,
+        AgentType::Codex => UsageSource::CodexRollout,
+        AgentType::Pi | AgentType::OpenCode => UsageSource::UsageFile,
+        AgentType::Devin | AgentType::None => UsageSource::NoChannel,
     }
 }
 
@@ -589,15 +668,28 @@ fn add_tokens(sum: Field<Tokens>, next: Field<Tokens>) -> Field<Tokens> {
     }
 }
 
-/// Usage per model from per-reply (or per-model) entries, each with its
-/// tokens and cost already classified: tokens combined by [`add_tokens`],
-/// costs by [`add_cost`], at most [`MAX_MODELS`] named models.
-fn per_model(
-    entries: impl IntoIterator<Item = (Option<Ident>, Field<Tokens>, Field<MicroUsd>)>,
-) -> Vec<ModelUsage> {
-    let mut by_model: BTreeMap<Option<Ident>, (Field<Tokens>, Field<MicroUsd>)> = BTreeMap::new();
-    for (model, tokens, cost) in entries {
-        match by_model.entry(capped(&by_model, model)) {
+/// Usage per model, folded one per-reply (or per-model) entry at a time,
+/// each with its tokens and cost already classified: tokens combined by
+/// [`add_tokens`], costs by [`add_cost`], at most [`MAX_MODELS`] named models.
+/// It holds one entry per model, however many replies it folds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UsageAcc {
+    by_model: BTreeMap<Option<Ident>, (Field<Tokens>, Field<MicroUsd>)>,
+}
+
+impl UsageAcc {
+    /// Fold one entry in. Returns `false` when its model was named but
+    /// [`MAX_MODELS`] others already were, so it was credited to no model.
+    pub fn add(
+        &mut self,
+        model: Option<Ident>,
+        tokens: Field<Tokens>,
+        cost: Field<MicroUsd>,
+    ) -> bool {
+        let named = model.is_some();
+        let key = capped(&self.by_model, model);
+        let kept = key.is_some() || !named;
+        match self.by_model.entry(key) {
             Entry::Vacant(entry) => {
                 entry.insert((tokens, cost));
             }
@@ -607,18 +699,87 @@ fn per_model(
                 *sum_cost = add_cost(*sum_cost, cost);
             }
         }
+        kept
     }
-    if by_model.is_empty() {
-        return usage_unavailable(Unavailable::NotRecorded);
+
+    pub fn is_empty(&self) -> bool {
+        self.by_model.is_empty()
     }
-    by_model
-        .into_iter()
-        .map(|(model, (tokens, cost))| ModelUsage {
-            model,
-            tokens,
-            cost,
-        })
-        .collect()
+
+    /// The models folded so far; with none, one entry whose usage is
+    /// [`Unavailable::NotRecorded`].
+    pub fn finish(&self) -> Vec<ModelUsage> {
+        if self.by_model.is_empty() {
+            return usage_unavailable(Unavailable::NotRecorded);
+        }
+        self.by_model
+            .iter()
+            .map(|(model, (tokens, cost))| ModelUsage {
+                model: model.clone(),
+                tokens: *tokens,
+                cost: *cost,
+            })
+            .collect()
+    }
+}
+
+/// Usage per model from per-reply (or per-model) entries ([`UsageAcc`]).
+fn per_model(
+    entries: impl IntoIterator<Item = (Option<Ident>, Field<Tokens>, Field<MicroUsd>)>,
+) -> Vec<ModelUsage> {
+    let mut acc = UsageAcc::default();
+    for (model, tokens, cost) in entries {
+        acc.add(model, tokens, cost);
+    }
+    acc.finish()
+}
+
+/// One run's usage from the usage of each agent session it held — a Claude
+/// Code `/clear` starts a new session, and so a new transcript, in the same
+/// run. Each session's own figures are counted once: models are folded as
+/// [`UsageAcc`] folds replies, so a session whose usage is unavailable makes
+/// the run's figure for that model incomplete rather than leaving it out.
+/// The quota is the one session's that has one; two sessions with a quota
+/// value are two windows' worth of samples, and their deltas are not
+/// combined ([`Unavailable::Incomplete`]). The last turn is the last
+/// session's. No session at all is usage not recorded.
+pub fn combine_sessions(parts: Vec<AgentUsage>) -> AgentUsage {
+    if parts.len() == 1 {
+        return parts.into_iter().next().expect("one part");
+    }
+    let mut acc = UsageAcc::default();
+    let mut quota: Option<Field<QuotaDelta>> = None;
+    let mut last_turn = None;
+    for part in parts {
+        for m in part.models {
+            acc.add(m.model, m.tokens, m.cost);
+        }
+        quota = Some(match (quota, part.quota) {
+            (None, q) => q,
+            (Some(Field::Unavailable(_)), q @ Field::Unavailable(_)) => q,
+            (Some(Field::Unavailable(_)), q) | (Some(q), Field::Unavailable(_)) => q,
+            (Some(_), _) => Field::Unavailable(Unavailable::Incomplete),
+        });
+        if part.last_turn.is_some() {
+            last_turn = part.last_turn;
+        }
+    }
+    AgentUsage {
+        models: acc.finish(),
+        quota: quota.unwrap_or(Field::Unavailable(Unavailable::NotRecorded)),
+        last_turn,
+    }
+}
+
+/// The usage of a run whose agent the deck has no usage channel for — an
+/// arbitrary command, or Devin, whose own telemetry the deck does not
+/// receive: every value [`Unavailable::NoChannel`], never zero.
+pub fn no_usage_channel() -> AgentUsage {
+    AgentUsage {
+        models: usage_unavailable(Unavailable::NoChannel),
+        quota: Field::Unavailable(Unavailable::NoChannel),
+        last_turn: None,
+    }
 }
 
 /// Tokens from an agent that counts input without the cache.
@@ -702,18 +863,23 @@ pub fn from_claude(session: Option<&ClaudeSessionUsage>) -> AgentUsage {
 /// account, so deltas from several machines or accounts on the same plan and
 /// window are indistinguishable here.
 pub fn from_codex(summary: &CodexRolloutSummary) -> AgentUsage {
-    let models = per_model(summary.tokens_by_model.iter().map(|(model, tokens)| {
-        let tokens = if summary.tokens_incomplete || summary.total_unresolved {
-            Field::Unavailable(Unavailable::Incomplete)
-        } else {
-            Field::ProviderReported(*tokens)
-        };
-        (
-            model.clone(),
-            tokens,
-            Field::Unavailable(Unavailable::NoChannel),
-        )
-    }));
+    let unrecognized = summary.malformed && summary.tokens_by_model.is_empty();
+    let models = if unrecognized {
+        usage_unavailable(Unavailable::UnrecognizedFormat)
+    } else {
+        per_model(summary.tokens_by_model.iter().map(|(model, tokens)| {
+            let tokens = if summary.tokens_incomplete || summary.total_unresolved {
+                Field::Unavailable(Unavailable::Incomplete)
+            } else {
+                Field::ProviderReported(*tokens)
+            };
+            (
+                model.clone(),
+                tokens,
+                Field::Unavailable(Unavailable::NoChannel),
+            )
+        }))
+    };
     let quota = match (&summary.quota_first, &summary.quota_last) {
         (Some(first), Some(last)) => {
             match summary.quota_break.or_else(|| quota_break(first, last)) {
@@ -727,6 +893,7 @@ pub fn from_codex(summary: &CodexRolloutSummary) -> AgentUsage {
                 }),
             }
         }
+        _ if summary.malformed => Field::Unavailable(Unavailable::UnrecognizedFormat),
         _ => Field::Unavailable(Unavailable::NotRecorded),
     };
     AgentUsage {
@@ -796,7 +963,10 @@ pub fn from_pi(replies: &[PiReplyUsage]) -> AgentUsage {
     let last_turn = replies.last().map(|r| match r.stop_reason {
         Some(PiStopReason::Stop | PiStopReason::Length) => AgentTurnEnd::Completed,
         Some(PiStopReason::ToolUse) => AgentTurnEnd::MidTurn,
-        Some(PiStopReason::Error) => AgentTurnEnd::Failed { kind: None },
+        Some(PiStopReason::Error) => AgentTurnEnd::Failed {
+            kind: None,
+            status: None,
+        },
         Some(PiStopReason::Aborted) => AgentTurnEnd::Interrupted,
         None => AgentTurnEnd::Unknown,
     });
@@ -1108,6 +1278,10 @@ pub struct CodexRolloutSummary {
     /// delta ([`quota_break`]), if any.
     pub quota_break: Option<Unavailable>,
     pub last_turn: Option<AgentTurnEnd>,
+    /// A line carrying one of the rollout's marker words did not
+    /// deserialise: with no usable total, the rollout is in a format the
+    /// reader does not know ([`Unavailable::UnrecognizedFormat`]).
+    pub malformed: bool,
     current_model: Option<Ident>,
     last_total: Option<Tokens>,
 }
@@ -1164,7 +1338,28 @@ pub struct ReaderStats {
     pub polls_cut_short: u64,
 }
 
-/// An incremental reader of one Codex rollout, at the path it is given.
+/// What a [`JsonlReader`] keeps from the lines it reads: which lines are
+/// worth deserialising at all, the narrow shape they are deserialised into,
+/// and what each parsed record changes. Its `Default` is the state of a file
+/// read from the start.
+pub trait LineSummary: Default {
+    /// Quoted marker words ([`line_is_candidate`]); a line containing none of
+    /// them is counted and skipped without being parsed.
+    const MARKERS: &'static [&'static [u8]];
+    /// The narrow shape a candidate line is deserialised into. Every field it
+    /// does not name is skipped by the parser without being kept.
+    type Record: serde::de::DeserializeOwned;
+    fn observe(&mut self, record: Self::Record, stats: &mut ReaderStats);
+    /// A candidate line did not deserialise into [`Self::Record`]. The line
+    /// is lent only to look for a marker in it, never to be kept.
+    fn malformed(&mut self, _line: &[u8]) {}
+}
+
+/// An incremental reader of one JSON-lines file, at the path it is given,
+/// keeping only what its [`LineSummary`] keeps: a Codex rollout
+/// ([`CodexUsageReader`]), a Claude Code transcript
+/// ([`claude::ClaudeTranscriptReader`]) or the deck's own usage file
+/// ([`usage_file::UsageFileReader`]).
 ///
 /// Each [`poll`](Self::poll) reads only bytes appended since the last one,
 /// at most its budget ([`DEFAULT_POLL_BUDGET`]) and never past the file's
@@ -1175,46 +1370,46 @@ pub struct ReaderStats {
 /// as long as the disk does. A line is kept across polls until its newline
 /// arrives (at most [`MAX_LINE_BYTES`]), then dropped.
 ///
-/// Any complete line that contains one of five quoted marker words
+/// Any complete line that contains one of the summary's quoted marker words
 /// ([`line_is_candidate`]) is deserialised, wherever in the line the marker
 /// is, so a content line with a string that is exactly a marker word is
-/// deserialised too. What is kept is then decided by the parsed record's
-/// type and its payload's type: only `turn_context`, `token_count`,
-/// `task_started`, `task_complete` and `turn_aborted` update the summary,
-/// and only with the model, token counts, quota and turn-end kind, the
-/// fields the narrow structs name. So a prompt, reply, tool output or file
-/// content is scanned by the parser and, while its line is incomplete,
-/// buffered, but kept in nothing the reader returns, and its `Debug` shows
-/// neither the buffer nor the path.
+/// deserialised too. What is kept is then decided by the parsed record's own
+/// type, and only with the fields the narrow structs name. So a prompt, reply,
+/// tool output or file content is scanned by the parser and, while its line is
+/// incomplete, buffered, but kept in nothing the reader returns, and its
+/// `Debug` shows neither the buffer nor the path.
 ///
 /// On Unix the path is opened with `O_NOFOLLOW`, which refuses a symlink in
 /// its final component only: a symlinked parent directory is followed, so
-/// this is no confinement to a trusted root (that policy is #1858's to
-/// decide before the reader is wired). It is opened with `O_NONBLOCK` so a
-/// FIFO with no writer cannot stall the open, and anything but a regular
-/// file is refused, from the opened descriptor's own metadata, before a byte
-/// is read. Elsewhere it is a plain open, and the regular-file check follows
-/// it.
+/// confinement to a trusted root is the caller's ([`locate`] builds or
+/// admits every path the deck hands a reader). It is opened with `O_NONBLOCK`
+/// so a FIFO with no writer cannot stall the open, and anything but a regular
+/// file owned by this process's user is refused, from the opened descriptor's
+/// own metadata, before a byte is read. Elsewhere it is a plain open, and the
+/// regular-file check follows it.
 ///
 /// A file that gets shorter, or whose path now names another file (Unix),
-/// is read again from the start with the summary reset: that is a new rollout
+/// is read again from the start with the summary reset: that is a new file
 /// as far as the reader can tell. A file truncated and regrown past the
 /// reader's offset between two polls, keeping its inode, is not noticed: the
 /// reader carries on from its offset into the new content.
-pub struct CodexUsageReader {
+pub struct JsonlReader<S> {
     path: PathBuf,
     identity: Option<(u64, u64)>,
     offset: u64,
     partial: Vec<u8>,
     skipping: bool,
     poll_budget: u64,
-    summary: CodexRolloutSummary,
+    summary: S,
     stats: ReaderStats,
 }
 
-impl fmt::Debug for CodexUsageReader {
+/// An incremental reader of one Codex rollout.
+pub type CodexUsageReader = JsonlReader<CodexRolloutSummary>;
+
+impl<S> fmt::Debug for JsonlReader<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CodexUsageReader")
+        f.debug_struct("JsonlReader")
             .field("offset", &self.offset)
             .field("partial_bytes", &self.partial.len())
             .field("skipping", &self.skipping)
@@ -1224,16 +1419,16 @@ impl fmt::Debug for CodexUsageReader {
     }
 }
 
-impl CodexUsageReader {
+impl<S: LineSummary> JsonlReader<S> {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        CodexUsageReader {
+        JsonlReader {
             path: path.into(),
             identity: None,
             offset: 0,
             partial: Vec::new(),
             skipping: false,
             poll_budget: DEFAULT_POLL_BUDGET,
-            summary: CodexRolloutSummary::default(),
+            summary: S::default(),
             stats: ReaderStats::default(),
         }
     }
@@ -1245,8 +1440,12 @@ impl CodexUsageReader {
         self
     }
 
-    pub fn summary(&self) -> &CodexRolloutSummary {
+    pub fn summary(&self) -> &S {
         &self.summary
+    }
+
+    pub fn summary_mut(&mut self) -> &mut S {
+        &mut self.summary
     }
 
     pub fn stats(&self) -> ReaderStats {
@@ -1255,12 +1454,18 @@ impl CodexUsageReader {
 
     /// Read what was appended since the last poll, within the budget.
     pub fn poll(&mut self) -> io::Result<()> {
-        let mut file = open_rollout(&self.path)?;
+        let mut file = open_regular(&self.path)?;
         let meta = file.metadata()?;
         if !meta.is_file() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "not a regular file",
+            ));
+        }
+        if !owned_by_this_user(&meta) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "owned by another user",
             ));
         }
         let identity = file_identity(&meta);
@@ -1294,7 +1499,7 @@ impl CodexUsageReader {
         self.offset = 0;
         self.partial.clear();
         self.skipping = false;
-        self.summary = CodexRolloutSummary::default();
+        self.summary = S::default();
         self.stats.restarts += 1;
     }
 
@@ -1336,15 +1541,18 @@ impl CodexUsageReader {
     fn line(&mut self, line: &[u8]) {
         self.stats.lines += 1;
         let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if !line_is_candidate(line) {
+        if !line_is_candidate(line, S::MARKERS) {
             return;
         }
-        match serde_json::from_slice::<NarrowRecord>(line) {
+        match serde_json::from_slice::<S::Record>(line) {
             Ok(record) => {
                 self.stats.parsed += 1;
                 self.summary.observe(record, &mut self.stats);
             }
-            Err(_) => self.stats.malformed += 1,
+            Err(_) => {
+                self.stats.malformed += 1;
+                self.summary.malformed(line);
+            }
         }
     }
 }
@@ -1354,7 +1562,7 @@ impl CodexUsageReader {
 /// FIFO with no writer would otherwise block it). `O_NONBLOCK` does not make
 /// reading a regular file any faster on a slow disk.
 #[cfg(unix)]
-fn open_rollout(path: &Path) -> io::Result<File> {
+fn open_regular(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt as _;
     std::fs::OpenOptions::new()
         .read(true)
@@ -1363,8 +1571,22 @@ fn open_rollout(path: &Path) -> io::Result<File> {
 }
 
 #[cfg(not(unix))]
-fn open_rollout(path: &Path) -> io::Result<File> {
+fn open_regular(path: &Path) -> io::Result<File> {
     File::open(path)
+}
+
+/// Whether the opened file belongs to the user this process runs as: a
+/// reader never takes another user's file as an agent's record.
+#[cfg(unix)]
+fn owned_by_this_user(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    // SAFETY: `geteuid` takes no arguments and cannot fail.
+    meta.uid() == unsafe { libc::geteuid() }
+}
+
+#[cfg(not(unix))]
+fn owned_by_this_user(_meta: &std::fs::Metadata) -> bool {
+    true
 }
 
 #[cfg(unix)]
@@ -1378,23 +1600,33 @@ fn file_identity(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
     None
 }
 
-const CANDIDATE_MARKERS: [&[u8]; 5] = [
-    b"\"turn_context\"",
-    b"\"token_count\"",
-    b"\"task_started\"",
-    b"\"task_complete\"",
-    b"\"turn_aborted\"",
-];
-
-/// Whether a line could be a record the reader uses: the cheap pre-filter
+/// Whether a line could be a record its reader uses: the cheap pre-filter
 /// that decides which lines are deserialised at all. It matches a quoted
 /// marker anywhere in the line, not only as the record's type, so it lets
-/// through some content lines, which [`CodexRolloutSummary::observe`] then
-/// ignores by type.
-fn line_is_candidate(line: &[u8]) -> bool {
-    CANDIDATE_MARKERS
+/// through some content lines, which the summary then ignores by type.
+fn line_is_candidate(line: &[u8], markers: &[&[u8]]) -> bool {
+    markers
         .iter()
         .any(|m| line.windows(m.len()).any(|w| w == *m))
+}
+
+impl LineSummary for CodexRolloutSummary {
+    const MARKERS: &'static [&'static [u8]] = &[
+        b"\"turn_context\"",
+        b"\"token_count\"",
+        b"\"task_started\"",
+        b"\"task_complete\"",
+        b"\"turn_aborted\"",
+    ];
+    type Record = NarrowRecord;
+
+    fn observe(&mut self, record: NarrowRecord, stats: &mut ReaderStats) {
+        CodexRolloutSummary::observe(self, record, stats);
+    }
+
+    fn malformed(&mut self, _line: &[u8]) {
+        self.malformed = true;
+    }
 }
 
 impl CodexRolloutSummary {
@@ -1421,8 +1653,9 @@ impl CodexRolloutSummary {
             }
             (Some("event_msg"), Some("task_complete")) => {
                 self.last_turn = Some(match payload.error {
-                    Some(ErrorKind(kind)) => AgentTurnEnd::Failed {
+                    Some(ErrorKind { kind, status }) => AgentTurnEnd::Failed {
                         kind: kind.as_deref().and_then(Ident::new),
+                        status,
                     },
                     None => AgentTurnEnd::Completed,
                 });
@@ -1479,7 +1712,7 @@ impl CodexRolloutSummary {
 // named here is skipped by the parser without being kept.
 
 #[derive(Deserialize)]
-struct NarrowRecord {
+pub struct NarrowRecord {
     #[serde(rename = "type", default)]
     kind: OptStr,
     #[serde(default)]
@@ -1636,9 +1869,16 @@ impl<'de> Visitor<'de> for OptStrVisitor {
     }
 }
 
-/// A turn's `error`: the `codex_error_info` kind when it is a string, and
-/// nothing else of it — its `message` is skipped unread.
-struct ErrorKind(Option<String>);
+/// A turn's `error`: the `codex_error_info` kind and nothing else of it — its
+/// `message` is skipped unread. Codex writes the kind as a string
+/// (`"server_overloaded"`) or, for a kind that carries details, as an object
+/// with the kind as its one key (`{"http_connection_failed":
+/// {"http_status_code":502}}`), of whose details only `http_status_code` is
+/// kept.
+struct ErrorKind {
+    kind: Option<String>,
+    status: Option<u16>,
+}
 
 impl<'de> Deserialize<'de> for ErrorKind {
     fn deserialize<D: de::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
@@ -1651,40 +1891,299 @@ impl<'de> Deserialize<'de> for ErrorKind {
             }
 
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<ErrorKind, A::Error> {
-                let mut kind = None;
+                let mut out = ErrorKind {
+                    kind: None,
+                    status: None,
+                };
                 while let Some(key) = map.next_key::<OptStr>()? {
                     if key.0.as_deref() == Some("codex_error_info") {
-                        kind = map.next_value::<OptStr>()?.0;
+                        out = map.next_value::<CodexErrorInfo>()?.0;
                     } else {
                         map.next_value::<IgnoredAny>()?;
                     }
                 }
-                Ok(ErrorKind(kind))
+                Ok(out)
             }
 
             fn visit_str<E: de::Error>(self, _: &str) -> Result<ErrorKind, E> {
-                Ok(ErrorKind(None))
+                Ok(ErrorKind {
+                    kind: None,
+                    status: None,
+                })
             }
 
             fn visit_bool<E: de::Error>(self, _: bool) -> Result<ErrorKind, E> {
-                Ok(ErrorKind(None))
+                self.visit_str("")
             }
 
             fn visit_i64<E: de::Error>(self, _: i64) -> Result<ErrorKind, E> {
-                Ok(ErrorKind(None))
+                self.visit_str("")
             }
 
             fn visit_u64<E: de::Error>(self, _: u64) -> Result<ErrorKind, E> {
-                Ok(ErrorKind(None))
+                self.visit_str("")
             }
 
             fn visit_f64<E: de::Error>(self, _: f64) -> Result<ErrorKind, E> {
-                Ok(ErrorKind(None))
+                self.visit_str("")
             }
 
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<ErrorKind, A::Error> {
                 while seq.next_element::<IgnoredAny>()?.is_some() {}
-                Ok(ErrorKind(None))
+                self.visit_str("")
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// `codex_error_info`, as a string kind or an object keyed by its kind.
+struct CodexErrorInfo(ErrorKind);
+
+impl<'de> Deserialize<'de> for CodexErrorInfo {
+    fn deserialize<D: de::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = CodexErrorInfo;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("an error kind")
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<CodexErrorInfo, E> {
+                Ok(CodexErrorInfo(ErrorKind {
+                    kind: Some(v.to_owned()),
+                    status: None,
+                }))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<CodexErrorInfo, A::Error> {
+                let mut out = ErrorKind {
+                    kind: None,
+                    status: None,
+                };
+                let mut keys = 0;
+                while let Some(key) = map.next_key::<OptStr>()? {
+                    keys += 1;
+                    let details = map.next_value::<HttpStatusDetails>()?;
+                    out.kind = key.0;
+                    out.status = details.0;
+                }
+                if keys != 1 {
+                    out = ErrorKind {
+                        kind: None,
+                        status: None,
+                    };
+                }
+                Ok(CodexErrorInfo(out))
+            }
+
+            fn visit_bool<E: de::Error>(self, _: bool) -> Result<CodexErrorInfo, E> {
+                self.visit_unit()
+            }
+
+            fn visit_i64<E: de::Error>(self, _: i64) -> Result<CodexErrorInfo, E> {
+                self.visit_unit()
+            }
+
+            fn visit_u64<E: de::Error>(self, _: u64) -> Result<CodexErrorInfo, E> {
+                self.visit_unit()
+            }
+
+            fn visit_f64<E: de::Error>(self, _: f64) -> Result<CodexErrorInfo, E> {
+                self.visit_unit()
+            }
+
+            fn visit_unit<E: de::Error>(self) -> Result<CodexErrorInfo, E> {
+                Ok(CodexErrorInfo(ErrorKind {
+                    kind: None,
+                    status: None,
+                }))
+            }
+
+            fn visit_none<E: de::Error>(self) -> Result<CodexErrorInfo, E> {
+                self.visit_unit()
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<CodexErrorInfo, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                self.visit_unit()
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// The details of an object-form `codex_error_info`: its `http_status_code`
+/// when that is a valid HTTP status, and nothing else.
+struct HttpStatusDetails(Option<u16>);
+
+impl<'de> Deserialize<'de> for HttpStatusDetails {
+    fn deserialize<D: de::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = HttpStatusDetails;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("error details")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<HttpStatusDetails, A::Error> {
+                let mut status = None;
+                while let Some(key) = map.next_key::<OptStr>()? {
+                    if key.0.as_deref() == Some("http_status_code") {
+                        status = map.next_value::<OptScalar>()?.http_status();
+                    } else {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+                Ok(HttpStatusDetails(status))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<HttpStatusDetails, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(HttpStatusDetails(None))
+            }
+
+            fn visit_str<E: de::Error>(self, _: &str) -> Result<HttpStatusDetails, E> {
+                Ok(HttpStatusDetails(None))
+            }
+
+            fn visit_bool<E: de::Error>(self, _: bool) -> Result<HttpStatusDetails, E> {
+                Ok(HttpStatusDetails(None))
+            }
+
+            fn visit_i64<E: de::Error>(self, _: i64) -> Result<HttpStatusDetails, E> {
+                Ok(HttpStatusDetails(None))
+            }
+
+            fn visit_u64<E: de::Error>(self, _: u64) -> Result<HttpStatusDetails, E> {
+                Ok(HttpStatusDetails(None))
+            }
+
+            fn visit_f64<E: de::Error>(self, _: f64) -> Result<HttpStatusDetails, E> {
+                Ok(HttpStatusDetails(None))
+            }
+
+            fn visit_unit<E: de::Error>(self) -> Result<HttpStatusDetails, E> {
+                Ok(HttpStatusDetails(None))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// A JSON scalar of any type, or [`OptScalar::Other`] for an array, an
+/// object or `null`, each skipped unread. For a field whose type an agent
+/// upgrade could change without the whole line failing to parse.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) enum OptScalar {
+    Str(String),
+    U64(u64),
+    I64(i64),
+    F64(f64),
+    Bool(bool),
+    #[default]
+    Other,
+}
+
+impl OptScalar {
+    /// A non-negative whole number, as a count.
+    pub(crate) fn count(&self) -> Option<u64> {
+        match *self {
+            OptScalar::U64(v) => Some(v),
+            OptScalar::I64(v) => u64::try_from(v).ok(),
+            OptScalar::F64(v) if v.is_finite() && v >= 0.0 && v.fract() == 0.0 && v < 1e19 => {
+                Some(v as u64)
+            }
+            _ => None,
+        }
+    }
+
+    /// A finite, non-negative number, as an amount of money.
+    pub(crate) fn amount(&self) -> Option<f64> {
+        match *self {
+            OptScalar::U64(v) => Some(v as f64),
+            OptScalar::I64(v) if v >= 0 => Some(v as f64),
+            OptScalar::F64(v) if v.is_finite() && v >= 0.0 => Some(v),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_str(&self) -> Option<&str> {
+        match self {
+            OptScalar::Str(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_bool(&self) -> Option<bool> {
+        match *self {
+            OptScalar::Bool(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// An HTTP status code (100–599).
+    pub(crate) fn http_status(&self) -> Option<u16> {
+        self.count()
+            .and_then(|v| u16::try_from(v).ok())
+            .filter(|v| (100..=599).contains(v))
+    }
+}
+
+impl<'de> Deserialize<'de> for OptScalar {
+    fn deserialize<D: de::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = OptScalar;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("any value")
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<OptScalar, E> {
+                Ok(OptScalar::Str(v.to_owned()))
+            }
+
+            fn visit_bool<E: de::Error>(self, v: bool) -> Result<OptScalar, E> {
+                Ok(OptScalar::Bool(v))
+            }
+
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<OptScalar, E> {
+                Ok(OptScalar::I64(v))
+            }
+
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<OptScalar, E> {
+                Ok(OptScalar::U64(v))
+            }
+
+            fn visit_f64<E: de::Error>(self, v: f64) -> Result<OptScalar, E> {
+                Ok(OptScalar::F64(v))
+            }
+
+            fn visit_unit<E: de::Error>(self) -> Result<OptScalar, E> {
+                Ok(OptScalar::Other)
+            }
+
+            fn visit_none<E: de::Error>(self) -> Result<OptScalar, E> {
+                Ok(OptScalar::Other)
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<OptScalar, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(OptScalar::Other)
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<OptScalar, A::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(OptScalar::Other)
             }
         }
         d.deserialize_any(V)
@@ -1729,6 +2228,7 @@ pub enum AccountingKey {
     LastTurnProvenance,
     LastTurnUnavailableReason,
     ErrorType,
+    HttpStatus,
     Disposition,
     DispositionProvenance,
     DispositionUnavailableReason,
@@ -1766,6 +2266,7 @@ impl AccountingKey {
         AccountingKey::LastTurnProvenance,
         AccountingKey::LastTurnUnavailableReason,
         AccountingKey::ErrorType,
+        AccountingKey::HttpStatus,
         AccountingKey::Disposition,
         AccountingKey::DispositionProvenance,
         AccountingKey::DispositionUnavailableReason,
@@ -1804,6 +2305,7 @@ impl AccountingKey {
             AccountingKey::LastTurnProvenance => "deck.run.last_turn.provenance",
             AccountingKey::LastTurnUnavailableReason => "deck.run.last_turn.unavailable_reason",
             AccountingKey::ErrorType => "error.type",
+            AccountingKey::HttpStatus => "http.response.status_code",
             AccountingKey::Disposition => "deck.work.disposition",
             AccountingKey::DispositionProvenance => "deck.work.disposition.provenance",
             AccountingKey::DispositionUnavailableReason => {
@@ -1816,6 +2318,133 @@ impl AccountingKey {
     }
 }
 
+/// The span event that carries one model's usage on a run's `agent.run`
+/// span: one event per model the run used.
+pub const EVENT_MODEL_USAGE: &str = "deck.model_usage";
+
+/// Model families the export names: a model is exported under its own name
+/// only when its last `/`-separated part starts with one of these, or has
+/// one right after a `.` (a cloud region prefix such as
+/// `us.anthropic.claude-…`). Others are counted and exported without a name,
+/// since a custom or local model's name can be anything, a path included.
+const MODEL_FAMILIES: &[&str] = &[
+    "claude-",
+    "gpt-",
+    "o1",
+    "o3",
+    "o4",
+    "codex-",
+    "gemini-",
+    "gemma",
+    "llama",
+    "mistral",
+    "mixtral",
+    "codestral",
+    "devstral",
+    "magistral",
+    "ministral",
+    "qwen",
+    "deepseek",
+    "grok",
+    "kimi",
+    "glm",
+    "minimax",
+    "swe-",
+    "big-pickle",
+];
+
+/// The longest model name the export names.
+const MAX_EXPORTED_MODEL_BYTES: usize = 96;
+
+/// The name a model is exported under, if any: lowercase letters, digits and
+/// `.-_:@/`, at most [`MAX_EXPORTED_MODEL_BYTES`], not starting with `/` or
+/// `.`, and of a known family ([`MODEL_FAMILIES`]).
+pub fn exported_model(model: &Ident) -> Option<&Ident> {
+    let name = model.as_str();
+    let shaped = name.len() <= MAX_EXPORTED_MODEL_BYTES
+        && !name.starts_with(['/', '.'])
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-:@/".contains(&b));
+    let last = name.rsplit('/').next().unwrap_or(name);
+    let family = std::iter::once(last)
+        .chain(last.match_indices('.').map(|(i, _)| &last[i + 1..]))
+        .any(|part| MODEL_FAMILIES.iter().any(|f| part.starts_with(f)));
+    (shaped && family).then_some(model)
+}
+
+/// Plan names Codex is known to report (`rate_limits.plan_type`).
+const KNOWN_PLANS: &[&str] = &[
+    "free",
+    "go",
+    "plus",
+    "pro",
+    "prolite",
+    "team",
+    "business",
+    "enterprise",
+    "edu",
+    "education",
+];
+
+/// Error kinds the agents are known to record: Codex's `codex_error_info`,
+/// Claude Code's `error` on an API error record, and the deck's names for
+/// OpenCode's error types ([`usage_file`]).
+const KNOWN_ERROR_KINDS: &[&str] = &[
+    // Codex
+    "context_window_exceeded",
+    "usage_limit_exceeded",
+    "http_connection_failed",
+    "response_stream_connection_failed",
+    "response_stream_disconnected",
+    "response_too_many_failed_attempts",
+    "internal_server_error",
+    "unauthorized",
+    "bad_request",
+    "sandbox_error",
+    "server_overloaded",
+    "rate_limit_exceeded",
+    "thread_rollback_failed",
+    // Claude Code
+    "authentication_failed",
+    "billing_error",
+    "rate_limit",
+    "invalid_request",
+    "server_error",
+    "max_output_tokens",
+    "overloaded",
+    "model_not_found",
+    // OpenCode, as the deck names them
+    "api_error",
+    "provider_auth_error",
+    "output_length_exceeded",
+    "context_overflow",
+    // Shared, and the deck's own
+    "other",
+    "unknown",
+    "nonzero_exit",
+];
+
+/// A value from a closed list, or `other` for one the deck does not know.
+fn listed(value: &Ident, known: &'static [&'static str]) -> &'static str {
+    known
+        .iter()
+        .copied()
+        .find(|k| *k == value.as_str())
+        .unwrap_or("other")
+}
+
+/// The plan name the export sends: one Codex is known to report, or `other`.
+pub fn exported_plan(plan: &Ident) -> &'static str {
+    listed(plan, KNOWN_PLANS)
+}
+
+/// The error kind the export sends as `error.type`: one an agent is known to
+/// record, or `other`.
+pub fn exported_error_kind(kind: &Ident) -> &'static str {
+    listed(kind, KNOWN_ERROR_KINDS)
+}
+
 /// One allow-listed accounting attribute. Its fields are private, and the
 /// only constructors take an enum's name or an [`Ident`], so a string value
 /// is always one of those.
@@ -1823,6 +2452,16 @@ impl AccountingKey {
 pub struct AccountingAttribute {
     key: AccountingKey,
     value: AttrValue,
+}
+
+impl AccountingAttribute {
+    pub fn key(&self) -> AccountingKey {
+        self.key
+    }
+
+    pub fn value(&self) -> &AttrValue {
+        &self.value
+    }
 }
 
 /// An enum's name.
@@ -1860,8 +2499,11 @@ fn provenance<T>(
     }
 }
 
-/// A run's attributes: `run` for the run itself (an `agent.run` span), and one
-/// set per model in `models` (one span event each).
+/// A run's attributes: `run` for the run itself (on its `agent.run` span),
+/// with the run's totals across models, and one set per model in `models`
+/// (one [`EVENT_MODEL_USAGE`] span event each). A total is a sum only where
+/// every model's value has the same provenance ([`add_tokens`],
+/// [`add_cost`]); otherwise it is unavailable as incomplete.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunExport {
     pub run: Vec<AccountingAttribute>,
@@ -1878,7 +2520,10 @@ pub fn run_attributes(record: &RunRecord) -> RunExport {
     if let Some(t) = record.termination.value() {
         run.push(name(K::Termination, t.outcome.as_str()));
         if let Some(kind) = &t.error_type {
-            run.push(ident(K::ErrorType, kind));
+            run.push(name(K::ErrorType, exported_error_kind(kind)));
+        }
+        if let Some(status) = t.http_status {
+            run.push(int(K::HttpStatus, u64::from(status)));
         }
     }
     provenance(
@@ -1898,7 +2543,7 @@ pub fn run_attributes(record: &RunRecord) -> RunExport {
     );
     if let Some(q) = record.quota.value() {
         if let Some(plan) = &q.plan {
-            run.push(ident(K::QuotaPlan, plan));
+            run.push(name(K::QuotaPlan, exported_plan(plan)));
         }
         run.push(int(K::QuotaWindowMinutes, q.window_minutes));
         run.push(AccountingAttribute {
@@ -1914,12 +2559,36 @@ pub fn run_attributes(record: &RunRecord) -> RunExport {
         K::QuotaProvenance,
         K::QuotaUnavailableReason,
     );
+    let mut tokens = None;
+    let mut cost = None;
+    for usage in &record.models {
+        tokens = Some(tokens.map_or(usage.tokens, |sum| add_tokens(sum, usage.tokens)));
+        cost = Some(cost.map_or(usage.cost, |sum| add_cost(sum, usage.cost)));
+    }
+    let tokens = tokens.unwrap_or(Field::Unavailable(Unavailable::NotRecorded));
+    let cost = cost.unwrap_or(Field::Unavailable(Unavailable::NotRecorded));
+    if let Some(t) = tokens.value() {
+        run.push(int(K::InputTokens, t.input));
+        run.push(int(K::OutputTokens, t.output));
+        run.push(int(K::CacheReadInputTokens, t.cache_read));
+        run.push(int(K::CacheWriteInputTokens, t.cache_write));
+    }
+    provenance(
+        &mut run,
+        &tokens,
+        K::TokensProvenance,
+        K::TokensUnavailableReason,
+    );
+    if let Some(c) = cost.value() {
+        run.push(int(K::CostMicroUsd, c.0));
+    }
+    provenance(&mut run, &cost, K::CostProvenance, K::CostUnavailableReason);
     let models = record
         .models
         .iter()
         .map(|usage| {
             let mut attrs = Vec::new();
-            if let Some(model) = &usage.model {
+            if let Some(model) = usage.model.as_ref().and_then(exported_model) {
                 attrs.push(ident(K::ResponseModel, model));
             }
             if let Some(t) = usage.tokens.value() {
@@ -2063,6 +2732,7 @@ mod tests {
             termination: Field::ProviderReported(Termination {
                 outcome: RunTermination::Completed,
                 error_type: None,
+                http_status: None,
             }),
             last_turn: Field::ProviderReported(AgentTurnEnd::Completed),
         }
@@ -2157,6 +2827,7 @@ mod tests {
                 Unavailable::QuotaDecreased,
                 Unavailable::RunNotEnded,
                 Unavailable::NoWorkItem,
+                Unavailable::UnrecognizedFormat,
             ]
             .map(Unavailable::as_str)
             .to_vec(),
@@ -2171,7 +2842,10 @@ mod tests {
             .to_vec(),
             [
                 AgentTurnEnd::Completed,
-                AgentTurnEnd::Failed { kind: None },
+                AgentTurnEnd::Failed {
+                    kind: None,
+                    status: None,
+                },
                 AgentTurnEnd::Interrupted,
                 AgentTurnEnd::MidTurn,
                 AgentTurnEnd::Unknown,
@@ -2265,6 +2939,7 @@ mod tests {
     fn an_ended_run_takes_the_agents_word_and_the_decks_end_for_a_cut_turn() {
         let failed = AgentTurnEnd::Failed {
             kind: Some(id("server_overloaded")),
+            status: None,
         };
         let t = run_termination(Some(EndReason::Exited), Some(&failed));
         assert_eq!(t.provenance(), Provenance::ProviderReported);
@@ -2345,6 +3020,7 @@ mod tests {
             Some(AgentTurnEnd::Completed),
             Some(AgentTurnEnd::Failed {
                 kind: Some(id("server_overloaded")),
+                status: None,
             }),
             Some(AgentTurnEnd::Interrupted),
             Some(AgentTurnEnd::MidTurn),
@@ -2406,7 +3082,8 @@ mod tests {
             closed.termination,
             Field::Measured(Termination {
                 outcome: RunTermination::Interrupted,
-                error_type: None
+                error_type: None,
+                http_status: None,
             })
         );
         let exited = RunRecord::new(
@@ -2424,7 +3101,10 @@ mod tests {
             (Some(PiStopReason::ToolUse), AgentTurnEnd::MidTurn),
             (
                 Some(PiStopReason::Error),
-                AgentTurnEnd::Failed { kind: None },
+                AgentTurnEnd::Failed {
+                    kind: None,
+                    status: None,
+                },
             ),
             (Some(PiStopReason::Aborted), AgentTurnEnd::Interrupted),
             (None, AgentTurnEnd::Unknown),
@@ -2701,7 +3381,13 @@ mod tests {
             .find(|m| m.model == Some(id("other")))
             .unwrap();
         assert_eq!(other.cost, Field::Unavailable(Unavailable::NotRecorded));
-        assert_eq!(usage.last_turn, Some(AgentTurnEnd::Failed { kind: None }));
+        assert_eq!(
+            usage.last_turn,
+            Some(AgentTurnEnd::Failed {
+                kind: None,
+                status: None
+            })
+        );
         let zero = from_pi(&[pi_reply("gpt-5.5", Some(0.0), None)]);
         assert_eq!(
             zero.models[0].cost,
@@ -3384,7 +4070,8 @@ mod tests {
         assert_eq!(
             reader.summary().last_turn,
             Some(AgentTurnEnd::Failed {
-                kind: Some(id("server_overloaded"))
+                kind: Some(id("server_overloaded")),
+                status: None,
             })
         );
         write_lines(
@@ -3667,7 +4354,10 @@ mod tests {
         assert!(!format!("{summary:?}").contains(SENTINEL), "{summary:?}");
         assert_eq!(
             summary.last_turn,
-            Some(AgentTurnEnd::Failed { kind: None }),
+            Some(AgentTurnEnd::Failed {
+                kind: None,
+                status: None
+            }),
             "a failure is kept, its non-identifier kind is not"
         );
         let record = RunRecord::new(
@@ -3775,7 +4465,10 @@ mod tests {
             assert_eq!(summary.quota_last.as_ref().unwrap().plan, want, "{raw}");
             assert_eq!(
                 summary.last_turn,
-                Some(AgentTurnEnd::Failed { kind: want }),
+                Some(AgentTurnEnd::Failed {
+                    kind: want,
+                    status: None
+                }),
                 "{raw}"
             );
         }
@@ -3858,9 +4551,11 @@ mod tests {
             termination: Field::Measured(Termination {
                 outcome: RunTermination::Failed,
                 error_type: Ident::new(&hostile),
+                http_status: None,
             }),
             last_turn: Field::ProviderReported(AgentTurnEnd::Failed {
                 kind: Ident::new(&hostile),
+                status: None,
             }),
         };
         let records = [
@@ -3884,6 +4579,7 @@ mod tests {
                     has_unknown_model_cost: false,
                     last_turn: Some(AgentTurnEnd::Failed {
                         kind: Ident::new(&hostile),
+                        status: None,
                     }),
                 })),
                 Some(EndReason::Exited),
@@ -4260,6 +4956,7 @@ mod tests {
             ),
             (AccountingKey::ResponseModel, "gen_ai.response.model"),
             (AccountingKey::ErrorType, "error.type"),
+            (AccountingKey::HttpStatus, "http.response.status_code"),
             (AccountingKey::RunId, "deck.run.id"),
             (AccountingKey::Agent, "deck.agent"),
         ];
@@ -4275,7 +4972,10 @@ mod tests {
         for key in AccountingKey::ALL {
             let name = key.as_str();
             assert!(
-                name.starts_with("deck.") || name.starts_with("gen_ai.") || name == "error.type",
+                name.starts_with("deck.")
+                    || name.starts_with("gen_ai.")
+                    || name == "error.type"
+                    || name == "http.response.status_code",
                 "{name}"
             );
             let shared = AttrKey::is_allowed(name);
@@ -4285,6 +4985,413 @@ mod tests {
                 "{name} collides with a #1741 key"
             );
         }
+    }
+
+    /// An arbitrary command's end is the deck's to measure: its exit status
+    /// decides completed or failed, a closed pane or a shutdown interrupted
+    /// it, and a run still open has no termination yet.
+    #[test]
+    fn an_arbitrary_command_ends_by_its_exit_status() {
+        let outcome = |end, code| {
+            let t = command_termination(end, code);
+            (
+                t.provenance(),
+                t.value().map(|t| (t.outcome, t.error_type.clone())),
+                t.unavailable(),
+            )
+        };
+        assert_eq!(
+            outcome(Some(EndReason::Exited), Some(0)),
+            (
+                Provenance::Measured,
+                Some((RunTermination::Completed, None)),
+                None
+            )
+        );
+        assert_eq!(
+            outcome(Some(EndReason::Exited), Some(2)),
+            (
+                Provenance::Measured,
+                Some((RunTermination::Failed, Some(id("nonzero_exit")))),
+                None
+            )
+        );
+        for end in [EndReason::Closed, EndReason::DaemonShutdown] {
+            assert_eq!(
+                outcome(Some(end), None).1,
+                Some((RunTermination::Interrupted, None))
+            );
+        }
+        assert_eq!(
+            outcome(Some(EndReason::Exited), None).1,
+            Some((RunTermination::Unknown, None))
+        );
+        assert_eq!(
+            outcome(Some(EndReason::Unknown), Some(0)).1,
+            Some((RunTermination::Unknown, None))
+        );
+        assert_eq!(
+            outcome(None, Some(0)),
+            (
+                Provenance::Unavailable,
+                None,
+                Some(Unavailable::RunNotEnded)
+            )
+        );
+    }
+
+    /// Each agent has one source of usage, and an agent with none exports
+    /// its usage as unavailable for want of a channel, never as zero.
+    #[test]
+    fn each_agent_has_one_usage_source_and_none_is_never_zero() {
+        use crate::event::AgentType;
+        assert_eq!(
+            usage_source(&AgentType::ClaudeCode),
+            UsageSource::ClaudeTranscript
+        );
+        assert_eq!(usage_source(&AgentType::Codex), UsageSource::CodexRollout);
+        assert_eq!(usage_source(&AgentType::Pi), UsageSource::UsageFile);
+        assert_eq!(usage_source(&AgentType::OpenCode), UsageSource::UsageFile);
+        assert_eq!(usage_source(&AgentType::Devin), UsageSource::NoChannel);
+        assert_eq!(usage_source(&AgentType::None), UsageSource::NoChannel);
+        let record = RunRecord {
+            termination: command_termination(Some(EndReason::Exited), Some(0)),
+            ..RunRecord::new(identity("r", "none"), no_usage_channel(), None)
+        };
+        let export = run_attributes(&record);
+        assert!(has(
+            &export.run,
+            AccountingKey::TokensUnavailableReason,
+            "no_channel"
+        ));
+        assert!(has(
+            &export.run,
+            AccountingKey::CostUnavailableReason,
+            "no_channel"
+        ));
+        assert!(has(
+            &export.run,
+            AccountingKey::QuotaUnavailableReason,
+            "no_channel"
+        ));
+        assert!(has(&export.run, AccountingKey::Termination, "completed"));
+        for key in [
+            AccountingKey::InputTokens,
+            AccountingKey::OutputTokens,
+            AccountingKey::CostMicroUsd,
+        ] {
+            assert!(
+                !export
+                    .run
+                    .iter()
+                    .chain(export.models.iter().flatten())
+                    .any(|a| a.key() == key),
+                "{key:?} is not sent for a run with no channel"
+            );
+        }
+    }
+
+    /// A run with several agent sessions counts each session's usage once,
+    /// folds a model they share, keeps one quota and takes the last turn
+    /// from the last session; a session whose usage is unknown makes a model
+    /// they share incomplete rather than dropping out.
+    #[test]
+    fn a_runs_sessions_combine_without_double_counting() {
+        let session = |model: &str, t: Tokens, cost: u64, turn| AgentUsage {
+            models: vec![ModelUsage {
+                model: Some(id(model)),
+                tokens: Field::ProviderReported(t),
+                cost: Field::Estimated(MicroUsd(cost)),
+            }],
+            quota: Field::Unavailable(Unavailable::NoChannel),
+            last_turn: Some(turn),
+        };
+        let usage = combine_sessions(vec![
+            session(
+                "claude-opus-5-5",
+                tokens(10, 1),
+                100,
+                AgentTurnEnd::Completed,
+            ),
+            session(
+                "claude-opus-5-5",
+                tokens(5, 2),
+                50,
+                AgentTurnEnd::Interrupted,
+            ),
+            session("claude-haiku-5-5", tokens(1, 1), 1, AgentTurnEnd::MidTurn),
+        ]);
+        let opus = usage
+            .models
+            .iter()
+            .find(|m| m.model == Some(id("claude-opus-5-5")))
+            .unwrap();
+        assert_eq!(opus.tokens, Field::ProviderReported(tokens(15, 3)));
+        assert_eq!(opus.cost, Field::Estimated(MicroUsd(150)));
+        assert_eq!(usage.models.len(), 2);
+        assert_eq!(usage.last_turn, Some(AgentTurnEnd::MidTurn));
+        assert_eq!(usage.quota, Field::Unavailable(Unavailable::NoChannel));
+
+        let unknown = AgentUsage {
+            models: vec![ModelUsage {
+                model: Some(id("claude-opus-5-5")),
+                tokens: Field::Unavailable(Unavailable::NotRecorded),
+                cost: Field::Unavailable(Unavailable::NotRecorded),
+            }],
+            quota: Field::Unavailable(Unavailable::NoChannel),
+            last_turn: None,
+        };
+        let usage = combine_sessions(vec![
+            session(
+                "claude-opus-5-5",
+                tokens(10, 1),
+                100,
+                AgentTurnEnd::Completed,
+            ),
+            unknown,
+        ]);
+        assert_eq!(
+            usage.models[0].tokens,
+            Field::Unavailable(Unavailable::Incomplete)
+        );
+        assert_eq!(usage.last_turn, Some(AgentTurnEnd::Completed));
+        assert_eq!(
+            combine_sessions(vec![]).models[0].tokens,
+            Field::Unavailable(Unavailable::NotRecorded)
+        );
+
+        let quota = |from, to| AgentUsage {
+            models: vec![],
+            quota: Field::ProviderReported(QuotaDelta {
+                plan: Some(id("pro")),
+                window_minutes: 10_080,
+                resets_at: 7,
+                from_bp: from,
+                to_bp: to,
+            }),
+            last_turn: None,
+        };
+        assert_eq!(
+            combine_sessions(vec![quota(1, 2), quota(2, 3)]).quota,
+            Field::Unavailable(Unavailable::Incomplete)
+        );
+        assert_eq!(
+            combine_sessions(vec![quota(1, 2), no_usage_channel()]).quota,
+            quota(1, 2).quota
+        );
+    }
+
+    /// The run's span carries its totals across models, each with the
+    /// provenance they share, and every model gets its own event; a total
+    /// over models of different provenance is incomplete, not a sum.
+    #[test]
+    fn the_run_span_carries_totals_and_each_model_an_event() {
+        assert_eq!(EVENT_MODEL_USAGE, "deck.model_usage");
+        let record = run(
+            identity("r", "claude"),
+            "claude-opus-5-5",
+            tokens(10, 2),
+            Field::Estimated(MicroUsd(30)),
+        );
+        let mut record = RunRecord {
+            models: vec![
+                record.models[0].clone(),
+                ModelUsage {
+                    model: Some(id("claude-haiku-5-5")),
+                    tokens: Field::ProviderReported(tokens(5, 1)),
+                    cost: Field::Estimated(MicroUsd(4)),
+                },
+            ],
+            ..record
+        };
+        let export = run_attributes(&record);
+        let int_of = |key| {
+            export
+                .run
+                .iter()
+                .find(|a| a.key() == key)
+                .map(|a| match a.value() {
+                    AttrValue::Int(v) => *v,
+                    other => panic!("{key:?} is {other:?}"),
+                })
+        };
+        assert_eq!(int_of(AccountingKey::InputTokens), Some(15));
+        assert_eq!(int_of(AccountingKey::OutputTokens), Some(3));
+        assert_eq!(int_of(AccountingKey::CostMicroUsd), Some(34));
+        assert!(has(&export.run, AccountingKey::CostProvenance, "estimated"));
+        assert_eq!(export.models.len(), 2);
+
+        record.models[1].cost = Field::Unavailable(Unavailable::SubscriptionZero);
+        let export = run_attributes(&record);
+        assert!(has(
+            &export.run,
+            AccountingKey::CostUnavailableReason,
+            "incomplete"
+        ));
+        assert!(
+            !export
+                .run
+                .iter()
+                .any(|a| a.key() == AccountingKey::CostMicroUsd)
+        );
+        assert!(has(
+            &export.run,
+            AccountingKey::TokensProvenance,
+            "provider_reported"
+        ));
+    }
+
+    /// The export names a model only of a known family, a plan or an error
+    /// kind only from its list (else `other`), and sends a failure's HTTP
+    /// status as `http.response.status_code`; a path-, email- or
+    /// credential-shaped value an agent recorded in their place never
+    /// leaves.
+    #[test]
+    fn exported_names_come_from_closed_lists() {
+        for kept in [
+            "claude-opus-5-5",
+            "claude-haiku-5-5",
+            "gpt-5.4-mini",
+            "o3",
+            "openai/gpt-5.5",
+            "us.anthropic.claude-sonnet-5-5-v1:0",
+            "claude-opus-4@20250514",
+            "gemini-3-pro",
+            "qwen3-coder",
+        ] {
+            assert_eq!(
+                exported_model(&id(kept)).map(Ident::as_str),
+                Some(kept),
+                "{kept}"
+            );
+        }
+        for dropped in [
+            "/home/x/.ssh/id",
+            "me@example.com",
+            "sk-ant-api03-abcdef",
+            "ghp_0123456789abcdef",
+            "Claude-Opus",
+            "my-private-model",
+            "<synthetic>",
+            ".claude-x",
+        ] {
+            let Some(ident) = Ident::new(dropped) else {
+                continue;
+            };
+            assert_eq!(exported_model(&ident), None, "{dropped}");
+        }
+        assert_eq!(
+            exported_model(&id(&format!("claude-{}", "x".repeat(100)))),
+            None
+        );
+        assert_eq!(exported_plan(&id("prolite")), "prolite");
+        assert_eq!(exported_plan(&id("me@example.com")), "other");
+        assert_eq!(
+            exported_error_kind(&id("server_overloaded")),
+            "server_overloaded"
+        );
+        assert_eq!(exported_error_kind(&id("rate_limit")), "rate_limit");
+        assert_eq!(exported_error_kind(&id("/home/x")), "other");
+
+        let mut record = run(
+            identity("r", "claude"),
+            "/home/x/.ssh/id",
+            tokens(1, 1),
+            Field::Estimated(MicroUsd(1)),
+        );
+        record.termination = Field::ProviderReported(Termination {
+            outcome: RunTermination::Failed,
+            error_type: Some(id("me@example.com")),
+            http_status: Some(429),
+        });
+        record.quota = Field::ProviderReported(QuotaDelta {
+            plan: Some(id("sk-ant-api03-abcdef")),
+            window_minutes: 1,
+            resets_at: 1,
+            from_bp: 1,
+            to_bp: 2,
+        });
+        let export = run_attributes(&record);
+        assert!(has(&export.run, AccountingKey::ErrorType, "other"));
+        assert!(has(&export.run, AccountingKey::QuotaPlan, "other"));
+        assert!(
+            export
+                .run
+                .iter()
+                .any(|a| a.key() == AccountingKey::HttpStatus && *a.value() == AttrValue::Int(429))
+        );
+        assert!(
+            !export.models[0]
+                .iter()
+                .any(|a| a.key() == AccountingKey::ResponseModel)
+        );
+        let text = format!("{export:?}");
+        for leaked in ["/home/x", "example.com", "sk-ant"] {
+            assert!(!text.contains(leaked), "{leaked} in {text}");
+        }
+    }
+
+    /// Codex writes a detailed error as an object keyed by its kind: the kind
+    /// and its HTTP status are read, its message never is.
+    #[test]
+    fn a_codex_error_object_gives_its_kind_and_status() {
+        let reader = read(&[
+            task_started().to_string(),
+            format!(
+                r#"{{"type":"event_msg","payload":{{"type":"task_complete","error":{{"message":"{SENTINEL}","codex_error_info":{{"http_connection_failed":{{"http_status_code":502,"detail":"{SENTINEL}"}}}}}}}}}}"#
+            ),
+        ]);
+        assert_eq!(
+            reader.summary().last_turn,
+            Some(AgentTurnEnd::Failed {
+                kind: Some(id("http_connection_failed")),
+                status: Some(502),
+            })
+        );
+        assert!(!format!("{:?}", reader.summary()).contains(SENTINEL));
+    }
+
+    /// A rollout whose usage lines no longer parse is in a format the reader
+    /// does not know: its tokens and quota are unrecognized, never zero.
+    #[test]
+    fn a_rollout_in_a_changed_format_is_unrecognized() {
+        let reader = read(&[
+            turn_context("gpt-5.5"),
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":"#.to_string(),
+        ]);
+        let usage = from_codex(reader.summary());
+        assert_eq!(
+            usage.models[0].tokens,
+            Field::Unavailable(Unavailable::UnrecognizedFormat)
+        );
+        assert_eq!(
+            usage.quota,
+            Field::Unavailable(Unavailable::UnrecognizedFormat)
+        );
+    }
+
+    /// The work a poll does is the bytes appended since the last one: an
+    /// idle poll reads and parses nothing, and an appended line is read
+    /// once — the deterministic half of the per-poll cost, whose timing the
+    /// overhead drivers below measure.
+    #[test]
+    fn an_idle_poll_reads_nothing_and_an_append_is_read_once() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("usage.jsonl");
+        let mut file = File::create(&path).unwrap();
+        let mut reader = usage_file::UsageFileReader::new(&path);
+        reader.poll().unwrap();
+        let line = r#"{"v":1,"type":"reply","agent":"pi","model":"gpt-5.5","input":1,"output":1}"#;
+        writeln!(file, "{line}").unwrap();
+        reader.poll().unwrap();
+        let after_append = reader.stats();
+        assert_eq!(after_append.bytes_read, line.len() as u64 + 1);
+        assert_eq!(after_append.parsed, 1);
+        for _ in 0..10 {
+            reader.poll().unwrap();
+        }
+        assert_eq!(reader.stats(), after_append);
+        assert_eq!(usage_file::USAGE_FILE_ENV, "DOT_AGENT_DECK_USAGE_FILE");
     }
 
     // --- overhead benchmark ---
@@ -4390,7 +5497,7 @@ mod tests {
                 continue;
             };
             for line in bytes.split(|b| *b == b'\n') {
-                if line_is_candidate(line)
+                if line_is_candidate(line, CodexRolloutSummary::MARKERS)
                     && serde_json::from_slice::<serde_json::Value>(line).is_ok()
                 {
                     values += 1;
@@ -4436,6 +5543,111 @@ mod tests {
             idle.sort_unstable();
             println!(
                 "incremental, {} rollouts, {appended} bytes in {} polls: mean {:.1} µs, median {:.1} µs, p99 {:.1} µs, max {:.1} µs, {:.2} µs per KB appended",
+                largest.len(),
+                polls.len(),
+                total.as_secs_f64() * 1e6 / polls.len() as f64,
+                quantile_us(&polls, 0.5),
+                quantile_us(&polls, 0.99),
+                quantile_us(&polls, 1.0),
+                total.as_secs_f64() * 1e6 / (appended as f64 / 1024.0),
+            );
+            println!(
+                "idle poll, nothing appended, {} polls: median {:.1} µs, p99 {:.1} µs",
+                idle.len(),
+                quantile_us(&idle, 0.5),
+                quantile_us(&idle, 0.99),
+            );
+        }
+        println!("load average at end: {}", load_average());
+    }
+
+    /// The Claude Code half of the overhead measurement (PRD #1858). A no-op
+    /// unless `DAD_ACCOUNTING_BENCH_CLAUDE_DIR` names a directory of Claude
+    /// Code transcripts (`~/.claude/projects`): then it reads every `.jsonl`
+    /// under it whole with a fresh [`claude::ClaudeTranscriptReader`] each,
+    /// tallies the provenance of each transcript's usage, replays the 20
+    /// largest a line at a time into a scratch file polling after each line,
+    /// and times idle polls. Aggregates only — never a path, a file name or
+    /// a line. Run it in a release build on the machine that holds the
+    /// transcripts; `docs/develop/telemetry.md` has the command.
+    #[test]
+    fn overhead_over_a_directory_of_claude_transcripts() {
+        let Some(dir) = std::env::var_os("DAD_ACCOUNTING_BENCH_CLAUDE_DIR") else {
+            return;
+        };
+        let mut files = Vec::new();
+        rollouts_under(Path::new(&dir), &mut files);
+        assert!(!files.is_empty(), "no .jsonl file under the directory");
+        let total_bytes: u64 = files.iter().map(|(_, len)| len).sum();
+        println!("load average at start: {}", load_average());
+        println!("transcripts: {}, bytes: {total_bytes}", files.len());
+
+        let started = Instant::now();
+        let (mut stats, mut errors) = (ReaderStats::default(), 0);
+        let mut by_provenance: BTreeMap<String, u64> = BTreeMap::new();
+        for (path, _) in &files {
+            let mut reader = claude::ClaudeTranscriptReader::new(path).with_poll_budget(u64::MAX);
+            if reader.poll().is_err() {
+                errors += 1;
+                continue;
+            }
+            let s = reader.stats();
+            stats.lines += s.lines;
+            stats.parsed += s.parsed;
+            stats.malformed += s.malformed;
+            stats.overlong += s.overlong;
+            let usage = reader.summary().usage();
+            let tokens = &usage.models[0].tokens;
+            let key = match tokens.unavailable() {
+                Some(reason) => reason.as_str().to_owned(),
+                None => tokens.provenance().as_str().to_owned(),
+            };
+            *by_provenance.entry(key).or_default() += 1;
+        }
+        let secs = started.elapsed().as_secs_f64();
+        println!(
+            "full read: {secs:.2} s, {:.0} MB/s; lines {}, deserialised {}, malformed {}, overlong {}, open errors {errors}; usage by provenance or reason: {by_provenance:?}",
+            total_bytes as f64 / 1e6 / secs,
+            stats.lines,
+            stats.parsed,
+            stats.malformed,
+            stats.overlong,
+        );
+
+        let mut largest = files.clone();
+        largest.sort_by_key(|(_, len)| std::cmp::Reverse(*len));
+        largest.truncate(20);
+        let scratch = crate::test_temp::tempdir().unwrap();
+        let mut polls: Vec<Duration> = Vec::new();
+        let mut appended = 0u64;
+        let mut idle: Vec<Duration> = Vec::new();
+        for (i, (path, _)) in largest.iter().enumerate() {
+            let Ok(bytes) = std::fs::read(path) else {
+                continue;
+            };
+            let target = scratch.path().join(format!("replay-{i}.jsonl"));
+            let mut out = File::create(&target).unwrap();
+            let mut reader = claude::ClaudeTranscriptReader::new(&target);
+            for line in bytes.split_inclusive(|b| *b == b'\n') {
+                out.write_all(line).unwrap();
+                out.flush().unwrap();
+                appended += line.len() as u64;
+                let started = Instant::now();
+                reader.poll().unwrap();
+                polls.push(started.elapsed());
+            }
+            for _ in 0..100 {
+                let started = Instant::now();
+                reader.poll().unwrap();
+                idle.push(started.elapsed());
+            }
+        }
+        if !polls.is_empty() {
+            let total: Duration = polls.iter().sum();
+            polls.sort_unstable();
+            idle.sort_unstable();
+            println!(
+                "incremental, {} transcripts, {appended} bytes in {} polls: mean {:.1} µs, median {:.1} µs, p99 {:.1} µs, max {:.1} µs, {:.2} µs per KB appended",
                 largest.len(),
                 polls.len(),
                 total.as_secs_f64() * 1e6 / polls.len() as f64,

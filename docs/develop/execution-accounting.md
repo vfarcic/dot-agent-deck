@@ -2,6 +2,8 @@
 
 This page is the evidence for PRD #633's discovery milestones: which signals each supported agent exposes about a run, a minimal provider-neutral record built from them, and an outcome taxonomy checked against runs that already happened in this repository. It builds on PRD #1741, which shipped the deck's OpenTelemetry run traces ([`telemetry.md`](telemetry.md), the user page [`docs/telemetry.md`](../telemetry.md), `src/telemetry/`), and on #1692's resource measurements, folded into #633. It is a discovery record written on 2026-10-23, not a description of shipped behaviour: beyond what #1741 shipped, the only code behind it is milestone 4's prototype ([below](#prototype-results-milestone-4)), which is compiled for tests only and which nothing in the product calls. Milestone 5's outcome, Revise, is recorded [below](#decision-milestone-5).
 
+PRD #1858 builds on the prototype described here; its design, and what of it is built, are in [Usage and how a run ended](telemetry.md#usage-and-how-a-run-ended-prd-1858). Statements below about the prototype describe it as of 2026-10-23.
+
 ## How the evidence was gathered
 
 Every number below comes from data already on the maintainer's development machine and from this repository's GitHub history. No agent session was started to produce it.

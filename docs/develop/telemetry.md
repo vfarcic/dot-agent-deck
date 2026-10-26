@@ -6,6 +6,8 @@ The design and measurements of the separate resource collector (PRD #1859) are i
 
 What each agent can report beyond these spans (tokens, cost, quota, outcomes), and the record and outcome taxonomy PRD #633 proposes from real runs, are in [Execution accounting](execution-accounting.md).
 
+How each run's usage and how it ended are to be read and exported (PRD #1858) is in [Usage and how a run ended](#usage-and-how-a-run-ended-prd-1858).
+
 ## From a command line to `deck.operation.program` and `deck.operation.word`
 
 The classifier is `src/telemetry/operation.rs`. It does not parse shell syntax: it reads words that an allow-list matches, and any other word it reads declines the command, so the span carries neither program nor word. It reads the first line of the command, split on `&&`, `||`, `;` and `|` (`segments`) and into words on spaces and tabs only. The first segment that does more than set up the next is the one described: a segment running `cd`, `export`, `source`, `.`, `set` or `true` (`SETUP_PROGRAMS`) is skipped, and in front of the program so are `NAME=value` assignments and an `env`, `sudo`, `command`, `time` or `nice`, with the options each knows (`Options`) and their values (`time -f %e cargo test` is `cargo test`).
@@ -52,6 +54,116 @@ Each Devin configuration file is named `devin-<run>-<pid>.json`, for the Devin's
 ## Querying the telemetry from Claude Code
 
 The repository's `.mcp.json` declares Honeycomb's hosted MCP server for the US region (`https://mcp.honeycomb.io/mcp`), so a Claude Code session in this repo can query the shared Honeycomb environment that receives the deck's telemetry. The server is remote, so it starts no local process. The file holds no credentials: run `/mcp` once in Claude Code to sign in through the browser with your own Honeycomb account, and the Honeycomb team needs Honeycomb Intelligence enabled for the server to answer. A team in the EU region uses `https://mcp.eu1.honeycomb.io/mcp` instead. Of the agents the deck supports, only Claude Code reads `.mcp.json`; the others need the server added in their own configuration.
+
+## Usage and how a run ended (PRD #1858)
+
+PRD #1858 adds to each run's `agent.run` span what the run consumed — tokens per model, the share of a plan's allowance, cost as an estimate — and how the agent's own turn ended, each value with its provenance. This section is the design. **What exists on this branch is its pure-data core, compiled for tests only** (`src/telemetry/accounting.rs` and `src/telemetry/accounting/`, still behind the `#[cfg(test)]` the PRD #633 prototype had): the record, the readers and the export mapping, with unit tests. The daemon does not call any of it yet, the Pi extension and the OpenCode plugin do not yet write the usage file below, and no attribute in this section is sent today. The evidence behind the field list is PRD #633's discovery record, [Execution accounting](execution-accounting.md).
+
+### Where each value comes from
+
+The agents' own OpenTelemetry goes from each agent straight to the user's backend; the deck switches it on and tags it, but receives none of it. Reading it would mean pointing each agent at an endpoint the deck runs, which changes how the agent is started and puts the daemon in the path of the agent's own telemetry. So the deck reads, per agent, one local record of the agent's own usage figures, located from what the deck already knows about the run:
+
+| Agent | Source (`UsageSource`) | Located by | Tokens | Allowance | Cost | How the last turn ended |
+| --- | --- | --- | --- | --- | --- | --- |
+| Claude Code | its transcript's `cost-state` record: Claude Code's own session total per model, its subagents included, appended when the session ends | `projects/<working directory, every character but an ASCII letter or digit as ->/<session id>.jsonl` under `CLAUDE_CONFIG_DIR` or `~/.claude`, from the session id and working directory on Claude Code's hook events; else the file of that name in any of the first 4,096 project directories (`locate::claude_transcript`) | provider-reported | `no_channel` | Claude Code's own estimate (`estimated`); `subscription_zero` for a zero on a model that used tokens; `unknown_price` when Claude Code marks a price unknown | the last main-chain `assistant` record: an API error (`isApiErrorMessage`, its `error` kind and `apiErrorStatus`), its `stop_reason`, or a `user` record that interrupted it or started a turn |
+| Codex | its rollout | the `transcript_path` Codex's hooks report (already on its events as `codex_transcript_path`), admitted only when it resolves under `sessions` in `CODEX_HOME` or `~/.codex` and is named `rollout-*.jsonl` (`locate::admit_codex_rollout`) | provider-reported, from Codex's running total | provider-reported, from the primary rate-limit window, an upper bound when runs overlap | `no_channel` | `task_complete` (with `codex_error_info` as the kind, and its `http_status_code` when it carries one), `turn_aborted`, `task_started` |
+| Pi | the deck's usage file for the run | the path the deck gives the run in `DOT_AGENT_DECK_USAGE_FILE` | provider-reported, per reply | `no_channel` | Pi's estimate (`estimated`), `subscription_zero` as for every agent that reports a cost | the last reply's `stopReason` |
+| OpenCode | the deck's usage file for the run | as for Pi | provider-reported, per message; `not_recorded` for a message the provider returned no usage for | `no_channel` | OpenCode's figure (`estimated`); its zeros on a subscription provider are `subscription_zero` | the last message's error type (`MessageAbortedError` is an interruption) and `finish` |
+| Devin | none | — | `no_channel` | `no_channel` | `no_channel` | not recorded |
+| an arbitrary command | none | — | `no_channel` | `no_channel` | `no_channel` | not applicable: its exit status decides ([below](#how-a-run-ended)) |
+
+**Why a usage file for Pi and OpenCode, and not their stores.** PRD #1858's milestone names OpenCode's local store; this design reads a file the deck's own code in the agent writes instead, for both agents. The deck already installs code in both: Pi's extension, whose telemetry already sends each reply's usage as `pi.model_usage`, and OpenCode's plugin. Each sees every reply's usage as the agent hands it over (Pi's `message_end`, OpenCode's `message.updated`), through the agent's extension interface, which an upgrade is less likely to change than a private store. OpenCode's store is an SQLite database (`opencode.db`, in WAL mode with OpenCode 1.18), which the crate has no reader for (reading it means a new SQLite dependency, opened beside a live writer), and whose sessions the deck cannot reliably tie to a run: the plugin reports a later session of one OpenCode process in the same directory under the first one's id. Pi's session files are named by Pi's session id, which no event the deck receives carries. The usage file has no field a prompt, a reply, a tool's input or output, an error message or a path could go in, so a producer that writes what it should gives its reader no content to handle. The cost is that a run whose producer is older than this change, or was not loaded, has its usage `not_recorded`. If OpenCode's store is wanted after all, the record and its normaliser (`from_opencode`) already take what such a reader would extract.
+
+**Devin is a documented gap.** Devin's own telemetry is documented to carry `devin.token.usage`, but the deck receives none of it, and the Devin CLI on the development machine (3000.11.3) keeps logs and no session record. PRD #1858's milestone for Devin, verifying its reported usage against a signed-in session, is still open.
+
+**Children.** A run's sessions combine without counting a session twice (`combine_sessions`): Claude Code starts a new transcript on `/clear`, and two transcripts whose totals share a start (`startTime`) are one running total carried from one session into the next, of which only the later counts (`claude::combine_transcripts`; one such pair among 654 transcripts on the development machine on 2026-10-26). A Claude Code subagent's usage is already in its parent's total. An agent started inside another agent's pane still shares that pane's `deck.run.id` (PRD #633's [aggregation](execution-accounting.md#aggregation-without-double-counting)); giving it its own run is not part of this core. Until it is, a usage-file line names its agent, and a run reads only lines of its own agent, so a Pi started inside an OpenCode pane is not counted as OpenCode's.
+
+### The usage file
+
+One JSON object per line, appended by the producer, version 1. The deck reads lines whose `type` is `reply`, `v` is `1` and `agent` is `pi` or `opencode`; a line of another version or agent is ignored, and a file with only such lines is `unrecognized_format`.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `v` | integer | `1` |
+| `type` | string | `reply` |
+| `agent` | string | `pi` or `opencode` |
+| `id` | string, optional | the reply's id, for an agent that writes a reply more than once (OpenCode, once per update); the last line for an id is the reply. Without it, each line is one reply |
+| `model` | string | the model the reply came from |
+| `input`, `output`, `cache_read`, `cache_write` | integer | the reply's tokens; `input` without the cache, as both agents count it. `cache_read` and `cache_write` may be left out for zero |
+| `cost_usd` | number, optional | the agent's own cost figure for the reply; left out when the agent has none |
+| `reported` | boolean, optional | `false` when the provider returned no usage for the reply (a request that failed or never completed), so its counts are the agent's initial zeros |
+| `stop` | string, optional | how the reply stopped, in the agent's own words: Pi's `stopReason`, OpenCode's `finish` (left out while the reply is unfinished) |
+| `error` | string, optional | the reply's error, as the agent names its kind: OpenCode's error `name`. Never the message |
+| `status` | integer, optional | the HTTP status of the provider response that failed the reply |
+
+### How a run ended
+
+`deck.run.termination` joins the deck's end reason (`deck.run.end_reason`) to the agent's last turn (`run_termination`), and is unavailable as `run_not_ended` while the run is open:
+
+| Agent's last turn | Deck's end | `deck.run.termination` | Provenance |
+| --- | --- | --- | --- |
+| completed | any | `completed` | `provider_reported` |
+| failed | any | `failed`, with `error.type` and, when recorded, `http.response.status_code` | `provider_reported` |
+| interrupted | any | `interrupted` | `provider_reported` |
+| mid-turn | `closed`, `daemon_shutdown` | `interrupted` | `measured` |
+| mid-turn, unknown or not recorded | otherwise | `unknown` | `measured` |
+
+An agent's turn completing is not its run ending: an interactive agent completes a turn and waits for the next, so the last turn is kept beside the termination as `deck.run.last_turn`. For an arbitrary command the deck's own view decides (`command_termination`, `measured`): exit status 0 is `completed`, any other `failed` with `error.type` `nonzero_exit`, `closed` and `daemon_shutdown` are `interrupted`, and an exit with no status or an `unknown` end is `unknown`. `timed_out` is reserved: the deck sets no run time limit.
+
+### What is exported
+
+On the `agent.run` span, the run's totals across models and its outcome:
+
+| Attribute | Type | Value |
+| --- | --- | --- |
+| `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.usage.cache_read.input_tokens`, `gen_ai.usage.cache_write.input_tokens` | int | the run's tokens across models; input includes the cache parts, as the GenAI conventions define it. Absent when unavailable |
+| `deck.tokens.provenance`, `deck.tokens.unavailable_reason` | string | the totals' provenance, and the reason when unavailable. A total is a sum only of values with one provenance; any other mix is `incomplete` |
+| `deck.cost.microusd` | int | the run's cost estimate across models, in millionths of a US dollar. Absent when unavailable |
+| `deck.cost.provenance`, `deck.cost.unavailable_reason` | string | as for tokens. `estimated` is the only provenance a cost has today; nothing is reported as a charge |
+| `deck.quota.plan` | string | the plan, from a known list, else `other` |
+| `deck.quota.window_minutes`, `deck.quota.resets_at`, `deck.quota.used_from_bp`, `deck.quota.used_to_bp` | int | the window's length, its reset time in seconds since the Unix epoch, and the used share at the run's first and last sample, in basis points. Short by the run's first request, and an upper bound when runs of one plan overlap |
+| `deck.quota.provenance`, `deck.quota.unavailable_reason` | string | |
+| `deck.run.termination`, `deck.run.termination.provenance`, `deck.run.termination.unavailable_reason` | string | [above](#how-a-run-ended) |
+| `deck.run.last_turn`, `deck.run.last_turn.provenance`, `deck.run.last_turn.unavailable_reason` | string | `completed`, `failed`, `interrupted`, `mid_turn` or `unknown` |
+| `error.type` | string | the kind of a failure, from a known list, else `other` |
+| `http.response.status_code` | int | the HTTP status of the response that failed the run's last turn, when the agent recorded one |
+
+On the `agent.run` span, one `deck.model_usage` event per model the run used, with `gen_ai.response.model` (absent for a model not of a known family), the four `gen_ai.usage.*` counts, `deck.tokens.provenance`, `deck.cost.microusd` and `deck.cost.provenance`, each with its `.unavailable_reason` when unavailable. `deck.run.id` and `deck.agent` are the span's own. A run with no usage known at all has one event without a model, its tokens and cost unavailable with the reason.
+
+**Provenance.** Every value carries one of `measured`, `provider_reported`, `estimated`, `agent_asserted` (unused by the run fields) or `unavailable`. **An unavailable value is never sent as 0**: its value attribute is left out, and `.provenance` is `unavailable` with `.unavailable_reason` one of `no_channel`, `subscription_zero`, `unknown_price`, `not_recorded`, `incomplete`, `window_reset`, `plan_changed`, `quota_decreased`, `run_not_ended`, `no_work_item` and `unrecognized_format`. A zero is sent only when it is one of the agent's own counts, or the difference between two of the agent's own totals.
+
+**Strings that leave the deck.** The record holds strings only as identifiers (`Ident`: ASCII letters, digits and `._-:/@+`, at most 128 bytes), and the export narrows them further to closed lists, since an identifier's shape fits a path, an email address or a credential too: a model is named only when its name is lowercase, at most 96 bytes, not a path, and of a known family (`MODEL_FAMILIES`: `claude-`, `gpt-`, `o3`, `gemini-`, `qwen` and the others listed there), so a custom or local model's tokens are sent without its name; a plan and an error kind are sent only from their lists (`KNOWN_PLANS`, `KNOWN_ERROR_KINDS`), and as `other` otherwise. Nothing else in the record is a string the agent wrote.
+
+### Readers
+
+Each reader is a `JsonlReader` with the summary of its source (`CodexRolloutSummary`, `claude::ClaudeTranscriptSummary`, `usage_file::UsageFileSummary`): incremental, reading only bytes appended since its last poll, at most 4 MiB per poll, skipping a line over 256 KiB, deserialising only lines that contain one of its marker words into structs that name the fields it keeps, with every other field skipped by the parser. On Unix it refuses a final-component symlink, anything but a regular file, and a file owned by another user, before reading a byte; the paths it is handed are built or admitted by `locate`. A reader whose usage record no longer parses fails to `unrecognized_format`, and one whose total went down to `incomplete`, rather than to a number.
+
+**Claude Code's total is counted from a baseline.** A resumed session's transcript already holds the last run's total when the run begins, and Claude Code starts from it, so for a transcript that was already there when the run began, the deck seals the last `cost-state` it read when it first caught up with the file as the run's baseline (`seal_baseline`) and credits only what the total grew by since. A model the run did not use again is not credited. A total that went down since the baseline is `incomplete`. Whether Claude Code restores its total on every kind of resume has not been checked against a real resume; a resume that starts the total over makes the run `incomplete`, not wrong.
+
+### Per-poll cost
+
+Measured on 2026-10-26 on the development machine (16 cores) with an optimised build of the Claude Code reader over its 699 Claude Code transcripts (1.4 GB, 483,327 lines), at a load average of 64.5 / 46.3 / 40.2 (1, 5 and 15 minutes) when it started and 55.9 / 45.0 / 39.8 when it ended — a busy deck:
+
+| Measurement | Result |
+| --- | --- |
+| Full read, one fresh reader per transcript | 11.3 s (125 MB/s); 181,042 lines deserialised, 1 malformed, 54 over 256 KiB skipped |
+| Usage found | `provider_reported` in 649 transcripts, `not_recorded` in 50 (sessions still running or ended without a total), `unrecognized_format` in none |
+| Incremental: the 20 largest transcripts (171 MB) replayed into a scratch file one line at a time, polling after each line | 69,016 polls: mean 20.1 µs, median 14.7 µs, 99th percentile 81.9 µs, maximum 1.66 ms; 8.3 µs per KB appended |
+| Idle poll, nothing appended | median 7.9 µs, 99th percentile 15.2 µs |
+
+PRD #633's measurement of the Codex reader, which the generic reader keeps unchanged, was a median of 14 µs per poll and 7.5 µs idle ([Overhead](execution-accounting.md#overhead)). The usage file holds one short line per reply, so its polls do less work per poll than these; it was not timed separately. The driver is `overhead_over_a_directory_of_claude_transcripts` in `src/telemetry/accounting.rs`, which prints aggregates only and does nothing unless its variable names a directory. `cargo test --release --lib` does not build on this branch (a test in `src/lock_rank.rs` uses a debug-only static), so it runs under an optimised profile that keeps debug assertions:
+
+```sh
+DAD_ACCOUNTING_BENCH_CLAUDE_DIR=~/.claude/projects cargo test --config 'profile.accbench.inherits="release"' --config 'profile.accbench.debug-assertions=true' --profile accbench --lib telemetry::accounting::tests::overhead_over_a_directory_of_claude_transcripts -- --exact --nocapture
+```
+
+The deterministic half — an idle poll reads and parses nothing, an appended line is read once — is the unit test `an_idle_poll_reads_nothing_and_an_append_is_read_once`.
+
+### What this core does not do yet
+
+- **Wiring.** No reader is polled for a live run: the tracker (`tracker.rs`) has to open a reader per run once its source is known (the first Claude Code event naming a session id, the first Codex event carrying a rollout path, the run's start for the usage file), poll it on the two-second interval `codex_rollout_tail.rs` uses, drain it when the run ends, and add the attributes and events above to the run's span. The inputs it needs are on events the tracker already receives — Claude Code's session id and working directory on its hook events, and Codex's rollout path on the `SessionStart`, `Thinking` and `Idle` events the daemon admits it on — or are the deck's own (the run id, and the exit status `end_run` is already passed), so wiring them should not need `src/hook.rs` or `src/agent_pty.rs` changed.
+- **The producers.** The deck's Pi extension and OpenCode plugin do not write the usage file yet, and the deck does not set `DOT_AGENT_DECK_USAGE_FILE`.
+- **A nested run's own run id**, the user page, and Devin's verification against a signed-in session.
 
 ## The per-run resource collector (PRD #1859)
 
