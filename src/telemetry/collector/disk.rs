@@ -1228,7 +1228,10 @@ mod tests {
 
     /// V2: a root below an ancestor the user may search but not read is
     /// walked on both open paths, as a directory and as a file, as an
-    /// ordinary path lookup would reach it.
+    /// ordinary path lookup would reach it. Linux only: elsewhere there is
+    /// no `O_PATH`, so an ancestor is opened for reading (`OPEN_PATH`), and
+    /// the collector runs on Linux alone.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_root_below_a_search_only_ancestor_is_walked() {
         use std::os::unix::fs::PermissionsExt;
