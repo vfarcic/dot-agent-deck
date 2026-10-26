@@ -2492,6 +2492,54 @@ function withDeliveryNotice(agents: AgentSession[], payload: unknown): AgentSess
   return next;
 }
 
+/**
+ * PRD #1666 part 3, round 5-wake: a wake update from the daemon's inbox
+ * stream — the agent's stall and hold as they stand now, both carried whole —
+ * or `undefined` for any other payload. Flattened and snake_case, as the
+ * daemon's `BroadcastMsg` is: `wake_update: true` marks it, and `state` stays
+ * the message's own. A payload whose `state` reads `wake_update` is taken as
+ * one too.
+ */
+function wakeUpdateOf(payload: unknown): { agentId: string; paneId?: string; wakeStalled: boolean; wakeHold?: WakeHold } | undefined {
+  if (!payload || typeof payload !== "object") return undefined;
+  const notice = payload as Record<string, unknown>;
+  if (notice.kind !== "inbox" || (notice.wake_update !== true && notice.state !== "wake_update")) return undefined;
+  // Bound to the generation it names: a notice naming none could be a
+  // predecessor's, so it changes nothing.
+  if (typeof notice.agent_id !== "string" || !notice.agent_id) return undefined;
+  const hold = typeof notice.wake_hold === "string"
+    ? (WAKE_HOLDS.has(notice.wake_hold) ? notice.wake_hold as WakeHold : "unknown" as const)
+    : undefined;
+  return {
+    agentId: notice.agent_id,
+    ...(typeof notice.pane_id === "string" ? { paneId: notice.pane_id } : {}),
+    wakeStalled: notice.wake_stalled === true,
+    ...(hold ? { wakeHold: hold } : {}),
+  };
+}
+
+/**
+ * PRD #1666 part 3, round 5-wake: `agents` with a wake update applied to the
+ * card of the generation it names — same agent id, same pane — replacing its
+ * stall and hold; the same array for any other payload, and for an update
+ * naming a generation the snapshot no longer lists, so a replaced agent's late
+ * update never marks its successor. The next snapshot is authoritative again.
+ */
+function withWakeUpdate(agents: AgentSession[], payload: unknown): AgentSession[] {
+  const found = wakeUpdateOf(payload);
+  if (!found) return agents;
+  const index = agents.findIndex((agent) => agent.id === found.agentId && (found.paneId === undefined || agent.paneId === found.paneId));
+  const inbox = index === -1 ? undefined : agents[index].inbox;
+  if (!inbox) return agents;
+  const { wakeStalled: _stalled, wakeHold: _hold, ...rest } = inbox;
+  const next = agents.slice();
+  next[index] = {
+    ...next[index],
+    inbox: { ...rest, ...(found.wakeStalled ? { wakeStalled: true } : {}), ...(found.wakeHold ? { wakeHold: found.wakeHold } : {}) },
+  };
+  return next;
+}
+
 /** The largest value the daemon's `u32` counts can take. */
 const U32_MAX = 0xffff_ffff;
 
@@ -4835,11 +4883,15 @@ export class TauriDeckBridge implements DeckBridge {
       // Recorded BEFORE the guards below, exactly as it was when the guard was
       // `!latest`: an event that lands before the first snapshot still belongs
       // in the ring, and dropping it would lose the drawer's earliest entries.
-      const changed = this.recordDaemonEvent(event.payload);
+      const recorded = this.recordDaemonEvent(event.payload);
       const selectedDeckId = this.selectedDeckId;
       const selected = selectedDeckId === undefined ? undefined : this.fleet.get(selectedDeckId);
-      if (!changed || selectedDeckId === undefined || selected === undefined) return;
-      this.fleet.set(selectedDeckId, { ...selected, agents: withDeliveryNotice(selected.agents, event.payload), evidence: this.evidence, handoffs: this.handoffs });
+      if (selectedDeckId === undefined || selected === undefined) return;
+      // PRD #1666 part 3, round 5-wake: a wake update changes the card (its
+      // hold, its stall) without waiting for the next snapshot.
+      const agents = withWakeUpdate(withDeliveryNotice(selected.agents, event.payload), event.payload);
+      if (!recorded && agents === selected.agents) return;
+      this.fleet.set(selectedDeckId, { ...selected, agents, evidence: this.evidence, handoffs: this.handoffs });
       onFleet(this.fleetView());
     });
     const stopTerminalState = await listen<DesktopTerminalStateDto>("desktop://terminal-state", (event) => {

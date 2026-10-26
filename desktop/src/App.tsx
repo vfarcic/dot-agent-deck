@@ -39,6 +39,8 @@ import { ConfirmDialog, type ConfirmState } from "./components/ConfirmDialog";
 import { UpgradeDialog, type UpgradeTarget } from "./components/UpgradeDialog";
 import { DeckSelector, chooseDeckSelection } from "./components/DeckSelector";
 import { HandoffRail } from "./components/HandoffRail";
+import { DeckAttention } from "./components/DeckAttention";
+import { deckAttentionText } from "./lib/inboxWords";
 import { SelectDeckNote } from "./components/SelectDeckNote";
 import { ProfilesPanel, ProjectsPanel, PromptLibraryPanel, OrchestrationPanel } from "./components/ConfigurationPanels";
 import { SettingsSheet } from "./components/SettingsSheet";
@@ -2433,10 +2435,13 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
     ...(mode === "fixture" ? [{ label: "Advance fixture", hint: "Move the deterministic loop one node", icon: Zap, run: () => VOICE_ACTIONS.advanceFixture.run(voiceContext) }] : []),
   ];
 
+  // PRD #1666 part 3, round 5-wake (Q6): who the deck holds the doorbell for.
+  const deckAttention = deckAttentionText(snapshot.agents);
+
   return (
     <div className={`control-deck ${evidenceOpen && !allDecks ? "with-evidence" : ""}`}>
       <main className="deck-main">
-        <header className="topbar">
+        <header className={`topbar${deckAttention ? " with-attention" : ""}`}>
           <div className="repo-context">
             <div className="repo-line"><FolderGit2 size={15} /><strong>{activeProject?.displayName || snapshot.repo}</strong><ChevronRight size={13} /><span>{snapshot.runId}</span></div>
             {/*
@@ -2492,6 +2497,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
               onClick={requestStop}
             ><CircleStop size={14} /><span>{selectedAgent ? "Close" : "Stop"}</span></button>
           </div>
+          <DeckAttention text={deckAttention} />
         </header>
 
         {mode === "fixture" && (

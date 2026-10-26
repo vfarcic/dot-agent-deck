@@ -9319,6 +9319,24 @@ impl AppState {
         })
     }
 
+    /// PRD #1666 part 3, round 5-wake (Q6): every pane whose current agent
+    /// generation the deck holds the doorbell for, with the words the
+    /// deck-wide attention item gives its hold
+    /// ([`crate::inbox_display::CardInbox::attention_words`]). Read from the
+    /// pane's account, which a generation change replaces, so a predecessor's
+    /// hold never marks its successor.
+    pub fn held_inbox_panes(&self) -> std::collections::BTreeMap<&str, String> {
+        self.pane_inboxes
+            .iter()
+            .filter_map(|(pane_id, inbox)| {
+                inbox
+                    .card()
+                    .attention_words()
+                    .map(|words| (pane_id.as_str(), words))
+            })
+            .collect()
+    }
+
     /// PRD #1666 §6.4: the items `pane_id`'s card lists for the user to
     /// decide on, with the agent generation they belong to.
     pub fn inbox_attention(

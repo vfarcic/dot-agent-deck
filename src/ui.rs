@@ -1887,6 +1887,15 @@ struct UiState {
     pane_names: HashMap<String, String>,
     /// Maps pane_id → display name; survives session restarts (e.g. /clear).
     pane_display_names: HashMap<String, String>,
+    /// PRD #1666 part 3, round 5-wake (Q6): this frame's deck-wide attention
+    /// item ([`deck_attention`]), drawn in the tab strip's row, or in the
+    /// deck's title row when no strip is shown. Recomputed every frame from
+    /// the daemon's inbox accounts, so it survives tab switches and a
+    /// reattach and is cleared by nothing the user does in the TUI.
+    deck_attention: Option<String>,
+    /// Whether this frame draws [`Self::deck_attention`] in the tab strip,
+    /// set by `render_frame` before the card grid reads it.
+    deck_attention_in_tab_bar: bool,
     /// PRD #1666 part 2 (G-fix6): what the dashboard's names for a pane were
     /// before its last rename — the card's session id and its
     /// `display_names` / `pane_display_names` entries — so a rename the deck
@@ -2464,6 +2473,8 @@ impl UiState {
             submitted_orchestration_form: None,
             pane_names: HashMap::new(),
             pane_display_names: HashMap::new(),
+            deck_attention: None,
+            deck_attention_in_tab_bar: false,
             renamed_from: HashMap::new(),
             pane_declared_agent: HashMap::new(),
             pane_metadata: HashMap::new(),
@@ -13744,6 +13755,8 @@ pub fn run_tui(
                 _ => None,
             })
             .collect();
+        // PRD #1666 part 3, round 5-wake (Q6): the deck-wide attention item.
+        ui.deck_attention = deck_attention(&snapshot, tab_manager.tabs());
         let tab_bar_info = TabBarInfo {
             show: tab_manager.show_tab_bar(),
             labels: tab_bar_labels,
@@ -15792,7 +15805,12 @@ pub(crate) fn build_pane_status_for_gate(state: &AppState) -> HashMap<&str, Sess
 ///
 /// Split out of [`render_frame`] because two call sites build it (the card grid
 /// and the everything-filtered-out branch) and only one of them can overflow.
-fn deck_title_line(showing: usize, total_sessions: usize, scroll_hint: &str) -> Line<'static> {
+fn deck_title_line(
+    showing: usize,
+    total_sessions: usize,
+    scroll_hint: &str,
+    attention: Option<&str>,
+) -> Line<'static> {
     let title_text = if showing < total_sessions {
         format!("— {showing}/{total_sessions} agent(s)")
     } else {
@@ -15819,7 +15837,241 @@ fn deck_title_line(showing: usize, total_sessions: usize, scroll_hint: &str) -> 
                 .add_modifier(Modifier::BOLD),
         ));
     }
+    // PRD #1666 part 3, round 5-wake (Q6): with no tab strip to carry it.
+    if let Some(attention) = attention {
+        spans.push(Span::styled(
+            format!("  {attention}"),
+            deck_attention_style(),
+        ));
+    }
     Line::from(spans)
+}
+
+/// PRD #1666 part 3, round 5-wake (Q6): the deck-wide attention item
+/// ([`crate::inbox_display::deck_attention_text`]): the first orchestration
+/// tab's start role whose agent the deck holds the doorbell for is named with
+/// its hold's words, and every other held recipient is counted. Start-role
+/// membership decides who is named, not the role's name.
+fn deck_attention(state: &AppState, tabs: &[Tab]) -> Option<String> {
+    let held = state.held_inbox_panes();
+    let named = tabs.iter().find_map(|tab| match tab {
+        Tab::Orchestration {
+            role_pane_ids,
+            start_role_index,
+            config,
+            ..
+        } => {
+            let words = held.get(role_pane_ids.get(*start_role_index)?.as_str())?;
+            let role = config.roles.get(*start_role_index)?;
+            Some((role.name.as_str(), words.as_str()))
+        }
+        Tab::Dashboard { .. } => None,
+    });
+    let others = held.len() - usize::from(named.is_some());
+    crate::inbox_display::deck_attention_text(named, others)
+}
+
+/// Attention reads as attention, not chrome: the colour the overflow hint
+/// takes for the same reason.
+fn deck_attention_style() -> Style {
+    Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// Draw `attention` on the tab strip's row `area`, two columns after `after`
+/// (where the tabs end), clipped at the row's end.
+fn draw_deck_attention(buf: &mut ratatui::buffer::Buffer, area: Rect, after: u16, attention: &str) {
+    let end = area.x.saturating_add(area.width);
+    let x = after.saturating_add(2);
+    if x < end {
+        buf.set_span(
+            x,
+            area.y,
+            &Span::styled(attention.to_string(), deck_attention_style()),
+            end - x,
+        );
+    }
+}
+
+#[cfg(test)]
+mod deck_attention_tests {
+    use super::*;
+    use crate::inbox_display::{
+        WAKE_HOLD_AWAITING_PROMPT, WAKE_HOLD_POSSIBLE_DRAFT, WAKE_STALLED, WakeHold,
+    };
+
+    fn summary(queued: usize, hold: Option<WakeHold>) -> crate::inbox_hub::InboxSummary {
+        crate::inbox_hub::InboxSummary {
+            queued,
+            fetched: 0,
+            claimed: 0,
+            undeliverable: 0,
+            last_acked_at: None,
+            wake: crate::inbox_hub::WakePath::Doorbell,
+            component: None,
+            wake_stalled: true,
+            wake_hold: hold,
+            notices: Default::default(),
+        }
+    }
+
+    /// A team whose start role, `captain`, sits in `captain-pane` behind
+    /// `coder-pane`, so neither the role's name nor its position decides.
+    fn tabs() -> Vec<Tab> {
+        let role = |name: &str, start: bool| crate::project_config::OrchestrationRoleConfig {
+            agent: None,
+            name: name.to_string(),
+            command: "cat".to_string(),
+            start,
+            description: None,
+            prompt_template: None,
+            clear: true,
+        };
+        vec![
+            Tab::Dashboard {
+                selected_session_id: None,
+                zoomed: false,
+            },
+            Tab::Orchestration {
+                id: 2,
+                name: "team".to_string(),
+                role_pane_ids: vec!["coder-pane".to_string(), "captain-pane".to_string()],
+                role_statuses: vec![OrchestrationRoleStatus::Working; 2],
+                cwd: "/work".to_string(),
+                focused_role_pane_id: None,
+                start_role_index: 1,
+                orchestrator_prompt: None,
+                config: crate::project_config::OrchestrationConfig {
+                    name: "team".to_string(),
+                    default: false,
+                    roles: vec![role("coder", false), role("captain", true)],
+                },
+                status: OrchestrationStatus::WaitingForOrchestrator,
+                had_waiting_pane: false,
+                all_clear_pending: false,
+                split_narrow: false,
+                zoomed: false,
+                orchestration_id: None,
+                context_path: None,
+            },
+        ]
+    }
+
+    fn wake_update(pane: &str, agent: &str, hold: Option<WakeHold>) -> crate::event::InboxNotice {
+        serde_json::from_value(serde_json::json!({
+            "pane_id": pane, "agent_id": agent, "message_id": "m-1", "subject": "s",
+            "from_label": "the orchestrator", "state": "queued", "wake_update": true,
+            "wake_stalled": true, "wake_hold": hold,
+        }))
+        .unwrap()
+    }
+
+    /// PRD #1666 part 3, round 5-wake (`inbox/status/031`'s fast half): the
+    /// held start role is named with its hold's words, whatever its name and
+    /// wherever it sits in the team; the coder's hold and a dashboard agent's
+    /// are counted; an agent with mail and no hold is not.
+    #[test]
+    fn deck_attention_names_the_held_start_role_and_counts_the_rest() {
+        let mut state = AppState::default();
+        state.apply_inbox_summary(
+            "captain-pane",
+            "a1",
+            &summary(1, Some(WakeHold::PossibleDraft)),
+        );
+        state.apply_inbox_summary("coder-pane", "a2", &summary(2, Some(WakeHold::NotTaken)));
+        state.apply_inbox_summary(
+            "other-pane",
+            "a3",
+            &summary(1, Some(WakeHold::AwaitingPrompt)),
+        );
+        state.apply_inbox_summary("quiet-pane", "a4", &summary(3, None));
+        assert_eq!(
+            deck_attention(&state, &tabs()).as_deref(),
+            Some(format!("✉ captain: {WAKE_HOLD_POSSIBLE_DRAFT} · 2 other held").as_str())
+        );
+        // The start role's reason changes: the item follows it.
+        state.apply_inbox_notice(&wake_update(
+            "captain-pane",
+            "a1",
+            Some(WakeHold::AwaitingPrompt),
+        ));
+        assert_eq!(
+            deck_attention(&state, &tabs()).as_deref(),
+            Some(format!("✉ captain: {WAKE_HOLD_AWAITING_PROMPT} · 2 other held").as_str())
+        );
+        // With no tabs, nobody is a start role: everyone is counted.
+        assert_eq!(deck_attention(&state, &[]).as_deref(), Some("✉ 3 held"));
+    }
+
+    /// The item is bound to the pane's current generation: a successor with
+    /// a clean inbox is not named, and its predecessor's late update does not
+    /// mark it. A hold this build does not know reads as the stall's words.
+    #[test]
+    fn deck_attention_follows_the_generation_and_reads_unknown_holds_as_stalled() {
+        let mut state = AppState::default();
+        state.apply_inbox_summary(
+            "captain-pane",
+            "a1",
+            &summary(1, Some(WakeHold::PossibleDraft)),
+        );
+        state.apply_inbox_summary("coder-pane", "a2", &summary(1, Some(WakeHold::Unknown)));
+        state.apply_inbox_summary("captain-pane", "a9", &summary(0, None));
+        state.apply_inbox_notice(&wake_update(
+            "captain-pane",
+            "a1",
+            Some(WakeHold::PossibleDraft),
+        ));
+        assert_eq!(deck_attention(&state, &tabs()).as_deref(), Some("✉ 1 held"));
+        state.apply_inbox_notice(&wake_update(
+            "captain-pane",
+            "a9",
+            Some(WakeHold::UncertainInput),
+        ));
+        assert_eq!(
+            deck_attention(&state, &tabs()),
+            Some(format!(
+                "✉ captain: {} · 1 other held",
+                crate::inbox_display::WAKE_HOLD_UNCERTAIN_INPUT_ALONE
+            ))
+        );
+        state.apply_inbox_notice(&wake_update("captain-pane", "a9", None));
+        state.apply_inbox_notice(&wake_update("coder-pane", "a2", None));
+        assert_eq!(deck_attention(&state, &tabs()), None);
+        let mut alone = AppState::default();
+        alone.apply_inbox_summary("captain-pane", "a1", &summary(1, Some(WakeHold::Unknown)));
+        assert_eq!(
+            deck_attention(&alone, &tabs()),
+            Some(format!("✉ captain: {WAKE_STALLED}: send it a prompt"))
+        );
+    }
+
+    /// The item follows the tabs on the strip's row and is clipped at its end;
+    /// with no strip it rides the deck's title row.
+    #[test]
+    fn deck_attention_is_drawn_after_the_tabs_or_in_the_title() {
+        let mut buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 30, 1));
+        draw_deck_attention(
+            &mut buf,
+            Rect::new(0, 0, 30, 1),
+            10,
+            "✉ captain: held for a reason",
+        );
+        let row: String = (0..30).map(|x| buf[(x, 0)].symbol().to_string()).collect();
+        assert_eq!(row, "            ✉ captain: held fo");
+        let title: String = deck_title_line(1, 1, "", Some("✉ 2 held"))
+            .spans
+            .iter()
+            .map(|span| span.content.to_string())
+            .collect();
+        assert!(title.ends_with("  ✉ 2 held"), "{title}");
+        let plain: String = deck_title_line(1, 1, "", None)
+            .spans
+            .iter()
+            .map(|span| span.content.to_string())
+            .collect();
+        assert!(!plain.contains('✉'), "{plain}");
+    }
 }
 
 /// Lay out and draw the deck's card grid into `area` — the title row, every card
@@ -15906,6 +16158,9 @@ fn render_card_grid(
         sessions.len(),
         total_sessions,
         &scroll_indicator(hidden_above, hidden_below),
+        ui.deck_attention
+            .as_deref()
+            .filter(|_| !ui.deck_attention_in_tab_bar),
     ));
 
     let mut constraints: Vec<Constraint> = vec![Constraint::Length(1)]; // title
@@ -16202,9 +16457,20 @@ fn render_frame(
             tab_bar.active_index,
             &orchestration_statuses,
         );
+        // PRD #1666 part 3, round 5-wake (Q6): the attention item follows
+        // the tabs on their row, clipped at its end.
+        let after_tabs = strip
+            .headers
+            .last()
+            .map_or(tab_bar_rect.x, |(_, rect)| rect.x + rect.width);
+        if let Some(attention) = ui.deck_attention.as_deref() {
+            draw_deck_attention(frame.buffer_mut(), tab_bar_rect, after_tabs, attention);
+        }
+        ui.deck_attention_in_tab_bar = true;
         ui.tab_header_rects = strip.headers;
         ui.tab_close_rects = strip.closes;
     } else {
+        ui.deck_attention_in_tab_bar = false;
         // No tab strip this frame — drop any stale rects so a click can't hit a
         // tab affordance that isn't on screen.
         ui.tab_header_rects.clear();
@@ -16319,7 +16585,14 @@ fn render_frame(
         if draw_sidebar {
             // All filtered out. Nothing is drawn, so nothing can be hidden — no
             // overflow indicator on this title.
-            let title = Paragraph::new(deck_title_line(showing, total_sessions, ""));
+            let title = Paragraph::new(deck_title_line(
+                showing,
+                total_sessions,
+                "",
+                ui.deck_attention
+                    .as_deref()
+                    .filter(|_| !ui.deck_attention_in_tab_bar),
+            ));
             let vertical = Layout::vertical([
                 Constraint::Length(1),
                 Constraint::Fill(1),

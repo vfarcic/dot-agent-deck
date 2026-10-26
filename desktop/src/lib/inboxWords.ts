@@ -1,4 +1,4 @@
-import type { AgentInbox, InboxActionVerb, InboxAttentionItem } from "../types";
+import type { AgentInbox, AgentSession, InboxActionVerb, InboxAttentionItem } from "../types";
 
 /**
  * The words both clients use for a message's journey through an agent's inbox
@@ -59,6 +59,14 @@ export const INBOX_WORDS = {
   cancelApplied: "delivery cancelled",
   actionUnsupported: "this deck cannot Retry or Cancel deck messages: upgrade dot-agent-deck",
   attentionTitle: "Deck messages",
+  /**
+   * PRD #1666 part 3, round 5-wake (Q6): the header's attention item counts
+   * the held recipients other than the orchestrator it names (`· 1 other
+   * held`), or all of them when it names none (`✉ 2 held`).
+   */
+  attentionOtherHeld: "other held",
+  /** `attentionOtherHeld`'s count when no orchestrator is named. */
+  attentionHeld: "held",
   adapterTooOld: "this agent's deck integration is out of date; restart the agent to update it",
   cliTooOld: "the dot-agent-deck command this agent runs does not support this deck's integration: upgrade dot-agent-deck, then restart the agent",
   notArmed: "this agent's deck integration has not connected yet; its messages wait until it does",
@@ -120,6 +128,43 @@ function inboxHoldText(inbox: AgentInbox): string | undefined {
   if (inbox.wakeHold === undefined || inbox.wakeHold === "unknown") return undefined;
   if (pending <= 0) return INBOX_WORDS.wakeHoldsAlone[inbox.wakeHold];
   return `${INBOX_WORDS.glyph}${pending} ${INBOX_WORDS.wakeHolds[inbox.wakeHold]}`;
+}
+
+/**
+ * PRD #1666 part 3, round 5-wake (Q6): the words the header's attention item
+ * gives an agent's hold, without the count: the hold's words while messages
+ * wait (`wakeStalled`'s for a hold this build does not know), the two warnings
+ * that stand alone with nothing waiting, and nothing when the deck holds
+ * nothing for it. The TUI's `CardInbox::attention_words` is the same.
+ */
+export function inboxAttentionWords(inbox: AgentInbox | undefined): string | undefined {
+  if (inbox?.wakeHold === undefined) return undefined;
+  const pending = inbox.queued + inbox.fetched;
+  if (pending <= 0) return inbox.wakeHold === "unknown" ? undefined : INBOX_WORDS.wakeHoldsAlone[inbox.wakeHold];
+  return inbox.wakeHold === "unknown"
+    ? `${INBOX_WORDS.wakeStalled}: ${INBOX_WORDS.wakeStalledHint}`
+    : INBOX_WORDS.wakeHolds[inbox.wakeHold];
+}
+
+/**
+ * PRD #1666 part 3, round 5-wake (Q6): the deck-wide attention item both
+ * clients show in their header: `✉ <orchestrator>: <its hold> · 1 other held`,
+ * or `✉ 2 held` with no orchestrator held, or nothing. The first held agent of
+ * an orchestration's start role is named, whatever the role is called; every
+ * other held agent is counted. The TUI's `deck_attention_text` is the same.
+ */
+export function deckAttentionText(agents: readonly AgentSession[]): string | undefined {
+  const held = agents.flatMap((agent) => {
+    const words = inboxAttentionWords(agent.inbox);
+    return words === undefined ? [] : [{ agent, words }];
+  });
+  const named = held.find((entry) => entry.agent.isStartRole);
+  const others = held.length - (named ? 1 : 0);
+  if (named) {
+    const head = `${INBOX_WORDS.glyph} ${named.agent.role}: ${named.words}`;
+    return others > 0 ? `${head} · ${others} ${INBOX_WORDS.attentionOtherHeld}` : head;
+  }
+  return others > 0 ? `${INBOX_WORDS.glyph} ${others} ${INBOX_WORDS.attentionHeld}` : undefined;
 }
 
 /** Whether the notice row is the hold's, so the badge keeps only the count. */

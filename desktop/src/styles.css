@@ -477,6 +477,9 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 
 .topbar { height: 72px; padding: 0 18px 0 22px; position: sticky; z-index: 30; top: 0; display: grid; grid-template-columns: minmax(210px, 1fr) auto minmax(244px, auto); align-items: stretch; gap: 18px; border-bottom: 1px solid var(--line-strong); background: rgb(var(--paper-rgb) / .97); }
 .repo-context { min-width: 0; display: flex; flex-direction: column; justify-content: center; }
+/* PRD #1666 part 3, round 5-wake (Q6): a held orchestrator, across the whole bar, below its instruments. */
+.topbar.with-attention { height: auto; grid-template-rows: 72px auto; }
+.deck-attention { grid-column: 1 / -1; padding: 0 0 8px; color: var(--amber-ink); font-size: 12px; font-weight: 600; overflow-wrap: anywhere; }
 .repo-line, .branch-line { display: flex; align-items: center; min-width: 0; }
 .repo-line { gap: 6px; font-size: 13px; }
 .repo-line strong { white-space: nowrap; }

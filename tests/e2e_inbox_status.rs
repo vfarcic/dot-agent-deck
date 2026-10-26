@@ -17,6 +17,145 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::Instant;
 
+fn attention_client(daemon: &common::DaemonProc) -> common::TuiDeck {
+    common::TuiDeck::builder()
+        .with_pty_size(200, 50)
+        .with_env(
+            "DOT_AGENT_DECK_ATTACH_SOCKET",
+            daemon.attach_socket.to_string_lossy(),
+        )
+        .with_env(
+            "DOT_AGENT_DECK_SOCKET",
+            daemon.hook_socket.to_string_lossy(),
+        )
+        .launch_with_fixture("minimal")
+}
+
+fn attention_header(deck: &common::TuiDeck) -> String {
+    // Inspect chrome, not a held agent's already-working card notice.
+    deck.snapshot_grid()
+        .lines()
+        .take_while(|line| !line.starts_with(['┌', '┏', '╭']))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn assert_orchestrator_attention(deck: &common::TuiDeck, reason: &str) {
+    let words: Value = serde_json::from_str(include_str!("fixtures/inbox-display.json")).unwrap();
+    let glyph = words["glyph"].as_str().unwrap();
+    // Keep the labelled-count grammar identical to InboxWakeAttention.test.tsx.
+    let one_other_held = regex::Regex::new(
+        r"(?i)(?:^|[^a-z0-9_])(?:1\s+(?:other|held|blocked)|(?:other|held|blocked)\s*:?\s*1)(?:$|[^a-z0-9_])",
+    )
+    .unwrap();
+    assert!(
+        common::wait_until(WAIT, || {
+            let header = attention_header(deck);
+            let label = header.to_ascii_lowercase();
+            label.contains("orchestrator")
+                && header.contains(reason)
+                && header.contains(glyph)
+                && one_other_held.is_match(&header)
+                && !label.contains("coder")
+        }),
+        "deck-wide attention must name the held orchestrator, explain its hold and count one other held recipient outside its card; grid:\n{}",
+        deck.snapshot_grid()
+    );
+}
+
+/// Scenario: A worker reports to an orchestrator whose input holds an unsent draft, while one other recipient is held too. The real attached TUI must show the envelope glyph, name the orchestrator and count the other recipient without worker detail in its header even on another tab, retain that attention across detach/reattach and tab switches, then clear it after the user clears the draft and the report is taken.
+#[spec("inbox/status/031")]
+#[test]
+fn status_031_orchestrator_attention_survives_tabs_and_reattach() {
+    let daemon = daemon_unbound(&[("DOT_AGENT_DECK_INBOX_WAKE_STALL_AFTER_MS", "100")]);
+    let member = |role, index, start| {
+        json!({"tab_membership": {
+            "kind":"orchestration", "name":"attention-team", "role_name":role,
+            "role_index":index, "is_start_role":start, "orchestration_id":"attention-team",
+            "orchestration_cwd":daemon.cwd()
+        }})
+    };
+    let orch = pane_with(
+        &daemon,
+        "attention-orchestrator",
+        member("orchestrator", 0, true),
+    );
+    let worker = pane_with(&daemon, "attention-coder", member("coder", 1, false));
+    let other = pane(&daemon, "attention-other");
+    let mut deck = attention_client(&daemon);
+    deck.wait_for_string("attention-team");
+    // Attaching can select the orchestration tab. Choose the Dashboard
+    // explicitly before checking its distinct card and starting the round-trip.
+    let (col, row) = deck.wait_for_in_grid("Dashboard");
+    deck.click(col + 1, row);
+    deck.wait_until_grid(
+        "Dashboard selected, showing its non-team recipient",
+        |grid| grid.contains("attention-other") && !grid.contains("attention-coder"),
+    );
+    for agent in [&orch, &other] {
+        status(&daemon, agent, "session_start", "pi");
+        status(&daemon, agent, "idle", "pi");
+    }
+    let mut draft = input(&daemon, &orch, DRAFT);
+    let mut other_draft = input(&daemon, &other, DRAFT);
+    let mut report = request(&worker, "work_done");
+    report["task"] = json!("ATTENTION-WORKER-REPORT-79d1");
+    report["timestamp"] = json!(chrono::Utc::now());
+    assert_eq!(
+        hook(&daemon, report)["accepted"],
+        true,
+        "worker report accepted"
+    );
+    enqueue(&daemon, &other, "other held work");
+    assert!(
+        common::wait_until(WAIT, || summary(&daemon, &orch)["wake_hold"]
+            == "possible_draft"),
+        "precondition: the orchestrator's real inbox is held for its draft: {}",
+        summary(&daemon, &orch)
+    );
+    assert!(common::wait_until(
+        WAIT,
+        || summary(&daemon, &other)["wake_hold"] == "possible_draft"
+    ));
+    let words: Value = serde_json::from_str(include_str!("fixtures/inbox-display.json")).unwrap();
+    let reason = words["wakeHolds"]["possible_draft"].as_str().unwrap();
+    assert_orchestrator_attention(&deck, reason);
+    // Dashboard -> the team's tab -> Dashboard. No focus or selection clears it.
+    deck.send_keys(b"\x1b[C");
+    deck.wait_until_grid("team tab selected, showing its worker", |grid| {
+        grid.contains("attention-coder") && !grid.contains("attention-other")
+    });
+    assert_orchestrator_attention(&deck, reason);
+    deck.send_keys(b"\x1b[D");
+    deck.wait_until_grid(
+        "Dashboard selected again, showing its non-team recipient",
+        |grid| grid.contains("attention-other") && !grid.contains("attention-coder"),
+    );
+    assert_orchestrator_attention(&deck, reason);
+    deck.send_keys(b"\x03");
+    deck.wait_for_string("Quit dot-agent-deck?");
+    deck.send_keys(b"\r");
+    assert_eq!(deck.wait_for_exit_within(WAIT), Some(true));
+    let reattached = attention_client(&daemon);
+    let (col, row) = reattached.wait_for_in_grid("Dashboard");
+    reattached.click(col + 1, row);
+    reattached.wait_until_grid(
+        "reattached Dashboard shows its non-team recipient",
+        |grid| grid.contains("attention-other") && !grid.contains("attention-coder"),
+    );
+    assert_orchestrator_attention(&reattached, reason);
+    draft.write("\u{15}");
+    other_draft.write("\u{15}");
+    let taken = fetch(&daemon, &orch, true);
+    assert!(taken.to_string().contains("ATTENTION-WORKER-REPORT-79d1"));
+    fetch(&daemon, &other, true);
+    assert!(
+        common::wait_until(WAIT, || !attention_header(&reattached).contains(reason)),
+        "clearing the drafts and taking the messages must clear header attention: {}",
+        reattached.snapshot_grid()
+    );
+}
+
 fn summary(daemon: &impl Endpoint, pane: &Pane) -> Value {
     let reply = attach(daemon, json!({"op":"list-agents"}));
     assert_eq!(reply["ok"], true, "ListAgents: {reply}");

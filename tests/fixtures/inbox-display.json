@@ -54,5 +54,7 @@
   },
   "evidencePaused": "deck messages paused: {n} delivered messages still wait for proof that older copies cannot run; restart the agent to clear them",
   "actionUnsupported": "this deck cannot Retry or Cancel deck messages: upgrade dot-agent-deck",
-  "attentionTitle": "Deck messages"
+  "attentionTitle": "Deck messages",
+  "attentionOtherHeld": "other held",
+  "attentionHeld": "held"
 }

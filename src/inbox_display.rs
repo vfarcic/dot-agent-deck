@@ -58,6 +58,29 @@ pub const WAKE_HOLD_UNCERTAIN_INPUT_ALONE: &str =
 pub const WAKE_HOLD_DIALOG_DURING_RING_ALONE: &str =
     "A dialog may have taken the deck's keys. Check the agent's pane.";
 
+/// PRD #1666 part 3, round 5-wake (Q6): the deck-wide attention item names a
+/// held orchestrator and counts the other held recipients after it
+/// (`· 1 other held`); with no orchestrator held it only counts (`✉ 2 held`).
+pub const ATTENTION_OTHER_HELD: &str = "other held";
+/// [`ATTENTION_OTHER_HELD`]'s count when no orchestrator is named.
+pub const ATTENTION_HELD: &str = "held";
+
+/// The deck-wide attention item both clients show in their header, the same
+/// words in each: `✉ <orchestrator>: <its hold words> · 1 other held`, or
+/// `✉ 2 held` when no orchestrator is held; `None` when nothing is held.
+/// `named` is the held orchestrator's name and [`CardInbox::attention_words`];
+/// `others` counts every other held recipient, other orchestrators included.
+pub fn deck_attention_text(named: Option<(&str, &str)>, others: usize) -> Option<String> {
+    match named {
+        Some((name, words)) if others > 0 => Some(format!(
+            "{GLYPH} {name}: {words} · {others} {ATTENTION_OTHER_HELD}"
+        )),
+        Some((name, words)) => Some(format!("{GLYPH} {name}: {words}")),
+        None if others > 0 => Some(format!("{GLYPH} {others} {ATTENTION_HELD}")),
+        None => None,
+    }
+}
+
 /// The card notice for a message handed to the agent the most times allowed,
 /// none acknowledged. Fixed text, as every delivery notice is
 /// ([`crate::agent_pty::DeliveryNotice::detail`]).
@@ -590,6 +613,23 @@ impl CardInbox {
         }
     }
 
+    /// PRD #1666 part 3, round 5-wake (Q6): the words the deck-wide attention
+    /// item gives this agent's hold, without the count: the hold's words while
+    /// messages wait ([`WAKE_STALLED`]'s for a hold this build does not
+    /// know), the two warnings that stand alone with nothing waiting, and
+    /// `None` when the deck holds nothing for it.
+    pub fn attention_words(&self) -> Option<String> {
+        let hold = self.hold?;
+        if self.pending == 0 {
+            return hold.alone_words().map(str::to_string);
+        }
+        Some(
+            hold.words()
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{WAKE_STALLED}: {WAKE_STALLED_HINT}")),
+        )
+    }
+
     /// Whether the notice row is the hold's ([`Self::notice_text`] reaches
     /// [`Self::hold_text`]), so the inbox line keeps only the count.
     fn hold_in_notice(&self) -> bool {
@@ -678,6 +718,61 @@ impl CardInbox {
 mod tests {
     use super::*;
 
+    /// PRD #1666 part 3, round 5-wake (Q6): the deck-wide attention item, in
+    /// the forms `deckAttentionText` (`desktop/src/lib/inboxWords.ts`) builds
+    /// from the same words; its tests pin the same strings.
+    #[test]
+    fn the_deck_attention_names_one_orchestrator_and_counts_the_rest() {
+        assert_eq!(
+            deck_attention_text(Some(("Captain", WAKE_HOLD_POSSIBLE_DRAFT)), 1).as_deref(),
+            Some(
+                "✉ Captain: waiting: there may be an unsent draft. Send it, or type x then Ctrl+C. · 1 other held"
+            )
+        );
+        assert_eq!(
+            deck_attention_text(Some(("Captain", WAKE_HOLD_PASTE_OPEN)), 0).as_deref(),
+            Some("✉ Captain: waiting: a paste into its input has not finished.")
+        );
+        assert_eq!(deck_attention_text(None, 2).as_deref(), Some("✉ 2 held"));
+        assert_eq!(deck_attention_text(None, 0), None);
+    }
+
+    /// The attention item's words for one agent: the hold's words while
+    /// messages wait, the stall's for a hold this build does not know, the
+    /// standalone warnings with nothing waiting, and nothing otherwise.
+    #[test]
+    fn attention_words_follow_the_card_hold() {
+        let card = |pending, hold| CardInbox {
+            pending,
+            hold,
+            ..CardInbox::default()
+        };
+        assert_eq!(
+            card(2, Some(WakeHold::CannotType))
+                .attention_words()
+                .as_deref(),
+            Some(WAKE_HOLD_CANNOT_TYPE)
+        );
+        assert_eq!(
+            card(1, Some(WakeHold::Unknown))
+                .attention_words()
+                .as_deref(),
+            Some("waiting to wake: send it a prompt")
+        );
+        assert_eq!(
+            card(0, Some(WakeHold::DialogDuringRing))
+                .attention_words()
+                .as_deref(),
+            Some(WAKE_HOLD_DIALOG_DURING_RING_ALONE)
+        );
+        assert_eq!(
+            card(0, Some(WakeHold::PossibleDraft)).attention_words(),
+            None
+        );
+        assert_eq!(card(0, Some(WakeHold::Unknown)).attention_words(), None);
+        assert_eq!(card(3, None).attention_words(), None);
+    }
+
     /// The words are the ones the desktop reads from the shared fixture.
     #[test]
     fn the_words_match_the_shared_fixture() {
@@ -735,6 +830,8 @@ mod tests {
         assert_eq!(words["cancelApplied"], CANCEL_APPLIED);
         assert_eq!(words["actionUnsupported"], ACTION_UNSUPPORTED);
         assert_eq!(words["attentionTitle"], ATTENTION_TITLE);
+        assert_eq!(words["attentionOtherHeld"], ATTENTION_OTHER_HELD);
+        assert_eq!(words["attentionHeld"], ATTENTION_HELD);
         assert_eq!(words["adapterTooOld"], ADAPTER_TOO_OLD);
         assert_eq!(words["cliTooOld"], CLI_TOO_OLD);
         assert_eq!(words["notArmed"], NOT_ARMED);
