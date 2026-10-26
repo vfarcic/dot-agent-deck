@@ -745,6 +745,18 @@ impl crate::composer_probe::classifier::ProcView for LinuxProcView {
     fn exe_path(&mut self, pid: u32) -> std::io::Result<std::path::PathBuf> {
         std::fs::read_link(format!("/proc/{pid}/exe"))
     }
+
+    fn file(
+        &mut self,
+        path: &std::path::Path,
+    ) -> std::io::Result<crate::composer_probe::classifier::FileId> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(path)?;
+        Ok(crate::composer_probe::classifier::FileId {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })
+    }
 }
 
 /// The calling process's parent pid. Wraps `getppid(2)` (async-signal-safe,

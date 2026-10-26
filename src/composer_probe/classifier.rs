@@ -11,36 +11,57 @@
 //!
 //! **The agent** `A` is the generation's [`Identity`]: its pid and start
 //! ticks name the process, its executable's `(dev, ino)` is F1, and its
-//! install root (F2) and command basenames (F3) make up the agent's family
-//! with F1 (R5 §2.2). A process is **in the family** when its executable is
-//! F1, its resolved path lies under F2, its basename is `claude`, `codex` or
-//! `A`'s own, or its executable link reads `… (deleted)`.
+//! install root (F2, a path and that directory's `(dev, ino)`) and command
+//! basenames (F3) make up the agent's family with F1 (R5 §2.2). A process is
+//! **in the family** when its executable is F1, a directory above its
+//! resolved path is F2 (by `(dev, ino)`, so a renamed or bind-mounted root
+//! still counts), its basename is `claude`, `codex` or `A`'s own, or its
+//! executable link reads `… (deleted)`.
 //!
-//! **The classes, first match wins** (R5 §2.3):
+//! **The classes, first match wins** (R5 §2.3, narrowed):
 //! 1. No identity, or `Q`'s stat or executable unreadable: `Unknown`.
 //! 2. `Q` is `A` by pid and start ticks: `Owned` if it still runs F1, else
 //!    `Unknown` (`A` after an `exec` or a replaced binary is never a tool).
-//! 3. The parent walk from `Q` reaches `A` within [`MAX_OWNED_STEPS`], every
-//!    process on it, `A` included, runs F1, and every start is at or after
-//!    its parent's: `Owned` (M24's overview chain).
-//! 4. `Q` is in the family: `Unknown` (a nested agent, a descendant after an
-//!    update, a copy of the agent, a deleted executable).
+//! 3. F2's recorded path no longer reads as F2's `(dev, ino)`, or a
+//!    directory above `Q`'s executable doesn't read: `Unknown`. The family's
+//!    boundary can't be drawn, so nothing outside it is positively a tool.
+//! 4. `Q` is in the family: `Unknown` (a nested agent, an agent process
+//!    other than `A`, a descendant after an update, a copy of the agent, a
+//!    deleted executable).
 //! 5. The walk from `Q` reaches `A` within [`MAX_TOOL_STEPS`] through
 //!    processes whose stat reads, with monotone starts: `PositivelyTool`.
 //! 6. Anything else, a `Q` reparented away from `A` among them: `Unknown`.
 //!
+//! **Only `A` itself is `Owned`.** R5 §2.3 also admitted a chain of F1
+//! processes from `Q` up to `A` (M24's overview: `claude daemon run` →
+//! `bg-pty-host` → `--session-id`). That chain can't be told from a nested
+//! agent a tool started: a tool's shell that `exec`s the agent's binary
+//! leaves the same tree (`A` → F1 → …), and `/proc` keeps no record of what
+//! a process ran before its last `exec` (R35CODE4-U2-01). So every F1
+//! process but `A` is family, and `Unknown`; Claude's composer after the
+//! overview is one of them.
+//!
 //! A tool is reached only on positive evidence, outside the family **and**
-//! with unbroken ancestry to `A`; every executable mismatch is `Unknown`.
-//! The walk is read twice, and two reads that differ are `Unknown`: the tree
-//! changed while it was read. A pid is never trusted without its start
-//! ticks, so a process that reuses `A`'s pid isn't `A`.
+//! with unbroken ancestry to `A`; every executable mismatch is `Unknown`, and
+//! so is a family record that has gone stale (R35CODE4-U2-02). A pid is never
+//! trusted without its start ticks, so a process that reuses `A`'s pid isn't
+//! `A`.
+//!
+//! **What a classification is, and what its caller owes.** The walk is read
+//! twice, and two reads that differ are `Unknown`. That detects a change
+//! between the samples, not every change: each process is read in separate
+//! `stat`, `stat`-of-executable and `readlink` calls, a process can `exec`
+//! or be reparented after the last read, and a change undone between reads
+//! leaves equal samples. A pid with its start ticks names a process to the
+//! tick, not beyond it. So a result is evidence about the samples, not a
+//! live snapshot. The caller pins what it relies on: the helper holds
+//! pidfds for itself and `Q` from before the first read (Q35-12), and the
+//! daemon's attribution holds `Q`'s pidfd across the walk and the export
+//! read, revalidating around that read (Q35-14a, Q35-14b).
 
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
-
-/// How many parent steps an `Owned` walk takes from `Q` to `A`, at most.
-pub const MAX_OWNED_STEPS: usize = 8;
 
 /// How many parent steps a tool's walk takes from `Q` to `A`, at most.
 pub const MAX_TOOL_STEPS: usize = 16;
@@ -66,7 +87,8 @@ pub struct ProcStat {
     pub start: u64,
 }
 
-/// The processes as the classifier reads them, by pid.
+/// The processes as the classifier reads them, by pid, and the directories
+/// their executables are in, by path.
 pub trait ProcView {
     /// `/proc/<pid>/stat`.
     fn stat(&mut self, pid: u32) -> io::Result<ProcStat>;
@@ -74,6 +96,8 @@ pub trait ProcView {
     fn exe(&mut self, pid: u32) -> io::Result<FileId>;
     /// `readlink(/proc/<pid>/exe)`: where that executable is, or was.
     fn exe_path(&mut self, pid: u32) -> io::Result<PathBuf>;
+    /// `stat(path)`: a directory's identity.
+    fn file(&mut self, path: &Path) -> io::Result<FileId>;
 }
 
 /// The generation's agent `A` and its family (R5 §2.2), from the identity
@@ -88,6 +112,8 @@ pub struct Identity {
     /// F2: the install root, such as Claude's `versions/` directory or
     /// Codex's npm package root.
     pub install_root: PathBuf,
+    /// F2's `(dev, ino)`, recorded with its path.
+    pub install_root_id: FileId,
     /// `A`'s own executable basename, with [`AGENT_BASENAMES`] F3.
     pub basename: OsString,
 }
@@ -95,7 +121,7 @@ pub struct Identity {
 /// Whose invocation it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Class {
-    /// The agent's own composer: `A`, or `A`'s executable all the way to it.
+    /// The agent's own composer: `A` itself, still on F1.
     Owned,
     /// A tool the agent ran: outside the family, below `A`.
     PositivelyTool,
@@ -103,14 +129,16 @@ pub enum Class {
     Unknown,
 }
 
-/// One process on the walk, as read. Errors keep only their errno, so two
-/// reads compare.
+/// A read, with an error kept as its errno only, so two reads compare.
+type Read<T> = Result<T, Option<i32>>;
+
+/// One process on the walk, as read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Link {
     pid: u32,
-    stat: Result<ProcStat, Option<i32>>,
-    exe: Result<FileId, Option<i32>>,
-    exe_path: Result<PathBuf, Option<i32>>,
+    stat: Read<ProcStat>,
+    exe: Read<FileId>,
+    exe_path: Read<PathBuf>,
 }
 
 impl Link {
@@ -125,6 +153,18 @@ impl Link {
     fn runs_f1(&self, identity: &Identity) -> bool {
         self.exe == Ok(identity.exe)
     }
+}
+
+/// One read of everything a classification looks at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Sample {
+    /// From `Q` up (see [`read_walk`]).
+    walk: Vec<Link>,
+    /// What F2's recorded path reads as now.
+    root: Read<FileId>,
+    /// The directories above `Q`'s executable, nearest first, when its link
+    /// read.
+    dirs: Vec<Read<FileId>>,
 }
 
 fn errno(error: io::Error) -> Option<i32> {
@@ -157,6 +197,20 @@ fn read_walk<V: ProcView>(view: &mut V, identity: &Identity, q: u32) -> Vec<Link
     }
 }
 
+fn read_sample<V: ProcView>(view: &mut V, identity: &Identity, q: u32) -> Sample {
+    let walk = read_walk(view, identity, q);
+    let root = view.file(&identity.install_root).map_err(errno);
+    let dirs = match &walk[0].exe_path {
+        Ok(path) => path
+            .ancestors()
+            .skip(1)
+            .map(|dir| view.file(dir).map_err(errno))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    Sample { walk, root, dirs }
+}
+
 /// The steps from `Q` to `A` over a walk whose every start is at or after
 /// its parent's, or `None` when it doesn't reach `A` that way.
 fn steps_to_agent(walk: &[Link], identity: &Identity) -> Option<usize> {
@@ -167,10 +221,12 @@ fn steps_to_agent(walk: &[Link], identity: &Identity) -> Option<usize> {
     monotone.then_some(at)
 }
 
-/// Whether `link` is in `identity`'s family (R5 §2.2). Its executable reads.
-fn in_family(link: &Link, path: &Path, identity: &Identity) -> bool {
+/// Whether `link`, whose executable is at `path` below the directories
+/// `dirs`, is in `identity`'s family (R5 §2.2). Under F2's recorded path is
+/// within this: [`class_of`] has checked that path reads as F2.
+fn in_family(link: &Link, path: &Path, dirs: &[Read<FileId>], identity: &Identity) -> bool {
     link.runs_f1(identity)
-        || path.starts_with(&identity.install_root)
+        || dirs.contains(&Ok(identity.install_root_id))
         || path.as_os_str().as_encoded_bytes().ends_with(DELETED)
         || path.file_name().is_some_and(|name| {
             name == identity.basename
@@ -180,8 +236,8 @@ fn in_family(link: &Link, path: &Path, identity: &Identity) -> bool {
         })
 }
 
-fn class_of(walk: &[Link], identity: &Identity) -> Class {
-    let q = &walk[0];
+fn class_of(sample: &Sample, identity: &Identity) -> Class {
+    let q = &sample.walk[0];
     let (Ok(_), Ok(_), Ok(path)) = (&q.stat, &q.exe, &q.exe_path) else {
         return Class::Unknown;
     };
@@ -192,31 +248,28 @@ fn class_of(walk: &[Link], identity: &Identity) -> Class {
             Class::Unknown
         };
     }
-    let steps = steps_to_agent(walk, identity);
-    if let Some(at) = steps
-        && at <= MAX_OWNED_STEPS
-        && walk[..=at].iter().all(|link| link.runs_f1(identity))
-    {
-        return Class::Owned;
-    }
-    if in_family(q, path, identity) {
+    if sample.root != Ok(identity.install_root_id) || sample.dirs.iter().any(Result::is_err) {
         return Class::Unknown;
     }
-    match steps {
+    if in_family(q, path, &sample.dirs, identity) {
+        return Class::Unknown;
+    }
+    match steps_to_agent(&sample.walk, identity) {
         Some(_) => Class::PositivelyTool,
         None => Class::Unknown,
     }
 }
 
 /// Classify the invocation whose editor's parent is `q`, against the
-/// generation's identity (`None` when its file can't be read). The walk is
-/// read twice, and differing reads are [`Class::Unknown`].
+/// generation's identity (`None` when its file can't be read). Everything is
+/// read twice, and differing reads are [`Class::Unknown`]; the module doc
+/// says what that does and doesn't establish, and what the caller pins.
 pub fn classify<V: ProcView>(view: &mut V, identity: Option<&Identity>, q: u32) -> Class {
     let Some(identity) = identity else {
         return Class::Unknown;
     };
-    let first = read_walk(view, identity, q);
-    let second = read_walk(view, identity, q);
+    let first = read_sample(view, identity, q);
+    let second = read_sample(view, identity, q);
     if first != second {
         return Class::Unknown;
     }

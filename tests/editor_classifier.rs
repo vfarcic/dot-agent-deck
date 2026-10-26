@@ -6,10 +6,10 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use dot_agent_deck::composer_probe::classifier::{
-    Class, FileId, Identity, MAX_OWNED_STEPS, MAX_TOOL_STEPS, ProcStat, ProcView, classify,
+    Class, FileId, Identity, MAX_TOOL_STEPS, ProcStat, ProcView, classify,
 };
 use spec::spec;
 
@@ -20,6 +20,8 @@ const EACCES: i32 = 13;
 /// Claude's native binary: F1, under F2.
 const CLAUDE: FileId = FileId { dev: 8, ino: 4242 };
 const VERSIONS: &str = "/home/me/.local/share/claude/versions";
+/// F2's `(dev, ino)`: the `versions/` directory.
+const VERSIONS_DIR: FileId = FileId { dev: 8, ino: 4000 };
 const A: u32 = 100;
 const A_START: u64 = 10_000;
 
@@ -35,16 +37,23 @@ struct Proc {
 /// Processes by pid.
 type Procs = BTreeMap<u32, Proc>;
 
+/// Directories by path, as `stat` reads them. A path not listed reads as a
+/// directory of its own, never F2.
+type Dirs = BTreeMap<PathBuf, Result<FileId, i32>>;
+
 /// An edit to a process table.
 type Change = fn(&mut Procs);
 
-/// A scripted process table. From the second read of the first pid it was
-/// asked about (the walk's second pass), it answers from `then` instead: a
-/// tree that changed while it was read.
+/// A scripted process table and the directories above executables. From
+/// the second read of the first pid it was asked about (the second pass),
+/// it answers from `then` and `dirs_then` instead, where set: a tree that
+/// changed while it was read.
 #[derive(Debug, Clone)]
 struct Table {
     now: Procs,
     then: Option<Procs>,
+    dirs: Dirs,
+    dirs_then: Option<Dirs>,
     first: Option<u32>,
     passes: usize,
 }
@@ -56,6 +65,8 @@ impl Table {
         let mut table = Table {
             now: BTreeMap::new(),
             then: None,
+            dirs: BTreeMap::from([(PathBuf::from(VERSIONS), Ok(VERSIONS_DIR))]),
+            dirs_then: None,
             first: None,
             passes: 0,
         };
@@ -139,6 +150,24 @@ impl ProcView for Table {
             .clone()
             .map_err(io::Error::from_raw_os_error)
     }
+
+    fn file(&mut self, path: &Path) -> io::Result<FileId> {
+        let dirs = match &self.dirs_then {
+            Some(then) if self.passes > 1 => then,
+            _ => &self.dirs,
+        };
+        match dirs.get(path) {
+            Some(read) => read.map_err(io::Error::from_raw_os_error),
+            None => Ok(FileId {
+                dev: 9,
+                ino: path
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .iter()
+                    .fold(17, |ino: u64, &byte| ino.wrapping_mul(31) ^ u64::from(byte)),
+            }),
+        }
+    }
 }
 
 fn identity() -> Identity {
@@ -147,6 +176,7 @@ fn identity() -> Identity {
         start: A_START,
         exe: CLAUDE,
         install_root: PathBuf::from(VERSIONS),
+        install_root_id: VERSIONS_DIR,
         basename: "2.1.310".into(),
     }
 }
@@ -159,26 +189,51 @@ const BASH: FileId = FileId { dev: 8, ino: 300 };
 const GIT: FileId = FileId { dev: 8, ino: 301 };
 const PYTHON: FileId = FileId { dev: 8, ino: 302 };
 
-/// Scenario: Classify the agent's own invocations on a scripted process table: the editor's parent is the agent `A` itself, a process running `A`'s executable whose link reads `(deleted)` (the running inode is still `A`'s), M24's overview chain (`claude daemon run` → `bg-pty-host` → `--session-id`, each running `A`'s executable), and a chain of exactly 8 such steps. Each is `Owned`.
+/// Scenario: Classify the agent's own invocations on a scripted process table: the editor's parent is the agent `A` itself, and `A` with its executable link reading `(deleted)` (the running inode is still `A`'s). Both are `Owned`, also when `A`'s install root has since moved, which only `A`'s descendants depend on.
 #[spec("inbox/probe/006")]
 #[test]
 fn probe_006_the_agents_own_invocations_are_owned() {
-    let mut table = Table::new();
+    let table = Table::new();
     assert_eq!(class(&table, A), Class::Owned);
 
     let path = format!("{VERSIONS}/2.1.310");
-    let session = table.chain(A, 200, 3, CLAUDE, &path);
-    assert_eq!(class(&table, session), Class::Owned);
-
-    let eighth = table.chain(A, 300, MAX_OWNED_STEPS, CLAUDE, &path);
-    assert_eq!(class(&table, eighth), Class::Owned);
-
     let mut replaced = Table::new();
     replaced.now.get_mut(&A).unwrap().path = Ok(format!("{path} (deleted)").into());
     assert_eq!(class(&replaced, A), Class::Owned);
+
+    let mut moved = Table::new();
+    moved.dirs.insert(VERSIONS.into(), Err(ENOENT));
+    assert_eq!(class(&moved, A), Class::Owned);
 }
 
-/// Scenario: The fake-tree mismatch controls: the editor's parent has `A`'s pid and start ticks but now runs another executable (after an `exec`, or a replaced binary read as `(deleted)`); a descendant runs a new binary in the install root (an auto-update's `versions/2.1.311`); a copy of the agent named `claude`, `codex` or `A`'s own basename elsewhere; a process whose executable was deleted; a chain of `A`'s executable one step past 8; and an overview-style chain with a start-time inversion. Each is `Unknown`, never a tool.
+/// Scenario: Every process on `A`'s executable other than `A` is `Unknown`, because the tree can't say how it came to run that executable: a tool's shell below `A` that `exec`ed the agent's binary (`A` → F1), the same two and three steps down (`A` → `bash` → F1 after `bash` `exec`ed it, and `A` → F1 → F1), M24's overview chain (`claude daemon run` → `bg-pty-host` → `--session-id`, each on `A`'s executable), which is the same tree, and a `git` that such a process runs, which is a tool. Before the fix each chain was `Owned`.
+#[spec("inbox/probe/006")]
+#[test]
+fn probe_006_an_agent_process_other_than_a_is_unknown() {
+    let path = format!("{VERSIONS}/2.1.310");
+    let mut table = Table::new();
+    // `bash -c 'claude …'` from a tool: bash `exec`s its one command.
+    table.spawn(201, A, A_START + 1, CLAUDE, &path);
+    assert_eq!(class(&table, 201), Class::Unknown, "a tool shell exec'd F1");
+    // The shell `exec`ed F1 after it had run a child of its own.
+    table.spawn(211, A, A_START + 1, CLAUDE, "/home/me/.local/bin/claude");
+    table.spawn(212, 211, A_START + 2, CLAUDE, &path);
+    assert_eq!(class(&table, 212), Class::Unknown, "below an exec'd shell");
+    let session = table.chain(A, 300, 3, CLAUDE, &path);
+    assert_eq!(
+        class(&table, session),
+        Class::Unknown,
+        "M24's overview chain"
+    );
+    let long = table.chain(A, 400, 8, CLAUDE, &path);
+    assert_eq!(class(&table, long), Class::Unknown, "eight steps");
+
+    table.spawn(221, 201, A_START + 2, BASH, "/usr/bin/bash");
+    table.spawn(222, 221, A_START + 3, GIT, "/usr/bin/git");
+    assert_eq!(class(&table, 222), Class::PositivelyTool);
+}
+
+/// Scenario: The fake-tree mismatch controls: the editor's parent has `A`'s pid and start ticks but now runs another executable (after an `exec`, or a replaced binary read as `(deleted)`); a descendant runs a new binary in the install root (an auto-update's `versions/2.1.311`), directly below `A` or below an overview-style chain; a copy of the agent named `claude`, `codex` or `A`'s own basename elsewhere; and a process whose executable was deleted. Each is `Unknown`, never a tool.
 #[spec("inbox/probe/006")]
 #[test]
 fn probe_006_an_executable_mismatch_is_unknown() {
@@ -219,14 +274,65 @@ fn probe_006_an_executable_mismatch_is_unknown() {
         table.spawn(pid, pid - 10, A_START + 2, other, path);
         assert_eq!(class(&table, pid), Class::Unknown, "{path}");
     }
+}
 
-    let path = format!("{VERSIONS}/2.1.310");
-    let ninth = table.chain(A, 400, MAX_OWNED_STEPS + 1, CLAUDE, &path);
-    assert_eq!(class(&table, ninth), Class::Unknown);
+/// Scenario: A family record gone stale: `A` ran from `versions/2.1.310`, then the `versions` directory was renamed `versions-moved` and an updated descendant runs `versions-moved/2.1.311` from it (a new inode, a path outside the recorded root, a basename that isn't the agent's); the same with a new, different directory made at the old path; the root reached through another path whose directory is the root's own (a bind mount); the recorded root unreadable (`EACCES`); and a directory above the editor's parent's executable that doesn't read. Each is `Unknown`, as is a `git` below `A` while the root is moved or unreadable, which is a tool again once the root reads as recorded. Before the fix the moved-root descendant was a tool.
+#[spec("inbox/probe/006")]
+#[test]
+fn probe_006_a_stale_install_root_is_unknown() {
+    let updated = FileId { dev: 8, ino: 9999 };
+    let moved_root = "/home/me/.local/share/claude/versions-moved";
+    let mut table = Table::new();
+    table.spawn(
+        201,
+        A,
+        A_START + 1,
+        updated,
+        &format!("{moved_root}/2.1.311"),
+    );
+    table.spawn(202, A, A_START + 1, GIT, "/usr/bin/git");
+    assert_eq!(class(&table, 202), Class::PositivelyTool);
 
-    let session = table.chain(A, 500, 3, CLAUDE, &path);
-    table.now.get_mut(&501).unwrap().start = A_START - 1;
-    assert_eq!(class(&table, session), Class::Unknown);
+    table.dirs.insert(VERSIONS.into(), Err(ENOENT));
+    table.dirs.insert(moved_root.into(), Ok(VERSIONS_DIR));
+    assert_eq!(class(&table, 201), Class::Unknown, "the root renamed");
+    assert_eq!(
+        class(&table, 202),
+        Class::Unknown,
+        "a tool, the root renamed"
+    );
+
+    let mut remade = table.clone();
+    remade
+        .dirs
+        .insert(VERSIONS.into(), Ok(FileId { dev: 8, ino: 4001 }));
+    assert_eq!(
+        class(&remade, 201),
+        Class::Unknown,
+        "a new root at the path"
+    );
+
+    let mut alias = Table::new();
+    alias.dirs.insert("/mnt/claude".into(), Ok(VERSIONS_DIR));
+    alias.spawn(201, A, A_START + 1, updated, "/mnt/claude/2.1.311");
+    assert_eq!(class(&alias, 201), Class::Unknown, "through a bind mount");
+
+    let mut unreadable = Table::new();
+    unreadable.spawn(202, A, A_START + 1, GIT, "/usr/bin/git");
+    unreadable.dirs.insert(VERSIONS.into(), Err(EACCES));
+    assert_eq!(
+        class(&unreadable, 202),
+        Class::Unknown,
+        "the root unreadable"
+    );
+    unreadable.dirs.insert(VERSIONS.into(), Ok(VERSIONS_DIR));
+    assert_eq!(class(&unreadable, 202), Class::PositivelyTool);
+    unreadable.dirs.insert("/usr/bin".into(), Err(EACCES));
+    assert_eq!(
+        class(&unreadable, 202),
+        Class::Unknown,
+        "/usr/bin unreadable"
+    );
 }
 
 /// Scenario: Nested agents: `A` runs `bash`, which runs another `claude` on `A`'s executable, and that one invokes the editor; the same with Python and Bash between them, as M28 measured a Bash tool starting a nested Claude on a usable PTY; and a nested Codex reached the same way. Each nested agent's invocation is `Unknown`, while a `git` run by the nested agent's own shell, outside the family and below `A`, is a tool.
@@ -297,7 +403,7 @@ fn probe_006_a_tool_needs_unbroken_ancestry_to_the_agent() {
     assert_eq!(class(&reused, A), Class::Unknown);
 }
 
-/// Scenario: What can't be read: no identity; the editor's parent whose stat, executable or executable link can't be read, or that has vanished; a process on a tool's walk whose stat fails (`ESRCH`, `EACCES`); and the tree changing between the walk's two reads (a `bash` reparented, a process gone, a start changed, or a `bash` whose executable stopped reading with `EACCES` and then reads `ENOENT`, as a zombie's does). Each is `Unknown`, while the deck's daemon above `A` being reparented between the reads leaves a tool a tool, since the walk stops at `A`. A process on a tool's walk whose executable alone can't be read still leaves the tool a tool, and the same on an overview chain makes it `Unknown`.
+/// Scenario: What can't be read: no identity; the editor's parent whose stat, executable or executable link can't be read, or that has vanished; a process on a tool's walk whose stat fails (`ESRCH`, `EACCES`); and the tree changing between the two reads (a `bash` reparented, a process gone, a start changed, the `bash` or the `git` reading another executable or another executable path, a `bash` whose executable stopped reading with `EACCES` and then reads `ENOENT`, as a zombie's does, the install root read as another directory, and a directory above the `git` read as another or no longer readable). Each is `Unknown`, while the deck's daemon above `A` being reparented between the reads leaves a tool a tool, since the walk stops at `A`. A process on a tool's walk whose executable alone can't be read still leaves the tool a tool.
 #[spec("inbox/probe/006")]
 #[test]
 fn probe_006_what_cant_be_read_is_unknown() {
@@ -329,20 +435,26 @@ fn probe_006_what_cant_be_read_is_unknown() {
     hidden.now.get_mut(&201).unwrap().exe = Err(EACCES);
     hidden.now.get_mut(&201).unwrap().path = Err(EACCES);
     assert_eq!(class(&hidden, 202), Class::PositivelyTool);
-    let path = format!("{VERSIONS}/2.1.310");
-    let session = table.chain(A, 300, 3, CLAUDE, &path);
-    assert_eq!(class(&table, session), Class::Owned);
-    let mut hidden = table.clone();
-    hidden.now.get_mut(&301).unwrap().exe = Err(EACCES);
-    assert_eq!(class(&hidden, session), Class::Unknown);
 
-    let changes: [(&str, Change); 3] = [
+    let changes: [(&str, Change); 7] = [
         ("bash reparented", |then| {
             then.get_mut(&201).unwrap().ppid = 1
         }),
         ("bash gone", |then| drop(then.remove(&201))),
         ("a start changed", |then| {
             then.get_mut(&202).unwrap().start += 1;
+        }),
+        ("bash exec'd another binary", |then| {
+            then.get_mut(&201).unwrap().exe = Ok(PYTHON);
+        }),
+        ("bash's link moved", |then| {
+            then.get_mut(&201).unwrap().path = Ok("/usr/bin/sh".into());
+        }),
+        ("git exec'd another binary", |then| {
+            then.get_mut(&202).unwrap().exe = Ok(BASH);
+        }),
+        ("git's link moved", |then| {
+            then.get_mut(&202).unwrap().path = Ok("/usr/local/bin/git".into());
         }),
     ];
     for (label, change) in changes {
@@ -367,6 +479,26 @@ fn probe_006_what_cant_be_read_is_unknown() {
     then.get_mut(&50).unwrap().ppid = 7;
     above.then = Some(then);
     assert_eq!(class(&above, 202), Class::PositivelyTool);
+
+    for (label, path, read) in [
+        (
+            "the root replaced",
+            VERSIONS,
+            Ok(FileId { dev: 8, ino: 4001 }),
+        ),
+        (
+            "/usr/bin replaced",
+            "/usr/bin",
+            Ok(FileId { dev: 8, ino: 5 }),
+        ),
+        ("/usr/bin unreadable", "/usr/bin", Err(EACCES)),
+    ] {
+        let mut changing = table.clone();
+        let mut then = changing.dirs.clone();
+        then.insert(path.into(), read);
+        changing.dirs_then = Some(then);
+        assert_eq!(class(&changing, 202), Class::Unknown, "{label}");
+    }
 }
 
 /// Scenario: Codex's layout: a Node launcher above the native `codex` binary, which is `A`, from the npm package root. The editor's parent is `A` itself (`Owned`); a descendant running a different binary from the same package root is `Unknown`; a `git` from `A`'s shell tool is a tool; and the Node launcher above `A` is `Unknown`.
@@ -380,9 +512,11 @@ fn probe_006_codex_below_its_node_launcher() {
         start: 12_000,
         exe: codex,
         install_root: PathBuf::from(root),
+        install_root_id: FileId { dev: 8, ino: 4100 },
         basename: "codex".into(),
     };
     let mut table = Table::new();
+    table.dirs.insert(root.into(), Ok(identity.install_root_id));
     table.spawn(
         110,
         50,
@@ -416,7 +550,9 @@ fn probe_006_codex_below_its_node_launcher() {
 /// Real processes, through the Linux view.
 #[cfg(target_os = "linux")]
 mod real {
+    use std::ffi::OsStr;
     use std::fs;
+    use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::MetadataExt as _;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command};
@@ -435,21 +571,42 @@ mod real {
         }
     }
 
+    fn tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .unwrap()
+    }
+
+    /// A `sleep` that runs as `sleep` under any name. uutils' multi-call
+    /// binary picks its program from its own file name, so where `/bin/sleep`
+    /// is that, GNU's copy is used; [`Copy::running`] catches a host with
+    /// neither.
+    fn sleep() -> &'static str {
+        ["/usr/bin/gnusleep", "/bin/sleep"]
+            .into_iter()
+            .find(|path| Path::new(path).exists())
+            .unwrap()
+    }
+
     /// `sleep`, copied to `name` in a fresh directory under the target
-    /// directory, started for a minute.
+    /// directory, or in a directory of the test's, started for a minute.
     struct Copy {
-        _dir: tempfile::TempDir,
+        _dir: Option<tempfile::TempDir>,
         path: PathBuf,
         child: Child,
     }
 
     impl Copy {
-        fn start(name: &str) -> Copy {
-            let dir = tempfile::Builder::new()
-                .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
-                .unwrap();
-            let path = dir.path().join(name);
-            fs::copy("/bin/sleep", &path).unwrap();
+        fn start(name: impl AsRef<OsStr>) -> Copy {
+            let dir = tempdir();
+            let mut copy = Copy::start_in(dir.path(), name);
+            copy._dir = Some(dir);
+            copy
+        }
+
+        fn start_in(dir: &Path, name: impl AsRef<OsStr>) -> Copy {
+            let path = dir.join(name.as_ref());
+            fs::copy(sleep(), &path).unwrap();
             // Another test thread forking while the copy was open for writing
             // holds it open until its child execs: `ETXTBSY` until then.
             let mut tries = 0;
@@ -463,7 +620,7 @@ mod real {
                 }
             };
             Copy {
-                _dir: dir,
+                _dir: None,
                 path,
                 child,
             }
@@ -471,6 +628,11 @@ mod real {
 
         fn pid(&self) -> u32 {
             self.child.id()
+        }
+
+        /// Whether the copy is still running, not exited and unreaped.
+        fn running(&mut self) -> bool {
+            self.child.try_wait().unwrap().is_none()
         }
     }
 
@@ -489,11 +651,12 @@ mod real {
             start: process_start_of(std::process::id()).unwrap(),
             exe: file_id(&exe),
             install_root: exe.parent().unwrap().to_owned(),
+            install_root_id: file_id(exe.parent().unwrap()),
             basename: exe.file_name().unwrap().to_owned(),
         }
     }
 
-    /// Scenario: Read real processes through the Linux view: this test process's parent, start ticks, executable and its link match what the process and its parent report; a child started from a copy of `sleep` named `a) b (c 1 2` reads this process as its parent, a start at or after this process's, and the copy's inode and path, and after the copy is deleted its link reads `(deleted)` with the same inode; once the child is reaped, its stat fails.
+    /// Scenario: Read real processes through the Linux view: this test process's parent, start ticks, executable and its link match what the process and its parent report; a child started from a copy of `sleep` named `a) b (c 1 2` reads this process as its parent, a start at or after this process's, and the copy's inode and path, and after the copy is deleted its link reads `(deleted)` with the same inode; once the child is reaped, its stat fails. A copy whose name holds a newline among parentheses and digits reads this process as its parent too, while one whose name isn't UTF-8 has a stat that doesn't read, and classifies `Unknown`. The view reads a directory's `(dev, ino)` as `stat` does.
     #[spec("inbox/probe/006")]
     #[test]
     fn probe_006_the_linux_view_reads_proc() {
@@ -524,6 +687,63 @@ mod real {
         copy.child.kill().unwrap();
         copy.child.wait().unwrap();
         assert!(view.stat(pid).is_err());
+
+        let newline = Copy::start("n\n) 4 (5\n6");
+        assert_eq!(view.stat(newline.pid()).unwrap().ppid, me);
+        let bytes = Copy::start(OsStr::from_bytes(b"x\xff) 7 8"));
+        assert!(view.stat(bytes.pid()).is_err());
+        let git = Copy::start("git");
+        let identity = self::me();
+        assert_eq!(
+            classify(&mut view, Some(&identity), git.pid()),
+            Class::PositivelyTool
+        );
+        assert_eq!(
+            classify(&mut view, Some(&identity), bytes.pid()),
+            Class::Unknown
+        );
+        let (mut newline, mut bytes, mut git) = (newline, bytes, git);
+        assert!(newline.running() && bytes.running() && git.running());
+
+        let dir = tempdir();
+        assert_eq!(view.file(dir.path()).unwrap(), file_id(dir.path()));
+        assert!(view.file(&dir.path().join("missing")).is_err());
+    }
+
+    /// Scenario: A real family record gone stale. With this test process standing in as the agent and a `versions` directory of the test's recorded as its install root, a copy of `sleep` named `2.1.311` started from that directory is `Unknown` (in the family), while a copy named `git` elsewhere is a tool. Once `versions` is renamed `versions-moved`, the `2.1.311` copy, its path now outside the recorded root, and the `git` copy are both `Unknown`. Renamed back, `git` is a tool again.
+    #[spec("inbox/probe/006")]
+    #[test]
+    fn probe_006_a_real_moved_install_root_is_unknown() {
+        let dir = tempdir();
+        let versions = dir.path().join("versions");
+        fs::create_dir(&versions).unwrap();
+        let moved = dir.path().join("versions-moved");
+        let identity = Identity {
+            install_root: versions.clone(),
+            install_root_id: file_id(&versions),
+            ..me()
+        };
+        let mut view = LinuxProcView;
+        let updated = Copy::start_in(&versions, "2.1.311");
+        let git = Copy::start("git");
+        let class =
+            |view: &mut LinuxProcView, copy: &Copy| classify(view, Some(&identity), copy.pid());
+        assert_eq!(class(&mut view, &updated), Class::Unknown);
+        assert_eq!(class(&mut view, &git), Class::PositivelyTool);
+
+        fs::rename(&versions, &moved).unwrap();
+        assert_eq!(view.exe_path(updated.pid()).unwrap(), moved.join("2.1.311"));
+        assert_eq!(class(&mut view, &updated), Class::Unknown, "the root moved");
+        assert_eq!(
+            class(&mut view, &git),
+            Class::Unknown,
+            "a tool, the root moved"
+        );
+
+        fs::rename(&moved, &versions).unwrap();
+        assert_eq!(class(&mut view, &git), Class::PositivelyTool);
+        let (mut updated, mut git) = (updated, git);
+        assert!(updated.running() && git.running());
     }
 
     /// Scenario: Classify real processes, with this test process standing in as the agent: itself is `Owned`; a child running a copy of `sleep` named `git` is a tool; a copy named `claude`, or named as this test binary, is `Unknown`; and with no identity, `Unknown`.
@@ -541,7 +761,13 @@ mod real {
         assert_eq!(classify(&mut view, None, git.pid()), Class::Unknown);
         let claude = Copy::start("claude");
         assert_eq!(classify(&mut view, Some(&me), claude.pid()), Class::Unknown);
-        let twin = Copy::start(me.basename.to_str().unwrap());
+        let mut twin = Copy::start(me.basename.to_str().unwrap());
         assert_eq!(classify(&mut view, Some(&me), twin.pid()), Class::Unknown);
+        // Each class above was of a live process, not one that had exited.
+        let mut git = git;
+        let mut claude = claude;
+        for copy in [&mut git, &mut claude, &mut twin] {
+            assert!(copy.running(), "{}", copy.path.display());
+        }
     }
 }

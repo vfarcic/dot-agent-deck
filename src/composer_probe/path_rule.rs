@@ -272,13 +272,19 @@ enum AclAt {
 /// owning group's effective rights are capped by the mask, which is read
 /// here.
 ///
-/// `None`, which refuses, unless the value is a whole ACL as the kernel
-/// validates one: the version-2 header and whole entries after it; one owner
-/// entry first, then named users, one owning-group entry, named groups, a
-/// mask (required when there is a named entry, and at most one) and one
-/// other entry last; no tag outside those six; permissions within read,
-/// write and execute; an id on each named entry and on no other; and no
-/// named user or group twice. That makes the value's length its entry count.
+/// `None`, which refuses, unless the value is a whole, well-formed ACL: the
+/// version-2 header and whole entries after it; one owner entry first, then
+/// named users, one owning-group entry, named groups, a mask (required when
+/// there is a named entry, and at most one) and one other entry last; no tag
+/// outside those six; permissions within read, write and execute; an id on
+/// each named entry and on no other; and no named user or group twice. That
+/// makes the value's length its entry count. The tag order, the mask rule
+/// and the permission check follow Linux's `posix_acl_valid`; the header and
+/// framing are `posix_acl_from_xattr`'s. Two checks are stricter than the
+/// kernel's: a named user or group twice, and an id on an entry that isn't
+/// named, both refuse here. Named ids out of order are accepted, as the
+/// kernel accepts them; grants are read from every entry, so order can't
+/// hide one.
 pub fn acl_grants(value: &[u8]) -> Option<AclGrants> {
     let (header, entries) = value.split_first_chunk::<4>()?;
     if u32::from_le_bytes(*header) != ACL_XATTR_VERSION || !entries.len().is_multiple_of(8) {
