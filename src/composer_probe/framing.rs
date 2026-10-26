@@ -26,17 +26,21 @@
 //!   is malformed: it returns to ground at its final byte, dispatching
 //!   nothing ([`Event::MalformedCsi`]).
 //! - Any other C0 control (and DEL) inside a CSI or a string is reported
-//!   ([`Event::Inside`]) and doesn't end it, as a terminal executes it in
-//!   place. Inside an SS3 or X10 prefix any C0 control, BEL and ESC
-//!   included, ends the prefix, which was never a sequence, and is read
-//!   afresh in ground.
+//!   ([`Event::Inside`]) and doesn't end it: the tokenizer's rule, chosen
+//!   because staying inside is the conservative direction for the boundary,
+//!   not a claim that it reads every control as a given terminal does. Inside
+//!   an SS3 or X10 prefix any C0 control, BEL and ESC included, ends the
+//!   prefix, which was never a sequence, and is read afresh in ground.
 //! - A string's length is unbounded; only the first [`MAX_SEQUENCE_BYTES`]
 //!   of its payload are kept, for classifying a reply. Staying in a string is
 //!   the conservative direction: the stream isn't at a boundary, so no deck
 //!   line starts there (core §4.8), which costs availability only.
 //!
 //! **Bracketed paste** opens at `ESC [ 200 ~` and closes at `ESC [ 201 ~`,
-//! exactly those bytes. Inside a paste every sequence is still tokenized,
+//! exactly those bytes, as a bracketed-paste reader waiting for the literal
+//! marker sees them: a marker with a control or DEL anywhere between its
+//! `ESC [` and its `~` is not one, although the CSI it spells is otherwise
+//! read as usual. Inside a paste every sequence is still tokenized,
 //! so the closing marker is found even after an abandoned sequence, and
 //! every token says it was inside a paste ([`Token::in_paste`]): the agent
 //! reads a paste as text only while its own bracketed-paste mode is on, which
@@ -83,6 +87,10 @@ pub struct Framing {
     private: Option<u8>,
     /// Whether the CSI being read has had any byte after `ESC [`.
     started: bool,
+    /// Every byte of the CSI since `ESC [` was kept as its private marker,
+    /// a parameter or an intermediate: no control or DEL came between. Only
+    /// such a CSI can be a paste marker, whose bytes are exact.
+    literal: bool,
     /// The CSI is malformed, or the string's payload overflowed `buf`.
     malformed: bool,
 }
@@ -97,6 +105,7 @@ impl Default for Framing {
             params_len: 0,
             private: None,
             started: false,
+            literal: false,
             malformed: false,
         }
     }
@@ -163,7 +172,7 @@ pub enum Event<'a> {
     Escape(u8),
     /// An SS3 key: `ESC O` and its final byte.
     Ss3(u8),
-    /// A complete, well-formed CSI sequence, paste markers excepted.
+    /// A complete, well-formed CSI sequence, exact paste markers excepted.
     Csi(Csi<'a>),
     /// A CSI sequence that reached its final byte malformed.
     MalformedCsi {
@@ -180,9 +189,9 @@ pub enum Event<'a> {
     /// opened another, a control that ended an SS3 or X10 prefix, or a lone
     /// ESC followed by another ESC (the Escape key). Its bytes were input.
     Abandoned,
-    /// `ESC [ 200 ~` outside a paste.
+    /// `ESC [ 200 ~`, exactly those bytes, outside a paste.
     PasteStart,
-    /// `ESC [ 201 ~` inside a paste.
+    /// `ESC [ 201 ~`, exactly those bytes, inside a paste.
     PasteEnd,
 }
 
@@ -362,6 +371,7 @@ impl Framing {
                 self.params_len = 0;
                 self.private = None;
                 self.started = false;
+                self.literal = true;
                 self.malformed = false;
                 State::Csi
             }
@@ -417,7 +427,10 @@ impl Framing {
                 self.state = State::Ground;
                 self.dispatch_csi(byte, emit);
             }
-            BEL => emit(self.token(Event::Bel(BelAt::Sequence))),
+            BEL => {
+                self.literal = false;
+                emit(self.token(Event::Bel(BelAt::Sequence)));
+            }
             CAN | SUB => {
                 emit(self.token(Event::Abandoned));
                 self.state = State::Ground;
@@ -426,7 +439,10 @@ impl Framing {
                 emit(self.token(Event::Abandoned));
                 self.state = State::Esc;
             }
-            0x00..=0x1f | DEL => emit(self.token(Event::Inside(byte))),
+            0x00..=0x1f | DEL => {
+                self.literal = false;
+                emit(self.token(Event::Inside(byte)));
+            }
             _ => self.malformed = true,
         }
     }
@@ -453,10 +469,11 @@ impl Framing {
         let params = &self.buf[..self.params_len];
         let intermediates = &self.buf[self.params_len..self.len];
         let plain = self.private.is_none() && intermediates.is_empty();
-        if plain && final_byte == b'~' && params == b"200" && !self.paste {
+        let marker = plain && self.literal && final_byte == b'~';
+        if marker && params == b"200" && !self.paste {
             emit(self.token(Event::PasteStart));
             self.paste = true;
-        } else if plain && final_byte == b'~' && params == b"201" && self.paste {
+        } else if marker && params == b"201" && self.paste {
             emit(self.token(Event::PasteEnd));
             self.paste = false;
         } else if plain && final_byte == b'M' && params.is_empty() {

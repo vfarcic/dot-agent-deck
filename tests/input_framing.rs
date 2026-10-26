@@ -181,7 +181,7 @@ fn candidate_cases() -> Vec<(Vec<u8>, CandidateForm)> {
     cases
 }
 
-/// Scenario: Feed every Ctrl+G form the deck must treat as a candidate (BEL, Alt+Ctrl+G, every CSI-u and modifyOtherKeys spelling of Ctrl+G with any modifiers and event type, a BEL inside a sequence or string, and a malformed key sequence) into a fresh tokenizer. Each is found exactly once, as its own form, at its last byte, and the stream is back at a boundary afterwards.
+/// Scenario: Feed every Ctrl+G form the deck must treat as a candidate (BEL, Alt+Ctrl+G, every CSI-u and modifyOtherKeys spelling of Ctrl+G with any modifiers and event type, a BEL inside a sequence or string, and a malformed key sequence) into a fresh tokenizer. Each is found exactly once, as its own form, at its last byte; afterwards the stream is back at a boundary, except after a BEL inside an unfinished sequence or string, which goes on.
 #[spec("inbox/probe/003")]
 #[test]
 fn probe_003_every_candidate_form_is_found_once_at_its_last_byte() {
@@ -270,7 +270,7 @@ fn probe_003_splits_across_writes_change_nothing() {
     assert_eq!(out, whole);
 }
 
-/// Scenario: Open a bracketed paste and put each Ctrl+G form inside it, including after an OSC and a CSI left unfinished in the paste. Every form is still a candidate, marked as inside the paste, and the paste closes only at its exact closing marker.
+/// Scenario: Open a bracketed paste and put each Ctrl+G form inside it, including after an OSC and a CSI left unfinished in the paste. Every form is still a candidate, marked as inside the paste, and the paste closes at the exact closing marker, while an opening marker or a private-marked, longer or extra-parameter closing marker inside it does not close it.
 #[spec("inbox/probe/003")]
 #[test]
 fn probe_003_candidates_inside_a_paste_are_found_and_marked() {
@@ -330,6 +330,145 @@ fn probe_003_candidates_inside_a_paste_are_found_and_marked() {
             ..
         }]
     ));
+}
+
+/// The tokens of `stream` fed in two writes cut at every offset, the state
+/// cloned at the cut, each equal to the tokens of one write.
+fn assert_split_invariant(stream: &[u8]) {
+    let whole = tokens(stream);
+    for cut in 0..=stream.len() {
+        let mut framing = Framing::default();
+        let mut out = Vec::new();
+        feed_into(&mut framing, &stream[..cut], 0, &mut out);
+        let mut next = framing.clone();
+        feed_into(&mut next, &stream[cut..], cut, &mut out);
+        assert_eq!(out, whole, "{stream:?} cut at {cut}");
+    }
+}
+
+fn state_after(bytes: &[u8]) -> Framing {
+    let mut framing = Framing::default();
+    for &b in bytes {
+        framing.feed(b, |_| {});
+    }
+    framing
+}
+
+/// `marker` with `controls` inserted before its byte at `at`: every
+/// spelling of a marker with one control or DEL anywhere in it, and before
+/// and after it.
+fn polluted_markers(marker: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    for control in (0x00..=0x1fu8).chain([0x7f]) {
+        for at in 0..=marker.len() {
+            let mut polluted = marker[..at].to_vec();
+            polluted.push(control);
+            polluted.extend_from_slice(&marker[at..]);
+            out.push(polluted);
+        }
+    }
+    // Two controls at once, and the two reviewers' spellings.
+    out.push(b"\x1b[2\x000\x7f1~".to_vec());
+    out.push(b"\x1b[\r\n201~".to_vec());
+    out.push(b"\x1b[20\r1~".to_vec());
+    out.push(b"\x1b[20\x001~".to_vec());
+    out.push(b"\x1b[2\x000\x7f0~".to_vec());
+    out.push(b"\x1b[20\r0~".to_vec());
+    out.push(b"\x1b[20\x000~".to_vec());
+    out
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Scenario: Open a paste, then send its closing marker with a control byte or DEL inserted at every position, each of the 32 C0 controls and DEL in turn; then an opening marker spelled the same ways. A spelling that no longer contains the exact marker bytes neither closes nor opens a paste: Enter, Ctrl+U, a BEL and a focus report after it are still read as pasted text, and only a later exact marker changes that. Each stream is also fed split at every offset with the state cloned, with the same result.
+#[spec("inbox/probe/003")]
+#[test]
+fn probe_003_a_marker_with_a_control_in_it_is_no_marker() {
+    const OPEN: &[u8] = b"\x1b[200~";
+    const CLOSE: &[u8] = b"\x1b[201~";
+    // After the marker: Enter, Ctrl+U, Ctrl+G and a focus report.
+    const AFTER: &[u8] = b"\r\x15\x07";
+    const FOCUS: &[u8] = b"\x1b[I";
+
+    for polluted in polluted_markers(CLOSE) {
+        let head = [OPEN, b"text", &polluted].concat();
+        // The oracle: a bracketed-paste reader closes the paste at the
+        // literal marker bytes, and nowhere else.
+        let closes = contains(&polluted, CLOSE);
+        let state = state_after(&head);
+        if !closes {
+            assert!(!state.at_ground(), "{polluted:?}");
+            assert_eq!(whole_report(&state, FOCUS), None, "{polluted:?}");
+        }
+
+        let mut stream = [&head[..], AFTER, FOCUS].concat();
+        let after = head.len();
+        stream.extend_from_slice(CLOSE);
+        let close_at = stream.len() - 1;
+        stream.push(b'\r');
+        let found = tokens(&stream);
+
+        let ends: Vec<usize> = found
+            .iter()
+            .filter(|t| t.seen == Seen::PasteEnd)
+            .map(|t| t.at)
+            .collect();
+        if closes {
+            assert_eq!(ends.len(), 1, "{polluted:?}");
+            assert!(ends[0] < after, "{polluted:?}");
+        } else {
+            assert_eq!(ends, vec![close_at], "{polluted:?}");
+            // Until the exact marker, everything after the polluted one is
+            // pasted: no edit, and the BEL a pasted candidate.
+            let inside: Vec<&Tok> = found.iter().filter(|t| t.at >= after).collect();
+            assert!(inside.iter().all(|t| t.at > close_at || t.in_paste));
+            assert!(
+                inside
+                    .iter()
+                    .filter(|t| t.at < close_at)
+                    .all(|t| t.edit.is_none()),
+                "{polluted:?}"
+            );
+            assert!(
+                inside
+                    .iter()
+                    .any(|t| t.at == after + 2 && t.candidate == Some(pasted(CandidateForm::Bel)))
+            );
+        }
+        // The Enter after the exact closing marker submits, from ground.
+        assert_eq!(found.last().unwrap().edit, Some(Edit::Submit));
+        assert!(at_ground_after(&stream), "{polluted:?}");
+        assert_split_invariant(&stream);
+    }
+
+    for polluted in polluted_markers(OPEN) {
+        let head = [&b"typed"[..], &polluted].concat();
+        let opens = contains(&polluted, OPEN);
+        let mut stream = [&head[..], b"\r"].concat();
+        let enter = stream.len() - 1;
+        let found = tokens(&stream);
+        let starts = found.iter().filter(|t| t.seen == Seen::PasteStart).count();
+        assert_eq!(starts, usize::from(opens), "{polluted:?}");
+        let edit = found.iter().find(|t| t.at == enter).unwrap().edit;
+        if opens {
+            assert_eq!(edit, None, "{polluted:?}");
+            assert!(!at_ground_after(&stream));
+        } else {
+            assert_eq!(edit, Some(Edit::Submit), "{polluted:?}");
+            assert!(at_ground_after(&stream), "{polluted:?}");
+            assert_eq!(
+                whole_report(&state_after(&head), FOCUS),
+                Some(Report::FocusIn)
+            );
+        }
+        stream.extend_from_slice(OPEN);
+        stream.extend_from_slice(b"x\x07");
+        stream.extend_from_slice(CLOSE);
+        assert!(at_ground_after(&stream), "{polluted:?}");
+        assert_split_invariant(&stream);
+    }
 }
 
 /// Scenario: Start a sequence or string and abandon it with CAN, SUB, a new ESC or a control byte, with a Ctrl+G form around it; then send a sequence longer than the parameter cap. Nothing abandoned dispatches as a key, the bytes that follow are read afresh from ground, and the overlong sequence returns to ground at its final byte.
