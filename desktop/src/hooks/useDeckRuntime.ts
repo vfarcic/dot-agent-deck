@@ -4,7 +4,7 @@ import { createDeckBridge, selectRuntimeMode } from "../lib/bridge";
 import type { DesktopSettingsDto, EndpointSettingsDto, RemoteEndpointDto, VoiceDictationTargetDto, VoiceDirectoriesDto, VoiceReadingStateDto, VoiceNewAgentDto, VoiceResolvedParamDto, VoiceScreen, VoiceSecretId } from "../lib/bridge";
 import type { ReadingSentenceDto, ReadingTarget } from "../lib/reading";
 import { voiceDeckStep } from "../lib/newAgent";
-import { boundAgentKey } from "../lib/agentKey";
+import { agentKey, boundAgentKey } from "../lib/agentKey";
 import { LaunchCleanupError } from "../lib/actionError";
 import { applyTerminalChunk } from "../lib/terminalBuffer";
 import { deckName } from "../lib/displayText";
@@ -56,6 +56,25 @@ function seedSnapshot(mode: RuntimeMode): DeckSnapshot {
     ...initial,
     connection: { status: "loading", message: "Loading deterministic fixture…" },
   };
+}
+
+/**
+ * Issue #1845 — whether a `boundAgentKey` names an agent that a CONNECTED deck
+ * in `fleet` no longer lists: one it closed, or one of a process it restarted
+ * away from. Keys of a deck that is not connected, or not in the fleet at all,
+ * are never retired here. Matched by the deck's `agentKey` prefix rather than
+ * by splitting the key, which `NUL` makes unambiguous.
+ */
+function retiredAgentKeys(fleet: DeckFleet): (key: string) => boolean {
+  const listed = new Set<string>();
+  const decks: string[] = [];
+  for (const deck of fleet) {
+    const deckId = deck.connection.deckId;
+    if (deck.connection.status !== "connected" || deckId === undefined) continue;
+    decks.push(agentKey(deckId, ""));
+    for (const agent of deck.agents) listed.add(boundAgentKey({ deckId, agentId: agent.id, incarnation: agent.incarnation }));
+  }
+  return (key) => !listed.has(key) && decks.some((prefix) => key.startsWith(prefix));
 }
 
 export function useDeckRuntime(): DeckRuntimeState {
@@ -148,7 +167,12 @@ export function useDeckRuntime(): DeckRuntimeState {
       const listeners = terminalListenersRef.current.get(key) ?? new Set();
       listeners.add(listener);
       terminalListenersRef.current.set(key, listeners);
-      return () => { listeners.delete(listener); };
+      return () => {
+        listeners.delete(listener);
+        // The last terminal on an agent leaving takes the agent's empty set
+        // with it (issue #1845), unless a newer subscription already replaced it.
+        if (!listeners.size && terminalListenersRef.current.get(key) === listeners) terminalListenersRef.current.delete(key);
+      };
     },
   }), []);
 
@@ -417,6 +441,24 @@ export function useDeckRuntime(): DeckRuntimeState {
       });
     });
   }, [bridge]);
+
+  // Issue #1845: the buffers and grids above are kept per agent and per daemon
+  // process, and nothing else removes one — so every agent a deck closed, and
+  // every agent of a process the deck restarted away from, held up to a
+  // megabyte of output until the window reloaded. Forget an agent once a deck
+  // that is connected stops listing it. A deck that is not answering lists
+  // nobody and vouches for nothing, so its agents are kept until it answers.
+  useEffect(() => {
+    const retired = retiredAgentKeys(fleet);
+    for (const key of Object.keys(terminalBuffersRef.current)) {
+      if (retired(key)) delete terminalBuffersRef.current[key];
+    }
+    setAppliedGeometry((current) => {
+      const entries = Object.entries(current);
+      const kept = entries.filter(([key]) => !retired(key));
+      return kept.length === entries.length ? current : Object.fromEntries(kept);
+    });
+  }, [fleet]);
 
   // Issue #1198: the app's experimental surfaces, asked ONCE per bridge. The
   // flag is a presentation switch read at startup — changing it means
