@@ -3212,6 +3212,20 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** the laptop side choosing stdin over `--confirm-hex` or the ssh transport (`remote_daemon` unit tests own those); a remote whose ssh client drops stdin.
 - **Platform coverage:** linux+mac.
 
+##### lifecycle/wire-restart/010 — The desktop's local Replace hands a supervised daemon back to its service instead of stopping it (issue #1760).
+- **Layer:** L2 (lane 1, a real headless daemon under a stand-in for the `daemon install` service: a shell loop with systemd's `Restart=on-failure` semantics that sets `INVOCATION_ID` and `SYSTEMD_EXEC_PID`; the shared `upgrade_daemon` with the desktop's `WireDaemonPort` and `NoInstall`, its spawn a stand-in for `spawn_local_daemon`).
+- **Agent:** none.
+- **Asserts:** the Replace reports `Restarted`; the stand-in service is still running; the old daemon exited with `SUPERVISED_RESTART_EXIT`; the daemon listening at the endpoint is the new one the service started; the client started no daemon of its own. Control (same id): the remote upgrade's `Installed` restart sent straight to the same supervised daemon hands back the same way without the fix, so the stand-in and the daemon's detection of it are not what the main case catches.
+- **Does not assert:** real systemd or launchd (verified by hand against a transient `systemd-run --user` unit with `Restart=on-failure` on 2026-10-26); the fallback when the service's build is another version (`daemon_upgrade` unit test `a_supervised_daemon_is_handed_back_to_its_service_unless_it_refuses`); the desktop's UI.
+- **Platform coverage:** linux+mac.
+
+##### lifecycle/wire-restart/011 — The TUI's launch-time version check hands a supervised daemon of an older build back to its service (issue #1760).
+- **Layer:** L2 (lane 1, the real TUI in a PTY against a real headless daemon under the same stand-in service as 010, whose first run reports an older build id).
+- **Agent:** none.
+- **Asserts:** the dashboard appears; the stand-in service is still running; the old daemon exited with `SUPERVISED_RESTART_EXIT`; the daemon listening at the endpoint is the new one the service started, and it reports this build.
+- **Does not assert:** the consented restart with live agents; a service whose build is another version, which the TUI stops as before; real systemd (verified by hand as for 010).
+- **Platform coverage:** linux+mac.
+
 
 #### lifecycle/wire-stop
 

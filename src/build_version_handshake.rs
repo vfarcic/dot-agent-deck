@@ -297,7 +297,7 @@ pub async fn ensure_compatible_daemon_or_die(
                 daemon_build = ?daemon_build,
                 "local daemon build_version handshake: mismatch, no agents — silent restart"
             );
-            return terminate_and_recover(&probe, endpoint).await;
+            return terminate_and_recover(&probe, endpoint, false).await;
         }
         MismatchAction::AgentsPresent { names } => names,
     };
@@ -389,7 +389,7 @@ pub async fn ensure_compatible_daemon_or_die(
         (InteractiveDecision::Decline, ProtocolCheck::Skewed { daemon }) => {
             Err(refuse_protocol(daemon))
         }
-        (InteractiveDecision::Restart, _) => terminate_and_recover(&probe, endpoint).await,
+        (InteractiveDecision::Restart, _) => terminate_and_recover(&probe, endpoint, true).await,
     }
 }
 
@@ -487,11 +487,54 @@ fn decide_mismatch_action(
 /// SIGTERM the probed daemon and report [`HandshakeOutcome::Recovered`] so
 /// the caller re-runs `ensure_external_daemon_or_die` to lazy-spawn a fresh
 /// daemon at the current build. Shared by the silent no-agents restart (a)
-/// and the consented restart (b).
+/// and the consented restart (b); `consented` is (b), where the user agreed to
+/// stop the daemon's agents.
+///
+/// Issue #1760: a daemon a service manager runs is first handed back to its
+/// service ([`hand_back_to_service`]), since a SIGTERM is a clean stop and the
+/// service would stay stopped while this TUI's own daemon ran unsupervised.
 async fn terminate_and_recover(
     probe: &ProbeOutcome,
     endpoint: &LocalEndpoint,
+    consented: bool,
 ) -> Result<HandshakeOutcome, HandshakeError> {
+    if probe.response.supervised {
+        match hand_back_to_service(endpoint, &probe.response, consented).await {
+            HandBack::Recovered => return Ok(HandshakeOutcome::Recovered),
+            HandBack::OtherBuild => {
+                // The caller attaches without checking the build again, so the
+                // service's daemon of another build is stopped the way the old
+                // one would have been, and this TUI starts its own as before.
+                // Decided and signalled through one connection, so the process
+                // stopped is the one that just reported another build.
+                match probe_daemon(endpoint.path()).await {
+                    Ok(fresh)
+                        if fresh.response.build_version.as_deref()
+                            != Some(local_build_id().as_str()) =>
+                    {
+                        terminate_daemon_graceful(
+                            fresh.peer_pid,
+                            endpoint,
+                            TERMINATE_POLL_TIMEOUT,
+                            None,
+                        )
+                        .await?;
+                    }
+                    // This build answers now.
+                    Ok(_) => {}
+                    // Nothing listens: the caller starts this build.
+                    Err(HandshakeError::Probe(e))
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                        ) => {}
+                    Err(e) => return Err(e),
+                }
+                return Ok(HandshakeOutcome::Recovered);
+            }
+            HandBack::Declined => {}
+        }
+    }
     // PRD #103 PID-reuse mitigation: re-resolve `peer_pid()` on the SAME
     // `UnixStream` we kept open across the (possible) interactive prompt.
     // Holding the stream open prevents the kernel from tearing down the
@@ -531,6 +574,111 @@ async fn terminate_and_recover(
     // Recovered.
     terminate_daemon_graceful(resolved_pid, endpoint, TERMINATE_POLL_TIMEOUT, None).await?;
     Ok(HandshakeOutcome::Recovered)
+}
+
+/// How long [`hand_back_to_service`] waits for the service to start its daemon
+/// again: the upgrade's own wait for a successor
+/// ([`crate::daemon_upgrade::VERIFY_TIMEOUT`]).
+const HAND_BACK_TIMEOUT: Duration = crate::daemon_upgrade::VERIFY_TIMEOUT;
+
+/// How [`hand_back_to_service`] ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HandBack {
+    /// The service runs a daemon of this build, or nothing answers any more
+    /// and the caller starts this build.
+    Recovered,
+    /// The service runs a daemon of another build.
+    OtherBuild,
+    /// The daemon that was probed is still the one running: it refused,
+    /// predates the request, or named live work no one agreed to stop.
+    Declined,
+}
+
+/// Issue #1760: ask a supervised daemon to restart onto the build installed at
+/// its own path, which it does by exiting with a failure status for its service
+/// manager to start that build again — the remote upgrade's restart
+/// (`RestartSuccessor::Installed`). The daemon refuses unless that build reports
+/// this TUI's version. It names any live work and stops it only when the same
+/// set comes back confirmed, which is sent only when the user `consented`.
+async fn hand_back_to_service(
+    endpoint: &LocalEndpoint,
+    old: &AttachResponse,
+    consented: bool,
+) -> HandBack {
+    use crate::daemon_client::{ClientError, GatedQuery, RestartDaemonRequest};
+    use crate::daemon_protocol::{RestartDaemonReply, RestartSuccessor};
+    // Without the daemon's identity its successor cannot be told from it.
+    if old.instance_id.is_none() {
+        return HandBack::Declined;
+    }
+    let client = DaemonClient::new(endpoint.path().to_path_buf());
+    let mut confirm = None;
+    for _ in 0..2 {
+        let request = RestartDaemonRequest {
+            confirm: confirm.take(),
+            expected_version: Some(crate::daemon_upgrade::CLIENT_VERSION.to_string()),
+            successor: RestartSuccessor::Installed,
+        };
+        match client.restart_daemon(request).await {
+            // An unread reply may still have been acted on; the wait says.
+            Ok(GatedQuery::Answered(RestartDaemonReply::Accepted { .. }))
+            | Err(ClientError::Unanswered(_)) => return wait_for_service(&client, old).await,
+            Ok(GatedQuery::Answered(RestartDaemonReply::NeedsConfirmation {
+                at_stake, ..
+            })) if consented && confirm.is_none() => confirm = Some(at_stake),
+            other => {
+                tracing::debug!(
+                    target: "build_version_handshake",
+                    answer = ?other,
+                    "the supervised daemon was not handed back to its service; stopping it instead"
+                );
+                return HandBack::Declined;
+            }
+        }
+    }
+    HandBack::Declined
+}
+
+/// Wait for a daemon other than `old` to answer, up to [`HAND_BACK_TIMEOUT`].
+async fn wait_for_service(client: &DaemonClient, old: &AttachResponse) -> HandBack {
+    let deadline = Instant::now() + HAND_BACK_TIMEOUT;
+    let mut old_answering = true;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(1), client.probe_running()).await {
+            Ok(Ok(Some(hello))) if hello.instance_id != old.instance_id => {
+                return if hello.build_version.as_deref() == Some(local_build_id().as_str()) {
+                    HandBack::Recovered
+                } else {
+                    tracing::warn!(
+                        target: "build_version_handshake",
+                        service_build = ?hello.build_version,
+                        "the service restarted its daemon on another build; stopping it so this \
+                         build runs"
+                    );
+                    HandBack::OtherBuild
+                };
+            }
+            Ok(Ok(Some(_))) => old_answering = true,
+            Ok(Ok(None)) => old_answering = false,
+            // A probe that learned nothing is neither an answer nor a gap.
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    tracing::warn!(
+        target: "build_version_handshake",
+        old_answering,
+        "the service did not start its daemon again within {}s",
+        HAND_BACK_TIMEOUT.as_secs()
+    );
+    if old_answering {
+        HandBack::Declined
+    } else {
+        HandBack::Recovered
+    }
 }
 
 struct ProbeOutcome {
