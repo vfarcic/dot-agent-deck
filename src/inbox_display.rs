@@ -128,9 +128,12 @@ pub enum PaneTermination {
     /// the command the deck started there had not exited, as far as the deck
     /// could tell in time.
     ConnectionEnded { read_end: String },
-    /// The generation was removed and a successor holds its pane.
+    /// The generation was removed by a respawn that published a successor in
+    /// its pane. A record of that publication, not of the pane now: the
+    /// successor may since have exited or been closed.
     Replaced,
-    /// The generation was removed and nothing holds its pane.
+    /// The generation was removed by an explicit close or the deck's
+    /// shutdown. A record of that removal, not of the pane now.
     Closed,
     /// The pane ended and the deck cannot say how: a respawn removed the
     /// generation without a successor confirmed, or a newer deck names a

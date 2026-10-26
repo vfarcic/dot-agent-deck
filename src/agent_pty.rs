@@ -2558,7 +2558,7 @@ pub enum Termination {
     /// The output stream ended and the child had not exited by the bound.
     ConnectionEnded { read_end: ReadEnd },
     /// The generation was removed by a respawn that published its successor
-    /// in the pane.
+    /// in the pane, whatever became of the successor since.
     Replaced,
     /// The generation was removed by a close or the deck's shutdown.
     Closed,

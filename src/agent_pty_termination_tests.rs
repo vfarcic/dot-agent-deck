@@ -386,7 +386,7 @@ fn status_032_a_replacement_counts_only_once_its_successor_is_published() {
     registry.shutdown_all();
 }
 
-/// Scenario: A respawn fails, and its removed generation's reader is delayed while a hundred later respawns in other panes fail too. When the delayed reader finally captures, it must still say the replacement failed, never that the pane was closed.
+/// Scenario: A respawn fails, and its removed generation's reader is delayed while a hundred later respawns in other panes fail too, none of their readers capturing yet. When the delayed reader finally captures, it must still say the replacement failed, never that the pane was closed, and so must each later one when it captures after it.
 #[spec("inbox/status/032")]
 #[test]
 fn status_032_a_delayed_reader_keeps_its_failed_respawn_however_many_follow() {
@@ -394,21 +394,39 @@ fn status_032_a_delayed_reader_keeps_its_failed_respawn_however_many_follow() {
     let delayed = spawn_on(&registry, "termination-delayed-pane", "sleep 30");
     let (ticket, mut delayed_lifted) = lift_for_respawn(&registry, &delayed);
     drop(ticket);
+    // Every later failure stays uncaptured until the delayed one is read:
+    // their children keep running, so their own readers do not end and
+    // capture first.
+    let mut later = Vec::new();
     for n in 0..100 {
-        let agent = spawn_on(&registry, &format!("termination-later-{n}"), "true");
-        let (ticket, mut lifted) = lift_for_respawn(&registry, &agent);
+        let agent = spawn_on(&registry, &format!("termination-later-{n}"), "sleep 30");
+        let (ticket, lifted) = lift_for_respawn(&registry, &agent);
         drop(ticket);
-        assert_eq!(
-            capture_now(&registry, &agent, &lifted),
-            Termination::ReplacementFailed
-        );
-        let _ = lifted.child.kill();
+        later.push((agent, lifted));
     }
     let termination = capture_now(&registry, &delayed, &delayed_lifted);
     assert_eq!(termination, Termination::ReplacementFailed);
     assert_eq!(termination.wire(), PaneTermination::Unknown);
     let _ = delayed_lifted.child.kill();
+    for (agent, mut lifted) in later {
+        assert_eq!(
+            capture_now(&registry, &agent, &lifted),
+            Termination::ReplacementFailed,
+            "{agent}"
+        );
+        let _ = lifted.child.kill();
+    }
     registry.shutdown_all();
+}
+
+/// Scenario: The deck shuts down gracefully with a generation still running in its pane. The capture must say the pane was closed.
+#[spec("inbox/status/032")]
+#[test]
+fn status_032_a_graceful_shutdown_closes_what_it_drains() {
+    let registry = Arc::new(AgentPtyRegistry::new());
+    let agent = spawn_on(&registry, "termination-graceful-pane", "sleep 30");
+    registry.shutdown_all_graceful(Duration::from_millis(500));
+    assert_eq!(captured(&registry, &agent), Termination::Closed);
 }
 
 /// Scenario: A respawn publishes a successor that exits straight away, before the respawn returns and before the removed generation's reader captures. The removed generation must still read as replaced, not closed or failed.

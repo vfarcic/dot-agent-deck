@@ -153,7 +153,7 @@ fn fault_of(case: &str) -> Fault {
     }
 }
 
-/// Scenario: A respawn's in-flight ticket drops during an unwind, once with the registry lock poisoned and once with a higher rank held. The child is not aborted: poisoned, the ticket still settles its respawn (recovering, as it always has); with the rank held, it skips.
+/// Scenario: A respawn's in-flight ticket drops during an unwind, once with the registry lock poisoned and once with a higher rank held. The child is not aborted: poisoned, the ticket still settles its respawn (recovering, as it always has); with the rank held, it skips. Either way the removed generation's evidence records the replacement as failed, since that is written before the lock.
 #[spec("orchestration/work-done/056")]
 #[test]
 fn work_done_056_respawn_ticket_drop_survives_an_unwind() {
@@ -161,6 +161,8 @@ fn work_done_056_respawn_ticket_drop_survives_an_unwind() {
         return outer("work_done_056_respawn_ticket_drop_survives_an_unwind");
     };
     let fault = fault_of(&case);
+    let removal = Arc::new(RemovalEvidence::default());
+    removal.respawning();
     let registry = unwind_through(
         fault,
         |registry| {
@@ -168,7 +170,7 @@ fn work_done_056_respawn_ticket_drop_survives_an_unwind() {
             RespawnTicket {
                 registry: Arc::as_ref(registry),
                 agent_id: "unwind-agent".into(),
-                removal: Arc::default(),
+                removal: Arc::clone(&removal),
             }
         },
         poison_registry,
@@ -178,6 +180,11 @@ fn work_done_056_respawn_ticket_drop_survives_an_unwind() {
         Fault::Poisoned => assert_eq!(in_flight, 0, "recovered and settled"),
         Fault::RankHeld => assert_eq!(in_flight, 1, "skipped"),
     }
+    assert_eq!(
+        removal.get(),
+        Some(Removal::ReplacementFailed),
+        "the failure is recorded whether or not the lock was taken"
+    );
 }
 
 /// Scenario: A commission-dispatch guard drops during an unwind with the delegation tracker poisoned (where it used to panic) or a higher rank held. The child survives, and the guard skipped: its in-flight entry is left.
