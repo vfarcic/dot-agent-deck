@@ -6813,6 +6813,20 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** that Codex asks the user to re-trust the deck's hooks once the set changes, which is inferred from its trust model and not run here; scoped trust of the new rule (`codex_hooks_safety`).
 - **Platform coverage:** mac+linux.
 
+##### codex/hooks/014 — A `codex app-server` that never answers `hooks/list` does not hold the daemon's socket bind (issue #1665).
+- **Layer:** L2 (`tests/e2e_codex_startup_trust.rs`: the REAL binary as a `daemon serve` subprocess against an isolated `HOME`, `CODEX_HOME` and sockets; no PTY, no TUI, no LLM).
+- **Agent:** none (a `codex` stand-in first on `PATH` whose `app-server` reads every request and answers none).
+- **Asserts:** the daemon binds its attach socket with `hooks.json` already installed; the log holds no trust-write failure at that point, and `daemon serve: pre-bind work done` precedes the `could not record scoped hook trust` line the trust write logs once the 5 s listing bound runs out. RED before the fix: the timeout line came first, because the trust write ran before the bind.
+- **Does not assert:** the TUI's startup, which runs the same installer (`auto_install_and_trust_at_startup`); a wall-clock bind time, which load would make flaky; why a real Codex does not answer under the harness.
+- **Platform coverage:** mac+linux.
+
+##### codex/hooks/015 — The startup trust write, no longer run before the daemon binds, still lands when Codex answers (issue #1665).
+- **Layer:** L2 (`tests/e2e_codex_startup_trust.rs`, as `codex/hooks/014`).
+- **Agent:** none (the `codex-synthetic` stand-in, answering `hooks/list` with the deck's eleven hooks as the startup install wrote them).
+- **Asserts:** after the daemon binds, Codex's `config.toml` comes to trust exactly the deck's hook keys.
+- **Does not assert:** ordering against a Codex launched before the trust lands (`codex/hooks/003` covers a launcher that waits for it); the wrapper's own trust write (`codex/trust/009`).
+- **Platform coverage:** mac+linux.
+
 #### codex/live
 
 ##### codex/live/001 — A real interactive cheap-model Codex run launched through the normal new-pane flow works visibly and reports live status (PRD #20, rule 4 / finding 16). [reel]

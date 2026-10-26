@@ -882,9 +882,10 @@ const HOOKS_LIST_TIMEOUT: Duration = Duration::from_secs(5);
 /// Codex's launch for about 50 s. Threading one deadline through
 /// `crate::wrap::codex_spawn_prep` is not done here. A task delegated to the
 /// pane meanwhile waits in its inbox until Codex is up to take it.
-/// The daemon's startup install and `hooks install` keep the shorter bound: the
-/// startup one sits before the daemon binds its sockets (issue #1665), and
-/// neither is about to launch Codex.
+/// The daemon's and the TUI's startup install and `hooks install` keep the
+/// shorter bound, since none of them is about to launch Codex. The startup one
+/// runs its trust write on a thread of its own, so even that bound no longer
+/// holds back the daemon's socket bind or the TUI's first draw (issue #1665).
 pub const SPAWN_HOOKS_LIST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One hook as Codex itself reports it from `hooks/list`. The deck never computes
@@ -1038,6 +1039,17 @@ fn list_hooks_in_within(
     list_hooks_with(Path::new("codex"), home, cwd, timeout)
 }
 
+/// The variables among `keys` that [`list_hooks_with`] keeps from `codex
+/// app-server`: every `OTEL_` one. The listing is the deck asking Codex a
+/// question, not a Codex run anyone wants to observe, and with the deck's own
+/// exporter settings Codex exported its own traces, as `codex-app-server`, to
+/// wherever the deck's go (issue #1665: an e2e deck's telemetry receiver read
+/// them as the deck's).
+fn telemetry_vars(keys: impl Iterator<Item = std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    keys.filter(|key| key.as_encoded_bytes().starts_with(b"OTEL_"))
+        .collect()
+}
+
 /// [`list_hooks_in_within`] with the `codex` program named, so a test can hand
 /// it a stand-in without rewriting this process's `PATH`.
 fn list_hooks_with(
@@ -1046,14 +1058,18 @@ fn list_hooks_with(
     cwd: &Path,
     timeout: Duration,
 ) -> std::io::Result<HooksListing> {
-    let mut child = Command::new(codex)
+    let mut command = Command::new(codex);
+    command
         .arg("app-server")
         .current_dir(cwd)
         .env("CODEX_HOME", home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::null());
+    for key in telemetry_vars(std::env::vars_os().map(|(key, _)| key)) {
+        command.env_remove(key);
+    }
+    let mut child = command.spawn()?;
 
     let requests = format!(
         "{}\n{}\n",
@@ -2350,12 +2366,26 @@ fn codex_present_on_path() -> bool {
 /// real home resolves (never a `/tmp` write), and any failure is logged, never
 /// fatal.
 ///
+/// Only the `hooks.json` install runs on the caller's thread; the trust write
+/// runs on a thread of its own and this returns without waiting for it (issue
+/// #1665). The trust write asks `codex app-server` for `hooks/list`, and a Codex
+/// that never answers held `daemon serve` for the whole [`HOOKS_LIST_TIMEOUT`]
+/// before it bound its sockets, and the TUI as long before it drew. Nothing here
+/// needs the trust result: the pins come from the install. A Codex the spawn seam
+/// recognises records its own trust before it launches ([`crate::wrap`], with
+/// the longer [`SPAWN_HOOKS_LIST_TIMEOUT`]), so what this trust write is for is a
+/// Codex started where the wrapper does not run, which no longer waits on it.
+///
 /// Returns what the hooks are pinned to afterwards (issue #1637). After a
 /// takeover that is the new copy, and the trust recorded here is for its
 /// command, so Codex may ask the user once to review the changed hooks.
 pub fn auto_install_and_trust_at_startup() -> Vec<crate::hook_binary::HookPin> {
-    match install_and_trust_at_startup() {
-        Some(Ok(Installed { pins, .. })) => pins,
+    match install_at_startup() {
+        Some(Ok(install)) => {
+            let pins = install.pins.clone();
+            install.trust_in_background();
+            pins
+        }
         Some(Err(e)) => {
             tracing::warn!("auto-install: {e}");
             Vec::new()
@@ -2368,25 +2398,55 @@ pub fn auto_install_and_trust_at_startup() -> Vec<crate::hook_binary::HookPin> {
 /// 3, R-3): whether Codex is installed here, and what the install could not
 /// write, which the startup install only logs. Since part 3's H4 that
 /// includes a trust write that failed or recorded none of the deck's hooks
-/// ([`trust_failure`]): hooks Codex will not run are not ready.
+/// ([`trust_failure`]): hooks Codex will not run are not ready. So, unlike the
+/// startup install, it waits for the trust write.
 pub fn refresh_install() -> crate::hooks_refresh::InstallAttempt {
-    let attempt = install_and_trust_at_startup();
+    let attempt = install_at_startup();
     if let Some(Err(e)) = &attempt {
         tracing::warn!("auto-install: {e}");
     }
     crate::hooks_refresh::InstallAttempt::of(attempt.map(|installed| {
-        installed.and_then(|installed| match installed.trust_failed {
+        installed.and_then(|install| match trust_failure(&install.trust()) {
             Some(why) => Err(why),
-            None => Ok(installed.pins),
+            None => Ok(install.pins),
         })
     }))
 }
 
-/// What [`install_and_trust_at_startup`] installed: the pins, and why the
-/// trust write left the deck's hooks untrusted, if it did.
-struct Installed {
+/// What [`install_at_startup`] installed: the pins, and what its trust write
+/// needs, captured on the caller's thread.
+#[derive(Clone)]
+struct StartupInstall {
+    home: PathBuf,
+    cwd: PathBuf,
+    binary_paths: Vec<String>,
     pins: Vec<crate::hook_binary::HookPin>,
-    trust_failed: Option<String>,
+}
+
+impl StartupInstall {
+    /// Record scoped trust for what was installed, and log what that came to.
+    fn trust(&self) -> std::io::Result<TrustOutcome> {
+        let trusted = trust_deck_hooks_for(&self.home, &self.cwd, &self.binary_paths);
+        report_startup_trust(&trusted, &self.cwd);
+        trusted
+    }
+
+    /// [`Self::trust`] on a thread of its own (issue #1665). Where no thread
+    /// can be started, it runs here instead, as it did before.
+    fn trust_in_background(self) {
+        let fallback = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("codex-startup-trust".to_string())
+            .spawn(move || {
+                let _ = self.trust();
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(
+                "codex startup install: no thread for the trust write ({e}); running it now"
+            );
+            let _ = fallback.trust();
+        }
+    }
 }
 
 /// PRD #1666 part 3 (H4, round 2's U3): why a startup trust write leaves the
@@ -2406,9 +2466,10 @@ fn trust_failure(result: &std::io::Result<TrustOutcome>) -> Option<String> {
     }
 }
 
-/// [`auto_install_and_trust_at_startup`]'s work: `None` when Codex is not
-/// installed here, else what it installed or why the install wrote nothing.
-fn install_and_trust_at_startup() -> Option<Result<Installed, String>> {
+/// [`auto_install_and_trust_at_startup`]'s install: `None` when Codex is not
+/// installed here, else what it installed or why it wrote nothing. The trust
+/// write is the caller's ([`StartupInstall::trust`]).
+fn install_at_startup() -> Option<Result<StartupInstall, String>> {
     if !codex_present_on_path() {
         tracing::debug!("codex startup install: skipped (codex not on PATH)");
         return None;
@@ -2436,11 +2497,11 @@ fn install_and_trust_at_startup() -> Option<Result<Installed, String>> {
         })
         .collect();
     let cwd = std::env::current_dir().unwrap_or_else(|_| home.clone());
-    let trusted = trust_deck_hooks_for(&home, &cwd, &binary_paths);
-    report_startup_trust(&trusted, &cwd);
-    Some(Ok(Installed {
+    Some(Ok(StartupInstall {
+        home,
+        cwd,
+        binary_paths,
         pins,
-        trust_failed: trust_failure(&trusted),
     }))
 }
 
@@ -3825,6 +3886,31 @@ mod tests {
         assert!(
             !sent.contains(&"x".repeat(200)),
             "an id too large to echo must draw no reply at all"
+        );
+    }
+
+    /// Issue #1665: the `hooks/list` probe keeps every `OTEL_` variable from
+    /// `codex app-server`, and nothing else.
+    #[test]
+    fn the_hooks_list_probe_keeps_only_telemetry_variables_from_codex() {
+        let keys = [
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_HEADERS",
+            "OTEL_SERVICE_NAME",
+            "PATH",
+            "CODEX_HOME",
+            "MY_OTEL_THING",
+            "otel_lowercase",
+        ]
+        .map(std::ffi::OsString::from);
+        assert_eq!(
+            telemetry_vars(keys.into_iter()),
+            [
+                "OTEL_EXPORTER_OTLP_ENDPOINT",
+                "OTEL_EXPORTER_OTLP_HEADERS",
+                "OTEL_SERVICE_NAME",
+            ]
+            .map(std::ffi::OsString::from)
         );
     }
 
