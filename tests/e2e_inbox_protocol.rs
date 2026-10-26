@@ -492,7 +492,7 @@ fn inbox_protocol_004_once_claims_newest_and_explicit_ack() {
     state(&daemon, &pane, &queued, "queued");
 }
 
-/// Scenario: Queue nine messages for a stand-in and hold eight hook receivers open, each a one-shot `inbox fetch` handed one message within a one-character budget. A ninth is refused as too many hooks at once: it is handed nothing and its message stays queued, and none of the hooks counts as an armed waiter. Once one hook closes, a fresh fetch is admitted and handed the ninth message.
+/// Scenario: Queue nine messages for a stand-in and hold eight hook receivers open, each a one-shot `inbox fetch` handed one message within a one-character budget. Acknowledge the first hook's actual message while its socket stays open: a ninth hook is still refused as too many hooks, is handed nothing, and its message stays queued, while none of the hooks counts as an armed waiter. Once that settled hook closes, a fresh fetch is admitted and handed the ninth message.
 #[spec("inbox/protocol/005")]
 #[test]
 fn inbox_protocol_005_hook_receivers_are_bounded_and_freed_by_closing() {
@@ -509,6 +509,7 @@ fn inbox_protocol_005_hook_receivers_are_bounded_and_freed_by_closing() {
         (socket, reply)
     };
     let mut hooks = Vec::new();
+    let mut first_id = None;
     for count in 1..=8 {
         let (socket, reply) = open();
         assert_eq!(
@@ -516,8 +517,16 @@ fn inbox_protocol_005_hook_receivers_are_bounded_and_freed_by_closing() {
             Some(1),
             "hook {count} is handed one message: {reply}"
         );
+        if count == 1 {
+            first_id = Some(reply["messages"][0]["id"].as_str().unwrap().to_owned());
+        }
         hooks.push(socket);
     }
+    let first_id = first_id.expect("the first hook's message id");
+    let mut ack = request(&pane, "ack");
+    ack["delivery_id"] = json!(first_id);
+    assert_eq!(hook(&daemon, ack)["delivery"], "acknowledged");
+    state(&daemon, &pane, &first_id, "acknowledged");
     armed(&daemon, &pane, 0);
     let (_refused, reply) = open();
     assert_eq!(reply["refused"], "too_many_hooks", "{reply}");
