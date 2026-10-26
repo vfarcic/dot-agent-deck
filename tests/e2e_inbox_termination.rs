@@ -193,10 +193,10 @@ fn status_032_closed_pane_says_closed() {
     );
 }
 
-/// Scenario: Start a successor in the same pane while the previous recipient still has a delegated task queued. The orchestrator must be told the pane was replaced and the task stayed with the previous agent, and the successor must receive none of it.
+/// Scenario: Force-restart a worker while its delegated task is still queued, then inspect the orchestration's inbox history. The cancelled task must be superseded against the previous agent, the successor must receive none of it, and the orchestrator must receive no undeliverable notice.
 #[spec("inbox/status/032")]
 #[test]
-fn status_032_replaced_pane_keeps_the_previous_agents_message() {
+fn status_032_forced_restart_supersedes_the_previous_agents_message() {
     let (daemon, orch, worker, task, _descendant) = fixture("zero", true);
     route::cli(
         &daemon,
@@ -211,13 +211,30 @@ fn status_032_replaced_pane_keeps_the_previous_agents_message() {
         .id;
     let successor = route::observe(&daemon, &successor_id);
     assert_ne!(successor.agent, worker.agent);
-    assert!(
-        !fetch(&daemon, &successor, true)
-            .to_string()
-            .contains("TERMINATION-WAITING-TASK-4c91")
+    assert_eq!(
+        fetch(&daemon, &successor, true)["messages"],
+        json!([]),
+        "the successor must receive no cancelled task"
     );
-    let message = notice(&daemon, &orch, &task);
-    assert!(message.contains("the agent's pane was replaced before it took this message; the message stays with the previous agent"), "replacement notice: {message}");
+    let mut history_request = request(&orch, "inbox_list");
+    history_request["all"] = json!(true);
+    let history = hook(&daemon, history_request);
+    let cancelled = history["messages"]
+        .as_array()
+        .expect("orchestration inbox history")
+        .iter()
+        .find(|message| message["id"] == task)
+        .expect("cancelled task remains in the orchestration's inbox history");
+    assert_eq!(cancelled["bind_agent"], worker.agent);
+    assert_eq!(cancelled["state"], "undeliverable");
+    assert_eq!(cancelled["undeliverable_reason"], "superseded");
+    assert!(
+        !common::wait_until(Duration::from_millis(700), || !route::messages(
+            &daemon, &orch
+        )
+        .is_empty()),
+        "an orchestrator cancelling a task by restarting its worker must receive no undeliverable notice"
+    );
 }
 
 /// Scenario: A launcher exits while a forked descendant keeps its terminal open and the delegated task is still queued. No exit notice may reach the orchestrator before that descendant releases the terminal.

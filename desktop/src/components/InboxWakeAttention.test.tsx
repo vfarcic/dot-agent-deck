@@ -85,7 +85,7 @@ function expectOnlyCount(top: HTMLElement) {
 function wake(agentId: string, paneId: string, hold?: string) {
   listeners.get("desktop://daemon-event")?.({ payload: {
     kind: "inbox", pane_id: paneId, agent_id: agentId, message_id: message,
-    subject: "worker report", from_label: "coder", state: "wake_update", wake_stalled: true,
+    subject: "worker report", from_label: "coder", state: "queued", wake_update: true, wake_stalled: true,
     ...(hold ? { wake_hold: hold } : {}),
   } });
 }
