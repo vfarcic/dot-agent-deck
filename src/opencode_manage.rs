@@ -809,17 +809,20 @@ const childRoutes = new Map();
 
 const routeOf = (key) => activeSubagents.get(key)?.root ?? childRoutes.get(key);
 
-const isChildSession = (sessionId) => {{
-  const key = sessionKey(sessionId);
+// What session `key` (a sessionKey) is known to be: "child", "root", or
+// undefined while its ancestry is not known.
+const ancestryOfKey = (key) => {{
   if (key === undefined) {{
-    return false;
+    return undefined;
   }}
   const parent = sessionParents.get(key);
   if (parent !== undefined) {{
-    return parent !== "";
+    return parent === "" ? "root" : "child";
   }}
-  return activeSubagents.has(key) || childRoutes.has(key);
+  return activeSubagents.has(key) || childRoutes.has(key) ? "child" : undefined;
 }};
+
+const isChildSession = (sessionId) => ancestryOfKey(sessionKey(sessionId)) === "child";
 
 // The root `key` descends from (itself for a root), so a grandchild's work is
 // filed under the main session too. Walks the known ancestry; where that is
@@ -1398,7 +1401,9 @@ export default DotAgentDeckPlugin;
 /// skipping an update that changes none of them. The deck reads the last
 /// line for an id as the message's usage
 /// (`telemetry::accounting::usage_file`). Nothing else from the message, its
-/// text and error message included, is written.
+/// text and error message included, is written. Between updates this helper
+/// holds a message's latest update and its steps only as a copy of the
+/// fields its line is made from (`usageInfo`, `usageTokens`).
 ///
 /// OpenCode gives every assistant message all five counts (`input`,
 /// `output`, `reasoning`, `cache.read`, `cache.write`), starting at 0 until
@@ -1413,25 +1418,37 @@ export default DotAgentDeckPlugin;
 /// undercounted. Each finished step's `step-finish` part carries that step's
 /// counts under an id of its own, so once one is seen the line's counts are
 /// the sum of the message's steps, each counted once however often its part
-/// is updated.
+/// is updated. A message forgotten with steps recorded (past the
+/// `MAX_USAGE_MESSAGES` most recent) that updates again has its counts
+/// written as `null`, since the steps it lost are not in the sum; its id is
+/// remembered for that among the `MAX_USAGE_FORGOTTEN` most recently
+/// forgotten.
 ///
 /// A message of a subagent's child session is marked `"subagent": true`: its
 /// usage is the run's, but how it ended says nothing about how the run's own
-/// turn did.
+/// turn did. One of a session whose ancestry is not known yet is marked
+/// `"subagent": null`, which the deck reads as a turn whose ending is not
+/// known, since it may be either.
 ///
 /// The file is appended to only when it is safe: already there (the deck
 /// makes it), opened without following a symlink or waiting on a FIFO, and a
 /// regular file of this user's that no other user can read or write.
 /// Otherwise the line is skipped, and OpenCode carries on; a line that was not
-/// written is written by the message's next update, even one identical to it.
+/// written is not remembered as written, so the message's next update, even
+/// one identical to it, tries it again.
 const USAGE_FILE_JS: &str = r#"// PRD #1858: each assistant message's usage, for the deck's run record.
 const USAGE_FILE = process.env.DOT_AGENT_DECK_USAGE_FILE;
 const USAGE_FILE_ON = typeof USAGE_FILE === "string" && USAGE_FILE.startsWith("/");
 const MAX_USAGE_MESSAGES = 256;
 const MAX_USAGE_STEPS = 256;
-// Message id -> { info, steps, written }: its latest update, its finished
-// steps' counts by part id, and the line last written for it.
+const MAX_USAGE_FORGOTTEN = 4096;
+// Message id -> { info, steps, written }: its latest update (usageInfo), its
+// finished steps' counts by part id (usageTokens), and the line last written
+// for it.
 const usageMessages = new Map();
+// Ids of messages forgotten with steps recorded, the most recent
+// MAX_USAGE_FORGOTTEN: a later step of one cannot be added to those it lost.
+const usageForgotten = new Set();
 const USAGE_COUNTS = [["input"], ["output"], ["reasoning"], ["cache", "read"], ["cache", "write"]];
 const usageCount = (value) =>
   typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
@@ -1439,12 +1456,50 @@ const usageName = (value) =>
   typeof value === "string" && /^[A-Za-z0-9._:/@+-]{1,128}$/.test(value) ? value : undefined;
 const usageRecord = (value) =>
   typeof value === "object" && value !== null && !Array.isArray(value) ? value : undefined;
+// A copy of a message's or a step's `tokens`: its counts, each a count or
+// null, and nothing else.
+const usageTokens = (value) => {
+  const tokens = usageRecord(value);
+  if (tokens === undefined) return undefined;
+  const cache = usageRecord(tokens.cache);
+  return {
+    input: usageCount(tokens.input),
+    output: usageCount(tokens.output),
+    reasoning: usageCount(tokens.reasoning),
+    cache: cache === undefined ? undefined : { read: usageCount(cache.read), write: usageCount(cache.write) },
+  };
+};
+// The fields of an assistant message's update that its line is made from,
+// copied, so nothing else the update holds — its paths, a structured reply,
+// an error's message or response body — is kept.
+const usageInfo = (info) => {
+  const status = info.error?.data?.statusCode;
+  return {
+    id: usageName(info.id),
+    model: usageName(info.modelID),
+    session: sessionKey(info.sessionID),
+    tokens: usageTokens(info.tokens),
+    cost: typeof info.cost === "number" && Number.isFinite(info.cost) && info.cost >= 0 ? info.cost : undefined,
+    finish: usageName(info.finish),
+    failed: !!info.error,
+    error: usageName(info.error?.name),
+    status: Number.isInteger(status) && status >= 100 && status <= 599 ? status : undefined,
+    completed: !!info.time?.completed,
+  };
+};
 const usageMessage = (id) => {
-  const message = usageMessages.get(id) ?? { info: undefined, steps: new Map(), written: undefined };
+  let message = usageMessages.get(id);
+  if (message === undefined) {
+    message = { info: undefined, steps: new Map(), written: undefined };
+    // Its earlier steps were forgotten: its counts are not known.
+    if (usageForgotten.has(id)) message.steps.set(undefined, undefined);
+  }
   usageMessages.delete(id);
   usageMessages.set(id, message);
   if (usageMessages.size > MAX_USAGE_MESSAGES) {
-    usageMessages.delete(usageMessages.keys().next().value);
+    const [oldest, forgotten] = usageMessages.entries().next().value;
+    usageMessages.delete(oldest);
+    if (forgotten.steps.size > 0) rememberBounded(usageForgotten, oldest, undefined, MAX_USAGE_FORGOTTEN);
   }
   return message;
 };
@@ -1489,14 +1544,15 @@ const usageStepTotal = (steps) => {
   }
   return total;
 };
+// `info` is a message's usageInfo.
 const usageLine = (info, steps) => {
-  const id = usageName(info.id);
   const line = { v: 1, type: "reply", agent: "opencode" };
-  if (id !== undefined) line.id = id;
-  const model = usageName(info.modelID);
-  if (model !== undefined) line.model = model;
-  if (isChildSession(info.sessionID)) line.subagent = true;
-  const tokens = steps === undefined || steps.size === 0 ? usageRecord(info.tokens) : usageStepTotal(steps);
+  if (info.id !== undefined) line.id = info.id;
+  if (info.model !== undefined) line.model = info.model;
+  const ancestry = ancestryOfKey(info.session);
+  if (ancestry === "child") line.subagent = true;
+  else if (ancestry === undefined) line.subagent = null;
+  const tokens = steps === undefined || steps.size === 0 ? info.tokens : usageStepTotal(steps);
   const cache = usageRecord(tokens?.cache);
   const counts = {
     input: usageCount(tokens?.input),
@@ -1506,7 +1562,7 @@ const usageLine = (info, steps) => {
     cache_write: usageCount(cache?.write),
   };
   const zeros = Object.values(counts).every((count) => count === 0);
-  if ((zeros || tokens === undefined) && (info.error || !info.time?.completed)) {
+  if ((zeros || tokens === undefined) && (info.failed || !info.completed)) {
     line.reported = false;
   } else {
     line.input = counts.input;
@@ -1514,16 +1570,11 @@ const usageLine = (info, steps) => {
       counts.output === null || counts.reasoning === null ? null : counts.output + counts.reasoning;
     line.cache_read = counts.cache_read;
     line.cache_write = counts.cache_write;
-    if (typeof info.cost === "number" && Number.isFinite(info.cost) && info.cost >= 0) {
-      line.cost_usd = info.cost;
-    }
+    if (info.cost !== undefined) line.cost_usd = info.cost;
   }
-  const finish = usageName(info.finish);
-  if (finish !== undefined) line.stop = finish;
-  const error = usageName(info.error?.name);
-  if (error !== undefined) line.error = error;
-  const status = info.error?.data?.statusCode;
-  if (Number.isInteger(status) && status >= 100 && status <= 599) line.status = status;
+  if (info.finish !== undefined) line.stop = info.finish;
+  if (info.error !== undefined) line.error = info.error;
+  if (info.status !== undefined) line.status = info.status;
   return JSON.stringify(line);
 };
 const writeUsage = (message) => {
@@ -1533,13 +1584,13 @@ const writeUsage = (message) => {
 };
 const recordUsage = (info) => {
   if (!USAGE_FILE_ON || info?.role !== "assistant") return;
-  const id = usageName(info.id);
-  if (id === undefined) {
-    appendUsageLine(usageLine(info, undefined));
+  const fields = usageInfo(info);
+  if (fields.id === undefined) {
+    appendUsageLine(usageLine(fields, undefined));
     return;
   }
-  const message = usageMessage(id);
-  message.info = info;
+  const message = usageMessage(fields.id);
+  message.info = fields;
   writeUsage(message);
 };
 // A finished step of an assistant message (a `step-finish` part).
@@ -1554,7 +1605,7 @@ const recordUsageStep = (part) => {
     // counts are not known.
     message.steps.set(undefined, undefined);
   } else {
-    message.steps.set(step, part.tokens);
+    message.steps.set(step, usageTokens(part.tokens));
   }
   if (message.info !== undefined) writeUsage(message);
 };
@@ -4694,6 +4745,7 @@ process.exit(0);
                 r#"const {{ default: plugin }} = await import("{}");
 const hooks = await plugin({{ directory: "/work", client: {{}} }});
 const updated = (info) => hooks.event({{ event: {{ type: "message.updated", properties: {{ info }} }} }});
+await hooks.event({{ event: {{ type: "session.created", properties: {{ info: {{ id: "s1", directory: "/work" }} }} }} }});
 const done = {{ time: {{ created: 1, completed: 2 }}, finish: "stop", role: "assistant", sessionID: "s1", modelID: "gpt-5.4-mini" }};
 const reply = {{ ...done, id: "msg_1", cost: 0, tokens: {{ input: 100, output: 15, reasoning: 5, cache: {{ read: 7, write: 0 }} }} }};
 await updated(reply);
@@ -4790,7 +4842,8 @@ process.exit(0);
     /// message that took two steps counts both steps' tokens, each once,
     /// though OpenCode's message holds only the latest step's. And an update
     /// whose line could not be written — the file briefly readable by others
-    /// — is written when the same update comes again.
+    /// — is tried again when the same update comes again, here once the file
+    /// is private again.
     #[cfg(unix)]
     #[test]
     fn opencode_plugin_usage_counts_subagents_steps_and_retries() {
@@ -4902,6 +4955,331 @@ process.exit(0);
                 cache_write: 1,
             })
         );
+    }
+
+    /// PRD #1858: what the usage helper keeps of an assistant message between
+    /// its updates is a copy of the fields its line is made from, and of a
+    /// step only its counts: no path, structured reply, error message or
+    /// response body the update carried, and none of the update's own
+    /// objects, stays reachable from it.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_plugin_usage_keeps_only_the_fields_its_line_needs() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let source = format!(
+            r#"const fsConstants = {{ O_WRONLY: 1, O_APPEND: 1024 }};
+const written = [];
+const openSync = () => 3;
+const fstatSync = () => ({{ isFile: () => true, uid: process.getuid(), mode: 0o100600 }});
+const writeSync = (_fd, buffer) => {{ written.push(buffer.toString()); return buffer.length; }};
+const closeSync = () => {{}};
+const sessionKey = (id) => (typeof id === "string" && id ? id : undefined);
+const ancestryOfKey = (key) => (key === "root" ? "root" : undefined);
+const rememberBounded = (set, key) => {{ set.delete(key); set.add(key); }};
+{USAGE_FILE_JS}
+const SENTINEL = "SENTINEL_4c19e7";
+const info = {{ id: "msg_1", sessionID: "root", role: "assistant", modelID: "gpt-5.4-mini", providerID: "openai",
+  time: {{ created: 1, completed: 2 }}, finish: "stop", cost: 0.01,
+  path: {{ cwd: "/" + SENTINEL + "/cwd", root: "/" + SENTINEL + "/root" }},
+  structured: {{ answer: SENTINEL + " structured reply" }},
+  tokens: {{ input: 10, output: 2, reasoning: 0, cache: {{ read: 1, write: 0, note: SENTINEL }}, note: SENTINEL }},
+  error: {{ name: "APIError", data: {{ message: SENTINEL + " message", responseBody: SENTINEL + " body", statusCode: 500 }} }} }};
+const part = {{ id: "prt_1", messageID: "msg_1", sessionID: "root", type: "step-finish", reason: SENTINEL,
+  snapshot: SENTINEL, tokens: {{ input: 10, output: 2, reasoning: 0, cache: {{ read: 1, write: 0 }}, note: SENTINEL }} }};
+recordUsageStep(part);
+recordUsage(info);
+const originals = new Set([info, info.time, info.path, info.structured, info.tokens, info.tokens.cache, info.error,
+  info.error.data, part, part.tokens, part.tokens.cache]);
+const found = [];
+const seen = new Set();
+const walk = (value, at) => {{
+  if (originals.has(value)) found.push(at + " is the update's own object");
+  if (typeof value === "string" && value.includes(SENTINEL)) found.push(at + " holds the sentinel");
+  if (typeof value !== "object" || value === null || seen.has(value)) return;
+  seen.add(value);
+  const entries = value instanceof Map ? Array.from(value.entries())
+    : value instanceof Set ? Array.from(value, (key) => [key, key])
+    : Object.entries(value);
+  for (const [key, inner] of entries) {{
+    walk(key, at + "[key]");
+    walk(inner, at + "." + String(key));
+  }}
+}};
+walk(usageMessages, "usageMessages");
+walk(usageForgotten, "usageForgotten");
+const message = usageMessages.get("msg_1");
+console.log(JSON.stringify({{
+  found,
+  info: Object.keys(message.info).sort(),
+  step: Object.keys(message.steps.get("prt_1")).sort(),
+  cache: Object.keys(message.steps.get("prt_1").cache).sort(),
+  written,
+}}));
+"#
+        );
+        let output = std::process::Command::new("node")
+            .arg("--input-type=module")
+            .arg("-e")
+            .arg(&source)
+            .env("DOT_AGENT_DECK_USAGE_FILE", "/usage.jsonl")
+            .output()
+            .expect("run node");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["found"], serde_json::json!([]), "{result}");
+        assert_eq!(
+            result["info"],
+            serde_json::json!([
+                "completed",
+                "cost",
+                "error",
+                "failed",
+                "finish",
+                "id",
+                "model",
+                "session",
+                "status",
+                "tokens"
+            ]),
+            "{result}"
+        );
+        assert_eq!(
+            result["step"],
+            serde_json::json!(["cache", "input", "output", "reasoning"]),
+            "{result}"
+        );
+        assert_eq!(
+            result["cache"],
+            serde_json::json!(["read", "write"]),
+            "{result}"
+        );
+        // What the line is made from is still all there.
+        let line: serde_json::Value =
+            serde_json::from_str(result["written"][0].as_str().unwrap().trim()).unwrap();
+        assert_eq!(
+            line,
+            serde_json::json!({"v":1,"type":"reply","agent":"opencode","id":"msg_1",
+                "model":"gpt-5.4-mini","input":10,"output":2,"cache_read":1,"cache_write":0,
+                "cost_usd":0.01,"stop":"stop","error":"APIError","status":500}),
+            "{result}"
+        );
+    }
+
+    /// PRD #1858: a message whose recorded steps were forgotten — 256 other
+    /// messages updated after its first step — and that then finishes a
+    /// second step has its counts written as unknown, which the deck reads
+    /// as unavailable, not as the second step's 50 input tokens alone.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_plugin_usage_of_a_message_whose_steps_were_forgotten_is_unavailable() {
+        use crate::telemetry::accounting::usage_file::{UsageAgent, UsageFileReader};
+        use crate::telemetry::accounting::{Field, Ident};
+        use std::os::unix::fs::OpenOptionsExt as _;
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (recorder, _controls) = inbox_recorder(dir.path());
+        let plugin = dir.path().join("dot-agent-deck.mjs");
+        std::fs::write(&plugin, plugin_template(&recorder.to_string_lossy())).unwrap();
+        let usage = dir.path().join("run.usage.jsonl");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&usage)
+            .unwrap();
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                r#"const {{ default: plugin }} = await import("{}");
+const hooks = await plugin({{ directory: "/work", client: {{}} }});
+const send = (type, properties) => hooks.event({{ event: {{ type, properties }} }});
+const updated = (info) => send("message.updated", {{ info }});
+const step = (id, messageID, tokens) =>
+  send("message.part.updated", {{ part: {{ id, messageID, sessionID: "root", type: "step-finish", reason: "stop", cost: 0.01, tokens }} }});
+const tokens = (input, output) => ({{ input, output, reasoning: 0, cache: {{ read: 0, write: 0 }} }});
+const reply = (id, modelID, finish, cost, counts) => ({{ id, sessionID: "root", role: "assistant", modelID,
+  time: {{ created: 1, completed: 2 }}, finish, cost, tokens: counts }});
+await send("session.created", {{ info: {{ id: "root", directory: "/work" }} }});
+await step("prt_1", "long", tokens(100, 10));
+await updated(reply("long", "gpt-5.4", "tool-calls", 0.01, tokens(100, 10)));
+for (let n = 0; n < 256; n++) {{
+  await updated(reply("other_" + n, "gpt-5.4-mini", "stop", 0, tokens(1, 1)));
+}}
+await step("prt_2", "long", tokens(50, 4));
+await updated(reply("long", "gpt-5.4", "stop", 0.02, tokens(50, 4)));
+process.exit(0);
+"#,
+                plugin.display()
+            ),
+        )
+        .unwrap();
+        let out = std::process::Command::new("node")
+            .arg(&driver)
+            .env("DOT_AGENT_DECK_USAGE_FILE", &usage)
+            .env("DOT_AGENT_DECK_INBOX_WATCHER_BACKOFF_MS", "3600000")
+            .output()
+            .expect("run node");
+        assert!(out.status.success(), "{out:?}");
+        let written = std::fs::read_to_string(&usage).unwrap();
+        let last: serde_json::Value = written
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .rfind(|l| l["id"] == "long")
+            .unwrap();
+        assert_eq!(
+            (&last["input"], &last["output"], &last["stop"]),
+            (
+                &serde_json::Value::Null,
+                &serde_json::Value::Null,
+                &serde_json::json!("stop")
+            ),
+            "{last}"
+        );
+
+        let mut reader = UsageFileReader::new(&usage);
+        reader.poll().unwrap();
+        let read = reader.summary().usage(UsageAgent::OpenCode);
+        let long = read
+            .models
+            .iter()
+            .find(|m| m.model == Ident::new("gpt-5.4"))
+            .unwrap_or_else(|| panic!("{read:?}"));
+        assert!(
+            !matches!(long.tokens, Field::ProviderReported(_)),
+            "a partial sum read as the message's usage: {read:?}"
+        );
+        assert_eq!(
+            long.tokens.unavailable().map(|r| r.as_str()),
+            Some("unrecognized_format"),
+            "{read:?}"
+        );
+    }
+
+    /// PRD #1858: a reply of a session whose ancestry the plugin does not
+    /// know yet — OpenCode's client has not answered whether it is a child —
+    /// ends no turn. Here the main session is asking for tools when a reply
+    /// of that session completes: the run's ending reads as unknown, not
+    /// completed, and stays so once the answer says the session is a
+    /// subagent's and the reply is written again as one; the main session's
+    /// own later reply says how the run ended.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_plugin_usage_of_unknown_ancestry_never_completes_the_run() {
+        use crate::telemetry::accounting::usage_file::{UsageAgent, UsageFileReader};
+        use crate::telemetry::accounting::{AgentTurnEnd, Field, Tokens};
+        use std::os::unix::fs::OpenOptionsExt as _;
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (recorder, _controls) = inbox_recorder(dir.path());
+        let plugin = dir.path().join("dot-agent-deck.mjs");
+        std::fs::write(&plugin, plugin_template(&recorder.to_string_lossy())).unwrap();
+        let usage = dir.path().join("run.usage.jsonl");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&usage)
+            .unwrap();
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                r#"import {{ copyFileSync }} from "fs";
+const {{ default: plugin }} = await import("{}");
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const asked = [];
+let answer;
+const client = {{ session: {{ get: (request) => {{
+  asked.push(request?.path?.id);
+  return new Promise((resolve) => {{ answer = (info) => resolve({{ data: info }}); }});
+}} }} }};
+const hooks = await plugin({{ directory: "/work", client }});
+const send = (type, properties) => hooks.event({{ event: {{ type, properties }} }});
+const updated = (info) => send("message.updated", {{ info }});
+const reply = (id, sessionID, finish, input, output) => ({{ id, sessionID, role: "assistant", modelID: "gpt-5.4-mini",
+  time: {{ created: 1, completed: 2 }}, finish, cost: 0.1,
+  tokens: {{ input, output, reasoning: 0, cache: {{ read: 0, write: 0 }} }} }});
+const file = process.env.DOT_AGENT_DECK_USAGE_FILE;
+await send("session.created", {{ info: {{ id: "root", directory: "/work" }} }});
+await updated(reply("msg_p", "root", "tool-calls", 10, 2));
+await updated(reply("msg_c", "late", "stop", 5, 2));
+copyFileSync(file, file + ".unknown");
+answer?.({{ id: "late", parentID: "root" }});
+await sleep(50);
+await updated(reply("msg_c", "late", "stop", 5, 2));
+copyFileSync(file, file + ".learned");
+await updated(reply("msg_q", "root", "stop", 1, 1));
+console.log(JSON.stringify({{ asked }}));
+process.exit(0);
+"#,
+                plugin.display()
+            ),
+        )
+        .unwrap();
+        let out = std::process::Command::new("node")
+            .arg(&driver)
+            .env("DOT_AGENT_DECK_USAGE_FILE", &usage)
+            .env("DOT_AGENT_DECK_INBOX_WATCHER_BACKOFF_MS", "3600000")
+            .output()
+            .expect("run node");
+        assert!(out.status.success(), "{out:?}");
+        let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(result["asked"], serde_json::json!(["late"]), "{result}");
+        let lines = |path: &std::path::Path| -> Vec<serde_json::Value> {
+            std::fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect()
+        };
+        let read = |path: &std::path::Path| {
+            let mut reader = UsageFileReader::new(path);
+            reader.poll().unwrap();
+            reader.summary().usage(UsageAgent::OpenCode)
+        };
+        let unknown = dir.path().join("run.usage.jsonl.unknown");
+        let learned = dir.path().join("run.usage.jsonl.learned");
+
+        let written = lines(&unknown);
+        assert!(written[0].get("subagent").is_none(), "{written:?}");
+        assert_eq!(written[1]["id"], "msg_c", "{written:?}");
+        assert_eq!(
+            written[1]["subagent"],
+            serde_json::Value::Null,
+            "{written:?}"
+        );
+        assert!(written[1].get("subagent").is_some(), "{written:?}");
+        let at_unknown = read(&unknown);
+        assert_eq!(at_unknown.last_turn, Some(AgentTurnEnd::Unknown));
+        assert_eq!(
+            at_unknown.models[0].tokens,
+            Field::ProviderReported(Tokens {
+                input: 15,
+                output: 4,
+                cache_read: 0,
+                cache_write: 0,
+            })
+        );
+
+        let written = lines(&learned);
+        assert_eq!(written.last().unwrap()["subagent"], true, "{written:?}");
+        assert_eq!(read(&learned).last_turn, Some(AgentTurnEnd::Unknown));
+
+        assert_eq!(read(&usage).last_turn, Some(AgentTurnEnd::Completed));
     }
 
     /// PRD #1666 §2–§4: drive the shared receipt receiver against a fake

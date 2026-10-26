@@ -24,7 +24,10 @@
 //! answering a prompt, says a turn began and adds no usage, so a Pi that
 //! dies before its next reply ends mid-turn. A reply marked `subagent`, a
 //! subagent's session's, adds its usage and leaves the last turn as the
-//! run's own lines left it. The agents' own words for
+//! run's own lines left it; one whose `subagent` is `null`, of a session the
+//! producer did not know to be the run's or a subagent's, adds its usage and
+//! makes the last turn unknown until a later line of the run's own says how
+//! a turn went. The agents' own words for
 //! how a reply stopped and why it failed are passed through raw (`stop`,
 //! `error`) and mapped here, so a stop reason an agent upgrade adds becomes
 //! `unknown`, never a wrong outcome.
@@ -186,10 +189,14 @@ impl UsageFileSummary {
         let reply = line.reply();
         let last_turn = line.turn_end(agent);
         let lines = self.agents.entry(agent).or_default();
-        // A subagent's reply counts toward the run's usage, but how it
-        // ended is not how the run's own turn did.
-        if line.subagent.as_bool() != Some(true) {
-            lines.last_turn = Some(last_turn);
+        match &line.subagent.0 {
+            None | Some(OptScalar::Bool(false)) => lines.last_turn = Some(last_turn),
+            // A subagent's reply counts toward the run's usage, but how it
+            // ended is not how the run's own turn did.
+            Some(OptScalar::Bool(true)) => {}
+            // Whose reply it is was not known: it may have ended the run's
+            // turn or not.
+            Some(_) => lines.last_turn = Some(AgentTurnEnd::Unknown),
         }
         match line.id.0.as_deref().map(Ident::new) {
             None => {
@@ -270,9 +277,11 @@ pub struct UsageLine {
     /// The HTTP status of the provider response that failed the reply.
     #[serde(default)]
     status: OptScalar,
-    /// `true` for a reply of a subagent's session rather than the run's own.
+    /// `true` for a reply of a subagent's session rather than the run's own;
+    /// absent or `false` for the run's own; anything else, `null` as the
+    /// OpenCode plugin writes it, when the producer did not know which.
     #[serde(default)]
-    subagent: OptScalar,
+    subagent: Present,
 }
 
 impl UsageLine {
@@ -465,6 +474,41 @@ mod tests {
         );
         let done = opencode("msg_p2", 1, 0.1, r#","stop":"stop""#);
         let reader = read(&[parent, child, done]);
+        assert_eq!(
+            reader.summary().usage(UsageAgent::OpenCode).last_turn,
+            Some(AgentTurnEnd::Completed)
+        );
+    }
+
+    /// A reply whose session the producer did not know to be the run's or a
+    /// subagent's (`"subagent": null`) adds its usage and makes the last turn
+    /// unknown, not its own ending; a later line marking it a subagent's
+    /// leaves that unknown, and a later reply of the run's own says how the
+    /// turn ended.
+    #[test]
+    fn a_reply_of_unknown_ancestry_counts_but_leaves_the_turn_unknown() {
+        let parent = opencode("msg_p", 10, 0.1, r#","stop":"tool-calls""#);
+        let unknown = opencode("msg_c", 5, 0.1, r#","stop":"stop","subagent":null"#);
+        let learned = opencode("msg_c", 5, 0.1, r#","stop":"stop","subagent":true"#);
+        let reader = read(&[parent.clone(), unknown.clone()]);
+        let usage = reader.summary().usage(UsageAgent::OpenCode);
+        assert_eq!(usage.last_turn, Some(AgentTurnEnd::Unknown));
+        assert_eq!(
+            usage.models[0].tokens,
+            Field::ProviderReported(Tokens {
+                input: 15,
+                output: 4,
+                cache_read: 0,
+                cache_write: 0,
+            })
+        );
+        let reader = read(&[parent.clone(), unknown.clone(), learned.clone()]);
+        assert_eq!(
+            reader.summary().usage(UsageAgent::OpenCode).last_turn,
+            Some(AgentTurnEnd::Unknown)
+        );
+        let own = opencode("msg_p", 10, 0.1, r#","stop":"stop","subagent":false"#);
+        let reader = read(&[parent, unknown, learned, own]);
         assert_eq!(
             reader.summary().usage(UsageAgent::OpenCode).last_turn,
             Some(AgentTurnEnd::Completed)
