@@ -1,11 +1,11 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { createFixtureFleet, createFixtureSnapshot, FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID, FIXTURE_UNREACHABLE_DAEMON_ID } from "../data/fixture";
-import { agentKey } from "../lib/agentKey";
+import { createFixtureFleet, createFixtureSnapshot, FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID, FIXTURE_UNREACHABLE_DAEMON_ID, restartedFixtureSnapshot } from "../data/fixture";
+import { agentKey, boundAgentKey } from "../lib/agentKey";
 import { deckName } from "../lib/displayText";
 import type { DeckBridge } from "../lib/bridge";
 import { LaunchCleanupError } from "../lib/actionError";
-import type { TerminalChunk } from "../types";
+import type { DeckFleet, TerminalChunk } from "../types";
 
 /*
  * A bridge stub rather than `FixtureDeckBridge`, because the state under test
@@ -23,7 +23,7 @@ const { bridge } = vi.hoisted(() => ({
     runAction: vi.fn(),
     sendTerminalInput: vi.fn(async () => {}),
     resizeTerminal: vi.fn(async () => {}),
-    onTerminalGeometry: vi.fn(() => () => {}),
+    onTerminalGeometry: vi.fn((_listener: (agentId: string, rows: number, cols: number, deckId?: string, incarnation?: string) => void) => () => {}),
     setZoom: vi.fn(async (level: number) => level),
     getSettings: vi.fn(async () => ({ settings: {} })),
     saveSettings: vi.fn(async (settings: unknown) => settings),
@@ -235,5 +235,67 @@ describe("useDeckRuntime", () => {
 
     expect(result.current.snapshot.connection.deckId).not.toBe(FIXTURE_REMOTE_DAEMON_ID);
     expect(result.current.cleanupWarnings?.map((warning) => warning.deck)).toEqual([deckName(remote.connection), "Local daemon"]);
+  });
+
+  /**
+   * Scenario: a deck lists two agents, both stream output and report a grid,
+   * and an agent on another deck streams too. Then the deck lists one of them
+   * (the other was closed), drops its link, and comes back as a restarted
+   * process listing nobody. Each closed or restarted-away agent's retained
+   * output and grid are gone once its deck's listing stops naming it; a
+   * disconnected deck and another deck keep theirs (issue #1845, finding 1).
+   */
+  it("forgets a closed or restarted agent's terminal buffer and grid once its deck's listing stops naming it", async () => {
+    let onFleet: ((fleet: DeckFleet) => void) | undefined;
+    let onTerminal: ((event: TerminalChunk) => void) | undefined;
+    let onGeometry: ((agentId: string, rows: number, cols: number, deckId?: string, incarnation?: string) => void) | undefined;
+    bridge.subscribe.mockImplementation(async (fleetListener, terminalListener) => {
+      onFleet = fleetListener as (fleet: DeckFleet) => void;
+      onTerminal = terminalListener;
+      return () => {};
+    });
+    bridge.onTerminalGeometry.mockImplementation((listener) => {
+      onGeometry = listener;
+      return () => {};
+    });
+    const before = createFixtureSnapshot("docs-restart");
+    bridge.connect.mockResolvedValue([before]);
+    const { result } = renderHook(() => useDeckRuntime());
+    await waitFor(() => expect(result.current.snapshot.connection.incarnation).toBe("docs-before"));
+
+    const OTHER_DECK = "/tmp/other-deck.sock";
+    const output = (deckId: string, agentId: string, incarnation: string) =>
+      onTerminal!({ deckId, agentId, incarnation, data: new TextEncoder().encode(`out of ${agentId}`), stream: "output", operation: "append" });
+    act(() => {
+      output(FIXTURE_DAEMON_ID, "1", "docs-before");
+      output(FIXTURE_DAEMON_ID, "2", "docs-before");
+      output(OTHER_DECK, "1", "elsewhere");
+      onGeometry!("1", 24, 80, FIXTURE_DAEMON_ID, "docs-before");
+      onGeometry!("2", 24, 80, FIXTURE_DAEMON_ID, "docs-before");
+    });
+    const buffer = (deckId: string, agentId: string, incarnation: string) => result.current.terminalFeed?.get(deckId, agentId, incarnation);
+    const grid = (agentId: string) => result.current.appliedGeometry?.[boundAgentKey({ deckId: FIXTURE_DAEMON_ID, agentId, incarnation: "docs-before" })];
+    expect(buffer(FIXTURE_DAEMON_ID, "1", "docs-before")).toBeDefined();
+    expect(buffer(FIXTURE_DAEMON_ID, "2", "docs-before")).toBeDefined();
+    expect(grid("2")).toEqual({ rows: 24, cols: 80 });
+
+    // Agent 2 closed: the same process lists agent 1 alone.
+    act(() => onFleet!([{ ...before, agents: before.agents.filter((agent) => agent.id === "1") }]));
+    expect(buffer(FIXTURE_DAEMON_ID, "2", "docs-before")).toBeUndefined();
+    expect(grid("2")).toBeUndefined();
+    expect(buffer(FIXTURE_DAEMON_ID, "1", "docs-before")).toBeDefined();
+    expect(grid("1")).toEqual({ rows: 24, cols: 80 });
+
+    // A deck that is not answering lists nobody and vouches for nothing: keep.
+    act(() => onFleet!([{ ...before, connection: { status: "disconnected", deckId: FIXTURE_DAEMON_ID, socketPath: FIXTURE_DAEMON_ID, message: "Daemon not responding" }, agents: [] }]));
+    expect(buffer(FIXTURE_DAEMON_ID, "1", "docs-before")).toBeDefined();
+    expect(grid("1")).toEqual({ rows: 24, cols: 80 });
+
+    // The deck restarted: another process, listing nobody.
+    act(() => onFleet!([restartedFixtureSnapshot()]));
+    expect(buffer(FIXTURE_DAEMON_ID, "1", "docs-before")).toBeUndefined();
+    expect(grid("1")).toBeUndefined();
+    // Another deck's agent is not this deck's to forget.
+    expect(buffer(OTHER_DECK, "1", "elsewhere")).toBeDefined();
   });
 });
