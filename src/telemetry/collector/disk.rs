@@ -681,7 +681,8 @@ mod fd {
     /// Which call opened a subdirectory.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum OpenedBy {
-        /// `openat2`, which refuses to cross a mount.
+        /// `openat2`, which refuses to cross a mount. Linux only.
+        #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
         Openat2,
         /// The `openat` fallback, which does not.
         Fallback,
