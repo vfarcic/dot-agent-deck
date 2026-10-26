@@ -845,6 +845,15 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
+      # Issue #1708 — the Pi extension's type gate, which until then ran
+      # nowhere. In this job, rather than `desktop-web` beside the desktop's own
+      # tsc, because `build` aggregates this one, so a type error blocks the
+      # merge. `--ignore-scripts`: tsc needs no install script, so none of the
+      # type packages' dependencies runs code on the runner.
+      - run: npm ci --ignore-scripts
+        working-directory: pi-extension
+      - run: npm run typecheck
+        working-directory: pi-extension
       # The desktop crate's Linux build deps — the comment on `clippy`'s copy of
       # this step has why, and where else the same set is declared.
       - run: |

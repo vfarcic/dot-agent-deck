@@ -1488,8 +1488,10 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 				await report("before_agent_start", event, ctx);
 			} finally {
 				// Once its own hook has run, a hand-over goes on to run or be refused.
+				// Pi 1.2.0+ starts a custom-message run with no `prompt`; narrowed
+				// by the field, not by `messageType`, which earlier Pi does not send.
 				if (instance.proc !== undefined) {
-					starting(instance.proc, instance, event.prompt);
+					starting(instance.proc, instance, "prompt" in event ? event.prompt : undefined);
 				}
 			}
 		}),
