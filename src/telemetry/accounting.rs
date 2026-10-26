@@ -1357,6 +1357,19 @@ pub trait LineSummary: Default {
     /// A candidate line did not deserialise into [`Self::Record`]. The line
     /// is lent only to look for a marker in it, never to be kept.
     fn malformed(&mut self, _line: &[u8]) {}
+    /// Whether a complete line is deserialised at all: by default, one that
+    /// holds one of [`Self::MARKERS`] ([`line_is_candidate`]).
+    fn candidate(line: &[u8]) -> bool {
+        line_is_candidate(line, Self::MARKERS)
+    }
+    /// A line longer than [`MAX_LINE_BYTES`] was skipped without being
+    /// parsed; `prefix` is what was buffered of it. One that may have been a
+    /// record the summary reads is taken as [`Self::malformed`].
+    fn discarded(&mut self, prefix: &[u8]) {
+        if Self::candidate(prefix) {
+            self.malformed(prefix);
+        }
+    }
     /// The file was replaced or truncated, so reading starts over: forget
     /// what it read, keeping what the summary was told about its run.
     fn reset(&mut self) {
@@ -1501,11 +1514,12 @@ impl<S: LineSummary> JsonlReader<S> {
         self.born
     }
 
-    /// Whether the reader holds the start of a line its summary would read
-    /// whose newline has not arrived: at a run's end, a record the agent did
-    /// not finish writing.
-    pub fn unfinished_candidate(&self) -> bool {
-        !self.partial.is_empty() && line_is_candidate(&self.partial, S::MARKERS)
+    /// Whether the reader holds the start of a line whose newline has not
+    /// arrived — anything but blanks, however short, or a line too long to
+    /// buffer: at a run's end, a record the agent did not finish writing,
+    /// which may have been one its summary reads.
+    pub fn unfinished_line(&self) -> bool {
+        self.skipping || self.partial.iter().any(|b| !b.is_ascii_whitespace())
     }
 
     /// Read what was appended since the last poll, within the budget.
@@ -1571,6 +1585,7 @@ impl<S: LineSummary> JsonlReader<S> {
             if self.partial.is_empty() {
                 self.line(head);
             } else if self.partial.len() + head.len() > MAX_LINE_BYTES {
+                self.summary.discarded(&self.partial);
                 self.partial.clear();
                 self.stats.overlong += 1;
                 self.stats.lines += 1;
@@ -1586,6 +1601,11 @@ impl<S: LineSummary> JsonlReader<S> {
             return;
         }
         if self.partial.len() + data.len() > MAX_LINE_BYTES {
+            if self.partial.is_empty() {
+                self.summary.discarded(data);
+            } else {
+                self.summary.discarded(&self.partial);
+            }
             self.partial.clear();
             self.skipping = true;
             self.stats.overlong += 1;
@@ -1598,7 +1618,7 @@ impl<S: LineSummary> JsonlReader<S> {
     fn line(&mut self, line: &[u8]) {
         self.stats.lines += 1;
         let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if !line_is_candidate(line, S::MARKERS) {
+        if !S::candidate(line) {
             return;
         }
         match serde_json::from_slice::<S::Record>(line) {
@@ -2401,94 +2421,166 @@ impl AccountingKey {
 /// span: one event per model the run used.
 pub const EVENT_MODEL_USAGE: &str = "deck.model_usage";
 
-/// The model families the export names, each the first word of a model's
-/// name ([`exported_model`]). A family marked `true` takes its version
-/// attached (`qwen3`, `llama3.1`, `o4`).
-const MODEL_FAMILIES: &[(&str, bool)] = &[
-    ("claude", false),
-    ("gpt", false),
-    ("o", true),
-    ("codex", false),
-    ("gemini", false),
-    ("gemma", true),
-    ("llama", true),
-    ("mistral", false),
-    ("mixtral", false),
-    ("codestral", false),
-    ("devstral", false),
-    ("magistral", false),
-    ("ministral", false),
-    ("qwen", true),
-    ("deepseek", false),
-    ("grok", false),
-    ("kimi", false),
-    ("glm", false),
-    ("minimax", false),
-    ("swe", false),
-    ("big", false),
-];
+/// One model family the export names ([`exported_model`]).
+struct ModelFamily {
+    /// The family's word, which a model's name starts with.
+    name: &'static str,
+    /// Whether its version may be attached to that word (`qwen3`,
+    /// `llama3.1`), and whether it must be (`o3`).
+    attached: Attached,
+    /// An Ollama tag may follow the name: `:latest` or `:` and a size
+    /// (`llama3.1:8b`).
+    tag: bool,
+    /// Vertex AI's `@` and an eight-digit date may follow the name
+    /// (`claude-opus-4@20250514`).
+    vertex: bool,
+    /// The shapes of the words after the family's, split on `-`: one
+    /// pattern each, as [`shape_matches`] reads them.
+    shapes: &'static [&'static str],
+}
 
-/// The words a model's name may hold after its family, besides versions,
-/// sizes and dates ([`model_word`]). A word outside the list makes the name
-/// one the export does not send, so a name cannot carry a word of its own
-/// in a family's clothing (`gpt-confidential-project`).
-const MODEL_WORDS: &[&str] = &[
-    "opus",
-    "sonnet",
-    "haiku",
-    "fable",
-    "instant",
-    "mini",
-    "nano",
-    "pro",
-    "max",
-    "turbo",
-    "preview",
-    "latest",
-    "chat",
-    "codex",
-    "high",
-    "low",
-    "medium",
-    "xhigh",
-    "flash",
-    "lite",
-    "exp",
-    "experimental",
-    "thinking",
-    "think",
-    "instruct",
-    "coder",
-    "code",
-    "oss",
-    "large",
-    "small",
-    "tiny",
-    "base",
-    "vision",
-    "reasoner",
-    "reasoning",
-    "fast",
-    "spark",
-    "image",
-    "audio",
-    "realtime",
-    "search",
-    "plus",
-    "ultra",
-    "distill",
-    "it",
-    "pickle",
-    "air",
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Attached {
+    No,
+    Also,
+    Only,
+}
+
+const fn family(
+    name: &'static str,
+    attached: Attached,
+    shapes: &'static [&'static str],
+) -> ModelFamily {
+    ModelFamily {
+        name,
+        attached,
+        tag: false,
+        vertex: false,
+        shapes,
+    }
+}
+
+const fn tagged(
+    name: &'static str,
+    attached: Attached,
+    shapes: &'static [&'static str],
+) -> ModelFamily {
+    ModelFamily {
+        tag: true,
+        ..family(name, attached, shapes)
+    }
+}
+
+/// The model families the export names, and the shapes of their published
+/// names. A name of a listed family in a shape not listed for it — another
+/// word, another order, a longer number — is not named, so a family cannot
+/// carry a word or number of a deployment's own (`gpt-confidential-project`,
+/// `gpt-5-12345678901234567890`). A new public name in a new shape needs its
+/// shape added here; until then its tokens are sent without its name.
+const MODEL_FAMILIES: &[ModelFamily] = &[
+    ModelFamily {
+        vertex: true,
+        ..family(
+            "claude",
+            Attached::No,
+            &[
+                "opus|sonnet|haiku|fable #v #v? #d|latest?",
+                "#v #v? opus|sonnet|haiku #d|latest?",
+            ],
+        )
+    },
+    tagged(
+        "gpt",
+        Attached::No,
+        &[
+            "#v|4o mini|nano|pro|codex|codex-mini|codex-max|codex-spark|luna|chat-latest|turbo|turbo-preview|preview|instant|search-preview|mini-search-preview|audio-preview|mini-audio-preview|realtime-preview|mini-realtime-preview|mini-tts|mini-transcribe|transcribe? #d?",
+            "oss #s?",
+            "image #v mini?",
+        ],
+    ),
+    family(
+        "o",
+        Attached::Only,
+        &["#v mini|pro|preview|deep-research|mini-deep-research? #d?"],
+    ),
+    family("codex", Attached::No, &["mini latest?"]),
+    family(
+        "gemini",
+        Attached::No,
+        &[
+            "#v pro|flash|flash-lite|flash-8b|ultra|nano preview|exp|thinking-exp|latest|image|image-preview|live|tts|preview-tts? #d|#r?",
+            "exp #d",
+        ],
+    ),
+    tagged("gemma", Attached::Also, &["#v #s? it?"]),
+    tagged(
+        "llama",
+        Attached::Also,
+        &[
+            "#v #s? instruct|chat|vision-instruct?",
+            "4 maverick|scout #s? 16e|128e? instruct?",
+        ],
+    ),
+    tagged(
+        "mistral",
+        Attached::No,
+        &[
+            "large|medium|small|tiny|nemo|saba latest|#d|#v?",
+            "#s instruct?",
+        ],
+    ),
+    tagged("mixtral", Attached::No, &["8x7b|8x22b instruct?"]),
+    tagged("codestral", Attached::No, &["latest|#d|mamba?"]),
+    tagged("devstral", Attached::No, &["small|medium? latest|#d|#v?"]),
+    tagged("magistral", Attached::No, &["small|medium latest|#d|#v?"]),
+    tagged("ministral", Attached::No, &["#s latest|#d?"]),
+    tagged(
+        "qwen",
+        Attached::Also,
+        &[
+            "#v? max|plus|turbo|flash latest|#d?",
+            "#v coder? plus|flash?",
+            "#v coder? #s #s? instruct|thinking? #d?",
+        ],
+    ),
+    tagged(
+        "deepseek",
+        Attached::No,
+        &[
+            "chat|reasoner",
+            "coder #p? instruct|base?",
+            "#p exp|terminus? #d?",
+            "r1 distill llama|qwen #s",
+        ],
+    ),
+    family(
+        "grok",
+        Attached::No,
+        &[
+            "#v #v? mini|fast|vision? reasoning|non-reasoning? #d?",
+            "code fast #v?",
+        ],
+    ),
+    tagged(
+        "kimi",
+        Attached::No,
+        &["#p instruct|thinking|turbo|turbo-preview? #d? preview?"],
+    ),
+    tagged("glm", Attached::No, &["#v air|airx|flash|x?"]),
+    family("minimax", Attached::No, &["#p"]),
+    family("swe", Attached::No, &["#v lite?"]),
+    family("big", Attached::No, &["pickle"]),
 ];
 
 /// The provider namespaces a model's name may carry in front of it, exactly
 /// as listed: a router's `<provider>/` and a cloud's region prefix. Any other
 /// prefix, a path or a host name included, makes the name one the export does
-/// not send.
+/// not send. Behind a cloud's prefix (one that ends in `.`), Bedrock's `-v`,
+/// a digit, `:` and a digit may end the name (`-v1:0`).
 const MODEL_NAMESPACES: &[&str] = &[
     "anthropic/",
     "openai/",
+    "openai-codex/",
     "google/",
     "mistralai/",
     "meta-llama/",
@@ -2507,63 +2599,187 @@ const MODEL_NAMESPACES: &[&str] = &[
 /// The longest model name the export names.
 const MAX_EXPORTED_MODEL_BYTES: usize = 96;
 
-/// The most words a model's name the export names has, its family's
-/// included.
-const MAX_MODEL_WORDS: usize = 8;
-
-/// Whether `word` is a version (`5`, `5.4`, `4o`, `v1`, `20251001`), a size
-/// (`8b`, `1.5b`, `a3b`), a letter with a number (`k2`, `r1`) or one of
-/// [`MODEL_WORDS`].
-fn model_word(word: &str) -> bool {
-    let b = word.as_bytes();
-    let number = |b: &[u8]| {
-        !b.is_empty()
-            && b.first().is_some_and(u8::is_ascii_digit)
-            && b.last().is_some_and(u8::is_ascii_digit)
-            && b.iter().all(|c| c.is_ascii_digit() || *c == b'.')
-            && !b.windows(2).any(|w| w == b"..")
-    };
-    let version = |b: &[u8]| match b {
-        [rest @ .., last] if last.is_ascii_lowercase() => number(rest),
-        _ => number(b),
-    };
-    MODEL_WORDS.contains(&word)
-        || version(b)
-        || matches!(b, [b'v' | b'a' | b'e' | b'k' | b'm' | b'r' | b'q', rest @ ..] if version(rest))
+/// Whether `word` is all digits, and as long as `len` allows.
+fn digits(word: &str, len: std::ops::RangeInclusive<usize>) -> bool {
+    len.contains(&word.len()) && word.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// The name a model is exported under, if any: a name of [`MODEL_FAMILIES`],
-/// optionally behind one of [`MODEL_NAMESPACES`], every other word of it
-/// (split on `-`, `_`, `:` and `@`) a version, size, date or one of
-/// [`MODEL_WORDS`], lowercase, at most [`MAX_EXPORTED_MODEL_BYTES`] long and
-/// [`MAX_MODEL_WORDS`] words. Every other name, a custom or local model's,
-/// a path or a namespaced name the deck does not know, is not exported;
-/// its usage still is, without a name.
+/// A version: one or two digits, then optionally `.` and one digit (`5`,
+/// `5.4`, `3.5`).
+fn is_version(word: &str) -> bool {
+    match word.split_once('.') {
+        Some((major, minor)) => digits(major, 1..=2) && digits(minor, 1..=1),
+        None => digits(word, 1..=2),
+    }
+}
+
+/// A size in billions of parameters: up to three digits, optionally `.` and
+/// one digit, then `b` (`70b`, `1.5b`), or an active size behind `a`
+/// (`a35b`).
+fn is_size(word: &str) -> bool {
+    let Some(number) = word.strip_suffix('b') else {
+        return false;
+    };
+    match number.strip_prefix('a') {
+        Some(active) => digits(active, 1..=3),
+        None => match number.split_once('.') {
+            Some((whole, part)) => digits(whole, 1..=3) && digits(part, 1..=1),
+            None => digits(number, 1..=3),
+        },
+    }
+}
+
+/// Whether `word` is digits of length `len` whose value is in `range`.
+fn number_in(word: &str, len: usize, range: std::ops::RangeInclusive<u32>) -> bool {
+    digits(word, len..=len) && word.parse().is_ok_and(|n| range.contains(&n))
+}
+
+fn is_month(word: &str) -> bool {
+    number_in(word, 2, 1..=12)
+}
+
+fn is_day(word: &str) -> bool {
+    number_in(word, 2, 1..=31)
+}
+
+fn is_year(word: &str) -> bool {
+    number_in(word, 4, 2020..=2039)
+}
+
+/// An eight-digit date, `YYYYMMDD` (`20251001`).
+fn is_date8(word: &str) -> bool {
+    word.len() == 8 && is_year(&word[..4]) && is_month(&word[4..6]) && is_day(&word[6..])
+}
+
+/// How many of `words` a date can take, each way it can: one eight-digit
+/// date, one four-digit `MMDD` or `YYMM` (`0613`, `2411`), `YYYY-MM-DD` as
+/// three words, or `MM-DD` as two.
+fn date_lengths(words: &[&str]) -> Vec<usize> {
+    let mut lengths = Vec::new();
+    if let [word, ..] = words
+        && (is_date8(word)
+            || (word.len() == 4
+                && ((is_month(&word[..2]) && is_day(&word[2..]))
+                    || (number_in(&word[..2], 2, 23..=39) && is_month(&word[2..])))))
+    {
+        lengths.push(1);
+    }
+    if let [month, day, ..] = words
+        && is_month(month)
+        && is_day(day)
+    {
+        lengths.push(2);
+    }
+    if let [year, month, day, ..] = words
+        && is_year(year)
+        && is_month(month)
+        && is_day(day)
+    {
+        lengths.push(3);
+    }
+    lengths
+}
+
+/// How many of `words` the alternative `choice` of a shape can take, each
+/// way it can (see [`shape_matches`]).
+fn taken(choice: &str, words: &[&str]) -> Vec<usize> {
+    let Some(word) = words.first() else {
+        return Vec::new();
+    };
+    let one = |fits: bool| if fits { vec![1] } else { Vec::new() };
+    match choice {
+        "#v" => one(is_version(word)),
+        "#p" => {
+            one(matches!(word.as_bytes(), [b'v' | b'r' | b'k' | b'm', ..])
+                && is_version(&word[1..]))
+        }
+        "#s" => one(is_size(word)),
+        "#r" => one(matches!(word.as_bytes(), [b'0', b'0', b'1'..=b'9'])),
+        "#d" => date_lengths(words),
+        literal => {
+            let parts: Vec<&str> = literal.split('-').collect();
+            if words.len() >= parts.len() && words[..parts.len()] == parts[..] {
+                vec![parts.len()]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+}
+
+/// Whether `words` are, in order, the slots of `shape`. Slots are separated
+/// by spaces, each a choice of alternatives separated by `|`, and optional
+/// when it ends in `?`. An alternative is literal words joined by `-`, or a
+/// class: `#v` a version ([`is_version`]), `#p` a version behind `v`, `r`,
+/// `k` or `m` (`r1`, `v3.1`), `#s` a size ([`is_size`]), `#d` a date
+/// ([`date_lengths`]), `#r` a revision (`001`).
+fn shape_matches(shape: &str, words: &[&str]) -> bool {
+    fn rest_matches(slots: &[&str], words: &[&str]) -> bool {
+        let Some((slot, rest)) = slots.split_first() else {
+            return words.is_empty();
+        };
+        let (choices, optional) = match slot.strip_suffix('?') {
+            Some(choices) => (choices, true),
+            None => (*slot, false),
+        };
+        (optional && rest_matches(rest, words))
+            || choices.split('|').any(|choice| {
+                taken(choice, words)
+                    .into_iter()
+                    .any(|n| rest_matches(rest, &words[n..]))
+            })
+    }
+    let slots: Vec<&str> = shape.split(' ').collect();
+    rest_matches(&slots, words)
+}
+
+/// The name a model is exported under, if any: optionally one of
+/// [`MODEL_NAMESPACES`], then a name of one of [`MODEL_FAMILIES`] in one of
+/// the shapes listed for it, with only the suffix its family allows, at most
+/// [`MAX_EXPORTED_MODEL_BYTES`] long. Every other name — a custom or local
+/// model's, a path, a namespace the deck does not know, a deployment's own
+/// suffix after `@` or `:` — is not exported; its usage still is, without a
+/// name.
 pub fn exported_model(model: &Ident) -> Option<&Ident> {
     let name = model.as_str();
     if name.len() > MAX_EXPORTED_MODEL_BYTES {
         return None;
     }
-    let bare = MODEL_NAMESPACES
+    let (namespace, mut bare) = MODEL_NAMESPACES
         .iter()
-        .find_map(|ns| name.strip_prefix(ns))
-        .unwrap_or(name);
-    let mut words = bare.split(['-', '_', ':', '@']);
-    let first = words.next()?;
-    let family = MODEL_FAMILIES.iter().any(|(family, attached)| {
-        first == *family
-            || (*attached
-                && first
-                    .strip_prefix(family)
-                    .is_some_and(|v| model_word(v) && v.as_bytes()[0].is_ascii_digit()))
-    });
-    let rest: Vec<&str> = words.collect();
-    let shaped = family
-        && rest.len() < MAX_MODEL_WORDS
-        && rest.iter().all(|w| model_word(w))
-        // A family that takes its version attached says nothing alone.
-        && !(first == "o" || (first == "big" && rest.is_empty()));
-    shaped.then_some(model)
+        .find_map(|ns| name.strip_prefix(ns).map(|bare| (*ns, bare)))
+        .unwrap_or(("", name));
+    if namespace.ends_with('.')
+        && let Some((core, version)) = bare.rsplit_once("-v")
+        && matches!(version.as_bytes(), [a, b':', b] if a.is_ascii_digit() && b.is_ascii_digit())
+    {
+        bare = core;
+    }
+    let (core, suffix) = match bare.find(['@', ':']) {
+        Some(at) => (&bare[..at], Some((&bare[at..at + 1], &bare[at + 1..]))),
+        None => (bare, None),
+    };
+    let mut words = core.split('-');
+    let head = words.next()?;
+    let (family, attached) = MODEL_FAMILIES.iter().find_map(|family| {
+        if head == family.name {
+            return (family.attached != Attached::Only).then_some((family, None));
+        }
+        let version = head.strip_prefix(family.name)?;
+        (family.attached != Attached::No && is_version(version)).then_some((family, Some(version)))
+    })?;
+    let suffix_fits = match suffix {
+        None => true,
+        Some(("@", date)) => family.vertex && is_date8(date),
+        Some((_, tag)) => family.tag && (tag == "latest" || is_size(tag)),
+    };
+    let words: Vec<&str> = attached.into_iter().chain(words).collect();
+    (suffix_fits
+        && family
+            .shapes
+            .iter()
+            .any(|shape| shape_matches(shape, &words)))
+    .then_some(model)
 }
 
 /// Plan names Codex is known to report (`rate_limits.plan_type`).
@@ -5462,6 +5678,54 @@ mod tests {
             "kimi-k2",
             "glm-4.6",
             "big-pickle",
+            // What the four agents report for the models this repository's
+            // real-agent tests run on (`tests/common/mod.rs`): Claude Code's
+            // and OpenCode's Claude models, Codex's ChatGPT default and its
+            // API-key default, Pi's default (`openai-codex/gpt-5.6-luna`, of
+            // which Pi reports the model), OpenCode's override for a
+            // ChatGPT login (`openai/gpt-5.6-luna`, of which OpenCode
+            // reports the model) and for OpenRouter.
+            "claude-haiku-5-5",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-fable-5-1",
+            "claude-haiku-4-5",
+            "anthropic/claude-haiku-4-5-20251001",
+            "gpt-5.6-luna",
+            "openai-codex/gpt-5.6-luna",
+            "openai/gpt-5.6-luna",
+            "gpt-5.1-codex-mini",
+            "gpt-5-nano",
+            "gpt-5.3-codex-spark",
+            "gpt-5.4",
+            "openai/gpt-4o-mini",
+            // Other published shapes.
+            "claude-3-5-sonnet-20241022",
+            "claude-3-7-sonnet-latest",
+            "gpt-5-codex",
+            "gpt-4o-2024-08-06",
+            "gpt-oss-120b",
+            "gpt-oss:20b",
+            "o3-mini-2025-01-31",
+            "codex-mini-latest",
+            "gemini-2.5-pro",
+            "gemini-2.5-flash-lite",
+            "gemini-2.5-pro-preview-05-06",
+            "gemini-1.5-pro-002",
+            "gemma-3-27b-it",
+            "llama-3.3-70b-instruct",
+            "llama-4-maverick-17b-128e-instruct",
+            "mistral-large-2411",
+            "devstral-small-2505",
+            "qwen3-235b-a22b-thinking-2507",
+            "qwen2.5-coder:32b",
+            "deepseek-v3.1",
+            "deepseek-r1-0528",
+            "grok-code-fast-1",
+            "grok-4-fast-reasoning",
+            "kimi-k2-0905-preview",
+            "glm-4.5-air",
+            "minimax-m2",
         ] {
             assert_eq!(
                 exported_model(&id(kept)).map(Ident::as_str),
@@ -5492,6 +5756,22 @@ mod tests {
             "o",
             "big",
             "gpt-5-1-2-3-4-5-6-7",
+            // A known family with a deployment's own suffix: an address, a
+            // host, a long number, words in no published combination.
+            "gpt-5@10.42.0.7",
+            "gpt-5:10.42.0.7",
+            "gpt-5-12345678901234567890",
+            "gpt-5-10.42.0.7",
+            "gpt-5-db01.corp.example",
+            "gpt-5-prod-eu",
+            "gpt-high-code-search",
+            "gpt-5-mini-pro-codex",
+            "claude-opus-4@10.42.0.7",
+            "claude-opus-4@99999999",
+            "llama3.1:customer",
+            "claude-haiku-5-5-v1:0",
+            "gpt-123.4",
+            "gpt-5.44",
         ] {
             let Some(ident) = Ident::new(dropped) else {
                 continue;
@@ -5546,6 +5826,50 @@ mod tests {
         let text = format!("{export:?}");
         for leaked in ["/home/x", "example.com", "sk-ant"] {
             assert!(!text.contains(leaked), "{leaked} in {text}");
+        }
+
+        // The same at the export: a deployment's own model name sends no
+        // name but keeps the model's tokens; a published one is sent.
+        for (model, named) in [
+            ("gpt-5@10.42.0.7", false),
+            ("gpt-5-12345678901234567890", false),
+            ("gpt-5-10.42.0.7", false),
+            ("gpt-5-db01.corp.example", false),
+            ("gpt-high-code-search", false),
+            ("home/alice/private/gpt-5", false),
+            ("customer-secret.example/gpt-5", false),
+            ("gpt-5.6-luna", true),
+            ("openai-codex/gpt-5.6-luna", true),
+            ("claude-haiku-5-5", true),
+        ] {
+            let export = run_attributes(&run(
+                identity("r", "codex"),
+                model,
+                tokens(7, 3),
+                Field::Estimated(MicroUsd(1)),
+            ));
+            let event = &export.models[0];
+            assert_eq!(
+                has(event, AccountingKey::ResponseModel, model),
+                named,
+                "{model}"
+            );
+            assert!(
+                event
+                    .iter()
+                    .any(|a| a.key() == AccountingKey::InputTokens
+                        && *a.value() == AttrValue::Int(7)),
+                "{model}: {event:?}"
+            );
+            if !named {
+                assert!(
+                    !event
+                        .iter()
+                        .any(|a| a.key() == AccountingKey::ResponseModel),
+                    "{model}"
+                );
+                assert!(!format!("{export:?}").contains(model), "{model}");
+            }
         }
     }
 

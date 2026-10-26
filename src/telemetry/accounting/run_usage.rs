@@ -71,9 +71,8 @@ pub struct UsageFile {
 /// from the readers so that noting one never waits for a read.
 #[derive(Default)]
 struct Inbox {
-    /// Claude Code: session id, working directory, and when the deck first
-    /// saw it, in milliseconds since the Unix epoch.
-    claude: Vec<(String, Option<String>, i64)>,
+    /// Claude Code: session id and working directory.
+    claude: Vec<(String, Option<String>)>,
     /// Codex: the rollout path its hook reported.
     codex: Vec<String>,
     /// More sessions than [`MAX_SESSIONS`] were seen.
@@ -204,16 +203,14 @@ impl RunUsage {
                     return;
                 }
                 let mut inbox = lock(&inner.inbox);
-                if inbox.claude.iter().any(|(s, _, _)| s == id) {
+                if inbox.claude.iter().any(|(s, _)| s == id) {
                     return;
                 }
                 if inbox.claude.len() >= MAX_SESSIONS {
                     inbox.lost = true;
                     return;
                 }
-                let seen = i64::try_from(crate::telemetry::now_unix_nanos() / 1_000_000)
-                    .unwrap_or(i64::MAX);
-                inbox.claude.push((id.to_string(), event.cwd.clone(), seen));
+                inbox.claude.push((id.to_string(), event.cwd.clone()));
             }
             UsageSource::CodexRollout => {
                 let Some(reported) = event.metadata.get(CODEX_TRANSCRIPT_PATH_METADATA_KEY) else {
@@ -231,6 +228,13 @@ impl RunUsage {
             }
             _ => {}
         }
+    }
+
+    /// Hold the run's readers, as a poll or a finish reading a slow disk
+    /// would, until the returned guard is dropped.
+    #[cfg(test)]
+    pub(crate) fn hold_readers(&self) -> impl Sized + '_ {
+        lock(&self.inner.readers)
     }
 
     /// Read what each record gained since the last poll, locating the ones
@@ -264,7 +268,7 @@ impl RunUsage {
             let observed = inbox.claude.clone();
             drop(inbox);
             if let Some(root) = &readers.claude_root {
-                for (s, (id, cwd, _)) in readers.claude.iter_mut().zip(&observed) {
+                for (s, (id, cwd)) in readers.claude.iter_mut().zip(&observed) {
                     if s.reader.is_none()
                         && let Some(rel) =
                             locate::claude_transcript(root, cwd.as_deref(), id, search)
@@ -344,10 +348,10 @@ impl RunUsage {
 
     /// The agent's usage from what the readers read. A session whose record
     /// was observed but could not be read stands for an unknown part of the
-    /// run, which makes its total incomplete, unless a later Claude Code
-    /// transcript's running total started before the deck saw that session,
-    /// and so covers it. With no session read at all, the usage is not
-    /// recorded.
+    /// run, which makes its total incomplete, unless what was read of a
+    /// Claude Code transcript carries a running total that a later one the
+    /// run read carries too ([`combine_transcripts`]). With no session read
+    /// at all, the usage is not recorded.
     fn usage(&self, readers: &Readers) -> AgentUsage {
         let inner = &*self.inner;
         match inner.source {
@@ -356,15 +360,13 @@ impl RunUsage {
                 if readers.claude.is_empty() {
                     return from_claude(None);
                 }
-                let seen = lock(&inner.inbox).claude.clone();
                 let observed: Vec<Observed> = readers
                     .claude
                     .iter()
-                    .zip(&seen)
-                    .map(|(s, (_, _, at))| Observed {
-                        summary: s.read().map(JsonlReader::summary),
+                    .map(|s| Observed {
+                        summary: s.reader.as_ref().map(JsonlReader::summary),
+                        read: s.read().is_some(),
                         cut_short: s.cut_short(),
-                        seen_at_ms: *at,
                     })
                     .collect();
                 combine_transcripts(&observed)
@@ -432,13 +434,13 @@ impl Readers {
         let claude = self.claude.iter().filter_map(|s| s.reader.as_ref());
         let codex = self.codex.iter().filter_map(|s| s.reader.as_ref());
         claude
-            .map(|r| (r.stats().backlog, r.unfinished_candidate()))
-            .chain(codex.map(|r| (r.stats().backlog, r.unfinished_candidate())))
+            .map(|r| (r.stats().backlog, r.unfinished_line()))
+            .chain(codex.map(|r| (r.stats().backlog, r.unfinished_line())))
             .chain(
                 self.usage_file
                     .reader
                     .iter()
-                    .map(|r| (r.stats().backlog, r.unfinished_candidate())),
+                    .map(|r| (r.stats().backlog, r.unfinished_line())),
             )
     }
 
@@ -766,11 +768,12 @@ mod tests {
         }
     }
 
-    /// A session whose transcript was not read is covered when a later
-    /// transcript's running total had started by the time the deck saw it:
-    /// that total holds it, and the run's figure is that total.
+    /// A session whose transcript was not read is not covered by a later
+    /// transcript only because that one's running total had started by the
+    /// time the deck saw it: nothing ties the two totals together, so the
+    /// run is incomplete rather than the later total.
     #[test]
-    fn a_session_not_read_is_covered_by_a_later_total_that_holds_it() {
+    fn a_session_not_read_is_not_covered_by_an_earlier_starting_total() {
         let config = tempfile::tempdir().unwrap();
         let usage = RunUsage::new(&AgentType::ClaudeCode, claude_dirs(config.path()), 0);
         usage.observe(&claude_event("s-gone", "/w"));
@@ -780,7 +783,8 @@ mod tests {
             &[&cost_state(10, "0.0123", now_ms() - 60_000)],
         );
         let run = exported(&usage.finish("run6", EndReason::Exited, None));
-        assert_eq!(run["gen_ai.usage.input_tokens"], int(350));
+        assert_eq!(run["deck.tokens.unavailable_reason"], text("incomplete"));
+        assert!(!run.contains_key("gen_ai.usage.input_tokens"));
     }
 
     /// A second Codex rollout that is missing, or unreadable, makes the
@@ -970,6 +974,86 @@ mod tests {
         usage.observe(&codex_event(&rollout));
         let run = exported(&usage.finish("run15", EndReason::Exited, None));
         assert_eq!(run["deck.tokens.unavailable_reason"], text("incomplete"));
+    }
+
+    /// A tail cut off after only a few bytes — too short to hold a record's
+    /// type — is still a record the agent did not finish: incomplete, last
+    /// turn unknown, for a usage file and a Claude Code transcript alike.
+    #[test]
+    fn a_very_short_cut_off_tail_makes_the_run_incomplete() {
+        let tail = |path: &Path, bytes: &str| {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(path)
+                .unwrap()
+                .write_all(bytes.as_bytes())
+                .unwrap();
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("run19.usage.jsonl");
+        append(&file, &[PI_REPLY]);
+        tail(&file, r#"{"v":1,"ty"#);
+        let usage = RunUsage::new(
+            &AgentType::Pi,
+            usage_file_dirs(dir.path(), "run19.usage.jsonl"),
+            0,
+        );
+        let run = exported(&usage.finish("run19", EndReason::Exited, None));
+        assert_eq!(run["deck.tokens.unavailable_reason"], text("incomplete"));
+        assert_eq!(run["deck.run.last_turn"], text("unknown"));
+        assert_eq!(run["deck.run.termination"], text("unknown"));
+
+        let config = tempfile::tempdir().unwrap();
+        let path = config.path().join("projects/-w/s-short.jsonl");
+        append(
+            &path,
+            &[
+                r#"{"type":"assistant","message":{"stop_reason":"end_turn"}}"#,
+                COST_STATE,
+            ],
+        );
+        tail(&path, r#"{"type":"ass"#);
+        let usage = RunUsage::new(&AgentType::ClaudeCode, claude_dirs(config.path()), 0);
+        usage.observe(&claude_event("s-short", "/w"));
+        let run = exported(&usage.finish("run20", EndReason::Exited, None));
+        assert_eq!(run["deck.tokens.unavailable_reason"], text("incomplete"));
+        assert_eq!(run["deck.run.last_turn"], text("unknown"));
+    }
+
+    /// A Pi or OpenCode reply that completed, then a line the deck cannot
+    /// read — another version — ends the run `unknown`, not `completed`: the
+    /// lost line may have been a failure or a new turn. A later reply of the
+    /// agent's says how it ended again.
+    #[test]
+    fn a_lost_line_after_a_completed_reply_leaves_the_ending_unknown() {
+        let opencode_reply = r#"{"v":1,"type":"reply","agent":"opencode","id":"msg_1","model":"gpt-5.4-mini","input":100,"output":20,"cache_read":0,"cache_write":0,"cost_usd":0.1,"stop":"stop"}"#;
+        for (agent, reply) in [
+            (AgentType::Pi, PI_REPLY),
+            (AgentType::OpenCode, opencode_reply),
+        ] {
+            for recovered in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let file = dir.path().join("run21.usage.jsonl");
+                let lost = reply.replace(r#""v":1"#, r#""v":2"#);
+                let again = reply.replace("msg_1", "msg_2");
+                let mut lines = vec![reply, lost.as_str()];
+                if recovered {
+                    lines.push(&again);
+                }
+                append(&file, &lines);
+                let usage =
+                    RunUsage::new(&agent, usage_file_dirs(dir.path(), "run21.usage.jsonl"), 0);
+                let run = exported(&usage.finish("run21", EndReason::Exited, None));
+                let ending = if recovered { "completed" } else { "unknown" };
+                assert_eq!(run["deck.run.last_turn"], text(ending), "{agent:?}");
+                assert_eq!(run["deck.run.termination"], text(ending), "{agent:?}");
+                assert_eq!(
+                    run["deck.tokens.unavailable_reason"],
+                    text("incomplete"),
+                    "{agent:?}"
+                );
+            }
+        }
     }
 
     /// An arbitrary command has no usage channel, and its exit status

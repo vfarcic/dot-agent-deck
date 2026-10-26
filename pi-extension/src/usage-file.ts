@@ -104,7 +104,9 @@ export type AppendResult = "appended" | "unsafe" | "failed";
  * file must already be there (the deck makes it), and is opened without
  * following a symlink and without waiting on a FIFO; it must be a regular
  * file of this user's that no other user can read or write. Anything else is
- * skipped — the run's usage is then not recorded — and never blocks Pi.
+ * skipped, and the run's usage is then not recorded. `O_NONBLOCK` keeps a
+ * FIFO from holding up the open; the calls are synchronous, so a slow file
+ * system still holds Pi up for as long as the open, stat and write take.
  */
 export function appendUsageLine(path: string, line: string): AppendResult {
 	const flags =

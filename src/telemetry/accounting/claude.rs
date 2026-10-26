@@ -10,18 +10,22 @@
 //!
 //! A resumed session starts from the total its last run left, so a
 //! `cost-state` already in the transcript when the run began is that run's,
-//! not this one's. Where the run's part of a transcript begins is read from
-//! the transcript itself ([`ClaudeTranscriptSummary::set_run_start`]): the
-//! first record stamped at or after the run's start, in a transcript holding
-//! records stamped before it, is the boundary, wherever the reader was when
-//! it got there. The last `cost-state` before it is the baseline
-//! ([`ClaudeTranscriptSummary::seal_baseline`]), and the run is credited
-//! only with what the total grew by since, unless the total itself started
-//! during the run (`startTime`), which makes it the run's alone. A total
-//! carried from before the run with no baseline to count from, one in a
-//! transcript older than the run with no stamped record to place the
-//! boundary by, or one that went down in any count since the baseline is
-//! [`Unavailable::Incomplete`], never a guess.
+//! not this one's. A total is credited to the run as a number only on
+//! evidence that it is wholly the run's, or counted from a baseline the
+//! transcript places before the run; in any doubt it is
+//! [`Unavailable::Incomplete`]. Where the run's part of a transcript begins
+//! is read from the transcript itself
+//! ([`ClaudeTranscriptSummary::set_run_start`]): the first record stamped at
+//! or after the run's start, after records stamped before it, is the
+//! boundary, wherever the reader was when it got there, and the last
+//! `cost-state` before it is the baseline. The evidence that a total is
+//! wholly the run's is a total that itself started during the run
+//! (`startTime`), or a transcript created after the run began (its creation
+//! time, where the file system records one). A total carried from before the
+//! run with neither a baseline nor that evidence — after records with no
+//! stamp, in a transcript older than the run, or with no creation time to
+//! tell — is incomplete, as is one that went down in any count since its
+//! baseline.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -85,6 +89,9 @@ pub struct ClaudeTranscriptSummary {
     /// The file was created before the run began, where its creation time
     /// is known ([`Self::note_birth`]).
     born_before_run: Option<bool>,
+    /// A record has been read: one that comes before the first stamped one
+    /// is history with no stamp to place it by.
+    records: bool,
 }
 
 /// Where in a transcript the reader is, relative to the run's start.
@@ -102,35 +109,39 @@ enum Part {
 impl ClaudeTranscriptSummary {
     /// Mark everything read so far as the transcript's state when the run
     /// began: its last `cost-state` becomes the baseline the run's usage is
-    /// counted from, and its last turn is forgotten. Called once, after the
-    /// reader has first caught up with a transcript that was already there
-    /// when the run began (a resumed session); a transcript the run created
-    /// holds only the run's own records and needs no baseline. A second call
-    /// does nothing.
+    /// counted from, and its last turn is forgotten. The reader does this
+    /// when a record stamped at or after the run's start follows records
+    /// stamped before it ([`Self::set_run_start`]). A second call does
+    /// nothing.
     pub fn seal_baseline(&mut self) {
+        let baseline = match &self.latest {
+            Some(Ok(state)) => Some(state.clone()),
+            _ => None,
+        };
+        self.seal(baseline);
+    }
+
+    fn seal(&mut self, baseline: Option<CostState>) {
         if self.sealed {
             return;
         }
         self.sealed = true;
-        self.baseline = match &self.latest {
-            Some(Ok(state)) => Some(state.clone()),
-            _ => None,
-        };
+        self.baseline = baseline;
         self.last_turn = None;
         self.before_user = None;
     }
 
     /// The run this transcript is read for began at `started`, in
     /// nanoseconds since the Unix epoch: records stamped before it are an
-    /// earlier run's, and the first one stamped at or after it seals the
-    /// baseline (see the module docs). Kept when the reader starts over.
+    /// earlier run's, and the first one stamped at or after it is the
+    /// boundary (see the module docs). Kept when the reader starts over.
     pub fn set_run_start(&mut self, started: u64) {
         self.run_start_ms = i64::try_from(started / 1_000_000).ok();
     }
 
-    /// When the file was created, where known: a transcript older than the
-    /// run with no stamped record to place its boundary by is not read as
-    /// the run's.
+    /// When the file was created, where known: a transcript created after
+    /// the run began holds only the run's records, and one created before it
+    /// holds an earlier run's.
     pub fn note_birth(&mut self, born: Option<SystemTime>) {
         let (Some(start), Some(born)) = (self.run_start_ms, born) else {
             return;
@@ -160,7 +171,15 @@ impl ClaudeTranscriptSummary {
                 self.seal_baseline();
                 self.part = Part::Run;
             }
-            Part::Unplaced => self.part = Part::Run,
+            Part::Unplaced => {
+                // Records with no stamp came first: they may be an earlier
+                // run's, and nothing places a total among them before or
+                // after the run's start, so none of them is a baseline.
+                if self.records {
+                    self.seal(None);
+                }
+                self.part = Part::Run;
+            }
         }
     }
 
@@ -176,111 +195,104 @@ impl ClaudeTranscriptSummary {
         }
     }
 
-    /// The run's usage. Without a run start, and before
-    /// [`seal_baseline`](Self::seal_baseline), every total read counts as the
-    /// run's own.
-    pub fn usage(&self) -> AgentUsage {
-        let older = self.born_before_run == Some(true);
+    /// The last turn read, unless nothing places the records it came from
+    /// in the run.
+    fn placed_turn(&self) -> Option<AgentTurnEnd> {
         let placed = match self.part {
             _ if self.run_start_ms.is_none() => true,
-            Part::Run => true,
-            // Only an earlier run's records so far: this run wrote none.
             Part::Before => false,
-            // No stamped record yet: the run's own transcript, unless the
-            // file is older than the run.
-            Part::Unplaced => !older,
+            _ if self.sealed => true,
+            // No record before the first one the run could have written: the
+            // run's own, unless the file is older than the run.
+            _ => self.born_before_run != Some(true),
         };
-        let models = match (&self.latest, self.sealed && !self.total_since_seal) {
-            (None, _) | (_, true) => usage_unavailable(Unavailable::NotRecorded),
-            _ if !placed && self.part == Part::Before => {
+        if placed { self.last_turn.clone() } else { None }
+    }
+
+    /// The run's usage. Without a run start, every total read counts as the
+    /// run's own.
+    pub fn usage(&self) -> AgentUsage {
+        self.usage_from(self)
+    }
+
+    /// The run's usage from the running total this transcript's last
+    /// `cost-state` carries, counted from what `first` — the earliest
+    /// transcript the run read that carries the same total, or this one —
+    /// places before the run.
+    fn usage_from(&self, first: &Self) -> AgentUsage {
+        let models = match &self.latest {
+            None => usage_unavailable(Unavailable::NotRecorded),
+            // No total since the boundary, or only an earlier run's records:
+            // this run wrote none.
+            Some(_) if self.sealed && !self.total_since_seal => {
                 usage_unavailable(Unavailable::NotRecorded)
             }
-            // A transcript older than the run, with nothing to say where the
-            // run's part of it begins.
-            _ if !placed => usage_unavailable(Unavailable::Incomplete),
-            (Some(Err(())), _) => usage_unavailable(Unavailable::UnrecognizedFormat),
-            (Some(Ok(latest)), _) => self.models_since_baseline(latest),
+            Some(_) if self.run_start_ms.is_some() && self.part == Part::Before => {
+                usage_unavailable(Unavailable::NotRecorded)
+            }
+            Some(latest) => {
+                let own_total = latest.as_ref().is_ok_and(|latest| {
+                    self.run_start_ms
+                        .zip(latest.start_time)
+                        .is_some_and(|(start, total)| total >= start)
+                });
+                match (first.base(own_total), latest) {
+                    (Err(reason), _) => usage_unavailable(reason),
+                    (Ok(_), Err(())) => usage_unavailable(Unavailable::UnrecognizedFormat),
+                    (Ok(base), Ok(latest)) => {
+                        models_since(base.unwrap_or(&CostState::default()), latest)
+                    }
+                }
+            }
         };
         AgentUsage {
             models,
             quota: Field::Unavailable(Unavailable::NoChannel),
-            last_turn: if placed { self.last_turn.clone() } else { None },
+            last_turn: self.placed_turn(),
         }
     }
 
-    fn models_since_baseline(&self, latest: &CostState) -> Vec<super::ModelUsage> {
-        let empty = CostState::default();
-        // A total that started during the run holds the run's usage alone.
-        let own_total = self
-            .run_start_ms
-            .zip(latest.start_time)
-            .is_some_and(|(start, total)| total >= start);
-        let base = match (&self.baseline, own_total) {
-            (Some(base), false) => base,
-            // Carried from before the run, with no total before the
-            // boundary to count from.
-            (None, false) if self.sealed && self.run_start_ms.is_some() => {
-                return usage_unavailable(Unavailable::Incomplete);
-            }
-            _ => &empty,
-        };
-        if base
-            .models
-            .keys()
-            .any(|model| !latest.models.contains_key(model))
+    /// What a total of this transcript's running total is counted from:
+    /// `None` for a total that is wholly the run's, else the baseline before
+    /// the boundary, or why neither is known. `own_total` says the total
+    /// itself started during the run.
+    fn base(&self, own_total: bool) -> Result<Option<&CostState>, Unavailable> {
+        if self.run_start_ms.is_some()
+            && !self.sealed
+            && self.part != Part::Before
+            && self.born_before_run == Some(true)
         {
-            return usage_unavailable(Unavailable::Incomplete);
+            // A file older than the run with no record stamped before it:
+            // its stamps, and so a total's start, are not on the run's clock.
+            return Err(Unavailable::Incomplete);
         }
-        let mut acc = super::UsageAcc::default();
-        for (model, now) in &latest.models {
-            let before = base.models.get(model).copied().unwrap_or_default();
-            let grown = (|| {
-                Some(ModelTotal {
-                    input: now.input.checked_sub(before.input)?,
-                    output: now.output.checked_sub(before.output)?,
-                    cache_read: now.cache_read.checked_sub(before.cache_read)?,
-                    cache_write: now.cache_write.checked_sub(before.cache_write)?,
-                    cost_usd: match (now.cost_usd, before.cost_usd) {
-                        (Some(a), Some(b)) if a >= b => Some(a - b),
-                        (Some(a), None) if before == ModelTotal::default() => Some(a),
-                        _ => None,
-                    },
-                })
-            })();
-            let Some(grown) = grown else {
-                let none = Unavailable::Incomplete;
-                acc.add(
-                    model.clone(),
-                    Field::Unavailable(none),
-                    Field::Unavailable(none),
-                );
-                continue;
-            };
-            let counts = |t: &ModelTotal| (t.input, t.output, t.cache_read, t.cache_write);
-            if counts(&grown) == (0, 0, 0, 0) && counts(&before) != (0, 0, 0, 0) {
-                // A model the run did not use again: nothing to credit.
-                continue;
-            }
-            let tokens = input_plus_cache(
-                grown.input,
-                grown.output,
-                grown.cache_read,
-                grown.cache_write,
-            );
-            let cost = if latest.has_unknown_model_cost {
-                Field::Unavailable(Unavailable::UnknownPrice)
-            } else {
-                agent_cost(grown.cost_usd.and_then(MicroUsd::from_usd), &tokens)
-            };
-            acc.add(model.clone(), Field::ProviderReported(tokens), cost);
+        if own_total {
+            return Ok(None);
         }
-        acc.finish()
+        if let Some(baseline) = self.baseline.as_ref().filter(|_| self.sealed) {
+            return Ok(Some(baseline));
+        }
+        if self.run_start_ms.is_none() {
+            return Ok(None);
+        }
+        if self.part == Part::Before || self.sealed {
+            // Nothing read at or after the run's start to place a baseline
+            // by, or no total before the boundary to count from.
+            return Err(Unavailable::Incomplete);
+        }
+        // Nothing was read before the run's first record: the whole total is
+        // the run's only when the file is known to be newer than the run.
+        match self.born_before_run {
+            Some(false) => Ok(None),
+            Some(true) | None => Err(Unavailable::Incomplete),
+        }
     }
 
     fn observe_record(&mut self, record: ClaudeRecord) {
         if let Some(stamp) = record.timestamp.0.as_deref() {
             self.observe_stamp(stamp);
         }
+        self.records = true;
         let flag = |v: &OptScalar| v.as_bool() == Some(true);
         if flag(&record.sidechain) {
             return;
@@ -350,44 +362,102 @@ impl ClaudeTranscriptSummary {
     }
 }
 
-/// One Claude Code session a run's events named: its transcript's summary,
-/// when the transcript was read, and when the deck first saw the session, in
-/// milliseconds since the Unix epoch.
+/// Each model's growth from `base` to `latest`, the cost estimate with it.
+/// A model `base` had that `latest` lost, or a count that went down, is
+/// incomplete; a model the run did not use again is not credited.
+fn models_since(base: &CostState, latest: &CostState) -> Vec<super::ModelUsage> {
+    if base
+        .models
+        .keys()
+        .any(|model| !latest.models.contains_key(model))
+    {
+        return usage_unavailable(Unavailable::Incomplete);
+    }
+    let mut acc = super::UsageAcc::default();
+    for (model, now) in &latest.models {
+        let before = base.models.get(model).copied().unwrap_or_default();
+        let grown = (|| {
+            Some(ModelTotal {
+                input: now.input.checked_sub(before.input)?,
+                output: now.output.checked_sub(before.output)?,
+                cache_read: now.cache_read.checked_sub(before.cache_read)?,
+                cache_write: now.cache_write.checked_sub(before.cache_write)?,
+                cost_usd: match (now.cost_usd, before.cost_usd) {
+                    (Some(a), Some(b)) if a >= b => Some(a - b),
+                    (Some(a), None) if before == ModelTotal::default() => Some(a),
+                    _ => None,
+                },
+            })
+        })();
+        let Some(grown) = grown else {
+            let none = Unavailable::Incomplete;
+            acc.add(
+                model.clone(),
+                Field::Unavailable(none),
+                Field::Unavailable(none),
+            );
+            continue;
+        };
+        let counts = |t: &ModelTotal| (t.input, t.output, t.cache_read, t.cache_write);
+        if counts(&grown) == (0, 0, 0, 0) && counts(&before) != (0, 0, 0, 0) {
+            // A model the run did not use again: nothing to credit.
+            continue;
+        }
+        let tokens = input_plus_cache(
+            grown.input,
+            grown.output,
+            grown.cache_read,
+            grown.cache_write,
+        );
+        let cost = if latest.has_unknown_model_cost {
+            Field::Unavailable(Unavailable::UnknownPrice)
+        } else {
+            agent_cost(grown.cost_usd.and_then(MicroUsd::from_usd), &tokens)
+        };
+        acc.add(model.clone(), Field::ProviderReported(tokens), cost);
+    }
+    acc.finish()
+}
+
+/// One Claude Code session a run's events named, as far as its transcript
+/// was read.
 pub struct Observed<'a> {
+    /// What was read of its transcript, if it was found.
     pub summary: Option<&'a ClaudeTranscriptSummary>,
+    /// The transcript was readable at the run's end.
+    pub read: bool,
     /// The transcript was read from, then could not be.
     pub cut_short: bool,
-    pub seen_at_ms: i64,
 }
 
 /// One run's usage from the transcripts of every Claude Code session it
 /// held, in the order the run saw them. Claude Code can carry one running
-/// total from a session into the next (a `/clear`, or a resume), so of the
-/// transcripts whose last totals share a start, only the last is counted;
-/// the rest are combined as separate sessions
-/// ([`super::combine_sessions`]). A session whose transcript was not read
-/// is an unknown part of the run, so the run's total is incomplete and its
-/// last turn unknown when it was the last — unless a later transcript's
-/// running total had started by the time the deck saw that session, and so
-/// already holds it.
+/// total from a session into the next (a `/clear`, or a resume), so the
+/// transcripts whose last totals share a start (`startTime`) hold one total:
+/// it is counted once, as the last of them the run read carries it, from
+/// what the earliest of them places before the run. The rest are combined as
+/// separate sessions ([`super::combine_sessions`]). A session whose
+/// transcript was not read is an unknown part of the run — its total
+/// incomplete, its last turn unknown when it was the last — unless what was
+/// read of it carries a total that a later transcript the run read carries
+/// too, which then holds it.
 pub fn combine_transcripts(sessions: &[Observed]) -> AgentUsage {
-    let later_start = |i: usize| {
-        sessions[i + 1..].iter().filter_map(|later| {
-            later
-                .summary
-                .and_then(ClaudeTranscriptSummary::tracker_start)
-        })
-    };
+    let start = |s: &Observed| s.summary.and_then(ClaudeTranscriptSummary::tracker_start);
     let parts = sessions
         .iter()
         .enumerate()
-        .filter_map(|(i, session)| match session.summary {
-            Some(summary) => summary
-                .tracker_start()
-                .is_none_or(|start| !later_start(i).any(|later| later == start))
-                .then(|| summary.usage()),
-            None => {
-                (!later_start(i).any(|start| start <= session.seen_at_ms)).then(|| AgentUsage {
+        .filter_map(|(i, session)| {
+            let shared = start(session);
+            let carried_on = shared.is_some_and(|total| {
+                sessions[i + 1..]
+                    .iter()
+                    .any(|later| later.read && start(later) == Some(total))
+            });
+            if carried_on {
+                return None;
+            }
+            let Some(summary) = session.summary.filter(|_| session.read) else {
+                return Some(AgentUsage {
                     models: usage_unavailable(if session.cut_short {
                         Unavailable::Incomplete
                     } else {
@@ -395,8 +465,27 @@ pub fn combine_transcripts(sessions: &[Observed]) -> AgentUsage {
                     }),
                     quota: Field::Unavailable(Unavailable::NoChannel),
                     last_turn: Some(AgentTurnEnd::Unknown),
-                })
-            }
+                });
+            };
+            let first = shared.and_then(|total| {
+                sessions[..i]
+                    .iter()
+                    .find(|earlier| start(earlier) == Some(total))
+            });
+            Some(match first {
+                None => summary.usage(),
+                Some(Observed {
+                    summary: Some(first),
+                    read: true,
+                    ..
+                }) => summary.usage_from(first),
+                // The total's earliest transcript was not read through: what
+                // it placed before the run is not known.
+                Some(_) => AgentUsage {
+                    models: usage_unavailable(Unavailable::Incomplete),
+                    ..summary.usage()
+                },
+            })
         })
         .collect();
     super::combine_sessions(parts)
@@ -423,6 +512,7 @@ impl LineSummary for ClaudeTranscriptSummary {
     }
 
     fn malformed(&mut self, line: &[u8]) {
+        self.records = true;
         // A total that did not parse is newer than the last one read, so
         // keeping the older one would report a figure the session has since
         // moved past: it is unrecognized instead.
@@ -890,8 +980,8 @@ mod tests {
         )]);
         let read = |s| Observed {
             summary: Some(s),
+            read: true,
             cut_short: false,
-            seen_at_ms: 0,
         };
         let carried = combine_transcripts(&[read(first.summary()), read(second.summary())]);
         assert_eq!(
@@ -1111,5 +1201,294 @@ mod tests {
             usage.models[0].tokens.provenance(),
             Provenance::ProviderReported
         );
+    }
+
+    /// When the runs below began, in milliseconds since the Unix epoch.
+    const RUN_START_MS: i64 = 1_800_000_000_000;
+
+    fn total(models: &[(&str, u64, u64, u64, u64, f64)], start_ms: i64) -> String {
+        cost_state(models).replace(r#""startTime":1"#, &format!(r#""startTime":{start_ms}"#))
+    }
+
+    fn stamped(line: String, at_ms: i64) -> String {
+        let at = chrono::DateTime::from_timestamp_millis(at_ms)
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        line.replacen('{', &format!(r#"{{"timestamp":"{at}","#), 1)
+    }
+
+    /// `lines` read for a run that began at [`RUN_START_MS`], in a file
+    /// created at `born` (unknown when `None`).
+    fn read_for_run(lines: &[String], born: Option<i64>) -> ClaudeTranscriptReader {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut file = File::create(&path).unwrap();
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
+        let mut reader = ClaudeTranscriptReader::new(&path);
+        reader
+            .summary_mut()
+            .set_run_start(u64::try_from(RUN_START_MS).unwrap() * 1_000_000);
+        reader.poll().unwrap();
+        let born = born.map(|ms| {
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(u64::try_from(ms).unwrap())
+        });
+        reader.summary_mut().note_birth(born);
+        reader
+    }
+
+    const BEFORE: i64 = RUN_START_MS - 3_600_000;
+    const OPUS_100: &[(&str, u64, u64, u64, u64, f64)] = &[("claude-opus-5-5", 100, 0, 0, 0, 1.0)];
+    const OPUS_120: &[(&str, u64, u64, u64, u64, f64)] = &[("claude-opus-5-5", 120, 0, 0, 0, 1.2)];
+
+    fn opus_input(usage: &AgentUsage) -> Field<Tokens> {
+        model(usage, "claude-opus-5-5").tokens
+    }
+
+    fn input(n: u64) -> Field<Tokens> {
+        Field::ProviderReported(Tokens {
+            input: n,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+        })
+    }
+
+    /// A total carried from before the run is the run's whole only on
+    /// evidence the transcript is the run's own — created after the run
+    /// began — and counts from a baseline the stamps place before the run
+    /// otherwise; with neither, it is incomplete, never the earlier run's
+    /// total: no stamps and no creation time, history with no stamp before a
+    /// record stamped exactly at the run's start, and a file older than the
+    /// run whose stamps say every record is newer (a clock that moved).
+    #[test]
+    fn a_carried_total_needs_a_baseline_or_a_newer_file() {
+        let incomplete = Field::Unavailable(Unavailable::Incomplete);
+        // A case's name, its lines, when its file was created, and its tokens.
+        type Case = (&'static str, Vec<String>, Option<i64>, Field<Tokens>);
+        let cases: Vec<Case> = vec![
+            (
+                "no stamps, no creation time",
+                vec![total(OPUS_100, BEFORE), prompt(), total(OPUS_120, BEFORE)],
+                None,
+                incomplete,
+            ),
+            (
+                "no stamps, older file",
+                vec![total(OPUS_100, BEFORE), prompt(), total(OPUS_120, BEFORE)],
+                Some(BEFORE),
+                incomplete,
+            ),
+            (
+                "no stamps, a file created during the run",
+                vec![prompt(), total(OPUS_120, BEFORE)],
+                Some(RUN_START_MS + 1),
+                input(120),
+            ),
+            (
+                "unstamped history, then a record stamped exactly at the start",
+                vec![
+                    total(OPUS_100, BEFORE),
+                    stamped(prompt(), RUN_START_MS),
+                    total(OPUS_120, BEFORE),
+                ],
+                None,
+                incomplete,
+            ),
+            (
+                "unstamped history, a stamp at the start, and a newer file",
+                vec![
+                    total(OPUS_100, BEFORE),
+                    stamped(prompt(), RUN_START_MS),
+                    total(OPUS_120, BEFORE),
+                ],
+                Some(RUN_START_MS + 1),
+                incomplete,
+            ),
+            (
+                "an older file whose stamps are all after the start",
+                vec![
+                    stamped(prompt(), RUN_START_MS + 5),
+                    total(OPUS_100, BEFORE),
+                    stamped(prompt(), RUN_START_MS + 10),
+                    total(OPUS_120, BEFORE),
+                ],
+                Some(BEFORE),
+                incomplete,
+            ),
+            (
+                "an older file whose stamps and total start are after the start",
+                vec![
+                    stamped(prompt(), RUN_START_MS + 5),
+                    total(OPUS_120, RUN_START_MS + 5),
+                ],
+                Some(BEFORE),
+                incomplete,
+            ),
+            (
+                "stamps place the boundary: counted from the baseline",
+                vec![
+                    stamped(prompt(), BEFORE),
+                    total(OPUS_100, BEFORE),
+                    stamped(prompt(), RUN_START_MS),
+                    total(OPUS_120, BEFORE),
+                ],
+                Some(BEFORE),
+                input(20),
+            ),
+        ];
+        for (name, lines, born, want) in cases {
+            let reader = read_for_run(&lines, born);
+            let usage = reader.summary().usage();
+            let got = usage.models[0].tokens;
+            if want == incomplete {
+                assert_eq!(
+                    usage.models,
+                    usage_unavailable(Unavailable::Incomplete),
+                    "{name}"
+                );
+            } else {
+                assert_eq!(got, want, "{name}");
+            }
+        }
+    }
+
+    /// Resume a session, then `/clear` into a new one that carries the same
+    /// running total, then exit: the run is credited with what the total grew
+    /// by since the resumed session's baseline, not the new session's whole
+    /// total, and a model the run did not use again is not credited.
+    #[test]
+    fn a_total_carried_from_a_resumed_session_counts_from_its_baseline() {
+        let haiku = ("claude-haiku-5-5", 5, 5, 0, 0, 0.5);
+        let resumed = read_for_run(
+            &[
+                stamped(prompt(), BEFORE),
+                total(&[("claude-opus-5-5", 100, 0, 0, 0, 1.0), haiku], BEFORE),
+                stamped(prompt(), RUN_START_MS + 1),
+                total(&[("claude-opus-5-5", 110, 0, 0, 0, 1.1), haiku], BEFORE),
+            ],
+            Some(BEFORE),
+        );
+        let cleared = read_for_run(
+            &[
+                stamped(prompt(), RUN_START_MS + 2),
+                stamped(assistant("end_turn"), RUN_START_MS + 3),
+                total(&[("claude-opus-5-5", 120, 0, 0, 0, 1.25), haiku], BEFORE),
+            ],
+            Some(RUN_START_MS + 2),
+        );
+        let read = |s| Observed {
+            summary: Some(s),
+            read: true,
+            cut_short: false,
+        };
+        let usage = combine_transcripts(&[read(resumed.summary()), read(cleared.summary())]);
+        assert_eq!(usage.models.len(), 1, "{:?}", usage.models);
+        assert_eq!(opus_input(&usage), input(20));
+        assert_eq!(
+            model(&usage, "claude-opus-5-5").cost,
+            Field::Estimated(MicroUsd(250_000))
+        );
+        assert_eq!(usage.last_turn, Some(AgentTurnEnd::Completed));
+    }
+
+    /// A session the run named whose transcript was not read is covered only
+    /// by explicit evidence that a later transcript carries its total: an
+    /// unrelated later session whose total started before the deck saw it,
+    /// or an older resumed session, leaves the run incomplete; one whose
+    /// partly read total a later transcript carries is covered.
+    #[test]
+    fn an_unread_session_is_covered_only_by_a_shared_total() {
+        let unread = Observed {
+            summary: None,
+            read: false,
+            cut_short: false,
+        };
+        let read = |s| Observed {
+            summary: Some(s),
+            read: true,
+            cut_short: false,
+        };
+        let unrelated = read_for_run(
+            &[
+                stamped(prompt(), RUN_START_MS + 2),
+                total(OPUS_100, RUN_START_MS + 1),
+            ],
+            Some(RUN_START_MS + 1),
+        );
+        let older_resumed = read_for_run(
+            &[
+                stamped(prompt(), BEFORE),
+                total(OPUS_100, BEFORE - 1),
+                stamped(prompt(), RUN_START_MS + 2),
+                total(OPUS_120, BEFORE - 1),
+            ],
+            Some(BEFORE),
+        );
+        for (name, later) in [("unrelated", &unrelated), ("older resumed", &older_resumed)] {
+            let usage = combine_transcripts(&[
+                Observed {
+                    summary: None,
+                    read: false,
+                    cut_short: false,
+                },
+                read(later.summary()),
+            ]);
+            // The unread session stands for an unknown part, which makes
+            // the run's total unavailable.
+            assert!(
+                usage.models.iter().any(|m| m.tokens.value().is_none()),
+                "{name}: {:?}",
+                usage.models
+            );
+        }
+        let usage = combine_transcripts(&[read(unrelated.summary()), unread]);
+        assert!(usage.models.iter().any(|m| m.tokens.value().is_none()));
+        assert_eq!(usage.last_turn, Some(AgentTurnEnd::Unknown));
+
+        // Read, then cut short, carrying a total the last session carries on.
+        let first = read_for_run(
+            &[
+                stamped(prompt(), RUN_START_MS + 1),
+                total(OPUS_100, RUN_START_MS + 1),
+            ],
+            Some(RUN_START_MS + 1),
+        );
+        let cut = read_for_run(
+            &[
+                stamped(prompt(), RUN_START_MS + 2),
+                total(OPUS_100, RUN_START_MS + 1),
+            ],
+            Some(RUN_START_MS + 2),
+        );
+        let last = read_for_run(
+            &[
+                stamped(prompt(), RUN_START_MS + 3),
+                total(OPUS_120, RUN_START_MS + 1),
+            ],
+            Some(RUN_START_MS + 3),
+        );
+        let usage = combine_transcripts(&[
+            read(first.summary()),
+            Observed {
+                summary: Some(cut.summary()),
+                read: false,
+                cut_short: true,
+            },
+            read(last.summary()),
+        ]);
+        assert_eq!(opus_input(&usage), input(120));
+        // The total's earliest transcript cut short: what it placed before
+        // the run is not known.
+        let usage = combine_transcripts(&[
+            Observed {
+                summary: Some(cut.summary()),
+                read: false,
+                cut_short: true,
+            },
+            read(last.summary()),
+        ]);
+        assert_eq!(usage.models, usage_unavailable(Unavailable::Incomplete));
     }
 }

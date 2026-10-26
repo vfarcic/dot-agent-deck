@@ -178,6 +178,26 @@ impl TrustedDir {
         }
     }
 
+    /// Rename the entry `from` of this directory to `to`, both names in it.
+    #[cfg(unix)]
+    pub(crate) fn rename(&self, from: &OsStr, to: &OsStr) -> io::Result<()> {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::ffi::OsStrExt as _;
+        let name = |n: &OsStr| {
+            std::ffi::CString::new(n.as_bytes())
+                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
+        };
+        let (from, to) = (name(from)?, name(to)?);
+        let fd = self.fd.as_raw_fd();
+        // SAFETY: both names are NUL-terminated and the descriptor is open;
+        // `renameat` renames entries, never what a symlink points at.
+        if unsafe { libc::renameat(fd, from.as_ptr(), fd, to.as_ptr()) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
     #[cfg(unix)]
     pub(crate) fn open_raw(
         &self,
@@ -371,30 +391,56 @@ pub fn admit_codex_rollout(
 }
 
 /// The name of run `run_id`'s usage file in the deck's usage directory, for
-/// the daemon with process id `daemon_pid`: `<run_id>-<daemon_pid>.usage.jsonl`.
-/// The process id says which daemon owns the file, so a daemon starting
-/// later removes only files whose daemon is gone ([`usage_file_daemon`]).
-/// `None` for a run id that is not an identifier, or that holds a `/` or
-/// starts with `.`.
-pub fn usage_file_name(run_id: &str, daemon_pid: u32) -> Option<String> {
+/// the daemon holding lease `lease` ([`lease_file_name`]):
+/// `<run_id>-<lease>.usage.jsonl`. The lease says which daemon owns the file,
+/// so a daemon starting later removes only files whose lease it can take
+/// ([`usage_file_lease`]). `None` for a run id that is not an identifier, or
+/// that holds a `/` or starts with `.`, or a lease that is not one.
+pub fn usage_file_name(run_id: &str, lease: &str) -> Option<String> {
     let id = Ident::new(run_id)?;
-    (!id.as_str().contains('/') && !id.as_str().starts_with('.'))
-        .then(|| format!("{}-{daemon_pid}{USAGE_FILE_SUFFIX}", id.as_str()))
+    (!id.as_str().contains('/') && !id.as_str().starts_with('.') && is_lease(lease.as_bytes()))
+        .then(|| format!("{}-{lease}{USAGE_FILE_SUFFIX}", id.as_str()))
 }
 
 const USAGE_FILE_SUFFIX: &str = ".usage.jsonl";
 
-/// The owning daemon's process id, as digits, of a usage file named as
-/// [`usage_file_name`] names them; `None` for any other name.
-pub fn usage_file_daemon(name: &[u8]) -> Option<&[u8]> {
+/// The suffix of a daemon's lease file, and of one it is still making.
+const LEASE_SUFFIX: &str = ".lease";
+const NEW_LEASE_SUFFIX: &str = ".lease-new";
+
+/// A lease: 32 lowercase hexadecimal digits, as [`crate::telemetry::span::new_run_id`] makes them.
+fn is_lease(lease: &[u8]) -> bool {
+    lease.len() == 32 && lease.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The owning daemon's lease of a usage file named as [`usage_file_name`]
+/// names them; `None` for any other name.
+pub fn usage_file_lease(name: &[u8]) -> Option<&[u8]> {
     let stem = name.strip_suffix(USAGE_FILE_SUFFIX.as_bytes())?;
     let dash = stem.iter().rposition(|b| *b == b'-')?;
-    let (run, pid) = (&stem[..dash], &stem[dash + 1..]);
+    let (run, lease) = (&stem[..dash], &stem[dash + 1..]);
     let run_ok = std::str::from_utf8(run).is_ok_and(|r| Ident::new(r).is_some())
         && !run.is_empty()
         && !run.starts_with(b".");
-    let pid_ok = (1..=10).contains(&pid.len()) && pid.iter().all(u8::is_ascii_digit);
-    (run_ok && pid_ok).then_some(pid)
+    (run_ok && is_lease(lease)).then_some(lease)
+}
+
+/// The name of the file a daemon holding lease `lease` keeps locked while it
+/// runs, and the name it makes it under before it is locked.
+pub fn lease_file_name(lease: &str, made: bool) -> String {
+    format!(
+        "{lease}{}",
+        if made { LEASE_SUFFIX } else { NEW_LEASE_SUFFIX }
+    )
+}
+
+/// The lease of a lease file named as [`lease_file_name`] names them, made
+/// or being made; `None` for any other name.
+pub fn lease_of_file(name: &[u8]) -> Option<&[u8]> {
+    let lease = name
+        .strip_suffix(LEASE_SUFFIX.as_bytes())
+        .or_else(|| name.strip_suffix(NEW_LEASE_SUFFIX.as_bytes()))?;
+    is_lease(lease).then_some(lease)
 }
 
 #[cfg(test)]
@@ -593,25 +639,34 @@ mod tests {
     }
 
     #[test]
-    fn a_usage_file_is_named_by_its_run_and_daemon() {
+    fn a_usage_file_is_named_by_its_run_and_daemons_lease() {
+        let lease = "0123456789abcdef0123456789abcdef";
         assert_eq!(
-            usage_file_name("run-1a2b", 42).as_deref(),
-            Some("run-1a2b-42.usage.jsonl")
+            usage_file_name("run-1a2b", lease).as_deref(),
+            Some("run-1a2b-0123456789abcdef0123456789abcdef.usage.jsonl")
         );
-        assert_eq!(usage_file_name("../x", 1), None);
-        assert_eq!(usage_file_name("a/b", 1), None);
-        assert_eq!(usage_file_name("a b", 1), None);
-        assert_eq!(usage_file_name(".hidden", 1), None);
-        let name = usage_file_name("0123abcd", 777).unwrap();
-        assert_eq!(usage_file_daemon(name.as_bytes()), Some(&b"777"[..]));
+        assert_eq!(usage_file_name("../x", lease), None);
+        assert_eq!(usage_file_name("a/b", lease), None);
+        assert_eq!(usage_file_name("a b", lease), None);
+        assert_eq!(usage_file_name(".hidden", lease), None);
+        assert_eq!(usage_file_name("run", "42"), None);
+        let name = usage_file_name("0123abcd", lease).unwrap();
+        assert_eq!(usage_file_lease(name.as_bytes()), Some(lease.as_bytes()));
         for other in [
             &b"run-.usage.jsonl"[..],
-            b"run-12.usage.json",
-            b"-12.usage.jsonl",
-            b"run-1x.usage.jsonl",
+            b"run-12.usage.jsonl",
+            b"run-0123456789abcdef0123456789abcdef.usage.json",
+            b"-0123456789abcdef0123456789abcdef.usage.jsonl",
+            b"run-0123456789ABCDEF0123456789abcdef.usage.jsonl",
             b"notes.txt",
         ] {
-            assert_eq!(usage_file_daemon(other), None, "{other:?}");
+            assert_eq!(usage_file_lease(other), None, "{other:?}");
         }
+        for made in [true, false] {
+            let file = lease_file_name(lease, made);
+            assert_eq!(lease_of_file(file.as_bytes()), Some(lease.as_bytes()));
+        }
+        assert_eq!(lease_of_file(b"42.lease"), None);
+        assert_eq!(lease_of_file(b"notes.txt"), None);
     }
 }

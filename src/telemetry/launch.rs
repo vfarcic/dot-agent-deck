@@ -583,7 +583,7 @@ pub fn remove_run_config_files(dir: &Path, run_id: &str) {
 /// or past `pid_t` — is no process. The system can reuse an exited Devin's
 /// id, which keeps its file until a later daemon's start.
 #[cfg(unix)]
-pub(crate) fn process_is_live(pid: &[u8]) -> bool {
+fn process_is_live(pid: &[u8]) -> bool {
     let Some(pid) = std::str::from_utf8(pid)
         .ok()
         .and_then(|p| p.parse::<libc::pid_t>().ok())

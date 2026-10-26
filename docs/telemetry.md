@@ -187,7 +187,7 @@ Events on the `agent.run` span, one `deck.model_usage` per model the run used:
 
 | Attribute | Value |
 | --- | --- |
-| `gen_ai.response.model` | The model, such as `claude-haiku-4-5-20251001` or `gpt-5.4-mini`. Left out for a model whose name the deck does not recognise as a known model's, such as a custom or local model, or a name with a path or a prefix of your own in front of it: its tokens are still sent. |
+| `gen_ai.response.model` | The model, such as `claude-haiku-4-5-20251001` or `gpt-5.4-mini`. Left out for a model whose name the deck does not recognise as a known model's, such as a custom or local model, a name with a path or a prefix of your own in front of it, or one with a suffix of your own after it, such as an address: its tokens are still sent. |
 | `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.usage.cache_read.input_tokens`, `gen_ai.usage.cache_write.input_tokens` | That model's tokens, as on the run. |
 | `deck.tokens.provenance`, `deck.tokens.unavailable_reason`, `deck.cost.microusd`, `deck.cost.provenance`, `deck.cost.unavailable_reason` | That model's provenance and cost estimate, as on the run. |
 

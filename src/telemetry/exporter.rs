@@ -138,11 +138,12 @@ fn private_dir(config_dir: &Path) -> Option<TrustedDir> {
     }
 }
 
-/// Create run `run_id`'s usage file in `dir`: a new regular file only this
-/// user can read or write, so a name already there — a file, a symlink or a
-/// FIFO — is refused rather than reused. `None` when it cannot be made.
-fn new_usage_file(dir: TrustedDir, run_id: &str) -> Option<UsageFile> {
-    let name = locate::usage_file_name(run_id, std::process::id())?;
+/// Create run `run_id`'s usage file in `dir`, named for the daemon's lease
+/// `lease`: a new regular file only this user can read or write, so a name
+/// already there — a file, a symlink or a FIFO — is refused rather than
+/// reused. `None` when it cannot be made.
+fn new_usage_file(dir: TrustedDir, run_id: &str, lease: &str) -> Option<UsageFile> {
+    let name = locate::usage_file_name(run_id, lease)?;
     #[cfg(unix)]
     {
         let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW;
@@ -151,35 +152,97 @@ fn new_usage_file(dir: TrustedDir, run_id: &str) -> Option<UsageFile> {
     Some(UsageFile { dir, name })
 }
 
+/// This daemon's lease on its usage files (PRD #1858): a file in the usage
+/// directory, named by a token of its own, on which the daemon holds an
+/// exclusive `flock` for as long as it runs — the lock goes when its
+/// descriptor closes, a crash included. Its usage files carry the token
+/// ([`locate::usage_file_name`]), so a daemon that starts later removes them
+/// only once it can take the lock itself ([`remove_leftover_usage_files`]),
+/// which no process id decides.
+struct UsageLease {
+    token: String,
+    /// Holds the lock.
+    #[cfg(unix)]
+    _held: std::os::fd::OwnedFd,
+}
+
+/// Take a new lease in `dir`: made under a name no cleanup takes as a lease
+/// ([`locate::lease_file_name`]), locked, then renamed to its own, so a
+/// lease another daemon finds under its own name is already held. `None`
+/// when any step fails, and then no run gets a usage file.
+#[cfg(unix)]
+fn take_usage_lease(dir: &TrustedDir) -> Option<UsageLease> {
+    use std::os::fd::AsRawFd as _;
+    let token = new_run_id();
+    let making = locate::lease_file_name(&token, false);
+    let made = locate::lease_file_name(&token, true);
+    let flags = libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let held = dir.open_raw(Path::new(&making), flags, 0o600).ok()?;
+    // SAFETY: `held` is an open descriptor.
+    let locked = unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    if !locked || dir.rename(making.as_ref(), made.as_ref()).is_err() {
+        dir.remove(making.as_ref());
+        return None;
+    }
+    Some(UsageLease { token, _held: held })
+}
+
+#[cfg(not(unix))]
+fn take_usage_lease(_dir: &TrustedDir) -> Option<UsageLease> {
+    None
+}
+
 /// Remove the usage files in the deck's usage directory under `config_dir`
 /// left by a daemon that ended without removing them (PRD #1858): called as
-/// a daemon starts, before any run of its own exists. A file names the
-/// daemon that owns it ([`locate::usage_file_name`]); one whose daemon still
-/// runs is kept, since another daemon on the same state directory may be
-/// reading it, unless that process is this one, which has no run yet. The
-/// system can reuse an ended daemon's process id, which keeps its files
-/// until a later start.
+/// a daemon starts, before it has a lease of its own. A file names the lease
+/// of the daemon that made it ([`UsageLease`]). For each lease file there,
+/// the lease's files and the lease file itself are removed only when its
+/// lock can be taken at once, so the daemon that held it has ended; a lease
+/// another daemon holds — on this machine, whatever process-id namespace it
+/// runs in — keeps its files. A usage file whose lease file is not there is
+/// kept. Every open and removal is made beneath the usage directory's
+/// descriptor, with no symlink followed. Elsewhere than Unix no run has a
+/// usage file, and nothing is removed.
 pub(crate) fn remove_leftover_usage_files(config_dir: &Path) {
-    let Some(dir) = TrustedDir::open(config_dir).and_then(|root| root.subdir(Path::new(USAGE_DIR)))
-    else {
-        return;
-    };
-    let own = std::process::id().to_string();
-    for name in dir.entry_names(usize::MAX) {
-        let Some(pid) = locate::usage_file_daemon(name.as_encoded_bytes()) else {
-            continue;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+        let Some(dir) =
+            TrustedDir::open(config_dir).and_then(|root| root.subdir(Path::new(USAGE_DIR)))
+        else {
+            return;
         };
-        #[cfg(unix)]
-        let gone = pid == own.as_bytes() || !super::launch::process_is_live(pid);
-        #[cfg(not(unix))]
-        let gone = {
-            let _ = (pid, &own);
-            true
-        };
-        if gone && dir.has_file(Path::new(&name)) {
-            dir.remove(&name);
+        let names = dir.entry_names(usize::MAX);
+        for lease_file in &names {
+            let Some(lease) = locate::lease_of_file(lease_file.as_encoded_bytes()) else {
+                continue;
+            };
+            let flags = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+            let Ok(held) = dir.open_raw(Path::new(lease_file), flags, 0) else {
+                continue;
+            };
+            let Ok(file) = held.try_clone().map(std::fs::File::from) else {
+                continue;
+            };
+            if !file.metadata().is_ok_and(|m| m.is_file()) {
+                continue;
+            }
+            // SAFETY: `held` is an open descriptor.
+            if unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                continue;
+            }
+            for name in &names {
+                if locate::usage_file_lease(name.as_encoded_bytes()) == Some(lease)
+                    && dir.has_file(Path::new(name))
+                {
+                    dir.remove(name);
+                }
+            }
+            dir.remove(lease_file);
         }
     }
+    #[cfg(not(unix))]
+    let _ = config_dir;
 }
 
 enum ExportMsg {
@@ -303,6 +366,13 @@ struct Shared {
     /// Turned true as shutdown begins: an export in flight gives way to the
     /// final flush.
     stopping: watch::Sender<bool>,
+    /// The runtime ended runs are completed on ([`Shared::complete_later`]).
+    runtime: tokio::runtime::Handle,
+    /// This, for a run completed on another thread to queue its span.
+    me: std::sync::Weak<Shared>,
+    /// Ended runs whose usage is being drained and whose spans are not
+    /// queued yet.
+    finalizing: watch::Sender<usize>,
     /// Test seam: pauses the ingest task once inside its `escape_held`
     /// branch, after signalling the first half, until the second receives.
     #[cfg(test)]
@@ -342,6 +412,9 @@ pub struct Telemetry {
     /// The committed runs whose per-run agent configuration files the shim
     /// may write, removed as each run's agent ends ([`super::launch`]).
     run_files: Mutex<Vec<RunFiles>>,
+    /// This daemon's lease on its usage files, taken with the first one;
+    /// `None` inside when it could not be.
+    usage_lease: OnceLock<Option<UsageLease>>,
 }
 
 /// A committed run whose agent may have per-run configuration files.
@@ -427,6 +500,7 @@ impl Telemetry {
             config_dir: None,
             shim_dir: None,
             run_files: Mutex::new(Vec::new()),
+            usage_lease: OnceLock::new(),
         }
     }
 
@@ -511,6 +585,7 @@ impl Telemetry {
             config_dir: Some(config_dir),
             shim_dir: None,
             run_files: Mutex::new(Vec::new()),
+            usage_lease: OnceLock::new(),
         }
     }
 
@@ -630,11 +705,17 @@ impl Telemetry {
                 dirs.codex_home = locate::codex_home(var("CODEX_HOME").as_deref(), home.as_deref());
             }
             UsageSource::UsageFile if self.exporting.is_some() => {
-                dirs.usage_file = self
-                    .config_dir
-                    .as_deref()
-                    .and_then(private_dir)
-                    .and_then(|dir| new_usage_file(dir, &start.run_id));
+                dirs.usage_file =
+                    self.config_dir
+                        .as_deref()
+                        .and_then(private_dir)
+                        .and_then(|dir| {
+                            let lease = self
+                                .usage_lease
+                                .get_or_init(|| take_usage_lease(&dir))
+                                .as_ref()?;
+                            new_usage_file(dir, &start.run_id, &lease.token)
+                        });
             }
             UsageSource::UsageFile | UsageSource::NoChannel => {}
         }
@@ -931,6 +1012,18 @@ impl Telemetry {
             .collect()
     }
 
+    /// The descriptor holding this daemon's usage lease, once it has one:
+    /// a test closes it to stand for the kernel closing it as a crashed
+    /// daemon's process ends.
+    #[cfg(all(test, unix))]
+    pub(crate) fn usage_lease_fd(&self) -> Option<std::os::fd::RawFd> {
+        use std::os::fd::AsRawFd as _;
+        self.usage_lease
+            .get()?
+            .as_ref()
+            .map(|lease| lease._held.as_raw_fd())
+    }
+
     /// Run-context probes queued or running.
     #[cfg(test)]
     pub fn outstanding_probes(&self) -> usize {
@@ -942,16 +1035,52 @@ impl Telemetry {
 
 impl Shared {
     /// Run `f` on the tracker, then queue the spans it finished. A run that
-    /// ended has its usage record drained after the tracker is let go
-    /// ([`FinishingRun::complete`]), on this thread.
+    /// ended has its usage record drained after the tracker is let go, on a
+    /// blocking thread ([`Self::complete_later`]).
     fn with_tracker(&self, f: impl FnOnce(&mut RunTracker)) {
-        let (mut finished, finishing) = {
+        let (finished, finishing) = {
             let mut tracker = self.tracker.lock().unwrap_or_else(|p| p.into_inner());
             f(&mut tracker);
             tracker.take_finished_deferred()
         };
-        finished.extend(finishing.into_iter().map(FinishingRun::complete));
         self.enqueue(finished);
+        self.complete_later(finishing);
+    }
+
+    /// Drain the usage record of each run in `finishing` and queue its span
+    /// once that is done ([`FinishingRun::complete`]), on a blocking thread,
+    /// so the caller — the ingest task, mostly — goes on with other runs'
+    /// events meanwhile. Counted in [`Self::finalizing`] until queued.
+    fn complete_later(&self, finishing: Vec<FinishingRun>) {
+        if finishing.is_empty() {
+            return;
+        }
+        /// Counts the runs off as done however the drain ends.
+        struct Done(std::sync::Weak<Shared>);
+        impl Drop for Done {
+            fn drop(&mut self) {
+                if let Some(shared) = self.0.upgrade() {
+                    shared.finalizing.send_modify(|n| *n -= 1);
+                }
+            }
+        }
+        self.finalizing.send_modify(|n| *n += 1);
+        let me = self.me.clone();
+        self.runtime.spawn_blocking(move || {
+            let done = Done(me);
+            let spans: Vec<SpanRecord> =
+                finishing.into_iter().map(FinishingRun::complete).collect();
+            if let Some(shared) = done.0.upgrade() {
+                shared.enqueue(spans);
+            }
+        });
+    }
+
+    /// Resolves once no ended run is being completed
+    /// ([`Self::complete_later`]): every span of a run ended before the call
+    /// is queued, or was dropped with the queue full.
+    async fn finalized(&self) {
+        let _ = self.finalizing.subscribe().wait_for(|n| *n == 0).await;
     }
 
     /// Poll every open run's usage record (PRD #1858) on a blocking thread,
@@ -1093,13 +1222,16 @@ fn start_exporting(
     tracker.set_held_input(Box::new(move |pane_id, run_id| {
         retire_input(&held, pane_id, run_id)
     }));
-    let shared = Arc::new(Shared {
+    let shared = Arc::new_cyclic(|me| Shared {
         tracker: Mutex::new(tracker),
         queue,
         dropped: Mutex::new(RateLimitedLog::new(ERROR_LOG_INTERVAL)),
         filters,
         escape_held: tokio::sync::Notify::new(),
         stopping,
+        runtime: tokio::runtime::Handle::current(),
+        me: me.clone(),
+        finalizing: watch::Sender::new(0),
         #[cfg(test)]
         timer_gate: Mutex::new(None),
         #[cfg(test)]
@@ -1242,7 +1374,7 @@ async fn drain(shared: &Shared, events: &mut Option<broadcast::Receiver<Broadcas
 }
 
 /// Apply one command; `false` once the task is to stop.
-fn apply(shared: &Shared, command: Command) -> bool {
+fn apply(shared: &Arc<Shared>, command: Command) -> bool {
     match command {
         Command::Subscribe(_) => {}
         Command::Commit { run_id } => {
@@ -1269,7 +1401,12 @@ fn apply(shared: &Shared, command: Command) -> bool {
         Command::HumanInput { pane_id, run_id } => shared.take_input(&pane_id, &run_id),
         #[cfg(test)]
         Command::Barrier(ack) => {
-            let _ = ack.send(());
+            // Once the runs ended before it are completed too.
+            let shared = Arc::clone(shared);
+            tokio::spawn(async move {
+                shared.finalized().await;
+                let _ = ack.send(());
+            });
         }
         Command::Shutdown { ack } => {
             // A run's last key, a lone ESC still in its window, is counted as
@@ -1279,13 +1416,28 @@ fn apply(shared: &Shared, command: Command) -> bool {
                 tracker.end_all(EndReason::DaemonShutdown, now_unix_nanos());
                 tracker.take_finished_deferred()
             };
-            finished.extend(finishing.into_iter().map(FinishingRun::complete));
             shared.lock_filters().clear();
-            // Queued by `shutdown`, which can wait for room; when it stopped
-            // waiting for these, as best it can.
-            if let Err(finished) = ack.send(finished) {
-                shared.enqueue(finished);
-            }
+            // The runs still open are completed on a blocking thread, after
+            // every run ended before them has queued its span, so the final
+            // flush `shutdown` sends after these finds those in the queue.
+            let shared = Arc::clone(shared);
+            tokio::spawn(async move {
+                shared.finalized().await;
+                let completed = tokio::task::spawn_blocking(move || {
+                    finishing
+                        .into_iter()
+                        .map(FinishingRun::complete)
+                        .collect::<Vec<_>>()
+                })
+                .await
+                .unwrap_or_default();
+                finished.extend(completed);
+                // Queued by `shutdown`, which can wait for room; when it
+                // stopped waiting for these, as best it can.
+                if let Err(finished) = ack.send(finished) {
+                    shared.enqueue(finished);
+                }
+            });
             return false;
         }
     }
@@ -2158,11 +2310,15 @@ mod tests {
                 continue;
             }
             let file = PathBuf::from(file.unwrap());
+            let lease = &telemetry.usage_lease.get().unwrap().as_ref().unwrap().token;
             assert_eq!(
                 file,
-                usage_dir.join(format!("{}-{}.usage.jsonl", run.run_id, std::process::id())),
+                usage_dir.join(format!("{}-{lease}.usage.jsonl", run.run_id)),
                 "{agent:?}"
             );
+            // The daemon's lease is there under its own name, and held.
+            let lease_file = usage_dir.join(format!("{lease}.lease"));
+            assert!(lease_held(&lease_file), "{agent:?}");
             let meta = std::fs::symlink_metadata(&file).unwrap();
             assert!(meta.is_file() && meta.len() == 0, "{agent:?}");
             assert_eq!(meta.permissions().mode() & 0o777, 0o600, "{agent:?}");
@@ -2204,37 +2360,69 @@ mod tests {
         assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
     }
 
+    /// Whether another open file description holds `path`'s lock.
+    #[cfg(unix)]
+    fn lease_held(path: &Path) -> bool {
+        use std::os::fd::AsRawFd as _;
+        let file = std::fs::File::open(path).unwrap();
+        // SAFETY: `file` is open.
+        let free = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+        !free
+    }
+
     /// PRD #1858: the usage files a daemon that ended without reading them
-    /// left are removed as the next daemon starts — its own process id's
-    /// included, since it has no run yet — and a file whose daemon still runs
-    /// is kept, as is anything not named as the deck names them.
+    /// left are removed as the next daemon starts, with their lease, when
+    /// that lease's lock is free; a lease held through another open file
+    /// description — another daemon's, whichever process-id namespace it is
+    /// in, and whatever its process id is here — keeps its files. A file
+    /// with no lease file, or not named as the deck names them, is kept.
     #[cfg(unix)]
     #[test]
-    fn leftover_usage_files_go_unless_their_daemon_runs() {
-        let mut child = std::process::Command::new("true").spawn().unwrap();
-        let dead = child.id();
-        child.wait().unwrap();
+    fn leftover_usage_files_go_unless_their_lease_is_held() {
+        use std::os::fd::AsRawFd as _;
         let home = tempfile::tempdir().unwrap();
         let usage = home.path().join(USAGE_DIR);
         std::fs::create_dir_all(&usage).unwrap();
-        let name = |pid: u32| format!("{}-{pid}.usage.jsonl", super::super::span::new_run_id());
-        let gone = [name(dead), name(std::process::id())];
-        // Process 1 always runs.
+        let (ended, running, unleased) = (new_run_id(), new_run_id(), new_run_id());
+        let file = |lease: &str| format!("{}-{lease}.usage.jsonl", new_run_id());
+        let gone = [
+            file(&ended),
+            file(&ended),
+            format!("{ended}.lease"),
+            format!("{}.lease-new", new_run_id()),
+        ];
         let kept = [
-            name(1),
+            file(&running),
+            format!("{running}.lease"),
+            file(&unleased),
             "notes.txt".to_string(),
             "x.usage.jsonl".to_string(),
+            format!("x-{}.usage.jsonl", std::process::id()),
         ];
-        for file in gone.iter().chain(&kept) {
-            std::fs::write(usage.join(file), "{}").unwrap();
+        for name in gone.iter().chain(&kept) {
+            std::fs::write(usage.join(name), "{}").unwrap();
         }
+        // Another daemon's lock on its lease: an open file description this
+        // cleanup does not share.
+        let held = std::fs::File::open(usage.join(format!("{running}.lease"))).unwrap();
+        // SAFETY: `held` is open.
+        assert_eq!(
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
         remove_leftover_usage_files(home.path());
-        for file in &gone {
-            assert!(!usage.join(file).exists(), "left over: {file}");
+        for name in &gone {
+            assert!(!usage.join(name).exists(), "left over: {name}");
         }
-        for file in &kept {
-            assert!(usage.join(file).exists(), "removed: {file}");
+        for name in &kept {
+            assert!(usage.join(name).exists(), "removed: {name}");
         }
+        // Once that daemon has ended, its files go too.
+        drop(held);
+        remove_leftover_usage_files(home.path());
+        assert!(!usage.join(&kept[0]).exists());
+        assert!(!usage.join(&kept[1]).exists());
+        assert!(usage.join(&kept[2]).exists());
         remove_leftover_usage_files(&home.path().join("absent"));
     }
 
@@ -2744,6 +2932,50 @@ mod tests {
         for event in &run.events {
             assert!(event.time_unix_nanos <= end, "{} past {end}", event.name);
         }
+    }
+
+    /// PRD #1858: a run's final drain runs off the ingest task. While one
+    /// run's usage record is held up — a slow disk — the ingest task goes on
+    /// applying other runs' commands, the ended run's span waits for its
+    /// drain, and is queued, usage and all, once the drain is done.
+    #[tokio::test]
+    async fn a_slow_final_drain_does_not_hold_up_other_runs() {
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        let shared = Arc::clone(&telemetry.exporting.as_ref().unwrap().shared);
+        begin(&telemetry, generation("p1", "a1"), &[]);
+        telemetry.settled().await;
+        let usage = shared.tracker.lock().unwrap().usage_to_poll();
+        assert_eq!(usage.len(), 1);
+        let held = usage[0].hold_readers();
+        telemetry.end_run("p1", Some("a1"), EndReason::Closed, None);
+        begin(&telemetry, generation("p2", "a2"), &[]);
+        eventually("the next run was applied", || {
+            shared.tracker.lock().unwrap().run_id("p2").is_some()
+        })
+        .await;
+        let ended = |spans: &[SpanRecord]| {
+            spans
+                .iter()
+                .filter(|s| s.name == SPAN_AGENT_RUN)
+                .filter(|s| attr(s, AttrKey::EndReason).is_some())
+                .count()
+        };
+        assert_eq!(ended(&captured(&mut rx)), 0, "queued before its drain");
+        drop(held);
+        telemetry.settled().await;
+        let spans = captured(&mut rx);
+        assert_eq!(ended(&spans), 1);
+        let run = spans
+            .iter()
+            .find(|s| s.name == SPAN_AGENT_RUN && attr(s, AttrKey::EndReason).is_some())
+            .unwrap();
+        assert!(
+            run.attributes.iter().any(|a| matches!(
+                a.key,
+                AttrKey::Accounting(crate::telemetry::accounting::AccountingKey::TokensProvenance)
+            )),
+            "the drain's usage is on the span"
+        );
     }
 
     /// Threads 2 / 9: shutdown with the export queue full — a backend slow

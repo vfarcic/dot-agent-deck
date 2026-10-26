@@ -12,11 +12,13 @@
 //! input or output, an error message or a path could go in, so a producer
 //! that writes what it should puts no content in the file.
 //!
-//! The format is the deck's, versioned by `v` ([`VERSION`]); a line of
-//! another version, or one that does not parse, makes the run's usage
-//! [`Unavailable::UnrecognizedFormat`] when nothing usable is beside it and
-//! [`Unavailable::Incomplete`] when something is, since the reply it held is
-//! not counted. A count the agent gave its producer that was missing or not a
+//! The format is the deck's, versioned by `v` ([`VERSION`]); every line
+//! but a blank one is read. A line of another version or type, one that does
+//! not parse — a type cut short included — or one too long to read makes the
+//! run's usage [`Unavailable::UnrecognizedFormat`] when nothing usable is
+//! beside it and [`Unavailable::Incomplete`] when something is, since the
+//! reply it held is not counted, and makes the last turn unknown until a
+//! later line of the agent's says how a turn went. A count the agent gave its producer that was missing or not a
 //! count is written as `null`, so its reply is unrecognized rather than a
 //! zero. A `turn_start` line, which the Pi extension writes when Pi starts
 //! answering a prompt, says a turn began and adds no usage, so a Pi that
@@ -98,9 +100,9 @@ struct AgentLines {
 pub struct UsageFileSummary {
     agents: BTreeMap<UsageAgent, AgentLines>,
     /// Lines of another version or type, or of an agent this reader does
-    /// not know.
+    /// not know: anything but a blank line or a known record.
     pub unknown_lines: u64,
-    /// A line with a marker did not parse.
+    /// A line did not parse, or was too long to read.
     pub malformed: bool,
 }
 
@@ -152,14 +154,27 @@ impl UsageFileSummary {
         }
     }
 
+    /// A line this reader could not read: it may have been `agent`'s (any
+    /// agent's, when it names none the reader knows) reply or turn, so how
+    /// that agent's last turn went is not known until a later line says.
+    fn lost_line(&mut self, agent: Option<UsageAgent>) {
+        for (_, lines) in self
+            .agents
+            .iter_mut()
+            .filter(|(a, _)| agent.is_none_or(|agent| **a == agent))
+        {
+            lines.last_turn = Some(AgentTurnEnd::Unknown);
+        }
+    }
+
     fn observe_line(&mut self, line: UsageLine) {
         let kind = line.kind.0.as_deref();
-        if line.v.count() != Some(VERSION) || !matches!(kind, Some("reply" | "turn_start")) {
+        let agent = line.agent.0.as_deref().and_then(UsageAgent::parse);
+        let Some(agent) = agent.filter(|_| {
+            line.v.count() == Some(VERSION) && matches!(kind, Some("reply" | "turn_start"))
+        }) else {
             self.unknown_lines += 1;
-            return;
-        }
-        let Some(agent) = line.agent.0.as_deref().and_then(UsageAgent::parse) else {
-            self.unknown_lines += 1;
+            self.lost_line(agent);
             return;
         };
         if kind == Some("turn_start") {
@@ -190,12 +205,19 @@ impl LineSummary for UsageFileSummary {
     const MARKERS: &'static [&'static [u8]] = &[b"\"type\":\"reply\"", b"\"type\":\"turn_start\""];
     type Record = UsageLine;
 
+    /// Every line but a blank one: the file holds nothing but the deck's
+    /// records, so a line with its type cut short or changed is one too.
+    fn candidate(line: &[u8]) -> bool {
+        line.iter().any(|b| !b.is_ascii_whitespace())
+    }
+
     fn observe(&mut self, record: UsageLine, _stats: &mut ReaderStats) {
         self.observe_line(record);
     }
 
     fn malformed(&mut self, _line: &[u8]) {
         self.malformed = true;
+        self.lost_line(None);
     }
 }
 
@@ -660,20 +682,64 @@ mod tests {
     }
 
     /// A line the reader cannot read after replies it could — one that does
-    /// not parse, or of another version — may have been a reply, so the
-    /// replies read are a part: incomplete, not the earlier total.
+    /// not parse, its type cut short (`{"v":1,"ty`), of another version or
+    /// type, or too long to read — may have been a reply or a turn, so the
+    /// replies read are a part: incomplete, not the earlier total, and the
+    /// last turn is unknown, not the earlier reply's. A later reply of the
+    /// agent's says how its turn went again; its tokens stay incomplete.
     #[test]
     fn an_unreadable_line_after_usable_ones_makes_the_usage_incomplete() {
-        for later in [
+        let overlong = format!(
+            r#"{{"v":1,"type":"reply","agent":"pi","pad":"{}"}}"#,
+            "x".repeat(super::super::MAX_LINE_BYTES)
+        );
+        let lost = [
             r#"{"v":1,"type":"reply","agent":"pi","#.to_owned(),
+            r#"{"v":1,"ty"#.to_owned(),
             pi("gpt-5.5", 10, 2, None, "stop").replace(r#""v":1"#, r#""v":2"#),
+            pi("gpt-5.5", 10, 2, None, "stop").replace(r#""type":"reply""#, r#""type":"response""#),
+            r#"{"v":2,"type":"response","agent":"pi"}"#.to_owned(),
+            overlong,
+        ];
+        for (agent, reply) in [
+            (UsageAgent::Pi, pi("gpt-5.5", 10, 2, Some(0.5), "stop")),
+            (
+                UsageAgent::OpenCode,
+                opencode("msg_a", 10, 0.5, r#","stop":"stop""#),
+            ),
         ] {
-            let reader = read(&[pi("gpt-5.5", 10, 2, Some(0.5), "stop"), later.clone()]);
-            assert_eq!(
-                reader.summary().usage(UsageAgent::Pi).models,
-                usage_unavailable(Unavailable::Incomplete),
-                "{later}"
-            );
+            for later in &lost {
+                let later = later.replace(
+                    r#""agent":"pi""#,
+                    &format!(r#""agent":"{}""#, agent.as_str()),
+                );
+                let shown = &later[..later.len().min(60)];
+                let reader = read(&[reply.clone(), later.clone()]);
+                let usage = reader.summary().usage(agent);
+                assert_eq!(
+                    usage.models,
+                    usage_unavailable(Unavailable::Incomplete),
+                    "{agent:?} {shown}"
+                );
+                assert_eq!(
+                    usage.last_turn,
+                    Some(AgentTurnEnd::Unknown),
+                    "{agent:?} {shown}"
+                );
+                let recovered = reply.replace("msg_a", "msg_b");
+                let reader = read(&[reply.clone(), later.clone(), recovered]);
+                let usage = reader.summary().usage(agent);
+                assert_eq!(
+                    usage.last_turn,
+                    Some(AgentTurnEnd::Completed),
+                    "{agent:?} {shown}"
+                );
+                assert_eq!(
+                    usage.models,
+                    usage_unavailable(Unavailable::Incomplete),
+                    "{agent:?} {shown}"
+                );
+            }
         }
     }
 

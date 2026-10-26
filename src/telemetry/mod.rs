@@ -598,8 +598,13 @@ mod tests {
             .unwrap();
         commit_spawn(Some(run));
         assert!(file.is_file());
-        // The crash: the daemon never ends the run nor shuts down.
+        // The crash: the daemon never ends the run nor shuts down, and its
+        // process ends, which closes the descriptor holding its usage lease.
+        let lease = crashed.usage_lease_fd().expect("a usage lease");
         std::mem::forget(crashed);
+        // SAFETY: the descriptor belongs to the leaked handle, which never
+        // closes it.
+        unsafe { libc::close(lease) };
         let registry = crate::agent_pty::AgentPtyRegistry::new();
         let next = start_from(
             &exporting_env(),
