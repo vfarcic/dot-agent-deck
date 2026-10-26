@@ -24578,9 +24578,12 @@ mod spawn_tests {
             .bus
             .push(claude_screen_at(" ", 0, &[], false, EDITOR_COLS as usize));
         blank_with_cursor_at(&editor, 0).await;
-        editor_draws_again(&editor);
+        // Still frozen: the editor may read the keys only now, and a redraw
+        // of its empty composer would show its suggestion, which proves the
+        // box empty on the screen alone.
         let report = editor.ring().await;
         assert_eq!(report.outcome, held, "before the report: {report:?}");
+        editor_draws_again(&editor);
         registry.note_prompt_report(
             &editor.pane,
             &editor.id,
