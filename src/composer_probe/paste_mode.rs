@@ -7,7 +7,8 @@
 //! I-2 and the output half of I-3); its one call site is
 //! `AgentBus::push_timed`. Today it feeds only [`PasteModeTracker`], and
 //! nothing reads the tracker yet: the hook changes no byte that is published,
-//! kept or replayed.
+//! kept or replayed, and no decision. It is not free: it is one more pass
+//! over the bytes while the output lock is held, before they are published.
 //!
 //! The tracker is separate from the ring's `ReplayModes` on purpose (plan PA
 //! U3-01): it reads the output through [`Framing::output`], which reads
@@ -23,7 +24,17 @@
 //! bytes after the `?` don't stop it, as they don't stop `vt100`. The
 //! difference known and tested: a CSI with more than [`MAX_SEQUENCE_BYTES`]
 //! parameter and intermediate bytes is malformed here and changes nothing,
-//! where `vt100` still applies it. No agent writes a mode change that long.
+//! where `vt100` still applies it. That isn't a conservative direction: an
+//! overlong enable leaves the tracker off where `vt100` is on, and an
+//! overlong disable leaves it on where `vt100` is off.
+//!
+//! **What matching `vt100` does and doesn't establish.** `vt100` is this
+//! repository's consumer, so equality with it is what the tests check. It is
+//! not evidence of how xterm, xterm.js or the outer terminal read the same
+//! bytes, nor of how an agent's input reader treats a paste. Before anything
+//! uses this state to decide (core plan Q35-16/20), that caller has to handle
+//! a stale on as well as a stale off, and keep a candidate whenever the mode
+//! it needs isn't established.
 //!
 //! [`MAX_SEQUENCE_BYTES`]: super::framing::MAX_SEQUENCE_BYTES
 

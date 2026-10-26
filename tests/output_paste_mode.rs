@@ -187,7 +187,7 @@ fn probe_004_controls_escapes_and_private_markers_read_as_vt100_does() {
     }
 }
 
-/// Scenario: Where the tracker is known to differ from `vt100`: a mode change longer than the 64-byte sequence cap. `vt100` applies it and the tracker changes nothing; at the cap the two agree.
+/// Scenario: Where the tracker is known to differ from `vt100`: a mode change longer than the 64-byte sequence cap. `vt100` applies it and the tracker changes nothing, so an overlong enable leaves the tracker off where `vt100` is on, and an overlong disable after an ordinary enable leaves it on where `vt100` is off; at the cap the two agree.
 #[spec("inbox/probe/004")]
 #[test]
 fn probe_004_the_known_overlong_difference_is_pinned() {
@@ -195,6 +195,11 @@ fn probe_004_the_known_overlong_difference_is_pinned() {
     overlong.extend(std::iter::repeat_n(b'0', MAX_SEQUENCE_BYTES));
     overlong.extend_from_slice(b"2004h");
     assert_eq!(both(&overlong), (false, true));
+
+    let mut stale_on = b"\x1b[?2004h\x1b[?".to_vec();
+    stale_on.extend(std::iter::repeat_n(b'0', MAX_SEQUENCE_BYTES));
+    stale_on.extend_from_slice(b"2004l");
+    assert_eq!(both(&stale_on), (true, false));
 
     let mut capped = b"\x1b[?".to_vec();
     capped.extend(std::iter::repeat_n(b'0', MAX_SEQUENCE_BYTES - 4));
