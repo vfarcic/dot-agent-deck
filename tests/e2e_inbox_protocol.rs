@@ -518,7 +518,11 @@ fn inbox_protocol_005_hook_receivers_are_bounded_and_freed_by_closing() {
             "hook {count} is handed one message: {reply}"
         );
         if count == 1 {
-            first_id = Some(reply["messages"][0]["id"].as_str().unwrap().to_owned());
+            let id = reply["messages"][0]["id"].as_str();
+            first_id = Some(
+                id.unwrap_or_else(|| panic!("the first message carries a string id: {reply}"))
+                    .to_owned(),
+            );
         }
         hooks.push(socket);
     }
