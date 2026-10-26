@@ -6450,3 +6450,75 @@ fn a_missing_sentinel_found_elsewhere_is_reported_as_misplaced() {
         "the expected path itself is never reported as misplaced"
     );
 }
+
+/// Scenario: A `PATH` holding a deck's telemetry shim directory, as the deck
+/// installs one, loses that entry when the harness contains it. A directory
+/// holding a `codex` that is not a shim script, or a shim beside another
+/// program, or an unreadable `codex`, is kept, and relative entries are
+/// dropped as before.
+#[cfg(unix)]
+#[test]
+fn contain_path_drops_a_deck_telemetry_shim_directory_and_nothing_like_it() {
+    use dot_agent_deck::telemetry::shim;
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().expect("scratch root");
+    let executable = |path: &Path, body: &str| {
+        std::fs::write(path, body).expect("write a program");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .expect("make it executable");
+    };
+    let shim_dir = shim::install(&root.path().join("telemetry"), "/opt/deck/dot-agent-deck")
+        .expect("install a shim directory as the deck does");
+
+    let real = root.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    executable(
+        &real.join("codex"),
+        "#!/bin/sh\nexec node codex.js \"$@\"\n",
+    );
+
+    let mixed = root.path().join("mixed");
+    std::fs::create_dir(&mixed).unwrap();
+    std::fs::copy(shim_dir.join("codex"), mixed.join("codex")).unwrap();
+    executable(&mixed.join("git"), "#!/bin/sh\n");
+
+    let unreadable = root.path().join("unreadable");
+    std::fs::create_dir(&unreadable).unwrap();
+    std::fs::copy(shim_dir.join("codex"), unreadable.join("codex")).unwrap();
+    std::fs::set_permissions(
+        unreadable.join("codex"),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+
+    let dangling = root.path().join("dangling");
+    std::fs::create_dir(&dangling).unwrap();
+    std::os::unix::fs::symlink(root.path().join("nowhere"), dangling.join("codex")).unwrap();
+
+    assert!(is_deck_telemetry_shim_dir(&shim_dir));
+    let path = std::env::join_paths([
+        shim_dir.as_path(),
+        real.as_path(),
+        mixed.as_path(),
+        Path::new(""),
+        Path::new("bin"),
+        unreadable.as_path(),
+        dangling.as_path(),
+    ])
+    .expect("join a PATH");
+    let rewritten = contain_path(&path.to_string_lossy());
+    // A process that can read any file (root) reads the unreadable script as
+    // a shim, so that one entry's fate depends on who runs the test.
+    let unreadable_kept = std::fs::read(unreadable.join("codex")).is_err();
+    let mut expected = vec![real, mixed];
+    if unreadable_kept {
+        expected.push(unreadable);
+    }
+    expected.push(dangling);
+    assert_eq!(
+        std::env::split_paths(&rewritten).collect::<Vec<_>>(),
+        expected,
+        "only the shim directory and the relative entries are dropped: {rewritten}"
+    );
+}

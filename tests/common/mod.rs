@@ -455,6 +455,7 @@ pub struct TuiDeckBuilder {
     suppress_agent_credentials: bool,
     launch_subdir: Option<PathBuf>,
     launch_cargo_artifact: bool,
+    keep_startup_hook_install: bool,
 }
 
 impl TuiDeckBuilder {
@@ -531,6 +532,15 @@ impl TuiDeckBuilder {
     /// the deck spells its own path into agent text ([`contained_deck_binary`]).
     pub fn launching_the_cargo_artifact(mut self) -> Self {
         self.launch_cargo_artifact = true;
+        self
+    }
+
+    /// Opt out of [`preinstall_deck_hooks`]: launch into a HOME whose agent
+    /// hooks the TUI's own startup install has to write, for the tests whose
+    /// subject is that install. A test that passes its own `HOME` or
+    /// `XDG_CONFIG_HOME` through [`Self::with_env`] is opted out already.
+    pub fn keeping_the_startup_hook_install(mut self) -> Self {
+        self.keep_startup_hook_install = true;
         self
     }
 
@@ -971,6 +981,7 @@ impl TuiDeck {
             suppress_agent_credentials: false,
             launch_subdir: None,
             launch_cargo_artifact: false,
+            keep_startup_hook_install: false,
         }
     }
 
@@ -1393,6 +1404,15 @@ impl TuiDeck {
         {
             let contained = contain_path(path);
             final_env.insert("PATH".into(), contained);
+        }
+        // PRD #91: start from the deck's hooks already installed, so the TUI's
+        // startup install finds nothing to change and puts no note over the
+        // button bar. See `preinstall_deck_hooks`.
+        if !builder.keep_startup_hook_install
+            && final_env.get("HOME").map(PathBuf::from) == Some(home.clone())
+            && final_env.get("XDG_CONFIG_HOME").map(PathBuf::from) == Some(xdg_config_home.clone())
+        {
+            preinstall_deck_hooks(&deck_binary, &launch_dir, &final_env);
         }
         // Read AFTER the `with_env` layer, so a test that moves the state dir
         // still gets its own daemon's log dumped rather than a missing path.
@@ -5290,6 +5310,41 @@ fn seed_durable_binary(home: &Path, target: &Path) {
     let _ = std::os::unix::fs::symlink(target, link);
 }
 
+/// PRD #91: run `hooks refresh` from `binary`, in the environment the deck is
+/// about to launch with, so the per-test HOME starts with the deck's hooks
+/// installed for every agent the startup install would touch.
+///
+/// **Why.** The TUI's startup install puts a note on the status line when it
+/// changes any agent's hooks, and the note replaces the button bar for the
+/// status-message TTL. `PATH` crosses into the deck from the host, so on a
+/// developer machine with an agent CLI installed, every launch into a fresh
+/// HOME installs hooks and every test that waits for the bar waits out the
+/// note. CI runners have no agent installed, so there the startup install
+/// usually finds nothing to do; this makes local runs start from the same
+/// state.
+///
+/// `hooks refresh` runs each agent's `refresh_install`, the same function the
+/// startup install runs, so the HOME ends up as that install would leave it
+/// rather than as a hand-written copy of it. Run last, after everything the
+/// harness seeds into the HOME, so it sees what the deck would. Best-effort:
+/// a refresh that fails leaves the startup install to do, and report, what it
+/// always did.
+///
+/// Skipped for a test that passes its own `HOME` or `XDG_CONFIG_HOME`, which
+/// owns what is in it, and for one that asks for
+/// [`TuiDeckBuilder::keeping_the_startup_hook_install`].
+fn preinstall_deck_hooks(binary: &Path, cwd: &Path, env: &HashMap<String, String>) {
+    let _ = std::process::Command::new(binary)
+        .args(["hooks", "refresh"])
+        .current_dir(cwd)
+        .env_clear()
+        .envs(env)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
 /// [`contained_deck_binary`] and the directory [`contain_path`] puts on `PATH`
 /// in place of cargo's build directory.
 struct ContainedDeck {
@@ -5411,6 +5466,13 @@ fn is_inside_checkout(path: &Path) -> bool {
 ///   devbox shell's `<checkout>/.devbox/nix/profile/default/bin` is a symlink
 ///   into `/nix/store`, so `git`, `cargo` and every other tool it provides still
 ///   resolve;
+/// - a deck's telemetry shim directory ([`is_deck_telemetry_shim_dir`]) is
+///   dropped. Only a developer's machine has one: running the tests from a
+///   pane of a deck with telemetry on puts that deck's shim directory on the
+///   host `PATH`, which `INHERIT_PASS` carries into the test, and a `codex`
+///   run inside a test would then go through the outer deck, exporting to the
+///   test's collector, until the shim refuses it for re-entering too often.
+///   CI starts no deck around its runs, so there it drops nothing;
 /// - everything else is kept as spelled, in order;
 /// - when nothing is kept, the result is [`contained_deck_path_dir`] alone,
 ///   never the empty string: an empty `PATH` on unix is one zero-length entry,
@@ -5447,7 +5509,7 @@ pub fn contain_path(path: &str) -> String {
         let is_cargo_dir = entry == cargo_dir || cargo_canonical.as_ref() == Some(&resolved);
         let kept = if is_cargo_dir {
             deck_dir.to_path_buf()
-        } else if is_inside_checkout(&resolved) {
+        } else if is_inside_checkout(&resolved) || is_deck_telemetry_shim_dir(&entry) {
             continue;
         } else if is_inside_checkout(&entry) {
             resolved
@@ -5465,6 +5527,58 @@ pub fn contain_path(path: &str) -> String {
         .expect("PATH entries rejoin")
         .to_string_lossy()
         .into_owned()
+}
+
+/// Whether the `PATH` entry `dir` is a deck's telemetry shim directory, as
+/// `telemetry::shim::install` writes one, whichever deck wrote it: it can be
+/// read, and everything in it a lookup by name can reach is a `codex` or
+/// `devin` that reads as a shim script ([`is_deck_telemetry_shim_script`]),
+/// at least one of them. Anything else in it (a real agent binary, another
+/// program, a file that cannot be read or a link that does not resolve) keeps
+/// the directory: a lookup by name may need it.
+#[allow(dead_code)]
+pub fn is_deck_telemetry_shim_dir(dir: &Path) -> bool {
+    use dot_agent_deck::telemetry::shim;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let mut shims = 0;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        // `install` stages each script as `.<name>.<pid>` beside its final name.
+        if name.starts_with('.') {
+            continue;
+        }
+        if !shim::PROGRAMS.contains(&name) || !is_deck_telemetry_shim_script(&entry.path()) {
+            return false;
+        }
+        shims += 1;
+    }
+    shims > 0
+}
+
+/// Whether the file at `path`, links followed, is a deck's telemetry shim
+/// script: a `#!` script with an `exec` line running the deck's shim
+/// subcommand. `false` when it cannot be read as text.
+#[allow(dead_code)]
+pub fn is_deck_telemetry_shim_script(path: &Path) -> bool {
+    use dot_agent_deck::telemetry::shim;
+    use std::io::Read;
+    let needle = format!(" {} ", shim::SUBCOMMAND);
+    let mut head = String::new();
+    std::fs::File::open(path)
+        .and_then(|f| f.take(16 * 1024).read_to_string(&mut head))
+        .is_ok()
+        && head.starts_with("#!")
+        && head
+            .lines()
+            .any(|line| line.starts_with("exec ") && line.contains(&needle))
 }
 
 /// Where the absolute `entry` resolves: its deepest existing ancestor's

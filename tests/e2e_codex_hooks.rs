@@ -274,6 +274,9 @@ fn codex_hooks_003_non_codex_launcher_gets_startup_integration() {
             deck_hook_response("__DECK_COMMAND__"),
         )
         .with_continue_session("launcher-codex", "/bin/sh startup-parity-launcher.sh")
+        // The install and trust under test are the startup install's own, so
+        // the harness must not have done them first.
+        .keeping_the_startup_hook_install()
         .launch_with_fixture("codex-synthetic");
 
     deck.wait_for_string("[Command Mode Ctrl+D]");
@@ -347,9 +350,12 @@ fn assert_codex_card_holds_idle(deck: &TuiDeck, moment: &str) {
 fn codex_hooks_001_real_interactive_turn_reaches_idle_without_exit() {
     skip_unless!(common::check_codex_available());
 
+    // Past a deck's telemetry shim, which a run from a deck pane has on PATH:
+    // the launcher below would otherwise exec the outer deck's shim.
     let real_codex = std::env::var_os("PATH")
         .and_then(|path| {
             std::env::split_paths(&path)
+                .filter(|dir| !common::is_deck_telemetry_shim_dir(dir))
                 .map(|dir| dir.join("codex"))
                 .find(|candidate| candidate.is_file())
         })
