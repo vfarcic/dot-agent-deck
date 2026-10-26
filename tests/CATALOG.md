@@ -11284,6 +11284,20 @@ The live moved-back case (`doorbell_010_live_spaces_moved_back_draft_stays_held`
 - **Does not assert:** a real Codex, or a modal present before admission (`inbox/codex/001`–`003`).
 - **Platform coverage:** mac+linux.
 
+##### inbox/codex/027 — A measured Codex whose own hooks have reported is rung in two stages, and never into a dialog, a line it did not type or a kept draft.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex_doorbell.rs`), the real wrapper, writer, hook CLI and daemon.
+- **Agent:** none (`tests/support/codex_composer.py`, a scripted screen drawing Codex 0.164.0's measured header, composer, transcript and dialogs, and running the real Codex prompt and Stop hooks on a submit). Synthetic readiness: each generation's own SessionStart and Stop are run by hand before a task is queued. Trusted hooks: a `codex app-server` stand-in (`tests/fixtures/codex-synthetic/codex`) lets the wrapper record the hooks' trust, so it reports nothing from the screen's output. Until the release records carry 0.164.0's `head_echo`, the e2e daemon is asked to assume it (`DOT_AGENT_DECK_E2E_ASSUME_CODEX_HEAD_ECHO`).
+- **Asserts:** no byte before the settle window, then the token head alone, the rest once the head shows, and one Enter, with the task acknowledged through Codex's own prompt hook and WAKE naming `turn_end`; the update, folder-trust and hooks-review dialogs at admission each get no byte and no tripwire on the measured release, and the task is delivered once the dialog closes; a dialog opening on the head gets nothing more and the card says so; a doorbell-shaped line the deck did not type, and the deck's own old line typed back, get no byte; a draft Codex keeps on Enter holds the doorbell; a pane its hooks call Codex is rung; on an inherited release (0.165.0) a recognised dialog sets the release's tripwire while an unrecognised screen, a swallowed Enter and an "Update now" transcript row do not.
+- **Does not assert:** a real Codex, a generation that has not reported (`inbox/codex/028`), or the untrusted-hooks path, where the wrapper reads the screen's output as activity.
+- **Platform coverage:** mac+linux.
+
+##### inbox/codex/028 — A fresh Codex is rung before its first prompt on its own measured proof, and on nothing else.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex_doorbell.rs`), the real wrapper, writer, hook CLI and daemon.
+- **Agent:** none (`tests/support/codex_composer.py`, as in `inbox/codex/027`, with trusted hooks and the assumed `head_echo`). No hook is run by hand before a ring: the generation's first own hook is the prompt hook the ring's Enter brings, as with a real Codex.
+- **Asserts:** a fresh measured Codex with no own hook gets the token head, the rest and one Enter after its settle window, with the attempt logged `hook_route=false`, and the task acknowledged; a replacement whose predecessor reported Idle, and which gets a shell-idle report carrying the predecessor's session, gets no byte until it draws its own composer, then only its own task; a fresh Codex behind its update, folder-trust or hooks-review dialog gets no byte until the dialog closes, then is rung with no prompt typed; a screen with no start-up header (a resumed session's) gets no byte, logged `unknown_release`, the card holding as `cannot_type`; a launcher's own output before the Codex screen does not stop the ring, while a launcher that prints a header-shaped line in raw mode and draws no composer gets no byte, the card holding as `awaiting_prompt`; at 24 × 80, where the start-up frame has no width witness, a fresh Codex gets no byte and the card holds as `awaiting_prompt`.
+- **Does not assert:** a real Codex (lane 2's `inbox/codex/009` and `010`), the untrusted-hooks path, or that the header and composer come from Codex: they are screen recognisers, and a launcher that draws the whole measured screen is not told apart.
+- **Platform coverage:** mac+linux.
+
 
 ### Test harness: Claude Code prompt submission
 

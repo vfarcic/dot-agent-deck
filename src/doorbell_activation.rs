@@ -498,6 +498,56 @@ pub fn without_unrecorded_claude<'a>(
         .collect()
 }
 
+/// The variable the e2e build reads for [`assumed_codex_head_echo`].
+pub const ASSUME_CODEX_HEAD_ECHO_ENV: &str = "DOT_AGENT_DECK_E2E_ASSUME_CODEX_HEAD_ECHO";
+
+/// PRD #1666 part 3, Q28: the Codex releases whose `head_echo` an e2e run
+/// asks the deck to treat as verified, so a lane-1 test can drive an
+/// activated Codex before the records say so (the Q27 Go change). A
+/// malformed list assumes nothing and is logged as `head echo assumption
+/// refused`.
+#[cfg(feature = "e2e")]
+pub fn assumed_codex_head_echo() -> Vec<Version> {
+    let Ok(list) = std::env::var(ASSUME_CODEX_HEAD_ECHO_ENV) else {
+        return Vec::new();
+    };
+    match parse_unrecorded_claude_releases(&list) {
+        Ok(releases) => releases,
+        Err(why) => {
+            tracing::warn!(target: "doorbell", %why, "head echo assumption refused");
+            Vec::new()
+        }
+    }
+}
+
+/// The production build reads no variable and assumes nothing.
+#[cfg(not(feature = "e2e"))]
+pub fn assumed_codex_head_echo() -> Vec<Version> {
+    Vec::new()
+}
+
+/// `records` with an absent `head_echo` read as verified on the **Codex**
+/// records for `assumed`. Every other field, and every other agent's record,
+/// is kept as it is, so the assumption can only turn a Codex release whose
+/// one missing measurement is `head_echo` into its measured verdict.
+pub fn with_assumed_codex_head_echo<'a>(
+    records: Vec<ReleaseRecord<'a>>,
+    assumed: &[Version],
+) -> Vec<ReleaseRecord<'a>> {
+    records
+        .into_iter()
+        .map(|mut r| {
+            if r.agent == AgentType::Codex
+                && assumed.contains(&r.release)
+                && r.head_echo == Measurement::Absent
+            {
+                r.head_echo = Measurement::Verified(());
+            }
+            r
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // The recorded measurements (M1, M2; 2026-10-24). Each record states its
 // sample counts and figures; the raw captures 036 replays are under

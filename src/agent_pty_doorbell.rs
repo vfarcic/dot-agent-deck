@@ -484,6 +484,27 @@ impl AgentPtyRegistry {
         None
     }
 
+    /// PRD #1666 part 3, Q28: whether `agent_id`'s generation in `pane_id`
+    /// may be rung before its own hooks report: its effective agent's first
+    /// hook comes with its first prompt
+    /// ([`crate::agent_registry::FirstHook::WithFirstPrompt`]) and its own
+    /// latched release is activated. That is permission to try, not
+    /// readiness: every ring's transaction still needs the generation's own
+    /// Clean frame of the empty ready composer, mode evidence and settle
+    /// anchor, and no hook route is assumed (`hook_route` stays false, so
+    /// submit evidence is the transcript's).
+    pub fn doorbell_ready_before_hooks(&self, pane_id: &str, agent_id: &str) -> bool {
+        let Some(generation) = self.doorbell_generation(pane_id, agent_id) else {
+            return false;
+        };
+        let Some(agent) = generation.agent.as_ref() else {
+            return false;
+        };
+        crate::agent_registry::spec(agent).first_hook
+            == crate::agent_registry::FirstHook::WithFirstPrompt
+            && self.doorbell_typing(&generation, false).is_ok()
+    }
+
     /// Whether `agent_id`'s first ring still waits out the settle window
     /// (plan §4.4), so its hold clock is paused. A release with no window
     /// waits for nothing. An unwrapped generation's anchor is its first Clean
@@ -768,6 +789,7 @@ impl AgentPtyRegistry {
             j0 = marks.job_mark,
             layout_epoch = admission.frame.epoch,
             staged = typing.caps.staged_head.is_some(),
+            hook_route = typing.caps.hook_route,
             "doorbell attempt"
         );
         // E2E interleave seams (`inbox/doorbell/031`), on a generation's

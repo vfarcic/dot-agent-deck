@@ -858,6 +858,13 @@ async fn run_tick(
         let refused = (queued && !receiver)
             .then(|| registry.doorbell_refusal(&pane, &agent, hooked))
             .flatten();
+        // Q28: an agent whose first own hook comes with its first prompt may
+        // be rung on its own measured proof before it reports.
+        let ready = hooked
+            || (queued
+                && !receiver
+                && refused.is_none()
+                && registry.doorbell_ready_before_hooks(&pane, &agent));
         let settling = queued
             && !receiver
             && refused.is_none()
@@ -916,9 +923,10 @@ async fn run_tick(
             let facts = Facts {
                 inbox,
                 // `inbox/doorbell/008`: a generation whose own hooks have not
-                // reported is never rung, whatever its screen shows; a
-                // predecessor's Idle on the pane is not its readiness.
-                idle: admission.is_some() && hooked,
+                // reported is never rung on what its card or a predecessor's
+                // Idle presents, only, for an agent that reports nothing
+                // before its first prompt, on its own measured proof (Q28).
+                idle: admission.is_some() && ready,
                 held: input.paste_open
                     || refused.is_some()
                     || settling

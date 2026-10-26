@@ -2175,6 +2175,68 @@ fn doorbell_058_part_of_a_head_is_never_deleted_and_a_whole_one_is_withdrawn() {
     );
 }
 
+/// The rest's seam (seam 1) contended from its first read, and the admission
+/// lost 100 ms later, while it still is; `then` runs at 200 ms.
+fn contended_rest_then_lost(world: &mut World, then: Option<Change>) {
+    world.before_seam.push((
+        1,
+        Box::new(move |w| {
+            w.contended = true;
+            let since = w.now - w.start;
+            w.at.push((
+                since + Duration::from_millis(100),
+                Box::new(|w| w.events.push_back(Event::AdmissionLost)),
+            ));
+            if let Some(then) = then {
+                w.at.push((since + Duration::from_millis(200), then));
+            }
+        }),
+    ));
+}
+
+/// Scenario: With the token head written and its echo seen, the rest's seam stays contended and the admission is lost while it does. When the locks come free the head is withdrawn with eight deletes and the placeholder's confirmation, and the rest is never typed (Withdrawn); separately, when they come free with another token in the composer, the deletes' own fresh seam refuses them and nothing more is written (Unresolved); separately, when they never come free, the transaction is released by the deadline with the cell suspended and nothing more written.
+#[spec("inbox/doorbell/058")]
+#[test]
+fn doorbell_058_a_cancellation_while_the_rest_s_seam_is_contended() {
+    let mut freed = staged();
+    contended_rest_then_lost(&mut freed, Some(Box::new(|w| w.contended = false)));
+    let (outcome, line) = run(&mut freed);
+    assert_eq!(outcome, Ok(Outcome::Withdrawn));
+    assert_eq!(
+        freed.pane,
+        vec![head_of(&line).to_string(), "<DEL×8>".to_string()],
+        "the head and its deletes, never the rest"
+    );
+
+    let mut other = staged();
+    contended_rest_then_lost(
+        &mut other,
+        Some(Box::new(|w| {
+            w.contended = false;
+            w.stale = Some("(zzzzzz)".to_string());
+        })),
+    );
+    let (outcome, line) = run(&mut other);
+    assert!(matches!(outcome, Ok(Outcome::Unresolved(_))), "{outcome:?}");
+    assert_eq!(
+        other.pane,
+        vec![head_of(&line).to_string()],
+        "no delete into a composer showing another token"
+    );
+
+    let mut stuck = staged();
+    contended_rest_then_lost(&mut stuck, None);
+    let start = stuck.now;
+    let (outcome, line) = run(&mut stuck);
+    assert_eq!(outcome, Ok(Outcome::Unresolved(Cause::Deadline)));
+    assert_eq!(stuck.pane, vec![head_of(&line).to_string()]);
+    assert!(stuck.released_at.unwrap() <= start + TXN_MAX);
+    assert_eq!(
+        stuck.cell_at_release,
+        Some(Latch::Suspended(1, Cause::Deadline))
+    );
+}
+
 /// Scenario: With the token head written and echoed, the rest's job stays queued until the deadline; separately, the writer claims it at the deadline and its reports arrive after; separately, its end is the first the transaction hears of it, at the deadline or a millisecond after, whether the writer took its bytes or none. The queued rest is taken back and never written; every case releases by the deadline with the cell suspended, never as nothing written, since the head is in.
 #[spec("inbox/doorbell/058")]
 #[test]

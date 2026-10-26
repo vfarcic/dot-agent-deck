@@ -5,7 +5,7 @@ use std::time::Duration;
 use dot_agent_deck::doorbell_activation::{
     Activation, DialogKeys, FirstModal, KeyEffect, LatchedRelease, Measurement, NoGo,
     RELEASE_RECORDS, ReleaseRecord, SETTLE_CAP, activation, exact_verdict, first_stage_bytes,
-    parse_unrecorded_claude_releases, without_unrecorded_claude,
+    parse_unrecorded_claude_releases, with_assumed_codex_head_echo, without_unrecorded_claude,
 };
 use dot_agent_deck::event::AgentType;
 use semver::Version;
@@ -749,6 +749,37 @@ fn doorbell_053_every_recorded_dialog_leaves_the_token_head_inert() {
             }
         }
     }
+}
+
+/// Scenario: Assume `head_echo` for Codex 0.164.0, as an e2e run asks before the Q27 Go change, over the shipped records. 0.164.0 becomes Go exactly as its other measurements say, staged; 0.160.0, named nowhere, and the Claude Code record, named or not, are unchanged; and a Codex record missing anything besides `head_echo` keeps its own NoGo.
+#[spec("inbox/doorbell/053")]
+#[test]
+fn doorbell_053_an_assumed_head_echo_completes_only_that_codex_record() {
+    let assumed =
+        with_assumed_codex_head_echo(RELEASE_RECORDS.to_vec(), &[v("0.164.0"), v("2.1.310")]);
+    assert!(matches!(
+        verdict(&assumed, &CODEX, "0.164.0"),
+        Activation::Go { staged: true, .. }
+    ));
+    assert_eq!(
+        verdict(&assumed, &CODEX, "0.160.0"),
+        verdict(&RELEASE_RECORDS, &CODEX, "0.160.0")
+    );
+    assert_eq!(
+        verdict(&assumed, &CLAUDE, "2.1.310"),
+        verdict(&RELEASE_RECORDS, &CLAUDE, "2.1.310")
+    );
+    let missing = [incomplete(CODEX, "0.164.0", 2)];
+    let still = with_assumed_codex_head_echo(missing.to_vec(), &[v("0.164.0")]);
+    assert_eq!(
+        verdict(&still, &CODEX, "0.164.0"),
+        verdict(&missing, &CODEX, "0.164.0")
+    );
+    assert!(no_go(&verdict(&still, &CODEX, "0.164.0")).is_some());
+    assert_eq!(
+        with_assumed_codex_head_echo(RELEASE_RECORDS.to_vec(), &[]),
+        RELEASE_RECORDS.to_vec()
+    );
 }
 
 /// Scenario: Ask the table about each release the deck carries a record for, as it ships. Claude Code 2.1.310 is Go, unstaged; both Codex releases stage the line and are held as missing_measurement until their head echo is recorded; and every record has its parser cost verified.

@@ -327,6 +327,10 @@ pub struct AgentSpec {
     /// `SessionStart` is readiness enough, or where [`Self::doorbell_composer`]
     /// already guards every write.
     pub doorbell_ready_screen: Option<fn(&[String]) -> bool>,
+    /// PRD #1666 part 3, Q28: when this agent's own hooks first report, which
+    /// decides what a generation that has not reported yet needs before the
+    /// doorbell may ring it ([`FirstHook`]).
+    pub first_hook: FirstHook,
     /// PRD #1631: the options this agent draws on screen but never reports in
     /// a payload — its permission and plan menus, and the free-text entries it
     /// appends to a multiple-choice list — with the keys that pick each where
@@ -335,6 +339,30 @@ pub struct AgentSpec {
     /// ([`crate::question::answer_keys`]). `None` for an agent with no such
     /// menus (Pi, whose dialogs report their own options) and the placeholder.
     pub questions: Option<&'static QuestionTables>,
+}
+
+/// PRD #1666 part 3, Q28 ([`AgentSpec::first_hook`]): when an agent's own
+/// hooks first report, as measured. A generation whose own hooks have not
+/// reported is [`crate::state::ReadinessLevel::Unproven`] either way, and
+/// its own hooks stay the only thing that makes it more: this decides only
+/// whether the doorbell may ring it before they do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirstHook {
+    /// Its own hooks report before its prompt takes input (Claude Code's
+    /// `SessionStart`), or nothing measured says otherwise: a generation
+    /// they have not reported for is never rung (`inbox/doorbell/008`).
+    BeforePrompt,
+    /// Its first own hook comes with its first prompt, so a generation
+    /// nobody has typed to reports nothing at all (Codex 0.164.0 and
+    /// 0.160.0, measured: `SessionStart` 338 ms and 449 ms after the first
+    /// prompt's Enter). Such a generation may be rung on its own measured
+    /// proof instead, which the doorbell's transaction checks on every ring
+    /// whatever this says: an activated release (`Go` or `Inherited`) it
+    /// latched from its own start-up header, a Clean frame of that release's
+    /// profile showing the empty ready composer, its own input-mode evidence
+    /// and its settle anchor. A predecessor's report in the same pane is
+    /// none of these.
+    WithFirstPrompt,
 }
 
 /// [`AgentSpec::doorbell_stranded_line`]: screen rows, cursor, the line the
@@ -834,6 +862,7 @@ pub static CLAUDE_CODE: AgentSpec = AgentSpec {
     // before its prompt is drawn, so a generation that has not yet reported
     // Idle is rung only once that prompt is on screen.
     doorbell_ready_screen: Some(claude_prompt_on_screen),
+    first_hook: FirstHook::BeforePrompt,
     questions: Some(&CLAUDE_CODE_QUESTIONS),
 };
 
@@ -910,6 +939,7 @@ pub static OPEN_CODE: AgentSpec = AgentSpec {
     doorbell_composer: None,
     doorbell_stranded_line: None,
     doorbell_ready_screen: None,
+    first_hook: FirstHook::BeforePrompt,
     questions: Some(&OPEN_CODE_QUESTIONS),
 };
 
@@ -949,6 +979,7 @@ pub static PI: AgentSpec = AgentSpec {
     doorbell_composer: None,
     doorbell_stranded_line: None,
     doorbell_ready_screen: None,
+    first_hook: FirstHook::BeforePrompt,
     questions: None,
 };
 
@@ -1004,6 +1035,8 @@ pub static CODEX: AgentSpec = AgentSpec {
     doorbell_composer: Some(codex_composer_on_screen),
     doorbell_stranded_line: Some(codex_composer_holds_doorbell_line),
     doorbell_ready_screen: None,
+    // PRD #1666 part 3, Q28: its SessionStart comes with its first prompt.
+    first_hook: FirstHook::WithFirstPrompt,
     questions: Some(&CODEX_QUESTIONS),
 };
 
@@ -1217,6 +1250,7 @@ pub static DEVIN: AgentSpec = AgentSpec {
     doorbell_composer: None,
     doorbell_stranded_line: None,
     doorbell_ready_screen: None,
+    first_hook: FirstHook::BeforePrompt,
     questions: Some(&DEVIN_QUESTIONS),
 };
 
@@ -1245,6 +1279,7 @@ pub static NONE: AgentSpec = AgentSpec {
     doorbell_composer: None,
     doorbell_stranded_line: None,
     doorbell_ready_screen: None,
+    first_hook: FirstHook::BeforePrompt,
     questions: None,
 };
 

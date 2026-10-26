@@ -2163,9 +2163,14 @@ impl DoorbellAdmission {
 /// establishing any of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ReadinessLevel {
-    /// Nothing from the generation's own hooks. Only an agent whose writer
-    /// recognises its empty composer on screen (Codex) may be rung, and only
-    /// while it does.
+    /// Nothing from the generation's own hooks. Never rung, unless its agent's
+    /// first own hook comes with its first prompt
+    /// ([`crate::agent_registry::FirstHook::WithFirstPrompt`], Codex) and the
+    /// generation's own measured proof holds (PRD #1666 part 3, Q28): an
+    /// activated release latched from its own start-up header, a Clean frame
+    /// of the empty ready composer, its mode evidence and its settle anchor.
+    /// That proof never raises this level, and no own hook route is assumed
+    /// from it.
     Unproven,
     /// Its own `SessionStart`, from an agent that posts it before its prompt
     /// is up (Claude Code): ready once the writer recognises that prompt on
