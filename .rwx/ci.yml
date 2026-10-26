@@ -213,6 +213,8 @@ tasks:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_INCREMENTAL: "0"
     run: |
+      # pi-extension/'s typecheck (issue #1708), as in ci.yml's `test` job.
+      (cd pi-extension && npm ci --ignore-scripts && npm run typecheck)
       cargo test-fast
       # Keep only the dependencies in the tool cache, as Swatinem/rust-cache
       # does on GitHub: the workspace crates rebuild every run anyway (fresh
@@ -316,18 +318,12 @@ tasks:
       npm install -g pnpm@12.9.0
       pnpm --version
 
-  # desktop/: the web app's unit tests and build (ci.yml's `desktop-web`),
-  # and pi-extension/'s typecheck, which rides the same job there.
+  # desktop/: the web app's unit tests and build (ci.yml's `desktop-web`).
   - key: desktop-web
     if: ${{ tasks.backend.values.rust == 'true' }}
     use: [code, pnpm]
     run: |
-      # pi-extension first: `set -e` exempts a `!` command, so the grep below
-      # only fails the task while it is the last line.
-      cd pi-extension
-      npm ci --ignore-scripts
-      npm run typecheck
-      cd ../desktop
+      cd desktop
       pnpm install --frozen-lockfile
       pnpm test
       pnpm build

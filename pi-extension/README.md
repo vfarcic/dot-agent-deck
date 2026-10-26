@@ -45,7 +45,7 @@ The tests import only the import-free `src/orchestrator.ts`, so they need **no r
 All of them are dev dependencies, which `package-lock.json` pins; Pi installs none of them when it loads the extension.
 
 - **`tsx`** — lets Node's built-in test runner execute the TypeScript tests.
-- **`typescript`** and **`@types/node`** — `npm run typecheck`. CI runs it in `ci.yml`'s `desktop-web` job and in `.rwx/ci.yml`'s task of the same name (issue #1708).
+- **`typescript`** and **`@types/node`** — `npm run typecheck`. CI runs it in `ci.yml`'s `test` job, which the required `build` check aggregates, and in `.rwx/ci.yml`'s task of the same name (issue #1708).
 - **`@earendil-works/pi-coding-agent`** and **`typebox`** — imported by `src/index.ts` for types and tool schemas, and installed here only so the typecheck can resolve them. At runtime Pi resolves both from its own installation when it loads the extension (via jiti). `typebox` is pinned to the version `@earendil-works/pi-coding-agent` itself pins, so the two share one copy.
 
 ## Pi extension API used (Pi 0.80.6)
