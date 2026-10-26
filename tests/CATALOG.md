@@ -8397,7 +8397,7 @@ Since PRD #1666 S5 the deck types nothing into the orchestrator: its idle, waiti
 - **Agent:** none.
 - **Asserts:** Leave a task Queued and then Fetched across two idle windows. No idle notice appears until the worker acknowledges it, after which the idle clock begins and one daemon notice reaches the orchestrator inbox.
 - **Test:** `idle_worker_026_response_clocks_start_after_deferred_pointer` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
-- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
+- **Does not assert:** silence during intervals missed by a delayed observer or exact daemon timer arithmetic; real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
 
 ##### scheduler/idle-worker/027 — Supersede an unacknowledged task with a newer one. The newer task starts no idle clock until its own acknowledgement; inbox samples completed within 250 ms of the acknowledgement request remain silent, then one bound idle notice reaches the orchestrator inbox.
