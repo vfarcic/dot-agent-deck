@@ -688,27 +688,53 @@ fn opencode_005_a_lost_watcher_resumes_and_a_closed_one_requeues_nothing() {
     }
 }
 
-/// Scenario: Leave a delivered task without an assistant child across many keepalives. The plugin keeps it in every possession snapshot, so it is never repeated and never undeliverable; once OpenCode answers it, it is acknowledged, with one prompt.
+/// Scenario: Leave a delivered task without an assistant child and stall the plugin for one second, within a load-scaled possession TTL. Fresh snapshots must keep the task fetched with one prompt across a full TTL; once OpenCode answers it, it is acknowledged.
 #[spec("inbox/opencode/006")]
 #[test]
 fn opencode_006_a_held_delivery_is_never_repeated() {
-    let op = OpenCode::new("session", json!({"keepaliveMs":"300","maxDeliver":"2"}));
+    // A one-second scheduling gap exceeded the old 900 ms TTL (#1940).
+    // Keep the gap, but give the fixture's 100 ms snapshot cadence a six-second
+    // TTL, widened under load. Observe beyond that TTL so a missing renewal
+    // cannot hide inside the initial issue grace. The fixture pulses the real
+    // plugin's keepalive callback; it does not manufacture possession reports.
+    let keepalive = common::load_scaled(Duration::from_secs(2));
+    let ttl = keepalive * 3;
+    let op = OpenCode::new(
+        "session",
+        json!({"keepaliveMs":keepalive.as_millis().to_string(),"maxDeliver":"2","snapshotStallMs":1000,"snapshotEveryMs":100}),
+    );
     let id = op.post();
     op.wait_kind("prompt");
+    op.wait_kind("stalled");
+    let repeated_or_lost = common::wait_until(keepalive * 4, || {
+        op.prompts().len() > 1 || op.message_state(&id) != "fetched"
+    });
+    let snapshots: Vec<_> = op
+        .events()
+        .into_iter()
+        .filter(|e| e["kind"] == "stdin")
+        .filter_map(|e| {
+            let control: Value = serde_json::from_str(e["text"].as_str()?).ok()?;
+            control["possess"]["held"]
+                .as_array()?
+                .iter()
+                .any(|held| held["id"] == id)
+                .then(|| e["t"].as_u64().unwrap())
+        })
+        .collect();
     assert!(
-        !common::wait_until(Duration::from_secs(4), || op.prompts().len() > 1
-            || op.message_state(&id) != "fetched"),
-        "a possessed delivery is never repeated: {:?}",
+        snapshots.len() >= 4
+            && snapshots.last().unwrap() - snapshots[0] >= ttl.as_millis() as u64
+            && snapshots
+                .windows(2)
+                .all(|pair| pair[1] - pair[0] < ttl.as_millis() as u64),
+        "fixture must report possession across a full TTL without a lapse; ttl={ttl:?}, snapshots={snapshots:?}; events={:?}",
         op.events()
     );
     assert!(
-        op.controls()
-            .iter()
-            .filter(|c| c["possess"].is_object())
-            .count()
-            >= 6,
-        "a snapshot answers each keepalive: {:?}",
-        op.controls()
+        !repeated_or_lost,
+        "a possessed delivery is never repeated: {:?}",
+        op.events()
     );
     op.acknowledge(&id);
     assert_eq!(op.prompts().len(), 1);

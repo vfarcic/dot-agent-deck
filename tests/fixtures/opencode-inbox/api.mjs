@@ -26,6 +26,7 @@ const realSpawn = cp.spawn;
 // With `firstWatcherDelaysPublish`, only the first watcher inherits the
 // publish delay knob: a later one publishes at once.
 let watchers = 0;
+let stalledSnapshot = false;
 cp.spawn = (...args) => {
   if (config.firstWatcherDelaysPublish && args[1]?.[1] === 'wait' && watchers++ > 0) {
     const env = {...process.env};
@@ -38,10 +39,31 @@ cp.spawn = (...args) => {
   const write = child.stdin?.write.bind(child.stdin);
   child.rawWrite = write;
   if (write) child.stdin.write = (bytes, ...rest) => {
+    const snapshot = JSON.parse(bytes.toString()).possess;
+    if (!stalledSnapshot && config.snapshotStallMs && snapshot?.seq >= 3 && snapshot.held.length) {
+      stalledSnapshot = true;
+      // Place a held snapshot between keepalives, then block the plugin's
+      // event loop to reproduce a scheduling gap independently of its TTL.
+      setTimeout(() => {
+        log('stdin', {text: bytes.toString()});
+        write(bytes, ...rest);
+        const until = Date.now() + config.snapshotStallMs;
+        while (Date.now() < until) {}
+        log('stalled', {ms: config.snapshotStallMs});
+      }, 100);
+      return true;
+    }
     log('stdin', {text: bytes.toString()});
     return write(bytes, ...rest);
   };
   child.stdout?.on?.('data', (bytes) => log('stdout', {pid: child.pid, text: bytes.toString()}));
+  // Exercise the generated plugin's snapshot callback at a controlled cadence
+  // independent of the real watcher's keepalive (which sets the daemon TTL).
+  if (config.snapshotEveryMs) {
+    const timer = setInterval(() => child.stdout.emit('data', '{"keepalive":true}\n'), config.snapshotEveryMs);
+    timer.unref();
+    child.on('exit', () => clearInterval(timer));
+  }
   child.on('exit', (code, signal) => log('exit', {pid: child.pid, code, signal}));
   return child;
 };
