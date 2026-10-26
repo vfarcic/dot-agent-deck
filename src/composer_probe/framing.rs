@@ -14,6 +14,25 @@
 //! (the physical tracker, Q35-16), and the agent's output (paste mode,
 //! Q35-02; the queries the epoch's ledger waits on, Q35-06).
 //!
+//! **Two grammars.** [`Framing::default`] reads what a client sends an agent:
+//! an ESC and the byte after it are one Alt+key, `ESC O` opens an SS3 key,
+//! `CSI M` an X10 mouse report, and bracketed paste is tracked.
+//! [`Framing::output`] reads what an agent writes to its terminal, following
+//! the state machine of the `vte` crate that the deck's `vt100` parser is built
+//! on: a C0 control or DEL after an ESC is reported without ending the escape
+//! (`ESC NUL c` is still RIS), an ESC with intermediate bytes (`ESC ( B`) runs
+//! to its final byte ([`Event::IntermediateEscape`]), `ESC O` and `CSI M` are
+//! ordinary sequences, a byte at or above `0x80` inside an escape or a CSI is
+//! skipped rather than making it malformed, and there is no paste. Two
+//! differences from `vte` are kept: the 64-byte CSI cap, and a DCS that ends
+//! only at ST, CAN, SUB or another ESC, not at the 8-bit ST (`0x9C`): an ESC
+//! ends the DCS in both, so a sequence an ESC opens after it reads the same.
+//! In both grammars, a control before a CSI's private marker leaves it the
+//! private marker, and a private-marker byte after the first is malformed, as
+//! `vte` ignores that CSI. `tests/output_paste_mode.rs` compares the output
+//! grammar's reading of mode 2004 with `vt100`'s, and pins the difference it
+//! knows of.
+//!
 //! **Edge cases, explicitly:**
 //! - CAN (`0x18`) and SUB (`0x1A`) abandon a sequence or string and return to
 //!   ground.
@@ -22,15 +41,17 @@
 //! - A BEL ends an OSC string only. Inside a CSI, DCS, APC, PM or SOS it is
 //!   reported and the sequence goes on.
 //! - A CSI with more than [`MAX_SEQUENCE_BYTES`] parameter and intermediate
-//!   bytes, a parameter byte after an intermediate, or a byte no CSI carries
-//!   is malformed: it returns to ground at its final byte, dispatching
-//!   nothing ([`Event::MalformedCsi`]).
+//!   bytes, a parameter byte after an intermediate, a private-marker byte
+//!   after its first byte, or (on input) a byte at or above `0x80` is
+//!   malformed: it returns to ground at its final byte, dispatching nothing
+//!   ([`Event::MalformedCsi`]).
 //! - Any other C0 control (and DEL) inside a CSI or a string is reported
 //!   ([`Event::Inside`]) and doesn't end it: the tokenizer's rule, chosen
 //!   because staying inside is the conservative direction for the boundary,
-//!   not a claim that it reads every control as a given terminal does. Inside
-//!   an SS3 or X10 prefix any C0 control, BEL and ESC included, ends the
-//!   prefix, which was never a sequence, and is read afresh in ground.
+//!   not a claim that it reads every control as a given terminal does. On
+//!   input, inside an SS3 or X10 prefix any C0 control, BEL and ESC included,
+//!   ends the prefix, which was never a sequence, and is read afresh in
+//!   ground.
 //! - A string's length is unbounded; only the first [`MAX_SEQUENCE_BYTES`]
 //!   of its payload are kept, for classifying a reply. Staying in a string is
 //!   the conservative direction: the stream isn't at a boundary, so no deck
@@ -93,6 +114,8 @@ pub struct Framing {
     literal: bool,
     /// The CSI is malformed, or the string's payload overflowed `buf`.
     malformed: bool,
+    /// The output grammar ([`Framing::output`]).
+    output: bool,
 }
 
 impl Default for Framing {
@@ -107,6 +130,7 @@ impl Default for Framing {
             started: false,
             literal: false,
             malformed: false,
+            output: false,
         }
     }
 }
@@ -115,10 +139,17 @@ impl Default for Framing {
 enum State {
     Ground,
     Esc,
+    /// On output, an ESC and one or more intermediate bytes.
+    EscIntermediate,
     Csi,
     Ss3,
-    X10 { remaining: u8 },
-    Str { kind: StringKind, esc: bool },
+    X10 {
+        remaining: u8,
+    },
+    Str {
+        kind: StringKind,
+        esc: bool,
+    },
 }
 
 /// Which string a [`Str`] was.
@@ -150,7 +181,7 @@ pub enum Terminator {
 pub enum BelAt {
     /// In ground: Ctrl+G itself.
     Ground,
-    /// Inside an unfinished CSI.
+    /// Inside an unfinished CSI, or, on output, an unfinished escape.
     Sequence,
     /// Inside a DCS, APC, PM or SOS string.
     String,
@@ -170,6 +201,12 @@ pub enum Event<'a> {
     /// `ESC` and one byte that opens no sequence: an Alt+key on input (`ESC
     /// CR` is Alt+Enter), an escape such as RIS (`ESC c`) on output.
     Escape(u8),
+    /// On output, an ESC, its intermediate bytes and its final byte, such as
+    /// a character-set designation (`ESC ( B`).
+    IntermediateEscape {
+        /// Its final byte.
+        final_byte: u8,
+    },
     /// An SS3 key: `ESC O` and its final byte.
     Ss3(u8),
     /// A complete, well-formed CSI sequence, exact paste markers excepted.
@@ -183,7 +220,8 @@ pub enum Event<'a> {
     X10Mouse,
     /// A string ended by its terminator.
     Str(Str<'a>),
-    /// A C0 control or DEL inside an unfinished CSI or string, which goes on.
+    /// A C0 control or DEL inside an unfinished CSI or string, or, on
+    /// output, an unfinished escape, which goes on.
     Inside(u8),
     /// A sequence or string that ended unfinished: CAN or SUB, an ESC that
     /// opened another, a control that ended an SS3 or X10 prefix, or a lone
@@ -301,6 +339,15 @@ pub enum Report {
 }
 
 impl Framing {
+    /// A tokenizer for what an agent writes to its terminal: the output
+    /// grammar (see the module documentation).
+    pub fn output() -> Self {
+        Self {
+            output: true,
+            ..Self::default()
+        }
+    }
+
     /// Read one byte, handing each [`Token`] it completes to `emit`.
     pub fn feed(&mut self, byte: u8, mut emit: impl FnMut(Token<'_>)) {
         self.step(byte, &mut emit);
@@ -323,6 +370,7 @@ impl Framing {
         match self.state {
             State::Ground => self.ground(byte, emit),
             State::Esc => self.escape(byte, emit),
+            State::EscIntermediate => self.escape_intermediate(byte, emit),
             State::Csi => self.csi(byte, emit),
             State::Ss3 => match byte {
                 0x00..=0x1f => {
@@ -364,6 +412,30 @@ impl Framing {
     }
 
     fn escape(&mut self, byte: u8, emit: &mut dyn FnMut(Token<'_>)) {
+        if self.output {
+            match byte {
+                0x20..=0x2f => {
+                    self.state = State::EscIntermediate;
+                    return;
+                }
+                b'O' => {
+                    emit(self.token(Event::Escape(byte)));
+                    self.state = State::Ground;
+                    return;
+                }
+                BEL => {
+                    emit(self.token(Event::Bel(BelAt::Sequence)));
+                    return;
+                }
+                ESC | CAN | SUB => {}
+                0x00..=0x1f | DEL => {
+                    emit(self.token(Event::Inside(byte)));
+                    return;
+                }
+                0x80..=0xff => return,
+                _ => {}
+            }
+        }
         let string = |kind| State::Str { kind, esc: false };
         self.state = match byte {
             b'[' => {
@@ -407,12 +479,41 @@ impl Framing {
         };
     }
 
-    fn csi(&mut self, byte: u8, emit: &mut dyn FnMut(Token<'_>)) {
-        let first = !self.started;
-        self.started = true;
+    /// On output, after an ESC and an intermediate byte: more intermediates,
+    /// then the final byte.
+    fn escape_intermediate(&mut self, byte: u8, emit: &mut dyn FnMut(Token<'_>)) {
         match byte {
-            b'<' | b'=' | b'>' | b'?' if first => self.private = Some(byte),
-            0x30..=0x3f => {
+            0x30..=0x7e => {
+                self.state = State::Ground;
+                emit(self.token(Event::IntermediateEscape { final_byte: byte }));
+            }
+            BEL => emit(self.token(Event::Bel(BelAt::Sequence))),
+            CAN | SUB => {
+                emit(self.token(Event::Abandoned));
+                self.state = State::Ground;
+            }
+            ESC => {
+                emit(self.token(Event::Abandoned));
+                self.state = State::Esc;
+            }
+            0x00..=0x1f | DEL => emit(self.token(Event::Inside(byte))),
+            // More intermediates, or a high byte, which `vte` skips.
+            _ => {}
+        }
+    }
+
+    fn csi(&mut self, byte: u8, emit: &mut dyn FnMut(Token<'_>)) {
+        // A control doesn't start the CSI: a private marker after one is
+        // still its private marker.
+        let first = !self.started;
+        match byte {
+            b'<' | b'=' | b'>' | b'?' if first => {
+                self.started = true;
+                self.private = Some(byte);
+            }
+            b'<' | b'=' | b'>' | b'?' => self.malformed = true,
+            0x30..=0x3b => {
+                self.started = true;
                 if self.len > self.params_len {
                     self.malformed = true;
                 }
@@ -421,6 +522,7 @@ impl Framing {
                 }
             }
             0x20..=0x2f => {
+                self.started = true;
                 self.push(byte);
             }
             0x40..=0x7e => {
@@ -443,6 +545,7 @@ impl Framing {
                 self.literal = false;
                 emit(self.token(Event::Inside(byte)));
             }
+            _ if self.output => {}
             _ => self.malformed = true,
         }
     }
@@ -469,14 +572,14 @@ impl Framing {
         let params = &self.buf[..self.params_len];
         let intermediates = &self.buf[self.params_len..self.len];
         let plain = self.private.is_none() && intermediates.is_empty();
-        let marker = plain && self.literal && final_byte == b'~';
+        let marker = !self.output && plain && self.literal && final_byte == b'~';
         if marker && params == b"200" && !self.paste {
             emit(self.token(Event::PasteStart));
             self.paste = true;
         } else if marker && params == b"201" && self.paste {
             emit(self.token(Event::PasteEnd));
             self.paste = false;
-        } else if plain && final_byte == b'M' && params.is_empty() {
+        } else if !self.output && plain && final_byte == b'M' && params.is_empty() {
             self.state = State::X10 { remaining: 3 };
         } else {
             emit(Token {

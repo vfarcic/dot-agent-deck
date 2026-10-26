@@ -2060,6 +2060,9 @@ struct AgentBusState {
     /// PRD #1666 part 3, round 5-wake (plan §4.6): the generation's release,
     /// read off its start-up header by a scanner fed every byte of the window.
     release: crate::release_scanner::ReleaseCapture,
+    /// PRD #1666 part 3 (Q35-02): core's output hook, fed every byte under this
+    /// lock before it is published. Nothing reads it yet.
+    output_hook: crate::composer_probe::paste_mode::OutputHook,
 }
 
 impl AgentBusState {
@@ -2120,6 +2123,7 @@ impl AgentBus {
                 ring_start_modes: ReplayModes::default(),
                 evidence: crate::evidence_state::EvidenceState::new(profile, rows, cols),
                 release: crate::release_scanner::ReleaseCapture::start(rows, cols),
+                output_hook: Default::default(),
             }),
             label: String::new(),
             #[cfg(test)]
@@ -2178,6 +2182,7 @@ impl AgentBus {
         let release = state.release.push(&arc);
         let scanner = state.release.last_push();
         state.live_modes.feed(&arc);
+        state.output_hook.on_output(&arc);
         for &b in arc.iter() {
             state.scrollback.push_back(b);
         }
@@ -27417,6 +27422,59 @@ mod spawn_tests {
             parser.screen().mouse_protocol_mode(),
             vt100::MouseProtocolMode::None
         );
+    }
+
+    /// The replay [`probe_004_the_output_hook_changes_no_published_or_replayed_byte`]
+    /// gets, recorded with the hook's one call in `push_timed` removed (the push
+    /// path as it was at `78a4652c`): the preamble for the modes in force at the
+    /// clear, which carries no mode 2004, then the ring.
+    const PROBE_004_GOLDEN_REPLAY: &[u8] = b"\x1b[?1049h\x1b[?1006h\x1b[2J\x1b[Hredrawn\x1b[?2004l\x1b[?2004h more\x1bcreset\r\n\x1b[?2004hlast";
+
+    /// Scenario: Push an agent's output that turns the alternate screen and bracketed paste on with the sequence split across two pushes, puts `?2004l` as text in an OSC title, and then, across a ring clear, a resize edge and a nudge edge, turns bracketed paste off and on and resets the terminal. Every push reaches a subscriber byte for byte, the replay snapshot is the one recorded before the output hook existed, and the hook's tracker follows mode 2004 as `vt100` does over the whole stream, across the edges.
+    #[spec("inbox/probe/004")]
+    #[test]
+    fn probe_004_the_output_hook_changes_no_published_or_replayed_byte() {
+        let pushes: [&[u8]; 7] = [
+            b"\x1b[?1049h\x1b[?20",
+            b"04h\x1b[?1006hprompt> ",
+            b"\x1b]0;?2004l in a title\x07typed",
+            b"\x1b[2J\x1b[Hredrawn\x1b[?2004l",
+            b"\x1b[?2004h more",
+            b"\x1bcreset\r\n",
+            b"\x1b[?2004hlast",
+        ];
+        let bus = AgentBus::new();
+        let (initial, mut rx) = bus.subscribe();
+        assert!(initial.is_empty());
+        let mut reference = crate::vt_grid::parser(24, 80, 0);
+        let mut seen_on = false;
+        for (i, push) in pushes.iter().enumerate() {
+            bus.push(push.to_vec());
+            reference.process(push);
+            assert_eq!(&rx.try_recv().unwrap()[..], *push, "push {i}");
+            let on = bus.state.lock().unwrap().output_hook.paste_mode().on();
+            assert_eq!(on, reference.screen().bracketed_paste(), "push {i}");
+            seen_on |= on;
+            match i {
+                2 => bus.resize_and_clear(30, 100, || Ok::<(), ()>(())).unwrap(),
+                4 => bus
+                    .resize_and_mark_edge(
+                        crate::evidence_state::EdgeReason::NudgeShrink,
+                        30,
+                        99,
+                        || Ok::<(), ()>(()),
+                    )
+                    .unwrap(),
+                _ => {}
+            }
+        }
+        assert!(seen_on && bus.state.lock().unwrap().output_hook.paste_mode().on());
+        assert!(rx.try_recv().is_err(), "one publish per push, nothing more");
+        assert_eq!(
+            String::from_utf8_lossy(&bus.snapshot()),
+            String::from_utf8_lossy(PROBE_004_GOLDEN_REPLAY)
+        );
+        assert_eq!(bus.snapshot(), PROBE_004_GOLDEN_REPLAY);
     }
 
     #[test]

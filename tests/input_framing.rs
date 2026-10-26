@@ -15,6 +15,7 @@ enum Seen {
     Bel(BelAt),
     EscBel,
     Escape(u8),
+    IntermediateEscape(u8),
     Ss3(u8),
     Csi {
         private: Option<u8>,
@@ -55,6 +56,7 @@ fn feed_into(framing: &mut Framing, bytes: &[u8], offset: usize, out: &mut Vec<T
                 Event::Bel(at) => Seen::Bel(at),
                 Event::EscBel => Seen::EscBel,
                 Event::Escape(b) => Seen::Escape(b),
+                Event::IntermediateEscape { final_byte } => Seen::IntermediateEscape(final_byte),
                 Event::Ss3(b) => Seen::Ss3(b),
                 Event::Csi(csi) => Seen::Csi {
                     private: csi.private,
@@ -737,7 +739,7 @@ fn probe_003_submit_and_clear_are_the_plain_keys_outside_a_paste() {
     assert_eq!(edits(b"\x1b[200~a\rb\x1b[201~\r"), vec![(15, Edit::Submit)]);
 }
 
-/// Scenario: Feed the sequences later commits read: private-mode sets and resets, RIS, sub-parameters, intermediates, each string kind, and a control inside a sequence or string. Each comes out as its own token with its parameters, intermediates and payload read back exactly, and a control inside is reported without ending the sequence.
+/// Scenario: Feed the sequences later commits read: private-mode sets and resets, RIS, sub-parameters, intermediates, each string kind, and a control inside a sequence or string, including one before a CSI's private marker. Each comes out as its own token with its parameters, intermediates and payload read back exactly, a control inside is reported without ending the sequence or taking the private marker's place, and a private-marker byte after the first byte makes the CSI malformed.
 #[spec("inbox/probe/003")]
 #[test]
 fn probe_003_sequences_read_back_their_parts() {
@@ -781,8 +783,10 @@ fn probe_003_sequences_read_back_their_parts() {
     }
     assert_eq!(out, vec![vec![], vec![None, Some(u32::MAX)]]);
 
-    // Intermediates, a private-use byte after the first parameter byte, and
-    // a control inside a CSI, which goes on and completes it.
+    // Intermediates, a private-marker byte after the first byte (malformed,
+    // as `vte` ignores that CSI), a control before the private marker (still
+    // the marker), and a control inside a CSI, which goes on and completes
+    // it.
     let s = |private: Option<u8>, params: &[u8], intermediates: &[u8], final_byte| Seen::Csi {
         private,
         params: params.to_vec(),
@@ -800,7 +804,22 @@ fn probe_003_sequences_read_back_their_parts() {
         seen(b"\x1b[?2004;1$y"),
         vec![s(Some(b'?'), b"2004;1", b"$", b'y')]
     );
-    assert_eq!(seen(b"\x1b[1?2h"), vec![s(None, b"1?2", b"", b'h')]);
+    assert_eq!(seen(b"\x1b[1?2h"), vec![Seen::MalformedCsi(b'h')]);
+    assert_eq!(seen(b"\x1b[??2h"), vec![Seen::MalformedCsi(b'h')]);
+    assert_eq!(seen(b"\x1b[ ?2h"), vec![Seen::MalformedCsi(b'h')]);
+    assert_eq!(seen(b"\x1b[ ?h"), vec![Seen::MalformedCsi(b'h')]);
+    assert_eq!(
+        seen(b"\x1b[\x00?2004h"),
+        vec![Seen::Inside(0), s(Some(b'?'), b"2004", b"", b'h')]
+    );
+    assert_eq!(
+        candidates(b"\x1b[\r?103;5u"),
+        vec![(9, cand(CandidateForm::CsiU))]
+    );
+    assert_eq!(
+        candidates(b"\x1b[1?;5u"),
+        vec![(6, cand(CandidateForm::MalformedKey))]
+    );
     assert_eq!(
         seen(b"\x1b[1;\r5A"),
         vec![Seen::Inside(b'\r'), s(None, b"1;5", b"", b'A')]
