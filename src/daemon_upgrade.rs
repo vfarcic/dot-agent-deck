@@ -632,6 +632,10 @@ const PRODUCTION_TIMING: Timing = Timing {
 ///    [`MAX_CONFIRM_ROUNDS`] requests in all. A daemon without the request
 ///    falls back to [`DaemonPort::legacy_restart`] or is
 ///    [`UpgradeOutcome::InstalledDaemonTooOld`].
+///    A [`RestartSuccessor::ClientSpawns`] plan asks a daemon whose `Hello`
+///    says a service manager runs it ([`AttachResponse::supervised`]) for
+///    [`RestartSuccessor::Installed`] instead, so it hands back to its service
+///    (issue #1760), and asks again the plan's way if it refuses.
 /// 3. For [`RestartSuccessor::ClientSpawns`], start the client's build.
 /// 4. `Verifying`: wait up to [`VERIFY_TIMEOUT`] for the new daemon to answer.
 pub fn upgrade_daemon(
@@ -729,15 +733,26 @@ fn run_upgrade(
         reason,
     };
 
+    // Issue #1760: a daemon a service manager runs is handed back to it. The
+    // local Replace asks it to restart onto the build installed at its own
+    // path, which it does by exiting for the service to start that build
+    // again. It refuses unless that build is the version the client wants, and
+    // the client then starts its own build, as for an unsupervised daemon.
+    let mut successor = plan.successor;
+    if successor == RestartSuccessor::ClientSpawns && hello.supervised {
+        successor = RestartSuccessor::Installed;
+    }
+
     let mut confirm: Option<RestartStopSet> = None;
     let mut stopped = None;
     // Why the last request's answer was never read, when it was not.
     let mut reply_lost: Option<String> = None;
-    for round in 0..MAX_CONFIRM_ROUNDS {
+    let mut round = 0;
+    while round < MAX_CONFIRM_ROUNDS {
         let request = RestartDaemonRequest {
             confirm: confirm.clone(),
             expected_version: Some(installed.version.clone()),
-            successor: plan.successor,
+            successor,
         };
         match daemon.restart(&request) {
             Err(PortError::InstalledBuildTooOld(_)) => {
@@ -785,6 +800,14 @@ fn run_upgrade(
                     }
                 }
             }
+            Ok(GatedQuery::Answered(RestartDaemonReply::Refused { reason, .. }))
+                if successor != plan.successor && reason != RestartRefusalReason::InProgress =>
+            {
+                // The hand-back was refused before anything stopped: ask
+                // again the plan's way, in the same round.
+                successor = plan.successor;
+                continue;
+            }
             Ok(GatedQuery::Answered(RestartDaemonReply::Refused { reason, message })) => {
                 return match reason {
                     RestartRefusalReason::InProgress => {
@@ -794,6 +817,7 @@ fn run_upgrade(
                 };
             }
         }
+        round += 1;
     }
     let Some(stopped) = stopped else {
         // Unreachable with MAX_CONFIRM_ROUNDS >= 1: the last round returns.
@@ -803,7 +827,7 @@ fn run_upgrade(
     };
 
     let mut endpoint_emptied = false;
-    if plan.successor == RestartSuccessor::ClientSpawns {
+    if successor == RestartSuccessor::ClientSpawns {
         // With the reply lost this is also the check: a daemon that did not
         // accept keeps its endpoint, so nothing is spawned.
         if let Err(reason) = daemon.spawn_successor() {
@@ -828,7 +852,7 @@ fn run_upgrade(
         stage: UpgradeStage::Verifying,
         detail: None,
     });
-    let expected = match plan.successor {
+    let expected = match successor {
         RestartSuccessor::Installed => Expect::Version(installed.version.clone()),
         RestartSuccessor::ClientSpawns => Expect::Build(crate::build_id::local_build_id()),
     };
@@ -3418,6 +3442,99 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Issue #1760: the local Replace asks a supervised daemon for `Installed`,
+    /// so it hands back to its service and the client starts nothing. Refused —
+    /// the service's build is another version — it asks again the plan's way,
+    /// in the same round, and starts its own build as before. Another restart
+    /// in progress is not a reason to ask again.
+    #[test]
+    fn a_supervised_daemon_is_handed_back_to_its_service_unless_it_refuses() {
+        let local = crate::build_id::local_build_id();
+        let supervised = || {
+            let mut h = hello("0.1.0", "old");
+            h.supervised = true;
+            Ok(Some(h))
+        };
+        let plan = UpgradePlan {
+            version: CLIENT_VERSION.into(),
+            successor: RestartSuccessor::ClientSpawns,
+        };
+        let refused = |reason| {
+            Ok(GatedQuery::Answered(RestartDaemonReply::Refused {
+                reason,
+                message: "no".into(),
+            }))
+        };
+
+        let port = FakePort::new(
+            vec![
+                supervised(),
+                Ok(Some(hello(CLIENT_VERSION, "service-build"))),
+            ],
+            vec![accepted(RestartStopSet::default())],
+        );
+        let (outcome, _) = run(&NoInstall, &port, &NoDecider, &plan);
+        assert!(
+            matches!(outcome, UpgradeOutcome::Restarted { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(port.spawned.get(), 0, "the service starts the daemon");
+        let requests = port.requests.borrow();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].successor, RestartSuccessor::Installed);
+        assert_eq!(
+            requests[0].expected_version.as_deref(),
+            Some(CLIENT_VERSION)
+        );
+        drop(requests);
+
+        // Refused, then a full set of confirmation rounds the plan's way: the
+        // refusal spent none of them.
+        let port = FakePort::new(
+            vec![supervised(), Ok(Some(hello(CLIENT_VERSION, &local)))],
+            vec![
+                refused(RestartRefusalReason::VersionMismatch),
+                needs(live("coder"), false),
+                needs(live("coder"), true),
+                accepted(live("coder")),
+            ],
+        );
+        let decider = Scripted::new(&[RestartChoice::RestartNow, RestartChoice::RestartNow]);
+        let (outcome, _) = run(&NoInstall, &port, &decider, &plan);
+        assert!(
+            matches!(outcome, UpgradeOutcome::Restarted { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(port.spawned.get(), 1, "refused, the client starts its own");
+        let successors: Vec<_> = port.requests.borrow().iter().map(|r| r.successor).collect();
+        assert_eq!(
+            successors,
+            vec![
+                RestartSuccessor::Installed,
+                RestartSuccessor::ClientSpawns,
+                RestartSuccessor::ClientSpawns,
+                RestartSuccessor::ClientSpawns,
+            ]
+        );
+
+        let port = FakePort::new(
+            vec![supervised()],
+            vec![refused(RestartRefusalReason::InProgress)],
+        );
+        let (outcome, _) = run(&NoInstall, &port, &NoDecider, &plan);
+        assert!(
+            matches!(
+                outcome,
+                UpgradeOutcome::InstalledNotRestarted {
+                    reason: NotRestartedReason::AnotherRestartInProgress,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(port.requests.borrow().len(), 1);
     }
 
     #[test]
