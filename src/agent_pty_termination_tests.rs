@@ -241,6 +241,25 @@ async fn status_032_a_successor_that_exits_at_once_still_replaced_its_predecesso
     registry.shutdown_all();
 }
 
+/// A lifted generation is outside registry shutdown's reach. Kill and reap
+/// its child when its test scope ends, including on an assertion panic.
+struct LiftedAgent(RunningAgent);
+
+impl std::ops::Deref for LiftedAgent {
+    type Target = RunningAgent;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for LiftedAgent {
+    fn drop(&mut self) {
+        let _ = self.0.child.kill();
+        let _ = self.0.child.wait();
+    }
+}
+
 /// Lift `agent` out of the registry as a respawn does before it terminates
 /// the old child: its record counted as respawning, under a real
 /// [`RespawnTicket`]. The lifted generation is returned with its child still
@@ -248,9 +267,9 @@ async fn status_032_a_successor_that_exits_at_once_still_replaced_its_predecesso
 fn lift_for_respawn<'a>(
     registry: &'a AgentPtyRegistry,
     agent: &str,
-) -> (RespawnTicket<'a>, RunningAgent) {
+) -> (RespawnTicket<'a>, LiftedAgent) {
     let mut inner = registry.inner.lock();
-    let lifted = inner.agents.remove(agent).expect("registered");
+    let lifted = LiftedAgent(inner.agents.remove(agent).expect("registered"));
     let record = AgentPtyRegistry::cleanup_record(agent, &lifted);
     lifted.removal.respawning();
     inner.respawning_members.insert(agent.to_string(), record);
@@ -312,7 +331,7 @@ fn capture_now(registry: &AgentPtyRegistry, agent: &str, lifted: &RunningAgent) 
     capture_removed(registry, agent, lifted, || {})
 }
 
-/// Scenario: A respawn removes a generation and publishes its successor in time, publishes it only after the capture's bound, or ends without one, after or before the removed generation's capture starts. Only the published successor reads as replaced; a replacement still pending at the bound, or one that failed, reads as the pane having ended, in words that say neither replaced nor closed.
+/// Scenario: A respawn removes a generation and publishes its successor in time, publishes it only after the capture's bound, or ends without one, after or before the removed generation's capture starts. Only the published successor reads as replaced; a replacement still pending at the bound, or one that failed, reads as the pane having ended, in words that say neither replaced nor closed. Lifted children are killed and reaped even if an assertion fails.
 #[spec("inbox/status/032")]
 #[test]
 fn status_032_a_replacement_counts_only_once_its_successor_is_published() {
@@ -331,11 +350,11 @@ fn status_032_a_replacement_counts_only_once_its_successor_is_published() {
     };
 
     // In time: the successor is published, then the respawn returns.
-    let first = spawn_on(&registry, pane, "sleep 30");
-    let (ticket, mut lifted) = lift_for_respawn(&registry, &first);
+    let first = spawn_on(&registry, pane, "cat");
+    let (ticket, lifted) = lift_for_respawn(&registry, &first);
     let termination = capture_removed(&registry, &first, &lifted, || {
         std::thread::sleep(Duration::from_millis(50));
-        publish_successor(&registry, &ticket, pane, "sleep 30");
+        publish_successor(&registry, &ticket, pane, "cat");
     });
     assert_eq!(termination, Termination::Replaced);
     drop(ticket);
@@ -344,37 +363,37 @@ fn status_032_a_replacement_counts_only_once_its_successor_is_published() {
         Termination::Replaced,
         "the respawn returning after its successor changes nothing"
     );
-    let _ = lifted.child.kill();
+    drop(lifted);
     let successor = registry.pane_current_agent_id(pane).expect("successor");
 
     // Delayed: nothing is published by the bound, and the replacement then
     // succeeds. The capture had already said only that the pane ended.
-    let (ticket, mut lifted) = lift_for_respawn(&registry, &successor);
+    let (ticket, lifted) = lift_for_respawn(&registry, &successor);
     let termination = capture_now(&registry, &successor, &lifted);
     assert_eq!(termination, Termination::ReplacementPending);
     ended(&termination);
-    publish_successor(&registry, &ticket, pane, "sleep 30");
+    publish_successor(&registry, &ticket, pane, "cat");
     drop(ticket);
-    let _ = lifted.child.kill();
+    drop(lifted);
     let late = registry
         .pane_current_agent_id(pane)
         .expect("late successor");
 
     // Failed while the capture waits: the respawn returns, publishing nothing.
-    let (ticket, mut lifted) = lift_for_respawn(&registry, &late);
+    let (ticket, lifted) = lift_for_respawn(&registry, &late);
     let termination = capture_removed(&registry, &late, &lifted, || {
         std::thread::sleep(Duration::from_millis(50));
         drop(ticket);
     });
     assert_eq!(termination, Termination::ReplacementFailed);
     ended(&termination);
-    let _ = lifted.child.kill();
+    drop(lifted);
 
     // Failed before the capture starts: the ticket is gone, and the
     // generation's own evidence still tells the failure from a close, as
     // often as it is read.
-    let again = spawn_on(&registry, pane, "sleep 30");
-    let (ticket, mut lifted) = lift_for_respawn(&registry, &again);
+    let again = spawn_on(&registry, pane, "cat");
+    let (ticket, lifted) = lift_for_respawn(&registry, &again);
     drop(ticket);
     for _ in 0..2 {
         assert_eq!(
@@ -382,24 +401,24 @@ fn status_032_a_replacement_counts_only_once_its_successor_is_published() {
             Termination::ReplacementFailed
         );
     }
-    let _ = lifted.child.kill();
+    drop(lifted);
     registry.shutdown_all();
 }
 
-/// Scenario: A respawn fails, and its removed generation's reader is delayed while a hundred later respawns in other panes fail too, none of their readers capturing yet. When the delayed reader finally captures, it must still say the replacement failed, never that the pane was closed, and so must each later one when it captures after it.
+/// Scenario: A respawn fails, and its removed generation's reader is delayed while a hundred later respawns in other panes fail too, their children blocked on PTY input until the test kills and reaps them, including on assertion failure. When the delayed reader finally captures, it must still say the replacement failed, never that the pane was closed, and so must each later one when it captures after it.
 #[spec("inbox/status/032")]
 #[test]
 fn status_032_a_delayed_reader_keeps_its_failed_respawn_however_many_follow() {
     let registry = Arc::new(AgentPtyRegistry::new());
-    let delayed = spawn_on(&registry, "termination-delayed-pane", "sleep 30");
-    let (ticket, mut delayed_lifted) = lift_for_respawn(&registry, &delayed);
+    let delayed = spawn_on(&registry, "termination-delayed-pane", "cat");
+    let (ticket, delayed_lifted) = lift_for_respawn(&registry, &delayed);
     drop(ticket);
     // Every later failure stays uncaptured until the delayed one is read:
-    // their children keep running, so their own readers do not end and
-    // capture first.
+    // cat blocks on the untouched PTY input, whose master each lifted
+    // record retains. Only the guards' kills release these children.
     let mut later = Vec::new();
     for n in 0..100 {
-        let agent = spawn_on(&registry, &format!("termination-later-{n}"), "sleep 30");
+        let agent = spawn_on(&registry, &format!("termination-later-{n}"), "cat");
         let (ticket, lifted) = lift_for_respawn(&registry, &agent);
         drop(ticket);
         later.push((agent, lifted));
@@ -407,14 +426,13 @@ fn status_032_a_delayed_reader_keeps_its_failed_respawn_however_many_follow() {
     let termination = capture_now(&registry, &delayed, &delayed_lifted);
     assert_eq!(termination, Termination::ReplacementFailed);
     assert_eq!(termination.wire(), PaneTermination::Unknown);
-    let _ = delayed_lifted.child.kill();
-    for (agent, mut lifted) in later {
+    drop(delayed_lifted);
+    for (agent, lifted) in later {
         assert_eq!(
             capture_now(&registry, &agent, &lifted),
             Termination::ReplacementFailed,
             "{agent}"
         );
-        let _ = lifted.child.kill();
     }
     registry.shutdown_all();
 }
@@ -429,14 +447,14 @@ fn status_032_a_graceful_shutdown_closes_what_it_drains() {
     assert_eq!(captured(&registry, &agent), Termination::Closed);
 }
 
-/// Scenario: A respawn publishes a successor that exits straight away, before the respawn returns and before the removed generation's reader captures. The removed generation must still read as replaced, not closed or failed.
+/// Scenario: A respawn publishes a successor that exits straight away, before the respawn returns and before the removed generation's reader captures. The removed generation must still read as replaced, not closed or failed, and its lifted child is killed and reaped even if an assertion fails.
 #[spec("inbox/status/032")]
 #[test]
 fn status_032_a_successor_already_exited_at_capture_still_counts() {
     let registry = Arc::new(AgentPtyRegistry::new());
     let pane = "termination-exited-successor-pane";
-    let first = spawn_on(&registry, pane, "sleep 30");
-    let (ticket, mut lifted) = lift_for_respawn(&registry, &first);
+    let first = spawn_on(&registry, pane, "cat");
+    let (ticket, lifted) = lift_for_respawn(&registry, &first);
     let successor = publish_successor(&registry, &ticket, pane, "exit 7");
     assert!(
         matches!(
@@ -450,7 +468,7 @@ fn status_032_a_successor_already_exited_at_capture_still_counts() {
         capture_now(&registry, &first, &lifted),
         Termination::Replaced
     );
-    let _ = lifted.child.kill();
+    drop(lifted);
     registry.shutdown_all();
 }
 
