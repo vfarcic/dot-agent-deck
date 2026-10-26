@@ -300,11 +300,11 @@ The collector runs on its own, beside the deck rather than inside it. You start 
   chmod +x ~/.local/bin/dot-agent-deck-collector
   ```
 
+- **Homebrew.** On Linux, `brew install dot-agent-deck` (or `dot-agent-deck-beta`) installs `dot-agent-deck-collector` next to `dot-agent-deck`. If your Homebrew install has no collector, `brew upgrade dot-agent-deck` (or `brew upgrade dot-agent-deck-beta`) adds it. On macOS the formula installs only the deck, since the collector does not run there.
 - **Nix.** The package installs `dot-agent-deck-collector` next to `dot-agent-deck`.
 - **Build from source.** `cargo build --release --locked` builds `target/release/dot-agent-deck-collector` next to the deck; copy it onto your `PATH`.
-- **Homebrew** installs only the deck. Download the release binary as above.
 
-`dot-agent-deck upgrade` upgrades the deck, not the collector, so replace the collector the same way you installed it.
+`dot-agent-deck upgrade` upgrades the deck, not the collector, so replace the collector the same way you installed it. A Homebrew install is the exception: the collector is part of the formula, so `brew upgrade` of the formula you installed, and `dot-agent-deck upgrade` on a Homebrew copy, upgrade both.
 
 ### Turn it on
 
@@ -321,7 +321,7 @@ OTEL_EXPORTER_OTLP_ENDPOINT=https://api.honeycomb.io
 OTEL_EXPORTER_OTLP_HEADERS=x-honeycomb-team=<your API key>
 ```
 
-then create `~/.config/systemd/user/dot-agent-deck-collector.service`:
+then create `~/.config/systemd/user/dot-agent-deck-collector.service`. `ExecStart` below is the release-binary path; for a Homebrew or Nix install, use the path `command -v dot-agent-deck-collector` prints instead:
 
 ```ini
 [Unit]
