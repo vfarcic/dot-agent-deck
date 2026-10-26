@@ -5,7 +5,6 @@
 mod common;
 
 use common::TuiDeck;
-use dot_agent_deck::agent_pty::AgentRecord;
 use dot_agent_deck::daemon_client::{DaemonClient, StartAgentOptions};
 use dot_agent_deck::daemon_protocol::AttachRequest;
 use dot_agent_deck::event::AgentType;
@@ -302,7 +301,8 @@ fn start(
     kind: AgentType,
     cwd: &std::path::Path,
     command: String,
-) -> AgentRecord {
+) -> (String, String) {
+    let pane = format!("usage-{name}");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -315,16 +315,15 @@ fn start(
                     cwd: Some(cwd.to_string_lossy().into_owned()),
                     display_name: Some(name.into()),
                     agent_type: Some(kind),
-                    env: vec![("DOT_AGENT_DECK_PANE_ID".into(), format!("usage-{name}"))],
+                    env: vec![("DOT_AGENT_DECK_PANE_ID".into(), pane.clone())],
                     ..Default::default()
                 },
             ),
         )
         .expect("start offline usage stand-in");
-    common::agent_records_on(deck.attach_socket_path())
-        .into_iter()
-        .find(|r| r.id == id)
-        .unwrap()
+    // ListAgents omits exited processes, including commands that finish before
+    // start_agent returns. Both identities are already known without that lookup.
+    (id, pane)
 }
 
 fn fixture_run(
@@ -349,7 +348,7 @@ fn fixture_run(
         AgentType::OpenCode => "opencode",
         _ => unreachable!(),
     };
-    let agent = start(
+    let (agent_id, pane) = start(
         deck,
         name,
         kind.clone(),
@@ -373,13 +372,13 @@ fn fixture_run(
         .find_map(|s| s.strip_prefix("deck.run.id="))
         .unwrap();
     if matches!(kind, AgentType::ClaudeCode | AgentType::Codex) {
-        let payload = json!({"session_id": name, "pane_id":agent.pane_id_env, "agent_id":agent.id,
+        let payload = json!({"session_id": name, "pane_id":pane, "agent_id":agent_id,
             "agent_type": if kind == AgentType::Codex {"codex"} else {"claude_code"}, "event_type":"thinking",
             "timestamp":chrono::Utc::now().to_rfc3339(), "cwd":cwd,
             "metadata":{"codex_transcript_path":path}});
         let events = deck.subscribe_events();
         common::write_hook_line(deck.hook_socket_path(), &payload.to_string()).unwrap();
-        events.wait_for(|event| event.agent_id.as_deref() == Some(&agent.id), WAIT);
+        events.wait_for(|event| event.agent_id.as_deref() == Some(&agent_id), WAIT);
     }
     std::fs::write(cwd.join(format!("{name}.go")), "go").unwrap();
     receiver.run(id)
@@ -512,7 +511,7 @@ fn telemetry_usage_003_pi_tokens_and_estimated_cost() {
     ended(&run, "completed", "provider_reported");
 }
 
-/// Scenario: Arbitrary shell commands exit with success and failure. Their exported runs must report measured termination and no-channel usage, with numeric usage fields absent and nonzero_exit only on failure.
+/// Scenario: Arbitrary shell commands exit immediately with success and failure, without waiting for a live-agent lookup. Their exported runs must report measured termination and no-channel usage, with numeric usage fields absent and nonzero_exit only on failure.
 #[spec("telemetry/usage/004")]
 #[test]
 fn telemetry_usage_004_commands_have_no_channel_and_measured_exit() {
@@ -520,14 +519,13 @@ fn telemetry_usage_004_commands_have_no_channel_and_measured_exit() {
     let deck = launch(&receiver);
     let mut runs = Vec::new();
     for code in [0, 3] {
-        let agent = start(
+        let (_, pane) = start(
             &deck,
             &format!("command-{code}"),
             AgentType::None,
             deck.workdir(),
             format!("sh -c 'exit {code}'"),
         );
-        let pane = agent.pane_id_env.unwrap();
         let find = || {
             receiver
                 .spans()
