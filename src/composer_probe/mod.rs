@@ -4,9 +4,12 @@
 //! check runs.
 //!
 //! Built a commit at a time (Q35-core's implementation plan). Today it holds
-//! the framing tokenizer ([`framing`]) and the output hook with its
-//! bracketed-paste tracker ([`paste_mode`]). The daemon feeds the hook every
-//! byte an agent writes; nothing reads what it tracks yet.
+//! the framing tokenizer ([`framing`]), the output hook with its
+//! bracketed-paste tracker ([`paste_mode`]) and the rule for trusting the
+//! file an agent exports ([`path_rule`]). The daemon feeds the hook every
+//! byte an agent writes; nothing in it reads what the hook tracks yet, or
+//! calls the path rule.
 
 pub mod framing;
 pub mod paste_mode;
+pub mod path_rule;
