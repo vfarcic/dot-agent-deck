@@ -105,7 +105,7 @@ pub enum Protocol {
 }
 
 impl Protocol {
-    fn parse(value: &str) -> Self {
+    pub(crate) fn parse(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
             "http/protobuf" => Protocol::HttpProtobuf,
             "http/json" => Protocol::HttpJson,

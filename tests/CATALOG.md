@@ -20,6 +20,50 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 
 ### Telemetry export (PRD #1741)
 
+#### telemetry/resources
+
+##### telemetry/resources/001 — Detached work keeps its run identity in resource exports.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_resource_collector.rs`).
+- **Agent:** synthetic Python stand-in with a double-forked CPU-burning grandchild; no real agent.
+- **Asserts:** the grandchild is reparented; only it performs a file-triggered CPU burn between samples, and the HTTP/JSON run's CPU growth covers that measured burn within two clock ticks. The run reports named anon/file/shmem PSS with positive anon PSS and shares deck.run.id with the actual agent.run span at the same receiver. With disk metrics disabled, worktree identity stays stable and working-directory paths are absent by default and present as deck.worktree.path after explicit opt-in.
+- **Does not assert:** work that exits between samples, exact whole-host CPU totals, cgroup accuracy, protobuf encoding or a hosted backend.
+- **Platform coverage:** Linux.
+
+##### telemetry/resources/002 — Unattributed CPU growth covers a cleared detached burn.
+- **Layer:** L2 process integration, lane 1 (`tests/e2e_resource_collector.rs`).
+- **Agent:** synthetic double-forked Python burner with a cleared environment; no real agent.
+- **Asserts:** the fixture is reparented and has no OTEL_RESOURCE_ATTRIBUTES. A continuously sampled, shared unattributed bucket has no deck.run.id, live processes, positive anon PSS and named anon/file/shmem points; its cumulative CPU growth across a file-triggered fixture burn covers the measured burn within two clock ticks.
+- **Does not assert:** exact unattributed totals, fixture-specific memory or exclusive process membership: unrelated host processes can contribute CPU and PSS to the same bucket and metrics intentionally omit pids. Does not cover cleared-environment children that remain in a run's ancestry.
+- **Platform coverage:** Linux.
+
+##### telemetry/resources/003 — Runs sharing a worktree share one disk series.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_resource_collector.rs`).
+- **Agent:** two synthetic shell/cat runs started by the real deck daemon; no real agent.
+- **Asserts:** distinct deck.run.id resources carry the same deck.worktree.id returned by the collector's worktree-id command, and exactly one deck.worktree.disk.usage series grows by at least the allocated blocks of an 8 MiB ballast file added between samples.
+- **Does not assert:** background disk-walk cadence, hardlink or nested-repository traversal, exact total disk usage or disk attribution per run.
+- **Platform coverage:** Linux.
+
+##### telemetry/resources/004 — Real interactive Haiku resource figures join the deck run. [reel]
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_resource_collector_live.rs`), developer machine only.
+- **Agent:** real interactive Claude Code on pinned Haiku with imported isolated credentials, onboarding and project trust.
+- **Asserts:** a directive visibly advances Thinking → Working/Bash → Idle and copies a uniquely named sentinel fixture while the collector runs. At least two samples arrive, with cumulative CPU growing above a pre-task baseline; named anon/file/shmem PSS points (positive anon, file and shmem may be zero) carry the same deck.run.id as the completed agent.run span.
+- **Does not assert:** native Claude telemetry, exact CPU or memory values, hosted-backend ingestion, cgroup accuracy or non-Linux collection.
+- **Platform coverage:** Linux.
+
+##### telemetry/resources/005 — Terminal run gauges keep their live resource identity.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_resource_collector.rs`).
+- **Agent:** synthetic warm-up and measured shell/cat runs started by the real deck daemon; no real agent.
+- **Asserts:** collectors with and without path opt-in first export the warm-up worktree's disk series, proving discovery has answered before the measured run starts, then export that run's live and terminal samples after pane close. Complete resource attributes remain identical, including deck.worktree.id and the opted-in canonical path; terminal process count and all three named PSS gauges are zero, and cumulative CPU does not decrease.
+- **Does not assert:** worktree changes during a live run, successful delivery after export failures, or CPU in the final unsampled interval.
+- **Platform coverage:** Linux.
+
+##### telemetry/resources/006 — OTLP partial rejection fails once without leaking backend text.
+- **Layer:** L2 process integration, lane 1 (`tests/e2e_resource_collector.rs`).
+- **Agent:** none; standalone collector and loopback HTTP receiver.
+- **Asserts:** HTTP 200 JSON and protobuf partial-success responses rejecting 100 points cause --once to exit non-zero, report rejected and 100 on stderr, omit the unique backend errorMessage sentinel, and make exactly one request to /v1/metrics with the selected content type.
+- **Does not assert:** retry policy for transport failures, malformed responses, or hosted-backend behavior.
+- **Platform coverage:** Linux.
+
 #### telemetry/otlp
 
 ##### telemetry/otlp/001 — No telemetry configuration leaves export and agent enablement off.
@@ -2138,10 +2182,10 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Platform coverage:** mac+linux.
 
 ##### prompt/dir-picker/003 — `l` / `Right` / `Enter` descend into the selected directory; `h` / `Left` / `Backspace` ascend.
-- **Layer:** L2.
+- **Layer:** L2; plus L1 `TestBackend` (`dir_picker_003_opens_only_an_entry_it_drew`, issue #1799).
 - **Agent:** none.
-- **Asserts:** after descending, the picker shows the child directory's contents; after ascending, it shows the parent's contents again.
-- **Does not assert:** any breadcrumb / path rendering beyond directory contents.
+- **Asserts:** after descending, the picker shows the child directory's contents; after ascending, it shows the parent's contents again. L1 (issue #1799): in a frame whose popup shows the current directory but no entry, `Enter`, `l` and `Right` open nothing while `Space` still picks the current directory; in one too short to show the current directory either, `Space` picks nothing; at 80×24, with the selected entry on screen, each of the three keys opens it, an entry whose name carries a combining accent included; with room for one entry row, `j` and Enter in one burst open nothing until the newly selected entry is drawn.
+- **Does not assert:** any breadcrumb / path rendering beyond directory contents; keys typed before the picker's first frame, which it still takes (it is not a confirmation, and the e2e tier types `Ctrl+n` and `Space` in one burst).
 - **Platform coverage:** mac+linux.
 
 ##### prompt/dir-picker/004 — `Space` confirms the current directory and advances to the new-pane form.
@@ -2170,6 +2214,15 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Agent:** none.
 - **Asserts:** the picker closes; no new pane appears; daemon `list_agents` is unchanged.
 - **Does not assert:** rendering of any toast / status-line message.
+- **Platform coverage:** mac+linux.
+
+#### prompt/star
+
+##### prompt/star/001 — The star prompt's `s` / `l` / `d` keys act only while the line naming them is on screen (issue #1799).
+- **Layer:** L1 `TestBackend` (`star_001_keys_are_refused_while_their_choices_are_not_drawn`), through the production `render_frame` and the read-back of the flushed frame that PRD #1666 part 2's confirmations use.
+- **Agent:** none.
+- **Asserts:** before the prompt's first frame, and at a height of 8 rows where its `s Star  l Later  d Don't ask again` line is cut off, `s`, `l` and `d` do not reach the prompt and Escape does; at 80×24 each key reaches it and the drawn `[Star]` button is clickable.
+- **Does not assert:** what `s` does once it reaches the prompt (opening the browser, the persisted dismissal), or when the prompt opens (`StarPromptState::increment_and_check`).
 - **Platform coverage:** mac+linux.
 
 #### prompt/new-pane
@@ -8001,9 +8054,10 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Platform coverage:** mac+linux.
 
 ##### scheduler/manager/005 — The delete confirmation stays contained within the modal even for a long schedule name (PRD #127 finding).
-- **Layer:** L2 (same no-L1-seam reason). Drives the real dialog via `S` + `d` and asserts on the rendered vt100 grid.
+- **Layer:** L2 (same no-L1-seam reason). Drives the real dialog via `S` + `d` and asserts on the rendered vt100 grid. Plus L1 `TestBackend` for its tiny-terminal case (issue #1799), through the production `render_frame` and the dialog's key handler.
 - **Agent:** none (fixture global `schedules.toml` via `DOT_AGENT_DECK_SCHEDULES`, one enabled task with a deliberately long name).
 - **Asserts:** after arming delete (`d`) on a long-named row, the confirmation's trailing `(y/n)` prompt — the only `(y/n)` in the app — still renders, proving the message is contained within the modal. Under PRD #144 the confirmation sits on two fixed natural lines (the name line; the `… (y/n)` trailer) and the content-sized modal grows in WIDTH to contain the long name line (clamped to ≤90% of the terminal), so the trailer is never clipped off the right border — superseding the PRD #127 wrap-to-grow-height band-aid.
+- **Asserts (L1, issue #1799, `manager_005_delete_is_refused_while_its_question_is_not_drawn`):** `y` deletes nothing before the question's first frame (input queued behind `d` waits for it), nor in an 80×6 terminal whose frame cuts off the question and its `(y/n)` line, where Escape still cancels; at 80×24, with both lines drawn, `y` deletes the schedule, one whose name carries a combining accent included; a question cancelled and asked again before its frame refuses `y` too.
 - **Does not assert:** the modal's precise content-sized width / clamp fraction; the confirmation wording beyond the `(y/n)` tail and `Delete schedule` prefix.
 - **Platform coverage:** mac+linux.
 
@@ -8578,8 +8632,8 @@ Since PRD #1666 S5 the deck types nothing into the orchestrator: its idle, waiti
 ##### newagent/visibility/002 — A desktop-prepared orchestration surfaces as its own TUI tab with every role.
 - **Layer:** L2 lane 1, PTY-attached (a headless real daemon receives the desktop's own client calls — `DaemonClient::prepare_orchestration`, which chooses the `prepare-orchestration` op this daemon advertises, with an empty task, then one `DaemonClient::start_prepared_role` per role — while or before a real TUI attaches; the control launches the same three-role fixture through the TUI's own form and role loop).
 - **Agent:** none (three `printf …; sleep 600` role stand-ins declared as Claude Code coordinator, OpenCode builder and Pi reviewer — the coordinator's also prints a `CONTEXT_LISTS <role>` line per agent its published coordinator context lists; no credential).
-- **Asserts:** the TUI-native control creates a separate orchestration tab containing `coordinator`, `builder`, and `reviewer`; the client chooses `PrepareSpelling::Orchestration` against this build's daemon (issue #1045), the preparation reports a unique context file inside the project, every configured start is answered rather than withheld, and the desktop path uses the desktop's 32×120 defaults, shares one orchestration id, and preserves role index/name/start-role/cwd/display-title membership, declared agent type and pane id across all prepared starts. Starting before attachment rebuilds the titled tab with all roles. Starting while the TUI is attached creates the same titled tab without a reconnect; switching into it shows `3 agent(s)` and the grouped, role-named `ClaudeCode · coordinator`, `OpenCode · builder`, and `Pi · reviewer` cards, and selecting the coordinator's card shows `CONTEXT_LISTS builder` and `CONTEXT_LISTS reviewer` (and no `CONTEXT_LISTS coordinator`) in its pane — the prepared context is what the role started with. Regression guard: before `9d66ef6b`, the live roles could appear as flat dashboard cards without their orchestration tab.
-- **Does not assert:** the Tauri form itself; the legacy `prepare-workflow` spelling (`project/launch/*` sends that one); coordinator prompt delivery; hook delivery; agent work; role-pane body contents beyond the exact role-card labels, session count and tab strip.
+- **Asserts:** the TUI-native control creates a separate orchestration tab containing `coordinator`, `builder`, and `reviewer`; the client chooses `PrepareSpelling::Orchestration` against this build's daemon (issue #1045), the preparation reports a unique context file inside the project, every configured start is answered rather than withheld, and the desktop path uses the desktop's 32×120 defaults, shares one orchestration id, and preserves role index/name/start-role/cwd/display-title membership, declared agent type and pane id across all prepared starts. Starting before attachment rebuilds the titled tab with all roles. Starting while the TUI is attached creates the same titled tab without a reconnect; switching into it shows `3 agent(s)` and the grouped, role-named `ClaudeCode · coordinator`, `OpenCode · builder`, and `Pi · reviewer` cards, and selecting the coordinator's card shows `CONTEXT_LISTS builder` and `CONTEXT_LISTS reviewer` (and no `CONTEXT_LISTS coordinator`) in its pane — the prepared context is what the role started with. Regression guard: before `9d66ef6b`, the live roles could appear as flat dashboard cards without their orchestration tab. Starting while the attached TUI's event stream is down (issue #1800: the `e2e`-build seams `DOT_AGENT_DECK_E2E_BREAK_STREAM_ON` break it on a plain Pi pane's `Thinking` from the real `agent-event --type running` CLI, and `DOT_AGENT_DECK_E2E_HOLD_STREAM_DOWN` keeps it down while a file exists and writes `<file>.held` once it holds): no tab appears while the stream is held down (precondition), and once it reconnects the titled tab appears and switching into it shows `3/4 agent(s)` (the trigger pane is the fourth) and the same three role-named cards — the resync rebuilds the tab from the deck's agent listing. Before the fix the resync carded only non-role agents, so the tab never appeared.
+- **Does not assert:** the Tauri form itself; the legacy `prepare-workflow` spelling (`project/launch/*` sends that one); coordinator prompt delivery; hook delivery; agent work; role-pane body contents beyond the exact role-card labels, session count and tab strip; a gap caused by a deck restart rather than a broken stream (the stream-gap case holds one process throughout), or a role spawned during a gap into an orchestration whose tab already exists: the unit tests `handshake_013_an_orchestration_with_any_unseen_role_is_surfaced_whole` (which orchestrations the resync queues) and `handshake_013_a_resync_surface_grows_the_existing_tab_and_keeps_the_seeded_card` (the render loop grows the tab and keeps the role's seeded state) pin that, against a scripted daemon rather than a PTY.
 - **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]` — the daemon/harness uses Unix-domain sockets and PTYs).
 
 ##### newagent/visibility/003 — A desktop-stopped plain agent disappears from an already-attached TUI dashboard.
@@ -9063,6 +9117,20 @@ The pure state model of a deck message's delivery attempts (`src/inbox_attempts.
 - **Agent:** none.
 - **Asserts:** with one attempt allowed per message, a once-waiter attempt issued while the agent reads idle, and a `tick_turn` well past the idle grace that first reads the turn busy, leaves the message `Attempting` with its revision unchanged: it never passes through `Uncertain(OutOfAttempts)`.
 - **Does not assert:** the engine's clock calling `tick_turn` (inbox/boundary/056 drives the clock with injected instants).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/attempts/036 — A record is spent once its message ended and its evidence was reclaimed.
+- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Agent:** none.
+- **Asserts:** a settled message's record is `spent` and `forget` drops it once, a live one's is not; a cancelled message whose once-waiter attempt is `HandedInert` is not spent until that attempt's late commit raises `DeliveredAfterAll`, after which it is (issue #1816).
+- **Does not assert:** when the hub's engine drops a spent record, which also waits for the inbox to drop its copy (inbox/boundary/075).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/attempts/037 — A reused id takes no late commit of a dropped record.
+- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Agent:** none.
+- **Asserts:** after a settled record is dropped, a record created for the same id starts its assignment above the dropped one's, so the old `(a, e)`'s commit answers `Unknown` and leaves the new message attempting; its own attempt's commit settles it; any record created afterwards also starts above the dropped assignment (issue #1816).
+- **Does not assert:** the inbox accepting the reused id, which needs its dedup window and history to have let the old one go.
 - **Platform coverage:** mac+linux+windows.
 
 #### inbox/receipt
@@ -10539,6 +10607,13 @@ The live moved-back case (`doorbell_010_live_spaces_moved_back_draft_stays_held`
 - **Asserts:** 0.47's readers decode a summary and a notice carrying every provenance kind; this build decodes unknown provenance, dispatch phase, outcome phase, cause, delivery, operation and disposition values as `unknown`; an unknown work-done mode is refused `unsupported_mode` with nothing changed.
 - **Why it exists:** PRD #1666 part 3, round 5 (plan D10, §4): a worker's `work-done` names its task, is kept before it is acknowledged, and never reaches a successor.
 - **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### inbox/boundary/075 — A long-lived generation keeps only the delivery records the inbox lists.
+- **Layer:** fast unit (`src/inbox_engine_tests.rs`), the hub's own entry points with an OpenCode receipt stream over an in-memory duplex.
+- **Agent:** none.
+- **Asserts:** with the pane's history held to two ended messages, six messages handed to one generation and committed in turn leave its attempt model holding at most two records after each, at the end exactly the two the inbox still lists; a Cancel on one of those is still answered `already_settled` (issue #1816).
+- **Does not assert:** a record kept while an attempt still holds evidence (inbox/attempts/036); the `uncertain_told` bound (`told_markers_stay_within_the_live_watches_over_many_tasks`, unannotated).
 - **Platform coverage:** mac+linux.
 
 ##### inbox/status/001 — Human daemon status shows each agent's pending inbox counts and wake path.

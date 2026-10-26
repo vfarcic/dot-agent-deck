@@ -199,6 +199,32 @@ pub async fn run(client: DaemonClient, state: SharedState, config: SubscriberCon
         }
         tokio::time::sleep(delay).await;
         delay = std::cmp::min(delay * 2, config.max_delay);
+        #[cfg(feature = "e2e")]
+        e2e_hold_stream_down().await;
+    }
+}
+
+/// Issue #1800 e2e seam: while the file `DOT_AGENT_DECK_E2E_HOLD_STREAM_DOWN`
+/// names exists, do not resubscribe, so a PTY test can start something on the
+/// daemon while this subscriber is certainly not listening, which the backoff
+/// alone cannot be timed against. Writes `<that path>.held` once it holds, for
+/// the test to wait on. Compiled only into the `e2e` build, like the seams
+/// `main.rs` passes in [`SubscriberConfig`], so a shipped binary has no switch
+/// that keeps its stream down.
+#[cfg(feature = "e2e")]
+async fn e2e_hold_stream_down() {
+    let Some(path) = std::env::var_os("DOT_AGENT_DECK_E2E_HOLD_STREAM_DOWN") else {
+        return;
+    };
+    let path = std::path::PathBuf::from(path);
+    let mut held = path.clone().into_os_string();
+    held.push(".held");
+    let exists = || tokio::fs::try_exists(&path);
+    if exists().await.unwrap_or(false) {
+        let _ = tokio::fs::write(&held, b"").await;
+    }
+    while exists().await.unwrap_or(false) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -1411,11 +1437,12 @@ mod tests {
         }
     }
 
-    /// Scenario: after a gap, the deck's snapshot lists a named agent with no card, an orchestration role with no card, and an agent whose pane already has the card its start drew, with no agent id. Only the first gets a new card, titled with its name; the role waits for its tab, and the carded pane keeps its one card and its name.
+    /// Scenario: after a gap, the deck's snapshot lists a named agent with no card, two roles of one orchestration with no card, a role whose membership carries no orchestration id, and an agent whose pane already has the card its start drew, with no agent id. Only the first is titled with its name; the two roles are queued as one surface, in role order, for the render loop to build their tab, and each gets the card that tab shows (issue #1800); the id-less role gets neither; and the carded pane keeps its one card and its name.
     #[spec("lifecycle/handshake/013")]
     #[test]
-    fn handshake_013_unseen_agents_are_carded_once_and_roles_are_left_to_their_tab() {
+    fn handshake_013_unseen_agents_are_carded_once_and_roles_are_surfaced_for_their_tab() {
         use crate::daemon_client::Incarnation;
+        use crate::event::OrchestrationSurfaceRole;
         let mut tui = AppState::default();
         tui.learn_stream_incarnation(Incarnation::from(Some("b".to_string())));
         tui.apply_event(event_on("carded", "3", "card", EventType::SessionStart, 1));
@@ -1426,10 +1453,18 @@ mod tests {
         }
         let records: Vec<AgentRecord> = serde_json::from_value(serde_json::json!([
             { "id": "1", "pane_id_env": "named", "display_name": "held-successor" },
-            { "id": "2", "pane_id_env": "role", "tab_membership": {
-                "kind": "orchestration", "name": "o", "role_index": 0,
-                "role_name": "lead", "is_start_role": true } },
+            { "id": "2", "pane_id_env": "worker", "cwd": "/work/o/sub", "tab_membership": {
+                "kind": "orchestration", "name": "o", "role_index": 1,
+                "role_name": "worker", "orchestration_cwd": "/work/o",
+                "display_title": "o run", "orchestration_id": "o-1" } },
             { "id": "3", "pane_id_env": "carded" },
+            { "id": "4", "pane_id_env": "lead", "tab_membership": {
+                "kind": "orchestration", "name": "o", "role_index": 0,
+                "role_name": "lead", "is_start_role": true,
+                "orchestration_cwd": "/work/o", "orchestration_id": "o-1" } },
+            { "id": "5", "pane_id_env": "tokenless", "cwd": "/work/t", "tab_membership": {
+                "kind": "orchestration", "name": "t", "role_index": 0,
+                "role_name": "lead", "is_start_role": true } },
         ]))
         .unwrap();
         tui.card_unseen_agents(&records);
@@ -1441,16 +1476,113 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(on("named"), vec![Some("held-successor".to_string())]);
+        for role in ["lead", "worker"] {
+            assert_eq!(
+                on(role),
+                vec![None],
+                "role {role}, whose tab is queued, has no card for it"
+            );
+        }
         assert_eq!(
-            on("role"),
+            on("tokenless"),
             Vec::<Option<String>>::new(),
-            "a role was carded"
+            "a role no tab is built for was carded on the dashboard"
         );
         assert_eq!(
             on("carded"),
             vec![Some("surfaced".to_string())],
             "a carded pane got a second card, or lost its own"
         );
+        let role = |pane_id: &str, role_index: usize, role_name: &str, is_start_role: bool| {
+            OrchestrationSurfaceRole {
+                pane_id: pane_id.into(),
+                role_index,
+                role_name: role_name.into(),
+                is_start_role,
+            }
+        };
+        assert_eq!(
+            tui.pending_orchestration_surfaces,
+            vec![(
+                crate::event::OrchestrationSurface {
+                    name: "o".into(),
+                    cwd: "/work/o".into(),
+                    display_title: Some("o run".into()),
+                    orchestration_id: Some("o-1".into()),
+                    roles: vec![
+                        role("lead", 0, "lead", true),
+                        role("worker", 1, "worker", false)
+                    ],
+                    context_path: None,
+                },
+                Incarnation::from(Some("b".to_string())),
+            )],
+            "the unseen roles were not queued as their orchestration's one surface"
+        );
+    }
+
+    /// Scenario: after a gap, the deck's snapshot lists three orchestrations. In `mixed`, one role is carded and placed in its tab and the other has no card; in `tabless`, the only role has a card but was never placed in a tab; in `shown`, the only role is carded and placed. `mixed` is queued with both roles, so the render loop places the missing one beside the one its tab holds, and only the uncarded role gets a new card; `tabless` is queued so its tab is built; `shown` is not queued (issue #1800).
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_an_orchestration_with_any_unseen_role_is_surfaced_whole() {
+        use crate::daemon_client::Incarnation;
+        let mut tui = AppState::default();
+        tui.learn_stream_incarnation(Incarnation::from(Some("b".to_string())));
+        for (pane, agent) in [("m0", "1"), ("t0", "3"), ("s0", "4")] {
+            tui.apply_event(event_on(pane, agent, pane, EventType::SessionStart, 1));
+        }
+        for (pane, role) in [("m0", "lead"), ("s0", "lead")] {
+            tui.pane_role_map.insert(pane.into(), role.into());
+        }
+        let role = |id: &str, pane: &str, name: &str, index: usize| {
+            serde_json::json!({ "id": id, "pane_id_env": pane, "tab_membership": {
+                "kind": "orchestration", "name": name, "role_index": index,
+                "role_name": format!("r{index}"), "is_start_role": index == 0,
+                "orchestration_cwd": format!("/work/{name}"),
+                "orchestration_id": format!("{name}-id") } })
+        };
+        let records: Vec<AgentRecord> = serde_json::from_value(serde_json::json!([
+            role("1", "m0", "mixed", 0),
+            role("2", "m1", "mixed", 1),
+            role("3", "t0", "tabless", 0),
+            role("4", "s0", "shown", 0),
+        ]))
+        .unwrap();
+        tui.card_unseen_agents(&records);
+        let queued: Vec<(String, Vec<String>)> = tui
+            .pending_orchestration_surfaces
+            .iter()
+            .map(|(surface, _)| {
+                (
+                    surface.name.clone(),
+                    surface.roles.iter().map(|r| r.pane_id.clone()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            queued,
+            vec![
+                (
+                    "mixed".to_string(),
+                    vec!["m0".to_string(), "m1".to_string()]
+                ),
+                ("tabless".to_string(), vec!["t0".to_string()]),
+            ],
+            "the orchestrations with an unseen role were not queued whole, or a shown one was"
+        );
+        let cards_on = |pane: &str| {
+            tui.sessions
+                .values()
+                .filter(|card| card.pane_id.as_deref() == Some(pane))
+                .count()
+        };
+        for (pane, cards) in [("m0", 1), ("m1", 1), ("t0", 1), ("s0", 1)] {
+            assert_eq!(
+                cards_on(pane),
+                cards,
+                "pane {pane} has the wrong number of cards"
+            );
+        }
     }
 
     /// Scenario: after a gap the deck's snapshot lists an idle agent with no card, and the TUI cards it. The agent then reports it is thinking, with no new session start, and its card says Thinking; a later resync whose snapshot says it waits for input moves the card there. A report applied while the stream comes from another deck process does not update the card: the card is dropped for the restart notice, and the report draws that process's own card (control).

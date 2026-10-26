@@ -92,7 +92,7 @@ const STOP_CLIENT_WINDOW: Duration = crate::agent_pty::DAEMON_STOP_POLL_BUDGET;
 /// exiting, while the client samples only every 100 ms.
 pub const SHUTDOWN_HEADROOM: Duration = Duration::from_millis(500);
 /// Bytes of a successful answer read, at most, for its partial-success report.
-const MAX_RESPONSE_BODY: usize = 64 * 1024;
+pub const MAX_RESPONSE_BODY: usize = 64 * 1024;
 
 enum ExportMsg {
     Span(Box<SpanRecord>),
@@ -450,10 +450,9 @@ impl Telemetry {
     /// `spawn_env` is the spawn's own overlay and is applied over the daemon's
     /// environment captured by [`Self::start_in`]: a value set in either counts as
     /// the user's. `cwd` is used only to resolve the run's git context, off
-    /// this thread. With the shim installed, its directory
-    /// goes first on the agent's `PATH` — the spawn's own, else the daemon's —
-    /// and the run id beside it ([`super::shim::RUN_ID_ENV`]). `None` when
-    /// telemetry is off.
+    /// this thread. The run id goes in as [`super::shim::RUN_ID_ENV`], and with
+    /// the shim installed its directory goes first on the agent's `PATH` — the
+    /// spawn's own, else the daemon's. `None` when telemetry is off.
     pub fn prepare_run(
         self: &Arc<Self>,
         mut start: RunStart,
@@ -479,13 +478,15 @@ impl Telemetry {
             self.host.as_deref(),
         );
         env.extend(super::launch::extra_env(&start.agent, &base));
+        // Whether or not the shim is installed: without it, an id the daemon
+        // inherited from another deck's agent would reach this one (#1902).
+        env.push((super::shim::RUN_ID_ENV.to_string(), start.run_id.clone()));
         if let Some(shim) = self.shim_dir.as_deref().and_then(Path::to_str)
             && let Some(path) = base.get("PATH")
         {
             // An empty `PATH` is the current directory, and stays so after
             // the shim: `<shim>:` ends in an empty entry.
             env.push(("PATH".to_string(), format!("{shim}:{path}")));
-            env.push((super::shim::RUN_ID_ENV.to_string(), start.run_id.clone()));
         }
         let prepared = PreparedRun {
             env,
@@ -1277,14 +1278,14 @@ struct Sender {
 }
 
 /// Whether an HTTP status is a transient failure the OTLP specification
-/// retries.
-fn is_retryable_status(status: u16) -> bool {
+/// retries. Shared with PRD #1859's collector.
+pub fn is_retryable_status(status: u16) -> bool {
     matches!(status, 429 | 502 | 503 | 504)
 }
 
 /// A `Retry-After` given in seconds. The HTTP-date form is not honoured; the
 /// backoff applies instead.
-fn retry_after(response: &reqwest::Response) -> Option<Duration> {
+pub fn retry_after(response: &reqwest::Response) -> Option<Duration> {
     response
         .headers()
         .get(reqwest::header::RETRY_AFTER)?
@@ -1305,7 +1306,7 @@ fn deadline_after(after: Duration) -> Instant {
 }
 
 /// `backoff` scaled by a random factor in `[0.5, 1]`.
-fn jittered(backoff: Duration) -> Duration {
+pub fn jittered(backoff: Duration) -> Duration {
     let mut bytes = [0u8; 4];
     let fraction = match getrandom::fill(&mut bytes) {
         Ok(()) => f64::from(u32::from_le_bytes(bytes)) / f64::from(u32::MAX),
@@ -1439,11 +1440,11 @@ impl Sender {
                 Ok(response) if response.status().is_success() => {
                     match self.partial_success(response).await {
                         Some(partial)
-                            if partial.rejected_spans > 0 || !partial.error_message.is_empty() =>
+                            if partial.rejected > 0 || !partial.error_message.is_empty() =>
                         {
                             break SendOutcome::PartiallyRejected {
                                 attempts,
-                                rejected: partial.rejected_spans,
+                                rejected: partial.rejected,
                             };
                         }
                         _ => break SendOutcome::Delivered { attempts },
@@ -1486,23 +1487,27 @@ impl Sender {
     /// What a successful answer reports the backend did not accept, from at
     /// most [`MAX_RESPONSE_BODY`] bytes of it, in the configured protocol's
     /// format. `None` when it reports nothing, or cannot be read.
-    async fn partial_success(
-        &self,
-        mut response: reqwest::Response,
-    ) -> Option<otlp::PartialSuccess> {
-        let mut body = Vec::new();
-        while body.len() < MAX_RESPONSE_BODY {
-            let Ok(Some(chunk)) = response.chunk().await else {
-                break;
-            };
-            let room = MAX_RESPONSE_BODY - body.len();
-            body.extend_from_slice(&chunk[..chunk.len().min(room)]);
-        }
+    async fn partial_success(&self, response: reqwest::Response) -> Option<otlp::PartialSuccess> {
+        let body = bounded_body(response, MAX_RESPONSE_BODY).await;
         match self.protocol {
             Protocol::HttpJson => otlp::decode_partial_success_json(&body),
             _ => otlp::decode_partial_success_protobuf(&body),
         }
     }
+}
+
+/// At most `max` bytes of `response`'s body; what could not be read is left
+/// out.
+async fn bounded_body(mut response: reqwest::Response, max: usize) -> Vec<u8> {
+    let mut body = Vec::new();
+    while body.len() < max {
+        let Ok(Some(chunk)) = response.chunk().await else {
+            break;
+        };
+        let room = max - body.len();
+        body.extend_from_slice(&chunk[..chunk.len().min(room)]);
+    }
+    body
 }
 
 /// Await one export, so that a panic inside it costs that batch only: the
@@ -1896,8 +1901,8 @@ mod tests {
     }
 
     /// With the shim installed every agent's `PATH` starts with its directory
-    /// — in front of the spawn's own `PATH`, else the daemon's — and carries
-    /// its run id; without it neither is added.
+    /// — in front of the spawn's own `PATH`, else the daemon's; without it the
+    /// `PATH` is left alone. Every agent carries its run id either way (#1902).
     #[cfg(unix)]
     #[tokio::test]
     async fn the_shim_goes_first_on_every_agents_path() {
@@ -1937,7 +1942,11 @@ mod tests {
         );
         let run = plain.prepare_run(run_start("p3"), &[], None).unwrap();
         assert_eq!(get(&run.env, "PATH"), None, "no shim, no PATH");
-        assert_eq!(get(&run.env, super::super::shim::RUN_ID_ENV), None);
+        assert_eq!(
+            get(&run.env, super::super::shim::RUN_ID_ENV),
+            Some(run.run_id.as_str()),
+            "no shim, still the run id"
+        );
     }
 
     /// The Devin configurations the shim writes for a run go when that run's

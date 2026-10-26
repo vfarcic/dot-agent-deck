@@ -42,11 +42,12 @@ const BLOCKS: [&str; 4] = [
 const KEY_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Scenario: Launch the deck on an empty dashboard and open the filter with
-/// `/`. Then, sixty times, resize the terminal, resize it again once the deck
-/// has sent a screen clear after that resize, and type one character straight
-/// after the second resize; every character must appear in the filter prompt
-/// without the test sending any further byte. The filter is closed with Esc and
-/// reopened every fifteen characters.
+/// `/`. Then, sixty times, resize the terminal, resize it again once a screen
+/// clear has been recorded after that first resize (usually its redraw, though
+/// it can be a late clear from the previous pair), and type one character
+/// straight after the second resize; every character must appear in the
+/// filter prompt without the test sending any further byte. The filter is
+/// closed with Esc and reopened every fifteen characters.
 #[spec("resize/sigwinch/004")]
 #[test]
 fn sigwinch_004_keys_right_after_a_resize_arrive_without_more_input() {

@@ -384,6 +384,64 @@ struct UnprovenSession {
     /// reach this accounting with a journal already on it.
     journal_bytes: Option<usize>,
 }
+
+/// Issue #1800: add `record`, the deck's listing of an orchestration role on
+/// `pane_id`, to the surface in `surfaces` for its orchestration, opening one
+/// when it is that orchestration's first role — grouped by orchestration id and
+/// name, as the startup hydration partitions a listing into tabs. A membership
+/// with no orchestration id, or no cwd to build the tab in, adds nothing.
+fn add_listed_role_to_surface(
+    surfaces: &mut Vec<OrchestrationSurface>,
+    record: &crate::agent_pty::AgentRecord,
+    pane_id: &str,
+) {
+    let Some(crate::agent_pty::TabMembership::Orchestration {
+        name,
+        role_index,
+        role_name,
+        is_start_role,
+        orchestration_cwd,
+        display_title,
+        orchestration_id: Some(orchestration_id),
+    }) = &record.tab_membership
+    else {
+        return;
+    };
+    let Some(cwd) = orchestration_cwd.as_ref().or(record.cwd.as_ref()) else {
+        return;
+    };
+    let index = match surfaces.iter().position(|surface| {
+        surface.orchestration_id.as_deref() == Some(orchestration_id.as_str())
+            && surface.name == *name
+    }) {
+        Some(index) => index,
+        None => {
+            surfaces.push(OrchestrationSurface {
+                name: name.clone(),
+                cwd: cwd.clone(),
+                display_title: None,
+                orchestration_id: Some(orchestration_id.clone()),
+                roles: Vec::new(),
+                context_path: None,
+            });
+            surfaces.len() - 1
+        }
+    };
+    let surface = &mut surfaces[index];
+    if surface.display_title.is_none() {
+        surface.display_title = display_title.clone();
+    }
+    if surface.context_path.is_none() {
+        surface.context_path = record.orchestrator_context_path.clone();
+    }
+    surface.roles.push(OrchestrationSurfaceRole {
+        pane_id: pane_id.to_string(),
+        role_index: *role_index,
+        role_name: role_name.clone(),
+        is_start_role: *is_start_role,
+    });
+}
+
 /// The session key a pane's PLACEHOLDER card is filed under — the one
 /// [`AppState::insert_placeholder_session`] mints.
 ///
@@ -8188,8 +8246,19 @@ impl AppState {
     /// card-surfacing start would have drawn it had the stream been open when it
     /// was broadcast. Without it an agent started while the stream was down —
     /// across a deck restart, or a lagged stream — had no card until the TUI
-    /// restarted. An orchestration role's record is left alone: its tab is
-    /// built from the deck's surface, not from a listing.
+    /// restarted.
+    ///
+    /// Issue #1800: an orchestration role's card belongs in its orchestration's
+    /// tab, which only the render loop can build. So when any role of an
+    /// orchestration has no card or was never placed in a tab here, the
+    /// orchestration's listed roles are grouped into the surface the deck
+    /// broadcast while the stream was down, and that surface is queued
+    /// ([`Self::queue_orchestration_surface`]) for the render loop to build the
+    /// tab, or place the roles its tab lacks, through the live surface path.
+    /// Each of its roles with no card is carded as above, since that path draws
+    /// no card for a live role. A role whose membership carries no
+    /// orchestration id, or whose surface does not validate, is left alone, as
+    /// that path builds no tab for it.
     ///
     /// G-fix7g: its pane is admitted as that start would have admitted it
     /// ([`Self::apply_event`]'s unmarked-start branch), so the agent's later
@@ -8200,45 +8269,89 @@ impl AppState {
         if self.agent_ownership.is_some() {
             return;
         }
+        let mut surfaces: Vec<OrchestrationSurface> = Vec::new();
+        let mut uncarded_roles = Vec::new();
         for record in records {
             let Some(pane_id) = record.pane_id_env.as_deref() else {
                 continue;
             };
-            if matches!(
-                record.tab_membership,
-                Some(crate::agent_pty::TabMembership::Orchestration { .. })
-            ) || self
+            let carded = self
                 .sessions
                 .values()
-                .any(|card| card.pane_id.as_deref() == Some(pane_id))
+                .any(|card| card.pane_id.as_deref() == Some(pane_id));
+            if let Some(crate::agent_pty::TabMembership::Orchestration { .. }) =
+                record.tab_membership
             {
+                add_listed_role_to_surface(&mut surfaces, record, pane_id);
+                if !carded {
+                    uncarded_roles.push((record, pane_id));
+                }
                 continue;
             }
-            self.seed_hydrated_session(
-                pane_id.to_string(),
-                record.cwd.clone(),
-                record.agent_type.clone(),
-                Some(record.id.clone()),
-                record.live.as_ref(),
-            );
-            let name = record
-                .display_name
-                .as_deref()
-                .and_then(crate::untrusted_text::sanitize_display_name);
-            if let Some(card) = self
-                .sessions
-                .get_mut(&placeholder_session_id(pane_id))
-                .filter(|card| card.display_name.is_none())
-            {
-                card.display_name = name;
+            if !carded {
+                self.card_unseen_agent(record, pane_id);
             }
-            if let Ok(seq) = record.id.parse::<u64>() {
-                self.pane_surfaced_agent_seq
-                    .entry(pane_id.to_string())
-                    .or_insert(seq);
-            }
-            self.managed_pane_ids.insert(pane_id.to_string());
         }
+        // Issue #1800: an orchestration is rebuilt when any of its roles has no
+        // card or was never placed in a tab here (the render loop records each
+        // role it places in `pane_role_map`, and `unregister_pane` forgets it).
+        // Its whole listed role set is queued: the render loop skips the roles
+        // its tab already holds and places the rest.
+        let mut surfaced = HashSet::new();
+        for mut surface in surfaces {
+            let unseen = surface.roles.iter().any(|role| {
+                !self.pane_role_map.contains_key(&role.pane_id)
+                    || uncarded_roles
+                        .iter()
+                        .any(|(_, pane_id)| *pane_id == role.pane_id)
+            });
+            if !unseen {
+                continue;
+            }
+            surface.roles.sort_by_key(|role| role.role_index);
+            if let Some(surface) = crate::agent_pty::validate_orchestration_surface(surface) {
+                surfaced.extend(surface.roles.iter().map(|role| role.pane_id.clone()));
+                self.queue_orchestration_surface(surface);
+            }
+        }
+        // The live surface path draws no card for a live role — the deck's
+        // card-surfacing start does, and a gap loses it too. Only a role whose
+        // orchestration was queued, so none is left as a flat dashboard card.
+        for (record, pane_id) in uncarded_roles {
+            if surfaced.contains(pane_id) {
+                self.card_unseen_agent(record, pane_id);
+            }
+        }
+    }
+
+    /// [`Self::card_unseen_agents`]' card for one agent: seeded from its
+    /// record, named, and its pane admitted as the deck's card-surfacing start
+    /// would have admitted it.
+    fn card_unseen_agent(&mut self, record: &crate::agent_pty::AgentRecord, pane_id: &str) {
+        self.seed_hydrated_session(
+            pane_id.to_string(),
+            record.cwd.clone(),
+            record.agent_type.clone(),
+            Some(record.id.clone()),
+            record.live.as_ref(),
+        );
+        let name = record
+            .display_name
+            .as_deref()
+            .and_then(crate::untrusted_text::sanitize_display_name);
+        if let Some(card) = self
+            .sessions
+            .get_mut(&placeholder_session_id(pane_id))
+            .filter(|card| card.display_name.is_none())
+        {
+            card.display_name = name;
+        }
+        if let Ok(seq) = record.id.parse::<u64>() {
+            self.pane_surfaced_agent_seq
+                .entry(pane_id.to_string())
+                .or_insert(seq);
+        }
+        self.managed_pane_ids.insert(pane_id.to_string());
     }
 
     /// PRD #120: record a daemon-spawned orchestration for the render loop to
