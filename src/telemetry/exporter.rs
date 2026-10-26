@@ -1142,8 +1142,9 @@ impl Telemetry {
 
 impl Shared {
     /// Run `f` on the tracker, then queue the spans it finished. A run that
-    /// ended has its usage record drained after the tracker is let go, on a
-    /// blocking thread ([`Self::complete_later`]).
+    /// ended with a usage record to read has it drained after the tracker is
+    /// let go, on a blocking thread ([`Self::complete_later`]); one with
+    /// nothing to read is among the spans queued here.
     fn with_tracker(&self, f: impl FnOnce(&mut RunTracker)) {
         let (finished, finishing) = {
             let mut tracker = self.tracker.lock().unwrap_or_else(|p| p.into_inner());
@@ -1196,7 +1197,8 @@ impl Shared {
     }
 
     /// Poll every open run's usage record (PRD #1858) on a blocking thread,
-    /// outside the tracker's lock, unless the last poll is still reading.
+    /// outside the tracker's lock, unless the last poll is still reading. No
+    /// thread is taken while no open run has a record to read.
     fn poll_usage(&self, polling: &Arc<std::sync::atomic::AtomicBool>) {
         use std::sync::atomic::Ordering;
         if polling.swap(true, Ordering::AcqRel) {
@@ -1207,6 +1209,10 @@ impl Shared {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .usage_to_poll();
+        if runs.is_empty() {
+            polling.store(false, Ordering::Release);
+            return;
+        }
         let polling = Arc::clone(polling);
         tokio::task::spawn_blocking(move || {
             for run in runs {
@@ -1529,26 +1535,29 @@ fn apply(shared: &Arc<Shared>, command: Command) -> bool {
                 tracker.take_finished_deferred()
             };
             shared.lock_filters().clear();
-            // The runs still open are completed on a blocking thread, after
-            // every run ended before them has queued its span, so the final
-            // flush `shutdown` sends after these finds those in the queue.
+            // The runs still open with a usage record to read are completed
+            // on a blocking thread, after every run ended before them has
+            // queued its span, so the final flush `shutdown` sends after
+            // these finds those in the queue. With none, no thread is taken.
             let shared = Arc::clone(shared);
             tokio::spawn(async move {
                 shared.finalized().await;
-                let completed = tokio::task::spawn_blocking(move || {
-                    finishing
-                        .into_iter()
-                        .map(FinishingRun::complete)
-                        .collect::<Vec<_>>()
-                })
-                .await
-                .unwrap_or_else(|_| {
-                    tracing::warn!(
-                        "completing the runs open at shutdown failed; their spans are lost"
-                    );
-                    Vec::new()
-                });
-                finished.extend(completed);
+                if !finishing.is_empty() {
+                    let completed = tokio::task::spawn_blocking(move || {
+                        finishing
+                            .into_iter()
+                            .map(FinishingRun::complete)
+                            .collect::<Vec<_>>()
+                    })
+                    .await
+                    .unwrap_or_else(|_| {
+                        tracing::warn!(
+                            "completing the runs open at shutdown failed; their spans are lost"
+                        );
+                        Vec::new()
+                    });
+                    finished.extend(completed);
+                }
                 // Queued by `shutdown`, which can wait for room; when it
                 // stopped waiting for these, as best it can.
                 if let Err(finished) = ack.send(finished) {
@@ -3320,6 +3329,170 @@ mod tests {
             )
             .is_some()
         );
+    }
+
+    /// A current-thread runtime whose only blocking thread is taken until
+    /// this is dropped: the thread is let go first, then the runtime, so an
+    /// assertion that fails inside it still lets the thread go.
+    struct BlockingThreadTaken {
+        _release: std::sync::mpsc::Sender<()>,
+        runtime: tokio::runtime::Runtime,
+    }
+
+    impl BlockingThreadTaken {
+        fn new() -> Self {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .max_blocking_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let (taken, is_taken) = std::sync::mpsc::channel();
+            runtime.spawn_blocking(move || {
+                let _ = taken.send(());
+                // Returns once the sender is dropped.
+                let _ = released.recv();
+            });
+            is_taken.recv().unwrap();
+            BlockingThreadTaken {
+                _release: release,
+                runtime,
+            }
+        }
+    }
+
+    /// A run of an arbitrary command, which the deck has no usage channel for.
+    fn command_run(pane: &str, agent_id: &str) -> RunStart {
+        RunStart {
+            agent: AgentType::None,
+            ..generation(pane, agent_id)
+        }
+    }
+
+    fn ended_runs(spans: &[SpanRecord]) -> Vec<&SpanRecord> {
+        spans
+            .iter()
+            .filter(|s| s.name == SPAN_AGENT_RUN && attr(s, AttrKey::EndReason).is_some())
+            .collect()
+    }
+
+    /// PRD #1858: a run the deck has no usage channel for — an arbitrary
+    /// command, Devin — is completed as it ends, on no blocking thread. With
+    /// the runtime's only one taken, two command runs end, the second after
+    /// its pull request's checks went pending, failing, pending and passing,
+    /// and both spans reach the sink with their unavailable usage, how they
+    /// ended, and the second's four CI changes, two rounds and one failure.
+    #[test]
+    fn a_run_with_nothing_to_read_takes_no_blocking_thread() {
+        use crate::telemetry::accounting::AccountingKey;
+        use crate::telemetry::tracker::tests::checks_report;
+        let taken = BlockingThreadTaken::new();
+        taken.runtime.block_on(async {
+            let (telemetry, mut rx) = capturing(ProbeSettings::default());
+            let (tx, events) = broadcast::channel(16);
+            telemetry.subscribe(events);
+            begin(&telemetry, command_run("p1", "a1"), &[]);
+            begin(&telemetry, command_run("p2", "a2"), &[]);
+            tx.send(of("p2", "a2", EventType::SessionStart)).unwrap();
+            for (revision, state, counts) in [
+                (1, "pending", (0, 0, 0)),
+                (2, "failing", (5, 1, 0)),
+                (3, "pending", (5, 0, 0)),
+                (4, "passing", (6, 0, 0)),
+            ] {
+                let mut report = checks_report("p2", 9, revision, state, counts);
+                report.agent_id = Some("a2".to_string());
+                tx.send(BroadcastMsg::Event(report)).unwrap();
+            }
+            telemetry.end_run("p1", Some("a1"), EndReason::Closed, None);
+            telemetry.end_run("p2", Some("a2"), EndReason::Exited, Some(0));
+            let mut spans = Vec::new();
+            eventually("both runs' spans were queued", || {
+                spans.extend(captured(&mut rx));
+                ended_runs(&spans).len() == 2
+            })
+            .await;
+            let run = |pane: &str| {
+                *ended_runs(&spans)
+                    .iter()
+                    .find(|s| attr(s, AttrKey::PaneId) == Some(&AttrValue::Str(pane.into())))
+                    .unwrap_or_else(|| panic!("no run span for {pane}"))
+            };
+            let text = |v: &str| Some(AttrValue::Str(v.to_string()));
+            let accounting = |pane: &str, key| attr(run(pane), AttrKey::Accounting(key)).cloned();
+            for (pane, ended) in [("p1", "interrupted"), ("p2", "completed")] {
+                for key in [
+                    AccountingKey::TokensUnavailableReason,
+                    AccountingKey::CostUnavailableReason,
+                    AccountingKey::QuotaUnavailableReason,
+                ] {
+                    assert_eq!(accounting(pane, key), text("no_channel"), "{pane} {key:?}");
+                }
+                assert_eq!(
+                    accounting(pane, AccountingKey::Termination),
+                    text(ended),
+                    "{pane}"
+                );
+                assert_eq!(
+                    accounting(pane, AccountingKey::TerminationProvenance),
+                    text("measured"),
+                    "{pane}"
+                );
+            }
+            let changes = run("p2")
+                .events
+                .iter()
+                .filter(|e| e.name == crate::telemetry::EVENT_CI_CHANGE)
+                .count();
+            assert_eq!(changes, 4);
+            assert_eq!(
+                attr(run("p2"), AttrKey::CiRoundsCount),
+                Some(&AttrValue::Int(2))
+            );
+            assert_eq!(
+                attr(run("p2"), AttrKey::CiFailuresCount),
+                Some(&AttrValue::Int(1))
+            );
+        });
+    }
+
+    /// PRD #1858: a shutdown with no open run to read the usage of takes no
+    /// blocking thread: with the runtime's only one taken, it ends the open
+    /// command run, queues its span and the final flush, and returns.
+    #[test]
+    fn a_shutdown_with_nothing_to_read_takes_no_blocking_thread() {
+        let taken = BlockingThreadTaken::new();
+        taken.runtime.block_on(async {
+            let (telemetry, mut rx) = capturing(ProbeSettings::default());
+            begin(&telemetry, command_run("p1", "a1"), &[]);
+            telemetry.settled().await;
+            let mut shutting = tokio::spawn({
+                let telemetry = Arc::clone(&telemetry);
+                async move { telemetry.shutdown(Duration::from_secs(60)).await }
+            });
+            let mut spans = Vec::new();
+            let mut flushed = false;
+            loop {
+                tokio::select! {
+                    msg = rx.recv() => match msg {
+                        Some(ExportMsg::Span(span)) => spans.push(*span),
+                        Some(ExportMsg::Flush { ack, .. }) => {
+                            let _ = ack.send(());
+                            flushed = true;
+                        }
+                        None => break,
+                    },
+                    _ = &mut shutting => break,
+                }
+            }
+            spans.extend(captured(&mut rx));
+            assert!(flushed, "the final flush was queued");
+            let reasons: Vec<_> = ended_runs(&spans)
+                .iter()
+                .filter_map(|s| attr(s, AttrKey::EndReason).cloned())
+                .collect();
+            assert_eq!(reasons, vec![AttrValue::Str("daemon_shutdown".into())]);
+        });
     }
 
     /// Threads 2 / 9: shutdown with the export queue full — a backend slow

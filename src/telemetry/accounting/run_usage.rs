@@ -270,6 +270,13 @@ impl RunUsage {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Whether the run has a usage record to read: not when the deck has no
+    /// usage channel for its agent ([`UsageSource::NoChannel`]), whose
+    /// [`Self::finish`] reads nothing and waits for nothing.
+    pub fn reads(&self) -> bool {
+        self.inner.source != UsageSource::NoChannel
+    }
+
     /// Read what each record gained since the last poll, locating the ones
     /// not found yet where their directory name says. Blocks on file reads:
     /// call it outside the tracker's lock.
@@ -343,8 +350,24 @@ impl RunUsage {
     /// The run's record, once it has ended as `end` (with `exit_code`, when
     /// the deck has one): every reader drained first, at most
     /// [`MAX_DRAIN_POLLS`] polls each. The deck's usage file is removed.
-    /// Blocks on file reads: call it outside the tracker's lock.
+    /// Blocks on file reads: call it outside the tracker's lock. A run with
+    /// nothing to read ([`Self::reads`]) is given its record at once, without
+    /// waiting for its readers, which hold nothing.
     pub fn finish(self, run_id: &str, end: EndReason, exit_code: Option<i32>) -> RunExport {
+        if !self.reads() {
+            return export(
+                run_id,
+                &self.inner.agent,
+                no_usage_channel(),
+                end,
+                exit_code,
+            );
+        }
+        self.drain(run_id, end, exit_code)
+    }
+
+    /// [`Self::finish`] by reading: the readers held, every one drained.
+    fn drain(self, run_id: &str, end: EndReason, exit_code: Option<i32>) -> RunExport {
         let inner = &*self.inner;
         let mut readers = lock(&inner.readers);
         #[cfg(test)]
@@ -1112,6 +1135,39 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A run the deck has no usage channel for is given, without reading,
+    /// the record a drain of its readers gives: the same attributes, in the
+    /// same order, however it ended.
+    #[test]
+    fn a_run_with_nothing_to_read_gets_what_a_drain_gives() {
+        for agent in [AgentType::None, AgentType::Devin] {
+            let usage = RunUsage::new(&agent, UsageDirs::default(), 0);
+            assert!(!usage.reads(), "{agent:?}");
+            for end in [
+                EndReason::Exited,
+                EndReason::Closed,
+                EndReason::DaemonShutdown,
+                EndReason::Unknown,
+            ] {
+                for code in [None, Some(0), Some(3)] {
+                    assert_eq!(
+                        usage.clone().finish("run9", end, code),
+                        usage.clone().drain("run9", end, code),
+                        "{agent:?} {end:?} {code:?}"
+                    );
+                }
+            }
+            // Its readers are never waited for.
+            let held = usage.hold_readers();
+            let finishing = usage.clone();
+            std::thread::spawn(move || finishing.finish("run9", EndReason::Closed, None))
+                .join()
+                .unwrap();
+            drop(held);
+        }
+        assert!(RunUsage::new(&AgentType::ClaudeCode, UsageDirs::default(), 0).reads());
     }
 
     /// An arbitrary command has no usage channel, and its exit status

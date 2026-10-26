@@ -345,7 +345,8 @@ pub struct RunTracker {
     replaced: Vec<ReplacedRun>,
     finished: Vec<SpanRecord>,
     /// Ended runs whose span waits for their usage to be read
-    /// ([`Self::take_finished_deferred`]).
+    /// ([`Self::take_finished_deferred`]). A run with nothing to read
+    /// ([`RunUsage::reads`]) is never one: its span is in `finished`.
     finishing: Vec<FinishingRun>,
     held_input: Option<HeldInput>,
     /// Test witness: the [`ShadowCards`] alive.
@@ -514,16 +515,18 @@ impl RunTracker {
         }
     }
 
-    /// The usage readers of every open run (PRD #1858), for the caller to
-    /// [`RunUsage::poll`] once it has let go of the tracker: polling reads
-    /// files, and nothing that waits for the tracker should wait for that.
-    /// The daemon polls on an interval; a run's end drains its record however
-    /// long ago the last poll was.
+    /// The usage readers of every open run with a record to read (PRD
+    /// #1858, [`RunUsage::reads`]), for the caller to [`RunUsage::poll`] once
+    /// it has let go of the tracker: polling reads files, and nothing that
+    /// waits for the tracker should wait for that. The daemon polls on an
+    /// interval; a run's end drains its record however long ago the last
+    /// poll was.
     pub fn usage_to_poll(&self) -> Vec<RunUsage> {
         self.runs
             .values()
             .chain(self.replaced.iter().map(|r| &r.run))
             .filter_map(|run| run.usage.clone())
+            .filter(RunUsage::reads)
             .collect()
     }
 
@@ -755,6 +758,18 @@ impl RunTracker {
         let run_id = run.start_info.run_id.clone();
         let span = run_span(run, reason, exit_code, now);
         match usage {
+            // A run with nothing to read is completed here, its span queued
+            // with the others it finished.
+            Some(usage) if !usage.reads() => self.finished.push(
+                FinishingRun {
+                    span,
+                    usage,
+                    run_id,
+                    reason,
+                    exit_code,
+                }
+                .complete(),
+            ),
             Some(usage) => self.finishing.push(FinishingRun {
                 span,
                 usage,
@@ -2387,7 +2402,7 @@ pub(crate) mod tests {
         );
     }
 
-    fn checks_report(
+    pub(crate) fn checks_report(
         pane: &str,
         number: u64,
         revision: u64,
