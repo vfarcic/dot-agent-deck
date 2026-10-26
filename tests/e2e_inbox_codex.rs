@@ -352,7 +352,7 @@ fn codex_005_recognised_composer_rings_before_first_hook() {
     );
 }
 
-/// Scenario: Strand a fixed line in Codex's recognized composer and pause its CR-only retry before admission. Fetch that selected task while another stays queued; releasing the attempt must send no CR and must not submit the settled task.
+/// Scenario: Strand a fixed line in Codex's recognized composer and wait for its CR-only retry to reach the admission fence before starting the interleave budget. Fetch that selected task while another stays queued; releasing the attempt must send no CR and must not submit the settled task.
 #[spec("inbox/doorbell/031")]
 #[test]
 fn doorbell_031_codex_flush_only_rechecks_selected_message() {
@@ -366,18 +366,29 @@ fn doorbell_031_codex_flush_only_rechecks_selected_message() {
     );
     let root = codex.daemon.home.join("ring-barriers");
     std::fs::create_dir_all(&root).unwrap();
-    let _budget = InterleaveBudget::start(&root);
+    // Preparation has its own load-scaled wait. Release armed fences even
+    // when preparation panics before the interleave budget starts (#1941).
+    struct ReleaseFences(std::path::PathBuf);
+    impl Drop for ReleaseFences {
+        fn drop(&mut self) {
+            for phase in ["before-pre-cr", "completed"] {
+                let _ = std::fs::write(self.0.join(format!("{phase}.release")), "");
+            }
+        }
+    }
+    let _release = ReleaseFences(root.clone());
     std::fs::write(root.join("before-pre-cr.armed"), "").unwrap();
     let base = codex.pane.capture.with_extension("strand");
     std::fs::write(base.with_extension("empty"), COMPOSER).unwrap();
     std::fs::write(&base, "").unwrap();
     let id = codex.queued(BODY);
     assert!(
-        common::wait_until(wait_budget(), || root
+        common::wait_until(common::load_scaled(WAIT), || root
             .join("before-pre-cr.reached")
             .exists()),
         "recognized Codex CR-only retry must reach its fence"
     );
+    let _budget = InterleaveBudget::start(&root);
     let first = format!("{}\r", fixed_line(&id));
     assert_eq!(bytes(&codex.pane), first.as_bytes());
     fetch(&codex.daemon, &codex.pane, true);
