@@ -10738,6 +10738,20 @@ The live spaces-only case first completes a fallback-delivered positive control 
 - **Does not assert:** when the doorbell names a reason (`inbox/doorbell/041`), or a narrow card's row budget.
 - **Platform coverage:** all.
 
+##### inbox/status/031 — Held orchestrators remain prominent across tabs and reconnects.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_status.rs`), attached real TUI and daemon.
+- **Agent:** profiled synthetic editor stand-ins; no real agent or credential.
+- **Asserts:** a worker report waits behind an orchestrator's possible draft while one other recipient is held; dashboard chrome names the orchestrator with the shared hold words and counts that other recipient, also on another tab. Attention survives a tab round-trip and a clean detach/reattach and clears when the drafts are cleared and the messages taken.
+- **Does not assert:** recovery controls, voice actions or persistence beyond the daemon's lifetime.
+- **Platform coverage:** Unix PTY.
+
+##### inbox/status/032 — Termination notices report what happened to the pane command, without asserting that the agent exited.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_termination.rs`), real daemon and wrapper; reader faults belong to coder-owned in-module tests of `pump_reader`/`capture_termination` in `src/agent_pty.rs`, to come.
+- **Agent:** Python pane commands, including forked and detached descendants; no real agent or credential.
+- **Asserts:** a wrapped command's exit zero and exit seven name that command and its reported code; terminal EOF while the command remains alive says the connection ended and whether the agent runs is unknown; close says closed; replacement says the message stayed with the previous agent and hands none to the successor; launcher exit with a descendant holding the terminal sends no notice; a detached descendant survives while the notice stops at the pane command. Notices never claim that the agent's process exited.
+- **Does not assert:** injected `Read::read` error or `Interrupted` retry through the binary harness: those two cases require the coder-owned reader tests named above. No production reader seam is added here.
+- **Platform coverage:** Unix PTY; Linux may report the terminal's last-slave close as EIO rather than a zero-length read.
+
 ##### inbox/status/033 — The overdue notice tells the orchestrator why the doorbell holds, as it stood when the notice was composed.
 - **Layer:** Fast (`src/inbox_hub.rs`), the real inbox with a zero overdue window.
 - **Agent:** none.
@@ -10746,10 +10760,11 @@ The live spaces-only case first completes a fallback-delivered positive control 
 - **Platform coverage:** all.
 
 ##### inbox/status/034 — The hold reason crosses versions: older readers keep the stall, newer reasons read as unknown.
-- **Layer:** Fast (`src/inbox_hub.rs`, `src/state.rs`, `desktop/src-tauri/src/dto.rs`); desktop component (`desktop/src/components/InboxSurfaces.test.tsx`).
+- **Layer:** Fast (`src/inbox_hub.rs`, `src/state.rs`, `desktop/src-tauri/src/dto.rs`); desktop component (`desktop/src/components/InboxSurfaces.test.tsx`, `desktop/src/components/InboxWakeAttention.test.tsx`).
 - **Agent:** none.
 - **Asserts:** every wake update the inbox broadcasts carries the current stall and the current reason, so the notice decoded as a released client decodes it (no `wake_hold`) keeps `wake_stalled` true while the reason changes; an unchanged reason is not told again, a hold asked for with nothing queued records nothing, the stall ending keeps the reason, the same reason told again after the oldest message is taken while another waits sends nothing and keeps naming the message it was last told against, and the agent exiting clears both in one update that names that message. A TUI card attached to the real inbox follows the reason from those updates, keeping the count on its line and the reason on its notice row, and returns to the stall's words when the hold ends; a summary naming a reason no build knows yet, and one from an older daemon with no reason, read as the stall's words in the TUI and the desktop tile. The desktop DTO carries each known reason by its wire spelling, an unknown one as `unknown`, and none when the summary has none.
-- **Does not assert:** a released binary run against this one (the cross-version job), or orchestrator attention, which arrives later.
+- **Desktop attention:** the real bridge and rendered deck header name a held start role even while another agent's pane/tab is selected, with shared-fixture hold words and one other held recipient counted. A reason change and clear update a rendered tile directly from broadcasts, reconnect restores header attention from a snapshot alone, and a predecessor's delayed update cannot mark its clean successor; a successor's own update appears under its role. Start-role membership, not a literal `orchestrator` role name, determines prominence.
+- **Does not assert:** a released binary run against this one (the cross-version job), or new recovery/voice controls.
 - **Platform coverage:** all.
 
 ##### inbox/claude/001 — Supported Claude installs one status handler and one day-long native waiter per managed event.
