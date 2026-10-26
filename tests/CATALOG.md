@@ -245,8 +245,8 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 
 ##### telemetry/usage/006 — Usage export excludes transcript content, paths and arbitrary model and error names.
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_usage.rs`).
-- **Agent:** offline Claude with private transcript markers.
-- **Asserts:** prompt, reply, tool result, error message, cwd, unrecognized model and error-kind markers reach neither captured request bodies (including span attributes/events) nor telemetry-module logs; a positive control requires exported token counts and failed termination, maps the error kind to other and omits the model name.
+- **Agent:** offline Claude, Codex, Pi and OpenCode with private transcript and model markers.
+- **Asserts:** prompt, reply, tool result, error message, cwd, unrecognized model and error-kind markers reach neither captured request bodies (including span attributes/events) nor telemetry-module logs; lowercase paths, slash/dot namespaces and a private family-prefixed name are excluded through Claude modelUsage and assistant message.model, Codex turn_context.model and Pi/OpenCode reply-file models. Positive controls retain run/event token counts, recognized Claude/GPT model names and failed termination, map the error kind to other and omit unrecognized model names.
 - **Does not assert:** an external agent's own telemetry, unrelated daemon log targets or protobuf encoding.
 - **Platform coverage:** mac+linux.
 
@@ -262,6 +262,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** offline Pi parent and child; parent requests the child through the real attach socket from inside its process.
 - **Asserts:** inherited usage-file and OTEL resource environment do not combine the runs; receiver spans have different run ids and separate model/aggregate token counts and estimated costs, each with completed termination.
 - **Does not assert:** work-item rollups, real-agent tool invocation or orchestration role accounting.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/usage/009 — Spawns without an allocated usage channel discard an inherited usage-file path.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_usage.rs`).
+- **Agent:** offline Pi/OpenCode stand-ins with export disabled and a plain command with export enabled.
+- **Asserts:** when the daemon inherits DOT_AGENT_DECK_USAGE_FILE, a spawn without an allocated channel receives an absent or empty value and its attempted reply append leaves the parent's file unchanged.
+- **Does not assert:** real extension/plugin callbacks, the allocated-channel case (covered by 002/003/008) or hosted ingestion.
 - **Platform coverage:** mac+linux.
 
 ### Session pull requests

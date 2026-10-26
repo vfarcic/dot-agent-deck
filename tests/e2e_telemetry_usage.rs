@@ -293,6 +293,7 @@ if target:
     with target.open('a') as out:
         for record in data['records']: out.write(json.dumps(record, separators=(',', ':')) + '\n')
 print('USAGE_STANDIN_FINISHED_' + name, flush=True)
+(base / (name + '.done')).write_text('done')
 "#;
 
 fn start(
@@ -335,6 +336,17 @@ fn fixture_run(
     records: Vec<Value>,
     cwd: &std::path::Path,
 ) -> Value {
+    receiver.run(&fixture_start(deck, name, kind, path, records, cwd))
+}
+
+fn fixture_start(
+    deck: &TuiDeck,
+    name: &str,
+    kind: AgentType,
+    path: Option<&std::path::Path>,
+    records: Vec<Value>,
+    cwd: &std::path::Path,
+) -> String {
     std::fs::write(cwd.join("usage-standin.py"), STANDIN).unwrap();
     std::fs::write(
         cwd.join(format!("{name}.fixture")),
@@ -381,7 +393,7 @@ fn fixture_run(
         events.wait_for(|event| event.agent_id.as_deref() == Some(&agent_id), WAIT);
     }
     std::fs::write(cwd.join(format!("{name}.go")), "go").unwrap();
-    receiver.run(id)
+    id.to_string()
 }
 
 fn codex_records(ending: Value) -> Vec<Value> {
@@ -642,7 +654,7 @@ fn telemetry_usage_005_claude_cost_state_and_api_failure() {
     }
 }
 
-/// Scenario: An offline Claude transcript contains distinct private markers in prompt, reply, tool result, error text, cwd, model and error kind. The completed run must export usage and the sanitized failure while request bodies and telemetry-module logs exclude those markers.
+/// Scenario: Offline Claude, Codex, Pi and OpenCode panes report private content and lowercase path-shaped or namespaced model names through each reader route. Completed runs must retain token counts while request bodies, attributes, events and telemetry-module logs omit private names; recognized model names still export normally.
 #[spec("telemetry/usage/006")]
 #[test]
 fn telemetry_usage_006_content_is_excluded_from_usage_exports() {
@@ -715,6 +727,140 @@ fn telemetry_usage_006_content_is_excluded_from_usage_exports() {
         .collect();
     assert_eq!(events.len(), 1);
     assert!(attr(events[0], "gen_ai.response.model").is_none());
+
+    let private_models = [
+        "home/alice/private/gpt-5",
+        "private/customer/llama-3.gguf",
+        "customer-secret.example/gpt-5",
+        "customer-secret.example.gpt-5",
+        "gpt-confidential-project",
+    ];
+    let mut violations = Vec::new();
+    let mut runs = Vec::new();
+    for route in ["claude-total", "claude-message", "codex", "pi", "opencode"] {
+        // Each route gets its own recognized-name control, so discarding a
+        // reader's entire record or all model names cannot satisfy privacy.
+        let known = if route.starts_with("claude") {
+            "claude-haiku-5-5"
+        } else {
+            "gpt-5.4-mini"
+        };
+        for (index, candidate) in private_models
+            .iter()
+            .chain([known].iter())
+            .copied()
+            .enumerate()
+        {
+            let name = format!("private-{route}-{index}");
+            let (kind, path, records, counts, exported_name) = match route {
+                "claude-total" | "claude-message" => {
+                    let mut records = claude_records(&name, known, None);
+                    if route == "claude-total" {
+                        records[2]["modelUsage"] = json!({candidate:{
+                            "inputTokens":10,"outputTokens":20,"cacheReadInputTokens":300,
+                            "cacheCreationInputTokens":40,"costUSD":0.0123
+                        }});
+                    } else {
+                        records[1]["message"]["model"] = json!(candidate);
+                    }
+                    (
+                        AgentType::ClaudeCode,
+                        Some(claude_path(&deck, &name, deck.workdir())),
+                        records,
+                        [350, 20, 300, 40],
+                        if route == "claude-message" {
+                            known
+                        } else {
+                            candidate
+                        },
+                    )
+                }
+                "codex" => {
+                    let mut records = codex_records(json!({"type":"task_complete"}));
+                    records[0]["payload"]["model"] = json!(candidate);
+                    (
+                        AgentType::Codex,
+                        Some(
+                            deck.home_dir()
+                                .join(format!(".codex/sessions/2026/10/26/rollout-{name}.jsonl")),
+                        ),
+                        records,
+                        [1500, 80, 900, 0],
+                        candidate,
+                    )
+                }
+                _ => (
+                    if route == "pi" {
+                        AgentType::Pi
+                    } else {
+                        AgentType::OpenCode
+                    },
+                    None,
+                    vec![json!({
+                        "v":1,"type":"reply","agent":route,"id":"private-reply",
+                        "model":candidate,"input":100,"output":20,"cache_read":0,
+                        "cache_write":0,"cost_usd":0.0042,"stop":"stop"
+                    })],
+                    [100, 20, 0, 0],
+                    candidate,
+                ),
+            };
+            // Start all cases before waiting for OTLP's export batch, so the
+            // matrix pays one flush interval instead of one per reply.
+            let id = fixture_start(&deck, &name, kind, path.as_deref(), records, deck.workdir());
+            runs.push((id, route, candidate, known, exported_name, counts));
+        }
+    }
+    for (id, route, candidate, known, exported_name, counts) in runs {
+        let run = receiver.run(&id);
+        tokens(&run, counts);
+        ended(&run, "completed", "provider_reported");
+        let events: Vec<_> = run["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["name"] == "deck.model_usage")
+            .collect();
+        assert_eq!(events.len(), 1, "{route}: retain the reply's model usage");
+        tokens(events[0], counts);
+        if exported_name == known {
+            expect_string(events[0], "gen_ai.response.model", known);
+        } else if let Some(value) = attr(events[0], "gen_ai.response.model") {
+            violations.push(format!(
+                "{route}: private model {candidate} exported as {value}"
+            ));
+        }
+    }
+    // Check entire serialized bodies, including attributes and events outside
+    // agent.run, rather than only the model field we expect to be vulnerable.
+    for body in receiver.bodies.lock().unwrap().iter() {
+        let body = String::from_utf8_lossy(body);
+        for secret in private_models {
+            if body.contains(secret) {
+                violations.push(format!(
+                    "private model {secret} leaked into OTLP request body"
+                ));
+            }
+        }
+    }
+    let log = std::fs::read_to_string(deck.workdir().join("deck.log")).unwrap();
+    for line in log.lines().filter(|line| {
+        line.contains(" dot_agent_deck::telemetry:")
+            || line.contains(" dot_agent_deck::telemetry::")
+    }) {
+        for secret in private_models {
+            if line.contains(secret) {
+                violations.push(format!("private model {secret} leaked into telemetry log"));
+            }
+        }
+    }
+    violations.sort();
+    violations.dedup();
+    assert!(
+        violations.is_empty(),
+        "model privacy violations:\n{}",
+        violations.join("\n")
+    );
 }
 
 /// Scenario: A synthetic Pi parent starts a second Pi pane from inside its own process and passes along its inherited telemetry environment. Parent and child append different usage, and the receiver must associate each model total with its own run id rather than combining them.
@@ -786,4 +932,96 @@ fn telemetry_usage_008_child_usage_has_its_own_run_identity() {
         expect_string(run, "deck.cost.provenance", "estimated");
         ended(run, "completed", "provider_reported");
     }
+}
+
+/// Scenario: A daemon inherits a parent's usage-file path and starts Pi and OpenCode stand-ins with export disabled, then a plain command with export enabled. Each stand-in records its environment and attempts a usage append; without an allocated channel it must see no usage path and leave the parent's file unchanged.
+#[spec("telemetry/usage/009")]
+#[test]
+fn telemetry_usage_009_unallocated_usage_file_is_not_inherited() {
+    let receiver = Receiver::start();
+    let mut violations = Vec::new();
+    for enabled in [false, true] {
+        let scratch = common::harness_tempdir().unwrap();
+        let inherited = scratch.path().join("parent-usage.jsonl");
+        let parent_contents = "parent-run-only\n";
+        std::fs::write(&inherited, parent_contents).unwrap();
+        let mut builder = TuiDeck::builder()
+            .without_agent_credentials()
+            .impersonating_pane_signals()
+            .with_env("PATH", common::path_with_binary_dir())
+            .with_env("DOT_AGENT_DECK_USAGE_FILE", inherited.to_string_lossy())
+            .with_continue_session("usage-bootstrap", "cat");
+        if enabled {
+            builder = builder
+                .with_env("OTEL_EXPORTER_OTLP_ENDPOINT", &receiver.endpoint)
+                .with_env("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json");
+        } else {
+            builder = builder.with_env("OTEL_SDK_DISABLED", "true");
+        }
+        let deck = builder.launch_with_fixture("minimal");
+        deck.wait_for_string("[Command Mode Ctrl+D]");
+        std::fs::write(deck.workdir().join("usage-standin.py"), STANDIN).unwrap();
+        let kinds = if enabled {
+            vec![("command", AgentType::None)]
+        } else {
+            vec![("pi", AgentType::Pi), ("opencode", AgentType::OpenCode)]
+        };
+        for (family, kind) in kinds {
+            let name = format!("unallocated-{enabled}-{family}");
+            std::fs::write(
+                deck.workdir().join(format!("{name}.fixture")),
+                json!({
+                    "records":[{"v":1,"type":"reply","agent":"pi","model":"gpt-5.4-mini",
+                        "input":100,"output":20,"cost_usd":0.0042,"stop":"stop"}]
+                })
+                .to_string(),
+            )
+            .unwrap();
+            // The plain command uses the same append attempt as Pi so the
+            // environment contract is observable even without an agent reader.
+            start(
+                &deck,
+                &name,
+                kind,
+                deck.workdir(),
+                format!("python3 usage-standin.py {name} pi"),
+            );
+            let ready = deck.workdir().join(format!("{name}.ready"));
+            assert!(
+                common::wait_until(WAIT, || std::fs::read_to_string(&ready)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                    .is_some()),
+                "{name}: stand-in never recorded its environment"
+            );
+            let environment: Value =
+                serde_json::from_str(&std::fs::read_to_string(ready).unwrap()).unwrap();
+            std::fs::write(deck.workdir().join(format!("{name}.go")), "go").unwrap();
+            assert!(
+                common::wait_until(WAIT, || deck
+                    .workdir()
+                    .join(format!("{name}.done"))
+                    .exists()),
+                "{name}: stand-in never completed its append attempt"
+            );
+            if environment["DOT_AGENT_DECK_USAGE_FILE"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty())
+            {
+                violations.push(format!("{name}: inherited DOT_AGENT_DECK_USAGE_FILE survived without an allocated channel"));
+            }
+            if std::fs::read_to_string(&inherited).unwrap() != parent_contents {
+                violations.push(format!(
+                    "{name}: stand-in appended to the parent's usage file"
+                ));
+            }
+            // Give each case the same pristine parent file, even in RED.
+            std::fs::write(&inherited, parent_contents).unwrap();
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "usage-file isolation violations:\n{}",
+        violations.join("\n")
+    );
 }
