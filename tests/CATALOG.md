@@ -11998,7 +11998,7 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 ##### inbox/opencode/006 — A delivery with fresh possession is never repeated.
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`), load-scaled two-second keepalive and six-second possession TTL
 - **Agent:** fake API withholding assistant-child events and pulsing the real plugin's keepalive callback every 100 ms, independently of the daemon TTL.
-- **Asserts:** a delivery without an assistant child stays fetched with one prompt despite a one-second plugin scheduling stall; snapshots containing its held attempt span a full possession TTL with no TTL-expiring gap, and the matching assistant turn then acknowledges it.
+- **Asserts:** a delivery without an assistant child stays fetched with one prompt despite a one-second plugin scheduling stall; a repeat or loss of fetched state is reported before judging fixture history. Snapshots containing its held attempt span a full possession TTL with no TTL-expiring gap, measured on a monotonic clock with signed arithmetic, and the matching assistant turn then acknowledges it.
 - **Does not assert:** real agent cancellation behaviour or suppression after a genuine possession lapse; inbox/attempts/005 pins the allowed marked repeat after expiry and settlement by the original attempt's commit.
 - **Cost:** none.
 

@@ -688,7 +688,7 @@ fn opencode_005_a_lost_watcher_resumes_and_a_closed_one_requeues_nothing() {
     }
 }
 
-/// Scenario: Leave a delivered task without an assistant child and stall the plugin for one second, within a load-scaled possession TTL. Fresh snapshots must keep the task fetched with one prompt across a full TTL; once OpenCode answers it, it is acknowledged.
+/// Scenario: Leave a delivered task without an assistant child and stall the plugin for one second, within a load-scaled possession TTL. Check for a repeat or loss of fetched state before checking that fresh snapshots span a full TTL on a monotonic clock; once OpenCode answers it, it is acknowledged.
 #[spec("inbox/opencode/006")]
 #[test]
 fn opencode_006_a_held_delivery_is_never_repeated() {
@@ -706,9 +706,29 @@ fn opencode_006_a_held_delivery_is_never_repeated() {
     let id = op.post();
     op.wait_kind("prompt");
     op.wait_kind("stalled");
-    let repeated_or_lost = common::wait_until(keepalive * 4, || {
-        op.prompts().len() > 1 || op.message_state(&id) != "fetched"
+    let observation = std::cell::RefCell::new((0, Value::Null));
+    common::wait_until(keepalive * 4, || {
+        let prompt_count = op.prompts().len();
+        let message_state = op.message_state(&id);
+        let repeated_or_lost = prompt_count > 1 || message_state != "fetched";
+        observation.replace((prompt_count, message_state));
+        repeated_or_lost
     });
+    let (prompt_count, message_state) = observation.into_inner();
+    // Preserve the observation that ended polling and name a regression before
+    // judging fixture history, which an early failure necessarily cuts short.
+    assert_eq!(
+        prompt_count,
+        1,
+        "a possessed delivery was repeated before acknowledgement: {:?}",
+        op.events()
+    );
+    assert_eq!(
+        message_state,
+        "fetched",
+        "a possessed delivery lost fetched state before acknowledgement: {:?}",
+        op.events()
+    );
     let snapshots: Vec<_> = op
         .events()
         .into_iter()
@@ -719,21 +739,17 @@ fn opencode_006_a_held_delivery_is_never_repeated() {
                 .as_array()?
                 .iter()
                 .any(|held| held["id"] == id)
-                .then(|| e["t"].as_u64().unwrap())
+                .then(|| e["monotonicMs"].as_i64().unwrap())
         })
         .collect();
+    let ttl_ms = i64::try_from(ttl.as_millis()).unwrap();
     assert!(
         snapshots.len() >= 4
-            && snapshots.last().unwrap() - snapshots[0] >= ttl.as_millis() as u64
+            && snapshots.last().unwrap() - snapshots[0] >= ttl_ms
             && snapshots
                 .windows(2)
-                .all(|pair| pair[1] - pair[0] < ttl.as_millis() as u64),
+                .all(|pair| (0..ttl_ms).contains(&(pair[1] - pair[0]))),
         "fixture must report possession across a full TTL without a lapse; ttl={ttl:?}, snapshots={snapshots:?}; events={:?}",
-        op.events()
-    );
-    assert!(
-        !repeated_or_lost,
-        "a possessed delivery is never repeated: {:?}",
         op.events()
     );
     op.acknowledge(&id);

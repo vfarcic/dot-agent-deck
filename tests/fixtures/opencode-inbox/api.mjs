@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import cp from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
 import { pathToFileURL } from 'node:url';
+import { performance } from 'node:perf_hooks';
 import { Worker, workerData, parentPort } from 'node:worker_threads';
 
 const [pluginPath, base, scenario] = process.argv.slice(2);
@@ -13,8 +14,8 @@ if(config.worker && !workerData) {
   worker.on('error',error=>{console.error(error);process.exit(1);});
   await new Promise(resolve=>worker.on('exit',resolve));process.exit(0);
 }
-// `t` (wall-clock ms) lets a failing test say how far apart two events were.
-const log = (kind, data = {}) => fs.appendFileSync(base + '.events', JSON.stringify({kind, t: Date.now(), ...data}) + '\n');
+// Keep wall time for diagnostics; elapsed-time assertions use monotonic ms.
+const log = (kind, data = {}) => fs.appendFileSync(base + '.events', JSON.stringify({kind, t: Date.now(), monotonicMs: Math.trunc(performance.now()), ...data}) + '\n');
 const handlers = new Map();
 const emit = (type, properties) => {
   for (const fn of handlers.get(type) ?? []) fn({type, properties});
@@ -47,8 +48,8 @@ cp.spawn = (...args) => {
       setTimeout(() => {
         log('stdin', {text: bytes.toString()});
         write(bytes, ...rest);
-        const until = Date.now() + config.snapshotStallMs;
-        while (Date.now() < until) {}
+        const until = performance.now() + config.snapshotStallMs;
+        while (performance.now() < until) {}
         log('stalled', {ms: config.snapshotStallMs});
       }, 100);
       return true;
@@ -161,7 +162,7 @@ const timer=setInterval(async ()=>{
     // plugin, as a component that reports a stage before registration would.
     if(control.rawStdin) {const text=JSON.stringify(control.rawStdin)+'\n';spawned[spawned.length-1]?.rawWrite?.(text);log('raw-stdin',{text});}
     // PRD #1666 §4: a stalled event loop (a dead adapter, while it lasts).
-    if(control.stall) {const until=Date.now()+control.stall;while(Date.now()<until){} log('stalled',{ms:control.stall});}
+    if(control.stall) {const until=performance.now()+control.stall;while(performance.now()<until){} log('stalled',{ms:control.stall});}
     // PRD #1666 §4: OpenCode re-running the server plugin in the same module, as
     // it does when it disposes an instance: the new instance knows nothing.
     if(control.reload && config.server) {
