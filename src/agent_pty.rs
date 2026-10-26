@@ -2301,7 +2301,10 @@ fn pump_reader(
             &agent_id,
             registry.is_shutting_down(),
             || registry.is_agent_still_registered(&agent_id),
-            || registry.agent_exit_code(&agent_id),
+            || {
+                let mut inner = registry.inner.lock();
+                inner.agents.get_mut(&agent_id)?.child.try_wait().ok()?
+            },
         );
     }
     // PRD #1666 S3: whatever the exit, messages bound to this agent can no
@@ -9754,22 +9757,6 @@ impl AgentPtyRegistry {
     /// correctly answers `false`.
     fn is_agent_still_registered(&self, agent_id: &str) -> bool {
         self.inner.lock().agents.contains_key(agent_id)
-    }
-
-    /// PRD #1858: `agent_id`'s exit code, once its child has exited, while
-    /// it is still registered; `None` while it runs, or when a signal ended
-    /// it (`portable_pty` names a signal only in its `Display`).
-    fn agent_exit_code(&self, agent_id: &str) -> Option<i32> {
-        let status = self
-            .inner
-            .lock()
-            .agents
-            .get_mut(agent_id)?
-            .child
-            .try_wait()
-            .ok()??;
-        let signalled = status.to_string().starts_with("Terminated by");
-        (!signalled).then(|| i32::try_from(status.exit_code()).ok())?
     }
 
     /// Marks `agent_id`'s entry as crashed if it is still registered — a

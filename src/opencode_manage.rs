@@ -139,7 +139,7 @@ fn plugin_template(binary_path: &str) -> String {
     let usage = USAGE_FILE_JS;
     format!(
         r#"import {{ execFile, execFileSync, spawn }} from "child_process";
-import {{ appendFileSync }} from "fs";
+import {{ closeSync, constants as fsConstants, fstatSync, openSync, writeSync }} from "fs";
 import {{ isMainThread }} from "worker_threads";
 
 // Duplicate-load guard. The installer fans out to EVERY candidate config root
@@ -1395,32 +1395,76 @@ export default DotAgentDeckPlugin;
 /// of them. The deck reads the last line for an id as the message's usage
 /// (`telemetry::accounting::usage_file`). Nothing else from the message, its
 /// text and error message included, is written.
+///
+/// OpenCode gives every assistant message all five counts (`input`,
+/// `output`, `reasoning`, `cache.read`, `cache.write`), starting at 0 until
+/// the provider reports them. One that is missing or not a count is written
+/// as `null`, which the deck reads as a format it does not know, never as 0;
+/// a message whose counts are all still 0 while it has failed or not
+/// completed is written with `"reported": false`. The file is appended to
+/// only when it is safe: already there (the deck makes it), opened without
+/// following a symlink or waiting on a FIFO, and a regular file of this
+/// user's that no other user can read or write. Otherwise the line is
+/// skipped, and OpenCode carries on.
 const USAGE_FILE_JS: &str = r#"// PRD #1858: each assistant message's usage, for the deck's run record.
 const USAGE_FILE = process.env.DOT_AGENT_DECK_USAGE_FILE;
 const USAGE_FILE_ON = typeof USAGE_FILE === "string" && USAGE_FILE.startsWith("/");
 const MAX_USAGE_MESSAGES = 256;
 const usageWritten = new Map();
 const usageCount = (value) =>
-  typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0;
+  typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
 const usageName = (value) =>
   typeof value === "string" && /^[A-Za-z0-9._:/@+-]{1,128}$/.test(value) ? value : undefined;
+const usageRecord = (value) =>
+  typeof value === "object" && value !== null && !Array.isArray(value) ? value : undefined;
+const appendUsageLine = (text) => {
+  const flags =
+    fsConstants.O_WRONLY | fsConstants.O_APPEND | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0);
+  let fd;
+  try {
+    fd = openSync(USAGE_FILE, flags);
+  } catch {
+    return;
+  }
+  try {
+    const stat = fstatSync(fd);
+    const own = typeof process.getuid !== "function" || stat.uid === process.getuid();
+    if (stat.isFile() && own && (stat.mode & 0o077) === 0) writeSync(fd, text + "\n");
+  } catch {
+    // The run's usage is then not recorded; OpenCode carries on.
+  } finally {
+    closeSync(fd);
+  }
+};
 const recordUsage = (info) => {
   if (!USAGE_FILE_ON || info?.role !== "assistant") return;
   const id = usageName(info.id);
-  const tokens = info.tokens ?? {};
   const line = { v: 1, type: "reply", agent: "opencode" };
   if (id !== undefined) line.id = id;
   const model = usageName(info.modelID);
   if (model !== undefined) line.model = model;
-  line.input = usageCount(tokens.input);
-  line.output = usageCount(tokens.output) + usageCount(tokens.reasoning);
-  line.cache_read = usageCount(tokens.cache?.read);
-  line.cache_write = usageCount(tokens.cache?.write);
-  if (typeof info.cost === "number" && Number.isFinite(info.cost) && info.cost >= 0) {
-    line.cost_usd = info.cost;
+  const tokens = usageRecord(info.tokens);
+  const cache = usageRecord(tokens?.cache);
+  const counts = {
+    input: usageCount(tokens?.input),
+    output: usageCount(tokens?.output),
+    reasoning: usageCount(tokens?.reasoning),
+    cache_read: usageCount(cache?.read),
+    cache_write: usageCount(cache?.write),
+  };
+  const zeros = Object.values(counts).every((count) => count === 0);
+  if ((zeros || tokens === undefined) && (info.error || !info.time?.completed)) {
+    line.reported = false;
+  } else {
+    line.input = counts.input;
+    line.output =
+      counts.output === null || counts.reasoning === null ? null : counts.output + counts.reasoning;
+    line.cache_read = counts.cache_read;
+    line.cache_write = counts.cache_write;
+    if (typeof info.cost === "number" && Number.isFinite(info.cost) && info.cost >= 0) {
+      line.cost_usd = info.cost;
+    }
   }
-  const counted = line.input + line.output + line.cache_read + line.cache_write > 0;
-  if (!counted && (info.error || !info.time?.completed)) line.reported = false;
   const finish = usageName(info.finish);
   if (finish !== undefined) line.stop = finish;
   const error = usageName(info.error?.name);
@@ -1436,11 +1480,7 @@ const recordUsage = (info) => {
       usageWritten.delete(usageWritten.keys().next().value);
     }
   }
-  try {
-    appendFileSync(USAGE_FILE, text + "\n", { mode: 0o600 });
-  } catch {
-    // The run's usage is then not recorded; OpenCode carries on.
-  }
+  appendUsageLine(text);
 };
 "#;
 
@@ -4544,10 +4584,15 @@ process.exit(0);
     /// PRD #1858: each update of an assistant message appends its usage to
     /// the file the deck names, one line of named fields, an unchanged update
     /// appends nothing, and neither the message's text nor its error message
-    /// reaches the file.
+    /// reaches the file. Counts OpenCode gave the plugin that are missing or
+    /// not counts are written as `null`, and the deck's reader takes each
+    /// line as the plugin means it: an empty, partial, renamed, string or
+    /// negative count unrecognized, never a reported zero.
     #[cfg(unix)]
     #[test]
     fn opencode_plugin_appends_assistant_usage_to_the_deck_usage_file() {
+        use crate::telemetry::accounting::usage_file::{UsageAgent, UsageFileReader};
+        use std::os::unix::fs::OpenOptionsExt as _;
         if !node_available() {
             eprintln!("SKIP: node is not available");
             return;
@@ -4557,6 +4602,15 @@ process.exit(0);
         let plugin = dir.path().join("dot-agent-deck.mjs");
         std::fs::write(&plugin, plugin_template(&recorder.to_string_lossy())).unwrap();
         let usage = dir.path().join("run.usage.jsonl");
+        let private = |path: &std::path::Path| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+                .unwrap();
+        };
+        private(&usage);
         let driver = dir.path().join("driver.mjs");
         std::fs::write(
             &driver,
@@ -4564,15 +4618,18 @@ process.exit(0);
                 r#"const {{ default: plugin }} = await import("{}");
 const hooks = await plugin({{ directory: "/work", client: {{}} }});
 const updated = (info) => hooks.event({{ event: {{ type: "message.updated", properties: {{ info }} }} }});
-const reply = {{ id: "msg_1", sessionID: "s1", role: "assistant", modelID: "gpt-5.4-mini",
-  cost: 0, tokens: {{ input: 100, output: 15, reasoning: 5, cache: {{ read: 7, write: 0 }} }},
-  time: {{ created: 1, completed: 2 }}, finish: "stop" }};
+const done = {{ time: {{ created: 1, completed: 2 }}, finish: "stop", role: "assistant", sessionID: "s1", modelID: "gpt-5.4-mini" }};
+const reply = {{ ...done, id: "msg_1", cost: 0, tokens: {{ input: 100, output: 15, reasoning: 5, cache: {{ read: 7, write: 0 }} }} }};
 await updated(reply);
 await updated(reply);
 await updated({{ id: "msg_2", sessionID: "s1", role: "assistant", modelID: "gpt-5.4-mini", cost: 0,
   tokens: {{ input: 0, output: 0, reasoning: 0, cache: {{ read: 0, write: 0 }} }}, time: {{ created: 3 }},
   error: {{ name: "APIError", data: {{ message: "SECRET_ERROR_TEXT", statusCode: 400 }} }} }});
 await updated({{ id: "msg_3", sessionID: "s1", role: "user", text: "SECRET_PROMPT" }});
+await updated({{ ...done, id: "msg_4", tokens: {{}} }});
+await updated({{ ...done, id: "msg_5", tokens: {{ input: 5, output: "7", reasoning: 0, cache: {{ read: 0, write: 0 }} }} }});
+await updated({{ ...done, id: "msg_6", tokens: {{ inputTokens: 5, output: 7, reasoning: 0, cache: {{ read: 0, write: 0 }} }} }});
+await updated({{ ...done, id: "msg_7", tokens: {{ input: 5, output: 7, reasoning: -1, cache: {{ read: 0, write: 0 }} }} }});
 console.log("null");
 process.exit(0);
 "#,
@@ -4580,19 +4637,29 @@ process.exit(0);
             ),
         )
         .unwrap();
-        let out = std::process::Command::new("node")
-            .arg(&driver)
-            .env("DOT_AGENT_DECK_USAGE_FILE", &usage)
-            .env("DOT_AGENT_DECK_INBOX_WATCHER_BACKOFF_MS", "3600000")
-            .output()
-            .expect("run node");
-        assert!(out.status.success(), "{out:?}");
+        let run = |file: &std::path::Path| {
+            let out = std::process::Command::new("node")
+                .arg(&driver)
+                .env("DOT_AGENT_DECK_USAGE_FILE", file)
+                .env("DOT_AGENT_DECK_INBOX_WATCHER_BACKOFF_MS", "3600000")
+                .output()
+                .expect("run node");
+            assert!(out.status.success(), "{out:?}");
+        };
+        run(&usage);
         let written = std::fs::read_to_string(&usage).unwrap();
         assert!(!written.contains("SECRET"), "{written}");
         let lines: Vec<serde_json::Value> = written
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
+        let nulls = |id: &str, input: serde_json::Value, output: serde_json::Value| {
+            serde_json::json!({"v":1,"type":"reply","agent":"opencode","id":id,
+                "model":"gpt-5.4-mini","input":input,"output":output,
+                "cache_read":if id == "msg_4" { serde_json::Value::Null } else { serde_json::json!(0) },
+                "cache_write":if id == "msg_4" { serde_json::Value::Null } else { serde_json::json!(0) },
+                "stop":"stop"})
+        };
         assert_eq!(
             lines,
             vec![
@@ -4600,11 +4667,45 @@ process.exit(0);
                     "model":"gpt-5.4-mini","input":100,"output":20,"cache_read":7,"cache_write":0,
                     "cost_usd":0,"stop":"stop"}),
                 serde_json::json!({"v":1,"type":"reply","agent":"opencode","id":"msg_2",
-                    "model":"gpt-5.4-mini","input":0,"output":0,"cache_read":0,"cache_write":0,
-                    "cost_usd":0,"reported":false,"error":"APIError","status":400}),
+                    "model":"gpt-5.4-mini","reported":false,"error":"APIError","status":400}),
+                nulls("msg_4", serde_json::Value::Null, serde_json::Value::Null),
+                nulls("msg_5", serde_json::json!(5), serde_json::Value::Null),
+                nulls("msg_6", serde_json::Value::Null, serde_json::json!(7)),
+                nulls("msg_7", serde_json::json!(5), serde_json::Value::Null),
             ],
             "{written}"
         );
+        // Each line as the deck's reader takes it.
+        let want = [
+            "provider_reported",
+            "not_recorded",
+            "unrecognized_format",
+            "unrecognized_format",
+            "unrecognized_format",
+            "unrecognized_format",
+        ];
+        for (n, (line, want)) in written.lines().zip(want).enumerate() {
+            let one = dir.path().join(format!("line-{n}.jsonl"));
+            std::fs::write(&one, format!("{line}\n")).unwrap();
+            let mut reader = UsageFileReader::new(&one);
+            reader.poll().unwrap();
+            let tokens = reader.summary().usage(UsageAgent::OpenCode).models[0].tokens;
+            let got = tokens
+                .unavailable()
+                .map_or(tokens.provenance().as_str(), |r| r.as_str());
+            assert_eq!(got, want, "{line}: {tokens:?}");
+        }
+        // A path that is not a private regular file the deck made is not
+        // written: a symlink, and a name that is not there.
+        let target = dir.path().join("elsewhere");
+        private(&target);
+        let link = dir.path().join("link.usage.jsonl");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        run(&link);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "");
+        let missing = dir.path().join("missing.usage.jsonl");
+        run(&missing);
+        assert!(!missing.exists());
     }
 
     /// PRD #1666 §2–§4: drive the shared receipt receiver against a fake

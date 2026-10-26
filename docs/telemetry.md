@@ -159,7 +159,7 @@ Each `agent.run` span says how many tokens the run used on which model, how much
 | `subscription_zero` | The agent reported a cost of 0 for work that used tokens, which is what a subscription provider reports. The run's cost is not knowable. |
 | `unknown_price` | The agent did not know the price of a model the run used. |
 | `not_recorded` | The agent kept no record of it for this run, for example because it was killed before writing its totals, or because the deck's Pi extension or OpenCode plugin was not loaded. |
-| `incomplete` | Part of the value was known and part was not, so a total would have been a part presented as the whole. |
+| `incomplete` | Part of the value was known and part was not, so a total would have been a part presented as the whole: for example, one of the run's sessions had a record the deck could not read, or the agent stopped in the middle of writing it. |
 | `unrecognized_format` | The agent's record is in a format the deck does not know, as can happen after an agent upgrade. |
 | `window_reset`, `plan_changed`, `quota_decreased` | Codex's allowance window reset, its plan changed, or its used share went down during the run, so the share the run used cannot be worked out. |
 
@@ -187,7 +187,7 @@ Events on the `agent.run` span, one `deck.model_usage` per model the run used:
 
 | Attribute | Value |
 | --- | --- |
-| `gen_ai.response.model` | The model, such as `claude-haiku-4-5-20251001` or `gpt-5.4-mini`. Left out for a model whose name the deck does not recognise as one of the known model families, such as a custom or local model: its tokens are still sent. |
+| `gen_ai.response.model` | The model, such as `claude-haiku-4-5-20251001` or `gpt-5.4-mini`. Left out for a model whose name the deck does not recognise as a known model's, such as a custom or local model, or a name with a path or a prefix of your own in front of it: its tokens are still sent. |
 | `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.usage.cache_read.input_tokens`, `gen_ai.usage.cache_write.input_tokens` | That model's tokens, as on the run. |
 | `deck.tokens.provenance`, `deck.tokens.unavailable_reason`, `deck.cost.microusd`, `deck.cost.provenance`, `deck.cost.unavailable_reason` | That model's provenance and cost estimate, as on the run. |
 
@@ -197,8 +197,8 @@ Where each agent's figures come from:
 
 | Agent | Tokens | Cost | Allowance | How it ended |
 | --- | --- | --- | --- | --- |
-| Claude Code | Claude Code's own session total, which it writes when it exits. End a Claude Code run with `/exit`: one that is killed, or whose pane is closed while Claude Code runs, can have its tokens `not_recorded`. | Claude Code's own estimate. | `no_channel` | Claude Code's last turn, with the kind of an API error and its HTTP status. |
-| Codex | Codex's own running total, as the run goes. | `no_channel`: Codex reports no cost. | Codex's plan and its main allowance window. **The used share is the plan's, not the run's alone**: runs on the same plan whose times overlap share one window, so each of them counts the others' use too, and a run's figure is at most what it used. The first figure arrives with the run's first reply, so the run's first request is not in it. | Codex's last turn, with its error kind. |
+| Claude Code | Claude Code's own session total, which it writes when it exits. End a Claude Code run with `/exit`: one that is killed, or whose pane is closed while Claude Code runs, can have its tokens `not_recorded`. A run that resumes an earlier session counts only what it added, or is `incomplete` when the deck cannot tell what that was. | Claude Code's own estimate. | `no_channel` | Claude Code's last turn, with the kind of an API error and its HTTP status. |
+| Codex | Codex's own running total, as the run goes. | `no_channel`: Codex reports no cost. | Codex's plan and its main allowance window. **The used share is the plan's, not the run's alone**: runs on the same plan whose times overlap share one window, so a run's figure includes their use too. The first figure arrives with the run's first reply, so the run's first request is not in it. So the difference between the two figures is not an exact count of what the run took from the allowance. | Codex's last turn, with its error kind. |
 | OpenCode | Each reply's tokens, as OpenCode hands them to the deck's OpenCode plugin. | OpenCode's own figure. Subscription providers report 0, which is sent as `unavailable` with `subscription_zero`. | `no_channel` | OpenCode's last reply. |
 | Pi | Each reply's tokens, as Pi hands them to the deck's Pi extension. | Pi's own estimate. | `no_channel` | Pi's last reply. |
 | Devin | `no_channel` | `no_channel` | `no_channel` | `unknown`, `measured` |
@@ -282,7 +282,7 @@ The deck builds what it sends from the attributes on this page. The values of `O
 - secrets: API keys, the values of environment variables, and the values of your OTLP headers (those go to the endpoint you configured as headers, and to nothing else, and the deck does not write them to its log);
 - pane titles, status details, branch names, working-directory paths, remote URLs, or command lines;
 - an agent's error messages: a failed run carries the kind of failure from a known list, or `other`;
-- names you chose: a model name is sent only when it is of a known model family, and a Codex plan only from the plans Codex is known to report.
+- names you chose: a model name is sent only when the deck recognises it as a known model's name, and a Codex plan only from the plans Codex is known to report.
 
 The [collector](#cpu-memory-and-disk-per-run), a separate program you run yourself, sends a worktree's path only when you start it with `--send-worktree-paths`; [What it sends](#what-it-sends) has its list.
 

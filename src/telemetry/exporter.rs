@@ -55,7 +55,8 @@ use tokio::time::Instant;
 
 use crate::event::BroadcastMsg;
 
-use super::accounting::run_usage::UsageDirs;
+use super::accounting::locate::TrustedDir;
+use super::accounting::run_usage::{UsageDirs, UsageFile};
 use super::accounting::usage_file::USAGE_FILE_ENV;
 use super::accounting::{UsageSource, locate, usage_source};
 use super::config::{EnvMap, TelemetryConfig, redacted_endpoint};
@@ -65,7 +66,7 @@ use super::propagation::{RunIdentity, agent_env};
 use super::resource::{ResourceAttribute, deck_resource, host_name};
 use super::run_context::{ProbeSettings, Probes};
 use super::span::{SpanRecord, new_run_id};
-use super::tracker::{EndReason, RunStart, RunTracker};
+use super::tracker::{EndReason, FinishingRun, RunStart, RunTracker};
 use super::{Protocol, now_unix_nanos, otlp};
 
 /// Spans per request, at most.
@@ -102,19 +103,83 @@ pub const MAX_RESPONSE_BODY: usize = 64 * 1024;
 pub const USAGE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// The directory, under the per-run configuration directory, that holds the
 /// usage files the deck's Pi extension and OpenCode plugin append to.
-const USAGE_DIR: &str = "usage";
+pub(crate) const USAGE_DIR: &str = "usage";
 
-/// Whether `dir` exists, or could be made, as a directory only this user can
-/// enter.
-fn private_dir(dir: &Path) -> bool {
-    let made = {
-        let mut builder = std::fs::DirBuilder::new();
-        builder.recursive(true);
-        #[cfg(unix)]
-        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-        builder.create(dir)
+/// The deck's usage directory, [`USAGE_DIR`] in `config_dir`, made if it is
+/// not there and opened as a [`TrustedDir`] when it is a directory of this
+/// user's — not a symlink — that no other user can enter: one with group or
+/// other permissions is narrowed to the owner first. `config_dir` itself is
+/// resolved once, as any trusted root is. `None` otherwise, and then no run
+/// gets a usage file; elsewhere than Unix no run gets one either.
+fn private_dir(config_dir: &Path) -> Option<TrustedDir> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(config_dir)
+            .ok()?;
+        let root = TrustedDir::open(config_dir)?;
+        root.make_dir(std::ffi::OsStr::new(USAGE_DIR), 0o700).ok()?;
+        let dir = root.subdir(Path::new(USAGE_DIR))?;
+        if dir.metadata().ok()?.permissions().mode() & 0o077 != 0 {
+            dir.set_mode(0o700).ok()?;
+            if dir.metadata().ok()?.permissions().mode() & 0o077 != 0 {
+                return None;
+            }
+        }
+        Some(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = config_dir;
+        None
+    }
+}
+
+/// Create run `run_id`'s usage file in `dir`: a new regular file only this
+/// user can read or write, so a name already there — a file, a symlink or a
+/// FIFO — is refused rather than reused. `None` when it cannot be made.
+fn new_usage_file(dir: TrustedDir, run_id: &str) -> Option<UsageFile> {
+    let name = locate::usage_file_name(run_id, std::process::id())?;
+    #[cfg(unix)]
+    {
+        let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW;
+        drop(dir.open_raw(Path::new(&name), flags, 0o600).ok()?);
+    }
+    Some(UsageFile { dir, name })
+}
+
+/// Remove the usage files in the deck's usage directory under `config_dir`
+/// left by a daemon that ended without removing them (PRD #1858): called as
+/// a daemon starts, before any run of its own exists. A file names the
+/// daemon that owns it ([`locate::usage_file_name`]); one whose daemon still
+/// runs is kept, since another daemon on the same state directory may be
+/// reading it, unless that process is this one, which has no run yet. The
+/// system can reuse an ended daemon's process id, which keeps its files
+/// until a later start.
+pub(crate) fn remove_leftover_usage_files(config_dir: &Path) {
+    let Some(dir) = TrustedDir::open(config_dir).and_then(|root| root.subdir(Path::new(USAGE_DIR)))
+    else {
+        return;
     };
-    made.is_ok() && std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir())
+    let own = std::process::id().to_string();
+    for name in dir.entry_names(usize::MAX) {
+        let Some(pid) = locate::usage_file_daemon(name.as_encoded_bytes()) else {
+            continue;
+        };
+        #[cfg(unix)]
+        let gone = pid == own.as_bytes() || !super::launch::process_is_live(pid);
+        #[cfg(not(unix))]
+        let gone = {
+            let _ = (pid, &own);
+            true
+        };
+        if gone && dir.has_file(Path::new(&name)) {
+            dir.remove(&name);
+        }
+    }
 }
 
 enum ExportMsg {
@@ -502,11 +567,15 @@ impl Telemetry {
         );
         env.extend(super::launch::extra_env(&start.agent, &base));
         let usage_dirs = self.usage_dirs(&start, spawn_env);
-        if let Some(file) = usage_dirs.usage_file.as_deref().and_then(Path::to_str) {
-            // Over any value the spawn inherited, which names another run's
-            // file: a run started from inside another agent's pane.
-            env.push((USAGE_FILE_ENV.to_string(), file.to_string()));
-        }
+        // This run's own usage file, else none: over any value the spawn
+        // inherited, which names another run's file (a run started from
+        // inside another agent's pane, or by a daemon started in one).
+        let usage_file = usage_dirs
+            .usage_file
+            .as_ref()
+            .and_then(|f| f.dir.path().join(&f.name).to_str().map(str::to_string))
+            .unwrap_or_default();
+        env.push((USAGE_FILE_ENV.to_string(), usage_file));
         // Whether or not the shim is installed: without it, an id the daemon
         // inherited from another deck's agent would reach this one (#1902).
         env.push((super::shim::RUN_ID_ENV.to_string(), start.run_id.clone()));
@@ -564,9 +633,8 @@ impl Telemetry {
                 dirs.usage_file = self
                     .config_dir
                     .as_deref()
-                    .map(|dir| dir.join(USAGE_DIR))
-                    .filter(|dir| private_dir(dir))
-                    .and_then(|dir| locate::usage_file(&dir, &start.run_id));
+                    .and_then(private_dir)
+                    .and_then(|dir| new_usage_file(dir, &start.run_id));
             }
             UsageSource::UsageFile | UsageSource::NoChannel => {}
         }
@@ -873,13 +941,38 @@ impl Telemetry {
 }
 
 impl Shared {
+    /// Run `f` on the tracker, then queue the spans it finished. A run that
+    /// ended has its usage record drained after the tracker is let go
+    /// ([`FinishingRun::complete`]), on this thread.
     fn with_tracker(&self, f: impl FnOnce(&mut RunTracker)) {
-        let finished = {
+        let (mut finished, finishing) = {
             let mut tracker = self.tracker.lock().unwrap_or_else(|p| p.into_inner());
             f(&mut tracker);
-            tracker.take_finished()
+            tracker.take_finished_deferred()
         };
+        finished.extend(finishing.into_iter().map(FinishingRun::complete));
         self.enqueue(finished);
+    }
+
+    /// Poll every open run's usage record (PRD #1858) on a blocking thread,
+    /// outside the tracker's lock, unless the last poll is still reading.
+    fn poll_usage(&self, polling: &Arc<std::sync::atomic::AtomicBool>) {
+        use std::sync::atomic::Ordering;
+        if polling.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let runs = self
+            .tracker
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .usage_to_poll();
+        let polling = Arc::clone(polling);
+        tokio::task::spawn_blocking(move || {
+            for run in runs {
+                run.poll();
+            }
+            polling.store(false, Ordering::Release);
+        });
     }
 
     fn lock_filters(&self) -> std::sync::MutexGuard<'_, HashMap<String, Vec<PaneInput>>> {
@@ -1034,6 +1127,7 @@ async fn run_ingest(shared: Arc<Shared>, mut commands: mpsc::UnboundedReceiver<C
     let mut escape_due: Option<std::time::Instant> = None;
     let mut usage_poll = tokio::time::interval(USAGE_POLL_INTERVAL);
     usage_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let usage_polling = Arc::new(std::sync::atomic::AtomicBool::new(false));
     loop {
         tokio::select! {
             biased;
@@ -1059,7 +1153,7 @@ async fn run_ingest(shared: Arc<Shared>, mut commands: mpsc::UnboundedReceiver<C
             () = sleep_until(escape_due) => {
                 escape_due = shared.settle_escapes(std::time::Instant::now());
             }
-            _ = usage_poll.tick() => shared.with_tracker(RunTracker::poll_usage),
+            _ = usage_poll.tick() => shared.poll_usage(&usage_polling),
             msg = next_event(&mut events) => match msg {
                 Ok(msg) => shared.observe(&msg),
                 Err(broadcast::error::RecvError::Lagged(missed)) => {
@@ -1180,11 +1274,12 @@ fn apply(shared: &Shared, command: Command) -> bool {
         Command::Shutdown { ack } => {
             // A run's last key, a lone ESC still in its window, is counted as
             // the tracker ends the run.
-            let finished = {
+            let (mut finished, finishing) = {
                 let mut tracker = shared.tracker.lock().unwrap_or_else(|p| p.into_inner());
                 tracker.end_all(EndReason::DaemonShutdown, now_unix_nanos());
-                tracker.take_finished()
+                tracker.take_finished_deferred()
             };
+            finished.extend(finishing.into_iter().map(FinishingRun::complete));
             shared.lock_filters().clear();
             // Queued by `shutdown`, which can wait for room; when it stopped
             // waiting for these, as best it can.
@@ -2020,17 +2115,20 @@ mod tests {
         );
     }
 
-    /// The Devin configurations the shim writes for a run go when that run's
-    /// agent ends, and only that run's; a stopping daemon removes the rest.
     /// PRD #1858: a Pi or OpenCode run is handed a usage file of its own,
-    /// in a directory only this user can enter, over one it inherited from
-    /// the pane it was started from; a run of another agent is handed none.
+    /// made new and only this user's, in a directory no other user can
+    /// enter, over one it inherited from the pane it was started from; a run
+    /// of another agent is handed an empty value over the inherited one.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_pi_or_opencode_run_gets_its_own_usage_file() {
         use std::os::unix::fs::PermissionsExt as _;
         let home = tempfile::tempdir().unwrap();
         let dir = home.path().join("state");
+        // A directory left open to others is narrowed before it is used.
+        std::fs::create_dir_all(dir.join(USAGE_DIR)).unwrap();
+        std::fs::set_permissions(dir.join(USAGE_DIR), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
         let telemetry = Arc::new(Telemetry::start_with(
             &env(&ON),
             Settings {
@@ -2042,6 +2140,7 @@ mod tests {
             USAGE_FILE_ENV.to_string(),
             "/parent.usage.jsonl".to_string(),
         )];
+        let usage_dir = std::fs::canonicalize(dir.join(USAGE_DIR)).unwrap();
         for agent in [AgentType::Pi, AgentType::OpenCode, AgentType::ClaudeCode] {
             let start = RunStart {
                 agent: agent.clone(),
@@ -2053,19 +2152,23 @@ mod tests {
                 .iter()
                 .rev()
                 .find(|(k, _)| k == USAGE_FILE_ENV)
-                .map(|(_, v)| PathBuf::from(v));
+                .map(|(_, v)| v.clone());
             if agent == AgentType::ClaudeCode {
-                assert_eq!(file, None);
+                assert_eq!(file.as_deref(), Some(""));
                 continue;
             }
+            let file = PathBuf::from(file.unwrap());
             assert_eq!(
                 file,
-                Some(
-                    dir.join(USAGE_DIR)
-                        .join(format!("{}.usage.jsonl", run.run_id))
-                ),
+                usage_dir.join(format!("{}-{}.usage.jsonl", run.run_id, std::process::id())),
                 "{agent:?}"
             );
+            let meta = std::fs::symlink_metadata(&file).unwrap();
+            assert!(meta.is_file() && meta.len() == 0, "{agent:?}");
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600, "{agent:?}");
+            // A run whose agent never started leaves no file behind.
+            drop(run);
+            assert!(!file.exists(), "{agent:?}");
         }
         let mode = std::fs::metadata(dir.join(USAGE_DIR))
             .unwrap()
@@ -2074,6 +2177,69 @@ mod tests {
         assert_eq!(mode & 0o777, 0o700);
     }
 
+    /// PRD #1858: a usage directory that is a symlink, or another user's,
+    /// is not used: the run gets an empty value, never a path into it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unsafe_usage_directory_gives_no_usage_file() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("state");
+        std::fs::create_dir_all(&dir).unwrap();
+        let elsewhere = home.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, dir.join(USAGE_DIR)).unwrap();
+        let telemetry = Arc::new(Telemetry::start_with(
+            &env(&ON),
+            Settings {
+                config_dir: Some(dir.clone()),
+                ..Settings::default()
+            },
+        ));
+        let start = RunStart {
+            agent: AgentType::Pi,
+            ..run_start("p1")
+        };
+        let run = telemetry.prepare_run(start, &[], None).unwrap();
+        assert_eq!(get(&run.env, USAGE_FILE_ENV), Some(""));
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+    }
+
+    /// PRD #1858: the usage files a daemon that ended without reading them
+    /// left are removed as the next daemon starts — its own process id's
+    /// included, since it has no run yet — and a file whose daemon still runs
+    /// is kept, as is anything not named as the deck names them.
+    #[cfg(unix)]
+    #[test]
+    fn leftover_usage_files_go_unless_their_daemon_runs() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let usage = home.path().join(USAGE_DIR);
+        std::fs::create_dir_all(&usage).unwrap();
+        let name = |pid: u32| format!("{}-{pid}.usage.jsonl", super::super::span::new_run_id());
+        let gone = [name(dead), name(std::process::id())];
+        // Process 1 always runs.
+        let kept = [
+            name(1),
+            "notes.txt".to_string(),
+            "x.usage.jsonl".to_string(),
+        ];
+        for file in gone.iter().chain(&kept) {
+            std::fs::write(usage.join(file), "{}").unwrap();
+        }
+        remove_leftover_usage_files(home.path());
+        for file in &gone {
+            assert!(!usage.join(file).exists(), "left over: {file}");
+        }
+        for file in &kept {
+            assert!(usage.join(file).exists(), "removed: {file}");
+        }
+        remove_leftover_usage_files(&home.path().join("absent"));
+    }
+
+    /// The Devin configurations the shim writes for a run go when that run's
+    /// agent ends, and only that run's; a stopping daemon removes the rest.
     /// Without the shim no run is tracked.
     #[cfg(unix)]
     #[tokio::test]

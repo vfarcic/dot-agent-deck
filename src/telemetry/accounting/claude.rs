@@ -10,14 +10,22 @@
 //!
 //! A resumed session starts from the total its last run left, so a
 //! `cost-state` already in the transcript when the run began is that run's,
-//! not this one's: the deck marks it as the baseline
-//! ([`ClaudeTranscriptSummary::seal_baseline`]) and counts only what the
-//! total grew by since. A total that went down in any count since the
-//! baseline cannot be told apart from a counter that restarted, so it is
+//! not this one's. Where the run's part of a transcript begins is read from
+//! the transcript itself ([`ClaudeTranscriptSummary::set_run_start`]): the
+//! first record stamped at or after the run's start, in a transcript holding
+//! records stamped before it, is the boundary, wherever the reader was when
+//! it got there. The last `cost-state` before it is the baseline
+//! ([`ClaudeTranscriptSummary::seal_baseline`]), and the run is credited
+//! only with what the total grew by since, unless the total itself started
+//! during the run (`startTime`), which makes it the run's alone. A total
+//! carried from before the run with no baseline to count from, one in a
+//! transcript older than the run with no stamped record to place the
+//! boundary by, or one that went down in any count since the baseline is
 //! [`Unavailable::Incomplete`], never a guess.
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::time::SystemTime;
 
 use serde::Deserialize;
 use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
@@ -68,6 +76,27 @@ pub struct ClaudeTranscriptSummary {
     /// The last turn before the latest prompt-like `user` record, restored
     /// when that record turns out to have been a local command (`/exit`).
     before_user: Option<Option<AgentTurnEnd>>,
+    /// When the run began, in milliseconds since the Unix epoch
+    /// ([`Self::set_run_start`]); `None` reads every record as the run's.
+    run_start_ms: Option<i64>,
+    /// Which part of the transcript the reader is in, by its records'
+    /// stamps, relative to the run's start.
+    part: Part,
+    /// The file was created before the run began, where its creation time
+    /// is known ([`Self::note_birth`]).
+    born_before_run: Option<bool>,
+}
+
+/// Where in a transcript the reader is, relative to the run's start.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Part {
+    /// No stamped record read yet.
+    #[default]
+    Unplaced,
+    /// Records stamped before the run began: an earlier run's.
+    Before,
+    /// The run's own records.
+    Run,
 }
 
 impl ClaudeTranscriptSummary {
@@ -91,6 +120,50 @@ impl ClaudeTranscriptSummary {
         self.before_user = None;
     }
 
+    /// The run this transcript is read for began at `started`, in
+    /// nanoseconds since the Unix epoch: records stamped before it are an
+    /// earlier run's, and the first one stamped at or after it seals the
+    /// baseline (see the module docs). Kept when the reader starts over.
+    pub fn set_run_start(&mut self, started: u64) {
+        self.run_start_ms = i64::try_from(started / 1_000_000).ok();
+    }
+
+    /// When the file was created, where known: a transcript older than the
+    /// run with no stamped record to place its boundary by is not read as
+    /// the run's.
+    pub fn note_birth(&mut self, born: Option<SystemTime>) {
+        let (Some(start), Some(born)) = (self.run_start_ms, born) else {
+            return;
+        };
+        if let Ok(since) = born.duration_since(SystemTime::UNIX_EPOCH) {
+            self.born_before_run =
+                Some(i64::try_from(since.as_millis()).is_ok_and(|ms| ms < start));
+        }
+    }
+
+    /// A record stamped `stamp` was read, before the record itself is
+    /// applied, so the record that crosses the boundary is the run's.
+    fn observe_stamp(&mut self, stamp: &str) {
+        let Some(start) = self.run_start_ms else {
+            return;
+        };
+        let Some(at) = chrono::DateTime::parse_from_rfc3339(stamp)
+            .ok()
+            .map(|t| t.timestamp_millis())
+        else {
+            return;
+        };
+        match self.part {
+            Part::Run => {}
+            _ if at < start => self.part = Part::Before,
+            Part::Before => {
+                self.seal_baseline();
+                self.part = Part::Run;
+            }
+            Part::Unplaced => self.part = Part::Run,
+        }
+    }
+
     pub fn last_turn(&self) -> Option<&AgentTurnEnd> {
         self.last_turn.as_ref()
     }
@@ -103,24 +176,54 @@ impl ClaudeTranscriptSummary {
         }
     }
 
-    /// The run's usage. Before [`seal_baseline`](Self::seal_baseline) every
-    /// total read counts as the run's own.
+    /// The run's usage. Without a run start, and before
+    /// [`seal_baseline`](Self::seal_baseline), every total read counts as the
+    /// run's own.
     pub fn usage(&self) -> AgentUsage {
+        let older = self.born_before_run == Some(true);
+        let placed = match self.part {
+            _ if self.run_start_ms.is_none() => true,
+            Part::Run => true,
+            // Only an earlier run's records so far: this run wrote none.
+            Part::Before => false,
+            // No stamped record yet: the run's own transcript, unless the
+            // file is older than the run.
+            Part::Unplaced => !older,
+        };
         let models = match (&self.latest, self.sealed && !self.total_since_seal) {
             (None, _) | (_, true) => usage_unavailable(Unavailable::NotRecorded),
+            _ if !placed && self.part == Part::Before => {
+                usage_unavailable(Unavailable::NotRecorded)
+            }
+            // A transcript older than the run, with nothing to say where the
+            // run's part of it begins.
+            _ if !placed => usage_unavailable(Unavailable::Incomplete),
             (Some(Err(())), _) => usage_unavailable(Unavailable::UnrecognizedFormat),
             (Some(Ok(latest)), _) => self.models_since_baseline(latest),
         };
         AgentUsage {
             models,
             quota: Field::Unavailable(Unavailable::NoChannel),
-            last_turn: self.last_turn.clone(),
+            last_turn: if placed { self.last_turn.clone() } else { None },
         }
     }
 
     fn models_since_baseline(&self, latest: &CostState) -> Vec<super::ModelUsage> {
         let empty = CostState::default();
-        let base = self.baseline.as_ref().unwrap_or(&empty);
+        // A total that started during the run holds the run's usage alone.
+        let own_total = self
+            .run_start_ms
+            .zip(latest.start_time)
+            .is_some_and(|(start, total)| total >= start);
+        let base = match (&self.baseline, own_total) {
+            (Some(base), false) => base,
+            // Carried from before the run, with no total before the
+            // boundary to count from.
+            (None, false) if self.sealed && self.run_start_ms.is_some() => {
+                return usage_unavailable(Unavailable::Incomplete);
+            }
+            _ => &empty,
+        };
         if base
             .models
             .keys()
@@ -175,6 +278,9 @@ impl ClaudeTranscriptSummary {
     }
 
     fn observe_record(&mut self, record: ClaudeRecord) {
+        if let Some(stamp) = record.timestamp.0.as_deref() {
+            self.observe_stamp(stamp);
+        }
         let flag = |v: &OptScalar| v.as_bool() == Some(true);
         if flag(&record.sidechain) {
             return;
@@ -244,24 +350,54 @@ impl ClaudeTranscriptSummary {
     }
 }
 
+/// One Claude Code session a run's events named: its transcript's summary,
+/// when the transcript was read, and when the deck first saw the session, in
+/// milliseconds since the Unix epoch.
+pub struct Observed<'a> {
+    pub summary: Option<&'a ClaudeTranscriptSummary>,
+    /// The transcript was read from, then could not be.
+    pub cut_short: bool,
+    pub seen_at_ms: i64,
+}
+
 /// One run's usage from the transcripts of every Claude Code session it
 /// held, in the order the run saw them. Claude Code can carry one running
 /// total from a session into the next (a `/clear`, or a resume), so of the
 /// transcripts whose last totals share a start, only the last is counted;
 /// the rest are combined as separate sessions
-/// ([`super::combine_sessions`]).
-pub fn combine_transcripts(sessions: &[&ClaudeTranscriptSummary]) -> AgentUsage {
+/// ([`super::combine_sessions`]). A session whose transcript was not read
+/// is an unknown part of the run, so the run's total is incomplete and its
+/// last turn unknown when it was the last — unless a later transcript's
+/// running total had started by the time the deck saw that session, and so
+/// already holds it.
+pub fn combine_transcripts(sessions: &[Observed]) -> AgentUsage {
+    let later_start = |i: usize| {
+        sessions[i + 1..].iter().filter_map(|later| {
+            later
+                .summary
+                .and_then(ClaudeTranscriptSummary::tracker_start)
+        })
+    };
     let parts = sessions
         .iter()
         .enumerate()
-        .filter(|(i, session)| {
-            session.tracker_start().is_none_or(|start| {
-                !sessions[i + 1..]
-                    .iter()
-                    .any(|later| later.tracker_start() == Some(start))
-            })
+        .filter_map(|(i, session)| match session.summary {
+            Some(summary) => summary
+                .tracker_start()
+                .is_none_or(|start| !later_start(i).any(|later| later == start))
+                .then(|| summary.usage()),
+            None => {
+                (!later_start(i).any(|start| start <= session.seen_at_ms)).then(|| AgentUsage {
+                    models: usage_unavailable(if session.cut_short {
+                        Unavailable::Incomplete
+                    } else {
+                        Unavailable::NotRecorded
+                    }),
+                    quota: Field::Unavailable(Unavailable::NoChannel),
+                    last_turn: Some(AgentTurnEnd::Unknown),
+                })
+            }
         })
-        .map(|(_, session)| session.usage())
         .collect();
     super::combine_sessions(parts)
 }
@@ -279,6 +415,13 @@ impl LineSummary for ClaudeTranscriptSummary {
         self.observe_record(record);
     }
 
+    fn reset(&mut self) {
+        *self = ClaudeTranscriptSummary {
+            run_start_ms: self.run_start_ms,
+            ..ClaudeTranscriptSummary::default()
+        };
+    }
+
     fn malformed(&mut self, line: &[u8]) {
         // A total that did not parse is newer than the last one read, so
         // keeping the older one would report a figure the session has since
@@ -288,6 +431,11 @@ impl LineSummary for ClaudeTranscriptSummary {
             if self.sealed {
                 self.total_since_seal = true;
             }
+        } else {
+            // A turn's record the reader could not read: how the last turn
+            // ended is not known.
+            self.before_user = None;
+            self.last_turn = Some(AgentTurnEnd::Unknown);
         }
     }
 }
@@ -328,6 +476,9 @@ pub struct ClaudeRecord {
     has_unknown_model_cost: OptScalar,
     #[serde(rename = "startTime", default)]
     start_time: OptScalar,
+    /// When the record was written: RFC 3339.
+    #[serde(default)]
+    timestamp: OptStr,
 }
 
 /// A record's `message`, of which only `stop_reason` is kept; any other
@@ -737,7 +888,12 @@ mod tests {
             cost_state(&[("claude-opus-5-5", 1, 1, 0, 0, 0.5)]),
             9,
         )]);
-        let carried = combine_transcripts(&[first.summary(), second.summary()]);
+        let read = |s| Observed {
+            summary: Some(s),
+            cut_short: false,
+            seen_at_ms: 0,
+        };
+        let carried = combine_transcripts(&[read(first.summary()), read(second.summary())]);
         assert_eq!(
             model(&carried, "claude-opus-5-5").tokens,
             Field::ProviderReported(Tokens {
@@ -747,7 +903,7 @@ mod tests {
                 cache_write: 0,
             })
         );
-        let separate = combine_transcripts(&[first.summary(), other.summary()]);
+        let separate = combine_transcripts(&[read(first.summary()), read(other.summary())]);
         assert_eq!(
             model(&separate, "claude-opus-5-5").cost,
             Field::Estimated(MicroUsd(1_500_000))

@@ -27,7 +27,6 @@
  */
 
 import { spawn } from "node:child_process";
-import { appendFileSync } from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
@@ -66,11 +65,10 @@ import {
 	spawnFailureMessage,
 	tagHandOver,
 	untagHandOver,
-	usageFileLine,
-	usageFilePath,
 	WATCHER_NOT_IN_DECK_EXIT,
 } from "./orchestrator.ts";
 import { createPiTelemetry } from "./telemetry.ts";
+import { appendUsageLine, usageFileLine, usageFilePath, usageTurnStartLine } from "./usage-file.ts";
 
 /**
  * The deck CLI this pane shells: the operator's absolute `DOT_AGENT_DECK_BIN`
@@ -1305,19 +1303,19 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 			await telemetry.shutdown();
 		});
 	}
-	// PRD #1858: each reply's usage, appended to the file the deck reads this
-	// run's usage from, when the deck named one.
+	// PRD #1858: each reply's usage, and each turn's start, appended to the
+	// file the deck reads this run's usage from, when the deck named one. An
+	// append that is not safe is skipped: the run's usage is then not
+	// recorded, and Pi carries on.
 	const usageFile = usageFilePath(process.env, process.platform);
 	if (usageFile !== undefined) {
+		pi.on("agent_start", () => {
+			appendUsageLine(usageFile, usageTurnStartLine());
+		});
 		pi.on("message_end", (event) => {
 			const line = usageFileLine(event);
-			if (line === undefined) {
-				return;
-			}
-			try {
-				appendFileSync(usageFile, `${line}\n`, { mode: 0o600 });
-			} catch {
-				// The run's usage is then not recorded; Pi carries on.
+			if (line !== undefined) {
+				appendUsageLine(usageFile, line);
 			}
 		});
 	}

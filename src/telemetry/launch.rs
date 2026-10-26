@@ -583,7 +583,7 @@ pub fn remove_run_config_files(dir: &Path, run_id: &str) {
 /// or past `pid_t` — is no process. The system can reuse an exited Devin's
 /// id, which keeps its file until a later daemon's start.
 #[cfg(unix)]
-fn process_is_live(pid: &[u8]) -> bool {
+pub(crate) fn process_is_live(pid: &[u8]) -> bool {
     let Some(pid) = std::str::from_utf8(pid)
         .ok()
         .and_then(|p| p.parse::<libc::pid_t>().ok())
@@ -669,7 +669,7 @@ fn remove_config_files_where(dir: &Path, which: impl Fn(&[u8], &[u8]) -> bool) {
 /// The names of the entries of the directory open at `dir`, `.` and `..`
 /// left out. Empty when it cannot be read.
 #[cfg(unix)]
-fn dir_entry_names(dir: &std::fs::File) -> Vec<std::ffi::CString> {
+pub(crate) fn dir_entry_names(dir: &std::fs::File) -> Vec<std::ffi::CString> {
     use std::os::fd::AsRawFd;
     // `fdopendir` takes ownership of the descriptor it is given, so it gets
     // its own copy.

@@ -46,8 +46,8 @@ use std::collections::{HashMap, VecDeque};
 use crate::event::{AgentEvent, AgentType, DAEMON_PANE_CLOSED_METADATA_KEY, EventType};
 use crate::state::{AppState, SessionStatus};
 
+use super::accounting::AccountingKey;
 use super::accounting::run_usage::{RunUsage, UsageDirs};
-use super::accounting::{AccountingKey, RunExport};
 use super::ci::{CiEffect, RunCi};
 use super::operation::{Description, describe_tool, is_shell_tool};
 use super::run_context::RunContext;
@@ -287,6 +287,15 @@ struct ActiveRun {
     usage: Option<RunUsage>,
 }
 
+impl PendingRun {
+    /// The run will not open: remove the usage file made for it.
+    fn forget(self) {
+        if let Some(file) = self.usage_dirs.usage_file {
+            file.dir.remove(std::ffi::OsStr::new(&file.name));
+        }
+    }
+}
+
 /// A run a newer generation of its pane replaced before its own end was seen:
 /// see [`RunTracker::begin_run`].
 struct ReplacedRun {
@@ -335,6 +344,9 @@ pub struct RunTracker {
     /// Runs replaced before their own end was seen, the longest-waiting first.
     replaced: Vec<ReplacedRun>,
     finished: Vec<SpanRecord>,
+    /// Ended runs whose span waits for their usage to be read
+    /// ([`Self::take_finished_deferred`]).
+    finishing: Vec<FinishingRun>,
     held_input: Option<HeldInput>,
     /// Test witness: the [`ShadowCards`] alive.
     #[cfg(test)]
@@ -380,7 +392,9 @@ impl RunTracker {
 
     /// The agent of the prepared run `run_id` did not start: forget the run.
     pub fn abort_run(&mut self, run_id: &str) {
-        self.pending.remove(run_id);
+        if let Some(pending) = self.pending.remove(run_id) {
+            pending.forget();
+        }
     }
 
     /// The agent of the prepared run `run_id` started: open its run, from the
@@ -494,19 +508,17 @@ impl RunTracker {
         }
     }
 
-    /// Read what each open run's usage record gained since the last poll
-    /// (PRD #1858). The daemon calls it on an interval; a run's end drains
-    /// its record however long ago the last poll was.
-    pub fn poll_usage(&mut self) {
-        for run in self
-            .runs
-            .values_mut()
-            .chain(self.replaced.iter_mut().map(|r| &mut r.run))
-        {
-            if let Some(usage) = run.usage.as_mut() {
-                usage.poll();
-            }
-        }
+    /// The usage readers of every open run (PRD #1858), for the caller to
+    /// [`RunUsage::poll`] once it has let go of the tracker: polling reads
+    /// files, and nothing that waits for the tracker should wait for that.
+    /// The daemon polls on an interval; a run's end drains its record however
+    /// long ago the last poll was.
+    pub fn usage_to_poll(&self) -> Vec<RunUsage> {
+        self.runs
+            .values()
+            .chain(self.replaced.iter().map(|r| &r.run))
+            .filter_map(|run| run.usage.clone())
+            .collect()
     }
 
     /// Apply one event from the daemon's broadcast.
@@ -585,7 +597,7 @@ impl RunTracker {
             return;
         }
 
-        if let Some(usage) = run.usage.as_mut() {
+        if let Some(usage) = &run.usage {
             usage.observe(event);
         }
         // `deck.agent` stays the kind the run started as, which is the value
@@ -733,12 +745,19 @@ impl RunTracker {
         if let Some(effect) = run.ci.end_run() {
             record_ci(&mut run, effect, now, &mut self.finished);
         }
-        let usage = run
-            .usage
-            .take()
-            .map(|usage| usage.finish(&run.start_info.run_id, reason, exit_code));
-        self.finished
-            .push(run_span(run, usage, reason, exit_code, now));
+        let usage = run.usage.take();
+        let run_id = run.start_info.run_id.clone();
+        let span = run_span(run, reason, exit_code, now);
+        match usage {
+            Some(usage) => self.finishing.push(FinishingRun {
+                span,
+                usage,
+                run_id,
+                reason,
+                exit_code,
+            }),
+            None => self.finished.push(span),
+        }
     }
 
     /// [`Self::end_run`], but only when the run open on `pane_id` belongs to
@@ -784,7 +803,9 @@ impl RunTracker {
     /// shutdown. A replaced run still waiting for its own end ends as
     /// [`EndReason::Unknown`], at the time it was replaced.
     pub fn end_all(&mut self, reason: EndReason, now: u64) {
-        self.pending.clear();
+        for (_, pending) in self.pending.drain() {
+            pending.forget();
+        }
         for r in std::mem::take(&mut self.replaced) {
             self.finish(r.run, EndReason::Unknown, None, r.at);
         }
@@ -801,9 +822,68 @@ impl RunTracker {
         (self.runs.len() + self.replaced.len(), self.pending.len())
     }
 
-    /// The spans finished since the last call.
+    /// The spans finished since the last call, each run's usage read here
+    /// and now ([`FinishingRun::complete`]).
     pub fn take_finished(&mut self) -> Vec<SpanRecord> {
-        std::mem::take(&mut self.finished)
+        let (mut finished, finishing) = self.take_finished_deferred();
+        finished.extend(finishing.into_iter().map(FinishingRun::complete));
+        finished
+    }
+
+    /// The spans finished since the last call, and the runs that ended since,
+    /// whose spans are complete once their usage is read
+    /// ([`FinishingRun::complete`]): the caller reads it after letting go of
+    /// the tracker.
+    pub fn take_finished_deferred(&mut self) -> (Vec<SpanRecord>, Vec<FinishingRun>) {
+        (
+            std::mem::take(&mut self.finished),
+            std::mem::take(&mut self.finishing),
+        )
+    }
+}
+
+/// A run that ended, whose `agent.run` span waits for its usage record to be
+/// drained (PRD #1858).
+pub struct FinishingRun {
+    span: SpanRecord,
+    usage: RunUsage,
+    run_id: String,
+    reason: EndReason,
+    exit_code: Option<i32>,
+}
+
+impl FinishingRun {
+    /// Drain the run's usage record and put what it says on the span: the
+    /// usage and termination attributes, and one [`EVENT_MODEL_USAGE`] event
+    /// per model, past the cap on the run's other events, so a run's usage is
+    /// not dropped for having changed status often. Reads files.
+    pub fn complete(self) -> SpanRecord {
+        let FinishingRun {
+            mut span,
+            usage,
+            run_id,
+            reason,
+            exit_code,
+        } = self;
+        let usage = usage.finish(&run_id, reason, exit_code);
+        // The run's own id and agent are already the span's.
+        let own = |a: &super::accounting::AccountingAttribute| {
+            !matches!(a.key(), AccountingKey::RunId | AccountingKey::Agent)
+        };
+        let attribute = |a: &super::accounting::AccountingAttribute| Attribute {
+            key: AttrKey::Accounting(a.key()),
+            value: a.value().clone(),
+        };
+        span.attributes
+            .extend(usage.run.iter().filter(|a| own(a)).map(attribute));
+        let end = span.end_unix_nanos;
+        span.events
+            .extend(usage.models.iter().map(|model| SpanEventRecord {
+                name: EVENT_MODEL_USAGE,
+                time_unix_nanos: end,
+                attributes: model.iter().map(attribute).collect(),
+            }));
+        span
     }
 }
 
@@ -1075,13 +1155,7 @@ fn operation_span(run: &ActiveRun, open: OpenOperation, now: u64) -> SpanRecord 
     }
 }
 
-fn run_span(
-    run: ActiveRun,
-    usage: Option<RunExport>,
-    reason: EndReason,
-    exit_code: Option<i32>,
-    now: u64,
-) -> SpanRecord {
+fn run_span(run: ActiveRun, reason: EndReason, exit_code: Option<i32>, now: u64) -> SpanRecord {
     let start = &run.start_info;
     let mut attributes = identity_attributes(start);
     attributes.push(Attribute::str(AttrKey::Agent, agent_name(&start.agent)));
@@ -1141,26 +1215,6 @@ fn run_span(
         saturating_i64(run.ci.failures),
     ));
     let end = now.max(run.start);
-    let mut events = run.events;
-    if let Some(usage) = usage {
-        // The run's own id and agent are already the span's.
-        let own = |a: &super::accounting::AccountingAttribute| {
-            !matches!(a.key(), AccountingKey::RunId | AccountingKey::Agent)
-        };
-        let attribute = |a: &super::accounting::AccountingAttribute| Attribute {
-            key: AttrKey::Accounting(a.key()),
-            value: a.value().clone(),
-        };
-        attributes.extend(usage.run.iter().filter(|a| own(a)).map(attribute));
-        // One event per model, at most `MAX_MODELS` and an unnamed one, past
-        // the cap on the run's other events: a run's usage is not dropped
-        // for having changed status often.
-        events.extend(usage.models.iter().map(|model| SpanEventRecord {
-            name: EVENT_MODEL_USAGE,
-            time_unix_nanos: end,
-            attributes: model.iter().map(attribute).collect(),
-        }));
-    }
     SpanRecord {
         trace_id: run.trace_id,
         span_id: run.span_id,
@@ -1169,7 +1223,7 @@ fn run_span(
         start_unix_nanos: run.start,
         end_unix_nanos: end,
         attributes,
-        events,
+        events: run.events,
     }
 }
 

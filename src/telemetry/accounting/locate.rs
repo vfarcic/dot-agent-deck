@@ -1,16 +1,24 @@
 //! PRD #1858: where the deck finds each run's usage record, and which paths
 //! it hands a reader at all.
 //!
-//! Every path a reader opens is built here from values the deck holds — an
-//! agent's configuration directory, the session id and working directory an
-//! agent's hook reported, the deck's own run id — or, for Codex, admitted
-//! here from the path Codex's hook reported: under the agent's own sessions
-//! directory, named as the agent names it. A reader then opens it without
-//! following a symlink in its last component and refuses anything but a
-//! regular file of this user's ([`super::JsonlReader`]).
+//! Every record is read beneath a [`TrustedDir`]: an agent's configuration
+//! directory, Codex's `sessions` directory or the deck's own usage
+//! directory, each resolved once — so a configuration root the user
+//! symlinked elsewhere is followed there and only there — then kept open.
+//! The path beneath it is built here from values the deck holds — the
+//! session id and working directory an agent's hook reported, the deck's own
+//! run id — or, for Codex, admitted here from the path Codex's hook reported:
+//! under the agent's own sessions directory, named as the agent names it. A
+//! reader opens it relative to the kept directory, refusing a symlink in any
+//! component of it (on Unix), and refuses anything but a regular file of this
+//! user's ([`super::JsonlReader`]).
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
+use std::fs::File;
+use std::io;
 use std::path::{Component, Path, PathBuf};
+#[cfg(unix)]
+use std::sync::Arc;
 
 use super::Ident;
 
@@ -21,6 +29,226 @@ pub const MAX_PROJECT_DIRS: usize = 4096;
 /// The longest directory name Claude Code derives from a working directory
 /// without shortening it; a longer one is looked for by session id instead.
 const MAX_PLAIN_PROJECT_NAME: usize = 200;
+
+/// A directory the deck reads an agent's records beneath, opened once.
+///
+/// [`TrustedDir::open`] resolves its path once, following any symlink in it,
+/// and requires a directory owned by the user the deck runs as. On Unix it
+/// then keeps the directory open, and every later open beneath it is made
+/// relative to that descriptor with no symlink followed in any component
+/// ([`crate::telemetry::collector::disk::fd::open_beneath_at`]: `openat2`
+/// with `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS` on Linux, one
+/// `O_NOFOLLOW` component at a time elsewhere), so a directory inside it
+/// replaced by a symlink later is refused rather than followed. Elsewhere
+/// it keeps the resolved path and opens through it, which a directory
+/// swapped in between two opens would redirect.
+#[derive(Clone)]
+pub struct TrustedDir {
+    #[cfg(unix)]
+    fd: Arc<std::os::fd::OwnedFd>,
+    path: PathBuf,
+}
+
+impl std::fmt::Debug for TrustedDir {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // A path is not shown: it can name the user.
+        f.debug_struct("TrustedDir").finish_non_exhaustive()
+    }
+}
+
+#[cfg(unix)]
+const OPEN_FILE: libc::c_int =
+    libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+#[cfg(unix)]
+const OPEN_DIR: libc::c_int =
+    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+
+impl TrustedDir {
+    /// `root`, resolved and opened as described on [`TrustedDir`]; `None`
+    /// when it is not there, is not a directory, or is another user's.
+    pub fn open(root: &Path) -> Option<TrustedDir> {
+        let path = std::fs::canonicalize(root).ok()?;
+        #[cfg(unix)]
+        {
+            let fd = crate::telemetry::collector::disk::fd::open_dir_no_symlinks(&path).ok()?;
+            let dir = TrustedDir {
+                fd: Arc::new(fd),
+                path,
+            };
+            dir.owned_directory().then_some(dir)
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::symlink_metadata(&path)
+                .is_ok_and(|m| m.is_dir())
+                .then_some(TrustedDir { path })
+        }
+    }
+
+    /// The resolved path it was opened at.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The directory `rel` beneath this one, opened as this one was.
+    pub fn subdir(&self, rel: &Path) -> Option<TrustedDir> {
+        #[cfg(unix)]
+        {
+            let fd = self.open_raw(rel, OPEN_DIR, 0).ok()?;
+            let dir = TrustedDir {
+                fd: Arc::new(fd),
+                path: self.path.join(rel),
+            };
+            dir.owned_directory().then_some(dir)
+        }
+        #[cfg(not(unix))]
+        {
+            let path = self.path.join(rel);
+            std::fs::symlink_metadata(&path)
+                .is_ok_and(|m| m.is_dir())
+                .then_some(TrustedDir { path })
+        }
+    }
+
+    /// The file `rel` beneath this one, opened for reading without blocking
+    /// on a FIFO and, on Unix, with no symlink followed in any component.
+    pub fn open_file(&self, rel: &Path) -> io::Result<File> {
+        #[cfg(unix)]
+        {
+            self.open_raw(rel, OPEN_FILE, 0).map(File::from)
+        }
+        #[cfg(not(unix))]
+        {
+            File::open(self.path.join(plain(rel)?))
+        }
+    }
+
+    /// Whether `rel` beneath this one opens as a regular file.
+    pub fn has_file(&self, rel: &Path) -> bool {
+        self.open_file(rel)
+            .and_then(|f| f.metadata())
+            .is_ok_and(|m| m.is_file())
+    }
+
+    /// The names of the entries of this directory, at most `limit`; empty
+    /// when it cannot be read.
+    pub fn entry_names(&self, limit: usize) -> Vec<OsString> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt as _;
+            let Ok(dir) = self.fd.try_clone().map(File::from) else {
+                return Vec::new();
+            };
+            crate::telemetry::launch::dir_entry_names(&dir)
+                .into_iter()
+                .take(limit)
+                .map(|name| OsString::from_vec(name.into_bytes()))
+                .collect()
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::read_dir(&self.path)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .take(limit)
+                        .map(|e| e.file_name())
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+    }
+
+    /// Remove the entry `name` of this directory, never what a symlink there
+    /// points at.
+    pub fn remove(&self, name: &OsStr) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            use std::os::unix::ffi::OsStrExt as _;
+            if let Ok(name) = std::ffi::CString::new(name.as_bytes()) {
+                // SAFETY: `name` is NUL-terminated and the descriptor is open;
+                // `unlinkat` removes a name, never what a symlink points at.
+                unsafe { libc::unlinkat(self.fd.as_raw_fd(), name.as_ptr(), 0) };
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = std::fs::remove_file(self.path.join(name));
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn open_raw(
+        &self,
+        rel: &Path,
+        flags: libc::c_int,
+        mode: libc::mode_t,
+    ) -> io::Result<std::os::fd::OwnedFd> {
+        use std::os::fd::AsFd as _;
+        crate::telemetry::collector::disk::fd::open_beneath_at(
+            self.fd.as_fd(),
+            plain(rel)?,
+            flags,
+            mode,
+        )
+    }
+
+    /// The open directory's own metadata.
+    #[cfg(unix)]
+    pub(crate) fn metadata(&self) -> io::Result<std::fs::Metadata> {
+        File::from(self.fd.try_clone()?).metadata()
+    }
+
+    /// Make the directory `name` in this one with `mode`, unless something
+    /// of that name is there already.
+    #[cfg(unix)]
+    pub(crate) fn make_dir(&self, name: &OsStr, mode: libc::mode_t) -> io::Result<()> {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::ffi::OsStrExt as _;
+        let name = std::ffi::CString::new(name.as_bytes())
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        // SAFETY: `name` is NUL-terminated and the descriptor is open.
+        if unsafe { libc::mkdirat(self.fd.as_raw_fd(), name.as_ptr(), mode) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        match error.kind() {
+            io::ErrorKind::AlreadyExists => Ok(()),
+            _ => Err(error),
+        }
+    }
+
+    /// Set the open directory's permission bits to `mode`.
+    #[cfg(unix)]
+    pub(crate) fn set_mode(&self, mode: libc::mode_t) -> io::Result<()> {
+        use std::os::fd::AsRawFd as _;
+        // SAFETY: the descriptor is open.
+        if unsafe { libc::fchmod(self.fd.as_raw_fd(), mode) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(unix)]
+    fn owned_directory(&self) -> bool {
+        use std::os::unix::fs::MetadataExt as _;
+        self.metadata()
+            .is_ok_and(|m| m.is_dir() && m.uid() == super::effective_uid())
+    }
+}
+
+/// `rel` when it is one or more plain names: no root, `.` or `..`.
+fn plain(rel: &Path) -> io::Result<&Path> {
+    let ok = rel.components().next().is_some()
+        && rel.components().all(|c| matches!(c, Component::Normal(_)));
+    if ok {
+        Ok(rel)
+    } else {
+        Err(io::Error::from(io::ErrorKind::InvalidInput))
+    }
+}
 
 /// An absolute path from an environment value, or `None`.
 fn absolute(value: Option<&OsStr>) -> Option<PathBuf> {
@@ -63,63 +291,110 @@ pub fn claude_project_dir_name(cwd: &str) -> Option<String> {
     (name.len() <= MAX_PLAIN_PROJECT_NAME).then_some(name)
 }
 
-/// The transcript of Claude Code session `session_id`, started in `cwd`:
-/// `projects/<cwd's directory name>/<session_id>.jsonl` under
-/// `config_dir`, or, when that is not there (a working directory whose name
-/// Claude Code shortened, or one the hook reported differently), the file of
-/// that name in any of the first [`MAX_PROJECT_DIRS`] project directories.
-/// `None` for a session id that could name another file, or when no such
-/// regular file exists. A directory symlinked into `projects` is not
-/// searched.
+/// The transcript of Claude Code session `session_id`, started in `cwd`,
+/// beneath Claude Code's configuration directory `config`:
+/// `projects/<cwd's directory name>/<session_id>.jsonl`, the one place
+/// [`claude_transcript_in_place`] looks; or, when that is not there (a
+/// working directory whose name Claude Code shortened, or one the hook
+/// reported differently) and `search` is set, the file of that name in any of
+/// the first [`MAX_PROJECT_DIRS`] project directories. Returned as the path
+/// beneath `config`. `None` for a session id that could name another file,
+/// or when no such regular file opens; a project directory that is a
+/// symlink, or a transcript that is one, does not open.
 pub fn claude_transcript(
-    config_dir: &Path,
+    config: &TrustedDir,
+    cwd: Option<&str>,
+    session_id: &str,
+    search: bool,
+) -> Option<PathBuf> {
+    if let Some(found) = claude_transcript_in_place(config, cwd, session_id) {
+        return Some(found);
+    }
+    if !search || !admissible_session_id(session_id) {
+        return None;
+    }
+    let file = format!("{session_id}.jsonl");
+    let projects = Path::new("projects");
+    config
+        .subdir(projects)?
+        .entry_names(MAX_PROJECT_DIRS)
+        .into_iter()
+        .map(|name| projects.join(name).join(&file))
+        .find(|rel| config.has_file(rel))
+}
+
+/// [`claude_transcript`] without its search: only the file the working
+/// directory names.
+pub fn claude_transcript_in_place(
+    config: &TrustedDir,
     cwd: Option<&str>,
     session_id: &str,
 ) -> Option<PathBuf> {
     if !admissible_session_id(session_id) {
         return None;
     }
-    let projects = config_dir.join("projects");
-    let file = format!("{session_id}.jsonl");
-    let is_file = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_file());
-    if let Some(name) = cwd.and_then(claude_project_dir_name) {
-        let path = projects.join(name).join(&file);
-        if is_file(&path) {
-            return Some(path);
-        }
-    }
-    std::fs::read_dir(&projects)
-        .ok()?
-        .flatten()
-        .take(MAX_PROJECT_DIRS)
-        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
-        .map(|entry| entry.path().join(&file))
-        .find(|path| is_file(path))
+    let rel = Path::new("projects")
+        .join(claude_project_dir_name(cwd?)?)
+        .join(format!("{session_id}.jsonl"));
+    config.has_file(&rel).then_some(rel)
 }
 
 /// The rollout path a Codex hook reported, admitted only when it is
-/// absolute, has no `..`, resolves to a file named `rollout-*.jsonl`, and
-/// resolves to somewhere under `sessions` in `codex_home`. Returns the
-/// resolved path.
-pub fn admit_codex_rollout(reported: &str, codex_home: &Path) -> Option<PathBuf> {
+/// absolute, has no `..`, names a file `rollout-*.jsonl`, lies beneath
+/// `sessions`, Codex's sessions directory (given as `sessions_path` and
+/// opened as `sessions`), and opens there as a regular file. Returns the
+/// path beneath `sessions`. The reported path is taken beneath the sessions
+/// directory as written, or as it resolves when it reaches it through a
+/// symlink.
+pub fn admit_codex_rollout(
+    reported: &str,
+    sessions_path: &Path,
+    sessions: &TrustedDir,
+) -> Option<PathBuf> {
     let path = Path::new(reported);
     if !path.is_absolute() || path.components().any(|c| c == Component::ParentDir) {
         return None;
     }
-    let resolved = std::fs::canonicalize(path).ok()?;
-    let root = std::fs::canonicalize(codex_home.join("sessions")).ok()?;
-    let name = resolved.file_name()?.to_str()?;
-    (resolved.starts_with(&root) && name.starts_with("rollout-") && name.ends_with(".jsonl"))
-        .then_some(resolved)
+    let beneath = |p: &Path| {
+        p.strip_prefix(sessions_path)
+            .or_else(|_| p.strip_prefix(sessions.path()))
+            .ok()
+            .map(Path::to_path_buf)
+    };
+    let rel = beneath(path).or_else(|| beneath(&std::fs::canonicalize(path).ok()?))?;
+    let name = rel.file_name()?.to_str()?;
+    (plain(&rel).is_ok()
+        && name.starts_with("rollout-")
+        && name.ends_with(".jsonl")
+        && sessions.has_file(&rel))
+    .then_some(rel)
 }
 
-/// The usage file of run `run_id` in `dir`, the deck's own per-run
-/// directory: `<run_id>.usage.jsonl`. `None` for a run id that is not an
-/// identifier or that holds a `/`.
-pub fn usage_file(dir: &Path, run_id: &str) -> Option<PathBuf> {
+/// The name of run `run_id`'s usage file in the deck's usage directory, for
+/// the daemon with process id `daemon_pid`: `<run_id>-<daemon_pid>.usage.jsonl`.
+/// The process id says which daemon owns the file, so a daemon starting
+/// later removes only files whose daemon is gone ([`usage_file_daemon`]).
+/// `None` for a run id that is not an identifier, or that holds a `/` or
+/// starts with `.`.
+pub fn usage_file_name(run_id: &str, daemon_pid: u32) -> Option<String> {
     let id = Ident::new(run_id)?;
     (!id.as_str().contains('/') && !id.as_str().starts_with('.'))
-        .then(|| dir.join(format!("{}.usage.jsonl", id.as_str())))
+        .then(|| format!("{}-{daemon_pid}{USAGE_FILE_SUFFIX}", id.as_str()))
+}
+
+const USAGE_FILE_SUFFIX: &str = ".usage.jsonl";
+
+/// The owning daemon's process id, as digits, of a usage file named as
+/// [`usage_file_name`] names them; `None` for any other name.
+pub fn usage_file_daemon(name: &[u8]) -> Option<&[u8]> {
+    let stem = name.strip_suffix(USAGE_FILE_SUFFIX.as_bytes())?;
+    let dash = stem.iter().rposition(|b| *b == b'-')?;
+    let (run, pid) = (&stem[..dash], &stem[dash + 1..]);
+    let run_ok = std::str::from_utf8(run).is_ok_and(|r| Ident::new(r).is_some())
+        && !run.is_empty()
+        && !run.starts_with(b".");
+    let pid_ok = (1..=10).contains(&pid.len()) && pid.iter().all(u8::is_ascii_digit);
+    (run_ok && pid_ok).then_some(pid)
 }
 
 #[cfg(test)]
@@ -158,9 +433,14 @@ mod tests {
         assert_eq!(claude_project_dir_name(&"/a".repeat(101)), None);
     }
 
-    /// The transcript is found where the directory name says, else by its
-    /// session id in another project directory; a session id that could name
-    /// another file is refused, and a symlinked transcript is not taken.
+    fn trusted(path: &Path) -> TrustedDir {
+        TrustedDir::open(path).expect("a directory of this user's")
+    }
+
+    /// The transcript is found where the directory name says, else (when
+    /// searching) by its session id in another project directory; a session
+    /// id that could name another file is refused, and neither a symlinked
+    /// transcript nor a symlinked project directory is taken.
     #[test]
     fn a_transcript_is_found_by_directory_then_by_session_id() {
         let dir = crate::test_temp::tempdir().unwrap();
@@ -169,18 +449,30 @@ mod tests {
         let here = config.join("projects").join("-work-repo");
         std::fs::create_dir_all(&here).unwrap();
         File::create(here.join(format!("{id}.jsonl"))).unwrap();
+        let root = trusted(config);
+        let rel = Path::new("projects/-work-repo").join(format!("{id}.jsonl"));
         assert_eq!(
-            claude_transcript(config, Some("/work/repo"), id),
-            Some(here.join(format!("{id}.jsonl")))
+            claude_transcript(&root, Some("/work/repo"), id, false),
+            Some(rel.clone())
         );
         assert_eq!(
-            claude_transcript(config, Some("/elsewhere"), id),
-            Some(here.join(format!("{id}.jsonl"))),
+            claude_transcript(&root, Some("/elsewhere"), id, false),
+            None
+        );
+        assert_eq!(
+            claude_transcript(&root, Some("/elsewhere"), id, true),
+            Some(rel),
             "found by session id when the directory differs"
         );
-        assert_eq!(claude_transcript(config, Some("/work/repo"), "../x"), None);
-        assert_eq!(claude_transcript(config, Some("/work/repo"), "a/b"), None);
-        assert_eq!(claude_transcript(config, None, "missing"), None);
+        assert_eq!(
+            claude_transcript(&root, Some("/work/repo"), "../x", true),
+            None
+        );
+        assert_eq!(
+            claude_transcript(&root, Some("/work/repo"), "a/b", true),
+            None
+        );
+        assert_eq!(claude_transcript(&root, None, "missing", true), None);
         #[cfg(unix)]
         {
             let link_id = "linked";
@@ -189,12 +481,50 @@ mod tests {
                 here.join(format!("{link_id}.jsonl")),
             )
             .unwrap();
-            assert_eq!(claude_transcript(config, Some("/work/repo"), link_id), None);
+            assert_eq!(
+                claude_transcript(&root, Some("/work/repo"), link_id, true),
+                None
+            );
         }
     }
 
+    /// A project directory that is a symlink is not followed, neither where
+    /// the working directory names it nor in the search, even when what it
+    /// points at holds the session's transcript.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_project_directory_is_not_followed() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let config = dir.path().join("config");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(config.join("projects")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let id = "s-linked-project";
+        File::create(outside.join(format!("{id}.jsonl"))).unwrap();
+        std::os::unix::fs::symlink(&outside, config.join("projects/-work-repo")).unwrap();
+        let root = trusted(&config);
+        assert_eq!(claude_transcript(&root, Some("/work/repo"), id, true), None);
+    }
+
+    /// A configuration root the user symlinked elsewhere is followed once,
+    /// where the deck resolves it, and read beneath what it resolved to.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_configuration_root_is_resolved_and_kept() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let real = dir.path().join("dotfiles-claude");
+        let here = real.join("projects/-w");
+        std::fs::create_dir_all(&here).unwrap();
+        File::create(here.join("s-1.jsonl")).unwrap();
+        let link = dir.path().join(".claude");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let root = trusted(&link);
+        assert_eq!(root.path(), std::fs::canonicalize(&real).unwrap());
+        assert!(claude_transcript(&root, Some("/w"), "s-1", false).is_some());
+    }
+
     /// A rollout is admitted only under the Codex home's `sessions`, by its
-    /// own name, as the path it resolves to.
+    /// own name, as its path beneath it.
     #[test]
     fn a_rollout_is_admitted_only_under_the_sessions_root() {
         let dir = crate::test_temp::tempdir().unwrap();
@@ -207,45 +537,81 @@ mod tests {
         File::create(&other).unwrap();
         let wrong_name = day.join("notes.jsonl");
         File::create(&wrong_name).unwrap();
-        let canonical = std::fs::canonicalize(&rollout).unwrap();
+        let sessions_path = home.join("sessions");
+        let sessions = trusted(&sessions_path);
+        let admit = |p: &str| admit_codex_rollout(p, &sessions_path, &sessions);
         assert_eq!(
-            admit_codex_rollout(rollout.to_str().unwrap(), &home),
-            Some(canonical)
+            admit(rollout.to_str().unwrap()),
+            Some(PathBuf::from(
+                "2026/10/26/rollout-2026-10-26T10-00-00-abc.jsonl"
+            ))
         );
-        assert_eq!(admit_codex_rollout(other.to_str().unwrap(), &home), None);
-        assert_eq!(
-            admit_codex_rollout(wrong_name.to_str().unwrap(), &home),
-            None
-        );
+        assert_eq!(admit(other.to_str().unwrap()), None);
+        assert_eq!(admit(wrong_name.to_str().unwrap()), None);
         let climbing = format!(
             "{}/../26/{}",
             day.display(),
             "rollout-2026-10-26T10-00-00-abc.jsonl"
         );
-        assert_eq!(admit_codex_rollout(&climbing, &home), None);
-        assert_eq!(admit_codex_rollout("rollout-x.jsonl", &home), None);
+        assert_eq!(admit(&climbing), None);
+        assert_eq!(admit("rollout-x.jsonl"), None);
         #[cfg(unix)]
         {
             let link = day.join("rollout-link.jsonl");
             std::os::unix::fs::symlink(&other, &link).unwrap();
             assert_eq!(
-                admit_codex_rollout(link.to_str().unwrap(), &home),
+                admit(link.to_str().unwrap()),
                 None,
-                "a link out of the root resolves outside it"
+                "a link out of the root does not open beneath it"
             );
         }
     }
 
+    /// Once admitted, a rollout is opened beneath the kept sessions
+    /// directory each time: an ancestor replaced by a symlink to a directory
+    /// outside it is refused, not followed to a file of the same name.
+    #[cfg(unix)]
     #[test]
-    fn a_usage_file_is_named_by_an_identifier_run_id_only() {
-        let dir = Path::new("/state/telemetry");
+    fn an_ancestor_swapped_after_admission_is_refused() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let sessions_path = dir.path().join(".codex/sessions");
+        let day = sessions_path.join("2026/10/26");
+        std::fs::create_dir_all(&day).unwrap();
+        let name = "rollout-swap.jsonl";
+        File::create(day.join(name)).unwrap();
+        let sessions = trusted(&sessions_path);
+        let rel = admit_codex_rollout(day.join(name).to_str().unwrap(), &sessions_path, &sessions)
+            .unwrap();
+        assert!(sessions.open_file(&rel).is_ok());
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        File::create(outside.join(name)).unwrap();
+        std::fs::rename(&day, dir.path().join("moved")).unwrap();
+        std::os::unix::fs::symlink(&outside, &day).unwrap();
+        assert!(sessions.open_file(&rel).is_err());
+        assert!(!sessions.has_file(&rel));
+    }
+
+    #[test]
+    fn a_usage_file_is_named_by_its_run_and_daemon() {
         assert_eq!(
-            usage_file(dir, "run-1a2b"),
-            Some(dir.join("run-1a2b.usage.jsonl"))
+            usage_file_name("run-1a2b", 42).as_deref(),
+            Some("run-1a2b-42.usage.jsonl")
         );
-        assert_eq!(usage_file(dir, "../x"), None);
-        assert_eq!(usage_file(dir, "a/b"), None);
-        assert_eq!(usage_file(dir, "a b"), None);
-        assert_eq!(usage_file(dir, ".hidden"), None);
+        assert_eq!(usage_file_name("../x", 1), None);
+        assert_eq!(usage_file_name("a/b", 1), None);
+        assert_eq!(usage_file_name("a b", 1), None);
+        assert_eq!(usage_file_name(".hidden", 1), None);
+        let name = usage_file_name("0123abcd", 777).unwrap();
+        assert_eq!(usage_file_daemon(name.as_bytes()), Some(&b"777"[..]));
+        for other in [
+            &b"run-.usage.jsonl"[..],
+            b"run-12.usage.json",
+            b"-12.usage.jsonl",
+            b"run-1x.usage.jsonl",
+            b"notes.txt",
+        ] {
+            assert_eq!(usage_file_daemon(other), None, "{other:?}");
+        }
     }
 }

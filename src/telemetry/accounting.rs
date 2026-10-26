@@ -1,9 +1,11 @@
-//! PRD #633, discovery milestone 4: a narrow prototype of the execution
-//! record, following `docs/develop/execution-accounting.md`. It is compiled
-//! for tests only (`#[cfg(test)]` in `src/telemetry/mod.rs`), so it is no
-//! product API and ships in no release build; wiring it to a live run, and
-//! dropping that `cfg(test)`, is the follow-up PRD's first step. Nothing here
-//! locates, watches or tails a file by itself.
+//! The execution record: what an agent run consumed and how it ended. PRD
+//! #633's discovery milestone 4 prototyped it, following
+//! `docs/develop/execution-accounting.md`; PRD #1858 wires its run half to
+//! live runs: [`run_usage::RunUsage`] reads each run's usage record from the
+//! paths [`locate`] builds or admits, and the run tracker exports the result
+//! on the run's span through [`run_attributes`]. The work-item and roll-up
+//! halves ([`WorkItemRecord`], [`rollup`], [`work_item_attributes`]) are
+//! still the prototype's, for #1860, and no product path calls them yet.
 //!
 //! * **Provenance on every value** ([`Field`]): measured, provider-reported,
 //!   estimated, agent-asserted, or unavailable with a reason. Unavailable is a
@@ -19,11 +21,12 @@
 //!   structs, to one shape ([`AgentUsage`]): [`from_claude`], [`from_codex`],
 //!   [`from_pi`], [`from_opencode`]. No input struct has a field that could
 //!   hold a prompt, a reply, a tool's input or output, or file content.
-//! * **Local capture** of one agent's store ([`CodexUsageReader`]): a bounded,
-//!   incremental reader of a Codex rollout at a path it is given, reading only
-//!   bytes appended since its last poll, deserialising only lines that contain
-//!   one of five marker words, and keeping only the model, usage, quota and
-//!   turn-end fields of the record types that carry them.
+//! * **Local capture** ([`JsonlReader`]): a bounded, incremental reader of one
+//!   agent's record — a Codex rollout ([`CodexUsageReader`]), a Claude Code
+//!   transcript ([`claude`]) or the deck's own usage file ([`usage_file`]) —
+//!   reading only bytes appended since its last poll, deserialising only
+//!   lines that contain one of its marker words, and keeping only the usage,
+//!   quota and turn-end fields of the record types that carry them.
 //! * **Aggregation** ([`rollup`]) of runs to a work item or an orchestration,
 //!   without counting a run twice, a Claude Code subagent inside its parent's
 //!   total, or money of different provenance as one number.
@@ -1354,6 +1357,11 @@ pub trait LineSummary: Default {
     /// A candidate line did not deserialise into [`Self::Record`]. The line
     /// is lent only to look for a marker in it, never to be kept.
     fn malformed(&mut self, _line: &[u8]) {}
+    /// The file was replaced or truncated, so reading starts over: forget
+    /// what it read, keeping what the summary was told about its run.
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
 }
 
 /// An incremental reader of one JSON-lines file, at the path it is given,
@@ -1380,14 +1388,18 @@ pub trait LineSummary: Default {
 /// incomplete, buffered, but kept in nothing the reader returns, and its
 /// `Debug` shows neither the buffer nor the path.
 ///
-/// On Unix the path is opened with `O_NOFOLLOW`, which refuses a symlink in
-/// its final component only: a symlinked parent directory is followed, so
-/// confinement to a trusted root is the caller's ([`locate`] builds or
-/// admits every path the deck hands a reader). It is opened with `O_NONBLOCK`
-/// so a FIFO with no writer cannot stall the open, and anything but a regular
-/// file owned by this process's user is refused, from the opened descriptor's
-/// own metadata, before a byte is read. Elsewhere it is a plain open, and the
-/// regular-file check follows it.
+/// A reader the deck runs is opened [`beneath`](Self::beneath) a
+/// [`locate::TrustedDir`], relative to the directory it keeps open with no
+/// symlink followed in any component (on Unix), so a directory replaced by a
+/// symlink after the reader was made is refused rather than followed. A
+/// reader made with [`new`](Self::new) opens its path with `O_NOFOLLOW`, which
+/// refuses a symlink in the final component only, so confining that path is
+/// its caller's; the deck's own runs do not use it. Either way the file is
+/// opened with `O_NONBLOCK` so a FIFO with no writer cannot stall the open,
+/// and anything but a regular file owned by this process's user is refused,
+/// from the opened descriptor's own metadata, before a byte is read.
+/// Elsewhere than Unix it is a plain open, and the regular-file check
+/// follows it.
 ///
 /// A file that gets shorter, or whose path now names another file (Unix),
 /// is read again from the start with the summary reset: that is a new file
@@ -1395,7 +1407,10 @@ pub trait LineSummary: Default {
 /// reader's offset between two polls, keeping its inode, is not noticed: the
 /// reader carries on from its offset into the new content.
 pub struct JsonlReader<S> {
-    path: PathBuf,
+    source: Source,
+    /// When the file was created, from the last poll's metadata, where the
+    /// platform records it.
+    born: Option<std::time::SystemTime>,
     identity: Option<(u64, u64)>,
     offset: u64,
     partial: Vec<u8>,
@@ -1420,10 +1435,37 @@ impl<S> fmt::Debug for JsonlReader<S> {
     }
 }
 
+/// Where a reader's file is.
+enum Source {
+    Path(PathBuf),
+    Beneath(locate::TrustedDir, PathBuf),
+}
+
+impl Source {
+    fn open(&self) -> io::Result<File> {
+        match self {
+            Source::Path(path) => open_regular(path),
+            Source::Beneath(dir, rel) => dir.open_file(rel),
+        }
+    }
+}
+
 impl<S: LineSummary> JsonlReader<S> {
+    /// A reader of the file at `path`, confined by its caller (see the type's
+    /// docs).
     pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self::from_source(Source::Path(path.into()))
+    }
+
+    /// A reader of the file `rel` beneath `dir`.
+    pub fn beneath(dir: locate::TrustedDir, rel: PathBuf) -> Self {
+        Self::from_source(Source::Beneath(dir, rel))
+    }
+
+    fn from_source(source: Source) -> Self {
         JsonlReader {
-            path: path.into(),
+            source,
+            born: None,
             identity: None,
             offset: 0,
             partial: Vec::new(),
@@ -1453,9 +1495,22 @@ impl<S: LineSummary> JsonlReader<S> {
         self.stats
     }
 
+    /// When the file was created, as of the last poll; `None` where the
+    /// platform or file system does not record it.
+    pub fn born(&self) -> Option<std::time::SystemTime> {
+        self.born
+    }
+
+    /// Whether the reader holds the start of a line its summary would read
+    /// whose newline has not arrived: at a run's end, a record the agent did
+    /// not finish writing.
+    pub fn unfinished_candidate(&self) -> bool {
+        !self.partial.is_empty() && line_is_candidate(&self.partial, S::MARKERS)
+    }
+
     /// Read what was appended since the last poll, within the budget.
     pub fn poll(&mut self) -> io::Result<()> {
-        let mut file = open_regular(&self.path)?;
+        let mut file = self.source.open()?;
         let meta = file.metadata()?;
         if !meta.is_file() {
             return Err(io::Error::new(
@@ -1469,6 +1524,7 @@ impl<S: LineSummary> JsonlReader<S> {
                 "owned by another user",
             ));
         }
+        self.born = meta.created().ok();
         let identity = file_identity(&meta);
         let end = meta.len();
         if (self.identity.is_some() && identity != self.identity) || end < self.offset {
@@ -1500,7 +1556,7 @@ impl<S: LineSummary> JsonlReader<S> {
         self.offset = 0;
         self.partial.clear();
         self.skipping = false;
-        self.summary = S::default();
+        self.summary.reset();
         self.stats.restarts += 1;
     }
 
@@ -1581,8 +1637,14 @@ fn open_regular(path: &Path) -> io::Result<File> {
 #[cfg(unix)]
 fn owned_by_this_user(meta: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt as _;
+    meta.uid() == effective_uid()
+}
+
+/// The user this process runs as.
+#[cfg(unix)]
+pub(crate) fn effective_uid() -> u32 {
     // SAFETY: `geteuid` takes no arguments and cannot fail.
-    meta.uid() == unsafe { libc::geteuid() }
+    unsafe { libc::geteuid() }
 }
 
 #[cfg(not(unix))]
@@ -1625,8 +1687,16 @@ impl LineSummary for CodexRolloutSummary {
         CodexRolloutSummary::observe(self, record, stats);
     }
 
+    /// A line that should have parsed did not: it may have been a running
+    /// total, a model change or a turn's end. Until a later usable total
+    /// covers it, the tokens are not known to be complete; usage from here is
+    /// credited to no model until the next `turn_context` names one; and the
+    /// last turn is unknown until a later turn event says how it ended.
     fn malformed(&mut self, _line: &[u8]) {
         self.malformed = true;
+        self.total_unresolved = true;
+        self.current_model = None;
+        self.last_turn = Some(AgentTurnEnd::Unknown);
     }
 }
 
@@ -1638,8 +1708,16 @@ impl CodexRolloutSummary {
                 self.current_model = payload.model.0.as_deref().and_then(Ident::new);
             }
             (Some("event_msg"), Some("token_count")) => {
-                if let Some(total) = payload.info.and_then(|i| i.total_token_usage) {
-                    self.observe_total(&total, stats);
+                match payload.info.and_then(|i| i.total_token_usage) {
+                    Some(total) => self.observe_total(&total, stats),
+                    // Codex reports no total before its first reply; one
+                    // missing after a usable total is a total the reader
+                    // cannot read.
+                    None if self.last_total.is_some() => {
+                        stats.unusable_totals += 1;
+                        self.total_unresolved = true;
+                    }
+                    None => {}
                 }
                 if let Some(sample) = payload.rate_limits.and_then(NarrowRateLimits::sample) {
                     if let Some(last) = &self.quota_last {
@@ -2323,55 +2401,169 @@ impl AccountingKey {
 /// span: one event per model the run used.
 pub const EVENT_MODEL_USAGE: &str = "deck.model_usage";
 
-/// Model families the export names: a model is exported under its own name
-/// only when its last `/`-separated part starts with one of these, or has
-/// one right after a `.` (a cloud region prefix such as
-/// `us.anthropic.claude-…`). Others are counted and exported without a name,
-/// since a custom or local model's name can be anything, a path included.
-const MODEL_FAMILIES: &[&str] = &[
-    "claude-",
-    "gpt-",
-    "o1",
-    "o3",
-    "o4",
-    "codex-",
-    "gemini-",
-    "gemma",
-    "llama",
-    "mistral",
-    "mixtral",
-    "codestral",
-    "devstral",
-    "magistral",
-    "ministral",
-    "qwen",
-    "deepseek",
-    "grok",
-    "kimi",
-    "glm",
-    "minimax",
-    "swe-",
-    "big-pickle",
+/// The model families the export names, each the first word of a model's
+/// name ([`exported_model`]). A family marked `true` takes its version
+/// attached (`qwen3`, `llama3.1`, `o4`).
+const MODEL_FAMILIES: &[(&str, bool)] = &[
+    ("claude", false),
+    ("gpt", false),
+    ("o", true),
+    ("codex", false),
+    ("gemini", false),
+    ("gemma", true),
+    ("llama", true),
+    ("mistral", false),
+    ("mixtral", false),
+    ("codestral", false),
+    ("devstral", false),
+    ("magistral", false),
+    ("ministral", false),
+    ("qwen", true),
+    ("deepseek", false),
+    ("grok", false),
+    ("kimi", false),
+    ("glm", false),
+    ("minimax", false),
+    ("swe", false),
+    ("big", false),
+];
+
+/// The words a model's name may hold after its family, besides versions,
+/// sizes and dates ([`model_word`]). A word outside the list makes the name
+/// one the export does not send, so a name cannot carry a word of its own
+/// in a family's clothing (`gpt-confidential-project`).
+const MODEL_WORDS: &[&str] = &[
+    "opus",
+    "sonnet",
+    "haiku",
+    "fable",
+    "instant",
+    "mini",
+    "nano",
+    "pro",
+    "max",
+    "turbo",
+    "preview",
+    "latest",
+    "chat",
+    "codex",
+    "high",
+    "low",
+    "medium",
+    "xhigh",
+    "flash",
+    "lite",
+    "exp",
+    "experimental",
+    "thinking",
+    "think",
+    "instruct",
+    "coder",
+    "code",
+    "oss",
+    "large",
+    "small",
+    "tiny",
+    "base",
+    "vision",
+    "reasoner",
+    "reasoning",
+    "fast",
+    "spark",
+    "image",
+    "audio",
+    "realtime",
+    "search",
+    "plus",
+    "ultra",
+    "distill",
+    "it",
+    "pickle",
+    "air",
+];
+
+/// The provider namespaces a model's name may carry in front of it, exactly
+/// as listed: a router's `<provider>/` and a cloud's region prefix. Any other
+/// prefix, a path or a host name included, makes the name one the export does
+/// not send.
+const MODEL_NAMESPACES: &[&str] = &[
+    "anthropic/",
+    "openai/",
+    "google/",
+    "mistralai/",
+    "meta-llama/",
+    "deepseek/",
+    "qwen/",
+    "x-ai/",
+    "moonshotai/",
+    "z-ai/",
+    "anthropic.",
+    "us.anthropic.",
+    "eu.anthropic.",
+    "apac.anthropic.",
+    "global.anthropic.",
 ];
 
 /// The longest model name the export names.
 const MAX_EXPORTED_MODEL_BYTES: usize = 96;
 
-/// The name a model is exported under, if any: lowercase letters, digits and
-/// `.-_:@/`, at most [`MAX_EXPORTED_MODEL_BYTES`], not starting with `/` or
-/// `.`, and of a known family ([`MODEL_FAMILIES`]).
+/// The most words a model's name the export names has, its family's
+/// included.
+const MAX_MODEL_WORDS: usize = 8;
+
+/// Whether `word` is a version (`5`, `5.4`, `4o`, `v1`, `20251001`), a size
+/// (`8b`, `1.5b`, `a3b`), a letter with a number (`k2`, `r1`) or one of
+/// [`MODEL_WORDS`].
+fn model_word(word: &str) -> bool {
+    let b = word.as_bytes();
+    let number = |b: &[u8]| {
+        !b.is_empty()
+            && b.first().is_some_and(u8::is_ascii_digit)
+            && b.last().is_some_and(u8::is_ascii_digit)
+            && b.iter().all(|c| c.is_ascii_digit() || *c == b'.')
+            && !b.windows(2).any(|w| w == b"..")
+    };
+    let version = |b: &[u8]| match b {
+        [rest @ .., last] if last.is_ascii_lowercase() => number(rest),
+        _ => number(b),
+    };
+    MODEL_WORDS.contains(&word)
+        || version(b)
+        || matches!(b, [b'v' | b'a' | b'e' | b'k' | b'm' | b'r' | b'q', rest @ ..] if version(rest))
+}
+
+/// The name a model is exported under, if any: a name of [`MODEL_FAMILIES`],
+/// optionally behind one of [`MODEL_NAMESPACES`], every other word of it
+/// (split on `-`, `_`, `:` and `@`) a version, size, date or one of
+/// [`MODEL_WORDS`], lowercase, at most [`MAX_EXPORTED_MODEL_BYTES`] long and
+/// [`MAX_MODEL_WORDS`] words. Every other name, a custom or local model's,
+/// a path or a namespaced name the deck does not know, is not exported;
+/// its usage still is, without a name.
 pub fn exported_model(model: &Ident) -> Option<&Ident> {
     let name = model.as_str();
-    let shaped = name.len() <= MAX_EXPORTED_MODEL_BYTES
-        && !name.starts_with(['/', '.'])
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-:@/".contains(&b));
-    let last = name.rsplit('/').next().unwrap_or(name);
-    let family = std::iter::once(last)
-        .chain(last.match_indices('.').map(|(i, _)| &last[i + 1..]))
-        .any(|part| MODEL_FAMILIES.iter().any(|f| part.starts_with(f)));
-    (shaped && family).then_some(model)
+    if name.len() > MAX_EXPORTED_MODEL_BYTES {
+        return None;
+    }
+    let bare = MODEL_NAMESPACES
+        .iter()
+        .find_map(|ns| name.strip_prefix(ns))
+        .unwrap_or(name);
+    let mut words = bare.split(['-', '_', ':', '@']);
+    let first = words.next()?;
+    let family = MODEL_FAMILIES.iter().any(|(family, attached)| {
+        first == *family
+            || (*attached
+                && first
+                    .strip_prefix(family)
+                    .is_some_and(|v| model_word(v) && v.as_bytes()[0].is_ascii_digit()))
+    });
+    let rest: Vec<&str> = words.collect();
+    let shaped = family
+        && rest.len() < MAX_MODEL_WORDS
+        && rest.iter().all(|w| model_word(w))
+        // A family that takes its version attached says nothing alone.
+        && !(first == "o" || (first == "big" && rest.is_empty()));
+    shaped.then_some(model)
 }
 
 /// Plan names Codex is known to report (`rate_limits.plan_type`).
@@ -2511,7 +2703,8 @@ pub struct RunExport {
     pub models: Vec<Vec<AccountingAttribute>>,
 }
 
-/// The attributes for `record`. Pure; the live exporter does not call it.
+/// The attributes for `record`. Pure: the run tracker puts them on the
+/// run's span ([`run_usage::RunUsage::finish`]).
 pub fn run_attributes(record: &RunRecord) -> RunExport {
     use AccountingKey as K;
     let mut run = vec![
@@ -5259,6 +5452,16 @@ mod tests {
             "claude-opus-4@20250514",
             "gemini-3-pro",
             "qwen3-coder",
+            "claude-haiku-4-5-20251001",
+            "anthropic.claude-opus-4-1-20250805-v1:0",
+            "gpt-4o",
+            "o4-mini",
+            "llama3.1:8b",
+            "qwen3-coder-480b-a35b-instruct",
+            "deepseek-r1",
+            "kimi-k2",
+            "glm-4.6",
+            "big-pickle",
         ] {
             assert_eq!(
                 exported_model(&id(kept)).map(Ident::as_str),
@@ -5275,6 +5478,20 @@ mod tests {
             "my-private-model",
             "<synthetic>",
             ".claude-x",
+            // A path, host or private namespace in front of a known name,
+            // or a known family with words that are not a model's (#1858).
+            "home/alice/private/gpt-5",
+            "private/customer/llama-3.gguf",
+            "customer-secret.example/gpt-5",
+            "customer-secret.example.gpt-5",
+            "gpt-confidential-project",
+            "claude-acme-internal",
+            "openai/../gpt-5",
+            "acme/openai/gpt-5",
+            "gpt-5/private",
+            "o",
+            "big",
+            "gpt-5-1-2-3-4-5-6-7",
         ] {
             let Some(ident) = Ident::new(dropped) else {
                 continue;

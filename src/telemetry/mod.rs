@@ -113,6 +113,7 @@ fn start_from(
     registry: &crate::agent_pty::AgentPtyRegistry,
 ) -> Arc<Telemetry> {
     launch::remove_leftover_config_files(&config_dir);
+    exporter::remove_leftover_usage_files(&config_dir);
     let mut telemetry = Telemetry::start_in(env, config_dir.clone());
     #[cfg(unix)]
     if telemetry.is_enabled()
@@ -183,6 +184,14 @@ pub fn prepare_spawn(
     if run.is_none() && !opts.env.iter().any(|(k, _)| k == shim::RUN_ID_ENV) {
         opts.env.push((shim::RUN_ID_ENV.to_string(), String::new()));
     }
+    if run.is_none() {
+        // PRD #1858: only a run's own usage file, which a prepared run sets,
+        // over one the daemon or the spawn inherited from another run.
+        opts.env.push((
+            accounting::usage_file::USAGE_FILE_ENV.to_string(),
+            String::new(),
+        ));
+    }
     run
 }
 
@@ -218,16 +227,17 @@ pub fn commit_spawn(run: Option<PreparedRun>) {
 /// as `daemon_shutdown` while the daemon is shutting down, as `exited` when
 /// the agent is still registered (nothing removed it, so it went by itself),
 /// and as `closed` otherwise. `still_registered` is asked only when telemetry
-/// is on, and `exit_code` only for an agent that went by itself: its child
-/// can close its terminal a moment before it exits, so it is asked again for
-/// up to [`EXIT_CODE_WAIT`].
+/// is on, and `exit_status` (the agent's child's, once it has exited) only
+/// for an agent that went by itself: its child can close its terminal a
+/// moment before it exits, so it is asked again for up to
+/// [`EXIT_CODE_WAIT`].
 pub fn agent_exited(
     telemetry: Option<Arc<Telemetry>>,
     pane_id: Option<&str>,
     agent_id: &str,
     shutting_down: bool,
     still_registered: impl FnOnce() -> bool,
-    exit_code: impl Fn() -> Option<i32>,
+    exit_status: impl Fn() -> Option<portable_pty::ExitStatus>,
 ) {
     let (Some(telemetry), Some(pane_id)) = (telemetry, pane_id) else {
         return;
@@ -237,8 +247,8 @@ pub fn agent_exited(
         .then(|| {
             let deadline = std::time::Instant::now() + EXIT_CODE_WAIT;
             loop {
-                if let Some(code) = exit_code() {
-                    break Some(code);
+                if let Some(status) = exit_status() {
+                    break exit_code(&status);
                 }
                 if std::time::Instant::now() >= deadline {
                     break None;
@@ -248,6 +258,18 @@ pub fn agent_exited(
         })
         .flatten();
     telemetry.end_run(pane_id, Some(agent_id), reason, code);
+}
+
+/// The exit code of a child that exited with `status`, as the run carries
+/// it; `None` when a signal ended it, which `portable_pty` names only in its
+/// `Display`, or for a code past `i32`.
+fn exit_code(status: &portable_pty::ExitStatus) -> Option<i32> {
+    let signalled = status.to_string().starts_with("Terminated by");
+    if signalled {
+        None
+    } else {
+        i32::try_from(status.exit_code()).ok()
+    }
 }
 
 /// How long [`agent_exited`] waits for an agent's exit code after its
@@ -490,7 +512,7 @@ mod tests {
             "a1",
             false,
             || panic!("registration is not asked with telemetry off"),
-            || panic!("the exit code is not asked with telemetry off"),
+            || panic!("the exit status is not asked with telemetry off"),
         );
         observe_pane_input(None, true, "p1", b"x");
         commit_spawn(None);
@@ -537,6 +559,57 @@ mod tests {
             (disposition(libc::SIGTERM), disposition(libc::SIGINT)),
             before
         );
+    }
+
+    /// PRD #1858: a daemon that ends without reading its runs' usage files —
+    /// crashed, or killed — leaves them, and the next daemon to start on the
+    /// same state directory removes them before it has a run of its own.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_crashed_daemons_usage_files_go_when_the_next_one_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (event_tx, _) = tokio::sync::broadcast::channel(8);
+        let registry = crate::agent_pty::AgentPtyRegistry::new();
+        let crashed = start_from(
+            &exporting_env(),
+            dir.path().to_path_buf(),
+            None,
+            &event_tx,
+            &registry,
+        );
+        let mut opts = crate::agent_pty::SpawnOptions {
+            agent_type: Some(crate::event::AgentType::Pi),
+            ..Default::default()
+        };
+        let run = prepare_spawn(
+            Some(Arc::clone(&crashed)),
+            Some("p1"),
+            "a1",
+            &mut opts,
+            None,
+        )
+        .expect("a prepared run");
+        let file = opts
+            .env
+            .iter()
+            .rev()
+            .find(|(k, _)| k == accounting::usage_file::USAGE_FILE_ENV)
+            .map(|(_, v)| std::path::PathBuf::from(v))
+            .unwrap();
+        commit_spawn(Some(run));
+        assert!(file.is_file());
+        // The crash: the daemon never ends the run nor shuts down.
+        std::mem::forget(crashed);
+        let registry = crate::agent_pty::AgentPtyRegistry::new();
+        let next = start_from(
+            &exporting_env(),
+            dir.path().to_path_buf(),
+            None,
+            &event_tx,
+            &registry,
+        );
+        assert!(!file.exists(), "left over after a restart");
+        next.shutdown(std::time::Duration::from_millis(100)).await;
     }
 
     /// A Devin configuration a crashed or SIGKILLed daemon left behind is
@@ -736,14 +809,25 @@ mod tests {
         assert!(registry.telemetry().is_none());
         let mut opts = crate::agent_pty::SpawnOptions::default();
         assert!(prepare_spawn(registry.telemetry(), Some("p1"), "a1", &mut opts, None).is_none());
-        assert_eq!(opts.env, [(shim::RUN_ID_ENV.to_string(), String::new())]);
+        // PRD #1858: an inherited usage file is blanked the same way.
+        let usage_file = (
+            accounting::usage_file::USAGE_FILE_ENV.to_string(),
+            String::new(),
+        );
+        assert_eq!(
+            opts.env,
+            [
+                (shim::RUN_ID_ENV.to_string(), String::new()),
+                usage_file.clone()
+            ]
+        );
         let own = [(shim::RUN_ID_ENV.to_string(), "mine".to_string())];
         let mut opts = crate::agent_pty::SpawnOptions {
             env: own.to_vec(),
             ..Default::default()
         };
         assert!(prepare_spawn(registry.telemetry(), Some("p1"), "a1", &mut opts, None).is_none());
-        assert_eq!(opts.env, own);
+        assert_eq!(opts.env, [own[0].clone(), usage_file]);
         telemetry
             .shutdown(std::time::Duration::from_millis(100))
             .await;

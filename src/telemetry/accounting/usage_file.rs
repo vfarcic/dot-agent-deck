@@ -13,8 +13,14 @@
 //! that writes what it should puts no content in the file.
 //!
 //! The format is the deck's, versioned by `v` ([`VERSION`]); a line of
-//! another version is ignored and, with nothing usable beside it, makes the
-//! run's usage [`Unavailable::UnrecognizedFormat`]. The agents' own words for
+//! another version, or one that does not parse, makes the run's usage
+//! [`Unavailable::UnrecognizedFormat`] when nothing usable is beside it and
+//! [`Unavailable::Incomplete`] when something is, since the reply it held is
+//! not counted. A count the agent gave its producer that was missing or not a
+//! count is written as `null`, so its reply is unrecognized rather than a
+//! zero. A `turn_start` line, which the Pi extension writes when Pi starts
+//! answering a prompt, says a turn began and adds no usage, so a Pi that
+//! dies before its next reply ends mid-turn. The agents' own words for
 //! how a reply stopped and why it failed are passed through raw (`stop`,
 //! `error`) and mapped here, so a stop reason an agent upgrade adds becomes
 //! `unknown`, never a wrong outcome.
@@ -91,9 +97,10 @@ struct AgentLines {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UsageFileSummary {
     agents: BTreeMap<UsageAgent, AgentLines>,
-    /// Lines of another version, or of an agent this reader does not know.
+    /// Lines of another version or type, or of an agent this reader does
+    /// not know.
     pub unknown_lines: u64,
-    /// A line with the reply marker did not parse.
+    /// A line with a marker did not parse.
     pub malformed: bool,
 }
 
@@ -119,6 +126,14 @@ impl UsageFileSummary {
         };
         let models = if lines.lost {
             usage_unavailable(Unavailable::Incomplete)
+        } else if self.unknown_lines > 0 || self.malformed {
+            // A line the reader could not read may have been a reply of
+            // this agent's: what it did read is a part, not the whole.
+            if lines.anonymous.is_empty() && lines.by_id.is_empty() {
+                unrecognized()
+            } else {
+                usage_unavailable(Unavailable::Incomplete)
+            }
         } else {
             let mut acc = lines.anonymous.clone();
             for reply in lines.by_id.values() {
@@ -138,7 +153,8 @@ impl UsageFileSummary {
     }
 
     fn observe_line(&mut self, line: UsageLine) {
-        if line.v.count() != Some(VERSION) || line.kind.0.as_deref() != Some("reply") {
+        let kind = line.kind.0.as_deref();
+        if line.v.count() != Some(VERSION) || !matches!(kind, Some("reply" | "turn_start")) {
             self.unknown_lines += 1;
             return;
         }
@@ -146,6 +162,10 @@ impl UsageFileSummary {
             self.unknown_lines += 1;
             return;
         };
+        if kind == Some("turn_start") {
+            self.agents.entry(agent).or_default().last_turn = Some(AgentTurnEnd::MidTurn);
+            return;
+        }
         let reply = line.reply();
         let last_turn = line.turn_end(agent);
         let lines = self.agents.entry(agent).or_default();
@@ -167,7 +187,7 @@ impl UsageFileSummary {
 }
 
 impl LineSummary for UsageFileSummary {
-    const MARKERS: &'static [&'static [u8]] = &[b"\"type\":\"reply\""];
+    const MARKERS: &'static [&'static [u8]] = &[b"\"type\":\"reply\"", b"\"type\":\"turn_start\""];
     type Record = UsageLine;
 
     fn observe(&mut self, record: UsageLine, _stats: &mut ReaderStats) {
@@ -199,10 +219,11 @@ pub struct UsageLine {
     input: OptScalar,
     #[serde(default)]
     output: OptScalar,
+    /// Left out for zero; present, it must be a count.
     #[serde(default)]
-    cache_read: OptScalar,
+    cache_read: Present,
     #[serde(default)]
-    cache_write: OptScalar,
+    cache_write: Present,
     /// The agent's own cost figure for the reply; absent when it has none.
     #[serde(default)]
     cost_usd: OptScalar,
@@ -234,9 +255,9 @@ impl UsageLine {
         if self.reported.as_bool() == Some(false) {
             return unrecorded(Unavailable::NotRecorded);
         }
-        let cache = |v: &OptScalar| match v {
-            OptScalar::Other => Some(0),
-            v => v.count(),
+        let cache = |v: &Present| match &v.0 {
+            None => Some(0),
+            Some(v) => v.count(),
         };
         let (Some(input), Some(output), Some(cache_read), Some(cache_write)) = (
             self.input.count(),
@@ -285,6 +306,17 @@ impl UsageLine {
                 (None, Some(_)) => AgentTurnEnd::Unknown,
             },
         }
+    }
+}
+
+/// A field that may be left out, told apart from one given as `null` or as
+/// a value of another type: `None` only when it is absent.
+#[derive(Default)]
+pub struct Present(Option<OptScalar>);
+
+impl<'de> Deserialize<'de> for Present {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        OptScalar::deserialize(d).map(|v| Present(Some(v)))
     }
 }
 
@@ -539,6 +571,133 @@ mod tests {
         assert_eq!(
             usage.models[0].tokens.provenance(),
             Provenance::ProviderReported
+        );
+    }
+
+    /// The Pi extension's lines for each case in its shared fixture (PRD
+    /// #1858), read here: what the extension writes for a missing, renamed,
+    /// string, negative or fractional count is unrecognized, never a
+    /// provider-reported zero, and its initial zeros on a failed or aborted
+    /// reply are not recorded. The extension's own test pins the same lines
+    /// to the replies they come from (`pi-extension/test/usage-file.test.ts`).
+    #[test]
+    fn the_pi_extensions_lines_read_as_the_extension_means_them() {
+        let cases: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../../../pi-extension/test/usage-file-cases.json"
+        ))
+        .unwrap();
+        assert!(!cases.is_empty());
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let reader = read(&[case["line"].to_string()]);
+            let usage = reader.summary().usage(UsageAgent::Pi);
+            let deck = &case["deck"];
+            match deck["unavailable"].as_str() {
+                Some(reason) => assert_eq!(
+                    usage.models[0]
+                        .tokens
+                        .unavailable()
+                        .map(Unavailable::as_str),
+                    Some(reason),
+                    "{name}"
+                ),
+                None => {
+                    let want: Vec<u64> = deck["tokens"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_u64().unwrap())
+                        .collect();
+                    let Field::ProviderReported(t) = usage.models[0].tokens else {
+                        panic!("{name}: {:?}", usage.models[0].tokens);
+                    };
+                    assert_eq!(
+                        vec![t.input, t.output, t.cache_read, t.cache_write],
+                        want,
+                        "{name}"
+                    );
+                }
+            }
+            assert_eq!(
+                usage.last_turn.as_ref().map(AgentTurnEnd::as_str),
+                deck["last_turn"].as_str(),
+                "{name}"
+            );
+        }
+    }
+
+    /// A cache count left out is zero; given as `null`, a string or a
+    /// negative number, it is not a count, and the reply is unrecognized.
+    #[test]
+    fn a_cache_count_left_out_is_zero_but_an_invalid_one_is_not() {
+        let line = |cache: &str| {
+            format!(
+                r#"{{"v":1,"type":"reply","agent":"opencode","id":"m","model":"gpt-5.4","input":3,"output":2{cache},"stop":"stop"}}"#
+            )
+        };
+        let reader = read(&[line("")]);
+        assert_eq!(
+            reader.summary().usage(UsageAgent::OpenCode).models[0].tokens,
+            Field::ProviderReported(Tokens {
+                input: 3,
+                output: 2,
+                cache_read: 0,
+                cache_write: 0,
+            })
+        );
+        for cache in [
+            r#","cache_read":null"#,
+            r#","cache_write":"1""#,
+            r#","cache_read":-1"#,
+        ] {
+            let reader = read(&[line(cache)]);
+            assert_eq!(
+                reader.summary().usage(UsageAgent::OpenCode).models[0].tokens,
+                Field::Unavailable(Unavailable::UnrecognizedFormat),
+                "{cache}"
+            );
+        }
+    }
+
+    /// A line the reader cannot read after replies it could — one that does
+    /// not parse, or of another version — may have been a reply, so the
+    /// replies read are a part: incomplete, not the earlier total.
+    #[test]
+    fn an_unreadable_line_after_usable_ones_makes_the_usage_incomplete() {
+        for later in [
+            r#"{"v":1,"type":"reply","agent":"pi","#.to_owned(),
+            pi("gpt-5.5", 10, 2, None, "stop").replace(r#""v":1"#, r#""v":2"#),
+        ] {
+            let reader = read(&[pi("gpt-5.5", 10, 2, Some(0.5), "stop"), later.clone()]);
+            assert_eq!(
+                reader.summary().usage(UsageAgent::Pi).models,
+                usage_unavailable(Unavailable::Incomplete),
+                "{later}"
+            );
+        }
+    }
+
+    /// A turn's start adds no usage and makes the last turn mid-turn until a
+    /// reply ends it.
+    #[test]
+    fn a_turn_start_marks_the_turn_open() {
+        let start = r#"{"v":1,"type":"turn_start","agent":"pi"}"#.to_owned();
+        let reader = read(&[pi("gpt-5.5", 10, 2, Some(0.5), "stop"), start.clone()]);
+        let usage = reader.summary().usage(UsageAgent::Pi);
+        assert_eq!(usage.last_turn, Some(AgentTurnEnd::MidTurn));
+        assert_eq!(
+            usage.models[0].tokens,
+            Field::ProviderReported(Tokens {
+                input: 16,
+                output: 2,
+                cache_read: 5,
+                cache_write: 1,
+            })
+        );
+        let reader = read(&[start, pi("gpt-5.5", 10, 2, Some(0.5), "stop")]);
+        assert_eq!(
+            reader.summary().usage(UsageAgent::Pi).last_turn,
+            Some(AgentTurnEnd::Completed)
         );
     }
 }
