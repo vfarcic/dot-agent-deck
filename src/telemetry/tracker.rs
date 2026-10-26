@@ -374,6 +374,12 @@ impl RunTracker {
             .map(|run| run.start_info.run_id.as_str())
     }
 
+    /// The usage of the run open on `pane_id`, if it has any.
+    #[cfg(test)]
+    pub fn usage_of(&self, pane_id: &str) -> Option<RunUsage> {
+        self.runs.get(pane_id)?.usage.clone()
+    }
+
     /// An agent is about to start: remember its run, so events it causes before
     /// [`Self::commit_run`] are kept for it. A run id prepared twice keeps the
     /// first preparation.
@@ -856,7 +862,9 @@ impl FinishingRun {
     /// Drain the run's usage record and put what it says on the span: the
     /// usage and termination attributes, and one [`EVENT_MODEL_USAGE`] event
     /// per model, past the cap on the run's other events, so a run's usage is
-    /// not dropped for having changed status often. Reads files.
+    /// not dropped for having changed status often. A drain that panics
+    /// gives the span with its usage incomplete
+    /// ([`RunUsage::finish_or_incomplete`]). Reads files.
     pub fn complete(self) -> SpanRecord {
         let FinishingRun {
             mut span,
@@ -865,7 +873,7 @@ impl FinishingRun {
             reason,
             exit_code,
         } = self;
-        let usage = usage.finish(&run_id, reason, exit_code);
+        let usage = usage.finish_or_incomplete(&run_id, reason, exit_code);
         // The run's own id and agent are already the span's.
         let own = |a: &super::accounting::AccountingAttribute| {
             !matches!(a.key(), AccountingKey::RunId | AccountingKey::Agent)

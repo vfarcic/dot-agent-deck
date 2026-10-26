@@ -187,7 +187,7 @@ Events on the `agent.run` span, one `deck.model_usage` per model the run used:
 
 | Attribute | Value |
 | --- | --- |
-| `gen_ai.response.model` | The model, such as `claude-haiku-4-5-20251001` or `gpt-5.4-mini`. Left out for a model whose name the deck does not recognise as a known model's, such as a custom or local model, a name with a path or a prefix of your own in front of it, or one with a suffix of your own after it, such as an address: its tokens are still sent. |
+| `gen_ai.response.model` | The model, such as `claude-haiku-4-5-20251001` or `gpt-5.4-mini`. Left out for a model whose name the deck does not recognise as a known model's, such as a custom or local model, a name with a path or a prefix of your own in front of it, or one with a suffix of your own after it, such as an address: its tokens are still sent. A name of your own that has exactly the form of a published model's name, such as a known model followed by a date, is sent as it is. |
 | `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.usage.cache_read.input_tokens`, `gen_ai.usage.cache_write.input_tokens` | That model's tokens, as on the run. |
 | `deck.tokens.provenance`, `deck.tokens.unavailable_reason`, `deck.cost.microusd`, `deck.cost.provenance`, `deck.cost.unavailable_reason` | That model's provenance and cost estimate, as on the run. |
 
@@ -197,7 +197,7 @@ Where each agent's figures come from:
 
 | Agent | Tokens | Cost | Allowance | How it ended |
 | --- | --- | --- | --- | --- |
-| Claude Code | Claude Code's own session total, which it writes when it exits. End a Claude Code run with `/exit`: one that is killed, or whose pane is closed while Claude Code runs, can have its tokens `not_recorded`. A run that resumes an earlier session counts only what it added, or is `incomplete` when the deck cannot tell what that was. | Claude Code's own estimate. | `no_channel` | Claude Code's last turn, with the kind of an API error and its HTTP status. |
+| Claude Code | Claude Code's own session total, which it writes when it exits. End a Claude Code run with `/exit`: one that is killed, or whose pane is closed while Claude Code runs, can have its tokens `not_recorded`. A run that resumes an earlier session counts only what it added, or is `incomplete` when the deck cannot tell what that was. Starting a new conversation in Claude Code, for example with `/clear`, and then leaving before sending anything in it can make the run's tokens `incomplete`. | Claude Code's own estimate. | `no_channel` | Claude Code's last turn, with the kind of an API error and its HTTP status. |
 | Codex | Codex's own running total, as the run goes. | `no_channel`: Codex reports no cost. | Codex's plan and its main allowance window. **The used share is the plan's, not the run's alone**: runs on the same plan whose times overlap share one window, so a run's figure includes their use too. The first figure arrives with the run's first reply, so the run's first request is not in it. So the difference between the two figures is not an exact count of what the run took from the allowance. | Codex's last turn, with its error kind. |
 | OpenCode | Each reply's tokens, as OpenCode hands them to the deck's OpenCode plugin. | OpenCode's own figure. Subscription providers report 0, which is sent as `unavailable` with `subscription_zero`. | `no_channel` | OpenCode's last reply. |
 | Pi | Each reply's tokens, as Pi hands them to the deck's Pi extension. | Pi's own estimate. | `no_channel` | Pi's last reply. |

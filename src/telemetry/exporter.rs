@@ -104,6 +104,15 @@ pub const USAGE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// The directory, under the per-run configuration directory, that holds the
 /// usage files the deck's Pi extension and OpenCode plugin append to.
 pub(crate) const USAGE_DIR: &str = "usage";
+/// How many tokens one attempt to take a usage lease tries
+/// ([`take_usage_lease`]).
+const LEASE_TOKENS: usize = 4;
+/// How long after an attempt to take a usage lease failed a later run's
+/// start tries again ([`LeaseSlot`]).
+const LEASE_RETRY_AFTER: Duration = Duration::from_secs(10);
+/// How old a lease file still being made is before a starting daemon's
+/// cleanup removes it ([`remove_leftover_usage_files`]).
+const ABANDONED_LEASE_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// The deck's usage directory, [`USAGE_DIR`] in `config_dir`, made if it is
 /// not there and opened as a [`TrustedDir`] when it is a directory of this
@@ -166,30 +175,109 @@ struct UsageLease {
     _held: std::os::fd::OwnedFd,
 }
 
-/// Take a new lease in `dir`: made under a name no cleanup takes as a lease
-/// ([`locate::lease_file_name`]), locked, then renamed to its own, so a
-/// lease another daemon finds under its own name is already held. `None`
-/// when any step fails, and then no run gets a usage file.
+/// A lease token: 16 bytes from the operating system's random source, as
+/// hexadecimal. `None` when that source fails: there is no fallback, as a
+/// token from a clock or a counter could be another daemon's.
+fn lease_token() -> Option<String> {
+    let mut token = [0u8; 16];
+    getrandom::fill(&mut token).ok()?;
+    Some(super::span::hex(&token))
+}
+
+/// Take a new lease in `dir`. Its file is made under the name of a lease
+/// being made ([`locate::lease_being_made`]), which cleanup does not take as
+/// a lease, locked, then renamed to the lease's own name only if no entry
+/// has that name ([`TrustedDir::rename_new`]), so a lease another daemon
+/// finds under its own name is already held and a held one is never
+/// replaced. A token whose file cannot be made, locked or renamed is given
+/// up for another, at most [`LEASE_TOKENS`] of them. `None` when none could
+/// be, or the random source fails, and then no run gets a usage file.
 #[cfg(unix)]
 fn take_usage_lease(dir: &TrustedDir) -> Option<UsageLease> {
+    take_usage_lease_with(dir, lease_token, |_| {})
+}
+
+/// [`take_usage_lease`], with its tokens from `token` and `made` called with
+/// each token between making its file and locking it: a test's seam.
+#[cfg(unix)]
+fn take_usage_lease_with(
+    dir: &TrustedDir,
+    mut token: impl FnMut() -> Option<String>,
+    mut made: impl FnMut(&str),
+) -> Option<UsageLease> {
     use std::os::fd::AsRawFd as _;
-    let token = new_run_id();
-    let making = locate::lease_file_name(&token, false);
-    let made = locate::lease_file_name(&token, true);
     let flags = libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    let held = dir.open_raw(Path::new(&making), flags, 0o600).ok()?;
-    // SAFETY: `held` is an open descriptor.
-    let locked = unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
-    if !locked || dir.rename(making.as_ref(), made.as_ref()).is_err() {
+    for _ in 0..LEASE_TOKENS {
+        let token = token()?;
+        let making = locate::lease_file_name(&token, false);
+        let lease = locate::lease_file_name(&token, true);
+        // A name that is there already is not this daemon's to remove.
+        let Ok(held) = dir.open_raw(Path::new(&making), flags, 0o600) else {
+            continue;
+        };
+        made(&token);
+        // SAFETY: `held` is an open descriptor.
+        let locked = unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+        if locked && dir.rename_new(making.as_ref(), lease.as_ref()).is_ok() {
+            return Some(UsageLease { token, _held: held });
+        }
         dir.remove(making.as_ref());
-        return None;
     }
-    Some(UsageLease { token, _held: held })
+    None
 }
 
 #[cfg(not(unix))]
 fn take_usage_lease(_dir: &TrustedDir) -> Option<UsageLease> {
     None
+}
+
+/// This daemon's usage lease, taken with its first usage file and then held
+/// for as long as the daemon runs. An attempt that failed is not final: a
+/// later run's start tries again, no sooner than [`LEASE_RETRY_AFTER`] after
+/// it, so a passing failure does not leave the daemon without usage files.
+#[derive(Default)]
+struct LeaseSlot(Mutex<LeaseState>);
+
+#[derive(Default)]
+enum LeaseState {
+    #[default]
+    Untried,
+    Failed(std::time::Instant),
+    Held(UsageLease),
+}
+
+impl LeaseSlot {
+    /// The lease's token, `take` called for a lease when there is none: the
+    /// first time, and again once [`LEASE_RETRY_AFTER`] has passed since it
+    /// last failed. `None` while there is no lease.
+    fn token(
+        &self,
+        now: std::time::Instant,
+        take: impl FnOnce() -> Option<UsageLease>,
+    ) -> Option<String> {
+        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        match &*state {
+            LeaseState::Held(lease) => return Some(lease.token.clone()),
+            LeaseState::Failed(at) if now.saturating_duration_since(*at) < LEASE_RETRY_AFTER => {
+                return None;
+            }
+            LeaseState::Untried | LeaseState::Failed(_) => {}
+        }
+        *state = take().map_or(LeaseState::Failed(now), LeaseState::Held);
+        match &*state {
+            LeaseState::Held(lease) => Some(lease.token.clone()),
+            LeaseState::Untried | LeaseState::Failed(_) => None,
+        }
+    }
+
+    /// The lease held, if any.
+    #[cfg(test)]
+    fn with_held<T>(&self, f: impl FnOnce(&UsageLease) -> T) -> Option<T> {
+        match &*self.0.lock().unwrap_or_else(|p| p.into_inner()) {
+            LeaseState::Held(lease) => Some(f(lease)),
+            LeaseState::Untried | LeaseState::Failed(_) => None,
+        }
+    }
 }
 
 /// Remove the usage files in the deck's usage directory under `config_dir`
@@ -200,9 +288,15 @@ fn take_usage_lease(_dir: &TrustedDir) -> Option<UsageLease> {
 /// lock can be taken at once, so the daemon that held it has ended; a lease
 /// another daemon holds — on this machine, whatever process-id namespace it
 /// runs in — keeps its files. A usage file whose lease file is not there is
-/// kept. Every open and removal is made beneath the usage directory's
-/// descriptor, with no symlink followed. Elsewhere than Unix no run has a
-/// usage file, and nothing is removed.
+/// kept. A lease file still being made ([`locate::lease_being_made`]) is not
+/// a lease, and no usage file names its token: it is removed only once it is
+/// [`ABANDONED_LEASE_AGE`] old and its lock can be taken at once. A daemon
+/// makes, locks and renames one within a single call ([`take_usage_lease`]),
+/// so one that old was left by a daemon that stopped part way; and should a
+/// daemon still making one find it gone, it takes another token. Every open
+/// and removal is made beneath the usage directory's descriptor, with no
+/// symlink followed. Elsewhere than Unix no run has a usage file, and nothing
+/// is removed.
 pub(crate) fn remove_leftover_usage_files(config_dir: &Path) {
     #[cfg(unix)]
     {
@@ -214,17 +308,30 @@ pub(crate) fn remove_leftover_usage_files(config_dir: &Path) {
         };
         let names = dir.entry_names(usize::MAX);
         for lease_file in &names {
-            let Some(lease) = locate::lease_of_file(lease_file.as_encoded_bytes()) else {
+            let name = lease_file.as_encoded_bytes();
+            // `None` for a lease file still being made.
+            let lease = locate::lease_of_file(name);
+            if lease.is_none() && locate::lease_being_made(name).is_none() {
                 continue;
-            };
+            }
             let flags = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC;
             let Ok(held) = dir.open_raw(Path::new(lease_file), flags, 0) else {
                 continue;
             };
-            let Ok(file) = held.try_clone().map(std::fs::File::from) else {
+            let Ok(meta) = held
+                .try_clone()
+                .map(std::fs::File::from)
+                .and_then(|file| file.metadata())
+            else {
                 continue;
             };
-            if !file.metadata().is_ok_and(|m| m.is_file()) {
+            let abandoned = || {
+                meta.modified()
+                    .ok()
+                    .and_then(|at| at.elapsed().ok())
+                    .is_some_and(|age| age >= ABANDONED_LEASE_AGE)
+            };
+            if !meta.is_file() || (lease.is_none() && !abandoned()) {
                 continue;
             }
             // SAFETY: `held` is an open descriptor.
@@ -232,7 +339,8 @@ pub(crate) fn remove_leftover_usage_files(config_dir: &Path) {
                 continue;
             }
             for name in &names {
-                if locate::usage_file_lease(name.as_encoded_bytes()) == Some(lease)
+                if lease.is_some()
+                    && locate::usage_file_lease(name.as_encoded_bytes()) == lease
                     && dir.has_file(Path::new(name))
                 {
                     dir.remove(name);
@@ -370,8 +478,8 @@ struct Shared {
     runtime: tokio::runtime::Handle,
     /// This, for a run completed on another thread to queue its span.
     me: std::sync::Weak<Shared>,
-    /// Ended runs whose usage is being drained and whose spans are not
-    /// queued yet.
+    /// Batches of ended runs, one per [`Shared::complete_later`] call with
+    /// any, whose task has not ended yet: not runs.
     finalizing: watch::Sender<usize>,
     /// Test seam: pauses the ingest task once inside its `escape_held`
     /// branch, after signalling the first half, until the second receives.
@@ -412,9 +520,8 @@ pub struct Telemetry {
     /// The committed runs whose per-run agent configuration files the shim
     /// may write, removed as each run's agent ends ([`super::launch`]).
     run_files: Mutex<Vec<RunFiles>>,
-    /// This daemon's lease on its usage files, taken with the first one;
-    /// `None` inside when it could not be.
-    usage_lease: OnceLock<Option<UsageLease>>,
+    /// This daemon's lease on its usage files, taken with the first one.
+    usage_lease: LeaseSlot,
 }
 
 /// A committed run whose agent may have per-run configuration files.
@@ -500,7 +607,7 @@ impl Telemetry {
             config_dir: None,
             shim_dir: None,
             run_files: Mutex::new(Vec::new()),
-            usage_lease: OnceLock::new(),
+            usage_lease: LeaseSlot::default(),
         }
     }
 
@@ -585,7 +692,7 @@ impl Telemetry {
             config_dir: Some(config_dir),
             shim_dir: None,
             run_files: Mutex::new(Vec::new()),
-            usage_lease: OnceLock::new(),
+            usage_lease: LeaseSlot::default(),
         }
     }
 
@@ -712,9 +819,8 @@ impl Telemetry {
                         .and_then(|dir| {
                             let lease = self
                                 .usage_lease
-                                .get_or_init(|| take_usage_lease(&dir))
-                                .as_ref()?;
-                            new_usage_file(dir, &start.run_id, &lease.token)
+                                .token(std::time::Instant::now(), || take_usage_lease(&dir))?;
+                            new_usage_file(dir, &start.run_id, &lease)
                         });
             }
             UsageSource::UsageFile | UsageSource::NoChannel => {}
@@ -1018,10 +1124,7 @@ impl Telemetry {
     #[cfg(all(test, unix))]
     pub(crate) fn usage_lease_fd(&self) -> Option<std::os::fd::RawFd> {
         use std::os::fd::AsRawFd as _;
-        self.usage_lease
-            .get()?
-            .as_ref()
-            .map(|lease| lease._held.as_raw_fd())
+        self.usage_lease.with_held(|lease| lease._held.as_raw_fd())
     }
 
     /// Run-context probes queued or running.
@@ -1050,12 +1153,15 @@ impl Shared {
     /// Drain the usage record of each run in `finishing` and queue its span
     /// once that is done ([`FinishingRun::complete`]), on a blocking thread,
     /// so the caller — the ingest task, mostly — goes on with other runs'
-    /// events meanwhile. Counted in [`Self::finalizing`] until queued.
+    /// events meanwhile. The batch is counted in [`Self::finalizing`] until
+    /// its task ends. A run whose drain panics still gives its span, its
+    /// usage incomplete ([`FinishingRun::complete`]), so one run's failure
+    /// does not take the others' spans with it.
     fn complete_later(&self, finishing: Vec<FinishingRun>) {
         if finishing.is_empty() {
             return;
         }
-        /// Counts the runs off as done however the drain ends.
+        /// Counts the batch off however its task ends.
         struct Done(std::sync::Weak<Shared>);
         impl Drop for Done {
             fn drop(&mut self) {
@@ -1076,9 +1182,11 @@ impl Shared {
         });
     }
 
-    /// Resolves once no ended run is being completed
-    /// ([`Self::complete_later`]): every span of a run ended before the call
-    /// is queued, or was dropped with the queue full.
+    /// Resolves once no batch of ended runs ([`Self::complete_later`]) begun
+    /// before the call is still being completed. A batch's task ends having
+    /// handed its spans to [`Self::enqueue`], which drops what a full queue
+    /// has no room for, unless it panics outside the runs' drains — which
+    /// [`FinishingRun::complete`] catches — and then its spans are lost.
     async fn finalized(&self) {
         let _ = self.finalizing.subscribe().wait_for(|n| *n == 0).await;
     }
@@ -1430,7 +1538,12 @@ fn apply(shared: &Arc<Shared>, command: Command) -> bool {
                         .collect::<Vec<_>>()
                 })
                 .await
-                .unwrap_or_default();
+                .unwrap_or_else(|_| {
+                    tracing::warn!(
+                        "completing the runs open at shutdown failed; their spans are lost"
+                    );
+                    Vec::new()
+                });
                 finished.extend(completed);
                 // Queued by `shutdown`, which can wait for room; when it
                 // stopped waiting for these, as best it can.
@@ -2310,7 +2423,10 @@ mod tests {
                 continue;
             }
             let file = PathBuf::from(file.unwrap());
-            let lease = &telemetry.usage_lease.get().unwrap().as_ref().unwrap().token;
+            let lease = &telemetry
+                .usage_lease
+                .with_held(|lease| lease.token.clone())
+                .unwrap();
             assert_eq!(
                 file,
                 usage_dir.join(format!("{}-{lease}.usage.jsonl", run.run_id)),
@@ -2375,21 +2491,24 @@ mod tests {
     /// that lease's lock is free; a lease held through another open file
     /// description — another daemon's, whichever process-id namespace it is
     /// in, and whatever its process id is here — keeps its files. A file
-    /// with no lease file, or not named as the deck names them, is kept.
+    /// with no lease file, or not named as the deck names them, is kept. A
+    /// lease file still being made is not a lease: it goes only once it is
+    /// [`ABANDONED_LEASE_AGE`] old and unlocked, and takes no usage file
+    /// with it.
     #[cfg(unix)]
     #[test]
     fn leftover_usage_files_go_unless_their_lease_is_held() {
-        use std::os::fd::AsRawFd as _;
         let home = tempfile::tempdir().unwrap();
         let usage = home.path().join(USAGE_DIR);
         std::fs::create_dir_all(&usage).unwrap();
         let (ended, running, unleased) = (new_run_id(), new_run_id(), new_run_id());
+        let (abandoned, making, stuck) = (new_run_id(), new_run_id(), new_run_id());
         let file = |lease: &str| format!("{}-{lease}.usage.jsonl", new_run_id());
         let gone = [
             file(&ended),
             file(&ended),
             format!("{ended}.lease"),
-            format!("{}.lease-new", new_run_id()),
+            format!("{abandoned}.lease-new"),
         ];
         let kept = [
             file(&running),
@@ -2398,18 +2517,27 @@ mod tests {
             "notes.txt".to_string(),
             "x.usage.jsonl".to_string(),
             format!("x-{}.usage.jsonl", std::process::id()),
+            format!("{making}.lease-new"),
+            file(&making),
+            format!("{stuck}.lease-new"),
+            file(&abandoned),
         ];
         for name in gone.iter().chain(&kept) {
             std::fs::write(usage.join(name), "{}").unwrap();
         }
-        // Another daemon's lock on its lease: an open file description this
-        // cleanup does not share.
-        let held = std::fs::File::open(usage.join(format!("{running}.lease"))).unwrap();
-        // SAFETY: `held` is open.
-        assert_eq!(
-            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
+        let old = std::time::SystemTime::now() - ABANDONED_LEASE_AGE - Duration::from_secs(60);
+        for lease in [&abandoned, &stuck] {
+            std::fs::File::options()
+                .write(true)
+                .open(usage.join(format!("{lease}.lease-new")))
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        // Another daemon's lock on its lease, and on an old lease file it is
+        // still making: open file descriptions this cleanup does not share.
+        let held = lock(&usage.join(format!("{running}.lease")));
+        let _stuck = lock(&usage.join(format!("{stuck}.lease-new")));
         remove_leftover_usage_files(home.path());
         for name in &gone {
             assert!(!usage.join(name).exists(), "left over: {name}");
@@ -2424,6 +2552,154 @@ mod tests {
         assert!(!usage.join(&kept[1]).exists());
         assert!(usage.join(&kept[2]).exists());
         remove_leftover_usage_files(&home.path().join("absent"));
+    }
+
+    /// An exclusive lock on `path` through an open file description of its
+    /// own, as another daemon holds its lease.
+    #[cfg(unix)]
+    fn lock(path: &Path) -> std::fs::File {
+        use std::os::fd::AsRawFd as _;
+        let file = std::fs::File::open(path).unwrap();
+        // SAFETY: `file` is open.
+        assert_eq!(
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        file
+    }
+
+    /// The usage directory under `home`, made, and opened as the daemon
+    /// opens it.
+    #[cfg(unix)]
+    fn usage_dir(home: &Path) -> TrustedDir {
+        private_dir(home).unwrap()
+    }
+
+    /// The inode of the entry `name` in `dir`.
+    #[cfg(unix)]
+    fn inode(dir: &Path, name: &str) -> u64 {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::symlink_metadata(dir.join(name)).unwrap().ino()
+    }
+
+    /// PRD #1858: a daemon whose lease file is made but not yet locked when
+    /// another daemon starts and cleans up — the order two daemons starting
+    /// together can take — still ends with a lease, and the cleanup removes
+    /// no file of a lease that is held. Then a daemon whose file went before
+    /// it locked it, as cleanup takes an abandoned one, takes another token
+    /// and still ends with a lease.
+    #[cfg(unix)]
+    #[test]
+    fn a_lease_being_made_survives_another_daemons_cleanup() {
+        use std::os::unix::fs::MetadataExt as _;
+        let home = tempfile::tempdir().unwrap();
+        let dir = usage_dir(home.path());
+        let usage = home.path().join(USAGE_DIR);
+        let running = new_run_id();
+        let live = format!("{}-{running}.usage.jsonl", new_run_id());
+        for name in [format!("{running}.lease"), live.clone()] {
+            std::fs::write(usage.join(name), "").unwrap();
+        }
+        let _running = lock(&usage.join(format!("{running}.lease")));
+
+        let mut paused = Vec::new();
+        let lease = take_usage_lease_with(&dir, lease_token, |token| {
+            paused.push(token.to_string());
+            remove_leftover_usage_files(home.path());
+        })
+        .expect("a lease");
+        assert_eq!(paused, std::slice::from_ref(&lease.token));
+        let name = format!("{}.lease", lease.token);
+        assert!(lease_held(&usage.join(&name)));
+        let held = std::fs::File::from(lease._held.try_clone().unwrap());
+        assert_eq!(held.metadata().unwrap().ino(), inode(&usage, &name));
+        assert!(!usage.join(format!("{}.lease-new", lease.token)).exists());
+        assert!(usage.join(&live).exists());
+        assert!(usage.join(format!("{running}.lease")).exists());
+        // Its own files outlive the next daemon's cleanup too.
+        let own = format!("{}-{}.usage.jsonl", new_run_id(), lease.token);
+        std::fs::write(usage.join(&own), "").unwrap();
+        remove_leftover_usage_files(home.path());
+        assert!(usage.join(&own).exists() && usage.join(&live).exists());
+
+        let mut first = true;
+        let again = take_usage_lease_with(&dir, lease_token, |token| {
+            if std::mem::take(&mut first) {
+                dir.remove(locate::lease_file_name(token, false).as_ref());
+            }
+        })
+        .expect("a lease under another token");
+        assert!(lease_held(&usage.join(format!("{}.lease", again.token))));
+    }
+
+    /// PRD #1858: a token that names a lease already held — two daemons
+    /// drawing the same one — never replaces that lease: the second daemon
+    /// gives the token up, leaves nothing of it behind, and takes the next.
+    /// With no other token it takes no lease at all, and neither does a
+    /// daemon whose random source fails.
+    #[cfg(unix)]
+    #[test]
+    fn a_repeated_token_never_replaces_a_held_lease() {
+        use std::os::unix::fs::MetadataExt as _;
+        let home = tempfile::tempdir().unwrap();
+        let dir = usage_dir(home.path());
+        let usage = home.path().join(USAGE_DIR);
+        let (same, next) = (new_run_id(), new_run_id());
+        let tokens = |tokens: Vec<String>| {
+            let mut tokens = tokens.into_iter();
+            move || tokens.next()
+        };
+        let first = take_usage_lease_with(&dir, tokens(vec![same.clone()]), |_| {}).unwrap();
+        let name = format!("{same}.lease");
+        let held = std::fs::File::from(first._held.try_clone().unwrap());
+        assert_eq!(held.metadata().unwrap().ino(), inode(&usage, &name));
+
+        let second =
+            take_usage_lease_with(&dir, tokens(vec![same.clone(), next.clone()]), |_| {}).unwrap();
+        assert_eq!(second.token, next);
+        assert_eq!(held.metadata().unwrap().ino(), inode(&usage, &name));
+        assert!(lease_held(&usage.join(&name)));
+        assert!(!usage.join(format!("{same}.lease-new")).exists());
+
+        assert!(take_usage_lease_with(&dir, tokens(vec![same.clone()]), |_| {}).is_none());
+        assert!(take_usage_lease_with(&dir, || None, |_| unreachable!()).is_none());
+        assert_eq!(held.metadata().unwrap().ino(), inode(&usage, &name));
+        let mut names: Vec<_> = std::fs::read_dir(&usage)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        let mut want = vec![name, format!("{next}.lease")];
+        want.sort();
+        assert_eq!(names, want);
+    }
+
+    /// PRD #1858: a daemon that could not take its usage lease tries again on
+    /// a later run's start once [`LEASE_RETRY_AFTER`] has passed, not before,
+    /// and keeps the lease it then takes.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_lease_is_taken_again_on_a_later_run() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = usage_dir(home.path());
+        let slot = LeaseSlot::default();
+        let start = std::time::Instant::now();
+        assert_eq!(slot.token(start, || None), None);
+        assert_eq!(
+            slot.token(start + LEASE_RETRY_AFTER / 2, || unreachable!()),
+            None
+        );
+        let later = start + LEASE_RETRY_AFTER;
+        let token = slot
+            .token(later, || take_usage_lease(&dir))
+            .expect("a lease");
+        assert!(lease_held(
+            &home.path().join(USAGE_DIR).join(format!("{token}.lease"))
+        ));
+        assert_eq!(
+            slot.token(later + LEASE_RETRY_AFTER, || unreachable!()),
+            Some(token)
+        );
     }
 
     /// The Devin configurations the shim writes for a run go when that run's
@@ -2975,6 +3251,70 @@ mod tests {
                 AttrKey::Accounting(crate::telemetry::accounting::AccountingKey::TokensProvenance)
             )),
             "the drain's usage is on the span"
+        );
+    }
+
+    /// PRD #1858: a run whose final drain panics — a bug in a reader — is
+    /// still sent, its usage incomplete, and the run ended with it in the
+    /// same batch is sent with its usage as read.
+    #[tokio::test]
+    async fn a_drain_that_panics_loses_no_span() {
+        use crate::telemetry::accounting::AccountingKey;
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        let shared = Arc::clone(&telemetry.exporting.as_ref().unwrap().shared);
+        begin(&telemetry, generation("p1", "a1"), &[]);
+        begin(&telemetry, generation("p2", "a2"), &[]);
+        telemetry.settled().await;
+        let (failing, kept) = {
+            let tracker = shared.tracker.lock().unwrap();
+            tracker.usage_of("p1").unwrap().panic_in_finish();
+            (
+                tracker.run_id("p1").unwrap().to_string(),
+                tracker.run_id("p2").unwrap().to_string(),
+            )
+        };
+        let finishing = {
+            let mut tracker = shared.tracker.lock().unwrap();
+            tracker.end_all(EndReason::Closed, now_unix_nanos());
+            let (finished, finishing) = tracker.take_finished_deferred();
+            shared.enqueue(finished);
+            finishing
+        };
+        assert_eq!(finishing.len(), 2);
+        shared.complete_later(finishing);
+        telemetry.settled().await;
+        let spans = captured(&mut rx);
+        let run = |id: &str| {
+            spans
+                .iter()
+                .find(|s| {
+                    s.name == SPAN_AGENT_RUN
+                        && attr(s, AttrKey::EndReason).is_some()
+                        && attr(s, AttrKey::RunId) == Some(&AttrValue::Str(id.to_string()))
+                })
+                .unwrap_or_else(|| panic!("no span for {id}"))
+        };
+        let reason = |id: &str| {
+            attr(
+                run(id),
+                AttrKey::Accounting(AccountingKey::TokensUnavailableReason),
+            )
+            .cloned()
+        };
+        assert_eq!(
+            reason(&failing),
+            Some(AttrValue::Str("incomplete".to_string()))
+        );
+        assert_ne!(
+            reason(&kept),
+            Some(AttrValue::Str("incomplete".to_string()))
+        );
+        assert!(
+            attr(
+                run(&kept),
+                AttrKey::Accounting(AccountingKey::TokensProvenance)
+            )
+            .is_some()
         );
     }
 

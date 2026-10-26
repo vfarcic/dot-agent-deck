@@ -178,9 +178,14 @@ impl TrustedDir {
         }
     }
 
-    /// Rename the entry `from` of this directory to `to`, both names in it.
+    /// Rename the entry `from` of this directory to `to`, both names in it,
+    /// unless an entry `to` is there already: then it fails, with
+    /// `AlreadyExists`, and replaces nothing. On Linux by `renameat2` with
+    /// `RENAME_NOREPLACE`; where the file system does not support that, and
+    /// elsewhere, by `linkat`, which does not replace a name either, then
+    /// removing `from`. Entries are renamed, never what a symlink points at.
     #[cfg(unix)]
-    pub(crate) fn rename(&self, from: &OsStr, to: &OsStr) -> io::Result<()> {
+    pub(crate) fn rename_new(&self, from: &OsStr, to: &OsStr) -> io::Result<()> {
         use std::os::fd::AsRawFd as _;
         use std::os::unix::ffi::OsStrExt as _;
         let name = |n: &OsStr| {
@@ -189,13 +194,36 @@ impl TrustedDir {
         };
         let (from, to) = (name(from)?, name(to)?);
         let fd = self.fd.as_raw_fd();
-        // SAFETY: both names are NUL-terminated and the descriptor is open;
-        // `renameat` renames entries, never what a symlink points at.
-        if unsafe { libc::renameat(fd, from.as_ptr(), fd, to.as_ptr()) } == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: both names are NUL-terminated and the descriptor is
+            // open.
+            let renamed = unsafe {
+                libc::syscall(
+                    libc::SYS_renameat2,
+                    fd,
+                    from.as_ptr(),
+                    fd,
+                    to.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
+            };
+            if renamed == 0 {
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            if !matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS)) {
+                return Err(error);
+            }
         }
+        // SAFETY: both names are NUL-terminated and the descriptor is open;
+        // without `AT_SYMLINK_FOLLOW`, `linkat` links the entry itself.
+        if unsafe { libc::linkat(fd, from.as_ptr(), fd, to.as_ptr(), 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: as above.
+        unsafe { libc::unlinkat(fd, from.as_ptr(), 0) };
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -434,12 +462,17 @@ pub fn lease_file_name(lease: &str, made: bool) -> String {
     )
 }
 
-/// The lease of a lease file named as [`lease_file_name`] names them, made
-/// or being made; `None` for any other name.
+/// The lease of a lease file named as [`lease_file_name`] names a made one;
+/// `None` for any other name, one still being made included.
 pub fn lease_of_file(name: &[u8]) -> Option<&[u8]> {
-    let lease = name
-        .strip_suffix(LEASE_SUFFIX.as_bytes())
-        .or_else(|| name.strip_suffix(NEW_LEASE_SUFFIX.as_bytes()))?;
+    let lease = name.strip_suffix(LEASE_SUFFIX.as_bytes())?;
+    is_lease(lease).then_some(lease)
+}
+
+/// The lease of a lease file named as [`lease_file_name`] names one still
+/// being made; `None` for any other name, a made one included.
+pub fn lease_being_made(name: &[u8]) -> Option<&[u8]> {
+    let lease = name.strip_suffix(NEW_LEASE_SUFFIX.as_bytes())?;
     is_lease(lease).then_some(lease)
 }
 
@@ -662,11 +695,15 @@ mod tests {
         ] {
             assert_eq!(usage_file_lease(other), None, "{other:?}");
         }
-        for made in [true, false] {
-            let file = lease_file_name(lease, made);
-            assert_eq!(lease_of_file(file.as_bytes()), Some(lease.as_bytes()));
-        }
+        let (made, making) = (lease_file_name(lease, true), lease_file_name(lease, false));
+        assert_eq!(lease_of_file(made.as_bytes()), Some(lease.as_bytes()));
+        assert_eq!(lease_being_made(making.as_bytes()), Some(lease.as_bytes()));
+        // A lease being made is not one cleanup takes as a lease, nor the
+        // other way round.
+        assert_eq!(lease_of_file(making.as_bytes()), None);
+        assert_eq!(lease_being_made(made.as_bytes()), None);
         assert_eq!(lease_of_file(b"42.lease"), None);
+        assert_eq!(lease_being_made(b"42.lease-new"), None);
         assert_eq!(lease_of_file(b"notes.txt"), None);
     }
 }

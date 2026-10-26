@@ -135,6 +135,9 @@ struct Inner {
     started: u64,
     inbox: Mutex<Inbox>,
     readers: Mutex<Readers>,
+    /// Test seam: [`RunUsage::finish`] panics, as a reader with a bug would.
+    #[cfg(test)]
+    panic_in_finish: std::sync::atomic::AtomicBool,
 }
 
 /// See the module docs. Cheap to clone: a clone is the same run's.
@@ -145,6 +148,26 @@ pub struct RunUsage {
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// The export of run `run_id` of `agent`, ended as `end`, from its usage.
+fn export(
+    run_id: &str,
+    agent: &AgentType,
+    usage: AgentUsage,
+    end: EndReason,
+    exit_code: Option<i32>,
+) -> RunExport {
+    let identity = RunIdentity::new(
+        Ident::new(run_id).unwrap_or_else(|| Ident::new("unknown").expect("an identifier")),
+        Ident::new(crate::telemetry::tracker::agent_name(agent))
+            .expect("an agent name is an identifier"),
+    );
+    let mut record = RunRecord::new(identity, usage, Some(end));
+    if *agent == AgentType::None {
+        record.termination = command_termination(Some(end), exit_code);
+    }
+    run_attributes(&record)
 }
 
 /// The part of a run's usage that a session whose record was observed but
@@ -183,6 +206,8 @@ impl RunUsage {
                 started,
                 inbox: Mutex::new(Inbox::default()),
                 readers: Mutex::new(readers),
+                #[cfg(test)]
+                panic_in_finish: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }
@@ -235,6 +260,14 @@ impl RunUsage {
     #[cfg(test)]
     pub(crate) fn hold_readers(&self) -> impl Sized + '_ {
         lock(&self.inner.readers)
+    }
+
+    /// Make [`Self::finish`] panic once it holds the readers.
+    #[cfg(test)]
+    pub(crate) fn panic_in_finish(&self) {
+        self.inner
+            .panic_in_finish
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Read what each record gained since the last poll, locating the ones
@@ -314,6 +347,13 @@ impl RunUsage {
     pub fn finish(self, run_id: &str, end: EndReason, exit_code: Option<i32>) -> RunExport {
         let inner = &*self.inner;
         let mut readers = lock(&inner.readers);
+        #[cfg(test)]
+        if inner
+            .panic_in_finish
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            panic!("a reader failed");
+        }
         self.poll_with(&mut readers, true);
         for _ in 1..MAX_DRAIN_POLLS {
             if !readers.backlogged() {
@@ -334,16 +374,31 @@ impl RunUsage {
             file.dir.remove(Path::new(&file.name).as_os_str());
         }
         drop(readers);
-        let agent = crate::telemetry::tracker::agent_name(&inner.agent);
-        let identity = RunIdentity::new(
-            Ident::new(run_id).unwrap_or_else(|| Ident::new("unknown").expect("an identifier")),
-            Ident::new(agent).expect("an agent name is an identifier"),
-        );
-        let mut record = RunRecord::new(identity, usage, Some(end));
-        if inner.agent == AgentType::None {
-            record.termination = command_termination(Some(end), exit_code);
-        }
-        run_attributes(&record)
+        export(run_id, &inner.agent, usage, end, exit_code)
+    }
+
+    /// [`Self::finish`], unless it panics — a bug in a reader — and then the
+    /// run's record with its usage [`Unavailable::Incomplete`] and its last
+    /// turn unknown, so the run's span is still sent. Its usage file is then
+    /// left for the next daemon's cleanup. Only a panic that unwinds is
+    /// caught.
+    pub fn finish_or_incomplete(
+        self,
+        run_id: &str,
+        end: EndReason,
+        exit_code: Option<i32>,
+    ) -> RunExport {
+        let agent = self.inner.agent.clone();
+        let finish = std::panic::AssertUnwindSafe(|| self.finish(run_id, end, exit_code));
+        std::panic::catch_unwind(finish).unwrap_or_else(|_| {
+            tracing::warn!("reading a run's usage failed; its usage is sent as incomplete");
+            let usage = AgentUsage {
+                models: usage_unavailable(Unavailable::Incomplete),
+                quota: Field::Unavailable(Unavailable::Incomplete),
+                last_turn: Some(AgentTurnEnd::Unknown),
+            };
+            export(run_id, &agent, usage, end, exit_code)
+        })
     }
 
     /// The agent's usage from what the readers read. A session whose record

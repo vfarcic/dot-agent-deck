@@ -2428,12 +2428,19 @@ struct ModelFamily {
     /// Whether its version may be attached to that word (`qwen3`,
     /// `llama3.1`), and whether it must be (`o3`).
     attached: Attached,
-    /// An Ollama tag may follow the name: `:latest` or `:` and a size
-    /// (`llama3.1:8b`).
+    /// An Ollama tag may follow the name: `:latest` or `:` and one of
+    /// [`sizes`](Self::sizes) (`llama3.1:8b`).
     tag: bool,
+    /// The sizes the family is published in, across its versions (`70b`,
+    /// `a35b`, `8x7b`): the only words `#s` takes, and the only tags but
+    /// `latest`.
+    sizes: &'static [&'static str],
     /// Vertex AI's `@` and an eight-digit date may follow the name
     /// (`claude-opus-4@20250514`).
     vertex: bool,
+    /// The year the family was first published: a date in one of its names
+    /// is no earlier, and no later than the year after the current one.
+    since: i32,
     /// The shapes of the words after the family's, split on `-`: one
     /// pattern each, as [`shape_matches`] reads them.
     shapes: &'static [&'static str],
@@ -2449,13 +2456,16 @@ enum Attached {
 const fn family(
     name: &'static str,
     attached: Attached,
+    since: i32,
     shapes: &'static [&'static str],
 ) -> ModelFamily {
     ModelFamily {
         name,
         attached,
         tag: false,
+        sizes: &[],
         vertex: false,
+        since,
         shapes,
     }
 }
@@ -2463,37 +2473,49 @@ const fn family(
 const fn tagged(
     name: &'static str,
     attached: Attached,
+    since: i32,
+    sizes: &'static [&'static str],
     shapes: &'static [&'static str],
 ) -> ModelFamily {
     ModelFamily {
         tag: true,
-        ..family(name, attached, shapes)
+        sizes,
+        ..family(name, attached, since, shapes)
     }
 }
 
-/// The model families the export names, and the shapes of their published
-/// names. A name of a listed family in a shape not listed for it — another
-/// word, another order, a longer number — is not named, so a family cannot
-/// carry a word or number of a deployment's own (`gpt-confidential-project`,
-/// `gpt-5-12345678901234567890`). A new public name in a new shape needs its
-/// shape added here; until then its tokens are sent without its name.
+/// The model families the export names, and the shapes of their names. A
+/// name of a listed family in a shape not listed for it — another word,
+/// another order, a longer number, a size the family is not published in, a
+/// date in a form the family does not use or that is not a calendar date —
+/// is not named (`gpt-confidential-project`, `gpt-5-12345678901234567890`,
+/// `gpt-5-2411`, `claude-sonnet-4@20250231`, `qwen3:123b`). A shape is not a
+/// catalogue of published names: a private name that fits one, such as a
+/// date-shaped revision on a known model, is named. A new public name in a
+/// new shape needs its shape added here; until then its tokens are sent
+/// without its name.
 const MODEL_FAMILIES: &[ModelFamily] = &[
     ModelFamily {
         vertex: true,
         ..family(
             "claude",
             Attached::No,
+            2023,
             &[
-                "opus|sonnet|haiku|fable #v #v? #d|latest?",
-                "#v #v? opus|sonnet|haiku #d|latest?",
+                "opus|sonnet|haiku|fable #v #v? #ymd8|latest?",
+                "#v #v? opus|sonnet|haiku #ymd8|latest?",
             ],
         )
     },
     tagged(
         "gpt",
         Attached::No,
+        2023,
+        &["20b", "120b"],
         &[
-            "#v|4o mini|nano|pro|codex|codex-mini|codex-max|codex-spark|luna|chat-latest|turbo|turbo-preview|preview|instant|search-preview|mini-search-preview|audio-preview|mini-audio-preview|realtime-preview|mini-realtime-preview|mini-tts|mini-transcribe|transcribe? #d?",
+            "#v|4o mini|nano|pro|codex|codex-mini|codex-max|codex-spark|luna|sol|astra|terra|cyber|chat-latest|turbo|turbo-preview|preview|instant|search-preview|mini-search-preview|audio-preview|mini-audio-preview|realtime-preview|mini-realtime-preview|mini-tts|mini-transcribe|transcribe? #ymd?",
+            // GPT-4's and GPT-3.5's own snapshots are `MMDD` (`gpt-4-0613`).
+            "3.5|4 turbo|16k|32k|turbo-16k|turbo-instruct? #mmdd? preview|vision-preview?",
             "oss #s?",
             "image #v mini?",
         ],
@@ -2501,21 +2523,33 @@ const MODEL_FAMILIES: &[ModelFamily] = &[
     family(
         "o",
         Attached::Only,
-        &["#v mini|pro|preview|deep-research|mini-deep-research? #d?"],
+        2024,
+        &["#v mini|pro|preview|deep-research|mini-deep-research? #ymd?"],
     ),
-    family("codex", Attached::No, &["mini latest?"]),
+    family("codex", Attached::No, 2025, &["mini latest?"]),
     family(
         "gemini",
         Attached::No,
+        2023,
         &[
-            "#v pro|flash|flash-lite|flash-8b|ultra|nano preview|exp|thinking-exp|latest|image|image-preview|live|tts|preview-tts? #d|#r?",
-            "exp #d",
+            "#v pro|flash|flash-lite|flash-8b|ultra|nano preview|exp|thinking-exp|latest|image|image-preview|live|tts|preview-tts? #md|#my|#mmdd|#r?",
+            "exp #mmdd",
         ],
     ),
-    tagged("gemma", Attached::Also, &["#v #s? it?"]),
+    tagged(
+        "gemma",
+        Attached::Also,
+        2024,
+        &["270m", "1b", "2b", "4b", "7b", "9b", "12b", "27b"],
+        &["#v #s? it?"],
+    ),
     tagged(
         "llama",
         Attached::Also,
+        2023,
+        &[
+            "1b", "3b", "7b", "8b", "11b", "13b", "17b", "70b", "90b", "405b", "16x17b", "128x17b",
+        ],
         &[
             "#v #s? instruct|chat|vision-instruct?",
             "4 maverick|scout #s? 16e|128e? instruct?",
@@ -2524,59 +2558,111 @@ const MODEL_FAMILIES: &[ModelFamily] = &[
     tagged(
         "mistral",
         Attached::No,
+        2023,
+        &["7b", "12b", "22b", "24b", "123b"],
         &[
-            "large|medium|small|tiny|nemo|saba latest|#d|#v?",
+            "large|medium|small|tiny|nemo|saba latest|#yymm|#v?",
             "#s instruct?",
         ],
     ),
-    tagged("mixtral", Attached::No, &["8x7b|8x22b instruct?"]),
-    tagged("codestral", Attached::No, &["latest|#d|mamba?"]),
-    tagged("devstral", Attached::No, &["small|medium? latest|#d|#v?"]),
-    tagged("magistral", Attached::No, &["small|medium latest|#d|#v?"]),
-    tagged("ministral", Attached::No, &["#s latest|#d?"]),
+    tagged(
+        "mixtral",
+        Attached::No,
+        2023,
+        &["8x7b", "8x22b"],
+        &["#s instruct?", "#s?"],
+    ),
+    tagged(
+        "codestral",
+        Attached::No,
+        2024,
+        &["22b"],
+        &["latest|#yymm|mamba?"],
+    ),
+    tagged(
+        "devstral",
+        Attached::No,
+        2025,
+        &["24b"],
+        &["small|medium? latest|#yymm|#v?"],
+    ),
+    tagged(
+        "magistral",
+        Attached::No,
+        2025,
+        &["24b"],
+        &["small|medium latest|#yymm|#v?"],
+    ),
+    tagged(
+        "ministral",
+        Attached::No,
+        2024,
+        &["3b", "8b", "14b"],
+        &["#s latest|#yymm?"],
+    ),
     tagged(
         "qwen",
         Attached::Also,
+        2023,
         &[
-            "#v? max|plus|turbo|flash latest|#d?",
+            "0.5b", "0.6b", "1.5b", "1.7b", "1.8b", "3b", "4b", "7b", "8b", "14b", "30b", "32b",
+            "72b", "110b", "235b", "480b", "a3b", "a22b", "a35b",
+        ],
+        &[
+            "#v? max|plus|turbo|flash latest|#ymd|#mmdd?",
             "#v coder? plus|flash?",
-            "#v coder? #s #s? instruct|thinking? #d?",
+            "#v coder? #s #s? instruct|thinking? #yymm?",
         ],
     ),
     tagged(
         "deepseek",
         Attached::No,
+        2023,
+        &[
+            "1.3b", "1.5b", "6.7b", "7b", "8b", "14b", "16b", "32b", "33b", "70b", "236b", "671b",
+        ],
         &[
             "chat|reasoner",
             "coder #p? instruct|base?",
-            "#p exp|terminus? #d?",
+            "#p exp|terminus|pro|flash|flash-free? #mmdd?",
             "r1 distill llama|qwen #s",
         ],
     ),
     family(
         "grok",
         Attached::No,
+        2023,
         &[
-            "#v #v? mini|fast|vision? reasoning|non-reasoning? #d?",
+            "#v #v? mini|fast|vision? reasoning|non-reasoning? #mmdd?",
             "code fast #v?",
         ],
     ),
     tagged(
         "kimi",
         Attached::No,
-        &["#p instruct|thinking|turbo|turbo-preview? #d? preview?"],
+        2024,
+        &[],
+        &["#p instruct|thinking|turbo|turbo-preview? #mmdd? preview?"],
     ),
-    tagged("glm", Attached::No, &["#v air|airx|flash|x?"]),
-    family("minimax", Attached::No, &["#p"]),
-    family("swe", Attached::No, &["#v lite?"]),
-    family("big", Attached::No, &["pickle"]),
+    tagged(
+        "glm",
+        Attached::No,
+        2023,
+        &[],
+        &["#v air|airx|flash|x? free?"],
+    ),
+    family("minimax", Attached::No, 2024, &["#p"]),
+    family("MiniMax", Attached::No, 2024, &["M#v"]),
+    family("swe", Attached::No, 2025, &["#v lite?"]),
+    family("big", Attached::No, 2025, &["pickle"]),
 ];
 
 /// The provider namespaces a model's name may carry in front of it, exactly
 /// as listed: a router's `<provider>/` and a cloud's region prefix. Any other
 /// prefix, a path or a host name included, makes the name one the export does
-/// not send. Behind a cloud's prefix (one that ends in `.`), Bedrock's `-v`,
-/// a digit, `:` and a digit may end the name (`-v1:0`).
+/// not send. Behind a cloud's prefix (one that ends in `.`), Bedrock's `-v`
+/// and a digit, optionally then `:` and a digit, may end the name (`-v1`,
+/// `-v1:0`).
 const MODEL_NAMESPACES: &[&str] = &[
     "anthropic/",
     "openai/",
@@ -2589,6 +2675,7 @@ const MODEL_NAMESPACES: &[&str] = &[
     "x-ai/",
     "moonshotai/",
     "z-ai/",
+    "zai/",
     "anthropic.",
     "us.anthropic.",
     "eu.anthropic.",
@@ -2613,108 +2700,120 @@ fn is_version(word: &str) -> bool {
     }
 }
 
-/// A size in billions of parameters: up to three digits, optionally `.` and
-/// one digit, then `b` (`70b`, `1.5b`), or an active size behind `a`
-/// (`a35b`).
-fn is_size(word: &str) -> bool {
-    let Some(number) = word.strip_suffix('b') else {
-        return false;
-    };
-    match number.strip_prefix('a') {
-        Some(active) => digits(active, 1..=3),
-        None => match number.split_once('.') {
-            Some((whole, part)) => digits(whole, 1..=3) && digits(part, 1..=1),
-            None => digits(number, 1..=3),
-        },
+/// `word`'s value, when it is exactly `len` digits.
+fn number(word: &str, len: usize) -> Option<u32> {
+    digits(word, len..=len).then(|| word.parse().ok())?
+}
+
+/// Whether `month` and `day` are a calendar date in some year: in a leap
+/// year, so `0229` is one.
+fn is_month_day(month: u32, day: u32) -> bool {
+    chrono::NaiveDate::from_ymd_opt(2024, month, day).is_some()
+}
+
+/// What a shape's classes accept for one family ([`shape_matches`]): its
+/// sizes, and dates in its years.
+struct Classes {
+    sizes: &'static [&'static str],
+    years: std::ops::RangeInclusive<i32>,
+}
+
+impl Classes {
+    fn of(family: &ModelFamily) -> Self {
+        use chrono::Datelike as _;
+        Self {
+            sizes: family.sizes,
+            years: family.since..=chrono::Utc::now().year() + 1,
+        }
     }
-}
 
-/// Whether `word` is digits of length `len` whose value is in `range`.
-fn number_in(word: &str, len: usize, range: std::ops::RangeInclusive<u32>) -> bool {
-    digits(word, len..=len) && word.parse().is_ok_and(|n| range.contains(&n))
-}
-
-fn is_month(word: &str) -> bool {
-    number_in(word, 2, 1..=12)
-}
-
-fn is_day(word: &str) -> bool {
-    number_in(word, 2, 1..=31)
-}
-
-fn is_year(word: &str) -> bool {
-    number_in(word, 4, 2020..=2039)
-}
-
-/// An eight-digit date, `YYYYMMDD` (`20251001`).
-fn is_date8(word: &str) -> bool {
-    word.len() == 8 && is_year(&word[..4]) && is_month(&word[4..6]) && is_day(&word[6..])
-}
-
-/// How many of `words` a date can take, each way it can: one eight-digit
-/// date, one four-digit `MMDD` or `YYMM` (`0613`, `2411`), `YYYY-MM-DD` as
-/// three words, or `MM-DD` as two.
-fn date_lengths(words: &[&str]) -> Vec<usize> {
-    let mut lengths = Vec::new();
-    if let [word, ..] = words
-        && (is_date8(word)
-            || (word.len() == 4
-                && ((is_month(&word[..2]) && is_day(&word[2..]))
-                    || (number_in(&word[..2], 2, 23..=39) && is_month(&word[2..])))))
-    {
-        lengths.push(1);
+    fn year(&self, year: Option<u32>) -> Option<i32> {
+        let year = i32::try_from(year?).ok()?;
+        self.years.contains(&year).then_some(year)
     }
-    if let [month, day, ..] = words
-        && is_month(month)
-        && is_day(day)
-    {
-        lengths.push(2);
+
+    fn date(&self, year: Option<u32>, month: Option<u32>, day: Option<u32>) -> bool {
+        self.year(year)
+            .zip(month.zip(day))
+            .is_some_and(|(y, (m, d))| chrono::NaiveDate::from_ymd_opt(y, m, d).is_some())
     }
-    if let [year, month, day, ..] = words
-        && is_year(year)
-        && is_month(month)
-        && is_day(day)
-    {
-        lengths.push(3);
+
+    /// `YYYYMMDD` (`20251001`).
+    fn is_ymd8(&self, word: &str) -> bool {
+        digits(word, 8..=8)
+            && self.date(
+                number(&word[..4], 4),
+                number(&word[4..6], 2),
+                number(&word[6..], 2),
+            )
     }
-    lengths
+
+    /// How many of `words` the date class `class` takes, if it is one and
+    /// they start with one: `#ymd8` `YYYYMMDD`, `#mmdd` `MMDD` (`0613`),
+    /// `#yymm` `YYMM` (`2411`), `#ymd` `YYYY-MM-DD`, `#md` `MM-DD` and `#my`
+    /// `MM-YYYY`. Each is a calendar date, and its year one of the family's.
+    fn date_taken(&self, class: &str, words: &[&str]) -> Option<usize> {
+        match (class, words) {
+            ("#ymd8", [word, ..]) => self.is_ymd8(word).then_some(1),
+            ("#mmdd", [word, ..]) => (digits(word, 4..=4)
+                && number(&word[..2], 2)
+                    .zip(number(&word[2..], 2))
+                    .is_some_and(|(m, d)| is_month_day(m, d)))
+            .then_some(1),
+            ("#yymm", [word, ..]) => (digits(word, 4..=4)
+                && self
+                    .year(number(&word[..2], 2).map(|yy| 2000 + yy))
+                    .is_some()
+                && number(&word[2..], 2).is_some_and(|m| (1..=12).contains(&m)))
+            .then_some(1),
+            ("#md", [month, day, ..]) => number(month, 2)
+                .zip(number(day, 2))
+                .is_some_and(|(m, d)| is_month_day(m, d))
+                .then_some(2),
+            ("#my", [month, year, ..]) => (number(month, 2).is_some_and(|m| (1..=12).contains(&m))
+                && self.year(number(year, 4)).is_some())
+            .then_some(2),
+            ("#ymd", [year, month, day, ..]) => self
+                .date(number(year, 4), number(month, 2), number(day, 2))
+                .then_some(3),
+            _ => None,
+        }
+    }
 }
 
 /// How many of `words` the alternative `choice` of a shape can take, each
 /// way it can (see [`shape_matches`]).
-fn taken(choice: &str, words: &[&str]) -> Vec<usize> {
-    let Some(word) = words.first() else {
-        return Vec::new();
-    };
-    let one = |fits: bool| if fits { vec![1] } else { Vec::new() };
+fn taken(choice: &str, words: &[&str], classes: &Classes) -> Option<usize> {
+    let word = words.first()?;
+    let one = |fits: bool| fits.then_some(1);
     match choice {
         "#v" => one(is_version(word)),
         "#p" => {
             one(matches!(word.as_bytes(), [b'v' | b'r' | b'k' | b'm', ..])
                 && is_version(&word[1..]))
         }
-        "#s" => one(is_size(word)),
+        "#s" => one(classes.sizes.contains(word)),
         "#r" => one(matches!(word.as_bytes(), [b'0', b'0', b'1'..=b'9'])),
-        "#d" => date_lengths(words),
+        date if date.starts_with('#') => classes.date_taken(date, words),
+        prefixed if prefixed.ends_with("#v") => one(word
+            .strip_prefix(&prefixed[..prefixed.len() - 2])
+            .is_some_and(is_version)),
         literal => {
             let parts: Vec<&str> = literal.split('-').collect();
-            if words.len() >= parts.len() && words[..parts.len()] == parts[..] {
-                vec![parts.len()]
-            } else {
-                Vec::new()
-            }
+            (words.len() >= parts.len() && words[..parts.len()] == parts[..]).then_some(parts.len())
         }
     }
 }
 
 /// Whether `words` are, in order, the slots of `shape`. Slots are separated
 /// by spaces, each a choice of alternatives separated by `|`, and optional
-/// when it ends in `?`. An alternative is literal words joined by `-`, or a
-/// class: `#v` a version ([`is_version`]), `#p` a version behind `v`, `r`,
-/// `k` or `m` (`r1`, `v3.1`), `#s` a size ([`is_size`]), `#d` a date
-/// ([`date_lengths`]), `#r` a revision (`001`).
-fn shape_matches(shape: &str, words: &[&str]) -> bool {
-    fn rest_matches(slots: &[&str], words: &[&str]) -> bool {
+/// when it ends in `?`. An alternative is literal words joined by `-`, a
+/// literal immediately followed by `#v` (`M#v`, `M2.7`), or a class: `#v` a
+/// version ([`is_version`]), `#p` a version behind `v`, `r`, `k` or `m`
+/// (`r1`, `v3.1`), `#s` one of the family's sizes, `#r` a revision (`001`),
+/// or a date ([`Classes::date_taken`]).
+fn shape_matches(shape: &str, words: &[&str], classes: &Classes) -> bool {
+    fn rest_matches(slots: &[&str], words: &[&str], classes: &Classes) -> bool {
         let Some((slot, rest)) = slots.split_first() else {
             return words.is_empty();
         };
@@ -2722,15 +2821,14 @@ fn shape_matches(shape: &str, words: &[&str]) -> bool {
             Some(choices) => (choices, true),
             None => (*slot, false),
         };
-        (optional && rest_matches(rest, words))
+        (optional && rest_matches(rest, words, classes))
             || choices.split('|').any(|choice| {
-                taken(choice, words)
-                    .into_iter()
-                    .any(|n| rest_matches(rest, &words[n..]))
+                taken(choice, words, classes)
+                    .is_some_and(|n| rest_matches(rest, &words[n..], classes))
             })
     }
     let slots: Vec<&str> = shape.split(' ').collect();
-    rest_matches(&slots, words)
+    rest_matches(&slots, words, classes)
 }
 
 /// The name a model is exported under, if any: optionally one of
@@ -2751,7 +2849,11 @@ pub fn exported_model(model: &Ident) -> Option<&Ident> {
         .unwrap_or(("", name));
     if namespace.ends_with('.')
         && let Some((core, version)) = bare.rsplit_once("-v")
-        && matches!(version.as_bytes(), [a, b':', b] if a.is_ascii_digit() && b.is_ascii_digit())
+        && match version.as_bytes() {
+            [a] => a.is_ascii_digit(),
+            [a, b':', b] => a.is_ascii_digit() && b.is_ascii_digit(),
+            _ => false,
+        }
     {
         bare = core;
     }
@@ -2768,17 +2870,18 @@ pub fn exported_model(model: &Ident) -> Option<&Ident> {
         let version = head.strip_prefix(family.name)?;
         (family.attached != Attached::No && is_version(version)).then_some((family, Some(version)))
     })?;
+    let classes = Classes::of(family);
     let suffix_fits = match suffix {
         None => true,
-        Some(("@", date)) => family.vertex && is_date8(date),
-        Some((_, tag)) => family.tag && (tag == "latest" || is_size(tag)),
+        Some(("@", date)) => family.vertex && classes.is_ymd8(date),
+        Some((_, tag)) => family.tag && (tag == "latest" || family.sizes.contains(&tag)),
     };
     let words: Vec<&str> = attached.into_iter().chain(words).collect();
     (suffix_fits
         && family
             .shapes
             .iter()
-            .any(|shape| shape_matches(shape, &words)))
+            .any(|shape| shape_matches(shape, &words, &classes)))
     .then_some(model)
 }
 
@@ -5699,6 +5802,39 @@ mod tests {
             "gpt-5.3-codex-spark",
             "gpt-5.4",
             "openai/gpt-4o-mini",
+            // Every default of a family listed here in Pi's
+            // `defaultModelPerProvider` at pi-mono `d5b3de22d0e2`
+            // (`packages/coding-agent/src/core/model-resolver.ts:20-43`).
+            "us.anthropic.claude-opus-4-6-v1",
+            "claude-opus-4-8",
+            "gpt-5.5",
+            "gpt-6.1-sol",
+            "openai-codex/gpt-6.1-sol",
+            "deepseek-v4-pro",
+            "gemini-3.1-pro-preview",
+            "moonshotai/kimi-k2.6",
+            "zai/glm-5.1",
+            "grok-4.7",
+            "openai/gpt-oss-120b",
+            "glm-5.3",
+            "devstral-medium-latest",
+            "MiniMax-M2.7",
+            "kimi-k2.6",
+            // Claude Code's default and aliases (Opus 5.5, Sonnet 5.5,
+            // Haiku 5.5, Fable 5.1 and 5), Codex's catalogue (GPT-6 Astra,
+            // Sol and Luna, and the GPT-5.6 line, Cyber included) and
+            // OpenCode's preferred free models.
+            "claude-opus-5-5",
+            "claude-fable-5",
+            "us.anthropic.claude-opus-5-5-v1:0",
+            "gpt-6-astra",
+            "gpt-6-luna",
+            "gpt-6-sol",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-cyber",
+            "deepseek-v4.1-flash-free",
+            "glm-5.3-flash-free",
             // Other published shapes.
             "claude-3-5-sonnet-20241022",
             "claude-3-7-sonnet-latest",
@@ -5726,6 +5862,27 @@ mod tests {
             "kimi-k2-0905-preview",
             "glm-4.5-air",
             "minimax-m2",
+            // Each family's dates in the forms it publishes them.
+            "gpt-4-0613",
+            "gpt-3.5-turbo-0125",
+            "gpt-4-1106-preview",
+            "gpt-4-turbo-2024-04-09",
+            "gpt-4.1-2025-04-14",
+            "gpt-5-2025-08-07",
+            "o1-2024-12-17",
+            "claude-sonnet-4-20250514",
+            "gemini-2.5-flash-preview-09-2025",
+            "gemini-exp-1206",
+            "codestral-2501",
+            "ministral-8b-2410",
+            "qwen-max-2025-01-25",
+            "grok-2-1212",
+            "deepseek-v3-0324",
+            // Ollama tags in published sizes.
+            "qwen3:235b",
+            "llama3.1:405b",
+            "gemma3:270m",
+            "mixtral:8x22b",
         ] {
             assert_eq!(
                 exported_model(&id(kept)).map(Ident::as_str),
@@ -5772,6 +5929,32 @@ mod tests {
             "claude-haiku-5-5-v1:0",
             "gpt-123.4",
             "gpt-5.44",
+            // A date in a form the family does not publish, a date that is
+            // not one, a year outside the family's, a size it is not
+            // published in (#1858).
+            "gpt-5-2411",
+            "gpt-5-1231",
+            "gpt-5-20250807",
+            "gpt-4o-0806",
+            "claude-sonnet-4-5-3912",
+            "claude-sonnet-4-5-2025-05-14",
+            "gpt-5-20250231",
+            "gpt-5-2025-02-31",
+            "claude-sonnet-4@20250231",
+            "claude-sonnet-4-20251301",
+            "claude-sonnet-4-20190514",
+            "claude-sonnet-4-20990514",
+            "gpt-4-1332",
+            "mistral-large-2413",
+            "mistral-large-1411",
+            "mistral-large-0613",
+            "qwen3:123b",
+            "llama3.1:999b",
+            "qwen3-123b-instruct",
+            "kimi-k2:8b",
+            "claude-opus-4-6-v1",
+            "us.anthropic.claude-opus-4-6-v12",
+            "minimax-M2.7",
         ] {
             let Some(ident) = Ident::new(dropped) else {
                 continue;
@@ -5838,6 +6021,16 @@ mod tests {
             ("gpt-high-code-search", false),
             ("home/alice/private/gpt-5", false),
             ("customer-secret.example/gpt-5", false),
+            ("gpt-5-2411", false),
+            ("gpt-5-1231", false),
+            ("claude-sonnet-4-5-3912", false),
+            ("gpt-5-20250231", false),
+            ("claude-sonnet-4@20250231", false),
+            ("qwen3:123b", false),
+            ("llama3.1:999b", false),
+            ("gpt-6.1-sol", true),
+            ("us.anthropic.claude-opus-4-6-v1", true),
+            ("deepseek-v4-pro", true),
             ("gpt-5.6-luna", true),
             ("openai-codex/gpt-5.6-luna", true),
             ("claude-haiku-5-5", true),
