@@ -9476,8 +9476,8 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 ##### inbox/protocol/005 — Live hook receivers are bounded at eight and freed by closing.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), nine receipt fetches (`inbox_receipt_fetch`, consumer `cli`) with a one-character budget, eight held open.
 - **Agent:** none (`cat` stand-in).
-- **Asserts:** each of eight held hooks is handed one message and none counts as an armed waiter; a ninth is refused `too_many_hooks`, handed nothing, and its message stays Queued; once one hook closes, a fresh fetch is admitted and handed that message (PRD #1666 part 3, H5, which retired the legacy per-agent waiter cap).
-- **Does not assert:** the deck-wide `MAX_INBOX_WAITERS` (`inbox_hub` unit tests).
+- **Asserts:** each of eight held hooks is handed one message and none counts as an armed waiter; the first hook's actual message is explicitly Acknowledged while its socket stays open; a ninth is still refused `too_many_hooks`, handed nothing, and its message stays Queued; once that settled hook closes, a fresh fetch is admitted and handed the ninth message (PRD #1666 part 3, H5, which retired the legacy per-agent waiter cap).
+- **Does not assert:** recovery of an unacknowledged message after its hook closes (inbox/attempts/017), or the deck-wide `MAX_INBOX_WAITERS` (`inbox_hub` unit tests).
 - **Platform coverage:** mac+linux.
 
 ##### inbox/protocol/006 — Idle waiters survive the hook read timeout.
