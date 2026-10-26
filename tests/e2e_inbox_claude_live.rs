@@ -833,7 +833,7 @@ fn doorbell_010_live_left_opens_overview_and_the_line_is_not_typed_there() {
     );
 }
 
-/// Scenario: Disable native delivery, leave a unique human draft in interactive Haiku's composer, and queue a sentinel task past the accelerated stall threshold. Repeat with history-recalled and partly deleted drafts; each stays exact and unsent with zero deliveries and a stall diagnostic until the user clears it, then the original task runs once.
+/// Scenario: Disable native delivery, leave a unique human draft in interactive Haiku's composer, and queue a sentinel task past the accelerated stall threshold. Repeat with history-recalled and partly deleted drafts; each stays exact and unsent with zero deliveries and a stall diagnostic until the user moves to the end and clears the whole draft, then the original task runs once.
 #[spec("inbox/doorbell/010")]
 #[test]
 #[cfg(target_os = "linux")]
@@ -927,7 +927,9 @@ fn kept_draft_trial(claude: &Claude, variant: &str, draft: &str) -> Value {
         claude.evidence()
     );
     let hold = claude.record()["inbox"]["wake_hold"].clone();
-    claude.deck.send_keys(b"\x15");
+    // Ctrl+U deletes only to the cursor. The typed and partial variants
+    // moved Left, so move to the end before clearing the whole draft.
+    claude.deck.send_keys(b"\x05\x15");
     claude.done(&id, &name, false);
     eprintln!(
         "retained {variant}: exact draft held 5s, zero deliveries, wake_stalled and matching log; clear delivered original sentinel; wake_hold={hold}"
