@@ -289,11 +289,15 @@ impl LeaseSlot {
 /// another daemon holds — on this machine, whatever process-id namespace it
 /// runs in — keeps its files. A usage file whose lease file is not there is
 /// kept. A lease file still being made ([`locate::lease_being_made`]) is not
-/// a lease, and no usage file names its token: it is removed only once it is
-/// [`ABANDONED_LEASE_AGE`] old and its lock can be taken at once. A daemon
-/// makes, locks and renames one within a single call ([`take_usage_lease`]),
-/// so one that old was left by a daemon that stopped part way; and should a
-/// daemon still making one find it gone, it takes another token. Every open
+/// taken as authority to remove usage files: only that file itself is
+/// removed, once it is [`ABANDONED_LEASE_AGE`] old and its lock can be taken
+/// at once. A daemon makes, locks and renames one within a single call
+/// ([`take_usage_lease`]), so one that old and unlocked is eligible to go; it
+/// does not prove its maker ended, which may be paused between making and
+/// locking it, and a maker that then finds it gone takes another token. Where
+/// the rename falls back to a link, a removal of the old name that fails
+/// leaves both names on the held lease, and its usage files carry the token
+/// they share; the held lock keeps both. Every open
 /// and removal is made beneath the usage directory's descriptor, with no
 /// symlink followed. Elsewhere than Unix no run has a usage file, and nothing
 /// is removed.

@@ -2513,10 +2513,11 @@ const MODEL_FAMILIES: &[ModelFamily] = &[
         2023,
         &["20b", "120b"],
         &[
-            "#v|4o mini|nano|pro|codex|codex-mini|codex-max|codex-spark|luna|sol|astra|terra|cyber|chat-latest|turbo|turbo-preview|preview|instant|search-preview|mini-search-preview|audio-preview|mini-audio-preview|realtime-preview|mini-realtime-preview|mini-tts|mini-transcribe|transcribe? #ymd?",
+            "#v|4o mini|nano|pro|codex|codex-mini|codex-max|codex-spark|luna|sol|astra|terra|luna-pro|sol-pro|astra-pro|terra-pro|cyber|chat|chat-latest|turbo|turbo-preview|preview|instant|search-preview|mini-search-preview|audio-preview|mini-audio-preview|realtime-preview|mini-realtime-preview|mini-tts|mini-transcribe|transcribe? #ymd?",
             // GPT-4's and GPT-3.5's own snapshots are `MMDD` (`gpt-4-0613`).
             "3.5|4 turbo|16k|32k|turbo-16k|turbo-instruct? #mmdd? preview|vision-preview?",
-            "oss #s?",
+            "chat-latest",
+            "oss safeguard? #s?",
             "image #v mini?",
         ],
     ),
@@ -2524,7 +2525,7 @@ const MODEL_FAMILIES: &[ModelFamily] = &[
         "o",
         Attached::Only,
         2024,
-        &["#v mini|pro|preview|deep-research|mini-deep-research? #ymd?"],
+        &["#v mini|mini-high|pro|preview|deep-research|mini-deep-research? #ymd?"],
     ),
     family("codex", Attached::No, 2025, &["mini latest?"]),
     family(
@@ -2532,27 +2533,34 @@ const MODEL_FAMILIES: &[ModelFamily] = &[
         Attached::No,
         2023,
         &[
-            "#v pro|flash|flash-lite|flash-8b|ultra|nano preview|exp|thinking-exp|latest|image|image-preview|live|tts|preview-tts? #md|#my|#mmdd|#r?",
+            "#v pro|flash|flash-lite|flash-8b|ultra|nano|argon preview|preview-customtools|exp|thinking-exp|latest|image|image-preview|live|tts|preview-tts? #md|#my|#mmdd|#r?",
             "exp #mmdd",
+            "nano-banana #v",
         ],
     ),
     tagged(
         "gemma",
         Attached::Also,
         2024,
-        &["270m", "1b", "2b", "4b", "7b", "9b", "12b", "27b"],
-        &["#v #s? it?"],
+        &[
+            "270m", "1b", "2b", "4b", "7b", "9b", "12b", "26b", "27b", "31b", "a4b",
+        ],
+        // A mixture of experts' total size, then its active one
+        // (`gemma-4-26b-a4b-it`).
+        &["#v #s? #s? it?"],
     ),
     tagged(
         "llama",
         Attached::Also,
         2023,
         &[
-            "1b", "3b", "7b", "8b", "11b", "13b", "17b", "70b", "90b", "405b", "16x17b", "128x17b",
+            "1b", "3b", "7b", "8b", "11b", "12b", "13b", "17b", "70b", "90b", "405b", "16x17b",
+            "128x17b",
         ],
         &[
             "#v #s? instruct|chat|vision-instruct?",
             "4 maverick|scout #s? 16e|128e? instruct?",
+            "guard #v #s?",
         ],
     ),
     tagged(
@@ -2562,6 +2570,9 @@ const MODEL_FAMILIES: &[ModelFamily] = &[
         &["7b", "12b", "22b", "24b", "123b"],
         &[
             "large|medium|small|tiny|nemo|saba latest|#yymm|#v?",
+            // A version written with `-` (`mistral-medium-3-5`).
+            "large|medium|small #v #v",
+            "small #v? #s instruct #yymm?",
             "#s instruct?",
         ],
     ),
@@ -2605,13 +2616,17 @@ const MODEL_FAMILIES: &[ModelFamily] = &[
         Attached::Also,
         2023,
         &[
-            "0.5b", "0.6b", "1.5b", "1.7b", "1.8b", "3b", "4b", "7b", "8b", "14b", "30b", "32b",
-            "72b", "110b", "235b", "480b", "a3b", "a22b", "a35b",
+            "0.5b", "0.6b", "1.5b", "1.7b", "1.8b", "3b", "4b", "7b", "8b", "9b", "14b", "27b",
+            "30b", "32b", "35b", "72b", "80b", "110b", "122b", "235b", "397b", "480b", "2.4t",
+            "a3b", "a10b", "a17b", "a22b", "a35b", "a95b",
         ],
         &[
-            "#v? max|plus|turbo|flash latest|#ymd|#mmdd?",
-            "#v coder? plus|flash?",
-            "#v coder? #s #s? instruct|thinking? #yymm?",
+            // Alibaba Cloud's hosted models, dated `YYYY-MM-DD`, `YYYYMMDD`,
+            // `MM-DD` or `MMDD` (`qwen3.5-plus-20260420`,
+            // `qwen3.5-plus-02-15`).
+            "#v? max|max-prime|plus|turbo|flash|omni-flash latest|#ymd|#ymd8|#md|#mmdd?",
+            "#v coder? plus|flash|next?",
+            "#v coder|vl|next? #s #s? instruct|thinking? #yymm?",
         ],
     ),
     tagged(
@@ -2622,9 +2637,9 @@ const MODEL_FAMILIES: &[ModelFamily] = &[
             "1.3b", "1.5b", "6.7b", "7b", "8b", "14b", "16b", "32b", "33b", "70b", "236b", "671b",
         ],
         &[
-            "chat|reasoner",
+            "chat|reasoner #p? #mmdd?",
             "coder #p? instruct|base?",
-            "#p exp|terminus|pro|flash|flash-free? #mmdd?",
+            "#p exp|terminus|pro|flash|flash-free|flash-vision-exp? #mmdd?",
             "r1 distill llama|qwen #s",
         ],
     ),
@@ -2633,8 +2648,10 @@ const MODEL_FAMILIES: &[ModelFamily] = &[
         Attached::No,
         2023,
         &[
-            "#v #v? mini|fast|vision? reasoning|non-reasoning? #mmdd?",
+            // Grok 4.20's minor version is two digits, which `#v` is not.
+            "#v|4.20 #v? mini|fast|vision|multi-agent? reasoning|non-reasoning? #mmdd?",
             "code fast #v?",
+            "build #v",
         ],
     ),
     tagged(
@@ -2642,16 +2659,20 @@ const MODEL_FAMILIES: &[ModelFamily] = &[
         Attached::No,
         2024,
         &[],
-        &["#p instruct|thinking|turbo|turbo-preview? #mmdd? preview?"],
+        &["#p instruct|thinking|turbo|turbo-preview|code|pro? #mmdd? preview?"],
     ),
     tagged(
         "glm",
         Attached::No,
         2023,
         &[],
-        &["#v air|airx|flash|x? free?"],
+        &[
+            "#v air|airx|flash|flashx|x|turbo|prime? free?",
+            // The vision models (`glm-4.5v`, `glm-5v-turbo`).
+            "4.5v|4.6v|5v turbo?",
+        ],
     ),
-    family("minimax", Attached::No, 2024, &["#p"]),
+    family("minimax", Attached::No, 2024, &["#p her|flash?", "01"]),
     family("MiniMax", Attached::No, 2024, &["M#v"]),
     family("swe", Attached::No, 2025, &["#v lite?"]),
     family("big", Attached::No, 2025, &["pickle"]),
@@ -2660,9 +2681,10 @@ const MODEL_FAMILIES: &[ModelFamily] = &[
 /// The provider namespaces a model's name may carry in front of it, exactly
 /// as listed: a router's `<provider>/` and a cloud's region prefix. Any other
 /// prefix, a path or a host name included, makes the name one the export does
-/// not send. Behind a cloud's prefix (one that ends in `.`), Bedrock's `-v`
-/// and a digit, optionally then `:` and a digit, may end the name (`-v1`,
-/// `-v1:0`).
+/// not send. Behind a router's prefix (one that ends in `/`), one of
+/// [`ROUTER_VARIANTS`] after `:` may end the name; behind a cloud's (one that
+/// ends in `.`), Bedrock's `-v` and a digit, optionally then `:` and a digit,
+/// may (`-v1`, `-v1:0`).
 const MODEL_NAMESPACES: &[&str] = &[
     "anthropic/",
     "openai/",
@@ -2676,12 +2698,17 @@ const MODEL_NAMESPACES: &[&str] = &[
     "moonshotai/",
     "z-ai/",
     "zai/",
+    "minimax/",
     "anthropic.",
     "us.anthropic.",
     "eu.anthropic.",
     "apac.anthropic.",
     "global.anthropic.",
 ];
+
+/// OpenRouter's variants of a model, as its catalogue lists them
+/// (`google/gemma-4-31b-it:free`, `openai/gpt-5.4:batch`).
+const ROUTER_VARIANTS: &[&str] = &["free", "batch"];
 
 /// The longest model name the export names.
 const MAX_EXPORTED_MODEL_BYTES: usize = 96;
@@ -2719,11 +2746,11 @@ struct Classes {
 }
 
 impl Classes {
-    fn of(family: &ModelFamily) -> Self {
-        use chrono::Datelike as _;
+    /// `family`'s, in the year `current`.
+    fn of(family: &ModelFamily, current: i32) -> Self {
         Self {
             sizes: family.sizes,
-            years: family.since..=chrono::Utc::now().year() + 1,
+            years: family.since..=current + 1,
         }
     }
 
@@ -2837,8 +2864,14 @@ fn shape_matches(shape: &str, words: &[&str], classes: &Classes) -> bool {
 /// [`MAX_EXPORTED_MODEL_BYTES`] long. Every other name — a custom or local
 /// model's, a path, a namespace the deck does not know, a deployment's own
 /// suffix after `@` or `:` — is not exported; its usage still is, without a
-/// name.
+/// name. A date's year is checked against the current UTC year.
 pub fn exported_model(model: &Ident) -> Option<&Ident> {
+    use chrono::Datelike as _;
+    exported_model_in(model, chrono::Utc::now().year())
+}
+
+/// [`exported_model`] in the UTC year `current`.
+fn exported_model_in(model: &Ident, current: i32) -> Option<&Ident> {
     let name = model.as_str();
     if name.len() > MAX_EXPORTED_MODEL_BYTES {
         return None;
@@ -2870,11 +2903,14 @@ pub fn exported_model(model: &Ident) -> Option<&Ident> {
         let version = head.strip_prefix(family.name)?;
         (family.attached != Attached::No && is_version(version)).then_some((family, Some(version)))
     })?;
-    let classes = Classes::of(family);
+    let classes = Classes::of(family, current);
     let suffix_fits = match suffix {
         None => true,
         Some(("@", date)) => family.vertex && classes.is_ymd8(date),
-        Some((_, tag)) => family.tag && (tag == "latest" || family.sizes.contains(&tag)),
+        Some((_, tag)) => {
+            (family.tag && (tag == "latest" || family.sizes.contains(&tag)))
+                || (namespace.ends_with('/') && ROUTER_VARIANTS.contains(&tag))
+        }
     };
     let words: Vec<&str> = attached.into_iter().chain(words).collect();
     (suffix_fits
@@ -5754,6 +5790,79 @@ mod tests {
         ));
     }
 
+    /// A date in a model's name is named only when its year is between its
+    /// family's first and the year after the current one, in every form that
+    /// carries a year, checked against a given year rather than the clock:
+    /// so the window's edges, leap days and the move to a new year are each
+    /// pinned.
+    #[test]
+    fn a_model_names_year_is_in_its_familys_window() {
+        let named = |model: &str, year: i32| exported_model_in(&id(model), year).is_some();
+        // Claude (since 2023): `YYYYMMDD`, and Vertex AI's `@YYYYMMDD`.
+        for (model, in_2026) in [
+            ("claude-sonnet-4-20221231", false),
+            ("claude-sonnet-4-20230101", true),
+            ("claude-sonnet-4-20271231", true),
+            ("claude-sonnet-4-20280101", false),
+            ("claude-opus-4@20221231", false),
+            ("claude-opus-4@20271231", true),
+            ("claude-opus-4@20280101", false),
+            // Leap days: 2024 and 2028 are leap years, 2025 and 2027 not.
+            ("claude-sonnet-4-20240229", true),
+            ("claude-sonnet-4-20250229", false),
+            ("claude-sonnet-4-20270229", false),
+            // GPT (since 2023): `YYYY-MM-DD`.
+            ("gpt-5-2022-12-31", false),
+            ("gpt-5-2023-01-01", true),
+            ("gpt-5-2027-12-31", true),
+            ("gpt-5-2028-01-01", false),
+            ("gpt-4o-2024-02-29", true),
+            ("gpt-4o-2026-02-29", false),
+            // Mistral (since 2023): `YYMM`.
+            ("mistral-large-2212", false),
+            ("mistral-large-2301", true),
+            ("mistral-large-2712", true),
+            ("mistral-large-2801", false),
+            // Gemini (since 2023): `MM-YYYY`.
+            ("gemini-2.5-flash-preview-12-2022", false),
+            ("gemini-2.5-flash-preview-01-2023", true),
+            ("gemini-2.5-flash-preview-12-2027", true),
+            ("gemini-2.5-flash-preview-01-2028", false),
+            // Hosted Qwen (since 2023): `YYYYMMDD` and `YYYY-MM-DD`.
+            ("qwen3.5-plus-20221231", false),
+            ("qwen3.5-plus-20230101", true),
+            ("qwen3.5-plus-20271231", true),
+            ("qwen3.5-plus-20280101", false),
+            ("qwen-max-2028-01-25", false),
+            ("qwen-max-2027-01-25", true),
+            // `MMDD` and `MM-DD` carry no year: any leap-year calendar day.
+            ("gpt-4-0229", true),
+            ("gpt-4-0230", false),
+            ("qwen3.5-plus-02-29", true),
+            ("qwen3.5-plus-02-30", false),
+        ] {
+            assert_eq!(named(model, 2026), in_2026, "{model} in 2026");
+        }
+        // The move to a new year: a name dated two years ahead is refused on
+        // the last day of one year and named from the first day of the next.
+        for model in [
+            "claude-sonnet-4-20280105",
+            "claude-opus-4@20280105",
+            "gpt-5-2028-01-05",
+            "mistral-large-2801",
+            "gemini-2.5-flash-preview-01-2028",
+            "qwen3.5-plus-20280105",
+        ] {
+            assert!(!named(model, 2026), "{model} in 2026");
+            assert!(named(model, 2027), "{model} in 2027");
+        }
+        // A leap day two years ahead joins the window with its year.
+        assert!(!named("claude-sonnet-4-20280229", 2026));
+        assert!(named("claude-sonnet-4-20280229", 2027));
+        // A family's first year does not move with the current one.
+        assert!(!named("claude-sonnet-4-20221231", 2100));
+    }
+
     /// The export names a model only of a known family, a plan or an error
     /// kind only from its list (else `other`), and sends a failure's HTTP
     /// status as `http.response.status_code`; a path-, email- or
@@ -5883,6 +5992,55 @@ mod tests {
             "llama3.1:405b",
             "gemma3:270m",
             "mixtral:8x22b",
+            // OpenRouter's catalogue (https://openrouter.ai/api/v1/models)
+            // and OpenAI's model index, as of 2026-10-26: published sizes,
+            // a mixture of experts' active size included, hosted Qwen's
+            // dates, two-word GPT suffixes and the router's variants.
+            "google/gemma-4-31b-it",
+            "google/gemma-4-26b-a4b-it",
+            "qwen/qwen3.5-9b",
+            "qwen/qwen3.5-27b",
+            "qwen/qwen3.5-35b-a3b",
+            "qwen/qwen3.6-27b",
+            "qwen/qwen3.6-35b-a3b",
+            "qwen/qwen3.8-27b",
+            "qwen/qwen3.5-122b-a10b",
+            "qwen/qwen3.5-397b-a17b",
+            "qwen/qwen3.8-2.4t-a95b",
+            "qwen/qwen3-next-80b-a3b-instruct",
+            "qwen/qwen3-vl-30b-a3b-thinking",
+            "qwen/qwen3-coder-next",
+            "qwen/qwen3.8-max-prime",
+            "qwen/qwen3.5-plus-20260420",
+            "qwen/qwen3.5-plus-02-15",
+            "qwen/qwen3.5-flash-02-23",
+            "openai/gpt-6.1-sol-pro",
+            "openai/gpt-6-luna-pro",
+            "openai/gpt-6-astra-pro",
+            "openai/gpt-5.6-terra-pro",
+            "openai/gpt-5.2-chat",
+            "openai/gpt-chat-latest",
+            "openai/gpt-oss-safeguard-20b",
+            "openai/o4-mini-high",
+            "google/gemma-4-31b-it:free",
+            "openai/gpt-5.4:batch",
+            "anthropic/claude-opus-4.8:batch",
+            "google/gemini-3.1-pro-preview-customtools",
+            "google/gemini-4-argon",
+            "google/gemini-nano-banana-2.1",
+            "meta-llama/llama-guard-4-12b",
+            "mistralai/mistral-medium-3-5",
+            "mistralai/mistral-small-3.2-24b-instruct",
+            "mistralai/mistral-small-24b-instruct-2501",
+            "deepseek/deepseek-chat-v3-0324",
+            "deepseek/deepseek-v4-flash-vision-exp",
+            "x-ai/grok-4.20-multi-agent",
+            "x-ai/grok-build-0.1",
+            "moonshotai/kimi-k3.1-pro",
+            "z-ai/glm-5v-turbo",
+            "z-ai/glm-5.3-flashx",
+            "minimax/minimax-m3.1-flash",
+            "minimax/minimax-01",
         ] {
             assert_eq!(
                 exported_model(&id(kept)).map(Ident::as_str),
@@ -5955,6 +6113,41 @@ mod tests {
             "claude-opus-4-6-v1",
             "us.anthropic.claude-opus-4-6-v12",
             "minimax-M2.7",
+            // Next to each published size, date, word and variant admitted
+            // from the catalogues: a size not listed for the family, an
+            // address, a host or a long number in the same place, and words
+            // in no published combination.
+            "qwen3.5-28b",
+            "qwen3.5-35b-a4b",
+            "qwen3.5-27b-10.42.0.7",
+            "gemma-4-31b-a3b-it",
+            "gemma-4-31b-it-db01.corp.example",
+            "gemma-4-26b-a4b-a4b-a4b-it",
+            "qwen3.5-plus-20260230",
+            "qwen3.5-plus-02-30",
+            "qwen3.5-plus-13-01",
+            "qwen3.5-plus-12345678",
+            "qwen3.5-plus-10-42-0-7",
+            "qwen3.5-plus-2026042012",
+            "qwen3-235b-a22b-20260420",
+            "qwen3-235b-a22b-02-15",
+            "gpt-5-02-15",
+            "gpt-6.1-sol-pro-max",
+            "gpt-6.1-pro-sol",
+            "gpt-6.1-sol-sol-pro",
+            "gpt-6.1-sol-pro-12345678901234567890",
+            "gpt-5.2-chat-prod",
+            "o4-mini-high-eu",
+            "google/gemma-4-31b-it:10.42.0.7",
+            "google/gemma-4-31b-it:freebie",
+            "gemma-4-31b-it:free",
+            "us.anthropic.claude-opus-4-6:batch",
+            "x-ai/grok-4.21",
+            "x-ai/grok-4.200",
+            "z-ai/glm-5.7v",
+            "minimax/minimax-02",
+            "mistral-medium-3-5-7",
+            "llama-guard-4-999b",
         ] {
             let Some(ident) = Ident::new(dropped) else {
                 continue;
