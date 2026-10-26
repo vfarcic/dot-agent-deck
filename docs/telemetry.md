@@ -1,6 +1,6 @@
 # Telemetry
 
-The deck can send a record of every agent run to an OpenTelemetry backend of your choice: which agent ran in which pane, its role and orchestration, how long it worked, when its status changed, when you stepped in, what kinds of shell commands it ran and how long they took, how long its pull request's CI took, and how it ended. Collected over weeks and across machines, that record answers questions such as which agent or model finishes a kind of task with the least help from you, whether a change to your `CLAUDE.md` or skills made agents stumble less, or how much of a run's time went to tests and CI.
+The deck can send a record of every agent run to an OpenTelemetry backend of your choice: which agent ran in which pane, its role and orchestration, how long it worked, when its status changed, when you stepped in, what kinds of shell commands it ran and how long they took, how long its pull request's CI took, how many tokens it used on which model, and how it ended. Collected over weeks and across machines, that record answers questions such as which agent or model finishes a kind of task with the least help from you, whether a change to your `CLAUDE.md` or skills made agents stumble less, or how much of a run's time went to tests and CI.
 
 **It is off unless you configure it.** With no OpenTelemetry endpoint set, the deck sends nothing and behaves exactly as it does without this feature. You turn it on with the standard OpenTelemetry environment variables, so a backend that accepts OTLP over HTTP with its credentials in a header works, hosted or your own; [Connections](#connections) has what the deck's connection does and does not support.
 
@@ -99,7 +99,7 @@ A run starts when the deck starts an agent in a pane and ends when the agent exi
 | `service.name` | `dot-agent-deck`, or `OTEL_SERVICE_NAME` |
 | `service.version` | The deck's version |
 | `host.name` | The machine's hostname. Tells several machines apart in one backend. |
-| `deck.telemetry.schema_version` | `2`. It changes when the set or meaning of the attributes on this page changes, so data recorded before and after stays comparable. |
+| `deck.telemetry.schema_version` | `2`. It changes when the meaning of an attribute on this page changes, so you can keep data recorded before and after apart. A new attribute does not change it. |
 | your own | Every pair from `OTEL_RESOURCE_ATTRIBUTES`. Your pairs cannot replace the four above; set `OTEL_SERVICE_NAME` to rename the service. |
 
 ### `agent.run`
@@ -117,6 +117,7 @@ A run starts when the deck starts an agent in a pane and ends when the agent exi
 | `vcs.repository.name` | The repository's name, taken from the last part of its `origin` remote (`dot-agent-deck` for `git@github.com:vfarcic/dot-agent-deck.git`). The remote's URL itself is never sent. |
 | `deck.pr.number` | The pull request the agent's branch has, once the deck has found it (the same pull request the card's badge shows). |
 | `deck.run.end_reason` | `exited` (the agent exited by itself), `closed` (its pane was closed, or the deck stopped the agent, for example to restart it in its pane), `daemon_shutdown`, or `unknown` when the deck could not tell how the run ended. |
+| `deck.run.exit_code` | The exit status of an agent or command that exited by itself. Absent otherwise: when a signal ended it, when its pane was closed or the daemon stopped, or when the deck could not read the status. |
 | `deck.status_changes.count` | How many status changes the run had. |
 | `deck.interventions.count` | How many times you stepped in (see `deck.intervention` below). |
 | `deck.operations.count` | How many shell commands the agent ran (see [`agent.operation`](#agentoperation)). |
@@ -133,7 +134,83 @@ Events on the `agent.run` span:
 
 A run with many changes keeps its first 1024 events; the two counts keep counting after that.
 
-**Not sent yet.** A run does not say which model the agent used, the agent's exit code, which issue it worked on, or which skill or command started it. For the model, cost and tokens, use the agent's own telemetry ([Agents' own telemetry](#agents-own-telemetry)). Nor is there an event when an orchestrator hands work to a role; `deck.orchestration.id`, `deck.orchestrator` and `deck.role` tie an orchestration's runs together instead.
+A run also says what it used and how it ended, with one more event per model: [What a run used and how it ended](#what-a-run-used-and-how-it-ended).
+
+**Not sent yet.** A run does not say which issue it worked on, or which skill or command started it. Nor is there an event when an orchestrator hands work to a role; `deck.orchestration.id`, `deck.orchestrator` and `deck.role` tie an orchestration's runs together instead.
+
+### What a run used and how it ended
+
+Each `agent.run` span says how many tokens the run used on which model, how much of a plan's allowance it took, what it would cost, and how the agent's own work ended. The figures are the agent's own: the deck reads them from the record each agent keeps of its usage on your machine, so they need no extra setup and are sent only from the deck, with the run they belong to. Neither client shows them; they are in your backend only.
+
+**Every value says where it came from**, in a `.provenance` attribute beside it:
+
+| Provenance | Meaning |
+| --- | --- |
+| `provider_reported` | The agent's own count, as its provider reported it. |
+| `estimated` | Worked out from other values. A cost is always this: what the tokens would cost at the agent's list price. **It is never what you were charged**, and on a subscription it is not what the run cost you. |
+| `measured` | Seen by the deck itself, such as an exit status. |
+| `unavailable` | Not known. The value itself is left out, and `.unavailable_reason` says why. |
+
+**A value that is not known is never sent as `0`.** A `0` you see is one the agent counted. The reasons a value can be unavailable:
+
+| Reason | Meaning |
+| --- | --- |
+| `no_channel` | The deck has no way to learn this value for this agent (see the table below). |
+| `subscription_zero` | The agent reported a cost of 0 for work that used tokens, which is what a subscription provider reports. The run's cost is not knowable. |
+| `unknown_price` | The agent did not know the price of a model the run used. |
+| `not_recorded` | The agent kept no record of it for this run, for example because it was killed before writing its totals, or because the deck's Pi extension or OpenCode plugin was not loaded. |
+| `incomplete` | Part of the value was known and part was not, so a total would have been a part presented as the whole: for example, one of the run's sessions had a record the deck could not read, or the agent stopped in the middle of writing it. |
+| `unrecognized_format` | The agent's record is in a format the deck does not know, as can happen after an agent upgrade. |
+| `window_reset`, `plan_changed`, `quota_decreased` | Codex's allowance window reset, its plan changed, or its used share went down during the run, so the share the run used cannot be worked out. |
+
+On the `agent.run` span:
+
+| Attribute | Value |
+| --- | --- |
+| `gen_ai.usage.input_tokens` | The run's input tokens across all models, including tokens read from and written to the provider's cache. |
+| `gen_ai.usage.output_tokens` | The run's output tokens across all models. |
+| `gen_ai.usage.cache_read.input_tokens`, `gen_ai.usage.cache_write.input_tokens` | The parts of the input read from and written to the cache. |
+| `deck.tokens.provenance`, `deck.tokens.unavailable_reason` | Where the token counts came from, or why they are unavailable. |
+| `deck.cost.microusd` | The run's cost estimate across all models, in millionths of a US dollar: `12300` is $0.0123. |
+| `deck.cost.provenance`, `deck.cost.unavailable_reason` | `estimated`, or why the cost is unavailable. |
+| `deck.quota.plan` | Codex's plan (`plus`, `pro`, `team` and the others Codex reports), or `other` for a plan the deck does not know. |
+| `deck.quota.window_minutes`, `deck.quota.resets_at` | The length of Codex's allowance window, and when it resets, in seconds since 1970. |
+| `deck.quota.used_from_bp`, `deck.quota.used_to_bp` | The share of the window's allowance used when the run's first and last figures arrived, in hundredths of a percent: `1200` is 12%. The difference is what the run used. |
+| `deck.quota.provenance`, `deck.quota.unavailable_reason` | Where the allowance figures came from, or why they are unavailable. |
+| `deck.run.termination` | How the run ended: `completed`, `failed`, `interrupted` or `unknown`. |
+| `deck.run.termination.provenance` | `provider_reported` when the agent's own record of its last turn decided it, `measured` when the deck did. |
+| `deck.run.last_turn`, `deck.run.last_turn.provenance` | How the agent's last turn ended, by its own record: `completed`, `failed`, `interrupted`, `mid_turn` or `unknown`. An interactive agent completes a turn and then waits, so this is kept beside the termination. `unavailable` with `not_recorded` when the agent kept no record. |
+| `error.type` | For a failed run, the kind of failure, such as `rate_limit` or `server_overloaded`, from a list of kinds the agents are known to report, or `other`. For a command, `nonzero_exit`. Never the error's message. |
+| `http.response.status_code` | The HTTP status of the provider's answer that failed the run, when the agent recorded one. |
+
+Events on the `agent.run` span, one `deck.model_usage` per model the run used:
+
+| Attribute | Value |
+| --- | --- |
+| `gen_ai.response.model` | The model, such as `claude-haiku-4-5-20251001` or `gpt-5.4-mini`. Left out for a model whose name the deck does not recognise as a known model's, such as a custom or local model, a name with a path or a prefix of your own in front of it, or one with a suffix of your own after it, such as an address: its tokens are still sent. A name of your own that has exactly the form of a published model's name, such as a known model followed by a date, is sent as it is. |
+| `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.usage.cache_read.input_tokens`, `gen_ai.usage.cache_write.input_tokens` | That model's tokens, as on the run. |
+| `deck.tokens.provenance`, `deck.tokens.unavailable_reason`, `deck.cost.microusd`, `deck.cost.provenance`, `deck.cost.unavailable_reason` | That model's provenance and cost estimate, as on the run. |
+
+A run with no usage known at all has one `deck.model_usage` event without a model, its tokens and cost unavailable with the reason. A run that used models of different provenance, such as one model with a cost estimate and one without, has its total `unavailable` as `incomplete`; the per-model events still carry what is known.
+
+Where each agent's figures come from:
+
+| Agent | Tokens | Cost | Allowance | How it ended |
+| --- | --- | --- | --- | --- |
+| Claude Code | Claude Code's own session total, which it writes when it exits. End a Claude Code run with `/exit`: one that is killed, or whose pane is closed while Claude Code runs, can have its tokens `not_recorded`. A run that resumes an earlier session counts only what it added, or is `incomplete` when the deck cannot tell what that was. Starting a new conversation in Claude Code, for example with `/clear`, and then leaving before sending anything in it can make the run's tokens `incomplete`. | Claude Code's own estimate. | `no_channel` | Claude Code's last turn, with the kind of an API error and its HTTP status. |
+| Codex | Codex's own running total, as the run goes. | `no_channel`: Codex reports no cost. | Codex's plan and its main allowance window. **The used share is the plan's, not the run's alone**: runs on the same plan whose times overlap share one window, so a run's figure includes their use too. The first figure arrives with the run's first reply, so the run's first request is not in it. So the difference between the two figures is not an exact count of what the run took from the allowance. | Codex's last turn, with its error kind. |
+| OpenCode | Each reply's tokens, as OpenCode hands them to the deck's OpenCode plugin. | OpenCode's own figure. Subscription providers report 0, which is sent as `unavailable` with `subscription_zero`. | `no_channel` | OpenCode's last reply. |
+| Pi | Each reply's tokens, as Pi hands them to the deck's Pi extension. | Pi's own estimate. | `no_channel` | Pi's last reply. |
+| Devin | `no_channel` | `no_channel` | `no_channel` | `unknown`, `measured` |
+| A command the deck does not recognise as an agent | `no_channel` | `no_channel` | `no_channel` | Its exit status, `measured`: `completed` for 0, `failed` with `error.type` `nonzero_exit` for any other status, `interrupted` when you closed its pane or the daemon stopped, `unknown` when a signal ended it. |
+
+**Devin usage is unavailable: its reported token counts have not been verified against a signed-in session; missing values are not zero.**
+
+How the run ended, for an agent: the agent's own last turn decides when it completed, failed or was interrupted (`provider_reported`). When its record stops in the middle of a turn, a run you closed or that the daemon stopped is `interrupted`, and one that ended any other way is `unknown` (`measured`). So an agent that exits by itself after finishing its work is `completed`, and a crash in the middle of a turn is `unknown`, not `failed`.
+
+The OpenCode and Pi figures arrive through the plugin and extension the deck installs for them, and only while telemetry is on. An OpenCode or Pi started before you updated the deck, or one that did not load them, has its usage `not_recorded`.
+
+**An agent started inside another agent's pane**, as a program of that pane rather than in a pane of its own, has no run of its own: its usage is added to that pane's run when it is the same agent, and is not recorded when it is another one. An agent the deck starts in a new pane has its own run, whichever pane asked for it.
 
 ### `agent.status`
 
@@ -203,7 +280,9 @@ The deck builds what it sends from the attributes on this page. The values of `O
 - file contents, agent output, or the screen of a pane;
 - tool-call arguments, or anything else from an agent's tool calls;
 - secrets: API keys, the values of environment variables, and the values of your OTLP headers (those go to the endpoint you configured as headers, and to nothing else, and the deck does not write them to its log);
-- pane titles, status details, branch names, working-directory paths, remote URLs, or command lines.
+- pane titles, status details, branch names, working-directory paths, remote URLs, or command lines;
+- an agent's error messages: a failed run carries the kind of failure from a known list, or `other`;
+- names you chose: a model name is sent only when the deck recognises it as a known model's name, and a Codex plan only from the plans Codex is known to report.
 
 The [collector](#cpu-memory-and-disk-per-run), a separate program you run yourself, sends a worktree's path only when you start it with `--send-worktree-paths`; [What it sends](#what-it-sends) has its list.
 

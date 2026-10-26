@@ -1,0 +1,78 @@
+[
+	{
+		"name": "a complete reply",
+		"usage": { "input": 100, "output": 20, "cacheRead": 50, "cacheWrite": 0, "cost": { "total": 0.0042 } },
+		"stopReason": "stop",
+		"line": { "v": 1, "type": "reply", "agent": "pi", "model": "gpt-5.4-mini", "input": 100, "output": 20, "cache_read": 50, "cache_write": 0, "cost_usd": 0.0042, "stop": "stop" },
+		"deck": { "tokens": [150, 20, 50, 0], "last_turn": "completed" }
+	},
+	{
+		"name": "a reply with no usage",
+		"stopReason": "error",
+		"line": { "v": 1, "type": "reply", "agent": "pi", "model": "gpt-5.4-mini", "reported": false, "stop": "error" },
+		"deck": { "unavailable": "not_recorded", "last_turn": "failed" }
+	},
+	{
+		"name": "an empty usage object",
+		"usage": {},
+		"stopReason": "stop",
+		"line": { "v": 1, "type": "reply", "agent": "pi", "model": "gpt-5.4-mini", "input": null, "output": null, "cache_read": null, "cache_write": null, "stop": "stop" },
+		"deck": { "unavailable": "unrecognized_format", "last_turn": "completed" }
+	},
+	{
+		"name": "a partial usage object",
+		"usage": { "input": 100, "cost": { "total": 0 } },
+		"stopReason": "stop",
+		"line": { "v": 1, "type": "reply", "agent": "pi", "model": "gpt-5.4-mini", "input": 100, "output": null, "cache_read": null, "cache_write": null, "cost_usd": 0, "stop": "stop" },
+		"deck": { "unavailable": "unrecognized_format", "last_turn": "completed" }
+	},
+	{
+		"name": "a renamed count",
+		"usage": { "inputTokens": 100, "output": 20, "cacheRead": 0, "cacheWrite": 0 },
+		"stopReason": "stop",
+		"line": { "v": 1, "type": "reply", "agent": "pi", "model": "gpt-5.4-mini", "input": null, "output": 20, "cache_read": 0, "cache_write": 0, "stop": "stop" },
+		"deck": { "unavailable": "unrecognized_format", "last_turn": "completed" }
+	},
+	{
+		"name": "a count given as a string",
+		"usage": { "input": "100", "output": 20, "cacheRead": 0, "cacheWrite": 0 },
+		"stopReason": "stop",
+		"line": { "v": 1, "type": "reply", "agent": "pi", "model": "gpt-5.4-mini", "input": null, "output": 20, "cache_read": 0, "cache_write": 0, "stop": "stop" },
+		"deck": { "unavailable": "unrecognized_format", "last_turn": "completed" }
+	},
+	{
+		"name": "a negative count",
+		"usage": { "input": 100, "output": -20, "cacheRead": 0, "cacheWrite": 0 },
+		"stopReason": "stop",
+		"line": { "v": 1, "type": "reply", "agent": "pi", "model": "gpt-5.4-mini", "input": 100, "output": null, "cache_read": 0, "cache_write": 0, "stop": "stop" },
+		"deck": { "unavailable": "unrecognized_format", "last_turn": "completed" }
+	},
+	{
+		"name": "a fractional count",
+		"usage": { "input": 100.5, "output": 20, "cacheRead": 0, "cacheWrite": 0 },
+		"stopReason": "stop",
+		"line": { "v": 1, "type": "reply", "agent": "pi", "model": "gpt-5.4-mini", "input": null, "output": 20, "cache_read": 0, "cache_write": 0, "stop": "stop" },
+		"deck": { "unavailable": "unrecognized_format", "last_turn": "completed" }
+	},
+	{
+		"name": "a failed reply with Pi's initial zeros",
+		"usage": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "cost": { "total": 0 } },
+		"stopReason": "error",
+		"line": { "v": 1, "type": "reply", "agent": "pi", "model": "gpt-5.4-mini", "reported": false, "stop": "error" },
+		"deck": { "unavailable": "not_recorded", "last_turn": "failed" }
+	},
+	{
+		"name": "an aborted reply with Pi's initial zeros",
+		"usage": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "cost": { "total": 0 } },
+		"stopReason": "aborted",
+		"line": { "v": 1, "type": "reply", "agent": "pi", "model": "gpt-5.4-mini", "reported": false, "stop": "aborted" },
+		"deck": { "unavailable": "not_recorded", "last_turn": "interrupted" }
+	},
+	{
+		"name": "an aborted reply that used tokens",
+		"usage": { "input": 40, "output": 3, "cacheRead": 0, "cacheWrite": 0, "cost": { "total": 0.001 } },
+		"stopReason": "aborted",
+		"line": { "v": 1, "type": "reply", "agent": "pi", "model": "gpt-5.4-mini", "input": 40, "output": 3, "cache_read": 0, "cache_write": 0, "cost_usd": 0.001, "stop": "aborted" },
+		"deck": { "tokens": [40, 3, 0, 0], "last_turn": "interrupted" }
+	}
+]
