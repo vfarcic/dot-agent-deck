@@ -41,16 +41,18 @@ fn attention_header(deck: &common::TuiDeck) -> String {
 }
 
 fn assert_orchestrator_attention(deck: &common::TuiDeck, reason: &str) {
+    // Keep the labelled-count grammar identical to InboxWakeAttention.test.tsx.
+    let one_other_held = regex::Regex::new(
+        r"(?i)(?:^|[^a-z0-9_])(?:1\s+(?:other|held|blocked)|(?:other|held|blocked)\s*:?\s*1)(?:$|[^a-z0-9_])",
+    )
+    .unwrap();
     assert!(
         common::wait_until(WAIT, || {
             let header = attention_header(deck);
             let label = header.to_ascii_lowercase();
             label.contains("orchestrator")
                 && header.contains(reason)
-                && (label.contains("1 other")
-                    || label.contains("other: 1")
-                    || label.contains("1 held")
-                    || label.contains("1 blocked"))
+                && one_other_held.is_match(&header)
         }),
         "deck-wide attention must name the held orchestrator, explain its hold and count one other held recipient outside its card; grid:\n{}",
         deck.snapshot_grid()
@@ -78,6 +80,14 @@ fn status_031_orchestrator_attention_survives_tabs_and_reattach() {
     let other = pane(&daemon, "attention-other");
     let mut deck = attention_client(&daemon);
     deck.wait_for_string("attention-team");
+    // Attaching can select the orchestration tab. Choose the Dashboard
+    // explicitly before checking its distinct card and starting the round-trip.
+    let (col, row) = deck.wait_for_in_grid("Dashboard");
+    deck.click(col + 1, row);
+    deck.wait_until_grid(
+        "Dashboard selected, showing its non-team recipient",
+        |grid| grid.contains("attention-other") && !grid.contains("attention-coder"),
+    );
     for agent in [&orch, &other] {
         status(&daemon, agent, "session_start", "pi");
         status(&daemon, agent, "idle", "pi");
@@ -108,14 +118,27 @@ fn status_031_orchestrator_attention_survives_tabs_and_reattach() {
     assert_orchestrator_attention(&deck, reason);
     // Dashboard -> the team's tab -> Dashboard. No focus or selection clears it.
     deck.send_keys(b"\x1b[C");
+    deck.wait_until_grid("team tab selected, showing its worker", |grid| {
+        grid.contains("attention-coder") && !grid.contains("attention-other")
+    });
     assert_orchestrator_attention(&deck, reason);
     deck.send_keys(b"\x1b[D");
+    deck.wait_until_grid(
+        "Dashboard selected again, showing its non-team recipient",
+        |grid| grid.contains("attention-other") && !grid.contains("attention-coder"),
+    );
     assert_orchestrator_attention(&deck, reason);
     deck.send_keys(b"\x03");
     deck.wait_for_string("Quit dot-agent-deck?");
     deck.send_keys(b"\r");
     assert_eq!(deck.wait_for_exit_within(WAIT), Some(true));
     let reattached = attention_client(&daemon);
+    let (col, row) = reattached.wait_for_in_grid("Dashboard");
+    reattached.click(col + 1, row);
+    reattached.wait_until_grid(
+        "reattached Dashboard shows its non-team recipient",
+        |grid| grid.contains("attention-other") && !grid.contains("attention-coder"),
+    );
     assert_orchestrator_attention(&reattached, reason);
     draft.write("\u{15}");
     other_draft.write("\u{15}");

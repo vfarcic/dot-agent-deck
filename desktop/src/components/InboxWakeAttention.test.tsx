@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import words from "../../../tests/fixtures/inbox-display.json";
 import { DeckShell } from "../App";
@@ -63,12 +63,23 @@ function header(container: HTMLElement): HTMLElement {
   return top!;
 }
 
+// Keep the labelled-count grammar identical to e2e_inbox_status.rs.
+const oneOtherHeld = /(?:^|[^a-z0-9_])(?:1\s+(?:other|held|blocked)|(?:other|held|blocked)\s*:?\s*1)(?:$|[^a-z0-9_])/i;
+
 function expectAttention(top: HTMLElement, reason = words.wakeHolds.possible_draft) {
   expect(top).toHaveTextContent(/captain/i);
   expect(top).toHaveTextContent(reason);
   expect(top).toHaveTextContent(words.glyph);
-  expect(top).toHaveTextContent(/1\s+(?:other|held|blocked)|(?:other|held|blocked)[^0-9]*1/i);
-  expect(top).not.toHaveTextContent("Helper");
+  expect(top).toHaveTextContent(oneOtherHeld);
+  expect(top).not.toHaveTextContent(/coder/i);
+}
+
+function expectOnlyCount(top: HTMLElement) {
+  expect(top).not.toHaveTextContent(/captain|coder/i);
+  expect(top).not.toHaveTextContent(words.wakeHolds.possible_draft);
+  expect(top).not.toHaveTextContent(words.wakeHolds.awaiting_prompt);
+  expect(top).toHaveTextContent(words.glyph);
+  expect(top).toHaveTextContent(oneOtherHeld);
 }
 
 function wake(agentId: string, paneId: string, hold?: string) {
@@ -80,7 +91,7 @@ function wake(agentId: string, paneId: string, hold?: string) {
 }
 
 describe("inbox/status/034 — orchestrator wake attention", () => {
-  /// Scenario: inbox/status/034 — Render an unselected start role's Diff tab with a possible draft, then open the deck while another worker is held. The tile and visible deck header must explain its hold using the shared words, the header must name the start role and count the other worker, and navigating to the dashboard and back must retain attention.
+  /// Scenario: inbox/status/034 — Render an unselected start role's Diff tab with a possible draft, then open the real deck and select Coder while Captain remains held. The header must name Captain and count the other worker before and after selecting Coder, and retain attention through a dashboard round-trip with Coder selected again on return.
   it("shows an off-selected-tab orchestrator in the deck header and on its tile", () => {
     const mapped = mapDesktopSnapshot(snapshot());
     const offTab = render(tile(mapped, "diff"));
@@ -88,14 +99,22 @@ describe("inbox/status/034 — orchestrator wake attention", () => {
     expect(screen.getByRole("tab", { name: "Diff" })).toHaveAttribute("aria-selected", "true");
     offTab.unmount();
     const view = render(<DeckShell runtime={runtime(mapped)} initialView={{ kind: "deck" }} />);
+    const coder = screen.getByRole("article", { name: "Coder" });
+    expect(coder).not.toHaveClass("is-selected");
+    expectAttention(header(view.container));
+    fireEvent.mouseDown(coder);
+    expect(coder).toHaveClass("is-selected");
+    expect(screen.getByRole("article", { name: "Captain" })).not.toHaveClass("is-selected");
     expectAttention(header(view.container));
     fireEvent.click(screen.getByTestId("open-overview"));
     expectAttention(header(view.container));
     fireEvent.click(screen.getByTestId("open-deck"));
+    fireEvent.mouseDown(screen.getByRole("article", { name: "Coder" }));
+    expect(screen.getByRole("article", { name: "Coder" })).toHaveClass("is-selected");
     expectAttention(header(view.container));
   });
 
-  /// Scenario: inbox/status/034 — A connected real bridge receives a wake-update reason change and then its clear for the listed generation. The rendered tile must follow both immediately without a replacement snapshot, using the shared words and returning to the stalled-wake words when the reason clears.
+  /// Scenario: inbox/status/034 — A connected real bridge receives a wake-update reason change and then its clear for the listed generation. The already-mounted tile and header must follow both without a replacement snapshot; clearing Captain's hold removes its header detail while the other held worker remains counted.
   it.each(["awaiting_prompt", null])("renders a broadcast reason change or clear (%s) without waiting for a snapshot", async (nextHold) => {
     invoke.mockResolvedValue(snapshot());
     const bridge = new TauriDeckBridge();
@@ -103,16 +122,22 @@ describe("inbox/status/034 — orchestrator wake attention", () => {
     try {
       await bridge.subscribe((next) => { fleet = next; }, vi.fn());
       fleet = await bridge.connect();
-      const view = render(tile(fleet[0]));
+      const shell = () => <DeckShell runtime={runtime(fleet[0])} initialView={{ kind: "deck" }} />;
+      const view = render(shell());
       expect(screen.getByRole("article", { name: "Captain" })).toHaveTextContent(words.wakeHolds.possible_draft);
+      expectAttention(header(view.container));
       await act(async () => { wake("7", "captain-pane", nextHold ?? undefined); });
-      view.rerender(tile(fleet[0]));
+      view.rerender(shell());
       expect(screen.getByRole("article", { name: "Captain" })).not.toHaveTextContent(words.wakeHolds.possible_draft);
       expect(screen.getByRole("article", { name: "Captain" })).toHaveTextContent(nextHold ? words.wakeHolds.awaiting_prompt : words.wakeStalled);
+      expect(header(view.container)).not.toHaveTextContent(words.wakeHolds.possible_draft);
+      if (nextHold) expectAttention(header(view.container), words.wakeHolds.awaiting_prompt);
+      else expectOnlyCount(header(view.container));
       await act(async () => { wake("7", "captain-pane"); });
-      view.rerender(tile(fleet[0]));
+      view.rerender(shell());
       expect(screen.getByRole("article", { name: "Captain" })).not.toHaveTextContent(words.wakeHolds.awaiting_prompt);
       expect(screen.getByRole("article", { name: "Captain" })).toHaveTextContent(words.wakeStalled);
+      expectOnlyCount(header(view.container));
     } finally { await bridge.dispose(); }
   });
 
@@ -143,7 +168,7 @@ describe("inbox/status/034 — orchestrator wake attention", () => {
       await act(async () => { listeners.get("desktop://snapshot")?.({ payload: replacement }); });
       await act(async () => { wake("7", "captain-pane", "possible_draft"); });
       const view = render(<DeckShell runtime={runtime(fleet[0])} initialView={{ kind: "deck" }} />);
-      expect(within(screen.getByRole("article", { name: "Captain" })).queryByText(words.wakeHolds.possible_draft)).toBeNull();
+      expect(screen.getByRole("article", { name: "Captain" })).not.toHaveTextContent(words.wakeHolds.possible_draft);
       expect(header(view.container)).not.toHaveTextContent(words.wakeHolds.possible_draft);
       await act(async () => { wake("9", "captain-pane", "awaiting_prompt"); });
       view.rerender(<DeckShell runtime={runtime(fleet[0])} initialView={{ kind: "deck" }} />);

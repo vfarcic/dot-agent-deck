@@ -41,7 +41,8 @@ fn fixture(mode: &str, wrapped: bool) -> (common::DaemonProc, Pane, Pane, String
             "is_start_role":true,"orchestration_id":"route-fixture","orchestration_cwd":daemon.cwd()
         }}),
     );
-    let script = daemon.home.join("terminal-command.py");
+    // Exercise shell quoting with an apostrophe in the executable's path too.
+    let script = daemon.home.join("terminal'command.py");
     std::fs::write(&script, r#"import os, sys, time, signal, subprocess
 base, mode = sys.argv[1:]
 open(base + '.pid', 'w').write(str(os.getpid()))
@@ -66,10 +67,11 @@ if mode == 'detached':
 sys.exit(7 if mode == 'nonzero' else 0)
 "#).unwrap();
     let base = daemon.home.join("terminal-worker");
+    let quote = |path: &std::path::Path| path.to_string_lossy().replace('\'', "'\\''");
     let command = format!(
         "exec python3 '{}' '{}' '{mode}'",
-        script.display(),
-        base.display()
+        quote(&script),
+        quote(&base)
     );
     let worker = pane_with(
         &daemon,
@@ -111,8 +113,8 @@ fn notice(daemon: &impl Endpoint, orch: &Pane, task: &str) -> String {
     notice
 }
 
-fn exited(mode: &str, code: i32) {
-    let (daemon, orch, worker, task, _descendant) = fixture(mode, true);
+fn exited(mode: &str, code: i32, wrapped: bool) {
+    let (daemon, orch, worker, task, _descendant) = fixture(mode, wrapped);
     finish(&worker);
     state(&daemon, &worker, &task, "undeliverable");
     if mode == "detached" {
@@ -128,7 +130,7 @@ fn exited(mode: &str, code: i32) {
     );
     assert!(
         message.contains(&expected),
-        "wrapper-reported pane-command exit must say {expected:?}: {message}"
+        "pane-command exit (wrapped={wrapped}) must say {expected:?}: {message}"
     );
 }
 
@@ -136,14 +138,28 @@ fn exited(mode: &str, code: i32) {
 #[spec("inbox/status/032")]
 #[test]
 fn status_032_wrapped_zero_exit_names_the_pane_command() {
-    exited("zero", 0);
+    exited("zero", 0, true);
 }
 
-/// Scenario: A wrapped synthetic pane command exits with code seven before taking its delegated message. The orchestrator's notice must report seven from the wrapper, rather than the wrapper's own status or an agent-process exit.
+/// Scenario: A wrapped synthetic pane command exits with code seven before taking its delegated message. The orchestrator's notice must report seven without claiming an agent-process exit; this public wrapper also exits seven, so distinguishing the two evidence sources requires a coder-owned capture test.
 #[spec("inbox/status/032")]
 #[test]
 fn status_032_wrapped_nonzero_exit_names_the_child_code() {
-    exited("nonzero", 7);
+    exited("nonzero", 7, true);
+}
+
+/// Scenario: A synthetic command started directly in its pane exits zero before taking its delegated message. The orchestrator's notice must name the pane command and its observed code, without a wrapper report or a claim about an agent process.
+#[spec("inbox/status/032")]
+#[test]
+fn status_032_unwrapped_zero_exit_names_the_pane_command() {
+    exited("zero", 0, false);
+}
+
+/// Scenario: A synthetic command started directly in its pane exits seven before taking its delegated message. The orchestrator's notice must name that pane command's observed code seven without depending on a wrapper report.
+#[spec("inbox/status/032")]
+#[test]
+fn status_032_unwrapped_nonzero_exit_names_the_pane_command() {
+    exited("nonzero", 7, false);
 }
 
 /// Scenario: A live pane command closes its terminal descriptors without exiting or reporting a child status. Its waiting task becomes undeliverable and the orchestrator is told that the connection ended and whether the agent still runs is unknown.
@@ -241,5 +257,5 @@ fn status_032_launcher_exit_with_terminal_descendant_sends_no_notice() {
 #[spec("inbox/status/032")]
 #[test]
 fn status_032_detached_descendant_does_not_justify_agent_exit_words() {
-    exited("detached", 0);
+    exited("detached", 0, true);
 }
