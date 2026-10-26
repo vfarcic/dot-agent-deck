@@ -501,21 +501,34 @@ async fn terminate_and_recover(
     if probe.response.supervised {
         match hand_back_to_service(endpoint, &probe.response, consented).await {
             HandBack::Recovered => return Ok(HandshakeOutcome::Recovered),
-            HandBack::OtherBuild(instance) => {
+            HandBack::OtherBuild => {
                 // The caller attaches without checking the build again, so the
                 // service's daemon of another build is stopped the way the old
                 // one would have been, and this TUI starts its own as before.
-                // Only that process: the endpoint may have changed hands since.
-                if let Ok(fresh) = probe_daemon(endpoint.path()).await
-                    && fresh.response.instance_id == instance
-                {
-                    terminate_daemon_graceful(
-                        fresh.peer_pid,
-                        endpoint,
-                        TERMINATE_POLL_TIMEOUT,
-                        None,
-                    )
-                    .await?;
+                // Decided and signalled through one connection, so the process
+                // stopped is the one that just reported another build.
+                match probe_daemon(endpoint.path()).await {
+                    Ok(fresh)
+                        if fresh.response.build_version.as_deref()
+                            != Some(local_build_id().as_str()) =>
+                    {
+                        terminate_daemon_graceful(
+                            fresh.peer_pid,
+                            endpoint,
+                            TERMINATE_POLL_TIMEOUT,
+                            None,
+                        )
+                        .await?;
+                    }
+                    // This build answers now.
+                    Ok(_) => {}
+                    // Nothing listens: the caller starts this build.
+                    Err(HandshakeError::Probe(e))
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                        ) => {}
+                    Err(e) => return Err(e),
                 }
                 return Ok(HandshakeOutcome::Recovered);
             }
@@ -574,8 +587,8 @@ enum HandBack {
     /// The service runs a daemon of this build, or nothing answers any more
     /// and the caller starts this build.
     Recovered,
-    /// The service runs a daemon of another build, the process named here.
-    OtherBuild(Option<String>),
+    /// The service runs a daemon of another build.
+    OtherBuild,
     /// The daemon that was probed is still the one running: it refused,
     /// predates the request, or named live work no one agreed to stop.
     Declined,
@@ -642,7 +655,7 @@ async fn wait_for_service(client: &DaemonClient, old: &AttachResponse) -> HandBa
                         "the service restarted its daemon on another build; stopping it so this \
                          build runs"
                     );
-                    HandBack::OtherBuild(hello.instance_id)
+                    HandBack::OtherBuild
                 };
             }
             Ok(Ok(Some(_))) => old_answering = true,
