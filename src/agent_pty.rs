@@ -4230,26 +4230,35 @@ impl PaneInputState {
     }
 
     /// PRD #1666 part 3, round 5-wake: what [`Self::draft_pending`] joins,
-    /// apart, with the pane's turn count.
-    fn input_hold(&self, pane_id_env: &str) -> PaneInputHold {
+    /// apart, with the pane's turn count; the box as `semantics` edits it
+    /// (Q32).
+    fn input_hold(
+        &self,
+        pane_id_env: &str,
+        semantics: Option<crate::composer_model::Semantics>,
+    ) -> PaneInputHold {
         self.input
             .get(pane_id_env)
             .map_or_else(PaneInputHold::default, |stream| PaneInputHold {
                 paste_open: stream.in_paste,
                 draft: stream.draft.pending()
-                    || stream.composer.proof() != crate::composer_model::InputProof::Empty,
+                    || stream.composer.proof(semantics) != crate::composer_model::InputProof::Empty,
                 turns: stream.turns,
             })
     }
 
     /// PRD #1666 part 3, round 5-wake (R6-4): what the bytes written into
-    /// `pane_id_env` say its input box holds; empty for a pane nothing was
-    /// written to.
-    fn input_proof(&self, pane_id_env: &str) -> crate::composer_model::InputProof {
+    /// `pane_id_env` say its input box holds, as `semantics` edits it (Q32);
+    /// empty for a pane nothing was written to.
+    fn input_proof(
+        &self,
+        pane_id_env: &str,
+        semantics: Option<crate::composer_model::Semantics>,
+    ) -> crate::composer_model::InputProof {
         self.input
             .get(pane_id_env)
             .map_or(crate::composer_model::InputProof::Empty, |stream| {
-                stream.composer.proof()
+                stream.composer.proof(semantics)
             })
     }
 
@@ -10547,17 +10556,34 @@ impl AgentPtyRegistry {
         self.pane_input.lock().unwrap().draft_pending(pane_id_env)
     }
 
-    /// Test seam: what the composer model says `pane_id_env`'s box holds.
+    /// Test seam: what the composer model says `pane_id_env`'s box holds,
+    /// as `semantics` edits it.
     #[cfg(test)]
-    pub(crate) fn input_proof(&self, pane_id_env: &str) -> crate::composer_model::InputProof {
-        self.pane_input.lock().unwrap().input_proof(pane_id_env)
+    pub(crate) fn input_proof(
+        &self,
+        pane_id_env: &str,
+        semantics: Option<crate::composer_model::Semantics>,
+    ) -> crate::composer_model::InputProof {
+        self.pane_input
+            .lock()
+            .unwrap()
+            .input_proof(pane_id_env, semantics)
     }
 
     /// PRD #1666 part 3, round 5-wake (plan §5.1): the pane's open paste and
     /// unsent draft, told apart, and how many of its agent's turns have
-    /// ended, for the doorbell's hold reason and episode.
-    pub fn pane_input_hold(&self, pane_id_env: &str) -> PaneInputHold {
-        self.pane_input.lock().unwrap().input_hold(pane_id_env)
+    /// ended, for the doorbell's hold reason and episode. The draft is the
+    /// box as `semantics` edits it ([`Self::doorbell_input_semantics`]), or
+    /// as every measured agent does for `None`.
+    pub fn pane_input_hold(
+        &self,
+        pane_id_env: &str,
+        semantics: Option<crate::composer_model::Semantics>,
+    ) -> PaneInputHold {
+        self.pane_input
+            .lock()
+            .unwrap()
+            .input_hold(pane_id_env, semantics)
     }
 
     /// Type `bytes` into `pane_id` as a user would, while `agent_id` is the
@@ -23610,6 +23636,11 @@ mod spawn_tests {
                                         composer.replace_range(..at(cursor, &composer), "");
                                         cursor = 0;
                                     }
+                                    // Ctrl+C empties the whole box.
+                                    0x03 => {
+                                        composer.clear();
+                                        cursor = 0;
+                                    }
                                     0x01 => cursor = 0,
                                     0x05 => cursor = composer.chars().count(),
                                     b if b >= 0x20 => {
@@ -24438,7 +24469,7 @@ mod spawn_tests {
         control.on_enter = OnEnter::Submit;
     }
 
-    /// Scenario: PRD #1666 part 3 (Q30). The user leaves blanks in a Claude Code 2.1.310 model editor's composer and presses Enter, which submits nothing, by key paths the input model cannot fully follow, while the screen shows exactly the empty composer with no placeholder: spaces, a non-ASCII character, Backspace and Ctrl+A, then the agent reports an unrelated turn starting and ending, or a late report of a prompt the user sent before; and the reviewer's composed sequence (a non-ASCII character and Backspace, Enter, a space, Ctrl+J, End, Ctrl+U, Backspace, Ctrl+A). The deck types nothing (nothing written: no empty composer) and the card says there may be an unsent draft; End then Ctrl+U lets the next ring type once. A positive control: Up then Enter, which really submits, holds the ring only until the agent's prompt hook reports the prompt it took, and then the ring types its line.
+    /// Scenario: PRD #1666 part 3 (Q30). The user leaves blanks in a Claude Code 2.1.310 model editor's composer and presses Enter, which submits nothing, by key paths the input model cannot fully follow, while the screen shows exactly the empty composer with no placeholder: spaces, a non-ASCII character, Backspace and Ctrl+A, then the agent reports an unrelated turn starting and ending, or a late report of a prompt the user sent before; the reviewer's composed sequence (a non-ASCII character and Backspace, Enter, a space, Ctrl+J, End, Ctrl+U, Backspace, Ctrl+A); and, with no Enter at all, the reviewer's sequence that leaves two spaces on both measured agents (ab, Ctrl+J, two spaces, Home, Ctrl+U, Home, Backspace, Delete, Delete, Ctrl+U). The deck types nothing (nothing written: no empty composer) and the card says there may be an unsent draft; the measured remedy, a letter then Ctrl+C, proves the box empty and lets the next ring type once. A positive control: Up then Enter, which really submits, holds the ring only until the agent's prompt hook reports the prompt it took, and then the ring types its line.
     #[spec("inbox/doorbell/050")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn doorbell_050_an_unknown_enter_needs_its_own_report() {
@@ -24468,10 +24499,12 @@ mod spawn_tests {
         blanks_enter.extend_from_slice(b"\x7f\x01\r");
         let mut composed = "\u{e9}".as_bytes().to_vec();
         composed.extend_from_slice(b"\x7f\r \n\x05\x15\x7f\x01");
+        let reviewer = b"ab\n  \x1b[H\x15\x1b[H\x7f\x1b[3~\x1b[3~\x15".to_vec();
         for (case, keys, before) in [
             ("an unrelated turn", blanks_enter.clone(), None),
             ("a late report", blanks_enter, Some("hello")),
             ("End and Ctrl+U after the Enter", composed, None),
+            ("the reviewer's sequence", reviewer, None),
         ] {
             let registry = Arc::new(AgentPtyRegistry::new());
             let editor = ModelEditor::spawn(
@@ -24507,13 +24540,22 @@ mod spawn_tests {
             .await;
             bell.abort();
             assert_eq!(editor.typed(), before_ring, "{case}: no deck byte");
-            // The user's remedy: clear from the end.
+            // The user's remedy: a letter, then Ctrl+C. The model proves the
+            // box empty, not only the editor's suggestion.
             editor_draws_again(&editor);
             registry
-                .write_user_bytes(&editor.pane, &editor.id, b"\x05\x15")
+                .write_user_bytes(&editor.pane, &editor.id, b"x\x03")
                 .await
                 .unwrap();
             editor.wait_drawn("");
+            assert_eq!(
+                registry.input_proof(
+                    &editor.pane,
+                    Some(crate::composer_model::Semantics::ClaudeCode)
+                ),
+                crate::composer_model::InputProof::Empty,
+                "{case}: the remedy empties the box"
+            );
             rings_once(&editor, editor.ring().await, case);
             registry.shutdown_all();
         }
@@ -24547,6 +24589,43 @@ mod spawn_tests {
         registry.note_turn(&editor.pane, &editor.id, TurnEdge::Started);
         registry.note_turn(&editor.pane, &editor.id, TurnEdge::Ended);
         rings_once(&editor, editor.ring().await, "Up then Enter");
+        registry.shutdown_all();
+    }
+
+    /// Scenario: PRD #1666 part 3 (Q32), a positive control. On a Claude Code 2.1.310 model editor, type three spaces, Enter (which keeps them), x and Ctrl+U, which on Claude Code takes the whole line, so the box is empty; on Codex the three spaces would stay after its cursor. The ring is admitted and types its line once: the deck reads the box as the pane's own agent edits it.
+    #[spec("inbox/doorbell/050")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_050_the_box_is_read_as_the_panes_agent_edits_it() {
+        use crate::composer_model::{InputProof, Semantics};
+        use crate::doorbell_txn::Outcome;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-claude-rules", OnEnter::Submit);
+        user_keys_behind_a_blank_frame(&editor, b"   \rx\x15").await;
+        assert_eq!(
+            registry.input_proof(&editor.pane, Some(Semantics::ClaudeCode)),
+            InputProof::Empty
+        );
+        assert_eq!(
+            registry.input_proof(&editor.pane, Some(Semantics::Codex)),
+            InputProof::Draft
+        );
+        editor_draws_again(&editor);
+        let report = editor.ring().await;
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::Submitted),
+            "{report:?}"
+        );
+        let typed = editor.typed();
+        let line = typed_line(&typed).expect("the line was typed");
+        assert_eq!(
+            typed
+                .windows(line.len())
+                .filter(|w| *w == line.as_bytes())
+                .count(),
+            1,
+            "the line once"
+        );
         registry.shutdown_all();
     }
 
@@ -27320,7 +27399,7 @@ mod spawn_tests {
                         tokio::time::Instant::now() < deadline,
                         "the inbox never said {want:?}; it says {:?}, the pane's input {:?}, its queue {:?}",
                         registry.inbox().wake_hold(PANE, &agent),
-                        registry.pane_input_hold(PANE),
+                        registry.pane_input_hold(PANE, None),
                         registry.inbox().doorbell_facts(PANE, &agent),
                     );
                     tokio::time::sleep(Duration::from_millis(10)).await;

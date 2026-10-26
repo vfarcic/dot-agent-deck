@@ -1321,6 +1321,160 @@ fn doorbell_010_live_blanks_enter_and_an_unrelated_turn_stay_held() {
     );
 }
 
+/// Scenario: In real interactive Claude Code 2.1.310, complete a doorbell-delivered control task with native delivery disabled, then type the reviewer's sequence one key at a time: ab, Ctrl+J, two spaces, Home, Ctrl+U, Home, Backspace, Delete, Delete, Ctrl+U. Claude joins the second line to the first at that Ctrl+U, so two spaces stay in a composer that looks empty. Post a sentinel task: for five seconds the composer is unchanged, the input ledger gains no byte, the task stays queued with zero deliveries, no ring or pane write is logged, and the card names the draft hold. Then type x and press Ctrl+C once, the remedy the docs name; the task must be delivered once through the doorbell.
+#[spec("inbox/doorbell/010")]
+#[test]
+#[cfg(target_os = "linux")]
+fn doorbell_010_live_reviewer_sequence_stays_held_until_a_letter_and_ctrl_c() {
+    skip_unless!(common::check_claude_available());
+    let version = std::process::Command::new("script")
+        .arg("--version")
+        .output()
+        .expect("Linux reviewer-sequence input ledger requires util-linux script on PATH");
+    assert!(
+        version.status.success(),
+        "util-linux script preflight failed"
+    );
+    let claude = Claude::launch(&common::capability_export_command(&format!(
+        "exec script --quiet --flush --return --echo never --log-in reviewer-input.log --log-out /dev/null --command 'exec {CLAUDE}'"
+    )));
+    claude.deck.wait_for_string("? for shortcuts");
+    assert!(
+        claude.pane_grid().contains("Claude Code v2.1.310"),
+        "this measured-release regression requires Claude Code 2.1.310; {}",
+        claude.evidence()
+    );
+    let claude = fallback_ready_with(claude, "reviewer-seq");
+    let input = || std::fs::read(claude.deck.workdir().join("reviewer-input.log")).unwrap();
+    let composer_frame = || {
+        let (grid, cursor) = claude.pane_frame();
+        (
+            grid.lines().nth(usize::from(cursor.0)).map(str::to_string),
+            cursor,
+        )
+    };
+    let blank = |frame: &(Option<String>, (u16, u16))| {
+        frame.0.as_deref().is_some_and(|row| {
+            row.trim_start()
+                .strip_prefix('\u{276f}')
+                .is_some_and(|tail| tail.trim().is_empty())
+        })
+    };
+    // One key at a time, as a user types them (the bytes the tester
+    // measured: 61620a20201b5b48151b5b487f1b5b337e1b5b337e15).
+    let keys: [&[u8]; 10] = [
+        b"ab", b"\n", b"  ", b"\x1b[H", b"\x15", b"\x1b[H", b"\x7f", b"\x1b[3~", b"\x1b[3~",
+        b"\x15",
+    ];
+    // Each key reaches the agent's PTY (the ledger) and the agent has
+    // finished drawing for it (the frame stays the same over several
+    // samples) before the next is sent, so no two arrive in one read.
+    let mut sent = Vec::new();
+    for key in keys {
+        claude.deck.send_keys(key);
+        sent.extend_from_slice(key);
+        assert!(
+            common::wait_until(Duration::from_secs(10), || input().ends_with(&sent)),
+            "the ledger must capture {key:?}; {}",
+            claude.evidence()
+        );
+        let seen = std::cell::RefCell::new((None, 0));
+        assert!(
+            common::wait_until(Duration::from_secs(10), || {
+                let frame = claude.pane_frame();
+                let mut seen = seen.borrow_mut();
+                if seen.0.as_ref() == Some(&frame) {
+                    seen.1 += 1;
+                } else {
+                    *seen = (Some(frame), 0);
+                }
+                seen.1 >= 5
+            }),
+            "the agent must settle after {key:?}; {}",
+            claude.evidence()
+        );
+    }
+    assert!(
+        common::wait_until(Duration::from_secs(10), || blank(&composer_frame())),
+        "the two spaces must leave a blank-looking composer; {}",
+        claude.evidence()
+    );
+    let held = composer_frame();
+    let input_before = input();
+    let since = claude.log().len();
+    let name = "reviewer-seq-held-4b1e07.txt";
+    let id = claude.post(&claude.directive(name));
+    // A bounded observation: the closure asserts on every sample and never
+    // asks to stop, so it samples for the whole five seconds.
+    common::wait_until(Duration::from_secs(5), || {
+        let listing = claude.listing();
+        let message = listing["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["id"] == id)
+            .unwrap();
+        assert_eq!(message["state"], "queued", "{message}");
+        assert_eq!(message["deliveries"], 0, "{message}");
+        assert_eq!(
+            composer_frame(),
+            held,
+            "the composer changed; {}",
+            claude.evidence()
+        );
+        assert_eq!(input(), input_before, "no automatic input byte is allowed");
+        assert!(!claude.deck.workdir().join(name).exists());
+        assert!(
+            !claude.log()[since..].lines().any(|line| {
+                line.contains("doorbell attempt")
+                    || line.contains("doorbell rang")
+                    || line.contains("pane_write:")
+            }),
+            "the two spaces must prevent a ring or pane write; {}",
+            claude.evidence()
+        );
+        false
+    });
+    assert_eq!(
+        claude.record()["inbox"]["wake_hold"],
+        "possible_draft",
+        "the two spaces must report the draft hold; {}",
+        claude.evidence()
+    );
+    assert!(
+        claude
+            .deck
+            .snapshot_grid()
+            .contains("there may be an unsent draft"),
+        "card must visibly explain the draft hold; {}",
+        claude.evidence()
+    );
+    eprintln!(
+        "{}",
+        common::redact_credentials_for_output(&format!(
+            "reviewer sequence held: composer={held:?}; 5s unchanged, unchanged input ledger, queued with zero deliveries, no ring/write; wake_hold=possible_draft; card=\n{}",
+            claude.deck.snapshot_grid()
+        ))
+    );
+    // The remedy the docs name: a letter, so Ctrl+C has something to clear,
+    // then Ctrl+C once.
+    claude.deck.send_keys(b"x");
+    claude.expect_composer("x");
+    claude.deck.send_keys(b"\x03");
+    claude.done(&id, name, false);
+    assert!(
+        claude.log()[since..].contains("doorbell rang"),
+        "the remedy must recover through the doorbell; {}",
+        claude.evidence()
+    );
+    let after = input()[input_before.len()..].to_vec();
+    assert!(
+        after.starts_with(b"x\x03"),
+        "the remedy reached the pane before anything else: {:?}",
+        String::from_utf8_lossy(&after)
+    );
+}
+
 /// Scenario: Complete a fallback-delivered control task in real interactive Haiku, send a prompt of your own, then recall it with Up and press Enter, which submits it again, while native delivery is disabled. Once that turn ends, post another sentinel task: the doorbell must type it without another keypress, since Claude Code's prompt hook reported the recalled prompt it took.
 #[spec("inbox/doorbell/010")]
 #[test]

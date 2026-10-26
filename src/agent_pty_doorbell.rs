@@ -184,7 +184,7 @@ impl txn::Seam for DaemonSeam<'_> {
             .pane_input
             .try_lock()
             .ok()?
-            .input_proof(&self.generation.pane_id);
+            .input_proof(&self.generation.pane_id, Some(self.profile.input));
         let marks = ledger.marks();
         let read = txn::SeamRead {
             watermark: marks.watermark,
@@ -423,11 +423,10 @@ impl AgentPtyRegistry {
         let ledger = generation.ledger.try_hold()?;
         let state = generation.bus.state.try_lock().ok()?;
         let store = generation.mode.try_lock().ok()?;
-        let input = self
-            .pane_input
-            .try_lock()
-            .ok()?
-            .input_proof(&generation.pane_id);
+        let input = self.pane_input.try_lock().ok()?.input_proof(
+            &generation.pane_id,
+            typing.as_ref().ok().map(|typing| typing.profile.input),
+        );
         let frame = match &typing {
             Ok(typing) => txn::Frame {
                 input,
@@ -453,6 +452,24 @@ impl AgentPtyRegistry {
             nudge_in_flight,
             ..reads
         })
+    }
+
+    /// PRD #1666 part 3, Q32: how the input box of `agent_id`'s generation
+    /// in `pane_id` edits, from the screen profile its evidence tracks (the
+    /// e2e build's stand-in editor's own, when it runs one); `None` when the
+    /// generation is gone or has no measured profile.
+    pub fn doorbell_input_semantics(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+    ) -> Option<crate::composer_model::Semantics> {
+        let generation = self.doorbell_generation(pane_id, agent_id)?;
+        #[cfg(feature = "e2e")]
+        if generation.doorbell.standin().is_some() {
+            return Some(crate::doorbell_screen::STANDIN_PROFILE.input);
+        }
+        let state = generation.bus.state.lock().unwrap();
+        state.evidence.profile().map(|profile| profile.input)
     }
 
     /// The clause that holds `agent_id`'s generation in `pane_id` from the
@@ -528,7 +545,7 @@ impl AgentPtyRegistry {
                 .pane_input
                 .lock()
                 .unwrap()
-                .input_proof(&generation.pane_id);
+                .input_proof(&generation.pane_id, Some(typing.profile.input));
             let ready = txn::Frame {
                 input,
                 ..frame_of(&generation.bus.state.lock().unwrap(), typing.profile, None)

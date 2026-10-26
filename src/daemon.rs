@@ -8087,12 +8087,12 @@ mod hook_ingestion_tests {
     use tokio::io::AsyncWriteExt;
     use tokio::net::{UnixListener, UnixStream};
 
-    /// Scenario: PRD #1666 part 3 (Q30). A user presses Enter on a box the input model lost track of (Tab, then Enter) in a pane whose agent is live, and the daemon ingests that agent's events: working reports with no prompt (thinking, a tool starting), a prompt report from the pane's previous generation, and a subagent's prompt report. None of them proves the box empty. The live agent's own prompt report (a thinking event carrying the prompt its hook took) does; so does the deck's own line it recognised, but only for the deck's own submit, never for the user's Enter.
+    /// Scenario: PRD #1666 part 3 (Q30). A user presses Enter on a box the input model lost track of (Up, then Enter) in a pane whose agent is live, and the daemon ingests that agent's events: working reports with no prompt (thinking, a tool starting), a prompt report from the pane's previous generation, and a subagent's prompt report. None of them proves the box empty. The live agent's own prompt report (a thinking event carrying the prompt its hook took) does; so does the deck's own line it recognised, but only for the deck's own submit, never for the user's Enter.
     #[spec("inbox/doorbell/059")]
     #[tokio::test]
     async fn doorbell_059_the_daemon_confirms_an_unknown_enter_only_from_its_agents_prompt_report()
     {
-        use crate::composer_model::InputProof;
+        use crate::composer_model::{InputProof, Semantics};
         let pane = "prompt-report";
         let registry = Arc::new(AgentPtyRegistry::new());
         let owner = registry
@@ -8119,10 +8119,13 @@ mod hook_ingestion_tests {
         };
         use crate::event::EventType::{Idle, Thinking, ToolStart};
         registry
-            .write_user_bytes(pane, &owner, b"\t\r")
+            .write_user_bytes(pane, &owner, b"\x1b[A\r")
             .await
             .unwrap();
-        assert_eq!(registry.input_proof(pane), InputProof::Unknown);
+        assert_eq!(
+            registry.input_proof(pane, Some(Semantics::ClaudeCode)),
+            InputProof::Unknown
+        );
         for (what, frame) in [
             ("a thinking report", event(Thinking, &owner, None)),
             ("a tool starting", event(ToolStart, &owner, None)),
@@ -8141,7 +8144,11 @@ mod hook_ingestion_tests {
             }),
         ] {
             ingest_event(&state, &event_tx, &registry, frame).await;
-            assert_eq!(registry.input_proof(pane), InputProof::Unknown, "{what}");
+            assert_eq!(
+                registry.input_proof(pane, Some(Semantics::ClaudeCode)),
+                InputProof::Unknown,
+                "{what}"
+            );
         }
         // The deck's own line, reported as the deck's: settles the deck's
         // submit, not the user's Enter.
@@ -8152,7 +8159,7 @@ mod hook_ingestion_tests {
         );
         ingest_event(&state, &event_tx, &registry, deck).await;
         assert_eq!(
-            registry.input_proof(pane),
+            registry.input_proof(pane, Some(Semantics::ClaudeCode)),
             InputProof::Unknown,
             "the deck's"
         );
@@ -8163,7 +8170,55 @@ mod hook_ingestion_tests {
             event(Thinking, &owner, Some("the recalled prompt")),
         )
         .await;
-        assert_eq!(registry.input_proof(pane), InputProof::Empty);
+        assert_eq!(
+            registry.input_proof(pane, Some(Semantics::ClaudeCode)),
+            InputProof::Empty
+        );
+        registry.shutdown_all();
+    }
+
+    /// Scenario: PRD #1666 part 3 (Q32). Type three spaces, Enter, x and Ctrl+U into a Codex pane and into a Claude Code pane. Codex keeps the blanks after its cursor, so its box still holds three spaces; Claude Code's Ctrl+U takes the whole line. Each generation's doorbell reads its own agent's editing rules, so the Codex pane's hold says there may be a draft and the Claude Code pane's does not, and a pane read with no agent's rules holds a draft too.
+    #[spec("inbox/doorbell/059")]
+    #[tokio::test]
+    async fn doorbell_059_the_hold_reads_the_box_as_the_panes_agent_edits_it() {
+        use crate::composer_model::Semantics;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let mut panes = Vec::new();
+        for (pane, agent_type) in [
+            ("hold-codex", AgentType::Codex),
+            ("hold-claude", AgentType::ClaudeCode),
+        ] {
+            let owner = registry
+                .spawn_agent(SpawnOptions {
+                    command: Some("/bin/cat"),
+                    env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                        DOT_AGENT_DECK_PANE_ID.to_string(),
+                        pane.to_string(),
+                    )]),
+                    agent_type: Some(agent_type),
+                    ..SpawnOptions::default()
+                })
+                .expect("spawn stand-in");
+            registry
+                .write_user_bytes(pane, &owner, b"   \rx\x15")
+                .await
+                .unwrap();
+            panes.push((pane, owner));
+        }
+        let hold = |(pane, owner): &(&str, String)| {
+            registry.pane_input_hold(pane, registry.doorbell_input_semantics(pane, owner))
+        };
+        assert_eq!(
+            registry.doorbell_input_semantics(panes[0].0, &panes[0].1),
+            Some(Semantics::Codex)
+        );
+        assert!(hold(&panes[0]).draft, "Codex keeps the blanks");
+        assert_eq!(
+            registry.doorbell_input_semantics(panes[1].0, &panes[1].1),
+            Some(Semantics::ClaudeCode)
+        );
+        assert!(!hold(&panes[1]).draft, "Claude Code's box is empty");
+        assert!(registry.pane_input_hold(panes[1].0, None).draft);
         registry.shutdown_all();
     }
 

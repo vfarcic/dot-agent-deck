@@ -849,7 +849,8 @@ async fn run_tick(
     let now = Instant::now();
     for ((pane, agent), (admission, hooked, status)) in keys.into_iter().zip(admissions) {
         let explained = status_explains_waiting(status.as_ref());
-        let input = registry.pane_input_hold(&pane);
+        let input =
+            registry.pane_input_hold(&pane, registry.doorbell_input_semantics(&pane, &agent));
         let inbox = hub.doorbell_facts(&pane, &agent);
         let receiver = !ring_still_admitted(&inbox, config, now);
         let queued = !inbox.queued.is_empty();
@@ -1019,7 +1020,7 @@ async fn run_tick(
             if effect.not_taken {
                 // Q9: the agent did not take the deck's Enter. No more rings
                 // until its next turn.
-                slot.not_taken = Some(registry.pane_input_hold(&pane).turns);
+                slot.not_taken = Some(registry.pane_input_hold(&pane, None).turns);
             }
             use crate::doorbell_txn::Outcome;
             match report.outcome {

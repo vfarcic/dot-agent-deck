@@ -7,7 +7,7 @@
   "wakeStalled": "waiting to wake",
   "wakeStalledHint": "send it a prompt",
   "wakeHolds": {
-    "possible_draft": "waiting: there may be an unsent draft in its input. Send or clear it.",
+    "possible_draft": "waiting: there may be an unsent draft. Send it, or type x then Ctrl+C.",
     "awaiting_prompt": "not yet taken: the agent may be waiting at a prompt. Check its pane.",
     "paste_open": "waiting: a paste into its input has not finished.",
     "cannot_type": "waiting for the agent to fetch it. Send it a prompt.",

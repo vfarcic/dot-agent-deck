@@ -4,7 +4,7 @@ expression: rendered
 ---
 ┌ 1 ClaudeCode · api-svc ─────────────────────────────────────────── ● Idle ✉1 ┐
 │Dir:  api-svc                                                                 │
-│✉1 waiting: there may be an unsent draft in its input. Send or clear it.      │
+│✉1 waiting: there may be an unsent draft. Send it, or type x then Ctrl+C.     │
 │Prmt: move the stats into the border                                          │
 │                                                                              │
 │                                                                              │

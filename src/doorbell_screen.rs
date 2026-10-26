@@ -259,6 +259,9 @@ pub struct ScreenProfile {
     pub width_witness: fn(&vt100::Screen, &WidthsSeen) -> bool,
     /// The narrowest pane the measurements cover; a narrower one refuses.
     pub min_cols: u16,
+    /// How the agent's input box edits, which the input model follows
+    /// ([`crate::composer_model::Semantics`]).
+    pub input: crate::composer_model::Semantics,
 }
 
 impl ScreenProfile {
@@ -630,6 +633,7 @@ pub static CODEX_PROFILE: ScreenProfile = ScreenProfile {
     redraw_marker: b"\x1b[?2026h\x1b[1;1H\x1b[J",
     width_witness: codex_width_witness,
     min_cols: 80,
+    input: crate::composer_model::Semantics::Codex,
 };
 
 // ---------------------------------------------------------------------------
@@ -812,6 +816,7 @@ pub static CLAUDE_PROFILE: ScreenProfile = ScreenProfile {
     redraw_marker: b"\x1b[2J\x1b[H",
     width_witness: claude_width_witness,
     min_cols: 80,
+    input: crate::composer_model::Semantics::ClaudeCode,
 };
 
 // ---------------------------------------------------------------------------
@@ -945,6 +950,7 @@ pub static STANDIN_PROFILE: ScreenProfile = ScreenProfile {
     redraw_marker: b"\x1b[2J\x1b[H",
     width_witness: standin_width_witness,
     min_cols: 40,
+    input: crate::composer_model::Semantics::ClaudeCode,
 };
 
 /// The stand-in's executable when a pane's spawn selects the stand-in

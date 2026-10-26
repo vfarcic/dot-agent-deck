@@ -26,7 +26,7 @@ export const INBOX_WORDS = {
    * glyph and the pending count, by the daemon's wire value.
    */
   wakeHolds: {
-    possible_draft: "waiting: there may be an unsent draft in its input. Send or clear it.",
+    possible_draft: "waiting: there may be an unsent draft. Send it, or type x then Ctrl+C.",
     awaiting_prompt: "not yet taken: the agent may be waiting at a prompt. Check its pane.",
     paste_open: "waiting: a paste into its input has not finished.",
     cannot_type: "waiting for the agent to fetch it. Send it a prompt.",
@@ -110,7 +110,7 @@ const heldLongCount = (inbox: AgentInbox) => countOf(inbox, ["held_long"]);
 /**
  * PRD #1666 part 3, round 5-wake: why the deck holds the doorbell, with the
  * pending count, while messages wait (`✉2 waiting: there may be an unsent
- * draft in its input. Send or clear it.`). With none pending, only the two
+ * draft. Send it, or type x then Ctrl+C.`). With none pending, only the two
  * warnings that stand on their own (the deck's line may be in the input, a
  * dialog may have taken its keys); nothing otherwise, or for a hold this
  * build does not know. The TUI's card prints the same row.
