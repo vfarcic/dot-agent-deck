@@ -71,7 +71,10 @@
 //! (measured on both agents over text, blanks and line breaks); `End` then
 //! `Ctrl+U` with nothing between them on a box known to be one line, which
 //! empties that line (on a box that may have more, it does not: on an empty
-//! line it joins the line above instead); and an `Enter` the agent's own
+//! line it joins the line above instead, with the cursor after that line's
+//! text; on Claude Code it then proves only the cursor's line empty,
+//! [`InputProof::LineEmpty`], which a composer drawn as one blank row with
+//! the cursor at its start completes); and an `Enter` the agent's own
 //! prompt hook then reports as a prompt it took
 //! ([`ComposerModel::prompt_reported`]). An `Enter` on a box of blanks
 //! submits nothing and starts nothing, so a turn starting is not that
@@ -125,6 +128,12 @@ pub enum InputProof {
     Empty,
     /// The box holds something: text, blanks or a line break.
     Draft,
+    /// The line the cursor is on is empty and the cursor at its start, and
+    /// other lines may hold anything: on Claude Code, after `End` then
+    /// `Ctrl+U` on a box the model did not know (Q32). Claude Code draws
+    /// every line as a row, so a composer drawn as one blank row with the
+    /// cursor at its start, and nothing hidden, is then empty.
+    LineEmpty,
     /// A key the model does not follow reached the box since it was last
     /// known: only the screen's own proof of empty (the agent's
     /// placeholder) can say it is empty.
@@ -137,8 +146,9 @@ impl InputProof {
     fn join(self, other: Self) -> Self {
         match (self, other) {
             (Self::Draft, _) | (_, Self::Draft) => Self::Draft,
+            (Self::Unknown, _) | (_, Self::Unknown) => Self::Unknown,
             (Self::Empty, Self::Empty) => Self::Empty,
-            _ => Self::Unknown,
+            _ => Self::LineEmpty,
         }
     }
 }
@@ -196,8 +206,13 @@ const MAX_OWED: usize = 64;
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Content {
     /// The box's text, with `\n` for a line break, and where the cursor is
-    /// in it.
-    Known { text: Vec<char>, cursor: usize },
+    /// in it. `others`: lines before and after `text` may exist, which a key
+    /// reaching past `text` would meet ([`InputProof::LineEmpty`]).
+    Known {
+        text: Vec<char>,
+        cursor: usize,
+        others: bool,
+    },
     /// Not known; `multiline` when it may hold more than one line.
     Unknown { multiline: bool },
 }
@@ -207,6 +222,7 @@ impl Default for Content {
         Self::Known {
             text: Vec::new(),
             cursor: 0,
+            others: false,
         }
     }
 }
@@ -215,7 +231,7 @@ impl Content {
     /// Whether the box may hold more than one line.
     fn multiline(&self) -> bool {
         match self {
-            Self::Known { text, .. } => text.contains(&'\n'),
+            Self::Known { text, others, .. } => *others || text.contains(&'\n'),
             Self::Unknown { multiline } => *multiline,
         }
     }
@@ -448,6 +464,9 @@ impl Model {
             // A sequence still arriving may be swallowing keys.
             _ if !matches!(self.decode, Decode::Ground | Decode::Esc { paste: false }) => {
                 InputProof::Unknown
+            }
+            Content::Known { others: true, .. } if self.unconfirmed.is_none() => {
+                InputProof::LineEmpty
             }
             Content::Known { .. } if self.unconfirmed.is_none() => InputProof::Empty,
             Content::Known { .. } | Content::Unknown { .. } => InputProof::Unknown,
@@ -762,10 +781,21 @@ impl Model {
         }
         let content = std::mem::take(&mut self.content);
         self.content = match content {
-            Content::Known { text, cursor } if key == Key::Submit => {
-                self.submit(text, cursor, deck)
+            // What the other lines hold decides what Enter does.
+            Content::Known { others: true, .. } if key == Key::Submit => {
+                self.await_report(true);
+                Content::default()
             }
-            Content::Known { text, cursor } => known(self.semantics, text, cursor, key),
+            Content::Known {
+                text,
+                cursor,
+                others,
+            } if key == Key::Submit && !others => self.submit(text, cursor, deck),
+            Content::Known {
+                text,
+                cursor,
+                others,
+            } => known(self.semantics, text, cursor, others, key),
             Content::Unknown { multiline } => match key {
                 // Whatever the box held went with it, unless it was only
                 // blanks: confirmed by the agent's report of it.
@@ -774,8 +804,17 @@ impl Model {
                     Content::default()
                 }
                 // One line: `End` reached its end and `Ctrl+U` emptied it.
-                // On more, an empty line would join the one above instead.
+                // On more, an empty line would join the one above instead,
+                // and the cursor would end after that line's text: on Claude
+                // Code the screen tells the two apart.
                 Key::KillBefore if after_end && !multiline => Content::default(),
+                Key::KillBefore if after_end && self.semantics == Semantics::ClaudeCode => {
+                    Content::Known {
+                        text: Vec::new(),
+                        cursor: 0,
+                        others: true,
+                    }
+                }
                 Key::Newline | Key::Unfollowed { newline: true } => {
                     Content::Unknown { multiline: true }
                 }
@@ -809,7 +848,11 @@ impl Model {
                 Semantics::ClaudeCode => cursor,
                 Semantics::Codex => 0,
             };
-            return Content::Known { text, cursor };
+            return Content::Known {
+                text,
+                cursor,
+                others: false,
+            };
         }
         // A menu may have taken it: a file to complete, or a mode a leading
         // character switched to, with nothing but blanks to submit.
@@ -845,7 +888,10 @@ impl Model {
     /// Whether `key`, after an unconfirmed `Enter`, reaches past what was
     /// typed after it, into what that `Enter` may have left.
     fn reaches_past(&self, key: Key) -> bool {
-        let Content::Known { text, cursor: at } = &self.content else {
+        let Content::Known {
+            text, cursor: at, ..
+        } = &self.content
+        else {
             return false;
         };
         let at = *at;
@@ -928,8 +974,8 @@ fn moves_on(semantics: Semantics, edge: Edge) -> bool {
 
 /// The box after `key`, from known `text` and `cursor`, as `semantics`
 /// edits it. `Enter` and `Ctrl+C` are [`Model::apply`]'s.
-fn known(semantics: Semantics, mut text: Vec<char>, at: usize, key: Key) -> Content {
-    let multiline = text.contains(&'\n');
+fn known(semantics: Semantics, mut text: Vec<char>, at: usize, others: bool, key: Key) -> Content {
+    let multiline = others || text.contains(&'\n');
     let unknown = |newline: bool| Content::Unknown {
         multiline: multiline || newline,
     };
@@ -947,6 +993,21 @@ fn known(semantics: Semantics, mut text: Vec<char>, at: usize, key: Key) -> Cont
     };
     if let Key::Unfollowed { newline } = key {
         return unknown(newline);
+    }
+    // A key that reaches past `text` meets the other lines. `text` began at
+    // the start of an empty line, so its first line starts that line and
+    // its last line ends it.
+    let first = !text[..at].contains(&'\n');
+    let last = !text[at..].contains(&'\n');
+    let crosses = match key {
+        Key::Backspace | Key::Left | Key::KillBefore => at == 0,
+        Key::Delete | Key::Right => at == text.len(),
+        Key::Home(edge) => first && at == 0 && moves_on(semantics, edge),
+        Key::End(edge) => last && at == text.len() && moves_on(semantics, edge),
+        _ => false,
+    };
+    if others && crosses {
+        return unknown(true);
     }
     let at = match key {
         Key::Insert(c) => {
@@ -1001,7 +1062,11 @@ fn known(semantics: Semantics, mut text: Vec<char>, at: usize, key: Key) -> Cont
             unreachable!("Model::apply handles it")
         }
     };
-    Content::Known { text, cursor: at }
+    Content::Known {
+        text,
+        cursor: at,
+        others,
+    }
 }
 
 /// How many continuation bytes follow a UTF-8 lead byte.
@@ -1056,7 +1121,7 @@ mod tests {
 
     use spec::spec;
 
-    use super::InputProof::{self, Draft, Empty, Unknown};
+    use super::InputProof::{self, Draft, Empty, LineEmpty, Unknown};
     use super::PromptReport::{Deck, User};
     use super::Semantics::{self, ClaudeCode, Codex};
     use crate::agent_pty::DraftTestStream;
@@ -1104,6 +1169,17 @@ mod tests {
     fn after(bytes: &[u8]) -> InputProof {
         Pane::default().user(bytes).proof()
     }
+
+    /// The proofs as Claude Code and as Codex edit the box.
+    fn each(bytes: &[u8]) -> (InputProof, InputProof) {
+        let mut pane = Pane::default();
+        pane.user(bytes);
+        (pane.proof_in(ClaudeCode), pane.proof_in(Codex))
+    }
+
+    /// End then Ctrl+U on a box the model did not know, of several lines:
+    /// the cursor's line on Claude Code, nothing on Codex.
+    const LINE_EMPTY: (InputProof, InputProof) = (LineEmpty, Unknown);
 
     const H: &str = "\x1b[H";
     const E: &str = "\x1b[F";
@@ -1633,8 +1709,8 @@ mod tests {
             assert_eq!(after(key), Unknown, "{key:?}");
             let mut cleared = key.to_vec();
             cleared.extend_from_slice(b"\x05\x15");
-            let one_line = if lines { Unknown } else { Empty };
-            assert_eq!(after(&cleared), one_line, "{key:?} then End, Ctrl+U");
+            let one_line = if lines { LINE_EMPTY } else { (Empty, Empty) };
+            assert_eq!(each(&cleared), one_line, "{key:?} then End, Ctrl+U");
             let mut killed = key.to_vec();
             killed.extend_from_slice(b"\x03");
             assert_eq!(after(&killed), Empty, "{key:?} then Ctrl+C");
@@ -1642,11 +1718,21 @@ mod tests {
             apart.extend_from_slice(b"\x05\x1b[D\x15");
             assert_eq!(after(&apart), Unknown, "{key:?}: End and Ctrl+U apart");
         }
-        // Other lines may be there: End then Ctrl+U does not empty the box,
-        // and Enter on what may be blanks keeps them.
-        assert_eq!(after(b"\x1b[A\x05\x15"), Unknown);
-        assert_eq!(after(b"\x1b[A\x05\x15\x05\x15\x05\x15"), Unknown);
-        assert_eq!(after(b"\x1b[A\x05\x15ab\x7f\x7f"), Unknown);
+        // Other lines may be there: End then Ctrl+U proves the cursor's line
+        // empty on Claude Code, and a key that reaches past it, or Enter on
+        // what may be blanks, loses track again.
+        assert_eq!(each(b"\x1b[A\x05\x15"), LINE_EMPTY);
+        assert_eq!(each(b"\x1b[A\x05\x15\x05\x15\x05\x15"), LINE_EMPTY);
+        assert_eq!(each(b"\x1b[A\x05\x15ab\x7f\x7f"), LINE_EMPTY);
+        assert_eq!(each(b"\x1b[A\x05\x15ab\x01\x1b[3~"), (Draft, Unknown));
+        for past in [&b"\x7f"[..], b"\x1b[D", b"\x1b[C", b"\x1b[3~", b"\x15"] {
+            let mut bytes = b"\x1b[A\x05\x15".to_vec();
+            bytes.extend_from_slice(past);
+            assert_eq!(after(&bytes), Unknown, "{past:?}");
+        }
+        // Claude Code's Home and End keys move on to the line above or below.
+        assert_eq!(each(b"\x1b[A\x05\x15\x1b[H"), (Unknown, Unknown));
+        assert_eq!(each(b"\x1b[A\x05\x15\x01"), LINE_EMPTY);
         assert_eq!(after(b"\x1b[A\x05\x15  \r"), Unknown);
         assert_eq!(after(b"\x1b[A\x05\x15\x03"), Empty);
     }
@@ -1718,7 +1804,7 @@ mod tests {
         paste.insert(6, b' ');
         assert_eq!(after(&paste), Unknown);
         paste.extend_from_slice(b"\x05\x15");
-        assert_eq!(after(&paste), Unknown, "it may have broken lines");
+        assert_eq!(each(&paste), LINE_EMPTY, "it may have broken lines");
         // A menu may take the Enter: confirmed only by its report.
         for text in [&b"see @src"[..], b"!  ", b"/ ", b"?", b"#"] {
             let mut bytes = text.to_vec();
@@ -1808,7 +1894,11 @@ mod tests {
         pane.user(b"\x1b[A\r");
         assert_eq!(pane.proof(), Unknown);
         pane.user(b"\x05\x15");
-        assert_eq!(pane.proof(), Unknown, "End then Ctrl+U: maybe two lines");
+        assert_eq!(
+            (pane.proof_in(ClaudeCode), pane.proof_in(Codex)),
+            LINE_EMPTY,
+            "End then Ctrl+U: maybe two lines"
+        );
         pane.user(b"x\x03");
         assert_eq!(pane.proof(), Empty, "a letter, then Ctrl+C");
         let mut pane = Pane::default();
@@ -1925,14 +2015,22 @@ mod tests {
         bytes.extend_from_slice(b"\x7f\r \n\x05\x15");
         let mut pane = Pane::default();
         pane.user(&bytes);
-        assert_eq!(pane.proof(), Unknown, "the space joined back");
+        assert_eq!(
+            (pane.proof_in(ClaudeCode), pane.proof_in(Codex)),
+            LINE_EMPTY,
+            "the space joined back, after which the cursor shows"
+        );
         pane.user(b"\x7f\x01");
         assert_eq!(pane.proof(), Unknown);
         pane.0.turn_started();
         pane.0.turn_ended();
         assert_eq!(pane.proof(), Unknown);
         pane.user(b"\x05\x15");
-        assert_eq!(pane.proof(), Unknown, "maybe still two lines");
+        assert_eq!(
+            (pane.proof_in(ClaudeCode), pane.proof_in(Codex)),
+            LINE_EMPTY,
+            "maybe still two lines"
+        );
         pane.user(b"x\x03");
         assert_eq!(pane.proof(), Empty, "a letter, then Ctrl+C");
     }
@@ -2225,7 +2323,22 @@ mod tests {
                     if model.proof() == Empty {
                         assert_eq!(held, "", "read empty over a held box: {what}");
                     }
-                    if let super::Content::Known { text, cursor } = &model.content
+                    // What a blank composer row with the cursor at its start
+                    // then proves: Claude Code draws a line of blanks with
+                    // the cursor at its start as the empty composer.
+                    if model.proof() == LineEmpty {
+                        assert_eq!(agent, ClaudeCode, "{what}");
+                        let looks_empty = !held.contains('\n') && reference.cursor == 0;
+                        assert!(
+                            held.is_empty() || !looks_empty,
+                            "a blank row over a held box: {what}"
+                        );
+                    }
+                    if let super::Content::Known {
+                        text,
+                        cursor,
+                        others: false,
+                    } = &model.content
                         && model.unconfirmed.is_none()
                     {
                         assert_eq!(text.iter().collect::<String>(), held, "{what}");

@@ -571,7 +571,11 @@ impl Frame {
     /// (R6-4). A blank composer counts only with the cursor where an empty
     /// one keeps it and nothing hidden in its region, and only while the
     /// input proves the box empty: spaces with the cursor moved back to the
-    /// start draw exactly the empty composer. The agent's placeholder is
+    /// start draw exactly the empty composer. When the input proves only the
+    /// cursor's line empty (Claude Code, after `End` then `Ctrl+U` on a box
+    /// it did not know), a blank composer still proves the box empty: Claude
+    /// Code draws every line as a row, a blank one included, and its
+    /// recogniser marks such a row hidden. The agent's placeholder is
     /// drawn only over an empty box, so it is proof enough while the input
     /// cannot say; it does not outweigh input that says the box holds
     /// something, since the frame may predate that input.
@@ -581,7 +585,9 @@ impl Frame {
             && self.composer.as_ref().is_some_and(|c| {
                 let blank = !c.hidden && c.text.is_empty() && c.cursor_at_end;
                 match self.input {
-                    InputProof::Empty => c.placeholder || blank,
+                    // A blank composer is one empty row with the cursor at
+                    // its start, so the line the input proves empty is all.
+                    InputProof::Empty | InputProof::LineEmpty => c.placeholder || blank,
                     InputProof::Unknown => c.placeholder,
                     InputProof::Draft => false,
                 }

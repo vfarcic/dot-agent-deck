@@ -24629,6 +24629,49 @@ mod spawn_tests {
         registry.shutdown_all();
     }
 
+    /// Scenario: PRD #1666 part 3 (Q32). On a Claude Code 2.1.310 model editor, recall a prompt with Up, type after it, then press End and Ctrl+U: the input model knows only that the cursor's line is empty, since the recalled prompt may have had other lines. Behind a blank composer row with the cursor at its start, the ring is admitted and types its line once; behind a blank row with the cursor two columns in, where Ctrl+U on an empty line joined it to a line of blanks above, nothing is written.
+    #[spec("inbox/doorbell/050")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_050_end_then_ctrl_u_proves_the_cursors_line_with_the_screen() {
+        use crate::composer_model::{InputProof, Semantics};
+        use crate::doorbell_txn::{NotTyped, Outcome};
+        let keys = b"\x1b[Ahi\x05\x15";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-line-empty", OnEnter::Submit);
+        user_keys_behind_a_blank_frame(&editor, keys).await;
+        assert_eq!(
+            registry.input_proof(&editor.pane, Some(Semantics::ClaudeCode)),
+            InputProof::LineEmpty
+        );
+        assert_eq!(
+            registry.input_proof(&editor.pane, Some(Semantics::Codex)),
+            InputProof::Unknown
+        );
+        editor_draws_again(&editor);
+        let report = editor.ring().await;
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::Submitted),
+            "{report:?}"
+        );
+        registry.shutdown_all();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-line-joined", OnEnter::Submit);
+        user_keys_behind_a_blank_frame(&editor, keys).await;
+        editor
+            .bus
+            .push(claude_screen_at("  ", 2, &[], false, EDITOR_COLS as usize));
+        blank_with_cursor_at(&editor, 2).await;
+        let report = editor.ring().await;
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::NothingWritten(NotTyped::AwaitingPrompt)),
+            "{report:?}"
+        );
+        assert_eq!(editor.typed(), keys, "only the user's keys");
+        registry.shutdown_all();
+    }
+
     /// Scenario: The model editor stops drawing, so the deck's line is typed and never echoed and the attempt will end suspended; while that ring holds the writer, a second ring for the same generation is started and waits for the writer. Once the first ring releases the writer with the cell suspended, the second is not admitted (suspended) and types nothing: the pane holds only the first line.
     #[spec("inbox/doorbell/050")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
