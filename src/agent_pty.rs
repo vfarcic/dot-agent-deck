@@ -6132,6 +6132,10 @@ pub struct AgentPtyRegistry {
     /// Test seam: holds the publisher before each run while set.
     #[cfg(test)]
     publisher_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// Test seam: run once by the next ring, holding the writer, after its
+    /// ledger drained and before admission reads the ledger.
+    #[cfg(test)]
+    ring_admission_seam: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Test seam: the first-ring settle window every typed generation gets
     /// while set, in place of its release's (`inbox/doorbell/041`; no
     /// measured release has one today).
@@ -8271,6 +8275,8 @@ impl AgentPtyRegistry {
             doorbell_publishing: Mutex::new(()),
             #[cfg(test)]
             publisher_gate: Mutex::new(None),
+            #[cfg(test)]
+            ring_admission_seam: Mutex::new(None),
             #[cfg(test)]
             doorbell_settle_for_test: Mutex::new(None),
             #[cfg(test)]
@@ -12030,9 +12036,10 @@ impl AgentPtyRegistry {
             hub.hand_over(pane, &id, || self.publication_owns_pane(pane, &id));
         }
         // PRD #1666 part 3, round 5-wake (plan §5.3, Q16): the generation's
-        // card and WAKE from its registration on, unlatched until its
-        // start-up header is read: published before the spawn returns, so no
-        // status reads the doorbell's route for it before its verdict is in.
+        // card and WAKE, unlatched until its start-up header is read:
+        // published before the spawn returns. Not atomically with the
+        // registration: a status read between the two can still see the
+        // route as it was before this verdict.
         if let Some(pane) = inbox_spawn.0.as_deref()
             && self.doorbell_publisher.get().is_some()
         {
@@ -23659,6 +23666,289 @@ mod spawn_tests {
         registry.shutdown_all();
     }
 
+    /// Scenario: Q19's admission snapshot: the deck rings the model editor while nothing is outstanding, and once the ring holds the writer and has seen the generation's earlier writes drained, a human write arrives, its operation admitted and waiting for the writer, before admission reads the ledger. The ring ends with nothing written (human input), no deck byte reaches the pane, and the human's text is written first; the next ring follows it.
+    #[spec("inbox/doorbell/050")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_050_a_ticket_outstanding_at_the_admission_snapshot_refuses_the_ring() {
+        use crate::doorbell_txn::{NotTyped, Outcome};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-ticket-snapshot", OnEnter::Submit);
+        let ledger = registry.ingress_ledger(&editor.id).unwrap();
+        let human = Arc::new(Mutex::new(None));
+        {
+            let (registry, human, ledger) = (
+                Arc::clone(&registry),
+                Arc::clone(&human),
+                Arc::clone(&ledger),
+            );
+            let (pane, id) = (editor.pane.clone(), editor.id.clone());
+            registry.clone().set_ring_admission_seam(move || {
+                let before = ledger.marks().watermark;
+                // Spawned from outside the runtime's workers, so it is not queued
+                // behind the ring on the worker this seam blocks.
+                let runtime = tokio::runtime::Handle::current();
+                *human.lock().unwrap() = Some(
+                    std::thread::spawn(move || {
+                        runtime.spawn(async move {
+                            registry.write_user_bytes(&pane, &id, b"HUMAN").await
+                        })
+                    })
+                    .join()
+                    .unwrap(),
+                );
+                // Its ticket is taken as the write arrives, before it waits.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while ledger.marks().watermark == before {
+                    assert!(Instant::now() < deadline, "the human write never arrived");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            });
+        }
+        let report = editor.ring().await;
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::NothingWritten(NotTyped::HumanInput)),
+            "{report:?}"
+        );
+        let human = human.lock().unwrap().take().expect("the seam ran");
+        human.await.unwrap().expect("the human write");
+        typed_until(&editor, |t| t.ends_with(b"HUMAN")).await;
+        assert_eq!(editor.typed(), b"HUMAN", "no deck byte, the human's first");
+        editor.wait_drawn("HUMAN");
+        registry
+            .write_user_bytes(&editor.pane, &editor.id, b"\x15")
+            .await
+            .unwrap();
+        editor.wait_drawn("");
+        assert_eq!(
+            editor.ring().await.outcome,
+            RingOutcome::Txn(Outcome::Submitted),
+            "control"
+        );
+        let typed = editor.typed();
+        assert!(
+            typed.starts_with(b"HUMAN\x15("),
+            "{:?}",
+            String::from_utf8_lossy(&typed)
+        );
+        registry.shutdown_all();
+    }
+
+    /// Scenario: Plan §2.3's one deadline over the whole hold of the writer. The deck rings the model editor (a) while a test thread holds the generation's output lock, (b) while it holds the input-mode store's lock, both from before the ring and past its deadline, (c) while the admission's last check never answers, and (d) while that check answers once and then never again, after the line is typed. Each ring returns by its deadline with the writer free: (a) to (c) with nothing written (deadline) and no byte in the pane, (d) unresolved with the cell suspended, the line in the pane and no Enter after it.
+    #[spec("inbox/doorbell/050")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_050_blocked_admission_reads_and_answers_release_the_writer_by_the_deadline() {
+        use crate::doorbell_txn::{Latch, NotTyped, Outcome, TXN_MAX};
+        let bound = TXN_MAX + Duration::from_millis(500);
+        /// Ring, the admission's check answering `true` on the calls `still`
+        /// picks and never on the others; how it ended, and how long the
+        /// ring held on.
+        async fn ring_within(
+            editor: &ModelEditor,
+            still: impl Fn(usize) -> bool + Send + Sync + 'static,
+        ) -> (RingReport, Duration) {
+            let still = Arc::new(still);
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let started = Instant::now();
+            let ring = editor.ring_with(move || {
+                let (still, calls) = (Arc::clone(&still), Arc::clone(&calls));
+                async move {
+                    if still(calls.fetch_add(1, Ordering::SeqCst)) {
+                        true
+                    } else {
+                        std::future::pending::<bool>().await
+                    }
+                }
+            });
+            let report = tokio::time::timeout(TXN_MAX + Duration::from_secs(5), ring)
+                .await
+                .expect("the ring hung past its deadline");
+            (report, started.elapsed())
+        }
+        for which in ["bus", "mode"] {
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let editor = ModelEditor::spawn(
+                &registry,
+                &format!("pane-ring-blocked-{which}"),
+                OnEnter::Submit,
+            );
+            let (held_tx, held_rx) = std::sync::mpsc::channel();
+            let holder = {
+                let bus = Arc::clone(&editor.bus);
+                let mode = Arc::clone(&registry.inner.lock().agents[&editor.id].input_mode);
+                let which = which.to_string();
+                std::thread::spawn(move || {
+                    let hold = TXN_MAX + Duration::from_millis(1500);
+                    if which == "bus" {
+                        let _guard = bus.state.lock().unwrap();
+                        let _ = held_tx.send(());
+                        std::thread::sleep(hold);
+                    } else {
+                        let _guard = mode.lock().unwrap();
+                        let _ = held_tx.send(());
+                        std::thread::sleep(hold);
+                    }
+                })
+            };
+            held_rx.recv().unwrap();
+            let (report, took) = ring_within(&editor, |_| true).await;
+            assert_eq!(
+                report.outcome,
+                RingOutcome::Txn(Outcome::NothingWritten(NotTyped::Deadline)),
+                "{which}: {report:?}"
+            );
+            assert!(took <= bound, "{which}: the writer was held for {took:?}");
+            assert!(
+                registry
+                    .agent_writer(&editor.id)
+                    .unwrap()
+                    .try_lock()
+                    .is_ok(),
+                "{which}: the writer is free"
+            );
+            assert!(editor.typed().is_empty(), "{which}: {:?}", editor.typed());
+            holder.join().unwrap();
+            registry.shutdown_all();
+        }
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-silent-admission", OnEnter::Submit);
+        let (report, took) = ring_within(&editor, |_| false).await;
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::NothingWritten(NotTyped::Deadline)),
+            "{report:?}"
+        );
+        assert!(took <= bound, "the writer was held for {took:?}");
+        assert!(
+            registry
+                .agent_writer(&editor.id)
+                .unwrap()
+                .try_lock()
+                .is_ok()
+        );
+        assert!(editor.typed().is_empty(), "{:?}", editor.typed());
+
+        // Answered at admission, then never again: the line is in.
+        let (report, took) = ring_within(&editor, |call| call == 0).await;
+        assert!(
+            matches!(report.outcome, RingOutcome::Txn(Outcome::Unresolved(_))),
+            "{report:?}"
+        );
+        assert!(took <= bound, "the writer was held for {took:?}");
+        assert!(
+            matches!(editor.cell(), Latch::Suspended(..)),
+            "{:?}",
+            editor.cell()
+        );
+        assert!(
+            registry
+                .agent_writer(&editor.id)
+                .unwrap()
+                .try_lock()
+                .is_ok()
+        );
+        let typed = editor.typed();
+        let line = typed_line(&typed).expect("the line was typed");
+        assert_eq!(typed, line.into_bytes(), "no Enter after the line");
+        registry.shutdown_all();
+    }
+
+    /// Scenario: The user types three spaces into a Claude Code 2.1.310 model editor's empty composer while a message waits and the agent is Idle, so the composer shows no text but its cursor sits past the spaces. The deck types nothing into it, whether the tick rings or the deck rings directly (nothing written: no empty composer), and the card says there may be an unsent draft. The screen is the model editor's, drawn as the profile measured; no session typing spaces into the real agent was recorded.
+    #[spec("inbox/doorbell/050")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_050_a_spaces_only_draft_is_not_an_empty_composer() {
+        use crate::doorbell_txn::{NotTyped, Outcome};
+        use crate::inbox_display::WakeHold;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-spaces", OnEnter::Submit);
+        registry
+            .write_user_bytes(&editor.pane, &editor.id, b"   ")
+            .await
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let composer = editor
+                .bus
+                .clean_frame()
+                .and_then(|grid| (crate::doorbell_screen::CLAUDE_PROFILE.composer)(&grid));
+            if composer.is_some_and(|c| c.text.is_empty() && !c.cursor_at_end) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the spaces were never drawn");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let report = editor.ring().await;
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::NothingWritten(NotTyped::AwaitingPrompt)),
+            "{report:?}"
+        );
+        let state = idle_with_mail(&editor).await;
+        let bell = crate::doorbell::spawn(
+            registry.clone(),
+            state,
+            tick_config(Duration::from_millis(150)),
+        );
+        until("possible_draft", || {
+            shown_hold(&editor) == Some(WakeHold::PossibleDraft)
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        bell.abort();
+        assert_eq!(
+            editor.typed(),
+            b"   ",
+            "only the user's spaces reached the pane"
+        );
+        registry.shutdown_all();
+    }
+
+    /// Scenario: The model editor stops drawing, so the deck's line is typed and never echoed and the attempt will end suspended; while that ring holds the writer, a second ring for the same generation is started and waits for the writer. Once the first ring releases the writer with the cell suspended, the second is not admitted (suspended) and types nothing: the pane holds only the first line.
+    #[spec("inbox/doorbell/050")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_050_a_ring_queued_behind_a_suspension_is_not_admitted() {
+        use crate::doorbell_txn::{Latch, Outcome};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-queued-suspended", OnEnter::Submit);
+        editor.control.lock().unwrap().drawing = Drawing::Frozen;
+        let ring = |registry: &Arc<AgentPtyRegistry>| {
+            let registry = Arc::clone(registry);
+            let (pane, id) = (editor.pane.clone(), editor.id.clone());
+            tokio::spawn(async move {
+                registry
+                    .ring_doorbell(
+                        &pane,
+                        &id,
+                        crate::inbox::MessageId::parse("m-abcdefgh-0123456789abcdef").unwrap(),
+                        true,
+                        || async { true },
+                    )
+                    .await
+            })
+        };
+        let first = ring(&registry);
+        typed_until(&editor, line_in).await;
+        assert!(!editor.registry.doorbell_suspended(&editor.id));
+        let second = ring(&registry);
+        let first = first.await.unwrap();
+        assert!(
+            matches!(first.outcome, RingOutcome::Txn(Outcome::Unresolved(_))),
+            "{first:?}"
+        );
+        let second = second.await.unwrap();
+        assert_eq!(second.outcome, RingOutcome::Suspended, "{second:?}");
+        assert!(
+            matches!(editor.cell(), Latch::Suspended(1, _)),
+            "{:?}",
+            editor.cell()
+        );
+        let typed = editor.typed();
+        let line = typed_line(&typed).unwrap();
+        assert_eq!(typed, line.into_bytes(), "one line, nothing after it");
+        registry.shutdown_all();
+    }
+
     /// Wait (bounded) until the model editor has been typed something that
     /// satisfies `done`.
     async fn typed_until(editor: &ModelEditor, done: impl Fn(&[u8]) -> bool) {
@@ -24526,6 +24816,23 @@ mod spawn_tests {
             typed,
             "an exhausted generation is not typed into"
         );
+        // The card agrees with WAKE: the tick holds it as cannot_type.
+        assert_eq!(
+            registry.doorbell_refusal(&last.pane, &last.id, true),
+            Some("attempt_exhausted")
+        );
+        let state = idle_with_mail(&last).await;
+        let bell = crate::doorbell::spawn(
+            registry.clone(),
+            state,
+            tick_config(Duration::from_millis(150)),
+        );
+        until("cannot_type on the card", || {
+            shown_hold(&last) == Some(crate::inbox_display::WakeHold::CannotType)
+        })
+        .await;
+        bell.abort();
+        assert_eq!(last.typed(), typed, "nor by the tick");
         registry.shutdown_all();
     }
 

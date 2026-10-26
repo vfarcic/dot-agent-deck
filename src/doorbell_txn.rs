@@ -559,12 +559,17 @@ pub struct Frame {
 
 impl Frame {
     /// The empty ready composer and no dialog (step 2).
+    ///
+    /// A blank composer counts only with the cursor where an empty one keeps
+    /// it: the text drops trailing blanks, so spaces the user typed, or a row
+    /// before blank continuation rows, read as no text with the cursor past
+    /// it.
     pub fn empty_and_ready(&self) -> bool {
         self.dialog.is_none()
             && self
                 .composer
                 .as_ref()
-                .is_some_and(|c| c.text.is_empty() || c.placeholder)
+                .is_some_and(|c| c.placeholder || (c.text.is_empty() && c.cursor_at_end))
     }
 
     /// The composer holds exactly `text`, the cursor right after it.
@@ -1165,6 +1170,12 @@ impl<'c> Txn<'c> {
             (Event::JobEnded { accepted, .. }, Owned::Queued(kind) | Owned::Running(kind)) => {
                 self.job = Owned::Idle;
                 self.claim = None;
+                // An ended job took its bytes whatever order its reports came
+                // in: a line the pane accepted is written even when its start
+                // was never seen, so the deadline cannot call it nothing.
+                if kind == JobKind::Line {
+                    self.wrote |= *accepted > 0;
+                }
                 if kind == JobKind::Cr {
                     self.cr_ended_at = Some(now);
                     self.after_cr |= *accepted > 0;

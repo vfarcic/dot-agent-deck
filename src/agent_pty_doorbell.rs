@@ -190,6 +190,17 @@ impl txn::Seam for DaemonSeam<'_> {
     }
 }
 
+/// What admission reads of a generation, with nothing written yet.
+struct AdmissionReads {
+    typing: Result<Typing, &'static str>,
+    /// The ledger's counters and outstanding set, in one hold.
+    marks: crate::ingress_ledger::LedgerMarks,
+    frame: txn::Frame,
+    mode: Result<(), &'static str>,
+    anchor: Option<u64>,
+    nudge_in_flight: bool,
+}
+
 /// The transaction's one job on the writer, from its enqueue until it ends
 /// or is taken back.
 struct JobSlot {
@@ -259,13 +270,35 @@ impl AgentPtyRegistry {
         generation: &Generation,
         hook_route: bool,
     ) -> Result<Typing, &'static str> {
-        use crate::doorbell_activation::{Activation, RELEASE_RECORDS};
+        self.doorbell_typing_from(generation, hook_route, |state| Some(state.lock().unwrap()))
+            .expect("a blocking read always reads")
+    }
+
+    /// [`Self::doorbell_typing`] with the generation's bus state read by
+    /// `try_lock`: `None` while it is contended, for a reader that holds the
+    /// writer and so must not wait on it (plan §2.3).
+    fn doorbell_typing_now(
+        &self,
+        generation: &Generation,
+        hook_route: bool,
+    ) -> Option<Result<Typing, &'static str>> {
+        self.doorbell_typing_from(generation, hook_route, |state| state.try_lock().ok())
+    }
+
+    fn doorbell_typing_from<'s>(
+        &self,
+        generation: &'s Generation,
+        hook_route: bool,
+        lock: impl FnOnce(&'s Mutex<AgentBusState>) -> Option<std::sync::MutexGuard<'s, AgentBusState>>,
+    ) -> Option<Result<Typing, &'static str>> {
         #[cfg(feature = "e2e")]
         if let Some(binary) = generation.doorbell.standin() {
             if !crate::doorbell_screen::standin_running(generation.child_pid, binary) {
-                return Err(crate::doorbell_activation::NoGo::UnmeasuredRelease.clause());
+                return Some(Err(
+                    crate::doorbell_activation::NoGo::UnmeasuredRelease.clause()
+                ));
             }
-            return Ok(Typing {
+            return Some(Ok(Typing {
                 profile: &crate::doorbell_screen::STANDIN_PROFILE,
                 caps: txn::Caps {
                     delete_key: true,
@@ -278,17 +311,29 @@ impl AgentPtyRegistry {
                 inherited: None,
                 verdict: "Go (e2e stand-in)".to_string(),
                 release: None,
-            });
+            }));
         }
         let agent = generation.agent.clone();
         let (latch, evidence_profile) = {
-            let state = generation.bus.state.lock().unwrap();
+            let state = lock(&generation.bus.state)?;
             let latch = agent
                 .as_ref()
                 .map(|a| state.release.latched_for(a))
                 .unwrap_or(crate::doorbell_activation::LatchedRelease::Unseen);
             (latch, state.evidence.profile())
         };
+        Some(self.typing_for(hook_route, agent, latch, evidence_profile))
+    }
+
+    /// The verdict and its typing, from what the generation latched.
+    fn typing_for(
+        &self,
+        hook_route: bool,
+        agent: Option<AgentType>,
+        latch: crate::doorbell_activation::LatchedRelease,
+        evidence_profile: Option<&'static crate::doorbell_screen::ScreenProfile>,
+    ) -> Result<Typing, &'static str> {
+        use crate::doorbell_activation::{Activation, RELEASE_RECORDS};
         let tripwires = self.doorbell_tripwires.tripped();
         let verdict = crate::doorbell_generation::generation_activation(
             &RELEASE_RECORDS,
@@ -358,10 +403,45 @@ impl AgentPtyRegistry {
         })
     }
 
+    /// Admission's reads (plan §1.1 step 1), each lock by `try_lock`: `None`
+    /// while any is contended, since the caller holds the writer. The
+    /// ledger, the bus state and the mode store are held together, in the
+    /// final seam's order, so the frame, the mode and the ledger's marks are
+    /// one moment.
+    fn admission_reads(&self, generation: &Generation, hook_route: bool) -> Option<AdmissionReads> {
+        let typing = self.doorbell_typing_now(generation, hook_route)?;
+        let ledger = generation.ledger.try_hold()?;
+        let state = generation.bus.state.try_lock().ok()?;
+        let store = generation.mode.try_lock().ok()?;
+        let frame = match &typing {
+            Ok(typing) => frame_of(&state, typing.profile, None),
+            Err(_) => txn::Frame::default(),
+        };
+        let reads = AdmissionReads {
+            marks: ledger.marks(),
+            frame,
+            mode: generation.mode_now(&store),
+            anchor: store.anchor(),
+            nudge_in_flight: false,
+            typing,
+        };
+        drop((store, state, ledger));
+        let nudge_in_flight = self
+            .repaint_nudges
+            .try_lock()
+            .ok()?
+            .contains_key(&generation.agent_id);
+        Some(AdmissionReads {
+            nudge_in_flight,
+            ..reads
+        })
+    }
+
     /// The clause that holds `agent_id`'s generation in `pane_id` from the
     /// typed doorbell right now, for its card (plan §5.1 row 8): its
-    /// activation, its input-mode evidence, no submit route. `None` when the
-    /// doorbell may type, or the generation is gone.
+    /// activation, its input-mode evidence, its spent attempt numbers, no
+    /// submit route. `None` when the doorbell may type, or the generation is
+    /// gone.
     pub fn doorbell_refusal(
         &self,
         pane_id: &str,
@@ -375,6 +455,10 @@ impl AgentPtyRegistry {
         };
         if let Err(clause) = generation.mode_now(&generation.mode.lock().unwrap()) {
             return Some(clause);
+        }
+        // The same clause the publisher gives WAKE (Q18).
+        if generation.doorbell.counter().exhausted() {
+            return Some("attempt_exhausted");
         }
         if !(typing.caps.hook_route || typing.caps.transcript_route) {
             return Some("no_submit_route");
@@ -472,13 +556,24 @@ impl AgentPtyRegistry {
         else {
             return RingReport::before_admission(RingOutcome::NotReading);
         };
+        // The one deadline of the whole hold (plan §2.3): `D` runs from the
+        // moment the writer is the ring's, so admission's reads spend the same
+        // budget as the transaction.
+        let deadline = Instant::now() + txn::TXN_MAX;
         let registry = Arc::clone(self);
         // Supervised: the task owns the writer, so dropping the caller (a
         // doorbell tick, a shutdown path) detaches it and does not drop the
         // guard. It ends at a terminal state or at the deadline.
         let task = tokio::spawn(async move {
             registry
-                .run_ring(generation, guard, message, hook_route, still_admitted)
+                .run_ring(
+                    generation,
+                    guard,
+                    deadline,
+                    message,
+                    hook_route,
+                    still_admitted,
+                )
                 .await
         });
         task.await
@@ -489,6 +584,7 @@ impl AgentPtyRegistry {
         self: Arc<Self>,
         generation: Generation,
         guard: tokio::sync::OwnedMutexGuard<PaneWriter>,
+        deadline: Instant,
         message: crate::inbox::MessageId,
         hook_route: bool,
         still_admitted: F,
@@ -499,31 +595,61 @@ impl AgentPtyRegistry {
     {
         let pane = generation.pane_id.clone();
         let agent = generation.agent_id.clone();
-        let mut evidence = self.subscribe_doorbell_evidence(&pane);
-        // Step 1: admission, with nothing written yet.
-        let typing = self.doorbell_typing(&generation, hook_route);
-        let ledger_idle = !generation.ledger.any_outstanding()
-            && within_real_time(Duration::from_millis(100), guard.until_idle())
-                .await
-                .is_some();
-        let marks = generation.ledger.marks();
-        let now_ns = crate::input_mode::monotonic_ns().unwrap_or(0);
-        let (frame, mode, anchor) = {
-            let state = generation.bus.state.lock().unwrap();
-            let store = generation.mode.lock().unwrap();
-            let frame = match &typing {
-                Ok(typing) => frame_of(&state, typing.profile, None),
-                Err(_) => txn::Frame::default(),
-            };
-            (frame, generation.mode_now(&store), store.anchor())
+        let left = || deadline.saturating_duration_since(Instant::now());
+        let expired = |guard| {
+            drop(guard);
+            RingReport::before_admission(RingOutcome::Txn(txn::Outcome::NothingWritten(
+                txn::NotTyped::Deadline,
+            )))
         };
+        // Read again under the writer: a ring queued behind one that
+        // suspended the cell is not admitted either.
+        if generation.doorbell.suspended() {
+            drop(guard);
+            return RingReport::before_admission(RingOutcome::Suspended);
+        }
+        let mut evidence = self.subscribe_doorbell_evidence(&pane);
+        // Step 1: admission, with nothing written yet. Every read is bounded
+        // by `D`: the locks by `try_lock`, retried, and the awaits by what is
+        // left of the budget.
+        let drained = within_real_time(Duration::from_millis(100).min(left()), guard.until_idle())
+            .await
+            .is_some();
+        #[cfg(test)]
+        self.ring_admission_seam_run();
+        let reads = loop {
+            if let Some(reads) = self.admission_reads(&generation, hook_route) {
+                break reads;
+            }
+            if left().is_zero() {
+                return expired(guard);
+            }
+            real_sleep(txn::SEAM_RETRY.min(left())).await;
+        };
+        let AdmissionReads {
+            typing,
+            marks,
+            frame,
+            mode,
+            anchor,
+            nudge_in_flight,
+        } = reads;
+        // Idle is one snapshot with `W0` and `J0`: a human ticket outstanding
+        // in it refuses the ring, and one admitted after it moves the
+        // watermark the first seam checks (Q19).
+        let ledger_idle = drained && marks.outstanding == 0;
+        let now_ns = crate::input_mode::monotonic_ns().unwrap_or(0);
         if frame.empty_and_ready() && !generation.doorbell.wrapped() {
             generation.doorbell.note_ready_frame(now_ns);
         }
         let settle = typing.as_ref().map_or(Duration::ZERO, |t| t.settle);
         let settling = generation.doorbell.settling(anchor, settle, now_ns);
-        let nudge_in_flight = self.repaint_nudges.lock().unwrap().contains_key(&agent);
-        let still = still_admitted().await;
+        let Some(still) = within_real_time(left(), still_admitted()).await else {
+            return expired(guard);
+        };
+        if left().is_zero() {
+            return expired(guard);
+        }
         let caps = typing.as_ref().map_or(
             txn::Caps {
                 delete_key: false,
@@ -559,7 +685,7 @@ impl AgentPtyRegistry {
             draw,
             &message,
             caps,
-            Instant::now(),
+            deadline - txn::TXN_MAX,
         );
         let mut txn = match admitted {
             Ok(txn) => txn,
@@ -582,10 +708,10 @@ impl AgentPtyRegistry {
                     ?why,
                     "doorbell attempt: not admitted"
                 );
+                drop(guard);
                 if let (txn::NotTyped::Dialog(dialog), Ok(typing)) = (why, &typing) {
                     self.trip_on_dialog(typing, dialog);
                 }
-                drop(guard);
                 return RingReport::before_admission(RingOutcome::Txn(
                     txn::Outcome::NothingWritten(why),
                 ));
@@ -725,7 +851,10 @@ impl AgentPtyRegistry {
             }
             if !lost && asked_at.elapsed() >= STILL_ADMITTED_EVERY {
                 asked_at = Instant::now();
-                if !still_admitted().await {
+                // Bounded by what is left of `D`: an answer still out then is
+                // no answer, and the deadline ends the transaction.
+                let left = txn.deadline().saturating_duration_since(asked_at);
+                if within_real_time(left, still_admitted()).await == Some(false) {
                     lost = true;
                     pending.push_back(txn::Event::AdmissionLost);
                 }
@@ -742,7 +871,14 @@ impl AgentPtyRegistry {
         // Submitted, with no human job since admission: the deck's own
         // verified submit reconciles a stale draft bit, under the writer
         // (plan §1.4).
-        if outcome == txn::Outcome::Submitted && generation.ledger.marks().job_mark == txn.j0() {
+        // The ledger by `try_lock`: contended, a human operation is moving
+        // through it, so the bit is not the deck's to clear.
+        if outcome == txn::Outcome::Submitted
+            && generation
+                .ledger
+                .try_hold()
+                .is_some_and(|ledger| ledger.marks().job_mark == txn.j0())
+        {
             self.pane_input.lock().unwrap().reconcile_deck_submit(&pane);
         }
         if let txn::Outcome::Unresolved(cause) = outcome {
@@ -1128,6 +1264,21 @@ impl AgentPtyRegistry {
         let gate = self.publisher_gate.lock().unwrap().clone();
         if let Some(gate) = gate {
             let _ = gate.acquire().await;
+        }
+    }
+
+    /// Test seam: run `seam` once, in the next ring, after its ledger drained
+    /// and before admission reads the ledger.
+    #[cfg(test)]
+    pub(crate) fn set_ring_admission_seam(&self, seam: impl FnOnce() + Send + 'static) {
+        *self.ring_admission_seam.lock().unwrap() = Some(Box::new(seam));
+    }
+
+    #[cfg(test)]
+    fn ring_admission_seam_run(&self) {
+        let seam = self.ring_admission_seam.lock().unwrap().take();
+        if let Some(seam) = seam {
+            seam();
         }
     }
 

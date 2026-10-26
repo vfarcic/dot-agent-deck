@@ -378,8 +378,8 @@ pub struct HoldFacts {
     /// The user may have an unsent draft in the pane.
     pub draft: bool,
     /// The deck may not type into the generation: its activation, its
-    /// input-mode evidence or a missing submit route says no, with this
-    /// clause.
+    /// input-mode evidence, its spent attempt numbers or a missing submit
+    /// route says no, with this clause.
     pub cannot_type: Option<&'static str>,
     /// The doorbell's last try found no screen it could type into (its
     /// composer not shown empty and ready, a dialog, a layout edge), or the

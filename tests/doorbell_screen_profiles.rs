@@ -441,6 +441,38 @@ fn doorbell_036_claude_composer_over_real_frames() {
     );
 }
 
+/// Scenario: Take the recorded Claude Code 2.1.310 session at its cleared, empty composer and type three spaces into it, then move the cursor out of the composer instead. Neither is the empty ready composer, to the profile or to the frame admission reads, although both show no text: the blank composer with the cursor where Claude Code keeps it is the control. The spaces are appended to the real capture, as the terminal shows typed spaces; no session typing spaces was recorded.
+#[spec("inbox/doorbell/036")]
+#[test]
+fn doorbell_036_a_blank_draft_in_the_claude_composer_is_not_empty() {
+    use dot_agent_deck::doorbell_screen::frame;
+    let trace = fixture("claude-inbox/r5wake/claude-2.1.310-composer-24x80");
+    let p = &CLAUDE_PROFILE;
+    let at = trace.points["cleared-01"];
+    let with = |extra: &[u8]| {
+        let mut bytes = trace.bytes[..at].to_vec();
+        bytes.extend_from_slice(extra);
+        Grid::parse(&bytes, trace.rows, trace.cols)
+    };
+    let cleared = with(b"");
+    assert!(p.empty_and_ready(&cleared), "the control");
+    assert!(frame(p, &cleared, 0, true, None).empty_and_ready());
+    for (case, extra) in [
+        ("spaces", &b"   "[..]),
+        ("cursor outside the composer", &b"\x1b[1;1H"[..]),
+    ] {
+        let grid = with(extra);
+        let composer = (p.composer)(&grid).expect("the composer is still drawn");
+        assert_eq!(composer.text, "", "{case}: the recogniser trims the blanks");
+        assert!(!composer.cursor_at_end, "{case}");
+        assert!(!p.empty_and_ready(&grid), "{case}");
+        assert!(
+            !frame(p, &grid, 0, true, None).empty_and_ready(),
+            "{case}: admission reads no empty composer"
+        );
+    }
+}
+
 /// Scenario: Read Codex 0.164.0's recorded update, folder-trust and hooks-review dialogs, its composer, and frames whose transcript merely mentions "update", "Update now", "login" or "trust". The three dialogs are recognised by name; the composer and the transcript mentions give no dialog verdict; an unknown title with the dialog's shape is unrecognised.
 #[spec("inbox/doorbell/036")]
 #[test]

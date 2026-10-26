@@ -286,11 +286,11 @@ The doorbell waits while the agent is busy, a permission or dialog answer is nee
 
 The deck is holding the agent's messages instead of typing the doorbell line, because it can't be sure the line would reach the agent's input box and nothing else. The TUI card and the desktop tile show the same words.
 
-**First, whatever the cause,** type a prompt in that agent's own pane, in the TUI or the desktop app. The agent takes its waiting messages at that turn. Sending it another message, or delegating to it again, is not a prompt: that message waits the same way. This fetches the messages waiting now; it doesn't change whether later ones wait.
+**First,** type a prompt in that agent's own pane, in the TUI or the desktop app. When the agent's deck integration is working (Claude Code's or Codex's hooks, OpenCode's plugin, Pi's extension), the agent takes its waiting messages at that turn. When it isn't, a prompt alone doesn't hand them over: for example OpenCode or Pi before their integration connects, or Codex with untrusted hooks. Then ask the agent, in its pane, to run `dot-agent-deck inbox fetch`, or repair its integration ([Which agents wake for messages](orchestration.md#which-agents-wake-for-messages)) and restart it from the deck once it has taken its messages. Sending it another message, or delegating to it again, is not a prompt: that message waits the same way. This fetches the messages waiting now; it doesn't change whether later ones wait.
 
 **Before you restart the agent,** let it take its messages first. A restart doesn't hand waiting messages to the agent that replaces it: they show as not delivered, its orchestrator is told about each of its delegated tasks among them, a job offered to it goes back to its pool, and other messages have to be sent again ([Delivery in the TUI and desktop app](orchestration.md#delivery-in-the-tui-and-desktop-app)).
 
-**Find the cause** in the [deck log](#enabling-debug-logs): the agent's `doorbell off` line names it, and for a start-up screen the deck didn't read, the pane's `pane release` line says why. Then:
+**Find the cause** in the [deck log](#enabling-debug-logs): the agent's `doorbell off` line names it, and for a start-up screen the deck didn't read, the pane's `pane release` line says why. A cause that can clear by itself, such as `input_mode_unverified`, writes no `doorbell off` line: the agent's `doorbell hold` line names it after `cannot_type`. Then:
 
 - **`unmeasured_release`, Claude Code:** the deck hasn't measured this Claude Code version, so it types nothing into it; the `doorbell off` line names the versions it has measured. A prompt in the pane fetches the messages on any Claude Code version. To have messages arrive without one: on Claude Code 2.1.296 or later, make sure its own wake-up is running (run `dot-agent-deck hooks install`, then, once it has taken its messages, restart Claude Code from the deck; `dot-agent-deck daemon status` shows `native` under WAKE when it is). Or update the deck to a release that has measured your Claude Code version, or run a Claude Code version the line names, with Claude Code's own automatic updates turned off (Claude Code's documentation says how).
 - **`first_stage_commits` or `unmeasured_release`, Codex:** the deck doesn't type into Codex. Send it a prompt and its hooks hand it the messages at that turn; while it is busy, they hand them over at the end of each turn.
@@ -301,7 +301,7 @@ The deck is holding the agent's messages instead of typing the doorbell line, be
 - **`scanner_budget`:** the pane printed a very large amount of screen-clearing output at a very large size. Make the window smaller and start the agent afresh from the deck.
 - **`release_conflict`:** two different versions appeared on the agent's start-up screen. Start it afresh from the deck.
 - **`input_mode_conflict`:** the pane's agent was restarted inside the same pane by something other than the deck. Restart it from the deck.
-- **`input_mode_unverified`:** the agent's pane runs an older `dot-agent-deck` than the deck. Restart the agent after upgrading.
+- **`input_mode_unverified`:** the deck can't confirm how the agent's terminal input is set up. One possible cause is that the agent's pane runs an older `dot-agent-deck` than the deck: if you upgraded the deck since the agent started, restart the agent from the deck.
 
 An orchestrator told about the hold keeps the reason it was given when it was told; it isn't told again when the reason changes.
 

@@ -284,12 +284,19 @@ impl ScreenProfile {
     }
 
     /// The empty ready composer, with no dialog over it: what the doorbell
-    /// needs before it types (step 2).
+    /// needs before it types (step 2). A blank one only with the cursor where
+    /// an empty composer keeps it, as [`crate::doorbell_txn::Frame`] reads it.
     pub fn empty_and_ready(&self, grid: &Grid) -> bool {
         grid.cols >= self.min_cols
             && (self.dialog)(grid).is_none()
             && (self.ready)(grid)
-            && matches!(self.holds(grid, "\u{0}"), Some(ComposerText::Empty { .. }))
+            && match self.holds(grid, "\u{0}") {
+                Some(ComposerText::Empty { placeholder: true }) => true,
+                Some(ComposerText::Empty { placeholder: false }) => {
+                    (self.composer)(grid).is_some_and(|c| c.cursor_at_end)
+                }
+                _ => false,
+            }
     }
 
     /// The agent's placeholder in the composer: drawn while its input is

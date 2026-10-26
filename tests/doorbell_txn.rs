@@ -48,6 +48,13 @@ enum Write {
     Stall,
     /// Starts, stalls, and finishes this long after it started.
     Late(Duration),
+    /// Starts and writes now (every byte when `took`, none otherwise), and
+    /// the transaction hears only that it ended, `after` from the start,
+    /// never that it started: the order a late look at the writer gives.
+    EndsUnseen {
+        after: Duration,
+        took: bool,
+    },
     /// Stays queued: the writer claims it only when a test says it races
     /// the deck's take-back ([`writer_claims`]), else once the writer is
     /// free after the release, and either way only if it was not taken back
@@ -303,6 +310,18 @@ impl World {
         let (bytes, shown) = Self::bytes(job);
         match write {
             Write::NeverStarts => unreachable!("a job that never starts stays queued"),
+            Write::EndsUnseen { after, took } => {
+                if took {
+                    self.pane.push(shown);
+                    self.type_into_composer(&bytes);
+                }
+                let accepted = if took { bytes.len() } else { 0 };
+                let at = self.now - self.start + after;
+                self.at.push((
+                    at,
+                    Box::new(move |w| w.events.push_back(Event::JobEnded { accepted, ok: took })),
+                ));
+            }
             Write::Late(after) => {
                 self.events.push_back(Event::JobStarted);
                 self.events.push_back(Event::JobStalled);
@@ -1132,6 +1151,90 @@ fn doorbell_049_nothing_is_written_only_when_the_take_back_wins() {
         Some(Latch::Suspended(1, Cause::EchoMismatch))
     );
     assert_eq!(unconfirmed.pane, vec![line]);
+}
+
+/// Scenario: The writer takes the deck's line and the transaction first hears of it as an ended job, with no report that it started, at the deadline or a millisecond after it. A line the pane accepted is written: the attempt is suspended as unresolved and no Enter follows. A job that ended having taken no byte is the control: nothing was written.
+#[spec("inbox/doorbell/049")]
+#[test]
+fn doorbell_049_a_line_first_seen_ending_at_the_deadline_is_written() {
+    for late in [Duration::ZERO, Duration::from_millis(1)] {
+        for took in [true, false] {
+            let mut world = World::new();
+            let start = world.now;
+            let (cell, ring, counter) = (
+                Arc::clone(&world.cell),
+                Arc::clone(&world.ring),
+                Arc::clone(&world.counter),
+            );
+            let mut txn = admit(
+                &world.admission(),
+                &counter,
+                &ring,
+                &cell,
+                draws(),
+                &id(),
+                world.caps,
+                start,
+            )
+            .expect("admitted");
+            let actions = txn.start(&mut world, start);
+            let Some(Action::Enqueue(Job::Line(line), claim)) = actions.into_iter().next() else {
+                panic!("the line is queued first");
+            };
+            assert!(claim.start(), "the writer takes the line");
+            let accepted = if took { line.len() } else { 0 };
+            let at = txn.deadline() + late;
+            let actions = txn.on(Event::JobEnded { accepted, ok: took }, &mut world, at);
+            let released = actions.iter().find_map(|a| match a {
+                Action::Release(outcome) => Some(*outcome),
+                _ => None,
+            });
+            assert!(
+                !actions.iter().any(|a| matches!(a, Action::Enqueue(..))),
+                "late {late:?}, took {took}: nothing more is queued: {actions:?}"
+            );
+            if took {
+                assert_eq!(
+                    released,
+                    Some(Outcome::Unresolved(Cause::Deadline)),
+                    "late {late:?}"
+                );
+                assert_eq!(cell.load(), Latch::Suspended(1, Cause::Deadline));
+            } else {
+                assert_eq!(
+                    released,
+                    Some(Outcome::NothingWritten(NotTyped::Deadline)),
+                    "late {late:?}"
+                );
+                assert_eq!(cell.load(), Latch::Resolved(1, Resolution::NotTyped));
+            }
+        }
+    }
+    // The same through the model writer: the line goes in at once and its
+    // end is the first the transaction hears of it, at the deadline.
+    for took in [true, false] {
+        let mut world = World::new();
+        world.writes.push_back(Write::EndsUnseen {
+            after: TXN_MAX,
+            took,
+        });
+        let (outcome, line) = run(&mut world);
+        if took {
+            assert_eq!(outcome, Ok(Outcome::Unresolved(Cause::Deadline)));
+            assert_eq!(
+                world.cell_at_release,
+                Some(Latch::Suspended(1, Cause::Deadline))
+            );
+            assert_eq!(world.pane, vec![line], "no Enter");
+        } else {
+            assert_eq!(outcome, Ok(Outcome::NothingWritten(NotTyped::Deadline)));
+            assert_eq!(
+                world.cell_at_release,
+                Some(Latch::Resolved(1, Resolution::NotTyped))
+            );
+            assert!(world.pane.is_empty(), "{:?}", world.pane);
+        }
+    }
 }
 
 /// Scenario: After the first byte a later job is still queued on the writer when the transaction ends: the line's second stage or the Enter at the deadline, the deletes at the deadline or when the generation retires, and the Enter when the user submits the line and its exact evidence arrives first. The deck takes each back before the release, so it never runs after it; one the writer started first runs on and the attempt is accounted for as written.
