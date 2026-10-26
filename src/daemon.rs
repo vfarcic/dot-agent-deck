@@ -2142,6 +2142,33 @@ where
         | crate::event::EventType::PermissionRequest => Some(crate::agent_pty::TurnEdge::Started),
         _ => None,
     };
+    // PRD #1666 part 3 (Q30): a prompt the agent's own prompt hook reported
+    // taking (Claude Code's `UserPromptSubmit`, a Thinking with its prompt,
+    // or the deck's own line it recognised). It is the composer model's only
+    // evidence that an Enter on a box it could not follow submitted it: a
+    // turn starting is not, since an Enter on a box of blanks submits
+    // nothing and a turn can start for another reason. The same generation
+    // and live-owner checks as the turn edge, and before it.
+    let prompt_report = match event.event_type {
+        _ if event.is_wrapper_output_classified() => None,
+        crate::event::EventType::Thinking if crate::inbox_prompt::is_deck_message(&event) => {
+            Some(crate::composer_model::PromptReport::Deck)
+        }
+        crate::event::EventType::Thinking => event
+            .user_prompt
+            .as_deref()
+            .map(crate::composer_model::PromptReport::User),
+        _ => None,
+    };
+    if !unproven
+        && let Some(report) = prompt_report
+        && !event.is_daemon_synthetic()
+        && !event.is_from_subagent()
+        && let Some(pane_id) = event.pane_id.as_deref()
+        && let Some(generation) = event.agent_id.as_deref().or(attested_agent)
+    {
+        registry.note_prompt_report(pane_id, generation, report);
+    }
     if !unproven
         && let Some(edge) = turn_edge
         && !event.is_daemon_synthetic()
@@ -8059,6 +8086,86 @@ mod hook_ingestion_tests {
     use std::os::unix::fs::PermissionsExt;
     use tokio::io::AsyncWriteExt;
     use tokio::net::{UnixListener, UnixStream};
+
+    /// Scenario: PRD #1666 part 3 (Q30). A user presses Enter on a box the input model lost track of (Tab, then Enter) in a pane whose agent is live, and the daemon ingests that agent's events: working reports with no prompt (thinking, a tool starting), a prompt report from the pane's previous generation, and a subagent's prompt report. None of them proves the box empty. The live agent's own prompt report (a thinking event carrying the prompt its hook took) does; so does the deck's own line it recognised, but only for the deck's own submit, never for the user's Enter.
+    #[spec("inbox/doorbell/059")]
+    #[tokio::test]
+    async fn doorbell_059_the_daemon_confirms_an_unknown_enter_only_from_its_agents_prompt_report()
+    {
+        use crate::composer_model::InputProof;
+        let pane = "prompt-report";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let owner = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    pane.to_string(),
+                )]),
+                agent_type: Some(AgentType::ClaudeCode),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn stand-in");
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        state.write().await.register_pane(pane.to_string());
+        let (event_tx, _rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        let event = |event_type, agent: &str, prompt: Option<&str>| {
+            let mut event = super::quota_admission_tests::quota_frame(event_type);
+            event.pane_id = Some(pane.to_string());
+            event.agent_id = Some(agent.to_string());
+            event.user_prompt = prompt.map(str::to_string);
+            event
+        };
+        use crate::event::EventType::{Idle, Thinking, ToolStart};
+        registry
+            .write_user_bytes(pane, &owner, b"\t\r")
+            .await
+            .unwrap();
+        assert_eq!(registry.input_proof(pane), InputProof::Unknown);
+        for (what, frame) in [
+            ("a thinking report", event(Thinking, &owner, None)),
+            ("a tool starting", event(ToolStart, &owner, None)),
+            ("the turn ending", event(Idle, &owner, None)),
+            (
+                "a predecessor's prompt",
+                event(Thinking, "a-predecessor", Some("old prompt")),
+            ),
+            ("a subagent's prompt", {
+                let mut frame = event(Thinking, &owner, Some("sub prompt"));
+                frame.metadata.insert(
+                    crate::event::SUBAGENT_ID_METADATA_KEY.to_string(),
+                    "sub-1".to_string(),
+                );
+                frame
+            }),
+        ] {
+            ingest_event(&state, &event_tx, &registry, frame).await;
+            assert_eq!(registry.input_proof(pane), InputProof::Unknown, "{what}");
+        }
+        // The deck's own line, reported as the deck's: settles the deck's
+        // submit, not the user's Enter.
+        let mut deck = event(Thinking, &owner, Some("✉ task"));
+        deck.metadata.insert(
+            crate::inbox_prompt::DECK_MESSAGE_METADATA_KEY.to_string(),
+            "1".to_string(),
+        );
+        ingest_event(&state, &event_tx, &registry, deck).await;
+        assert_eq!(
+            registry.input_proof(pane),
+            InputProof::Unknown,
+            "the deck's"
+        );
+        ingest_event(
+            &state,
+            &event_tx,
+            &registry,
+            event(Thinking, &owner, Some("the recalled prompt")),
+        )
+        .await;
+        assert_eq!(registry.input_proof(pane), InputProof::Empty);
+        registry.shutdown_all();
+    }
 
     /// Issue #714: the Codex rollout tailer is armed only for an event whose
     /// pane and agent name the pane's live owner, and only by a genuine Codex

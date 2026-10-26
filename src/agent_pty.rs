@@ -3927,7 +3927,12 @@ impl PaneInputStream {
         let in_paste = self.in_paste;
         let submits = self.scan_submit(byte);
         self.draft.feed_byte(byte, submits, in_paste, origin);
-        self.composer.feed_byte(byte, submits, in_paste);
+        self.composer.feed_byte(
+            byte,
+            submits,
+            in_paste,
+            origin == crate::draft_deferral::ByteOrigin::Deck,
+        );
         submits
     }
 
@@ -3964,6 +3969,26 @@ impl PaneInputStream {
         }
         !self.in_paste && crate::ui::user_byte_submits_input_box(preceding, byte)
     }
+
+    /// PRD #1666: apply a turn edge the pane's own agent reported. Only an
+    /// Idle that ends a turn under way counts the turn and releases what the
+    /// draft bit was holding for it; the composer model keeps its own count,
+    /// by which an unknown `Enter` it gave up on stops owing a report.
+    fn note_turn(&mut self, edge: TurnEdge) {
+        match edge {
+            TurnEdge::Started => {
+                self.busy = true;
+                self.composer.turn_started();
+            }
+            TurnEdge::Ended => {
+                if std::mem::replace(&mut self.busy, false) {
+                    self.turns += 1;
+                    self.draft.turn_ended();
+                }
+                self.composer.turn_ended();
+            }
+        }
+    }
 }
 
 /// Issue #544: a pane's input stream for `crate::draft_deferral`'s tests,
@@ -3999,15 +4024,18 @@ impl DraftTestStream {
     /// The pane's own agent reported a turn starting, as
     /// [`PaneInputState::note_turn`] applies it.
     pub(crate) fn turn_started(&mut self) {
-        if !self.0.busy {
-            self.0.composer.turn_started();
-        }
-        self.0.busy = true;
+        self.0.note_turn(TurnEdge::Started);
     }
 
     /// The agent reported Idle after working.
     pub(crate) fn turn_ended(&mut self) {
-        self.0.busy = false;
+        self.0.note_turn(TurnEdge::Ended);
+    }
+
+    /// The agent's prompt hook reported a prompt, as
+    /// [`PaneInputState::note_prompt_report`] applies it.
+    pub(crate) fn prompt_reported(&mut self, report: crate::composer_model::PromptReport<'_>) {
+        self.0.composer.prompt_reported(report);
     }
 
     /// The doorbell's verified submit, as [`PaneInputState::reconcile_deck_submit`]
@@ -4233,24 +4261,32 @@ impl PaneInputState {
             return;
         }
         match edge {
-            TurnEdge::Started => {
-                let stream = self.input.entry(pane_id_env.to_string()).or_default();
-                // A turn starting, not one already under way: an `Enter`
-                // the composer model has not confirmed submitted the box.
-                if !stream.busy {
-                    stream.composer.turn_started();
-                }
-                stream.busy = true;
-            }
+            TurnEdge::Started => self
+                .input
+                .entry(pane_id_env.to_string())
+                .or_default()
+                .note_turn(edge),
             TurnEdge::Ended => {
-                if let Some(stream) = self.input.get_mut(pane_id_env)
-                    && stream.busy
-                {
-                    stream.busy = false;
-                    stream.turns += 1;
-                    stream.draft.turn_ended();
+                if let Some(stream) = self.input.get_mut(pane_id_env) {
+                    stream.note_turn(edge);
                 }
             }
+        }
+    }
+
+    /// PRD #1666 part 3 (Q30): the agent in `pane_id_env` reported, from its
+    /// prompt hook, a prompt it took — the only evidence that an `Enter` on
+    /// a box the composer model did not know submitted it (see
+    /// [`crate::composer_model::ComposerModel::prompt_reported`]). The
+    /// caller has already checked the report came from the pane's live
+    /// owner — see [`AgentPtyRegistry::note_prompt_report`].
+    fn note_prompt_report(
+        &mut self,
+        pane_id_env: &str,
+        report: crate::composer_model::PromptReport<'_>,
+    ) {
+        if let Some(stream) = self.input.get_mut(pane_id_env) {
+            stream.composer.prompt_reported(report);
         }
     }
 
@@ -10511,6 +10547,12 @@ impl AgentPtyRegistry {
         self.pane_input.lock().unwrap().draft_pending(pane_id_env)
     }
 
+    /// Test seam: what the composer model says `pane_id_env`'s box holds.
+    #[cfg(test)]
+    pub(crate) fn input_proof(&self, pane_id_env: &str) -> crate::composer_model::InputProof {
+        self.pane_input.lock().unwrap().input_proof(pane_id_env)
+    }
+
     /// PRD #1666 part 3, round 5-wake (plan §5.1): the pane's open paste and
     /// unsent draft, told apart, and how many of its agent's turns have
     /// ended, for the doorbell's hold reason and episode.
@@ -10853,6 +10895,30 @@ impl AgentPtyRegistry {
         match pane_id_env.and_then(|pane| self.pane_current_agent_id(pane)) {
             Some(current) if current != agent_id => Termination::Replaced,
             _ => Termination::Closed,
+        }
+    }
+
+    /// PRD #1666 part 3 (Q30): `agent_id` reported, from its prompt hook, a
+    /// prompt it took on `pane_id_env`, applied to the pane's composer model
+    /// only while `agent_id` is the pane's live owner: a predecessor's, or a
+    /// reservation's, report is not about this input box. Taken before the
+    /// same event's turn edge ([`Self::note_turn`]), under the same locks in
+    /// the same order.
+    pub(crate) fn note_prompt_report(
+        &self,
+        pane_id_env: &str,
+        agent_id: &str,
+        report: crate::composer_model::PromptReport<'_>,
+    ) {
+        let inner = self.inner.lock();
+        let owner = inner.agents.iter().find(|(_, a)| {
+            a.pane_id_env.as_deref() == Some(pane_id_env) && !a.exited.load(Ordering::SeqCst)
+        });
+        if owner.is_some_and(|(id, _)| id == agent_id) {
+            self.pane_input
+                .lock()
+                .unwrap()
+                .note_prompt_report(pane_id_env, report);
         }
     }
 
@@ -24337,6 +24403,151 @@ mod spawn_tests {
             );
             registry.shutdown_all();
         }
+    }
+
+    /// The model editor stops drawing, takes `keys` from the user without
+    /// its Enter submitting anything (a box of blanks keeps them), and shows
+    /// the frame the real agent would: its composer blank with the cursor at
+    /// the start, no placeholder.
+    async fn user_keys_behind_a_blank_frame(editor: &ModelEditor, keys: &[u8]) {
+        {
+            let mut control = editor.control.lock().unwrap();
+            control.drawing = Drawing::Frozen;
+            control.on_enter = OnEnter::Drop;
+        }
+        editor
+            .registry
+            .write_user_bytes(&editor.pane, &editor.id, keys)
+            .await
+            .unwrap();
+        let typed_by = Instant::now() + Duration::from_secs(8);
+        while !editor.typed().ends_with(keys) {
+            assert!(Instant::now() < typed_by, "the keys never reached the pane");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        editor
+            .bus
+            .push(claude_screen_at(" ", 0, &[], false, EDITOR_COLS as usize));
+        blank_with_cursor_at(editor, 0).await;
+    }
+
+    /// The model editor draws again and submits the deck's Enter.
+    fn editor_draws_again(editor: &ModelEditor) {
+        let mut control = editor.control.lock().unwrap();
+        control.drawing = Drawing::Composer;
+        control.on_enter = OnEnter::Submit;
+    }
+
+    /// Scenario: PRD #1666 part 3 (Q30). The user leaves blanks in a Claude Code 2.1.310 model editor's composer and presses Enter, which submits nothing, by key paths the input model cannot fully follow, while the screen shows exactly the empty composer with no placeholder: spaces, a non-ASCII character, Backspace and Ctrl+A, then the agent reports an unrelated turn starting and ending, or a late report of a prompt the user sent before; and the reviewer's composed sequence (a non-ASCII character and Backspace, Enter, a space, Ctrl+J, End, Ctrl+U, Backspace, Ctrl+A). The deck types nothing (nothing written: no empty composer) and the card says there may be an unsent draft; End then Ctrl+U lets the next ring type once. A positive control: Up then Enter, which really submits, holds the ring only until the agent's prompt hook reports the prompt it took, and then the ring types its line.
+    #[spec("inbox/doorbell/050")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_050_an_unknown_enter_needs_its_own_report() {
+        use crate::composer_model::PromptReport;
+        use crate::doorbell_txn::{NotTyped, Outcome};
+        use crate::inbox_display::WakeHold;
+        let held = RingOutcome::Txn(Outcome::NothingWritten(NotTyped::AwaitingPrompt));
+        let rings_once = |editor: &ModelEditor, report: RingReport, case: &str| {
+            assert_eq!(
+                report.outcome,
+                RingOutcome::Txn(Outcome::Submitted),
+                "{case}: {report:?}"
+            );
+            let typed = editor.typed();
+            let line = typed_line(&typed).expect("the line was typed");
+            assert_eq!(
+                typed
+                    .windows(line.len())
+                    .filter(|w| *w == line.as_bytes())
+                    .count(),
+                1,
+                "{case}: the line once"
+            );
+        };
+        let mut blanks_enter = b"  ".to_vec();
+        blanks_enter.extend_from_slice("\u{e9}".as_bytes());
+        blanks_enter.extend_from_slice(b"\x7f\x01\r");
+        let mut composed = "\u{e9}".as_bytes().to_vec();
+        composed.extend_from_slice(b"\x7f\r \n\x05\x15\x7f\x01");
+        for (case, keys, before) in [
+            ("an unrelated turn", blanks_enter.clone(), None),
+            ("a late report", blanks_enter, Some("hello")),
+            ("End and Ctrl+U after the Enter", composed, None),
+        ] {
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let editor = ModelEditor::spawn(
+                &registry,
+                &format!("pane-ring-unknown-enter-{}", case.len()),
+                OnEnter::Submit,
+            );
+            if let Some(prompt) = before {
+                registry
+                    .write_user_bytes(&editor.pane, &editor.id, format!("{prompt}\r").as_bytes())
+                    .await
+                    .unwrap();
+                editor.wait_drawn("");
+            }
+            user_keys_behind_a_blank_frame(&editor, &keys).await;
+            if let Some(prompt) = before {
+                registry.note_prompt_report(&editor.pane, &editor.id, PromptReport::User(prompt));
+            }
+            registry.note_turn(&editor.pane, &editor.id, TurnEdge::Started);
+            registry.note_turn(&editor.pane, &editor.id, TurnEdge::Ended);
+            let before_ring = editor.typed();
+            let report = editor.ring().await;
+            assert_eq!(report.outcome, held, "{case}: {report:?}");
+            let state = idle_with_mail(&editor).await;
+            let bell = crate::doorbell::spawn(
+                registry.clone(),
+                state,
+                tick_config(Duration::from_millis(150)),
+            );
+            until("possible_draft", || {
+                shown_hold(&editor) == Some(WakeHold::PossibleDraft)
+            })
+            .await;
+            bell.abort();
+            assert_eq!(editor.typed(), before_ring, "{case}: no deck byte");
+            // The user's remedy: clear from the end.
+            editor_draws_again(&editor);
+            registry
+                .write_user_bytes(&editor.pane, &editor.id, b"\x05\x15")
+                .await
+                .unwrap();
+            editor.wait_drawn("");
+            rings_once(&editor, editor.ring().await, case);
+            registry.shutdown_all();
+        }
+        // The positive control: history recalled with Up, then Enter.
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-unknown-enter-up", OnEnter::Submit);
+        editor.control.lock().unwrap().drawing = Drawing::Frozen;
+        registry
+            .write_user_bytes(&editor.pane, &editor.id, b"\x1b[A\r")
+            .await
+            .unwrap();
+        let typed_by = Instant::now() + Duration::from_secs(8);
+        while !editor.typed().ends_with(b"\x1b[A\r") {
+            assert!(Instant::now() < typed_by, "the keys never reached the pane");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        // A submitted prompt leaves the composer empty without its
+        // placeholder.
+        editor
+            .bus
+            .push(claude_screen_at(" ", 0, &[], false, EDITOR_COLS as usize));
+        blank_with_cursor_at(&editor, 0).await;
+        editor_draws_again(&editor);
+        let report = editor.ring().await;
+        assert_eq!(report.outcome, held, "before the report: {report:?}");
+        registry.note_prompt_report(
+            &editor.pane,
+            &editor.id,
+            PromptReport::User("the recalled prompt"),
+        );
+        registry.note_turn(&editor.pane, &editor.id, TurnEdge::Started);
+        registry.note_turn(&editor.pane, &editor.id, TurnEdge::Ended);
+        rings_once(&editor, editor.ring().await, "Up then Enter");
+        registry.shutdown_all();
     }
 
     /// Scenario: The model editor stops drawing, so the deck's line is typed and never echoed and the attempt will end suspended; while that ring holds the writer, a second ring for the same generation is started and waits for the writer. Once the first ring releases the writer with the cell suspended, the second is not admitted (suspended) and types nothing: the pane holds only the first line.

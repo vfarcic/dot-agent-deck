@@ -685,9 +685,11 @@ fn claude_composer(grid: &Grid) -> Option<Composer> {
         text.push_str(next.trim());
         last_row = row;
     }
-    // A blank written into an empty box: every measured empty composer
-    // (fresh, cleared, after a task, resized) wrote nothing past the indent.
-    let written_blank = text.is_empty() && grid.written_extent(prompt_row) > CLAUDE_INDENT;
+    // Blanks written as cells on the prompt row say nothing either way:
+    // Claude Code writes typed spaces after a repaint, and clearing them
+    // with `End` then `Ctrl+U` writes blanks over them (measured on 2.1.310,
+    // 2026-10-26), so an empty box can draw them. The input model decides
+    // (`crate::composer_model`).
     let mut dim = true;
     let mut any = false;
     for r in prompt_row..=last_row {
@@ -715,7 +717,7 @@ fn claude_composer(grid: &Grid) -> Option<Composer> {
         text,
         dim: any && dim,
         cursor_at_end,
-        hidden: blank_line || written_blank,
+        hidden: blank_line,
     })
 }
 

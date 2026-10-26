@@ -473,7 +473,7 @@ fn doorbell_036_a_blank_draft_in_the_claude_composer_is_not_empty() {
     }
 }
 
-/// Scenario: Take the recorded Claude Code 2.1.310 session at its cleared composer and redraw it the way a real 2.1.310 session draws blanks it holds (measured 2026-10-26: typed spaces write no cell, the cursor only moves; a line of nothing is a row of nothing): three spaces with the cursor moved back to the start, the same spaces written as cells, a blank line with text below it and the cursor back on the first row, a line of spaces under the prompt row, and a letter, a blank line and more text with the cursor after the letter. The first looks exactly like the empty composer, so the frame is ready only while the input says the box is empty, never when it says a draft or cannot say; the next three are not empty whatever the input says, and the last does not hold the letter alone. Every recorded empty composer (fresh, cleared, deleted, resized, nudged) stays ready with the input proving it empty, the placeholder alone is ready while the input cannot say, and none is ready with the input saying a draft. The redraws are synthesized on the real capture; the measured session's own bytes are not committed.
+/// Scenario: Take the recorded Claude Code 2.1.310 session at its cleared composer and redraw it the way a real 2.1.310 session draws blanks it holds (measured 2026-10-26: typed spaces write no cell, the cursor only moves; a line of nothing is a row of nothing): three spaces with the cursor moved back to the start, the same spaces written as cells (which a real session also draws for the empty box after clearing spaces a repaint wrote), a blank line with text below it and the cursor back on the first row, a line of spaces under the prompt row, and a letter, a blank line and more text with the cursor after the letter. The first two look like the empty composer, so the frame is ready only while the input says the box is empty, never when it says a draft or cannot say; the next two are not empty whatever the input says, and the last does not hold the letter alone. Every recorded empty composer (fresh, cleared, deleted, resized, nudged) stays ready with the input proving it empty, the placeholder alone is ready while the input cannot say, and none is ready with the input saying a draft. The redraws are synthesized on the real capture; the measured session's own bytes are not committed.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_blanks_and_blank_lines_the_claude_screen_cannot_show() {
@@ -518,8 +518,27 @@ fn doorbell_036_blanks_and_blank_lines_the_claude_screen_cannot_show() {
         "no placeholder to prove it"
     );
     let rule = "\u{2500}".repeat(usize::from(trace.cols));
+    // Spaces written as cells, the cursor moved back: a real 2.1.310 draws
+    // this for spaces it holds after a repaint, and for the empty box once
+    // `End` then `Ctrl+U` cleared them, which writes blanks over them
+    // (measured 2026-10-26). Only the input can tell them apart.
+    let written = with(b"   \x1b[3D");
+    let composer = (p.composer)(&written).expect("the composer");
+    assert_eq!(composer.text, "");
+    assert!(composer.cursor_at_end && !composer.hidden, "{composer:?}");
+    assert!(
+        ready(&written, InputProof::Empty),
+        "the input proves it empty"
+    );
+    assert!(
+        !ready(&written, InputProof::Draft),
+        "the input says a draft"
+    );
+    assert!(
+        !ready(&written, InputProof::Unknown),
+        "no placeholder to prove it"
+    );
     for (case, extra) in [
-        ("spaces written as cells", "   \x1b[3D".to_string()),
         (
             "a blank line with text below it",
             format!(
