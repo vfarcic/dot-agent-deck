@@ -884,6 +884,140 @@ fn doorbell_010_live_kept_draft_stays_held() {
     }
 }
 
+/// Scenario: Complete a fallback-delivered control task in real interactive Claude Code 2.1.310, disable its next native waiter, and type exactly three spaces before posting another sentinel task. For five seconds the blank composer row and its three-column cursor offset stay exact, the input ledger gains no byte, the task stays queued with zero deliveries, and the card names the draft hold. Move to the end and clear the spaces; the original task must then be delivered once and write its sentinel once.
+#[spec("inbox/doorbell/010")]
+#[test]
+#[cfg(target_os = "linux")]
+fn doorbell_010_live_spaces_only_draft_stays_held() {
+    skip_unless!(common::check_claude_available());
+    let version = std::process::Command::new("script")
+        .arg("--version")
+        .output()
+        .expect("Linux spaces-only input ledger requires util-linux script on PATH");
+    assert!(
+        version.status.success(),
+        "util-linux script preflight failed"
+    );
+    let claude = fallback_ready_with(
+        Claude::launch(&common::capability_export_command(&format!(
+            "exec script --quiet --flush --return --echo never --log-in spaces-input.log --log-out /dev/null --command 'exec {CLAUDE}'"
+        ))),
+        "spaces",
+    );
+    assert!(
+        claude.pane_grid().contains("Claude Code v2.1.310"),
+        "this measured-release regression requires Claude Code 2.1.310; {}",
+        claude.evidence()
+    );
+    assert!(
+        claude.log().contains("doorbell rang"),
+        "positive control must really use the doorbell; {}",
+        claude.evidence()
+    );
+    let input = || std::fs::read(claude.deck.workdir().join("spaces-input.log")).unwrap();
+    // vt100 trims trailing ASCII blanks from contents(). The cursor's exact
+    // three-column displacement, paired with the unchanged blank row and
+    // captured input, distinguishes three spaces from the empty composer.
+    let composer_frame = || {
+        let (grid, cursor) = claude.pane_frame();
+        (
+            grid.lines().nth(usize::from(cursor.0)).map(str::to_string),
+            cursor,
+        )
+    };
+    let empty = composer_frame();
+    assert!(
+        empty.0.as_deref().is_some_and(|row| row
+            .trim_start()
+            .strip_prefix('❯')
+            .is_some_and(|tail| tail.trim().is_empty())),
+        "control must leave a blank composer: {empty:?}; {}",
+        claude.evidence()
+    );
+    let input_empty = input();
+    claude.deck.send_keys(b"   ");
+    let spaces = (empty.0.clone(), (empty.1.0, empty.1.1 + 3));
+    assert!(
+        common::wait_until(Duration::from_secs(10), || {
+            composer_frame() == spaces
+                && input().strip_prefix(input_empty.as_slice()) == Some(b"   ".as_slice())
+        }),
+        "real Claude must retain exactly three spaces: empty={empty:?}, expected={spaces:?}, actual={:?}; {}",
+        composer_frame(),
+        claude.evidence()
+    );
+    let input_before = input();
+    let since = claude.log().len();
+    let name = "spaces-held-4c29e1.txt";
+    let id = claude.post(&claude.directive(name));
+    common::wait_until(Duration::from_secs(5), || {
+        let listing = claude.listing();
+        let message = listing["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["id"] == id)
+            .unwrap();
+        assert_eq!(message["state"], "queued", "{message}");
+        assert_eq!(message["deliveries"], 0, "{message}");
+        assert_eq!(
+            composer_frame(),
+            spaces,
+            "three-space draft changed; {}",
+            claude.evidence()
+        );
+        assert_eq!(input(), input_before, "no automatic input byte is allowed");
+        assert!(!claude.deck.workdir().join(name).exists());
+        assert!(
+            !claude.log()[since..].lines().any(|line| {
+                line.contains("doorbell attempt")
+                    || line.contains("doorbell held")
+                    || line.contains("doorbell rang")
+                    || line.contains("doorbell ring withdrawn")
+                    || line.contains("doorbell ring failed")
+                    || line.contains("doorbell write")
+                    || line.contains("doorbell sent its cleanup CR")
+                    || line.contains("pane_write:")
+            }),
+            "draft must prevent a ring or pane write; {}",
+            claude.evidence()
+        );
+        false
+    });
+    assert_eq!(
+        claude.record()["inbox"]["wake_hold"],
+        "possible_draft",
+        "spaces must report the draft hold; {}",
+        claude.evidence()
+    );
+    assert!(
+        claude
+            .deck
+            .snapshot_grid()
+            .contains("there may be an unsent draft"),
+        "card must visibly explain the draft hold; {}",
+        claude.evidence()
+    );
+    eprintln!(
+        "{}",
+        common::redact_credentials_for_output(&format!(
+            "three-space hold: empty={empty:?}; spaces={spaces:?}; 5s exact row/cursor, unchanged input ledger, queued with zero deliveries, no ring/write; wake_hold=possible_draft; card=\n{}",
+            claude.deck.snapshot_grid()
+        ))
+    );
+    // Clear from the end: Ctrl+U alone only erases up to the current cursor.
+    claude.deck.send_keys(b"\x05\x15");
+    claude.done(&id, name, false);
+    assert!(
+        claude.log()[since..].contains("doorbell rang"),
+        "clearing spaces must recover through the doorbell; {}",
+        claude.evidence()
+    );
+    eprintln!(
+        "three-space recovery: original {id} acknowledged, deliveries=1, sentinel appended once"
+    );
+}
+
 #[cfg(target_os = "linux")]
 fn kept_draft_trial(claude: &Claude, variant: &str, draft: &str) -> Value {
     let name = format!("kept-{variant}-c67e91.txt");
