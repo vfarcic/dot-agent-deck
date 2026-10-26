@@ -136,8 +136,10 @@ fn plugin_template(binary_path: &str) -> String {
     let binary_path_json =
         serde_json::to_string(binary_path).expect("serializing a &str to a String is infallible");
     let inbox = inbox_js(SERVER_INBOX_JS);
+    let usage = USAGE_FILE_JS;
     format!(
         r#"import {{ execFile, execFileSync, spawn }} from "child_process";
+import {{ appendFileSync }} from "fs";
 import {{ isMainThread }} from "worker_threads";
 
 // Duplicate-load guard. The installer fans out to EVERY candidate config root
@@ -1199,6 +1201,7 @@ const handleMessagePartUpdated = (event, directory) => {{
 }};
 
 {inbox}
+{usage}
 export const DotAgentDeckPlugin = async (ctx) => {{
   // A second copy of this plugin in the same OpenCode process returns inert
   // hooks, so one real action produces one event. See DAD_GUARD above.
@@ -1216,6 +1219,9 @@ export const DotAgentDeckPlugin = async (ctx) => {{
       const event = input?.event;
       const eventType = event?.type ?? "";
       observeInbox(event);
+      if (eventType === "message.updated") {{
+        recordUsage(event?.properties?.info);
+      }}
       if (
         eventType === "message.created" ||
         eventType === "message.updated"
@@ -1381,6 +1387,62 @@ export default DotAgentDeckPlugin;
 "#
     )
 }
+
+/// PRD #1858: the plugin's half of the deck's usage file. Each update of an
+/// assistant message appends one line of named fields — its id, model, token
+/// counts, OpenCode's cost, `finish` and error type — to the file the deck
+/// names in `DOT_AGENT_DECK_USAGE_FILE`, skipping an update that changes none
+/// of them. The deck reads the last line for an id as the message's usage
+/// (`telemetry::accounting::usage_file`). Nothing else from the message, its
+/// text and error message included, is written.
+const USAGE_FILE_JS: &str = r#"// PRD #1858: each assistant message's usage, for the deck's run record.
+const USAGE_FILE = process.env.DOT_AGENT_DECK_USAGE_FILE;
+const USAGE_FILE_ON = typeof USAGE_FILE === "string" && USAGE_FILE.startsWith("/");
+const MAX_USAGE_MESSAGES = 256;
+const usageWritten = new Map();
+const usageCount = (value) =>
+  typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0;
+const usageName = (value) =>
+  typeof value === "string" && /^[A-Za-z0-9._:/@+-]{1,128}$/.test(value) ? value : undefined;
+const recordUsage = (info) => {
+  if (!USAGE_FILE_ON || info?.role !== "assistant") return;
+  const id = usageName(info.id);
+  const tokens = info.tokens ?? {};
+  const line = { v: 1, type: "reply", agent: "opencode" };
+  if (id !== undefined) line.id = id;
+  const model = usageName(info.modelID);
+  if (model !== undefined) line.model = model;
+  line.input = usageCount(tokens.input);
+  line.output = usageCount(tokens.output) + usageCount(tokens.reasoning);
+  line.cache_read = usageCount(tokens.cache?.read);
+  line.cache_write = usageCount(tokens.cache?.write);
+  if (typeof info.cost === "number" && Number.isFinite(info.cost) && info.cost >= 0) {
+    line.cost_usd = info.cost;
+  }
+  const counted = line.input + line.output + line.cache_read + line.cache_write > 0;
+  if (!counted && (info.error || !info.time?.completed)) line.reported = false;
+  const finish = usageName(info.finish);
+  if (finish !== undefined) line.stop = finish;
+  const error = usageName(info.error?.name);
+  if (error !== undefined) line.error = error;
+  const status = info.error?.data?.statusCode;
+  if (Number.isInteger(status) && status >= 100 && status <= 599) line.status = status;
+  const text = JSON.stringify(line);
+  if (id !== undefined) {
+    if (usageWritten.get(id) === text) return;
+    usageWritten.delete(id);
+    usageWritten.set(id, text);
+    if (usageWritten.size > MAX_USAGE_MESSAGES) {
+      usageWritten.delete(usageWritten.keys().next().value);
+    }
+  }
+  try {
+    appendFileSync(USAGE_FILE, text + "\n", { mode: 0o600 });
+  } catch {
+    // The run's usage is then not recorded; OpenCode carries on.
+  }
+};
+"#;
 
 /// PRD #1666 S8: `chunk` with the deck's shared inbox helpers in front of it
 /// (the receiver, [`crate::inbox_receiver::RECEIVER_JS`], among them) and
@@ -4476,6 +4538,72 @@ process.exit(0);
         assert!(
             written.contains("\"not_handed\""),
             "positively not handed: {written}"
+        );
+    }
+
+    /// PRD #1858: each update of an assistant message appends its usage to
+    /// the file the deck names, one line of named fields, an unchanged update
+    /// appends nothing, and neither the message's text nor its error message
+    /// reaches the file.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_plugin_appends_assistant_usage_to_the_deck_usage_file() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (recorder, _controls) = inbox_recorder(dir.path());
+        let plugin = dir.path().join("dot-agent-deck.mjs");
+        std::fs::write(&plugin, plugin_template(&recorder.to_string_lossy())).unwrap();
+        let usage = dir.path().join("run.usage.jsonl");
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                r#"const {{ default: plugin }} = await import("{}");
+const hooks = await plugin({{ directory: "/work", client: {{}} }});
+const updated = (info) => hooks.event({{ event: {{ type: "message.updated", properties: {{ info }} }} }});
+const reply = {{ id: "msg_1", sessionID: "s1", role: "assistant", modelID: "gpt-5.4-mini",
+  cost: 0, tokens: {{ input: 100, output: 15, reasoning: 5, cache: {{ read: 7, write: 0 }} }},
+  time: {{ created: 1, completed: 2 }}, finish: "stop" }};
+await updated(reply);
+await updated(reply);
+await updated({{ id: "msg_2", sessionID: "s1", role: "assistant", modelID: "gpt-5.4-mini", cost: 0,
+  tokens: {{ input: 0, output: 0, reasoning: 0, cache: {{ read: 0, write: 0 }} }}, time: {{ created: 3 }},
+  error: {{ name: "APIError", data: {{ message: "SECRET_ERROR_TEXT", statusCode: 400 }} }} }});
+await updated({{ id: "msg_3", sessionID: "s1", role: "user", text: "SECRET_PROMPT" }});
+console.log("null");
+process.exit(0);
+"#,
+                plugin.display()
+            ),
+        )
+        .unwrap();
+        let out = std::process::Command::new("node")
+            .arg(&driver)
+            .env("DOT_AGENT_DECK_USAGE_FILE", &usage)
+            .env("DOT_AGENT_DECK_INBOX_WATCHER_BACKOFF_MS", "3600000")
+            .output()
+            .expect("run node");
+        assert!(out.status.success(), "{out:?}");
+        let written = std::fs::read_to_string(&usage).unwrap();
+        assert!(!written.contains("SECRET"), "{written}");
+        let lines: Vec<serde_json::Value> = written
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                serde_json::json!({"v":1,"type":"reply","agent":"opencode","id":"msg_1",
+                    "model":"gpt-5.4-mini","input":100,"output":20,"cache_read":7,"cache_write":0,
+                    "cost_usd":0,"stop":"stop"}),
+                serde_json::json!({"v":1,"type":"reply","agent":"opencode","id":"msg_2",
+                    "model":"gpt-5.4-mini","input":0,"output":0,"cache_read":0,"cache_write":0,
+                    "cost_usd":0,"reported":false,"error":"APIError","status":400}),
+            ],
+            "{written}"
         );
     }
 

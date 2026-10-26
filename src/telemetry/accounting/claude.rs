@@ -24,7 +24,7 @@ use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
 
 use super::{
     AgentTurnEnd, AgentUsage, Field, Ident, JsonlReader, LineSummary, MicroUsd, OptScalar, OptStr,
-    ReaderStats, Tokens, Unavailable, agent_cost, input_plus_cache, usage_unavailable,
+    ReaderStats, Unavailable, agent_cost, input_plus_cache, usage_unavailable,
 };
 
 /// An incremental reader of one Claude Code transcript.
@@ -202,11 +202,14 @@ impl ClaudeTranscriptSummary {
                 self.before_user = None;
                 if flag(&record.api_error) {
                     self.last_turn = Some(AgentTurnEnd::Failed {
-                        kind: record
-                            .error
-                            .as_str()
-                            .and_then(Ident::new)
-                            .filter(|k| k.as_str().bytes().all(|b| !b.is_ascii_uppercase())),
+                        // A kind that is not a lowercase identifier is one
+                        // the deck does not know: `other`, never its text.
+                        kind: record.error.as_str().map(|kind| {
+                            Ident::new(kind)
+                                .filter(|k| k.as_str().bytes().all(|b| !b.is_ascii_uppercase()))
+                                .or_else(|| Ident::new("other"))
+                                .expect("`other` is an identifier")
+                        }),
                         status: record.api_error_status.http_status(),
                     });
                     return;
@@ -558,7 +561,7 @@ impl<'de> Deserialize<'de> for ModelUsageMap {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{ModelUsage, Provenance};
+    use super::super::{ModelUsage, Provenance, Tokens};
     use super::*;
     use std::fs::File;
     use std::io::Write as _;
@@ -905,7 +908,7 @@ mod tests {
     }
 
     /// An error kind that is not identifier-shaped, or not lowercase, is
-    /// kept as a failure with no kind; a status outside HTTP's range is
+    /// kept as a failure of kind `other`; a status outside HTTP's range is
     /// dropped.
     #[test]
     fn a_strange_error_kind_or_status_is_dropped_not_kept() {
@@ -916,7 +919,7 @@ mod tests {
         assert_eq!(
             reader.summary().last_turn(),
             Some(&AgentTurnEnd::Failed {
-                kind: None,
+                kind: Ident::new("other"),
                 status: None
             })
         );

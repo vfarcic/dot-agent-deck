@@ -27,6 +27,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { appendFileSync } from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
@@ -65,6 +66,8 @@ import {
 	spawnFailureMessage,
 	tagHandOver,
 	untagHandOver,
+	usageFileLine,
+	usageFilePath,
 	WATCHER_NOT_IN_DECK_EXIT,
 } from "./orchestrator.ts";
 import { createPiTelemetry } from "./telemetry.ts";
@@ -1300,6 +1303,22 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 		pi.on("session_shutdown", async (event) => {
 			telemetry.observe("session_shutdown", event);
 			await telemetry.shutdown();
+		});
+	}
+	// PRD #1858: each reply's usage, appended to the file the deck reads this
+	// run's usage from, when the deck named one.
+	const usageFile = usageFilePath(process.env, process.platform);
+	if (usageFile !== undefined) {
+		pi.on("message_end", (event) => {
+			const line = usageFileLine(event);
+			if (line === undefined) {
+				return;
+			}
+			try {
+				appendFileSync(usageFile, `${line}\n`, { mode: 0o600 });
+			} catch {
+				// The run's usage is then not recorded; Pi carries on.
+			}
 		});
 	}
 	// --- M2.1: native delegate tool --------------------------------------

@@ -47,11 +47,12 @@
 //! shim that switches on Codex's and Devin's own telemetry runs there
 //! ([`shim::run_if_invoked`]).
 
-/// PRD #633's execution-accounting prototype, compiled for tests only: no
-/// product path calls it, and wiring it (and dropping this `cfg(test)`) is
-/// the follow-up PRD's first step.
-#[cfg(test)]
-mod accounting;
+/// PRD #1858: what each run consumed and how it ended, read from each
+/// agent's own usage record and exported on the run's span. The record's
+/// work-item and roll-up halves (PRD #633's prototype) are for #1860 and are
+/// exercised by its tests only, hence the `dead_code` allowance outside them.
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod accounting;
 pub mod ci;
 /// PRD #1859: the core of `dot-agent-deck-collector`, a separate binary
 /// (`src/bin/dot-agent-deck-collector.rs`). Nothing in the deck calls it.
@@ -217,24 +218,41 @@ pub fn commit_spawn(run: Option<PreparedRun>) {
 /// as `daemon_shutdown` while the daemon is shutting down, as `exited` when
 /// the agent is still registered (nothing removed it, so it went by itself),
 /// and as `closed` otherwise. `still_registered` is asked only when telemetry
-/// is on.
+/// is on, and `exit_code` only for an agent that went by itself: its child
+/// can close its terminal a moment before it exits, so it is asked again for
+/// up to [`EXIT_CODE_WAIT`].
 pub fn agent_exited(
     telemetry: Option<Arc<Telemetry>>,
     pane_id: Option<&str>,
     agent_id: &str,
     shutting_down: bool,
     still_registered: impl FnOnce() -> bool,
+    exit_code: impl Fn() -> Option<i32>,
 ) {
     let (Some(telemetry), Some(pane_id)) = (telemetry, pane_id) else {
         return;
     };
-    telemetry.end_run(
-        pane_id,
-        Some(agent_id),
-        end_reason(shutting_down, still_registered),
-        None,
-    );
+    let reason = end_reason(shutting_down, still_registered);
+    let code = (reason == EndReason::Exited)
+        .then(|| {
+            let deadline = std::time::Instant::now() + EXIT_CODE_WAIT;
+            loop {
+                if let Some(code) = exit_code() {
+                    break Some(code);
+                }
+                if std::time::Instant::now() >= deadline {
+                    break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        })
+        .flatten();
+    telemetry.end_run(pane_id, Some(agent_id), reason, code);
 }
+
+/// How long [`agent_exited`] waits for an agent's exit code after its
+/// terminal closed.
+pub const EXIT_CODE_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 
 fn end_reason(shutting_down: bool, still_registered: impl FnOnce() -> bool) -> EndReason {
     if shutting_down {
@@ -286,6 +304,7 @@ pub const SPAN_NAMES: [&str; 4] = [
 pub const EVENT_STATUS_CHANGE: &str = "deck.status_change";
 pub const EVENT_INTERVENTION: &str = "deck.intervention";
 pub const EVENT_CI_CHANGE: &str = "deck.ci.change";
+pub use accounting::EVENT_MODEL_USAGE;
 
 /// Every attribute key the deck can put on a span, a span event, or the
 /// resource it builds itself. The closed set IS the allow-list: an attribute
@@ -335,6 +354,9 @@ pub enum AttrKey {
     CiChecksSkipped,
     CiRoundsCount,
     CiFailuresCount,
+    /// PRD #1858: a run's usage and termination, and one model's usage on a
+    /// `deck.model_usage` event ([`accounting::AccountingKey`]).
+    Accounting(accounting::AccountingKey),
 }
 
 impl AttrKey {
@@ -423,6 +445,7 @@ impl AttrKey {
             AttrKey::CiChecksSkipped => "deck.ci.checks.skipped",
             AttrKey::CiRoundsCount => "deck.ci.rounds.count",
             AttrKey::CiFailuresCount => "deck.ci.failures.count",
+            AttrKey::Accounting(key) => key.as_str(),
         }
     }
 
@@ -430,6 +453,9 @@ impl AttrKey {
     #[cfg(test)]
     pub fn is_allowed(key: &str) -> bool {
         AttrKey::ALL.iter().any(|k| k.as_str() == key)
+            || accounting::AccountingKey::ALL
+                .iter()
+                .any(|k| k.as_str() == key)
     }
 }
 
@@ -458,9 +484,14 @@ mod tests {
 
     #[test]
     fn the_seams_do_nothing_when_telemetry_is_off() {
-        agent_exited(None, Some("p1"), "a1", false, || {
-            panic!("registration is not asked with telemetry off")
-        });
+        agent_exited(
+            None,
+            Some("p1"),
+            "a1",
+            false,
+            || panic!("registration is not asked with telemetry off"),
+            || panic!("the exit code is not asked with telemetry off"),
+        );
         observe_pane_input(None, true, "p1", b"x");
         commit_spawn(None);
     }

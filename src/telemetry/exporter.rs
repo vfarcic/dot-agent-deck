@@ -45,6 +45,7 @@
 //! client waits for: see [`Telemetry::shutdown`].
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -54,6 +55,9 @@ use tokio::time::Instant;
 
 use crate::event::BroadcastMsg;
 
+use super::accounting::run_usage::UsageDirs;
+use super::accounting::usage_file::USAGE_FILE_ENV;
+use super::accounting::{UsageSource, locate, usage_source};
 use super::config::{EnvMap, TelemetryConfig, redacted_endpoint};
 use super::input::{InputFilter, LONE_ESCAPE_WINDOW};
 use super::launch::LAUNCH_ENV_KEYS;
@@ -93,6 +97,25 @@ const STOP_CLIENT_WINDOW: Duration = crate::agent_pty::DAEMON_STOP_POLL_BUDGET;
 pub const SHUTDOWN_HEADROOM: Duration = Duration::from_millis(500);
 /// Bytes of a successful answer read, at most, for its partial-success report.
 pub const MAX_RESPONSE_BODY: usize = 64 * 1024;
+/// How often each open run's usage record is read (PRD #1858), as
+/// `codex_rollout_tail` reads a rollout. A run's end reads the rest.
+pub const USAGE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// The directory, under the per-run configuration directory, that holds the
+/// usage files the deck's Pi extension and OpenCode plugin append to.
+const USAGE_DIR: &str = "usage";
+
+/// Whether `dir` exists, or could be made, as a directory only this user can
+/// enter.
+fn private_dir(dir: &Path) -> bool {
+    let made = {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(dir)
+    };
+    made.is_ok() && std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir())
+}
 
 enum ExportMsg {
     Span(Box<SpanRecord>),
@@ -478,6 +501,12 @@ impl Telemetry {
             self.host.as_deref(),
         );
         env.extend(super::launch::extra_env(&start.agent, &base));
+        let usage_dirs = self.usage_dirs(&start, spawn_env);
+        if let Some(file) = usage_dirs.usage_file.as_deref().and_then(Path::to_str) {
+            // Over any value the spawn inherited, which names another run's
+            // file: a run started from inside another agent's pane.
+            env.push((USAGE_FILE_ENV.to_string(), file.to_string()));
+        }
         // Whether or not the shim is installed: without it, an id the daemon
         // inherited from another deck's agent would reach this one (#1902).
         env.push((super::shim::RUN_ID_ENV.to_string(), start.run_id.clone()));
@@ -498,11 +527,50 @@ impl Telemetry {
             committed: false,
         };
         if let Some(exporting) = &self.exporting {
-            exporting
-                .shared
-                .with_tracker(|t| t.prepare_run(start, now_unix_nanos()));
+            let run_id = start.run_id.clone();
+            exporting.shared.with_tracker(|t| {
+                t.prepare_run(start, now_unix_nanos());
+                t.set_usage_dirs(&run_id, usage_dirs);
+            });
         }
         Some(prepared)
+    }
+
+    /// Where `start`'s agent keeps its usage record (PRD #1858), from the
+    /// spawn's own environment, else the daemon's. A Pi or OpenCode run gets
+    /// a usage file of its own, under the per-run configuration directory,
+    /// when the deck exports traces and the directory can be made; nothing
+    /// else would read it.
+    fn usage_dirs(&self, start: &RunStart, spawn_env: &[(String, String)]) -> UsageDirs {
+        let var = |key: &str| {
+            spawn_env
+                .iter()
+                .rev()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| OsString::from(v))
+                .or_else(|| std::env::var_os(key))
+        };
+        let home = var("HOME");
+        let mut dirs = UsageDirs::default();
+        match usage_source(&start.agent) {
+            UsageSource::ClaudeTranscript => {
+                dirs.claude_config =
+                    locate::claude_config_dir(var("CLAUDE_CONFIG_DIR").as_deref(), home.as_deref());
+            }
+            UsageSource::CodexRollout => {
+                dirs.codex_home = locate::codex_home(var("CODEX_HOME").as_deref(), home.as_deref());
+            }
+            UsageSource::UsageFile if self.exporting.is_some() => {
+                dirs.usage_file = self
+                    .config_dir
+                    .as_deref()
+                    .map(|dir| dir.join(USAGE_DIR))
+                    .filter(|dir| private_dir(dir))
+                    .and_then(|dir| locate::usage_file(&dir, &start.run_id));
+            }
+            UsageSource::UsageFile | UsageSource::NoChannel => {}
+        }
+        dirs
     }
 
     fn commit(&self, run: &PreparedRun) {
@@ -964,6 +1032,8 @@ const DRAIN_YIELD_EVERY: usize = 256;
 async fn run_ingest(shared: Arc<Shared>, mut commands: mpsc::UnboundedReceiver<Command>) {
     let mut events: Option<broadcast::Receiver<BroadcastMsg>> = None;
     let mut escape_due: Option<std::time::Instant> = None;
+    let mut usage_poll = tokio::time::interval(USAGE_POLL_INTERVAL);
+    usage_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             biased;
@@ -989,6 +1059,7 @@ async fn run_ingest(shared: Arc<Shared>, mut commands: mpsc::UnboundedReceiver<C
             () = sleep_until(escape_due) => {
                 escape_due = shared.settle_escapes(std::time::Instant::now());
             }
+            _ = usage_poll.tick() => shared.with_tracker(RunTracker::poll_usage),
             msg = next_event(&mut events) => match msg {
                 Ok(msg) => shared.observe(&msg),
                 Err(broadcast::error::RecvError::Lagged(missed)) => {
@@ -1951,6 +2022,58 @@ mod tests {
 
     /// The Devin configurations the shim writes for a run go when that run's
     /// agent ends, and only that run's; a stopping daemon removes the rest.
+    /// PRD #1858: a Pi or OpenCode run is handed a usage file of its own,
+    /// in a directory only this user can enter, over one it inherited from
+    /// the pane it was started from; a run of another agent is handed none.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pi_or_opencode_run_gets_its_own_usage_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("state");
+        let telemetry = Arc::new(Telemetry::start_with(
+            &env(&ON),
+            Settings {
+                config_dir: Some(dir.clone()),
+                ..Settings::default()
+            },
+        ));
+        let inherited = vec![(
+            USAGE_FILE_ENV.to_string(),
+            "/parent.usage.jsonl".to_string(),
+        )];
+        for agent in [AgentType::Pi, AgentType::OpenCode, AgentType::ClaudeCode] {
+            let start = RunStart {
+                agent: agent.clone(),
+                ..run_start("p1")
+            };
+            let run = telemetry.prepare_run(start, &inherited, None).unwrap();
+            let file = run
+                .env
+                .iter()
+                .rev()
+                .find(|(k, _)| k == USAGE_FILE_ENV)
+                .map(|(_, v)| PathBuf::from(v));
+            if agent == AgentType::ClaudeCode {
+                assert_eq!(file, None);
+                continue;
+            }
+            assert_eq!(
+                file,
+                Some(
+                    dir.join(USAGE_DIR)
+                        .join(format!("{}.usage.jsonl", run.run_id))
+                ),
+                "{agent:?}"
+            );
+        }
+        let mode = std::fs::metadata(dir.join(USAGE_DIR))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
     /// Without the shim no run is tracked.
     #[cfg(unix)]
     #[tokio::test]

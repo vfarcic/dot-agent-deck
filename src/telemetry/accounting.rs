@@ -44,6 +44,7 @@ use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
 
 pub mod claude;
 pub mod locate;
+pub mod run_usage;
 pub mod usage_file;
 
 use super::AttrKey;
@@ -4978,7 +4979,7 @@ mod tests {
                     || name == "http.response.status_code",
                 "{name}"
             );
-            let shared = AttrKey::is_allowed(name);
+            let shared = AttrKey::ALL.iter().any(|k| k.as_str() == name);
             assert_eq!(
                 shared,
                 matches!(key, AccountingKey::RunId | AccountingKey::Agent),
