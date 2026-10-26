@@ -22,7 +22,9 @@
 //! count is written as `null`, so its reply is unrecognized rather than a
 //! zero. A `turn_start` line, which the Pi extension writes when Pi starts
 //! answering a prompt, says a turn began and adds no usage, so a Pi that
-//! dies before its next reply ends mid-turn. The agents' own words for
+//! dies before its next reply ends mid-turn. A reply marked `subagent`, a
+//! subagent's session's, adds its usage and leaves the last turn as the
+//! run's own lines left it. The agents' own words for
 //! how a reply stopped and why it failed are passed through raw (`stop`,
 //! `error`) and mapped here, so a stop reason an agent upgrade adds becomes
 //! `unknown`, never a wrong outcome.
@@ -184,7 +186,11 @@ impl UsageFileSummary {
         let reply = line.reply();
         let last_turn = line.turn_end(agent);
         let lines = self.agents.entry(agent).or_default();
-        lines.last_turn = Some(last_turn);
+        // A subagent's reply counts toward the run's usage, but how it
+        // ended is not how the run's own turn did.
+        if line.subagent.as_bool() != Some(true) {
+            lines.last_turn = Some(last_turn);
+        }
         match line.id.0.as_deref().map(Ident::new) {
             None => {
                 lines.anonymous.add(reply.model, reply.tokens, reply.cost);
@@ -264,6 +270,9 @@ pub struct UsageLine {
     /// The HTTP status of the provider response that failed the reply.
     #[serde(default)]
     status: OptScalar,
+    /// `true` for a reply of a subagent's session rather than the run's own.
+    #[serde(default)]
+    subagent: OptScalar,
 }
 
 impl UsageLine {
@@ -433,6 +442,33 @@ mod tests {
         );
         assert_eq!(usage.models[0].cost, Field::Estimated(MicroUsd(200_000)));
         assert_eq!(usage.last_turn, Some(AgentTurnEnd::Completed));
+    }
+
+    /// A subagent's reply that completes while the run's own reply is still
+    /// asking for tools adds its usage but leaves the run mid-turn; a later
+    /// reply of the run's own says how the turn ended.
+    #[test]
+    fn a_subagents_reply_counts_but_does_not_end_the_turn() {
+        let parent = opencode("msg_p", 10, 0.1, r#","stop":"tool-calls""#);
+        let child = opencode("msg_c", 5, 0.1, r#","stop":"stop","subagent":true"#);
+        let reader = read(&[parent.clone(), child.clone()]);
+        let usage = reader.summary().usage(UsageAgent::OpenCode);
+        assert_eq!(usage.last_turn, Some(AgentTurnEnd::MidTurn));
+        assert_eq!(
+            usage.models[0].tokens,
+            Field::ProviderReported(Tokens {
+                input: 15,
+                output: 4,
+                cache_read: 0,
+                cache_write: 0,
+            })
+        );
+        let done = opencode("msg_p2", 1, 0.1, r#","stop":"stop""#);
+        let reader = read(&[parent, child, done]);
+        assert_eq!(
+            reader.summary().usage(UsageAgent::OpenCode).last_turn,
+            Some(AgentTurnEnd::Completed)
+        );
     }
 
     /// OpenCode's subscription zeros are unavailable, not free, and a reply

@@ -1222,6 +1222,9 @@ export const DotAgentDeckPlugin = async (ctx) => {{
       if (eventType === "message.updated") {{
         recordUsage(event?.properties?.info);
       }}
+      if (eventType === "message.part.updated") {{
+        recordUsageStep(event?.properties?.part);
+      }}
       if (
         eventType === "message.created" ||
         eventType === "message.updated"
@@ -1389,10 +1392,11 @@ export default DotAgentDeckPlugin;
 }
 
 /// PRD #1858: the plugin's half of the deck's usage file. Each update of an
-/// assistant message appends one line of named fields — its id, model, token
-/// counts, OpenCode's cost, `finish` and error type — to the file the deck
-/// names in `DOT_AGENT_DECK_USAGE_FILE`, skipping an update that changes none
-/// of them. The deck reads the last line for an id as the message's usage
+/// assistant message, and each step of one that finishes, appends one line of
+/// named fields — its id, model, token counts, OpenCode's cost, `finish` and
+/// error type — to the file the deck names in `DOT_AGENT_DECK_USAGE_FILE`,
+/// skipping an update that changes none of them. The deck reads the last
+/// line for an id as the message's usage
 /// (`telemetry::accounting::usage_file`). Nothing else from the message, its
 /// text and error message included, is written.
 ///
@@ -1401,22 +1405,50 @@ export default DotAgentDeckPlugin;
 /// the provider reports them. One that is missing or not a count is written
 /// as `null`, which the deck reads as a format it does not know, never as 0;
 /// a message whose counts are all still 0 while it has failed or not
-/// completed is written with `"reported": false`. The file is appended to
-/// only when it is safe: already there (the deck makes it), opened without
-/// following a symlink or waiting on a FIFO, and a regular file of this
-/// user's that no other user can read or write. Otherwise the line is
-/// skipped, and OpenCode carries on.
+/// completed is written with `"reported": false`.
+///
+/// A message's counts are its latest step's while its cost adds up every
+/// step's (OpenCode's `SessionProcessor`, `step-finish`), so a message that
+/// took more than one step — one retried after a step finished — would be
+/// undercounted. Each finished step's `step-finish` part carries that step's
+/// counts under an id of its own, so once one is seen the line's counts are
+/// the sum of the message's steps, each counted once however often its part
+/// is updated.
+///
+/// A message of a subagent's child session is marked `"subagent": true`: its
+/// usage is the run's, but how it ended says nothing about how the run's own
+/// turn did.
+///
+/// The file is appended to only when it is safe: already there (the deck
+/// makes it), opened without following a symlink or waiting on a FIFO, and a
+/// regular file of this user's that no other user can read or write.
+/// Otherwise the line is skipped, and OpenCode carries on; a line that was not
+/// written is written by the message's next update, even one identical to it.
 const USAGE_FILE_JS: &str = r#"// PRD #1858: each assistant message's usage, for the deck's run record.
 const USAGE_FILE = process.env.DOT_AGENT_DECK_USAGE_FILE;
 const USAGE_FILE_ON = typeof USAGE_FILE === "string" && USAGE_FILE.startsWith("/");
 const MAX_USAGE_MESSAGES = 256;
-const usageWritten = new Map();
+const MAX_USAGE_STEPS = 256;
+// Message id -> { info, steps, written }: its latest update, its finished
+// steps' counts by part id, and the line last written for it.
+const usageMessages = new Map();
+const USAGE_COUNTS = [["input"], ["output"], ["reasoning"], ["cache", "read"], ["cache", "write"]];
 const usageCount = (value) =>
   typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
 const usageName = (value) =>
   typeof value === "string" && /^[A-Za-z0-9._:/@+-]{1,128}$/.test(value) ? value : undefined;
 const usageRecord = (value) =>
   typeof value === "object" && value !== null && !Array.isArray(value) ? value : undefined;
+const usageMessage = (id) => {
+  const message = usageMessages.get(id) ?? { info: undefined, steps: new Map(), written: undefined };
+  usageMessages.delete(id);
+  usageMessages.set(id, message);
+  if (usageMessages.size > MAX_USAGE_MESSAGES) {
+    usageMessages.delete(usageMessages.keys().next().value);
+  }
+  return message;
+};
+// Whether the whole line was written.
 const appendUsageLine = (text) => {
   const flags =
     fsConstants.O_WRONLY | fsConstants.O_APPEND | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0);
@@ -1424,26 +1456,47 @@ const appendUsageLine = (text) => {
   try {
     fd = openSync(USAGE_FILE, flags);
   } catch {
-    return;
+    return false;
   }
   try {
     const stat = fstatSync(fd);
     const own = typeof process.getuid !== "function" || stat.uid === process.getuid();
-    if (stat.isFile() && own && (stat.mode & 0o077) === 0) writeSync(fd, text + "\n");
+    if (!stat.isFile() || !own || (stat.mode & 0o077) !== 0) return false;
+    const line = Buffer.from(text + "\n");
+    return writeSync(fd, line) === line.length;
   } catch {
     // The run's usage is then not recorded; OpenCode carries on.
+    return false;
   } finally {
     closeSync(fd);
   }
 };
-const recordUsage = (info) => {
-  if (!USAGE_FILE_ON || info?.role !== "assistant") return;
+// The sum of a message's finished steps' counts, in the shape of a
+// message's `tokens`; a count some step lacks, or every count when a step
+// could not be told apart from the others, is left out.
+const usageStepTotal = (steps) => {
+  const total = { cache: {} };
+  for (const path of USAGE_COUNTS) {
+    let sum = 0;
+    for (const step of steps.values()) {
+      const count = usageCount(path.reduce((value, key) => usageRecord(value)?.[key], step));
+      sum = count === null || sum === null ? null : sum + count;
+    }
+    if (sum !== null && Number.isSafeInteger(sum)) {
+      if (path.length === 1) total[path[0]] = sum;
+      else total.cache[path[1]] = sum;
+    }
+  }
+  return total;
+};
+const usageLine = (info, steps) => {
   const id = usageName(info.id);
   const line = { v: 1, type: "reply", agent: "opencode" };
   if (id !== undefined) line.id = id;
   const model = usageName(info.modelID);
   if (model !== undefined) line.model = model;
-  const tokens = usageRecord(info.tokens);
+  if (isChildSession(info.sessionID)) line.subagent = true;
+  const tokens = steps === undefined || steps.size === 0 ? usageRecord(info.tokens) : usageStepTotal(steps);
   const cache = usageRecord(tokens?.cache);
   const counts = {
     input: usageCount(tokens?.input),
@@ -1471,16 +1524,39 @@ const recordUsage = (info) => {
   if (error !== undefined) line.error = error;
   const status = info.error?.data?.statusCode;
   if (Number.isInteger(status) && status >= 100 && status <= 599) line.status = status;
-  const text = JSON.stringify(line);
-  if (id !== undefined) {
-    if (usageWritten.get(id) === text) return;
-    usageWritten.delete(id);
-    usageWritten.set(id, text);
-    if (usageWritten.size > MAX_USAGE_MESSAGES) {
-      usageWritten.delete(usageWritten.keys().next().value);
-    }
+  return JSON.stringify(line);
+};
+const writeUsage = (message) => {
+  const text = usageLine(message.info, message.steps);
+  if (message.written === text) return;
+  if (appendUsageLine(text)) message.written = text;
+};
+const recordUsage = (info) => {
+  if (!USAGE_FILE_ON || info?.role !== "assistant") return;
+  const id = usageName(info.id);
+  if (id === undefined) {
+    appendUsageLine(usageLine(info, undefined));
+    return;
   }
-  appendUsageLine(text);
+  const message = usageMessage(id);
+  message.info = info;
+  writeUsage(message);
+};
+// A finished step of an assistant message (a `step-finish` part).
+const recordUsageStep = (part) => {
+  if (!USAGE_FILE_ON || part?.type !== "step-finish") return;
+  const id = usageName(part.messageID);
+  if (id === undefined) return;
+  const message = usageMessage(id);
+  const step = usageName(part.id);
+  if (step === undefined || (!message.steps.has(step) && message.steps.size >= MAX_USAGE_STEPS)) {
+    // A step that cannot be told apart from the others: the message's
+    // counts are not known.
+    message.steps.set(undefined, undefined);
+  } else {
+    message.steps.set(step, part.tokens);
+  }
+  if (message.info !== undefined) writeUsage(message);
 };
 "#;
 
@@ -4706,6 +4782,126 @@ process.exit(0);
         let missing = dir.path().join("missing.usage.jsonl");
         run(&missing);
         assert!(!missing.exists());
+    }
+
+    /// PRD #1858: what the plugin writes, as the deck's reader takes it. A
+    /// subagent's reply that completes while the main session's reply is
+    /// still asking for tools adds its usage but leaves the run mid-turn. A
+    /// message that took two steps counts both steps' tokens, each once,
+    /// though OpenCode's message holds only the latest step's. And an update
+    /// whose line could not be written — the file briefly readable by others
+    /// — is written when the same update comes again.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_plugin_usage_counts_subagents_steps_and_retries() {
+        use crate::telemetry::accounting::usage_file::{UsageAgent, UsageFileReader};
+        use crate::telemetry::accounting::{AgentTurnEnd, Field, Tokens};
+        use std::os::unix::fs::OpenOptionsExt as _;
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (recorder, _controls) = inbox_recorder(dir.path());
+        let plugin = dir.path().join("dot-agent-deck.mjs");
+        std::fs::write(&plugin, plugin_template(&recorder.to_string_lossy())).unwrap();
+        let usage = dir.path().join("run.usage.jsonl");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&usage)
+            .unwrap();
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                r#"import {{ chmodSync }} from "fs";
+const {{ default: plugin }} = await import("{}");
+const hooks = await plugin({{ directory: "/work", client: {{}} }});
+const send = (type, properties) => hooks.event({{ event: {{ type, properties }} }});
+const updated = (info) => send("message.updated", {{ info }});
+const step = (id, messageID, tokens) =>
+  send("message.part.updated", {{ part: {{ id, messageID, sessionID: "root", type: "step-finish", reason: "stop", cost: 0.01, tokens }} }});
+const tokens = (input, output, reasoning, read, write) => ({{ input, output, reasoning, cache: {{ read, write }} }});
+const reply = (id, sessionID, finish, cost, counts) => ({{ id, sessionID, role: "assistant", modelID: "gpt-5.4-mini",
+  time: {{ created: 1, completed: 2 }}, finish, cost, tokens: counts }});
+await send("session.created", {{ sessionID: "root", info: {{ id: "root", directory: "/work" }} }});
+await send("session.created", {{ sessionID: "child", info: {{ id: "child", parentID: "root", directory: "/work" }} }});
+// A reply of the main session asking for tools, then a subagent's that completes.
+await updated(reply("msg_p", "root", "tool-calls", 0.1, tokens(10, 2, 0, 0, 0)));
+await updated(reply("msg_c", "child", "stop", 0.1, tokens(5, 2, 0, 0, 0)));
+// Two steps of one message, the first step's part updated twice.
+const first = tokens(100, 10, 0, 5, 1);
+const second = tokens(50, 4, 2, 0, 0);
+await step("prt_1", "msg_s", first);
+await updated(reply("msg_s", "root", "tool-calls", 0.01, first));
+await step("prt_1", "msg_s", first);
+await step("prt_2", "msg_s", second);
+await updated(reply("msg_s", "root", "tool-calls", 0.02, second));
+// A write that fails, then the same update again.
+const retried = reply("msg_r", "root", "tool-calls", 0.1, tokens(7, 1, 0, 0, 0));
+chmodSync(process.env.DOT_AGENT_DECK_USAGE_FILE, 0o644);
+await updated(retried);
+chmodSync(process.env.DOT_AGENT_DECK_USAGE_FILE, 0o600);
+await updated(retried);
+await updated(retried);
+process.exit(0);
+"#,
+                plugin.display()
+            ),
+        )
+        .unwrap();
+        let out = std::process::Command::new("node")
+            .arg(&driver)
+            .env("DOT_AGENT_DECK_USAGE_FILE", &usage)
+            .env("DOT_AGENT_DECK_INBOX_WATCHER_BACKOFF_MS", "3600000")
+            .output()
+            .expect("run node");
+        assert!(out.status.success(), "{out:?}");
+        let written = std::fs::read_to_string(&usage).unwrap();
+        let lines: Vec<serde_json::Value> = written
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let of = |id: &str| -> Vec<&serde_json::Value> {
+            lines.iter().filter(|l| l["id"] == id).collect()
+        };
+        assert_eq!(of("msg_c")[0]["subagent"], true, "{written}");
+        assert!(of("msg_p")[0].get("subagent").is_none(), "{written}");
+        let last = of("msg_s").last().copied().unwrap();
+        assert_eq!(
+            (
+                &last["input"],
+                &last["output"],
+                &last["cache_read"],
+                &last["cache_write"]
+            ),
+            (
+                &serde_json::json!(150),
+                &serde_json::json!(16),
+                &serde_json::json!(5),
+                &serde_json::json!(1)
+            ),
+            "{written}"
+        );
+        assert_eq!(last["cost_usd"], 0.02, "{written}");
+        assert_eq!(of("msg_r").len(), 1, "{written}");
+
+        let mut reader = UsageFileReader::new(&usage);
+        reader.poll().unwrap();
+        let read = reader.summary().usage(UsageAgent::OpenCode);
+        assert_eq!(read.last_turn, Some(AgentTurnEnd::MidTurn));
+        assert_eq!(
+            read.models[0].tokens,
+            Field::ProviderReported(Tokens {
+                // The deck's input count includes the cache.
+                input: 10 + 5 + (150 + 5 + 1) + 7,
+                output: 2 + 2 + 16 + 1,
+                cache_read: 5,
+                cache_write: 1,
+            })
+        );
     }
 
     /// PRD #1666 §2–§4: drive the shared receipt receiver against a fake

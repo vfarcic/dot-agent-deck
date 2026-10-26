@@ -364,11 +364,14 @@ impl RunUsage {
         let mut usage = self.usage(&readers);
         let lost = lock(&inner.inbox).lost;
         if readers.backlogged() || lost || readers.unfinished() {
+            // Records were left unread — a session past the cap, a backlog
+            // the drain did not reach, a line cut off — and any of them may
+            // have been the run's last turn or a later allowance sample.
             usage.models = usage_unavailable(Unavailable::Incomplete);
-        }
-        if readers.unfinished() {
-            // The agent's last record was cut off: it may have been the turn.
             usage.last_turn = Some(AgentTurnEnd::Unknown);
+            if !matches!(usage.quota, Field::Unavailable(Unavailable::NoChannel)) {
+                usage.quota = Field::Unavailable(Unavailable::Incomplete);
+            }
         }
         if let Some(file) = &inner.dirs.usage_file {
             file.dir.remove(Path::new(&file.name).as_os_str());
@@ -1142,6 +1145,86 @@ mod tests {
         append(&config.path().join("projects/-w/s-0.jsonl"), &[COST_STATE]);
         let run = exported(&usage.finish("run17", EndReason::Exited, None));
         assert_eq!(run["deck.tokens.unavailable_reason"], text("incomplete"));
+    }
+
+    /// A session past [`MAX_SESSIONS`] may hold the run's last turn: with
+    /// every session the run did read ending completed, the run's ending is
+    /// still unknown, not the last read session's.
+    #[test]
+    fn a_session_past_the_cap_leaves_the_ending_unknown() {
+        for dropped in [false, true] {
+            let config = tempfile::tempdir().unwrap();
+            let usage = RunUsage::new(&AgentType::ClaudeCode, claude_dirs(config.path()), 0);
+            let sessions = if dropped {
+                MAX_SESSIONS + 1
+            } else {
+                MAX_SESSIONS
+            };
+            for n in 0..sessions {
+                let id = format!("s-{n}");
+                usage.observe(&claude_event(&id, "/w"));
+                if n < MAX_SESSIONS {
+                    append(
+                        &config.path().join(format!("projects/-w/{id}.jsonl")),
+                        &[
+                            r#"{"type":"assistant","message":{"model":"claude-haiku-5-5","stop_reason":"end_turn","content":[]}}"#,
+                            COST_STATE,
+                        ],
+                    );
+                }
+            }
+            let run = exported(&usage.finish("run22", EndReason::Exited, None));
+            let ending = if dropped { "unknown" } else { "completed" };
+            assert_eq!(
+                run["deck.run.last_turn"],
+                text(ending),
+                "dropped: {dropped}"
+            );
+            assert_eq!(
+                run["deck.run.termination"],
+                text(ending),
+                "dropped: {dropped}"
+            );
+        }
+    }
+
+    /// A Codex rollout with more left unread than the end-of-run drain
+    /// reaches may hold later allowance samples and the run's last turn: its
+    /// allowance is incomplete and its ending unknown, not what the read
+    /// part said.
+    #[test]
+    fn a_backlog_left_after_the_drain_leaves_allowance_and_ending_unknown() {
+        let sample = r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}},"rate_limits":{"plan_type":"pro","primary":{"used_percent":1.0,"window_minutes":300,"resets_at":1790500000}}}}"#;
+        let done = r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#;
+        let budget = 1024;
+        for backlogged in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let rollout = home.path().join("sessions/2026/10/26/rollout-big.jsonl");
+            append(&rollout, &[sample, done]);
+            let usage = RunUsage::new(&AgentType::Codex, codex_dirs(home.path()), 0);
+            usage.observe(&codex_event(&rollout));
+            usage.poll();
+            {
+                let mut readers = lock(&usage.inner.readers);
+                let session = &mut readers.codex[0];
+                let reader = session.reader.take().expect("the rollout was found");
+                session.reader = Some(reader.with_poll_budget(budget));
+            }
+            if backlogged {
+                let filler = vec![CODEX_TOTAL; MAX_DRAIN_POLLS * budget as usize / 64];
+                append(&rollout, &filler);
+            }
+            let run = exported(&usage.finish("run23", EndReason::Exited, None));
+            if backlogged {
+                assert_eq!(run["deck.quota.unavailable_reason"], text("incomplete"));
+                assert!(!run.contains_key("deck.quota.used_from_bp"));
+                assert_eq!(run["deck.run.last_turn"], text("unknown"));
+                assert_eq!(run["deck.tokens.unavailable_reason"], text("incomplete"));
+            } else {
+                assert!(run.contains_key("deck.quota.used_from_bp"), "{run:?}");
+                assert_eq!(run["deck.run.last_turn"], text("completed"));
+            }
+        }
     }
 
     /// The card-surface events the deck makes for a pane, filed under its

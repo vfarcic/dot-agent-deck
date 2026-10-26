@@ -633,8 +633,8 @@ impl<'de> Deserialize<'de> for StopReason {
 }
 
 /// `modelUsage`: per model, its four token counts and cost. `None` when it
-/// is not an object of objects each with an input and an output count, so a
-/// changed format is unreadable rather than read as zero. Past
+/// is not an object of objects each with all four counts, so a changed
+/// format is unreadable rather than read as zero. Past
 /// [`super::MAX_MODELS`] named models, usage is credited to no model.
 pub struct ModelUsageMap(Option<BTreeMap<Option<Ident>, ModelTotal>>);
 
@@ -730,12 +730,11 @@ impl<'de> Deserialize<'de> for ModelUsageMap {
                         readable = false;
                         continue;
                     };
-                    let cache = |v: &OptScalar| match v {
-                        OptScalar::Other => Some(0),
-                        v => v.count(),
-                    };
+                    // Claude Code writes both cache counts on every entry,
+                    // 0 included, so one that is missing, `null` or not a
+                    // count is a changed format, as a missing input is.
                     let (Some(cache_read), Some(cache_write)) =
-                        (cache(&entry.cache_read), cache(&entry.cache_write))
+                        (entry.cache_read.count(), entry.cache_write.count())
                     else {
                         readable = false;
                         continue;
@@ -1062,7 +1061,8 @@ mod tests {
     }
 
     /// A total in a shape the reader does not know — a renamed count, a
-    /// count that is not a number, `modelUsage` that is not an object — is
+    /// count that is `null` or not a number, cache counts included,
+    /// `modelUsage` that is not an object — is
     /// unrecognized, never zero; so is a total line that does not parse.
     #[test]
     fn a_changed_format_is_unrecognized_not_zero() {
@@ -1073,6 +1073,27 @@ mod tests {
                 .replace(r#""inputTokens":10"#, r#""inputTokens":"10""#),
             r#"{"type":"cost-state","modelUsage":[1,2]}"#.to_owned(),
             r#"{"type":"cost-state","modelUsage":{"claude-opus-5-5":7}}"#.to_owned(),
+            // A cache count renamed, `null`, or of another type.
+            cost_state(&[("claude-opus-5-5", 10, 20, 5, 0, 1.0)])
+                .replace("cacheReadInputTokens", "cacheReadTokens"),
+            cost_state(&[("claude-opus-5-5", 10, 20, 5, 0, 1.0)])
+                .replace("cacheCreationInputTokens", "cacheWriteTokens"),
+            cost_state(&[("claude-opus-5-5", 10, 20, 5, 0, 1.0)]).replace(
+                r#""cacheReadInputTokens":5"#,
+                r#""cacheReadInputTokens":null"#,
+            ),
+            cost_state(&[("claude-opus-5-5", 10, 20, 5, 0, 1.0)]).replace(
+                r#""cacheCreationInputTokens":0"#,
+                r#""cacheCreationInputTokens":{"ephemeral":3}"#,
+            ),
+            cost_state(&[("claude-opus-5-5", 10, 20, 5, 0, 1.0)]).replace(
+                r#""cacheReadInputTokens":5"#,
+                r#""cacheReadInputTokens":[5]"#,
+            ),
+            cost_state(&[("claude-opus-5-5", 10, 20, 5, 0, 1.0)]).replace(
+                r#""cacheReadInputTokens":5"#,
+                r#""cacheReadInputTokens":"5""#,
+            ),
         ] {
             let reader = read(std::slice::from_ref(&changed));
             assert_eq!(

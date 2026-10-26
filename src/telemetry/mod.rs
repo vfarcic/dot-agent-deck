@@ -564,9 +564,17 @@ mod tests {
     /// PRD #1858: a daemon that ends without reading its runs' usage files —
     /// crashed, or killed — leaves them, and the next daemon to start on the
     /// same state directory removes them before it has a run of its own.
+    ///
+    /// A plain test with a runtime of its own, entered, rather than an async
+    /// one: its file work then runs on the test's thread, outside any task.
     #[cfg(unix)]
-    #[tokio::test]
-    async fn a_crashed_daemons_usage_files_go_when_the_next_one_starts() {
+    #[test]
+    fn a_crashed_daemons_usage_files_go_when_the_next_one_starts() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
         let dir = tempfile::tempdir().unwrap();
         let (event_tx, _) = tokio::sync::broadcast::channel(8);
         let registry = crate::agent_pty::AgentPtyRegistry::new();
@@ -614,7 +622,7 @@ mod tests {
             &registry,
         );
         assert!(!file.exists(), "left over after a restart");
-        next.shutdown(std::time::Duration::from_millis(100)).await;
+        runtime.block_on(next.shutdown(std::time::Duration::from_millis(100)));
     }
 
     /// A Devin configuration a crashed or SIGKILLed daemon left behind is
