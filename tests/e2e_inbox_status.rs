@@ -41,6 +41,8 @@ fn attention_header(deck: &common::TuiDeck) -> String {
 }
 
 fn assert_orchestrator_attention(deck: &common::TuiDeck, reason: &str) {
+    let words: Value = serde_json::from_str(include_str!("fixtures/inbox-display.json")).unwrap();
+    let glyph = words["glyph"].as_str().unwrap();
     // Keep the labelled-count grammar identical to InboxWakeAttention.test.tsx.
     let one_other_held = regex::Regex::new(
         r"(?i)(?:^|[^a-z0-9_])(?:1\s+(?:other|held|blocked)|(?:other|held|blocked)\s*:?\s*1)(?:$|[^a-z0-9_])",
@@ -52,14 +54,16 @@ fn assert_orchestrator_attention(deck: &common::TuiDeck, reason: &str) {
             let label = header.to_ascii_lowercase();
             label.contains("orchestrator")
                 && header.contains(reason)
+                && header.contains(glyph)
                 && one_other_held.is_match(&header)
+                && !label.contains("coder")
         }),
         "deck-wide attention must name the held orchestrator, explain its hold and count one other held recipient outside its card; grid:\n{}",
         deck.snapshot_grid()
     );
 }
 
-/// Scenario: A worker reports to an orchestrator whose input holds an unsent draft, while one other recipient is held too. The real attached TUI must name the orchestrator and count the other recipient in its header even on another tab, retain that attention across detach/reattach and tab switches, then clear it after the user clears the draft and the report is taken.
+/// Scenario: A worker reports to an orchestrator whose input holds an unsent draft, while one other recipient is held too. The real attached TUI must show the envelope glyph, name the orchestrator and count the other recipient without worker detail in its header even on another tab, retain that attention across detach/reattach and tab switches, then clear it after the user clears the draft and the report is taken.
 #[spec("inbox/status/031")]
 #[test]
 fn status_031_orchestrator_attention_survives_tabs_and_reattach() {
