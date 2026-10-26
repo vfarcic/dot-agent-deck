@@ -1882,9 +1882,9 @@ thread_local! {
 
 /// Run `f`, and say whether it changed an agent's config, by whether it logged
 /// a change through [`log_auto_install_change`] on this thread (PRD #91: the
-/// TUI's note that its startup install changed the hooks). Every automatic
-/// install logs its changes there, so this needs nothing from the installers.
-/// A change made inside a nested call counts for the outer one too.
+/// TUI's note that its startup install changed the hooks), or counted one
+/// through [`note_config_change`]. A change made inside a nested call counts
+/// for the outer one too.
 pub(crate) fn noting_auto_install_changes<R>(f: impl FnOnce() -> R) -> (R, bool) {
     struct Restore(Option<usize>);
     impl Drop for Restore {
@@ -1900,6 +1900,14 @@ pub(crate) fn noting_auto_install_changes<R>(f: impl FnOnce() -> R) -> (R, bool)
     (result, changed)
 }
 
+/// Count a write to an agent's config for [`noting_auto_install_changes`],
+/// for a write that [`log_auto_install_change`] does not log: Codex's trust
+/// records and OpenCode's TUI plugin (Greptile and Qodo on PR #1925). Counts
+/// nothing outside a scope, so an explicit `hooks install` is unaffected.
+pub(crate) fn note_config_change() {
+    CHANGES_NOTED.with(|c| c.set(c.get().map(|n| n + 1)));
+}
+
 /// Log an automatic install that actually changed an agent's config (PRD
 /// #1487). A no-op logs nothing at info: what this records is that the deck
 /// rewrote somebody else's file, which is exactly what went unnoticed when test
@@ -1910,7 +1918,7 @@ pub(crate) fn log_auto_install_change(
     binary: &str,
     trigger: &str,
 ) {
-    CHANGES_NOTED.with(|c| c.set(c.get().map(|n| n + 1)));
+    note_config_change();
     tracing::info!(
         agent,
         destination = %destination.display(),

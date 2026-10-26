@@ -2539,6 +2539,7 @@ fn install_tui_half(root: &Path, pin: Option<&str>) -> std::io::Result<TuiEntry>
         let content = tui_plugin_template(pin);
         if std::fs::read(&file).ok().as_deref() != Some(content.as_bytes()) {
             crate::agent_hook_config::write_atomic(root, &file, content.as_bytes())?;
+            crate::agent_hook_config::note_config_change();
         }
     }
     let entry = file.to_string_lossy().into_owned();
@@ -2577,6 +2578,7 @@ fn install_tui_half(root: &Path, pin: Option<&str>) -> std::io::Result<TuiEntry>
         return Ok(TuiEntry::Refused(target, CHANGED_DURING_EDIT.to_string()));
     }
     crate::agent_hook_config::write_atomic(root, &target, updated.as_bytes())?;
+    crate::agent_hook_config::note_config_change();
     Ok(TuiEntry::Added(target))
 }
 
@@ -4199,6 +4201,26 @@ await hooks.event({{ event: {{ type: "session.error", properties: {{ sessionID: 
             (runs * per_run, per_run),
             "absolute: only the named binary"
         );
+    }
+
+    /// PRD #91 (Greptile and Qodo on PR #1925): writing the TUI plugin and
+    /// adding it to a TUI config is a change the TUI's startup note counts; a
+    /// pass that writes nothing (no pin to write, a config it will not edit)
+    /// is not.
+    #[test]
+    fn opencode_tui_half_writes_count_as_a_change_and_a_refusal_does_not() {
+        let root = tempfile::tempdir().unwrap();
+        let (first, changed) = crate::agent_hook_config::noting_auto_install_changes(|| {
+            install_tui_half(root.path(), Some("/opt/dot-agent-deck")).unwrap()
+        });
+        assert!(matches!(first, TuiEntry::Added(_)) && changed);
+
+        let refused = tempfile::tempdir().unwrap();
+        std::fs::write(refused.path().join(TUI_CONFIG_FILES[0]), "{ not json").unwrap();
+        let (again, changed) = crate::agent_hook_config::noting_auto_install_changes(|| {
+            install_tui_half(refused.path(), None).unwrap()
+        });
+        assert!(matches!(again, TuiEntry::Refused(_, _)) && !changed);
     }
 
     /// Hardening M5: the TUI config is edited under the same cross-process
