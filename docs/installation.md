@@ -35,6 +35,8 @@ brew install dot-agent-deck
 
 Pre-releases are published as a separate formula, `vfarcic/tap/dot-agent-deck-beta`. The two formulas conflict with each other, so uninstall one before installing the other.
 
+On Linux, either formula also installs `dot-agent-deck-collector`, the optional program that reports each run's CPU, memory and disk ([CPU, memory and disk per run](telemetry.md#cpu-memory-and-disk-per-run)). It does nothing until you start it.
+
 ## Download Binary
 
 Release assets are named `dot-agent-deck-<os>-<arch>`:

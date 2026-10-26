@@ -1,9 +1,11 @@
-//! PRD #633, discovery milestone 4: a narrow prototype of the execution
-//! record, following `docs/develop/execution-accounting.md`. It is compiled
-//! for tests only (`#[cfg(test)]` in `src/telemetry/mod.rs`), so it is no
-//! product API and ships in no release build; wiring it to a live run, and
-//! dropping that `cfg(test)`, is the follow-up PRD's first step. Nothing here
-//! locates, watches or tails a file by itself.
+//! The execution record: what an agent run consumed and how it ended. PRD
+//! #633's discovery milestone 4 prototyped it, following
+//! `docs/develop/execution-accounting.md`; PRD #1858 wires its run half to
+//! live runs: [`run_usage::RunUsage`] reads each run's usage record from the
+//! paths [`locate`] builds or admits, and the run tracker exports the result
+//! on the run's span through [`run_attributes`]. The work-item and roll-up
+//! halves ([`WorkItemRecord`], [`rollup`], [`work_item_attributes`]) are
+//! still the prototype's, for #1860, and no product path calls them yet.
 //!
 //! * **Provenance on every value** ([`Field`]): measured, provider-reported,
 //!   estimated, agent-asserted, or unavailable with a reason. Unavailable is a
@@ -19,11 +21,12 @@
 //!   structs, to one shape ([`AgentUsage`]): [`from_claude`], [`from_codex`],
 //!   [`from_pi`], [`from_opencode`]. No input struct has a field that could
 //!   hold a prompt, a reply, a tool's input or output, or file content.
-//! * **Local capture** of one agent's store ([`CodexUsageReader`]): a bounded,
-//!   incremental reader of a Codex rollout at a path it is given, reading only
-//!   bytes appended since its last poll, deserialising only lines that contain
-//!   one of five marker words, and keeping only the model, usage, quota and
-//!   turn-end fields of the record types that carry them.
+//! * **Local capture** ([`JsonlReader`]): a bounded, incremental reader of one
+//!   agent's record — a Codex rollout ([`CodexUsageReader`]), a Claude Code
+//!   transcript ([`claude`]) or the deck's own usage file ([`usage_file`]) —
+//!   reading only bytes appended since its last poll, deserialising only
+//!   lines that contain one of its marker words, and keeping only the usage,
+//!   quota and turn-end fields of the record types that carry them.
 //! * **Aggregation** ([`rollup`]) of runs to a work item or an orchestration,
 //!   without counting a run twice, a Claude Code subagent inside its parent's
 //!   total, or money of different provenance as one number.
@@ -41,6 +44,11 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
+
+pub mod claude;
+pub mod locate;
+pub mod run_usage;
+pub mod usage_file;
 
 use super::AttrKey;
 use super::ci::CiState;
@@ -106,6 +114,10 @@ pub enum Unavailable {
     RunNotEnded,
     /// The run serves no known work item.
     NoWorkItem,
+    /// The agent's record is there but not in a shape the reader knows, as
+    /// after an upgrade changed an undocumented format: the reader gives up
+    /// on the value rather than guess it.
+    UnrecognizedFormat,
 }
 
 impl Unavailable {
@@ -121,6 +133,7 @@ impl Unavailable {
             Unavailable::QuotaDecreased => "quota_decreased",
             Unavailable::RunNotEnded => "run_not_ended",
             Unavailable::NoWorkItem => "no_work_item",
+            Unavailable::UnrecognizedFormat => "unrecognized_format",
         }
     }
 }
@@ -323,11 +336,13 @@ impl RunTermination {
 }
 
 /// A run's termination with the kind of its failure, when the agent named one
-/// (`error.type`).
+/// (`error.type`), and the HTTP status of the provider's response that failed
+/// it, when the agent recorded one (`http.response.status_code`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Termination {
     pub outcome: RunTermination,
     pub error_type: Option<Ident>,
+    pub http_status: Option<u16>,
 }
 
 /// What an agent's own record says about its last turn. It is the last
@@ -336,9 +351,11 @@ pub struct Termination {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentTurnEnd {
     Completed,
-    /// `kind` is the agent's error identifier, never its message.
+    /// `kind` is the agent's error identifier, never its message; `status`
+    /// the HTTP status of the provider's response, when the agent kept one.
     Failed {
         kind: Option<Ident>,
+        status: Option<u16>,
     },
     Interrupted,
     /// The record ends inside a turn, for example on a reply that asked for a
@@ -379,11 +396,13 @@ pub fn run_termination(end: Option<EndReason>, agent: Option<&AgentTurnEnd>) -> 
     let of = |outcome| Termination {
         outcome,
         error_type: None,
+        http_status: None,
     };
     match agent {
-        Some(AgentTurnEnd::Failed { kind }) => Field::ProviderReported(Termination {
+        Some(AgentTurnEnd::Failed { kind, status }) => Field::ProviderReported(Termination {
             outcome: RunTermination::Failed,
             error_type: kind.clone(),
+            http_status: *status,
         }),
         Some(AgentTurnEnd::Interrupted) => Field::ProviderReported(of(RunTermination::Interrupted)),
         Some(AgentTurnEnd::Completed) => Field::ProviderReported(of(RunTermination::Completed)),
@@ -395,6 +414,70 @@ pub fn run_termination(end: Option<EndReason>, agent: Option<&AgentTurnEnd>) -> 
         Some(AgentTurnEnd::MidTurn | AgentTurnEnd::Unknown) | None => {
             Field::Measured(of(RunTermination::Unknown))
         }
+    }
+}
+
+/// How a run of an arbitrary command ended, from what the deck itself saw
+/// (measured): an exit status of 0 completed it, any other failed it
+/// (`error.type` `nonzero_exit`), a pane the deck closed or a daemon that shut
+/// down interrupted it, and an exit with no status (a signal) or an end the
+/// deck could not tell is unknown. An agent's exit status says nothing about
+/// its turns, which is why [`run_termination`] does not read it.
+pub fn command_termination(end: Option<EndReason>, exit_code: Option<i32>) -> Field<Termination> {
+    let outcome = match (end, exit_code) {
+        (None, _) => return Field::Unavailable(Unavailable::RunNotEnded),
+        (Some(EndReason::Exited), Some(0)) => RunTermination::Completed,
+        (Some(EndReason::Exited), Some(_)) => {
+            return Field::Measured(Termination {
+                outcome: RunTermination::Failed,
+                error_type: Ident::new("nonzero_exit"),
+                http_status: None,
+            });
+        }
+        (Some(EndReason::Closed | EndReason::DaemonShutdown), _) => RunTermination::Interrupted,
+        (Some(EndReason::Exited | EndReason::Unknown), _) => RunTermination::Unknown,
+    };
+    Field::Measured(Termination {
+        outcome,
+        error_type: None,
+        http_status: None,
+    })
+}
+
+/// Where the deck reads a run's usage and last turn from, per agent (the
+/// design in `docs/develop/telemetry.md`, "Usage and how a run ended"). The
+/// agents' own OpenTelemetry goes from each agent straight to the user's
+/// backend, so the deck reads none of it; each source below is a local
+/// record of the agent's own usage figures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageSource {
+    /// Claude Code's transcript, at the path [`locate::claude_transcript`]
+    /// builds from the session id and directory its hooks report; read with
+    /// [`claude::ClaudeTranscriptReader`].
+    ClaudeTranscript,
+    /// Codex's rollout, at the path its hooks report, once
+    /// [`locate::admit_codex_rollout`] admits it; read with
+    /// [`CodexUsageReader`].
+    CodexRollout,
+    /// The deck's own usage file for the run, which the deck's Pi extension
+    /// and OpenCode plugin append each reply's usage to; read with
+    /// [`usage_file::UsageFileReader`].
+    UsageFile,
+    /// None: the run's usage is [`Unavailable::NoChannel`] ([`no_usage_channel`]).
+    NoChannel,
+}
+
+/// The [`UsageSource`] for a run of `agent`. Devin's own telemetry is
+/// documented to carry token counts, but the deck receives none of it and
+/// found no local record of Devin's usage, so a Devin run has no channel;
+/// nor has an arbitrary command.
+pub fn usage_source(agent: &crate::event::AgentType) -> UsageSource {
+    use crate::event::AgentType;
+    match agent {
+        AgentType::ClaudeCode => UsageSource::ClaudeTranscript,
+        AgentType::Codex => UsageSource::CodexRollout,
+        AgentType::Pi | AgentType::OpenCode => UsageSource::UsageFile,
+        AgentType::Devin | AgentType::None => UsageSource::NoChannel,
     }
 }
 
@@ -589,15 +672,28 @@ fn add_tokens(sum: Field<Tokens>, next: Field<Tokens>) -> Field<Tokens> {
     }
 }
 
-/// Usage per model from per-reply (or per-model) entries, each with its
-/// tokens and cost already classified: tokens combined by [`add_tokens`],
-/// costs by [`add_cost`], at most [`MAX_MODELS`] named models.
-fn per_model(
-    entries: impl IntoIterator<Item = (Option<Ident>, Field<Tokens>, Field<MicroUsd>)>,
-) -> Vec<ModelUsage> {
-    let mut by_model: BTreeMap<Option<Ident>, (Field<Tokens>, Field<MicroUsd>)> = BTreeMap::new();
-    for (model, tokens, cost) in entries {
-        match by_model.entry(capped(&by_model, model)) {
+/// Usage per model, folded one per-reply (or per-model) entry at a time,
+/// each with its tokens and cost already classified: tokens combined by
+/// [`add_tokens`], costs by [`add_cost`], at most [`MAX_MODELS`] named models.
+/// It holds one entry per model, however many replies it folds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UsageAcc {
+    by_model: BTreeMap<Option<Ident>, (Field<Tokens>, Field<MicroUsd>)>,
+}
+
+impl UsageAcc {
+    /// Fold one entry in. Returns `false` when its model was named but
+    /// [`MAX_MODELS`] others already were, so it was credited to no model.
+    pub fn add(
+        &mut self,
+        model: Option<Ident>,
+        tokens: Field<Tokens>,
+        cost: Field<MicroUsd>,
+    ) -> bool {
+        let named = model.is_some();
+        let key = capped(&self.by_model, model);
+        let kept = key.is_some() || !named;
+        match self.by_model.entry(key) {
             Entry::Vacant(entry) => {
                 entry.insert((tokens, cost));
             }
@@ -607,18 +703,87 @@ fn per_model(
                 *sum_cost = add_cost(*sum_cost, cost);
             }
         }
+        kept
     }
-    if by_model.is_empty() {
-        return usage_unavailable(Unavailable::NotRecorded);
+
+    pub fn is_empty(&self) -> bool {
+        self.by_model.is_empty()
     }
-    by_model
-        .into_iter()
-        .map(|(model, (tokens, cost))| ModelUsage {
-            model,
-            tokens,
-            cost,
-        })
-        .collect()
+
+    /// The models folded so far; with none, one entry whose usage is
+    /// [`Unavailable::NotRecorded`].
+    pub fn finish(&self) -> Vec<ModelUsage> {
+        if self.by_model.is_empty() {
+            return usage_unavailable(Unavailable::NotRecorded);
+        }
+        self.by_model
+            .iter()
+            .map(|(model, (tokens, cost))| ModelUsage {
+                model: model.clone(),
+                tokens: *tokens,
+                cost: *cost,
+            })
+            .collect()
+    }
+}
+
+/// Usage per model from per-reply (or per-model) entries ([`UsageAcc`]).
+fn per_model(
+    entries: impl IntoIterator<Item = (Option<Ident>, Field<Tokens>, Field<MicroUsd>)>,
+) -> Vec<ModelUsage> {
+    let mut acc = UsageAcc::default();
+    for (model, tokens, cost) in entries {
+        acc.add(model, tokens, cost);
+    }
+    acc.finish()
+}
+
+/// One run's usage from the usage of each agent session it held — a Claude
+/// Code `/clear` starts a new session, and so a new transcript, in the same
+/// run. Each session's own figures are counted once: models are folded as
+/// [`UsageAcc`] folds replies, so a session whose usage is unavailable makes
+/// the run's figure for that model incomplete rather than leaving it out.
+/// The quota is the one session's that has one; two sessions with a quota
+/// value are two windows' worth of samples, and their deltas are not
+/// combined ([`Unavailable::Incomplete`]). The last turn is the last
+/// session's. No session at all is usage not recorded.
+pub fn combine_sessions(parts: Vec<AgentUsage>) -> AgentUsage {
+    if parts.len() == 1 {
+        return parts.into_iter().next().expect("one part");
+    }
+    let mut acc = UsageAcc::default();
+    let mut quota: Option<Field<QuotaDelta>> = None;
+    let mut last_turn = None;
+    for part in parts {
+        for m in part.models {
+            acc.add(m.model, m.tokens, m.cost);
+        }
+        quota = Some(match (quota, part.quota) {
+            (None, q) => q,
+            (Some(Field::Unavailable(_)), q @ Field::Unavailable(_)) => q,
+            (Some(Field::Unavailable(_)), q) | (Some(q), Field::Unavailable(_)) => q,
+            (Some(_), _) => Field::Unavailable(Unavailable::Incomplete),
+        });
+        if part.last_turn.is_some() {
+            last_turn = part.last_turn;
+        }
+    }
+    AgentUsage {
+        models: acc.finish(),
+        quota: quota.unwrap_or(Field::Unavailable(Unavailable::NotRecorded)),
+        last_turn,
+    }
+}
+
+/// The usage of a run whose agent the deck has no usage channel for — an
+/// arbitrary command, or Devin, whose own telemetry the deck does not
+/// receive: every value [`Unavailable::NoChannel`], never zero.
+pub fn no_usage_channel() -> AgentUsage {
+    AgentUsage {
+        models: usage_unavailable(Unavailable::NoChannel),
+        quota: Field::Unavailable(Unavailable::NoChannel),
+        last_turn: None,
+    }
 }
 
 /// Tokens from an agent that counts input without the cache.
@@ -702,18 +867,23 @@ pub fn from_claude(session: Option<&ClaudeSessionUsage>) -> AgentUsage {
 /// account, so deltas from several machines or accounts on the same plan and
 /// window are indistinguishable here.
 pub fn from_codex(summary: &CodexRolloutSummary) -> AgentUsage {
-    let models = per_model(summary.tokens_by_model.iter().map(|(model, tokens)| {
-        let tokens = if summary.tokens_incomplete || summary.total_unresolved {
-            Field::Unavailable(Unavailable::Incomplete)
-        } else {
-            Field::ProviderReported(*tokens)
-        };
-        (
-            model.clone(),
-            tokens,
-            Field::Unavailable(Unavailable::NoChannel),
-        )
-    }));
+    let unrecognized = summary.malformed && summary.tokens_by_model.is_empty();
+    let models = if unrecognized {
+        usage_unavailable(Unavailable::UnrecognizedFormat)
+    } else {
+        per_model(summary.tokens_by_model.iter().map(|(model, tokens)| {
+            let tokens = if summary.tokens_incomplete || summary.total_unresolved {
+                Field::Unavailable(Unavailable::Incomplete)
+            } else {
+                Field::ProviderReported(*tokens)
+            };
+            (
+                model.clone(),
+                tokens,
+                Field::Unavailable(Unavailable::NoChannel),
+            )
+        }))
+    };
     let quota = match (&summary.quota_first, &summary.quota_last) {
         (Some(first), Some(last)) => {
             match summary.quota_break.or_else(|| quota_break(first, last)) {
@@ -727,6 +897,7 @@ pub fn from_codex(summary: &CodexRolloutSummary) -> AgentUsage {
                 }),
             }
         }
+        _ if summary.malformed => Field::Unavailable(Unavailable::UnrecognizedFormat),
         _ => Field::Unavailable(Unavailable::NotRecorded),
     };
     AgentUsage {
@@ -796,7 +967,10 @@ pub fn from_pi(replies: &[PiReplyUsage]) -> AgentUsage {
     let last_turn = replies.last().map(|r| match r.stop_reason {
         Some(PiStopReason::Stop | PiStopReason::Length) => AgentTurnEnd::Completed,
         Some(PiStopReason::ToolUse) => AgentTurnEnd::MidTurn,
-        Some(PiStopReason::Error) => AgentTurnEnd::Failed { kind: None },
+        Some(PiStopReason::Error) => AgentTurnEnd::Failed {
+            kind: None,
+            status: None,
+        },
         Some(PiStopReason::Aborted) => AgentTurnEnd::Interrupted,
         None => AgentTurnEnd::Unknown,
     });
@@ -1108,6 +1282,10 @@ pub struct CodexRolloutSummary {
     /// delta ([`quota_break`]), if any.
     pub quota_break: Option<Unavailable>,
     pub last_turn: Option<AgentTurnEnd>,
+    /// A line carrying one of the rollout's marker words did not
+    /// deserialise: with no usable total, the rollout is in a format the
+    /// reader does not know ([`Unavailable::UnrecognizedFormat`]).
+    pub malformed: bool,
     current_model: Option<Ident>,
     last_total: Option<Tokens>,
 }
@@ -1164,7 +1342,46 @@ pub struct ReaderStats {
     pub polls_cut_short: u64,
 }
 
-/// An incremental reader of one Codex rollout, at the path it is given.
+/// What a [`JsonlReader`] keeps from the lines it reads: which lines are
+/// worth deserialising at all, the narrow shape they are deserialised into,
+/// and what each parsed record changes. Its `Default` is the state of a file
+/// read from the start.
+pub trait LineSummary: Default {
+    /// Quoted marker words ([`line_is_candidate`]); a line containing none of
+    /// them is counted and skipped without being parsed.
+    const MARKERS: &'static [&'static [u8]];
+    /// The narrow shape a candidate line is deserialised into. Every field it
+    /// does not name is skipped by the parser without being kept.
+    type Record: serde::de::DeserializeOwned;
+    fn observe(&mut self, record: Self::Record, stats: &mut ReaderStats);
+    /// A candidate line did not deserialise into [`Self::Record`]. The line
+    /// is lent only to look for a marker in it, never to be kept.
+    fn malformed(&mut self, _line: &[u8]) {}
+    /// Whether a complete line is deserialised at all: by default, one that
+    /// holds one of [`Self::MARKERS`] ([`line_is_candidate`]).
+    fn candidate(line: &[u8]) -> bool {
+        line_is_candidate(line, Self::MARKERS)
+    }
+    /// A line longer than [`MAX_LINE_BYTES`] was skipped without being
+    /// parsed; `prefix` is what was buffered of it. One that may have been a
+    /// record the summary reads is taken as [`Self::malformed`].
+    fn discarded(&mut self, prefix: &[u8]) {
+        if Self::candidate(prefix) {
+            self.malformed(prefix);
+        }
+    }
+    /// The file was replaced or truncated, so reading starts over: forget
+    /// what it read, keeping what the summary was told about its run.
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// An incremental reader of one JSON-lines file, at the path it is given,
+/// keeping only what its [`LineSummary`] keeps: a Codex rollout
+/// ([`CodexUsageReader`]), a Claude Code transcript
+/// ([`claude::ClaudeTranscriptReader`]) or the deck's own usage file
+/// ([`usage_file::UsageFileReader`]).
 ///
 /// Each [`poll`](Self::poll) reads only bytes appended since the last one,
 /// at most its budget ([`DEFAULT_POLL_BUDGET`]) and never past the file's
@@ -1175,46 +1392,53 @@ pub struct ReaderStats {
 /// as long as the disk does. A line is kept across polls until its newline
 /// arrives (at most [`MAX_LINE_BYTES`]), then dropped.
 ///
-/// Any complete line that contains one of five quoted marker words
+/// Any complete line that contains one of the summary's quoted marker words
 /// ([`line_is_candidate`]) is deserialised, wherever in the line the marker
 /// is, so a content line with a string that is exactly a marker word is
-/// deserialised too. What is kept is then decided by the parsed record's
-/// type and its payload's type: only `turn_context`, `token_count`,
-/// `task_started`, `task_complete` and `turn_aborted` update the summary,
-/// and only with the model, token counts, quota and turn-end kind, the
-/// fields the narrow structs name. So a prompt, reply, tool output or file
-/// content is scanned by the parser and, while its line is incomplete,
-/// buffered, but kept in nothing the reader returns, and its `Debug` shows
-/// neither the buffer nor the path.
+/// deserialised too. What is kept is then decided by the parsed record's own
+/// type, and only with the fields the narrow structs name. So a prompt, reply,
+/// tool output or file content is scanned by the parser and, while its line is
+/// incomplete, buffered, but kept in nothing the reader returns, and its
+/// `Debug` shows neither the buffer nor the path.
 ///
-/// On Unix the path is opened with `O_NOFOLLOW`, which refuses a symlink in
-/// its final component only: a symlinked parent directory is followed, so
-/// this is no confinement to a trusted root (that policy is #1858's to
-/// decide before the reader is wired). It is opened with `O_NONBLOCK` so a
-/// FIFO with no writer cannot stall the open, and anything but a regular
-/// file is refused, from the opened descriptor's own metadata, before a byte
-/// is read. Elsewhere it is a plain open, and the regular-file check follows
-/// it.
+/// A reader the deck runs is opened [`beneath`](Self::beneath) a
+/// [`locate::TrustedDir`], relative to the directory it keeps open with no
+/// symlink followed in any component (on Unix), so a directory replaced by a
+/// symlink after the reader was made is refused rather than followed. A
+/// reader made with [`new`](Self::new) opens its path with `O_NOFOLLOW`, which
+/// refuses a symlink in the final component only, so confining that path is
+/// its caller's; the deck's own runs do not use it. Either way the file is
+/// opened with `O_NONBLOCK` so a FIFO with no writer cannot stall the open,
+/// and anything but a regular file owned by this process's user is refused,
+/// from the opened descriptor's own metadata, before a byte is read.
+/// Elsewhere than Unix it is a plain open, and the regular-file check
+/// follows it.
 ///
 /// A file that gets shorter, or whose path now names another file (Unix),
-/// is read again from the start with the summary reset: that is a new rollout
+/// is read again from the start with the summary reset: that is a new file
 /// as far as the reader can tell. A file truncated and regrown past the
 /// reader's offset between two polls, keeping its inode, is not noticed: the
 /// reader carries on from its offset into the new content.
-pub struct CodexUsageReader {
-    path: PathBuf,
+pub struct JsonlReader<S> {
+    source: Source,
+    /// When the file was created, from the last poll's metadata, where the
+    /// platform records it.
+    born: Option<std::time::SystemTime>,
     identity: Option<(u64, u64)>,
     offset: u64,
     partial: Vec<u8>,
     skipping: bool,
     poll_budget: u64,
-    summary: CodexRolloutSummary,
+    summary: S,
     stats: ReaderStats,
 }
 
-impl fmt::Debug for CodexUsageReader {
+/// An incremental reader of one Codex rollout.
+pub type CodexUsageReader = JsonlReader<CodexRolloutSummary>;
+
+impl<S> fmt::Debug for JsonlReader<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CodexUsageReader")
+        f.debug_struct("JsonlReader")
             .field("offset", &self.offset)
             .field("partial_bytes", &self.partial.len())
             .field("skipping", &self.skipping)
@@ -1224,16 +1448,43 @@ impl fmt::Debug for CodexUsageReader {
     }
 }
 
-impl CodexUsageReader {
+/// Where a reader's file is.
+enum Source {
+    Path(PathBuf),
+    Beneath(locate::TrustedDir, PathBuf),
+}
+
+impl Source {
+    fn open(&self) -> io::Result<File> {
+        match self {
+            Source::Path(path) => open_regular(path),
+            Source::Beneath(dir, rel) => dir.open_file(rel),
+        }
+    }
+}
+
+impl<S: LineSummary> JsonlReader<S> {
+    /// A reader of the file at `path`, confined by its caller (see the type's
+    /// docs).
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        CodexUsageReader {
-            path: path.into(),
+        Self::from_source(Source::Path(path.into()))
+    }
+
+    /// A reader of the file `rel` beneath `dir`.
+    pub fn beneath(dir: locate::TrustedDir, rel: PathBuf) -> Self {
+        Self::from_source(Source::Beneath(dir, rel))
+    }
+
+    fn from_source(source: Source) -> Self {
+        JsonlReader {
+            source,
+            born: None,
             identity: None,
             offset: 0,
             partial: Vec::new(),
             skipping: false,
             poll_budget: DEFAULT_POLL_BUDGET,
-            summary: CodexRolloutSummary::default(),
+            summary: S::default(),
             stats: ReaderStats::default(),
         }
     }
@@ -1245,17 +1496,35 @@ impl CodexUsageReader {
         self
     }
 
-    pub fn summary(&self) -> &CodexRolloutSummary {
+    pub fn summary(&self) -> &S {
         &self.summary
+    }
+
+    pub fn summary_mut(&mut self) -> &mut S {
+        &mut self.summary
     }
 
     pub fn stats(&self) -> ReaderStats {
         self.stats
     }
 
+    /// When the file was created, as of the last poll; `None` where the
+    /// platform or file system does not record it.
+    pub fn born(&self) -> Option<std::time::SystemTime> {
+        self.born
+    }
+
+    /// Whether the reader holds the start of a line whose newline has not
+    /// arrived — anything but blanks, however short, or a line too long to
+    /// buffer: at a run's end, a record the agent did not finish writing,
+    /// which may have been one its summary reads.
+    pub fn unfinished_line(&self) -> bool {
+        self.skipping || self.partial.iter().any(|b| !b.is_ascii_whitespace())
+    }
+
     /// Read what was appended since the last poll, within the budget.
     pub fn poll(&mut self) -> io::Result<()> {
-        let mut file = open_rollout(&self.path)?;
+        let mut file = self.source.open()?;
         let meta = file.metadata()?;
         if !meta.is_file() {
             return Err(io::Error::new(
@@ -1263,6 +1532,13 @@ impl CodexUsageReader {
                 "not a regular file",
             ));
         }
+        if !owned_by_this_user(&meta) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "owned by another user",
+            ));
+        }
+        self.born = meta.created().ok();
         let identity = file_identity(&meta);
         let end = meta.len();
         if (self.identity.is_some() && identity != self.identity) || end < self.offset {
@@ -1294,7 +1570,7 @@ impl CodexUsageReader {
         self.offset = 0;
         self.partial.clear();
         self.skipping = false;
-        self.summary = CodexRolloutSummary::default();
+        self.summary.reset();
         self.stats.restarts += 1;
     }
 
@@ -1309,6 +1585,7 @@ impl CodexUsageReader {
             if self.partial.is_empty() {
                 self.line(head);
             } else if self.partial.len() + head.len() > MAX_LINE_BYTES {
+                self.summary.discarded(&self.partial);
                 self.partial.clear();
                 self.stats.overlong += 1;
                 self.stats.lines += 1;
@@ -1324,6 +1601,11 @@ impl CodexUsageReader {
             return;
         }
         if self.partial.len() + data.len() > MAX_LINE_BYTES {
+            if self.partial.is_empty() {
+                self.summary.discarded(data);
+            } else {
+                self.summary.discarded(&self.partial);
+            }
             self.partial.clear();
             self.skipping = true;
             self.stats.overlong += 1;
@@ -1336,15 +1618,18 @@ impl CodexUsageReader {
     fn line(&mut self, line: &[u8]) {
         self.stats.lines += 1;
         let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if !line_is_candidate(line) {
+        if !S::candidate(line) {
             return;
         }
-        match serde_json::from_slice::<NarrowRecord>(line) {
+        match serde_json::from_slice::<S::Record>(line) {
             Ok(record) => {
                 self.stats.parsed += 1;
                 self.summary.observe(record, &mut self.stats);
             }
-            Err(_) => self.stats.malformed += 1,
+            Err(_) => {
+                self.stats.malformed += 1;
+                self.summary.malformed(line);
+            }
         }
     }
 }
@@ -1354,7 +1639,7 @@ impl CodexUsageReader {
 /// FIFO with no writer would otherwise block it). `O_NONBLOCK` does not make
 /// reading a regular file any faster on a slow disk.
 #[cfg(unix)]
-fn open_rollout(path: &Path) -> io::Result<File> {
+fn open_regular(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt as _;
     std::fs::OpenOptions::new()
         .read(true)
@@ -1363,8 +1648,28 @@ fn open_rollout(path: &Path) -> io::Result<File> {
 }
 
 #[cfg(not(unix))]
-fn open_rollout(path: &Path) -> io::Result<File> {
+fn open_regular(path: &Path) -> io::Result<File> {
     File::open(path)
+}
+
+/// Whether the opened file belongs to the user this process runs as: a
+/// reader never takes another user's file as an agent's record.
+#[cfg(unix)]
+fn owned_by_this_user(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    meta.uid() == effective_uid()
+}
+
+/// The user this process runs as.
+#[cfg(unix)]
+pub(crate) fn effective_uid() -> u32 {
+    // SAFETY: `geteuid` takes no arguments and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(not(unix))]
+fn owned_by_this_user(_meta: &std::fs::Metadata) -> bool {
+    true
 }
 
 #[cfg(unix)]
@@ -1378,23 +1683,41 @@ fn file_identity(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
     None
 }
 
-const CANDIDATE_MARKERS: [&[u8]; 5] = [
-    b"\"turn_context\"",
-    b"\"token_count\"",
-    b"\"task_started\"",
-    b"\"task_complete\"",
-    b"\"turn_aborted\"",
-];
-
-/// Whether a line could be a record the reader uses: the cheap pre-filter
+/// Whether a line could be a record its reader uses: the cheap pre-filter
 /// that decides which lines are deserialised at all. It matches a quoted
 /// marker anywhere in the line, not only as the record's type, so it lets
-/// through some content lines, which [`CodexRolloutSummary::observe`] then
-/// ignores by type.
-fn line_is_candidate(line: &[u8]) -> bool {
-    CANDIDATE_MARKERS
+/// through some content lines, which the summary then ignores by type.
+fn line_is_candidate(line: &[u8], markers: &[&[u8]]) -> bool {
+    markers
         .iter()
         .any(|m| line.windows(m.len()).any(|w| w == *m))
+}
+
+impl LineSummary for CodexRolloutSummary {
+    const MARKERS: &'static [&'static [u8]] = &[
+        b"\"turn_context\"",
+        b"\"token_count\"",
+        b"\"task_started\"",
+        b"\"task_complete\"",
+        b"\"turn_aborted\"",
+    ];
+    type Record = NarrowRecord;
+
+    fn observe(&mut self, record: NarrowRecord, stats: &mut ReaderStats) {
+        CodexRolloutSummary::observe(self, record, stats);
+    }
+
+    /// A line that should have parsed did not: it may have been a running
+    /// total, a model change or a turn's end. Until a later usable total
+    /// covers it, the tokens are not known to be complete; usage from here is
+    /// credited to no model until the next `turn_context` names one; and the
+    /// last turn is unknown until a later turn event says how it ended.
+    fn malformed(&mut self, _line: &[u8]) {
+        self.malformed = true;
+        self.total_unresolved = true;
+        self.current_model = None;
+        self.last_turn = Some(AgentTurnEnd::Unknown);
+    }
 }
 
 impl CodexRolloutSummary {
@@ -1405,8 +1728,16 @@ impl CodexRolloutSummary {
                 self.current_model = payload.model.0.as_deref().and_then(Ident::new);
             }
             (Some("event_msg"), Some("token_count")) => {
-                if let Some(total) = payload.info.and_then(|i| i.total_token_usage) {
-                    self.observe_total(&total, stats);
+                match payload.info.and_then(|i| i.total_token_usage) {
+                    Some(total) => self.observe_total(&total, stats),
+                    // Codex reports no total before its first reply; one
+                    // missing after a usable total is a total the reader
+                    // cannot read.
+                    None if self.last_total.is_some() => {
+                        stats.unusable_totals += 1;
+                        self.total_unresolved = true;
+                    }
+                    None => {}
                 }
                 if let Some(sample) = payload.rate_limits.and_then(NarrowRateLimits::sample) {
                     if let Some(last) = &self.quota_last {
@@ -1421,8 +1752,9 @@ impl CodexRolloutSummary {
             }
             (Some("event_msg"), Some("task_complete")) => {
                 self.last_turn = Some(match payload.error {
-                    Some(ErrorKind(kind)) => AgentTurnEnd::Failed {
+                    Some(ErrorKind { kind, status }) => AgentTurnEnd::Failed {
                         kind: kind.as_deref().and_then(Ident::new),
+                        status,
                     },
                     None => AgentTurnEnd::Completed,
                 });
@@ -1479,7 +1811,7 @@ impl CodexRolloutSummary {
 // named here is skipped by the parser without being kept.
 
 #[derive(Deserialize)]
-struct NarrowRecord {
+pub struct NarrowRecord {
     #[serde(rename = "type", default)]
     kind: OptStr,
     #[serde(default)]
@@ -1636,9 +1968,16 @@ impl<'de> Visitor<'de> for OptStrVisitor {
     }
 }
 
-/// A turn's `error`: the `codex_error_info` kind when it is a string, and
-/// nothing else of it — its `message` is skipped unread.
-struct ErrorKind(Option<String>);
+/// A turn's `error`: the `codex_error_info` kind and nothing else of it — its
+/// `message` is skipped unread. Codex writes the kind as a string
+/// (`"server_overloaded"`) or, for a kind that carries details, as an object
+/// with the kind as its one key (`{"http_connection_failed":
+/// {"http_status_code":502}}`), of whose details only `http_status_code` is
+/// kept.
+struct ErrorKind {
+    kind: Option<String>,
+    status: Option<u16>,
+}
 
 impl<'de> Deserialize<'de> for ErrorKind {
     fn deserialize<D: de::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
@@ -1651,40 +1990,299 @@ impl<'de> Deserialize<'de> for ErrorKind {
             }
 
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<ErrorKind, A::Error> {
-                let mut kind = None;
+                let mut out = ErrorKind {
+                    kind: None,
+                    status: None,
+                };
                 while let Some(key) = map.next_key::<OptStr>()? {
                     if key.0.as_deref() == Some("codex_error_info") {
-                        kind = map.next_value::<OptStr>()?.0;
+                        out = map.next_value::<CodexErrorInfo>()?.0;
                     } else {
                         map.next_value::<IgnoredAny>()?;
                     }
                 }
-                Ok(ErrorKind(kind))
+                Ok(out)
             }
 
             fn visit_str<E: de::Error>(self, _: &str) -> Result<ErrorKind, E> {
-                Ok(ErrorKind(None))
+                Ok(ErrorKind {
+                    kind: None,
+                    status: None,
+                })
             }
 
             fn visit_bool<E: de::Error>(self, _: bool) -> Result<ErrorKind, E> {
-                Ok(ErrorKind(None))
+                self.visit_str("")
             }
 
             fn visit_i64<E: de::Error>(self, _: i64) -> Result<ErrorKind, E> {
-                Ok(ErrorKind(None))
+                self.visit_str("")
             }
 
             fn visit_u64<E: de::Error>(self, _: u64) -> Result<ErrorKind, E> {
-                Ok(ErrorKind(None))
+                self.visit_str("")
             }
 
             fn visit_f64<E: de::Error>(self, _: f64) -> Result<ErrorKind, E> {
-                Ok(ErrorKind(None))
+                self.visit_str("")
             }
 
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<ErrorKind, A::Error> {
                 while seq.next_element::<IgnoredAny>()?.is_some() {}
-                Ok(ErrorKind(None))
+                self.visit_str("")
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// `codex_error_info`, as a string kind or an object keyed by its kind.
+struct CodexErrorInfo(ErrorKind);
+
+impl<'de> Deserialize<'de> for CodexErrorInfo {
+    fn deserialize<D: de::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = CodexErrorInfo;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("an error kind")
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<CodexErrorInfo, E> {
+                Ok(CodexErrorInfo(ErrorKind {
+                    kind: Some(v.to_owned()),
+                    status: None,
+                }))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<CodexErrorInfo, A::Error> {
+                let mut out = ErrorKind {
+                    kind: None,
+                    status: None,
+                };
+                let mut keys = 0;
+                while let Some(key) = map.next_key::<OptStr>()? {
+                    keys += 1;
+                    let details = map.next_value::<HttpStatusDetails>()?;
+                    out.kind = key.0;
+                    out.status = details.0;
+                }
+                if keys != 1 {
+                    out = ErrorKind {
+                        kind: None,
+                        status: None,
+                    };
+                }
+                Ok(CodexErrorInfo(out))
+            }
+
+            fn visit_bool<E: de::Error>(self, _: bool) -> Result<CodexErrorInfo, E> {
+                self.visit_unit()
+            }
+
+            fn visit_i64<E: de::Error>(self, _: i64) -> Result<CodexErrorInfo, E> {
+                self.visit_unit()
+            }
+
+            fn visit_u64<E: de::Error>(self, _: u64) -> Result<CodexErrorInfo, E> {
+                self.visit_unit()
+            }
+
+            fn visit_f64<E: de::Error>(self, _: f64) -> Result<CodexErrorInfo, E> {
+                self.visit_unit()
+            }
+
+            fn visit_unit<E: de::Error>(self) -> Result<CodexErrorInfo, E> {
+                Ok(CodexErrorInfo(ErrorKind {
+                    kind: None,
+                    status: None,
+                }))
+            }
+
+            fn visit_none<E: de::Error>(self) -> Result<CodexErrorInfo, E> {
+                self.visit_unit()
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<CodexErrorInfo, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                self.visit_unit()
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// The details of an object-form `codex_error_info`: its `http_status_code`
+/// when that is a valid HTTP status, and nothing else.
+struct HttpStatusDetails(Option<u16>);
+
+impl<'de> Deserialize<'de> for HttpStatusDetails {
+    fn deserialize<D: de::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = HttpStatusDetails;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("error details")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<HttpStatusDetails, A::Error> {
+                let mut status = None;
+                while let Some(key) = map.next_key::<OptStr>()? {
+                    if key.0.as_deref() == Some("http_status_code") {
+                        status = map.next_value::<OptScalar>()?.http_status();
+                    } else {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+                Ok(HttpStatusDetails(status))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<HttpStatusDetails, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(HttpStatusDetails(None))
+            }
+
+            fn visit_str<E: de::Error>(self, _: &str) -> Result<HttpStatusDetails, E> {
+                Ok(HttpStatusDetails(None))
+            }
+
+            fn visit_bool<E: de::Error>(self, _: bool) -> Result<HttpStatusDetails, E> {
+                Ok(HttpStatusDetails(None))
+            }
+
+            fn visit_i64<E: de::Error>(self, _: i64) -> Result<HttpStatusDetails, E> {
+                Ok(HttpStatusDetails(None))
+            }
+
+            fn visit_u64<E: de::Error>(self, _: u64) -> Result<HttpStatusDetails, E> {
+                Ok(HttpStatusDetails(None))
+            }
+
+            fn visit_f64<E: de::Error>(self, _: f64) -> Result<HttpStatusDetails, E> {
+                Ok(HttpStatusDetails(None))
+            }
+
+            fn visit_unit<E: de::Error>(self) -> Result<HttpStatusDetails, E> {
+                Ok(HttpStatusDetails(None))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// A JSON scalar of any type, or [`OptScalar::Other`] for an array, an
+/// object or `null`, each skipped unread. For a field whose type an agent
+/// upgrade could change without the whole line failing to parse.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) enum OptScalar {
+    Str(String),
+    U64(u64),
+    I64(i64),
+    F64(f64),
+    Bool(bool),
+    #[default]
+    Other,
+}
+
+impl OptScalar {
+    /// A non-negative whole number, as a count.
+    pub(crate) fn count(&self) -> Option<u64> {
+        match *self {
+            OptScalar::U64(v) => Some(v),
+            OptScalar::I64(v) => u64::try_from(v).ok(),
+            OptScalar::F64(v) if v.is_finite() && v >= 0.0 && v.fract() == 0.0 && v < 1e19 => {
+                Some(v as u64)
+            }
+            _ => None,
+        }
+    }
+
+    /// A finite, non-negative number, as an amount of money.
+    pub(crate) fn amount(&self) -> Option<f64> {
+        match *self {
+            OptScalar::U64(v) => Some(v as f64),
+            OptScalar::I64(v) if v >= 0 => Some(v as f64),
+            OptScalar::F64(v) if v.is_finite() && v >= 0.0 => Some(v),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_str(&self) -> Option<&str> {
+        match self {
+            OptScalar::Str(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_bool(&self) -> Option<bool> {
+        match *self {
+            OptScalar::Bool(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// An HTTP status code (100–599).
+    pub(crate) fn http_status(&self) -> Option<u16> {
+        self.count()
+            .and_then(|v| u16::try_from(v).ok())
+            .filter(|v| (100..=599).contains(v))
+    }
+}
+
+impl<'de> Deserialize<'de> for OptScalar {
+    fn deserialize<D: de::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = OptScalar;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("any value")
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<OptScalar, E> {
+                Ok(OptScalar::Str(v.to_owned()))
+            }
+
+            fn visit_bool<E: de::Error>(self, v: bool) -> Result<OptScalar, E> {
+                Ok(OptScalar::Bool(v))
+            }
+
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<OptScalar, E> {
+                Ok(OptScalar::I64(v))
+            }
+
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<OptScalar, E> {
+                Ok(OptScalar::U64(v))
+            }
+
+            fn visit_f64<E: de::Error>(self, v: f64) -> Result<OptScalar, E> {
+                Ok(OptScalar::F64(v))
+            }
+
+            fn visit_unit<E: de::Error>(self) -> Result<OptScalar, E> {
+                Ok(OptScalar::Other)
+            }
+
+            fn visit_none<E: de::Error>(self) -> Result<OptScalar, E> {
+                Ok(OptScalar::Other)
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<OptScalar, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(OptScalar::Other)
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<OptScalar, A::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(OptScalar::Other)
             }
         }
         d.deserialize_any(V)
@@ -1729,6 +2327,7 @@ pub enum AccountingKey {
     LastTurnProvenance,
     LastTurnUnavailableReason,
     ErrorType,
+    HttpStatus,
     Disposition,
     DispositionProvenance,
     DispositionUnavailableReason,
@@ -1766,6 +2365,7 @@ impl AccountingKey {
         AccountingKey::LastTurnProvenance,
         AccountingKey::LastTurnUnavailableReason,
         AccountingKey::ErrorType,
+        AccountingKey::HttpStatus,
         AccountingKey::Disposition,
         AccountingKey::DispositionProvenance,
         AccountingKey::DispositionUnavailableReason,
@@ -1804,6 +2404,7 @@ impl AccountingKey {
             AccountingKey::LastTurnProvenance => "deck.run.last_turn.provenance",
             AccountingKey::LastTurnUnavailableReason => "deck.run.last_turn.unavailable_reason",
             AccountingKey::ErrorType => "error.type",
+            AccountingKey::HttpStatus => "http.response.status_code",
             AccountingKey::Disposition => "deck.work.disposition",
             AccountingKey::DispositionProvenance => "deck.work.disposition.provenance",
             AccountingKey::DispositionUnavailableReason => {
@@ -1816,6 +2417,582 @@ impl AccountingKey {
     }
 }
 
+/// The span event that carries one model's usage on a run's `agent.run`
+/// span: one event per model the run used.
+pub const EVENT_MODEL_USAGE: &str = "deck.model_usage";
+
+/// One model family the export names ([`exported_model`]).
+struct ModelFamily {
+    /// The family's word, which a model's name starts with.
+    name: &'static str,
+    /// Whether its version may be attached to that word (`qwen3`,
+    /// `llama3.1`), and whether it must be (`o3`).
+    attached: Attached,
+    /// An Ollama tag may follow the name: `:latest` or `:` and one of
+    /// [`sizes`](Self::sizes) (`llama3.1:8b`).
+    tag: bool,
+    /// The sizes the family is published in, across its versions (`70b`,
+    /// `a35b`, `8x7b`): the only words `#s` takes, and the only tags but
+    /// `latest`.
+    sizes: &'static [&'static str],
+    /// Vertex AI's `@` and an eight-digit date may follow the name
+    /// (`claude-opus-4@20250514`).
+    vertex: bool,
+    /// The year the family was first published: a date in one of its names
+    /// is no earlier, and no later than the year after the current one.
+    since: i32,
+    /// The shapes of the words after the family's, split on `-`: one
+    /// pattern each, as [`shape_matches`] reads them.
+    shapes: &'static [&'static str],
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Attached {
+    No,
+    Also,
+    Only,
+}
+
+const fn family(
+    name: &'static str,
+    attached: Attached,
+    since: i32,
+    shapes: &'static [&'static str],
+) -> ModelFamily {
+    ModelFamily {
+        name,
+        attached,
+        tag: false,
+        sizes: &[],
+        vertex: false,
+        since,
+        shapes,
+    }
+}
+
+const fn tagged(
+    name: &'static str,
+    attached: Attached,
+    since: i32,
+    sizes: &'static [&'static str],
+    shapes: &'static [&'static str],
+) -> ModelFamily {
+    ModelFamily {
+        tag: true,
+        sizes,
+        ..family(name, attached, since, shapes)
+    }
+}
+
+/// The model families the export names, and the shapes of their names. A
+/// name of a listed family in a shape not listed for it — another word,
+/// another order, a longer number, a size the family is not published in, a
+/// date in a form the family does not use or that is not a calendar date —
+/// is not named (`gpt-confidential-project`, `gpt-5-12345678901234567890`,
+/// `gpt-5-2411`, `claude-sonnet-4@20250231`, `qwen3:123b`). A shape is not a
+/// catalogue of published names: a private name that fits one, such as a
+/// date-shaped revision on a known model, is named. A new public name in a
+/// new shape needs its shape added here; until then its tokens are sent
+/// without its name.
+const MODEL_FAMILIES: &[ModelFamily] = &[
+    ModelFamily {
+        vertex: true,
+        ..family(
+            "claude",
+            Attached::No,
+            2023,
+            &[
+                "opus|sonnet|haiku|fable #v #v? #ymd8|latest?",
+                "#v #v? opus|sonnet|haiku #ymd8|latest?",
+            ],
+        )
+    },
+    tagged(
+        "gpt",
+        Attached::No,
+        2023,
+        &["20b", "120b"],
+        &[
+            "#v|4o mini|nano|pro|codex|codex-mini|codex-max|codex-spark|luna|sol|astra|terra|luna-pro|sol-pro|astra-pro|terra-pro|cyber|chat|chat-latest|turbo|turbo-preview|preview|instant|search-preview|mini-search-preview|audio-preview|mini-audio-preview|realtime-preview|mini-realtime-preview|mini-tts|mini-transcribe|transcribe? #ymd?",
+            // GPT-4's and GPT-3.5's own snapshots are `MMDD` (`gpt-4-0613`).
+            "3.5|4 turbo|16k|32k|turbo-16k|turbo-instruct? #mmdd? preview|vision-preview?",
+            "chat-latest",
+            "oss safeguard? #s?",
+            "image #v mini?",
+        ],
+    ),
+    family(
+        "o",
+        Attached::Only,
+        2024,
+        &["#v mini|mini-high|pro|preview|deep-research|mini-deep-research? #ymd?"],
+    ),
+    family("codex", Attached::No, 2025, &["mini latest?"]),
+    family(
+        "gemini",
+        Attached::No,
+        2023,
+        &[
+            "#v pro|flash|flash-lite|flash-8b|ultra|nano|argon preview|preview-customtools|exp|thinking-exp|latest|image|image-preview|live|tts|preview-tts? #md|#my|#mmdd|#r?",
+            "exp #mmdd",
+            "nano-banana #v",
+        ],
+    ),
+    tagged(
+        "gemma",
+        Attached::Also,
+        2024,
+        &[
+            "270m", "1b", "2b", "4b", "7b", "9b", "12b", "26b", "27b", "31b", "a4b",
+        ],
+        // A mixture of experts' total size, then its active one
+        // (`gemma-4-26b-a4b-it`).
+        &["#v #s? #s? it?"],
+    ),
+    tagged(
+        "llama",
+        Attached::Also,
+        2023,
+        &[
+            "1b", "3b", "7b", "8b", "11b", "12b", "13b", "17b", "70b", "90b", "405b", "16x17b",
+            "128x17b",
+        ],
+        &[
+            "#v #s? instruct|chat|vision-instruct?",
+            "4 maverick|scout #s? 16e|128e? instruct?",
+            "guard #v #s?",
+        ],
+    ),
+    tagged(
+        "mistral",
+        Attached::No,
+        2023,
+        &["7b", "12b", "22b", "24b", "123b"],
+        &[
+            "large|medium|small|tiny|nemo|saba latest|#yymm|#v?",
+            // A version written with `-` (`mistral-medium-3-5`).
+            "large|medium|small #v #v",
+            "small #v? #s instruct #yymm?",
+            "#s instruct?",
+        ],
+    ),
+    tagged(
+        "mixtral",
+        Attached::No,
+        2023,
+        &["8x7b", "8x22b"],
+        &["#s instruct?", "#s?"],
+    ),
+    tagged(
+        "codestral",
+        Attached::No,
+        2024,
+        &["22b"],
+        &["latest|#yymm|mamba?"],
+    ),
+    tagged(
+        "devstral",
+        Attached::No,
+        2025,
+        &["24b"],
+        &["small|medium? latest|#yymm|#v?"],
+    ),
+    tagged(
+        "magistral",
+        Attached::No,
+        2025,
+        &["24b"],
+        &["small|medium latest|#yymm|#v?"],
+    ),
+    tagged(
+        "ministral",
+        Attached::No,
+        2024,
+        &["3b", "8b", "14b"],
+        &["#s latest|#yymm?"],
+    ),
+    tagged(
+        "qwen",
+        Attached::Also,
+        2023,
+        &[
+            "0.5b", "0.6b", "1.5b", "1.7b", "1.8b", "3b", "4b", "7b", "8b", "9b", "14b", "27b",
+            "30b", "32b", "35b", "72b", "80b", "110b", "122b", "235b", "397b", "480b", "2.4t",
+            "a3b", "a10b", "a17b", "a22b", "a35b", "a95b",
+        ],
+        &[
+            // Alibaba Cloud's hosted models, dated `YYYY-MM-DD`, `YYYYMMDD`,
+            // `MM-DD` or `MMDD` (`qwen3.5-plus-20260420`,
+            // `qwen3.5-plus-02-15`).
+            "#v? max|max-prime|plus|turbo|flash|omni-flash latest|#ymd|#ymd8|#md|#mmdd?",
+            "#v coder? plus|flash|next?",
+            "#v coder|vl|next? #s #s? instruct|thinking? #yymm?",
+        ],
+    ),
+    tagged(
+        "deepseek",
+        Attached::No,
+        2023,
+        &[
+            "1.3b", "1.5b", "6.7b", "7b", "8b", "14b", "16b", "32b", "33b", "70b", "236b", "671b",
+        ],
+        &[
+            "chat|reasoner #p? #mmdd?",
+            "coder #p? instruct|base?",
+            "#p exp|terminus|pro|flash|flash-free|flash-vision-exp? #mmdd?",
+            "r1 distill llama|qwen #s",
+        ],
+    ),
+    family(
+        "grok",
+        Attached::No,
+        2023,
+        &[
+            // Grok 4.20's minor version is two digits, which `#v` is not.
+            "#v|4.20 #v? mini|fast|vision|multi-agent? reasoning|non-reasoning? #mmdd?",
+            "code fast #v?",
+            "build #v",
+        ],
+    ),
+    tagged(
+        "kimi",
+        Attached::No,
+        2024,
+        &[],
+        &["#p instruct|thinking|turbo|turbo-preview|code|pro? #mmdd? preview?"],
+    ),
+    tagged(
+        "glm",
+        Attached::No,
+        2023,
+        &[],
+        &[
+            "#v air|airx|flash|flashx|x|turbo|prime? free?",
+            // The vision models (`glm-4.5v`, `glm-5v-turbo`).
+            "4.5v|4.6v|5v turbo?",
+        ],
+    ),
+    family("minimax", Attached::No, 2024, &["#p her|flash?", "01"]),
+    family("MiniMax", Attached::No, 2024, &["M#v"]),
+    family("swe", Attached::No, 2025, &["#v lite?"]),
+    family("big", Attached::No, 2025, &["pickle"]),
+];
+
+/// The provider namespaces a model's name may carry in front of it, exactly
+/// as listed: a router's `<provider>/` and a cloud's region prefix. Any other
+/// prefix, a path or a host name included, makes the name one the export does
+/// not send. Behind a router's prefix (one that ends in `/`), one of
+/// [`ROUTER_VARIANTS`] after `:` may end the name; behind a cloud's (one that
+/// ends in `.`), Bedrock's `-v` and a digit, optionally then `:` and a digit,
+/// may (`-v1`, `-v1:0`).
+const MODEL_NAMESPACES: &[&str] = &[
+    "anthropic/",
+    "openai/",
+    "openai-codex/",
+    "google/",
+    "mistralai/",
+    "meta-llama/",
+    "deepseek/",
+    "qwen/",
+    "x-ai/",
+    "moonshotai/",
+    "z-ai/",
+    "zai/",
+    "minimax/",
+    "anthropic.",
+    "us.anthropic.",
+    "eu.anthropic.",
+    "apac.anthropic.",
+    "global.anthropic.",
+];
+
+/// OpenRouter's variants of a model, as its catalogue lists them
+/// (`google/gemma-4-31b-it:free`, `openai/gpt-5.4:batch`).
+const ROUTER_VARIANTS: &[&str] = &["free", "batch"];
+
+/// The longest model name the export names.
+const MAX_EXPORTED_MODEL_BYTES: usize = 96;
+
+/// Whether `word` is all digits, and as long as `len` allows.
+fn digits(word: &str, len: std::ops::RangeInclusive<usize>) -> bool {
+    len.contains(&word.len()) && word.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// A version: one or two digits, then optionally `.` and one digit (`5`,
+/// `5.4`, `3.5`).
+fn is_version(word: &str) -> bool {
+    match word.split_once('.') {
+        Some((major, minor)) => digits(major, 1..=2) && digits(minor, 1..=1),
+        None => digits(word, 1..=2),
+    }
+}
+
+/// `word`'s value, when it is exactly `len` digits.
+fn number(word: &str, len: usize) -> Option<u32> {
+    digits(word, len..=len).then(|| word.parse().ok())?
+}
+
+/// Whether `month` and `day` are a calendar date in some year: in a leap
+/// year, so `0229` is one.
+fn is_month_day(month: u32, day: u32) -> bool {
+    chrono::NaiveDate::from_ymd_opt(2024, month, day).is_some()
+}
+
+/// What a shape's classes accept for one family ([`shape_matches`]): its
+/// sizes, and dates in its years.
+struct Classes {
+    sizes: &'static [&'static str],
+    years: std::ops::RangeInclusive<i32>,
+}
+
+impl Classes {
+    /// `family`'s, in the year `current`.
+    fn of(family: &ModelFamily, current: i32) -> Self {
+        Self {
+            sizes: family.sizes,
+            years: family.since..=current + 1,
+        }
+    }
+
+    fn year(&self, year: Option<u32>) -> Option<i32> {
+        let year = i32::try_from(year?).ok()?;
+        self.years.contains(&year).then_some(year)
+    }
+
+    fn date(&self, year: Option<u32>, month: Option<u32>, day: Option<u32>) -> bool {
+        self.year(year)
+            .zip(month.zip(day))
+            .is_some_and(|(y, (m, d))| chrono::NaiveDate::from_ymd_opt(y, m, d).is_some())
+    }
+
+    /// `YYYYMMDD` (`20251001`).
+    fn is_ymd8(&self, word: &str) -> bool {
+        digits(word, 8..=8)
+            && self.date(
+                number(&word[..4], 4),
+                number(&word[4..6], 2),
+                number(&word[6..], 2),
+            )
+    }
+
+    /// How many of `words` the date class `class` takes, if it is one and
+    /// they start with one: `#ymd8` `YYYYMMDD`, `#mmdd` `MMDD` (`0613`),
+    /// `#yymm` `YYMM` (`2411`), `#ymd` `YYYY-MM-DD`, `#md` `MM-DD` and `#my`
+    /// `MM-YYYY`. Each is a calendar date, and its year one of the family's.
+    fn date_taken(&self, class: &str, words: &[&str]) -> Option<usize> {
+        match (class, words) {
+            ("#ymd8", [word, ..]) => self.is_ymd8(word).then_some(1),
+            ("#mmdd", [word, ..]) => (digits(word, 4..=4)
+                && number(&word[..2], 2)
+                    .zip(number(&word[2..], 2))
+                    .is_some_and(|(m, d)| is_month_day(m, d)))
+            .then_some(1),
+            ("#yymm", [word, ..]) => (digits(word, 4..=4)
+                && self
+                    .year(number(&word[..2], 2).map(|yy| 2000 + yy))
+                    .is_some()
+                && number(&word[2..], 2).is_some_and(|m| (1..=12).contains(&m)))
+            .then_some(1),
+            ("#md", [month, day, ..]) => number(month, 2)
+                .zip(number(day, 2))
+                .is_some_and(|(m, d)| is_month_day(m, d))
+                .then_some(2),
+            ("#my", [month, year, ..]) => (number(month, 2).is_some_and(|m| (1..=12).contains(&m))
+                && self.year(number(year, 4)).is_some())
+            .then_some(2),
+            ("#ymd", [year, month, day, ..]) => self
+                .date(number(year, 4), number(month, 2), number(day, 2))
+                .then_some(3),
+            _ => None,
+        }
+    }
+}
+
+/// How many of `words` the alternative `choice` of a shape can take, each
+/// way it can (see [`shape_matches`]).
+fn taken(choice: &str, words: &[&str], classes: &Classes) -> Option<usize> {
+    let word = words.first()?;
+    let one = |fits: bool| fits.then_some(1);
+    match choice {
+        "#v" => one(is_version(word)),
+        "#p" => {
+            one(matches!(word.as_bytes(), [b'v' | b'r' | b'k' | b'm', ..])
+                && is_version(&word[1..]))
+        }
+        "#s" => one(classes.sizes.contains(word)),
+        "#r" => one(matches!(word.as_bytes(), [b'0', b'0', b'1'..=b'9'])),
+        date if date.starts_with('#') => classes.date_taken(date, words),
+        prefixed if prefixed.ends_with("#v") => one(word
+            .strip_prefix(&prefixed[..prefixed.len() - 2])
+            .is_some_and(is_version)),
+        literal => {
+            let parts: Vec<&str> = literal.split('-').collect();
+            (words.len() >= parts.len() && words[..parts.len()] == parts[..]).then_some(parts.len())
+        }
+    }
+}
+
+/// Whether `words` are, in order, the slots of `shape`. Slots are separated
+/// by spaces, each a choice of alternatives separated by `|`, and optional
+/// when it ends in `?`. An alternative is literal words joined by `-`, a
+/// literal immediately followed by `#v` (`M#v`, `M2.7`), or a class: `#v` a
+/// version ([`is_version`]), `#p` a version behind `v`, `r`, `k` or `m`
+/// (`r1`, `v3.1`), `#s` one of the family's sizes, `#r` a revision (`001`),
+/// or a date ([`Classes::date_taken`]).
+fn shape_matches(shape: &str, words: &[&str], classes: &Classes) -> bool {
+    fn rest_matches(slots: &[&str], words: &[&str], classes: &Classes) -> bool {
+        let Some((slot, rest)) = slots.split_first() else {
+            return words.is_empty();
+        };
+        let (choices, optional) = match slot.strip_suffix('?') {
+            Some(choices) => (choices, true),
+            None => (*slot, false),
+        };
+        (optional && rest_matches(rest, words, classes))
+            || choices.split('|').any(|choice| {
+                taken(choice, words, classes)
+                    .is_some_and(|n| rest_matches(rest, &words[n..], classes))
+            })
+    }
+    let slots: Vec<&str> = shape.split(' ').collect();
+    rest_matches(&slots, words, classes)
+}
+
+/// The name a model is exported under, if any: optionally one of
+/// [`MODEL_NAMESPACES`], then a name of one of [`MODEL_FAMILIES`] in one of
+/// the shapes listed for it, with only the suffix its family allows, at most
+/// [`MAX_EXPORTED_MODEL_BYTES`] long. Every other name — a custom or local
+/// model's, a path, a namespace the deck does not know, a deployment's own
+/// suffix after `@` or `:` — is not exported; its usage still is, without a
+/// name. A date's year is checked against the current UTC year.
+pub fn exported_model(model: &Ident) -> Option<&Ident> {
+    use chrono::Datelike as _;
+    exported_model_in(model, chrono::Utc::now().year())
+}
+
+/// [`exported_model`] in the UTC year `current`.
+fn exported_model_in(model: &Ident, current: i32) -> Option<&Ident> {
+    let name = model.as_str();
+    if name.len() > MAX_EXPORTED_MODEL_BYTES {
+        return None;
+    }
+    let (namespace, mut bare) = MODEL_NAMESPACES
+        .iter()
+        .find_map(|ns| name.strip_prefix(ns).map(|bare| (*ns, bare)))
+        .unwrap_or(("", name));
+    if namespace.ends_with('.')
+        && let Some((core, version)) = bare.rsplit_once("-v")
+        && match version.as_bytes() {
+            [a] => a.is_ascii_digit(),
+            [a, b':', b] => a.is_ascii_digit() && b.is_ascii_digit(),
+            _ => false,
+        }
+    {
+        bare = core;
+    }
+    let (core, suffix) = match bare.find(['@', ':']) {
+        Some(at) => (&bare[..at], Some((&bare[at..at + 1], &bare[at + 1..]))),
+        None => (bare, None),
+    };
+    let mut words = core.split('-');
+    let head = words.next()?;
+    let (family, attached) = MODEL_FAMILIES.iter().find_map(|family| {
+        if head == family.name {
+            return (family.attached != Attached::Only).then_some((family, None));
+        }
+        let version = head.strip_prefix(family.name)?;
+        (family.attached != Attached::No && is_version(version)).then_some((family, Some(version)))
+    })?;
+    let classes = Classes::of(family, current);
+    let suffix_fits = match suffix {
+        None => true,
+        Some(("@", date)) => family.vertex && classes.is_ymd8(date),
+        Some((_, tag)) => {
+            (family.tag && (tag == "latest" || family.sizes.contains(&tag)))
+                || (namespace.ends_with('/') && ROUTER_VARIANTS.contains(&tag))
+        }
+    };
+    let words: Vec<&str> = attached.into_iter().chain(words).collect();
+    (suffix_fits
+        && family
+            .shapes
+            .iter()
+            .any(|shape| shape_matches(shape, &words, &classes)))
+    .then_some(model)
+}
+
+/// Plan names Codex is known to report (`rate_limits.plan_type`).
+const KNOWN_PLANS: &[&str] = &[
+    "free",
+    "go",
+    "plus",
+    "pro",
+    "prolite",
+    "team",
+    "business",
+    "enterprise",
+    "edu",
+    "education",
+];
+
+/// Error kinds the agents are known to record: Codex's `codex_error_info`,
+/// Claude Code's `error` on an API error record, and the deck's names for
+/// OpenCode's error types ([`usage_file`]).
+const KNOWN_ERROR_KINDS: &[&str] = &[
+    // Codex
+    "context_window_exceeded",
+    "usage_limit_exceeded",
+    "http_connection_failed",
+    "response_stream_connection_failed",
+    "response_stream_disconnected",
+    "response_too_many_failed_attempts",
+    "internal_server_error",
+    "unauthorized",
+    "bad_request",
+    "sandbox_error",
+    "server_overloaded",
+    "rate_limit_exceeded",
+    "thread_rollback_failed",
+    // Claude Code
+    "authentication_failed",
+    "billing_error",
+    "rate_limit",
+    "invalid_request",
+    "server_error",
+    "max_output_tokens",
+    "overloaded",
+    "model_not_found",
+    // OpenCode, as the deck names them
+    "api_error",
+    "provider_auth_error",
+    "output_length_exceeded",
+    "context_overflow",
+    // Shared, and the deck's own
+    "other",
+    "unknown",
+    "nonzero_exit",
+];
+
+/// A value from a closed list, or `other` for one the deck does not know.
+fn listed(value: &Ident, known: &'static [&'static str]) -> &'static str {
+    known
+        .iter()
+        .copied()
+        .find(|k| *k == value.as_str())
+        .unwrap_or("other")
+}
+
+/// The plan name the export sends: one Codex is known to report, or `other`.
+pub fn exported_plan(plan: &Ident) -> &'static str {
+    listed(plan, KNOWN_PLANS)
+}
+
+/// The error kind the export sends as `error.type`: one an agent is known to
+/// record, or `other`.
+pub fn exported_error_kind(kind: &Ident) -> &'static str {
+    listed(kind, KNOWN_ERROR_KINDS)
+}
+
 /// One allow-listed accounting attribute. Its fields are private, and the
 /// only constructors take an enum's name or an [`Ident`], so a string value
 /// is always one of those.
@@ -1823,6 +3000,16 @@ impl AccountingKey {
 pub struct AccountingAttribute {
     key: AccountingKey,
     value: AttrValue,
+}
+
+impl AccountingAttribute {
+    pub fn key(&self) -> AccountingKey {
+        self.key
+    }
+
+    pub fn value(&self) -> &AttrValue {
+        &self.value
+    }
 }
 
 /// An enum's name.
@@ -1860,15 +3047,19 @@ fn provenance<T>(
     }
 }
 
-/// A run's attributes: `run` for the run itself (an `agent.run` span), and one
-/// set per model in `models` (one span event each).
+/// A run's attributes: `run` for the run itself (on its `agent.run` span),
+/// with the run's totals across models, and one set per model in `models`
+/// (one [`EVENT_MODEL_USAGE`] span event each). A total is a sum only where
+/// every model's value has the same provenance ([`add_tokens`],
+/// [`add_cost`]); otherwise it is unavailable as incomplete.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunExport {
     pub run: Vec<AccountingAttribute>,
     pub models: Vec<Vec<AccountingAttribute>>,
 }
 
-/// The attributes for `record`. Pure; the live exporter does not call it.
+/// The attributes for `record`. Pure: the run tracker puts them on the
+/// run's span ([`run_usage::RunUsage::finish`]).
 pub fn run_attributes(record: &RunRecord) -> RunExport {
     use AccountingKey as K;
     let mut run = vec![
@@ -1878,7 +3069,10 @@ pub fn run_attributes(record: &RunRecord) -> RunExport {
     if let Some(t) = record.termination.value() {
         run.push(name(K::Termination, t.outcome.as_str()));
         if let Some(kind) = &t.error_type {
-            run.push(ident(K::ErrorType, kind));
+            run.push(name(K::ErrorType, exported_error_kind(kind)));
+        }
+        if let Some(status) = t.http_status {
+            run.push(int(K::HttpStatus, u64::from(status)));
         }
     }
     provenance(
@@ -1898,7 +3092,7 @@ pub fn run_attributes(record: &RunRecord) -> RunExport {
     );
     if let Some(q) = record.quota.value() {
         if let Some(plan) = &q.plan {
-            run.push(ident(K::QuotaPlan, plan));
+            run.push(name(K::QuotaPlan, exported_plan(plan)));
         }
         run.push(int(K::QuotaWindowMinutes, q.window_minutes));
         run.push(AccountingAttribute {
@@ -1914,12 +3108,36 @@ pub fn run_attributes(record: &RunRecord) -> RunExport {
         K::QuotaProvenance,
         K::QuotaUnavailableReason,
     );
+    let mut tokens = None;
+    let mut cost = None;
+    for usage in &record.models {
+        tokens = Some(tokens.map_or(usage.tokens, |sum| add_tokens(sum, usage.tokens)));
+        cost = Some(cost.map_or(usage.cost, |sum| add_cost(sum, usage.cost)));
+    }
+    let tokens = tokens.unwrap_or(Field::Unavailable(Unavailable::NotRecorded));
+    let cost = cost.unwrap_or(Field::Unavailable(Unavailable::NotRecorded));
+    if let Some(t) = tokens.value() {
+        run.push(int(K::InputTokens, t.input));
+        run.push(int(K::OutputTokens, t.output));
+        run.push(int(K::CacheReadInputTokens, t.cache_read));
+        run.push(int(K::CacheWriteInputTokens, t.cache_write));
+    }
+    provenance(
+        &mut run,
+        &tokens,
+        K::TokensProvenance,
+        K::TokensUnavailableReason,
+    );
+    if let Some(c) = cost.value() {
+        run.push(int(K::CostMicroUsd, c.0));
+    }
+    provenance(&mut run, &cost, K::CostProvenance, K::CostUnavailableReason);
     let models = record
         .models
         .iter()
         .map(|usage| {
             let mut attrs = Vec::new();
-            if let Some(model) = &usage.model {
+            if let Some(model) = usage.model.as_ref().and_then(exported_model) {
                 attrs.push(ident(K::ResponseModel, model));
             }
             if let Some(t) = usage.tokens.value() {
@@ -2063,6 +3281,7 @@ mod tests {
             termination: Field::ProviderReported(Termination {
                 outcome: RunTermination::Completed,
                 error_type: None,
+                http_status: None,
             }),
             last_turn: Field::ProviderReported(AgentTurnEnd::Completed),
         }
@@ -2157,6 +3376,7 @@ mod tests {
                 Unavailable::QuotaDecreased,
                 Unavailable::RunNotEnded,
                 Unavailable::NoWorkItem,
+                Unavailable::UnrecognizedFormat,
             ]
             .map(Unavailable::as_str)
             .to_vec(),
@@ -2171,7 +3391,10 @@ mod tests {
             .to_vec(),
             [
                 AgentTurnEnd::Completed,
-                AgentTurnEnd::Failed { kind: None },
+                AgentTurnEnd::Failed {
+                    kind: None,
+                    status: None,
+                },
                 AgentTurnEnd::Interrupted,
                 AgentTurnEnd::MidTurn,
                 AgentTurnEnd::Unknown,
@@ -2265,6 +3488,7 @@ mod tests {
     fn an_ended_run_takes_the_agents_word_and_the_decks_end_for_a_cut_turn() {
         let failed = AgentTurnEnd::Failed {
             kind: Some(id("server_overloaded")),
+            status: None,
         };
         let t = run_termination(Some(EndReason::Exited), Some(&failed));
         assert_eq!(t.provenance(), Provenance::ProviderReported);
@@ -2345,6 +3569,7 @@ mod tests {
             Some(AgentTurnEnd::Completed),
             Some(AgentTurnEnd::Failed {
                 kind: Some(id("server_overloaded")),
+                status: None,
             }),
             Some(AgentTurnEnd::Interrupted),
             Some(AgentTurnEnd::MidTurn),
@@ -2406,7 +3631,8 @@ mod tests {
             closed.termination,
             Field::Measured(Termination {
                 outcome: RunTermination::Interrupted,
-                error_type: None
+                error_type: None,
+                http_status: None,
             })
         );
         let exited = RunRecord::new(
@@ -2424,7 +3650,10 @@ mod tests {
             (Some(PiStopReason::ToolUse), AgentTurnEnd::MidTurn),
             (
                 Some(PiStopReason::Error),
-                AgentTurnEnd::Failed { kind: None },
+                AgentTurnEnd::Failed {
+                    kind: None,
+                    status: None,
+                },
             ),
             (Some(PiStopReason::Aborted), AgentTurnEnd::Interrupted),
             (None, AgentTurnEnd::Unknown),
@@ -2701,7 +3930,13 @@ mod tests {
             .find(|m| m.model == Some(id("other")))
             .unwrap();
         assert_eq!(other.cost, Field::Unavailable(Unavailable::NotRecorded));
-        assert_eq!(usage.last_turn, Some(AgentTurnEnd::Failed { kind: None }));
+        assert_eq!(
+            usage.last_turn,
+            Some(AgentTurnEnd::Failed {
+                kind: None,
+                status: None
+            })
+        );
         let zero = from_pi(&[pi_reply("gpt-5.5", Some(0.0), None)]);
         assert_eq!(
             zero.models[0].cost,
@@ -3384,7 +4619,8 @@ mod tests {
         assert_eq!(
             reader.summary().last_turn,
             Some(AgentTurnEnd::Failed {
-                kind: Some(id("server_overloaded"))
+                kind: Some(id("server_overloaded")),
+                status: None,
             })
         );
         write_lines(
@@ -3667,7 +4903,10 @@ mod tests {
         assert!(!format!("{summary:?}").contains(SENTINEL), "{summary:?}");
         assert_eq!(
             summary.last_turn,
-            Some(AgentTurnEnd::Failed { kind: None }),
+            Some(AgentTurnEnd::Failed {
+                kind: None,
+                status: None
+            }),
             "a failure is kept, its non-identifier kind is not"
         );
         let record = RunRecord::new(
@@ -3775,7 +5014,10 @@ mod tests {
             assert_eq!(summary.quota_last.as_ref().unwrap().plan, want, "{raw}");
             assert_eq!(
                 summary.last_turn,
-                Some(AgentTurnEnd::Failed { kind: want }),
+                Some(AgentTurnEnd::Failed {
+                    kind: want,
+                    status: None
+                }),
                 "{raw}"
             );
         }
@@ -3858,9 +5100,11 @@ mod tests {
             termination: Field::Measured(Termination {
                 outcome: RunTermination::Failed,
                 error_type: Ident::new(&hostile),
+                http_status: None,
             }),
             last_turn: Field::ProviderReported(AgentTurnEnd::Failed {
                 kind: Ident::new(&hostile),
+                status: None,
             }),
         };
         let records = [
@@ -3884,6 +5128,7 @@ mod tests {
                     has_unknown_model_cost: false,
                     last_turn: Some(AgentTurnEnd::Failed {
                         kind: Ident::new(&hostile),
+                        status: None,
                     }),
                 })),
                 Some(EndReason::Exited),
@@ -4260,6 +5505,7 @@ mod tests {
             ),
             (AccountingKey::ResponseModel, "gen_ai.response.model"),
             (AccountingKey::ErrorType, "error.type"),
+            (AccountingKey::HttpStatus, "http.response.status_code"),
             (AccountingKey::RunId, "deck.run.id"),
             (AccountingKey::Agent, "deck.agent"),
         ];
@@ -4275,16 +5521,805 @@ mod tests {
         for key in AccountingKey::ALL {
             let name = key.as_str();
             assert!(
-                name.starts_with("deck.") || name.starts_with("gen_ai.") || name == "error.type",
+                name.starts_with("deck.")
+                    || name.starts_with("gen_ai.")
+                    || name == "error.type"
+                    || name == "http.response.status_code",
                 "{name}"
             );
-            let shared = AttrKey::is_allowed(name);
+            let shared = AttrKey::ALL.iter().any(|k| k.as_str() == name);
             assert_eq!(
                 shared,
                 matches!(key, AccountingKey::RunId | AccountingKey::Agent),
                 "{name} collides with a #1741 key"
             );
         }
+    }
+
+    /// An arbitrary command's end is the deck's to measure: its exit status
+    /// decides completed or failed, a closed pane or a shutdown interrupted
+    /// it, and a run still open has no termination yet.
+    #[test]
+    fn an_arbitrary_command_ends_by_its_exit_status() {
+        let outcome = |end, code| {
+            let t = command_termination(end, code);
+            (
+                t.provenance(),
+                t.value().map(|t| (t.outcome, t.error_type.clone())),
+                t.unavailable(),
+            )
+        };
+        assert_eq!(
+            outcome(Some(EndReason::Exited), Some(0)),
+            (
+                Provenance::Measured,
+                Some((RunTermination::Completed, None)),
+                None
+            )
+        );
+        assert_eq!(
+            outcome(Some(EndReason::Exited), Some(2)),
+            (
+                Provenance::Measured,
+                Some((RunTermination::Failed, Some(id("nonzero_exit")))),
+                None
+            )
+        );
+        for end in [EndReason::Closed, EndReason::DaemonShutdown] {
+            assert_eq!(
+                outcome(Some(end), None).1,
+                Some((RunTermination::Interrupted, None))
+            );
+        }
+        assert_eq!(
+            outcome(Some(EndReason::Exited), None).1,
+            Some((RunTermination::Unknown, None))
+        );
+        assert_eq!(
+            outcome(Some(EndReason::Unknown), Some(0)).1,
+            Some((RunTermination::Unknown, None))
+        );
+        assert_eq!(
+            outcome(None, Some(0)),
+            (
+                Provenance::Unavailable,
+                None,
+                Some(Unavailable::RunNotEnded)
+            )
+        );
+    }
+
+    /// Each agent has one source of usage, and an agent with none exports
+    /// its usage as unavailable for want of a channel, never as zero.
+    #[test]
+    fn each_agent_has_one_usage_source_and_none_is_never_zero() {
+        use crate::event::AgentType;
+        assert_eq!(
+            usage_source(&AgentType::ClaudeCode),
+            UsageSource::ClaudeTranscript
+        );
+        assert_eq!(usage_source(&AgentType::Codex), UsageSource::CodexRollout);
+        assert_eq!(usage_source(&AgentType::Pi), UsageSource::UsageFile);
+        assert_eq!(usage_source(&AgentType::OpenCode), UsageSource::UsageFile);
+        assert_eq!(usage_source(&AgentType::Devin), UsageSource::NoChannel);
+        assert_eq!(usage_source(&AgentType::None), UsageSource::NoChannel);
+        let record = RunRecord {
+            termination: command_termination(Some(EndReason::Exited), Some(0)),
+            ..RunRecord::new(identity("r", "none"), no_usage_channel(), None)
+        };
+        let export = run_attributes(&record);
+        assert!(has(
+            &export.run,
+            AccountingKey::TokensUnavailableReason,
+            "no_channel"
+        ));
+        assert!(has(
+            &export.run,
+            AccountingKey::CostUnavailableReason,
+            "no_channel"
+        ));
+        assert!(has(
+            &export.run,
+            AccountingKey::QuotaUnavailableReason,
+            "no_channel"
+        ));
+        assert!(has(&export.run, AccountingKey::Termination, "completed"));
+        for key in [
+            AccountingKey::InputTokens,
+            AccountingKey::OutputTokens,
+            AccountingKey::CostMicroUsd,
+        ] {
+            assert!(
+                !export
+                    .run
+                    .iter()
+                    .chain(export.models.iter().flatten())
+                    .any(|a| a.key() == key),
+                "{key:?} is not sent for a run with no channel"
+            );
+        }
+    }
+
+    /// A run with several agent sessions counts each session's usage once,
+    /// folds a model they share, keeps one quota and takes the last turn
+    /// from the last session; a session whose usage is unknown makes a model
+    /// they share incomplete rather than dropping out.
+    #[test]
+    fn a_runs_sessions_combine_without_double_counting() {
+        let session = |model: &str, t: Tokens, cost: u64, turn| AgentUsage {
+            models: vec![ModelUsage {
+                model: Some(id(model)),
+                tokens: Field::ProviderReported(t),
+                cost: Field::Estimated(MicroUsd(cost)),
+            }],
+            quota: Field::Unavailable(Unavailable::NoChannel),
+            last_turn: Some(turn),
+        };
+        let usage = combine_sessions(vec![
+            session(
+                "claude-opus-5-5",
+                tokens(10, 1),
+                100,
+                AgentTurnEnd::Completed,
+            ),
+            session(
+                "claude-opus-5-5",
+                tokens(5, 2),
+                50,
+                AgentTurnEnd::Interrupted,
+            ),
+            session("claude-haiku-5-5", tokens(1, 1), 1, AgentTurnEnd::MidTurn),
+        ]);
+        let opus = usage
+            .models
+            .iter()
+            .find(|m| m.model == Some(id("claude-opus-5-5")))
+            .unwrap();
+        assert_eq!(opus.tokens, Field::ProviderReported(tokens(15, 3)));
+        assert_eq!(opus.cost, Field::Estimated(MicroUsd(150)));
+        assert_eq!(usage.models.len(), 2);
+        assert_eq!(usage.last_turn, Some(AgentTurnEnd::MidTurn));
+        assert_eq!(usage.quota, Field::Unavailable(Unavailable::NoChannel));
+
+        let unknown = AgentUsage {
+            models: vec![ModelUsage {
+                model: Some(id("claude-opus-5-5")),
+                tokens: Field::Unavailable(Unavailable::NotRecorded),
+                cost: Field::Unavailable(Unavailable::NotRecorded),
+            }],
+            quota: Field::Unavailable(Unavailable::NoChannel),
+            last_turn: None,
+        };
+        let usage = combine_sessions(vec![
+            session(
+                "claude-opus-5-5",
+                tokens(10, 1),
+                100,
+                AgentTurnEnd::Completed,
+            ),
+            unknown,
+        ]);
+        assert_eq!(
+            usage.models[0].tokens,
+            Field::Unavailable(Unavailable::Incomplete)
+        );
+        assert_eq!(usage.last_turn, Some(AgentTurnEnd::Completed));
+        assert_eq!(
+            combine_sessions(vec![]).models[0].tokens,
+            Field::Unavailable(Unavailable::NotRecorded)
+        );
+
+        let quota = |from, to| AgentUsage {
+            models: vec![],
+            quota: Field::ProviderReported(QuotaDelta {
+                plan: Some(id("pro")),
+                window_minutes: 10_080,
+                resets_at: 7,
+                from_bp: from,
+                to_bp: to,
+            }),
+            last_turn: None,
+        };
+        assert_eq!(
+            combine_sessions(vec![quota(1, 2), quota(2, 3)]).quota,
+            Field::Unavailable(Unavailable::Incomplete)
+        );
+        assert_eq!(
+            combine_sessions(vec![quota(1, 2), no_usage_channel()]).quota,
+            quota(1, 2).quota
+        );
+    }
+
+    /// The run's span carries its totals across models, each with the
+    /// provenance they share, and every model gets its own event; a total
+    /// over models of different provenance is incomplete, not a sum.
+    #[test]
+    fn the_run_span_carries_totals_and_each_model_an_event() {
+        assert_eq!(EVENT_MODEL_USAGE, "deck.model_usage");
+        let record = run(
+            identity("r", "claude"),
+            "claude-opus-5-5",
+            tokens(10, 2),
+            Field::Estimated(MicroUsd(30)),
+        );
+        let mut record = RunRecord {
+            models: vec![
+                record.models[0].clone(),
+                ModelUsage {
+                    model: Some(id("claude-haiku-5-5")),
+                    tokens: Field::ProviderReported(tokens(5, 1)),
+                    cost: Field::Estimated(MicroUsd(4)),
+                },
+            ],
+            ..record
+        };
+        let export = run_attributes(&record);
+        let int_of = |key| {
+            export
+                .run
+                .iter()
+                .find(|a| a.key() == key)
+                .map(|a| match a.value() {
+                    AttrValue::Int(v) => *v,
+                    other => panic!("{key:?} is {other:?}"),
+                })
+        };
+        assert_eq!(int_of(AccountingKey::InputTokens), Some(15));
+        assert_eq!(int_of(AccountingKey::OutputTokens), Some(3));
+        assert_eq!(int_of(AccountingKey::CostMicroUsd), Some(34));
+        assert!(has(&export.run, AccountingKey::CostProvenance, "estimated"));
+        assert_eq!(export.models.len(), 2);
+
+        record.models[1].cost = Field::Unavailable(Unavailable::SubscriptionZero);
+        let export = run_attributes(&record);
+        assert!(has(
+            &export.run,
+            AccountingKey::CostUnavailableReason,
+            "incomplete"
+        ));
+        assert!(
+            !export
+                .run
+                .iter()
+                .any(|a| a.key() == AccountingKey::CostMicroUsd)
+        );
+        assert!(has(
+            &export.run,
+            AccountingKey::TokensProvenance,
+            "provider_reported"
+        ));
+    }
+
+    /// A date in a model's name is named only when its year is between its
+    /// family's first and the year after the current one, in every form that
+    /// carries a year, checked against a given year rather than the clock:
+    /// so the window's edges, leap days and the move to a new year are each
+    /// pinned.
+    #[test]
+    fn a_model_names_year_is_in_its_familys_window() {
+        let named = |model: &str, year: i32| exported_model_in(&id(model), year).is_some();
+        // Claude (since 2023): `YYYYMMDD`, and Vertex AI's `@YYYYMMDD`.
+        for (model, in_2026) in [
+            ("claude-sonnet-4-20221231", false),
+            ("claude-sonnet-4-20230101", true),
+            ("claude-sonnet-4-20271231", true),
+            ("claude-sonnet-4-20280101", false),
+            ("claude-opus-4@20221231", false),
+            ("claude-opus-4@20271231", true),
+            ("claude-opus-4@20280101", false),
+            // Leap days: 2024 and 2028 are leap years, 2025 and 2027 not.
+            ("claude-sonnet-4-20240229", true),
+            ("claude-sonnet-4-20250229", false),
+            ("claude-sonnet-4-20270229", false),
+            // GPT (since 2023): `YYYY-MM-DD`.
+            ("gpt-5-2022-12-31", false),
+            ("gpt-5-2023-01-01", true),
+            ("gpt-5-2027-12-31", true),
+            ("gpt-5-2028-01-01", false),
+            ("gpt-4o-2024-02-29", true),
+            ("gpt-4o-2026-02-29", false),
+            // Mistral (since 2023): `YYMM`.
+            ("mistral-large-2212", false),
+            ("mistral-large-2301", true),
+            ("mistral-large-2712", true),
+            ("mistral-large-2801", false),
+            // Gemini (since 2023): `MM-YYYY`.
+            ("gemini-2.5-flash-preview-12-2022", false),
+            ("gemini-2.5-flash-preview-01-2023", true),
+            ("gemini-2.5-flash-preview-12-2027", true),
+            ("gemini-2.5-flash-preview-01-2028", false),
+            // Hosted Qwen (since 2023): `YYYYMMDD` and `YYYY-MM-DD`.
+            ("qwen3.5-plus-20221231", false),
+            ("qwen3.5-plus-20230101", true),
+            ("qwen3.5-plus-20271231", true),
+            ("qwen3.5-plus-20280101", false),
+            ("qwen-max-2028-01-25", false),
+            ("qwen-max-2027-01-25", true),
+            // `MMDD` and `MM-DD` carry no year: any leap-year calendar day.
+            ("gpt-4-0229", true),
+            ("gpt-4-0230", false),
+            ("qwen3.5-plus-02-29", true),
+            ("qwen3.5-plus-02-30", false),
+        ] {
+            assert_eq!(named(model, 2026), in_2026, "{model} in 2026");
+        }
+        // The move to a new year: a name dated two years ahead is refused on
+        // the last day of one year and named from the first day of the next.
+        for model in [
+            "claude-sonnet-4-20280105",
+            "claude-opus-4@20280105",
+            "gpt-5-2028-01-05",
+            "mistral-large-2801",
+            "gemini-2.5-flash-preview-01-2028",
+            "qwen3.5-plus-20280105",
+        ] {
+            assert!(!named(model, 2026), "{model} in 2026");
+            assert!(named(model, 2027), "{model} in 2027");
+        }
+        // A leap day two years ahead joins the window with its year.
+        assert!(!named("claude-sonnet-4-20280229", 2026));
+        assert!(named("claude-sonnet-4-20280229", 2027));
+        // A family's first year does not move with the current one.
+        assert!(!named("claude-sonnet-4-20221231", 2100));
+    }
+
+    /// The export names a model only of a known family, a plan or an error
+    /// kind only from its list (else `other`), and sends a failure's HTTP
+    /// status as `http.response.status_code`; a path-, email- or
+    /// credential-shaped value an agent recorded in their place never
+    /// leaves.
+    #[test]
+    fn exported_names_come_from_closed_lists() {
+        for kept in [
+            "claude-opus-5-5",
+            "claude-haiku-5-5",
+            "gpt-5.4-mini",
+            "o3",
+            "openai/gpt-5.5",
+            "us.anthropic.claude-sonnet-5-5-v1:0",
+            "claude-opus-4@20250514",
+            "gemini-3-pro",
+            "qwen3-coder",
+            "claude-haiku-4-5-20251001",
+            "anthropic.claude-opus-4-1-20250805-v1:0",
+            "gpt-4o",
+            "o4-mini",
+            "llama3.1:8b",
+            "qwen3-coder-480b-a35b-instruct",
+            "deepseek-r1",
+            "kimi-k2",
+            "glm-4.6",
+            "big-pickle",
+            // What the four agents report for the models this repository's
+            // real-agent tests run on (`tests/common/mod.rs`): Claude Code's
+            // and OpenCode's Claude models, Codex's ChatGPT default and its
+            // API-key default, Pi's default (`openai-codex/gpt-5.6-luna`, of
+            // which Pi reports the model), OpenCode's override for a
+            // ChatGPT login (`openai/gpt-5.6-luna`, of which OpenCode
+            // reports the model) and for OpenRouter.
+            "claude-haiku-5-5",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-fable-5-1",
+            "claude-haiku-4-5",
+            "anthropic/claude-haiku-4-5-20251001",
+            "gpt-5.6-luna",
+            "openai-codex/gpt-5.6-luna",
+            "openai/gpt-5.6-luna",
+            "gpt-5.1-codex-mini",
+            "gpt-5-nano",
+            "gpt-5.3-codex-spark",
+            "gpt-5.4",
+            "openai/gpt-4o-mini",
+            // Every default of a family listed here in Pi's
+            // `defaultModelPerProvider` at pi-mono `d5b3de22d0e2`
+            // (`packages/coding-agent/src/core/model-resolver.ts:20-43`).
+            "us.anthropic.claude-opus-4-6-v1",
+            "claude-opus-4-8",
+            "gpt-5.5",
+            "gpt-6.1-sol",
+            "openai-codex/gpt-6.1-sol",
+            "deepseek-v4-pro",
+            "gemini-3.1-pro-preview",
+            "moonshotai/kimi-k2.6",
+            "zai/glm-5.1",
+            "grok-4.7",
+            "openai/gpt-oss-120b",
+            "glm-5.3",
+            "devstral-medium-latest",
+            "MiniMax-M2.7",
+            "kimi-k2.6",
+            // Claude Code's default and aliases (Opus 5.5, Sonnet 5.5,
+            // Haiku 5.5, Fable 5.1 and 5), Codex's catalogue (GPT-6 Astra,
+            // Sol and Luna, and the GPT-5.6 line, Cyber included) and
+            // OpenCode's preferred free models.
+            "claude-opus-5-5",
+            "claude-fable-5",
+            "us.anthropic.claude-opus-5-5-v1:0",
+            "gpt-6-astra",
+            "gpt-6-luna",
+            "gpt-6-sol",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-cyber",
+            "deepseek-v4.1-flash-free",
+            "glm-5.3-flash-free",
+            // Other published shapes.
+            "claude-3-5-sonnet-20241022",
+            "claude-3-7-sonnet-latest",
+            "gpt-5-codex",
+            "gpt-4o-2024-08-06",
+            "gpt-oss-120b",
+            "gpt-oss:20b",
+            "o3-mini-2025-01-31",
+            "codex-mini-latest",
+            "gemini-2.5-pro",
+            "gemini-2.5-flash-lite",
+            "gemini-2.5-pro-preview-05-06",
+            "gemini-1.5-pro-002",
+            "gemma-3-27b-it",
+            "llama-3.3-70b-instruct",
+            "llama-4-maverick-17b-128e-instruct",
+            "mistral-large-2411",
+            "devstral-small-2505",
+            "qwen3-235b-a22b-thinking-2507",
+            "qwen2.5-coder:32b",
+            "deepseek-v3.1",
+            "deepseek-r1-0528",
+            "grok-code-fast-1",
+            "grok-4-fast-reasoning",
+            "kimi-k2-0905-preview",
+            "glm-4.5-air",
+            "minimax-m2",
+            // Each family's dates in the forms it publishes them.
+            "gpt-4-0613",
+            "gpt-3.5-turbo-0125",
+            "gpt-4-1106-preview",
+            "gpt-4-turbo-2024-04-09",
+            "gpt-4.1-2025-04-14",
+            "gpt-5-2025-08-07",
+            "o1-2024-12-17",
+            "claude-sonnet-4-20250514",
+            "gemini-2.5-flash-preview-09-2025",
+            "gemini-exp-1206",
+            "codestral-2501",
+            "ministral-8b-2410",
+            "qwen-max-2025-01-25",
+            "grok-2-1212",
+            "deepseek-v3-0324",
+            // Ollama tags in published sizes.
+            "qwen3:235b",
+            "llama3.1:405b",
+            "gemma3:270m",
+            "mixtral:8x22b",
+            // OpenRouter's catalogue (https://openrouter.ai/api/v1/models)
+            // and OpenAI's model index, as of 2026-10-26: published sizes,
+            // a mixture of experts' active size included, hosted Qwen's
+            // dates, two-word GPT suffixes and the router's variants.
+            "google/gemma-4-31b-it",
+            "google/gemma-4-26b-a4b-it",
+            "qwen/qwen3.5-9b",
+            "qwen/qwen3.5-27b",
+            "qwen/qwen3.5-35b-a3b",
+            "qwen/qwen3.6-27b",
+            "qwen/qwen3.6-35b-a3b",
+            "qwen/qwen3.8-27b",
+            "qwen/qwen3.5-122b-a10b",
+            "qwen/qwen3.5-397b-a17b",
+            "qwen/qwen3.8-2.4t-a95b",
+            "qwen/qwen3-next-80b-a3b-instruct",
+            "qwen/qwen3-vl-30b-a3b-thinking",
+            "qwen/qwen3-coder-next",
+            "qwen/qwen3.8-max-prime",
+            "qwen/qwen3.5-plus-20260420",
+            "qwen/qwen3.5-plus-02-15",
+            "qwen/qwen3.5-flash-02-23",
+            "openai/gpt-6.1-sol-pro",
+            "openai/gpt-6-luna-pro",
+            "openai/gpt-6-astra-pro",
+            "openai/gpt-5.6-terra-pro",
+            "openai/gpt-5.2-chat",
+            "openai/gpt-chat-latest",
+            "openai/gpt-oss-safeguard-20b",
+            "openai/o4-mini-high",
+            "google/gemma-4-31b-it:free",
+            "openai/gpt-5.4:batch",
+            "anthropic/claude-opus-4.8:batch",
+            "google/gemini-3.1-pro-preview-customtools",
+            "google/gemini-4-argon",
+            "google/gemini-nano-banana-2.1",
+            "meta-llama/llama-guard-4-12b",
+            "mistralai/mistral-medium-3-5",
+            "mistralai/mistral-small-3.2-24b-instruct",
+            "mistralai/mistral-small-24b-instruct-2501",
+            "deepseek/deepseek-chat-v3-0324",
+            "deepseek/deepseek-v4-flash-vision-exp",
+            "x-ai/grok-4.20-multi-agent",
+            "x-ai/grok-build-0.1",
+            "moonshotai/kimi-k3.1-pro",
+            "z-ai/glm-5v-turbo",
+            "z-ai/glm-5.3-flashx",
+            "minimax/minimax-m3.1-flash",
+            "minimax/minimax-01",
+        ] {
+            assert_eq!(
+                exported_model(&id(kept)).map(Ident::as_str),
+                Some(kept),
+                "{kept}"
+            );
+        }
+        for dropped in [
+            "/home/x/.ssh/id",
+            "me@example.com",
+            "sk-ant-api03-abcdef",
+            "ghp_0123456789abcdef",
+            "Claude-Opus",
+            "my-private-model",
+            "<synthetic>",
+            ".claude-x",
+            // A path, host or private namespace in front of a known name,
+            // or a known family with words that are not a model's (#1858).
+            "home/alice/private/gpt-5",
+            "private/customer/llama-3.gguf",
+            "customer-secret.example/gpt-5",
+            "customer-secret.example.gpt-5",
+            "gpt-confidential-project",
+            "claude-acme-internal",
+            "openai/../gpt-5",
+            "acme/openai/gpt-5",
+            "gpt-5/private",
+            "o",
+            "big",
+            "gpt-5-1-2-3-4-5-6-7",
+            // A known family with a deployment's own suffix: an address, a
+            // host, a long number, words in no published combination.
+            "gpt-5@10.42.0.7",
+            "gpt-5:10.42.0.7",
+            "gpt-5-12345678901234567890",
+            "gpt-5-10.42.0.7",
+            "gpt-5-db01.corp.example",
+            "gpt-5-prod-eu",
+            "gpt-high-code-search",
+            "gpt-5-mini-pro-codex",
+            "claude-opus-4@10.42.0.7",
+            "claude-opus-4@99999999",
+            "llama3.1:customer",
+            "claude-haiku-5-5-v1:0",
+            "gpt-123.4",
+            "gpt-5.44",
+            // A date in a form the family does not publish, a date that is
+            // not one, a year outside the family's, a size it is not
+            // published in (#1858).
+            "gpt-5-2411",
+            "gpt-5-1231",
+            "gpt-5-20250807",
+            "gpt-4o-0806",
+            "claude-sonnet-4-5-3912",
+            "claude-sonnet-4-5-2025-05-14",
+            "gpt-5-20250231",
+            "gpt-5-2025-02-31",
+            "claude-sonnet-4@20250231",
+            "claude-sonnet-4-20251301",
+            "claude-sonnet-4-20190514",
+            "claude-sonnet-4-20990514",
+            "gpt-4-1332",
+            "mistral-large-2413",
+            "mistral-large-1411",
+            "mistral-large-0613",
+            "qwen3:123b",
+            "llama3.1:999b",
+            "qwen3-123b-instruct",
+            "kimi-k2:8b",
+            "claude-opus-4-6-v1",
+            "us.anthropic.claude-opus-4-6-v12",
+            "minimax-M2.7",
+            // Next to each published size, date, word and variant admitted
+            // from the catalogues: a size not listed for the family, an
+            // address, a host or a long number in the same place, and words
+            // in no published combination.
+            "qwen3.5-28b",
+            "qwen3.5-35b-a4b",
+            "qwen3.5-27b-10.42.0.7",
+            "gemma-4-31b-a3b-it",
+            "gemma-4-31b-it-db01.corp.example",
+            "gemma-4-26b-a4b-a4b-a4b-it",
+            "qwen3.5-plus-20260230",
+            "qwen3.5-plus-02-30",
+            "qwen3.5-plus-13-01",
+            "qwen3.5-plus-12345678",
+            "qwen3.5-plus-10-42-0-7",
+            "qwen3.5-plus-2026042012",
+            "qwen3-235b-a22b-20260420",
+            "qwen3-235b-a22b-02-15",
+            "gpt-5-02-15",
+            "gpt-6.1-sol-pro-max",
+            "gpt-6.1-pro-sol",
+            "gpt-6.1-sol-sol-pro",
+            "gpt-6.1-sol-pro-12345678901234567890",
+            "gpt-5.2-chat-prod",
+            "o4-mini-high-eu",
+            "google/gemma-4-31b-it:10.42.0.7",
+            "google/gemma-4-31b-it:freebie",
+            "gemma-4-31b-it:free",
+            "us.anthropic.claude-opus-4-6:batch",
+            "x-ai/grok-4.21",
+            "x-ai/grok-4.200",
+            "z-ai/glm-5.7v",
+            "minimax/minimax-02",
+            "mistral-medium-3-5-7",
+            "llama-guard-4-999b",
+        ] {
+            let Some(ident) = Ident::new(dropped) else {
+                continue;
+            };
+            assert_eq!(exported_model(&ident), None, "{dropped}");
+        }
+        assert_eq!(
+            exported_model(&id(&format!("claude-{}", "x".repeat(100)))),
+            None
+        );
+        assert_eq!(exported_plan(&id("prolite")), "prolite");
+        assert_eq!(exported_plan(&id("me@example.com")), "other");
+        assert_eq!(
+            exported_error_kind(&id("server_overloaded")),
+            "server_overloaded"
+        );
+        assert_eq!(exported_error_kind(&id("rate_limit")), "rate_limit");
+        assert_eq!(exported_error_kind(&id("/home/x")), "other");
+
+        let mut record = run(
+            identity("r", "claude"),
+            "/home/x/.ssh/id",
+            tokens(1, 1),
+            Field::Estimated(MicroUsd(1)),
+        );
+        record.termination = Field::ProviderReported(Termination {
+            outcome: RunTermination::Failed,
+            error_type: Some(id("me@example.com")),
+            http_status: Some(429),
+        });
+        record.quota = Field::ProviderReported(QuotaDelta {
+            plan: Some(id("sk-ant-api03-abcdef")),
+            window_minutes: 1,
+            resets_at: 1,
+            from_bp: 1,
+            to_bp: 2,
+        });
+        let export = run_attributes(&record);
+        assert!(has(&export.run, AccountingKey::ErrorType, "other"));
+        assert!(has(&export.run, AccountingKey::QuotaPlan, "other"));
+        assert!(
+            export
+                .run
+                .iter()
+                .any(|a| a.key() == AccountingKey::HttpStatus && *a.value() == AttrValue::Int(429))
+        );
+        assert!(
+            !export.models[0]
+                .iter()
+                .any(|a| a.key() == AccountingKey::ResponseModel)
+        );
+        let text = format!("{export:?}");
+        for leaked in ["/home/x", "example.com", "sk-ant"] {
+            assert!(!text.contains(leaked), "{leaked} in {text}");
+        }
+
+        // The same at the export: a deployment's own model name sends no
+        // name but keeps the model's tokens; a published one is sent.
+        for (model, named) in [
+            ("gpt-5@10.42.0.7", false),
+            ("gpt-5-12345678901234567890", false),
+            ("gpt-5-10.42.0.7", false),
+            ("gpt-5-db01.corp.example", false),
+            ("gpt-high-code-search", false),
+            ("home/alice/private/gpt-5", false),
+            ("customer-secret.example/gpt-5", false),
+            ("gpt-5-2411", false),
+            ("gpt-5-1231", false),
+            ("claude-sonnet-4-5-3912", false),
+            ("gpt-5-20250231", false),
+            ("claude-sonnet-4@20250231", false),
+            ("qwen3:123b", false),
+            ("llama3.1:999b", false),
+            ("gpt-6.1-sol", true),
+            ("us.anthropic.claude-opus-4-6-v1", true),
+            ("deepseek-v4-pro", true),
+            ("gpt-5.6-luna", true),
+            ("openai-codex/gpt-5.6-luna", true),
+            ("claude-haiku-5-5", true),
+        ] {
+            let export = run_attributes(&run(
+                identity("r", "codex"),
+                model,
+                tokens(7, 3),
+                Field::Estimated(MicroUsd(1)),
+            ));
+            let event = &export.models[0];
+            assert_eq!(
+                has(event, AccountingKey::ResponseModel, model),
+                named,
+                "{model}"
+            );
+            assert!(
+                event
+                    .iter()
+                    .any(|a| a.key() == AccountingKey::InputTokens
+                        && *a.value() == AttrValue::Int(7)),
+                "{model}: {event:?}"
+            );
+            if !named {
+                assert!(
+                    !event
+                        .iter()
+                        .any(|a| a.key() == AccountingKey::ResponseModel),
+                    "{model}"
+                );
+                assert!(!format!("{export:?}").contains(model), "{model}");
+            }
+        }
+    }
+
+    /// Codex writes a detailed error as an object keyed by its kind: the kind
+    /// and its HTTP status are read, its message never is.
+    #[test]
+    fn a_codex_error_object_gives_its_kind_and_status() {
+        let reader = read(&[
+            task_started().to_string(),
+            format!(
+                r#"{{"type":"event_msg","payload":{{"type":"task_complete","error":{{"message":"{SENTINEL}","codex_error_info":{{"http_connection_failed":{{"http_status_code":502,"detail":"{SENTINEL}"}}}}}}}}}}"#
+            ),
+        ]);
+        assert_eq!(
+            reader.summary().last_turn,
+            Some(AgentTurnEnd::Failed {
+                kind: Some(id("http_connection_failed")),
+                status: Some(502),
+            })
+        );
+        assert!(!format!("{:?}", reader.summary()).contains(SENTINEL));
+    }
+
+    /// A rollout whose usage lines no longer parse is in a format the reader
+    /// does not know: its tokens and quota are unrecognized, never zero.
+    #[test]
+    fn a_rollout_in_a_changed_format_is_unrecognized() {
+        let reader = read(&[
+            turn_context("gpt-5.5"),
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":"#.to_string(),
+        ]);
+        let usage = from_codex(reader.summary());
+        assert_eq!(
+            usage.models[0].tokens,
+            Field::Unavailable(Unavailable::UnrecognizedFormat)
+        );
+        assert_eq!(
+            usage.quota,
+            Field::Unavailable(Unavailable::UnrecognizedFormat)
+        );
+    }
+
+    /// The work a poll does is the bytes appended since the last one: an
+    /// idle poll reads and parses nothing, and an appended line is read
+    /// once — the deterministic half of the per-poll cost, whose timing the
+    /// overhead drivers below measure.
+    #[test]
+    fn an_idle_poll_reads_nothing_and_an_append_is_read_once() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("usage.jsonl");
+        let mut file = File::create(&path).unwrap();
+        let mut reader = usage_file::UsageFileReader::new(&path);
+        reader.poll().unwrap();
+        let line = r#"{"v":1,"type":"reply","agent":"pi","model":"gpt-5.5","input":1,"output":1}"#;
+        writeln!(file, "{line}").unwrap();
+        reader.poll().unwrap();
+        let after_append = reader.stats();
+        assert_eq!(after_append.bytes_read, line.len() as u64 + 1);
+        assert_eq!(after_append.parsed, 1);
+        for _ in 0..10 {
+            reader.poll().unwrap();
+        }
+        assert_eq!(reader.stats(), after_append);
+        assert_eq!(usage_file::USAGE_FILE_ENV, "DOT_AGENT_DECK_USAGE_FILE");
     }
 
     // --- overhead benchmark ---
@@ -4390,7 +6425,7 @@ mod tests {
                 continue;
             };
             for line in bytes.split(|b| *b == b'\n') {
-                if line_is_candidate(line)
+                if line_is_candidate(line, CodexRolloutSummary::MARKERS)
                     && serde_json::from_slice::<serde_json::Value>(line).is_ok()
                 {
                     values += 1;
@@ -4436,6 +6471,111 @@ mod tests {
             idle.sort_unstable();
             println!(
                 "incremental, {} rollouts, {appended} bytes in {} polls: mean {:.1} µs, median {:.1} µs, p99 {:.1} µs, max {:.1} µs, {:.2} µs per KB appended",
+                largest.len(),
+                polls.len(),
+                total.as_secs_f64() * 1e6 / polls.len() as f64,
+                quantile_us(&polls, 0.5),
+                quantile_us(&polls, 0.99),
+                quantile_us(&polls, 1.0),
+                total.as_secs_f64() * 1e6 / (appended as f64 / 1024.0),
+            );
+            println!(
+                "idle poll, nothing appended, {} polls: median {:.1} µs, p99 {:.1} µs",
+                idle.len(),
+                quantile_us(&idle, 0.5),
+                quantile_us(&idle, 0.99),
+            );
+        }
+        println!("load average at end: {}", load_average());
+    }
+
+    /// The Claude Code half of the overhead measurement (PRD #1858). A no-op
+    /// unless `DAD_ACCOUNTING_BENCH_CLAUDE_DIR` names a directory of Claude
+    /// Code transcripts (`~/.claude/projects`): then it reads every `.jsonl`
+    /// under it whole with a fresh [`claude::ClaudeTranscriptReader`] each,
+    /// tallies the provenance of each transcript's usage, replays the 20
+    /// largest a line at a time into a scratch file polling after each line,
+    /// and times idle polls. Aggregates only — never a path, a file name or
+    /// a line. Run it in a release build on the machine that holds the
+    /// transcripts; `docs/develop/telemetry.md` has the command.
+    #[test]
+    fn overhead_over_a_directory_of_claude_transcripts() {
+        let Some(dir) = std::env::var_os("DAD_ACCOUNTING_BENCH_CLAUDE_DIR") else {
+            return;
+        };
+        let mut files = Vec::new();
+        rollouts_under(Path::new(&dir), &mut files);
+        assert!(!files.is_empty(), "no .jsonl file under the directory");
+        let total_bytes: u64 = files.iter().map(|(_, len)| len).sum();
+        println!("load average at start: {}", load_average());
+        println!("transcripts: {}, bytes: {total_bytes}", files.len());
+
+        let started = Instant::now();
+        let (mut stats, mut errors) = (ReaderStats::default(), 0);
+        let mut by_provenance: BTreeMap<String, u64> = BTreeMap::new();
+        for (path, _) in &files {
+            let mut reader = claude::ClaudeTranscriptReader::new(path).with_poll_budget(u64::MAX);
+            if reader.poll().is_err() {
+                errors += 1;
+                continue;
+            }
+            let s = reader.stats();
+            stats.lines += s.lines;
+            stats.parsed += s.parsed;
+            stats.malformed += s.malformed;
+            stats.overlong += s.overlong;
+            let usage = reader.summary().usage();
+            let tokens = &usage.models[0].tokens;
+            let key = match tokens.unavailable() {
+                Some(reason) => reason.as_str().to_owned(),
+                None => tokens.provenance().as_str().to_owned(),
+            };
+            *by_provenance.entry(key).or_default() += 1;
+        }
+        let secs = started.elapsed().as_secs_f64();
+        println!(
+            "full read: {secs:.2} s, {:.0} MB/s; lines {}, deserialised {}, malformed {}, overlong {}, open errors {errors}; usage by provenance or reason: {by_provenance:?}",
+            total_bytes as f64 / 1e6 / secs,
+            stats.lines,
+            stats.parsed,
+            stats.malformed,
+            stats.overlong,
+        );
+
+        let mut largest = files.clone();
+        largest.sort_by_key(|(_, len)| std::cmp::Reverse(*len));
+        largest.truncate(20);
+        let scratch = crate::test_temp::tempdir().unwrap();
+        let mut polls: Vec<Duration> = Vec::new();
+        let mut appended = 0u64;
+        let mut idle: Vec<Duration> = Vec::new();
+        for (i, (path, _)) in largest.iter().enumerate() {
+            let Ok(bytes) = std::fs::read(path) else {
+                continue;
+            };
+            let target = scratch.path().join(format!("replay-{i}.jsonl"));
+            let mut out = File::create(&target).unwrap();
+            let mut reader = claude::ClaudeTranscriptReader::new(&target);
+            for line in bytes.split_inclusive(|b| *b == b'\n') {
+                out.write_all(line).unwrap();
+                out.flush().unwrap();
+                appended += line.len() as u64;
+                let started = Instant::now();
+                reader.poll().unwrap();
+                polls.push(started.elapsed());
+            }
+            for _ in 0..100 {
+                let started = Instant::now();
+                reader.poll().unwrap();
+                idle.push(started.elapsed());
+            }
+        }
+        if !polls.is_empty() {
+            let total: Duration = polls.iter().sum();
+            polls.sort_unstable();
+            idle.sort_unstable();
+            println!(
+                "incremental, {} transcripts, {appended} bytes in {} polls: mean {:.1} µs, median {:.1} µs, p99 {:.1} µs, max {:.1} µs, {:.2} µs per KB appended",
                 largest.len(),
                 polls.len(),
                 total.as_secs_f64() * 1e6 / polls.len() as f64,

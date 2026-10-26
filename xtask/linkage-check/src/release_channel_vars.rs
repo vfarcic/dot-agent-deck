@@ -350,12 +350,15 @@ fn release_channel_vars_005_generating_tasks_run_under_go_task_on_the_release_di
     )
     .expect("copy the validator");
     fs::create_dir_all(w.join("dist")).expect("dist/");
-    // The four assets release.yml's build matrix produces, and no Windows one.
+    // The assets release.yml's build matrix produces: the deck for four
+    // platforms, the collector for the two Linux ones, and no Windows binary.
     let assets = [
         ("darwin-arm64", "1"),
         ("darwin-amd64", "2"),
         ("linux-arm64", "3"),
         ("linux-amd64", "4"),
+        ("collector-linux-arm64", "5"),
+        ("collector-linux-amd64", "6"),
     ];
     let checksums: String = assets
         .iter()
@@ -400,6 +403,39 @@ fn release_channel_vars_005_generating_tasks_run_under_go_task_on_the_release_di
     ] {
         assert!(rb.contains(&line), "formula lacks {line:?}:\n{rb}");
     }
+    // Issue #1906: on Linux the formula carries the collector as a resource
+    // beside each architecture's deck binary and installs it next to the deck.
+    // Matched as whole blocks, indentation included, because a dedent pass
+    // that flattens the nesting still leaves every line present.
+    for (arch, sum) in [("arm64", "5"), ("amd64", "6")] {
+        let block = format!(
+            "      resource \"collector\" do\n        \
+             url \"{base}/dot-agent-deck-collector-linux-{arch}\"\n        \
+             sha256 \"{}\"\n      end\n",
+            sum.repeat(64)
+        );
+        assert!(rb.contains(&block), "formula lacks {block:?}:\n{rb}");
+    }
+    for block in [
+        "    if OS.linux?\n      resource(\"collector\").stage do\n        \
+         bin.install Dir[\"dot-agent-deck-collector-*\"].first => \"dot-agent-deck-collector\"\n      \
+         end\n    end\n",
+        "    assert_match \"dot-agent-deck-collector\", \
+         shell_output(\"#{bin}/dot-agent-deck-collector --help\") if OS.linux?\n",
+    ] {
+        assert!(rb.contains(block), "formula lacks {block:?}:\n{rb}");
+    }
+    // The collector is a Linux asset only, so nothing in the macOS block
+    // names it: a macOS install stays the deck alone.
+    let macos = rb
+        .split("  on_macos do\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\n  end\n").next())
+        .expect("formula has an `on_macos` block");
+    assert!(
+        !macos.contains("collector"),
+        "the macOS block names the collector, which has no macOS asset:\n{macos}"
+    );
     let json = fs::read_to_string(w.join("dist/dot-agent-deck-beta.json")).expect("manifest");
     for line in [
         "    \"version\": \"0.42.0-rc.1\",\n".to_string(),

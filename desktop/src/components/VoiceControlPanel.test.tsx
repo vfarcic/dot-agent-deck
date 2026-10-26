@@ -2885,8 +2885,8 @@ describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
     expect(screen.queryByTestId("voice-reading-indicator")).toBeNull();
   });
 
-  /** Scenario: "reading on" with Reading already on, and "reading off" with it off, are refused in plain words and save nothing. */
-  it("refuses a switch that is already where it was asked to be", async () => {
+  /** Scenario: "reading on" with Reading already on is refused in plain words and saves nothing. */
+  it("refuses reading on when Reading is on", async () => {
     const on = await mount({ reading: "on", notice: "shown" });
     await on.say("reading on");
     expect(screen.getByTestId("voice-report")).toHaveTextContent(READING_ALREADY_ON);
