@@ -243,6 +243,12 @@ async fn status_032_a_successor_that_exits_at_once_still_replaced_its_predecesso
 
 /// A lifted generation is outside registry shutdown's reach. Kill and reap
 /// its child when its test scope ends, including on an assertion panic.
+///
+/// The cleanup is the registry's own force-kill teardown: on Unix a SIGKILL
+/// to the process group named by the child's own pid, then a blocking wait.
+/// It is best-effort, not a guarantee. Errors are discarded so `Drop` never
+/// panics; without a usable pid it falls back to portable-pty's SIGHUP; and
+/// the wait does not return for a child the kernel has not yet torn down.
 struct LiftedAgent(RunningAgent);
 
 impl std::ops::Deref for LiftedAgent {
@@ -255,8 +261,7 @@ impl std::ops::Deref for LiftedAgent {
 
 impl Drop for LiftedAgent {
     fn drop(&mut self) {
-        let _ = self.0.child.kill();
-        let _ = self.0.child.wait();
+        crate::platform::proc::force_kill_child_and_wait(&mut self.0.child, &self.0.process_group);
     }
 }
 
@@ -415,7 +420,9 @@ fn status_032_a_delayed_reader_keeps_its_failed_respawn_however_many_follow() {
     drop(ticket);
     // Every later failure stays uncaptured until the delayed one is read:
     // cat blocks on the untouched PTY input, whose master each lifted
-    // record retains. Only the guards' kills release these children.
+    // record retains. Barring an external signal or an inherited test
+    // lifetime backstop, these children stay blocked until their guards
+    // kill them.
     let mut later = Vec::new();
     for n in 0..100 {
         let agent = spawn_on(&registry, &format!("termination-later-{n}"), "cat");
