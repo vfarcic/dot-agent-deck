@@ -410,7 +410,7 @@ fn status_032_a_replacement_counts_only_once_its_successor_is_published() {
     registry.shutdown_all();
 }
 
-/// Scenario: A respawn fails, and its removed generation's reader is delayed while a hundred later respawns in other panes fail too, their children blocked on PTY input until the test kills and reaps them, including on assertion failure. When the delayed reader finally captures, it must still say the replacement failed, never that the pane was closed, and so must each later one when it captures after it.
+/// Scenario: A respawn fails with its removed generation's reader blocked on PTY input while a hundred later respawns fail on synthetic generations with no background reader. When the delayed reader finally captures, it must still say the replacement failed, never that the pane was closed, and so must each later one when it captures after it; the real child is killed and reaped even on assertion failure.
 #[spec("inbox/status/032")]
 #[test]
 fn status_032_a_delayed_reader_keeps_its_failed_respawn_however_many_follow() {
@@ -418,18 +418,27 @@ fn status_032_a_delayed_reader_keeps_its_failed_respawn_however_many_follow() {
     let delayed = spawn_on(&registry, "termination-delayed-pane", "cat");
     let (ticket, delayed_lifted) = lift_for_respawn(&registry, &delayed);
     drop(ticket);
-    // Every later failure stays uncaptured until the delayed one is read:
-    // cat blocks on the untouched PTY input, whose master each lifted
-    // record retains. Barring an external signal or an inherited test
-    // lifetime backstop, these children stay blocked until their guards
-    // kill them.
+    // The delayed generation's cat blocks on untouched PTY input while its
+    // lifted record holds the master. Later generations use the existing
+    // no-PTY seam, which starts no reader: their failed tickets still pass
+    // through the real Drop, but no background capture can consume them.
+    // This leaves 101 failures outstanding while holding just one PTY,
+    // reducing pressure on macOS's shared pool during concurrent tests.
     let mut later = Vec::new();
     for n in 0..100 {
-        let agent = spawn_on(&registry, &format!("termination-later-{n}"), "cat");
+        let agent = registry.insert_idle_member_for_test(
+            &format!("termination-later-{n}"),
+            "termination-later-instance",
+            false,
+        );
         let (ticket, lifted) = lift_for_respawn(&registry, &agent);
         drop(ticket);
         later.push((agent, lifted));
     }
+    assert!(
+        registry.terminations.lock().unwrap().is_empty(),
+        "no reader may capture a failure before the delayed assertion"
+    );
     let termination = capture_now(&registry, &delayed, &delayed_lifted);
     assert_eq!(termination, Termination::ReplacementFailed);
     assert_eq!(termination.wire(), PaneTermination::Unknown);
