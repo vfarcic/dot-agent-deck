@@ -206,6 +206,64 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** delivery on a logged-out host; that outcome is unverified, not a successful delivery check.
 - **Platform coverage:** mac+linux when authenticated.
 
+#### telemetry/usage
+
+##### telemetry/usage/001 — Codex rollout totals, allowance and final-turn termination reach the run.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_usage.rs`).
+- **Agent:** offline Codex stand-ins; no real agent or credentials.
+- **Asserts:** three ended runs export per-model and aggregate input/output/cache counts, provider provenance, unavailable cost, the Pro window and first/last allowance samples; completed, server-overloaded failure and interrupted endings retain provider termination.
+- **Does not assert:** a real Codex upgrade's rollout format, overlapping subscription attribution or hosted ingestion.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/usage/002 — OpenCode subscription zeros are unavailable costs with tokens preserved.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_usage.rs`).
+- **Agent:** offline OpenCode reply-file stand-in.
+- **Asserts:** run and model usage carry provider-reported tokens, cost unavailable with subscription_zero and no numeric cost, and a completed provider termination.
+- **Does not assert:** the real OpenCode plugin, duplicate reply replacement or interrupted replies.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/usage/003 — Pi exports tokens and a labelled cost estimate.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_usage.rs`).
+- **Agent:** offline Pi reply-file stand-in.
+- **Asserts:** run and model input include cache reads, output and cache counts match, cost is 4200 microusd with estimated provenance, quota is unavailable with no_channel, and termination is completed.
+- **Does not assert:** the real Pi extension or list-price correctness for an arbitrary provider.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/usage/004 — Arbitrary commands export no-channel usage and measured exit outcomes.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_usage.rs`).
+- **Agent:** shell commands exiting 0 and 3; no real agent.
+- **Asserts:** tokens, cost and quota are unavailable with no_channel and absent numeric values; one anonymous unavailable model event is exported; successful exit is completed, nonzero exit is failed with nonzero_exit, both measured.
+- **Does not assert:** signal termination, daemon shutdown or an unknown exit status.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/usage/005 — Claude final transcript exports model totals, estimates and API failure details.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_usage.rs`).
+- **Agent:** offline Claude transcript and session-hook stand-ins.
+- **Asserts:** completed and rate-limited runs export input including cache read/write, output, provider-reported tokens and estimated 12300 microusd cost per model and in aggregate; termination and last turn distinguish completed from failed, with rate_limit and HTTP 429 on failure.
+- **Does not assert:** resumed-session baseline subtraction or a killed Claude session without cost-state.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/usage/006 — Usage export excludes transcript content, paths and arbitrary model and error names.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_usage.rs`).
+- **Agent:** offline Claude with private transcript markers.
+- **Asserts:** prompt, reply, tool result, error message, cwd, unrecognized model and error-kind markers reach neither captured request bodies (including span attributes/events) nor telemetry-module logs; a positive control requires exported token counts and failed termination, maps the error kind to other and omits the model name.
+- **Does not assert:** an external agent's own telemetry, unrelated daemon log targets or protobuf encoding.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/usage/007 — Real interactive Haiku exports model usage and completed termination. [reel]
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_telemetry_export_live.rs`), developer machine only.
+- **Agent:** real interactive Claude Code on pinned Haiku, imported credentials and seeded trust.
+- **Asserts:** a directive inbox task visibly advances Thinking → Working/Bash → Idle and copies a unique fixture sentinel; normal Claude exit exports positive provider-reported input/output tokens, positive estimated cost and provider-reported completed termination, with a Haiku-family model usage event on agent.run.
+- **Does not assert:** billing, exact token counts or a different agent/model.
+- **Platform coverage:** mac+linux when authenticated.
+
+##### telemetry/usage/008 — A child started from a parent pane keeps its usage under its own run id.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_usage.rs`).
+- **Agent:** offline Pi parent and child; parent requests the child through the real attach socket from inside its process.
+- **Asserts:** inherited usage-file and OTEL resource environment do not combine the runs; receiver spans have different run ids and separate model/aggregate token counts and estimated costs, each with completed termination.
+- **Does not assert:** work-item rollups, real-agent tool invocation or orchestration role accounting.
+- **Platform coverage:** mac+linux.
+
 ### Session pull requests
 
 #### session/pr
