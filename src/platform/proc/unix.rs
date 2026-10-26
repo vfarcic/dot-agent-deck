@@ -707,6 +707,46 @@ pub fn executable_of(_pid: u32) -> Option<std::path::PathBuf> {
     None
 }
 
+/// PRD #1666 part 3 (Q35-04): the processes as the composer probe's
+/// classifier (`composer_probe::classifier`) reads them, from `/proc`.
+/// Nothing in the daemon uses it yet.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Default)]
+pub struct LinuxProcView;
+
+/// `/proc/<pid>/stat`'s parent and start ticks. `comm` may hold spaces and
+/// parentheses, so the fields are counted from its last `)`: `state` is
+/// field 3, so `ppid` (4) is the second after it and `starttime` (22) the
+/// 20th.
+#[cfg(target_os = "linux")]
+fn parse_proc_stat(stat: &str) -> Option<crate::composer_probe::classifier::ProcStat> {
+    let mut fields = stat[stat.rfind(')')? + 1..].split_whitespace();
+    let ppid = fields.nth(1)?.parse().ok()?;
+    let start = fields.nth(17)?.parse().ok()?;
+    Some(crate::composer_probe::classifier::ProcStat { ppid, start })
+}
+
+#[cfg(target_os = "linux")]
+impl crate::composer_probe::classifier::ProcView for LinuxProcView {
+    fn stat(&mut self, pid: u32) -> std::io::Result<crate::composer_probe::classifier::ProcStat> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+        parse_proc_stat(&stat).ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))
+    }
+
+    fn exe(&mut self, pid: u32) -> std::io::Result<crate::composer_probe::classifier::FileId> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(format!("/proc/{pid}/exe"))?;
+        Ok(crate::composer_probe::classifier::FileId {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })
+    }
+
+    fn exe_path(&mut self, pid: u32) -> std::io::Result<std::path::PathBuf> {
+        std::fs::read_link(format!("/proc/{pid}/exe"))
+    }
+}
+
 /// The calling process's parent pid. Wraps `getppid(2)` (async-signal-safe,
 /// infallible) so the single `unsafe` lives in one place.
 pub fn current_ppid() -> i32 {

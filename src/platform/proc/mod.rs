@@ -147,6 +147,8 @@ pub(crate) fn checked_target_pid(pid: u32) -> std::io::Result<u32> {
     Ok(pid)
 }
 
+#[cfg(target_os = "linux")]
+pub use unix::LinuxProcView;
 #[cfg(unix)]
 pub use unix::{
     AgentProcessGroup, PinnedProcess, current_ppid, executable_of, force_kill_child_and_wait,
