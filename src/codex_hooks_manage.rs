@@ -1046,7 +1046,17 @@ fn list_hooks_with(
     cwd: &Path,
     timeout: Duration,
 ) -> std::io::Result<HooksListing> {
-    let mut child = Command::new(codex)
+    let mut command = Command::new(codex);
+    // A listing is the deck's own probe, not a Codex session of the user's:
+    // Codex exports its own telemetry when an `OTEL_*` endpoint is in its
+    // environment, and this one would reach the user's backend as a
+    // `codex-app-server` service the user never ran.
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("OTEL_") {
+            command.env_remove(key);
+        }
+    }
+    let mut child = command
         .arg("app-server")
         .current_dir(cwd)
         .env("CODEX_HOME", home)
